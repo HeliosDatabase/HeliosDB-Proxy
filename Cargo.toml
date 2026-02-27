@@ -1,0 +1,73 @@
+[package]
+name = "heliosdb-proxy"
+version = "0.2.0"
+edition = "2021"
+description = "HeliosProxy - Intelligent connection router and failover manager for HeliosDB"
+license = "Apache-2.0"
+authors = ["HeliosDB Team"]
+repository = "https://github.com/dimensigon/heliosdb-proxy"
+keywords = ["database", "proxy", "failover", "load-balancer", "connection-pool"]
+categories = ["database", "network-programming"]
+readme = "README.md"
+
+[features]
+default = ["tr", "pool-modes"]
+
+# Transaction Replay (TR)
+tr = []
+
+# Connection pooling modes (Session/Transaction/Statement)
+pool-modes = []
+
+# Full observability (metrics, tracing)
+observability = ["dep:prometheus", "dep:opentelemetry"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Networking
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Concurrent data structures
+dashmap = "5"
+parking_lot = "0.12"
+
+# Configuration
+config = "0.14"
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+
+# Optional: Metrics
+prometheus = { version = "0.13", optional = true }
+opentelemetry = { version = "0.21", optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[bin]]
+name = "heliosdb-proxy"
+path = "src/main.rs"
+
+[lib]
+name = "heliosdb_proxy"
+path = "src/lib.rs"

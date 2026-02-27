@@ -1,0 +1,11 @@
+target/
+heliosdb-data/
+*.a
+*.rlib
+*.rmeta
+*.bin
+__pycache__/
+*.pyc
+.env
+*.key
+*.pem
