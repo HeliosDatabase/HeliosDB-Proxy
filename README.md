@@ -120,4 +120,4 @@ curl http://localhost:9090/metrics
 
 ## License
 
-Apache-2.0
+SSPL-1.0 (Server Side Public License, Version 1)
