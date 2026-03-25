@@ -1,8 +1,8 @@
 [package]
 name = "heliosdb-proxy"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "HeliosProxy - Intelligent connection router and failover manager for HeliosDB"
+description = "HeliosProxy - Intelligent connection router and failover manager for HeliosDB and PostgreSQL"
 license-file = "LICENSE"
 authors = ["HeliosDB Team"]
 repository = "https://github.com/dimensigon/heliosdb-proxy"
@@ -11,16 +11,81 @@ categories = ["database", "network-programming"]
 readme = "README.md"
 
 [features]
-default = ["tr", "pool-modes"]
+default = ["pool-modes"]
 
-# Transaction Replay (TR)
-tr = []
+# ── Core features ────────────────────────────────────────────────────
 
 # Connection pooling modes (Session/Transaction/Statement)
 pool-modes = []
 
+# Transaction Replay (TR) - failover replay, cursor restore, session migrate
+ha-tr = []
+
+# ── Topology providers ──────────────────────────────────────────────
+
+# PostgreSQL-based topology discovery (pg_is_in_recovery polling)
+postgres-topology = []
+
+# HeliosDB internal topology (requires HeliosDB-Lite workspace)
+heliosdb-topology = []
+
+# ── Proxy feature modules ───────────────────────────────────────────
+
+# Query caching (L1 hot / L2 warm / L3 semantic)
+query-cache = []
+
+# Query routing hints (/*+ route=primary */)
+routing-hints = []
+
+# Replica lag-aware routing with read-your-writes
+lag-routing = []
+
+# Rate limiting (token bucket, sliding window, concurrency)
+rate-limiting = []
+
+# Circuit breaker pattern (adaptive thresholds)
+circuit-breaker = []
+
+# Query analytics, slow query log, N+1 detection
+query-analytics = []
+
+# Multi-tenancy (tenant isolation, per-tenant pools)
+multi-tenancy = []
+
+# Authentication proxy (JWT, OAuth, API keys)
+auth-proxy = []
+
+# SQL query rewriting (rules engine)
+query-rewriting = []
+
+# WASM plugin system (hot-reload, sandboxed)
+wasm-plugins = []
+
+# GraphQL-to-SQL gateway
+graphql-gateway = []
+
+# Schema-aware routing (data temperature, workload classification)
+schema-routing = []
+
+# Distributed intelligent caching (DistribCache)
+distribcache = []
+
+# ── Observability ────────────────────────────────────────────────────
+
 # Full observability (metrics, tracing)
 observability = ["dep:prometheus", "dep:opentelemetry"]
+
+# ── Bundle features ─────────────────────────────────────────────────
+
+# All proxy features (no topology provider — choose one separately)
+all-features = [
+    "pool-modes", "ha-tr",
+    "query-cache", "routing-hints", "lag-routing",
+    "rate-limiting", "circuit-breaker", "query-analytics",
+    "multi-tenancy", "auth-proxy", "query-rewriting",
+    "wasm-plugins", "graphql-gateway", "schema-routing",
+    "distribcache",
+]
 
 [dependencies]
 # Async runtime
@@ -56,6 +121,23 @@ parking_lot = "0.12"
 config = "0.14"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
+
+# Regex (used by analytics, routing, rewriter)
+regex = "1"
+once_cell = "1"
+
+# Encoding (used by auth, distribcache)
+base64 = "0.21"
+bincode = "1"
+
+# Random (used by rate_limit, circuit_breaker)
+rand = "0.8"
+
+# HTTP (used by auth OAuth, optional)
+reqwest = { version = "0.11", features = ["json"], default-features = false }
+
+# Compression (used by distribcache tiers)
+zstd = "0.13"
 
 # Optional: Metrics
 prometheus = { version = "0.13", optional = true }
