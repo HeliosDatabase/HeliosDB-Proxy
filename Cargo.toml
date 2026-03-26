@@ -145,6 +145,7 @@ opentelemetry = { version = "0.21", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 
 [[bin]]
 name = "heliosdb-proxy"
@@ -153,3 +154,15 @@ path = "src/main.rs"
 [lib]
 name = "heliosdb_proxy"
 path = "src/lib.rs"
+
+[[bench]]
+name = "pooling"
+harness = false
+
+[[bench]]
+name = "routing"
+harness = false
+
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"

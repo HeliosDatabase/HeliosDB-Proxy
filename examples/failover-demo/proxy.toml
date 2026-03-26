@@ -1,0 +1,86 @@
+# HeliosProxy Configuration — Failover Demo with Transaction Replay
+#
+# Key differences from the basic cluster example:
+#   - TR mode set to "transaction" for full replay capability
+#   - Aggressive health check intervals (2s) to detect failure quickly
+#   - Low failure threshold (2) so failover triggers after ~4 seconds
+#   - Write timeout of 15s to allow time for re-routing during failover
+
+listen_address = "0.0.0.0:6432"
+admin_address  = "0.0.0.0:9090"
+
+# ── Transaction Replay (TR) ─────────────────────────────────────────
+# Modes:
+#   "none"        — no replay
+#   "session"     — re-establish session state (SET commands, search_path)
+#   "select"      — replay read-only queries on new backend
+#   "transaction" — full replay of in-flight transactions after failover
+tr_enabled = true
+tr_mode    = "transaction"
+
+# How long to wait for writes to succeed during a failover window
+write_timeout_secs = 15
+
+# ── Connection Pool ──────────────────────────────────────────────────
+[pool]
+min_connections      = 2
+max_connections      = 30
+idle_timeout_secs    = 300
+max_lifetime_secs    = 1800
+acquire_timeout_secs = 10
+test_on_acquire      = true
+
+# ── Pool Mode ────────────────────────────────────────────────────────
+[pool_mode]
+mode                    = "transaction"
+max_pool_size           = 30
+min_idle                = 2
+idle_timeout_secs       = 300
+max_lifetime_secs       = 1800
+acquire_timeout_secs    = 5
+reset_query             = "DISCARD ALL"
+prepared_statement_mode = "track"
+
+# ── Load Balancer ────────────────────────────────────────────────────
+[load_balancer]
+read_strategy        = "least_connections"
+read_write_split     = true
+latency_threshold_ms = 50
+
+# ── Health Checks (aggressive for demo) ──────────────────────────────
+# - Check every 2 seconds
+# - Timeout after 2 seconds
+# - Mark unhealthy after 2 consecutive failures (~4s detection)
+# - Mark healthy again after 2 consecutive successes
+[health]
+check_interval_secs = 2
+check_timeout_secs  = 2
+failure_threshold   = 2
+success_threshold   = 2
+check_query         = "SELECT 1"
+
+# ── Backend Nodes ────────────────────────────────────────────────────
+
+[[nodes]]
+host    = "pg-primary"
+port    = 5432
+role    = "primary"
+weight  = 100
+enabled = true
+name    = "primary"
+
+[[nodes]]
+host    = "pg-standby1"
+port    = 5432
+role    = "standby"
+weight  = 100
+enabled = true
+name    = "standby-1"
+
+[[nodes]]
+host    = "pg-standby2"
+port    = 5432
+role    = "standby"
+weight  = 100
+enabled = true
+name    = "standby-2"
