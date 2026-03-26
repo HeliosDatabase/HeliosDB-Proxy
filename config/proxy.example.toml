@@ -1,0 +1,198 @@
+# =============================================================================
+# HeliosProxy - Minimal Example Configuration
+# =============================================================================
+#
+# A starter configuration for HeliosProxy with one primary and one standby
+# node using transaction pooling. Copy this file to proxy.toml and edit to
+# match your environment.
+#
+# Environment variable substitution: use ${VAR_NAME:-default_value} syntax.
+# All addresses, credentials, and tuning parameters support env var overrides.
+#
+# Documentation: https://github.com/heliosdb/proxy
+
+# -----------------------------------------------------------------------------
+# Proxy listener settings
+# -----------------------------------------------------------------------------
+
+# Address the proxy listens on for PostgreSQL client connections.
+# Clients connect here instead of directly to the database.
+listen_address = "${HELIOS_PROXY_LISTEN:-0.0.0.0:6432}"
+
+# Address for the admin REST API (health checks, metrics, reload).
+admin_address = "${HELIOS_PROXY_ADMIN:-0.0.0.0:9090}"
+
+# Transaction Replay (TR) — automatically replays in-flight transactions
+# after a failover so clients see no errors.
+# Disable if you handle retries at the application level.
+tr_enabled = false
+tr_mode = "session"   # none | session | select | transaction
+
+# Maximum time (seconds) to wait for a new primary during failover before
+# returning an error to the client.
+write_timeout_secs = 30
+
+# -----------------------------------------------------------------------------
+# Connection pool — controls backend (proxy -> database) connections
+# -----------------------------------------------------------------------------
+
+[pool]
+# Minimum backend connections kept open per node (warm pool).
+min_connections = 5
+
+# Maximum backend connections per node. Size this based on your database's
+# max_connections minus headroom for admin/replication connections.
+max_connections = ${HELIOS_PROXY_POOL_MAX:-50}
+
+# Close idle backend connections after this many seconds.
+idle_timeout_secs = 300
+
+# Recycle backend connections after this many seconds regardless of activity.
+# Prevents issues with firewall/load-balancer idle timeouts.
+max_lifetime_secs = 1800
+
+# How long a client waits to acquire a backend connection before getting an
+# error. Keep this short to fail fast under load.
+acquire_timeout_secs = 5
+
+# Run a quick query before handing a connection to a client to make sure
+# it is still alive. Small overhead, high reliability.
+test_on_acquire = true
+
+# -----------------------------------------------------------------------------
+# Pool mode — determines when connections are returned to the pool
+# -----------------------------------------------------------------------------
+
+[pool_mode]
+# Pooling mode:
+#   session     — 1:1 mapping, connection held for the entire client session.
+#                 Safest; allows SET, LISTEN/NOTIFY, temp tables.
+#   transaction — connection returned after COMMIT/ROLLBACK. Best throughput
+#                 for most web applications.
+#   statement   — connection returned after every statement. Maximum reuse,
+#                 but no multi-statement transactions or prepared statements.
+mode = "${HELIOS_PROXY_POOL_MODE:-transaction}"
+
+# Maximum pool connections per node (pool_mode layer).
+max_pool_size = 50
+
+# Keep at least this many idle connections ready.
+min_idle = 5
+
+# Idle / lifetime / acquire timeouts (seconds).
+idle_timeout_secs = 300
+max_lifetime_secs = 1800
+acquire_timeout_secs = 5
+
+# SQL executed when a connection is returned to the pool to reset session
+# state. DISCARD ALL is the safest choice for transaction mode.
+reset_query = "DISCARD ALL"
+
+# How prepared statements are handled across pooled connections:
+#   disable — never use prepared statements (safest for statement mode)
+#   track   — proxy tracks and re-creates them transparently (recommended
+#             for transaction mode)
+#   named   — use protocol-level named statements (best for session mode)
+prepared_statement_mode = "track"
+
+# Validate connections with this query before handing them to a client.
+validation_query = "SELECT 1"
+
+# -----------------------------------------------------------------------------
+# Load balancer — read/write splitting and strategy
+# -----------------------------------------------------------------------------
+
+[load_balancer]
+# Strategy for distributing read queries across standbys:
+#   round_robin         — cycle through nodes evenly
+#   weighted_round_robin — use node weight values
+#   least_connections    — send to the node with fewest active connections
+#   latency_based        — send to the node with lowest measured latency
+#   random               — random selection
+read_strategy = "round_robin"
+
+# When true, SELECT queries are routed to standbys and writes to the primary.
+# Disable if your application cannot tolerate any replication lag on reads.
+read_write_split = true
+
+# If a node's average response time exceeds this threshold (milliseconds)
+# it is temporarily deprioritised for read traffic.
+latency_threshold_ms = 100
+
+# -----------------------------------------------------------------------------
+# Health checks — monitor backend node availability
+# -----------------------------------------------------------------------------
+
+[health]
+# Seconds between health check probes.
+check_interval_secs = 5
+
+# Maximum seconds a health check query may take before it counts as a failure.
+check_timeout_secs = 3
+
+# A node is marked unhealthy after this many consecutive check failures.
+failure_threshold = 3
+
+# A previously-unhealthy node must pass this many consecutive checks to be
+# marked healthy again.
+success_threshold = 2
+
+# The SQL query used as a health check. SELECT 1 works on all PostgreSQL
+# versions. For deeper checks, consider pg_is_in_recovery() or custom queries.
+check_query = "SELECT 1"
+
+# -----------------------------------------------------------------------------
+# Backend nodes — define your database cluster
+# -----------------------------------------------------------------------------
+
+# Primary node — handles all writes and can serve reads.
+[[nodes]]
+host = "${HELIOS_PROXY_PRIMARY_HOST:-db-primary}"
+port = 5432
+role = "primary"          # primary | standby | replica
+weight = 100              # relative weight for weighted_round_robin
+enabled = true
+
+# Standby node — serves read traffic when read_write_split is enabled.
+[[nodes]]
+host = "${HELIOS_PROXY_STANDBY1_HOST:-db-standby1}"
+port = 5432
+role = "standby"
+weight = 100
+enabled = true
+
+# -----------------------------------------------------------------------------
+# Cache — query result caching (disabled in this minimal config)
+# -----------------------------------------------------------------------------
+
+[cache]
+enabled = false
+
+# -----------------------------------------------------------------------------
+# High availability
+# -----------------------------------------------------------------------------
+
+[ha]
+enabled = true
+auto_failover = true
+failover_threshold = 3         # health check failures before failover
+max_replica_lag_ms = 100       # max replication lag for read routing
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+
+[logging]
+# Log level: trace | debug | info | warn | error
+level = "${HELIOS_PROXY_LOG_LEVEL:-info}"
+
+# Output format: pretty (human-readable) | compact | json
+format = "pretty"
+
+# -----------------------------------------------------------------------------
+# Prometheus metrics
+# -----------------------------------------------------------------------------
+
+[metrics]
+enabled = true
+addr = "0.0.0.0:9100"

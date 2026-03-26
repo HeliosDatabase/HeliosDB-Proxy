@@ -1,0 +1,219 @@
+# HeliosProxy + PostgreSQL 16 Cluster - Docker Compose
+# 3-node PostgreSQL cluster (1 primary + 2 standbys) with HeliosProxy router
+#
+# Topology:
+#   pg-primary       - read/write primary (port 15432)
+#   pg-standby-sync  - synchronous streaming replica (port 15442)
+#   pg-standby-async - asynchronous streaming replica (port 15462)
+#   heliosproxy      - connection router (port 6432 client, 9090 admin)
+#
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f
+#   docker compose down -v
+
+networks:
+  heliosproxy-cluster:
+    driver: bridge
+
+volumes:
+  pg-primary-data:
+  pg-standby-sync-data:
+  pg-standby-async-data:
+
+services:
+  # ==========================================================================
+  # PostgreSQL Primary
+  # ==========================================================================
+  pg-primary:
+    image: postgres:16
+    container_name: heliosproxy-pg-primary
+    hostname: pg-primary
+    networks:
+      - heliosproxy-cluster
+    ports:
+      - "15432:5432"
+    environment:
+      POSTGRES_USER: helios
+      POSTGRES_PASSWORD: helios
+      POSTGRES_DB: heliosdb
+      # Replication settings
+      POSTGRES_HOST_AUTH_METHOD: md5
+      POSTGRES_INITDB_ARGS: "--auth-host=md5"
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "hot_standby=on"
+      - "-c"
+      - "synchronous_standby_names=standby_sync"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "listen_addresses=*"
+    volumes:
+      - pg-primary-data:/var/lib/postgresql/data
+      - ./init/00-replication-setup.sh:/docker-entrypoint-initdb.d/00-replication-setup.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U helios -d heliosdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ==========================================================================
+  # PostgreSQL Standby - Synchronous
+  # ==========================================================================
+  pg-standby-sync:
+    image: postgres:16
+    container_name: heliosproxy-pg-standby-sync
+    hostname: pg-standby-sync
+    networks:
+      - heliosproxy-cluster
+    ports:
+      - "15442:5432"
+    environment:
+      PGUSER: replicator
+      PGPASSWORD: replicator
+    entrypoint: []
+    command:
+      - bash
+      - -c
+      - |
+        # Wait for primary to be ready
+        until pg_isready -h pg-primary -p 5432 -U helios; do
+          echo "Waiting for primary..."
+          sleep 2
+        done
+
+        # If data directory is empty, create base backup from primary
+        if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+          rm -rf /var/lib/postgresql/data/*
+          PGPASSWORD=replicator pg_basebackup \
+            -h pg-primary -p 5432 -U replicator \
+            -D /var/lib/postgresql/data -Fp -Xs -P -R
+          # Set application_name for synchronous replication
+          echo "primary_conninfo = 'host=pg-primary port=5432 user=replicator password=replicator application_name=standby_sync'" \
+            >> /var/lib/postgresql/data/postgresql.auto.conf
+        fi
+
+        # Ensure correct ownership
+        chown -R postgres:postgres /var/lib/postgresql/data
+        chmod 0700 /var/lib/postgresql/data
+
+        exec gosu postgres postgres \
+          -c hot_standby=on \
+          -c max_connections=200
+    volumes:
+      - pg-standby-sync-data:/var/lib/postgresql/data
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U helios -d heliosdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ==========================================================================
+  # PostgreSQL Standby - Asynchronous
+  # ==========================================================================
+  pg-standby-async:
+    image: postgres:16
+    container_name: heliosproxy-pg-standby-async
+    hostname: pg-standby-async
+    networks:
+      - heliosproxy-cluster
+    ports:
+      - "15462:5432"
+    environment:
+      PGUSER: replicator
+      PGPASSWORD: replicator
+    entrypoint: []
+    command:
+      - bash
+      - -c
+      - |
+        # Wait for primary to be ready
+        until pg_isready -h pg-primary -p 5432 -U helios; do
+          echo "Waiting for primary..."
+          sleep 2
+        done
+
+        # If data directory is empty, create base backup from primary
+        if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+          rm -rf /var/lib/postgresql/data/*
+          PGPASSWORD=replicator pg_basebackup \
+            -h pg-primary -p 5432 -U replicator \
+            -D /var/lib/postgresql/data -Fp -Xs -P -R
+          # Set application_name for async replication
+          echo "primary_conninfo = 'host=pg-primary port=5432 user=replicator password=replicator application_name=standby_async'" \
+            >> /var/lib/postgresql/data/postgresql.auto.conf
+        fi
+
+        # Ensure correct ownership
+        chown -R postgres:postgres /var/lib/postgresql/data
+        chmod 0700 /var/lib/postgresql/data
+
+        exec gosu postgres postgres \
+          -c hot_standby=on \
+          -c max_connections=200
+    volumes:
+      - pg-standby-async-data:/var/lib/postgresql/data
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U helios -d heliosdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ==========================================================================
+  # HeliosProxy - Connection Router & Load Balancer
+  # ==========================================================================
+  heliosproxy:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: heliosproxy
+    hostname: heliosproxy
+    networks:
+      - heliosproxy-cluster
+    ports:
+      - "6432:6432"    # Client connections (main entry point)
+      - "9090:9090"    # Admin / metrics API
+    command:
+      - "--listen"
+      - "0.0.0.0:6432"
+      - "--admin"
+      - "0.0.0.0:9090"
+      - "--primary"
+      - "pg-primary:5432"
+      - "--standby"
+      - "pg-standby-sync:5432"
+      - "--standby"
+      - "pg-standby-async:5432"
+      - "--tr"
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+      pg-standby-sync:
+        condition: service_healthy
+      pg-standby-async:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

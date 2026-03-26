@@ -1,0 +1,156 @@
+# HeliosProxy Configuration — Multi-Tenant Setup
+#
+# This configuration routes two tenants through a single proxy instance.
+#
+# Tenant identification: username prefix (e.g., "acme.appuser" -> tenant "acme")
+#
+# Isolation strategies shown:
+#   - Tenant "acme"    : schema isolation (shared database, separate schemas)
+#   - Tenant "widgetco": database isolation (dedicated database per tenant)
+#
+# Each tenant has its own pool limits, rate limits, and permissions.
+
+listen_address = "0.0.0.0:6432"
+admin_address  = "0.0.0.0:9090"
+
+tr_enabled = true
+tr_mode    = "session"
+
+write_timeout_secs = 30
+
+# ── Connection Pool (global defaults) ────────────────────────────────
+[pool]
+min_connections      = 2
+max_connections      = 100
+idle_timeout_secs    = 300
+max_lifetime_secs    = 1800
+acquire_timeout_secs = 10
+test_on_acquire      = true
+
+# ── Pool Mode ────────────────────────────────────────────────────────
+[pool_mode]
+mode                    = "transaction"
+max_pool_size           = 100
+min_idle                = 5
+idle_timeout_secs       = 600
+max_lifetime_secs       = 3600
+acquire_timeout_secs    = 5
+reset_query             = "DISCARD ALL"
+prepared_statement_mode = "track"
+
+# ── Load Balancer ────────────────────────────────────────────────────
+[load_balancer]
+read_strategy        = "round_robin"
+read_write_split     = true
+latency_threshold_ms = 100
+
+# ── Health Checks ────────────────────────────────────────────────────
+[health]
+check_interval_secs = 5
+check_timeout_secs  = 3
+failure_threshold   = 3
+success_threshold   = 2
+check_query         = "SELECT 1"
+
+# ── Backend Nodes ────────────────────────────────────────────────────
+
+[[nodes]]
+host    = "pg-primary"
+port    = 5432
+role    = "primary"
+weight  = 100
+enabled = true
+name    = "primary"
+
+[[nodes]]
+host    = "pg-standby1"
+port    = 5432
+role    = "standby"
+weight  = 100
+enabled = true
+name    = "standby-1"
+
+# ═════════════════════════════════════════════════════════════════════
+# MULTI-TENANCY CONFIGURATION
+# ═════════════════════════════════════════════════════════════════════
+
+[multi_tenancy]
+enabled                = true
+allow_unknown_tenants  = false
+auto_create_tenants    = false
+max_tenants            = 100
+cross_tenant_analytics = false
+
+# How tenants are identified from incoming connections.
+# Options: "header", "username_prefix", "jwt_claim", "database_name"
+#
+# With username_prefix and separator ".", a login as "acme.appuser"
+# identifies tenant "acme" and authenticates as database user "appuser".
+[multi_tenancy.identification]
+method    = "username_prefix"
+separator = "."
+
+# ── Tenant: Acme Corp ───────────────────────────────────────────────
+# Isolation: schema-based (shared database "shared_db", schema "acme")
+# All queries from this tenant are prefixed with SET search_path = acme;
+[[multi_tenancy.tenants]]
+id   = "acme"
+name = "Acme Corp"
+
+[multi_tenancy.tenants.isolation]
+strategy      = "schema"
+database_name = "shared_db"
+schema_name   = "acme"
+
+[multi_tenancy.tenants.pool]
+max_connections = 50
+min_idle        = 2
+dedicated_pool  = false
+
+[multi_tenancy.tenants.rate_limits]
+qps_limit          = 1000
+max_connections     = 50
+max_query_duration  = 60     # seconds
+max_result_size     = 104857600  # 100 MB
+max_rows_per_query  = 100000
+burst_multiplier    = 2.0
+
+[multi_tenancy.tenants.permissions]
+allowed_operations = ["SELECT", "INSERT", "UPDATE", "DELETE"]
+read_only          = false
+allow_ddl          = true
+allow_explain      = true
+allow_system_access = false
+max_tables_per_query = 10
+
+# ── Tenant: WidgetCo ────────────────────────────────────────────────
+# Isolation: database-based (dedicated database "widgetco_db")
+# Connections are routed to a separate database entirely.
+[[multi_tenancy.tenants]]
+id   = "widgetco"
+name = "WidgetCo"
+
+[multi_tenancy.tenants.isolation]
+strategy      = "database"
+database_name = "widgetco_db"
+
+[multi_tenancy.tenants.pool]
+max_connections = 20
+min_idle        = 1
+dedicated_pool  = true
+
+[multi_tenancy.tenants.rate_limits]
+qps_limit          = 200
+max_connections     = 20
+max_query_duration  = 30
+max_result_size     = 52428800   # 50 MB
+max_rows_per_query  = 50000
+burst_multiplier    = 1.5
+
+[multi_tenancy.tenants.permissions]
+allowed_operations  = ["SELECT", "INSERT", "UPDATE", "DELETE"]
+read_only           = false
+allow_ddl           = false
+allow_explain       = true
+allow_system_access = false
+max_tables_per_query = 5

@@ -1,0 +1,74 @@
+# HeliosProxy Configuration — 3-Node PostgreSQL Cluster
+#
+# This config routes traffic across one primary and two standby nodes.
+# Writes go to the primary; reads are load-balanced across standbys.
+
+listen_address = "0.0.0.0:6432"
+admin_address  = "0.0.0.0:9090"
+
+# Transaction Replay: re-establish sessions after failover
+tr_enabled = true
+tr_mode    = "session"
+
+# Write timeout during failover (seconds)
+write_timeout_secs = 30
+
+# ── Connection Pool ──────────────────────────────────────────────────
+[pool]
+min_connections     = 2
+max_connections     = 50
+idle_timeout_secs   = 300
+max_lifetime_secs   = 1800
+acquire_timeout_secs = 10
+test_on_acquire     = true
+
+# ── Pool Mode ────────────────────────────────────────────────────────
+[pool_mode]
+mode                    = "transaction"
+max_pool_size           = 50
+min_idle                = 5
+idle_timeout_secs       = 600
+max_lifetime_secs       = 3600
+acquire_timeout_secs    = 5
+reset_query             = "DISCARD ALL"
+prepared_statement_mode = "track"
+
+# ── Load Balancer ────────────────────────────────────────────────────
+[load_balancer]
+read_strategy        = "round_robin"
+read_write_split     = true
+latency_threshold_ms = 100
+
+# ── Health Checks ────────────────────────────────────────────────────
+[health]
+check_interval_secs = 5
+check_timeout_secs  = 3
+failure_threshold   = 3
+success_threshold   = 2
+check_query         = "SELECT 1"
+
+# ── Backend Nodes ────────────────────────────────────────────────────
+
+[[nodes]]
+host    = "pg-primary"
+port    = 5432
+role    = "primary"
+weight  = 100
+enabled = true
+name    = "primary"
+
+[[nodes]]
+host    = "pg-standby1"
+port    = 5432
+role    = "standby"
+weight  = 100
+enabled = true
+name    = "standby-1"
+
+[[nodes]]
+host    = "pg-standby2"
+port    = 5432
+role    = "standby"
+weight  = 100
+enabled = true
+name    = "standby-2"

@@ -1,0 +1,192 @@
+# =============================================================================
+# HeliosProxy - PostgreSQL Cluster Configuration
+# =============================================================================
+#
+# Pure PostgreSQL deployment: 3-node streaming replication cluster with
+# read/write splitting, transaction pooling, and health checks.
+#
+# Topology:
+#   pg-primary   — accepts all writes and can serve reads
+#   pg-sync      — synchronous standby (zero-lag, promotable)
+#   pg-async     — asynchronous standby (some lag, read-only overflow)
+#
+# No HeliosDB-specific features are enabled (no cache, no semantic layer,
+# no GraphQL gateway, no WASM plugins, no branch routing).
+#
+# This configuration is suitable for direct comparison with PgBouncer or
+# pgpool-II in a standard PostgreSQL environment.
+
+# =============================================================================
+# PROXY — Listener addresses
+# =============================================================================
+
+listen_address = "${HELIOS_PROXY_LISTEN:-0.0.0.0:6432}"
+admin_address  = "${HELIOS_PROXY_ADMIN:-0.0.0.0:9090}"
+
+# Transaction Replay is disabled — standard PostgreSQL does not expose the
+# WAL metadata needed for automatic replay. Handle retries in the application.
+tr_enabled = false
+tr_mode    = "none"
+
+# Time to wait for a new primary during manual/orchestrated failover.
+write_timeout_secs = 30
+
+# =============================================================================
+# POOL — Backend connection pool
+# =============================================================================
+
+[pool]
+# Size according to: (number of vCPUs * 2) + max_parallel_workers on the
+# PostgreSQL side, then subtract connections reserved for superuser and
+# replication. A safe default for most workloads:
+min_connections    = 10
+max_connections    = 100
+idle_timeout_secs  = 300
+max_lifetime_secs  = 1800
+acquire_timeout_secs = 5
+
+# Always verify a connection is alive before handing it to a client.
+test_on_acquire = true
+
+# =============================================================================
+# POOL MODE — Transaction pooling
+# =============================================================================
+
+[pool_mode]
+# Transaction mode gives the best connection reuse for web applications.
+# Each client gets a backend connection only for the duration of a transaction.
+mode = "transaction"
+
+max_pool_size        = 100
+min_idle             = 10
+idle_timeout_secs    = 300
+max_lifetime_secs    = 1800
+acquire_timeout_secs = 5
+
+# DISCARD ALL resets all session state (SET variables, prepared statements,
+# temp tables) when a connection is returned to the pool.
+reset_query = "DISCARD ALL"
+
+# Track prepared statements so the proxy can re-create them transparently
+# when a client's queries land on a different backend connection.
+prepared_statement_mode = "track"
+
+# Lightweight check on every acquire.
+validation_query = "SELECT 1"
+
+# =============================================================================
+# LOAD BALANCER — Read/write splitting
+# =============================================================================
+
+[load_balancer]
+# Distribute reads across healthy standbys using round-robin.
+read_strategy    = "round_robin"
+
+# Route SELECT queries to standbys; INSERT/UPDATE/DELETE/DDL to primary.
+read_write_split = true
+
+# If a standby's average latency exceeds this threshold (ms), stop routing
+# reads to it until latency recovers.
+latency_threshold_ms = 100
+
+# =============================================================================
+# HEALTH — PostgreSQL health checks
+# =============================================================================
+
+[health]
+# Probe every node every 5 seconds.
+check_interval_secs = 5
+
+# A health check probe that takes longer than this is considered failed.
+check_timeout_secs = 3
+
+# After 3 consecutive failures a node is marked unhealthy and removed from
+# the routing pool.
+failure_threshold = 3
+
+# After 2 consecutive successes a recovered node is added back.
+success_threshold = 2
+
+# SELECT 1 is the fastest possible check. For deeper validation you could
+# use: "SELECT CASE WHEN pg_is_in_recovery() THEN 1 ELSE 1 END"
+check_query = "SELECT 1"
+
+# =============================================================================
+# NODES — 3-node PostgreSQL cluster
+# =============================================================================
+
+# ---------- Primary ----------
+# The single read-write node. All writes and, when read_write_split is
+# disabled, all reads go here.
+[[nodes]]
+host    = "${PG_PRIMARY_HOST:-pg-primary}"
+port    = ${PG_PRIMARY_PORT:-5432}
+role    = "primary"
+weight  = 100
+enabled = true
+name    = "pg-primary"
+
+# ---------- Synchronous Standby ----------
+# Configured with synchronous_commit = on in postgresql.conf.
+# Zero data loss — every commit is confirmed replicated here before the
+# client receives OK. Safe for strong-consistency reads.
+[[nodes]]
+host    = "${PG_SYNC_HOST:-pg-sync}"
+port    = ${PG_SYNC_PORT:-5432}
+role    = "standby"
+weight  = 100
+enabled = true
+name    = "pg-sync"
+
+# ---------- Asynchronous Standby ----------
+# Best-effort replication. May lag behind the primary by a few transactions.
+# Good for read-heavy workloads that tolerate eventual consistency. Given a
+# lower weight so the synchronous standby is preferred for reads.
+[[nodes]]
+host    = "${PG_ASYNC_HOST:-pg-async}"
+port    = ${PG_ASYNC_PORT:-5432}
+role    = "standby"
+weight  = 50
+enabled = true
+name    = "pg-async"
+
+# =============================================================================
+# CACHE — Disabled (no HeliosDB features)
+# =============================================================================
+
+[cache]
+enabled = false
+
+# =============================================================================
+# HA — High availability
+# =============================================================================
+
+[ha]
+enabled            = true
+
+# Automatically promote the synchronous standby if the primary becomes
+# unreachable. Requires an external promotion mechanism (e.g., Patroni,
+# pg_auto_failover, or a custom script invoked via webhook).
+auto_failover      = true
+failover_threshold = 3
+
+# Only route reads to standbys within this replication lag (milliseconds).
+# The synchronous standby will always be within this limit. The async
+# standby will be excluded when it falls behind.
+max_replica_lag_ms = 100
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+[logging]
+level  = "${HELIOS_PROXY_LOG_LEVEL:-info}"
+format = "pretty"
+
+# =============================================================================
+# METRICS — Prometheus
+# =============================================================================
+
+[metrics]
+enabled = true
+addr    = "0.0.0.0:9100"

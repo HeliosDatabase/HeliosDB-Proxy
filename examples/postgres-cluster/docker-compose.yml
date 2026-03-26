@@ -1,0 +1,191 @@
+# HeliosProxy - Simple 3-Node PostgreSQL Cluster Example
+#
+# Self-contained setup with:
+#   - 1 PostgreSQL primary (read-write)
+#   - 2 PostgreSQL standbys (streaming replication, read-only)
+#   - 1 HeliosProxy (connection routing, pooling, read/write splitting)
+#
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f proxy
+#   docker compose down -v
+#
+# Connect through the proxy:
+#   psql postgresql://app:apppass@localhost:6432/appdb
+
+networks:
+  pg-cluster:
+    driver: bridge
+
+volumes:
+  pg-primary-data:
+  pg-standby1-data:
+  pg-standby2-data:
+
+services:
+  # ─────────────────────────────────────────────────────────────────────
+  # Primary PostgreSQL
+  # ─────────────────────────────────────────────────────────────────────
+  pg-primary:
+    image: postgres:16-alpine
+    container_name: pg-primary
+    hostname: pg-primary
+    networks:
+      - pg-cluster
+    ports:
+      - "15432:5432"
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: apppass
+      POSTGRES_DB: appdb
+      POSTGRES_HOST_AUTH_METHOD: md5
+      POSTGRES_INITDB_ARGS: "--auth-host=md5"
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "hot_standby=on"
+      - "-c"
+      - "listen_addresses=*"
+      - "-c"
+      - "password_encryption=md5"
+    volumes:
+      - pg-primary-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Standby 1 (streaming replication)
+  # ─────────────────────────────────────────────────────────────────────
+  pg-standby1:
+    image: postgres:16-alpine
+    container_name: pg-standby1
+    hostname: pg-standby1
+    networks:
+      - pg-cluster
+    ports:
+      - "15433:5432"
+    environment:
+      PGUSER: app
+      PGPASSWORD: apppass
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        # Wait for primary to be ready
+        until pg_isready -h pg-primary -U app; do
+          echo "Waiting for primary..."
+          sleep 2
+        done
+
+        # Take base backup from primary if data dir is empty
+        if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+          rm -rf /var/lib/postgresql/data/*
+          PGPASSWORD=apppass pg_basebackup \
+            -h pg-primary -U app -D /var/lib/postgresql/data \
+            -Fp -Xs -P -R
+        fi
+
+        # Start as standby
+        exec postgres \
+          -c hot_standby=on \
+          -c primary_conninfo='host=pg-primary port=5432 user=app password=apppass' \
+          -c listen_addresses='*' \
+          -c password_encryption=md5
+    volumes:
+      - pg-standby1-data:/var/lib/postgresql/data
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Standby 2 (streaming replication)
+  # ─────────────────────────────────────────────────────────────────────
+  pg-standby2:
+    image: postgres:16-alpine
+    container_name: pg-standby2
+    hostname: pg-standby2
+    networks:
+      - pg-cluster
+    ports:
+      - "15434:5432"
+    environment:
+      PGUSER: app
+      PGPASSWORD: apppass
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        until pg_isready -h pg-primary -U app; do
+          echo "Waiting for primary..."
+          sleep 2
+        done
+
+        if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+          rm -rf /var/lib/postgresql/data/*
+          PGPASSWORD=apppass pg_basebackup \
+            -h pg-primary -U app -D /var/lib/postgresql/data \
+            -Fp -Xs -P -R
+        fi
+
+        exec postgres \
+          -c hot_standby=on \
+          -c primary_conninfo='host=pg-primary port=5432 user=app password=apppass' \
+          -c listen_addresses='*' \
+          -c password_encryption=md5
+    volumes:
+      - pg-standby2-data:/var/lib/postgresql/data
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+  # ─────────────────────────────────────────────────────────────────────
+  # HeliosProxy - Connection router and load balancer
+  # ─────────────────────────────────────────────────────────────────────
+  proxy:
+    build:
+      context: ../../
+      dockerfile: docker/Dockerfile
+    container_name: heliosproxy
+    hostname: heliosproxy
+    networks:
+      - pg-cluster
+    ports:
+      - "6432:6432"   # Client connections (main entry point)
+      - "9090:9090"   # Admin / metrics API
+    volumes:
+      - ./proxy.toml:/etc/helios/proxy.toml:ro
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+      pg-standby1:
+        condition: service_healthy
+      pg-standby2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
