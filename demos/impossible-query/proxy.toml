@@ -1,0 +1,77 @@
+# HeliosProxy Configuration — Impossible Query Demo
+#
+# Optimised for fast failover detection and full transaction replay.
+
+listen_address = "0.0.0.0:6432"
+admin_address  = "0.0.0.0:9090"
+
+# ── Transaction Replay (TR) ─────────────────────────────────────────
+tr_enabled = true
+tr_mode    = "transaction"
+
+# Time to wait for a new primary during failover
+write_timeout_secs = 15
+
+# ── Connection Pool ──────────────────────────────────────────────────
+[pool]
+min_connections      = 2
+max_connections      = 20
+idle_timeout_secs    = 300
+max_lifetime_secs    = 1800
+acquire_timeout_secs = 10
+test_on_acquire      = true
+
+# ── Pool Mode ────────────────────────────────────────────────────────
+[pool_mode]
+mode                    = "transaction"
+max_pool_size           = 20
+min_idle                = 2
+idle_timeout_secs       = 300
+max_lifetime_secs       = 1800
+acquire_timeout_secs    = 5
+reset_query             = "DISCARD ALL"
+prepared_statement_mode = "track"
+
+# ── Load Balancer ────────────────────────────────────────────────────
+[load_balancer]
+read_strategy        = "least_connections"
+read_write_split     = true
+latency_threshold_ms = 50
+
+# ── Health Checks (aggressive — 2s interval, 2 failure threshold) ───
+[health]
+check_interval_secs = 2
+check_timeout_secs  = 2
+failure_threshold   = 2
+success_threshold   = 2
+check_query         = "SELECT 1"
+
+# ── HA / Failover ───────────────────────────────────────────────────
+[ha]
+enabled            = true
+auto_failover      = true
+failover_threshold = 2
+max_replica_lag_ms = 100
+
+# ── Logging ──────────────────────────────────────────────────────────
+[logging]
+level  = "info"
+format = "pretty"
+
+# ── Backend Nodes ────────────────────────────────────────────────────
+
+[[nodes]]
+host    = "pg-primary"
+port    = 5432
+role    = "primary"
+weight  = 100
+enabled = true
+name    = "primary"
+
+[[nodes]]
+host    = "pg-standby"
+port    = 5432
+role    = "standby"
+weight  = 100
+enabled = true
+name    = "standby"

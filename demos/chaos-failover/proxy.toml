@@ -1,0 +1,95 @@
+# HeliosProxy Configuration — Chaos Failover Stress Test
+#
+# All HA features enabled: TR, aggressive health checks, lag-aware routing,
+# auto-failover. Designed to survive random node kills and restarts.
+
+listen_address = "0.0.0.0:6432"
+admin_address  = "0.0.0.0:9090"
+
+# ── Transaction Replay (TR) ─────────────────────────────────────────
+tr_enabled = true
+tr_mode    = "transaction"
+
+write_timeout_secs = 20
+
+# ── Connection Pool ──────────────────────────────────────────────────
+[pool]
+min_connections      = 2
+max_connections      = 50
+idle_timeout_secs    = 300
+max_lifetime_secs    = 1800
+acquire_timeout_secs = 10
+test_on_acquire      = true
+
+# ── Pool Mode ────────────────────────────────────────────────────────
+[pool_mode]
+mode                    = "transaction"
+max_pool_size           = 50
+min_idle                = 5
+idle_timeout_secs       = 300
+max_lifetime_secs       = 1800
+acquire_timeout_secs    = 5
+reset_query             = "DISCARD ALL"
+prepared_statement_mode = "track"
+
+# ── Load Balancer ────────────────────────────────────────────────────
+[load_balancer]
+read_strategy        = "least_connections"
+read_write_split     = true
+latency_threshold_ms = 50
+
+# ── Health Checks (2s interval for fast detection) ───────────────────
+[health]
+check_interval_secs = 2
+check_timeout_secs  = 2
+failure_threshold   = 2
+success_threshold   = 2
+check_query         = "SELECT 1"
+
+# ── HA / Failover ───────────────────────────────────────────────────
+[ha]
+enabled            = true
+auto_failover      = true
+failover_threshold = 2
+max_replica_lag_ms = 100
+
+# ── Lag-Aware Routing ───────────────────────────────────────────────
+[lag]
+enabled                 = true
+poll_interval_ms        = 100
+default_max_lag_ms      = 100
+fresh_threshold_ms      = 50
+stale_threshold_secs    = 5
+fallback_to_primary     = true
+fallback_threshold_secs = 3
+
+# ── Logging ──────────────────────────────────────────────────────────
+[logging]
+level  = "info"
+format = "pretty"
+
+# ── Backend Nodes ────────────────────────────────────────────────────
+
+[[nodes]]
+host    = "pg-primary"
+port    = 5432
+role    = "primary"
+weight  = 100
+enabled = true
+name    = "primary"
+
+[[nodes]]
+host    = "pg-standby-sync"
+port    = 5432
+role    = "standby"
+weight  = 100
+enabled = true
+name    = "standby-sync"
+
+[[nodes]]
+host    = "pg-standby-async"
+port    = 5432
+role    = "standby"
+weight  = 80
+enabled = true
+name    = "standby-async"

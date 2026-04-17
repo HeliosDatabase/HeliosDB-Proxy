@@ -1,0 +1,92 @@
+# HeliosProxy Configuration — Lag-Aware Routing Demo
+#
+# Demonstrates lag-based read routing and read-your-writes consistency.
+# Reads are distributed round-robin across standbys whose lag is under
+# the threshold. When a session writes, subsequent reads are pinned to
+# the primary or a synchronous standby until the async standby catches up.
+
+listen_address = "0.0.0.0:6432"
+admin_address  = "0.0.0.0:9090"
+
+# ── Lag-Aware Routing ──────────────────────────────────────────────
+lag_routing_enabled   = true
+max_replica_lag_ms    = 100
+
+# ── Read-Your-Writes (RYW) ────────────────────────────────────────
+ryw_enabled = true
+
+# ── Transaction Replay ─────────────────────────────────────────────
+tr_enabled = false
+tr_mode    = "none"
+
+# ── Connection Pool ────────────────────────────────────────────────
+[pool]
+min_connections      = 2
+max_connections      = 20
+idle_timeout_secs    = 300
+max_lifetime_secs    = 1800
+acquire_timeout_secs = 10
+test_on_acquire      = true
+
+# ── Pool Mode ──────────────────────────────────────────────────────
+[pool_mode]
+mode                    = "transaction"
+max_pool_size           = 20
+min_idle                = 2
+idle_timeout_secs       = 300
+max_lifetime_secs       = 1800
+acquire_timeout_secs    = 5
+reset_query             = "DISCARD ALL"
+prepared_statement_mode = "track"
+
+# ── Load Balancer ──────────────────────────────────────────────────
+[load_balancer]
+read_strategy        = "round_robin"
+read_write_split     = true
+latency_threshold_ms = 50
+
+# ── Health Checks (2s interval for responsive lag detection) ───────
+[health]
+check_interval_secs = 2
+check_timeout_secs  = 2
+failure_threshold   = 2
+success_threshold   = 2
+check_query         = "SELECT 1"
+
+# ── HA / Failover ─────────────────────────────────────────────────
+[ha]
+enabled            = true
+auto_failover      = true
+failover_threshold = 2
+max_replica_lag_ms = 100
+
+# ── Logging ────────────────────────────────────────────────────────
+[logging]
+level  = "info"
+format = "pretty"
+
+# ── Backend Nodes ──────────────────────────────────────────────────
+
+[[nodes]]
+host    = "pg-primary"
+port    = 5432
+role    = "primary"
+weight  = 100
+enabled = true
+name    = "primary"
+
+[[nodes]]
+host    = "pg-standby-sync"
+port    = 5432
+role    = "standby"
+weight  = 100
+enabled = true
+name    = "standby-sync"
+
+[[nodes]]
+host    = "pg-standby-async"
+port    = 5432
+role    = "standby"
+weight  = 100
+enabled = true
+name    = "standby-async"
