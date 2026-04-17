@@ -1,0 +1,182 @@
+# HeliosProxy - Chaos Failover Stress Test
+#
+# 4-node cluster for chaos monkey testing:
+#   - 1 primary, 1 synchronous standby, 1 asynchronous standby
+#   - HeliosProxy with full HA features
+#
+# Usage:
+#   docker compose up -d --build
+#   # Terminal 1: ./workload.sh
+#   # Terminal 2: ./chaos.sh 300
+#   # Terminal 3: ./dashboard.sh
+#   # After: ./verify.sh
+
+networks:
+  chaos-net:
+    driver: bridge
+
+volumes:
+  primary-data:
+  standby-sync-data:
+  standby-async-data:
+
+services:
+  # ─────────────────────────────────────────────────────────────────────
+  # Primary PostgreSQL
+  # ─────────────────────────────────────────────────────────────────────
+  pg-primary:
+    image: postgres:16-alpine
+    container_name: chaos-primary
+    hostname: pg-primary
+    networks:
+      - chaos-net
+    ports:
+      - "35432:5432"
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: apppass
+      POSTGRES_DB: appdb
+      POSTGRES_HOST_AUTH_METHOD: md5
+      POSTGRES_INITDB_ARGS: "--auth-host=md5"
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "hot_standby=on"
+      - "-c"
+      - "listen_addresses=*"
+      - "-c"
+      - "password_encryption=md5"
+    volumes:
+      - primary-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 10s
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Synchronous Standby
+  # ─────────────────────────────────────────────────────────────────────
+  pg-standby-sync:
+    image: postgres:16-alpine
+    container_name: chaos-standby-sync
+    hostname: pg-standby-sync
+    networks:
+      - chaos-net
+    ports:
+      - "35442:5432"
+    environment:
+      PGUSER: app
+      PGPASSWORD: apppass
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        until pg_isready -h pg-primary -U app; do
+          echo "Waiting for primary..."
+          sleep 2
+        done
+        if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+          rm -rf /var/lib/postgresql/data/*
+          PGPASSWORD=apppass pg_basebackup \
+            -h pg-primary -U app -D /var/lib/postgresql/data \
+            -Fp -Xs -P -R
+        fi
+        exec postgres \
+          -c hot_standby=on \
+          -c primary_conninfo='host=pg-primary port=5432 user=app password=apppass application_name=sync_standby' \
+          -c listen_addresses='*' \
+          -c password_encryption=md5
+    volumes:
+      - standby-sync-data:/var/lib/postgresql/data
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 30s
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Asynchronous Standby
+  # ─────────────────────────────────────────────────────────────────────
+  pg-standby-async:
+    image: postgres:16-alpine
+    container_name: chaos-standby-async
+    hostname: pg-standby-async
+    networks:
+      - chaos-net
+    ports:
+      - "35462:5432"
+    environment:
+      PGUSER: app
+      PGPASSWORD: apppass
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        until pg_isready -h pg-primary -U app; do
+          echo "Waiting for primary..."
+          sleep 2
+        done
+        if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+          rm -rf /var/lib/postgresql/data/*
+          PGPASSWORD=apppass pg_basebackup \
+            -h pg-primary -U app -D /var/lib/postgresql/data \
+            -Fp -Xs -P -R
+        fi
+        exec postgres \
+          -c hot_standby=on \
+          -c primary_conninfo='host=pg-primary port=5432 user=app password=apppass application_name=async_standby' \
+          -c listen_addresses='*' \
+          -c password_encryption=md5
+    volumes:
+      - standby-async-data:/var/lib/postgresql/data
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 30s
+
+  # ─────────────────────────────────────────────────────────────────────
+  # HeliosProxy — Full HA configuration
+  # ─────────────────────────────────────────────────────────────────────
+  heliosproxy:
+    build:
+      context: ../../
+      dockerfile: docker/Dockerfile
+    container_name: chaos-proxy
+    hostname: heliosproxy
+    networks:
+      - chaos-net
+    ports:
+      - "36432:6432"   # Client connections
+      - "39090:9090"   # Admin / metrics API
+    volumes:
+      - ./proxy.toml:/etc/helios/proxy.toml:ro
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+      pg-standby-sync:
+        condition: service_healthy
+      pg-standby-async:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+      start_period: 10s

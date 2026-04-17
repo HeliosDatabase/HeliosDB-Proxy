@@ -1,0 +1,191 @@
+# HeliosProxy - Lag-Aware Routing Demo
+#
+# Shows how HeliosProxy detects replication lag and reroutes reads
+# to healthy standbys, plus read-your-writes (RYW) consistency.
+#
+# Usage:
+#   docker compose up -d
+#   ./observe.sh           # Watch routing decisions live
+#   ./induce-lag.sh on     # Add artificial lag to async standby
+#   ./induce-lag.sh off    # Remove artificial lag
+
+networks:
+  lag-net:
+    driver: bridge
+
+volumes:
+  primary-data:
+  standby-sync-data:
+  standby-async-data:
+
+services:
+  # ─────────────────────────────────────────────────────────────────────
+  # Primary PostgreSQL
+  # ─────────────────────────────────────────────────────────────────────
+  pg-primary:
+    image: postgres:16-alpine
+    container_name: lag-primary
+    hostname: pg-primary
+    networks:
+      - lag-net
+    ports:
+      - "65432:5432"
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: apppass
+      POSTGRES_DB: appdb
+      POSTGRES_HOST_AUTH_METHOD: md5
+      POSTGRES_INITDB_ARGS: "--auth-host=md5"
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "hot_standby=on"
+      - "-c"
+      - "synchronous_commit=on"
+      - "-c"
+      - "synchronous_standby_names='standby-sync'"
+      - "-c"
+      - "listen_addresses=*"
+      - "-c"
+      - "password_encryption=md5"
+    volumes:
+      - primary-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 10s
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Synchronous Standby (low lag — always consistent)
+  # ─────────────────────────────────────────────────────────────────────
+  pg-standby-sync:
+    image: postgres:16-alpine
+    container_name: lag-standby-sync
+    hostname: pg-standby-sync
+    networks:
+      - lag-net
+    ports:
+      - "65442:5432"
+    environment:
+      PGUSER: app
+      PGPASSWORD: apppass
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        until pg_isready -h pg-primary -U app; do
+          echo "Waiting for primary..."
+          sleep 2
+        done
+        if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+          rm -rf /var/lib/postgresql/data/*
+          PGPASSWORD=apppass pg_basebackup \
+            -h pg-primary -U app -D /var/lib/postgresql/data \
+            -Fp -Xs -P -R
+          # Set application_name for synchronous replication
+          echo "primary_conninfo = 'host=pg-primary port=5432 user=app password=apppass application_name=standby-sync'" \
+            >> /var/lib/postgresql/data/postgresql.auto.conf
+        fi
+        exec postgres \
+          -c hot_standby=on \
+          -c primary_conninfo='host=pg-primary port=5432 user=app password=apppass application_name=standby-sync' \
+          -c listen_addresses='*' \
+          -c password_encryption=md5
+    volumes:
+      - standby-sync-data:/var/lib/postgresql/data
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 30s
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Asynchronous Standby (will have induced lag for demo)
+  # ─────────────────────────────────────────────────────────────────────
+  pg-standby-async:
+    image: postgres:16-alpine
+    container_name: lag-standby-async
+    hostname: pg-standby-async
+    networks:
+      - lag-net
+    ports:
+      - "65462:5432"
+    cap_add:
+      - NET_ADMIN
+    environment:
+      PGUSER: app
+      PGPASSWORD: apppass
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        # Install iproute2 for tc/netem (used by induce-lag.sh)
+        apk add --no-cache iproute2 > /dev/null 2>&1 || true
+        until pg_isready -h pg-primary -U app; do
+          echo "Waiting for primary..."
+          sleep 2
+        done
+        if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+          rm -rf /var/lib/postgresql/data/*
+          PGPASSWORD=apppass pg_basebackup \
+            -h pg-primary -U app -D /var/lib/postgresql/data \
+            -Fp -Xs -P -R
+        fi
+        exec postgres \
+          -c hot_standby=on \
+          -c primary_conninfo='host=pg-primary port=5432 user=app password=apppass application_name=standby-async' \
+          -c listen_addresses='*' \
+          -c password_encryption=md5
+    volumes:
+      - standby-async-data:/var/lib/postgresql/data
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 30s
+
+  # ─────────────────────────────────────────────────────────────────────
+  # HeliosProxy — Lag-aware routing + Read-Your-Writes
+  # ─────────────────────────────────────────────────────────────────────
+  heliosproxy:
+    build:
+      context: ../../
+      dockerfile: docker/Dockerfile
+    container_name: lag-proxy
+    hostname: heliosproxy
+    networks:
+      - lag-net
+    ports:
+      - "66432:6432"   # Client connections
+      - "69090:9090"   # Admin / metrics API
+    volumes:
+      - ./proxy.toml:/etc/helios/proxy.toml:ro
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+      pg-standby-sync:
+        condition: service_healthy
+      pg-standby-async:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+      start_period: 10s

@@ -1,0 +1,134 @@
+# HeliosProxy - Impossible Query Demo
+#
+# A 60-second marketing demo: kill the primary mid-transaction,
+# and the COMMIT still succeeds. Zero errors. Zero data loss.
+#
+# Usage:
+#   ./demo.sh            # Interactive (pauses between steps)
+#   ./demo.sh --auto     # Automatic (no pauses)
+
+networks:
+  impossible-query-net:
+    driver: bridge
+
+volumes:
+  primary-data:
+  standby-data:
+
+services:
+  # ─────────────────────────────────────────────────────────────────────
+  # Primary PostgreSQL
+  # ─────────────────────────────────────────────────────────────────────
+  pg-primary:
+    image: postgres:16-alpine
+    container_name: iq-primary
+    hostname: pg-primary
+    networks:
+      - impossible-query-net
+    ports:
+      - "25432:5432"
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: apppass
+      POSTGRES_DB: appdb
+      POSTGRES_HOST_AUTH_METHOD: md5
+      POSTGRES_INITDB_ARGS: "--auth-host=md5"
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "hot_standby=on"
+      - "-c"
+      - "synchronous_commit=on"
+      - "-c"
+      - "synchronous_standby_names='*'"
+      - "-c"
+      - "listen_addresses=*"
+      - "-c"
+      - "password_encryption=md5"
+    volumes:
+      - primary-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 10s
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Standby PostgreSQL (streaming replication)
+  # ─────────────────────────────────────────────────────────────────────
+  pg-standby:
+    image: postgres:16-alpine
+    container_name: iq-standby
+    hostname: pg-standby
+    networks:
+      - impossible-query-net
+    ports:
+      - "25442:5432"
+    environment:
+      PGUSER: app
+      PGPASSWORD: apppass
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        until pg_isready -h pg-primary -U app; do
+          echo "Waiting for primary..."
+          sleep 2
+        done
+        if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+          rm -rf /var/lib/postgresql/data/*
+          PGPASSWORD=apppass pg_basebackup \
+            -h pg-primary -U app -D /var/lib/postgresql/data \
+            -Fp -Xs -P -R
+        fi
+        exec postgres \
+          -c hot_standby=on \
+          -c primary_conninfo='host=pg-primary port=5432 user=app password=apppass' \
+          -c listen_addresses='*' \
+          -c password_encryption=md5
+    volumes:
+      - standby-data:/var/lib/postgresql/data
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 30s
+
+  # ─────────────────────────────────────────────────────────────────────
+  # HeliosProxy — Transaction Replay enabled
+  # ─────────────────────────────────────────────────────────────────────
+  heliosproxy:
+    build:
+      context: ../../
+      dockerfile: docker/Dockerfile
+    container_name: iq-proxy
+    hostname: heliosproxy
+    networks:
+      - impossible-query-net
+    ports:
+      - "26432:6432"   # Client connections
+      - "29090:9090"   # Admin / metrics API
+    volumes:
+      - ./proxy.toml:/etc/helios/proxy.toml:ro
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+      pg-standby:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+      start_period: 10s

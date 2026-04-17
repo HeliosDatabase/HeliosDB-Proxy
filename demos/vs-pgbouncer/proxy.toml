@@ -1,0 +1,33 @@
+# HeliosProxy configuration — vs PgBouncer Comparison Demo
+# Transaction pooling with Transaction Replay enabled.
+
+[general]
+host = "0.0.0.0"
+port = 6432
+admin_host = "0.0.0.0"
+admin_port = 9090
+connect_timeout = 5000
+idle_timeout = 30000
+pool_mode = "transaction"
+
+[transaction_replay]
+enabled = true
+mode = "transaction"
+
+[pools.benchdb]
+pool_size = 20
+default_role = "primary"
+
+[pools.benchdb.users.app]
+password = "apppass"
+
+[pools.benchdb.shards.0]
+database = "benchdb"
+servers = [
+  ["hp-primary", 5432, "primary"],
+  ["hp-standby", 5432, "replica"],
+]
+
+[healthcheck]
+delay = 2000
+timeout = 1000
