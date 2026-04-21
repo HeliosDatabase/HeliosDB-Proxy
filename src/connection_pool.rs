@@ -112,11 +112,38 @@ pub struct ConnectionPool {
     total_connections: AtomicU64,
     /// Active (in-use) connections
     active_connections: AtomicU64,
-    /// Metrics
-    metrics: Arc<RwLock<PoolMetrics>>,
+    /// Metrics counters (atomics; snapshotted into PoolMetrics on demand)
+    metrics: PoolMetricsCounters,
 }
 
-/// Pool metrics
+/// Lock-free counters backing `PoolMetrics`. Every increment is a single
+/// atomic `fetch_add` with `Relaxed` ordering — no RwLock or `.await`.
+#[derive(Debug, Default)]
+struct PoolMetricsCounters {
+    acquires: AtomicU64,
+    acquire_failures: AtomicU64,
+    connections_created: AtomicU64,
+    connections_closed: AtomicU64,
+    connections_recycled: AtomicU64,
+    validation_failures: AtomicU64,
+    acquire_timeouts: AtomicU64,
+}
+
+impl PoolMetricsCounters {
+    fn snapshot(&self) -> PoolMetrics {
+        PoolMetrics {
+            acquires: self.acquires.load(Ordering::Relaxed),
+            acquire_failures: self.acquire_failures.load(Ordering::Relaxed),
+            connections_created: self.connections_created.load(Ordering::Relaxed),
+            connections_closed: self.connections_closed.load(Ordering::Relaxed),
+            connections_recycled: self.connections_recycled.load(Ordering::Relaxed),
+            validation_failures: self.validation_failures.load(Ordering::Relaxed),
+            acquire_timeouts: self.acquire_timeouts.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Pool metrics (plain-data snapshot of `PoolMetricsCounters`)
 #[derive(Debug, Clone, Default)]
 pub struct PoolMetrics {
     /// Total connection acquires
@@ -143,7 +170,7 @@ impl ConnectionPool {
             pools: Arc::new(RwLock::new(HashMap::new())),
             total_connections: AtomicU64::new(0),
             active_connections: AtomicU64::new(0),
-            metrics: Arc::new(RwLock::new(PoolMetrics::default())),
+            metrics: PoolMetricsCounters::default(),
         }
     }
 
@@ -171,10 +198,7 @@ impl ConnectionPool {
 
     /// Get a connection from the pool
     pub async fn get_connection(&self, node_id: &NodeId) -> Result<PooledConnection> {
-        {
-            let mut metrics = self.metrics.write().await;
-            metrics.acquires += 1;
-        }
+        self.metrics.acquires.fetch_add(1, Ordering::Relaxed);
 
         // Step 1: Briefly take the write lock to (a) pop an idle connection if
         // available, and (b) clone the per-node Arc<Semaphore>. The lock is
@@ -213,7 +237,9 @@ impl ConnectionPool {
 
             // Too old — drop it (which releases its permit) and fall through
             // to the create-new path.
-            self.metrics.write().await.connections_recycled += 1;
+            self.metrics
+                .connections_recycled
+                .fetch_add(1, Ordering::Relaxed);
             self.total_connections.fetch_sub(1, Ordering::SeqCst);
             drop(conn);
         }
@@ -228,14 +254,18 @@ impl ConnectionPool {
         {
             Ok(Ok(p)) => p,
             Ok(Err(_)) => {
-                self.metrics.write().await.acquire_failures += 1;
+                self.metrics
+                    .acquire_failures
+                    .fetch_add(1, Ordering::Relaxed);
                 return Err(ProxyError::PoolExhausted(format!(
                     "Failed to acquire semaphore for node {:?}",
                     node_id
                 )));
             }
             Err(_) => {
-                self.metrics.write().await.acquire_timeouts += 1;
+                self.metrics
+                    .acquire_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
                 return Err(ProxyError::Timeout(format!(
                     "Timeout acquiring connection for node {:?}",
                     node_id
@@ -273,9 +303,9 @@ impl ConnectionPool {
     pub async fn close_connection(&self, conn: PooledConnection) {
         self.active_connections.fetch_sub(1, Ordering::SeqCst);
         self.total_connections.fetch_sub(1, Ordering::SeqCst);
-
-        let mut metrics = self.metrics.write().await;
-        metrics.connections_closed += 1;
+        self.metrics
+            .connections_closed
+            .fetch_add(1, Ordering::Relaxed);
 
         let mut pools = self.pools.write().await;
         if let Some(pool) = pools.get_mut(&conn.node_id) {
@@ -306,7 +336,9 @@ impl ConnectionPool {
             permit,
         };
 
-        self.metrics.write().await.connections_created += 1;
+        self.metrics
+            .connections_created
+            .fetch_add(1, Ordering::Relaxed);
 
         tracing::debug!("Created connection {:?} for node {:?}", conn.id, node_id);
 
@@ -318,7 +350,9 @@ impl ConnectionPool {
         // TODO: Implement actual validation (e.g., ping)
         // For skeleton, always return true
         if conn.state == ConnectionState::Closed {
-            self.metrics.write().await.validation_failures += 1;
+            self.metrics
+                .validation_failures
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(false);
         }
         Ok(true)
@@ -373,7 +407,7 @@ impl ConnectionPool {
 
     /// Get pool metrics
     pub async fn metrics(&self) -> PoolMetrics {
-        self.metrics.read().await.clone()
+        self.metrics.snapshot()
     }
 
     /// Get per-node statistics
