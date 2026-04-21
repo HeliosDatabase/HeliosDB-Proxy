@@ -1,11 +1,17 @@
 //! L1 Hot Cache
 //!
 //! Per-connection, exact-match cache with LRU eviction.
-//! Provides sub-millisecond latency for repeated queries.
+//! Provides sub-microsecond latency for repeated queries.
+//!
+//! Hits take only a read lock on the entries map; `L1Entry::access_count`
+//! is an `AtomicU64`, so its increment doesn't require `&mut` access to
+//! the entry. `parking_lot::RwLock` is used throughout — no poisoning,
+//! no `.unwrap()` on every lock acquire.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::time::Instant;
+
+use parking_lot::RwLock;
 
 use super::config::L1Config;
 use super::result::{CachedResult, L1Entry};
@@ -37,30 +43,43 @@ impl L1HotCache {
         }
     }
 
-    /// Look up a query in the cache
+    /// Look up a query in the cache.
+    ///
+    /// Hits take only a read lock on the entries map; the `touch()` call
+    /// uses atomic `fetch_add` on `access_count` rather than exclusive
+    /// access. Expired entries still need a write-lock to evict, but that
+    /// is only the slow path.
     pub fn get(&self, query: &str) -> Option<CachedResult> {
         if !self.config.enabled {
             return None;
         }
 
-        let mut entries = self.entries.write().ok()?;
-
-        if let Some(entry) = entries.get_mut(query) {
-            // Check expiration
-            if entry.is_expired() {
-                entries.remove(query);
-                self.remove_from_lru(query);
-                return None;
+        // Fast path: read lock.
+        let (result, expired) = {
+            let entries = self.entries.read();
+            match entries.get(query) {
+                None => return None,
+                Some(entry) if entry.is_expired() => (None, true),
+                Some(entry) => {
+                    entry.touch();
+                    (Some(entry.result.clone()), false)
+                }
             }
+        };
 
-            // Update access tracking
-            entry.touch();
-            self.update_lru(query);
-
-            return Some(entry.result.clone());
+        if expired {
+            // Slow path: escalate to a write lock to evict the dead entry.
+            let mut entries = self.entries.write();
+            entries.remove(query);
+            drop(entries);
+            self.remove_from_lru(query);
+            return None;
         }
 
-        None
+        // Hit: update LRU ordering after releasing the entries read lock,
+        // so it contends only with other LRU updates, not with reads.
+        self.update_lru(query);
+        result
     }
 
     /// Store a query result in the cache
@@ -69,10 +88,7 @@ impl L1HotCache {
             return;
         }
 
-        let mut entries = match self.entries.write() {
-            Ok(e) => e,
-            Err(_) => return,
-        };
+        let mut entries = self.entries.write();
 
         // Check if we need to evict
         if entries.len() >= self.config.size && !entries.contains_key(&query) {
@@ -88,30 +104,25 @@ impl L1HotCache {
         // Insert or update entry
         let entry = L1Entry::new(query.clone(), adjusted_result);
         entries.insert(query.clone(), entry);
+        drop(entries);
         self.update_lru(&query);
     }
 
     /// Remove an entry from the cache
     pub fn remove(&self, query: &str) {
-        if let Ok(mut entries) = self.entries.write() {
-            entries.remove(query);
-            self.remove_from_lru(query);
-        }
+        self.entries.write().remove(query);
+        self.remove_from_lru(query);
     }
 
     /// Clear all entries
     pub fn clear(&self) {
-        if let Ok(mut entries) = self.entries.write() {
-            entries.clear();
-        }
-        if let Ok(mut lru) = self.lru_order.write() {
-            lru.clear();
-        }
+        self.entries.write().clear();
+        self.lru_order.write().clear();
     }
 
     /// Get current entry count
     pub fn len(&self) -> usize {
-        self.entries.read().map(|e| e.len()).unwrap_or(0)
+        self.entries.read().len()
     }
 
     /// Check if cache is empty
@@ -126,9 +137,9 @@ impl L1HotCache {
 
     /// Get hit statistics
     pub fn stats(&self) -> L1CacheStats {
-        let entries = self.entries.read().unwrap();
+        let entries = self.entries.read();
         let total_size: usize = entries.values().map(|e| e.result.size()).sum();
-        let total_access: u64 = entries.values().map(|e| e.access_count).sum();
+        let total_access: u64 = entries.values().map(|e| e.access_count()).sum();
 
         L1CacheStats {
             entry_count: entries.len(),
@@ -140,63 +151,61 @@ impl L1HotCache {
 
     /// Evict expired entries
     pub fn evict_expired(&self) {
-        if let Ok(mut entries) = self.entries.write() {
-            let expired: Vec<String> = entries
-                .iter()
-                .filter(|(_, entry)| entry.is_expired())
-                .map(|(key, _)| key.clone())
-                .collect();
+        let mut entries = self.entries.write();
+        let expired: Vec<String> = entries
+            .iter()
+            .filter(|(_, entry)| entry.is_expired())
+            .map(|(key, _)| key.clone())
+            .collect();
 
-            for key in expired {
-                entries.remove(&key);
-                self.remove_from_lru(&key);
-            }
+        for key in &expired {
+            entries.remove(key);
+        }
+        drop(entries);
+
+        for key in &expired {
+            self.remove_from_lru(key);
         }
     }
 
     /// Update LRU tracking for a query
     fn update_lru(&self, query: &str) {
-        if let Ok(mut lru) = self.lru_order.write() {
-            // Remove existing entry
-            lru.retain(|(q, _)| q != query);
-            // Add to end (most recent)
-            lru.push((query.to_string(), Instant::now()));
-        }
+        let mut lru = self.lru_order.write();
+        lru.retain(|(q, _)| q != query);
+        lru.push((query.to_string(), Instant::now()));
     }
 
     /// Remove from LRU tracking
     fn remove_from_lru(&self, query: &str) {
-        if let Ok(mut lru) = self.lru_order.write() {
-            lru.retain(|(q, _)| q != query);
-        }
+        self.lru_order.write().retain(|(q, _)| q != query);
     }
 
     /// Evict least recently used entry
     fn evict_lru(&self, entries: &mut HashMap<String, L1Entry>) {
-        if let Ok(mut lru) = self.lru_order.write() {
-            // First, try to evict expired entries
-            let expired: Vec<String> = lru
-                .iter()
-                .filter(|(q, _)| {
-                    entries
-                        .get(q)
-                        .map(|e| e.is_expired())
-                        .unwrap_or(true)
-                })
-                .map(|(q, _)| q.clone())
-                .collect();
+        let mut lru = self.lru_order.write();
 
-            for key in expired {
+        // First, try to evict expired entries
+        let expired: Vec<String> = lru
+            .iter()
+            .filter(|(q, _)| {
+                entries
+                    .get(q)
+                    .map(|e| e.is_expired())
+                    .unwrap_or(true)
+            })
+            .map(|(q, _)| q.clone())
+            .collect();
+
+        for key in expired {
+            entries.remove(&key);
+            lru.retain(|(q, _)| q != &key);
+        }
+
+        // If still full, evict LRU entry
+        if entries.len() >= self.config.size {
+            if let Some((key, _)) = lru.first().cloned() {
                 entries.remove(&key);
-                lru.retain(|(q, _)| q != &key);
-            }
-
-            // If still full, evict LRU entry
-            if entries.len() >= self.config.size {
-                if let Some((key, _)) = lru.first().cloned() {
-                    entries.remove(&key);
-                    lru.remove(0);
-                }
+                lru.remove(0);
             }
         }
     }
@@ -432,5 +441,48 @@ mod tests {
 
         let cached = cache.get("query").unwrap();
         assert_eq!(cached.data, Bytes::from("new"));
+    }
+
+    /// Concurrent hits on the same key must not block each other and must
+    /// all observe the cached result. Before the read-path refactor this
+    /// test could not be written sensibly — every `get()` took a write
+    /// lock, so reads serialised. With atomic access_count + read-locked
+    /// hits, many threads can hit the same entry in parallel.
+    #[test]
+    fn test_concurrent_hits_read_lock_only() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let cache = Arc::new(L1HotCache::new(L1Config {
+            enabled: true,
+            size: 100,
+            ttl: Duration::from_secs(60),
+        }));
+        cache.put("hot-query".to_string(), create_result("hot data"));
+
+        const THREADS: usize = 16;
+        const ITERS_PER_THREAD: usize = 500;
+
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let cache = Arc::clone(&cache);
+            handles.push(thread::spawn(move || {
+                for _ in 0..ITERS_PER_THREAD {
+                    let r = cache.get("hot-query").expect("hit expected");
+                    assert_eq!(r.data, Bytes::from("hot data"));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let stats = cache.stats();
+        // access_count starts at 1 (from put) and is bumped once per get.
+        // Total: 1 (put) + THREADS * ITERS_PER_THREAD (gets).
+        assert_eq!(
+            stats.total_accesses,
+            1 + (THREADS * ITERS_PER_THREAD) as u64
+        );
     }
 }

@@ -4,6 +4,7 @@
 
 use bytes::Bytes;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::normalizer::NormalizedQuery;
@@ -160,7 +161,13 @@ impl PartialEq for CacheKey {
 impl Eq for CacheKey {}
 
 /// Entry in the L1 hot cache
-#[derive(Debug, Clone)]
+///
+/// `access_count` is an `AtomicU64` so cache hits can bump it under a
+/// read lock on the containing map — `touch()` takes `&self`, not
+/// `&mut self`. `last_access` is deliberately cosmetic (not consulted
+/// by LRU eviction, which uses a separate ordered queue) and is not
+/// updated per-access.
+#[derive(Debug)]
 pub struct L1Entry {
     /// The cached result
     pub result: CachedResult,
@@ -168,10 +175,11 @@ pub struct L1Entry {
     /// Original query string (for exact match)
     pub query: String,
 
-    /// Access count for LRU tracking
-    pub access_count: u64,
+    /// Access count (atomic so hits only need a read lock on the map)
+    pub access_count: AtomicU64,
 
-    /// Last access time
+    /// Creation / last-put time. Not updated on hits (LRU uses a separate
+    /// ordered queue), so this reflects when the entry was first stored.
     pub last_access: Instant,
 }
 
@@ -181,15 +189,19 @@ impl L1Entry {
         Self {
             result,
             query,
-            access_count: 1,
+            access_count: AtomicU64::new(1),
             last_access: Instant::now(),
         }
     }
 
-    /// Record an access to this entry
-    pub fn touch(&mut self) {
-        self.access_count += 1;
-        self.last_access = Instant::now();
+    /// Record an access to this entry (lock-free — takes `&self`).
+    pub fn touch(&self) {
+        self.access_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get the current access count.
+    pub fn access_count(&self) -> u64 {
+        self.access_count.load(Ordering::Relaxed)
     }
 
     /// Check if this entry has expired
@@ -444,13 +456,13 @@ mod tests {
             Duration::from_millis(5),
         );
 
-        let mut entry = L1Entry::new("SELECT 1".to_string(), result);
-        assert_eq!(entry.access_count, 1);
+        let entry = L1Entry::new("SELECT 1".to_string(), result);
+        assert_eq!(entry.access_count(), 1);
 
         entry.touch();
-        assert_eq!(entry.access_count, 2);
+        assert_eq!(entry.access_count(), 2);
 
         entry.touch();
-        assert_eq!(entry.access_count, 3);
+        assert_eq!(entry.access_count(), 3);
     }
 }
