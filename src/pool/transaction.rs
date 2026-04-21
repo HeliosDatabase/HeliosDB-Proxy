@@ -162,6 +162,7 @@ mod tests {
             last_used: chrono::Utc::now(),
             state: ConnectionState::InUse,
             use_count: 1,
+            permit: None,
         }
     }
 

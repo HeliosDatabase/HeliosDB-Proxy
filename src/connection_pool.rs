@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use uuid::Uuid;
 
 /// Connection pool configuration
@@ -56,6 +56,11 @@ pub struct PooledConnection {
     pub state: ConnectionState,
     /// Use count
     pub use_count: u64,
+    /// Semaphore permit held for the lifetime of this connection.
+    /// Dropped when the connection is dropped or closed, releasing one
+    /// slot back to the per-node semaphore. `None` in unit-test helpers
+    /// that construct `PooledConnection` without going through the pool.
+    pub(crate) permit: Option<OwnedSemaphorePermit>,
 }
 
 /// Connection state
@@ -166,79 +171,90 @@ impl ConnectionPool {
 
     /// Get a connection from the pool
     pub async fn get_connection(&self, node_id: &NodeId) -> Result<PooledConnection> {
-        // Update metrics
         {
             let mut metrics = self.metrics.write().await;
             metrics.acquires += 1;
         }
 
-        let mut pools = self.pools.write().await;
-        let pool = pools.get_mut(node_id).ok_or_else(|| {
-            ProxyError::Connection(format!("Node {:?} not found in pool", node_id))
-        })?;
+        // Step 1: Briefly take the write lock to (a) pop an idle connection if
+        // available, and (b) clone the per-node Arc<Semaphore>. The lock is
+        // dropped before we await anything.
+        let (mut maybe_idle, semaphore) = {
+            let mut pools = self.pools.write().await;
+            let pool = pools.get_mut(node_id).ok_or_else(|| {
+                ProxyError::Connection(format!("Node {:?} not found in pool", node_id))
+            })?;
 
-        // Try to acquire a semaphore permit (with timeout)
-        let permit_result = tokio::time::timeout(
-            self.config.acquire_timeout,
-            pool.semaphore.clone().acquire_owned(),
-        )
-        .await;
+            let semaphore = pool.semaphore.clone();
+            let idle = pool
+                .connections
+                .iter()
+                .position(|c| c.state == ConnectionState::Idle)
+                .map(|idx| pool.connections.swap_remove(idx));
+            (idle, semaphore)
+        };
 
-        match permit_result {
-            Ok(Ok(_permit)) => {
-                // Try to get an existing idle connection
-                if let Some(idx) = pool
-                    .connections
-                    .iter()
-                    .position(|c| c.state == ConnectionState::Idle)
-                {
-                    let mut conn = pool.connections.remove(idx);
+        // Step 2: If we got an idle connection, check its age. If still fresh,
+        // return it directly — its permit is already attached, no new permit
+        // needs to be acquired.
+        if let Some(mut conn) = maybe_idle.take() {
+            let age = chrono::Utc::now()
+                .signed_duration_since(conn.created_at)
+                .to_std()
+                .unwrap_or(Duration::ZERO);
 
-                    // Check lifetime
-                    let age = chrono::Utc::now()
-                        .signed_duration_since(conn.created_at)
-                        .to_std()
-                        .unwrap_or(Duration::ZERO);
-
-                    if age > self.config.max_lifetime {
-                        // Recycle old connection
-                        self.metrics.write().await.connections_recycled += 1;
-                        // Create new connection instead
-                        conn = self.create_connection(*node_id).await?;
-                    }
-
-                    conn.state = ConnectionState::InUse;
-                    conn.last_used = chrono::Utc::now();
-                    conn.use_count += 1;
-
-                    self.active_connections.fetch_add(1, Ordering::SeqCst);
-
-                    return Ok(conn);
-                }
-
-                // Create new connection
-                let conn = self.create_connection(*node_id).await?;
+            if age <= self.config.max_lifetime {
+                conn.state = ConnectionState::InUse;
+                conn.last_used = chrono::Utc::now();
+                conn.use_count += 1;
                 self.active_connections.fetch_add(1, Ordering::SeqCst);
-                self.total_connections.fetch_add(1, Ordering::SeqCst);
-                pool.total_created += 1;
-
-                Ok(conn)
+                return Ok(conn);
             }
+
+            // Too old — drop it (which releases its permit) and fall through
+            // to the create-new path.
+            self.metrics.write().await.connections_recycled += 1;
+            self.total_connections.fetch_sub(1, Ordering::SeqCst);
+            drop(conn);
+        }
+
+        // Step 3: No reusable idle connection — acquire a permit (bounded by
+        // max_connections) and create a new connection that owns the permit.
+        let permit = match tokio::time::timeout(
+            self.config.acquire_timeout,
+            semaphore.acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
             Ok(Err(_)) => {
                 self.metrics.write().await.acquire_failures += 1;
-                Err(ProxyError::PoolExhausted(format!(
+                return Err(ProxyError::PoolExhausted(format!(
                     "Failed to acquire semaphore for node {:?}",
                     node_id
-                )))
+                )));
             }
             Err(_) => {
                 self.metrics.write().await.acquire_timeouts += 1;
-                Err(ProxyError::Timeout(format!(
+                return Err(ProxyError::Timeout(format!(
                     "Timeout acquiring connection for node {:?}",
                     node_id
-                )))
+                )));
+            }
+        };
+
+        let conn = self.create_connection(*node_id, Some(permit)).await?;
+        self.active_connections.fetch_add(1, Ordering::SeqCst);
+        self.total_connections.fetch_add(1, Ordering::SeqCst);
+
+        {
+            let mut pools = self.pools.write().await;
+            if let Some(pool) = pools.get_mut(node_id) {
+                pool.total_created += 1;
             }
         }
+
+        Ok(conn)
     }
 
     /// Return a connection to the pool
@@ -269,8 +285,13 @@ impl ConnectionPool {
         tracing::debug!("Closed connection {:?}", conn.id);
     }
 
-    /// Create a new connection
-    async fn create_connection(&self, node_id: NodeId) -> Result<PooledConnection> {
+    /// Create a new connection, attaching the given semaphore permit (if any)
+    /// so that it's released when the connection is dropped or closed.
+    async fn create_connection(
+        &self,
+        node_id: NodeId,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<PooledConnection> {
         // TODO: Implement actual connection creation
         // For skeleton, we create a mock connection
 
@@ -282,6 +303,7 @@ impl ConnectionPool {
             last_used: now,
             state: ConnectionState::InUse,
             use_count: 1,
+            permit,
         };
 
         self.metrics.write().await.connections_created += 1;
@@ -435,5 +457,73 @@ mod tests {
         let metrics = pool.metrics().await;
         assert_eq!(metrics.acquires, 1);
         assert_eq!(metrics.connections_created, 1);
+    }
+
+    /// Regression: `max_connections` must be enforced while connections are
+    /// in use. Before the permit fix, the semaphore permit was released
+    /// immediately at the end of `get_connection`, so the pool could hand out
+    /// an unlimited number of simultaneously-active connections.
+    #[tokio::test]
+    async fn test_max_connections_enforced_while_in_use() {
+        let pool = ConnectionPool::new(PoolConfig {
+            min_connections: 0,
+            max_connections: 2,
+            acquire_timeout: Duration::from_millis(50),
+            ..Default::default()
+        });
+        let node_id = NodeId::new();
+        pool.add_node(node_id).await;
+
+        let c1 = pool.get_connection(&node_id).await.expect("first acquire");
+        let c2 = pool.get_connection(&node_id).await.expect("second acquire");
+
+        // Third acquire must fail with a Timeout — the two permits are held
+        // by c1 and c2 and have not been released.
+        let err = pool
+            .get_connection(&node_id)
+            .await
+            .expect_err("third acquire should time out while c1/c2 held");
+        assert!(
+            matches!(err, ProxyError::Timeout(_)),
+            "expected Timeout, got {err:?}"
+        );
+
+        // Dropping c1 releases its permit; the next acquire must succeed.
+        drop(c1);
+        let _c3 = pool
+            .get_connection(&node_id)
+            .await
+            .expect("acquire should succeed after c1 dropped");
+
+        // Keep c2 alive through the end of the test.
+        drop(c2);
+    }
+
+    /// Returning a connection to the pool keeps the permit attached, so
+    /// reusing it should not consume a new permit.
+    #[tokio::test]
+    async fn test_return_then_reacquire_reuses_permit() {
+        let pool = ConnectionPool::new(PoolConfig {
+            min_connections: 0,
+            max_connections: 1,
+            acquire_timeout: Duration::from_millis(50),
+            ..Default::default()
+        });
+        let node_id = NodeId::new();
+        pool.add_node(node_id).await;
+
+        let c1 = pool.get_connection(&node_id).await.expect("first acquire");
+        pool.return_connection(c1).await;
+
+        // Pool now has one idle connection. Re-acquire must succeed without
+        // creating a new connection (and without timing out).
+        let c2 = pool.get_connection(&node_id).await.expect("reacquire");
+        assert!(c2.permit.is_some(), "reused connection must carry its permit");
+
+        let metrics = pool.metrics().await;
+        assert_eq!(
+            metrics.connections_created, 1,
+            "reuse must not create a second connection"
+        );
     }
 }
