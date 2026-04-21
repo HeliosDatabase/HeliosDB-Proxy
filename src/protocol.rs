@@ -3,7 +3,7 @@
 //! Wire protocol parsing and serialization for HeliosDB proxy.
 
 use crate::{ProxyError, Result};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 
 /// Protocol message types
@@ -323,20 +323,25 @@ pub enum StartupMessage {
     CancelRequest { pid: u32, key: u32 },
 }
 
-/// Read a null-terminated string from buffer
+/// Read a null-terminated string from the buffer.
+///
+/// Scans for the null terminator in a single pass (no per-byte `get_u8`
+/// loop, no Vec growth), then hands the exact-size byte slice to `String`.
+/// On `BytesMut`, `split_to` is O(1), and `BytesMut -> Vec<u8>` is
+/// zero-copy when (as here) the split-off buffer has a single owner.
 fn read_cstring(buf: &mut BytesMut) -> Result<String> {
-    let mut bytes = Vec::new();
+    let end = buf
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| ProxyError::Protocol(
+            "unterminated cstring in protocol buffer".to_string(),
+        ))?;
 
-    while buf.has_remaining() {
-        let b = buf.get_u8();
-        if b == 0 {
-            break;
-        }
-        bytes.push(b);
-    }
+    let bytes = buf.split_to(end);
+    buf.advance(1); // consume the null terminator
 
-    String::from_utf8(bytes)
-        .map_err(|e| ProxyError::Protocol(format!("Invalid UTF-8 in string: {}", e)))
+    String::from_utf8(bytes.into())
+        .map_err(|e| ProxyError::Protocol(format!("Invalid UTF-8 in cstring: {}", e)))
 }
 
 /// Write a null-terminated string to buffer
@@ -408,12 +413,16 @@ impl ParseMessage {
 }
 
 /// Bind message payload
+///
+/// `param_values` uses [`bytes::Bytes`] so parameter values are held by
+/// reference into the original protocol buffer — no per-parameter `Vec`
+/// allocation during parse.
 #[derive(Debug, Clone)]
 pub struct BindMessage {
     pub portal: String,
     pub statement: String,
     pub param_formats: Vec<i16>,
-    pub param_values: Vec<Option<Vec<u8>>>,
+    pub param_values: Vec<Option<Bytes>>,
     pub result_formats: Vec<i16>,
 }
 
@@ -430,7 +439,9 @@ impl BindMessage {
             param_formats.push(payload.get_i16());
         }
 
-        // Parameter values
+        // Parameter values — zero-copy: `split_to` slices the Arc'd buffer
+        // and `freeze()` turns the split-off `BytesMut` into a shared
+        // `Bytes` without allocating.
         let num_values = payload.get_u16() as usize;
         let mut param_values = Vec::with_capacity(num_values);
         for _ in 0..num_values {
@@ -438,7 +449,7 @@ impl BindMessage {
             if len == -1 {
                 param_values.push(None);
             } else {
-                let value = payload.split_to(len as usize).to_vec();
+                let value = payload.split_to(len as usize).freeze();
                 param_values.push(Some(value));
             }
         }
@@ -776,5 +787,60 @@ mod tests {
 
         assert!(encoded.len() > 5);
         assert_eq!(encoded[0], b'Q');
+    }
+
+    /// An unterminated cstring must surface a protocol error, not be
+    /// silently treated as the full remaining buffer (as the old
+    /// incremental-push loop did).
+    #[test]
+    fn test_read_cstring_unterminated() {
+        let mut buf = BytesMut::from("not-null-terminated");
+        let err = read_cstring(&mut buf).expect_err("should reject unterminated cstring");
+        assert!(
+            matches!(err, ProxyError::Protocol(_)),
+            "expected Protocol error, got {err:?}"
+        );
+    }
+
+    /// Multiple cstrings back-to-back in the same buffer must parse
+    /// independently and leave the tail intact for subsequent fields.
+    #[test]
+    fn test_read_cstring_sequence() {
+        let mut buf = BytesMut::new();
+        buf.put_slice(b"first\0second\0tail");
+        let a = read_cstring(&mut buf).unwrap();
+        let b = read_cstring(&mut buf).unwrap();
+        assert_eq!(a, "first");
+        assert_eq!(b, "second");
+        assert_eq!(&buf[..], b"tail");
+    }
+
+    /// BindMessage parameter values are now `Bytes` (zero-copy), not
+    /// `Vec<u8>`. Round-trip a synthetic payload and confirm the
+    /// parsed values match.
+    #[test]
+    fn test_bind_message_param_values_are_bytes() {
+        let mut payload = BytesMut::new();
+        // portal, statement (both empty)
+        payload.put_u8(0);
+        payload.put_u8(0);
+        // one param format: 0 (text)
+        payload.put_u16(1);
+        payload.put_i16(0);
+        // two params: "hi" (2 bytes) and NULL (-1)
+        payload.put_u16(2);
+        payload.put_i32(2);
+        payload.put_slice(b"hi");
+        payload.put_i32(-1);
+        // zero result formats
+        payload.put_u16(0);
+
+        let bind = BindMessage::parse(payload).expect("parse failed");
+        assert_eq!(bind.param_values.len(), 2);
+        match &bind.param_values[0] {
+            Some(b) => assert_eq!(b.as_ref(), b"hi"),
+            None => panic!("first param must be Some"),
+        }
+        assert!(bind.param_values[1].is_none());
     }
 }
