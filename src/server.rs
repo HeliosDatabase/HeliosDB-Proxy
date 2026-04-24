@@ -31,6 +31,12 @@ use crate::pool::lease::ClientId;
 #[cfg(feature = "pool-modes")]
 use crate::NodeEndpoint;
 
+// WASM plugin system imports
+#[cfg(feature = "wasm-plugins")]
+use crate::plugins::{
+    HookContext, PluginManager, PostQueryOutcome, PreQueryResult, QueryContext,
+};
+
 /// Proxy server
 pub struct ProxyServer {
     config: ProxyConfig,
@@ -53,6 +59,11 @@ struct ServerState {
     /// Pool manager for Session/Transaction/Statement modes
     #[cfg(feature = "pool-modes")]
     pool_manager: Option<Arc<ConnectionPoolManager>>,
+    /// WASM plugin manager. `None` means no plugins loaded — the per-query
+    /// hook path becomes a fast no-op. When `Some`, `PreQuery` / `PostQuery`
+    /// hooks fire on every simple-query message.
+    #[cfg(feature = "wasm-plugins")]
+    plugin_manager: Option<Arc<PluginManager>>,
 }
 
 /// Per-node connection pool
@@ -176,6 +187,27 @@ pub struct StatementLog {
     pub executed_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Disposition produced by the pre-query plugin hook stage.
+///
+/// When the `wasm-plugins` feature is off, only `Forward` is ever produced —
+/// the hook dispatch is compiled out entirely and the variant list exists
+/// purely for pattern-match symmetry.
+#[derive(Debug)]
+enum PreQueryAction {
+    /// Send the message to the backend as usual.
+    Forward,
+    /// A plugin blocked the query. The caller sends an error + ReadyForQuery
+    /// to the client and skips backend forwarding.
+    Block(String),
+    /// A plugin returned a cached response. Not yet wired — response
+    /// synthesis from raw bytes requires building a full protocol reply
+    /// (RowDescription + DataRow(s) + CommandComplete + ReadyForQuery),
+    /// which is the next step of T0-a. For now the caller falls back to
+    /// `Forward` and logs a warning.
+    #[allow(dead_code)]
+    Cached(Vec<u8>),
+}
+
 impl ProxyServer {
     /// Create a new proxy server
     pub fn new(config: ProxyConfig) -> Result<Self> {
@@ -266,6 +298,8 @@ impl ProxyServer {
             }),
             #[cfg(feature = "pool-modes")]
             pool_manager,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
         });
 
         Ok(Self {
@@ -535,8 +569,27 @@ impl ProxyServer {
                     return Ok(());
                 }
 
+                // Plugin pre-query hook — may rewrite the SQL, block the
+                // query with an error, or (future) return a cached response.
+                let (msg, action) = Self::apply_pre_query_hook(msg, state, session);
+
+                if let PreQueryAction::Block(reason) = &action {
+                    tracing::info!(reason = %reason, "pre-query plugin blocked query");
+                    Self::send_block_response(stream, reason, state).await?;
+                    state.metrics.queries_processed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if let PreQueryAction::Cached(_) = &action {
+                    // Response synthesis from a cached byte blob is a
+                    // follow-up task; fall through to backend for safety.
+                    tracing::warn!(
+                        "plugin returned Cached result but response synthesis is not yet wired — forwarding to backend"
+                    );
+                }
+
                 // Route and process the message
-                let (response, new_backend, new_node) = Self::route_and_forward(
+                let forward_start = std::time::Instant::now();
+                let forward_result = Self::route_and_forward(
                     &msg,
                     backend_stream.take(),
                     backend_node.take(),
@@ -544,7 +597,16 @@ impl ProxyServer {
                     state,
                     config,
                 )
-                .await?;
+                .await;
+                #[cfg(feature = "wasm-plugins")]
+                Self::fire_post_query_hook(
+                    &msg,
+                    session,
+                    state,
+                    &forward_result,
+                    forward_start.elapsed(),
+                );
+                let (response, new_backend, new_node) = forward_result?;
 
                 backend_stream = new_backend;
                 backend_node = new_node;
@@ -1166,6 +1228,154 @@ impl ProxyServer {
 
         let err = ErrorResponse { fields };
         err.encode().encode().to_vec()
+    }
+
+    /// Create a `ReadyForQuery` frame with the given transaction-status byte
+    /// (`b'I'` = idle, `b'T'` = in transaction, `b'E'` = failed transaction).
+    fn create_ready_for_query(status: u8) -> Vec<u8> {
+        let mut payload = BytesMut::with_capacity(1);
+        payload.put_u8(status);
+        Message::new(MessageType::ReadyForQuery, payload)
+            .encode()
+            .to_vec()
+    }
+
+    /// Run the pre-query plugin hook on a client message.
+    ///
+    /// When the `wasm-plugins` feature is off, or the plugin manager has no
+    /// loaded plugins, this is a zero-cost passthrough that returns the
+    /// message untouched with `PreQueryAction::Forward`.
+    ///
+    /// Only simple-query (`MessageType::Query`) messages are inspected today.
+    /// Extended-protocol messages (`Parse`/`Bind`/`Execute`) are passed
+    /// through unchanged — a future task wires them in.
+    fn apply_pre_query_hook(
+        msg: Message,
+        state: &Arc<ServerState>,
+        session: &Arc<ClientSession>,
+    ) -> (Message, PreQueryAction) {
+        #[cfg(feature = "wasm-plugins")]
+        {
+            let pm = match state.plugin_manager.as_ref() {
+                Some(pm) => pm,
+                None => return (msg, PreQueryAction::Forward),
+            };
+
+            if msg.msg_type != MessageType::Query {
+                return (msg, PreQueryAction::Forward);
+            }
+
+            let query_msg = match QueryMessage::parse(msg.payload.clone()) {
+                Ok(q) => q,
+                Err(_) => return (msg, PreQueryAction::Forward),
+            };
+
+            let ctx = Self::build_query_context(&query_msg.query, session);
+
+            match pm.execute_pre_query(&ctx) {
+                PreQueryResult::Continue => (msg, PreQueryAction::Forward),
+                PreQueryResult::Block(reason) => (msg, PreQueryAction::Block(reason)),
+                PreQueryResult::Rewrite(new_sql) => {
+                    let rewritten = QueryMessage { query: new_sql }.encode();
+                    (rewritten, PreQueryAction::Forward)
+                }
+                PreQueryResult::Cached(bytes) => (msg, PreQueryAction::Cached(bytes)),
+            }
+        }
+        #[cfg(not(feature = "wasm-plugins"))]
+        {
+            let _ = (state, session);
+            (msg, PreQueryAction::Forward)
+        }
+    }
+
+    /// Send the client a `Block`-outcome response: an error frame plus
+    /// `ReadyForQuery` so the client's state machine returns to idle and
+    /// the next query can be accepted.
+    async fn send_block_response(
+        stream: &mut TcpStream,
+        reason: &str,
+        state: &Arc<ServerState>,
+    ) -> Result<()> {
+        let err = Self::create_error_response(
+            "42000",
+            &format!("Query blocked by plugin: {}", reason),
+        );
+        stream
+            .write_all(&err)
+            .await
+            .map_err(|e| ProxyError::Network(format!("Write error: {}", e)))?;
+        let rfq = Self::create_ready_for_query(b'I');
+        stream
+            .write_all(&rfq)
+            .await
+            .map_err(|e| ProxyError::Network(format!("Write error: {}", e)))?;
+        state
+            .metrics
+            .bytes_sent
+            .fetch_add((err.len() + rfq.len()) as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Build a `QueryContext` for the plugin hook. Populated fields: `query`
+    /// (verbatim), `is_read_only` (derived from SQL verb), and `hook_context`
+    /// with the session id as `client_id`. `normalized` and `tables` are
+    /// left as cheap stand-ins until the analytics normaliser is wired in
+    /// (T0-d, unified context).
+    #[cfg(feature = "wasm-plugins")]
+    fn build_query_context(query: &str, session: &Arc<ClientSession>) -> QueryContext {
+        let is_read_only = !Self::is_write_query(query);
+        let mut hook_context = HookContext::default();
+        hook_context.client_id = Some(session.id.to_string());
+        QueryContext {
+            query: query.to_string(),
+            normalized: query.to_string(),
+            tables: Vec::new(),
+            is_read_only,
+            hook_context,
+        }
+    }
+
+    /// Fire post-query hooks after a message has been forwarded (or failed
+    /// to forward). Best-effort; errors from individual plugins are logged
+    /// by the plugin manager and never surface here.
+    #[cfg(feature = "wasm-plugins")]
+    fn fire_post_query_hook(
+        msg: &Message,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        result: &Result<(Vec<u8>, Option<TcpStream>, Option<String>)>,
+        elapsed: Duration,
+    ) {
+        let pm = match state.plugin_manager.as_ref() {
+            Some(pm) => pm,
+            None => return,
+        };
+        if msg.msg_type != MessageType::Query {
+            return;
+        }
+        let query_msg = match QueryMessage::parse(msg.payload.clone()) {
+            Ok(q) => q,
+            Err(_) => return,
+        };
+        let ctx = Self::build_query_context(&query_msg.query, session);
+        let outcome = match result {
+            Ok((resp, _, node)) => PostQueryOutcome {
+                success: true,
+                target_node: node.clone(),
+                elapsed_us: elapsed.as_micros() as u64,
+                response_bytes: resp.len() as u64,
+                error: None,
+            },
+            Err(e) => PostQueryOutcome {
+                success: false,
+                target_node: None,
+                elapsed_us: elapsed.as_micros() as u64,
+                response_bytes: 0,
+                error: Some(e.to_string()),
+            },
+        };
+        pm.execute_post_query(&ctx, &outcome);
     }
 
     /// Select a backend node for the request
