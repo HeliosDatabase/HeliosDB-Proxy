@@ -250,6 +250,29 @@ pub enum PreQueryResult {
     Cached(Vec<u8>),
 }
 
+/// Outcome passed to post-query hooks.
+///
+/// Observer-only — post hooks may not change the result that has already
+/// gone back to the client. Useful for audit logs, metrics, and async
+/// downstream signalling.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PostQueryOutcome {
+    /// Whether the query completed successfully
+    pub success: bool,
+
+    /// Backend node the query was routed to (if any)
+    pub target_node: Option<String>,
+
+    /// Wall-clock execution time in microseconds
+    pub elapsed_us: u64,
+
+    /// Response size in bytes (including all protocol framing)
+    pub response_bytes: u64,
+
+    /// Error message if the query failed
+    pub error: Option<String>,
+}
+
 /// Result of authentication hook
 #[derive(Debug, Clone)]
 pub enum AuthResult {
@@ -462,6 +485,62 @@ impl PluginManager {
         }
 
         PreQueryResult::Continue
+    }
+
+    /// Execute post-query hooks.
+    ///
+    /// Fan-out notification to every registered PostQuery plugin. Unlike
+    /// `execute_pre_query`, no plugin can short-circuit the others — post
+    /// hooks are observer-only (logging, metrics, audit). Errors from any
+    /// plugin are logged but never block completion.
+    pub fn execute_post_query(&self, ctx: &QueryContext, outcome: &PostQueryOutcome) {
+        let hooks = self.hooks.read();
+        let plugin_names = hooks.get(&HookType::PostQuery).cloned().unwrap_or_default();
+        drop(hooks);
+
+        for plugin_name in plugin_names {
+            if let Some(plugin) = self.plugins.get(&plugin_name) {
+                let start = std::time::Instant::now();
+
+                // Serialise ctx + outcome into a single payload via the generic
+                // `call_hook`. Runtime-specific marshalling lives there.
+                let payload = match serde_json::to_vec(&(ctx, outcome)) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            plugin = %plugin_name,
+                            error = %e,
+                            "Post-query serialisation failed"
+                        );
+                        continue;
+                    }
+                };
+
+                match self.runtime.call_hook(&plugin, HookType::PostQuery, &payload) {
+                    Ok(_) => {
+                        self.metrics.record_hook_call(
+                            &plugin_name,
+                            HookType::PostQuery,
+                            start.elapsed(),
+                            true,
+                        );
+                    }
+                    Err(e) => {
+                        self.metrics.record_hook_call(
+                            &plugin_name,
+                            HookType::PostQuery,
+                            start.elapsed(),
+                            false,
+                        );
+                        tracing::warn!(
+                            plugin = %plugin_name,
+                            error = %e,
+                            "Post-query hook failed"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Execute authentication hooks
@@ -744,5 +823,71 @@ mod tests {
         assert!(identity.user_id.is_empty());
         assert!(identity.roles.is_empty());
         assert!(identity.tenant_id.is_none());
+    }
+
+    /// With no plugins registered, `execute_post_query` must be a silent
+    /// no-op — the proxy's post-query hook call site fires unconditionally
+    /// whenever a plugin manager exists, so "no hooks subscribed" must not
+    /// panic or take a lock it shouldn't.
+    #[test]
+    fn test_execute_post_query_no_plugins_is_noop() {
+        let config = PluginRuntimeConfig::default();
+        let pm = PluginManager::new(config).expect("construct PluginManager");
+
+        let ctx = QueryContext {
+            query: "SELECT 1".to_string(),
+            normalized: "SELECT 1".to_string(),
+            tables: Vec::new(),
+            is_read_only: true,
+            hook_context: HookContext::default(),
+        };
+        let outcome = PostQueryOutcome {
+            success: true,
+            target_node: Some("primary".to_string()),
+            elapsed_us: 42,
+            response_bytes: 128,
+            error: None,
+        };
+
+        // Must not panic; no plugins registered means this is pure no-op.
+        pm.execute_post_query(&ctx, &outcome);
+
+        // Metrics should remain empty — no hook was actually invoked.
+        let metrics = pm.get_metrics();
+        assert_eq!(metrics.plugins_loaded, 0);
+        assert_eq!(metrics.total_hook_calls, 0);
+    }
+
+    /// Same for `execute_pre_query` — the no-plugins default path must
+    /// yield `Continue` so the proxy's main loop forwards normally.
+    #[test]
+    fn test_execute_pre_query_no_plugins_returns_continue() {
+        let pm = PluginManager::new(PluginRuntimeConfig::default())
+            .expect("construct PluginManager");
+        let ctx = QueryContext {
+            query: "SELECT 1".to_string(),
+            normalized: "SELECT 1".to_string(),
+            tables: Vec::new(),
+            is_read_only: true,
+            hook_context: HookContext::default(),
+        };
+        assert!(matches!(pm.execute_pre_query(&ctx), PreQueryResult::Continue));
+    }
+
+    /// `PostQueryOutcome` must serialise cleanly — post-hook plugins
+    /// receive a JSON representation on the WASM boundary.
+    #[test]
+    fn test_post_query_outcome_serialisation() {
+        let outcome = PostQueryOutcome {
+            success: false,
+            target_node: None,
+            elapsed_us: 1234,
+            response_bytes: 0,
+            error: Some("backend timeout".to_string()),
+        };
+        let json = serde_json::to_string(&outcome).expect("serialise");
+        assert!(json.contains("\"success\":false"));
+        assert!(json.contains("\"elapsed_us\":1234"));
+        assert!(json.contains("backend timeout"));
     }
 }
