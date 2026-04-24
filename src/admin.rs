@@ -15,6 +15,11 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, RwLock};
 
+/// Static admin UI (vanilla HTML + JS). Compiled into the binary via
+/// `include_str!` so deployments are a single binary — no extra file
+/// serving or asset bundling. Served at `GET /` and `GET /ui`.
+const ADMIN_UI_HTML: &str = include_str!("admin_ui.html");
+
 /// Admin API server
 pub struct AdminServer {
     /// Listen address
@@ -180,6 +185,13 @@ impl AdminServer {
             None
         };
 
+        // Static admin UI — single HTML file compiled into the binary.
+        // Served at `/` and `/ui`; all other routes remain JSON.
+        if method == "GET" && (path == "/" || path == "/ui" || path == "/ui/") {
+            Self::send_html_response(&mut writer, 200, ADMIN_UI_HTML).await?;
+            return Ok(());
+        }
+
         // Route request
         let response = Self::route_request(method, path, body.as_deref(), &state).await;
 
@@ -195,6 +207,31 @@ impl AdminServer {
             }
         }
 
+        Ok(())
+    }
+
+    /// Serve a text/html HTTP response. Used by the admin UI route.
+    async fn send_html_response(
+        writer: &mut tokio::net::tcp::WriteHalf<'_>,
+        status: u16,
+        html: &str,
+    ) -> Result<()> {
+        let status_text = match status {
+            200 => "OK",
+            404 => "Not Found",
+            _ => "Unknown",
+        };
+        let response = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
+            status_text,
+            html.len(),
+            html
+        );
+        writer
+            .write_all(response.as_bytes())
+            .await
+            .map_err(|e| ProxyError::Network(format!("Write error: {}", e)))?;
         Ok(())
     }
 
