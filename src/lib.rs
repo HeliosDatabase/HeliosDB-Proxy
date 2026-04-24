@@ -58,6 +58,7 @@
 //! ```
 
 // ── Core modules (always available) ──────────────────────────────────
+pub mod backend;
 pub mod config;
 pub mod server;
 pub mod protocol;
