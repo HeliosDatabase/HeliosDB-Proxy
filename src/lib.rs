@@ -93,6 +93,10 @@ pub mod replay;
 #[cfg(feature = "ha-tr")]
 pub mod upgrade_orchestrator;
 
+// ── R&D: shadow execution (T3.4) ────────────────────────────────────
+#[cfg(feature = "ha-tr")]
+pub mod shadow_execute;
+
 // ── Query caching (L1/L2/L3 multi-tier cache) ──────────────────────
 #[cfg(feature = "query-cache")]
 pub mod cache;
