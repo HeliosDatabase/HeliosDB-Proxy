@@ -232,6 +232,6 @@ Session-level advisory locks (`pg_advisory_lock()`) are not migrated. If the rep
 | **Verification / safety checks** | Row count + optional SELECT hash | Basic | Full (logical comparison) | N/A | N/A |
 | **Non-deterministic detection** | Yes (configurable strictness) | N/A | Yes (mutable function list) | N/A | N/A |
 | **Max journal size cap** | Configurable | N/A | Configurable | N/A | N/A |
-| **Open source** | Yes (SSPL-1.0) | No | No | Yes (BSL) | Yes (ISC) |
+| **Open source** | Yes (AGPL-3.0) | No | No | Yes (BSL) | Yes (ISC) |
 | **PostgreSQL support** | Native | No | No | No | Yes (no TR) |
 | **Proxy-level (no app changes)** | Yes | Requires OCI driver | Requires JDBC driver | Yes | Yes (no TR) |
