@@ -273,6 +273,33 @@ impl TransactionJournal {
         self.enabled = enabled;
     }
 
+    /// Collect every journal entry across every active transaction
+    /// whose `timestamp` falls within the inclusive window
+    /// `[from, to]`. Results are sorted in timestamp order so the
+    /// caller can replay them chronologically regardless of which
+    /// transaction they came from.
+    ///
+    /// Used by the time-travel replay engine (`src/replay/`) to
+    /// reconstruct "what happened at the source between these two
+    /// timestamps" against a staging target.
+    pub async fn entries_in_window(
+        &self,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<(Uuid, JournalEntry)> {
+        let journals = self.journals.read().await;
+        let mut out: Vec<(Uuid, JournalEntry)> = Vec::new();
+        for (tx_id, j) in journals.iter() {
+            for entry in &j.entries {
+                if entry.timestamp >= from && entry.timestamp <= to {
+                    out.push((*tx_id, entry.clone()));
+                }
+            }
+        }
+        out.sort_by_key(|(_, e)| e.timestamp);
+        out
+    }
+
     /// Start journaling a transaction
     pub async fn begin_transaction(
         &self,

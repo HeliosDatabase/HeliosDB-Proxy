@@ -86,6 +86,8 @@ pub mod failover_replay;
 pub mod cursor_restore;
 #[cfg(feature = "ha-tr")]
 pub mod session_migrate;
+#[cfg(feature = "ha-tr")]
+pub mod replay;
 
 // ── Query caching (L1/L2/L3 multi-tier cache) ──────────────────────
 #[cfg(feature = "query-cache")]
