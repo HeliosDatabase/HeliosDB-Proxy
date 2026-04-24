@@ -215,12 +215,31 @@ impl ConnectionPoolManager {
             if let Some(pool) = self.pools.get(&info.node_id) {
                 let mut connection = lease.into_connection();
 
-                // Reset connection if needed
+                // Reset connection for Transaction / Statement modes.
+                // When the pooled connection has a live backend client,
+                // run the configured reset query (default `DISCARD ALL`).
+                // When no live client is attached (skeleton / test path),
+                // record the reset as if it ran.
                 if mode != PoolingMode::Session {
-                    // TODO: Actually execute reset query when we have real connections
-                    // For now, just mark as needing reset
-                    tracing::trace!("Would reset connection with: {}", self.config.reset_query);
-                    self.metrics.record_reset(true);
+                    let reset_query = self.config.reset_query.as_str();
+                    match pool.run_reset_query(&mut connection, reset_query).await {
+                        Ok(()) => {
+                            tracing::trace!(
+                                query = reset_query,
+                                "reset query executed on release"
+                            );
+                            self.metrics.record_reset(true);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "reset query failed; connection will not be returned to pool"
+                            );
+                            self.metrics.record_reset(false);
+                            pool.close_connection(connection).await;
+                            return;
+                        }
+                    }
                 }
 
                 // Return to pool
