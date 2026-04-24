@@ -1,0 +1,64 @@
+# HeliosProxy config for the T2.1 upgrade-matrix cluster.
+#
+# Defaults all four PG nodes to "standby" so no traffic flows by
+# default. The upgrade orchestrator promotes one to primary at run
+# time (typically the source version) and tracks the rest as
+# upgrade targets.
+
+listen_address = "0.0.0.0:5432"
+admin_address = "0.0.0.0:9090"
+tr_enabled = true
+tr_mode = "session"
+write_timeout_secs = 60
+
+[pool]
+min_connections = 2
+max_connections = 20
+idle_timeout_secs = 60
+max_lifetime_secs = 600
+acquire_timeout_secs = 5
+test_on_acquire = true
+
+[load_balancer]
+read_strategy = "round_robin"
+read_write_split = true
+latency_threshold_ms = 200
+
+[health]
+check_interval_secs = 2
+check_timeout_secs = 3
+failure_threshold = 3
+success_threshold = 2
+check_query = "SELECT 1"
+
+[[nodes]]
+host    = "pg-14"
+port    = 5432
+role    = "primary"     # source version by default; orchestrator overrides
+weight  = 100
+enabled = true
+name    = "pg-14"
+
+[[nodes]]
+host    = "pg-15"
+port    = 5432
+role    = "standby"
+weight  = 100
+enabled = true
+name    = "pg-15"
+
+[[nodes]]
+host    = "pg-16"
+port    = 5432
+role    = "standby"
+weight  = 100
+enabled = true
+name    = "pg-16"
+
+[[nodes]]
+host    = "pg-17"
+port    = 5432
+role    = "standby"
+weight  = 100
+enabled = true
+name    = "pg-17"

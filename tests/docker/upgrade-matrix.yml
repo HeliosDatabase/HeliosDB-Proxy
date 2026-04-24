@@ -1,0 +1,91 @@
+version: '3.8'
+
+# T2.1: PG version matrix.
+#
+# Stands up FOUR independent PG instances on different ports — one per
+# major version 14/15/16/17 — so the upgrade orchestrator can be
+# exercised across every meaningful pair (14→15, 14→16, 14→17, 15→17,
+# 16→17, etc.).
+#
+# Each instance is single-node with replication enabled so the
+# orchestrator can attach a fresh standby as part of an upgrade run.
+# The harness lives separately from the IT cluster (cluster.yml) so a
+# T2.1 run can iterate on its own without disturbing T0-IT.
+#
+# Host ports:
+#   55014 → PG 14
+#   55015 → PG 15
+#   55016 → PG 16
+#   55017 → PG 17
+#   59001 → HeliosProxy listener
+#   59002 → HeliosProxy admin
+#
+# Usage:
+#   docker compose -f tests/docker/upgrade-matrix.yml up --wait -d
+#   tests/docker/upgrade-runner.sh upgrade 14 17
+
+x-pg-base: &pg-base
+  environment:
+    POSTGRES_USER: helios
+    POSTGRES_PASSWORD: helios
+    POSTGRES_DB: appdb
+  command:
+    - "postgres"
+    - "-c"
+    - "wal_level=replica"
+    - "-c"
+    - "max_wal_senders=10"
+    - "-c"
+    - "max_replication_slots=10"
+    - "-c"
+    - "listen_addresses=*"
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U helios -d appdb"]
+    interval: 2s
+    timeout: 2s
+    retries: 30
+
+services:
+  pg-14:
+    <<: *pg-base
+    image: postgres:14-alpine
+    ports: ["55014:5432"]
+
+  pg-15:
+    <<: *pg-base
+    image: postgres:15-alpine
+    ports: ["55015:5432"]
+
+  pg-16:
+    <<: *pg-base
+    image: postgres:16-alpine
+    ports: ["55016:5432"]
+
+  pg-17:
+    <<: *pg-base
+    image: postgres:17-alpine
+    ports: ["55017:5432"]
+
+  helios-proxy:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      pg-14:  { condition: service_healthy }
+      pg-15:  { condition: service_healthy }
+      pg-16:  { condition: service_healthy }
+      pg-17:  { condition: service_healthy }
+    environment:
+      RUST_LOG: heliosdb_proxy=debug,info
+    command:
+      - "--config"
+      - "/etc/helios/proxy.toml"
+    ports:
+      - "59001:5432"
+      - "59002:9090"
+    volumes:
+      - ./upgrade-matrix-proxy.toml:/etc/helios/proxy.toml:ro
+
+networks:
+  default:
+    name: helios-upgrade-matrix

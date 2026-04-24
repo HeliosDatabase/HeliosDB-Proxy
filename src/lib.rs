@@ -89,6 +89,10 @@ pub mod session_migrate;
 #[cfg(feature = "ha-tr")]
 pub mod replay;
 
+// ── Zero-downtime PG major-version upgrade orchestrator (T2.1) ─────
+#[cfg(feature = "ha-tr")]
+pub mod upgrade_orchestrator;
+
 // ── Query caching (L1/L2/L3 multi-tier cache) ──────────────────────
 #[cfg(feature = "query-cache")]
 pub mod cache;
