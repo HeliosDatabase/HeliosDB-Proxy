@@ -183,6 +183,11 @@ pub struct ProxyConfig {
     /// When primary is unavailable, wait this long for a new primary before returning error
     #[serde(default = "default_write_timeout_secs")]
     pub write_timeout_secs: u64,
+    /// Plugin system configuration. Only consumed when the `wasm-plugins`
+    /// feature is enabled; on a feature-off build, values are parsed and
+    /// ignored so existing configs don't break.
+    #[serde(default)]
+    pub plugins: PluginToml,
 }
 
 fn default_write_timeout_secs() -> u64 {
@@ -203,6 +208,83 @@ impl Default for ProxyConfig {
             nodes: Vec::new(),
             tls: None,
             write_timeout_secs: default_write_timeout_secs(),
+            plugins: PluginToml::default(),
+        }
+    }
+}
+
+// =============================================================================
+// PLUGIN SYSTEM CONFIG (TOML-friendly shape)
+// =============================================================================
+
+/// Plugin-system configuration, in a TOML-friendly shape.
+///
+/// Always present on `ProxyConfig` so existing configs round-trip, but only
+/// consumed when the `wasm-plugins` feature is enabled. When
+/// `plugins.enabled` is `false` (the default), plugin loading is skipped
+/// entirely and every plugin-hook call site becomes a zero-cost no-op.
+///
+/// Converted to `crate::plugins::PluginRuntimeConfig` at startup via a
+/// feature-gated `From` impl in `src/plugins/config.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginToml {
+    /// Enable the plugin subsystem. Defaults to `false` — plugins are
+    /// strictly opt-in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory to scan at startup for `.wasm` plugin files.
+    #[serde(default = "default_plugin_dir")]
+    pub plugin_dir: String,
+    /// Watch `plugin_dir` for file changes and reload plugins hot.
+    #[serde(default)]
+    pub hot_reload: bool,
+    /// Memory limit per plugin instance, in megabytes.
+    #[serde(default = "default_plugin_memory_mb")]
+    pub memory_limit_mb: usize,
+    /// Execution timeout per hook call, in milliseconds.
+    #[serde(default = "default_plugin_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Maximum number of concurrently-loaded plugins.
+    #[serde(default = "default_plugin_max")]
+    pub max_plugins: usize,
+    /// Enable per-call CPU-cycle (fuel) metering to bound plugin runtime.
+    #[serde(default = "default_true")]
+    pub fuel_metering: bool,
+    /// Fuel units allowed per hook call when `fuel_metering = true`.
+    #[serde(default = "default_plugin_fuel")]
+    pub fuel_limit: u64,
+}
+
+fn default_plugin_dir() -> String {
+    "/etc/heliosproxy/plugins".to_string()
+}
+fn default_plugin_memory_mb() -> usize {
+    64
+}
+fn default_plugin_timeout_ms() -> u64 {
+    100
+}
+fn default_plugin_max() -> usize {
+    20
+}
+fn default_true() -> bool {
+    true
+}
+fn default_plugin_fuel() -> u64 {
+    1_000_000
+}
+
+impl Default for PluginToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            plugin_dir: default_plugin_dir(),
+            hot_reload: false,
+            memory_limit_mb: default_plugin_memory_mb(),
+            timeout_ms: default_plugin_timeout_ms(),
+            max_plugins: default_plugin_max(),
+            fuel_metering: true,
+            fuel_limit: default_plugin_fuel(),
         }
     }
 }
@@ -610,5 +692,102 @@ mod tests {
     fn test_proxy_config_has_pool_mode() {
         let config = ProxyConfig::default();
         assert_eq!(config.pool_mode.mode, PoolingMode::Session);
+    }
+
+    /// `plugins` defaults to `enabled = false` so adding the field to
+    /// `ProxyConfig` doesn't spontaneously turn on the plugin subsystem
+    /// for existing deployments.
+    #[test]
+    fn test_plugin_toml_default_is_disabled() {
+        let config = ProxyConfig::default();
+        assert!(!config.plugins.enabled);
+        assert_eq!(config.plugins.plugin_dir, "/etc/heliosproxy/plugins");
+        assert_eq!(config.plugins.memory_limit_mb, 64);
+        assert_eq!(config.plugins.timeout_ms, 100);
+    }
+
+    /// Existing TOML configs (written before this field existed) must
+    /// round-trip through `Deserialize` without failing. The `plugins`
+    /// section is `#[serde(default)]`, so omitting it yields the default.
+    #[test]
+    fn test_proxy_config_toml_without_plugins_section_still_parses() {
+        let toml_text = r#"
+            listen_address = "0.0.0.0:5432"
+            admin_address = "0.0.0.0:9090"
+            tr_enabled = true
+            tr_mode = "session"
+            nodes = []
+
+            [pool]
+            min_connections = 2
+            max_connections = 10
+            idle_timeout_secs = 300
+            max_lifetime_secs = 1800
+            acquire_timeout_secs = 30
+            test_on_acquire = true
+
+            [load_balancer]
+            read_strategy = "round_robin"
+            read_write_split = true
+            latency_threshold_ms = 100
+
+            [health]
+            check_interval_secs = 5
+            check_timeout_secs = 3
+            failure_threshold = 3
+            success_threshold = 2
+            check_query = "SELECT 1"
+        "#;
+        let config: ProxyConfig = toml::from_str(toml_text).expect("parse");
+        assert!(!config.plugins.enabled);
+    }
+
+    /// A `[plugins]` section with overrides round-trips and populates the
+    /// struct correctly.
+    #[test]
+    fn test_plugin_toml_overrides_parse() {
+        let toml_text = r#"
+            listen_address = "0.0.0.0:5432"
+            admin_address = "0.0.0.0:9090"
+            tr_enabled = true
+            tr_mode = "session"
+            nodes = []
+
+            [pool]
+            min_connections = 2
+            max_connections = 10
+            idle_timeout_secs = 300
+            max_lifetime_secs = 1800
+            acquire_timeout_secs = 30
+            test_on_acquire = true
+
+            [load_balancer]
+            read_strategy = "round_robin"
+            read_write_split = true
+            latency_threshold_ms = 100
+
+            [health]
+            check_interval_secs = 5
+            check_timeout_secs = 3
+            failure_threshold = 3
+            success_threshold = 2
+            check_query = "SELECT 1"
+
+            [plugins]
+            enabled = true
+            plugin_dir = "/tmp/helios-plugins"
+            hot_reload = true
+            memory_limit_mb = 128
+            timeout_ms = 250
+        "#;
+        let config: ProxyConfig = toml::from_str(toml_text).expect("parse");
+        assert!(config.plugins.enabled);
+        assert_eq!(config.plugins.plugin_dir, "/tmp/helios-plugins");
+        assert!(config.plugins.hot_reload);
+        assert_eq!(config.plugins.memory_limit_mb, 128);
+        assert_eq!(config.plugins.timeout_ms, 250);
+        // Un-specified fields retain their defaults.
+        assert_eq!(config.plugins.max_plugins, 20);
+        assert!(config.plugins.fuel_metering);
     }
 }

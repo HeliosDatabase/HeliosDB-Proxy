@@ -228,6 +228,72 @@ enum RouteOverride {
 }
 
 impl ProxyServer {
+    /// Build a `PluginManager` from config and preload plugins from disk.
+    ///
+    /// Returns `None` when plugins are disabled in config, when the
+    /// runtime fails to initialise, or when the plugin directory is
+    /// missing. Individual per-file load failures are logged but do not
+    /// abort startup — the remaining plugins load normally and the
+    /// proxy stays up.
+    #[cfg(feature = "wasm-plugins")]
+    fn init_plugin_manager(
+        toml_cfg: &crate::config::PluginToml,
+    ) -> Option<Arc<crate::plugins::PluginManager>> {
+        if !toml_cfg.enabled {
+            return None;
+        }
+
+        let runtime_cfg = crate::plugins::PluginRuntimeConfig::from(toml_cfg);
+        let plugin_dir = runtime_cfg.plugin_dir.clone();
+
+        let pm = match crate::plugins::PluginManager::new(runtime_cfg) {
+            Ok(pm) => Arc::new(pm),
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to create plugin manager; plugins disabled");
+                return None;
+            }
+        };
+
+        match std::fs::read_dir(&plugin_dir) {
+            Ok(entries) => {
+                let mut loaded = 0usize;
+                let mut failed = 0usize;
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|s| s.to_str()) != Some("wasm") {
+                        continue;
+                    }
+                    match pm.load_plugin(&path) {
+                        Ok(()) => loaded += 1,
+                        Err(e) => {
+                            failed += 1;
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %e,
+                                "Failed to load plugin"
+                            );
+                        }
+                    }
+                }
+                tracing::info!(
+                    dir = %plugin_dir.display(),
+                    loaded = loaded,
+                    failed = failed,
+                    "Plugin loading complete"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    dir = %plugin_dir.display(),
+                    error = %e,
+                    "Plugin directory not readable; no plugins loaded"
+                );
+            }
+        }
+
+        Some(pm)
+    }
+
     /// Create a new proxy server
     pub fn new(config: ProxyConfig) -> Result<Self> {
         let (shutdown_tx, _) = broadcast::channel(1);
@@ -305,6 +371,13 @@ impl ProxyServer {
             Some(Arc::new(ConnectionPoolManager::new(pool_config)))
         };
 
+        // Initialize plugin manager if the wasm-plugins feature is enabled
+        // AND plugins are turned on in config. Scans plugin_dir for `.wasm`
+        // files and loads each; a missing directory is non-fatal and logs
+        // a warning so empty deployments don't fail startup.
+        #[cfg(feature = "wasm-plugins")]
+        let plugin_manager = Self::init_plugin_manager(&config.plugins);
+
         let state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
             pools: RwLock::new(pools),
@@ -318,7 +391,7 @@ impl ProxyServer {
             #[cfg(feature = "pool-modes")]
             pool_manager,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
+            plugin_manager,
         });
 
         Ok(Self {
@@ -1936,5 +2009,33 @@ mod tests {
         let sync_msg = Message::empty(MessageType::Sync);
         let decision = ProxyServer::apply_route_hook(&sync_msg, &server.state, &session);
         assert!(matches!(decision, RouteOverride::None));
+    }
+
+    /// By default, `[plugins].enabled = false`, so `init_plugin_manager`
+    /// short-circuits without touching the filesystem or wasmtime and
+    /// returns `None`. The proxy starts normally whether or not a plugin
+    /// directory exists on the host.
+    #[cfg(feature = "wasm-plugins")]
+    #[test]
+    fn test_init_plugin_manager_disabled_by_default_returns_none() {
+        let config = test_config();
+        assert!(!config.plugins.enabled);
+        let pm = ProxyServer::init_plugin_manager(&config.plugins);
+        assert!(pm.is_none());
+    }
+
+    /// Plugins enabled but pointing at a directory that doesn't exist
+    /// must still initialise the manager (so new plugins can be hot-
+    /// loaded later) and log a warning — it must NOT fail startup.
+    #[cfg(feature = "wasm-plugins")]
+    #[test]
+    fn test_init_plugin_manager_missing_dir_logs_warning() {
+        let mut config = test_config();
+        config.plugins.enabled = true;
+        config.plugins.plugin_dir = "/definitely/not/a/real/path".to_string();
+
+        // Manager is created; no panic; Some(pm) returned even with empty dir.
+        let pm = ProxyServer::init_plugin_manager(&config.plugins);
+        assert!(pm.is_some());
     }
 }

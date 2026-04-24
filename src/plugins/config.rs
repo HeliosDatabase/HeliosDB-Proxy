@@ -69,6 +69,30 @@ impl Default for PluginRuntimeConfig {
     }
 }
 
+/// Convert the TOML-shaped `PluginToml` into a live `PluginRuntimeConfig`.
+///
+/// Values that aren't exposed in TOML (SIMD, threading, module cache)
+/// take their runtime defaults.
+impl From<&crate::config::PluginToml> for PluginRuntimeConfig {
+    fn from(t: &crate::config::PluginToml) -> Self {
+        Self {
+            enabled: t.enabled,
+            plugin_dir: PathBuf::from(&t.plugin_dir),
+            hot_reload: t.hot_reload,
+            memory_limit: t.memory_limit_mb.saturating_mul(1024 * 1024),
+            timeout: Duration::from_millis(t.timeout_ms),
+            max_plugins: t.max_plugins,
+            fuel_metering: t.fuel_metering,
+            fuel_limit: t.fuel_limit,
+            enable_simd: true,
+            enable_threads: false,
+            cache_modules: true,
+            cache_dir: None,
+            plugins: HashMap::new(),
+        }
+    }
+}
+
 /// Builder for PluginRuntimeConfig
 pub struct PluginRuntimeConfigBuilder {
     config: PluginRuntimeConfig,
