@@ -316,4 +316,4 @@ HeliosProxy adds minimal overhead while providing significant throughput improve
 
 ## License
 
-SSPL-1.0 (Server Side Public License, Version 1)
+AGPL-3.0-only (GNU Affero General Public License v3.0).

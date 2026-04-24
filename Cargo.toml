@@ -3,7 +3,6 @@ name = "heliosdb-proxy"
 version = "0.3.1"
 edition = "2021"
 description = "HeliosProxy - Intelligent connection router and failover manager for HeliosDB and PostgreSQL"
-license-file = "LICENSE"
 license = "AGPL-3.0-only"
 authors = ["HeliosDB Team"]
 repository = "https://github.com/dimensigon/heliosdb-proxy"

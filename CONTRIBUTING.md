@@ -206,4 +206,4 @@ tests/
 ## License
 
 By contributing, you agree that your contributions will be licensed
-under the same license as the project (SSPL-1.0).
+under the same license as the project (AGPL-3.0-only).
