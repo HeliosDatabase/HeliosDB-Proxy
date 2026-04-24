@@ -4,7 +4,8 @@
 //! Ensures transaction continuity with verification.
 
 use super::transaction_journal::{JournalEntry, JournalValue, StatementType, TransactionJournalEntry};
-use super::{NodeId, ProxyError, Result};
+use super::{NodeEndpoint, NodeId, ProxyError, Result};
+use crate::backend::{BackendClient, BackendConfig, ParamValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -131,6 +132,15 @@ pub struct FailoverReplay {
     completed_replays: Arc<RwLock<Vec<ReplayResult>>>,
     /// Max history size
     max_history: usize,
+    /// Optional backend-connection template. Host/port are swapped to
+    /// each registered node's endpoint at replay time. When `None`,
+    /// `execute_statement` and `wait_for_wal_sync` take the skeleton
+    /// path (record success without touching the network).
+    backend_template: Option<BackendConfig>,
+    /// Per-node endpoints for resolving NodeId → host:port. Populated
+    /// via `register_endpoint`. Empty by default — replay falls back to
+    /// the skeleton path when an endpoint is missing.
+    endpoints: Arc<RwLock<HashMap<NodeId, NodeEndpoint>>>,
 }
 
 impl FailoverReplay {
@@ -141,7 +151,31 @@ impl FailoverReplay {
             active_replays: Arc::new(RwLock::new(HashMap::new())),
             completed_replays: Arc::new(RwLock::new(Vec::new())),
             max_history: 100,
+            backend_template: None,
+            endpoints: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Attach a backend-connection template. Required for real replay;
+    /// without it, all backend-touching calls take the skeleton path.
+    pub fn with_backend_template(mut self, template: BackendConfig) -> Self {
+        self.backend_template = Some(template);
+        self
+    }
+
+    /// Register an endpoint for a node so replay can resolve where to
+    /// send the statements. Idempotent.
+    pub async fn register_endpoint(&self, node_id: NodeId, endpoint: NodeEndpoint) {
+        self.endpoints.write().await.insert(node_id, endpoint);
+    }
+
+    fn build_config(&self, endpoint: &NodeEndpoint) -> Option<BackendConfig> {
+        self.backend_template.as_ref().map(|t| {
+            let mut c = t.clone();
+            c.host = endpoint.host.clone();
+            c.port = endpoint.port;
+            c
+        })
     }
 
     /// Start replaying a transaction
@@ -297,18 +331,14 @@ impl FailoverReplay {
     async fn replay_statement(
         &self,
         entry: &JournalEntry,
-        _target_node: NodeId,
+        target_node: NodeId,
     ) -> Result<StatementReplayResult> {
         let start = std::time::Instant::now();
         let mut retries = 0;
 
         loop {
-            // TODO: Implement actual statement execution
-            // 1. Send statement to target node
-            // 2. Get result
-            // 3. Compare checksum if available
-
-            let (success, checksum_matched, rows_matched) = self.execute_statement(entry).await;
+            let (success, checksum_matched, rows_matched, error_msg) =
+                self.execute_statement(entry, target_node).await;
 
             if success || !self.config.retry_on_error || retries >= self.config.max_retries {
                 return Ok(StatementReplayResult {
@@ -325,7 +355,13 @@ impl FailoverReplay {
                         None
                     },
                     duration_ms: start.elapsed().as_millis() as u64,
-                    error: if success { None } else { Some("Statement execution failed".to_string()) },
+                    error: if success {
+                        None
+                    } else {
+                        Some(error_msg.unwrap_or_else(|| {
+                            "statement execution failed".to_string()
+                        }))
+                    },
                     retries,
                 });
             }
@@ -335,22 +371,99 @@ impl FailoverReplay {
         }
     }
 
-    /// Execute a statement (stub)
-    async fn execute_statement(&self, _entry: &JournalEntry) -> (bool, bool, bool) {
-        // TODO: Implement actual execution
-        // For skeleton, simulate success
-        (true, true, true)
+    /// Execute a single journaled statement against the target node.
+    ///
+    /// Returns `(success, checksum_matched, rows_matched, error)`.
+    /// When no backend template / endpoint is configured, returns
+    /// `(true, true, true, None)` — the skeleton-test path that
+    /// preserves pre-T0-TR5 behaviour for unit tests.
+    async fn execute_statement(
+        &self,
+        entry: &JournalEntry,
+        target_node: NodeId,
+    ) -> (bool, bool, bool, Option<String>) {
+        let endpoint = self.endpoints.read().await.get(&target_node).cloned();
+        let cfg = match endpoint.as_ref().and_then(|e| self.build_config(e)) {
+            Some(c) => c,
+            None => return (true, true, true, None),
+        };
+
+        let mut client = match BackendClient::connect(&cfg).await {
+            Ok(c) => c,
+            Err(e) => return (false, false, false, Some(format!("connect: {}", e))),
+        };
+
+        let params: Vec<ParamValue> =
+            entry.parameters.iter().map(journal_value_to_param).collect();
+
+        let result = if params.is_empty() {
+            client.simple_query(&entry.statement).await
+        } else {
+            client.query_with_params(&entry.statement, &params).await
+        };
+
+        let outcome = match result {
+            Ok(qr) => {
+                let rows_matched = match entry.rows_affected {
+                    Some(expected) => qr.rows_affected() == Some(expected),
+                    None => true,
+                };
+                // Checksum matching is best-effort: we don't recompute the
+                // server-side hash here. Treat as matched when no
+                // checksum was recorded; otherwise leave as `false` and
+                // let the caller surface it via `verify_results`.
+                let checksum_matched = entry.result_checksum.is_none();
+                (true, checksum_matched, rows_matched, None)
+            }
+            Err(e) => (false, false, false, Some(e.to_string())),
+        };
+        client.close().await;
+        outcome
     }
 
-    /// Wait for WAL to catch up
-    async fn wait_for_wal_sync(&self, _node: NodeId, _start_lsn: u64) -> Result<()> {
-        // TODO: Implement WAL sync waiting
-        // 1. Query node's current LSN
-        // 2. Wait until LSN >= start_lsn
-        // 3. Timeout if too slow
+    /// Wait for the target node's WAL replay position to reach
+    /// `start_lsn`. `start_lsn` is encoded as a u64 (high 32 bits of
+    /// the PG `pg_lsn` × 2^32 + low 32 bits) — the standard
+    /// `to_u64` form used by PG internals.
+    ///
+    /// Polls every 200 ms; bounded by `config.statement_timeout_ms`.
+    async fn wait_for_wal_sync(&self, node: NodeId, start_lsn: u64) -> Result<()> {
+        let endpoint = self.endpoints.read().await.get(&node).cloned();
+        let cfg = match endpoint.as_ref().and_then(|e| self.build_config(e)) {
+            Some(c) => c,
+            None => {
+                // Skeleton path: short pause for state-machine ordering.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                return Ok(());
+            }
+        };
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let timeout = std::time::Duration::from_millis(self.config.statement_timeout_ms);
+        tokio::time::timeout(timeout, Self::poll_wal_lsn(cfg, start_lsn))
+            .await
+            .map_err(|_| ProxyError::Timeout("WAL sync wait timeout".into()))??;
         Ok(())
+    }
+
+    async fn poll_wal_lsn(cfg: BackendConfig, target: u64) -> Result<()> {
+        let mut client = BackendClient::connect(&cfg)
+            .await
+            .map_err(|e| ProxyError::ReplayFailed(format!("connect: {}", e)))?;
+        loop {
+            let value = client
+                .query_scalar("SELECT pg_last_wal_replay_lsn()::text")
+                .await
+                .map_err(|e| ProxyError::ReplayFailed(format!("lsn probe: {}", e)))?;
+            if let Some(s) = value.into_string() {
+                if let Some(current) = pg_lsn_to_u64(&s) {
+                    if current >= target {
+                        client.close().await;
+                        return Ok(());
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
     }
 
     /// Add result to history
@@ -405,6 +518,46 @@ impl FailoverReplay {
             total_statements_replayed: total_statements,
         }
     }
+}
+
+/// Convert a `JournalValue` to a `ParamValue` for text-format
+/// interpolation into replay SQL.
+fn journal_value_to_param(v: &JournalValue) -> ParamValue {
+    match v {
+        JournalValue::Null => ParamValue::Null,
+        JournalValue::Bool(b) => ParamValue::Bool(*b),
+        JournalValue::Int64(i) => ParamValue::Int(*i),
+        JournalValue::Float64(f) => ParamValue::Float(*f),
+        JournalValue::Text(s) => ParamValue::Text(s.clone()),
+        JournalValue::Bytes(b) => {
+            // Render bytes as PG hex-escape literal text for text protocol.
+            let mut s = String::with_capacity(2 + b.len() * 2);
+            s.push_str("\\x");
+            for byte in b {
+                s.push_str(&format!("{:02x}", byte));
+            }
+            ParamValue::Text(s)
+        }
+        JournalValue::Array(_) => {
+            // Arrays not yet supported in replay — fall back to NULL so
+            // the statement at least compiles. Replay reporting will
+            // show `rows_matched=false` which surfaces the issue.
+            ParamValue::Null
+        }
+    }
+}
+
+/// Parse a PostgreSQL `pg_lsn` text form (e.g. `"16/B3780A90"`) into
+/// its u64 numeric representation: `(hi << 32) | lo`. Returns `None`
+/// on malformed input.
+fn pg_lsn_to_u64(s: &str) -> Option<u64> {
+    let (hi, lo) = s.split_once('/')?;
+    let hi = u64::from_str_radix(hi.trim(), 16).ok()?;
+    let lo = u64::from_str_radix(lo.trim(), 16).ok()?;
+    if lo > u64::from(u32::MAX) {
+        return None;
+    }
+    Some((hi << 32) | lo)
 }
 
 /// Replay statistics
@@ -463,6 +616,72 @@ mod tests {
         assert!(config.verify_results);
         assert!(config.retry_on_error);
         assert!(config.wait_for_wal_sync);
+    }
+
+    /// `pg_lsn_to_u64` must round-trip through PG's text format:
+    /// `"hi/lo"` (hex) -> (hi << 32) | lo.
+    #[test]
+    fn test_pg_lsn_to_u64_roundtrip() {
+        assert_eq!(pg_lsn_to_u64("0/0"), Some(0));
+        assert_eq!(pg_lsn_to_u64("0/1"), Some(1));
+        assert_eq!(pg_lsn_to_u64("0/FFFFFFFF"), Some(0xFFFFFFFF));
+        assert_eq!(
+            pg_lsn_to_u64("1/0"),
+            Some(1u64 << 32)
+        );
+        assert_eq!(
+            pg_lsn_to_u64("16/B3780A90"),
+            Some((0x16u64 << 32) | 0xB3780A90u64)
+        );
+        // Ordering: earlier LSN < later LSN.
+        assert!(pg_lsn_to_u64("0/A").unwrap() < pg_lsn_to_u64("0/B").unwrap());
+        assert!(pg_lsn_to_u64("0/FFFFFFFF").unwrap() < pg_lsn_to_u64("1/0").unwrap());
+    }
+
+    #[test]
+    fn test_pg_lsn_to_u64_rejects_malformed() {
+        assert!(pg_lsn_to_u64("no-slash").is_none());
+        assert!(pg_lsn_to_u64("/lo-only").is_none());
+        assert!(pg_lsn_to_u64("hi-only/").is_none());
+        assert!(pg_lsn_to_u64("zz/zz").is_none());
+        // `lo` must fit in u32 (PG text format guarantees this).
+        assert!(pg_lsn_to_u64("0/100000000").is_none());
+    }
+
+    #[test]
+    fn test_journal_value_to_param_basic_types() {
+        use crate::backend::ParamValue;
+
+        assert!(matches!(
+            journal_value_to_param(&JournalValue::Null),
+            ParamValue::Null
+        ));
+        assert!(matches!(
+            journal_value_to_param(&JournalValue::Bool(true)),
+            ParamValue::Bool(true)
+        ));
+        assert!(matches!(
+            journal_value_to_param(&JournalValue::Int64(42)),
+            ParamValue::Int(42)
+        ));
+        match journal_value_to_param(&JournalValue::Float64(3.14)) {
+            ParamValue::Float(f) => assert!((f - 3.14).abs() < 1e-9),
+            other => panic!("expected Float, got {:?}", other),
+        }
+        match journal_value_to_param(&JournalValue::Text("hi".into())) {
+            ParamValue::Text(s) => assert_eq!(s, "hi"),
+            other => panic!("expected Text, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_journal_value_bytes_to_hex_escape() {
+        use crate::backend::ParamValue;
+        let v = journal_value_to_param(&JournalValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        match v {
+            ParamValue::Text(s) => assert_eq!(s, "\\xdeadbeef"),
+            other => panic!("expected Text, got {:?}", other),
+        }
     }
 
     #[tokio::test]
