@@ -4,6 +4,7 @@
 //! failure detection, and automatic recovery.
 
 use super::{NodeEndpoint, NodeId, ProxyError, Result};
+use crate::backend::{BackendClient, BackendConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -110,6 +111,12 @@ pub struct HealthChecker {
     shutdown_tx: Option<mpsc::Sender<()>>,
     /// Running flag
     running: Arc<RwLock<bool>>,
+    /// Optional backend-connection template. Host/port are overridden
+    /// per-node at check time; auth, TLS, and timeouts are shared. When
+    /// `None`, `perform_check` returns Ok(()) without opening a socket
+    /// — useful for unit tests and for construction-time scenarios
+    /// where the caller does not yet have backend credentials.
+    backend_template: Option<BackendConfig>,
 }
 
 impl HealthChecker {
@@ -125,7 +132,19 @@ impl HealthChecker {
             event_rx: Some(event_rx),
             shutdown_tx: None,
             running: Arc::new(RwLock::new(false)),
+            backend_template: None,
         }
+    }
+
+    /// Attach a backend-connection template. Required for real health
+    /// checks: the checker clones it, swaps host/port for each node,
+    /// opens a connection, runs `config.check_query`, and reports
+    /// success/failure. Without a template the checker runs a no-op
+    /// success (retained for tests that construct a checker without
+    /// real PG backing).
+    pub fn with_backend_template(mut self, template: BackendConfig) -> Self {
+        self.backend_template = Some(template);
+        self
     }
 
     /// Add a node to monitor
@@ -167,6 +186,7 @@ impl HealthChecker {
         let health = self.health.clone();
         let event_tx = self.event_tx.clone();
         let running = self.running.clone();
+        let backend_template = self.backend_template.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(config.check_interval);
@@ -178,16 +198,31 @@ impl HealthChecker {
                     break;
                 }
 
-                // Get all nodes to check
-                let node_ids: Vec<NodeId> = nodes.read().await.keys().cloned().collect();
+                // Snapshot (node_id, endpoint) pairs under a short read
+                // lock so the spawned tasks don't race on the map.
+                let snapshot: Vec<(NodeId, NodeEndpoint)> = nodes
+                    .read()
+                    .await
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect();
 
-                for node_id in node_ids {
+                for (node_id, endpoint) in snapshot {
                     let config = config.clone();
                     let health = health.clone();
                     let event_tx = event_tx.clone();
+                    let template = backend_template.clone();
 
                     tokio::spawn(async move {
-                        Self::check_node_health(node_id, &config, &health, &event_tx).await;
+                        Self::check_node_health(
+                            node_id,
+                            Some(endpoint),
+                            template,
+                            &config,
+                            &health,
+                            &event_tx,
+                        )
+                        .await;
                     });
                 }
             }
@@ -208,12 +243,16 @@ impl HealthChecker {
     /// Check a single node's health
     async fn check_node_health(
         node_id: NodeId,
+        endpoint: Option<NodeEndpoint>,
+        backend_template: Option<BackendConfig>,
         config: &HealthConfig,
         health: &Arc<RwLock<HashMap<NodeId, NodeHealth>>>,
         event_tx: &mpsc::Sender<HealthEvent>,
     ) {
         let start = std::time::Instant::now();
-        let check_result = Self::perform_check(node_id, config).await;
+        let check_result =
+            Self::perform_check(endpoint.as_ref(), backend_template.as_ref(), config)
+                .await;
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         let mut health_guard = health.write().await;
@@ -276,23 +315,52 @@ impl HealthChecker {
         }
     }
 
-    /// Perform the actual health check
-    async fn perform_check(_node_id: NodeId, config: &HealthConfig) -> std::result::Result<(), String> {
-        // TODO: Implement actual health check
-        // 1. Try to connect to the node
-        // 2. If detailed_checks, execute check_query
-        // 3. Return success or error
+    /// Perform the actual health check against a backend.
+    ///
+    /// Connects using a template `BackendConfig` with host/port swapped
+    /// for the node's endpoint, then runs `config.check_query` (default
+    /// `SELECT 1`) via a simple scalar query. The whole operation is
+    /// timed-out by `config.check_timeout`.
+    ///
+    /// If either `endpoint` or `backend_template` is `None`, returns
+    /// `Ok(())` immediately — this is the skeleton path used by unit
+    /// tests that don't wire a real backend. Production callers are
+    /// expected to supply both via
+    /// `HealthChecker::with_backend_template` + `add_node(endpoint)`.
+    async fn perform_check(
+        endpoint: Option<&NodeEndpoint>,
+        backend_template: Option<&BackendConfig>,
+        config: &HealthConfig,
+    ) -> std::result::Result<(), String> {
+        let (endpoint, template) = match (endpoint, backend_template) {
+            (Some(e), Some(t)) => (e, t),
+            _ => return Ok(()), // Skeleton / unit-test path.
+        };
 
-        // For skeleton, simulate with timeout
-        let check = tokio::time::timeout(config.check_timeout, async {
-            // Simulate check delay
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut cfg = template.clone();
+        cfg.host = endpoint.host.clone();
+        cfg.port = endpoint.port;
+        cfg.connect_timeout = cfg.connect_timeout.min(config.check_timeout);
+
+        let outcome = tokio::time::timeout(config.check_timeout, async {
+            let mut client = BackendClient::connect(&cfg)
+                .await
+                .map_err(|e| format!("connect: {}", e))?;
+            let _scalar = client
+                .query_scalar(&config.check_query)
+                .await
+                .map_err(|e| format!("query: {}", e))?;
+            client.close().await;
             Ok::<(), String>(())
-        });
+        })
+        .await;
 
-        match check.await {
-            Ok(result) => result,
-            Err(_) => Err("Health check timeout".to_string()),
+        match outcome {
+            Ok(inner) => inner,
+            Err(_) => Err(format!(
+                "health check exceeded {:?}",
+                config.check_timeout
+            )),
         }
     }
 
@@ -332,8 +400,10 @@ impl HealthChecker {
         let health = self.health.clone();
         let event_tx = self.event_tx.clone();
         let id = *node_id;
+        let endpoint = self.nodes.read().await.get(&id).cloned();
+        let template = self.backend_template.clone();
 
-        Self::check_node_health(id, &config, &health, &event_tx).await;
+        Self::check_node_health(id, endpoint, template, &config, &health, &event_tx).await;
         Ok(())
     }
 
@@ -434,6 +504,64 @@ mod tests {
         let health = checker.get_health(&node_id).await.unwrap();
         assert!(!health.healthy);
         assert_eq!(health.last_error, Some("Test failure".to_string()));
+    }
+
+    /// Without an endpoint or template, `perform_check` must return
+    /// `Ok(())` immediately — preserves the pre-T0-TR3 test-friendly
+    /// behaviour for unit tests that don't stand up a real backend.
+    #[tokio::test]
+    async fn test_perform_check_skeleton_path_returns_ok() {
+        let config = HealthConfig::default();
+        let result = HealthChecker::perform_check(None, None, &config).await;
+        assert!(result.is_ok());
+    }
+
+    /// When the endpoint + template point at an unreachable address,
+    /// `perform_check` surfaces a connect error inside the timeout.
+    /// This proves the real-check path is wired end-to-end without
+    /// requiring a live PG instance.
+    #[tokio::test]
+    async fn test_perform_check_returns_connect_error_to_unreachable_endpoint() {
+        use crate::backend::{tls::default_client_config, TlsMode};
+
+        let config = HealthConfig {
+            check_interval: Duration::from_secs(1),
+            // Tight timeout — we want this test to finish in a few
+            // hundred ms even when the OS TCP stack stalls.
+            check_timeout: Duration::from_millis(300),
+            failure_threshold: 1,
+            success_threshold: 1,
+            detailed_checks: true,
+            check_query: "SELECT 1".to_string(),
+        };
+
+        // 127.0.0.1:1 — almost always refused (no daemon on port 1).
+        let endpoint = NodeEndpoint::new("127.0.0.1", 1);
+        let template = BackendConfig {
+            host: "placeholder".into(),
+            port: 0,
+            user: "postgres".into(),
+            password: None,
+            database: None,
+            application_name: Some("helios-health-check".into()),
+            tls_mode: TlsMode::Disable,
+            connect_timeout: Duration::from_millis(200),
+            query_timeout: Duration::from_millis(200),
+            tls_config: default_client_config(),
+        };
+
+        let result =
+            HealthChecker::perform_check(Some(&endpoint), Some(&template), &config)
+                .await;
+        assert!(result.is_err(), "expected failure, got {:?}", result);
+        // Error should mention either "connect" (refused / unreachable)
+        // or the timeout message.
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("connect") || msg.contains("exceeded"),
+            "unexpected error message: {}",
+            msg
+        );
     }
 
     #[tokio::test]
