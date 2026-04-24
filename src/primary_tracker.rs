@@ -80,6 +80,11 @@ pub struct PostgresTopologyProvider {
     current_primary: RwLock<Option<TopologyNodeInfo>>,
     /// Polling interval
     poll_interval: Duration,
+    /// Shared rustls client config for TLS negotiation. Built once at
+    /// construction time from the Mozilla root set.
+    tls_config: std::sync::Arc<rustls::ClientConfig>,
+    /// TLS policy applied to every probe connection.
+    tls_mode: crate::backend::TlsMode,
 }
 
 #[cfg(feature = "postgres-topology")]
@@ -103,12 +108,20 @@ impl PostgresTopologyProvider {
             event_tx,
             current_primary: RwLock::new(None),
             poll_interval: Duration::from_secs(2),
+            tls_config: crate::backend::tls::default_client_config(),
+            tls_mode: crate::backend::TlsMode::Prefer,
         }
     }
 
     /// Set polling interval.
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
+        self
+    }
+
+    /// Set the TLS policy used when opening probe connections.
+    pub fn with_tls_mode(mut self, mode: crate::backend::TlsMode) -> Self {
+        self.tls_mode = mode;
         self
     }
 
@@ -124,30 +137,83 @@ impl PostgresTopologyProvider {
 
     /// Poll all nodes and detect primary.
     async fn poll_nodes(&self) {
-        // TODO: Implement actual PostgreSQL polling via `pg_is_in_recovery()`
-        // For each node:
-        //   1. Connect (or reuse connection)
-        //   2. Run `SELECT pg_is_in_recovery()`
-        //   3. The node returning `false` is the primary
-        //   4. Compare with cached primary and emit events on change
+        let mut next_primary: Option<TopologyNodeInfo> = None;
 
-        // Stub: simulate detection from first node
-        if let Some(node) = self.nodes.first() {
-            let info = TopologyNodeInfo {
-                node_id: node.node_id,
-                client_addr: format!("{}:{}", node.host, node.port),
-                is_healthy: true,
-            };
+        for node in &self.nodes {
+            match self.probe_recovery(node).await {
+                Ok(in_recovery) => {
+                    // The node reporting `pg_is_in_recovery() = false` is
+                    // the primary. In a healthy cluster there is exactly
+                    // one; we take the first we encounter so split-brain
+                    // (briefly possible during failover) still yields a
+                    // deterministic choice.
+                    if !in_recovery && next_primary.is_none() {
+                        next_primary = Some(TopologyNodeInfo {
+                            node_id: node.node_id,
+                            client_addr: format!("{}:{}", node.host, node.port),
+                            is_healthy: true,
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        node = %node.host,
+                        port = node.port,
+                        error = %e,
+                        "topology probe failed"
+                    );
+                    let _ = self.event_tx.send(TopologyEvent::HealthChanged {
+                        node_id: node.node_id,
+                        is_healthy: false,
+                    });
+                }
+            }
+        }
 
-            let old_primary = self.current_primary.read().as_ref().map(|p| p.node_id);
-            if old_primary != Some(node.node_id) {
-                *self.current_primary.write() = Some(info);
+        let old_primary_id = self.current_primary.read().as_ref().map(|p| p.node_id);
+        let new_primary_id = next_primary.as_ref().map(|p| p.node_id);
+        if old_primary_id != new_primary_id {
+            *self.current_primary.write() = next_primary;
+            if let Some(new_id) = new_primary_id {
                 let _ = self.event_tx.send(TopologyEvent::PrimaryChanged {
-                    old_primary,
-                    new_primary: node.node_id,
+                    old_primary: old_primary_id,
+                    new_primary: new_id,
                 });
             }
         }
+    }
+
+    /// Connect to a single node and run `SELECT pg_is_in_recovery()`.
+    ///
+    /// Returns `Ok(true)` if the node is a standby, `Ok(false)` for a
+    /// primary. Errors propagate as `BackendError`.
+    async fn probe_recovery(
+        &self,
+        node: &PostgresNode,
+    ) -> crate::backend::BackendResult<bool> {
+        use crate::backend::{BackendClient, BackendConfig};
+
+        let cfg = BackendConfig {
+            host: node.host.clone(),
+            port: node.port,
+            user: node.user.clone(),
+            password: node.password.clone(),
+            database: Some(node.database.clone()),
+            application_name: Some("helios-topology".into()),
+            tls_mode: self.tls_mode,
+            connect_timeout: self.poll_interval.min(Duration::from_secs(5)),
+            query_timeout: self.poll_interval,
+            tls_config: self.tls_config.clone(),
+        };
+
+        let mut client = BackendClient::connect(&cfg).await?;
+        let value = client
+            .query_scalar("SELECT pg_is_in_recovery()")
+            .await?;
+        client.close().await;
+        Ok(value
+            .as_bool("pg_is_in_recovery")?
+            .unwrap_or(false))
     }
 }
 
@@ -672,6 +738,61 @@ mod tests {
         assert_eq!(
             tracker.get_primary_address(),
             Some("patroni-leader.svc:5432".to_string())
+        );
+    }
+
+    /// Probing unreachable nodes must not crash the poller; it must
+    /// leave `current_primary` as `None` and emit `HealthChanged`
+    /// events for each failed probe. Exercises the real `probe_recovery`
+    /// path without a live PG.
+    #[cfg(feature = "postgres-topology")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_poll_nodes_all_unreachable_sets_no_primary() {
+        let nodes = vec![
+            PostgresNode {
+                node_id: Uuid::new_v4(),
+                host: "127.0.0.1".into(),
+                port: 1, // no daemon
+                user: "postgres".into(),
+                password: None,
+                database: "postgres".into(),
+            },
+            PostgresNode {
+                node_id: Uuid::new_v4(),
+                host: "127.0.0.1".into(),
+                port: 2,
+                user: "postgres".into(),
+                password: None,
+                database: "postgres".into(),
+            },
+        ];
+
+        let provider = PostgresTopologyProvider::new(nodes)
+            .with_poll_interval(Duration::from_millis(200));
+        let mut rx = provider.event_tx.subscribe();
+
+        // Run exactly one poll round.
+        provider.poll_nodes().await;
+
+        // No primary detected.
+        assert!(provider.get_primary().is_none());
+
+        // Collect health-change events. Use try_recv in a loop with a
+        // small yield budget rather than blocking, so the test is
+        // deterministic.
+        let mut health_events = 0;
+        for _ in 0..10 {
+            match rx.try_recv() {
+                Ok(TopologyEvent::HealthChanged { is_healthy: false, .. }) => {
+                    health_events += 1;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(
+            health_events >= 1,
+            "expected at least one HealthChanged event"
         );
     }
 }
