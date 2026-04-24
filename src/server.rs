@@ -680,12 +680,41 @@ impl ProxyServer {
                     state.metrics.queries_processed.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                if let PreQueryAction::Cached(_) = &action {
-                    // Response synthesis from a cached byte blob is a
-                    // follow-up task; fall through to backend for safety.
-                    tracing::warn!(
-                        "plugin returned Cached result but response synthesis is not yet wired — forwarding to backend"
-                    );
+
+                // Plugin returned a fully-formed cached response. Synthesise
+                // the PG wire reply (RowDescription + DataRows +
+                // CommandComplete + ReadyForQuery) and send it directly —
+                // the backend is never touched. On malformed payloads we
+                // log + fall through to normal forwarding so a buggy plugin
+                // degrades gracefully instead of taking the proxy down.
+                #[cfg(feature = "wasm-plugins")]
+                if let PreQueryAction::Cached(bytes) = &action {
+                    match Self::synthesise_cached_response(bytes) {
+                        Ok(reply) => {
+                            stream
+                                .write_all(&reply)
+                                .await
+                                .map_err(|e| {
+                                    ProxyError::Network(format!("Write error: {}", e))
+                                })?;
+                            state
+                                .metrics
+                                .bytes_sent
+                                .fetch_add(reply.len() as u64, Ordering::Relaxed);
+                            state
+                                .metrics
+                                .queries_processed
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "failed to synthesise cached response; falling back to backend"
+                            );
+                            // fall through to normal forwarding
+                        }
+                    }
                 }
 
                 // Route and process the message
@@ -1366,6 +1395,130 @@ impl ProxyServer {
         Message::new(MessageType::ReadyForQuery, payload)
             .encode()
             .to_vec()
+    }
+
+    /// Synthesise a full PostgreSQL simple-query response from a cached
+    /// payload produced by a plugin's `PreQueryResult::Cached`.
+    ///
+    /// # Payload format
+    ///
+    /// The plugin is expected to serialise a JSON document of the form:
+    ///
+    /// ```json
+    /// {
+    ///   "columns": [
+    ///     {"name": "id",    "oid": 23},
+    ///     {"name": "email", "oid": 25}
+    ///   ],
+    ///   "rows": [
+    ///     ["1", "alice@example.com"],
+    ///     ["2", null]
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// `oid` is the PostgreSQL type OID (`23` = int4, `25` = text,
+    /// `20` = int8, `16` = bool, `1184` = timestamptz, etc.). Row values
+    /// are strings in text format; `null` encodes a SQL NULL. The type
+    /// OID is advisory — pgwire clients accept `25` (text) universally
+    /// and cast as needed.
+    ///
+    /// # Returned bytes
+    ///
+    /// One concatenated PostgreSQL wire response:
+    ///
+    /// ```text
+    /// RowDescription (T) + DataRow (D) × N + CommandComplete (C: "SELECT N")
+    ///                    + ReadyForQuery (Z: idle)
+    /// ```
+    ///
+    /// Returns an error on malformed JSON; the caller falls back to
+    /// backend forwarding.
+    #[cfg(feature = "wasm-plugins")]
+    fn synthesise_cached_response(bytes: &[u8]) -> Result<Vec<u8>> {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct CachedPayload {
+            columns: Vec<ColumnDef>,
+            rows: Vec<Vec<Option<String>>>,
+        }
+
+        #[derive(Deserialize)]
+        struct ColumnDef {
+            name: String,
+            #[serde(default = "default_text_oid")]
+            oid: u32,
+        }
+
+        fn default_text_oid() -> u32 {
+            25 // text
+        }
+
+        let payload: CachedPayload = serde_json::from_slice(bytes).map_err(|e| {
+            ProxyError::Protocol(format!("invalid cached payload JSON: {}", e))
+        })?;
+
+        if payload.columns.is_empty() {
+            return Err(ProxyError::Protocol(
+                "cached payload must declare at least one column".to_string(),
+            ));
+        }
+
+        let mut reply = Vec::new();
+
+        // RowDescription (tag 'T')
+        let mut rd = BytesMut::new();
+        rd.put_u16(payload.columns.len() as u16);
+        for col in &payload.columns {
+            rd.extend_from_slice(col.name.as_bytes());
+            rd.put_u8(0); // cstring terminator
+            rd.put_i32(0); // tableOID (unknown)
+            rd.put_i16(0); // columnNumber (unknown)
+            rd.put_u32(col.oid);
+            rd.put_i16(-1); // typeLen (unspecified)
+            rd.put_i32(-1); // typeMod (unspecified)
+            rd.put_i16(0); // format code: text
+        }
+        reply.extend_from_slice(&Message::new(MessageType::RowDescription, rd).encode());
+
+        // DataRow (tag 'D') per row
+        let column_count = payload.columns.len();
+        for row in &payload.rows {
+            if row.len() != column_count {
+                return Err(ProxyError::Protocol(format!(
+                    "cached row has {} values but {} columns are declared",
+                    row.len(),
+                    column_count
+                )));
+            }
+            let mut dr = BytesMut::new();
+            dr.put_u16(row.len() as u16);
+            for value in row {
+                match value {
+                    Some(s) => {
+                        dr.put_i32(s.len() as i32);
+                        dr.extend_from_slice(s.as_bytes());
+                    }
+                    None => {
+                        dr.put_i32(-1); // NULL sentinel
+                    }
+                }
+            }
+            reply.extend_from_slice(&Message::new(MessageType::DataRow, dr).encode());
+        }
+
+        // CommandComplete (tag 'C')
+        let tag = format!("SELECT {}", payload.rows.len());
+        let mut cc = BytesMut::new();
+        cc.extend_from_slice(tag.as_bytes());
+        cc.put_u8(0);
+        reply.extend_from_slice(&Message::new(MessageType::CommandComplete, cc).encode());
+
+        // ReadyForQuery (tag 'Z', status 'I' idle)
+        reply.extend_from_slice(&Self::create_ready_for_query(b'I'));
+
+        Ok(reply)
     }
 
     /// Run the pre-query plugin hook on a client message.
@@ -2151,6 +2304,89 @@ mod tests {
             let ident = session.plugin_identity.read().await;
             assert!(ident.is_none());
         }
+    }
+
+    /// Cached-response synthesis round-trip: a well-formed plugin
+    /// payload must produce concatenated wire frames in the order
+    /// `T D D C Z`. We inspect the raw tag bytes directly because
+    /// `MessageType::from_tag` conflates server→client DataRow (`'D'`)
+    /// with client→server Describe (same byte) — a known quirk of the
+    /// shared `MessageType` enum that the real proxy side-steps by
+    /// knowing the direction at the call site.
+    #[cfg(feature = "wasm-plugins")]
+    #[test]
+    fn test_synthesise_cached_response_roundtrip() {
+        let payload = br#"{
+            "columns": [
+                {"name": "id",    "oid": 23},
+                {"name": "email", "oid": 25}
+            ],
+            "rows": [
+                ["1", "alice@example.com"],
+                ["2", null]
+            ]
+        }"#;
+        let reply =
+            ProxyServer::synthesise_cached_response(payload).expect("synthesis");
+
+        // Walk the concatenation frame-by-frame via length prefixes.
+        // Each PG message: tag(1) + length(4, big-endian, includes self) + payload.
+        let mut tags = Vec::new();
+        let mut i = 0;
+        while i < reply.len() {
+            let tag = reply[i];
+            let len = u32::from_be_bytes([
+                reply[i + 1],
+                reply[i + 2],
+                reply[i + 3],
+                reply[i + 4],
+            ]) as usize;
+            tags.push(tag);
+            i += 1 + len;
+        }
+        assert_eq!(i, reply.len(), "no trailing bytes");
+        assert_eq!(
+            tags,
+            vec![b'T', b'D', b'D', b'C', b'Z'],
+            "wire frame order"
+        );
+
+        // Spot-check the final ReadyForQuery payload is 'I' (idle).
+        assert_eq!(*reply.last().unwrap(), b'I');
+    }
+
+    /// Row width mismatch between columns and row data is rejected so
+    /// the plugin author can't produce ambiguous wire frames.
+    #[cfg(feature = "wasm-plugins")]
+    #[test]
+    fn test_synthesise_cached_response_rejects_row_width_mismatch() {
+        let payload = br#"{
+            "columns": [{"name": "id", "oid": 23}, {"name": "name", "oid": 25}],
+            "rows": [["1", "alice", "extra"]]
+        }"#;
+        let result = ProxyServer::synthesise_cached_response(payload);
+        assert!(matches!(result, Err(ProxyError::Protocol(_))));
+    }
+
+    /// Empty payload (no columns) is rejected — a RowDescription with
+    /// zero columns is technically valid PG but useless and likely a
+    /// plugin bug.
+    #[cfg(feature = "wasm-plugins")]
+    #[test]
+    fn test_synthesise_cached_response_rejects_empty_columns() {
+        let payload = br#"{ "columns": [], "rows": [] }"#;
+        let result = ProxyServer::synthesise_cached_response(payload);
+        assert!(matches!(result, Err(ProxyError::Protocol(_))));
+    }
+
+    /// Malformed JSON must return a Protocol error, not panic. The
+    /// caller treats this as "fall back to backend."
+    #[cfg(feature = "wasm-plugins")]
+    #[test]
+    fn test_synthesise_cached_response_rejects_bad_json() {
+        let payload = b"not json at all";
+        let result = ProxyServer::synthesise_cached_response(payload);
+        assert!(matches!(result, Err(ProxyError::Protocol(_))));
     }
 
     /// Denied by plugin surfaces as `ProxyError::Auth` so the existing
