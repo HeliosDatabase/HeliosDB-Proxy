@@ -1,0 +1,134 @@
+version: '3.8'
+
+# HeliosProxy integration-test cluster.
+#
+# Brings up:
+# - pg-primary: PostgreSQL 16 primary with streaming replication configured
+# - pg-standby-sync: synchronous physical standby
+# - pg-standby-async: asynchronous physical standby
+# - helios-proxy: HeliosProxy (built from the workspace) routing the pgbench
+#                 traffic across the three nodes
+# - pgbench-chaos: long-running workload driver; also the target of fault-
+#                  injection commands via `docker compose exec`
+#
+# Host ports exposed for local debugging:
+#   5442 -> primary, 5443 -> sync standby, 5444 -> async standby
+#   5500 -> proxy (the port pgbench-chaos talks to)
+#   9090 -> proxy admin HTTP
+#
+# Usage:
+#   docker compose -f tests/docker/cluster.yml up --build --wait
+#   tests/docker/pgbench-chaos.sh scenario primary-sigkill
+#   tests/docker/pgbench-chaos.sh scenario standby-netem-delay 30s
+
+services:
+  pg-primary:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: helios
+      POSTGRES_PASSWORD: helios
+      POSTGRES_DB: appdb
+      POSTGRES_INITDB_ARGS: "--wal-segsize=1"
+    ports: ["5442:5432"]
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "synchronous_standby_names=standby_sync"
+      - "-c"
+      - "synchronous_commit=on"
+      - "-c"
+      - "listen_addresses=*"
+      - "-c"
+      - "log_min_messages=warning"
+      - "-c"
+      - "max_connections=200"
+    volumes:
+      - ./primary-init.sh:/docker-entrypoint-initdb.d/01-replication.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U helios -d appdb"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  pg-standby-sync:
+    image: postgres:16-alpine
+    environment:
+      # Must match the primary's application_name for sync replication.
+      STANDBY_APPLICATION_NAME: standby_sync
+      PRIMARY_HOST: pg-primary
+      POSTGRES_USER: helios
+      POSTGRES_PASSWORD: helios
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    ports: ["5443:5432"]
+    entrypoint: ["/bin/sh", "/standby-init.sh"]
+    volumes:
+      - ./standby-init.sh:/standby-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U helios"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  pg-standby-async:
+    image: postgres:16-alpine
+    environment:
+      STANDBY_APPLICATION_NAME: standby_async
+      PRIMARY_HOST: pg-primary
+      POSTGRES_USER: helios
+      POSTGRES_PASSWORD: helios
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    ports: ["5444:5432"]
+    entrypoint: ["/bin/sh", "/standby-init.sh"]
+    volumes:
+      - ./standby-init.sh:/standby-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U helios"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  helios-proxy:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+      pg-standby-sync:
+        condition: service_healthy
+      pg-standby-async:
+        condition: service_healthy
+    environment:
+      RUST_LOG: heliosdb_proxy=debug,info
+    command:
+      - "--config"
+      - "/etc/helios/proxy.toml"
+    ports:
+      - "5500:5432"   # client-facing
+      - "9090:9090"   # admin HTTP
+    volumes:
+      - ./proxy.toml:/etc/helios/proxy.toml:ro
+
+  pgbench-chaos:
+    image: postgres:16-alpine
+    depends_on:
+      helios-proxy:
+        condition: service_started
+    environment:
+      PGPASSWORD: helios
+    # Kept idle; the harness script invokes pgbench via `docker compose exec`.
+    command: ["sleep", "infinity"]
+
+networks:
+  default:
+    name: helios-it-net
