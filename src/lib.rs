@@ -70,6 +70,7 @@ pub mod switchover_buffer;
 pub mod primary_tracker;
 pub mod pipeline;
 pub mod batch;
+pub mod request;
 
 // ── Connection pooling modes (Session/Transaction/Statement) ─────────
 #[cfg(feature = "pool-modes")]
