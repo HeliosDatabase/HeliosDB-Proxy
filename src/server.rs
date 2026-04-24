@@ -34,7 +34,8 @@ use crate::NodeEndpoint;
 // WASM plugin system imports
 #[cfg(feature = "wasm-plugins")]
 use crate::plugins::{
-    HookContext, PluginManager, PostQueryOutcome, PreQueryResult, QueryContext, RouteResult,
+    AuthRequest as PluginAuthRequest, AuthResult, HookContext, Identity, PluginManager,
+    PostQueryOutcome, PreQueryResult, QueryContext, RouteResult,
 };
 
 /// Proxy server
@@ -157,6 +158,12 @@ pub struct ClientSession {
     /// Client ID for pool-modes lease tracking
     #[cfg(feature = "pool-modes")]
     pub pool_client_id: ClientId,
+    /// Identity returned by an `Authenticate` plugin, if any. Downstream
+    /// plugins (masking, residency routing, cost governor) read this to
+    /// gate per-user policy. `None` when no plugin ran or every plugin
+    /// deferred to the default auth flow.
+    #[cfg(feature = "wasm-plugins")]
+    pub plugin_identity: RwLock<Option<Identity>>,
 }
 
 /// Transaction state
@@ -564,6 +571,8 @@ impl ProxyServer {
             tr_mode: config.tr_mode,
             #[cfg(feature = "pool-modes")]
             pool_client_id: ClientId::new(),
+            #[cfg(feature = "wasm-plugins")]
+            plugin_identity: RwLock::new(None),
         });
 
         // Register session
@@ -828,6 +837,13 @@ impl ProxyServer {
         state: &Arc<ServerState>,
         config: &ProxyConfig,
     ) -> Result<(Option<TcpStream>, String)> {
+        // Plugin Authenticate hook — may deny the connection outright or
+        // attach a richer identity (roles, tenant_id, claims) onto the
+        // session for downstream plugins to consume. Happens before any
+        // backend connection is opened so denials cost nothing on the
+        // backend side.
+        Self::apply_authenticate_hook(params, session, state).await?;
+
         // Select initial backend node (primary for now)
         let node_addr = Self::select_node(session, state, config).await?;
 
@@ -1448,6 +1464,77 @@ impl ProxyServer {
         }
     }
 
+    /// Run the Authenticate plugin hook at startup. Called from
+    /// `connect_and_authenticate` before any backend connection.
+    ///
+    /// Behaviour by `AuthResult`:
+    /// * `Defer` — no plugin opinion; proceed with the default
+    ///   PostgreSQL auth flow unchanged.
+    /// * `Success(identity)` — store the identity on the session so
+    ///   downstream plugins (masking, residency) can gate on roles /
+    ///   tenant_id / claims. PostgreSQL backend auth still runs
+    ///   normally afterwards (the plugin does not replace PG auth in
+    ///   this iteration; that's a follow-up).
+    /// * `Denied(reason)` — surfaces as `ProxyError::Auth`, which the
+    ///   caller already handles by writing an ErrorResponse to the
+    ///   client and closing the connection.
+    ///
+    /// The `AuthRequest` populated here carries username, database,
+    /// and client IP from the PostgreSQL startup parameters. Password
+    /// is deliberately `None` — PG protocol sends the password in
+    /// response to the backend's challenge, not at startup, so
+    /// password-aware plugin auth is a separate future task.
+    async fn apply_authenticate_hook(
+        _params: &HashMap<String, String>,
+        _session: &Arc<ClientSession>,
+        _state: &Arc<ServerState>,
+    ) -> Result<()> {
+        #[cfg(feature = "wasm-plugins")]
+        {
+            let pm = match _state.plugin_manager.as_ref() {
+                Some(pm) => pm,
+                None => return Ok(()),
+            };
+
+            let request = PluginAuthRequest {
+                headers: HashMap::new(),
+                username: _params.get("user").cloned(),
+                password: None,
+                client_ip: _session.client_addr.ip().to_string(),
+                database: _params.get("database").cloned(),
+            };
+
+            match pm.execute_authenticate(&request) {
+                AuthResult::Defer => Ok(()),
+                AuthResult::Success(identity) => {
+                    tracing::debug!(
+                        user = %identity.username,
+                        roles = ?identity.roles,
+                        "plugin authenticated user"
+                    );
+                    *_session.plugin_identity.write().await = Some(identity);
+                    Ok(())
+                }
+                AuthResult::Denied(reason) => {
+                    tracing::info!(
+                        reason = %reason,
+                        client = %_session.client_addr,
+                        user = ?_params.get("user"),
+                        "plugin denied authentication"
+                    );
+                    Err(ProxyError::Auth(format!(
+                        "authentication denied by plugin: {}",
+                        reason
+                    )))
+                }
+            }
+        }
+        #[cfg(not(feature = "wasm-plugins"))]
+        {
+            Ok(())
+        }
+    }
+
     /// Run the Route plugin hook on a message. Only simple-query messages
     /// are inspected; other message types always return `None`.
     fn apply_route_hook(
@@ -1953,6 +2040,8 @@ mod tests {
             tr_mode: crate::config::TrMode::default(),
             #[cfg(feature = "pool-modes")]
             pool_client_id: crate::pool::lease::ClientId::default(),
+            #[cfg(feature = "wasm-plugins")]
+            plugin_identity: RwLock::new(None),
         })
     }
 
@@ -2037,5 +2126,77 @@ mod tests {
         // Manager is created; no panic; Some(pm) returned even with empty dir.
         let pm = ProxyServer::init_plugin_manager(&config.plugins);
         assert!(pm.is_some());
+    }
+
+    /// With no plugin manager attached, `apply_authenticate_hook` is a
+    /// zero-cost `Ok(())` that leaves session identity unset — the
+    /// default PG auth flow applies.
+    #[tokio::test]
+    async fn test_apply_authenticate_hook_no_plugin_manager_defers() {
+        let config = test_config();
+        let server = ProxyServer::new(config).unwrap();
+        let session = make_test_session();
+
+        let mut params = HashMap::new();
+        params.insert("user".to_string(), "alice".to_string());
+        params.insert("database".to_string(), "app".to_string());
+
+        let result =
+            ProxyServer::apply_authenticate_hook(&params, &session, &server.state).await;
+        assert!(result.is_ok());
+
+        // No plugin → no identity stored.
+        #[cfg(feature = "wasm-plugins")]
+        {
+            let ident = session.plugin_identity.read().await;
+            assert!(ident.is_none());
+        }
+    }
+
+    /// Denied by plugin surfaces as `ProxyError::Auth` so the existing
+    /// error-response path in `handle_client` writes an ErrorResponse
+    /// and closes the connection. Here we prove the error variant
+    /// when the plugin manager is present but denies. We build a
+    /// PluginManager with no plugins loaded — so it defers — and
+    /// verify the Ok path. (Denial path requires an actual
+    /// auth-plugin `.wasm`; covered by the plugin unit tests in
+    /// `plugins::tests`.)
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn test_apply_authenticate_hook_with_manager_no_plugins_defers() {
+        use crate::plugins::{PluginManager, PluginRuntimeConfig};
+
+        let config = test_config();
+        let server = ProxyServer::new(config).unwrap();
+        let session = make_test_session();
+
+        // Synthesise a state with a real PluginManager but zero
+        // registered plugins — every hook must defer.
+        let pm = Arc::new(PluginManager::new(PluginRuntimeConfig::default()).unwrap());
+        let augmented_state = Arc::new(ServerState {
+            sessions: RwLock::new(HashMap::new()),
+            pools: RwLock::new(HashMap::new()),
+            health: RwLock::new(HashMap::new()),
+            metrics: ServerMetrics::default(),
+            lb_state: RwLock::new(LoadBalancerState {
+                rr_counter: 0,
+                weights: HashMap::new(),
+                weight_counter: HashMap::new(),
+            }),
+            #[cfg(feature = "pool-modes")]
+            pool_manager: None,
+            plugin_manager: Some(pm),
+        });
+
+        let mut params = HashMap::new();
+        params.insert("user".to_string(), "alice".to_string());
+
+        let result =
+            ProxyServer::apply_authenticate_hook(&params, &session, &augmented_state).await;
+        assert!(result.is_ok());
+        let ident = session.plugin_identity.read().await;
+        assert!(ident.is_none());
+        // Unused bindings for the sync-state build path.
+        let _ = server;
     }
 }
