@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>HeliosProxy admin</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      color-scheme: light dark;
+      --ok:     #2ea043;
+      --warn:   #bf8700;
+      --err:    #cf222e;
+      --bg:     #ffffff;
+      --fg:     #1f2328;
+      --muted:  #656d76;
+      --line:   #d0d7de;
+      --chip:   #f6f8fa;
+      --accent: #0969da;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg:    #0d1117;
+        --fg:    #e6edf3;
+        --muted: #848d97;
+        --line:  #30363d;
+        --chip:  #161b22;
+        --accent:#2f81f7;
+      }
+    }
+    html, body { background: var(--bg); color: var(--fg); margin: 0; padding: 0; }
+    body {
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    header {
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--line);
+      display: flex; align-items: baseline; gap: 16px;
+    }
+    header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+    header .version { color: var(--muted); font-size: 13px; }
+    header .right { margin-left: auto; color: var(--muted); font-size: 12px; }
+    main { padding: 24px; display: grid; gap: 24px; grid-template-columns: 1fr; max-width: 1200px; margin: 0 auto; }
+    @media (min-width: 900px) {
+      main { grid-template-columns: 1fr 1fr; }
+      main .full { grid-column: 1 / -1; }
+    }
+    section {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--bg);
+      overflow: hidden;
+    }
+    section > h2 {
+      margin: 0;
+      padding: 10px 14px;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      border-bottom: 1px solid var(--line);
+      background: var(--chip);
+    }
+    section > .body { padding: 14px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 6px 8px; font-variant-numeric: tabular-nums; }
+    th { font-weight: 500; color: var(--muted); border-bottom: 1px solid var(--line); }
+    tr + tr td { border-top: 1px solid var(--line); }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+    .dot-ok   { background: var(--ok); }
+    .dot-warn { background: var(--warn); }
+    .dot-err  { background: var(--err); }
+    .metric {
+      display: flex; justify-content: space-between; align-items: baseline;
+      padding: 6px 0;
+    }
+    .metric + .metric { border-top: 1px solid var(--line); }
+    .metric .k { color: var(--muted); font-size: 12px; }
+    .metric .v { font-variant-numeric: tabular-nums; font-size: 18px; font-weight: 500; }
+    textarea {
+      width: 100%; min-height: 80px; box-sizing: border-box;
+      font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: var(--chip); color: var(--fg);
+      border: 1px solid var(--line); border-radius: 6px;
+      padding: 8px; resize: vertical;
+    }
+    button {
+      font: inherit;
+      background: var(--accent); color: white; border: 0; border-radius: 6px;
+      padding: 6px 12px; cursor: pointer;
+    }
+    button:hover { filter: brightness(1.08); }
+    pre.result {
+      background: var(--chip); border: 1px solid var(--line); border-radius: 6px;
+      padding: 10px; overflow: auto; max-height: 340px;
+      font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre-wrap; word-break: break-word;
+      margin: 10px 0 0;
+    }
+    .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+    footer {
+      padding: 18px 24px; color: var(--muted); border-top: 1px solid var(--line);
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>HeliosProxy</h1>
+    <span class="version" id="version">—</span>
+    <span class="right" id="last-refresh">—</span>
+  </header>
+
+  <main>
+    <section class="full">
+      <h2>Nodes</h2>
+      <div class="body">
+        <table id="nodes">
+          <thead>
+            <tr>
+              <th style="width:16px"></th>
+              <th>Address</th>
+              <th>Healthy</th>
+              <th>Failures</th>
+              <th>Latency (ms)</th>
+              <th>Last check</th>
+            </tr>
+          </thead>
+          <tbody><tr><td colspan="6">loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Traffic</h2>
+      <div class="body" id="metrics-traffic">loading…</div>
+    </section>
+
+    <section>
+      <h2>Cluster</h2>
+      <div class="body" id="metrics-cluster">loading…</div>
+    </section>
+
+    <section class="full">
+      <h2>SQL</h2>
+      <div class="body">
+        <textarea id="sql" placeholder="SELECT 1" spellcheck="false">SELECT 1</textarea>
+        <div class="row">
+          <button id="run">Run</button>
+          <span id="sql-status" style="color: var(--muted);"></span>
+        </div>
+        <pre class="result" id="sql-result">—</pre>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    Data refreshes every 5 s. SQL requests go to <code>POST /api/sql</code> —
+    write statements route to the primary, reads to a healthy replica
+    per the proxy's load-balancing policy.
+  </footer>
+
+  <script>
+    const REFRESH_MS = 5000;
+
+    async function j(url, opts) {
+      const r = await fetch(url, opts);
+      if (!r.ok) throw new Error(r.status + " " + r.statusText);
+      return r.json();
+    }
+
+    function dotClass(healthy) {
+      return "dot " + (healthy ? "dot-ok" : "dot-err");
+    }
+
+    function fmtTs(iso) {
+      if (!iso) return "—";
+      try { return new Date(iso).toLocaleTimeString(); } catch (e) { return iso; }
+    }
+
+    function renderNodes(nodes) {
+      const rows = nodes.map(n => `
+        <tr>
+          <td><span class="${dotClass(n.healthy)}"></span></td>
+          <td><code>${n.address}</code></td>
+          <td>${n.healthy ? "yes" : "<strong style='color:var(--err)'>no</strong>"}</td>
+          <td>${n.failure_count ?? 0}</td>
+          <td>${(n.latency_ms ?? 0).toFixed(1)}</td>
+          <td>${fmtTs(n.last_check)}</td>
+        </tr>
+      `).join("");
+      document.querySelector("#nodes tbody").innerHTML = rows || "<tr><td colspan='6'>no nodes</td></tr>";
+    }
+
+    function metricRow(k, v) {
+      return `<div class="metric"><span class="k">${k}</span><span class="v">${v}</span></div>`;
+    }
+
+    function renderTraffic(m) {
+      document.querySelector("#metrics-traffic").innerHTML =
+        metricRow("Queries processed", (m.queries_processed ?? 0).toLocaleString()) +
+        metricRow("Connections accepted", (m.connections_accepted ?? 0).toLocaleString()) +
+        metricRow("Connections closed", (m.connections_closed ?? 0).toLocaleString()) +
+        metricRow("Bytes received", (m.bytes_received ?? 0).toLocaleString()) +
+        metricRow("Bytes sent", (m.bytes_sent ?? 0).toLocaleString());
+    }
+
+    function renderCluster(m, sessions) {
+      document.querySelector("#metrics-cluster").innerHTML =
+        metricRow("Active sessions", (sessions ?? 0).toLocaleString()) +
+        metricRow("Failovers", (m.failovers ?? 0).toLocaleString());
+    }
+
+    async function refresh() {
+      try {
+        const [nodes, metrics, sessions, version] = await Promise.all([
+          j("/nodes").catch(() => []),
+          j("/metrics").catch(() => ({})),
+          j("/sessions").catch(() => ({ active_sessions: 0 })),
+          j("/version").catch(() => ({})),
+        ]);
+        renderNodes(nodes);
+        renderTraffic(metrics);
+        renderCluster(metrics, sessions.active_sessions);
+        if (version.version) {
+          document.querySelector("#version").textContent = "v" + version.version;
+        }
+        document.querySelector("#last-refresh").textContent =
+          "Refreshed " + new Date().toLocaleTimeString();
+      } catch (e) {
+        document.querySelector("#last-refresh").textContent =
+          "Refresh failed: " + e.message;
+      }
+    }
+
+    document.querySelector("#run").addEventListener("click", async () => {
+      const sql = document.querySelector("#sql").value;
+      const status = document.querySelector("#sql-status");
+      const result = document.querySelector("#sql-result");
+      status.textContent = "running…";
+      result.textContent = "";
+      try {
+        const r = await fetch("/api/sql", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: sql }),
+        });
+        const j = await r.json();
+        status.textContent = r.ok ? "ok" : `error ${r.status}`;
+        result.textContent = JSON.stringify(j, null, 2);
+      } catch (e) {
+        status.textContent = "failed";
+        result.textContent = e.message;
+      }
+    });
+
+    refresh();
+    setInterval(refresh, REFRESH_MS);
+  </script>
+</body>
+</html>
