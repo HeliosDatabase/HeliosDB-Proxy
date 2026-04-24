@@ -1,0 +1,56 @@
+# HeliosProxy configuration for the integration-test cluster.
+#
+# Points at the three postgres containers by service-name (docker-compose
+# resolves those in the shared `helios-it-net` network). All three nodes
+# share the same credentials — the `helios` role created by the primary's
+# initdb hook is replicated to each standby via pg_basebackup.
+
+listen_address = "0.0.0.0:5432"
+admin_address = "0.0.0.0:9090"
+tr_enabled = true
+tr_mode = "session"
+write_timeout_secs = 30
+
+[pool]
+min_connections = 2
+max_connections = 20
+idle_timeout_secs = 60
+max_lifetime_secs = 600
+acquire_timeout_secs = 5
+test_on_acquire = true
+
+[load_balancer]
+read_strategy = "round_robin"
+read_write_split = true
+latency_threshold_ms = 200
+
+[health]
+check_interval_secs = 2
+check_timeout_secs = 3
+failure_threshold = 3
+success_threshold = 2
+check_query = "SELECT 1"
+
+[[nodes]]
+host = "pg-primary"
+port = 5432
+role = "primary"
+weight = 100
+enabled = true
+name = "primary"
+
+[[nodes]]
+host = "pg-standby-sync"
+port = 5432
+role = "standby"
+weight = 100
+enabled = true
+name = "sync-standby"
+
+[[nodes]]
+host = "pg-standby-async"
+port = 5432
+role = "standby"
+weight = 50
+enabled = true
+name = "async-standby"

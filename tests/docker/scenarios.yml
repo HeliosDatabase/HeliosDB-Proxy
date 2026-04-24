@@ -1,0 +1,118 @@
+# HeliosProxy fault-injection scenarios.
+#
+# Each scenario declares a name, the chaos event to fire, the expected
+# proxy response, and pass/fail assertions. The runner
+# (run-scenarios.sh) iterates scenarios, drives pgbench as the
+# workload, fires the event, and evaluates the assertions against the
+# proxy admin API, pgbench log, and checksum output.
+
+scenarios:
+
+  - name: primary-sigkill
+    description: >
+      Primary receives SIGKILL mid-write. Proxy must detect within
+      `health.check_interval_secs * failure_threshold` and route
+      subsequent writes to a promoted standby. In-flight writes that
+      were journaled replay onto the new primary.
+    event:
+      type: sigkill
+      target: pg-primary
+    expect:
+      dropped_connections: 0
+      recovery_time_max_s: 10
+      p99_latency_spike_max_ms: 5000
+      data_integrity: match
+
+  - name: primary-sigstop-15s
+    description: >
+      Primary paused (SIGSTOP) for 15 s. Tests failover timeout — if
+      proxy's `write_timeout_secs` > 15, the cluster must recover
+      without triggering failover. If < 15, failover must complete.
+    event:
+      type: sigstop
+      target: pg-primary
+      duration_s: 15
+    expect:
+      dropped_connections: 0
+      recovery_time_max_s: 20
+      # Behaviour depends on write_timeout_secs; asserted by runner.
+      failover_triggered: depends_on_config
+      data_integrity: match
+
+  - name: async-standby-lag-5s
+    description: >
+      Inject 5 s network delay on async standby. Lag-aware routing
+      should stop sending reads there; sync standby + primary absorb
+      the read traffic. No failover expected.
+    event:
+      type: netem-delay
+      target: pg-standby-async
+      delay_ms: 5000
+      duration_s: 30
+    expect:
+      dropped_connections: 0
+      recovery_time_max_s: 0   # no recovery needed; workload continues
+      failover_triggered: false
+      data_integrity: match
+
+  - name: sync-standby-partition-10s
+    description: >
+      Full network partition of sync standby for 10 s. synchronous_commit
+      blocks writes until the primary removes the sync standby from the
+      set (or the partition heals). Proxy must buffer through the
+      write_timeout_secs window.
+    event:
+      type: partition
+      target: pg-standby-sync
+      duration_s: 10
+    expect:
+      dropped_connections: 0
+      recovery_time_max_s: 15
+      data_integrity: match
+
+  - name: primary-oom
+    description: >
+      Kill primary with SIGTERM (graceful shutdown hang), simulating
+      slow-OOM. Tests the proxy's behaviour when the primary drains
+      connections rather than dying instantly.
+    event:
+      type: signal
+      target: pg-primary
+      signal: SIGTERM
+    expect:
+      dropped_connections: 0
+      recovery_time_max_s: 30
+      data_integrity: match
+
+# Assertions reference these names; the runner queries the proxy admin
+# API + pgbench log + checksum tool to populate them.
+assertions:
+  dropped_connections:
+    description: Count of pgbench transactions that reported errors.
+    source: pgbench-log
+
+  recovery_time_max_s:
+    description: >
+      Seconds between the event firing and pgbench TPS returning to
+      within 50% of its pre-event baseline.
+    source: pgbench-progress
+
+  p99_latency_spike_max_ms:
+    description: >
+      Peak p99 latency in the 1-minute window starting at the event.
+    source: pgbench-progress
+
+  failover_triggered:
+    description: >
+      Whether the proxy's admin `/nodes` reports a new primary during
+      the scenario window.
+    source: admin-api
+
+  data_integrity:
+    description: >
+      Whether the pre-event and post-recovery table checksums match.
+      Computed by tests/docker/checksum.sh.
+    source: checksum-tool
+    values:
+      - match      # pass
+      - mismatch   # fail (data loss or reorder)
