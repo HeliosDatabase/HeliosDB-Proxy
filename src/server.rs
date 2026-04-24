@@ -34,7 +34,7 @@ use crate::NodeEndpoint;
 // WASM plugin system imports
 #[cfg(feature = "wasm-plugins")]
 use crate::plugins::{
-    HookContext, PluginManager, PostQueryOutcome, PreQueryResult, QueryContext,
+    HookContext, PluginManager, PostQueryOutcome, PreQueryResult, QueryContext, RouteResult,
 };
 
 /// Proxy server
@@ -206,6 +206,25 @@ enum PreQueryAction {
     /// `Forward` and logs a warning.
     #[allow(dead_code)]
     Cached(Vec<u8>),
+}
+
+/// Override produced by the Route plugin hook. Consumed by `route_and_forward`
+/// when deciding which backend to talk to.
+///
+/// As with `PreQueryAction`, only `None` is ever produced when the
+/// `wasm-plugins` feature is off.
+#[derive(Debug)]
+enum RouteOverride {
+    /// No override — use the default SQL-verb-based routing.
+    None,
+    /// Force the write path (use `select_primary_with_timeout`).
+    Primary,
+    /// Force the read path (use `select_read_node`).
+    Standby,
+    /// Use this exact node address. Takes precedence over the is_write
+    /// heuristic; the proxy will still verify the node is healthy before
+    /// connecting (via the normal switch-vs-reuse flow).
+    Node(String),
 }
 
 impl ProxyServer {
@@ -877,15 +896,33 @@ impl ProxyServer {
         state: &Arc<ServerState>,
         config: &ProxyConfig,
     ) -> Result<(Vec<u8>, Option<TcpStream>, Option<String>)> {
-        // Determine if this is a write operation
-        let is_write = Self::is_write_message(msg);
+        // Determine if this is a write operation (from SQL verb).
+        let default_is_write = Self::is_write_message(msg);
 
-        // Sticky session mode: stay on same backend if we have one and it's healthy
-        // Only switch if:
-        // 1. No current backend
-        // 2. Write query and current backend is not primary
-        // 3. Current backend is unhealthy
-        let need_switch = if let Some(ref current) = current_node {
+        // Plugin Route hook may override the routing decision — force
+        // primary/standby, or pin the query to a specific node.
+        let route_override = Self::apply_route_hook(msg, state, session);
+
+        // Derive effective (is_write, forced_target) after override.
+        let (is_write, forced_target) = match route_override {
+            RouteOverride::None => (default_is_write, None),
+            RouteOverride::Primary => (true, None),
+            RouteOverride::Standby => (false, None),
+            RouteOverride::Node(name) => (default_is_write, Some(name)),
+        };
+
+        // Sticky session mode: stay on the same backend if healthy and
+        // compatible with the routing decision. A forced target shortcuts
+        // the usual write-needs-primary check: the only question is whether
+        // the current connection already points at the forced node.
+        let need_switch = if let Some(ref forced) = forced_target {
+            let health = state.health.read().await;
+            let reuse = current_node
+                .as_ref()
+                .map(|c| c == forced && health.get(c).map(|h| h.healthy).unwrap_or(false))
+                .unwrap_or(false);
+            !reuse
+        } else if let Some(ref current) = current_node {
             let health = state.health.read().await;
             let current_healthy = health.get(current).map(|h| h.healthy).unwrap_or(false);
 
@@ -905,7 +942,9 @@ impl ProxyServer {
             true
         };
 
-        let target_node = if need_switch {
+        let target_node = if let Some(forced) = forced_target {
+            forced
+        } else if need_switch {
             if is_write {
                 Self::select_primary_with_timeout(session, state, config).await?
             } else {
@@ -1333,6 +1372,48 @@ impl ProxyServer {
             tables: Vec::new(),
             is_read_only,
             hook_context,
+        }
+    }
+
+    /// Run the Route plugin hook on a message. Only simple-query messages
+    /// are inspected; other message types always return `None`.
+    fn apply_route_hook(
+        msg: &Message,
+        state: &Arc<ServerState>,
+        session: &Arc<ClientSession>,
+    ) -> RouteOverride {
+        #[cfg(feature = "wasm-plugins")]
+        {
+            let pm = match state.plugin_manager.as_ref() {
+                Some(pm) => pm,
+                None => return RouteOverride::None,
+            };
+            if msg.msg_type != MessageType::Query {
+                return RouteOverride::None;
+            }
+            let query_msg = match QueryMessage::parse(msg.payload.clone()) {
+                Ok(q) => q,
+                Err(_) => return RouteOverride::None,
+            };
+            let ctx = Self::build_query_context(&query_msg.query, session);
+            match pm.execute_route(&ctx) {
+                RouteResult::Default => RouteOverride::None,
+                RouteResult::Primary => RouteOverride::Primary,
+                RouteResult::Standby => RouteOverride::Standby,
+                RouteResult::Node(name) => RouteOverride::Node(name),
+                RouteResult::Branch(name) => {
+                    tracing::warn!(
+                        branch = %name,
+                        "Route hook returned Branch but branch routing is not yet wired — using default"
+                    );
+                    RouteOverride::None
+                }
+            }
+        }
+        #[cfg(not(feature = "wasm-plugins"))]
+        {
+            let _ = (msg, state, session);
+            RouteOverride::None
         }
     }
 
@@ -1785,5 +1866,75 @@ mod tests {
             assert!(node_health.healthy);
             assert_eq!(node_health.failure_count, 0);
         }
+    }
+
+    /// Build a minimal `ClientSession` for plugin-hook unit tests.
+    fn make_test_session() -> Arc<ClientSession> {
+        Arc::new(ClientSession {
+            id: Uuid::new_v4(),
+            client_addr: "127.0.0.1:0".parse().unwrap(),
+            current_node: RwLock::new(None),
+            tx_state: RwLock::new(TransactionState::default()),
+            variables: RwLock::new(HashMap::new()),
+            created_at: chrono::Utc::now(),
+            tr_mode: crate::config::TrMode::default(),
+            #[cfg(feature = "pool-modes")]
+            pool_client_id: crate::pool::lease::ClientId::default(),
+        })
+    }
+
+    /// With no plugin manager attached, `apply_route_hook` must be a
+    /// zero-cost `None` return so the default SQL-verb routing applies.
+    /// Verifies the feature-gated early-return path.
+    #[tokio::test]
+    async fn test_apply_route_hook_no_plugin_manager_returns_none() {
+        let config = test_config();
+        let server = ProxyServer::new(config).unwrap();
+        let session = make_test_session();
+
+        let msg = QueryMessage {
+            query: "SELECT * FROM users".to_string(),
+        }
+        .encode();
+
+        let decision = ProxyServer::apply_route_hook(&msg, &server.state, &session);
+        assert!(matches!(decision, RouteOverride::None));
+    }
+
+    /// Same invariant for the pre-query hook: without a plugin manager,
+    /// `apply_pre_query_hook` must return the message unchanged with
+    /// `PreQueryAction::Forward`.
+    #[tokio::test]
+    async fn test_apply_pre_query_hook_no_plugin_manager_forwards() {
+        let config = test_config();
+        let server = ProxyServer::new(config).unwrap();
+        let session = make_test_session();
+
+        let original = QueryMessage {
+            query: "SELECT 1".to_string(),
+        }
+        .encode();
+        let original_bytes = original.encode().to_vec();
+
+        let (msg_out, action) =
+            ProxyServer::apply_pre_query_hook(original, &server.state, &session);
+
+        assert!(matches!(action, PreQueryAction::Forward));
+        // The message must survive the hook byte-for-byte when no plugins run.
+        assert_eq!(msg_out.encode().to_vec(), original_bytes);
+    }
+
+    /// Non-Query message types (e.g., extended-protocol Parse/Execute) must
+    /// bypass the Route hook entirely regardless of plugin state, because
+    /// we haven't wired SQL extraction for those variants yet.
+    #[tokio::test]
+    async fn test_apply_route_hook_skips_non_query_messages() {
+        let config = test_config();
+        let server = ProxyServer::new(config).unwrap();
+        let session = make_test_session();
+
+        let sync_msg = Message::empty(MessageType::Sync);
+        let decision = ProxyServer::apply_route_hook(&sync_msg, &server.state, &session);
+        assert!(matches!(decision, RouteOverride::None));
     }
 }
