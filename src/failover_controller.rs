@@ -4,6 +4,7 @@
 //! automatic rerouting, and transaction replay coordination.
 
 use super::{NodeEndpoint, NodeId, NodeRole, ProxyError, Result};
+use crate::backend::{BackendClient, BackendConfig};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -152,6 +153,12 @@ pub struct FailoverController {
     history: Arc<RwLock<Vec<FailoverHistoryEntry>>>,
     /// Running flag
     running: Arc<RwLock<bool>>,
+    /// Optional backend-connection template. Host/port are swapped to
+    /// a candidate's endpoint when running `pg_promote()` or polling
+    /// `pg_last_wal_replay_lsn()`. When `None`, all backend-talking
+    /// paths become no-ops that log and succeed — preserving the
+    /// pre-T0-TR4 behaviour for unit tests.
+    backend_template: Option<BackendConfig>,
 }
 
 impl FailoverController {
@@ -169,7 +176,26 @@ impl FailoverController {
             failover_count: AtomicU64::new(0),
             history: Arc::new(RwLock::new(Vec::new())),
             running: Arc::new(RwLock::new(false)),
+            backend_template: None,
         }
+    }
+
+    /// Attach a backend-connection template so sync-wait and promotion
+    /// can actually run SQL against the candidate.
+    pub fn with_backend_template(mut self, template: BackendConfig) -> Self {
+        self.backend_template = Some(template);
+        self
+    }
+
+    /// Build a BackendConfig for a specific node's endpoint. Returns
+    /// `None` when no template is configured (the no-op / test path).
+    fn backend_config_for(&self, endpoint: &NodeEndpoint) -> Option<BackendConfig> {
+        self.backend_template.as_ref().map(|t| {
+            let mut c = t.clone();
+            c.host = endpoint.host.clone();
+            c.port = endpoint.port;
+            c
+        })
     }
 
     /// Set the current primary
@@ -370,30 +396,142 @@ impl FailoverController {
             .ok_or_else(|| ProxyError::FailoverFailed("No eligible candidates".to_string()))
     }
 
-    /// Wait for standby to catch up
-    async fn wait_for_sync(&self, _standby: NodeId) -> Result<()> {
-        // TODO: Implement actual sync waiting
-        // 1. Monitor standby lag
-        // 2. Wait until lag is below threshold
-        // 3. Timeout if too slow
+    /// Wait for a standby to catch up before promotion.
+    ///
+    /// Polls `pg_last_wal_replay_lsn()` on the candidate at 200 ms
+    /// cadence. Two consecutive polls that return the same LSN are
+    /// treated as "caught up as far as it can go" (the primary is
+    /// presumed dead, so no new WAL is arriving). Bounded by
+    /// `config.failover_timeout`.
+    ///
+    /// When no backend template is attached, returns `Ok(())` after
+    /// a short delay — the pre-T0-TR4 skeleton behaviour for tests.
+    async fn wait_for_sync(&self, standby: NodeId) -> Result<()> {
+        let endpoint = self
+            .candidates
+            .read()
+            .await
+            .get(&standby)
+            .map(|c| c.endpoint.clone());
+        let cfg = match endpoint.as_ref().and_then(|e| self.backend_config_for(e)) {
+            Some(c) => c,
+            None => {
+                // Skeleton path: simulate a brief wait so the state
+                // machine test harness still sees WaitingForSync.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return Ok(());
+            }
+        };
 
-        tokio::time::timeout(self.config.failover_timeout, async {
-            // Simulate waiting
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            Ok::<(), ProxyError>(())
-        })
-        .await
-        .map_err(|_| ProxyError::Timeout("Standby sync timeout".to_string()))?
+        let overall = self.config.failover_timeout;
+        tokio::time::timeout(overall, Self::poll_until_caught_up(cfg))
+            .await
+            .map_err(|_| ProxyError::Timeout("standby sync timeout".to_string()))??;
+        Ok(())
     }
 
-    /// Promote a standby to primary
-    async fn promote_standby(&self, standby: NodeId) -> Result<()> {
-        // TODO: Implement actual promotion
-        // 1. Tell standby to promote
-        // 2. Verify promotion succeeded
-        // 3. Update routing
+    /// Connect to the candidate and poll `pg_last_wal_replay_lsn()`
+    /// until it stabilises across two consecutive 200 ms polls.
+    async fn poll_until_caught_up(cfg: BackendConfig) -> Result<()> {
+        let mut client = BackendClient::connect(&cfg)
+            .await
+            .map_err(|e| ProxyError::Failover(format!("connect to candidate: {}", e)))?;
 
-        tracing::info!("Promoting standby {:?} to primary", standby);
+        let mut last: Option<String> = None;
+        let mut stable_polls = 0u32;
+        loop {
+            let value = client
+                .query_scalar("SELECT pg_last_wal_replay_lsn()::text")
+                .await
+                .map_err(|e| ProxyError::Failover(format!("wal lsn probe: {}", e)))?;
+            let lsn = value
+                .into_string()
+                .ok_or_else(|| ProxyError::Failover("null WAL replay LSN".into()))?;
+
+            if last.as_ref() == Some(&lsn) {
+                stable_polls += 1;
+                if stable_polls >= 2 {
+                    tracing::info!(lsn = %lsn, "standby caught up");
+                    client.close().await;
+                    return Ok(());
+                }
+            } else {
+                stable_polls = 0;
+                last = Some(lsn);
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Promote a standby to primary via `pg_promote()`.
+    ///
+    /// Uses `pg_promote(wait => true, wait_seconds => N)` so the server
+    /// waits for promotion to complete before returning. Verifies
+    /// post-promotion by re-running `pg_is_in_recovery()` (must now be
+    /// `false`) on a fresh connection.
+    ///
+    /// When no backend template is attached, logs and returns `Ok(())`
+    /// — skeleton / test path.
+    async fn promote_standby(&self, standby: NodeId) -> Result<()> {
+        let endpoint = self
+            .candidates
+            .read()
+            .await
+            .get(&standby)
+            .map(|c| c.endpoint.clone());
+        let cfg = match endpoint.as_ref().and_then(|e| self.backend_config_for(e)) {
+            Some(c) => c,
+            None => {
+                tracing::info!(
+                    node = ?standby,
+                    "promote_standby: skeleton path (no backend template) — no-op"
+                );
+                return Ok(());
+            }
+        };
+
+        let wait_secs = self.config.failover_timeout.as_secs().max(10).min(300);
+        let mut client = BackendClient::connect(&cfg)
+            .await
+            .map_err(|e| ProxyError::FailoverFailed(format!("connect to promote: {}", e)))?;
+
+        let sql = format!("SELECT pg_promote(true, {})", wait_secs);
+        let value = client
+            .query_scalar(&sql)
+            .await
+            .map_err(|e| ProxyError::FailoverFailed(format!("pg_promote: {}", e)))?;
+        let promoted = value
+            .as_bool("pg_promote")
+            .map_err(|e| ProxyError::FailoverFailed(format!("pg_promote result: {}", e)))?
+            .unwrap_or(false);
+        client.close().await;
+
+        if !promoted {
+            return Err(ProxyError::FailoverFailed(
+                "pg_promote returned false".to_string(),
+            ));
+        }
+
+        // Verify on a fresh connection that the node is no longer in recovery.
+        let mut verify = BackendClient::connect(&cfg)
+            .await
+            .map_err(|e| ProxyError::FailoverFailed(format!("connect to verify: {}", e)))?;
+        let in_recovery = verify
+            .query_scalar("SELECT pg_is_in_recovery()")
+            .await
+            .map_err(|e| ProxyError::FailoverFailed(format!("verify probe: {}", e)))?;
+        verify.close().await;
+        let still_standby = in_recovery
+            .as_bool("pg_is_in_recovery")
+            .map_err(|e| ProxyError::FailoverFailed(format!("verify bool: {}", e)))?
+            .unwrap_or(true);
+        if still_standby {
+            return Err(ProxyError::FailoverFailed(
+                "post-promote pg_is_in_recovery still true".to_string(),
+            ));
+        }
+
+        tracing::info!(node = ?standby, "standby promoted to primary");
         Ok(())
     }
 
@@ -417,20 +555,67 @@ impl FailoverController {
         tracing::error!("Failover failed: {}", reason);
     }
 
-    /// Handle old primary recovery (split-brain prevention)
+    /// Handle old primary recovery (split-brain prevention).
+    ///
+    /// PostgreSQL has no built-in "demote the current primary" command —
+    /// re-joining as a standby requires stopping the process and
+    /// re-initialising (`pg_rewind` or `pg_basebackup`). This method
+    /// therefore cannot fully automate demotion. What it CAN do:
+    ///
+    /// 1. Connect to the recovered node and verify whether it still
+    ///    believes it is the primary (`pg_is_in_recovery() = false`).
+    /// 2. Emit `OldPrimaryRecovered` so operators (or an external
+    ///    orchestrator like Patroni / pg_auto_failover) can react.
+    ///
+    /// This is deliberately read-only. Rewriting WAL on a live cluster
+    /// without operator oversight is the canonical way to lose data;
+    /// the proxy refuses to do it.
     pub async fn on_old_primary_recovered(&self, node_id: NodeId) {
-        // The old primary should be demoted to standby
         let _ = self
             .event_tx
             .send(FailoverEvent::OldPrimaryRecovered { node_id })
             .await;
-
         tracing::warn!(
-            "Old primary {:?} recovered - must be demoted to prevent split-brain",
+            "old primary {:?} recovered — must be demoted out-of-band to prevent split-brain",
             node_id
         );
 
-        // TODO: Implement demotion logic
+        // Best-effort: if we have an endpoint and template, probe to
+        // confirm recovery state and shout extra-loud if it still
+        // thinks it's primary.
+        let endpoint = self
+            .candidates
+            .read()
+            .await
+            .get(&node_id)
+            .map(|c| c.endpoint.clone());
+        let cfg = match endpoint.as_ref().and_then(|e| self.backend_config_for(e)) {
+            Some(c) => c,
+            None => return, // no backend template → nothing more to do
+        };
+
+        match BackendClient::connect(&cfg).await {
+            Ok(mut client) => {
+                let in_recovery_result = client
+                    .query_scalar("SELECT pg_is_in_recovery()")
+                    .await;
+                client.close().await;
+                if let Ok(tv) = in_recovery_result {
+                    if let Ok(Some(false)) = tv.as_bool("pg_is_in_recovery") {
+                        tracing::error!(
+                            "split-brain hazard: node {:?} recovered and still reports primary (pg_is_in_recovery=false). Shut it down or use pg_rewind before reintroducing.",
+                            node_id
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "could not connect to recovered node for split-brain probe"
+                );
+            }
+        }
     }
 
     /// Manual failover to specific node
