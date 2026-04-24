@@ -244,6 +244,7 @@ mod tests {
             state: ConnectionState::InUse,
             use_count: 1,
             permit: None,
+            client: None,
         }
     }
 
