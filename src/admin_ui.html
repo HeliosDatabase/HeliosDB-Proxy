@@ -155,6 +155,25 @@
     </section>
 
     <section class="full">
+      <h2>Plugins</h2>
+      <div class="body">
+        <table id="plugins">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Version</th>
+              <th>Hooks</th>
+              <th>State</th>
+              <th>Invocations</th>
+              <th>Errors</th>
+            </tr>
+          </thead>
+          <tbody><tr><td colspan="6">loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="full">
       <h2>SQL</h2>
       <div class="body">
         <textarea id="sql" placeholder="SELECT 1" spellcheck="false">SELECT 1</textarea>
@@ -249,6 +268,32 @@
         metricRow("Failovers", (m.failovers ?? 0).toLocaleString());
     }
 
+    function renderPlugins(plugins) {
+      if (!Array.isArray(plugins)) {
+        document.querySelector("#plugins tbody").innerHTML =
+          `<tr><td colspan="6" style="color: var(--muted);">${plugins.error ?? "plugins unavailable"}</td></tr>`;
+        return;
+      }
+      if (plugins.length === 0) {
+        document.querySelector("#plugins tbody").innerHTML =
+          `<tr><td colspan="6" style="color: var(--muted);">no plugins loaded</td></tr>`;
+        return;
+      }
+      const rows = plugins.map(p => `
+        <tr>
+          <td><code>${p.name}</code></td>
+          <td>${p.version}</td>
+          <td><code>${(p.hooks ?? []).join(", ")}</code></td>
+          <td>${p.state}</td>
+          <td>${(p.invocations ?? 0).toLocaleString()}</td>
+          <td>${(p.errors ?? 0) > 0
+            ? `<strong style='color:var(--err)'>${p.errors}</strong>`
+            : "0"}</td>
+        </tr>
+      `).join("");
+      document.querySelector("#plugins tbody").innerHTML = rows;
+    }
+
     function renderTopology(t) {
       const primary = t.currentPrimary
         ? `<code>${t.currentPrimary}</code>`
@@ -263,17 +308,26 @@
 
     async function refresh() {
       try {
-        const [nodes, metrics, sessions, version, topo] = await Promise.all([
+        // /plugins returns 503 when no plugin manager is attached; fetch
+        // returns ok=false in that case. Catch and forward the JSON body
+        // so renderPlugins can show the message rather than spinning.
+        const pluginsP = fetch("/plugins").then(async r => {
+          try { return await r.json(); } catch { return []; }
+        }).catch(() => []);
+
+        const [nodes, metrics, sessions, version, topo, plugins] = await Promise.all([
           j("/nodes").catch(() => []),
           j("/metrics").catch(() => ({})),
           j("/sessions").catch(() => ({ active_sessions: 0 })),
           j("/version").catch(() => ({})),
           j("/topology").catch(() => ({})),
+          pluginsP,
         ]);
         renderNodes(nodes);
         renderTraffic(metrics);
         renderCluster(metrics, sessions.active_sessions);
         renderTopology(topo);
+        renderPlugins(plugins);
         if (version.version) {
           document.querySelector("#version").textContent = "v" + version.version;
         }
