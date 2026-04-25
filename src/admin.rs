@@ -370,6 +370,19 @@ impl AdminServer {
                 serde_json::json!({ "error": "ha-tr feature not compiled in" }),
             )),
 
+            // Shadow execution (T3.4) — runs a query against a source
+            // backend AND a shadow backend, diffs the result. Used for
+            // major-version upgrade validation, schema-migration
+            // canaries, replica-drift detection. Body is
+            // `ShadowRequestBody`.
+            #[cfg(feature = "ha-tr")]
+            ("POST", "/api/shadow") => Self::handle_shadow_request(body).await,
+            #[cfg(not(feature = "ha-tr"))]
+            ("POST", "/api/shadow") => Ok((
+                503,
+                serde_json::json!({ "error": "ha-tr feature not compiled in" }),
+            )),
+
             // Loaded WASM plugins — name, version, hooks, state,
             // invocation count. Returns 503 when no plugin manager
             // is attached (proxy started without --features
@@ -720,6 +733,106 @@ impl AdminServer {
             Err(e) => Ok((
                 500,
                 serde_json::json!({ "error": format!("replay failed: {}", e) }),
+            )),
+        }
+    }
+
+    /// Handle `POST /api/shadow`. Body is a JSON `ShadowRequestBody`.
+    /// Connects to both source and shadow backends, runs the SQL on
+    /// each, returns a `ShadowExecuteReport` with the diff.
+    ///
+    /// Status codes:
+    ///   200 — both sides ran (report carries pass/fail details)
+    ///   400 — malformed body
+    ///   500 — source connect failure (shadow connect failures end up
+    ///         in the report rather than the HTTP status)
+    #[cfg(feature = "ha-tr")]
+    async fn handle_shadow_request(
+        body: Option<&str>,
+    ) -> Result<(u16, serde_json::Value)> {
+        use crate::backend::{tls::default_client_config, BackendClient, BackendConfig, ParamValue, TlsMode};
+        use crate::shadow_execute::shadow_execute;
+
+        let raw = body.ok_or_else(|| {
+            ProxyError::Internal("shadow: empty request body".to_string())
+        })?;
+        let req: ShadowRequestBody = match serde_json::from_str(raw) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok((
+                    400,
+                    serde_json::json!({ "error": format!("invalid body: {}", e) }),
+                ));
+            }
+        };
+
+        // Build the two configs from the request. TLS off + 5s
+        // connect / 30s query timeouts mirror the replay defaults.
+        let mk_cfg = |host: String, port: u16, user: Option<String>, password: Option<String>, database: Option<String>| BackendConfig {
+            host,
+            port,
+            user: user.unwrap_or_else(|| "postgres".into()),
+            password,
+            database,
+            application_name: Some("heliosdb-proxy-shadow".into()),
+            tls_mode: TlsMode::Disable,
+            connect_timeout: std::time::Duration::from_secs(5),
+            query_timeout: std::time::Duration::from_secs(30),
+            tls_config: default_client_config(),
+        };
+        let source_cfg = mk_cfg(
+            req.source_host,
+            req.source_port,
+            req.source_user,
+            req.source_password,
+            req.source_database,
+        );
+        let shadow_cfg = mk_cfg(
+            req.shadow_host,
+            req.shadow_port,
+            req.shadow_user,
+            req.shadow_password,
+            req.shadow_database,
+        );
+
+        // Connect to source. Connect failure here is a real HTTP
+        // error since we can't even attempt the diff; shadow connect
+        // failures land inside the report as `shadow_error`.
+        let mut source = match BackendClient::connect(&source_cfg).await {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok((
+                    500,
+                    serde_json::json!({ "error": format!("source connect: {}", e) }),
+                ));
+            }
+        };
+
+        let params: Vec<ParamValue> = req
+            .params
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| ParamValue::Text(s))
+            .collect();
+
+        let outcome = shadow_execute(&mut source, &shadow_cfg, &req.sql, &params).await;
+        source.close().await;
+
+        match outcome {
+            Ok((_qr, report)) => Ok((200, serde_json::json!({
+                "sql":                report.sql,
+                "both_succeeded":     report.both_succeeded,
+                "row_count_match":    report.row_count_match,
+                "row_hash_match":     report.row_hash_match,
+                "primary_elapsed_us": report.primary_elapsed_us,
+                "shadow_elapsed_us":  report.shadow_elapsed_us,
+                "primary_error":      report.primary_error,
+                "shadow_error":       report.shadow_error,
+                "is_clean":           report.is_clean(),
+            }))),
+            Err(e) => Ok((
+                500,
+                serde_json::json!({ "error": format!("shadow execute: {}", e) }),
             )),
         }
     }
@@ -1177,6 +1290,40 @@ struct SessionsResponse {
     active_sessions: u64,
 }
 
+/// JSON body for `POST /api/shadow`.
+#[cfg(feature = "ha-tr")]
+#[derive(Debug, Deserialize)]
+struct ShadowRequestBody {
+    /// SQL to execute on both sides.
+    sql: String,
+    /// Optional text-format parameters interpolated into `sql`. None
+    /// or empty list runs as a simple_query.
+    #[serde(default)]
+    params: Option<Vec<String>>,
+
+    /// Source backend (the side whose result the application would
+    /// see in production).
+    source_host: String,
+    source_port: u16,
+    #[serde(default)]
+    source_user: Option<String>,
+    #[serde(default)]
+    source_password: Option<String>,
+    #[serde(default)]
+    source_database: Option<String>,
+
+    /// Shadow backend (the side being validated — typically a
+    /// new-version replica or post-migration schema).
+    shadow_host: String,
+    shadow_port: u16,
+    #[serde(default)]
+    shadow_user: Option<String>,
+    #[serde(default)]
+    shadow_password: Option<String>,
+    #[serde(default)]
+    shadow_database: Option<String>,
+}
+
 /// Chaos actions the proxy supports today. Forward-compatible —
 /// unknown actions deserialise as an error.
 ///
@@ -1629,5 +1776,45 @@ mod tests {
             .await
             .expect("handler returns Ok");
         assert_eq!(status, 400);
+    }
+
+    #[cfg(feature = "ha-tr")]
+    #[tokio::test]
+    async fn test_shadow_400_on_malformed_body() {
+        let (status, _) = AdminServer::handle_shadow_request(Some("not json"))
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 400);
+    }
+
+    #[cfg(feature = "ha-tr")]
+    #[tokio::test]
+    async fn test_shadow_500_on_source_unreachable() {
+        // Address that nothing is listening on (port 1 = tcpmux,
+        // refused by everything reasonable).
+        let body = r#"{
+            "sql": "SELECT 1",
+            "source_host": "127.0.0.1",
+            "source_port": 1,
+            "shadow_host": "127.0.0.1",
+            "shadow_port": 1
+        }"#;
+        let (status, value) = AdminServer::handle_shadow_request(Some(body))
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 500);
+        let err = value["error"].as_str().expect("error field");
+        assert!(
+            err.contains("source connect"),
+            "expected source connect error, got {}",
+            err
+        );
+    }
+
+    #[cfg(feature = "ha-tr")]
+    #[tokio::test]
+    async fn test_shadow_errors_on_empty_body() {
+        let err = AdminServer::handle_shadow_request(None).await;
+        assert!(err.is_err(), "empty body must surface as Err");
     }
 }

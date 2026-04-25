@@ -208,6 +208,38 @@
     </section>
 
     <section class="full">
+      <h2>Shadow Execution</h2>
+      <div class="body">
+        <p style="color: var(--muted); margin: 0 0 8px 0;">
+          Run a query against two backends and diff the results. Use
+          for major-version upgrade validation, schema-migration
+          canaries, and replica-drift detection. The "is_clean" line
+          in the result tells you whether both sides matched.
+        </p>
+        <textarea id="shadow-sql" placeholder="SELECT id, name FROM users LIMIT 10" spellcheck="false">SELECT 1</textarea>
+        <div class="row wrap">
+          <label>Source host
+            <input type="text" id="shadow-src-host" placeholder="primary.svc">
+          </label>
+          <label>Source port
+            <input type="number" id="shadow-src-port" value="5432" min="1" max="65535">
+          </label>
+          <label>Shadow host
+            <input type="text" id="shadow-tgt-host" placeholder="upgrade-candidate.svc">
+          </label>
+          <label>Shadow port
+            <input type="number" id="shadow-tgt-port" value="5432" min="1" max="65535">
+          </label>
+        </div>
+        <div class="row">
+          <button id="shadow-run">Diff query</button>
+          <span id="shadow-status" style="color: var(--muted);"></span>
+        </div>
+        <pre class="result" id="shadow-result">Pick source + shadow, type a SELECT, hit Diff query.</pre>
+      </div>
+    </section>
+
+    <section class="full">
       <h2>Time-Travel Replay</h2>
       <div class="body">
         <div class="row wrap">
@@ -474,6 +506,48 @@
         result.textContent = e.message;
       }
     }
+
+    document.querySelector("#shadow-run").addEventListener("click", async () => {
+      const sql = document.querySelector("#shadow-sql").value.trim();
+      const sh = document.querySelector("#shadow-src-host").value.trim();
+      const sp = parseInt(document.querySelector("#shadow-src-port").value, 10);
+      const th = document.querySelector("#shadow-tgt-host").value.trim();
+      const tp = parseInt(document.querySelector("#shadow-tgt-port").value, 10);
+      const status = document.querySelector("#shadow-status");
+      const result = document.querySelector("#shadow-result");
+
+      if (!sql || !sh || !sp || !th || !tp) {
+        status.textContent = "fill SQL + both source and shadow host/port";
+        return;
+      }
+      status.textContent = "diffing…";
+      result.textContent = "";
+      try {
+        const r = await fetch("/api/shadow", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sql,
+            source_host: sh, source_port: sp,
+            shadow_host: th, shadow_port: tp,
+          }),
+        });
+        const j = await r.json();
+        if (r.ok) {
+          status.textContent = j.is_clean
+            ? "clean — both sides match"
+            : `divergent: count_match=${j.row_count_match} hash_match=${j.row_hash_match}`;
+          status.style.color = j.is_clean ? "var(--ok)" : "var(--err)";
+        } else {
+          status.textContent = `error ${r.status}`;
+          status.style.color = "var(--err)";
+        }
+        result.textContent = JSON.stringify(j, null, 2);
+      } catch (e) {
+        status.textContent = "failed";
+        result.textContent = e.message;
+      }
+    });
 
     document.querySelector("#chaos-force").addEventListener("click", () => {
       const node = document.querySelector("#chaos-node").value.trim();
