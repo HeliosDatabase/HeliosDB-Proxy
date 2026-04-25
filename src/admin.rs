@@ -6,6 +6,7 @@
 use crate::config::{NodeConfig, NodeRole, ProxyConfig};
 #[cfg(feature = "wasm-plugins")]
 use crate::plugins::PluginManager;
+#[cfg(feature = "ha-tr")]
 use crate::replay::{ReplayEngine, TimeTravelRequest};
 use crate::server::{NodeHealth, ServerMetricsSnapshot};
 use crate::{ProxyError, Result};
@@ -53,6 +54,7 @@ pub struct AdminState {
     /// Time-travel replay engine. Optional so test fixtures don't have
     /// to wire a backend template; production startup attaches it via
     /// `with_replay_engine`. Endpoint returns 503 when missing.
+    #[cfg(feature = "ha-tr")]
     pub replay_engine: RwLock<Option<Arc<ReplayEngine>>>,
     /// WASM plugin manager. None when the proxy started without
     /// plugins (or with a different feature set). `/plugins`
@@ -360,7 +362,13 @@ impl AdminServer {
             // Time-travel replay — replays a journal window against a
             // target backend (typically a staging DB). Body shape is
             // `ReplayRequestBody` below.
+            #[cfg(feature = "ha-tr")]
             ("POST", "/api/replay") => Self::handle_replay_request(body, state).await,
+            #[cfg(not(feature = "ha-tr"))]
+            ("POST", "/api/replay") => Ok((
+                503,
+                serde_json::json!({ "error": "ha-tr feature not compiled in" }),
+            )),
 
             // Loaded WASM plugins — name, version, hooks, state,
             // invocation count. Returns 503 when no plugin manager
@@ -672,6 +680,7 @@ impl AdminServer {
     /// Handle `POST /api/replay`. Body is a JSON `ReplayRequestBody`.
     /// Returns 503 when no replay engine is attached, 400 on a malformed
     /// body or inverted window, 200 with `ReplaySummary` on success.
+    #[cfg(feature = "ha-tr")]
     async fn handle_replay_request(
         body: Option<&str>,
         state: &Arc<AdminState>,
@@ -1011,6 +1020,7 @@ impl AdminState {
             proxy_config: RwLock::new(None),
             read_lb_counter: AtomicUsize::new(0),
             commands: RwLock::new(HashMap::new()),
+            #[cfg(feature = "ha-tr")]
             replay_engine: RwLock::new(None),
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: RwLock::new(None),
@@ -1022,6 +1032,7 @@ impl AdminState {
     /// this once with a `ReplayEngine` constructed from the proxy's
     /// shared `TransactionJournal` + a `BackendConfig` template; the
     /// `/api/replay` endpoint returns 503 until this is set.
+    #[cfg(feature = "ha-tr")]
     pub async fn with_replay_engine(&self, engine: Arc<ReplayEngine>) {
         *self.replay_engine.write().await = Some(engine);
     }
@@ -1199,6 +1210,7 @@ struct PluginListEntry {
 }
 
 /// JSON body for `POST /api/replay`.
+#[cfg(feature = "ha-tr")]
 #[derive(Debug, Deserialize)]
 struct ReplayRequestBody {
     /// RFC 3339 inclusive window start.
@@ -1443,6 +1455,7 @@ mod tests {
         assert_eq!(topo.current_primary.as_deref(), Some("primary.svc:5432"));
     }
 
+    #[cfg(feature = "ha-tr")]
     #[tokio::test]
     async fn test_replay_returns_503_when_engine_unattached() {
         let state = Arc::new(AdminState::new());
@@ -1459,6 +1472,7 @@ mod tests {
         assert_eq!(value["error"], "replay engine not attached");
     }
 
+    #[cfg(feature = "ha-tr")]
     #[tokio::test]
     async fn test_replay_400_on_malformed_body() {
         let state = Arc::new(AdminState::new());
@@ -1468,6 +1482,7 @@ mod tests {
         assert_eq!(status, 400);
     }
 
+    #[cfg(feature = "ha-tr")]
     #[tokio::test]
     async fn test_replay_errors_on_empty_body() {
         let state = Arc::new(AdminState::new());
