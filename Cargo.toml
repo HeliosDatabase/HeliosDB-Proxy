@@ -70,6 +70,15 @@ schema-routing = []
 # Distributed intelligent caching (DistribCache)
 distribcache = []
 
+# Anomaly detection (rate spikes, credential stuffing, SQL injection
+# heuristics, novel query shapes). In-process sliding windows; no
+# external data store.
+anomaly-detection = []
+
+# Edge / geo proxy mode — cache-first request handling, last-write-
+# wins TTL coherence, pull-on-miss + invalidation push.
+edge-proxy = []
+
 # ── Observability ────────────────────────────────────────────────────
 
 # Full observability (metrics, tracing)
@@ -84,7 +93,7 @@ all-features = [
     "rate-limiting", "circuit-breaker", "query-analytics",
     "multi-tenancy", "auth-proxy", "query-rewriting",
     "wasm-plugins", "graphql-gateway", "schema-routing",
-    "distribcache",
+    "distribcache", "anomaly-detection", "edge-proxy",
 ]
 
 [dependencies]
