@@ -60,6 +60,25 @@ pub struct AdminState {
     /// manager attached".
     #[cfg(feature = "wasm-plugins")]
     pub plugin_manager: RwLock<Option<Arc<PluginManager>>>,
+    /// Chaos-mode overrides: per-node-address marker that the chaos
+    /// system (POST /api/chaos) has forced this node to a particular
+    /// state. Lets the UI distinguish "operationally disabled" from
+    /// "chaos-injected fault" and lets `Reset` restore everything.
+    pub chaos_overrides: RwLock<HashMap<String, ChaosOverride>>,
+}
+
+/// Chaos override applied to a single node. Today only the
+/// `ForceUnhealthy` flavour is implemented — `inject_query_delay`
+/// is the natural follow-up but wants per-query interception that
+/// lives in the server message loop, not here.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChaosOverride {
+    /// Wall-clock when the override was applied (RFC 3339).
+    pub since: String,
+    /// "force_unhealthy" | "delay_ms"
+    pub kind: String,
+    /// Free-form description shown in admin UI.
+    pub note: String,
 }
 
 
@@ -348,6 +367,17 @@ impl AdminServer {
             // is attached (proxy started without --features
             // wasm-plugins or with plugins disabled in config).
             ("GET", "/plugins") => Self::handle_plugins_list(state).await,
+
+            // Chaos engineering — controlled fault injection for HA
+            // testing. Body is `ChaosRequestBody`; supported actions
+            // are `force_unhealthy` / `restore` / `reset`.
+            ("POST", "/api/chaos") => Self::handle_chaos_request(body, state).await,
+            // Read current overrides so the UI can show "what's
+            // currently broken on purpose".
+            ("GET", "/api/chaos") => {
+                let overrides = state.chaos_overrides.read().await.clone();
+                Ok((200, serde_json::to_value(overrides)?))
+            }
 
             // Configuration
             ("GET", "/config") => {
@@ -685,6 +715,87 @@ impl AdminServer {
         }
     }
 
+    /// Handle `POST /api/chaos`. Body is a JSON `ChaosRequestBody`.
+    ///
+    /// Supported actions (intentionally narrow — the goal is "test
+    /// the failover machinery without external chaos tooling", not
+    /// "ship a kitchen-sink fault injector"):
+    ///
+    ///   force_unhealthy { target_node }  — flip the node's health flag
+    ///                                      to false; the failover
+    ///                                      controller observes this and
+    ///                                      reroutes traffic.
+    ///   restore         { target_node }  — flip the node's health flag
+    ///                                      back to true and clear the
+    ///                                      override entry.
+    ///   reset                            — restore every overridden
+    ///                                      node in one call.
+    async fn handle_chaos_request(
+        body: Option<&str>,
+        state: &Arc<AdminState>,
+    ) -> Result<(u16, serde_json::Value)> {
+        let raw = body.ok_or_else(|| {
+            ProxyError::Internal("chaos: empty request body".to_string())
+        })?;
+        let action: ChaosAction = match serde_json::from_str(raw) {
+            Ok(a) => a,
+            Err(e) => {
+                return Ok((
+                    400,
+                    serde_json::json!({ "error": format!("invalid body: {}", e) }),
+                ));
+            }
+        };
+        match action {
+            ChaosAction::ForceUnhealthy { target_node } => {
+                if let Err(e) = Self::set_node_enabled(state, &target_node, false).await {
+                    return Ok((
+                        404,
+                        serde_json::json!({ "error": e.to_string() }),
+                    ));
+                }
+                state.chaos_overrides.write().await.insert(
+                    target_node.clone(),
+                    ChaosOverride {
+                        since: chrono::Utc::now().to_rfc3339(),
+                        kind: "force_unhealthy".to_string(),
+                        note: format!("forced unhealthy via chaos endpoint"),
+                    },
+                );
+                Ok((200, serde_json::json!({
+                    "applied":     "force_unhealthy",
+                    "target_node": target_node,
+                })))
+            }
+            ChaosAction::Restore { target_node } => {
+                if let Err(e) = Self::set_node_enabled(state, &target_node, true).await {
+                    return Ok((
+                        404,
+                        serde_json::json!({ "error": e.to_string() }),
+                    ));
+                }
+                state.chaos_overrides.write().await.remove(&target_node);
+                Ok((200, serde_json::json!({
+                    "restored":    target_node,
+                })))
+            }
+            ChaosAction::Reset => {
+                let overrides: Vec<String> =
+                    state.chaos_overrides.read().await.keys().cloned().collect();
+                let mut restored = Vec::with_capacity(overrides.len());
+                for addr in overrides {
+                    let _ = Self::set_node_enabled(state, &addr, true).await;
+                    restored.push(addr);
+                }
+                state.chaos_overrides.write().await.clear();
+                Ok((200, serde_json::json!({
+                    "reset":      true,
+                    "restored":   restored,
+                })))
+            }
+        }
+    }
+
     /// Handle `GET /plugins`. Returns 503 when no plugin manager is
     /// attached, 200 with `Vec<PluginListEntry>` otherwise. Building
     /// the response in admin.rs (rather than serialising
@@ -903,6 +1014,7 @@ impl AdminState {
             replay_engine: RwLock::new(None),
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: RwLock::new(None),
+            chaos_overrides: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1052,6 +1164,23 @@ impl From<NodeHealth> for NodeHealthResponse {
 #[derive(Serialize)]
 struct SessionsResponse {
     active_sessions: u64,
+}
+
+/// Chaos actions the proxy supports today. Forward-compatible —
+/// unknown actions deserialise as an error.
+///
+/// Wire shape: `{"action":"force_unhealthy","target_node":"..."}`.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum ChaosAction {
+    /// Mark a node unhealthy until restored (or until reset is
+    /// called). Triggers the failover path the same way a real
+    /// health-check failure would.
+    ForceUnhealthy { target_node: String },
+    /// Mark a previously-overridden node healthy again.
+    Restore { target_node: String },
+    /// Reset every chaos override in one call. Idempotent.
+    Reset,
 }
 
 /// JSON entry returned by `GET /plugins`. Built in admin.rs so the
@@ -1365,5 +1494,125 @@ mod tests {
             .await
             .expect("handler returns Ok");
         assert_eq!(status, 503);
+    }
+
+    /// Helper: state with a single healthy node seeded into health.
+    async fn chaos_state_with_node(addr: &str) -> Arc<AdminState> {
+        let state = Arc::new(AdminState::new());
+        state.node_health.write().await.insert(
+            addr.to_string(),
+            NodeHealth {
+                address: addr.to_string(),
+                healthy: true,
+                last_check: chrono::Utc::now(),
+                failure_count: 0,
+                last_error: None,
+                latency_ms: 1.0,
+                replication_lag_bytes: None,
+            },
+        );
+        state
+    }
+
+    #[tokio::test]
+    async fn test_chaos_force_unhealthy_flips_node_and_records_override() {
+        let state = chaos_state_with_node("primary.svc:5432").await;
+        let body = r#"{"action":"force_unhealthy","target_node":"primary.svc:5432"}"#;
+        let (status, value) = AdminServer::handle_chaos_request(Some(body), &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        assert_eq!(value["applied"], "force_unhealthy");
+        // Health flag flipped.
+        assert!(!state.node_health.read().await["primary.svc:5432"].healthy);
+        // Override recorded.
+        assert!(state.chaos_overrides.read().await.contains_key("primary.svc:5432"));
+    }
+
+    #[tokio::test]
+    async fn test_chaos_restore_clears_override_and_flips_back() {
+        let state = chaos_state_with_node("primary.svc:5432").await;
+        let _ = AdminServer::handle_chaos_request(
+            Some(r#"{"action":"force_unhealthy","target_node":"primary.svc:5432"}"#),
+            &state,
+        )
+        .await
+        .unwrap();
+        let (status, _) = AdminServer::handle_chaos_request(
+            Some(r#"{"action":"restore","target_node":"primary.svc:5432"}"#),
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, 200);
+        assert!(state.node_health.read().await["primary.svc:5432"].healthy);
+        assert!(state.chaos_overrides.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chaos_reset_restores_all_overrides() {
+        let state = chaos_state_with_node("a:5432").await;
+        state.node_health.write().await.insert(
+            "b:5432".to_string(),
+            NodeHealth {
+                address: "b:5432".to_string(),
+                healthy: true,
+                last_check: chrono::Utc::now(),
+                failure_count: 0,
+                last_error: None,
+                latency_ms: 1.0,
+                replication_lag_bytes: None,
+            },
+        );
+        for addr in &["a:5432", "b:5432"] {
+            let body = format!(r#"{{"action":"force_unhealthy","target_node":"{}"}}"#, addr);
+            let _ = AdminServer::handle_chaos_request(Some(&body), &state)
+                .await
+                .unwrap();
+        }
+        let (status, value) = AdminServer::handle_chaos_request(
+            Some(r#"{"action":"reset"}"#),
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(value["reset"], true);
+        let restored = value["restored"].as_array().unwrap();
+        assert_eq!(restored.len(), 2);
+        // Both nodes back to healthy + overrides cleared.
+        for addr in &["a:5432", "b:5432"] {
+            assert!(state.node_health.read().await[*addr].healthy);
+        }
+        assert!(state.chaos_overrides.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chaos_force_unhealthy_404s_when_node_unknown() {
+        let state = Arc::new(AdminState::new());
+        let body = r#"{"action":"force_unhealthy","target_node":"missing.svc:5432"}"#;
+        let (status, _) = AdminServer::handle_chaos_request(Some(body), &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn test_chaos_400_on_malformed_body() {
+        let state = Arc::new(AdminState::new());
+        let (status, _) = AdminServer::handle_chaos_request(Some("not json"), &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 400);
+    }
+
+    #[tokio::test]
+    async fn test_chaos_400_on_unknown_action() {
+        let state = Arc::new(AdminState::new());
+        let body = r#"{"action":"format_disk","target_node":"x"}"#;
+        let (status, _) = AdminServer::handle_chaos_request(Some(body), &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 400);
     }
 }

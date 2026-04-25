@@ -186,6 +186,28 @@
     </section>
 
     <section class="full">
+      <h2>Chaos Mode</h2>
+      <div class="body">
+        <p style="color: var(--muted); margin: 0 0 8px 0;">
+          Inject controlled faults to exercise the failover machinery.
+          Force a node unhealthy, then restore (or hit Reset to clear
+          everything in one call). Real health checks will reassert if
+          the underlying probe still fails.
+        </p>
+        <div class="row wrap">
+          <label>Target node
+            <input type="text" id="chaos-node" placeholder="primary.svc:5432">
+          </label>
+          <button id="chaos-force">Force unhealthy</button>
+          <button id="chaos-restore">Restore</button>
+          <button id="chaos-reset">Reset all</button>
+          <span id="chaos-status" style="color: var(--muted);"></span>
+        </div>
+        <pre class="result" id="chaos-result">No active chaos overrides.</pre>
+      </div>
+    </section>
+
+    <section class="full">
       <h2>Time-Travel Replay</h2>
       <div class="body">
         <div class="row wrap">
@@ -424,6 +446,53 @@
         status.textContent = "failed";
         result.textContent = e.message;
       }
+    });
+
+    async function chaos(action, opts = {}) {
+      const status = document.querySelector("#chaos-status");
+      const result = document.querySelector("#chaos-result");
+      status.textContent = `${action}…`;
+      try {
+        const r = await fetch("/api/chaos", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action, ...opts }),
+        });
+        const j = await r.json();
+        status.textContent = r.ok ? "ok" : `error ${r.status}`;
+        // After any action, re-query overrides for the result panel.
+        const cur = await fetch("/api/chaos").then(r => r.json()).catch(() => ({}));
+        const keys = Object.keys(cur);
+        if (keys.length === 0) {
+          result.textContent = "No active chaos overrides.";
+        } else {
+          result.textContent = JSON.stringify(cur, null, 2);
+        }
+        const _ = j;
+      } catch (e) {
+        status.textContent = "failed";
+        result.textContent = e.message;
+      }
+    }
+
+    document.querySelector("#chaos-force").addEventListener("click", () => {
+      const node = document.querySelector("#chaos-node").value.trim();
+      if (!node) {
+        document.querySelector("#chaos-status").textContent = "fill target node first";
+        return;
+      }
+      chaos("force_unhealthy", { target_node: node });
+    });
+    document.querySelector("#chaos-restore").addEventListener("click", () => {
+      const node = document.querySelector("#chaos-node").value.trim();
+      if (!node) {
+        document.querySelector("#chaos-status").textContent = "fill target node first";
+        return;
+      }
+      chaos("restore", { target_node: node });
+    });
+    document.querySelector("#chaos-reset").addEventListener("click", () => {
+      chaos("reset");
     });
 
     refresh();
