@@ -140,6 +140,11 @@
       <div class="body" id="metrics-cluster">loading…</div>
     </section>
 
+    <section>
+      <h2>Topology</h2>
+      <div class="body" id="topology">loading…</div>
+    </section>
+
     <section class="full">
       <h2>SQL</h2>
       <div class="body">
@@ -210,17 +215,31 @@
         metricRow("Failovers", (m.failovers ?? 0).toLocaleString());
     }
 
+    function renderTopology(t) {
+      const primary = t.currentPrimary
+        ? `<code>${t.currentPrimary}</code>`
+        : `<strong style='color:var(--warn)'>none — failover in progress</strong>`;
+      const failover = t.lastFailoverAt ? fmtTs(t.lastFailoverAt) : "never";
+      document.querySelector("#topology").innerHTML =
+        metricRow("Current primary", primary) +
+        metricRow("Healthy nodes", `${t.healthyNodes ?? 0} / ${t.totalNodes ?? 0}`) +
+        metricRow("Unhealthy nodes", (t.unhealthyNodes ?? 0).toLocaleString()) +
+        metricRow("Last failover", failover);
+    }
+
     async function refresh() {
       try {
-        const [nodes, metrics, sessions, version] = await Promise.all([
+        const [nodes, metrics, sessions, version, topo] = await Promise.all([
           j("/nodes").catch(() => []),
           j("/metrics").catch(() => ({})),
           j("/sessions").catch(() => ({ active_sessions: 0 })),
           j("/version").catch(() => ({})),
+          j("/topology").catch(() => ({})),
         ]);
         renderNodes(nodes);
         renderTraffic(metrics);
         renderCluster(metrics, sessions.active_sessions);
+        renderTopology(topo);
         if (version.version) {
           document.querySelector("#version").textContent = "v" + version.version;
         }
