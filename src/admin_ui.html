@@ -155,6 +155,26 @@
     </section>
 
     <section class="full">
+      <h2>Edge Mode</h2>
+      <div class="body">
+        <p style="color: var(--muted); margin: 0 0 8px 0;">
+          Cache stats + registered edges. Manual invalidation drops
+          cached results matching the supplied tables and broadcasts
+          to every edge.
+        </p>
+        <div id="edge-stats" style="margin-bottom: 12px;">loading…</div>
+        <div class="row wrap">
+          <label>Tables (comma-separated)
+            <input type="text" id="edge-inv-tables" placeholder="users, orders">
+          </label>
+          <button id="edge-invalidate">Invalidate</button>
+          <span id="edge-status" style="color: var(--muted);"></span>
+        </div>
+        <pre class="result" id="edge-result">No invalidations broadcast yet.</pre>
+      </div>
+    </section>
+
+    <section class="full">
       <h2>Anomalies</h2>
       <div class="body">
         <table id="anomalies">
@@ -398,6 +418,24 @@
       }
     }
 
+    function renderEdge(payload) {
+      const el = document.querySelector("#edge-stats");
+      if (!payload || payload.error) {
+        el.innerHTML = `<span style="color: var(--muted);">${payload?.error ?? "edge-proxy unavailable"}</span>`;
+        return;
+      }
+      const c = payload.cache ?? {};
+      const edges = payload.registered ?? [];
+      el.innerHTML =
+        metricRow("Edges registered", payload.edge_count ?? 0) +
+        metricRow("Cache entries", c.current_entries ?? 0) +
+        metricRow("Cache hits / misses", `${c.hits ?? 0} / ${c.misses ?? 0}`) +
+        metricRow("Inserts / evictions", `${c.inserts ?? 0} / ${c.entries_evicted ?? 0}`) +
+        metricRow("Invalidations received", c.invalidations_received ?? 0) +
+        (edges.length === 0 ? "" :
+          `<div style="margin-top:10px;font-size:12px;color:var(--muted);">Registered: ${edges.map(e => `<code>${e.edge_id}@${e.region}</code>`).join(", ")}</div>`);
+    }
+
     function renderAnomalies(payload) {
       const tbody = document.querySelector("#anomalies tbody");
       if (payload.error) {
@@ -433,17 +471,20 @@
 
     async function refresh() {
       try {
-        // /plugins and /anomalies return 503 when not attached; fetch
-        // .json() the response body either way so the panel can show
-        // the friendly message rather than spinning.
+        // /plugins, /anomalies, /api/edge return 503 when not attached;
+        // fetch .json() the response body either way so the panel
+        // shows the friendly message rather than spinning.
         const pluginsP = fetch("/plugins").then(async r => {
           try { return await r.json(); } catch { return []; }
         }).catch(() => []);
         const anomaliesP = fetch("/anomalies?limit=50").then(async r => {
           try { return await r.json(); } catch { return { events: [] }; }
         }).catch(() => ({ events: [] }));
+        const edgeP = fetch("/api/edge").then(async r => {
+          try { return await r.json(); } catch { return null; }
+        }).catch(() => null);
 
-        const [nodes, metrics, sessions, version, topo, plugins, anomalies] = await Promise.all([
+        const [nodes, metrics, sessions, version, topo, plugins, anomalies, edge] = await Promise.all([
           j("/nodes").catch(() => []),
           j("/metrics").catch(() => ({})),
           j("/sessions").catch(() => ({ active_sessions: 0 })),
@@ -451,6 +492,7 @@
           j("/topology").catch(() => ({})),
           pluginsP,
           anomaliesP,
+          edgeP,
         ]);
         renderNodes(nodes);
         renderTraffic(metrics);
@@ -458,6 +500,7 @@
         renderTopology(topo);
         renderPlugins(plugins);
         renderAnomalies(anomalies);
+        renderEdge(edge);
         if (version.version) {
           document.querySelector("#version").textContent = "v" + version.version;
         }
@@ -571,6 +614,33 @@
         result.textContent = e.message;
       }
     }
+
+    document.querySelector("#edge-invalidate").addEventListener("click", async () => {
+      const tablesRaw = document.querySelector("#edge-inv-tables").value.trim();
+      const tables = tablesRaw === ""
+        ? []
+        : tablesRaw.split(",").map(s => s.trim()).filter(Boolean);
+      const status = document.querySelector("#edge-status");
+      const result = document.querySelector("#edge-result");
+      status.textContent = "invalidating…";
+      try {
+        const r = await fetch("/api/edge/invalidate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tables }),
+        });
+        const j = await r.json();
+        if (r.ok) {
+          status.textContent = `dropped ${j.dropped_local ?? 0} local; notified ${j.edges_notified ?? 0} edges`;
+        } else {
+          status.textContent = `error ${r.status}`;
+        }
+        result.textContent = JSON.stringify(j, null, 2);
+      } catch (e) {
+        status.textContent = "failed";
+        result.textContent = e.message;
+      }
+    });
 
     document.querySelector("#shadow-run").addEventListener("click", async () => {
       const sql = document.querySelector("#shadow-sql").value.trim();
