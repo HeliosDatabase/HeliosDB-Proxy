@@ -62,6 +62,40 @@ impl From<PluginLoadError> for super::runtime::PluginError {
     }
 }
 
+/// Artefact manifest as it appears inside a `helios-plugin pack`
+/// `.tar.gz`. Mirrors `cli/src/manifest.rs::Manifest` exactly — kept
+/// here as a private deserialisation type so the proxy doesn't take a
+/// dep on the CLI crate.
+#[derive(Debug, serde::Deserialize)]
+struct ArtefactManifest {
+    schema_version: String,
+    name: String,
+    version: String,
+    description: String,
+    license: String,
+    hooks: Vec<String>,
+    wasm_sha256: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    signature_sha256: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    signature_algorithm: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    packed_at: String,
+}
+
+fn sha256_hex_local(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut s = String::with_capacity(64);
+    for b in digest.iter() {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
 /// Plugin manifest (from plugin.yaml or embedded in WASM)
 #[derive(Debug, Clone)]
 pub struct PluginManifest {
@@ -274,11 +308,16 @@ impl SignatureVerifier {
 }
 
 impl PluginLoader {
-    /// Create a new plugin loader
+    /// Create a new plugin loader. Accepts both raw `.wasm` files
+    /// (the dev-loop format) and packed `.tar.gz` artefacts (the
+    /// distribution format produced by `helios-plugin pack`).
     pub fn new() -> Self {
         Self {
             search_paths: Vec::new(),
-            allowed_extensions: vec!["wasm".to_string()],
+            allowed_extensions: vec![
+                "wasm".to_string(),
+                "gz".to_string(), // for `.tar.gz` artefacts
+            ],
             signature_verifier: None,
         }
     }
@@ -295,11 +334,24 @@ impl PluginLoader {
         self.search_paths.push(path);
     }
 
-    /// Load a plugin from a file path
+    /// Load a plugin from a file path. Two accepted shapes:
+    ///
+    ///   1. Bare `.wasm` (the dev-loop format) — looks for a sidecar
+    ///      `.yaml` / `.json` manifest and, if a trust root is
+    ///      attached, a `.sig` sidecar.
+    ///   2. Packed `.tar.gz` artefact (the distribution format
+    ///      produced by `helios-plugin pack`) — manifest and signature
+    ///      are baked into the tarball; no sidecars needed.
     pub fn load(&self, path: &Path) -> Result<(PluginManifest, Vec<u8>), PluginLoadError> {
         // Check file exists
         if !path.exists() {
             return Err(PluginLoadError::FileNotFound(path.display().to_string()));
+        }
+
+        // Tarball path — distinct because manifest + signature live
+        // inside the artefact rather than as sidecars.
+        if path.extension().and_then(|e| e.to_str()) == Some("gz") {
+            return self.load_tar_gz(path);
         }
 
         // Check extension
@@ -346,6 +398,139 @@ impl PluginLoader {
         let manifest = self.load_manifest(path, &wasm_bytes)?;
 
         Ok((manifest, wasm_bytes))
+    }
+
+    /// Load a plugin packed as a `.tar.gz` artefact (the format
+    /// `helios-plugin pack` produces). Reads `manifest.json` +
+    /// `plugin.wasm` + optional `plugin.sig` from the tarball,
+    /// verifies the wasm SHA-256 against the manifest, verifies the
+    /// signature against the configured trust root if set.
+    fn load_tar_gz(&self, path: &Path) -> Result<(PluginManifest, Vec<u8>), PluginLoadError> {
+        use std::io::{Cursor, Read};
+
+        let raw = fs::read(path)?;
+        let gz = flate2::read::GzDecoder::new(Cursor::new(raw));
+        let mut archive = tar::Archive::new(gz);
+
+        let mut manifest_json: Option<Vec<u8>> = None;
+        let mut wasm_bytes: Option<Vec<u8>> = None;
+        let mut sig_bytes: Option<Vec<u8>> = None;
+
+        let entries = archive.entries().map_err(|e| {
+            PluginLoadError::InvalidFormat(format!("tar entries: {}", e))
+        })?;
+        for entry in entries {
+            let mut entry = entry.map_err(|e| {
+                PluginLoadError::InvalidFormat(format!("tar entry: {}", e))
+            })?;
+            let entry_path = entry
+                .path()
+                .map_err(|e| PluginLoadError::InvalidFormat(format!("tar path: {}", e)))?
+                .to_string_lossy()
+                .to_string();
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf).map_err(|e| {
+                PluginLoadError::IoError(format!("tar read entry: {}", e))
+            })?;
+            match entry_path.as_str() {
+                "manifest.json" => manifest_json = Some(buf),
+                "plugin.wasm" => wasm_bytes = Some(buf),
+                "plugin.sig" => sig_bytes = Some(buf),
+                _ => {}
+            }
+        }
+
+        let manifest_json = manifest_json.ok_or_else(|| {
+            PluginLoadError::InvalidFormat(
+                "artefact missing manifest.json".to_string(),
+            )
+        })?;
+        let wasm = wasm_bytes.ok_or_else(|| {
+            PluginLoadError::InvalidFormat("artefact missing plugin.wasm".to_string())
+        })?;
+
+        // Parse the artefact manifest. Field names mirror the helios-
+        // plugin CLI's Manifest type one-for-one.
+        let art: ArtefactManifest = serde_json::from_slice(&manifest_json).map_err(|e| {
+            PluginLoadError::ManifestError(format!("manifest.json: {}", e))
+        })?;
+
+        // Major-version compatibility (today: only "1.x" understood).
+        let major_ok = art
+            .schema_version
+            .split('.')
+            .next()
+            .map(|m| m == "1")
+            .unwrap_or(false);
+        if !major_ok {
+            return Err(PluginLoadError::InvalidFormat(format!(
+                "unsupported artefact schema version: {}",
+                art.schema_version
+            )));
+        }
+
+        // Validate wasm SHA-256.
+        let actual_hash = sha256_hex_local(&wasm);
+        if actual_hash != art.wasm_sha256 {
+            return Err(PluginLoadError::InvalidFormat(format!(
+                "wasm sha256 mismatch: manifest claims {}, actual {}",
+                art.wasm_sha256, actual_hash
+            )));
+        }
+
+        // Validate WASM magic number too — the SHA check guarantees
+        // the bytes are intact, but a malicious manifest could
+        // advertise non-WASM bytes that hash correctly.
+        if wasm.len() < 8 || &wasm[0..4] != b"\x00asm" {
+            return Err(PluginLoadError::InvalidFormat(
+                "artefact plugin.wasm has bad magic number".to_string(),
+            ));
+        }
+
+        // Signature verification when trust root is attached.
+        if let Some(ref verifier) = self.signature_verifier {
+            let sig = sig_bytes.ok_or_else(|| {
+                PluginLoadError::SignatureInvalid(
+                    "artefact has no signature but trust root is active".into(),
+                )
+            })?;
+            let sig_str = std::str::from_utf8(&sig).map_err(|e| {
+                PluginLoadError::SignatureInvalid(format!(
+                    "signature must be UTF-8 base64: {}",
+                    e
+                ))
+            })?;
+            let label = verifier.verify(&wasm, sig_str)?;
+            tracing::info!(
+                artefact = %path.display(),
+                signed_by = %label,
+                "plugin artefact signature verified"
+            );
+        }
+
+        // Build a PluginManifest from the artefact metadata. Hooks
+        // come over as strings; map them through HookType::from_str.
+        let mut hooks = Vec::with_capacity(art.hooks.len());
+        for h in &art.hooks {
+            if let Some(t) = super::HookType::from_str(h) {
+                hooks.push(t);
+            }
+        }
+        let manifest = PluginManifest {
+            name: art.name,
+            version: art.version,
+            description: art.description,
+            author: String::new(),
+            license: art.license,
+            hooks,
+            permissions: vec![],
+            min_memory: 1024 * 1024,
+            max_memory: 64 * 1024 * 1024,
+            config_schema: HashMap::new(),
+            path: path.to_path_buf(),
+        };
+
+        Ok((manifest, wasm))
     }
 
     /// Load plugin manifest
@@ -849,5 +1034,220 @@ mod tests {
             "expected SignatureInvalid for missing .sig, got {:?}",
             err
         );
+    }
+
+    // -----------------------------------------------------------------
+    // .tar.gz artefact loader tests (FU-28). Manually build a tarball
+    // shaped like helios-plugin's output and feed it through load().
+    // Avoids a workspace dep on the CLI crate.
+    // -----------------------------------------------------------------
+
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use sha2::{Digest, Sha256};
+
+    fn fake_wasm(extra: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        v.extend_from_slice(extra);
+        v
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let d = Sha256::digest(bytes);
+        let mut s = String::new();
+        for b in d.iter() {
+            s.push_str(&format!("{:02x}", b));
+        }
+        s
+    }
+
+    fn pack_tarball(
+        dir: &Path,
+        name: &str,
+        wasm: &[u8],
+        sig: Option<&[u8]>,
+    ) -> std::path::PathBuf {
+        let manifest = serde_json::json!({
+            "schema_version": "1.0",
+            "name": name,
+            "version": "0.1.0",
+            "description": "test",
+            "license": "AGPL-3.0-only",
+            "hooks": ["pre_query", "post_query"],
+            "wasm_sha256": sha256_hex(wasm),
+            "signature_sha256": sig.map(sha256_hex),
+            "signature_algorithm": sig.map(|_| "ed25519"),
+            "packed_at": "2026-04-25T13:00:00Z",
+        });
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+
+        let out_path = dir.join(format!("{}.tar.gz", name));
+        let f = std::fs::File::create(&out_path).unwrap();
+        let gz = GzEncoder::new(f, Compression::default());
+        let mut tar = tar::Builder::new(gz);
+
+        let mut put = |path: &str, body: &[u8]| {
+            let mut h = tar::Header::new_gnu();
+            h.set_path(path).unwrap();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tar.append(&h, body).unwrap();
+        };
+        put("manifest.json", &manifest_bytes);
+        put("plugin.wasm", wasm);
+        if let Some(s) = sig {
+            put("plugin.sig", s);
+        }
+        let gz = tar.into_inner().unwrap();
+        gz.finish().unwrap();
+        out_path
+    }
+
+    #[test]
+    fn test_loader_accepts_tar_gz_artefact_without_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm = fake_wasm(b"unsigned");
+        let path = pack_tarball(dir.path(), "test-plugin", &wasm, None);
+
+        let loader = PluginLoader::new();
+        let (manifest, bytes) = loader.load(&path).unwrap();
+        assert_eq!(manifest.name, "test-plugin");
+        assert_eq!(manifest.version, "0.1.0");
+        assert_eq!(bytes, wasm);
+        // Hooks parsed from string array.
+        assert!(manifest.hooks.contains(&super::super::HookType::PreQuery));
+        assert!(manifest.hooks.contains(&super::super::HookType::PostQuery));
+    }
+
+    #[test]
+    fn test_loader_rejects_tar_gz_with_wrong_wasm_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        // Build a tarball where manifest.wasm_sha256 doesn't match
+        // the actual wasm bytes.
+        let real_wasm = fake_wasm(b"real");
+        let manifest = serde_json::json!({
+            "schema_version": "1.0",
+            "name": "x",
+            "version": "0.1.0",
+            "description": "",
+            "license": "AGPL-3.0-only",
+            "hooks": [],
+            "wasm_sha256": "deadbeef".repeat(8),  // wrong hash
+            "packed_at": "2026-04-25T13:00:00Z",
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let out_path = dir.path().join("bad.tar.gz");
+        let f = std::fs::File::create(&out_path).unwrap();
+        let gz = GzEncoder::new(f, Compression::default());
+        let mut tar = tar::Builder::new(gz);
+        let mut put = |path: &str, body: &[u8]| {
+            let mut h = tar::Header::new_gnu();
+            h.set_path(path).unwrap();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tar.append(&h, body).unwrap();
+        };
+        put("manifest.json", &manifest_bytes);
+        put("plugin.wasm", &real_wasm);
+        let gz = tar.into_inner().unwrap();
+        gz.finish().unwrap();
+
+        let loader = PluginLoader::new();
+        let err = loader.load(&out_path).unwrap_err();
+        match err {
+            PluginLoadError::InvalidFormat(msg) => {
+                assert!(msg.contains("sha256 mismatch"), "got {}", msg)
+            }
+            other => panic!("expected InvalidFormat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_loader_rejects_tar_gz_unknown_schema_major() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm = fake_wasm(b"x");
+        let manifest = serde_json::json!({
+            "schema_version": "9.0",
+            "name": "x",
+            "version": "0.1.0",
+            "description": "",
+            "license": "AGPL-3.0-only",
+            "hooks": [],
+            "wasm_sha256": sha256_hex(&wasm),
+            "packed_at": "2026-04-25T13:00:00Z",
+        });
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let out_path = dir.path().join("future.tar.gz");
+        let f = std::fs::File::create(&out_path).unwrap();
+        let gz = GzEncoder::new(f, Compression::default());
+        let mut tar = tar::Builder::new(gz);
+        let mut put = |path: &str, body: &[u8]| {
+            let mut h = tar::Header::new_gnu();
+            h.set_path(path).unwrap();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tar.append(&h, body).unwrap();
+        };
+        put("manifest.json", &manifest_bytes);
+        put("plugin.wasm", &wasm);
+        let gz = tar.into_inner().unwrap();
+        gz.finish().unwrap();
+
+        let loader = PluginLoader::new();
+        let err = loader.load(&out_path).unwrap_err();
+        match err {
+            PluginLoadError::InvalidFormat(msg) => {
+                assert!(msg.contains("schema version"), "got {}", msg)
+            }
+            other => panic!("expected InvalidFormat, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_loader_tar_gz_signature_verifies_against_trust_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = make_signing_key();
+        let wasm = fake_wasm(b"signed-body");
+
+        // Sign the wasm bytes with our test key.
+        use ed25519_dalek::Signer;
+        let sig = key.sign(&wasm);
+        let sig_b64 = base64::engine::general_purpose::STANDARD
+            .encode(sig.to_bytes())
+            .into_bytes();
+
+        let path = pack_tarball(dir.path(), "signed-plugin", &wasm, Some(&sig_b64));
+
+        let trust_dir = tempfile::tempdir().unwrap();
+        write_pub_key(trust_dir.path(), "official", &key);
+
+        let loader = PluginLoader::new()
+            .with_signature_verifier(
+                SignatureVerifier::from_trust_root(trust_dir.path()).unwrap(),
+            );
+        let (manifest, bytes) = loader.load(&path).unwrap();
+        assert_eq!(manifest.name, "signed-plugin");
+        assert_eq!(bytes, wasm);
+    }
+
+    #[test]
+    fn test_loader_tar_gz_rejects_missing_signature_when_trust_root_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm = fake_wasm(b"unsigned");
+        let path = pack_tarball(dir.path(), "p", &wasm, None);
+
+        let trust_dir = tempfile::tempdir().unwrap();
+        let key = make_signing_key();
+        write_pub_key(trust_dir.path(), "official", &key);
+
+        let loader = PluginLoader::new()
+            .with_signature_verifier(
+                SignatureVerifier::from_trust_root(trust_dir.path()).unwrap(),
+            );
+        let err = loader.load(&path).unwrap_err();
+        assert!(matches!(err, PluginLoadError::SignatureInvalid(_)));
     }
 }

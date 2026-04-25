@@ -153,6 +153,11 @@ md-5 = "0.10"
 # `default-features = false` strips std-allocator-only paths we don't
 # use and keeps the dep set tight.
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "fast"] }
+# Plugin OCI artefact (.tar.gz with manifest.json + plugin.wasm +
+# plugin.sig) ingestion. Optional — only pulled in when the plugin
+# loader sees a .tar.gz extension.
+tar    = "0.4"
+flate2 = "1"
 
 # WASM plugin runtime — wasmtime is feature-gated on wasm-plugins so
 # default builds don't pay the (~3 MB compiled) cost. The cranelift
