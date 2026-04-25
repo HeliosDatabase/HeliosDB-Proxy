@@ -781,6 +781,8 @@ impl<'de> serde::Deserialize<'de> for RouteResult {
             action: String,
             #[serde(default)]
             target: Option<String>,
+            #[serde(default)]
+            reason: Option<String>,
         }
 
         let helper = Helper::deserialize(deserializer)?;
@@ -790,6 +792,12 @@ impl<'de> serde::Deserialize<'de> for RouteResult {
             "primary" => Ok(RouteResult::Primary),
             "standby" => Ok(RouteResult::Standby),
             "branch" => Ok(RouteResult::Branch(helper.target.unwrap_or_default())),
+            // Block carries a human-readable reason in its own field so
+            // it doesn't overload `target` (which is a node identifier
+            // for the other variants).
+            "block" => Ok(RouteResult::Block(
+                helper.reason.unwrap_or_else(|| "blocked by plugin".to_string()),
+            )),
             _ => Ok(RouteResult::Default),
         }
     }
@@ -1088,6 +1096,35 @@ mod tests {
         "#;
         let bytes = wat::parse_str(wat).expect("sha256-wat parses");
         Module::from_binary(engine, &bytes).expect("sha256 module compiles")
+    }
+
+    /// RouteResult deserialiser handles the new Block variant via a
+    /// `reason` field separate from `target` (which the other variants
+    /// use as a node identifier).
+    #[test]
+    fn test_route_result_deserialises_block_with_reason() {
+        let json = r#"{"action":"block","reason":"cross-region read forbidden"}"#;
+        let r: RouteResult = serde_json::from_str(json).expect("block deserialises");
+        match r {
+            RouteResult::Block(reason) => {
+                assert_eq!(reason, "cross-region read forbidden");
+            }
+            other => panic!("expected Block, got {:?}", other),
+        }
+    }
+
+    /// Block without a reason field falls back to a generic message —
+    /// keeps the deserialiser permissive when plugins forget the field.
+    #[test]
+    fn test_route_result_block_defaults_reason_when_missing() {
+        let json = r#"{"action":"block"}"#;
+        let r: RouteResult = serde_json::from_str(json).expect("block deserialises");
+        match r {
+            RouteResult::Block(reason) => {
+                assert!(!reason.is_empty(), "default reason should not be empty");
+            }
+            other => panic!("expected Block, got {:?}", other),
+        }
     }
 
     /// SHA-256 of "abc" is the canonical RFC 6234 test vector. Verifies

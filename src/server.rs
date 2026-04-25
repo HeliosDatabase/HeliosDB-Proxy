@@ -267,6 +267,11 @@ enum RouteOverride {
     /// heuristic; the proxy will still verify the node is healthy before
     /// connecting (via the normal switch-vs-reuse flow).
     Node(String),
+    /// Reject the query: write a PG ErrorResponse + ReadyForQuery to
+    /// the client and skip the forward. Carries the reason the plugin
+    /// supplied. Takes precedence over every other field — the proxy
+    /// short-circuits before any backend selection.
+    Block(String),
 }
 
 impl ProxyServer {
@@ -1084,12 +1089,31 @@ impl ProxyServer {
         // primary/standby, or pin the query to a specific node.
         let route_override = Self::apply_route_hook(msg, state, session);
 
+        // Block short-circuits before any backend selection: synthesise
+        // a PG ErrorResponse + ReadyForQuery, hand the existing backend
+        // stream and current node back unchanged so the caller can
+        // continue the session normally with the next message.
+        if let RouteOverride::Block(reason) = route_override {
+            let mut response = Vec::with_capacity(64 + reason.len());
+            response.extend_from_slice(&Self::create_error_response(
+                "42000",
+                &format!("Query blocked by route plugin: {}", reason),
+            ));
+            response.extend_from_slice(&Self::create_ready_for_query(b'I'));
+            state
+                .metrics
+                .bytes_sent
+                .fetch_add(response.len() as u64, Ordering::Relaxed);
+            return Ok((response, backend_stream, current_node));
+        }
+
         // Derive effective (is_write, forced_target) after override.
         let (is_write, forced_target) = match route_override {
             RouteOverride::None => (default_is_write, None),
             RouteOverride::Primary => (true, None),
             RouteOverride::Standby => (false, None),
             RouteOverride::Node(name) => (default_is_write, Some(name)),
+            RouteOverride::Block(_) => unreachable!("handled above"),
         };
 
         // Sticky session mode: stay on the same backend if healthy and
@@ -1777,6 +1801,7 @@ impl ProxyServer {
                 RouteResult::Primary => RouteOverride::Primary,
                 RouteResult::Standby => RouteOverride::Standby,
                 RouteResult::Node(name) => RouteOverride::Node(name),
+                RouteResult::Block(reason) => RouteOverride::Block(reason),
                 RouteResult::Branch(name) => {
                     tracing::warn!(
                         branch = %name,
