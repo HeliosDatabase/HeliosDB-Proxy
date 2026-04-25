@@ -170,6 +170,54 @@ pub fn register_kv_imports(linker: &mut Linker<StoreCtx>) -> Result<(), PluginEr
     Ok(())
 }
 
+/// Register the `env.sha256_hex` host import. Plugins call:
+///
+/// ```text
+/// env.sha256_hex(in_ptr: i32, in_len: i32, out_ptr: i32) -> i32
+/// ```
+///
+/// where `out_ptr` must point to at least 64 bytes inside plugin
+/// memory (the lower-case hex SHA-256 digest is exactly 64 ASCII
+/// chars). Returns 64 on success, -1 on memory error.
+///
+/// The host computes the digest over the plugin-supplied byte range
+/// using the production `sha2` crate; plugins no longer need to
+/// embed their own (placeholder) hash and stay small.
+pub fn register_crypto_imports(linker: &mut Linker<StoreCtx>) -> Result<(), PluginError> {
+    use sha2::{Digest, Sha256};
+
+    linker
+        .func_wrap(
+            "env",
+            "sha256_hex",
+            |mut caller: Caller<'_, StoreCtx>, in_ptr: i32, in_len: i32, out_ptr: i32| -> i32 {
+                let memory = match get_memory(&mut caller) {
+                    Some(m) => m,
+                    None => return -1,
+                };
+                let input = match read_bytes(&memory, &caller, in_ptr, in_len) {
+                    Some(b) => b,
+                    None => return -1,
+                };
+                let digest = Sha256::digest(&input);
+                // Hex-encode into a fixed 64-byte stack buffer so we
+                // don't allocate per call.
+                let mut hex = [0u8; 64];
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                for (i, b) in digest.iter().enumerate() {
+                    hex[i * 2]     = HEX[(b >> 4) as usize];
+                    hex[i * 2 + 1] = HEX[(b & 0x0f) as usize];
+                }
+                if write_bytes(&memory, &mut caller, out_ptr, &hex).is_err() {
+                    return -1;
+                }
+                64
+            },
+        )
+        .map_err(|e| PluginError::RuntimeError(format!("link sha256_hex: {}", e)))?;
+    Ok(())
+}
+
 fn get_memory(caller: &mut Caller<'_, StoreCtx>) -> Option<Memory> {
     caller.get_export("memory").and_then(|e| e.into_memory())
 }

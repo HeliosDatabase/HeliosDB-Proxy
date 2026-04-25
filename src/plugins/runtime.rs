@@ -35,7 +35,7 @@ use wasmtime::{Engine, Instance, Linker, Module, Store, TypedFunc, Memory};
 
 use super::config::PluginRuntimeConfig;
 use super::host_functions::HostFunctionRegistry;
-use super::host_imports::{register_kv_imports, KvBackend, StoreCtx};
+use super::host_imports::{register_crypto_imports, register_kv_imports, KvBackend, StoreCtx};
 use super::sandbox::{PluginSandbox, SecurityPolicy, ResourceLimits};
 use super::{
     AuthRequest, AuthResult, HookType, PluginMetadata, PreQueryResult,
@@ -423,6 +423,7 @@ impl WasmPluginRuntime {
         // KV (or other future imports) get them resolved here.
         let mut linker: Linker<StoreCtx> = Linker::new(&self.engine);
         register_kv_imports(&mut linker)?;
+        register_crypto_imports(&mut linker)?;
         let instance = linker
             .instantiate(&mut store, &plugin.module)
             .map_err(|e| {
@@ -1054,5 +1055,69 @@ mod tests {
         );
         // And nowhere else.
         assert_eq!(runtime.kv().get("other-plugin", b"key"), None);
+    }
+
+    /// Build a WAT module that imports `env.sha256_hex` and exposes a
+    /// `pre_query` hook which:
+    ///   1. computes sha256_hex over an embedded "abc" payload at
+    ///      offset 100 (3 bytes)
+    ///   2. writes the 64-byte hex digest at offset 200
+    ///   3. returns the packed (200 << 32) | 64
+    /// so the host can read the digest out of plugin memory.
+    fn build_sha256_test_module(engine: &Engine) -> Module {
+        let wat = r#"
+            (module
+              (import "env" "sha256_hex"
+                (func $sha256_hex (param i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+
+              (data (i32.const 100) "abc")
+
+              (func (export "alloc") (param i32) (result i32) (i32.const 4096))
+              (func (export "dealloc") (param i32 i32))
+
+              (func (export "pre_query")
+                (param $in_ptr i32) (param $in_len i32) (result i64)
+                (drop (call $sha256_hex
+                  (i32.const 100) (i32.const 3)
+                  (i32.const 200)))
+                (i64.or
+                  (i64.shl (i64.const 200) (i64.const 32))
+                  (i64.const 64)))
+            )
+        "#;
+        let bytes = wat::parse_str(wat).expect("sha256-wat parses");
+        Module::from_binary(engine, &bytes).expect("sha256 module compiles")
+    }
+
+    /// SHA-256 of "abc" is the canonical RFC 6234 test vector. Verifies
+    /// the host-import bridge produces real cryptographic output, not
+    /// the FNV-flavoured placeholder that audit-chain ships today.
+    #[test]
+    fn test_host_sha256_import_matches_rfc_6234_vector() {
+        const SHA256_OF_ABC: &[u8; 64] =
+            b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+        let mut config = PluginRuntimeConfig::default();
+        config.fuel_metering = false;
+        let runtime = WasmPluginRuntime::new(&config).unwrap();
+
+        let module = build_sha256_test_module(runtime.engine());
+        let mut metadata = PluginMetadata::default();
+        metadata.name = "sha256-test-plugin".to_string();
+        metadata.hooks = vec![HookType::PreQuery];
+
+        let plugin = LoadedPlugin::new(
+            metadata,
+            PathBuf::from("/test/sha256.wasm"),
+            module,
+            PluginSandbox::default(),
+        );
+
+        let out = runtime
+            .call_hook(&plugin, HookType::PreQuery, &[])
+            .expect("pre_query call");
+        assert_eq!(out.len(), 64);
+        assert_eq!(&out[..], SHA256_OF_ABC);
     }
 }
