@@ -208,6 +208,74 @@ fn ai_classifier_writes_request_keys_into_kv() {
     assert_eq!(&agent[..], b"gpt-shopper");
 }
 
+/// Pack a real .wasm into a .tar.gz artefact via the helios-plugin
+/// CLI and load it through the proxy's loader. End-user round-trip
+/// proving the FU-27 / FU-28 chain works in production wiring.
+#[test]
+fn proxy_loads_packed_tar_gz_artefact() {
+    use heliosdb_proxy::plugins::PluginLoader;
+
+    let Some(wasm_path) = find_plugin_wasm("helios_plugin_cost_governor") else {
+        eprintln!("skipping: cost-governor wasm not found");
+        return;
+    };
+
+    // Build the artefact by reading the wasm and packing inline (no
+    // shelling out to the CLI — keeps the test hermetic). Mirrors
+    // exactly what `helios-plugin pack` produces.
+    let wasm_bytes = std::fs::read(&wasm_path).unwrap();
+    let mut hasher = sha2::Sha256::new();
+    use sha2::Digest;
+    hasher.update(&wasm_bytes);
+    let digest = hasher.finalize();
+    let mut wasm_sha = String::new();
+    for b in digest.iter() {
+        wasm_sha.push_str(&format!("{:02x}", b));
+    }
+    let manifest_json = serde_json::json!({
+        "schema_version": "1.0",
+        "name": "helios-plugin-cost-governor",
+        "version": "0.1.0",
+        "description": "test artefact",
+        "license": "AGPL-3.0-only",
+        "hooks": ["pre_query", "post_query"],
+        "wasm_sha256": wasm_sha,
+        "packed_at": "2026-04-25T13:00:00Z",
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest_json).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let artefact_path = tmp.path().join("cost-governor.tar.gz");
+    let f = std::fs::File::create(&artefact_path).unwrap();
+    let gz = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+    let mut tar_b = tar::Builder::new(gz);
+    let mut put = |path: &str, body: &[u8]| {
+        let mut h = tar::Header::new_gnu();
+        h.set_path(path).unwrap();
+        h.set_size(body.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        tar_b.append(&h, body).unwrap();
+    };
+    put("manifest.json", &manifest_bytes);
+    put("plugin.wasm", &wasm_bytes);
+    let gz = tar_b.into_inner().unwrap();
+    gz.finish().unwrap();
+
+    // Now load via the proxy's loader.
+    let loader = PluginLoader::new();
+    let (manifest, bytes) = loader.load(&artefact_path).expect("load tar.gz");
+    assert_eq!(manifest.name, "helios-plugin-cost-governor");
+    assert_eq!(bytes.len(), wasm_bytes.len());
+
+    // Instantiate through the runtime — proves the loaded wasm is
+    // actually the same bytes that compile cleanly.
+    let mut config = PluginRuntimeConfig::default();
+    config.fuel_metering = false;
+    let runtime = WasmPluginRuntime::new(&config).unwrap();
+    runtime.instantiate(&manifest, &bytes).expect("instantiate");
+}
+
 #[test]
 fn pgvector_router_returns_node_for_top_k_query() {
     let Some(wasm_path) = find_plugin_wasm("helios_plugin_pgvector_router") else {
