@@ -4,6 +4,7 @@
 //! Implements PostgreSQL wire protocol forwarding with TWR (Transparent Write Routing).
 
 use crate::admin::{AdminServer, AdminState, ConfigSnapshot, NodeSnapshot};
+use crate::backend::{tls::default_client_config, BackendConfig, TlsMode};
 use crate::config::{NodeConfig, NodeRole, ProxyConfig, TrMode};
 use crate::protocol::{
     AuthRequest, ErrorResponse, Message, MessageType, ParseMessage, ProtocolCodec, QueryMessage,
@@ -45,6 +46,35 @@ pub struct ProxyServer {
     shutdown_tx: broadcast::Sender<()>,
 }
 
+/// Build the BackendConfig template the time-travel replay engine
+/// uses for its target connection. The replay handler swaps in
+/// `target_host` / `target_port` per request; everything else
+/// (auth, TLS policy, timeouts) comes from this template.
+///
+/// Auth defaults to the bare PostgreSQL `postgres` superuser without
+/// a password — sensible for local development against `trust` auth,
+/// never for production. Real production deployments need per-call
+/// credential overrides on `ReplayRequestBody` (separate slice;
+/// flagged as the natural follow-up in admin.rs).
+///
+/// `_config` is kept in the signature so future iterations can pull
+/// shared TLS / timeout settings from the proxy config without
+/// changing the call site.
+fn build_replay_backend_template(_config: &ProxyConfig) -> BackendConfig {
+    BackendConfig {
+        host: "placeholder".to_string(),
+        port: 0,
+        user: "postgres".to_string(),
+        password: None,
+        database: None,
+        application_name: Some("heliosdb-proxy-replay".to_string()),
+        tls_mode: TlsMode::Disable,
+        connect_timeout: Duration::from_secs(5),
+        query_timeout: Duration::from_secs(30),
+        tls_config: default_client_config(),
+    }
+}
+
 /// Server runtime state
 struct ServerState {
     /// Active client sessions
@@ -65,6 +95,11 @@ struct ServerState {
     /// hooks fire on every simple-query message.
     #[cfg(feature = "wasm-plugins")]
     plugin_manager: Option<Arc<PluginManager>>,
+    /// Shared transaction journal — single sink for per-session
+    /// statement journaling. The replay engine reads windows from
+    /// this directly. Always present; journaling self-disables
+    /// internally when not configured.
+    transaction_journal: Arc<crate::transaction_journal::TransactionJournal>,
 }
 
 /// Per-node connection pool
@@ -399,6 +434,9 @@ impl ProxyServer {
             pool_manager,
             #[cfg(feature = "wasm-plugins")]
             plugin_manager,
+            transaction_journal: Arc::new(
+                crate::transaction_journal::TransactionJournal::new(),
+            ),
         });
 
         Ok(Self {
@@ -500,6 +538,22 @@ impl ProxyServer {
             #[cfg(feature = "wasm-plugins")]
             if let Some(ref pm) = state.plugin_manager {
                 admin_state.with_plugin_manager(pm.clone()).await;
+            }
+
+            // Attach the time-travel replay engine. The engine reads
+            // windows from the shared TransactionJournal and replays
+            // statements against a target backend supplied per-request.
+            // Template credentials default to the first node's
+            // address-derived defaults; production callers extending
+            // ReplayRequestBody to carry per-request overrides is the
+            // natural follow-up.
+            {
+                let template = build_replay_backend_template(&config);
+                let engine = Arc::new(crate::replay::ReplayEngine::new(
+                    state.transaction_journal.clone(),
+                    template,
+                ));
+                admin_state.with_replay_engine(engine).await;
             }
 
             // Create admin server
@@ -2431,6 +2485,9 @@ mod tests {
             #[cfg(feature = "pool-modes")]
             pool_manager: None,
             plugin_manager: Some(pm),
+            transaction_journal: Arc::new(
+                crate::transaction_journal::TransactionJournal::new(),
+            ),
         });
 
         let mut params = HashMap::new();
