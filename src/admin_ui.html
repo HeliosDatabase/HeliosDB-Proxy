@@ -97,6 +97,15 @@
       margin: 10px 0 0;
     }
     .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+    .row.wrap { flex-wrap: wrap; }
+    input[type="text"], input[type="number"], input[type="datetime-local"] {
+      font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: var(--chip); color: var(--fg);
+      border: 1px solid var(--line); border-radius: 6px;
+      padding: 6px 8px;
+      color-scheme: light dark;
+    }
+    label { font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 2px; }
     footer {
       padding: 18px 24px; color: var(--muted); border-top: 1px solid var(--line);
       font-size: 12px;
@@ -154,6 +163,31 @@
           <span id="sql-status" style="color: var(--muted);"></span>
         </div>
         <pre class="result" id="sql-result">—</pre>
+      </div>
+    </section>
+
+    <section class="full">
+      <h2>Time-Travel Replay</h2>
+      <div class="body">
+        <div class="row wrap">
+          <label>From (UTC)
+            <input type="datetime-local" id="replay-from" step="1">
+          </label>
+          <label>To (UTC)
+            <input type="datetime-local" id="replay-to" step="1">
+          </label>
+          <label>Target host
+            <input type="text" id="replay-host" placeholder="staging-db.svc">
+          </label>
+          <label>Target port
+            <input type="number" id="replay-port" value="5432" min="1" max="65535">
+          </label>
+        </div>
+        <div class="row">
+          <button id="replay-run">Replay window</button>
+          <span id="replay-status" style="color: var(--muted);"></span>
+        </div>
+        <pre class="result" id="replay-result">Pick a window + target, then click Replay window. Replays every journaled statement in the inclusive window onto the target backend in chronological order. Returns a summary of statements applied / failed / elapsed.</pre>
       </div>
     </section>
   </main>
@@ -265,6 +299,56 @@
         });
         const j = await r.json();
         status.textContent = r.ok ? "ok" : `error ${r.status}`;
+        result.textContent = JSON.stringify(j, null, 2);
+      } catch (e) {
+        status.textContent = "failed";
+        result.textContent = e.message;
+      }
+    });
+
+    // datetime-local emits "YYYY-MM-DDTHH:MM[:SS]" without a TZ suffix.
+    // The replay endpoint expects RFC 3339 — append ":00Z" / "Z" so the
+    // server interprets the value as UTC. The label literally says "UTC"
+    // so the user expectation matches.
+    function localToRfc3339Utc(s) {
+      if (!s) return null;
+      // Already has seconds?
+      if (/T\d{2}:\d{2}:\d{2}/.test(s)) return s + "Z";
+      return s + ":00Z";
+    }
+
+    document.querySelector("#replay-run").addEventListener("click", async () => {
+      const from = localToRfc3339Utc(document.querySelector("#replay-from").value);
+      const to   = localToRfc3339Utc(document.querySelector("#replay-to").value);
+      const host = document.querySelector("#replay-host").value.trim();
+      const port = parseInt(document.querySelector("#replay-port").value, 10);
+      const status = document.querySelector("#replay-status");
+      const result = document.querySelector("#replay-result");
+
+      if (!from || !to || !host || !port) {
+        status.textContent = "fill all four fields";
+        return;
+      }
+      status.textContent = "replaying…";
+      result.textContent = "";
+      try {
+        const r = await fetch("/api/replay", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            from, to,
+            target_host: host,
+            target_port: port,
+          }),
+        });
+        const j = await r.json();
+        if (r.ok) {
+          status.textContent = `applied ${j.statements_replayed ?? 0}, failed ${j.failures ?? 0}, ${j.elapsed_ms ?? 0} ms`;
+        } else if (r.status === 503) {
+          status.textContent = "engine not attached on this proxy";
+        } else {
+          status.textContent = `error ${r.status}`;
+        }
         result.textContent = JSON.stringify(j, null, 2);
       } catch (e) {
         status.textContent = "failed";
