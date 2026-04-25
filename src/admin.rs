@@ -6,6 +6,8 @@
 #[cfg(feature = "anomaly-detection")]
 use crate::anomaly::AnomalyDetector;
 use crate::config::{NodeConfig, NodeRole, ProxyConfig};
+#[cfg(feature = "edge-proxy")]
+use crate::edge::{EdgeCache, EdgeRegistry, InvalidationEvent};
 #[cfg(feature = "wasm-plugins")]
 use crate::plugins::PluginManager;
 #[cfg(feature = "ha-tr")]
@@ -74,6 +76,12 @@ pub struct AdminState {
     /// ring buffer.
     #[cfg(feature = "anomaly-detection")]
     pub anomaly_detector: RwLock<Option<Arc<AnomalyDetector>>>,
+    /// Edge proxy cache + registry. Cache surfaces stats; registry
+    /// is the home-side fanout for invalidations.
+    #[cfg(feature = "edge-proxy")]
+    pub edge_cache: RwLock<Option<Arc<EdgeCache>>>,
+    #[cfg(feature = "edge-proxy")]
+    pub edge_registry: RwLock<Option<Arc<EdgeRegistry>>>,
 }
 
 /// Chaos override applied to a single node. Today only the
@@ -407,6 +415,27 @@ impl AdminServer {
             ("GET", p) if p == "/anomalies" || p.starts_with("/anomalies?") => Ok((
                 503,
                 serde_json::json!({ "error": "anomaly-detection feature not compiled in" }),
+            )),
+
+            // Edge mode (T3.2). Stats panel for the home; the home's
+            // registered edges + cache stats; and a manual
+            // invalidation endpoint for ops drills.
+            #[cfg(feature = "edge-proxy")]
+            ("GET", "/api/edge") => Self::handle_edge_status(state).await,
+            #[cfg(feature = "edge-proxy")]
+            ("POST", "/api/edge/register") => {
+                Self::handle_edge_register(body, state).await
+            }
+            #[cfg(feature = "edge-proxy")]
+            ("POST", "/api/edge/invalidate") => {
+                Self::handle_edge_invalidate(body, state).await
+            }
+            #[cfg(not(feature = "edge-proxy"))]
+            ("GET", "/api/edge")
+            | ("POST", "/api/edge/register")
+            | ("POST", "/api/edge/invalidate") => Ok((
+                503,
+                serde_json::json!({ "error": "edge-proxy feature not compiled in" }),
             )),
 
             // Chaos engineering — controlled fault injection for HA
@@ -755,6 +784,139 @@ impl AdminServer {
                 serde_json::json!({ "error": format!("replay failed: {}", e) }),
             )),
         }
+    }
+
+    /// `GET /api/edge` — surfaces edge-mode state: cache stats +
+    /// the list of registered edges (when running in home mode).
+    #[cfg(feature = "edge-proxy")]
+    async fn handle_edge_status(
+        state: &Arc<AdminState>,
+    ) -> Result<(u16, serde_json::Value)> {
+        let cache_stats = match state.edge_cache.read().await.clone() {
+            Some(c) => Some(c.stats()),
+            None => None,
+        };
+        let edges = match state.edge_registry.read().await.clone() {
+            Some(r) => r.list(),
+            None => Vec::new(),
+        };
+        Ok((200, serde_json::json!({
+            "cache":          cache_stats,
+            "registered":     edges,
+            "edge_count":     edges.len(),
+        })))
+    }
+
+    /// `POST /api/edge/register` — edges call this once at boot to
+    /// announce themselves to the home. Body shape:
+    /// `{"edge_id":"e1","region":"us-east","base_url":"https://e1"}`.
+    /// Returns 201 with the assigned slot, 503 when registry full.
+    #[cfg(feature = "edge-proxy")]
+    async fn handle_edge_register(
+        body: Option<&str>,
+        state: &Arc<AdminState>,
+    ) -> Result<(u16, serde_json::Value)> {
+        let raw = body.ok_or_else(|| {
+            ProxyError::Internal("edge register: empty body".to_string())
+        })?;
+        let req: EdgeRegisterBody = match serde_json::from_str(raw) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok((
+                    400,
+                    serde_json::json!({ "error": format!("invalid body: {}", e) }),
+                ));
+            }
+        };
+        let registry = match state.edge_registry.read().await.clone() {
+            Some(r) => r,
+            None => {
+                return Ok((
+                    503,
+                    serde_json::json!({ "error": "edge registry not attached" }),
+                ));
+            }
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        match registry.register(&req.edge_id, &req.region, &req.base_url, &now) {
+            Ok(_rx) => {
+                // Receiver dropped here — in production the SSE
+                // handler keeps it alive for the connection's
+                // lifetime. For the JSON endpoint, we acknowledge
+                // the registration and the edge polls /api/edge for
+                // invalidations until SSE is wired.
+                Ok((201, serde_json::json!({
+                    "edge_id":  req.edge_id,
+                    "region":   req.region,
+                    "base_url": req.base_url,
+                    "registered_at": now,
+                })))
+            }
+            Err(e) => Ok((
+                503,
+                serde_json::json!({ "error": e.to_string() }),
+            )),
+        }
+    }
+
+    /// `POST /api/edge/invalidate` — manual invalidation for ops
+    /// drills. The proxy normally fans out invalidations
+    /// automatically on writes; this endpoint is for "I just ran
+    /// a migration outside the proxy, please drop caches".
+    /// Body: `{"tables":["users"],"up_to_version":null}` — null
+    /// version means "use the cache's current version" (drop all).
+    #[cfg(feature = "edge-proxy")]
+    async fn handle_edge_invalidate(
+        body: Option<&str>,
+        state: &Arc<AdminState>,
+    ) -> Result<(u16, serde_json::Value)> {
+        let raw = body.ok_or_else(|| {
+            ProxyError::Internal("edge invalidate: empty body".to_string())
+        })?;
+        let req: EdgeInvalidateBody = match serde_json::from_str(raw) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok((
+                    400,
+                    serde_json::json!({ "error": format!("invalid body: {}", e) }),
+                ));
+            }
+        };
+        let cache = match state.edge_cache.read().await.clone() {
+            Some(c) => c,
+            None => {
+                return Ok((
+                    503,
+                    serde_json::json!({ "error": "edge cache not attached" }),
+                ));
+            }
+        };
+        let registry = match state.edge_registry.read().await.clone() {
+            Some(r) => r,
+            None => {
+                return Ok((
+                    503,
+                    serde_json::json!({ "error": "edge registry not attached" }),
+                ));
+            }
+        };
+        let version = req.up_to_version.unwrap_or_else(|| cache.next_version());
+        // Local cache invalidation (home-side cache, if any).
+        let dropped_local = cache.invalidate(version, &req.tables);
+        // Fan out to every registered edge.
+        let ev = InvalidationEvent {
+            up_to_version: version,
+            tables: req.tables.clone(),
+            committed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let (sent, pruned) = registry.broadcast(ev).await;
+        Ok((200, serde_json::json!({
+            "version":         version,
+            "tables":          req.tables,
+            "dropped_local":   dropped_local,
+            "edges_notified":  sent,
+            "edges_pruned":    pruned,
+        })))
     }
 
     /// Handle `GET /anomalies`. Returns the anomaly detector's
@@ -1188,6 +1350,10 @@ impl AdminState {
             chaos_overrides: RwLock::new(HashMap::new()),
             #[cfg(feature = "anomaly-detection")]
             anomaly_detector: RwLock::new(None),
+            #[cfg(feature = "edge-proxy")]
+            edge_cache: RwLock::new(None),
+            #[cfg(feature = "edge-proxy")]
+            edge_registry: RwLock::new(None),
         }
     }
 
@@ -1196,6 +1362,14 @@ impl AdminState {
     #[cfg(feature = "anomaly-detection")]
     pub async fn with_anomaly_detector(&self, detector: Arc<AnomalyDetector>) {
         *self.anomaly_detector.write().await = Some(detector);
+    }
+
+    /// Attach edge cache + registry. Server calls this once at
+    /// startup; both Arcs are the same instances ServerState holds.
+    #[cfg(feature = "edge-proxy")]
+    pub async fn with_edge(&self, cache: Arc<EdgeCache>, registry: Arc<EdgeRegistry>) {
+        *self.edge_cache.write().await = Some(cache);
+        *self.edge_registry.write().await = Some(registry);
     }
 
     /// Attach a time-travel replay engine. Production startup calls
@@ -1345,6 +1519,27 @@ impl From<NodeHealth> for NodeHealthResponse {
 #[derive(Serialize)]
 struct SessionsResponse {
     active_sessions: u64,
+}
+
+/// JSON body for `POST /api/edge/register`.
+#[cfg(feature = "edge-proxy")]
+#[derive(Debug, Deserialize)]
+struct EdgeRegisterBody {
+    edge_id: String,
+    region: String,
+    base_url: String,
+}
+
+/// JSON body for `POST /api/edge/invalidate`. `up_to_version` is
+/// optional — when None, the cache mints the next version stamp
+/// (effectively "drop everything matching `tables`").
+#[cfg(feature = "edge-proxy")]
+#[derive(Debug, Deserialize)]
+struct EdgeInvalidateBody {
+    #[serde(default)]
+    tables: Vec<String>,
+    #[serde(default)]
+    up_to_version: Option<u64>,
 }
 
 /// Parse `?limit=N` from a path. Returns clamped value, or `default`
@@ -1968,5 +2163,96 @@ mod tests {
         assert_eq!(parse_limit_query("/anomalies?limit=99999", 100, 1024), 1024);
         assert_eq!(parse_limit_query("/anomalies?limit=abc", 100, 1024), 100);
         assert_eq!(parse_limit_query("/anomalies?other=x&limit=7", 100, 1024), 7);
+    }
+
+    #[cfg(feature = "edge-proxy")]
+    async fn edge_state() -> Arc<AdminState> {
+        use crate::edge::{EdgeCache, EdgeRegistry};
+        use std::time::Duration;
+        let s = Arc::new(AdminState::new());
+        let cache = Arc::new(EdgeCache::new(100));
+        let registry = Arc::new(EdgeRegistry::new(8, Duration::from_secs(60)));
+        s.with_edge(cache, registry).await;
+        s
+    }
+
+    #[cfg(feature = "edge-proxy")]
+    #[tokio::test]
+    async fn test_edge_status_returns_empty_lists_initially() {
+        let s = edge_state().await;
+        let (status, value) = AdminServer::handle_edge_status(&s)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        assert_eq!(value["edge_count"].as_u64().unwrap(), 0);
+        assert_eq!(value["registered"].as_array().unwrap().len(), 0);
+        assert!(value["cache"].is_object(), "cache stats present");
+    }
+
+    #[cfg(feature = "edge-proxy")]
+    #[tokio::test]
+    async fn test_edge_register_then_status_lists_edge() {
+        let s = edge_state().await;
+        let body = r#"{"edge_id":"e1","region":"us-east","base_url":"https://e1.svc"}"#;
+        let (status, _) = AdminServer::handle_edge_register(Some(body), &s)
+            .await
+            .expect("handler ok");
+        assert_eq!(status, 201);
+        let (status2, value2) = AdminServer::handle_edge_status(&s).await.unwrap();
+        assert_eq!(status2, 200);
+        assert_eq!(value2["edge_count"].as_u64().unwrap(), 1);
+        assert_eq!(
+            value2["registered"][0]["edge_id"].as_str().unwrap(),
+            "e1"
+        );
+    }
+
+    #[cfg(feature = "edge-proxy")]
+    #[tokio::test]
+    async fn test_edge_register_400_on_malformed_body() {
+        let s = edge_state().await;
+        let (status, _) = AdminServer::handle_edge_register(Some("not json"), &s)
+            .await
+            .expect("handler ok");
+        assert_eq!(status, 400);
+    }
+
+    #[cfg(feature = "edge-proxy")]
+    #[tokio::test]
+    async fn test_edge_invalidate_drops_local_cache_entries() {
+        use crate::edge::{CacheEntry, CacheKey};
+        use std::time::{Duration, Instant};
+        let s = edge_state().await;
+        // Seed an entry into the local cache.
+        let cache = s.edge_cache.read().await.clone().unwrap();
+        cache.insert(
+            CacheKey::new("fp1", "p1"),
+            CacheEntry {
+                version: 1,
+                response_bytes: b"row".to_vec(),
+                tables: vec!["users".into()],
+                expires_at: Instant::now() + Duration::from_secs(60),
+            },
+        );
+        assert!(cache.get(&CacheKey::new("fp1", "p1")).is_some());
+
+        let body = r#"{"tables":["users"]}"#;
+        let (status, value) = AdminServer::handle_edge_invalidate(Some(body), &s)
+            .await
+            .expect("handler ok");
+        assert_eq!(status, 200);
+        assert_eq!(value["dropped_local"].as_u64().unwrap(), 1);
+        assert!(cache.get(&CacheKey::new("fp1", "p1")).is_none());
+    }
+
+    #[cfg(feature = "edge-proxy")]
+    #[tokio::test]
+    async fn test_edge_invalidate_503_when_cache_unattached() {
+        let s = Arc::new(AdminState::new());
+        let body = r#"{"tables":["users"]}"#;
+        let (status, _) = AdminServer::handle_edge_invalidate(Some(body), &s)
+            .await
+            .expect("handler ok");
+        assert_eq!(status, 503);
     }
 }

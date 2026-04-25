@@ -163,6 +163,13 @@ struct ServerState {
     /// auth outcome; surfaces detections via /api/anomalies.
     #[cfg(feature = "anomaly-detection")]
     anomaly_detector: Arc<crate::anomaly::AnomalyDetector>,
+    /// Edge cache + home registry (T3.2). Both always-present even
+    /// in Home mode (the cache is a no-op there); avoids an extra
+    /// Option in the hot path.
+    #[cfg(feature = "edge-proxy")]
+    edge_cache: Arc<crate::edge::EdgeCache>,
+    #[cfg(feature = "edge-proxy")]
+    edge_registry: Arc<crate::edge::EdgeRegistry>,
 }
 
 /// Per-node connection pool
@@ -512,6 +519,13 @@ impl ProxyServer {
                     crate::anomaly::AnomalyConfig::default(),
                 ),
             ),
+            #[cfg(feature = "edge-proxy")]
+            edge_cache: Arc::new(crate::edge::EdgeCache::new(10_000)),
+            #[cfg(feature = "edge-proxy")]
+            edge_registry: Arc::new(crate::edge::EdgeRegistry::new(
+                32,
+                std::time::Duration::from_secs(120),
+            )),
         });
 
         Ok(Self {
@@ -637,6 +651,13 @@ impl ProxyServer {
             #[cfg(feature = "anomaly-detection")]
             admin_state
                 .with_anomaly_detector(state.anomaly_detector.clone())
+                .await;
+
+            // Attach the edge cache + registry. Both surfaced via
+            // /api/edge/* admin routes.
+            #[cfg(feature = "edge-proxy")]
+            admin_state
+                .with_edge(state.edge_cache.clone(), state.edge_registry.clone())
                 .await;
 
             // Create admin server
@@ -2658,6 +2679,13 @@ mod tests {
                     crate::anomaly::AnomalyConfig::default(),
                 ),
             ),
+            #[cfg(feature = "edge-proxy")]
+            edge_cache: Arc::new(crate::edge::EdgeCache::new(10_000)),
+            #[cfg(feature = "edge-proxy")]
+            edge_registry: Arc::new(crate::edge::EdgeRegistry::new(
+                32,
+                std::time::Duration::from_secs(120),
+            )),
         });
 
         let mut params = HashMap::new();
