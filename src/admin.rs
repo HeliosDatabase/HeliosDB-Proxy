@@ -4,8 +4,10 @@
 //! Includes HTTP SQL API for transparent write routing (TWR) and load balancing.
 
 use crate::config::{NodeConfig, NodeRole, ProxyConfig};
+use crate::replay::{ReplayEngine, TimeTravelRequest};
 use crate::server::{NodeHealth, ServerMetricsSnapshot};
 use crate::{ProxyError, Result};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -46,6 +48,10 @@ pub struct AdminState {
     read_lb_counter: AtomicUsize,
     /// Registered command handlers
     commands: RwLock<HashMap<String, CommandHandler>>,
+    /// Time-travel replay engine. Optional so test fixtures don't have
+    /// to wire a backend template; production startup attaches it via
+    /// `with_replay_engine`. Endpoint returns 503 when missing.
+    pub replay_engine: RwLock<Option<Arc<ReplayEngine>>>,
 }
 
 
@@ -323,6 +329,11 @@ impl AdminServer {
                 let topo = Self::compute_topology(state).await;
                 Ok((200, serde_json::to_value(topo)?))
             }
+
+            // Time-travel replay — replays a journal window against a
+            // target backend (typically a staging DB). Body shape is
+            // `ReplayRequestBody` below.
+            ("POST", "/api/replay") => Self::handle_replay_request(body, state).await,
 
             // Configuration
             ("GET", "/config") => {
@@ -614,6 +625,49 @@ impl AdminServer {
         Vec::new()
     }
 
+    /// Handle `POST /api/replay`. Body is a JSON `ReplayRequestBody`.
+    /// Returns 503 when no replay engine is attached, 400 on a malformed
+    /// body or inverted window, 200 with `ReplaySummary` on success.
+    async fn handle_replay_request(
+        body: Option<&str>,
+        state: &Arc<AdminState>,
+    ) -> Result<(u16, serde_json::Value)> {
+        let raw = body.ok_or_else(|| {
+            ProxyError::Internal("replay: empty request body".to_string())
+        })?;
+        let req: ReplayRequestBody = match serde_json::from_str(raw) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok((
+                    400,
+                    serde_json::json!({ "error": format!("invalid body: {}", e) }),
+                ));
+            }
+        };
+        let engine = match state.replay_engine.read().await.clone() {
+            Some(e) => e,
+            None => {
+                return Ok((
+                    503,
+                    serde_json::json!({ "error": "replay engine not attached" }),
+                ));
+            }
+        };
+        let tt = TimeTravelRequest {
+            from: req.from,
+            to: req.to,
+            target_host: req.target_host,
+            target_port: req.target_port,
+        };
+        match engine.replay_window(&tt).await {
+            Ok(summary) => Ok((200, serde_json::to_value(summary)?)),
+            Err(e) => Ok((
+                500,
+                serde_json::json!({ "error": format!("replay failed: {}", e) }),
+            )),
+        }
+    }
+
     /// Compute the joined topology view used by `/topology`.
     ///
     /// `currentPrimary` is the address of the first node whose role
@@ -785,7 +839,16 @@ impl AdminState {
             proxy_config: RwLock::new(None),
             read_lb_counter: AtomicUsize::new(0),
             commands: RwLock::new(HashMap::new()),
+            replay_engine: RwLock::new(None),
         }
+    }
+
+    /// Attach a time-travel replay engine. Production startup calls
+    /// this once with a `ReplayEngine` constructed from the proxy's
+    /// shared `TransactionJournal` + a `BackendConfig` template; the
+    /// `/api/replay` endpoint returns 503 until this is set.
+    pub async fn with_replay_engine(&self, engine: Arc<ReplayEngine>) {
+        *self.replay_engine.write().await = Some(engine);
     }
 
     /// Set the proxy configuration for SQL routing
@@ -918,6 +981,19 @@ impl From<NodeHealth> for NodeHealthResponse {
 #[derive(Serialize)]
 struct SessionsResponse {
     active_sessions: u64,
+}
+
+/// JSON body for `POST /api/replay`.
+#[derive(Debug, Deserialize)]
+struct ReplayRequestBody {
+    /// RFC 3339 inclusive window start.
+    from: DateTime<Utc>,
+    /// RFC 3339 inclusive window end.
+    to: DateTime<Utc>,
+    /// Target backend host (typically a staging DB).
+    target_host: String,
+    /// Target backend port.
+    target_port: u16,
 }
 
 /// Joined view exposed at `/topology`. Field names use camelCase so
@@ -1139,5 +1215,37 @@ mod tests {
         .await;
         let topo = AdminServer::compute_topology(&state).await;
         assert_eq!(topo.current_primary.as_deref(), Some("primary.svc:5432"));
+    }
+
+    #[tokio::test]
+    async fn test_replay_returns_503_when_engine_unattached() {
+        let state = Arc::new(AdminState::new());
+        let body = r#"{
+            "from": "2026-04-25T10:00:00Z",
+            "to":   "2026-04-25T11:00:00Z",
+            "target_host": "127.0.0.1",
+            "target_port": 5432
+        }"#;
+        let (status, value) = AdminServer::handle_replay_request(Some(body), &state)
+            .await
+            .expect("handler returns Ok with status code");
+        assert_eq!(status, 503);
+        assert_eq!(value["error"], "replay engine not attached");
+    }
+
+    #[tokio::test]
+    async fn test_replay_400_on_malformed_body() {
+        let state = Arc::new(AdminState::new());
+        let (status, _) = AdminServer::handle_replay_request(Some("not json"), &state)
+            .await
+            .expect("handler returns Ok with status code");
+        assert_eq!(status, 400);
+    }
+
+    #[tokio::test]
+    async fn test_replay_errors_on_empty_body() {
+        let state = Arc::new(AdminState::new());
+        let err = AdminServer::handle_replay_request(None, &state).await;
+        assert!(err.is_err(), "empty body must surface as Err");
     }
 }
