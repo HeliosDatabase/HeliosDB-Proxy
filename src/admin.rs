@@ -314,6 +314,16 @@ impl AdminServer {
                 Ok((200, serde_json::json!({ "status": "disabled" })))
             }
 
+            // Topology — joins config (role) with node_health (healthy)
+            // so external controllers (operator, ops dashboards) can
+            // populate `currentPrimary` / `healthyNodes` /
+            // `unhealthyNodes` in one round-trip. Designed for
+            // poll-friendly use; never blocks.
+            ("GET", "/topology") => {
+                let topo = Self::compute_topology(state).await;
+                Ok((200, serde_json::to_value(topo)?))
+            }
+
             // Configuration
             ("GET", "/config") => {
                 let config = state.config_snapshot.read().await.clone();
@@ -604,6 +614,39 @@ impl AdminServer {
         Vec::new()
     }
 
+    /// Compute the joined topology view used by `/topology`.
+    ///
+    /// `currentPrimary` is the address of the first node whose role
+    /// is "primary" and whose health entry is `healthy = true`. None
+    /// is the legitimate answer when failover is in progress.
+    async fn compute_topology(state: &Arc<AdminState>) -> TopologyResponse {
+        let health = state.node_health.read().await;
+        let cfg = state.config_snapshot.read().await;
+
+        let mut current_primary: Option<String> = None;
+        for n in &cfg.nodes {
+            if n.role.eq_ignore_ascii_case("primary") {
+                let healthy = health.get(&n.address).map(|h| h.healthy).unwrap_or(false);
+                if healthy {
+                    current_primary = Some(n.address.clone());
+                    break;
+                }
+            }
+        }
+
+        let healthy_nodes = health.values().filter(|h| h.healthy).count() as u32;
+        let unhealthy_nodes = health.values().filter(|h| !h.healthy).count() as u32;
+        let total_nodes = cfg.nodes.len() as u32;
+
+        TopologyResponse {
+            current_primary,
+            healthy_nodes,
+            unhealthy_nodes,
+            total_nodes,
+            last_failover_at: None,
+        }
+    }
+
     /// Format metrics as Prometheus text format
     fn format_prometheus_metrics(metrics: &ServerMetricsSnapshot) -> String {
         let mut output = String::new();
@@ -877,6 +920,25 @@ struct SessionsResponse {
     active_sessions: u64,
 }
 
+/// Joined view exposed at `/topology`. Field names use camelCase so
+/// they map cleanly into the Kubernetes operator's CRD status
+/// (`HeliosProxyStatus.currentPrimary`, etc).
+#[derive(Serialize)]
+struct TopologyResponse {
+    #[serde(rename = "currentPrimary")]
+    current_primary: Option<String>,
+    #[serde(rename = "healthyNodes")]
+    healthy_nodes: u32,
+    #[serde(rename = "unhealthyNodes")]
+    unhealthy_nodes: u32,
+    #[serde(rename = "totalNodes")]
+    total_nodes: u32,
+    /// RFC 3339 timestamp of the last detected primary change.
+    /// `None` when the proxy hasn't observed a failover since boot.
+    #[serde(rename = "lastFailoverAt")]
+    last_failover_at: Option<String>,
+}
+
 #[derive(Serialize)]
 struct PoolStatsResponse {
     node: String,
@@ -987,5 +1049,95 @@ mod tests {
 
         let response = MetricsResponse::from(snapshot);
         assert_eq!(response.connections_active, 70);
+    }
+
+    /// Helper: build an AdminState with the given (address, role,
+    /// healthy) tuples seeded into config + node_health.
+    async fn topology_state(
+        nodes: &[(&str, &str, bool)],
+    ) -> Arc<AdminState> {
+        let state = Arc::new(AdminState::new());
+        {
+            let mut cfg = state.config_snapshot.write().await;
+            cfg.nodes = nodes
+                .iter()
+                .map(|(addr, role, _)| NodeSnapshot {
+                    address: (*addr).to_string(),
+                    role: (*role).to_string(),
+                    weight: 100,
+                    enabled: true,
+                })
+                .collect();
+        }
+        {
+            let mut health = state.node_health.write().await;
+            for (addr, _, healthy) in nodes {
+                health.insert(
+                    (*addr).to_string(),
+                    NodeHealth {
+                        address: (*addr).to_string(),
+                        healthy: *healthy,
+                        last_check: chrono::Utc::now(),
+                        failure_count: 0,
+                        last_error: None,
+                        latency_ms: 1.0,
+                        replication_lag_bytes: None,
+                    },
+                );
+            }
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn test_topology_returns_healthy_primary() {
+        let state = topology_state(&[
+            ("primary.svc:5432", "primary", true),
+            ("standby-a.svc:5432", "standby", true),
+            ("standby-b.svc:5432", "standby", false),
+        ])
+        .await;
+
+        let topo = AdminServer::compute_topology(&state).await;
+        assert_eq!(topo.current_primary.as_deref(), Some("primary.svc:5432"));
+        assert_eq!(topo.healthy_nodes, 2);
+        assert_eq!(topo.unhealthy_nodes, 1);
+        assert_eq!(topo.total_nodes, 3);
+    }
+
+    #[tokio::test]
+    async fn test_topology_no_primary_when_primary_unhealthy() {
+        // Failover in progress: the configured primary is sick and
+        // no other node has been promoted yet.
+        let state = topology_state(&[
+            ("primary.svc:5432", "primary", false),
+            ("standby.svc:5432", "standby", true),
+        ])
+        .await;
+
+        let topo = AdminServer::compute_topology(&state).await;
+        assert_eq!(topo.current_primary, None);
+        assert_eq!(topo.healthy_nodes, 1);
+        assert_eq!(topo.unhealthy_nodes, 1);
+    }
+
+    #[tokio::test]
+    async fn test_topology_handles_empty_cluster() {
+        let state = Arc::new(AdminState::new());
+        let topo = AdminServer::compute_topology(&state).await;
+        assert_eq!(topo.current_primary, None);
+        assert_eq!(topo.healthy_nodes, 0);
+        assert_eq!(topo.unhealthy_nodes, 0);
+        assert_eq!(topo.total_nodes, 0);
+    }
+
+    #[tokio::test]
+    async fn test_topology_role_match_is_case_insensitive() {
+        let state = topology_state(&[
+            ("primary.svc:5432", "PRIMARY", true),
+        ])
+        .await;
+        let topo = AdminServer::compute_topology(&state).await;
+        assert_eq!(topo.current_primary.as_deref(), Some("primary.svc:5432"));
     }
 }
