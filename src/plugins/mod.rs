@@ -182,7 +182,7 @@ impl HookType {
 }
 
 /// Hook context passed to plugins
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct HookContext {
     /// Request ID
     pub request_id: String,

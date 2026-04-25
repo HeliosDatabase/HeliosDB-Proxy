@@ -4,6 +4,7 @@
 //! Implements PostgreSQL wire protocol forwarding with TWR (Transparent Write Routing).
 
 use crate::admin::{AdminServer, AdminState, ConfigSnapshot, NodeSnapshot};
+#[cfg(feature = "ha-tr")]
 use crate::backend::{tls::default_client_config, BackendConfig, TlsMode};
 use crate::config::{NodeConfig, NodeRole, ProxyConfig, TrMode};
 use crate::protocol::{
@@ -53,13 +54,13 @@ pub struct ProxyServer {
 ///
 /// Auth defaults to the bare PostgreSQL `postgres` superuser without
 /// a password — sensible for local development against `trust` auth,
-/// never for production. Real production deployments need per-call
-/// credential overrides on `ReplayRequestBody` (separate slice;
-/// flagged as the natural follow-up in admin.rs).
+/// never for production. Per-call credential overrides on
+/// ReplayRequestBody land in FU-21.
 ///
 /// `_config` is kept in the signature so future iterations can pull
 /// shared TLS / timeout settings from the proxy config without
 /// changing the call site.
+#[cfg(feature = "ha-tr")]
 fn build_replay_backend_template(_config: &ProxyConfig) -> BackendConfig {
     BackendConfig {
         host: "placeholder".to_string(),
@@ -97,8 +98,9 @@ struct ServerState {
     plugin_manager: Option<Arc<PluginManager>>,
     /// Shared transaction journal — single sink for per-session
     /// statement journaling. The replay engine reads windows from
-    /// this directly. Always present; journaling self-disables
-    /// internally when not configured.
+    /// this directly. Always present when the `ha-tr` feature is on;
+    /// journaling self-disables internally when not configured.
+    #[cfg(feature = "ha-tr")]
     transaction_journal: Arc<crate::transaction_journal::TransactionJournal>,
 }
 
@@ -439,6 +441,7 @@ impl ProxyServer {
             pool_manager,
             #[cfg(feature = "wasm-plugins")]
             plugin_manager,
+            #[cfg(feature = "ha-tr")]
             transaction_journal: Arc::new(
                 crate::transaction_journal::TransactionJournal::new(),
             ),
@@ -548,10 +551,10 @@ impl ProxyServer {
             // Attach the time-travel replay engine. The engine reads
             // windows from the shared TransactionJournal and replays
             // statements against a target backend supplied per-request.
-            // Template credentials default to the first node's
-            // address-derived defaults; production callers extending
-            // ReplayRequestBody to carry per-request overrides is the
-            // natural follow-up.
+            // Per-call credential overrides land via FU-21's
+            // ReplayRequestBody.target_user / target_password /
+            // target_database fields.
+            #[cfg(feature = "ha-tr")]
             {
                 let template = build_replay_backend_template(&config);
                 let engine = Arc::new(crate::replay::ReplayEngine::new(
@@ -2510,6 +2513,7 @@ mod tests {
             #[cfg(feature = "pool-modes")]
             pool_manager: None,
             plugin_manager: Some(pm),
+            #[cfg(feature = "ha-tr")]
             transaction_journal: Arc::new(
                 crate::transaction_journal::TransactionJournal::new(),
             ),
