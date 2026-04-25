@@ -170,7 +170,7 @@ pub struct PluginLoader {
 /// Wire shape is intentionally plain text + base64 — no PEM, no
 /// X.509, no JSON envelope — so operators can sign with `openssl
 /// pkeyutl -sign` or `signify` without bringing a CA story along.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct SignatureVerifier {
     /// (label, public_key) pairs. Label is the .pub filename (no
     /// extension) and shows up in error messages so operators can

@@ -447,8 +447,8 @@ impl WasmPluginRuntime {
             ))
         })?;
 
-        let alloc = get_typed::<i32, i32>(&instance, &mut store, "alloc")?;
-        let dealloc = get_typed::<(i32, i32), ()>(&instance, &mut store, "dealloc")?;
+        let alloc = get_typed::<_, i32, i32>(&instance, &mut store, "alloc")?;
+        let dealloc = get_typed::<_, (i32, i32), ()>(&instance, &mut store, "dealloc")?;
 
         // Allocate input slot inside the plugin's address space and
         // copy `args` in.
@@ -463,7 +463,7 @@ impl WasmPluginRuntime {
         // Try the result-returning ABI first; if the export has the
         // observer ABI (no return), fall back to that.
         let export_name = hook.export_name();
-        let result_bytes = match get_typed::<(i32, i32), i64>(&instance, &mut store, export_name) {
+        let result_bytes = match get_typed::<_, (i32, i32), i64>(&instance, &mut store, export_name) {
             Ok(hook_fn) => {
                 let packed = hook_fn.call(&mut store, (in_ptr, in_len)).map_err(|e| {
                     PluginError::ExecutionError(format!(
@@ -484,7 +484,7 @@ impl WasmPluginRuntime {
             }
             Err(_) => {
                 // Observer ABI: (i32, i32) → ()
-                let observer = get_typed::<(i32, i32), ()>(
+                let observer = get_typed::<_, (i32, i32), ()>(
                     &instance,
                     &mut store,
                     export_name,
@@ -619,7 +619,10 @@ pub struct RuntimeStats {
     pub timeout: Duration,
 }
 
-// Serialization support for hook types
+// Serialization support for hook types — written by hand because the
+// types live in `super` and we can't derive without touching every
+// field's type chain. Includes hook_context so plugins can read
+// per-request attributes (tenant_id, agent_id, ai_traffic, etc).
 impl serde::Serialize for QueryContext {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -631,6 +634,7 @@ impl serde::Serialize for QueryContext {
         state.serialize_field("normalized", &self.normalized)?;
         state.serialize_field("tables", &self.tables)?;
         state.serialize_field("is_read_only", &self.is_read_only)?;
+        state.serialize_field("hook_context", &self.hook_context)?;
         state.end()
     }
 }
