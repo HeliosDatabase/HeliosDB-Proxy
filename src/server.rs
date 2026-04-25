@@ -493,6 +493,15 @@ impl ProxyServer {
             // Set proxy config for SQL routing
             admin_state.set_proxy_config(config.clone()).await;
 
+            // Attach the plugin manager so /plugins + the admin UI
+            // surface real loaded modules. Cheap Arc-clone — no
+            // duplicate state, both AdminState and ServerState hold
+            // the same manager.
+            #[cfg(feature = "wasm-plugins")]
+            if let Some(ref pm) = state.plugin_manager {
+                admin_state.with_plugin_manager(pm.clone()).await;
+            }
+
             // Create admin server
             let admin_server = AdminServer::new(config.admin_address.clone(), admin_state.clone());
 
