@@ -47,7 +47,7 @@ pub mod metrics;
 
 pub use config::{PluginRuntimeConfig, PluginRuntimeConfigBuilder, PluginConfig};
 pub use runtime::{WasmPluginRuntime, LoadedPlugin, PluginState, PluginError};
-pub use loader::{PluginLoader, PluginManifest, PluginLoadError};
+pub use loader::{PluginLoader, PluginManifest, PluginLoadError, SignatureVerifier};
 pub use host_functions::HostFunctionRegistry;
 pub use sandbox::{PluginSandbox, SecurityPolicy, Permission, ResourceLimits};
 pub use hot_reload::{HotReloader, ReloadEvent, ReloadError};
