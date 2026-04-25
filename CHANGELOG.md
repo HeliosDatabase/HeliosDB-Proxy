@@ -5,6 +5,189 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-04-25
+
+Major feature release: full delivery of the T1 / T2 / T3 roadmap shipped
+in v0.3.1's audit, plus a critical correctness fix in the WASM plugin
+hook serialization. 31 PRs across five repositories; 1 296 lib tests +
+5 end-to-end WASM tests + 57 plugin tests + 17 operator tests, all green.
+
+### ⚠ Critical fix
+- **`QueryContext` serializer was dropping `hook_context`.** Every WASM
+  plugin shipping in v0.3.1 received a context without the per-request
+  attributes the proxy carefully populated (`tenant_id`, `agent_id`,
+  `application_name`, `helios.region`, etc). All five attribute-driven
+  plugins (cost-governor, token-budget, llm-guardrail, ai-classifier,
+  residency-router) silently no-op'd their gates as a result. Fixed by
+  adding `hook_context` to the custom `Serialize` impl and deriving
+  `Serialize` on `HookContext`. Covered by the new
+  `tests/wasm_plugin_e2e.rs` end-to-end tests that load real .wasm
+  plugins through the production runtime.
+
+### Added — admin REST API
+- `GET /topology` — `{ currentPrimary, healthyNodes, unhealthyNodes,
+  totalNodes, lastFailoverAt }`. Joins config (role) with node_health
+  (healthy) so external controllers populate cluster topology in one
+  poll. Field names match `HeliosProxyStatus` directly (camelCase).
+- `POST /api/replay` + `GET /api/replay` — time-travel replay of a
+  journal window against a target backend. Per-call credential
+  overrides via `target_user` / `target_password` / `target_database`.
+  503 when `ha-tr` feature off.
+- `POST /api/shadow` — runs a query against source AND shadow backends,
+  diffs results, returns `{ row_count_match, row_hash_match, is_clean,
+  primary_elapsed_us, shadow_elapsed_us, primary_error, shadow_error }`.
+  Order-independent row-set hash so non-deterministic orderings tolerate.
+- `POST /api/chaos` — controlled fault injection: `force_unhealthy`,
+  `restore`, `reset` actions. `GET /api/chaos` lists active overrides.
+- `GET /plugins` — loaded WASM plugin list with name, version, hooks,
+  state, invocation + error counts.
+- `GET /anomalies?limit=N` — recent anomaly events (rate spikes,
+  credential bursts, SQLi patterns, novel queries).
+- `GET /api/edge` + `POST /api/edge/register` + `POST /api/edge/invalidate`
+  — edge-mode cache stats, edge-node registration, manual invalidation
+  broadcast.
+
+### Added — admin Web UI (`/` + `/ui`)
+Single embedded HTML file. Auto-refresh every 5 s. Panels:
+Nodes · Topology · Plugins · Anomalies · Edge Mode · Chaos Mode ·
+Shadow Execution · Time-Travel Replay · SQL Console · Traffic · Cluster.
+
+### Added — WASM plugin ecosystem
+- **Plugin host KV bridge.** `env.kv_get` / `env.kv_set` /
+  `env.kv_delete` wasmtime imports. Per-plugin namespaced
+  `Arc<RwLock<HashMap<plugin, HashMap<key, value>>>>`. Plugins can
+  persist state across hook invocations.
+- **`env.sha256_hex` host import.** Real SHA-256 via the audited
+  `sha2` crate; plugins no longer embed their own (now ~25 KiB
+  smaller). Replaces the FNV placeholder `audit-chain` shipped with
+  in v0.3.1.
+- **`PluginLoader.SignatureVerifier`.** Optional Ed25519 trust root
+  (directory of `*.pub` files, base64 raw 32-byte keys). Every
+  loaded `.wasm` requires a sidecar `.sig`. Wire-compatible with
+  `openssl pkeyutl -sign` and `signify`.
+- **OCI-style artefact loader.** `PluginLoader.load` now accepts
+  `.tar.gz` artefacts produced by the new `helios-plugin pack` CLI:
+  `manifest.json` + `plugin.wasm` + optional `plugin.sig`. Validates
+  wasm SHA-256 against the manifest, verifies signature against trust
+  root if attached.
+- **`RouteResult::Block { reason }` ABI variant.** Plugin-side route
+  rejection synthesises a PG `ErrorResponse` + `ReadyForQuery` —
+  same wire shape as `PreQueryResult::Block`.
+- **`trust_root` config knob** — plugins.trust_root in TOML wires the
+  signature verifier automatically.
+
+### Added — anomaly detection (T3.1)
+- **`anomaly-detection` feature.** In-process sliding-window
+  detector. Four families:
+  1. **Rate spike** — z-score on per-tenant queries-per-second vs
+     rolling EWMA baseline (default 60 s window, 3σ threshold).
+  2. **Credential stuffing** — failed-auth bursts per (user, ip);
+     Warning at 5, Critical at 10. Successful auth resets.
+  3. **SQL injection** — six pattern classes (classic OR, UNION
+     SELECT, comment escape, stacked queries, time-based blind,
+     information_schema probe).
+  4. **Novel query** — first-seen fingerprint, informational.
+- Wired into the query path via `record_anomaly_observation`. Tenant
+  identity from session vars / fallback to client IP.
+
+### Added — edge / geo proxy mode (T3.2)
+- **`edge-proxy` feature.** Cache-first edge mode with last-write-wins
+  TTL coherence. `EdgeRole::Edge` terminates reads against a local
+  LRU+TTL+version cache; `EdgeRole::Home` is authoritative and
+  broadcasts invalidations. Pull-on-miss + invalidation push,
+  no consensus, no central registrar.
+- `EdgeCache` (LRU + TTL + monotonic version + per-table tags).
+- `EdgeRegistry` (home-side fanout, bounded mpsc per edge,
+  back-pressure on slow edges, prune-stale).
+- Explicit "eventual consistency with bounded staleness via TTL"
+  contract.
+
+### Added — chaos engineering (T3.3)
+- **`POST /api/chaos`.** `force_unhealthy` / `restore` / `reset`
+  actions. Triggers the failover path the same way a real probe
+  failure would.
+
+### Added — query shadow execution (T3.4)
+- **`POST /api/shadow`.** Built on the existing `src/shadow_execute/`
+  module. Order-independent row-set hash for non-deterministic
+  orderings. SLO: HTTP 500 only on source-connect failures; shadow
+  failures land in the report.
+
+### Added — Kubernetes operator (`heliosdb-proxy-operator`)
+- Reconciler renders ConfigMap + Deployment + Service from
+  HeliosProxy CR. Owned objects use `SetControllerReference` so
+  `kubectl delete` reaps the stack.
+- `RefMissing` condition surfaces unresolved PoolProfile /
+  RoutingRule / AuditPolicy / TenantQuota refs.
+- Status polling: reconciler hits the proxy's `/topology` and
+  populates `currentPrimary` / `healthyNodes` / `unhealthyNodes` /
+  `lastFailover`.
+- 17 Go unit tests (render helpers + condition merge + config hash).
+
+### Added — Terraform + Pulumi providers
+- `terraform-provider-heliosproxy` — five resources
+  (`heliosproxy_instance`, `_pool_profile`, `_routing_rule`,
+  `_audit_policy`, `_tenant_quota`). Schema mirrors operator CRDs
+  via local replace.
+- `pulumi-heliosproxy` — terraform-bridge wrapper, Node.js / Python
+  / Go / .NET SDK metadata. Both providers wrap the same operator
+  CRDs.
+
+### Added — first-party plugins (`heliosdb-proxy-plugins`)
+All seven plugins on the new shared `helios-plugin-abi` crate +
+host KV bridge:
+- `cost-governor` — per-tenant query cost budgets (minute / hour /
+  day windows). Real `kv_get` / `kv_set` for usage tracking.
+- `ai-classifier` — detects LLM-generated SQL via
+  `application_name` keywords, generated-by markers, opt-in.
+  Best-effort `agent_id` + `model_id` extraction.
+- `token-budget` — per-(agent, model) cost gating.
+- `llm-guardrail` — blocks DROP/TRUNCATE in AI traffic, DELETE/UPDATE
+  without WHERE, SELECT without LIMIT against large tables, missing
+  tenant_id filter.
+- `pgvector-router` — detects pgvector top-K (`<->`, `<#>`, `<=>`),
+  routes to a topology-tagged vector replica via
+  `RouteResult::Node`.
+- `column-mask` — rewrites bare column refs to
+  `mask_<fn>(<col>) AS <col>` based on user roles.
+- `audit-chain` — hash-chained tamper-evident log. **Now uses real
+  SHA-256** via the `env.sha256_hex` host import (was an FNV
+  placeholder in v0.3.1).
+- `residency-router` — routes by `helios.region` attribute; uses
+  `RouteResult::Block` for cross-region rejections (was a sentinel
+  hack in v0.3.1).
+
+### Added — `helios-plugin` CLI
+Pack / inspect / verify WASM plugin artefacts as portable `.tar.gz`:
+
+```sh
+helios-plugin pack    --wasm <path> --name X --version 1.0 \
+                      --hooks pre_query,post_query [--sig <path>] \
+                      --out <path>
+helios-plugin inspect <artefact.tar.gz>
+helios-plugin verify  <artefact.tar.gz> --trust-root <dir>
+```
+
+Uses the same Ed25519 + base64 trust-root format as the proxy's
+loader so a single key directory works for both artefact
+verification AND in-proxy signature checking.
+
+### Changed
+- New feature flags: `anomaly-detection`, `edge-proxy`. Both added
+  to the `all-features` bundle.
+- `RouteResult` deserialiser accepts the new `block` action variant.
+- `PluginLoader.allowed_extensions` now accepts `gz` (for
+  `.tar.gz` artefacts) in addition to `wasm`.
+
+### Tests
+- 1 296 lib tests pass with `--features all-features` (+58
+  regression tests covering the additions above).
+- 5 new end-to-end WASM tests load real plugin .wasm artefacts
+  through the production runtime.
+- All 7 plugins compile to wasm32 (~120-150 KiB each).
+- All three feature configurations build clean: default,
+  `--no-default-features`, `--features all-features`.
+
 ## [0.3.1] - 2026-04-22
 
 ### Fixed
