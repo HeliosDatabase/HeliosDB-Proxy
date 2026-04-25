@@ -47,6 +47,13 @@ pub struct PluginRuntimeConfig {
 
     /// Per-plugin configurations
     pub plugins: HashMap<String, PluginConfig>,
+
+    /// Optional Ed25519 trust root: directory of `*.pub` files. When
+    /// set, every loaded `.wasm` requires a sidecar `.sig` that
+    /// verifies against one of the keys. When `None`, signatures
+    /// aren't checked (preserves the dev-loop ergonomic of dropping
+    /// unsigned `.wasm` files in the plugin dir).
+    pub trust_root: Option<PathBuf>,
 }
 
 impl Default for PluginRuntimeConfig {
@@ -65,6 +72,7 @@ impl Default for PluginRuntimeConfig {
             cache_modules: true,
             cache_dir: None,
             plugins: HashMap::new(),
+            trust_root: None,
         }
     }
 }
@@ -89,6 +97,7 @@ impl From<&crate::config::PluginToml> for PluginRuntimeConfig {
             cache_modules: true,
             cache_dir: None,
             plugins: HashMap::new(),
+            trust_root: t.trust_root.as_ref().map(PathBuf::from),
         }
     }
 }

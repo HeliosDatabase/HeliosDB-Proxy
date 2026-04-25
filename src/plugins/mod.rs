@@ -387,9 +387,16 @@ impl PluginManager {
         })
     }
 
-    /// Load a plugin from file
+    /// Load a plugin from file. When the runtime config sets a
+    /// `trust_root`, attaches a SignatureVerifier so every load
+    /// requires a matching `.sig` sidecar (FU-23 + FU-24).
     pub fn load_plugin(&self, path: &std::path::Path) -> Result<(), PluginError> {
-        let loader = PluginLoader::new();
+        let mut loader = PluginLoader::new();
+        if let Some(ref dir) = self.runtime.config().trust_root {
+            let verifier = SignatureVerifier::from_trust_root(dir)
+                .map_err(|e| PluginError::LoadError(e.to_string()))?;
+            loader = loader.with_signature_verifier(verifier);
+        }
         let (manifest, wasm_bytes) = loader.load(path)?;
 
         let plugin = self.runtime.instantiate(&manifest, &wasm_bytes)?;

@@ -253,6 +253,13 @@ pub struct PluginToml {
     /// Fuel units allowed per hook call when `fuel_metering = true`.
     #[serde(default = "default_plugin_fuel")]
     pub fuel_limit: u64,
+    /// Optional Ed25519 trust-root directory. When set, every loaded
+    /// .wasm requires a sidecar .sig that verifies against one of
+    /// the *.pub files in this directory. When omitted, signatures
+    /// are not checked (preserves the dev-loop ergonomic of dropping
+    /// unsigned .wasm files in the plugin dir).
+    #[serde(default)]
+    pub trust_root: Option<String>,
 }
 
 fn default_plugin_dir() -> String {
@@ -285,6 +292,7 @@ impl Default for PluginToml {
             max_plugins: default_plugin_max(),
             fuel_metering: true,
             fuel_limit: default_plugin_fuel(),
+            trust_root: None,
         }
     }
 }

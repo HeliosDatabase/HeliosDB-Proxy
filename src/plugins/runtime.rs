@@ -288,6 +288,13 @@ impl WasmPluginRuntime {
         &self.engine
     }
 
+    /// Expose the runtime config so the plugin manager can consult
+    /// fields it owns (e.g. `trust_root`) without holding a separate
+    /// copy.
+    pub fn config(&self) -> &PluginRuntimeConfig {
+        &self.config
+    }
+
     /// Instantiate a plugin from manifest and WASM bytes
     pub fn instantiate(
         &self,
