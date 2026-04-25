@@ -4,6 +4,8 @@
 //! Includes HTTP SQL API for transparent write routing (TWR) and load balancing.
 
 use crate::config::{NodeConfig, NodeRole, ProxyConfig};
+#[cfg(feature = "wasm-plugins")]
+use crate::plugins::PluginManager;
 use crate::replay::{ReplayEngine, TimeTravelRequest};
 use crate::server::{NodeHealth, ServerMetricsSnapshot};
 use crate::{ProxyError, Result};
@@ -52,6 +54,12 @@ pub struct AdminState {
     /// to wire a backend template; production startup attaches it via
     /// `with_replay_engine`. Endpoint returns 503 when missing.
     pub replay_engine: RwLock<Option<Arc<ReplayEngine>>>,
+    /// WASM plugin manager. None when the proxy started without
+    /// plugins (or with a different feature set). `/plugins`
+    /// endpoint returns 503 when missing; UI panel says "no plugin
+    /// manager attached".
+    #[cfg(feature = "wasm-plugins")]
+    pub plugin_manager: RwLock<Option<Arc<PluginManager>>>,
 }
 
 
@@ -334,6 +342,12 @@ impl AdminServer {
             // target backend (typically a staging DB). Body shape is
             // `ReplayRequestBody` below.
             ("POST", "/api/replay") => Self::handle_replay_request(body, state).await,
+
+            // Loaded WASM plugins — name, version, hooks, state,
+            // invocation count. Returns 503 when no plugin manager
+            // is attached (proxy started without --features
+            // wasm-plugins or with plugins disabled in config).
+            ("GET", "/plugins") => Self::handle_plugins_list(state).await,
 
             // Configuration
             ("GET", "/config") => {
@@ -668,6 +682,50 @@ impl AdminServer {
         }
     }
 
+    /// Handle `GET /plugins`. Returns 503 when no plugin manager is
+    /// attached, 200 with `Vec<PluginListEntry>` otherwise. Building
+    /// the response in admin.rs (rather than serialising
+    /// `plugins::PluginInfo` directly) keeps the plugins module
+    /// independent of serde — only the wire shape lives here.
+    #[cfg(feature = "wasm-plugins")]
+    async fn handle_plugins_list(state: &Arc<AdminState>) -> Result<(u16, serde_json::Value)> {
+        let pm = match state.plugin_manager.read().await.clone() {
+            Some(p) => p,
+            None => {
+                return Ok((
+                    503,
+                    serde_json::json!({ "error": "plugin manager not attached" }),
+                ));
+            }
+        };
+        let plugins: Vec<PluginListEntry> = pm
+            .list_plugins()
+            .into_iter()
+            .map(|info| PluginListEntry {
+                name: info.name,
+                version: info.version,
+                description: info.description,
+                hooks: info
+                    .hooks
+                    .iter()
+                    .map(|h| h.export_name().to_string())
+                    .collect(),
+                state: format!("{:?}", info.state),
+                invocations: info.stats.total_calls,
+                errors: info.stats.error_count,
+            })
+            .collect();
+        Ok((200, serde_json::to_value(plugins)?))
+    }
+
+    #[cfg(not(feature = "wasm-plugins"))]
+    async fn handle_plugins_list(_state: &Arc<AdminState>) -> Result<(u16, serde_json::Value)> {
+        Ok((
+            503,
+            serde_json::json!({ "error": "wasm-plugins feature not compiled in" }),
+        ))
+    }
+
     /// Compute the joined topology view used by `/topology`.
     ///
     /// `currentPrimary` is the address of the first node whose role
@@ -840,6 +898,8 @@ impl AdminState {
             read_lb_counter: AtomicUsize::new(0),
             commands: RwLock::new(HashMap::new()),
             replay_engine: RwLock::new(None),
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: RwLock::new(None),
         }
     }
 
@@ -849,6 +909,14 @@ impl AdminState {
     /// `/api/replay` endpoint returns 503 until this is set.
     pub async fn with_replay_engine(&self, engine: Arc<ReplayEngine>) {
         *self.replay_engine.write().await = Some(engine);
+    }
+
+    /// Attach a WASM plugin manager. Production startup calls this
+    /// once with the same Arc held by ProxyServer; the `/plugins`
+    /// endpoint returns 503 until set.
+    #[cfg(feature = "wasm-plugins")]
+    pub async fn with_plugin_manager(&self, manager: Arc<PluginManager>) {
+        *self.plugin_manager.write().await = Some(manager);
     }
 
     /// Set the proxy configuration for SQL routing
@@ -981,6 +1049,21 @@ impl From<NodeHealth> for NodeHealthResponse {
 #[derive(Serialize)]
 struct SessionsResponse {
     active_sessions: u64,
+}
+
+/// JSON entry returned by `GET /plugins`. Built in admin.rs so the
+/// plugins module doesn't need a serde dep.
+#[derive(Serialize)]
+struct PluginListEntry {
+    name: String,
+    version: String,
+    description: String,
+    /// Hook export names (`pre_query`, `post_query`, `route`, ...).
+    hooks: Vec<String>,
+    /// `Loading` | `Running` | `Paused` | `Error(...)` | `Unloading`.
+    state: String,
+    invocations: u64,
+    errors: u64,
 }
 
 /// JSON body for `POST /api/replay`.
@@ -1247,5 +1330,26 @@ mod tests {
         let state = Arc::new(AdminState::new());
         let err = AdminServer::handle_replay_request(None, &state).await;
         assert!(err.is_err(), "empty body must surface as Err");
+    }
+
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn test_plugins_list_returns_503_when_manager_unattached() {
+        let state = Arc::new(AdminState::new());
+        let (status, value) = AdminServer::handle_plugins_list(&state)
+            .await
+            .expect("handler returns Ok with status code");
+        assert_eq!(status, 503);
+        assert_eq!(value["error"], "plugin manager not attached");
+    }
+
+    #[cfg(not(feature = "wasm-plugins"))]
+    #[tokio::test]
+    async fn test_plugins_list_503_without_feature() {
+        let state = Arc::new(AdminState::new());
+        let (status, _) = AdminServer::handle_plugins_list(&state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 503);
     }
 }
