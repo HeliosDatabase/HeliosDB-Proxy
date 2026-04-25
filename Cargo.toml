@@ -148,6 +148,11 @@ webpki-roots = "0.26"
 sha2 = "0.10"
 hmac = "0.12"
 md-5 = "0.10"
+# Ed25519 signature verification for the plugin loader's trust-root
+# checks (FU-23). The dalek crate is the standard pure-Rust impl;
+# `default-features = false` strips std-allocator-only paths we don't
+# use and keeps the dep set tight.
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "fast"] }
 
 # WASM plugin runtime — wasmtime is feature-gated on wasm-plugins so
 # default builds don't pay the (~3 MB compiled) cost. The cranelift
@@ -165,6 +170,10 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 # Inline-WASM (.wat → .wasm) for plugin runtime tests so we don't have
 # to ship binary fixtures.
 wat = "1"
+# Temp directories for the plugin signature-verifier tests (FU-23) so
+# trust-root scaffolding stays inside cargo test's tempdir without
+# polluting the workspace.
+tempfile = "3"
 
 [[bin]]
 name = "heliosdb-proxy"
