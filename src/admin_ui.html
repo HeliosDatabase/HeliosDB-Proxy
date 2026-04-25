@@ -202,6 +202,17 @@
             <input type="number" id="replay-port" value="5432" min="1" max="65535">
           </label>
         </div>
+        <div class="row wrap">
+          <label>Target user (optional)
+            <input type="text" id="replay-user" placeholder="postgres">
+          </label>
+          <label>Target password (optional)
+            <input type="password" id="replay-password" placeholder="••••••••">
+          </label>
+          <label>Target database (optional)
+            <input type="text" id="replay-database" placeholder="appdb">
+          </label>
+        </div>
         <div class="row">
           <button id="replay-run">Replay window</button>
           <span id="replay-status" style="color: var(--muted);"></span>
@@ -376,24 +387,29 @@
       const to   = localToRfc3339Utc(document.querySelector("#replay-to").value);
       const host = document.querySelector("#replay-host").value.trim();
       const port = parseInt(document.querySelector("#replay-port").value, 10);
+      const user = document.querySelector("#replay-user").value.trim();
+      const password = document.querySelector("#replay-password").value;
+      const database = document.querySelector("#replay-database").value.trim();
       const status = document.querySelector("#replay-status");
       const result = document.querySelector("#replay-result");
 
       if (!from || !to || !host || !port) {
-        status.textContent = "fill all four fields";
+        status.textContent = "fill from / to / host / port";
         return;
       }
       status.textContent = "replaying…";
       result.textContent = "";
+
+      const body = { from, to, target_host: host, target_port: port };
+      if (user)     body.target_user = user;
+      if (password) body.target_password = password;
+      if (database) body.target_database = database;
+
       try {
         const r = await fetch("/api/replay", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            from, to,
-            target_host: host,
-            target_port: port,
-          }),
+          body: JSON.stringify(body),
         });
         const j = await r.json();
         if (r.ok) {

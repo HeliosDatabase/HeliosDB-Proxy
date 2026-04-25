@@ -672,6 +672,9 @@ impl AdminServer {
             to: req.to,
             target_host: req.target_host,
             target_port: req.target_port,
+            target_user: req.target_user,
+            target_password: req.target_password,
+            target_database: req.target_database,
         };
         match engine.replay_window(&tt).await {
             Ok(summary) => Ok((200, serde_json::to_value(summary)?)),
@@ -1077,6 +1080,17 @@ struct ReplayRequestBody {
     target_host: String,
     /// Target backend port.
     target_port: u16,
+    /// Optional credential overrides — when omitted, the engine uses
+    /// the template values set at server startup. Production callers
+    /// targeting a separate staging DB pass these explicitly so the
+    /// proxy doesn't need to hold staging credentials in its own
+    /// config.
+    #[serde(default)]
+    target_user: Option<String>,
+    #[serde(default)]
+    target_password: Option<String>,
+    #[serde(default)]
+    target_database: Option<String>,
 }
 
 /// Joined view exposed at `/topology`. Field names use camelCase so
