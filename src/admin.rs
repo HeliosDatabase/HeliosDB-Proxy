@@ -3,6 +3,8 @@
 //! REST API for proxy management, monitoring, and configuration.
 //! Includes HTTP SQL API for transparent write routing (TWR) and load balancing.
 
+#[cfg(feature = "anomaly-detection")]
+use crate::anomaly::AnomalyDetector;
 use crate::config::{NodeConfig, NodeRole, ProxyConfig};
 #[cfg(feature = "wasm-plugins")]
 use crate::plugins::PluginManager;
@@ -67,6 +69,11 @@ pub struct AdminState {
     /// state. Lets the UI distinguish "operationally disabled" from
     /// "chaos-injected fault" and lets `Reset` restore everything.
     pub chaos_overrides: RwLock<HashMap<String, ChaosOverride>>,
+    /// Anomaly detector — same Arc the server populates from the
+    /// query path. /api/anomalies polls this for the recent-events
+    /// ring buffer.
+    #[cfg(feature = "anomaly-detection")]
+    pub anomaly_detector: RwLock<Option<Arc<AnomalyDetector>>>,
 }
 
 /// Chaos override applied to a single node. Today only the
@@ -388,6 +395,19 @@ impl AdminServer {
             // is attached (proxy started without --features
             // wasm-plugins or with plugins disabled in config).
             ("GET", "/plugins") => Self::handle_plugins_list(state).await,
+
+            // Anomaly detector recent-events feed (T3.1). Optional
+            // ?limit query string clamps the response size; default
+            // is 100 events newest-first.
+            #[cfg(feature = "anomaly-detection")]
+            ("GET", p) if p == "/anomalies" || p.starts_with("/anomalies?") => {
+                Self::handle_anomalies_list(p, state).await
+            }
+            #[cfg(not(feature = "anomaly-detection"))]
+            ("GET", p) if p == "/anomalies" || p.starts_with("/anomalies?") => Ok((
+                503,
+                serde_json::json!({ "error": "anomaly-detection feature not compiled in" }),
+            )),
 
             // Chaos engineering — controlled fault injection for HA
             // testing. Body is `ChaosRequestBody`; supported actions
@@ -735,6 +755,34 @@ impl AdminServer {
                 serde_json::json!({ "error": format!("replay failed: {}", e) }),
             )),
         }
+    }
+
+    /// Handle `GET /anomalies`. Returns the anomaly detector's
+    /// recent-events ring buffer as JSON. Optional `?limit=N`
+    /// query string clamps the response size (default 100, max 1024).
+    /// Returns 503 when the detector hasn't been attached.
+    #[cfg(feature = "anomaly-detection")]
+    async fn handle_anomalies_list(
+        path: &str,
+        state: &Arc<AdminState>,
+    ) -> Result<(u16, serde_json::Value)> {
+        let limit = parse_limit_query(path, 100, 1024);
+        let det = match state.anomaly_detector.read().await.clone() {
+            Some(d) => d,
+            None => {
+                return Ok((
+                    503,
+                    serde_json::json!({ "error": "anomaly detector not attached" }),
+                ));
+            }
+        };
+        let events = det.recent_events(limit);
+        Ok((200, serde_json::json!({
+            "count":     events.len(),
+            "limit":     limit,
+            "events":    events,
+            "buffer_total": det.event_count(),
+        })))
     }
 
     /// Handle `POST /api/shadow`. Body is a JSON `ShadowRequestBody`.
@@ -1138,7 +1186,16 @@ impl AdminState {
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: RwLock::new(None),
             chaos_overrides: RwLock::new(HashMap::new()),
+            #[cfg(feature = "anomaly-detection")]
+            anomaly_detector: RwLock::new(None),
         }
+    }
+
+    /// Attach an anomaly detector. Mirror of with_replay_engine /
+    /// with_plugin_manager — wired by the server at startup.
+    #[cfg(feature = "anomaly-detection")]
+    pub async fn with_anomaly_detector(&self, detector: Arc<AnomalyDetector>) {
+        *self.anomaly_detector.write().await = Some(detector);
     }
 
     /// Attach a time-travel replay engine. Production startup calls
@@ -1288,6 +1345,27 @@ impl From<NodeHealth> for NodeHealthResponse {
 #[derive(Serialize)]
 struct SessionsResponse {
     active_sessions: u64,
+}
+
+/// Parse `?limit=N` from a path. Returns clamped value, or `default`
+/// when the param is missing / unparseable.
+#[cfg(feature = "anomaly-detection")]
+fn parse_limit_query(path: &str, default: usize, max: usize) -> usize {
+    let q = match path.find('?') {
+        Some(i) => &path[i + 1..],
+        None => return default,
+    };
+    for kv in q.split('&') {
+        let mut it = kv.splitn(2, '=');
+        if let (Some(k), Some(v)) = (it.next(), it.next()) {
+            if k == "limit" {
+                if let Ok(n) = v.parse::<usize>() {
+                    return n.min(max);
+                }
+            }
+        }
+    }
+    default
 }
 
 /// JSON body for `POST /api/shadow`.
@@ -1816,5 +1894,79 @@ mod tests {
     async fn test_shadow_errors_on_empty_body() {
         let err = AdminServer::handle_shadow_request(None).await;
         assert!(err.is_err(), "empty body must surface as Err");
+    }
+
+    #[cfg(feature = "anomaly-detection")]
+    #[tokio::test]
+    async fn test_anomalies_returns_503_when_detector_unattached() {
+        let state = Arc::new(AdminState::new());
+        let (status, value) =
+            AdminServer::handle_anomalies_list("/anomalies", &state)
+                .await
+                .expect("handler returns Ok");
+        assert_eq!(status, 503);
+        assert_eq!(value["error"], "anomaly detector not attached");
+    }
+
+    #[cfg(feature = "anomaly-detection")]
+    #[tokio::test]
+    async fn test_anomalies_returns_attached_detector_events() {
+        use crate::anomaly::{AnomalyConfig, AnomalyDetector, QueryObservation};
+        let state = Arc::new(AdminState::new());
+        let det = Arc::new(AnomalyDetector::new(AnomalyConfig::default()));
+        // Seed a SQL injection event into the detector.
+        let _ = det.record_query(&QueryObservation {
+            tenant: "test".into(),
+            fingerprint: "fp".into(),
+            sql: "SELECT * FROM users WHERE id = 1 OR 1=1 --".into(),
+            timestamp: std::time::Instant::now(),
+            iso_timestamp: "ts".into(),
+        });
+        state.with_anomaly_detector(det.clone()).await;
+
+        let (status, value) =
+            AdminServer::handle_anomalies_list("/anomalies", &state)
+                .await
+                .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        let count = value["count"].as_u64().expect("count field");
+        assert!(count > 0, "expected at least one event, got {}", count);
+    }
+
+    #[cfg(feature = "anomaly-detection")]
+    #[tokio::test]
+    async fn test_anomalies_limit_query_string_respected() {
+        use crate::anomaly::{AnomalyConfig, AnomalyDetector, QueryObservation};
+        let state = Arc::new(AdminState::new());
+        let det = Arc::new(AnomalyDetector::new(AnomalyConfig::default()));
+        for i in 0..50 {
+            let fp = format!("fp{}", i);
+            let _ = det.record_query(&QueryObservation {
+                tenant: "test".into(),
+                fingerprint: fp,
+                sql: "SELECT 1".into(),
+                timestamp: std::time::Instant::now(),
+                iso_timestamp: "ts".into(),
+            });
+        }
+        state.with_anomaly_detector(det).await;
+
+        let (status, value) =
+            AdminServer::handle_anomalies_list("/anomalies?limit=5", &state)
+                .await
+                .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        assert_eq!(value["limit"].as_u64().unwrap(), 5);
+        assert_eq!(value["events"].as_array().unwrap().len(), 5);
+    }
+
+    #[cfg(feature = "anomaly-detection")]
+    #[test]
+    fn test_parse_limit_query_helper() {
+        assert_eq!(parse_limit_query("/anomalies", 100, 1024), 100);
+        assert_eq!(parse_limit_query("/anomalies?limit=42", 100, 1024), 42);
+        assert_eq!(parse_limit_query("/anomalies?limit=99999", 100, 1024), 1024);
+        assert_eq!(parse_limit_query("/anomalies?limit=abc", 100, 1024), 100);
+        assert_eq!(parse_limit_query("/anomalies?other=x&limit=7", 100, 1024), 7);
     }
 }
