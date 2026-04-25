@@ -26,6 +26,11 @@ pub enum PluginLoadError {
 
     /// Validation error
     ValidationError(String),
+
+    /// Signature verification failed (Ed25519 over the .wasm bytes
+    /// did not match any trusted public key, or the signature blob
+    /// itself was malformed).
+    SignatureInvalid(String),
 }
 
 impl std::fmt::Display for PluginLoadError {
@@ -36,6 +41,9 @@ impl std::fmt::Display for PluginLoadError {
             PluginLoadError::ManifestError(msg) => write!(f, "Manifest error: {}", msg),
             PluginLoadError::IoError(msg) => write!(f, "IO error: {}", msg),
             PluginLoadError::ValidationError(msg) => write!(f, "Validation error: {}", msg),
+            PluginLoadError::SignatureInvalid(msg) => {
+                write!(f, "Signature verification failed: {}", msg)
+            }
         }
     }
 }
@@ -143,6 +151,126 @@ pub struct PluginLoader {
 
     /// Allowed extensions
     allowed_extensions: Vec<String>,
+
+    /// Optional Ed25519 trust root. When `Some`, every loaded .wasm
+    /// must have a matching `.sig` sidecar verifiable against one of
+    /// these keys. When `None`, signatures are not checked (preserves
+    /// the dev-loop ergonomic of dropping unsigned `.wasm` files in
+    /// the plugin dir).
+    signature_verifier: Option<SignatureVerifier>,
+}
+
+/// Ed25519 signature verifier for plugin .wasm files.
+///
+/// Trust root format: a directory of `*.pub` files, each containing
+/// a base64-encoded 32-byte Ed25519 public key (one per trusted
+/// publisher). The .sig file format is base64 of the raw 64-byte
+/// Ed25519 signature over the .wasm bytes.
+///
+/// Wire shape is intentionally plain text + base64 — no PEM, no
+/// X.509, no JSON envelope — so operators can sign with `openssl
+/// pkeyutl -sign` or `signify` without bringing a CA story along.
+#[derive(Default)]
+pub struct SignatureVerifier {
+    /// (label, public_key) pairs. Label is the .pub filename (no
+    /// extension) and shows up in error messages so operators can
+    /// trace which key matched.
+    keys: Vec<(String, ed25519_dalek::VerifyingKey)>,
+}
+
+impl SignatureVerifier {
+    /// Build a verifier from a directory of `*.pub` files. Each file
+    /// must contain exactly one base64-encoded 32-byte Ed25519
+    /// public key. Whitespace at the start / end is tolerated.
+    pub fn from_trust_root(dir: &Path) -> Result<Self, PluginLoadError> {
+        use base64::Engine as _;
+
+        let mut keys = Vec::new();
+        let entries = fs::read_dir(dir).map_err(|e| {
+            PluginLoadError::IoError(format!("trust-root {}: {}", dir.display(), e))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| PluginLoadError::IoError(e.to_string()))?;
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("pub") {
+                continue;
+            }
+            let raw = fs::read_to_string(&p).map_err(|e| {
+                PluginLoadError::IoError(format!("read {}: {}", p.display(), e))
+            })?;
+            let raw = raw.trim();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(raw)
+                .map_err(|e| {
+                    PluginLoadError::SignatureInvalid(format!(
+                        "{} not valid base64: {}",
+                        p.display(),
+                        e
+                    ))
+                })?;
+            if bytes.len() != 32 {
+                return Err(PluginLoadError::SignatureInvalid(format!(
+                    "{} should be 32 bytes (raw Ed25519 pubkey), got {}",
+                    p.display(),
+                    bytes.len()
+                )));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            let key = ed25519_dalek::VerifyingKey::from_bytes(&arr).map_err(|e| {
+                PluginLoadError::SignatureInvalid(format!(
+                    "{} not a valid Ed25519 pubkey: {}",
+                    p.display(),
+                    e
+                ))
+            })?;
+            let label = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("(unknown)")
+                .to_string();
+            keys.push((label, key));
+        }
+        Ok(Self { keys })
+    }
+
+    /// Verify a signature blob (base64-encoded Ed25519 signature)
+    /// against the .wasm bytes. Returns Ok with the matching label
+    /// on success.
+    pub fn verify(&self, wasm: &[u8], sig_b64: &str) -> Result<&str, PluginLoadError> {
+        use base64::Engine as _;
+        use ed25519_dalek::Verifier;
+
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(sig_b64.trim())
+            .map_err(|e| {
+                PluginLoadError::SignatureInvalid(format!("base64 decode: {}", e))
+            })?;
+        if sig_bytes.len() != 64 {
+            return Err(PluginLoadError::SignatureInvalid(format!(
+                "signature should be 64 bytes, got {}",
+                sig_bytes.len()
+            )));
+        }
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&sig_bytes);
+        let sig = ed25519_dalek::Signature::from_bytes(&arr);
+
+        for (label, key) in &self.keys {
+            if key.verify(wasm, &sig).is_ok() {
+                return Ok(label.as_str());
+            }
+        }
+        Err(PluginLoadError::SignatureInvalid(
+            "signature did not match any trusted key".to_string(),
+        ))
+    }
+
+    /// Number of trusted keys. Useful for diagnostics — a verifier
+    /// with zero keys rejects every signature.
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
+    }
 }
 
 impl PluginLoader {
@@ -151,7 +279,15 @@ impl PluginLoader {
         Self {
             search_paths: Vec::new(),
             allowed_extensions: vec!["wasm".to_string()],
+            signature_verifier: None,
         }
+    }
+
+    /// Attach a trust-root verifier. Once set, every load() call
+    /// requires a matching .sig sidecar; loads without one fail.
+    pub fn with_signature_verifier(mut self, verifier: SignatureVerifier) -> Self {
+        self.signature_verifier = Some(verifier);
+        self
     }
 
     /// Add a search path
@@ -183,6 +319,27 @@ impl PluginLoader {
             return Err(PluginLoadError::InvalidFormat(
                 "Invalid WASM file (bad magic number)".to_string(),
             ));
+        }
+
+        // Signature check (when a trust root is configured). The .sig
+        // sidecar is required — no signature, no load.
+        if let Some(ref verifier) = self.signature_verifier {
+            let sig_path = path.with_extension("sig");
+            if !sig_path.exists() {
+                return Err(PluginLoadError::SignatureInvalid(format!(
+                    "{} requires a sidecar .sig file (trust root active)",
+                    path.display()
+                )));
+            }
+            let sig_b64 = fs::read_to_string(&sig_path).map_err(|e| {
+                PluginLoadError::IoError(format!("read {}: {}", sig_path.display(), e))
+            })?;
+            let label = verifier.verify(&wasm_bytes, &sig_b64)?;
+            tracing::info!(
+                plugin = %path.display(),
+                signed_by = %label,
+                "plugin signature verified"
+            );
         }
 
         // Try to load manifest from sidecar file
@@ -561,5 +718,136 @@ mod tests {
     fn test_config_field_type() {
         assert_eq!(ConfigFieldType::String, ConfigFieldType::String);
         assert_ne!(ConfigFieldType::String, ConfigFieldType::Integer);
+    }
+
+    // -----------------------------------------------------------------
+    // SignatureVerifier tests
+    //
+    // We generate an Ed25519 keypair at runtime, write the public key
+    // into a temp trust-root dir, sign a fake .wasm, and check that
+    // the loader accepts the signed bytes and rejects tampered ones.
+    // -----------------------------------------------------------------
+
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    /// Helper: write a single .pub file with `key`'s public component
+    /// into `dir/<label>.pub`. Returns `dir`.
+    fn write_pub_key(dir: &Path, label: &str, key: &SigningKey) {
+        let pub_bytes = key.verifying_key().to_bytes();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(pub_bytes);
+        std::fs::write(dir.join(format!("{label}.pub")), b64).unwrap();
+    }
+
+    fn make_signing_key() -> SigningKey {
+        // Deterministic seed → reproducible tests.
+        let seed = [7u8; 32];
+        SigningKey::from_bytes(&seed)
+    }
+
+    #[test]
+    fn test_signature_verifier_accepts_matching_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = make_signing_key();
+        write_pub_key(dir.path(), "official", &key);
+
+        let verifier = SignatureVerifier::from_trust_root(dir.path()).unwrap();
+        assert_eq!(verifier.key_count(), 1);
+
+        let wasm = b"\x00asm\x01\x00\x00\x00pretend-real-wasm";
+        let sig = key.sign(wasm);
+        let sig_b64 =
+            base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+
+        let label = verifier.verify(wasm, &sig_b64).unwrap();
+        assert_eq!(label, "official");
+    }
+
+    #[test]
+    fn test_signature_verifier_rejects_tampered_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = make_signing_key();
+        write_pub_key(dir.path(), "official", &key);
+        let verifier = SignatureVerifier::from_trust_root(dir.path()).unwrap();
+
+        let wasm = b"\x00asm\x01\x00\x00\x00pretend-real-wasm";
+        let sig = key.sign(wasm);
+        let sig_b64 =
+            base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+
+        let tampered = b"\x00asm\x01\x00\x00\x00pretend-real-wasn"; // 'm' → 'n'
+        let err = verifier.verify(tampered, &sig_b64).unwrap_err();
+        assert!(matches!(err, PluginLoadError::SignatureInvalid(_)));
+    }
+
+    #[test]
+    fn test_signature_verifier_rejects_unknown_signer() {
+        let dir = tempfile::tempdir().unwrap();
+        let trusted = make_signing_key();
+        write_pub_key(dir.path(), "official", &trusted);
+        let verifier = SignatureVerifier::from_trust_root(dir.path()).unwrap();
+
+        // Sign with a completely different key.
+        let attacker = SigningKey::from_bytes(&[0xAB; 32]);
+        let wasm = b"\x00asm\x01\x00\x00\x00pretend-real-wasm";
+        let sig = attacker.sign(wasm);
+        let sig_b64 =
+            base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+
+        let err = verifier.verify(wasm, &sig_b64).unwrap_err();
+        assert!(matches!(err, PluginLoadError::SignatureInvalid(_)));
+    }
+
+    #[test]
+    fn test_signature_verifier_rejects_wrong_length_pubkey() {
+        let dir = tempfile::tempdir().unwrap();
+        // 31 bytes — invalid Ed25519 length.
+        std::fs::write(
+            dir.path().join("bad.pub"),
+            base64::engine::general_purpose::STANDARD.encode([0u8; 31]),
+        )
+        .unwrap();
+        let err = SignatureVerifier::from_trust_root(dir.path()).unwrap_err();
+        assert!(matches!(err, PluginLoadError::SignatureInvalid(_)));
+    }
+
+    #[test]
+    fn test_signature_verifier_supports_multiple_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let k1 = SigningKey::from_bytes(&[1u8; 32]);
+        let k2 = SigningKey::from_bytes(&[2u8; 32]);
+        write_pub_key(dir.path(), "publisher-a", &k1);
+        write_pub_key(dir.path(), "publisher-b", &k2);
+
+        let verifier = SignatureVerifier::from_trust_root(dir.path()).unwrap();
+        assert_eq!(verifier.key_count(), 2);
+
+        let wasm = b"\x00asm\x01\x00\x00\x00abc";
+        let sig = k2.sign(wasm); // signed by the SECOND publisher
+        let sig_b64 =
+            base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+
+        let label = verifier.verify(wasm, &sig_b64).unwrap();
+        assert_eq!(label, "publisher-b");
+    }
+
+    #[test]
+    fn test_loader_with_verifier_rejects_unsigned_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = dir.path().join("plugin.wasm");
+        std::fs::write(&wasm_path, b"\x00asm\x01\x00\x00\x00body").unwrap();
+
+        let trust_dir = tempfile::tempdir().unwrap();
+        let key = make_signing_key();
+        write_pub_key(trust_dir.path(), "official", &key);
+
+        let loader = PluginLoader::new()
+            .with_signature_verifier(SignatureVerifier::from_trust_root(trust_dir.path()).unwrap());
+        let err = loader.load(&wasm_path).unwrap_err();
+        assert!(
+            matches!(err, PluginLoadError::SignatureInvalid(_)),
+            "expected SignatureInvalid for missing .sig, got {:?}",
+            err
+        );
     }
 }
