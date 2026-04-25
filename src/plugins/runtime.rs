@@ -35,6 +35,7 @@ use wasmtime::{Engine, Instance, Linker, Module, Store, TypedFunc, Memory};
 
 use super::config::PluginRuntimeConfig;
 use super::host_functions::HostFunctionRegistry;
+use super::host_imports::{register_kv_imports, KvBackend, StoreCtx};
 use super::sandbox::{PluginSandbox, SecurityPolicy, ResourceLimits};
 use super::{
     AuthRequest, AuthResult, HookType, PluginMetadata, PreQueryResult,
@@ -223,6 +224,10 @@ pub struct WasmPluginRuntime {
     /// Host function registry
     host_functions: Arc<HostFunctionRegistry>,
 
+    /// Per-plugin KV backend bridged into wasmtime imports. Survives
+    /// across calls so plugins can persist state between hooks.
+    kv: KvBackend,
+
     /// Module cache (path -> compiled module). Avoids re-compiling
     /// the same `.wasm` on every load.
     module_cache: RwLock<HashMap<PathBuf, Module>>,
@@ -264,10 +269,17 @@ impl WasmPluginRuntime {
             config: config.clone(),
             engine,
             host_functions,
+            kv: KvBackend::new(),
             module_cache: RwLock::new(HashMap::new()),
             default_policy,
             created_at: Instant::now(),
         })
+    }
+
+    /// Expose the per-plugin KV backend so admin/test code can seed
+    /// or inspect a plugin's state without going through WASM.
+    pub fn kv(&self) -> &KvBackend {
+        &self.kv
     }
 
     /// Expose the engine so tests + the plugin manager can build new
@@ -384,7 +396,13 @@ impl WasmPluginRuntime {
         plugin.record_invocation();
 
         // Fresh per-call store; not Sync, so we never share across calls.
-        let mut store: Store<()> = Store::new(&self.engine, ());
+        // The data carries the plugin's identity + a clone of the shared
+        // KV backend so host imports can route to the right namespace.
+        let store_ctx = StoreCtx {
+            plugin_name: plugin.metadata.name.clone(),
+            kv: self.kv.clone(),
+        };
+        let mut store: Store<StoreCtx> = Store::new(&self.engine, store_ctx);
         if self.config.fuel_metering {
             // wasmtime's set_fuel returns Result; cap is per-call.
             store.set_fuel(self.config.fuel_limit).map_err(|e| {
@@ -400,10 +418,11 @@ impl WasmPluginRuntime {
         // from a background task to enforce wall-clock timeouts.
         store.set_epoch_deadline(u64::MAX);
 
-        // Empty linker — host functions land in a follow-up. Plugins
-        // that import `env::host_*` will fail instantiation with a
-        // diagnostic that mentions the missing import.
-        let linker: Linker<()> = Linker::new(&self.engine);
+        // Linker carries the host imports under `env::*`. Plugins that
+        // don't import any of them are unaffected; plugins that need
+        // KV (or other future imports) get them resolved here.
+        let mut linker: Linker<StoreCtx> = Linker::new(&self.engine);
+        register_kv_imports(&mut linker)?;
         let instance = linker
             .instantiate(&mut store, &plugin.module)
             .map_err(|e| {
@@ -610,9 +629,9 @@ impl serde::Serialize for QueryContext {
 
 /// Look up a typed exported function on an instance, with a uniform
 /// "missing/wrong-shape" error message.
-fn get_typed<P, R>(
+fn get_typed<T, P, R>(
     instance: &Instance,
-    store: &mut Store<()>,
+    store: &mut Store<T>,
     name: &str,
 ) -> Result<TypedFunc<P, R>, PluginError>
 where
@@ -626,9 +645,9 @@ where
 
 /// Copy `bytes` into the plugin's linear memory at `ptr`. Bounds-
 /// checked via wasmtime's safe `Memory::write`.
-fn write_memory(
+fn write_memory<T>(
     memory: &Memory,
-    store: &mut Store<()>,
+    store: &mut Store<T>,
     ptr: i32,
     bytes: &[u8],
 ) -> Result<(), PluginError> {
@@ -638,9 +657,9 @@ fn write_memory(
 }
 
 /// Copy `len` bytes out of plugin memory starting at `ptr`.
-fn read_memory(
+fn read_memory<T>(
     memory: &Memory,
-    store: &Store<()>,
+    store: &Store<T>,
     ptr: i32,
     len: i32,
 ) -> Result<Vec<u8>, PluginError> {
@@ -965,5 +984,75 @@ mod tests {
             .call_hook(&plugin, HookType::Authenticate, &[])
             .unwrap_err();
         assert!(matches!(err, PluginError::ExecutionError(_)));
+    }
+
+    /// Build a WAT module that imports kv_set + kv_get from `env` and
+    /// calls kv_set on `pre_query`. Used to validate the host-import
+    /// bridge end-to-end through wasmtime.
+    fn build_kv_test_module(engine: &Engine) -> Module {
+        // Layout:
+        //   offset 100: 3 bytes "key"
+        //   offset 200: 5 bytes "value"
+        let wat = r#"
+            (module
+              (import "env" "kv_set"
+                (func $kv_set (param i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+
+              (data (i32.const 100) "key")
+              (data (i32.const 200) "value")
+
+              (func (export "alloc") (param i32) (result i32) (i32.const 4096))
+              (func (export "dealloc") (param i32 i32))
+
+              ;; pre_query: kv_set("key", "value"); return 0 (no payload).
+              (func (export "pre_query")
+                (param $in_ptr i32) (param $in_len i32) (result i64)
+                (drop (call $kv_set
+                  (i32.const 100) (i32.const 3)
+                  (i32.const 200) (i32.const 5)))
+                (i64.const 0))
+            )
+        "#;
+        let bytes = wat::parse_str(wat).expect("kv-wat parses");
+        Module::from_binary(engine, &bytes).expect("kv module compiles")
+    }
+
+    /// Calls a WASM `pre_query` hook that invokes the host's kv_set
+    /// import. Verifies the value lands in the runtime's KvBackend
+    /// under the plugin's namespace and is readable from Rust.
+    #[test]
+    fn test_host_kv_import_persists_value() {
+        let mut config = PluginRuntimeConfig::default();
+        config.fuel_metering = false;
+        let runtime = WasmPluginRuntime::new(&config).unwrap();
+
+        let module = build_kv_test_module(runtime.engine());
+        let mut metadata = PluginMetadata::default();
+        metadata.name = "kv-test-plugin".to_string();
+        metadata.hooks = vec![HookType::PreQuery];
+
+        let plugin = LoadedPlugin::new(
+            metadata,
+            PathBuf::from("/test/kv.wasm"),
+            module,
+            PluginSandbox::default(),
+        );
+
+        // Sanity: namespace empty before the call.
+        assert_eq!(runtime.kv().get("kv-test-plugin", b"key"), None);
+
+        let _ = runtime
+            .call_hook(&plugin, HookType::PreQuery, &[])
+            .expect("pre_query call");
+
+        // The plugin called kv_set("key", "value") inside WASM; the
+        // host should have stored it under this plugin's namespace.
+        assert_eq!(
+            runtime.kv().get("kv-test-plugin", b"key"),
+            Some(b"value".to_vec())
+        );
+        // And nowhere else.
+        assert_eq!(runtime.kv().get("other-plugin", b"key"), None);
     }
 }
