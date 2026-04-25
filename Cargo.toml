@@ -58,8 +58,8 @@ auth-proxy = []
 # SQL query rewriting (rules engine)
 query-rewriting = []
 
-# WASM plugin system (hot-reload, sandboxed)
-wasm-plugins = []
+# WASM plugin system (hot-reload, sandboxed) — requires wasmtime.
+wasm-plugins = ["dep:wasmtime"]
 
 # GraphQL-to-SQL gateway
 graphql-gateway = []
@@ -149,6 +149,12 @@ sha2 = "0.10"
 hmac = "0.12"
 md-5 = "0.10"
 
+# WASM plugin runtime — wasmtime is feature-gated on wasm-plugins so
+# default builds don't pay the (~3 MB compiled) cost. The cranelift
+# backend is the JIT; we strip wasi/component-model since the plugin
+# ABI is bare extern "C" exports against linear memory.
+wasmtime = { version = "26", default-features = false, features = ["cranelift", "runtime", "parallel-compilation"], optional = true }
+
 # Optional: Metrics
 prometheus = { version = "0.13", optional = true }
 opentelemetry = { version = "0.21", optional = true }
@@ -156,6 +162,9 @@ opentelemetry = { version = "0.21", optional = true }
 [dev-dependencies]
 tokio-test = "0.4"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+# Inline-WASM (.wat → .wasm) for plugin runtime tests so we don't have
+# to ship binary fixtures.
+wat = "1"
 
 [[bin]]
 name = "heliosdb-proxy"

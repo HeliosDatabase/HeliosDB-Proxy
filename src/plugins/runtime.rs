@@ -1,6 +1,29 @@
 //! WASM Plugin Runtime
 //!
-//! Core runtime for executing WebAssembly plugins using wasmtime.
+//! Real wasmtime-backed plugin executor.
+//!
+//! ## ABI
+//!
+//! Plugins export, at minimum:
+//!
+//! - `memory` (default linear memory).
+//! - `alloc(size: i32) -> i32` — host calls this to obtain a slot
+//!   in plugin memory it can write input bytes into.
+//! - `dealloc(ptr: i32, size: i32)` — host calls this to free either
+//!   the input slot (after the call) or the output slot (after the
+//!   host has read the result).
+//! - One function per declared hook, with one of two signatures:
+//!   - **Result-returning hooks** (`pre_query`, `route`,
+//!     `authenticate`, `rewrite`): `(ptr: i32, len: i32) -> i64`
+//!     where the i64 is `(result_ptr << 32) | result_len`.
+//!     `result_ptr == 0 && result_len == 0` is a valid "no result"
+//!     reply (host treats it as the default per-hook outcome).
+//!   - **Observer hooks** (`post_query`, `metrics`, `on_connect`,
+//!     `on_disconnect`): `(ptr: i32, len: i32)` with no return —
+//!     the host ignores any output the plugin may have written.
+//!
+//! The runtime tries the result-returning signature first; if the
+//! exported function has the no-return shape it falls back.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -8,6 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
+use wasmtime::{Engine, Instance, Linker, Module, Store, TypedFunc, Memory};
 
 use super::config::PluginRuntimeConfig;
 use super::host_functions::HostFunctionRegistry;
@@ -96,8 +120,9 @@ pub struct LoadedPlugin {
     /// File path
     pub path: PathBuf,
 
-    /// Compiled module bytes (serialized)
-    compiled_module: Vec<u8>,
+    /// Compiled wasmtime module — cheap to clone (internally Arc'd)
+    /// and shared across invocations. Replaces the prior Vec<u8> stub.
+    module: Module,
 
     /// Security sandbox
     sandbox: PluginSandbox,
@@ -132,14 +157,14 @@ impl LoadedPlugin {
     pub fn new(
         metadata: PluginMetadata,
         path: PathBuf,
-        compiled_module: Vec<u8>,
+        module: Module,
         sandbox: PluginSandbox,
     ) -> Self {
         Self {
             metadata,
             state: PluginState::Running,
             path,
-            compiled_module,
+            module,
             sandbox,
             instance_data: RwLock::new(PluginInstanceData {
                 memory_used: 0,
@@ -150,6 +175,13 @@ impl LoadedPlugin {
             last_invoked: RwLock::new(None),
             invocation_count: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Borrow the compiled module (Arc-cheap clone available via
+    /// `plugin.module.clone()` if the caller needs to outlive the
+    /// borrow).
+    pub(crate) fn module(&self) -> &Module {
+        &self.module
     }
 
     /// Get memory usage
@@ -184,11 +216,16 @@ pub struct WasmPluginRuntime {
     /// Runtime configuration
     config: PluginRuntimeConfig,
 
+    /// wasmtime engine — shared across all plugins. Compiles modules
+    /// once; modules cheaply share a reference to it.
+    engine: Engine,
+
     /// Host function registry
     host_functions: Arc<HostFunctionRegistry>,
 
-    /// Module cache (path -> compiled bytes)
-    module_cache: RwLock<HashMap<PathBuf, Vec<u8>>>,
+    /// Module cache (path -> compiled module). Avoids re-compiling
+    /// the same `.wasm` on every load.
+    module_cache: RwLock<HashMap<PathBuf, Module>>,
 
     /// Default security policy
     default_policy: SecurityPolicy,
@@ -202,6 +239,18 @@ impl WasmPluginRuntime {
     pub fn new(config: &PluginRuntimeConfig) -> Result<Self, PluginError> {
         let host_functions = Arc::new(HostFunctionRegistry::new());
 
+        let mut engine_config = wasmtime::Config::new();
+        if config.fuel_metering {
+            engine_config.consume_fuel(true);
+        }
+        // Epoch-based interrupts let us bound execution time without
+        // polling fuel from inside the call.
+        engine_config.epoch_interruption(true);
+
+        let engine = Engine::new(&engine_config).map_err(|e| {
+            PluginError::RuntimeError(format!("wasmtime engine init: {}", e))
+        })?;
+
         let default_policy = SecurityPolicy {
             allowed_hosts: vec!["localhost".to_string()],
             allowed_paths: vec![config.plugin_dir.clone()],
@@ -213,11 +262,18 @@ impl WasmPluginRuntime {
 
         Ok(Self {
             config: config.clone(),
+            engine,
             host_functions,
             module_cache: RwLock::new(HashMap::new()),
             default_policy,
             created_at: Instant::now(),
         })
+    }
+
+    /// Expose the engine so tests + the plugin manager can build new
+    /// `Store`s against it.
+    pub(crate) fn engine(&self) -> &Engine {
+        &self.engine
     }
 
     /// Instantiate a plugin from manifest and WASM bytes
@@ -267,25 +323,41 @@ impl WasmPluginRuntime {
             manifest.permissions.clone(),
         );
 
-        // "Compile" module (in real impl, would use wasmtime::Module::new)
-        // For now, store the raw bytes as the "compiled" form
-        let compiled_module = wasm_bytes.to_vec();
+        // Compile via wasmtime — this validates the module and produces
+        // an Arc-wrapped Module ready for repeated instantiation.
+        let module = Module::from_binary(&self.engine, wasm_bytes).map_err(|e| {
+            PluginError::InstantiationError(format!("wasmtime compile: {}", e))
+        })?;
 
-        // Cache the compiled module
+        // Cache the compiled Module (cheap clone on hit).
         {
             let mut cache = self.module_cache.write();
-            cache.insert(manifest.path.clone(), compiled_module.clone());
+            cache.insert(manifest.path.clone(), module.clone());
         }
 
         Ok(LoadedPlugin::new(
             metadata,
             manifest.path.clone(),
-            compiled_module,
+            module,
             sandbox,
         ))
     }
 
-    /// Call a hook on a plugin
+    /// Call a hook on a plugin via wasmtime.
+    ///
+    /// 1. Build a fresh `Store` (wasmtime stores are not Sync, so each
+    ///    invocation is isolated).
+    /// 2. Apply fuel metering (per-call fuel cap) when configured.
+    /// 3. Instantiate the module against an empty Linker — host
+    ///    functions are TODO; plugins that import them will fail at
+    ///    instantiation with a clear error message.
+    /// 4. Look up `memory`, `alloc`, `dealloc`, and the named hook
+    ///    function exports.
+    /// 5. Allocate a slot in plugin memory, write `args`, call the
+    ///    hook, decode `(result_ptr, result_len)`, copy the result
+    ///    bytes out.
+    /// 6. Free both input and output slots via `dealloc`.
+    /// 7. Drop the store; the plugin's per-call state is gone.
     pub fn call_hook(
         &self,
         plugin: &LoadedPlugin,
@@ -311,15 +383,110 @@ impl WasmPluginRuntime {
         // Record invocation
         plugin.record_invocation();
 
-        // In a real implementation, this would:
-        // 1. Get or create a wasmtime::Instance
-        // 2. Look up the exported function for this hook
-        // 3. Call the function with args
-        // 4. Handle timeout/fuel exhaustion
-        // 5. Return the result
+        // Fresh per-call store; not Sync, so we never share across calls.
+        let mut store: Store<()> = Store::new(&self.engine, ());
+        if self.config.fuel_metering {
+            // wasmtime's set_fuel returns Result; cap is per-call.
+            store.set_fuel(self.config.fuel_limit).map_err(|e| {
+                PluginError::RuntimeError(format!("set_fuel: {}", e))
+            })?;
+        }
+        // Epoch interruption was enabled at engine init. If we don't
+        // raise the deadline above the engine's current epoch (0), the
+        // store traps as soon as the function is entered. A deadline
+        // of `u64::MAX` effectively disables the interrupt for this
+        // call — real time enforcement happens via fuel. A future
+        // commit can ratchet this down per-config and pump epoch ticks
+        // from a background task to enforce wall-clock timeouts.
+        store.set_epoch_deadline(u64::MAX);
 
-        // For now, return empty success
-        Ok(Vec::new())
+        // Empty linker — host functions land in a follow-up. Plugins
+        // that import `env::host_*` will fail instantiation with a
+        // diagnostic that mentions the missing import.
+        let linker: Linker<()> = Linker::new(&self.engine);
+        let instance = linker
+            .instantiate(&mut store, &plugin.module)
+            .map_err(|e| {
+                PluginError::InstantiationError(format!(
+                    "instantiate {}: {}",
+                    plugin.metadata.name, e
+                ))
+            })?;
+
+        let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| {
+            PluginError::ExecutionError(format!(
+                "plugin {} does not export `memory`",
+                plugin.metadata.name
+            ))
+        })?;
+
+        let alloc = get_typed::<i32, i32>(&instance, &mut store, "alloc")?;
+        let dealloc = get_typed::<(i32, i32), ()>(&instance, &mut store, "dealloc")?;
+
+        // Allocate input slot inside the plugin's address space and
+        // copy `args` in.
+        let in_len = args.len() as i32;
+        let in_ptr = alloc.call(&mut store, in_len).map_err(|e| {
+            PluginError::ExecutionError(format!("alloc({}): {}", in_len, e))
+        })?;
+        if in_len > 0 {
+            write_memory(&memory, &mut store, in_ptr, args)?;
+        }
+
+        // Try the result-returning ABI first; if the export has the
+        // observer ABI (no return), fall back to that.
+        let export_name = hook.export_name();
+        let result_bytes = match get_typed::<(i32, i32), i64>(&instance, &mut store, export_name) {
+            Ok(hook_fn) => {
+                let packed = hook_fn.call(&mut store, (in_ptr, in_len)).map_err(|e| {
+                    PluginError::ExecutionError(format!(
+                        "hook {} call: {}",
+                        export_name, e
+                    ))
+                })?;
+                let out_ptr = (packed >> 32) as i32;
+                let out_len = (packed & 0xFFFF_FFFF) as i32;
+                if out_len > 0 {
+                    let bytes = read_memory(&memory, &store, out_ptr, out_len)?;
+                    // Free the plugin-allocated output slot.
+                    let _ = dealloc.call(&mut store, (out_ptr, out_len));
+                    bytes
+                } else {
+                    Vec::new()
+                }
+            }
+            Err(_) => {
+                // Observer ABI: (i32, i32) → ()
+                let observer = get_typed::<(i32, i32), ()>(
+                    &instance,
+                    &mut store,
+                    export_name,
+                )?;
+                observer.call(&mut store, (in_ptr, in_len)).map_err(|e| {
+                    PluginError::ExecutionError(format!(
+                        "observer hook {} call: {}",
+                        export_name, e
+                    ))
+                })?;
+                Vec::new()
+            }
+        };
+
+        // Free the input slot. Best-effort; failure here doesn't
+        // abort the call (the store is about to be dropped anyway).
+        let _ = dealloc.call(&mut store, (in_ptr, in_len));
+
+        // Update per-plugin instance accounting.
+        if self.config.fuel_metering {
+            if let Ok(remaining) = store.get_fuel() {
+                let consumed = self.config.fuel_limit.saturating_sub(remaining);
+                plugin.instance_data.write().fuel_consumed = consumed;
+            }
+        }
+        plugin.instance_data.write().memory_used =
+            (memory.data_size(&store)) as usize;
+
+        Ok(result_bytes)
     }
 
     /// Call pre-query hook
@@ -439,6 +606,52 @@ impl serde::Serialize for QueryContext {
         state.serialize_field("is_read_only", &self.is_read_only)?;
         state.end()
     }
+}
+
+/// Look up a typed exported function on an instance, with a uniform
+/// "missing/wrong-shape" error message.
+fn get_typed<P, R>(
+    instance: &Instance,
+    store: &mut Store<()>,
+    name: &str,
+) -> Result<TypedFunc<P, R>, PluginError>
+where
+    P: wasmtime::WasmParams,
+    R: wasmtime::WasmResults,
+{
+    instance
+        .get_typed_func::<P, R>(store, name)
+        .map_err(|e| PluginError::ExecutionError(format!("export `{}`: {}", name, e)))
+}
+
+/// Copy `bytes` into the plugin's linear memory at `ptr`. Bounds-
+/// checked via wasmtime's safe `Memory::write`.
+fn write_memory(
+    memory: &Memory,
+    store: &mut Store<()>,
+    ptr: i32,
+    bytes: &[u8],
+) -> Result<(), PluginError> {
+    memory.write(store, ptr as usize, bytes).map_err(|e| {
+        PluginError::ExecutionError(format!("memory.write @ {}: {}", ptr, e))
+    })
+}
+
+/// Copy `len` bytes out of plugin memory starting at `ptr`.
+fn read_memory(
+    memory: &Memory,
+    store: &Store<()>,
+    ptr: i32,
+    len: i32,
+) -> Result<Vec<u8>, PluginError> {
+    if len <= 0 {
+        return Ok(Vec::new());
+    }
+    let mut out = vec![0u8; len as usize];
+    memory.read(store, ptr as usize, &mut out).map_err(|e| {
+        PluginError::ExecutionError(format!("memory.read @ {}+{}: {}", ptr, len, e))
+    })?;
+    Ok(out)
 }
 
 impl serde::Serialize for AuthRequest {
@@ -566,6 +779,59 @@ impl<'de> serde::Deserialize<'de> for RouteResult {
 mod tests {
     use super::*;
 
+    /// Build a tiny WAT module for runtime tests against a specific
+    /// engine. wasmtime requires Module and instantiating Engine to
+    /// match — so this takes the runtime's engine rather than
+    /// constructing one locally.
+    ///
+    /// Exports `memory`, `alloc`, `dealloc`, a `pre_query` hook that
+    /// ignores its input and returns a fixed payload at offset 1024,
+    /// and a `post_query` observer hook.
+    fn build_test_module(engine: &Engine) -> Module {
+        const PAYLOAD: &[u8] = b"hello-from-wasm";
+        let payload_hex: String = PAYLOAD
+            .iter()
+            .map(|b| format!("\\{:02x}", b))
+            .collect();
+        let wat = format!(
+            r#"
+            (module
+              (memory (export "memory") 1)
+
+              ;; Trivial alloc: always returns offset 4096 (test inputs
+              ;; are tiny so non-overlapping reuse is fine here). Real
+              ;; plugins ship a real allocator; the runtime only cares
+              ;; that `alloc` returns a writable address.
+              (func (export "alloc") (param $size i32) (result i32)
+                (i32.const 4096))
+
+              (func (export "dealloc") (param $ptr i32) (param $size i32)
+                (drop (local.get $ptr))
+                (drop (local.get $size)))
+
+              ;; Result-returning hook: writes PAYLOAD at offset 1024 and
+              ;; returns (1024 << 32) | PAYLOAD.len.
+              (func (export "pre_query")
+                (param $in_ptr i32) (param $in_len i32) (result i64)
+                (i64.or
+                  (i64.shl (i64.const 1024) (i64.const 32))
+                  (i64.const {payload_len})))
+
+              ;; Observer hook: takes args, returns nothing.
+              (func (export "post_query")
+                (param $in_ptr i32) (param $in_len i32)
+                (drop (local.get $in_ptr)))
+
+              (data (i32.const 1024) "{payload}")
+            )
+            "#,
+            payload = payload_hex,
+            payload_len = PAYLOAD.len(),
+        );
+        let bytes = wat::parse_str(&wat).expect("wat parses");
+        Module::from_binary(engine, &bytes).expect("module compiles")
+    }
+
     #[test]
     fn test_plugin_error_display() {
         let err = PluginError::LoadError("test".to_string());
@@ -600,12 +866,16 @@ mod tests {
 
     #[test]
     fn test_loaded_plugin_invocation_count() {
+        // Re-use the test module — its compiled `Module` is what
+        // the LoadedPlugin needs now that the field is wasmtime-typed.
+        let engine = Engine::default();
+        let module = build_test_module(&engine);
         let metadata = PluginMetadata::default();
         let sandbox = PluginSandbox::default();
         let plugin = LoadedPlugin::new(
             metadata,
             PathBuf::from("/test/plugin.wasm"),
-            vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+            module,
             sandbox,
         );
 
@@ -614,5 +884,86 @@ mod tests {
         assert_eq!(plugin.invocation_count(), 1);
         plugin.record_invocation();
         assert_eq!(plugin.invocation_count(), 2);
+    }
+
+    /// End-to-end: load a WAT-built module, call `pre_query`, observe
+    /// the plugin's payload comes back through the (ptr, len) ABI.
+    /// This is the killer test that proves the wasmtime path is
+    /// real, not a stub.
+    #[test]
+    fn test_call_hook_roundtrips_real_wasm() {
+        let mut config = PluginRuntimeConfig::default();
+        // Disable fuel metering — the test module is trivial and we
+        // don't want to debug fuel exhaustion in unit tests.
+        config.fuel_metering = false;
+        let runtime = WasmPluginRuntime::new(&config).unwrap();
+
+        let module = build_test_module(runtime.engine());
+        let mut metadata = PluginMetadata::default();
+        metadata.name = "test-roundtrip".to_string();
+        metadata.hooks = vec![HookType::PreQuery, HookType::PostQuery];
+
+        let plugin = LoadedPlugin::new(
+            metadata,
+            PathBuf::from("/test/roundtrip.wasm"),
+            module,
+            PluginSandbox::default(),
+        );
+        // Force into Running state — Loading would block.
+        // (LoadedPlugin::new already sets Running by default.)
+
+        let bytes = runtime
+            .call_hook(&plugin, HookType::PreQuery, b"ignored input")
+            .expect("pre_query call");
+        assert_eq!(bytes, b"hello-from-wasm");
+        assert_eq!(plugin.invocation_count(), 1);
+
+        // Observer ABI: post_query has no return; should yield empty.
+        let out = runtime
+            .call_hook(&plugin, HookType::PostQuery, b"some bytes")
+            .expect("post_query call");
+        assert!(out.is_empty());
+        assert_eq!(plugin.invocation_count(), 2);
+    }
+
+    /// A plugin that doesn't declare a hook in its metadata cannot
+    /// invoke that hook even if the WASM exports the function.
+    #[test]
+    fn test_call_hook_rejects_undeclared_hook() {
+        let runtime = WasmPluginRuntime::new(&PluginRuntimeConfig::default()).unwrap();
+        let module = build_test_module(runtime.engine());
+        let mut metadata = PluginMetadata::default();
+        metadata.hooks = vec![]; // declares nothing
+        let plugin = LoadedPlugin::new(
+            metadata,
+            PathBuf::from("/test/empty.wasm"),
+            module,
+            PluginSandbox::default(),
+        );
+        let err = runtime
+            .call_hook(&plugin, HookType::PreQuery, &[])
+            .unwrap_err();
+        assert!(matches!(err, PluginError::HookNotFound(_)));
+    }
+
+    /// Calling a hook whose export name is missing surfaces as
+    /// `ExecutionError`, not a panic.
+    #[test]
+    fn test_call_hook_missing_export_returns_error() {
+        let runtime = WasmPluginRuntime::new(&PluginRuntimeConfig::default()).unwrap();
+        let module = build_test_module(runtime.engine());
+        let mut metadata = PluginMetadata::default();
+        // Declare a hook the test module doesn't export.
+        metadata.hooks = vec![HookType::Authenticate];
+        let plugin = LoadedPlugin::new(
+            metadata,
+            PathBuf::from("/test/missing.wasm"),
+            module,
+            PluginSandbox::default(),
+        );
+        let err = runtime
+            .call_hook(&plugin, HookType::Authenticate, &[])
+            .unwrap_err();
+        assert!(matches!(err, PluginError::ExecutionError(_)));
     }
 }
