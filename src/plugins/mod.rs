@@ -40,6 +40,7 @@ pub mod config;
 pub mod runtime;
 pub mod loader;
 pub mod host_functions;
+pub mod host_imports;
 pub mod sandbox;
 pub mod hot_reload;
 pub mod metrics;
