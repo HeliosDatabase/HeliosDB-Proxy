@@ -335,6 +335,13 @@ pub enum RouteResult {
 
     /// Route to specific branch
     Branch(String),
+
+    /// Reject the query with the given reason. Reaches the client as a
+    /// PostgreSQL ErrorResponse (severity ERROR, SQLSTATE 42000)
+    /// followed by ReadyForQuery — same wire shape as
+    /// `PreQueryResult::Block` so clients see one consistent error
+    /// path regardless of which hook rejected.
+    Block(String),
 }
 
 /// Plugin manager for coordinating all plugins
