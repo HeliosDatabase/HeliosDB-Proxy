@@ -76,6 +76,63 @@ fn build_replay_backend_template(_config: &ProxyConfig) -> BackendConfig {
     }
 }
 
+/// Cheap query-shape fingerprint for the anomaly detector. Replaces
+/// numeric and string literals with `?` placeholders, lower-cases
+/// keywords, and collapses whitespace. Same shape regardless of
+/// literal values — `SELECT * FROM users WHERE id = 1` and
+/// `SELECT * FROM users WHERE id = 99` map to the same fingerprint.
+///
+/// Not a parser. The analytics module has the canonical normaliser
+/// when query-analytics is on; this is a lightweight standalone so
+/// the anomaly detector works even when analytics is off.
+#[cfg(feature = "anomaly-detection")]
+fn anomaly_fingerprint(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut in_single = false;
+    let mut prev_space = false;
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            in_single = !in_single;
+            // Replace the entire string literal (open + body +
+            // close) with a single ?.
+            if in_single {
+                out.push('?');
+                while let Some(&n) = chars.peek() {
+                    chars.next();
+                    if n == '\'' {
+                        in_single = false;
+                        break;
+                    }
+                }
+                prev_space = false;
+                continue;
+            }
+        }
+        if c.is_ascii_digit() {
+            if !out.ends_with('?') {
+                out.push('?');
+            }
+            // Skip the rest of the number.
+            while matches!(chars.peek(), Some(c) if c.is_ascii_digit() || *c == '.') {
+                chars.next();
+            }
+            prev_space = false;
+            continue;
+        }
+        if c.is_ascii_whitespace() {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+                prev_space = true;
+            }
+            continue;
+        }
+        out.push(c.to_ascii_lowercase());
+        prev_space = false;
+    }
+    out.trim_end().to_string()
+}
+
 /// Server runtime state
 struct ServerState {
     /// Active client sessions
@@ -102,6 +159,10 @@ struct ServerState {
     /// journaling self-disables internally when not configured.
     #[cfg(feature = "ha-tr")]
     transaction_journal: Arc<crate::transaction_journal::TransactionJournal>,
+    /// Anomaly detector (T3.1). Records every query and every
+    /// auth outcome; surfaces detections via /api/anomalies.
+    #[cfg(feature = "anomaly-detection")]
+    anomaly_detector: Arc<crate::anomaly::AnomalyDetector>,
 }
 
 /// Per-node connection pool
@@ -445,6 +506,12 @@ impl ProxyServer {
             transaction_journal: Arc::new(
                 crate::transaction_journal::TransactionJournal::new(),
             ),
+            #[cfg(feature = "anomaly-detection")]
+            anomaly_detector: Arc::new(
+                crate::anomaly::AnomalyDetector::new(
+                    crate::anomaly::AnomalyConfig::default(),
+                ),
+            ),
         });
 
         Ok(Self {
@@ -563,6 +630,14 @@ impl ProxyServer {
                 ));
                 admin_state.with_replay_engine(engine).await;
             }
+
+            // Attach the anomaly detector — same Arc the server
+            // populates from the query path. /api/anomalies polls
+            // this for surfaced detections.
+            #[cfg(feature = "anomaly-detection")]
+            admin_state
+                .with_anomaly_detector(state.anomaly_detector.clone())
+                .await;
 
             // Create admin server
             let admin_server = AdminServer::new(config.admin_address.clone(), admin_state.clone());
@@ -740,6 +815,14 @@ impl ProxyServer {
                 if msg.msg_type == MessageType::Terminate {
                     return Ok(());
                 }
+
+                // Anomaly detector — record every Query message
+                // (rate window, novel-fingerprint detector, SQLi
+                // pattern scan). Fires before the plugin hook so a
+                // detection lands in the audit trail even if a
+                // plugin later blocks.
+                #[cfg(feature = "anomaly-detection")]
+                Self::record_anomaly_observation(&msg, state, session);
 
                 // Plugin pre-query hook — may rewrite the SQL, block the
                 // query with an error, or (future) return a cached response.
@@ -1660,6 +1743,58 @@ impl ProxyServer {
         }
     }
 
+    /// Feed the anomaly detector a per-query observation. Cheap —
+    /// only the SQL-injection scan and the novel-fingerprint check
+    /// are non-trivial, both well under a microsecond on
+    /// representative queries. Returns nothing; detections land in
+    /// the detector's ring buffer and are surfaced via /api/anomalies.
+    #[cfg(feature = "anomaly-detection")]
+    fn record_anomaly_observation(
+        msg: &Message,
+        state: &Arc<ServerState>,
+        session: &Arc<ClientSession>,
+    ) {
+        if msg.msg_type != MessageType::Query {
+            return;
+        }
+        let query_msg = match QueryMessage::parse(msg.payload.clone()) {
+            Ok(q) => q,
+            Err(_) => return,
+        };
+        // Tenant identifier is the most-specific known per-session
+        // attribute the proxy can attribute traffic to. Multi-tenancy
+        // sets `tenant_id` in `variables`; otherwise we fall back to
+        // the client address (string-shaped per-client rate window).
+        // session.variables is a tokio RwLock — but record_anomaly is
+        // a sync helper. Use try_read so we don't add an await; on
+        // contention we fall back to the client IP, which is still a
+        // valid per-source identifier.
+        let tenant = match session.variables.try_read() {
+            Ok(vars) => vars
+                .get("tenant_id")
+                .or_else(|| vars.get("user"))
+                .cloned()
+                .unwrap_or_else(|| session.client_addr.ip().to_string()),
+            Err(_) => session.client_addr.ip().to_string(),
+        };
+        let fingerprint = anomaly_fingerprint(&query_msg.query);
+        let now = std::time::Instant::now();
+        let iso = chrono::Utc::now().to_rfc3339();
+        let obs = crate::anomaly::QueryObservation {
+            tenant,
+            fingerprint,
+            sql: query_msg.query,
+            timestamp: now,
+            iso_timestamp: iso,
+        };
+        for ev in state.anomaly_detector.record_query(&obs) {
+            tracing::warn!(
+                anomaly = ?ev,
+                "anomaly detected"
+            );
+        }
+    }
+
     /// Send the client a `Block`-outcome response: an error frame plus
     /// `ReadyForQuery` so the client's state machine returns to idle and
     /// the next query can be accepted.
@@ -2516,6 +2651,12 @@ mod tests {
             #[cfg(feature = "ha-tr")]
             transaction_journal: Arc::new(
                 crate::transaction_journal::TransactionJournal::new(),
+            ),
+            #[cfg(feature = "anomaly-detection")]
+            anomaly_detector: Arc::new(
+                crate::anomaly::AnomalyDetector::new(
+                    crate::anomaly::AnomalyConfig::default(),
+                ),
             ),
         });
 

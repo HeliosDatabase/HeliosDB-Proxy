@@ -121,6 +121,15 @@ pub mod circuit_breaker;
 #[cfg(feature = "query-analytics")]
 pub mod analytics;
 
+// ── Anomaly detection (T3.1) — rate spikes, credential stuffing,
+// SQL injection heuristics, novel query shapes ─────────────────────
+#[cfg(feature = "anomaly-detection")]
+pub mod anomaly;
+
+// ── Edge / geo proxy mode (T3.2) ───────────────────────────────────
+#[cfg(feature = "edge-proxy")]
+pub mod edge;
+
 // ── Multi-tenancy support ───────────────────────────────────────────
 #[cfg(feature = "multi-tenancy")]
 pub mod multi_tenancy;

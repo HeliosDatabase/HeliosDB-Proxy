@@ -155,6 +155,23 @@
     </section>
 
     <section class="full">
+      <h2>Anomalies</h2>
+      <div class="body">
+        <table id="anomalies">
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>Severity</th>
+              <th>Kind</th>
+              <th>Details</th>
+            </tr>
+          </thead>
+          <tbody><tr><td colspan="4">loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="full">
       <h2>Plugins</h2>
       <div class="body">
         <table id="plugins">
@@ -359,6 +376,49 @@
       document.querySelector("#plugins tbody").innerHTML = rows;
     }
 
+    function severityBadge(sev) {
+      const colour = sev === "critical" ? "var(--err)"
+                   : sev === "warning"  ? "var(--warn)"
+                   : "var(--muted)";
+      return `<strong style='color:${colour}'>${sev}</strong>`;
+    }
+
+    function anomalyDetails(ev) {
+      switch (ev.kind) {
+        case "rate_spike":
+          return `tenant <code>${ev.tenant}</code>: ${ev.rate_per_sec.toFixed(1)}/s (baseline ${ev.baseline.toFixed(1)}, z=${ev.z_score.toFixed(1)})`;
+        case "auth_burst":
+          return `user <code>${ev.user}</code> from <code>${ev.client_ip}</code>: ${ev.failures} failures in ${ev.window_secs}s`;
+        case "sql_injection":
+          return `patterns: ${(ev.patterns_matched ?? []).join(", ")} — <code>${(ev.sql_excerpt ?? "").replace(/</g, "&lt;")}</code>`;
+        case "novel_query":
+          return `fingerprint <code>${ev.fingerprint}</code> — ${(ev.sql_excerpt ?? "").replace(/</g, "&lt;")}`;
+        default:
+          return JSON.stringify(ev);
+      }
+    }
+
+    function renderAnomalies(payload) {
+      const tbody = document.querySelector("#anomalies tbody");
+      if (payload.error) {
+        tbody.innerHTML = `<tr><td colspan="4" style="color: var(--muted);">${payload.error}</td></tr>`;
+        return;
+      }
+      const events = payload.events ?? [];
+      if (events.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="4" style="color: var(--muted);">no anomalies detected</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = events.map(ev => `
+        <tr>
+          <td>${fmtTs(ev.detected_at)}</td>
+          <td>${severityBadge(ev.severity ?? "info")}</td>
+          <td><code>${ev.kind}</code></td>
+          <td>${anomalyDetails(ev)}</td>
+        </tr>
+      `).join("");
+    }
+
     function renderTopology(t) {
       const primary = t.currentPrimary
         ? `<code>${t.currentPrimary}</code>`
@@ -373,26 +433,31 @@
 
     async function refresh() {
       try {
-        // /plugins returns 503 when no plugin manager is attached; fetch
-        // returns ok=false in that case. Catch and forward the JSON body
-        // so renderPlugins can show the message rather than spinning.
+        // /plugins and /anomalies return 503 when not attached; fetch
+        // .json() the response body either way so the panel can show
+        // the friendly message rather than spinning.
         const pluginsP = fetch("/plugins").then(async r => {
           try { return await r.json(); } catch { return []; }
         }).catch(() => []);
+        const anomaliesP = fetch("/anomalies?limit=50").then(async r => {
+          try { return await r.json(); } catch { return { events: [] }; }
+        }).catch(() => ({ events: [] }));
 
-        const [nodes, metrics, sessions, version, topo, plugins] = await Promise.all([
+        const [nodes, metrics, sessions, version, topo, plugins, anomalies] = await Promise.all([
           j("/nodes").catch(() => []),
           j("/metrics").catch(() => ({})),
           j("/sessions").catch(() => ({ active_sessions: 0 })),
           j("/version").catch(() => ({})),
           j("/topology").catch(() => ({})),
           pluginsP,
+          anomaliesP,
         ]);
         renderNodes(nodes);
         renderTraffic(metrics);
         renderCluster(metrics, sessions.active_sessions);
         renderTopology(topo);
         renderPlugins(plugins);
+        renderAnomalies(anomalies);
         if (version.version) {
           document.querySelector("#version").textContent = "v" + version.version;
         }
