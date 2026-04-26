@@ -1,0 +1,35 @@
+name: hdb-demo-anomaly
+
+networks:
+  net:
+
+services:
+  pg-primary:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: demo
+    networks: [net]
+    volumes:
+      - ../_shared/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d demo"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+
+  proxy:
+    image: ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.0
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info,heliosdb_proxy::anomaly=debug
+    networks: [net]
+    ports:
+      - "6432:6432"     # PG wire
+      - "9090:9090"     # admin
+    volumes:
+      - ../_shared/proxy.base.toml:/etc/helios/proxy.toml:ro
+    command: ["--config", "/etc/helios/proxy.toml"]

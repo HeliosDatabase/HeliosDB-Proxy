@@ -1,0 +1,18 @@
+listen_address = "0.0.0.0:6432"
+admin_address  = "0.0.0.0:9090"
+
+[pool]
+min_connections   = 2
+max_connections   = 20
+idle_timeout_secs = 300
+
+[[nodes]]
+host    = "pg-primary"
+port    = 5432
+role    = "primary"
+weight  = 100
+enabled = true
+
+[plugins]
+enabled    = true
+plugin_dir = "/var/lib/helios/plugins"
