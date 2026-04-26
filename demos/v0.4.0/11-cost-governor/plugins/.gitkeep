@@ -1,0 +1,11 @@
+Drop helios_plugin_cost_governor.wasm here.
+
+Build with:
+  cd ../../../../HDB-HeliosDB-Proxy-Plugins
+  cargo build -p helios-plugin-cost-governor \
+    --target wasm32-unknown-unknown --release
+  cp target/wasm32-unknown-unknown/release/helios_plugin_cost_governor.wasm \
+     /path/to/this/dir/
+
+The demo.sh script does this automatically when invoked from a
+checkout that has the plugins workspace at ../../../../.

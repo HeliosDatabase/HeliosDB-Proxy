@@ -1,0 +1,49 @@
+name: hdb-demo-edge
+
+networks: { net: }
+
+services:
+  pg-primary:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: demo
+    networks: [net]
+    volumes:
+      - ../_shared/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d demo"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+
+  proxy-home:
+    image: ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.0
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+    networks: [net]
+    ports:
+      - "6432:6432"
+      - "9090:9090"
+    volumes:
+      - ./proxy-home.toml:/etc/helios/proxy.toml:ro
+    command: ["--config", "/etc/helios/proxy.toml"]
+
+  proxy-edge:
+    image: ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.0
+    depends_on:
+      proxy-home:
+        condition: service_started
+    environment:
+      RUST_LOG: info
+    networks: [net]
+    ports:
+      - "6433:6432"
+      - "9091:9090"
+    volumes:
+      - ./proxy-edge.toml:/etc/helios/proxy.toml:ro
+    command: ["--config", "/etc/helios/proxy.toml"]
