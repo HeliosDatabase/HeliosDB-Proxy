@@ -19,7 +19,7 @@ kind: HeliosProxy
 metadata:
   name: analytics
 spec:
-  image: ghcr.io/dimensigon/heliosdb-proxy:0.3.1
+  image: ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.0
   replicas: 2
   listenPort: 5432
   adminPort: 9090
@@ -199,6 +199,6 @@ Values YAML maps 1:1 to the `HeliosProxy` spec.
 ## Status
 
 Not yet implemented — this doc is the design contract. The Go
-scaffold (`operator-sdk init --domain=heliosproxy.dev --repo=github.com/dimensigon/heliosdb-proxy-operator`)
+scaffold (`operator-sdk init --domain=heliosproxy.dev --repo=github.com/dimensigon/HDB-HeliosDB-Proxy-Operator`)
 lands in a separate repo so the Go toolchain stays out of the Rust
 build graph.

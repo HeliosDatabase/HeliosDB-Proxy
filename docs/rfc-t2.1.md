@@ -11,7 +11,7 @@ before the T2.1 flagship lands.
 We're building an open-source proxy that upgrades a live PostgreSQL
 cluster across major versions (14 → 17, 15 → 17, etc.) **without
 dropping a single client connection**. The proxy is
-[HeliosProxy](https://github.com/dimensigon/heliosdb-proxy) (AGPL-3.0).
+[HeliosProxy](https://github.com/dimensigon/HDB-HeliosDB-Proxy) (AGPL-3.0).
 Looking for early operators willing to validate the workflow against
 their staging clusters.
 
@@ -67,7 +67,7 @@ vantage point and end up reinventing connection management.
 ## Status
 
 - The proxy itself is at v0.3.1, [private repo,
-  AGPL-3.0](https://github.com/dimensigon/heliosdb-proxy).
+  AGPL-3.0](https://github.com/dimensigon/HDB-HeliosDB-Proxy).
 - 1 184 unit + integration tests passing.
 - T0 foundation complete: real PG client, TR stubs filled, plugin
   hooks wired, docker test harness with fault injection.
@@ -105,7 +105,7 @@ vantage point and end up reinventing connection management.
 
 ## Where
 
-- Repo: <https://github.com/dimensigon/heliosdb-proxy>
+- Repo: <https://github.com/dimensigon/HDB-HeliosDB-Proxy>
 - Discussion: this thread (please reply)
 - Demo target: a pgbench-continuous demo recording landing
   alongside the v0.4 release tag once stage bodies are wired.

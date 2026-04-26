@@ -36,7 +36,7 @@ provider "heliosproxy" {
 resource "heliosproxy_instance" "analytics" {
   name     = "analytics"
   replicas = 2
-  image    = "ghcr.io/dimensigon/heliosdb-proxy:0.3.1"
+  image    = "ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.0"
 
   node {
     host   = "pg-primary.db.svc"
