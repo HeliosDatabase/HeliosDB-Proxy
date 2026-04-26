@@ -113,7 +113,7 @@ Shadow Execution · Time-Travel Replay · SQL Console · Traffic · Cluster.
   orderings. SLO: HTTP 500 only on source-connect failures; shadow
   failures land in the report.
 
-### Added — Kubernetes operator (`heliosdb-proxy-operator`)
+### Added — Kubernetes operator (`HDB-HeliosDB-Proxy-Operator`)
 - Reconciler renders ConfigMap + Deployment + Service from
   HeliosProxy CR. Owned objects use `SetControllerReference` so
   `kubectl delete` reaps the stack.
@@ -125,15 +125,15 @@ Shadow Execution · Time-Travel Replay · SQL Console · Traffic · Cluster.
 - 17 Go unit tests (render helpers + condition merge + config hash).
 
 ### Added — Terraform + Pulumi providers
-- `terraform-provider-heliosproxy` — five resources
+- `terraform-provider-HDB-HeliosDB-Proxy` — five resources
   (`heliosproxy_instance`, `_pool_profile`, `_routing_rule`,
   `_audit_policy`, `_tenant_quota`). Schema mirrors operator CRDs
   via local replace.
-- `pulumi-heliosproxy` — terraform-bridge wrapper, Node.js / Python
-  / Go / .NET SDK metadata. Both providers wrap the same operator
-  CRDs.
+- `pulumi-HDB-HeliosDB-Proxy` — terraform-bridge wrapper, Node.js /
+  Python / Go / .NET SDK metadata. Both providers wrap the same
+  operator CRDs.
 
-### Added — first-party plugins (`heliosdb-proxy-plugins`)
+### Added — first-party plugins (`HDB-HeliosDB-Proxy-Plugins`)
 All seven plugins on the new shared `helios-plugin-abi` crate +
 host KV bridge:
 - `cost-governor` — per-tenant query cost budgets (minute / hour /
@@ -329,7 +329,7 @@ compound under contention and are not captured by this bench.
 - Benchmark suite: HeliosProxy vs PgBouncer scalability comparison
 - Docker support for containerized deployment
 
-[0.3.1]: https://github.com/dimensigon/heliosdb-proxy/compare/v0.3.0...v0.3.1
-[0.3.0]: https://github.com/dimensigon/heliosdb-proxy/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/dimensigon/heliosdb-proxy/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/dimensigon/heliosdb-proxy/releases/tag/v0.1.0
+[0.3.1]: https://github.com/dimensigon/HDB-HeliosDB-Proxy/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/dimensigon/HDB-HeliosDB-Proxy/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/dimensigon/HDB-HeliosDB-Proxy/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/dimensigon/HDB-HeliosDB-Proxy/releases/tag/v0.1.0

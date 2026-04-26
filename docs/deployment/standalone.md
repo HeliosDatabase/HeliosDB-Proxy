@@ -17,7 +17,7 @@ This guide covers installing and running HeliosProxy as a standalone binary on a
 ### Default Build (Connection Pooling Only)
 
 ```bash
-git clone https://github.com/dimensigon/heliosdb-proxy.git
+git clone https://github.com/dimensigon/HDB-HeliosDB-Proxy.git
 cd heliosdb-proxy
 cargo build --release
 ```
@@ -184,7 +184,7 @@ Create `/etc/systemd/system/heliosproxy.service`:
 ```ini
 [Unit]
 Description=HeliosProxy - Intelligent Database Connection Router
-Documentation=https://github.com/dimensigon/heliosdb-proxy
+Documentation=https://github.com/dimensigon/HDB-HeliosDB-Proxy
 After=network-online.target
 Wants=network-online.target
 
