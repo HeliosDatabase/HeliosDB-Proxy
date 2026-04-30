@@ -14,6 +14,7 @@ use crate::plugins::PluginManager;
 use crate::replay::{ReplayEngine, TimeTravelRequest};
 use crate::server::{NodeHealth, ServerMetricsSnapshot};
 use crate::{ProxyError, Result};
+#[cfg(feature = "ha-tr")]
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1427,9 +1428,6 @@ impl Default for AdminState {
 struct SqlRequest {
     /// SQL query to execute
     query: String,
-    /// Optional parameters (for prepared statements - future use)
-    #[serde(default)]
-    params: Vec<serde_json::Value>,
 }
 
 /// SQL execution response
@@ -1616,6 +1614,7 @@ enum ChaosAction {
 
 /// JSON entry returned by `GET /plugins`. Built in admin.rs so the
 /// plugins module doesn't need a serde dep.
+#[cfg(feature = "wasm-plugins")]
 #[derive(Serialize)]
 struct PluginListEntry {
     name: String,

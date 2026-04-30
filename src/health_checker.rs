@@ -107,8 +107,6 @@ pub struct HealthChecker {
     event_tx: mpsc::Sender<HealthEvent>,
     /// Event channel receiver
     event_rx: Option<mpsc::Receiver<HealthEvent>>,
-    /// Shutdown signal
-    shutdown_tx: Option<mpsc::Sender<()>>,
     /// Running flag
     running: Arc<RwLock<bool>>,
     /// Optional backend-connection template. Host/port are overridden
@@ -130,7 +128,6 @@ impl HealthChecker {
             health: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             event_rx: Some(event_rx),
-            shutdown_tx: None,
             running: Arc::new(RwLock::new(false)),
             backend_template: None,
         }

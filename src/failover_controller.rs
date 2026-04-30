@@ -3,7 +3,9 @@
 //! Orchestrates failover operations including primary detection,
 //! automatic rerouting, and transaction replay coordination.
 
-use super::{NodeEndpoint, NodeId, NodeRole, ProxyError, Result};
+use super::{NodeEndpoint, NodeId, ProxyError, Result};
+#[cfg(test)]
+use super::NodeRole;
 use crate::backend::{BackendClient, BackendConfig};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -151,8 +153,6 @@ pub struct FailoverController {
     failover_count: AtomicU64,
     /// Failover history
     history: Arc<RwLock<Vec<FailoverHistoryEntry>>>,
-    /// Running flag
-    running: Arc<RwLock<bool>>,
     /// Optional backend-connection template. Host/port are swapped to
     /// a candidate's endpoint when running `pg_promote()` or polling
     /// `pg_last_wal_replay_lsn()`. When `None`, all backend-talking
@@ -175,7 +175,6 @@ impl FailoverController {
             event_rx: Some(event_rx),
             failover_count: AtomicU64::new(0),
             history: Arc::new(RwLock::new(Vec::new())),
-            running: Arc::new(RwLock::new(false)),
             backend_template: None,
         }
     }

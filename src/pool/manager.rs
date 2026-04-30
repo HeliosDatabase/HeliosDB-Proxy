@@ -6,7 +6,6 @@ use super::config::PoolModeConfig;
 use super::lease::{ClientId, ConnectionLease, LeaseAction};
 use super::metrics::PoolModeMetrics;
 use super::mode::PoolingMode;
-use super::reset::ConnectionResetExecutor;
 use crate::connection_pool::{ConnectionPool, PoolConfig};
 use crate::{NodeEndpoint, NodeId, ProxyError, Result};
 use dashmap::DashMap;
@@ -24,8 +23,6 @@ pub struct ConnectionPoolManager {
     pools: DashMap<NodeId, ConnectionPool>,
     /// Active leases by client ID
     active_leases: DashMap<ClientId, LeaseInfo>,
-    /// Connection reset executor
-    reset_executor: Arc<ConnectionResetExecutor>,
     /// Metrics
     metrics: Arc<PoolModeMetrics>,
 }
@@ -34,10 +31,6 @@ pub struct ConnectionPoolManager {
 struct LeaseInfo {
     /// Node the lease is connected to
     node_id: NodeId,
-    /// Pooling mode
-    mode: PoolingMode,
-    /// When lease was acquired
-    acquired_at: Instant,
     /// Statements executed
     statements: u64,
 }
@@ -73,13 +66,10 @@ pub struct NodePoolStats {
 impl ConnectionPoolManager {
     /// Create a new connection pool manager
     pub fn new(config: PoolModeConfig) -> Self {
-        let reset_executor = Arc::new(ConnectionResetExecutor::new(&config.reset_query));
-
         Self {
             config,
             pools: DashMap::new(),
             active_leases: DashMap::new(),
-            reset_executor,
             metrics: Arc::new(PoolModeMetrics::new()),
         }
     }
@@ -181,8 +171,6 @@ impl ConnectionPoolManager {
             client_id,
             LeaseInfo {
                 node_id: *node_id,
-                mode,
-                acquired_at: Instant::now(),
                 statements: 0,
             },
         );

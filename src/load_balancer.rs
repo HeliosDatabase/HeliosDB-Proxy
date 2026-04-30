@@ -124,21 +124,6 @@ pub struct LoadBalancer {
     rr_counter: AtomicU64,
     /// Total requests routed
     total_requests: AtomicU64,
-    /// Weighted round-robin state
-    wrr_state: Arc<RwLock<WeightedRRState>>,
-}
-
-/// Weighted round-robin state
-#[derive(Debug, Default)]
-struct WeightedRRState {
-    /// Current index
-    current_index: usize,
-    /// Current weight
-    current_weight: i32,
-    /// GCD of all weights
-    gcd_weight: u32,
-    /// Maximum weight
-    max_weight: u32,
 }
 
 impl LoadBalancer {
@@ -149,7 +134,6 @@ impl LoadBalancer {
             nodes: Arc::new(RwLock::new(HashMap::new())),
             rr_counter: AtomicU64::new(0),
             total_requests: AtomicU64::new(0),
-            wrr_state: Arc::new(RwLock::new(WeightedRRState::default())),
         }
     }
 

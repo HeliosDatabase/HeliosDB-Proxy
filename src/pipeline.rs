@@ -81,7 +81,6 @@ pub struct PipelineResponse {
 
 /// Ticket for awaiting a pipelined response
 pub struct Ticket {
-    request_id: RequestId,
     rx: oneshot::Receiver<PipelineResponse>,
 }
 
@@ -241,7 +240,7 @@ impl RequestPipeline {
 
         pipeline.pending.push_back(pending);
 
-        Ok(Ticket { request_id, rx })
+        Ok(Ticket { rx })
     }
 
     /// Complete a request with a response

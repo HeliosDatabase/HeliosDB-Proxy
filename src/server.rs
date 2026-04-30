@@ -20,13 +20,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, RwLock, Semaphore};
+use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
 // Pool-modes feature imports
 #[cfg(feature = "pool-modes")]
 use crate::pool::{
-    ConnectionPoolManager, LeaseAction, PoolModeConfig, PoolingMode,
+    ConnectionPoolManager, PoolModeConfig, PoolingMode,
 };
 #[cfg(feature = "pool-modes")]
 use crate::pool::lease::ClientId;
@@ -137,8 +137,6 @@ fn anomaly_fingerprint(sql: &str) -> String {
 struct ServerState {
     /// Active client sessions
     sessions: RwLock<HashMap<Uuid, Arc<ClientSession>>>,
-    /// Connection pools per node
-    pools: RwLock<HashMap<String, NodePool>>,
     /// Node health status
     health: RwLock<HashMap<String, NodeHealth>>,
     /// Metrics
@@ -170,32 +168,6 @@ struct ServerState {
     edge_cache: Arc<crate::edge::EdgeCache>,
     #[cfg(feature = "edge-proxy")]
     edge_registry: Arc<crate::edge::EdgeRegistry>,
-}
-
-/// Per-node connection pool
-struct NodePool {
-    /// Node configuration
-    config: NodeConfig,
-    /// Available connections
-    connections: RwLock<Vec<BackendConnection>>,
-    /// Connection limit semaphore
-    semaphore: Semaphore,
-    /// Active connection count
-    active_count: AtomicU64,
-}
-
-/// Backend connection
-struct BackendConnection {
-    /// Connection ID
-    id: Uuid,
-    /// TCP stream (wrapped for protocol handling)
-    stream: Option<TcpStream>,
-    /// Creation time
-    created_at: chrono::DateTime<chrono::Utc>,
-    /// Last used time
-    last_used: chrono::DateTime<chrono::Utc>,
-    /// Whether connection is healthy
-    healthy: bool,
 }
 
 /// Node health status
@@ -238,10 +210,6 @@ struct ServerMetrics {
 struct LoadBalancerState {
     /// Round-robin counter
     rr_counter: u64,
-    /// Node weights for weighted round-robin
-    weights: HashMap<String, u32>,
-    /// Current weight counter
-    weight_counter: HashMap<String, u32>,
 }
 
 /// Client session
@@ -305,6 +273,7 @@ pub struct StatementLog {
 /// the hook dispatch is compiled out entirely and the variant list exists
 /// purely for pattern-match symmetry.
 #[derive(Debug)]
+#[allow(dead_code)] // Block/Cached only constructed under wasm-plugins
 enum PreQueryAction {
     /// Send the message to the backend as usual.
     Forward,
@@ -316,7 +285,6 @@ enum PreQueryAction {
     /// (RowDescription + DataRow(s) + CommandComplete + ReadyForQuery),
     /// which is the next step of T0-a. For now the caller falls back to
     /// `Forward` and logs a warning.
-    #[allow(dead_code)]
     Cached(Vec<u8>),
 }
 
@@ -326,6 +294,7 @@ enum PreQueryAction {
 /// As with `PreQueryAction`, only `None` is ever produced when the
 /// `wasm-plugins` feature is off.
 #[derive(Debug)]
+#[allow(dead_code)] // Primary/Standby/Node/Block only constructed under wasm-plugins
 enum RouteOverride {
     /// No override — use the default SQL-verb-based routing.
     None,
@@ -415,18 +384,6 @@ impl ProxyServer {
     pub fn new(config: ProxyConfig) -> Result<Self> {
         let (shutdown_tx, _) = broadcast::channel(1);
 
-        // Initialize pools for each node
-        let mut pools = HashMap::new();
-        for node in &config.nodes {
-            let pool = NodePool {
-                config: node.clone(),
-                connections: RwLock::new(Vec::new()),
-                semaphore: Semaphore::new(config.pool.max_connections),
-                active_count: AtomicU64::new(0),
-            };
-            pools.insert(node.address(), pool);
-        }
-
         // Initialize health status
         let mut health = HashMap::new();
         for node in &config.nodes {
@@ -442,14 +399,6 @@ impl ProxyServer {
                     replication_lag_bytes: None,
                 },
             );
-        }
-
-        // Initialize load balancer state
-        let mut weights = HashMap::new();
-        let mut weight_counter = HashMap::new();
-        for node in &config.nodes {
-            weights.insert(node.address(), node.weight);
-            weight_counter.insert(node.address(), node.weight);
         }
 
         // Initialize pool manager if pool-modes feature is enabled
@@ -497,13 +446,10 @@ impl ProxyServer {
 
         let state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
-            pools: RwLock::new(pools),
             health: RwLock::new(health),
             metrics: ServerMetrics::default(),
             lb_state: RwLock::new(LoadBalancerState {
                 rr_counter: 0,
-                weights,
-                weight_counter,
             }),
             #[cfg(feature = "pool-modes")]
             pool_manager,
@@ -788,30 +734,23 @@ impl ProxyServer {
     ) -> Result<()> {
         let codec = ProtocolCodec::new();
         let mut buffer = BytesMut::with_capacity(8192);
-        let mut backend_stream: Option<TcpStream> = None;
-        let mut backend_node: Option<String> = None;
 
         // Handle startup phase
-        let startup_result =
-            Self::handle_startup(stream, &mut buffer, &codec, session, state, config).await;
-
-        match startup_result {
-            Ok((Some(stream_conn), node_addr)) => {
-                backend_stream = Some(stream_conn);
-                backend_node = Some(node_addr);
-            }
-            Ok((None, _)) => {
-                // SSL rejected or cancel request, connection should close
-                return Ok(());
-            }
-            Err(e) => {
-                tracing::error!("Startup failed: {}", e);
-                // Send error to client
-                let err_msg = Self::create_error_response("08006", &format!("Startup failed: {}", e));
-                let _ = stream.write_all(&err_msg).await;
-                return Err(e);
-            }
-        }
+        let (mut backend_stream, mut backend_node): (Option<TcpStream>, Option<String>) =
+            match Self::handle_startup(stream, &mut buffer, &codec, session, state, config).await {
+                Ok((Some(stream_conn), node_addr)) => (Some(stream_conn), Some(node_addr)),
+                Ok((None, _)) => {
+                    // SSL rejected or cancel request, connection should close
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::error!("Startup failed: {}", e);
+                    // Send error to client
+                    let err_msg = Self::create_error_response("08006", &format!("Startup failed: {}", e));
+                    let _ = stream.write_all(&err_msg).await;
+                    return Err(e);
+                }
+            };
 
         // Main query loop
         loop {
@@ -893,6 +832,7 @@ impl ProxyServer {
                 }
 
                 // Route and process the message
+                #[cfg(feature = "wasm-plugins")]
                 let forward_start = std::time::Instant::now();
                 let forward_result = Self::route_and_forward(
                     &msg,
@@ -2077,56 +2017,6 @@ impl ProxyServer {
         Err(ProxyError::NoHealthyNodes)
     }
 
-    /// Get a connection from the pool
-    async fn get_connection(
-        node_addr: &str,
-        state: &Arc<ServerState>,
-        config: &ProxyConfig,
-    ) -> Result<BackendConnection> {
-        let pools = state.pools.read().await;
-        let pool = pools
-            .get(node_addr)
-            .ok_or_else(|| ProxyError::Pool(format!("No pool for node: {}", node_addr)))?;
-
-        // Try to get existing connection
-        {
-            let mut conns = pool.connections.write().await;
-            if let Some(conn) = conns.pop() {
-                if conn.healthy {
-                    pool.active_count.fetch_add(1, Ordering::Relaxed);
-                    return Ok(conn);
-                }
-            }
-        }
-
-        // Acquire permit for new connection
-        let _permit = pool
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|_| ProxyError::Pool("Failed to acquire connection permit".to_string()))?;
-
-        // Create new connection
-        let stream = tokio::time::timeout(
-            config.pool.acquire_timeout(),
-            TcpStream::connect(node_addr),
-        )
-        .await
-        .map_err(|_| ProxyError::Connection(format!("Connection timeout to {}", node_addr)))?
-        .map_err(|e| ProxyError::Connection(format!("Failed to connect to {}: {}", node_addr, e)))?;
-
-        let conn = BackendConnection {
-            id: Uuid::new_v4(),
-            stream: Some(stream),
-            created_at: chrono::Utc::now(),
-            last_used: chrono::Utc::now(),
-            healthy: true,
-        };
-
-        pool.active_count.fetch_add(1, Ordering::Relaxed);
-        Ok(conn)
-    }
-
     /// Spawn health checker background task
     fn spawn_health_checker(&self) -> tokio::task::JoinHandle<()> {
         let state = self.state.clone();
@@ -2203,7 +2093,6 @@ impl ProxyServer {
     /// Spawn pool manager background task
     fn spawn_pool_manager(&self) -> tokio::task::JoinHandle<()> {
         let state = self.state.clone();
-        let config = self.config.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         tokio::spawn(async move {
@@ -2212,9 +2101,7 @@ impl ProxyServer {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        Self::cleanup_pools(&state, &config).await;
-
-                        // Also evict idle connections from pool-modes manager
+                        // Evict idle connections from pool-modes manager
                         #[cfg(feature = "pool-modes")]
                         if let Some(ref pool_manager) = state.pool_manager {
                             pool_manager.evict_idle().await;
@@ -2233,18 +2120,6 @@ impl ProxyServer {
                 }
             }
         })
-    }
-
-    /// Cleanup idle connections from pools
-    async fn cleanup_pools(state: &Arc<ServerState>, config: &ProxyConfig) {
-        let pools = state.pools.read().await;
-        let now = chrono::Utc::now();
-        let idle_timeout = chrono::Duration::seconds(config.pool.idle_timeout_secs as i64);
-
-        for pool in pools.values() {
-            let mut conns = pool.connections.write().await;
-            conns.retain(|conn| now - conn.last_used < idle_timeout);
-        }
     }
 
     /// Shutdown the server
@@ -2300,25 +2175,6 @@ impl ProxyServer {
             pool_manager.add_node(&endpoint).await;
             tracing::info!("Added node {} to pool manager", node.address());
         }
-    }
-
-    /// Process SQL statement completion with pool-modes awareness
-    #[cfg(feature = "pool-modes")]
-    fn process_statement_for_pool_mode(
-        _pool_manager: &ConnectionPoolManager,
-        client_id: &ClientId,
-        sql: &str,
-    ) -> Option<LeaseAction> {
-        // This would be called after a statement completes to determine if
-        // the lease should be released based on the pooling mode
-        // Note: In a full implementation, we'd need to track leases per-client
-        // For now, this is a placeholder for the integration point
-        tracing::trace!(
-            "Processing statement for pool mode: client={:?}, sql_prefix={}",
-            client_id,
-            if sql.len() > 50 { &sql[..50] } else { sql }
-        );
-        None
     }
 
     /// Get server metrics
@@ -2658,13 +2514,10 @@ mod tests {
         let pm = Arc::new(PluginManager::new(PluginRuntimeConfig::default()).unwrap());
         let augmented_state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
-            pools: RwLock::new(HashMap::new()),
             health: RwLock::new(HashMap::new()),
             metrics: ServerMetrics::default(),
             lb_state: RwLock::new(LoadBalancerState {
                 rr_counter: 0,
-                weights: HashMap::new(),
-                weight_counter: HashMap::new(),
             }),
             #[cfg(feature = "pool-modes")]
             pool_manager: None,

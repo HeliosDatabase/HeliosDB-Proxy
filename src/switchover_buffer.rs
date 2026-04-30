@@ -27,7 +27,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use parking_lot::Mutex;
-use tokio::sync::{broadcast, oneshot, Semaphore};
+use tokio::sync::{broadcast, oneshot};
 
 use super::{Result, ProxyError};
 
@@ -112,8 +112,6 @@ pub struct SwitchoverBuffer {
     stats: BufferStats,
     /// State change broadcaster
     state_tx: broadcast::Sender<BufferState>,
-    /// Semaphore to limit concurrent buffer access
-    buffer_semaphore: Semaphore,
 }
 
 impl SwitchoverBuffer {
@@ -122,7 +120,6 @@ impl SwitchoverBuffer {
         let (state_tx, _) = broadcast::channel(16);
 
         Self {
-            buffer_semaphore: Semaphore::new(config.max_buffered_queries),
             config,
             state: AtomicU64::new(BufferState::Passthrough as u64),
             is_buffering: AtomicBool::new(false),

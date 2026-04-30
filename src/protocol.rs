@@ -98,13 +98,14 @@ impl MessageType {
             b'F' => MessageType::FunctionCall,
             b'p' => MessageType::Password,
             b'K' => MessageType::BackendKeyData,
-            b'S' => MessageType::ParameterStatus,
+            // Note: server-side D/E/C/S tags (DataRow, ErrorResponse,
+            // CommandComplete, ParameterStatus) collide with client-side
+            // Describe/Execute/Close/Sync above; from_tag() is direction-
+            // agnostic and resolves them to the client-side variants.
+            // Disambiguation, when needed, lives at the call site.
             b'Z' => MessageType::ReadyForQuery,
             b'T' => MessageType::RowDescription,
-            b'D' => MessageType::DataRow,
-            b'C' => MessageType::CommandComplete,
             b'I' => MessageType::EmptyQueryResponse,
-            b'E' => MessageType::ErrorResponse,
             b'N' => MessageType::NoticeResponse,
             b'A' => MessageType::NotificationResponse,
             b'1' => MessageType::ParseComplete,

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use dashmap::DashMap;
-use tokio::sync::{oneshot, mpsc};
+use tokio::sync::oneshot;
 use serde::{Deserialize, Serialize};
 
 /// Table identifier
@@ -226,8 +226,6 @@ pub struct InsertBatcher {
     stats: Arc<parking_lot::RwLock<BatchStats>>,
     /// Shutdown flag
     shutdown: AtomicBool,
-    /// Flush channel
-    flush_tx: Option<mpsc::Sender<TableId>>,
 }
 
 impl InsertBatcher {
@@ -239,19 +237,6 @@ impl InsertBatcher {
             next_ticket_id: AtomicU64::new(1),
             stats: Arc::new(parking_lot::RwLock::new(BatchStats::default())),
             shutdown: AtomicBool::new(false),
-            flush_tx: None,
-        }
-    }
-
-    /// Create with flush channel for async flushing
-    pub fn with_flush_channel(config: BatchConfig, flush_tx: mpsc::Sender<TableId>) -> Self {
-        Self {
-            config,
-            pending: DashMap::new(),
-            next_ticket_id: AtomicU64::new(1),
-            stats: Arc::new(parking_lot::RwLock::new(BatchStats::default())),
-            shutdown: AtomicBool::new(false),
-            flush_tx: Some(flush_tx),
         }
     }
 

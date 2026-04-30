@@ -99,8 +99,6 @@ pub enum ConnectionState {
 
 /// Per-node connection pool
 struct NodePool {
-    /// Node ID
-    node_id: NodeId,
     /// Available connections
     connections: Vec<PooledConnection>,
     /// Semaphore for limiting connections
@@ -116,9 +114,8 @@ struct NodePool {
 }
 
 impl NodePool {
-    fn new(node_id: NodeId, max_connections: usize) -> Self {
+    fn new(max_connections: usize) -> Self {
         Self {
-            node_id,
             connections: Vec::new(),
             semaphore: Arc::new(Semaphore::new(max_connections)),
             total_created: 0,
@@ -222,7 +219,7 @@ impl ConnectionPool {
         if !pools.contains_key(&node_id) {
             pools.insert(
                 node_id,
-                NodePool::new(node_id, self.config.max_connections),
+                NodePool::new(self.config.max_connections),
             );
             tracing::debug!("Added node {:?} to connection pool", node_id);
         }
@@ -239,7 +236,7 @@ impl ConnectionPool {
     ) {
         let mut pools = self.pools.write().await;
         if !pools.contains_key(&node_id) {
-            let mut np = NodePool::new(node_id, self.config.max_connections);
+            let mut np = NodePool::new(self.config.max_connections);
             np.endpoint = Some((host.into(), port));
             pools.insert(node_id, np);
             tracing::debug!("Added node {:?} to connection pool (with endpoint)", node_id);
