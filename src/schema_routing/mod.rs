@@ -63,7 +63,6 @@ pub use metrics::{
 };
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Schema-aware routing configuration

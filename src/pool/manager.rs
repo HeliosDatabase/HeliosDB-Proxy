@@ -7,7 +7,7 @@ use super::lease::{ClientId, ConnectionLease, LeaseAction};
 use super::metrics::PoolModeMetrics;
 use super::mode::PoolingMode;
 use super::reset::ConnectionResetExecutor;
-use crate::connection_pool::{ConnectionPool, PoolConfig, PooledConnection};
+use crate::connection_pool::{ConnectionPool, PoolConfig};
 use crate::{NodeEndpoint, NodeId, ProxyError, Result};
 use dashmap::DashMap;
 use std::sync::Arc;

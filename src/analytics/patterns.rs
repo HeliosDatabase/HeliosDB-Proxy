@@ -242,7 +242,7 @@ impl PatternDetector {
     pub fn record_query(
         &self,
         session_id: &str,
-        execution: &QueryExecution,
+        _execution: &QueryExecution,
         fingerprint: &QueryFingerprint,
     ) {
         // Periodic cleanup

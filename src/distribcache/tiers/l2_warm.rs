@@ -9,11 +9,11 @@ use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
 use dashmap::DashMap;
 
-use super::{CacheEntry, CacheKey, CompressionType, TierStats};
+use super::{CacheEntry, CompressionType, TierStats};
 use crate::distribcache::QueryFingerprint;
 
 /// Bloom filter for fast negative lookups

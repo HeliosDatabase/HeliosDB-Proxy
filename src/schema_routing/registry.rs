@@ -3,7 +3,6 @@
 //! Manages metadata about tables, indexes, and relationships for routing decisions.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 

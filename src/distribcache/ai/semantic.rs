@@ -17,7 +17,7 @@
 //! - RAG-specific caching strategies
 
 use dashmap::DashMap;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 

@@ -3,7 +3,6 @@
 //! Batches multiple INSERT statements into combined bulk operations for
 //! improved throughput. Reduces round-trips and enables lock-free bulk ingestion.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -326,7 +325,7 @@ impl InsertBatcher {
             let execution_start = Instant::now();
 
             // Combine into a single bulk INSERT
-            let combined_sql = self.combine_inserts(&requests);
+            let _combined_sql = self.combine_inserts(&requests);
 
             // Execute the combined INSERT
             // In production, this would call the backend

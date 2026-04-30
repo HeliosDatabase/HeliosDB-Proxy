@@ -3,7 +3,7 @@
 //! Routes queries to appropriate nodes based on hints and policies.
 
 use super::{
-    HintParser, ParsedHints, RouteTarget, ConsistencyLevel,
+    HintParser, ParsedHints, RouteTarget,
     NodeFilter, NodeCriteria, NodeInfo, FilterResult,
     RoutingConfig, RoutingError, RoutingMetrics, Result,
 };

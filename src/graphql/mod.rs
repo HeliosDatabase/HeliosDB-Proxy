@@ -56,8 +56,6 @@ pub use validation::{QueryValidator, ValidationError, ComplexityResult};
 pub use metrics::{GraphQLMetrics, QueryStats, OperationMetrics};
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
 
 /// GraphQL operation type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

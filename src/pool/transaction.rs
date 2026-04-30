@@ -61,7 +61,7 @@ impl TransactionModeHandler {
     ///
     /// Returns the connection on COMMIT/ROLLBACK outside of savepoints.
     pub fn on_statement_complete(&mut self, lease: &mut ConnectionLease, sql: &str) -> LeaseAction {
-        let event = TransactionEvent::detect(sql);
+        let _event = TransactionEvent::detect(sql);
 
         // Track prepared statements if enabled
         if self.track_prepared_statements {

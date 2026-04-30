@@ -66,7 +66,7 @@ impl ConcurrencyLimiter {
     }
 
     /// Try to acquire a concurrency slot immediately
-    pub fn try_acquire(&self) -> Option<ConcurrencyGuard> {
+    pub fn try_acquire(&self) -> Option<ConcurrencyGuard<'_>> {
         let max = self.max_concurrent.load(Ordering::Acquire);
 
         loop {
@@ -90,7 +90,7 @@ impl ConcurrencyLimiter {
     }
 
     /// Acquire a slot, waiting if necessary
-    pub async fn acquire(&self) -> ConcurrencyGuard {
+    pub async fn acquire(&self) -> ConcurrencyGuard<'_> {
         let start = Instant::now();
 
         // Try immediate acquisition
@@ -124,7 +124,7 @@ impl ConcurrencyLimiter {
     }
 
     /// Acquire with timeout
-    pub async fn acquire_timeout(&self, timeout: Duration) -> Result<ConcurrencyGuard, ConcurrencyExceeded> {
+    pub async fn acquire_timeout(&self, timeout: Duration) -> Result<ConcurrencyGuard<'_>, ConcurrencyExceeded> {
         let start = Instant::now();
 
         // Try immediate acquisition

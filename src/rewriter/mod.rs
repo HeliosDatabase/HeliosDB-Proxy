@@ -307,16 +307,16 @@ impl QueryRewriter {
                 let upper = query.to_uppercase();
                 upper.contains("SELECT *") || upper.contains("SELECT  *")
             }
-            Condition::SessionVar { name, exists } => {
+            Condition::SessionVar { name: _, exists } => {
                 // In production, check session variables
                 // For now, always return true if exists is expected
                 *exists
             }
-            Condition::ClientType { client_type } => {
+            Condition::ClientType { client_type: _ } => {
                 // In production, check client metadata
                 true
             }
-            Condition::TableExists { table } => {
+            Condition::TableExists { table: _ } => {
                 // In production, check schema cache
                 true
             }

@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 
 use super::config::{ExceededAction, PriorityLevel, RateLimitConfig};
-use super::concurrency::{ConcurrencyExceeded, ConcurrencyLimiter};
+use super::concurrency::ConcurrencyLimiter;
 use super::cost_estimator::QueryCostEstimator;
 use super::metrics::RateLimitMetrics;
 use super::sliding_window::{SlidingWindow, SlidingWindowExceeded};

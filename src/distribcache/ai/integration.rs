@@ -6,7 +6,6 @@
 //! - Workload scheduler coordination
 //! - Branch-aware time-travel queries
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,7 +14,7 @@ use dashmap::DashMap;
 
 use super::semantic::{AIWorkloadContext, BranchContext, BranchId, SemanticQueryCache};
 use crate::distribcache::classifier::WorkloadType;
-use crate::distribcache::scheduler::{QueryPriority, ScheduleResult, ScheduledQuery, WorkloadScheduler};
+use crate::distribcache::scheduler::{ScheduleResult, ScheduledQuery, WorkloadScheduler};
 use crate::distribcache::SessionId;
 
 /// AI workload detection result

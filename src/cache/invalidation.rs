@@ -5,7 +5,7 @@
 //! - TTL-based: Time-based expiration fallback
 //! - Manual: Explicit invalidation via API
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 

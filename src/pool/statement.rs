@@ -63,7 +63,7 @@ impl StatementModeHandler {
         let event = TransactionEvent::detect(sql);
 
         // Update lease transaction state
-        let action = lease.on_statement_complete(sql);
+        let _action = lease.on_statement_complete(sql);
 
         // Override for statement mode specifics
         match event {

@@ -3,10 +3,9 @@
 //! Track execution statistics per query fingerprint.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use dashmap::DashMap;
-use parking_lot::RwLock;
 
 use super::fingerprinter::{QueryFingerprint, OperationType};
 use super::histogram::LatencyHistogram;

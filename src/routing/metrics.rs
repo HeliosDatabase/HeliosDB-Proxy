@@ -72,7 +72,7 @@ impl RoutingMetrics {
 
         // Track target usage (async - won't block)
         if let Some(t) = target {
-            let target = t;
+            let _target = t;
             tokio::spawn(async move {
                 // In real implementation, would update the actual counter
                 // This is simplified for the skeleton

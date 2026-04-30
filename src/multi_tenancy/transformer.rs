@@ -484,7 +484,7 @@ impl TenantQueryTransformer {
 }
 
 /// Validate that a query doesn't try to bypass tenant isolation
-pub fn validate_query(query: &str, tenant: &TenantId, config: &TenantConfig) -> QueryValidation {
+pub fn validate_query(query: &str, _tenant: &TenantId, config: &TenantConfig) -> QueryValidation {
     let mut validation = QueryValidation {
         valid: true,
         violations: Vec::new(),

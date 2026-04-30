@@ -4,7 +4,6 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// DataLoader configuration
@@ -266,7 +265,7 @@ where
         };
 
         // Split into batches if needed
-        let batch_count = (unique_keys.len() + self.config.max_batch_size - 1)
+        let _batch_count = (unique_keys.len() + self.config.max_batch_size - 1)
             / self.config.max_batch_size;
 
         let mut all_results = HashMap::new();

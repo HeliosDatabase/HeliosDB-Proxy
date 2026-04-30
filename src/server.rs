@@ -8,7 +8,7 @@ use crate::admin::{AdminServer, AdminState, ConfigSnapshot, NodeSnapshot};
 use crate::backend::{tls::default_client_config, BackendConfig, TlsMode};
 use crate::config::{NodeConfig, NodeRole, ProxyConfig, TrMode};
 use crate::protocol::{
-    AuthRequest, ErrorResponse, Message, MessageType, ParseMessage, ProtocolCodec, QueryMessage,
+    ErrorResponse, Message, MessageType, ParseMessage, ProtocolCodec, QueryMessage,
     StartupMessage, TransactionStatus,
 };
 use crate::{ProxyError, Result};
@@ -20,13 +20,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
+use tokio::sync::{broadcast, RwLock, Semaphore};
 use uuid::Uuid;
 
 // Pool-modes feature imports
 #[cfg(feature = "pool-modes")]
 use crate::pool::{
-    ConnectionLease, ConnectionPoolManager, LeaseAction, PoolModeConfig, PoolingMode,
+    ConnectionPoolManager, LeaseAction, PoolModeConfig, PoolingMode,
 };
 #[cfg(feature = "pool-modes")]
 use crate::pool::lease::ClientId;
@@ -1183,7 +1183,7 @@ impl ProxyServer {
     /// Route message and forward to appropriate backend
     async fn route_and_forward(
         msg: &Message,
-        mut backend_stream: Option<TcpStream>,
+        backend_stream: Option<TcpStream>,
         current_node: Option<String>,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
@@ -2305,7 +2305,7 @@ impl ProxyServer {
     /// Process SQL statement completion with pool-modes awareness
     #[cfg(feature = "pool-modes")]
     fn process_statement_for_pool_mode(
-        pool_manager: &ConnectionPoolManager,
+        _pool_manager: &ConnectionPoolManager,
         client_id: &ClientId,
         sql: &str,
     ) -> Option<LeaseAction> {

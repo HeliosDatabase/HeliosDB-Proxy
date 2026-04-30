@@ -500,16 +500,16 @@ impl WalInvalidator {
     /// Start the WAL processing loop in a background task
     pub fn start_processing(&self) -> tokio::task::JoinHandle<()> {
         let running = self.running.clone();
-        let subscription = self.subscription.write();
-        let callbacks = self.callbacks.clone();
-        let stats = InvalidatorStats {
+        let _subscription = self.subscription.write();
+        let _callbacks = self.callbacks.clone();
+        let _stats = InvalidatorStats {
             wal_entries_processed: AtomicU64::new(0),
             tables_invalidated: AtomicU64::new(0),
             entries_invalidated: AtomicU64::new(0),
             invalidation_lag_ms: AtomicU64::new(0),
         };
-        let table_index = self.table_index.clone();
-        let last_lsn = AtomicU64::new(self.last_lsn.load(Ordering::Relaxed));
+        let _table_index = self.table_index.clone();
+        let _last_lsn = AtomicU64::new(self.last_lsn.load(Ordering::Relaxed));
 
         tokio::spawn(async move {
             tracing::info!("WAL processing loop started");
@@ -563,7 +563,7 @@ impl WalInvalidator {
         let mut sub = self.subscription.write().await;
         *sub = None;
 
-        if let Some(ref mut stream) = self.wal_stream.as_ref().map(|_| ()) {
+        if let Some(_stream) = self.wal_stream.as_ref().map(|_| ()) {
             // Stream cleanup handled by drop
         }
 

@@ -3,7 +3,7 @@
 //! Classify queries by intent for AI/Agent workload analysis.
 //! Supports RAG analytics, workflow tracing, and cost attribution.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 

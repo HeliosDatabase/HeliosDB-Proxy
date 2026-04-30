@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{GraphQLSchema, ExecutionContext, DataLoader};
+use super::{GraphQLSchema, ExecutionContext};
 
 /// Resolver context passed to field resolvers
 #[derive(Debug, Clone)]

@@ -74,7 +74,6 @@ pub use ai::{
 };
 pub use metrics::{DistribCacheMetrics, InvalidationSource, ErrorType};
 
-use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -394,7 +393,7 @@ impl HeliosDistribCache {
         let start = Instant::now();
 
         // Classify workload for scheduling
-        let workload = self.classifier.classify_query(&fingerprint.template, context);
+        let _workload = self.classifier.classify_query(&fingerprint.template, context);
 
         // Check L1 hot cache first
         if let Some(entry) = self.l1_hot.get(fingerprint, context.session_id.clone()) {
@@ -515,7 +514,7 @@ impl HeliosDistribCache {
     }
 
     /// Record cache hit for metrics and heatmap
-    fn record_hit(&self, fingerprint: &QueryFingerprint, tier: CacheTier, latency: Duration) {
+    fn record_hit(&self, fingerprint: &QueryFingerprint, tier: CacheTier, _latency: Duration) {
         let time_saved = match tier {
             CacheTier::L1 => Duration::from_millis(10), // Assume 10ms DB query
             CacheTier::L2 => Duration::from_millis(9),
@@ -556,7 +555,7 @@ impl HeliosDistribCache {
         let l1_hits = self.stats.l1_hits.load(Ordering::Relaxed);
         let l2_hits = self.stats.l2_hits.load(Ordering::Relaxed);
         let l3_hits = self.stats.l3_hits.load(Ordering::Relaxed);
-        let misses = self.stats.total_misses.load(Ordering::Relaxed);
+        let _misses = self.stats.total_misses.load(Ordering::Relaxed);
 
         DistribCacheStats {
             l1: self.l1_hot.stats(),

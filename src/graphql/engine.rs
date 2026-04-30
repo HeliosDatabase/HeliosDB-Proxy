@@ -4,10 +4,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::{
-    GraphQLConfig, GraphQLSchema, SqlGenerator, QueryValidator, DataLoader,
+    GraphQLConfig, GraphQLSchema, SqlGenerator, QueryValidator,
     GraphQLMetrics, ExecutionContext, ErrorCode, OperationType,
     QueryPlan, Selection, Filter,
 };

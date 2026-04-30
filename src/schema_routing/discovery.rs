@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 
 use super::{
     TableSchema, ColumnSchema, IndexSchema, AccessPattern,
-    DataTemperature, WorkloadType, Relationship, PartitionKey,
+    DataTemperature, WorkloadType, Relationship,
 };
 use super::registry::{StorageType, IndexType, RelationshipType};
 
@@ -113,7 +113,7 @@ impl SchemaDiscovery {
     /// Returns discovered tables with inferred properties
     pub async fn discover(&self) -> Result<Vec<TableSchema>, DiscoveryError> {
         // Build discovery queries
-        let queries = self.build_discovery_queries();
+        let _queries = self.build_discovery_queries();
 
         // In a real implementation, these would execute against the database
         // For now, we return mock data for testing
@@ -184,7 +184,7 @@ impl SchemaDiscovery {
         }
 
         // Query for specific table
-        let query = self.build_table_query(table_name);
+        let _query = self.build_table_query(table_name);
 
         // Mock implementation
         Err(DiscoveryError::TableNotFound(table_name.to_string()))
