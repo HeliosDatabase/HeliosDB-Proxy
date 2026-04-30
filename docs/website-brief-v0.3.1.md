@@ -132,5 +132,5 @@ HeliosProxy copy is **formal, commercial, protocol-level**:
 
 ## Open items (not blocking website update, but worth tracking)
 
-- LICENSE is mid-transition from SSPL-1.0 to AGPL-3.0 in the working tree. `Cargo.toml` carries both `license = "AGPL-3.0-only"` and `license-file = "LICENSE"`. If the website has a license/compliance page, **do not update it from this brief** — wait for the LICENSE commit to land.
+- LICENSE is now Apache-2.0 (was SSPL-1.0, transitioned through AGPL-3.0). `Cargo.toml` carries `license = "Apache-2.0"` and `license-file = "LICENSE"`.
 - No benchmark exists for the protocol-parser or L1-cache improvements. If marketing wants numbers for those, we need to author benches first.

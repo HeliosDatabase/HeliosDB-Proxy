@@ -316,4 +316,4 @@ HeliosProxy adds minimal overhead while providing significant throughput improve
 
 ## License
 
-AGPL-3.0-only (GNU Affero General Public License v3.0).
+Apache-2.0 (Apache License, Version 2.0).
