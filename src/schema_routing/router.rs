@@ -2,7 +2,6 @@
 //!
 //! Routes queries based on schema semantics and workload characteristics.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::{

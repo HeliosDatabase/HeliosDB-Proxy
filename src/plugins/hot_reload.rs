@@ -161,7 +161,7 @@ impl HotReloader {
         let plugin_files = self.plugin_files.read();
         let file_times = self.file_times.read();
 
-        for (plugin_name, path) in plugin_files.iter() {
+        for (_plugin_name, path) in plugin_files.iter() {
             if let Ok(metadata) = std::fs::metadata(path) {
                 if let Ok(modified) = metadata.modified() {
                     if let Some(old_time) = file_times.get(path) {

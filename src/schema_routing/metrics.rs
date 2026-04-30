@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 
 use super::{
     DataTemperature, WorkloadType, AccessPattern,
-    RoutingDecision, RoutingPreference, AIWorkloadType, RAGStage,
+    RoutingDecision, AIWorkloadType, RAGStage,
 };
 
 /// Schema routing metrics collector
@@ -565,7 +565,7 @@ impl SchemaRoutingMetrics {
     pub async fn generate_report(&self) -> MetricsReport {
         let routing = self.get_routing_stats();
         let tables = self.get_all_table_stats().await;
-        let workloads = self.get_all_workload_stats().await;
+        let _workloads = self.get_all_workload_stats().await;
         let ai = self.get_ai_stats().await;
         let rag = self.get_rag_stats().await;
         let nodes = self.get_all_node_stats().await;

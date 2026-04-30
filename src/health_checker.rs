@@ -3,7 +3,7 @@
 //! Continuous node health monitoring with configurable checks,
 //! failure detection, and automatic recovery.
 
-use super::{NodeEndpoint, NodeId, ProxyError, Result};
+use super::{NodeEndpoint, NodeId, Result};
 use crate::backend::{BackendClient, BackendConfig};
 use std::collections::HashMap;
 use std::sync::Arc;

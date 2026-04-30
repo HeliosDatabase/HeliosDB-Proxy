@@ -70,7 +70,7 @@ impl SessionModeHandler {
     }
 
     /// Called when client disconnects
-    pub fn on_client_disconnect(&self, lease: ConnectionLease) -> LeaseAction {
+    pub fn on_client_disconnect(&self, _lease: ConnectionLease) -> LeaseAction {
         // When client disconnects, reset and return to pool
         LeaseAction::Reset
     }

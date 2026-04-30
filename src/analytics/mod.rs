@@ -26,9 +26,6 @@ pub use histogram::{LatencyHistogram, HistogramBucket, HistogramSnapshot};
 pub use metrics::{AnalyticsMetrics, AnalyticsSnapshot, QueryMetricEntry};
 pub use intent::{QueryClassifier, QueryIntent, RagAnalytics, WorkflowTracer, WorkflowTrace, CostAttribution};
 
-use std::sync::Arc;
-use dashmap::DashMap;
-use parking_lot::RwLock;
 
 /// Main analytics engine
 pub struct QueryAnalytics {

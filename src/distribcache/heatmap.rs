@@ -221,7 +221,7 @@ impl CacheHeatmap {
     }
 
     /// Update time bucket
-    fn update_time_bucket(&self, tables: &[String], hit: bool) {
+    fn update_time_bucket(&self, tables: &[String], _hit: bool) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap_or_default()

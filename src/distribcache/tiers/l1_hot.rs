@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use super::{CacheEntry, CacheKey, EvictionPolicy, LFUEviction, TierStats};
+use super::{CacheEntry, EvictionPolicy, LFUEviction, TierStats};
 use crate::distribcache::{QueryFingerprint, SessionId};
 
 /// L1 Hot Cache - In-memory with LRU/LFU eviction
@@ -64,7 +64,7 @@ impl HotCache {
     }
 
     /// Get an entry from the cache
-    pub fn get(&self, fingerprint: &QueryFingerprint, session: SessionId) -> Option<CacheEntry> {
+    pub fn get(&self, fingerprint: &QueryFingerprint, _session: SessionId) -> Option<CacheEntry> {
         let key = self.fingerprint_to_hash(fingerprint);
 
         if let Some(mut entry) = self.cache.get_mut(&key) {

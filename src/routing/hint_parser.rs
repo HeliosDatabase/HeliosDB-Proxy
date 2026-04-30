@@ -12,7 +12,6 @@
 
 use super::{parse_duration, RoutingError, Result};
 use regex::Regex;
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::Duration;

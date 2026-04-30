@@ -8,7 +8,6 @@ use dashmap::DashMap;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 use super::{DistribCacheConfig, QueryFingerprint, SessionId};
 
@@ -196,7 +195,7 @@ impl PredictivePrefetcher {
     }
 
     /// Predict and enqueue prefetch requests
-    pub fn predict_and_prefetch(&self, current: &QueryFingerprint, session: &SessionId) {
+    pub fn predict_and_prefetch(&self, current: &QueryFingerprint, _session: &SessionId) {
         if !self.config.prefetch_enabled {
             return;
         }
@@ -291,7 +290,7 @@ impl PredictivePrefetcher {
     }
 
     /// Clean up old sessions
-    pub fn cleanup_old_sessions(&self, max_age: std::time::Duration) {
+    pub fn cleanup_old_sessions(&self, _max_age: std::time::Duration) {
         // In production, track timestamps and clean up
         // For now, just limit total sessions
         if self.session_sequences.len() > 10000 {

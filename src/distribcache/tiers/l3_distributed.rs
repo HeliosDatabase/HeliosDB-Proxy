@@ -8,15 +8,12 @@
 
 use dashmap::DashMap;
 use std::collections::BTreeMap;
-use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
 
-use super::{CacheEntry, CacheKey, TierStats};
+use super::{CacheEntry, TierStats};
 use crate::distribcache::QueryFingerprint;
 
 /// Cache protocol message types
@@ -105,7 +102,7 @@ impl HashRing {
         let mut seen = std::collections::HashSet::new();
 
         // Find first node >= key_hash
-        let mut iter = self.ring.range(key_hash..).chain(self.ring.range(..key_hash));
+        let iter = self.ring.range(key_hash..).chain(self.ring.range(..key_hash));
 
         for (_, peer) in iter {
             if !seen.contains(peer) {
@@ -180,7 +177,7 @@ impl PeerConnection {
 
     /// Get entry from peer via TCP
     pub async fn get(&self, fingerprint: &QueryFingerprint) -> Result<CacheEntry, &'static str> {
-        let start = std::time::Instant::now();
+        let _start = std::time::Instant::now();
 
         // Try to connect with timeout
         let stream = match tokio::time::timeout(
@@ -220,7 +217,7 @@ impl PeerConnection {
             return Err("Failed to read response header");
         }
 
-        let msg_type = MessageType::try_from(resp_header[0]).map_err(|_| "Invalid message type")?;
+        let _msg_type = MessageType::try_from(resp_header[0]).map_err(|_| "Invalid message type")?;
         let length = u32::from_le_bytes([resp_header[1], resp_header[2], resp_header[3], resp_header[4]]) as usize;
 
         if length == 0 {
@@ -281,7 +278,7 @@ impl PeerConnection {
 
     /// Ping peer to check health
     pub async fn ping(&self) -> bool {
-        let start = std::time::Instant::now();
+        let _start = std::time::Instant::now();
 
         let stream = match tokio::time::timeout(
             std::time::Duration::from_millis(1000),

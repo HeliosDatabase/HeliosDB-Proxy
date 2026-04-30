@@ -13,8 +13,8 @@ pub use l2_warm::WarmCache;
 pub use l3_distributed::DistributedCache;
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::atomic::AtomicU64;
+use std::time::{Duration, SystemTime};
 
 /// Cache tier identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

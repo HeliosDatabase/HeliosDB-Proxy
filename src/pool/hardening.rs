@@ -11,7 +11,6 @@ use super::mode::PoolingMode;
 use crate::{ProxyError, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use tracing::{warn, info, debug};

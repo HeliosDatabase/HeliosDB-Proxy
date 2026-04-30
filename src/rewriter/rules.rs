@@ -55,7 +55,7 @@ impl RewriteRule {
             QueryPattern::TableAny(table_patterns) => {
                 tables.iter().any(|t| table_patterns.contains(t))
             }
-            QueryPattern::Ast(ast_pattern) => {
+            QueryPattern::Ast(_ast_pattern) => {
                 // AST matching is done by the matcher
                 false
             }

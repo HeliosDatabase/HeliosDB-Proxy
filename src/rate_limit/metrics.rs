@@ -89,7 +89,7 @@ impl RateLimitMetrics {
             .entry(key_str)
             .and_modify(|stats| stats.record(result))
             .or_insert_with(|| {
-                let mut stats = KeyStats::new();
+                let stats = KeyStats::new();
                 stats.record(result);
                 stats
             });

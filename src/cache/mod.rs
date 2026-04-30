@@ -74,7 +74,6 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 
 /// Query cache context (for cache key generation)
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]

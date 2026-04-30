@@ -3,7 +3,6 @@
 //! Introspects database schema and generates GraphQL schema.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use super::{GraphQLScalar, RelationType, to_pascal_case, to_camel_case};
 
