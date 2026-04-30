@@ -44,7 +44,7 @@ fn manifest_for(name: &str, wasm_path: &PathBuf, hooks: Vec<HookType>) -> Plugin
     let mut m = PluginManifest::default();
     m.name = name.to_string();
     m.version = "0.1.0".to_string();
-    m.license = "AGPL-3.0-only".to_string();
+    m.license = "Apache-2.0".to_string();
     m.hooks = hooks;
     m.path = wasm_path.clone();
     m
@@ -237,7 +237,7 @@ fn proxy_loads_packed_tar_gz_artefact() {
         "name": "helios-plugin-cost-governor",
         "version": "0.1.0",
         "description": "test artefact",
-        "license": "AGPL-3.0-only",
+        "license": "Apache-2.0",
         "hooks": ["pre_query", "post_query"],
         "wasm_sha256": wasm_sha,
         "packed_at": "2026-04-25T13:00:00Z",

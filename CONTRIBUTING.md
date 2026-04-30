@@ -206,4 +206,4 @@ tests/
 ## License
 
 By contributing, you agree that your contributions will be licensed
-under the same license as the project (AGPL-3.0-only).
+under the same license as the project (Apache-2.0).
