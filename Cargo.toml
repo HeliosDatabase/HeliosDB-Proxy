@@ -2,13 +2,31 @@
 name = "heliosdb-proxy"
 version = "0.4.0"
 edition = "2021"
+rust-version = "1.75"
 description = "HeliosProxy - Intelligent connection router and failover manager for HeliosDB and PostgreSQL"
 license = "AGPL-3.0-only"
 authors = ["HeliosDB Team"]
 repository = "https://github.com/dimensigon/HDB-HeliosDB-Proxy"
+homepage = "https://www.heliosdb.com/heliosproxy.html"
+documentation = "https://docs.rs/heliosdb-proxy"
 keywords = ["database", "proxy", "failover", "load-balancer", "connection-pool"]
 categories = ["database", "network-programming"]
 readme = "README.md"
+exclude = [
+    "demos/",
+    "docs/",
+    "operator/",
+    "terraform/",
+    "docker/",
+    "scripts/",
+    ".github/",
+    "*.png",
+    "*.jpg",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["pool-modes"]
