@@ -1,6 +1,6 @@
 [package]
 name = "heliosdb-proxy"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 rust-version = "1.75"
 description = "HeliosProxy - Intelligent connection router and failover manager for HeliosDB and PostgreSQL"
@@ -185,6 +185,12 @@ ed25519-dalek = { version = "2", default-features = false, features = ["alloc", 
 # loader sees a .tar.gz extension.
 tar    = "0.4"
 flate2 = "1"
+
+# Embed the .claude/skills/ bundle into the binary so `cargo install`
+# users (no git clone) can deploy the skills via
+# `heliosdb-proxy install skills`. The bundle path is resolved at
+# compile time — keep `.claude/` out of `Cargo.toml`'s exclude list.
+include_dir = "0.7"
 
 # WASM plugin runtime — wasmtime is feature-gated on wasm-plugins so
 # default builds don't pay the (~3 MB compiled) cost. The cranelift
