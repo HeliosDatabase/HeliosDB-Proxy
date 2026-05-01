@@ -5,6 +5,52 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-05-01
+
+Patch release: internal cleanup + first tag-driven crates.io publish.
+No API surface changes; default-feature lib lint count drops from 41
+to 0. All 1 502 tests still green.
+
+### Build & release
+
+- Tag-driven `cargo publish` workflow (`.github/workflows/crates-io.yml`).
+  Pushing a `vX.Y.Z` tag matching `Cargo.toml`'s version uploads the
+  crate. `workflow_dispatch` retries against an existing tag.
+- Cargo metadata for crates.io: `rust-version = "1.75"`, `homepage`,
+  `documentation`, `exclude` (drops demos/docs/operator/terraform/docker
+  from the `.crate` — 320 → 188 files), and
+  `[package.metadata.docs.rs] all-features = true` so docs.rs renders
+  the full feature surface.
+
+### Internal — dead-code retirement
+
+- Removed legacy connection-pool path in `server.rs` that
+  `ConnectionPoolManager` superseded: `state.pools` field, `NodePool`
+  and `BackendConnection` structs, `get_connection`, `cleanup_pools`,
+  and `process_statement_for_pool_mode` methods. ~200 lines deleted.
+- Removed unused fields across `pool/manager.rs`,
+  `connection_pool.rs`, `health_checker.rs`, `failover_controller.rs`,
+  `switchover_buffer.rs`, `pipeline.rs`, `batch.rs`, `load_balancer.rs`,
+  `admin.rs` (and the now-empty `with_flush_channel` constructor on
+  `InsertBatcher`).
+- Cfg-gated imports / locals that only live under `wasm-plugins`,
+  `ha-tr`, or `#[cfg(test)]` (chrono `DateTime`/`Utc` in admin.rs,
+  `NodeRole` in failover_controller.rs, `forward_start` in server.rs).
+- `MessageType::from_tag` had four unreachable server-side arms
+  (`DataRow`/`ErrorResponse`/`CommandComplete`/`ParameterStatus`)
+  that collide with client-side `Describe`/`Execute`/`Close`/`Sync`
+  byte tags. Removed and documented that the function is
+  direction-agnostic and resolves collisions to the client-side variant.
+- Collapsed the `let mut backend_stream = None; ... match { ... =
+  Some(...) }` pattern in `handle_client` to a single
+  `let (mut backend_stream, mut backend_node) = match { ... }`.
+
+### Licensing
+
+- License changed from AGPL-3.0-only to Apache-2.0. (Already shipped
+  in the 0.4.0 crates.io upload — recorded here for the changelog
+  trail.)
+
 ## [0.4.0] - 2026-04-25
 
 Major feature release: full delivery of the T1 / T2 / T3 roadmap shipped
