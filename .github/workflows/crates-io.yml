@@ -1,0 +1,59 @@
+name: Publish to crates.io
+
+# Tag-driven publish: pushing a `vX.Y.Z` tag (matching Cargo.toml version)
+# uploads the crate. workflow_dispatch lets you re-run against an existing
+# tag if the registry rejected the upload mid-flight.
+#
+# Required repo secret:
+#   CARGO_REGISTRY_TOKEN — generate at https://crates.io/me with the
+#   `publish-update` scope limited to the `heliosdb-proxy` crate.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish (e.g. v0.4.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: cargo publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: crates-io-publish
+
+      - name: Verify tag matches Cargo.toml version
+        shell: bash
+        run: |
+          TAG_REF="${{ inputs.tag || github.ref_name }}"
+          TAG="${TAG_REF#v}"
+          CARGO_VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "Tag:        $TAG"
+          echo "Cargo.toml: $CARGO_VERSION"
+          if [ "$TAG" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($TAG) does not match Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          fi
+
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
