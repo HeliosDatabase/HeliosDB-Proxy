@@ -158,6 +158,13 @@ pub mod schema_routing;
 #[cfg(feature = "distribcache")]
 pub mod distribcache;
 
+// ── Embedded skill-bundle deployer ──────────────────────────────────
+//
+// Always-on: the `heliosdb-proxy install skills` subcommand calls
+// into this. Adds ~80 KiB to the binary (the `.claude/skills/`
+// bundle, embedded by `include_dir!`).
+pub mod skills;
+
 use thiserror::Error;
 use uuid::Uuid;
 

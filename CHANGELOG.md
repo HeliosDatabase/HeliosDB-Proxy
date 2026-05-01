@@ -5,6 +5,36 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-05-01
+
+Patch release: ship the operator skill bundle inside the binary so
+`cargo install heliosdb-proxy` users (no repo clone) can deploy
+the bundle to Claude Code / Codex with one subcommand.
+
+### Added
+
+- **`heliosdb-proxy install skills`** — new subcommand that deploys
+  the embedded `.claude/skills/` bundle (22 skills + index + template)
+  into `~/.claude/skills` and `~/.codex/skills`.
+- Flags: `--target claude|codex|both` (default `both`),
+  `--symlink` (use a symlink into `~/.local/share/heliosdb-proxy/skills/`
+  so re-running after a binary upgrade refreshes the bundle in place),
+  `--force` (overwrite pre-existing entries), `--dry-run` (show
+  planned actions without writing).
+- New module `src/skills.rs` with `EMBEDDED_SKILLS` (a `Dir<'_>`
+  populated by `include_dir!`), `install_skills()`, and a
+  test-friendly `install_skills_at(home, …)` overload.
+- Dependency: `include_dir = "0.7"` (~80 KiB binary growth).
+
+### Changed
+
+- `src/main.rs` now uses clap subcommands. The daemon path
+  (no subcommand + flags) is unchanged for backward compatibility
+  with v0.4.1 invocations.
+- Package size up from 188 files / 3.0 MiB to 214 files / 3.2 MiB
+  (compressed: 620 KiB → 673 KiB) — entirely from the embedded
+  skill bundle.
+
 ## [0.4.1] - 2026-05-01
 
 Patch release: internal cleanup + first tag-driven crates.io publish.
