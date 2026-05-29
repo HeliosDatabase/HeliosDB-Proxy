@@ -16,9 +16,9 @@ Pick the one that matches your existing platform stack.
 
 | Surface | Best for | Sibling repo |
 |---|---|---|
-| **Kubernetes operator** + `HeliosProxy` CRD | Anyone running on k8s | [`HDB-HeliosDB-Proxy-Operator`](https://github.com/dimensigon/HDB-HeliosDB-Proxy-Operator) |
-| **Terraform provider**                       | Multi-cloud, IaC pipelines | [`terraform-provider-HDB-HeliosDB-Proxy`](https://github.com/dimensigon/terraform-provider-HDB-HeliosDB-Proxy) |
-| **Pulumi provider**                          | TypeScript / Python IaC | [`pulumi-HDB-HeliosDB-Proxy`](https://github.com/dimensigon/pulumi-HDB-HeliosDB-Proxy) |
+| **Kubernetes operator** + `HeliosProxy` CRD | Anyone running on k8s | [`HDB-HeliosDB-Proxy-Operator`](https://github.com/HeliosDatabase/HeliosDB-Proxy-Operator) |
+| **Terraform provider**                       | Multi-cloud, IaC pipelines | [`terraform-provider-HDB-HeliosDB-Proxy`](https://github.com/HeliosDatabase/terraform-provider-HeliosDB-Proxy) |
+| **Pulumi provider**                          | TypeScript / Python IaC | [`pulumi-HDB-HeliosDB-Proxy`](https://github.com/HeliosDatabase/pulumi-HeliosDB-Proxy) |
 
 Operator and Terraform/Pulumi compose: many teams use the operator
 for k8s-native lifecycle and Terraform/Pulumi to declare the CR
@@ -233,7 +233,7 @@ The TF provider patches the CR; the operator reconciles.
 - `heliosproxy-config` — what the rendered `proxy.toml` looks like
 - `heliosproxy-install` — same image used by container deploys
 - `heliosproxy-release` — how the image gets built and tagged
-- Operator repo: <https://github.com/dimensigon/HDB-HeliosDB-Proxy-Operator>
-- TF provider: <https://github.com/dimensigon/terraform-provider-HDB-HeliosDB-Proxy>
-- Pulumi provider: <https://github.com/dimensigon/pulumi-HDB-HeliosDB-Proxy>
+- Operator repo: <https://github.com/HeliosDatabase/HeliosDB-Proxy-Operator>
+- TF provider: <https://github.com/HeliosDatabase/terraform-provider-HeliosDB-Proxy>
+- Pulumi provider: <https://github.com/HeliosDatabase/pulumi-HeliosDB-Proxy>
 - Demos: [`demos/v0.4.0/{20-k8s-operator,21-terraform,22-pulumi}/`](../../demos/v0.4.0/)

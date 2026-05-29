@@ -405,7 +405,7 @@ compound under contention and are not captured by this bench.
 - Benchmark suite: HeliosProxy vs PgBouncer scalability comparison
 - Docker support for containerized deployment
 
-[0.3.1]: https://github.com/dimensigon/HDB-HeliosDB-Proxy/compare/v0.3.0...v0.3.1
-[0.3.0]: https://github.com/dimensigon/HDB-HeliosDB-Proxy/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/dimensigon/HDB-HeliosDB-Proxy/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/dimensigon/HDB-HeliosDB-Proxy/releases/tag/v0.1.0
+[0.3.1]: https://github.com/HeliosDatabase/HeliosDB-Proxy/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/HeliosDatabase/HeliosDB-Proxy/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/HeliosDatabase/HeliosDB-Proxy/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/HeliosDatabase/HeliosDB-Proxy/releases/tag/v0.1.0

@@ -199,6 +199,6 @@ Values YAML maps 1:1 to the `HeliosProxy` spec.
 ## Status
 
 Not yet implemented — this doc is the design contract. The Go
-scaffold (`operator-sdk init --domain=heliosproxy.dev --repo=github.com/dimensigon/HDB-HeliosDB-Proxy-Operator`)
+scaffold (`operator-sdk init --domain=heliosproxy.dev --repo=github.com/HeliosDatabase/HeliosDB-Proxy-Operator`)
 lands in a separate repo so the Go toolchain stays out of the Rust
 build graph.

@@ -8,7 +8,7 @@ related: [heliosproxy-overview, heliosproxy-plugin-pack, heliosproxy-plugin-load
 # First-party plugin catalog
 
 Eight plugins ship in the
-[`HDB-HeliosDB-Proxy-Plugins`](https://github.com/dimensigon/HDB-HeliosDB-Proxy-Plugins)
+[`HDB-HeliosDB-Proxy-Plugins`](https://github.com/HeliosDatabase/HeliosDB-Proxy-Plugins)
 sibling repo. Each is independently versioned and packed as a
 standalone OCI artefact. This skill is the at-a-glance "which
 plugin do I want" reference.
@@ -160,5 +160,5 @@ need from KV.
 - `heliosproxy-plugin-pack` — build / sign these
 - `heliosproxy-plugin-load` — drop them into the proxy
 - `heliosproxy-plugin-kv` — runtime config knobs
-- Sibling repo: <https://github.com/dimensigon/HDB-HeliosDB-Proxy-Plugins>
+- Sibling repo: <https://github.com/HeliosDatabase/HeliosDB-Proxy-Plugins>
 - Demos: [`demos/v0.4.0/{11..18}-*`](../../demos/v0.4.0/) — one demo per plugin

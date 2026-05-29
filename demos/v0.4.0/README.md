@@ -80,6 +80,6 @@ running against an unreleased build, swap the `image:` line for
 
 ## Where to file improvements
 
-[github.com/dimensigon/HDB-HeliosDB-Proxy/issues](https://github.com/dimensigon/HDB-HeliosDB-Proxy/issues)
+[github.com/HeliosDatabase/HeliosDB-Proxy/issues](https://github.com/HeliosDatabase/HeliosDB-Proxy/issues)
 — one issue per demo, please. Pull requests welcome; new demos
 follow the layout described at the top of this file.

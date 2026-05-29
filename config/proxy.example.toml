@@ -9,7 +9,7 @@
 # Environment variable substitution: use ${VAR_NAME:-default_value} syntax.
 # All addresses, credentials, and tuning parameters support env var overrides.
 #
-# Documentation: https://github.com/heliosdb/proxy
+# Documentation: https://github.com/HeliosDatabase/HeliosDB-Proxy
 
 # -----------------------------------------------------------------------------
 # Proxy listener settings

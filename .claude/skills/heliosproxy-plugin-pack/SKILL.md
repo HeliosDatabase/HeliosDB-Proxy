@@ -32,7 +32,7 @@ proxy until the artefact is loaded (see `heliosproxy-plugin-load`).
 | `openssl genpkey` / `openssl pkey` | Generate / convert Ed25519 keys |
 
 The CLI binary lives in the sibling repo
-[`HDB-HeliosDB-Proxy-Plugins`](https://github.com/dimensigon/HDB-HeliosDB-Proxy-Plugins)
+[`HDB-HeliosDB-Proxy-Plugins`](https://github.com/HeliosDatabase/HeliosDB-Proxy-Plugins)
 and installs alongside the proxy:
 
 ```bash
@@ -62,7 +62,7 @@ Both PEM and the trailing-32-bytes form are accepted by the proxy's
 ### Recipe 2: Build a plugin from source (Rust → wasm)
 
 ```bash
-git clone git@github.com:dimensigon/HDB-HeliosDB-Proxy-Plugins.git
+git clone git@github.com:HeliosDatabase/HeliosDB-Proxy-Plugins.git
 cd HDB-HeliosDB-Proxy-Plugins
 cargo build -p helios-plugin-cost-governor \
   --target wasm32-unknown-unknown --release
@@ -178,5 +178,5 @@ required).
 - Demo: [`demos/v0.4.0/05-plugin-signatures/`](../../demos/v0.4.0/05-plugin-signatures/) — sig demo
 - Demo: [`demos/v0.4.0/06-plugin-oci/`](../../demos/v0.4.0/06-plugin-oci/) — pack-and-load
 - Demo: [`demos/v0.4.0/19-helios-plugin-cli/`](../../demos/v0.4.0/19-helios-plugin-cli/) — CLI walkthrough
-- Sibling repo: <https://github.com/dimensigon/HDB-HeliosDB-Proxy-Plugins>
+- Sibling repo: <https://github.com/HeliosDatabase/HeliosDB-Proxy-Plugins>
 - Code: [`src/plugins/loader.rs`](../../src/plugins/loader.rs) — verifier
