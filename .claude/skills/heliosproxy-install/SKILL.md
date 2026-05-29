@@ -25,7 +25,7 @@ minimal; opt in to feature flags explicitly.
 | Surface | When to use |
 |---|---|
 | `cargo install heliosdb-proxy` | Production / operator install — pulls from crates.io |
-| `cargo install --git github.com/dimensigon/HDB-HeliosDB-Proxy` | Pre-release / unreleased commit |
+| `cargo install --git github.com/HeliosDatabase/HeliosDB-Proxy` | Pre-release / unreleased commit |
 | `git clone … && cargo build --release` | Developer install with `--features` matrix |
 | `ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.1` | Container deploy (Docker/K8s) |
 
@@ -78,7 +78,7 @@ which feature unlocks which skill.
 ### Recipe 4: Developer install from source
 
 ```bash
-git clone git@github.com:dimensigon/HDB-HeliosDB-Proxy.git
+git clone git@github.com:HeliosDatabase/HeliosDB-Proxy.git
 cd HDB-HeliosDB-Proxy
 cargo build --release --features all-features
 ./target/release/heliosdb-proxy --version

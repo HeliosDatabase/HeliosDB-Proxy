@@ -2,7 +2,7 @@
 
 **Purpose:** Hand-off from the Proxy-repo agent to the website agent. Describes what changed in v0.3.1, what's defensible to claim publicly, what isn't, and which pages likely need updates. Read this before editing marketing copy; act on the sections flagged "action."
 
-**Release:** v0.3.1 — 2026-04-22 — commit `23a451c` on `main` of `github.com/dimensigon/heliosdb-proxy` (private).
+**Release:** v0.3.1 — 2026-04-22 — commit `23a451c` on `main` of `github.com/HeliosDatabase/HeliosDB-Proxy` (private).
 **Previous release:** v0.3.0 — 2026-03-26 — commit `8c43de9`.
 **Type:** patch release — correctness fixes + hot-path performance. No API removals. No new feature modules (still 24). Feature flags, module list, CLI, admin API, Docker image surface are unchanged.
 
@@ -86,7 +86,7 @@ Paths below are relative to `/home/app/Helios/Docs-Public/Lite/docs/website/` (b
 
 4. **`_nav.md` / nav structure** — no changes expected.
 
-5. **Release-notes / changelog page (if the site has one)** — mirror the content of `CHANGELOG.md` §[0.3.1] verbatim. The canonical CHANGELOG lives at `https://github.com/dimensigon/heliosdb-proxy/blob/main/CHANGELOG.md` (private repo — link only works for authenticated users).
+5. **Release-notes / changelog page (if the site has one)** — mirror the content of `CHANGELOG.md` §[0.3.1] verbatim. The canonical CHANGELOG lives at `https://github.com/HeliosDatabase/HeliosDB-Proxy/blob/main/CHANGELOG.md` (private repo — link only works for authenticated users).
 
 6. **Download / install page** — bump the latest version string to `0.3.1`. Docker tag: `ghcr.io/dimensigon/heliosdb-proxy:0.3.1` (once the release workflow runs; verify the tag exists before publishing the copy).
 
