@@ -8,7 +8,7 @@ HeliosProxy operates at the PostgreSQL wire protocol level, making it compatible
 
 ## Overview
 
-HeliosProxy sits between your application and your database cluster, providing transparent connection pooling, automatic failover, intelligent query routing, and 24 enterprise-grade feature modules — all without application code changes.
+HeliosProxy sits between your application and your database cluster, providing transparent connection pooling, automatic failover, intelligent query routing, and 46 enterprise-grade feature modules — all without application code changes.
 
 ```
 ┌──────────────┐     ┌─────────────────────────────────────────────────┐     ┌──────────────┐
@@ -31,7 +31,7 @@ HeliosProxy sits between your application and your database cluster, providing t
 
 ### Protocol-Level Compatibility
 
-All 24 feature modules operate at the PostgreSQL wire protocol level. They inspect, route, cache, and transform queries without requiring changes to your application or database. Any client library that connects to PostgreSQL connects to HeliosProxy.
+All 46 feature modules operate at the PostgreSQL wire protocol level. They inspect, route, cache, and transform queries without requiring changes to your application or database. Any client library that connects to PostgreSQL connects to HeliosProxy.
 
 ### Supported Backends
 
@@ -49,7 +49,9 @@ All 24 feature modules operate at the PostgreSQL wire protocol level. They inspe
 
 ## Feature Modules
 
-HeliosProxy ships 24 feature modules, each independently enabled via Cargo feature flags. Enable only what you need — from a lightweight connection pooler to a full-featured intelligent proxy.
+HeliosProxy ships **46 feature modules**, grouped into two tiers: the **24 connection-routing modules** introduced through v0.3 and the **22 platform modules** added in v0.4 (plugin-host extensions, admin surface, first-party plugins, and companion projects). Each module is independently enabled via Cargo feature flags — enable only what you need, from a lightweight connection pooler to a full programmable data-plane.
+
+## v0.3 — Connection-routing tier (24 modules)
 
 ### Connection Management
 
@@ -66,8 +68,7 @@ HeliosProxy ships 24 feature modules, each independently enabled via Cargo featu
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
 | **Failover Controller** | *(core)* | Automatic failover with sync-standby preference, candidate ranking by replication lag, and configurable promotion policies |
-| **Transaction Replay (TR)** | `ha-tr` | Journals in-flight transactions and transparently replays them on a new primary after failover — zero data loss for committed work |
-| **Failover Replay** | `ha-tr` | Coordinates the replay of journaled transactions during failover, maintaining statement ordering and parameter fidelity |
+| **Transaction Replay (TR)** | `ha-tr` | Journals in-flight transactions and transparently replays them on a new primary after failover — zero data loss for committed work, with statement ordering and parameter fidelity preserved |
 | **Session Migration** | `ha-tr` | Captures and restores full session state (SET parameters, prepared statements, advisory locks) when moving connections between nodes |
 | **Cursor Restore** | `ha-tr` | Preserves open cursor positions across failover — clients resume fetching without re-executing the query |
 | **Switchover Buffer** | *(core)* | Buffers incoming queries during planned switchover, drains them to the new primary once promotion completes |
@@ -78,7 +79,7 @@ HeliosProxy ships 24 feature modules, each independently enabled via Cargo featu
 
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
-| **Query Cache** | `query-cache` | Three-tier result cache (L1 hot / L2 warm / L3 semantic) with TTL-based expiration, pattern-based invalidation, and normalized query fingerprinting |
+| **Query Cache** | `query-cache` / `distribcache` | Three-tier result cache (L1 hot / L2 warm / L3 semantic) with TTL-based expiration, pattern-based invalidation, and normalized query fingerprinting. The optional `distribcache` flag adds an AI-powered distributed tier with workload classification, access heatmaps, and intelligent prefetching |
 | **Query Routing** | `routing-hints` | Hint-based routing via SQL comments (`/*+ route=primary */`) and automatic classification of read vs. write queries |
 | **Lag-Aware Routing** | `lag-routing` | Routes reads to replicas within an acceptable replication lag threshold, with read-your-writes (RYW) session consistency guarantees |
 | **Query Rewriter** | `query-rewriting` | Rule-based SQL transformation engine — rewrite, redirect, or annotate queries before they reach the backend |
@@ -101,11 +102,58 @@ HeliosProxy ships 24 feature modules, each independently enabled via Cargo featu
 | **WASM Plugins** | `wasm-plugins` | Sandboxed WebAssembly plugin runtime with hot-reload, host function bindings, and per-plugin resource limits |
 | **GraphQL Gateway** | `graphql-gateway` | GraphQL-to-SQL translation layer with automatic schema introspection, DataLoader batching, and query validation |
 
-### Distributed Caching
+## v0.4 — Platform tier (22 modules)
+
+The v0.4 release builds a programmable platform on top of the connection-routing core: a hardened WASM plugin host, an operations/observability surface (anomaly detection, edge cache, chaos engineering, shadow execution, time-travel replay), eight signed first-party plugins, and an IaC companion ecosystem.
+
+### Detection & Edge
 
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
-| **DistribCache** | `distribcache` | AI-powered distributed query cache with three-tier storage (hot/warm/distributed), workload classification, access heatmaps, and intelligent prefetching |
+| **Anomaly Detection** | `anomaly-detection` | In-process sliding-window detector: rate spikes (z-score vs. rolling EWMA), credential-stuffing bursts, six classes of SQL-injection patterns, and novel query shapes. Events stream over `GET /anomalies` — no external SIEM required |
+| **Edge Mode** | `edge-proxy` | Cache-first geo/edge proxy. Each edge terminates reads against a local LRU+TTL+version cache; the home proxy broadcasts table-scoped invalidations on writes. Last-write-wins, no consensus |
+
+### Programmable WASM Data-Plane
+
+| Module | Feature Flag | Description |
+|--------|-------------|-------------|
+| **Plugin Host KV** | `wasm-plugins` | `env.kv_get` / `kv_set` / `kv_delete` host imports with per-plugin namespaced state that persists across hook invocations |
+| **Plugin Host Crypto** | `wasm-plugins` | `env.sha256_hex` host import backed by the audited `sha2` crate — plugins compute real SHA-256 without embedding the algorithm |
+| **Plugin Signatures** | `wasm-plugins` | Optional Ed25519 trust root: every loaded `.wasm` requires a verifying `.sig` sidecar. Interoperates with `openssl` / `signify` |
+| **OCI Plugin Artefacts** | `wasm-plugins` | `.tar.gz` distribution format (`manifest.json` + `plugin.wasm` + optional `plugin.sig`); the loader validates the wasm SHA-256 against the manifest |
+| **Plugin Route-Block** | `wasm-plugins` | `RouteResult::Block { reason }` ABI variant — a plugin can hard-reject a query, synthesising a PostgreSQL `ErrorResponse` + `ReadyForQuery` |
+| **Plugin Trust Root Config** | `wasm-plugins` | `[plugins].trust_root` in `proxy.toml` auto-attaches the signature verifier; permissive when unset for dev-loop ergonomics |
+
+### Admin Surface
+
+| Module | Feature Flag | Description |
+|--------|-------------|-------------|
+| **Admin Web UI** | *(core)* | Single embedded HTML dashboard at `/` and `/ui`. Ten auto-refreshing panels: Nodes, Topology, Plugins, Anomalies, Edge Mode, Chaos Mode, Shadow Execution, Time-Travel Replay, SQL Console, and Traffic |
+| **Admin REST v2** | *(core)* | Endpoints surfacing every v0.4 capability: `/topology`, `/plugins`, `/anomalies`, `/api/edge*`, `/api/chaos`, `/api/shadow`, `/api/replay`. Operator and UI consume the same JSON |
+
+### First-Party Plugins
+
+Eight signed WASM plugins (shipped in the companion `HDB-HeliosDB-Proxy-Plugins` repo, loaded via `wasm-plugins`):
+
+| Module | Description |
+|--------|-------------|
+| **cost-governor** | Per-tenant query cost budgets (minute / hour / day windows), tracked in the plugin KV namespace |
+| **ai-classifier** | Detects LLM-generated SQL via `application_name` keywords and generated-by markers; extracts `agent_id` + `model_id` for downstream plugins |
+| **token-budget** | Per-`(agent, model)` cost gating for AI traffic with sliding-window budgets |
+| **llm-guardrail** | Refuses dangerous AI SQL: `DROP`/`TRUNCATE`, `DELETE`/`UPDATE` without `WHERE`, `SELECT` without `LIMIT` on large tables, missing tenant filter |
+| **pgvector-router** | Routes pgvector top-K queries (`<->`, `<#>`, `<=>`) to a topology-tagged vector replica |
+| **column-mask** | Per-role column masking via SQL rewriting (`SELECT ssn` → `SELECT mask_ssn(ssn) AS ssn`) |
+| **audit-chain** | Hash-chained tamper-evident audit log using the `env.sha256_hex` host import |
+| **residency-router** | Per-user data-residency routing by `helios.region`; blocks cross-region access with a proper PG error |
+
+### Companion Projects
+
+| Module | Description |
+|--------|-------------|
+| **`helios-plugin` CLI** | Pack, inspect, and verify WASM plugin artefacts as portable `.tar.gz` using the same Ed25519 trust-root format as the proxy loader |
+| **Kubernetes Operator** | CRDs for `HeliosProxy`, `PoolProfile`, `RoutingRule`, `AuditPolicy`, `TenantQuota`; reconciler renders ConfigMap + Deployment + Service and polls `/topology` for status |
+| **Terraform Provider** | Five resources mirroring the operator CRDs (`heliosproxy_instance`, `_pool_profile`, `_routing_rule`, `_audit_policy`, `_tenant_quota`) |
+| **Pulumi Provider** | Wraps the Terraform provider via `pulumi-terraform-bridge` — same five resources in TypeScript / Python / Go / .NET |
 
 ---
 
@@ -185,6 +233,8 @@ export DATABASE_URL="postgres://myapp:password@localhost:6432/mydb"
 | `graphql-gateway` | No | GraphQL-to-SQL translation with introspection |
 | `schema-routing` | No | Schema-aware routing and workload classification |
 | `distribcache` | No | AI-powered distributed query caching |
+| `anomaly-detection` | No | In-process anomaly detection (rate spikes, credential stuffing, SQLi heuristics, novel queries) |
+| `edge-proxy` | No | Cache-first edge / geo proxy mode with last-write-wins TTL coherence |
 | `postgres-topology` | No | PostgreSQL primary discovery via `pg_is_in_recovery()` |
 | `heliosdb-topology` | No | HeliosDB native topology integration |
 | `observability` | No | Prometheus metrics and OpenTelemetry tracing |
@@ -250,6 +300,33 @@ curl -X POST http://localhost:9090/failover
 # Drain node for maintenance
 curl -X POST http://localhost:9090/nodes/{id}/drain
 ```
+
+### v0.4 platform endpoints
+
+```bash
+# Cluster topology for external controllers (currentPrimary, healthy/unhealthy nodes)
+curl http://localhost:9090/topology
+
+# Loaded WASM plugins with invocation + error counts
+curl http://localhost:9090/plugins
+
+# Recent anomaly events (rate spikes, credential bursts, SQLi patterns, novel queries)
+curl http://localhost:9090/anomalies?limit=50
+
+# Chaos engineering — fault injection to validate the failover path
+curl -X POST http://localhost:9090/api/chaos -d '{"action":"force_unhealthy","node":"pg-primary"}'
+
+# Shadow execution — run a query against source + shadow backends and diff results
+curl -X POST http://localhost:9090/api/shadow -d '{"query":"SELECT count(*) FROM orders"}'
+
+# Time-travel replay — replay a journal window against a target backend
+curl -X POST http://localhost:9090/api/replay -d '{"from":"...","to":"..."}'
+
+# Edge mode — cache stats, edge registration, invalidation broadcast
+curl http://localhost:9090/api/edge
+```
+
+The embedded admin Web UI exposes all of the above at `/` and `/ui`.
 
 ---
 
