@@ -24,6 +24,7 @@ NANO_BIN=$HOME/HDB/Nano/target/release/heliosdb-nano
 POSTGRES_PORT=55432
 NANO_PORT=16432
 NANO_HTTP_PORT=18180
+NANO_REPLICATION_PORT=19432
 POSTGRES_CONTAINER=heliosproxy-demo-postgres
 DB_NAME=postgres
 DB_USER=postgres

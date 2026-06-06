@@ -18,6 +18,7 @@ load_env_defaults() {
 POSTGRES_PORT="${POSTGRES_PORT:-55432}"
 NANO_PORT="${NANO_PORT:-16432}"
 NANO_HTTP_PORT="${NANO_HTTP_PORT:-18180}"
+NANO_REPLICATION_PORT="${NANO_REPLICATION_PORT:-19432}"
 POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-heliosproxy-demo-postgres}"
 DB_NAME="${DB_NAME:-postgres}"
 DB_USER="${DB_USER:-postgres}"
@@ -124,18 +125,31 @@ EOF
       echo "[nano] HTTP port $NANO_HTTP_PORT is already in use; set NANO_HTTP_PORT in $ENV_FILE" >&2
       exit 2
     fi
+    if [[ "$NANO_REPLICATION_PORT" != "0" ]] && port_in_use "$NANO_REPLICATION_PORT"; then
+      echo "[nano] replication port $NANO_REPLICATION_PORT is already in use; set NANO_REPLICATION_PORT in $ENV_FILE" >&2
+      exit 2
+    fi
     rm -rf "$STATE_DIR/nano-data"
     mkdir -p "$STATE_DIR/nano-data"
-    "$NANO_BIN" start \
-      --data-dir "$STATE_DIR/nano-data" \
-      --listen 127.0.0.1 \
-      --port "$NANO_PORT" \
-      --http-listen 127.0.0.1 \
-      --http-port "$NANO_HTTP_PORT" \
-      --max-connections 512 \
-      --daemon \
-      --pid-file "$RUN_DIR/nano.pid" \
-      > "$LOG_DIR/nano.log" 2>&1
+    nano_args=(
+      start
+      --data-dir "$STATE_DIR/nano-data"
+      --listen 127.0.0.1
+      --port "$NANO_PORT"
+      --http-listen 127.0.0.1
+      --http-port "$NANO_HTTP_PORT"
+      --replication-role primary
+      --replication-port "$NANO_REPLICATION_PORT"
+      --sync-mode async
+      --max-connections 512
+      --daemon
+      --pid-file "$RUN_DIR/nano.pid"
+    )
+    if command -v setsid >/dev/null 2>&1; then
+      setsid "$NANO_BIN" "${nano_args[@]}" > "$LOG_DIR/nano.log" 2>&1
+    else
+      "$NANO_BIN" "${nano_args[@]}" > "$LOG_DIR/nano.log" 2>&1
+    fi
     sleep 1
     if ! kill -0 "$(cat "$RUN_DIR/nano.pid")" >/dev/null 2>&1; then
       echo "[nano] process exited during startup" >&2
@@ -189,8 +203,12 @@ run_one() {
 
 status_one() {
   local label="$1" port="$2"
-  if ! sql_exec "$port" "SELECT COUNT(*) AS ledger_rows, COALESCE(SUM(delta),0) AS ledger_delta FROM demo_ledger;"; then
+  if ! sql_exec "$port" "SELECT 1;" >/dev/null 2>&1; then
     echo "[$label] unavailable on port $port"
+    return 0
+  fi
+  if ! sql_exec "$port" "SELECT COUNT(*) AS ledger_rows, COALESCE(SUM(delta),0) AS ledger_delta FROM demo_ledger;" 2>/dev/null; then
+    echo "[$label] reachable on port $port; schema not loaded (run: oltp-race.sh init)"
     return 0
   fi
   sql_exec "$port" "SELECT COALESCE(SUM(balance),0) AS total_balance, COALESCE(SUM(version),0) AS total_versions FROM demo_accounts;" || true
