@@ -38,16 +38,17 @@ Defaults:
 
 - PostgreSQL container: `127.0.0.1:55432`
 - HeliosDB-Nano: `127.0.0.1:16432`
+- HeliosDB-Nano HTTP/replication: `127.0.0.1:18180` / `127.0.0.1:19432`
 - Nano binary: `~/HDB/Nano/target/release/heliosdb-nano`
 - Logs: `~/HDB/Proxy-Demogrounds/logs/`
 
 Tune `CLIENTS`, `JOBS`, `DURATION`, and ports in
 `~/HDB/Proxy-Demogrounds/.env`.
 
-If Nano is no longer reachable after a benchmark run, restart only the local
-services with `~/HDB/Proxy-Demogrounds/bin/oltp-race.sh up`. The benchmark
-summary and logs are still valid; some Nano builds exit after the last client
-disconnects.
+The launcher uses `setsid` when available so Nano daemon mode survives after a
+noninteractive setup command exits. If Nano is no longer reachable, check
+`~/HDB/Proxy-Demogrounds/logs/nano.log` and restart the local services with
+`~/HDB/Proxy-Demogrounds/bin/oltp-race.sh up`.
 
 ## Main Demo Runner
 

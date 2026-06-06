@@ -11,11 +11,12 @@ PostgreSQL client fallbacks, but the host still needs the tools below.
 - `curl` and `jq` for admin API calls and JSON formatting
 - `tmux` for the side-by-side presentation launcher
 - `ss` from `iproute2` for port collision checks; without it, checks are best effort
+- `setsid` from `util-linux` so Nano daemon mode survives noninteractive launch
 
 Recommended quick check:
 
 ```bash
-for c in docker git curl jq tmux ss; do command -v "$c" || echo "missing: $c"; done
+for c in docker git curl jq tmux ss setsid; do command -v "$c" || echo "missing: $c"; done
 docker compose version
 ```
 
@@ -87,6 +88,7 @@ Default ports must be free unless changed in `~/HDB/Proxy-Demogrounds/.env`:
 | Side-by-side PostgreSQL | `55432` |
 | Side-by-side Nano PG wire | `16432` |
 | Side-by-side Nano HTTP | `18180` |
+| Side-by-side Nano replication | `19432` |
 | Proxy PG wire for v0.4 demos | `6432` |
 | Proxy admin API | `9090` |
 | Upgrade matrix proxy | `59001` |
@@ -96,7 +98,7 @@ Default ports must be free unless changed in `~/HDB/Proxy-Demogrounds/.env`:
 Check active listeners:
 
 ```bash
-ss -ltn | grep -E ':(55432|16432|18180|6432|9090|59001|59002|55014|55015|55016|55017)\b'
+ss -ltn | grep -E ':(55432|16432|18180|19432|6432|9090|59001|59002|55014|55015|55016|55017)\b'
 ```
 
 ## WASM Plugin Tour
@@ -122,9 +124,9 @@ DURATION=5 CLIENTS=2 JOBS=2 NANO_CLIENTS=1 NANO_JOBS=1 \
   ~/HDB/Proxy-Demogrounds/bin/oltp-race.sh run
 ```
 
-If Nano exits after a completed benchmark, restart local services with:
+If Nano is not reachable after setup, confirm `setsid` is installed and restart
+local services with:
 
 ```bash
 ~/HDB/Proxy-Demogrounds/bin/oltp-race.sh up
 ```
-
