@@ -10,6 +10,9 @@ This directory contains the shareable assets for the three-demo talk:
 Local state, logs, and presentation scratch files live outside the repo in
 `~/HDB/Proxy-Demogrounds`.
 
+Before setup, review [PRE_REQUISITES.md](PRE_REQUISITES.md). The scripts do
+not install Docker, Nano, `tmux`, `curl`, `jq`, or system packages.
+
 ## One-Time Setup
 
 ```bash
