@@ -27,11 +27,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
-use wasmtime::{Engine, Instance, Linker, Module, Store, TypedFunc, Memory};
+use wasmtime::{Engine, Instance, InstancePre, Linker, Module, Store, TypedFunc, Memory};
 
 use super::config::PluginRuntimeConfig;
 use super::host_functions::HostFunctionRegistry;
@@ -125,6 +126,13 @@ pub struct LoadedPlugin {
     /// and shared across invocations. Replaces the prior Vec<u8> stub.
     module: Module,
 
+    /// Pre-resolved instantiation plan (module imports linked against the
+    /// runtime's shared `Linker`). Computed once on the first hook call and
+    /// reused for every subsequent call, so per-dispatch cost drops to
+    /// `Store::new` + `InstancePre::instantiate` — no per-call `Linker`
+    /// allocation, host-import re-registration, or import-name resolution.
+    instance_pre: OnceLock<InstancePre<StoreCtx>>,
+
     /// Security sandbox
     sandbox: PluginSandbox,
 
@@ -166,6 +174,7 @@ impl LoadedPlugin {
             state: PluginState::Running,
             path,
             module,
+            instance_pre: OnceLock::new(),
             sandbox,
             instance_data: RwLock::new(PluginInstanceData {
                 memory_used: 0,
@@ -221,6 +230,15 @@ pub struct WasmPluginRuntime {
     /// once; modules cheaply share a reference to it.
     engine: Engine,
 
+    /// Shared host-import linker, built once with the `env::*` KV and
+    /// crypto imports. Reused to pre-resolve every plugin's instantiation
+    /// plan instead of allocating a fresh `Linker` and re-registering host
+    /// functions on every hook call.
+    linker: Linker<StoreCtx>,
+
+    /// Stop flag for the background epoch ticker thread (see `new`).
+    epoch_stop: Arc<AtomicBool>,
+
     /// Host function registry
     host_functions: Arc<HostFunctionRegistry>,
 
@@ -256,6 +274,34 @@ impl WasmPluginRuntime {
             PluginError::RuntimeError(format!("wasmtime engine init: {}", e))
         })?;
 
+        // Build the host-import linker once. The KV/crypto imports read
+        // their state from each call's `Store` data (Caller<StoreCtx>), so
+        // a single shared linker is correct across all plugins and calls.
+        let mut linker: Linker<StoreCtx> = Linker::new(&engine);
+        register_kv_imports(&mut linker)?;
+        register_crypto_imports(&mut linker)?;
+
+        // Background epoch ticker: bumps the engine epoch every ~1ms so
+        // that per-call epoch deadlines actually enforce a wall-clock
+        // timeout on plugin execution (previously the deadline was set to
+        // u64::MAX, so the configured timeout was never enforced). A
+        // std::thread is used so enforcement works with or without a tokio
+        // runtime; it exits within ~1ms of the runtime being dropped.
+        let epoch_stop = Arc::new(AtomicBool::new(false));
+        {
+            let engine = engine.clone();
+            let stop = epoch_stop.clone();
+            std::thread::Builder::new()
+                .name("wasm-epoch-ticker".into())
+                .spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(1));
+                        engine.increment_epoch();
+                    }
+                })
+                .ok();
+        }
+
         let default_policy = SecurityPolicy {
             allowed_hosts: vec!["localhost".to_string()],
             allowed_paths: vec![config.plugin_dir.clone()],
@@ -268,6 +314,8 @@ impl WasmPluginRuntime {
         Ok(Self {
             config: config.clone(),
             engine,
+            linker,
+            epoch_stop,
             host_functions,
             kv: KvBackend::new(),
             module_cache: RwLock::new(HashMap::new()),
@@ -280,6 +328,13 @@ impl WasmPluginRuntime {
     /// or inspect a plugin's state without going through WASM.
     pub fn kv(&self) -> &KvBackend {
         &self.kv
+    }
+
+    /// Borrow the shared host-import linker (used by the manager/tests to
+    /// pre-resolve modules against the same import set).
+    #[allow(dead_code)]
+    pub(crate) fn linker(&self) -> &Linker<StoreCtx> {
+        &self.linker
     }
 
     /// Expose the engine so tests + the plugin manager can build new
@@ -416,29 +471,44 @@ impl WasmPluginRuntime {
                 PluginError::RuntimeError(format!("set_fuel: {}", e))
             })?;
         }
-        // Epoch interruption was enabled at engine init. If we don't
-        // raise the deadline above the engine's current epoch (0), the
-        // store traps as soon as the function is entered. A deadline
-        // of `u64::MAX` effectively disables the interrupt for this
-        // call — real time enforcement happens via fuel. A future
-        // commit can ratchet this down per-config and pump epoch ticks
-        // from a background task to enforce wall-clock timeouts.
-        store.set_epoch_deadline(u64::MAX);
+        // Epoch interruption was enabled at engine init and a background
+        // ticker bumps the engine epoch every ~1ms. Set the deadline to
+        // `timeout` worth of ticks so a runaway plugin traps at its
+        // configured wall-clock timeout instead of blocking the caller
+        // indefinitely. (Set after Store::new, before the call.)
+        let deadline_ticks = self
+            .config
+            .timeout
+            .as_millis()
+            .max(1)
+            .min(u64::MAX as u128) as u64;
+        store.set_epoch_deadline(deadline_ticks);
 
-        // Linker carries the host imports under `env::*`. Plugins that
-        // don't import any of them are unaffected; plugins that need
-        // KV (or other future imports) get them resolved here.
-        let mut linker: Linker<StoreCtx> = Linker::new(&self.engine);
-        register_kv_imports(&mut linker)?;
-        register_crypto_imports(&mut linker)?;
-        let instance = linker
-            .instantiate(&mut store, &plugin.module)
-            .map_err(|e| {
-                PluginError::InstantiationError(format!(
-                    "instantiate {}: {}",
-                    plugin.metadata.name, e
-                ))
-            })?;
+        // Instantiate from the plugin's pre-resolved plan, computed once
+        // against the runtime's shared host-import linker and cached on the
+        // plugin. Per call this is just a linear-memory/table init — no
+        // Linker allocation, no host-import re-registration, no import-name
+        // resolution.
+        let instance_pre = match plugin.instance_pre.get() {
+            Some(ip) => ip,
+            None => {
+                let ip = self.linker.instantiate_pre(&plugin.module).map_err(|e| {
+                    PluginError::InstantiationError(format!(
+                        "pre-instantiate {}: {}",
+                        plugin.metadata.name, e
+                    ))
+                })?;
+                // Race-tolerant: if another thread set it first, keep theirs.
+                let _ = plugin.instance_pre.set(ip);
+                plugin.instance_pre.get().expect("just set")
+            }
+        };
+        let instance = instance_pre.instantiate(&mut store).map_err(|e| {
+            PluginError::InstantiationError(format!(
+                "instantiate {}: {}",
+                plugin.metadata.name, e
+            ))
+        })?;
 
         let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| {
             PluginError::ExecutionError(format!(
@@ -597,6 +667,15 @@ impl WasmPluginRuntime {
             memory_limit: self.config.memory_limit,
             timeout: self.config.timeout,
         }
+    }
+}
+
+impl Drop for WasmPluginRuntime {
+    fn drop(&mut self) {
+        // Signal the epoch ticker thread to exit; it polls the flag every
+        // ~1ms and then releases its Engine clone.
+        self.epoch_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -869,6 +948,59 @@ mod tests {
         );
         let bytes = wat::parse_str(&wat).expect("wat parses");
         Module::from_binary(engine, &bytes).expect("module compiles")
+    }
+
+    /// A module whose `pre_query` hook spins forever — used to prove the
+    /// epoch-deadline wall-clock timeout actually interrupts a runaway
+    /// plugin instead of blocking the caller indefinitely.
+    fn build_spin_module(engine: &Engine) -> Module {
+        let wat = r#"
+            (module
+              (memory (export "memory") 1)
+              (func (export "alloc") (param i32) (result i32) (i32.const 4096))
+              (func (export "dealloc") (param i32) (param i32))
+              (func (export "pre_query") (param i32) (param i32) (result i64)
+                (loop $l (br $l))
+                (i64.const 0)))
+        "#;
+        let bytes = wat::parse_str(wat).expect("wat parses");
+        Module::from_binary(engine, &bytes).expect("module compiles")
+    }
+
+    /// A runaway plugin must trap at its configured timeout (enforced by
+    /// the background epoch ticker), not hang the caller. Guarded by a 5s
+    /// join so a regression fails fast instead of hanging the test binary.
+    #[test]
+    fn test_call_hook_enforces_timeout() {
+        let mut config = PluginRuntimeConfig::default();
+        config.fuel_metering = false; // isolate epoch enforcement from fuel
+        config.timeout = Duration::from_millis(100);
+        let runtime = Arc::new(WasmPluginRuntime::new(&config).unwrap());
+
+        let module = build_spin_module(runtime.engine());
+        let mut metadata = PluginMetadata::default();
+        metadata.name = "spin".to_string();
+        metadata.hooks = vec![HookType::PreQuery];
+        let plugin = Arc::new(LoadedPlugin::new(
+            metadata,
+            PathBuf::from("/test/spin.wasm"),
+            module,
+            PluginSandbox::default(),
+        ));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let r = runtime.clone();
+            let p = plugin.clone();
+            std::thread::spawn(move || {
+                let res = r.call_hook(&p, HookType::PreQuery, b"{}");
+                let _ = tx.send(res.is_err());
+            });
+        }
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(is_err) => assert!(is_err, "runaway plugin should trap with an error"),
+            Err(_) => panic!("call_hook did not return within 5s — epoch timeout not enforced"),
+        }
     }
 
     #[test]

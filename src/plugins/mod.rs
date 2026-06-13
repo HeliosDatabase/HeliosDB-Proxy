@@ -523,23 +523,23 @@ impl PluginManager {
         let plugin_names = hooks.get(&HookType::PostQuery).cloned().unwrap_or_default();
         drop(hooks);
 
+        if plugin_names.is_empty() {
+            return;
+        }
+
+        // Serialise (ctx, outcome) once and share the payload across every
+        // PostQuery plugin in the fan-out — it is identical for all of them.
+        let payload = match serde_json::to_vec(&(ctx, outcome)) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "Post-query serialisation failed");
+                return;
+            }
+        };
+
         for plugin_name in plugin_names {
             if let Some(plugin) = self.plugins.get(&plugin_name) {
                 let start = std::time::Instant::now();
-
-                // Serialise ctx + outcome into a single payload via the generic
-                // `call_hook`. Runtime-specific marshalling lives there.
-                let payload = match serde_json::to_vec(&(ctx, outcome)) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(
-                            plugin = %plugin_name,
-                            error = %e,
-                            "Post-query serialisation failed"
-                        );
-                        continue;
-                    }
-                };
 
                 match self.runtime.call_hook(&plugin, HookType::PostQuery, &payload) {
                     Ok(_) => {
