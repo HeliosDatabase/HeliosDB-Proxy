@@ -8,7 +8,7 @@ use crate::admin::{AdminServer, AdminState, ConfigSnapshot, NodeSnapshot};
 use crate::backend::{tls::default_client_config, BackendConfig, TlsMode};
 use crate::config::{NodeConfig, NodeRole, ProxyConfig, TrMode};
 use crate::protocol::{
-    ErrorResponse, Message, MessageType, ParseMessage, ProtocolCodec, QueryMessage,
+    ErrorResponse, Message, MessageType, ProtocolCodec, QueryMessage,
     StartupMessage, TransactionStatus,
 };
 use crate::{ProxyError, Result};
@@ -36,7 +36,7 @@ use crate::NodeEndpoint;
 // WASM plugin system imports
 #[cfg(feature = "wasm-plugins")]
 use crate::plugins::{
-    AuthRequest as PluginAuthRequest, AuthResult, HookContext, Identity, PluginManager,
+    AuthRequest as PluginAuthRequest, AuthResult, HookContext, HookType, Identity, PluginManager,
     PostQueryOutcome, PreQueryResult, QueryContext, RouteResult,
 };
 
@@ -142,7 +142,7 @@ struct ServerState {
     /// Metrics
     metrics: ServerMetrics,
     /// Load balancer state
-    lb_state: RwLock<LoadBalancerState>,
+    lb_state: LoadBalancerState,
     /// Pool manager for Session/Transaction/Statement modes
     #[cfg(feature = "pool-modes")]
     pool_manager: Option<Arc<ConnectionPoolManager>>,
@@ -208,8 +208,9 @@ struct ServerMetrics {
 
 /// Load balancer state
 struct LoadBalancerState {
-    /// Round-robin counter
-    rr_counter: u64,
+    /// Round-robin counter. Atomic so the read-routing path never
+    /// takes a write lock just to advance the rotation.
+    rr_counter: AtomicU64,
 }
 
 /// Client session
@@ -448,9 +449,9 @@ impl ProxyServer {
             sessions: RwLock::new(HashMap::new()),
             health: RwLock::new(health),
             metrics: ServerMetrics::default(),
-            lb_state: RwLock::new(LoadBalancerState {
-                rr_counter: 0,
-            }),
+            lb_state: LoadBalancerState {
+                rr_counter: AtomicU64::new(0),
+            },
             #[cfg(feature = "pool-modes")]
             pool_manager,
             #[cfg(feature = "wasm-plugins")]
@@ -503,6 +504,10 @@ impl ProxyServer {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, addr)) => {
+                            // PG wire traffic is small request/response
+                            // frames; Nagle + delayed-ACK costs tens of
+                            // ms per round-trip if left on.
+                            let _ = stream.set_nodelay(true);
                             self.state.metrics.connections_accepted.fetch_add(1, Ordering::Relaxed);
                             let state = self.state.clone();
                             let config = self.config.clone();
@@ -752,10 +757,25 @@ impl ProxyServer {
                 }
             };
 
-        // Main query loop
+        // Main query loop.
+        //
+        // Two wire shapes are handled. Simple-query (`Query`) messages are
+        // self-contained: route, forward, and stream the response back
+        // frame-by-frame until ReadyForQuery. Extended-protocol messages
+        // (`Parse`/`Bind`/`Describe`/`Execute`/`Close`) carry no response of
+        // their own until the client sends `Sync` (or `Flush`), so they are
+        // accumulated into `pending` and forwarded as one batch at that
+        // boundary — this is what stops the per-message 30s backend-read
+        // timeout that made every prepared-statement driver unusable. The
+        // routing decision for an extended batch is taken from the SQL in its
+        // first `Parse`; a batch with no `Parse` (a re-`Bind`/`Execute` of a
+        // named prepared statement) stays on the connection the statement was
+        // prepared on.
+        let mut read_buf = vec![0u8; 16384];
+        let mut pending = BytesMut::new();
+        let mut pending_route_sql: Option<String> = None;
         loop {
             // Read from client
-            let mut read_buf = vec![0u8; 8192];
             let n = stream
                 .read(&mut read_buf)
                 .await
@@ -771,105 +791,141 @@ impl ProxyServer {
 
             // Process all complete messages in buffer
             while let Some(msg) = codec.decode_message(&mut buffer)? {
-                // Handle Terminate message
-                if msg.msg_type == MessageType::Terminate {
-                    return Ok(());
-                }
+                match msg.msg_type {
+                    MessageType::Terminate => return Ok(()),
 
-                // Anomaly detector — record every Query message
-                // (rate window, novel-fingerprint detector, SQLi
-                // pattern scan). Fires before the plugin hook so a
-                // detection lands in the audit trail even if a
-                // plugin later blocks.
-                #[cfg(feature = "anomaly-detection")]
-                Self::record_anomaly_observation(&msg, state, session);
+                    // ---- Simple query protocol ----
+                    MessageType::Query => {
+                        // Anomaly detector — record every Query message before
+                        // the plugin hook so a detection lands in the audit
+                        // trail even if a plugin later blocks.
+                        #[cfg(feature = "anomaly-detection")]
+                        Self::record_anomaly_observation(&msg, state, session);
 
-                // Plugin pre-query hook — may rewrite the SQL, block the
-                // query with an error, or (future) return a cached response.
-                let (msg, action) = Self::apply_pre_query_hook(msg, state, session);
+                        // Plugin pre-query hook — may rewrite the SQL, block,
+                        // or return a cached response.
+                        let (msg, action) = Self::apply_pre_query_hook(msg, state, session);
 
-                if let PreQueryAction::Block(reason) = &action {
-                    tracing::info!(reason = %reason, "pre-query plugin blocked query");
-                    Self::send_block_response(stream, reason, state).await?;
-                    state.metrics.queries_processed.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-
-                // Plugin returned a fully-formed cached response. Synthesise
-                // the PG wire reply (RowDescription + DataRows +
-                // CommandComplete + ReadyForQuery) and send it directly —
-                // the backend is never touched. On malformed payloads we
-                // log + fall through to normal forwarding so a buggy plugin
-                // degrades gracefully instead of taking the proxy down.
-                #[cfg(feature = "wasm-plugins")]
-                if let PreQueryAction::Cached(bytes) = &action {
-                    match Self::synthesise_cached_response(bytes) {
-                        Ok(reply) => {
-                            stream
-                                .write_all(&reply)
-                                .await
-                                .map_err(|e| {
-                                    ProxyError::Network(format!("Write error: {}", e))
-                                })?;
-                            state
-                                .metrics
-                                .bytes_sent
-                                .fetch_add(reply.len() as u64, Ordering::Relaxed);
-                            state
-                                .metrics
-                                .queries_processed
-                                .fetch_add(1, Ordering::Relaxed);
+                        if let PreQueryAction::Block(reason) = &action {
+                            tracing::info!(reason = %reason, "pre-query plugin blocked query");
+                            Self::send_block_response(stream, reason, state).await?;
+                            state.metrics.queries_processed.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "failed to synthesise cached response; falling back to backend"
-                            );
-                            // fall through to normal forwarding
+
+                        #[cfg(feature = "wasm-plugins")]
+                        if let PreQueryAction::Cached(bytes) = &action {
+                            match Self::synthesise_cached_response(bytes) {
+                                Ok(reply) => {
+                                    stream.write_all(&reply).await.map_err(|e| {
+                                        ProxyError::Network(format!("Write error: {}", e))
+                                    })?;
+                                    state.metrics.bytes_sent.fetch_add(reply.len() as u64, Ordering::Relaxed);
+                                    state.metrics.queries_processed.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "failed to synthesise cached response; falling back to backend");
+                                }
+                            }
+                        }
+
+                        #[cfg(feature = "wasm-plugins")]
+                        let forward_start = std::time::Instant::now();
+                        let fr = Self::forward_simple_query(
+                            stream,
+                            &msg,
+                            backend_stream.take(),
+                            backend_node.take(),
+                            session,
+                            state,
+                            config,
+                        )
+                        .await;
+                        #[cfg(feature = "wasm-plugins")]
+                        Self::fire_post_query_hook(&msg, session, state, &fr, forward_start.elapsed());
+                        let (nb, nn, sent) = fr?;
+                        backend_stream = nb;
+                        backend_node = nn;
+                        state.metrics.bytes_sent.fetch_add(sent, Ordering::Relaxed);
+                        state.metrics.queries_processed.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    // ---- Extended query protocol: accumulate until Sync/Flush ----
+                    MessageType::Parse
+                    | MessageType::Bind
+                    | MessageType::Describe
+                    | MessageType::Execute
+                    | MessageType::Close => {
+                        if msg.msg_type == MessageType::Parse && pending_route_sql.is_none() {
+                            // Parse payload = statement-name cstring + query
+                            // cstring; borrow the query for routing.
+                            if let Some(end) = msg.payload.iter().position(|&b| b == 0) {
+                                if let Some(q) = crate::protocol::query_text(&msg.payload[end + 1..]) {
+                                    if !q.is_empty() {
+                                        pending_route_sql = Some(q.to_string());
+                                    }
+                                }
+                            }
+                            #[cfg(feature = "anomaly-detection")]
+                            if let Some(ref q) = pending_route_sql {
+                                Self::record_anomaly_sql(q, state, session);
+                            }
+                        }
+                        pending.extend_from_slice(&msg.encode());
+                    }
+
+                    // ---- Extended batch boundary ----
+                    MessageType::Sync | MessageType::Flush => {
+                        let wait_ready = msg.msg_type == MessageType::Sync;
+                        pending.extend_from_slice(&msg.encode());
+                        let batch = pending.split().freeze();
+                        let (nb, nn, sent) = Self::forward_extended_batch(
+                            stream,
+                            &batch,
+                            pending_route_sql.as_deref(),
+                            wait_ready,
+                            backend_stream.take(),
+                            backend_node.take(),
+                            session,
+                            state,
+                            config,
+                        )
+                        .await?;
+                        backend_stream = nb;
+                        backend_node = nn;
+                        state.metrics.bytes_sent.fetch_add(sent, Ordering::Relaxed);
+                        if wait_ready {
+                            // Sync ends the extended cycle; reset routing so the
+                            // next Parse can re-route. Flush leaves it intact so
+                            // the rest of the in-flight sequence stays put.
+                            pending_route_sql = None;
+                            state.metrics.queries_processed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+
+                    // ---- COPY sub-protocol (client -> backend) ----
+                    MessageType::CopyData | MessageType::CopyDone | MessageType::CopyFail => {
+                        if let Some(mut b) = backend_stream.take() {
+                            b.write_all(&msg.encode()).await.map_err(|e| {
+                                ProxyError::Network(format!("Backend copy write error: {}", e))
+                            })?;
+                            if matches!(msg.msg_type, MessageType::CopyDone | MessageType::CopyFail) {
+                                let sent = Self::stream_until_ready(stream, &mut b, session, state).await?;
+                                state.metrics.bytes_sent.fetch_add(sent, Ordering::Relaxed);
+                            }
+                            backend_stream = Some(b);
+                        }
+                    }
+
+                    // ---- Anything else: forward to current backend best-effort ----
+                    _ => {
+                        if let Some(mut b) = backend_stream.take() {
+                            let _ = b.write_all(&msg.encode()).await;
+                            backend_stream = Some(b);
                         }
                     }
                 }
-
-                // Route and process the message
-                #[cfg(feature = "wasm-plugins")]
-                let forward_start = std::time::Instant::now();
-                let forward_result = Self::route_and_forward(
-                    &msg,
-                    backend_stream.take(),
-                    backend_node.take(),
-                    session,
-                    state,
-                    config,
-                )
-                .await;
-                #[cfg(feature = "wasm-plugins")]
-                Self::fire_post_query_hook(
-                    &msg,
-                    session,
-                    state,
-                    &forward_result,
-                    forward_start.elapsed(),
-                );
-                let (response, new_backend, new_node) = forward_result?;
-
-                backend_stream = new_backend;
-                backend_node = new_node;
-
-                // Send response to client
-                if !response.is_empty() {
-                    stream
-                        .write_all(&response)
-                        .await
-                        .map_err(|e| ProxyError::Network(format!("Write error: {}", e)))?;
-
-                    state
-                        .metrics
-                        .bytes_sent
-                        .fetch_add(response.len() as u64, Ordering::Relaxed);
-                }
-
-                state.metrics.queries_processed.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -999,6 +1055,7 @@ impl ProxyServer {
         .await
         .map_err(|_| ProxyError::Connection(format!("Connection timeout to {}", node_addr)))?
         .map_err(|e| ProxyError::Connection(format!("Failed to connect to {}: {}", node_addr, e)))?;
+        let _ = backend.set_nodelay(true);
 
         // Build and send startup message to backend
         let startup_bytes = Self::build_startup_message(params);
@@ -1053,10 +1110,10 @@ impl ProxyServer {
         let codec = ProtocolCodec::new();
         let mut backend_buffer = BytesMut::with_capacity(4096);
         let mut client_buffer = BytesMut::with_capacity(4096);
+        let mut read_buf = vec![0u8; 4096];
 
         loop {
             // Read from backend
-            let mut read_buf = vec![0u8; 4096];
             let n = backend_stream
                 .read(&mut read_buf)
                 .await
@@ -1074,8 +1131,10 @@ impl ProxyServer {
                 .await
                 .map_err(|e| ProxyError::Network(format!("Client auth write error: {}", e)))?;
 
-            // Check for authentication complete or error
-            while let Some(msg) = codec.decode_message(&mut backend_buffer.clone())? {
+            // Check for authentication complete or error. Bytes were
+            // already forwarded above, so frames are consumed (decoded
+            // once) straight out of the buffer — no clone needed.
+            while let Some(msg) = codec.decode_message(&mut backend_buffer)? {
                 match msg.msg_type {
                     MessageType::AuthRequest => {
                         // Check if auth OK
@@ -1099,8 +1158,6 @@ impl ProxyServer {
                         // Continue forwarding
                     }
                 }
-                // Advance the actual buffer
-                let _ = codec.decode_message(&mut backend_buffer)?;
             }
 
             // If backend requires password, forward client's response
@@ -1120,53 +1177,21 @@ impl ProxyServer {
         }
     }
 
-    /// Route message and forward to appropriate backend
-    async fn route_and_forward(
-        msg: &Message,
+    /// Resolve which backend a request should go to and hand back a
+    /// connected, authenticated stream for it — reusing the current
+    /// connection when it is healthy and compatible, otherwise dialing and
+    /// silently re-authenticating a new one. Returns `(backend, node_addr)`.
+    async fn resolve_backend(
+        is_write: bool,
+        forced_target: Option<String>,
         backend_stream: Option<TcpStream>,
         current_node: Option<String>,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,
-    ) -> Result<(Vec<u8>, Option<TcpStream>, Option<String>)> {
-        // Determine if this is a write operation (from SQL verb).
-        let default_is_write = Self::is_write_message(msg);
-
-        // Plugin Route hook may override the routing decision — force
-        // primary/standby, or pin the query to a specific node.
-        let route_override = Self::apply_route_hook(msg, state, session);
-
-        // Block short-circuits before any backend selection: synthesise
-        // a PG ErrorResponse + ReadyForQuery, hand the existing backend
-        // stream and current node back unchanged so the caller can
-        // continue the session normally with the next message.
-        if let RouteOverride::Block(reason) = route_override {
-            let mut response = Vec::with_capacity(64 + reason.len());
-            response.extend_from_slice(&Self::create_error_response(
-                "42000",
-                &format!("Query blocked by route plugin: {}", reason),
-            ));
-            response.extend_from_slice(&Self::create_ready_for_query(b'I'));
-            state
-                .metrics
-                .bytes_sent
-                .fetch_add(response.len() as u64, Ordering::Relaxed);
-            return Ok((response, backend_stream, current_node));
-        }
-
-        // Derive effective (is_write, forced_target) after override.
-        let (is_write, forced_target) = match route_override {
-            RouteOverride::None => (default_is_write, None),
-            RouteOverride::Primary => (true, None),
-            RouteOverride::Standby => (false, None),
-            RouteOverride::Node(name) => (default_is_write, Some(name)),
-            RouteOverride::Block(_) => unreachable!("handled above"),
-        };
-
+    ) -> Result<(TcpStream, String)> {
         // Sticky session mode: stay on the same backend if healthy and
-        // compatible with the routing decision. A forced target shortcuts
-        // the usual write-needs-primary check: the only question is whether
-        // the current connection already points at the forced node.
+        // compatible with the routing decision.
         let need_switch = if let Some(ref forced) = forced_target {
             let health = state.health.read().await;
             let reuse = current_node
@@ -1177,12 +1202,12 @@ impl ProxyServer {
         } else if let Some(ref current) = current_node {
             let health = state.health.read().await;
             let current_healthy = health.get(current).map(|h| h.healthy).unwrap_or(false);
-
             if !current_healthy {
                 true
             } else if is_write {
-                // Check if current is primary
-                let is_primary = config.nodes.iter()
+                let is_primary = config
+                    .nodes
+                    .iter()
                     .find(|n| n.address() == *current)
                     .map(|n| n.role == NodeRole::Primary)
                     .unwrap_or(false);
@@ -1206,107 +1231,265 @@ impl ProxyServer {
             current_node.clone().unwrap()
         };
 
-        let mut backend = if need_switch {
-            // Close old connection if any
-            drop(backend_stream);
+        if !need_switch {
+            return Ok((backend_stream.unwrap(), target_node));
+        }
 
-            // Connect to new backend
-            let new_backend = tokio::time::timeout(
-                config.pool.acquire_timeout(),
-                TcpStream::connect(&target_node),
-            )
+        // Close old connection if any, dial + silently re-authenticate.
+        drop(backend_stream);
+        let new_backend = tokio::time::timeout(
+            config.pool.acquire_timeout(),
+            TcpStream::connect(&target_node),
+        )
+        .await
+        .map_err(|_| ProxyError::Connection(format!("Connection timeout to {}", target_node)))?
+        .map_err(|e| ProxyError::Connection(format!("Failed to connect to {}: {}", target_node, e)))?;
+        let _ = new_backend.set_nodelay(true);
+
+        let params = session.variables.read().await.clone();
+        let startup = Self::build_startup_message(&params);
+        let mut backend = new_backend;
+        backend
+            .write_all(&startup)
             .await
-            .map_err(|_| ProxyError::Connection(format!("Connection timeout to {}", target_node)))?
-            .map_err(|e| {
-                ProxyError::Connection(format!("Failed to connect to {}: {}", target_node, e))
-            })?;
+            .map_err(|e| ProxyError::Network(format!("Backend startup error: {}", e)))?;
+        Self::complete_backend_auth(&mut backend).await?;
+        tracing::debug!(to = %target_node, write = is_write, "switched backend");
+        Ok((backend, target_node))
+    }
 
-            // Re-authenticate to new backend (silently, without forwarding to client)
-            let params = session.variables.read().await.clone();
-            let startup = Self::build_startup_message(&params);
-            let mut backend = new_backend;
-            backend
-                .write_all(&startup)
+    /// Forward a simple-query (`Query`) message and stream its response back
+    /// to the client frame-by-frame, ending at ReadyForQuery. Returns the
+    /// (possibly switched) backend, its node address, and bytes streamed.
+    async fn forward_simple_query(
+        client: &mut TcpStream,
+        msg: &Message,
+        backend_stream: Option<TcpStream>,
+        current_node: Option<String>,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+    ) -> Result<(Option<TcpStream>, Option<String>, u64)> {
+        let default_is_write = Self::is_write_message(msg);
+        let route_override = Self::apply_route_hook(msg, state, session);
+
+        // Block short-circuits before any backend selection: synthesise a PG
+        // ErrorResponse + ReadyForQuery directly to the client and hand the
+        // existing connection back unchanged.
+        if let RouteOverride::Block(reason) = route_override {
+            let mut response = Vec::with_capacity(64 + reason.len());
+            response.extend_from_slice(&Self::create_error_response(
+                "42000",
+                &format!("Query blocked by route plugin: {}", reason),
+            ));
+            response.extend_from_slice(&Self::create_ready_for_query(b'I'));
+            client
+                .write_all(&response)
                 .await
-                .map_err(|e| ProxyError::Network(format!("Backend startup error: {}", e)))?;
+                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+            return Ok((backend_stream, current_node, response.len() as u64));
+        }
 
-            // Complete authentication by reading until ReadyForQuery
-            Self::complete_backend_auth(&mut backend).await?;
-
-            tracing::debug!(
-                "Switched backend from {:?} to {} for {} query",
-                current_node,
-                target_node,
-                if is_write { "write" } else { "read" }
-            );
-
-            backend
-        } else {
-            backend_stream.unwrap()
+        let (is_write, forced_target) = match route_override {
+            RouteOverride::None => (default_is_write, None),
+            RouteOverride::Primary => (true, None),
+            RouteOverride::Standby => (false, None),
+            RouteOverride::Node(name) => (default_is_write, Some(name)),
+            RouteOverride::Block(_) => unreachable!("handled above"),
         };
 
-        // Forward the message to backend
+        let (mut backend, node) = Self::resolve_backend(
+            is_write, forced_target, backend_stream, current_node, session, state, config,
+        )
+        .await?;
+
         let encoded = msg.encode();
         backend
             .write_all(&encoded)
             .await
             .map_err(|e| ProxyError::Network(format!("Backend write error: {}", e)))?;
 
-        // Read response from backend
-        let mut response = Vec::new();
-        let mut response_buffer = BytesMut::with_capacity(8192);
-        let codec = ProtocolCodec::new();
+        let sent = Self::stream_until_ready(client, &mut backend, session, state).await?;
+        Ok((Some(backend), Some(node), sent))
+    }
+
+    /// Forward an accumulated extended-protocol batch (Parse/Bind/Describe/
+    /// Execute/Close terminated by Sync or Flush) and stream the response.
+    /// Routing is taken from `route_sql` (the first Parse's SQL); when it is
+    /// `None` (a re-Bind/Execute of a named prepared statement) the request
+    /// stays on the connection the statement was prepared on — no switch.
+    async fn forward_extended_batch(
+        client: &mut TcpStream,
+        batch: &[u8],
+        route_sql: Option<&str>,
+        wait_ready: bool,
+        backend_stream: Option<TcpStream>,
+        current_node: Option<String>,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+    ) -> Result<(Option<TcpStream>, Option<String>, u64)> {
+        let (mut backend, node) = match route_sql {
+            Some(sql) => {
+                let is_write = Self::is_write_query(sql);
+                Self::resolve_backend(
+                    is_write, None, backend_stream, current_node, session, state, config,
+                )
+                .await?
+            }
+            None => match backend_stream {
+                // Stay on the connection that holds the prepared-statement /
+                // portal state — switching would lose it.
+                Some(b) => (b, current_node.unwrap_or_default()),
+                None => {
+                    Self::resolve_backend(false, None, None, current_node, session, state, config)
+                        .await?
+                }
+            },
+        };
+
+        backend
+            .write_all(batch)
+            .await
+            .map_err(|e| ProxyError::Network(format!("Backend write error: {}", e)))?;
+
+        let sent = if wait_ready {
+            Self::stream_until_ready(client, &mut backend, session, state).await?
+        } else {
+            Self::stream_flush(client, &mut backend, session, state).await?
+        };
+        Ok((Some(backend), Some(node), sent))
+    }
+
+    /// Stream backend response frames to the client until ReadyForQuery (end
+    /// of a Sync/simple-query response). Forwards bytes verbatim, coalescing
+    /// all currently-complete frames into one write and keeping only a
+    /// partial-frame tail buffered, so proxy memory stays O(frame) rather
+    /// than O(result). Also yields on CopyInResponse/CopyBothResponse so the
+    /// client can supply COPY data. Updates `tx_state` from the RFQ status.
+    /// Returns bytes streamed to the client.
+    async fn stream_until_ready(
+        client: &mut TcpStream,
+        backend: &mut TcpStream,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+    ) -> Result<u64> {
+        let _ = state;
+        let mut buf = BytesMut::with_capacity(16384);
+        let mut read_buf = vec![0u8; 16384];
+        let mut sent: u64 = 0;
 
         loop {
-            let mut read_buf = vec![0u8; 8192];
+            // Walk complete frames in `buf`, stopping at a boundary frame.
+            let mut consumed = 0usize;
+            let mut ready_status: Option<u8> = None;
+            let mut yield_for_copy = false;
+            loop {
+                let rem = &buf[consumed..];
+                if rem.len() < 5 {
+                    break;
+                }
+                let len = u32::from_be_bytes([rem[1], rem[2], rem[3], rem[4]]) as usize;
+                if len < 4 || rem.len() < len + 1 {
+                    break; // incomplete or malformed length — need more bytes
+                }
+                let frame_total = len + 1;
+                let mtype = rem[0];
+                consumed += frame_total;
+                if mtype == b'Z' {
+                    // ReadyForQuery: payload is one status byte at rem[5].
+                    ready_status = Some(if frame_total >= 6 { rem[5] } else { b'I' });
+                    break;
+                }
+                if mtype == b'G' || mtype == b'W' {
+                    // CopyInResponse / CopyBothResponse: the backend now wants
+                    // CopyData from the client — forward up to here and yield.
+                    yield_for_copy = true;
+                    break;
+                }
+            }
+
+            if consumed > 0 {
+                client
+                    .write_all(&buf[..consumed])
+                    .await
+                    .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+                sent += consumed as u64;
+                let _ = buf.split_to(consumed);
+            }
+
+            if let Some(status) = ready_status {
+                let st = TransactionStatus::from_byte(status);
+                let mut tx = session.tx_state.write().await;
+                tx.in_transaction = st != TransactionStatus::Idle;
+                return Ok(sent);
+            }
+            if yield_for_copy {
+                return Ok(sent);
+            }
+
             let n = tokio::time::timeout(Duration::from_secs(30), backend.read(&mut read_buf))
                 .await
                 .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
                 .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
-
             if n == 0 {
-                break;
+                return Err(ProxyError::Connection("Backend closed mid-response".to_string()));
             }
+            buf.extend_from_slice(&read_buf[..n]);
+        }
+    }
 
-            response.extend_from_slice(&read_buf[..n]);
-            response_buffer.extend_from_slice(&read_buf[..n]);
-
-            // Check if we've received ReadyForQuery (end of response)
-            while let Some(resp_msg) = codec.decode_message(&mut response_buffer.clone())? {
-                if resp_msg.msg_type == MessageType::ReadyForQuery {
-                    // Update transaction state
-                    if !resp_msg.payload.is_empty() {
-                        let status = TransactionStatus::from_byte(resp_msg.payload[0]);
-                        let mut tx_state = session.tx_state.write().await;
-                        tx_state.in_transaction = status != TransactionStatus::Idle;
-                    }
-                    return Ok((response, Some(backend), Some(target_node)));
+    /// Stream whatever the backend has produced in response to a `Flush`
+    /// (which, unlike `Sync`, produces no ReadyForQuery). Relays available
+    /// bytes and returns once the backend goes briefly idle, so the loop can
+    /// read the client's next frames — deadlock-free. The eventual `Sync`
+    /// drains the final ReadyForQuery via `stream_until_ready`.
+    async fn stream_flush(
+        client: &mut TcpStream,
+        backend: &mut TcpStream,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+    ) -> Result<u64> {
+        let _ = (session, state);
+        let mut read_buf = vec![0u8; 16384];
+        let mut sent: u64 = 0;
+        loop {
+            match tokio::time::timeout(Duration::from_millis(200), backend.read(&mut read_buf)).await
+            {
+                Ok(Ok(0)) => return Err(ProxyError::Connection("Backend closed mid-flush".to_string())),
+                Ok(Ok(n)) => {
+                    client
+                        .write_all(&read_buf[..n])
+                        .await
+                        .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+                    sent += n as u64;
                 }
-                let _ = codec.decode_message(&mut response_buffer)?;
+                Ok(Err(e)) => return Err(ProxyError::Network(format!("Backend read error: {}", e))),
+                Err(_) => return Ok(sent), // idle: backend has emitted all flush output
             }
         }
-
-        Ok((response, Some(backend), Some(target_node)))
     }
 
     /// Check if a message is a write operation
     fn is_write_message(msg: &Message) -> bool {
         match msg.msg_type {
             MessageType::Query => {
-                // Parse query and check if it's a write
-                if let Ok(query_msg) = QueryMessage::parse(msg.payload.clone()) {
-                    Self::is_write_query(&query_msg.query)
-                } else {
-                    false
-                }
+                // Borrow the SQL straight out of the payload — the
+                // message is forwarded verbatim, so no copy is needed
+                // just to inspect the leading keyword.
+                crate::protocol::query_text(&msg.payload)
+                    .map(Self::is_write_query)
+                    .unwrap_or(false)
             }
             MessageType::Parse => {
-                // Parse prepared statement
-                if let Ok(parse_msg) = ParseMessage::parse(msg.payload.clone()) {
-                    Self::is_write_query(&parse_msg.query)
-                } else {
-                    false
-                }
+                // Parse payload = statement-name cstring + query
+                // cstring; skip the name and borrow the query.
+                msg.payload
+                    .iter()
+                    .position(|&b| b == 0)
+                    .and_then(|end| crate::protocol::query_text(&msg.payload[end + 1..]))
+                    .map(Self::is_write_query)
+                    .unwrap_or(false)
             }
             // Execute, Bind, etc. maintain the current connection
             _ => false,
@@ -1315,38 +1498,39 @@ impl ProxyServer {
 
     /// Check if SQL query is a write operation
     fn is_write_query(sql: &str) -> bool {
-        let upper = sql.trim().to_uppercase();
+        use crate::protocol::starts_with_ci;
+        let trimmed = sql.trim();
 
         // Write operations
-        if upper.starts_with("INSERT")
-            || upper.starts_with("UPDATE")
-            || upper.starts_with("DELETE")
-            || upper.starts_with("CREATE")
-            || upper.starts_with("DROP")
-            || upper.starts_with("ALTER")
-            || upper.starts_with("TRUNCATE")
-            || upper.starts_with("GRANT")
-            || upper.starts_with("REVOKE")
-            || upper.starts_with("VACUUM")
-            || upper.starts_with("REINDEX")
-            || upper.starts_with("CLUSTER")
+        if starts_with_ci(trimmed, "INSERT")
+            || starts_with_ci(trimmed, "UPDATE")
+            || starts_with_ci(trimmed, "DELETE")
+            || starts_with_ci(trimmed, "CREATE")
+            || starts_with_ci(trimmed, "DROP")
+            || starts_with_ci(trimmed, "ALTER")
+            || starts_with_ci(trimmed, "TRUNCATE")
+            || starts_with_ci(trimmed, "GRANT")
+            || starts_with_ci(trimmed, "REVOKE")
+            || starts_with_ci(trimmed, "VACUUM")
+            || starts_with_ci(trimmed, "REINDEX")
+            || starts_with_ci(trimmed, "CLUSTER")
         {
             return true;
         }
 
         // Transaction control goes to current node
-        if upper.starts_with("BEGIN")
-            || upper.starts_with("START")
-            || upper.starts_with("COMMIT")
-            || upper.starts_with("ROLLBACK")
-            || upper.starts_with("SAVEPOINT")
-            || upper.starts_with("RELEASE")
+        if starts_with_ci(trimmed, "BEGIN")
+            || starts_with_ci(trimmed, "START")
+            || starts_with_ci(trimmed, "COMMIT")
+            || starts_with_ci(trimmed, "ROLLBACK")
+            || starts_with_ci(trimmed, "SAVEPOINT")
+            || starts_with_ci(trimmed, "RELEASE")
         {
             return true;
         }
 
         // SET commands go to primary to maintain session state
-        if upper.starts_with("SET") && !upper.starts_with("SET TRANSACTION READ ONLY") {
+        if starts_with_ci(trimmed, "SET") && !starts_with_ci(trimmed, "SET TRANSACTION READ ONLY") {
             return true;
         }
 
@@ -1433,9 +1617,8 @@ impl ProxyServer {
 
         if !healthy_standbys.is_empty() {
             // Round-robin across healthy standbys
-            let mut lb_state = state.lb_state.write().await;
-            let index = lb_state.rr_counter as usize % healthy_standbys.len();
-            lb_state.rr_counter = lb_state.rr_counter.wrapping_add(1);
+            let ticket = state.lb_state.rr_counter.fetch_add(1, Ordering::Relaxed);
+            let index = ticket as usize % healthy_standbys.len();
             let node_addr = healthy_standbys[index].address();
 
             let mut current = session.current_node.write().await;
@@ -1452,6 +1635,7 @@ impl ProxyServer {
     async fn complete_backend_auth(backend: &mut TcpStream) -> Result<()> {
         let codec = ProtocolCodec::new();
         let mut buffer = BytesMut::with_capacity(4096);
+        let mut read_buf = vec![0u8; 4096];
         let timeout = Duration::from_secs(10);
         let start = std::time::Instant::now();
 
@@ -1460,7 +1644,6 @@ impl ProxyServer {
                 return Err(ProxyError::Auth("Backend authentication timeout".to_string()));
             }
 
-            let mut read_buf = vec![0u8; 4096];
             let n = tokio::time::timeout(Duration::from_secs(5), backend.read(&mut read_buf))
                 .await
                 .map_err(|_| ProxyError::Auth("Read timeout during backend auth".to_string()))?
@@ -1472,37 +1655,22 @@ impl ProxyServer {
 
             buffer.extend_from_slice(&read_buf[..n]);
 
-            // Check for complete messages
-            loop {
-                if buffer.len() < 5 {
-                    break;
-                }
-
-                // Parse message
-                let mut temp_buffer = buffer.clone();
-                match codec.decode_message(&mut temp_buffer)? {
-                    Some(msg) => {
-                        match msg.msg_type {
-                            MessageType::ReadyForQuery => {
-                                // Authentication complete
-                                return Ok(());
-                            }
-                            MessageType::ErrorResponse => {
-                                let err = ErrorResponse::parse(msg.payload)
-                                    .map(|e| e.message().unwrap_or("Unknown error").to_string())
-                                    .unwrap_or_else(|_| "Parse error".to_string());
-                                return Err(ProxyError::Auth(err));
-                            }
-                            _ => {
-                                // Continue reading (AuthRequest, ParameterStatus, BackendKeyData, etc.)
-                            }
-                        }
-                        // Consume the message from actual buffer
-                        let _ = codec.decode_message(&mut buffer)?;
+            // Decode (and consume) complete frames directly; returns
+            // None when more data is needed.
+            while let Some(msg) = codec.decode_message(&mut buffer)? {
+                match msg.msg_type {
+                    MessageType::ReadyForQuery => {
+                        // Authentication complete
+                        return Ok(());
                     }
-                    None => {
-                        // Need more data
-                        break;
+                    MessageType::ErrorResponse => {
+                        let err = ErrorResponse::parse(msg.payload)
+                            .map(|e| e.message().unwrap_or("Unknown error").to_string())
+                            .unwrap_or_else(|_| "Parse error".to_string());
+                        return Err(ProxyError::Auth(err));
+                    }
+                    _ => {
+                        // Continue reading (AuthRequest, ParameterStatus, BackendKeyData, etc.)
                     }
                 }
             }
@@ -1680,6 +1848,12 @@ impl ProxyServer {
                 return (msg, PreQueryAction::Forward);
             }
 
+            // Zero plugins registered for this hook — skip the payload
+            // clone, SQL parse, and context construction entirely.
+            if !pm.has_hook(HookType::PreQuery) {
+                return (msg, PreQueryAction::Forward);
+            }
+
             let query_msg = match QueryMessage::parse(msg.payload.clone()) {
                 Ok(q) => q,
                 Err(_) => return (msg, PreQueryAction::Forward),
@@ -1718,18 +1892,24 @@ impl ProxyServer {
         if msg.msg_type != MessageType::Query {
             return;
         }
-        let query_msg = match QueryMessage::parse(msg.payload.clone()) {
-            Ok(q) => q,
-            Err(_) => return,
-        };
+        // Borrow the SQL straight out of the payload — the message is
+        // forwarded verbatim, so no deep copy of the frame is needed.
+        if let Some(query) = crate::protocol::query_text(&msg.payload) {
+            Self::record_anomaly_sql(query, state, session);
+        }
+    }
+
+    /// Feed one SQL statement to the anomaly detector. Shared by the
+    /// simple-query path and the extended-protocol `Parse` path so
+    /// prepared-statement traffic is observed too.
+    #[cfg(feature = "anomaly-detection")]
+    fn record_anomaly_sql(query: &str, state: &Arc<ServerState>, session: &Arc<ClientSession>) {
         // Tenant identifier is the most-specific known per-session
         // attribute the proxy can attribute traffic to. Multi-tenancy
         // sets `tenant_id` in `variables`; otherwise we fall back to
-        // the client address (string-shaped per-client rate window).
-        // session.variables is a tokio RwLock — but record_anomaly is
-        // a sync helper. Use try_read so we don't add an await; on
-        // contention we fall back to the client IP, which is still a
-        // valid per-source identifier.
+        // the client address. session.variables is a tokio RwLock but this
+        // is a sync helper — try_read avoids an await; on contention we
+        // fall back to the client IP, still a valid per-source identifier.
         let tenant = match session.variables.try_read() {
             Ok(vars) => vars
                 .get("tenant_id")
@@ -1738,21 +1918,15 @@ impl ProxyServer {
                 .unwrap_or_else(|| session.client_addr.ip().to_string()),
             Err(_) => session.client_addr.ip().to_string(),
         };
-        let fingerprint = anomaly_fingerprint(&query_msg.query);
-        let now = std::time::Instant::now();
-        let iso = chrono::Utc::now().to_rfc3339();
+        let fingerprint = anomaly_fingerprint(query);
         let obs = crate::anomaly::QueryObservation {
             tenant,
             fingerprint,
-            sql: query_msg.query,
-            timestamp: now,
-            iso_timestamp: iso,
+            sql: query.to_string(),
+            timestamp: std::time::Instant::now(),
         };
         for ev in state.anomaly_detector.record_query(&obs) {
-            tracing::warn!(
-                anomaly = ?ev,
-                "anomaly detected"
-            );
+            tracing::warn!(anomaly = ?ev, "anomaly detected");
         }
     }
 
@@ -1890,6 +2064,11 @@ impl ProxyServer {
             if msg.msg_type != MessageType::Query {
                 return RouteOverride::None;
             }
+            // Zero plugins registered for this hook — skip the payload
+            // clone, SQL parse, and context construction entirely.
+            if !pm.has_hook(HookType::Route) {
+                return RouteOverride::None;
+            }
             let query_msg = match QueryMessage::parse(msg.payload.clone()) {
                 Ok(q) => q,
                 Err(_) => return RouteOverride::None,
@@ -1925,7 +2104,7 @@ impl ProxyServer {
         msg: &Message,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
-        result: &Result<(Vec<u8>, Option<TcpStream>, Option<String>)>,
+        result: &Result<(Option<TcpStream>, Option<String>, u64)>,
         elapsed: Duration,
     ) {
         let pm = match state.plugin_manager.as_ref() {
@@ -1935,17 +2114,22 @@ impl ProxyServer {
         if msg.msg_type != MessageType::Query {
             return;
         }
+        // Zero plugins registered for this hook — skip the payload
+        // clone, SQL parse, and context construction entirely.
+        if !pm.has_hook(HookType::PostQuery) {
+            return;
+        }
         let query_msg = match QueryMessage::parse(msg.payload.clone()) {
             Ok(q) => q,
             Err(_) => return,
         };
         let ctx = Self::build_query_context(&query_msg.query, session);
         let outcome = match result {
-            Ok((resp, _, node)) => PostQueryOutcome {
+            Ok((_, node, bytes)) => PostQueryOutcome {
                 success: true,
                 target_node: node.clone(),
                 elapsed_us: elapsed.as_micros() as u64,
-                response_bytes: resp.len() as u64,
+                response_bytes: *bytes,
                 error: None,
             },
             Err(e) => PostQueryOutcome {
@@ -2516,9 +2700,9 @@ mod tests {
             sessions: RwLock::new(HashMap::new()),
             health: RwLock::new(HashMap::new()),
             metrics: ServerMetrics::default(),
-            lb_state: RwLock::new(LoadBalancerState {
-                rr_counter: 0,
-            }),
+            lb_state: LoadBalancerState {
+                rr_counter: AtomicU64::new(0),
+            },
             #[cfg(feature = "pool-modes")]
             pool_manager: None,
             plugin_manager: Some(pm),

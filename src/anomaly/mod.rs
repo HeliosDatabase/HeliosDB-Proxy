@@ -179,7 +179,7 @@ impl AnomalyDetector {
                     baseline: spike.baseline,
                     z_score: spike.z_score,
                     severity,
-                    detected_at: ctx.iso_timestamp.clone(),
+                    detected_at: chrono::Utc::now().to_rfc3339(),
                 };
                 emitted.push(ev.clone());
                 self.push_event(ev);
@@ -195,7 +195,7 @@ impl AnomalyDetector {
                 let ev = AnomalyEvent::NovelQuery {
                     fingerprint: ctx.fingerprint.clone(),
                     sql_excerpt: excerpt(&ctx.sql, 120),
-                    detected_at: ctx.iso_timestamp.clone(),
+                    detected_at: chrono::Utc::now().to_rfc3339(),
                 };
                 emitted.push(ev.clone());
                 self.push_event(ev);
@@ -216,7 +216,7 @@ impl AnomalyDetector {
                 sql_excerpt: excerpt(&ctx.sql, 200),
                 patterns_matched: matches,
                 severity,
-                detected_at: ctx.iso_timestamp.clone(),
+                detected_at: chrono::Utc::now().to_rfc3339(),
             };
             emitted.push(ev.clone());
             self.push_event(ev);
@@ -309,9 +309,6 @@ pub struct QueryObservation {
     /// Wall-clock timestamp the query arrived. Detectors compute
     /// rates against this.
     pub timestamp: Instant,
-    /// Pre-formatted RFC 3339 timestamp the proxy already has;
-    /// detectors copy it into events rather than re-format.
-    pub iso_timestamp: String,
 }
 
 /// Sliding 60s window of failed auths. Auto-evicts entries older
@@ -361,7 +358,6 @@ mod tests {
             fingerprint: fp.into(),
             sql: sql.into(),
             timestamp: Instant::now(),
-            iso_timestamp: "2026-04-25T13:30:00Z".into(),
         }
     }
 
