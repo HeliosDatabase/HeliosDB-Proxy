@@ -188,6 +188,45 @@ pub struct ProxyConfig {
     /// ignored so existing configs don't break.
     #[serde(default)]
     pub plugins: PluginToml,
+    /// pg_hba-style connection admission rules, evaluated in order before any
+    /// backend connection is opened. Empty (the default) means admit all
+    /// (current behaviour preserved).
+    #[serde(default)]
+    pub hba: Vec<HbaRule>,
+}
+
+/// A single pg_hba-style admission rule. The first rule whose `user`,
+/// `database`, and `address` all match the incoming connection decides the
+/// outcome (`allow`/`reject`). If no rule matches, the connection is
+/// admitted (rules are an explicit deny/allow list, not default-deny — add a
+/// trailing `{ action = "reject", user = "all", database = "all", address =
+/// "all" }` for default-deny).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HbaRule {
+    /// "allow" or "reject".
+    pub action: HbaAction,
+    /// Matching PostgreSQL user, or "all".
+    #[serde(default = "hba_all")]
+    pub user: String,
+    /// Matching database, or "all".
+    #[serde(default = "hba_all")]
+    pub database: String,
+    /// Matching client address: "all", a bare IP, or a CIDR (e.g.
+    /// "10.0.0.0/8", "::1/128").
+    #[serde(default = "hba_all")]
+    pub address: String,
+}
+
+fn hba_all() -> String {
+    "all".to_string()
+}
+
+/// Admission action for an [`HbaRule`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HbaAction {
+    Allow,
+    Reject,
 }
 
 fn default_write_timeout_secs() -> u64 {
@@ -209,6 +248,7 @@ impl Default for ProxyConfig {
             tls: None,
             write_timeout_secs: default_write_timeout_secs(),
             plugins: PluginToml::default(),
+            hba: Vec::new(),
         }
     }
 }

@@ -7,7 +7,7 @@ use crate::admin::{AdminServer, AdminState, ConfigSnapshot, NodeSnapshot};
 #[cfg(feature = "ha-tr")]
 use crate::backend::{tls::default_client_config, BackendConfig, TlsMode};
 use crate::client_tls::{build_tls_acceptor, ClientStream};
-use crate::config::{NodeConfig, NodeRole, ProxyConfig, TrMode};
+use crate::config::{HbaAction, HbaRule, NodeConfig, NodeRole, ProxyConfig, TrMode};
 use crate::protocol::{
     ErrorResponse, Message, MessageType, ProtocolCodec, QueryMessage,
     StartupMessage, TransactionStatus,
@@ -1114,6 +1114,47 @@ impl ProxyServer {
         }
     }
 
+    /// Evaluate pg_hba-style admission rules in order. The first rule whose
+    /// user, database, and address all match decides; if none match, admit.
+    fn hba_admits(rules: &[HbaRule], ip: std::net::IpAddr, user: &str, database: &str) -> bool {
+        for r in rules {
+            let user_ok = r.user == "all" || r.user == user;
+            let db_ok = r.database == "all" || r.database == database;
+            if user_ok && db_ok && Self::hba_addr_matches(&r.address, ip) {
+                return r.action == HbaAction::Allow;
+            }
+        }
+        true
+    }
+
+    /// Match a client address against an hba `address` spec: "all", a bare
+    /// IP, or a CIDR (`10.0.0.0/8`, `::1/128`).
+    fn hba_addr_matches(spec: &str, ip: std::net::IpAddr) -> bool {
+        use std::net::IpAddr;
+        if spec == "all" {
+            return true;
+        }
+        if let Some((net, bits)) = spec.split_once('/') {
+            let bits: u32 = match bits.parse() {
+                Ok(b) => b,
+                Err(_) => return false,
+            };
+            match (net.parse::<IpAddr>(), ip) {
+                (Ok(IpAddr::V4(n)), IpAddr::V4(i)) if bits <= 32 => {
+                    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+                    (u32::from(n) & mask) == (u32::from(i) & mask)
+                }
+                (Ok(IpAddr::V6(n)), IpAddr::V6(i)) if bits <= 128 => {
+                    let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+                    (u128::from(n) & mask) == (u128::from(i) & mask)
+                }
+                _ => false,
+            }
+        } else {
+            spec.parse::<IpAddr>().map(|s| s == ip).unwrap_or(false)
+        }
+    }
+
     /// Connect to backend and handle authentication
     async fn connect_and_authenticate(
         client_stream: &mut ClientStream,
@@ -1122,6 +1163,20 @@ impl ProxyServer {
         state: &Arc<ServerState>,
         config: &ProxyConfig,
     ) -> Result<(Option<TcpStream>, String)> {
+        // pg_hba-style admission: reject disallowed (user, database, client
+        // address) combinations before opening any backend connection.
+        let user = params.get("user").map(String::as_str).unwrap_or("");
+        let database = params.get("database").map(String::as_str).unwrap_or(user);
+        if !Self::hba_admits(&config.hba, session.client_addr.ip(), user, database) {
+            tracing::info!(%user, %database, client = %session.client_addr, "connection rejected by hba rule");
+            let err = Self::create_error_response(
+                "28000",
+                "connection rejected by proxy admission rules",
+            );
+            let _ = client_stream.write_all(&err).await;
+            return Ok((None, String::new()));
+        }
+
         // Plugin Authenticate hook — may deny the connection outright or
         // attach a richer identity (roles, tenant_id, claims) onto the
         // session for downstream plugins to consume. Happens before any
@@ -2608,6 +2663,51 @@ mod tests {
         let config = test_config();
         let server = ProxyServer::new(config);
         assert!(server.is_ok());
+    }
+
+    #[test]
+    fn test_hba_addr_matches() {
+        use std::net::IpAddr;
+        let v4 = |s: &str| s.parse::<IpAddr>().unwrap();
+        // "all" matches everything
+        assert!(ProxyServer::hba_addr_matches("all", v4("203.0.113.7")));
+        // CIDR membership
+        assert!(ProxyServer::hba_addr_matches("10.0.0.0/8", v4("10.1.2.3")));
+        assert!(!ProxyServer::hba_addr_matches("10.0.0.0/8", v4("11.1.2.3")));
+        assert!(ProxyServer::hba_addr_matches("127.0.0.1/32", v4("127.0.0.1")));
+        assert!(!ProxyServer::hba_addr_matches("127.0.0.1/32", v4("127.0.0.2")));
+        // bare IP exact match
+        assert!(ProxyServer::hba_addr_matches("192.168.1.1", v4("192.168.1.1")));
+        assert!(!ProxyServer::hba_addr_matches("192.168.1.1", v4("192.168.1.2")));
+        // IPv6 CIDR + /0 catch-all
+        assert!(ProxyServer::hba_addr_matches("::1/128", v4("::1")));
+        assert!(ProxyServer::hba_addr_matches("0.0.0.0/0", v4("8.8.8.8")));
+    }
+
+    #[test]
+    fn test_hba_admits() {
+        use crate::config::{HbaAction, HbaRule};
+        use std::net::IpAddr;
+        let ip: IpAddr = "10.0.0.5".parse().unwrap();
+        // No rules -> admit all
+        assert!(ProxyServer::hba_admits(&[], ip, "bench", "benchdb"));
+        // Reject a specific user, allow others (default admit)
+        let rules = vec![HbaRule {
+            action: HbaAction::Reject,
+            user: "bench".into(),
+            database: "all".into(),
+            address: "all".into(),
+        }];
+        assert!(!ProxyServer::hba_admits(&rules, ip, "bench", "benchdb"));
+        assert!(ProxyServer::hba_admits(&rules, ip, "alice", "benchdb"));
+        // First match wins: allow bench from 10/8, reject everything else
+        let rules = vec![
+            HbaRule { action: HbaAction::Allow, user: "bench".into(), database: "all".into(), address: "10.0.0.0/8".into() },
+            HbaRule { action: HbaAction::Reject, user: "all".into(), database: "all".into(), address: "all".into() },
+        ];
+        assert!(ProxyServer::hba_admits(&rules, ip, "bench", "benchdb"));
+        assert!(!ProxyServer::hba_admits(&rules, "192.168.0.1".parse().unwrap(), "bench", "benchdb"));
+        assert!(!ProxyServer::hba_admits(&rules, ip, "alice", "benchdb"));
     }
 
     #[test]
