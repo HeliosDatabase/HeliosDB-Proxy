@@ -6,6 +6,7 @@
 use crate::admin::{AdminServer, AdminState, ConfigSnapshot, NodeSnapshot};
 #[cfg(feature = "ha-tr")]
 use crate::backend::{tls::default_client_config, BackendConfig, TlsMode};
+use crate::client_tls::{build_tls_acceptor, ClientStream};
 use crate::config::{NodeConfig, NodeRole, ProxyConfig, TrMode};
 use crate::protocol::{
     ErrorResponse, Message, MessageType, ProtocolCodec, QueryMessage,
@@ -153,6 +154,9 @@ struct ServerState {
     /// fresh connection) can be forwarded to the right backend instead of
     /// being dropped. Bounded; best-effort.
     cancel_map: Arc<DashMap<(u32, u32), String>>,
+    /// Client-facing TLS acceptor, built from `[tls]` config when enabled.
+    /// `None` => the proxy rejects SSLRequests with `N` (plaintext only).
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     /// Load balancer state
     lb_state: LoadBalancerState,
     /// Pool manager for Session/Transaction/Statement modes
@@ -457,11 +461,31 @@ impl ProxyServer {
         #[cfg(feature = "wasm-plugins")]
         let plugin_manager = Self::init_plugin_manager(&config.plugins);
 
+        // Build the client TLS acceptor if [tls] is configured + enabled.
+        // A bad cert/key is fatal at startup (fail fast, don't silently
+        // fall back to plaintext for a deployment that asked for TLS).
+        let tls_acceptor = match config.tls.as_ref() {
+            Some(tls) if tls.enabled => match build_tls_acceptor(tls) {
+                Ok(acc) => {
+                    tracing::info!(
+                        mtls = tls.require_client_cert,
+                        "client TLS termination enabled"
+                    );
+                    Some(acc)
+                }
+                Err(e) => {
+                    return Err(ProxyError::Config(format!("TLS init failed: {}", e)));
+                }
+            },
+            _ => None,
+        };
+
         let state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
             health: ArcSwap::from_pointee(health),
             metrics: ServerMetrics::default(),
             cancel_map: Arc::new(DashMap::new()),
+            tls_acceptor,
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
             },
@@ -683,7 +707,7 @@ impl ProxyServer {
 
     /// Handle a client connection
     async fn handle_client(
-        mut stream: TcpStream,
+        stream: TcpStream,
         addr: SocketAddr,
         state: Arc<ServerState>,
         config: ProxyConfig,
@@ -712,8 +736,16 @@ impl ProxyServer {
             sessions.insert(session.id, session.clone());
         }
 
-        // Main client loop
-        let result = Self::client_loop(&mut stream, &session, &state, &config).await;
+        // Negotiate client TLS (if the client sent SSLRequest). Produces a
+        // ClientStream that is plaintext or TLS-wrapped; the rest of the
+        // session is written against that single stream type. `pre` carries
+        // a first startup/cancel message already read while peeking.
+        let result = match Self::negotiate_client_tls(stream, &state).await {
+            Ok((mut client_stream, pre)) => {
+                Self::client_loop(&mut client_stream, pre, &session, &state, &config).await
+            }
+            Err(e) => Err(e),
+        };
 
         // Cleanup session
         {
@@ -745,7 +777,8 @@ impl ProxyServer {
 
     /// Main client processing loop with full PostgreSQL protocol handling
     async fn client_loop(
-        stream: &mut TcpStream,
+        stream: &mut ClientStream,
+        pre: Option<StartupMessage>,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,
@@ -765,7 +798,7 @@ impl ProxyServer {
         // backend auth and is deferred to the auth batch.
         let mut conns: HashMap<String, TcpStream> = HashMap::new();
         let mut current_node: Option<String> =
-            match Self::handle_startup(stream, &mut buffer, &codec, session, state, config).await {
+            match Self::handle_startup(stream, &mut buffer, &codec, pre, session, state, config).await {
                 Ok((Some(stream_conn), node_addr)) => {
                     conns.insert(node_addr.clone(), stream_conn);
                     Some(node_addr)
@@ -970,108 +1003,120 @@ impl ProxyServer {
         Ok(())
     }
 
-    /// Handle PostgreSQL startup phase (SSL, authentication)
+    /// Peek the first startup-phase message and negotiate client TLS.
+    ///
+    /// On `SSLRequest` the proxy answers `S` and runs a rustls server
+    /// handshake when a TLS acceptor is configured, otherwise `N`
+    /// (plaintext). A `Startup`/`CancelRequest` arriving first (no
+    /// SSLRequest) is returned in `pre` so the caller doesn't re-read it.
+    async fn negotiate_client_tls(
+        mut tcp: TcpStream,
+        state: &Arc<ServerState>,
+    ) -> Result<(ClientStream, Option<StartupMessage>)> {
+        let codec = ProtocolCodec::new();
+        let mut buffer = BytesMut::with_capacity(1024);
+        let mut read_buf = vec![0u8; 1024];
+
+        let first = loop {
+            if let Some(msg) = codec.decode_startup(&mut buffer)? {
+                break msg;
+            }
+            let n = tcp
+                .read(&mut read_buf)
+                .await
+                .map_err(|e| ProxyError::Network(format!("Startup read error: {}", e)))?;
+            if n == 0 {
+                return Err(ProxyError::Connection("client closed before startup".to_string()));
+            }
+            buffer.extend_from_slice(&read_buf[..n]);
+        };
+
+        match first {
+            StartupMessage::SSLRequest => match state.tls_acceptor.as_ref() {
+                Some(acceptor) => {
+                    tcp.write_all(&[b'S'])
+                        .await
+                        .map_err(|e| ProxyError::Network(format!("SSL accept write: {}", e)))?;
+                    let tls = acceptor
+                        .accept(tcp)
+                        .await
+                        .map_err(|e| ProxyError::Network(format!("TLS handshake failed: {}", e)))?;
+                    if tls.get_ref().1.peer_certificates().is_some() {
+                        tracing::debug!("client presented a certificate (mTLS)");
+                    }
+                    Ok((ClientStream::Tls(Box::new(tls)), None))
+                }
+                None => {
+                    tcp.write_all(&[b'N'])
+                        .await
+                        .map_err(|e| ProxyError::Network(format!("SSL reject write: {}", e)))?;
+                    Ok((ClientStream::Plain(tcp), None))
+                }
+            },
+            other => Ok((ClientStream::Plain(tcp), Some(other))),
+        }
+    }
+
+    /// Handle PostgreSQL startup phase (authentication). TLS/SSLRequest is
+    /// already handled upstream in `negotiate_client_tls`; `pre` carries the
+    /// first startup/cancel message when it was read during negotiation.
     async fn handle_startup(
-        client_stream: &mut TcpStream,
+        client_stream: &mut ClientStream,
         buffer: &mut BytesMut,
         codec: &ProtocolCodec,
+        pre: Option<StartupMessage>,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,
     ) -> Result<(Option<TcpStream>, String)> {
-        // Read startup message
-        let mut read_buf = vec![0u8; 1024];
-        let n = client_stream
-            .read(&mut read_buf)
-            .await
-            .map_err(|e| ProxyError::Network(format!("Startup read error: {}", e)))?;
-
-        if n == 0 {
-            return Ok((None, String::new()));
-        }
-
-        buffer.extend_from_slice(&read_buf[..n]);
-
-        // Parse startup message
-        let startup_msg = codec.decode_startup(buffer)?;
+        // Use the message already read during TLS negotiation, or read one
+        // now (the TLS case, where the real startup follows the handshake).
+        let startup_msg = match pre {
+            Some(msg) => Some(msg),
+            None => {
+                let mut read_buf = vec![0u8; 1024];
+                loop {
+                    if let Some(msg) = codec.decode_startup(buffer)? {
+                        break Some(msg);
+                    }
+                    let n = client_stream
+                        .read(&mut read_buf)
+                        .await
+                        .map_err(|e| ProxyError::Network(format!("Startup read error: {}", e)))?;
+                    if n == 0 {
+                        return Ok((None, String::new()));
+                    }
+                    buffer.extend_from_slice(&read_buf[..n]);
+                }
+            }
+        };
 
         match startup_msg {
             Some(StartupMessage::SSLRequest) => {
-                // Reject SSL (send 'N')
+                // SSL is negotiated upstream; a second SSLRequest here is a
+                // protocol error — reject defensively.
                 client_stream
                     .write_all(&[b'N'])
                     .await
                     .map_err(|e| ProxyError::Network(format!("SSL reject error: {}", e)))?;
-
-                // Read actual startup message
-                buffer.clear();
-                let n = client_stream
-                    .read(&mut read_buf)
-                    .await
-                    .map_err(|e| ProxyError::Network(format!("Post-SSL read error: {}", e)))?;
-
-                if n == 0 {
-                    return Ok((None, String::new()));
-                }
-
-                buffer.extend_from_slice(&read_buf[..n]);
-
-                // Parse the real startup message
-                return Self::process_startup(
-                    client_stream,
-                    buffer,
-                    codec,
-                    session,
-                    state,
-                    config,
-                )
-                .await;
+                Err(ProxyError::Protocol("unexpected SSLRequest after startup".to_string()))
             }
             Some(StartupMessage::CancelRequest { pid, key }) => {
                 // Forward the cancel to the backend that owns this key, then
                 // close (the client opened this connection only to cancel).
                 Self::forward_cancel_request(state, pid, key).await;
-                return Ok((None, String::new()));
+                Ok((None, String::new()))
             }
-            Some(StartupMessage::Startup { params, .. }) => {
-                // Connect to backend and forward startup
-                return Self::connect_and_authenticate(
-                    client_stream,
-                    &params,
-                    session,
-                    state,
-                    config,
-                )
-                .await;
-            }
-            None => {
-                return Err(ProxyError::Protocol("Incomplete startup message".to_string()));
-            }
-        }
-    }
-
-    /// Process startup message after SSL negotiation
-    async fn process_startup(
-        client_stream: &mut TcpStream,
-        buffer: &mut BytesMut,
-        codec: &ProtocolCodec,
-        session: &Arc<ClientSession>,
-        state: &Arc<ServerState>,
-        config: &ProxyConfig,
-    ) -> Result<(Option<TcpStream>, String)> {
-        let startup_msg = codec.decode_startup(buffer)?;
-
-        match startup_msg {
             Some(StartupMessage::Startup { params, .. }) => {
                 Self::connect_and_authenticate(client_stream, &params, session, state, config).await
             }
-            _ => Err(ProxyError::Protocol("Expected startup message".to_string())),
+            None => Err(ProxyError::Protocol("Incomplete startup message".to_string())),
         }
     }
 
     /// Connect to backend and handle authentication
     async fn connect_and_authenticate(
-        client_stream: &mut TcpStream,
+        client_stream: &mut ClientStream,
         params: &HashMap<String, String>,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
@@ -1183,7 +1228,7 @@ impl ProxyServer {
 
     /// Proxy authentication messages between client and backend
     async fn proxy_authentication(
-        client_stream: &mut TcpStream,
+        client_stream: &mut ClientStream,
         backend_stream: &mut TcpStream,
         state: &Arc<ServerState>,
         node_addr: &str,
@@ -1363,7 +1408,7 @@ impl ProxyServer {
     /// cache. Returns `(Some(node_used), bytes)` — `None` node means the
     /// request was short-circuited (plugin block) without touching a backend.
     async fn forward_simple_query(
-        client: &mut TcpStream,
+        client: &mut ClientStream,
         msg: &Message,
         conns: &mut HashMap<String, TcpStream>,
         current_node: Option<&str>,
@@ -1424,7 +1469,7 @@ impl ProxyServer {
     /// `None` (a re-Bind/Execute of a named prepared statement) the request
     /// stays on the connection the statement was prepared on — no switch.
     async fn forward_extended_batch(
-        client: &mut TcpStream,
+        client: &mut ClientStream,
         batch: &[u8],
         route_sql: Option<&str>,
         wait_ready: bool,
@@ -1479,7 +1524,7 @@ impl ProxyServer {
     /// client can supply COPY data. Updates `tx_state` from the RFQ status.
     /// Returns bytes streamed to the client.
     async fn stream_until_ready(
-        client: &mut TcpStream,
+        client: &mut ClientStream,
         backend: &mut TcpStream,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
@@ -1555,7 +1600,7 @@ impl ProxyServer {
     /// read the client's next frames — deadlock-free. The eventual `Sync`
     /// drains the final ReadyForQuery via `stream_until_ready`.
     async fn stream_flush(
-        client: &mut TcpStream,
+        client: &mut ClientStream,
         backend: &mut TcpStream,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
@@ -2046,7 +2091,7 @@ impl ProxyServer {
     /// `ReadyForQuery` so the client's state machine returns to idle and
     /// the next query can be accepted.
     async fn send_block_response(
-        stream: &mut TcpStream,
+        stream: &mut ClientStream,
         reason: &str,
         state: &Arc<ServerState>,
     ) -> Result<()> {
@@ -2830,6 +2875,7 @@ mod tests {
             health: ArcSwap::from_pointee(HashMap::new()),
             metrics: ServerMetrics::default(),
             cancel_map: Arc::new(DashMap::new()),
+            tls_acceptor: None,
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
             },
