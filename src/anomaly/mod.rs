@@ -26,7 +26,9 @@
 //! [`AnomalyEvent`] trail makes it possible to bolt a learned
 //! classifier on later: events become labeled training data.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+
+use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -138,19 +140,27 @@ impl Default for AnomalyConfig {
 #[derive(Clone)]
 pub struct AnomalyDetector {
     config: Arc<AnomalyConfig>,
-    rate_windows: Arc<RwLock<HashMap<String, RateWindow>>>,
-    auth_windows: Arc<RwLock<HashMap<(String, String), AuthBurstWindow>>>,
-    seen_fingerprints: Arc<RwLock<HashMap<String, ()>>>,
+    // Per-key sliding windows live in DashMaps so concurrent sessions for
+    // different tenants/users hit different shards instead of serializing
+    // on one global writer per query.
+    rate_windows: Arc<DashMap<String, RateWindow>>,
+    auth_windows: Arc<DashMap<(String, String), AuthBurstWindow>>,
+    seen_fingerprints: Arc<DashMap<String, ()>>,
     events: Arc<RwLock<VecDeque<AnomalyEvent>>>,
 }
+
+/// Upper bound on the novel-query fingerprint set. Without a cap the set
+/// grows unbounded on high-cardinality SQL (a slow memory leak); the
+/// detector is informational, so clearing on overflow is acceptable.
+const MAX_SEEN_FINGERPRINTS: usize = 100_000;
 
 impl AnomalyDetector {
     pub fn new(config: AnomalyConfig) -> Self {
         Self {
             config: Arc::new(config),
-            rate_windows: Arc::new(RwLock::new(HashMap::new())),
-            auth_windows: Arc::new(RwLock::new(HashMap::new())),
-            seen_fingerprints: Arc::new(RwLock::new(HashMap::new())),
+            rate_windows: Arc::new(DashMap::new()),
+            auth_windows: Arc::new(DashMap::new()),
+            seen_fingerprints: Arc::new(DashMap::new()),
             events: Arc::new(RwLock::new(VecDeque::with_capacity(1024))),
         }
     }
@@ -161,37 +171,50 @@ impl AnomalyDetector {
     pub fn record_query(&self, ctx: &QueryObservation) -> Vec<AnomalyEvent> {
         let mut emitted = Vec::new();
 
-        // Rate-spike detector.
-        let mut rates = self.rate_windows.write();
-        let window = rates
-            .entry(ctx.tenant.clone())
-            .or_insert_with(|| RateWindow::new(self.config.rate_window_secs));
-        if let Some(spike) = window.observe_and_score(ctx.timestamp) {
-            if spike.z_score >= self.config.spike_z_threshold {
-                let severity = if spike.z_score >= self.config.spike_z_threshold * 2.0 {
-                    Severity::Critical
-                } else {
-                    Severity::Warning
-                };
-                let ev = AnomalyEvent::RateSpike {
-                    tenant: ctx.tenant.clone(),
-                    rate_per_sec: spike.rate,
-                    baseline: spike.baseline,
-                    z_score: spike.z_score,
-                    severity,
-                    detected_at: chrono::Utc::now().to_rfc3339(),
-                };
-                emitted.push(ev.clone());
-                self.push_event(ev);
+        // Rate-spike detector. Per-tenant shard lock only.
+        {
+            let mut window = self
+                .rate_windows
+                .entry(ctx.tenant.clone())
+                .or_insert_with(|| RateWindow::new(self.config.rate_window_secs));
+            if let Some(spike) = window.observe_and_score(ctx.timestamp) {
+                if spike.z_score >= self.config.spike_z_threshold {
+                    let severity = if spike.z_score >= self.config.spike_z_threshold * 2.0 {
+                        Severity::Critical
+                    } else {
+                        Severity::Warning
+                    };
+                    let ev = AnomalyEvent::RateSpike {
+                        tenant: ctx.tenant.clone(),
+                        rate_per_sec: spike.rate,
+                        baseline: spike.baseline,
+                        z_score: spike.z_score,
+                        severity,
+                        detected_at: chrono::Utc::now().to_rfc3339(),
+                    };
+                    drop(window); // release shard before pushing to the event ring
+                    emitted.push(ev.clone());
+                    self.push_event(ev);
+                }
             }
         }
-        drop(rates);
 
-        // Novel-query detector.
-        if self.config.emit_novel_queries {
-            let mut seen = self.seen_fingerprints.write();
-            if !seen.contains_key(&ctx.fingerprint) {
-                seen.insert(ctx.fingerprint.clone(), ());
+        // Novel-query detector. The common already-seen path takes only a
+        // shard read; a fresh fingerprint upgrades to a shard write.
+        if self.config.emit_novel_queries
+            && !self.seen_fingerprints.contains_key(&ctx.fingerprint)
+        {
+            // Bound the set so unique-SQL traffic can't leak memory.
+            if self.seen_fingerprints.len() >= MAX_SEEN_FINGERPRINTS {
+                self.seen_fingerprints.clear();
+            }
+            // insert returns the prior value; None means we won the race to
+            // first-see this fingerprint, so emit exactly once.
+            if self
+                .seen_fingerprints
+                .insert(ctx.fingerprint.clone(), ())
+                .is_none()
+            {
                 let ev = AnomalyEvent::NovelQuery {
                     fingerprint: ctx.fingerprint.clone(),
                     sql_excerpt: excerpt(&ctx.sql, 120),
@@ -239,15 +262,16 @@ impl AnomalyDetector {
             // Successful auth resets the burst counter — common
             // case after the operator unlocks an account.
             self.auth_windows
-                .write()
                 .remove(&(user.to_string(), client_ip.to_string()));
             return None;
         }
-        let mut windows = self.auth_windows.write();
-        let window = windows
-            .entry((user.to_string(), client_ip.to_string()))
-            .or_insert_with(|| AuthBurstWindow::new(self.config.auth_window_secs));
-        let count = window.record_failure(timestamp);
+        let count = {
+            let mut window = self
+                .auth_windows
+                .entry((user.to_string(), client_ip.to_string()))
+                .or_insert_with(|| AuthBurstWindow::new(self.config.auth_window_secs));
+            window.record_failure(timestamp)
+        };
         let severity = if count >= self.config.auth_critical_count {
             Severity::Critical
         } else if count >= self.config.auth_warning_count {
@@ -263,7 +287,6 @@ impl AnomalyDetector {
             severity,
             detected_at: iso_timestamp.to_string(),
         };
-        drop(windows);
         self.push_event(ev.clone());
         Some(ev)
     }
