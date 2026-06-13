@@ -232,3 +232,12 @@ harness = false
 [[test]]
 name = "integration"
 path = "tests/integration/mod.rs"
+
+# Release profile tuned for a long-running wire proxy: cross-crate
+# inlining matters (bytes/tokio/codec on every frame). `panic = "abort"`
+# is deliberately NOT set — a panic in one per-connection task must not
+# take down every other client session.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

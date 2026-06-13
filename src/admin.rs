@@ -2114,7 +2114,6 @@ mod tests {
             fingerprint: "fp".into(),
             sql: "SELECT * FROM users WHERE id = 1 OR 1=1 --".into(),
             timestamp: std::time::Instant::now(),
-            iso_timestamp: "ts".into(),
         });
         state.with_anomaly_detector(det.clone()).await;
 
@@ -2140,7 +2139,6 @@ mod tests {
                 fingerprint: fp,
                 sql: "SELECT 1".into(),
                 timestamp: std::time::Instant::now(),
-                iso_timestamp: "ts".into(),
             });
         }
         state.with_anomaly_detector(det).await;

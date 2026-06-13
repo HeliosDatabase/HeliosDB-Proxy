@@ -458,6 +458,16 @@ impl PluginManager {
         Ok(())
     }
 
+    /// Cheap check whether any loaded plugin registered the given hook.
+    /// Lets the server's hook wrappers keep the no-plugin path free of
+    /// payload clones, SQL parsing, and context construction.
+    pub fn has_hook(&self, hook: HookType) -> bool {
+        self.hooks
+            .read()
+            .get(&hook)
+            .map_or(false, |names| !names.is_empty())
+    }
+
     /// Execute pre-query hooks
     pub fn execute_pre_query(&self, ctx: &QueryContext) -> PreQueryResult {
         let hooks = self.hooks.read();

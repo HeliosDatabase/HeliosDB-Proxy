@@ -351,6 +351,35 @@ fn write_cstring(buf: &mut BytesMut, s: &str) {
     buf.put_u8(0);
 }
 
+/// Borrow the SQL text out of a Query/Parse-style payload without
+/// copying. Mirrors `read_cstring` semantics (bytes up to the first
+/// NUL, strict UTF-8) but never allocates — for hot-path inspection
+/// where the message itself is forwarded verbatim.
+pub fn query_text(payload: &[u8]) -> Option<&str> {
+    let end = payload.iter().position(|&b| b == 0)?;
+    std::str::from_utf8(&payload[..end]).ok()
+}
+
+/// Case-insensitive ASCII prefix test without allocating an
+/// uppercased copy of the haystack.
+pub fn starts_with_ci(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+/// Case-insensitive ASCII substring test without allocating.
+pub fn contains_ci(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 /// Query message payload
 #[derive(Debug, Clone)]
 pub struct QueryMessage {

@@ -158,34 +158,38 @@ impl TransactionEvent {
     /// # Returns
     /// The detected transaction event type
     pub fn detect(sql: &str) -> Self {
-        let upper = sql.trim().to_uppercase();
-        let upper_ref = upper.as_str();
+        use crate::protocol::{contains_ci, starts_with_ci};
+        // Allocation-free: transaction-control statements are short,
+        // and everything else bails on the leading-keyword check —
+        // a multi-megabyte INSERT must not pay an uppercased copy
+        // of itself just to be classified as `Statement`.
+        let trimmed = sql.trim();
 
         // Check for transaction control commands
-        if upper_ref.starts_with("BEGIN") {
+        if starts_with_ci(trimmed, "BEGIN") {
             return TransactionEvent::Begin;
         }
-        if upper_ref.starts_with("START TRANSACTION") || upper_ref.starts_with("START ") {
+        if starts_with_ci(trimmed, "START TRANSACTION") || starts_with_ci(trimmed, "START ") {
             // START could be START TRANSACTION
-            if upper.contains("TRANSACTION") {
+            if contains_ci(trimmed, "TRANSACTION") {
                 return TransactionEvent::Begin;
             }
         }
-        if upper_ref.starts_with("COMMIT") || upper_ref.starts_with("END") {
+        if starts_with_ci(trimmed, "COMMIT") || starts_with_ci(trimmed, "END") {
             // END is alias for COMMIT in PostgreSQL
             return TransactionEvent::Commit;
         }
-        if upper_ref.starts_with("ROLLBACK") {
+        if starts_with_ci(trimmed, "ROLLBACK") {
             // Check for ROLLBACK TO SAVEPOINT
-            if upper.contains(" TO ") {
+            if contains_ci(trimmed, " TO ") {
                 return TransactionEvent::RollbackToSavepoint;
             }
             return TransactionEvent::Rollback;
         }
-        if upper_ref.starts_with("SAVEPOINT") {
+        if starts_with_ci(trimmed, "SAVEPOINT") {
             return TransactionEvent::Savepoint;
         }
-        if upper_ref.starts_with("RELEASE") {
+        if starts_with_ci(trimmed, "RELEASE") {
             return TransactionEvent::ReleaseSavepoint;
         }
 
