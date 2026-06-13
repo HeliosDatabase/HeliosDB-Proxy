@@ -59,6 +59,7 @@
 
 // ── Core modules (always available) ──────────────────────────────────
 pub mod backend;
+pub mod client_tls;
 pub mod config;
 pub mod server;
 pub mod protocol;
