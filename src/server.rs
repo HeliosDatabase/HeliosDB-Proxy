@@ -14,6 +14,7 @@ use crate::protocol::{
 use crate::{ProxyError, Result};
 use arc_swap::ArcSwap;
 use bytes::{BufMut, BytesMut};
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -146,6 +147,12 @@ struct ServerState {
     health: ArcSwap<HashMap<String, NodeHealth>>,
     /// Metrics
     metrics: ServerMetrics,
+    /// Query-cancellation routing. Maps the BackendKeyData (pid, secret)
+    /// the backend handed to the client onto the backend address that
+    /// issued it, so a later out-of-band CancelRequest (which arrives on a
+    /// fresh connection) can be forwarded to the right backend instead of
+    /// being dropped. Bounded; best-effort.
+    cancel_map: Arc<DashMap<(u32, u32), String>>,
     /// Load balancer state
     lb_state: LoadBalancerState,
     /// Pool manager for Session/Transaction/Statement modes
@@ -454,6 +461,7 @@ impl ProxyServer {
             sessions: RwLock::new(HashMap::new()),
             health: ArcSwap::from_pointee(health),
             metrics: ServerMetrics::default(),
+            cancel_map: Arc::new(DashMap::new()),
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
             },
@@ -1019,8 +1027,10 @@ impl ProxyServer {
                 )
                 .await;
             }
-            Some(StartupMessage::CancelRequest { .. }) => {
-                // Cancel requests are handled separately, just close connection
+            Some(StartupMessage::CancelRequest { pid, key }) => {
+                // Forward the cancel to the backend that owns this key, then
+                // close (the client opened this connection only to cancel).
+                Self::forward_cancel_request(state, pid, key).await;
                 return Ok((None, String::new()));
             }
             Some(StartupMessage::Startup { params, .. }) => {
@@ -1094,8 +1104,10 @@ impl ProxyServer {
             .await
             .map_err(|e| ProxyError::Network(format!("Backend startup write error: {}", e)))?;
 
-        // Forward authentication messages between client and backend
-        Self::proxy_authentication(client_stream, &mut backend).await?;
+        // Forward authentication messages between client and backend.
+        // Registers the backend's BackendKeyData so a later CancelRequest
+        // can be routed back to this node.
+        Self::proxy_authentication(client_stream, &mut backend, state, &node_addr).await?;
 
         // Store session variables
         {
@@ -1132,10 +1144,49 @@ impl ProxyServer {
         msg.to_vec()
     }
 
+    /// Cap on the cancel-key map; cleared on overflow (a dropped stale
+    /// entry only means one best-effort cancel is not forwarded).
+    const MAX_CANCEL_KEYS: usize = 100_000;
+
+    /// Record the backend that owns a BackendKeyData (pid, secret) pair.
+    fn register_cancel_key(state: &Arc<ServerState>, pid: u32, key: u32, node_addr: &str) {
+        if state.cancel_map.len() >= Self::MAX_CANCEL_KEYS {
+            state.cancel_map.clear();
+        }
+        state.cancel_map.insert((pid, key), node_addr.to_string());
+    }
+
+    /// Forward a client CancelRequest to the backend that issued the
+    /// matching BackendKeyData. Best-effort: unknown keys are ignored.
+    async fn forward_cancel_request(state: &Arc<ServerState>, pid: u32, key: u32) {
+        let Some(addr) = state.cancel_map.get(&(pid, key)).map(|e| e.clone()) else {
+            tracing::debug!(pid, "cancel request for unknown key; ignoring");
+            return;
+        };
+        // CancelRequest: int32 len(16) + int32 code(80877102) + pid + key.
+        let mut msg = BytesMut::with_capacity(16);
+        msg.put_u32(16);
+        msg.put_u32(80877102);
+        msg.put_u32(pid);
+        msg.put_u32(key);
+        match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr)).await {
+            Ok(Ok(mut conn)) => {
+                let _ = conn.set_nodelay(true);
+                if let Err(e) = conn.write_all(&msg).await {
+                    tracing::warn!(node = %addr, error = %e, "failed to forward CancelRequest");
+                }
+                // PG closes the connection after handling a CancelRequest.
+            }
+            other => tracing::warn!(node = %addr, ?other, "could not connect to forward CancelRequest"),
+        }
+    }
+
     /// Proxy authentication messages between client and backend
     async fn proxy_authentication(
         client_stream: &mut TcpStream,
         backend_stream: &mut TcpStream,
+        state: &Arc<ServerState>,
+        node_addr: &str,
     ) -> Result<()> {
         let codec = ProtocolCodec::new();
         let mut backend_buffer = BytesMut::with_capacity(4096);
@@ -1166,6 +1217,20 @@ impl ProxyServer {
             // once) straight out of the buffer — no clone needed.
             while let Some(msg) = codec.decode_message(&mut backend_buffer)? {
                 match msg.msg_type {
+                    MessageType::BackendKeyData => {
+                        // The backend told the client how to cancel its
+                        // queries; remember which backend owns that key so
+                        // an out-of-band CancelRequest can be forwarded.
+                        if msg.payload.len() >= 8 {
+                            let pid = u32::from_be_bytes([
+                                msg.payload[0], msg.payload[1], msg.payload[2], msg.payload[3],
+                            ]);
+                            let key = u32::from_be_bytes([
+                                msg.payload[4], msg.payload[5], msg.payload[6], msg.payload[7],
+                            ]);
+                            Self::register_cancel_key(state, pid, key, node_addr);
+                        }
+                    }
                     MessageType::AuthRequest => {
                         // Check if auth OK
                         if msg.payload.len() >= 4 {
@@ -2764,6 +2829,7 @@ mod tests {
             sessions: RwLock::new(HashMap::new()),
             health: ArcSwap::from_pointee(HashMap::new()),
             metrics: ServerMetrics::default(),
+            cancel_map: Arc::new(DashMap::new()),
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
             },
