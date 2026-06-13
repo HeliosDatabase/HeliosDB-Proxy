@@ -26,6 +26,9 @@ case "$BK" in
   nano) CFG="$HERE/proxy-nano.toml"; BHOST=100.64.0.2; BPORT=54320; BUSER=postgres; BPASS=OTPZ7Mxh9FJEeeKF3qqSKmW64lmT2u3;    BDB=postgres ;;
   *) echo "unknown BK=$BK (use pg|nano)"; exit 2 ;;
 esac
+# Optional config override (e.g. the 2-node read/write-split config) while
+# keeping the same backend credentials.
+CFG="${CFG_OVERRIDE:-$CFG}"
 
 OUT="${OUT:-/tmp/regress-$BK}"; mkdir -p "$OUT"
 PASS=0; FAIL=0; SKIP=0; RESULTS=()

@@ -3,6 +3,40 @@
 > Generated from the 2026-06-10 deep audit (77-agent workflow, adversarially verified). 
 > Raw data: `docs/audit-2026-06/audit-result.json`.
 
+---
+## IMPLEMENTATION STATUS (2026-06-13)
+
+**Delivered: per-session multi-node connection cache.** `client_loop` now holds a
+`HashMap<node_addr, TcpStream>` of authenticated backend connections instead of a
+single stream. A read/write route switch (or a forced-route / failover switch)
+reuses the already-authenticated connection to each node rather than dropping the
+socket and paying a fresh TCP connect + startup + SCRAM handshake every time
+(audit finding #3, the per-switch re-auth cost). Broken connections are evicted
+and redialed lazily. Verified: 1307 unit tests + live battery green on PostgreSQL
+18.4 (single-node AND 2-node read/write-split) and HeliosDB-Nano 3.57 — zero
+regression.
+
+**Deferred to after BATCH F (proxy-side backend auth) — the headline finding:**
+the pool's *cross-client* multiplexing (many client connections sharing a small
+set of backend connections, the "decouple client count from backend count" claim)
+is **hard-blocked on proxy-owned backend credentials.** Auth is pass-through
+(`proxy_authentication`), so every backend connection is authenticated as one
+specific client and cannot be safely handed to another client. True transaction
+pooling therefore requires SCRAM-verifier / `auth_query` proxy-side auth (BATCH F)
+first; once that lands, the connection cache here becomes the per-(user,database)
+shared pool. This matches the verifier's own correction in finding #3 below.
+
+**Also deferred (correctness-sensitive, belongs with lag-routing):** aggressively
+routing reads to standbys to un-idle replicas. Under the current sticky routing a
+session stays on its initial node, so the cache rarely switches today; making
+reads offload to standbys needs read-your-writes / replica-lag awareness
+(`lag-routing`) to avoid serving stale reads, so it is not done here.
+
+The latent pool-manager defects below (DashMap guard across `.await`, dead
+`LoadBalancer`, unused `min_connections`/`test_on_acquire`) remain on the unwired
+`ConnectionPoolManager`; they become live work when BATCH F wires real pooling.
+---
+
 **Goal:** Make the shipped `ConnectionPoolManager` actually serve backend connections in `route_and_forward`, decoupling client count from backend count and removing per-switch TCP+auth round trips. This is the change that makes the pooler claim real.
 
 **Parallel-execution compatibility:** SOLO only. Highest-risk batch; do not parallelize.
