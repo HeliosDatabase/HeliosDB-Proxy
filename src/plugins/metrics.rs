@@ -6,20 +6,22 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use parking_lot::RwLock;
+use dashmap::DashMap;
 
 use super::HookType;
 
 /// Plugin metrics collector
 pub struct PluginMetrics {
-    /// Per-plugin statistics
-    plugin_stats: RwLock<HashMap<String, PluginStatsInner>>,
+    /// Per-plugin statistics. DashMap so concurrent hook calls for
+    /// different plugins land on different shards instead of serializing
+    /// on one global write lock.
+    plugin_stats: DashMap<String, PluginStatsInner>,
 
     /// Global counters
     global: GlobalMetrics,
 
-    /// Hook latency histograms
-    hook_latencies: RwLock<HashMap<HookType, LatencyHistogram>>,
+    /// Hook latency histograms (sharded per hook type).
+    hook_latencies: DashMap<HookType, LatencyHistogram>,
 
     /// Creation time
     created_at: Instant,
@@ -29,9 +31,9 @@ impl PluginMetrics {
     /// Create a new metrics collector
     pub fn new() -> Self {
         Self {
-            plugin_stats: RwLock::new(HashMap::new()),
+            plugin_stats: DashMap::new(),
             global: GlobalMetrics::new(),
-            hook_latencies: RwLock::new(HashMap::new()),
+            hook_latencies: DashMap::new(),
             created_at: Instant::now(),
         }
     }
@@ -52,8 +54,8 @@ impl PluginMetrics {
 
         // Update plugin-specific stats
         {
-            let mut stats = self.plugin_stats.write();
-            let entry = stats
+            let mut entry = self
+                .plugin_stats
                 .entry(plugin_name.to_string())
                 .or_insert_with(PluginStatsInner::new);
 
@@ -86,8 +88,8 @@ impl PluginMetrics {
 
         // Update hook latency histogram
         {
-            let mut histograms = self.hook_latencies.write();
-            let histogram = histograms
+            let mut histogram = self
+                .hook_latencies
                 .entry(hook)
                 .or_insert_with(LatencyHistogram::new);
             histogram.record(latency);
@@ -98,8 +100,8 @@ impl PluginMetrics {
     pub fn record_plugin_load(&self, plugin_name: &str) {
         self.global.plugins_loaded.fetch_add(1, Ordering::Relaxed);
 
-        let mut stats = self.plugin_stats.write();
-        let entry = stats
+        let mut entry = self
+            .plugin_stats
             .entry(plugin_name.to_string())
             .or_insert_with(PluginStatsInner::new);
         entry.loaded_at = Some(Instant::now());
@@ -109,8 +111,7 @@ impl PluginMetrics {
     pub fn record_plugin_unload(&self, plugin_name: &str) {
         self.global.plugins_unloaded.fetch_add(1, Ordering::Relaxed);
 
-        let mut stats = self.plugin_stats.write();
-        if let Some(entry) = stats.get_mut(plugin_name) {
+        if let Some(mut entry) = self.plugin_stats.get_mut(plugin_name) {
             entry.unloaded_at = Some(Instant::now());
         }
     }
@@ -119,8 +120,8 @@ impl PluginMetrics {
     pub fn record_plugin_error(&self, plugin_name: &str, _error: &str) {
         self.global.total_errors.fetch_add(1, Ordering::Relaxed);
 
-        let mut stats = self.plugin_stats.write();
-        let entry = stats
+        let mut entry = self
+            .plugin_stats
             .entry(plugin_name.to_string())
             .or_insert_with(PluginStatsInner::new);
         entry.error_count += 1;
@@ -128,8 +129,7 @@ impl PluginMetrics {
 
     /// Get plugin statistics
     pub fn get_plugin_stats(&self, plugin_name: &str) -> PluginStats {
-        let stats = self.plugin_stats.read();
-        stats
+        self.plugin_stats
             .get(plugin_name)
             .map(|s| s.to_public())
             .unwrap_or_default()
@@ -137,10 +137,9 @@ impl PluginMetrics {
 
     /// Get all plugin statistics
     pub fn get_all_stats(&self) -> HashMap<String, PluginStats> {
-        let stats = self.plugin_stats.read();
-        stats
+        self.plugin_stats
             .iter()
-            .map(|(name, s)| (name.clone(), s.to_public()))
+            .map(|e| (e.key().clone(), e.value().to_public()))
             .collect()
     }
 
@@ -156,11 +155,10 @@ impl PluginMetrics {
 
     /// Get average latency across all plugins
     pub fn avg_latency(&self) -> Duration {
-        let stats = self.plugin_stats.read();
         let mut total_latency = Duration::ZERO;
         let mut total_calls = 0u64;
 
-        for s in stats.values() {
+        for s in self.plugin_stats.iter() {
             total_latency += s.total_latency;
             total_calls += s.total_calls;
         }
@@ -174,8 +172,7 @@ impl PluginMetrics {
 
     /// Get hook latency
     pub fn get_hook_latency(&self, hook: HookType) -> HookLatency {
-        let histograms = self.hook_latencies.read();
-        histograms
+        self.hook_latencies
             .get(&hook)
             .map(|h| h.to_latency())
             .unwrap_or_default()
@@ -190,8 +187,8 @@ impl PluginMetrics {
     pub fn reset(&self) {
         self.global.total_calls.store(0, Ordering::Relaxed);
         self.global.total_errors.store(0, Ordering::Relaxed);
-        self.plugin_stats.write().clear();
-        self.hook_latencies.write().clear();
+        self.plugin_stats.clear();
+        self.hook_latencies.clear();
     }
 }
 
