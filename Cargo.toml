@@ -143,6 +143,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Concurrent data structures
 dashmap = "5"
 parking_lot = "0.12"
+# Lock-free read-mostly snapshots (node-health map on the per-query path)
+arc-swap = "1"
 
 # Configuration
 config = "0.14"

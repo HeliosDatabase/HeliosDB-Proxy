@@ -12,6 +12,7 @@ use crate::protocol::{
     StartupMessage, TransactionStatus,
 };
 use crate::{ProxyError, Result};
+use arc_swap::ArcSwap;
 use bytes::{BufMut, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -138,7 +139,11 @@ struct ServerState {
     /// Active client sessions
     sessions: RwLock<HashMap<Uuid, Arc<ClientSession>>>,
     /// Node health status
-    health: RwLock<HashMap<String, NodeHealth>>,
+    // Read-mostly: only the periodic health checker writes (a full-map
+    // swap), every query reads. ArcSwap makes the per-query read a single
+    // lock-free atomic load with no await, no semaphore, no guard held
+    // across the routing awaits.
+    health: ArcSwap<HashMap<String, NodeHealth>>,
     /// Metrics
     metrics: ServerMetrics,
     /// Load balancer state
@@ -447,7 +452,7 @@ impl ProxyServer {
 
         let state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
-            health: RwLock::new(health),
+            health: ArcSwap::from_pointee(health),
             metrics: ServerMetrics::default(),
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
@@ -624,9 +629,9 @@ impl ProxyServer {
 
                     // Sync health status
                     {
-                        let health = server_state.health.read().await;
+                        let health = server_state.health.load_full();
                         let mut admin_health = admin_state_sync.node_health.write().await;
-                        *admin_health = health.clone();
+                        *admin_health = (*health).clone();
                     }
 
                     // Sync metrics
@@ -1215,13 +1220,13 @@ impl ProxyServer {
         config: &ProxyConfig,
     ) -> Result<String> {
         let need_switch = if let Some(ref forced) = forced_target {
-            let health = state.health.read().await;
+            let health = state.health.load_full();
             let reuse = current_node
                 .map(|c| c == forced && health.get(c).map(|h| h.healthy).unwrap_or(false))
                 .unwrap_or(false);
             !reuse
         } else if let Some(current) = current_node {
-            let health = state.health.read().await;
+            let health = state.health.load_full();
             let current_healthy = health.get(current).map(|h| h.healthy).unwrap_or(false);
             if !current_healthy {
                 true
@@ -1585,11 +1590,13 @@ impl ProxyServer {
     ) -> Result<String> {
         let timeout = config.write_timeout();
         let start = std::time::Instant::now();
-        let check_interval = Duration::from_millis(500);
+        // Poll for the promoted primary fairly tightly so writes resume
+        // quickly after a failover (was 500ms — a needless recovery floor).
+        let check_interval = Duration::from_millis(100);
 
         loop {
             // Try to find healthy primary
-            let health = state.health.read().await;
+            let health = state.health.load_full();
             let primary = config
                 .nodes
                 .iter()
@@ -1641,7 +1648,7 @@ impl ProxyServer {
         }
 
         // Get healthy nodes (prefer standbys for reads)
-        let health = state.health.read().await;
+        let health = state.health.load_full();
         let healthy_standbys: Vec<&NodeConfig> = config
             .nodes
             .iter()
@@ -2202,7 +2209,7 @@ impl ProxyServer {
         }
 
         // Get healthy nodes
-        let health = state.health.read().await;
+        let health = state.health.load_full();
         let healthy_nodes: Vec<&NodeConfig> = config
             .nodes
             .iter()
@@ -2264,13 +2271,35 @@ impl ProxyServer {
         })
     }
 
-    /// Check health of all nodes
+    /// Check health of all nodes.
+    ///
+    /// Probes run concurrently (one slow/unreachable node no longer delays
+    /// detection on the others — lowers the failover-detection latency
+    /// floor), then a single new health snapshot is published via ArcSwap so
+    /// readers on the query path never block.
     async fn check_all_nodes(state: &Arc<ServerState>, config: &ProxyConfig) {
+        // Probe every node in parallel (owned address + timeout so each
+        // probe is 'static and runs on its own task).
+        let timeout = Duration::from_secs(config.health.check_timeout_secs);
+        let mut set = tokio::task::JoinSet::new();
         for node in &config.nodes {
-            let result = Self::check_node_health(node, config).await;
-            let mut health = state.health.write().await;
+            let addr = node.address();
+            set.spawn(async move {
+                let r = Self::check_node_addr(&addr, timeout).await;
+                (addr, r)
+            });
+        }
+        let mut results = Vec::with_capacity(config.nodes.len());
+        while let Some(joined) = set.join_next().await {
+            if let Ok(pair) = joined {
+                results.push(pair);
+            }
+        }
 
-            if let Some(node_health) = health.get_mut(&node.address()) {
+        // Clone-and-modify the current snapshot, then atomically swap it in.
+        let mut next = (*state.health.load_full()).clone();
+        for (addr, result) in results {
+            if let Some(node_health) = next.get_mut(&addr) {
                 match result {
                     Ok(latency) => {
                         node_health.healthy = true;
@@ -2281,12 +2310,11 @@ impl ProxyServer {
                     Err(e) => {
                         node_health.failure_count += 1;
                         node_health.last_error = Some(e.to_string());
-
                         if node_health.failure_count >= config.health.failure_threshold {
                             node_health.healthy = false;
                             tracing::warn!(
                                 "Node {} marked unhealthy after {} failures",
-                                node.address(),
+                                addr,
                                 node_health.failure_count
                             );
                         }
@@ -2295,21 +2323,17 @@ impl ProxyServer {
                 node_health.last_check = chrono::Utc::now();
             }
         }
+        state.health.store(Arc::new(next));
     }
 
-    /// Check health of a single node
-    async fn check_node_health(node: &NodeConfig, config: &ProxyConfig) -> Result<f64> {
+    /// Check health of a single node by TCP-connect probe. Returns the
+    /// connect latency in milliseconds.
+    async fn check_node_addr(addr: &str, timeout: Duration) -> Result<f64> {
         let start = std::time::Instant::now();
-
-        let timeout = std::time::Duration::from_secs(config.health.check_timeout_secs);
-        let _stream = tokio::time::timeout(timeout, TcpStream::connect(node.address()))
+        let _stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
             .await
-            .map_err(|_| ProxyError::HealthCheck(format!("Timeout connecting to {}", node.address())))?
-            .map_err(|e| {
-                ProxyError::HealthCheck(format!("Failed to connect to {}: {}", node.address(), e))
-            })?;
-
-        // In a real implementation, we would execute the health check query here
+            .map_err(|_| ProxyError::HealthCheck(format!("Timeout connecting to {}", addr)))?
+            .map_err(|e| ProxyError::HealthCheck(format!("Failed to connect to {}: {}", addr, e)))?;
         let latency = start.elapsed().as_secs_f64() * 1000.0;
         Ok(latency)
     }
@@ -2499,7 +2523,7 @@ mod tests {
         let config = test_config();
         let server = ProxyServer::new(config).unwrap();
 
-        let health = server.state.health.read().await;
+        let health = server.state.health.load_full();
         assert!(!health.is_empty());
 
         for node_health in health.values() {
@@ -2738,7 +2762,7 @@ mod tests {
         let pm = Arc::new(PluginManager::new(PluginRuntimeConfig::default()).unwrap());
         let augmented_state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
-            health: RwLock::new(HashMap::new()),
+            health: ArcSwap::from_pointee(HashMap::new()),
             metrics: ServerMetrics::default(),
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
