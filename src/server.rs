@@ -689,6 +689,7 @@ impl ProxyServer {
                         target: mirror.target().to_string(),
                         writes_only: mirror.writes_only(),
                         metrics: mirror.metrics.clone(),
+                        config: config.mirror.clone(),
                     })
                     .await;
             }

@@ -245,6 +245,17 @@ pub struct MirrorConfig {
     pub backend_user: String,
     pub backend_password: Option<String>,
     pub backend_database: Option<String>,
+    /// Source (primary) connection used by `POST /api/migration/snapshot` to
+    /// read existing data when bootstrapping the secondary. Defaults mirror
+    /// the listener-side backend; set explicitly for a snapshot.
+    #[serde(default = "default_localhost")]
+    pub source_host: String,
+    #[serde(default = "default_pg_port")]
+    pub source_port: u16,
+    #[serde(default = "default_pg_user")]
+    pub source_user: String,
+    pub source_password: Option<String>,
+    pub source_database: Option<String>,
 }
 
 impl Default for MirrorConfig {
@@ -259,6 +270,11 @@ impl Default for MirrorConfig {
             backend_user: default_pg_user(),
             backend_password: None,
             backend_database: None,
+            source_host: default_localhost(),
+            source_port: default_pg_port(),
+            source_user: default_pg_user(),
+            source_password: None,
+            source_database: None,
         }
     }
 }

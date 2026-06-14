@@ -111,6 +111,8 @@ pub struct MigrationInfo {
     pub target: String,
     pub writes_only: bool,
     pub metrics: Arc<crate::mirror::MirrorMetrics>,
+    /// Mirror config (source + target) for snapshot bootstrap.
+    pub config: crate::config::MirrorConfig,
 }
 
 /// Chaos override applied to a single node. Today only the
@@ -523,6 +525,32 @@ impl AdminServer {
                         Ok((200, serde_json::to_value(st)?))
                     }
                     None => Ok((503, serde_json::json!({ "error": "traffic mirroring not enabled" }))),
+                }
+            }
+
+            // Snapshot-bootstrap named tables from the source into the mirror.
+            ("POST", "/api/migration/snapshot") | ("POST", "/migration/snapshot") => {
+                let info = state.migration.read().await.clone();
+                let Some(info) = info else {
+                    return Ok((503, serde_json::json!({ "error": "traffic mirroring not enabled" })));
+                };
+                let body = body.unwrap_or("{}");
+                let req: serde_json::Value = serde_json::from_str(body)
+                    .map_err(|e| ProxyError::Internal(format!("invalid JSON: {}", e)))?;
+                let tables: Vec<String> = req
+                    .get("tables")
+                    .and_then(|t| t.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                if tables.is_empty() {
+                    return Ok((400, serde_json::json!({ "error": "provide a non-empty 'tables' array" })));
+                }
+                match crate::mirror::snapshot_tables(&info.config, &tables).await {
+                    Ok(rep) => {
+                        let total: u64 = rep.iter().map(|t| t.copied).sum();
+                        Ok((200, serde_json::json!({ "ok": true, "tables": rep, "rows_copied": total })))
+                    }
+                    Err(e) => Ok((500, serde_json::json!({ "ok": false, "error": e }))),
                 }
             }
 
