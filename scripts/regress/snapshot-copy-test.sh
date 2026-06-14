@@ -108,6 +108,18 @@ grep -qi "falling back" "$OUT/proxy.log" && bad "COPY: unexpectedly fell back to
 # 3. Forced-INSERT fallback path (kill-switch) — identical result.
 run_snapshot "INSERT" "HELIOS_SNAPSHOT_USE_COPY=0" ""
 
+# 4. Idempotency fence: target now has rows (from step 3); a re-snapshot must be
+#    REFUSED with no duplication (non-destructive default).
+"$BIN" --config "$OUT/proxy.toml" >"$OUT/proxy.log" 2>&1 & FP=$!
+for i in $(seq 1 30); do curl -s -o /dev/null "http://127.0.0.1:9099/health" && break; sleep 0.3; done
+before=$(tgt "SELECT count(*) FROM _snapcopy" | tr -d '[:space:]')
+resp=$(curl -s -X POST "http://127.0.0.1:9099/api/migration/snapshot" -d '{"tables":["_snapcopy"]}')
+after=$(tgt "SELECT count(*) FROM _snapcopy" | tr -d '[:space:]')
+echo "  [fence] before=$before resp=$resp after=$after"
+{ echo "$resp" | grep -qi "refusing snapshot" && echo "$resp" | grep -q '"ok":false'; } && ok "fence: re-snapshot of a non-empty target is refused" || bad "fence: not refused: $resp"
+{ [ "$before" = "$after" ] && [ "$after" = "$srccount" ]; } && ok "fence: target unchanged, no duplication (still $after)" || bad "fence: rows changed $before->$after"
+kill "$FP" 2>/dev/null; wait "$FP" 2>/dev/null
+
 # cleanup
 src "DROP TABLE IF EXISTS _snapcopy" >/dev/null 2>&1
 tgt "DROP TABLE IF EXISTS _snapcopy" >/dev/null 2>&1

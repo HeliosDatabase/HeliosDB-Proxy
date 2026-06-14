@@ -232,6 +232,30 @@ pub async fn snapshot_tables(cfg: &MirrorConfig, tables: &[String]) -> Result<Ve
     let mut src = BackendClient::connect(&src_cfg).await.map_err(|e| format!("source connect: {}", e))?;
     let mut tgt = BackendClient::connect(&tgt_cfg).await.map_err(|e| format!("target connect: {}", e))?;
 
+    // Idempotency fence (default, non-destructive): refuse the whole snapshot if
+    // ANY target table already has rows — silently appending would duplicate.
+    // Pre-flight all targets first so we never leave a partial load. A probe
+    // error (table absent, etc.) means "not populated" → eligible to load. We do
+    // NOT truncate; the operator points at an empty target or clears it first.
+    let mut blocked: Vec<String> = Vec::new();
+    for table in tables {
+        let qt = quote_ident(table);
+        if let Ok(res) = tgt.simple_query(&format!("SELECT 1 FROM {} LIMIT 1", qt)).await {
+            if !res.rows.is_empty() {
+                blocked.push(table.clone());
+            }
+        }
+    }
+    if !blocked.is_empty() {
+        src.close().await;
+        tgt.close().await;
+        return Err(format!(
+            "refusing snapshot: target table(s) already contain rows (snapshot would \
+             duplicate): {}. Snapshot into an empty target, or remove the rows first.",
+            blocked.join(", ")
+        ));
+    }
+
     let mut report = Vec::new();
     for table in tables {
         let qt = quote_ident(table);
