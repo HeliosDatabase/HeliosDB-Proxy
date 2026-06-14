@@ -206,6 +206,10 @@ pub struct ProxyConfig {
     /// MCP (Model Context Protocol) agent gateway. Disabled by default.
     #[serde(default)]
     pub mcp: McpConfig,
+    /// Per-agent SQL contracts (scoped grants). Referenced by id from the
+    /// MCP gateway (`[mcp] contract`). Empty by default.
+    #[serde(default)]
+    pub agent_contracts: Vec<crate::agent_contract::AgentContract>,
 }
 
 /// MCP agent-gateway configuration. When enabled, the proxy exposes a native
@@ -232,6 +236,10 @@ pub struct McpConfig {
     /// get a read-only database surface.
     #[serde(default = "default_true_bool")]
     pub read_only: bool,
+    /// Name of an `[[agent_contracts]]` entry to enforce on every tool call
+    /// (scoped grants + repair hints). None = only the `read_only` guardrail.
+    #[serde(default)]
+    pub contract: Option<String>,
 }
 
 impl Default for McpConfig {
@@ -245,6 +253,7 @@ impl Default for McpConfig {
             backend_password: None,
             backend_database: None,
             read_only: true,
+            contract: None,
         }
     }
 }
@@ -347,6 +356,7 @@ impl Default for ProxyConfig {
             hba: Vec::new(),
             auth: AuthConfig::default(),
             mcp: McpConfig::default(),
+            agent_contracts: Vec::new(),
         }
     }
 }

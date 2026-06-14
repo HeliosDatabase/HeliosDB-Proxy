@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
+use crate::agent_contract::{self, AgentContract};
 use crate::backend::{tls::default_client_config, BackendClient, BackendConfig, TlsMode};
 use crate::backend::client::QueryResult;
 use crate::backend::types::TextValue;
@@ -30,11 +31,12 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 /// The MCP gateway server.
 pub struct McpServer {
     config: McpConfig,
+    contract: Option<AgentContract>,
 }
 
 impl McpServer {
-    pub fn new(config: McpConfig) -> Self {
-        Self { config }
+    pub fn new(config: McpConfig, contract: Option<AgentContract>) -> Self {
+        Self { config, contract }
     }
 
     /// Bind and serve the MCP HTTP endpoint until the task is dropped.
@@ -43,8 +45,9 @@ impl McpServer {
             .await
             .map_err(|e| ProxyError::Network(format!("MCP bind {}: {}", self.config.listen_address, e)))?;
         tracing::info!(addr = %self.config.listen_address, read_only = self.config.read_only,
-            "MCP agent gateway listening");
+            contract = ?self.contract.as_ref().map(|c| &c.id), "MCP agent gateway listening");
         let cfg = Arc::new(self.config);
+        let contract = Arc::new(self.contract);
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(x) => x,
@@ -54,15 +57,20 @@ impl McpServer {
                 }
             };
             let cfg = cfg.clone();
+            let contract = contract.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_connection(stream, cfg).await {
+                if let Err(e) = Self::handle_connection(stream, cfg, contract).await {
                     tracing::debug!(%peer, "MCP connection error: {}", e);
                 }
             });
         }
     }
 
-    async fn handle_connection(mut stream: tokio::net::TcpStream, cfg: Arc<McpConfig>) -> Result<()> {
+    async fn handle_connection(
+        mut stream: tokio::net::TcpStream,
+        cfg: Arc<McpConfig>,
+        contract: Arc<Option<AgentContract>>,
+    ) -> Result<()> {
         let (reader, mut writer) = stream.split();
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
@@ -98,7 +106,7 @@ impl McpServer {
             String::new()
         };
 
-        let response = Self::dispatch(&body, &cfg).await;
+        let response = Self::dispatch(&body, &cfg, (*contract).as_ref()).await;
         match response {
             Some(v) => {
                 let payload = serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string());
@@ -110,7 +118,7 @@ impl McpServer {
     }
 
     /// Dispatch one JSON-RPC request. Returns `None` for notifications.
-    async fn dispatch(body: &str, cfg: &McpConfig) -> Option<Value> {
+    async fn dispatch(body: &str, cfg: &McpConfig, contract: Option<&AgentContract>) -> Option<Value> {
         let req: Value = match serde_json::from_str(body) {
             Ok(v) => v,
             Err(e) => return Some(rpc_error(Value::Null, -32700, &format!("parse error: {}", e))),
@@ -132,7 +140,7 @@ impl McpServer {
             "notifications/initialized" | "notifications/cancelled" => None,
             "ping" => Some(rpc_ok(id, json!({}))),
             "tools/list" => Some(rpc_ok(id, json!({ "tools": Self::tool_defs(cfg) }))),
-            "tools/call" => Some(Self::handle_tool_call(id, &params, cfg).await),
+            "tools/call" => Some(Self::handle_tool_call(id, &params, cfg, contract).await),
             other => Some(rpc_error(id, -32601, &format!("method not found: {}", other))),
         }
     }
@@ -170,7 +178,12 @@ impl McpServer {
         ])
     }
 
-    async fn handle_tool_call(id: Value, params: &Value, cfg: &McpConfig) -> Value {
+    async fn handle_tool_call(
+        id: Value,
+        params: &Value,
+        cfg: &McpConfig,
+        contract: Option<&AgentContract>,
+    ) -> Value {
         let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
@@ -179,10 +192,11 @@ impl McpServer {
                 let sql = args.get("sql").and_then(|s| s.as_str()).unwrap_or("").trim();
                 if sql.is_empty() {
                     Err("missing 'sql'".to_string())
-                } else if cfg.read_only && is_write_sql(sql) {
-                    Err("write/DDL refused: the MCP gateway is read-only".to_string())
                 } else {
-                    Self::run_sql(cfg, sql).await.map(|r| format_result(&r))
+                    match Self::check_policy(cfg, contract, sql) {
+                        Err(hint) => Err(hint),
+                        Ok(()) => Self::run_sql(cfg, sql).await.map(|r| format_result(&r)),
+                    }
                 }
             }
             "list_tables" => {
@@ -196,9 +210,12 @@ impl McpServer {
                 if sql.is_empty() {
                     Err("missing 'sql'".to_string())
                 } else {
-                    Self::run_sql(cfg, &format!("EXPLAIN {}", sql))
-                        .await
-                        .map(|r| format_result(&r))
+                    match Self::check_policy(cfg, contract, sql) {
+                        Err(hint) => Err(hint),
+                        Ok(()) => Self::run_sql(cfg, &format!("EXPLAIN {}", sql))
+                            .await
+                            .map(|r| format_result(&r)),
+                    }
                 }
             }
             other => Err(format!("unknown tool: {}", other)),
@@ -221,6 +238,23 @@ impl McpServer {
                     json!({ "content": [{ "type": "text", "text": e }], "isError": true }),
                 )
             }
+        }
+    }
+
+    /// Gate a SQL statement: when an agent contract is configured, validate
+    /// against it and return a structured JSON repair hint on violation;
+    /// otherwise apply the plain read-only guardrail.
+    fn check_policy(
+        cfg: &McpConfig,
+        contract: Option<&AgentContract>,
+        sql: &str,
+    ) -> std::result::Result<(), String> {
+        if let Some(c) = contract {
+            agent_contract::validate(sql, c).map_err(|v| v.to_json())
+        } else if cfg.read_only && is_write_sql(sql) {
+            Err("write/DDL refused: the MCP gateway is read-only".to_string())
+        } else {
+            Ok(())
         }
     }
 
@@ -339,6 +373,7 @@ mod tests {
         let init = McpServer::dispatch(
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
             &cfg,
+            None,
         )
         .await
         .unwrap();
@@ -348,6 +383,7 @@ mod tests {
         let tools = McpServer::dispatch(
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
             &cfg,
+            None,
         )
         .await
         .unwrap();
@@ -368,6 +404,7 @@ mod tests {
         let r = McpServer::dispatch(
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
             &cfg,
+            None,
         )
         .await;
         assert!(r.is_none());
@@ -379,6 +416,7 @@ mod tests {
         let r = McpServer::dispatch(
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query","arguments":{"sql":"DELETE FROM t"}}}"#,
             &cfg,
+            None,
         )
         .await
         .unwrap();

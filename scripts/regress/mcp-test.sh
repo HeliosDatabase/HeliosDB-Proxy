@@ -35,6 +35,14 @@ backend_user = "$BUSER"
 backend_password = "$BPASS"
 backend_database = "$BDB"
 read_only = true
+contract = "analyst"
+[[agent_contracts]]
+id = "analyst"
+read_only = true
+denied_tables = ["secrets"]
+require_limit = true
+max_rows = 1000
+require_predicate_on = [{ table = "orders", column = "tenant_id" }]
 [pool]
 min_connections = 2
 max_connections = 50
@@ -79,9 +87,23 @@ tl=$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}')
 echo "$tl" | grep -q '"query"' && echo "$tl" | grep -q '"list_tables"' && echo "$tl" | grep -q '"explain"' \
   && ok "tools/list: query + list_tables + explain" || bad "tools/list: $tl"
 
-# 3. tools/call query SELECT
-q=$(rpc '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 42 AS answer"}}}')
+# 3. tools/call query SELECT (compliant: bounded by LIMIT)
+q=$(rpc '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 42 AS answer LIMIT 1"}}}')
 echo "$q" | grep -q '42' && echo "$q" | grep -q '"isError":false' && ok "tools/call query: returned 42" || bad "tools/call query: $q"
+
+# 3b. contract: missing LIMIT -> structured repair hint with suggested_rewrite
+ml=$(rpc '{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1 AS x"}}}')
+echo "$ml" | grep -q '"isError":true' && echo "$ml" | grep -q 'missing_limit' && echo "$ml" | grep -q 'suggested_rewrite' \
+  && ok "contract missing_limit: structured repair hint returned" || bad "contract missing_limit: $ml"
+
+# 3c. contract: denied table -> structured violation
+dt=$(rpc '{"jsonrpc":"2.0","id":32,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT * FROM secrets LIMIT 1"}}}')
+echo "$dt" | grep -q '"isError":true' && echo "$dt" | grep -q 'table_forbidden' && ok "contract table_forbidden: secrets blocked" || bad "contract table_forbidden: $dt"
+
+# 3d. contract: missing required predicate -> repair hint suggests tenant_id filter
+mp=$(rpc '{"jsonrpc":"2.0","id":33,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT * FROM orders LIMIT 5"}}}')
+echo "$mp" | grep -q '"isError":true' && echo "$mp" | grep -q 'missing_predicate' && echo "$mp" | grep -q 'tenant_id' \
+  && ok "contract missing_predicate: repair hint suggests tenant_id" || bad "contract missing_predicate: $mp"
 
 # 4. tools/call list_tables
 lt=$(rpc '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_tables","arguments":{}}}')

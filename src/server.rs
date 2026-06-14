@@ -556,8 +556,16 @@ impl ProxyServer {
         // Start the MCP agent gateway when enabled.
         let mcp_task = if self.config.mcp.enabled {
             let mcp_cfg = self.config.mcp.clone();
+            // Resolve the configured agent contract (scoped grants) by id.
+            let contract = mcp_cfg.contract.as_ref().and_then(|id| {
+                let found = self.config.agent_contracts.iter().find(|c| &c.id == id).cloned();
+                if found.is_none() {
+                    tracing::warn!(%id, "mcp.contract names an unknown agent_contract; gateway runs with only the read-only guardrail");
+                }
+                found
+            });
             Some(tokio::spawn(async move {
-                if let Err(e) = crate::mcp::McpServer::new(mcp_cfg).run().await {
+                if let Err(e) = crate::mcp::McpServer::new(mcp_cfg, contract).run().await {
                     tracing::error!("MCP gateway error: {}", e);
                 }
             }))
