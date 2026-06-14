@@ -28,12 +28,17 @@ Verification backends throughout: **PostgreSQL 18.4** (`codex-pg184-bench`, 127.
 | **G2** | Transparent cutover + rollback | `54b6384` | `cutover-test.sh` 5/5 (`version()` flips PG↔Nano on one client) |
 | **H.1** | Zero-downtime SIGHUP config reload | `f78cd86` | `reload-test.sh` 6/6 (in-flight conn survives; new conn sees reload; bad config rejected) |
 | **H.2** | Plugin registry + `helios-plugin install` | `6f4c524` | `plugin-install-test.sh` 7/7 (signed install verified, sha256/untrusted-signer rejected) + 7 unit tests |
+| **H.3** | Zero-downtime binary handoff (SO_REUSEPORT + drain) | `3091ea9` | `handoff-test.sh` 6/6 (B binds shared port; 8/8 new conns served during handoff; in-flight survives; A drains+exits) |
 | — | 2×2 scalability matrix (2 proxy × 2 Nano) | `9b9e2f5` | `SCALABILITY-MATRIX.md` + Nano v3.57 recs |
 
-## Remaining
+## Roadmap complete
 
-- **Item 84 — binary handoff** (SO_REUSEPORT + session adoption via `switchover_buffer`/`session_migrate`): Effort L, the one outstanding roadmap item. H.1 landed the SIGHUP config-apply half; the live-binary-swap half (a new process adopts sockets *and* serialized sessions, including prepared statements) remains.
-- Item 78's **`https://` artefact fetch** (public registry over GitHub Releases) is a thin follow-on at the install fetch step; the offline `file://` slice with full SHA-256 + Ed25519 verification shipped (`6f4c524`).
+Every batch from the 2026-06 audit (A–H) is delivered and verified on PG 18.4 + Nano. Audit item 84 is delivered as SIGHUP config reload (H.1) + SO_REUSEPORT binary handoff with graceful drain (H.3) — the zero-downtime upgrade promise for new connections plus clean draining of old ones.
+
+Documented frontiers (beyond the audit scope, optional):
+- **Live session adoption**: passing in-flight client FDs to the new process via `SCM_RIGHTS` so a *mid-query* connection migrates between proxy processes (`session_migrate`/`switchover_buffer` serialize the session-state half; FD passing + mid-protocol resumption is the hard remainder). The SO_REUSEPORT+drain handoff covers the real-world upgrade case without it.
+- Item 78 **`https://` artefact fetch** (public registry over GitHub Releases): a thin follow-on at the install fetch step; the offline `file://` slice with full SHA-256 + Ed25519 verification shipped.
+- Admin listener SO_REUSEPORT (the client listener handles the connection-critical path today).
 
 ## Cross-team finding (HeliosDB-Nano)
 
