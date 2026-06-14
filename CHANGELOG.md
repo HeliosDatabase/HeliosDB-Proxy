@@ -5,6 +5,25 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-06-14
+
+Docs/branding patch. No code or behavior changes.
+
+### Changed
+
+- Rebrand the project org from `Dimensigon` to `HeliosDatabase` across the
+  README, embedded operator skills, demos, operator/Terraform guides, and the
+  LICENSE copyright line. Registry/k8s/npm references use lowercase
+  `heliosdatabase` where required (`ghcr.io` image refs, the k8s API group, the
+  npm scope, `*.github.io` / `charts.*` hosts, the Terraform provider source);
+  `github.com` URLs keep the `HeliosDatabase` display case.
+
+### Added
+
+- `AGENTS.md` — contributor guide (build/test commands, style, testing, and
+  commit conventions).
+- A README "Ecosystem" section linking the HeliosDatabase repositories.
+
 ## [0.5.0] - 2026-06-14
 
 Minor release: the 2026-06 deep-audit batches (A–H + G2). Table-stakes
