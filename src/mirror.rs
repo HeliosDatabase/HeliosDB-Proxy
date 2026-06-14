@@ -19,7 +19,8 @@ use std::time::Duration;
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use crate::backend::{tls::default_client_config, BackendClient, BackendConfig, TlsMode};
+use crate::backend::types::TextValue;
+use crate::backend::{tls::default_client_config, BackendClient, BackendConfig, ParamValue, TlsMode};
 use crate::config::MirrorConfig;
 
 /// Counters surfaced for observability.
@@ -135,6 +136,110 @@ pub fn spawn(config: MirrorConfig) -> MirrorHandle {
     };
     tokio::spawn(worker(config, rx, metrics));
     handle
+}
+
+/// Per-table snapshot result.
+#[derive(Debug, Clone, Serialize)]
+pub struct TableSnapshot {
+    pub table: String,
+    pub source_rows: u64,
+    pub copied: u64,
+}
+
+fn backend_cfg(host: &str, port: u16, user: &str, pass: Option<&str>, db: Option<&str>, app: &str) -> BackendConfig {
+    BackendConfig {
+        host: host.to_string(),
+        port,
+        user: user.to_string(),
+        password: pass.map(|s| s.to_string()),
+        database: db.map(|s| s.to_string()),
+        application_name: Some(app.to_string()),
+        tls_mode: TlsMode::Disable,
+        connect_timeout: Duration::from_secs(5),
+        query_timeout: Duration::from_secs(60),
+        tls_config: default_client_config(),
+    }
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Map a PostgreSQL type OID to a portable column type for the snapshot's
+/// `CREATE TABLE` on the secondary. Unknown OIDs fall back to `text`.
+fn oid_type(oid: u32) -> &'static str {
+    match oid {
+        16 => "boolean",
+        20 => "bigint",
+        21 | 23 => "integer",
+        700 => "real",
+        701 => "double precision",
+        1700 => "numeric",
+        1082 => "date",
+        1114 | 1184 => "timestamp",
+        2950 => "uuid",
+        114 | 3802 => "jsonb",
+        _ => "text",
+    }
+}
+
+/// Snapshot-bootstrap the secondary: for each table, read all existing rows
+/// from the source (primary) and copy them into the mirror target, creating
+/// the table there if needed. Returns a per-table report. Used by
+/// `POST /api/migration/snapshot` to seed a migration with existing data
+/// before/alongside the continuous write tail.
+pub async fn snapshot_tables(cfg: &MirrorConfig, tables: &[String]) -> Result<Vec<TableSnapshot>, String> {
+    let src_cfg = backend_cfg(
+        &cfg.source_host, cfg.source_port, &cfg.source_user,
+        cfg.source_password.as_deref(), cfg.source_database.as_deref(), "heliosproxy-snapshot-src",
+    );
+    let tgt_cfg = backend_cfg(
+        &cfg.backend_host, cfg.backend_port, &cfg.backend_user,
+        cfg.backend_password.as_deref(), cfg.backend_database.as_deref(), "heliosproxy-snapshot-tgt",
+    );
+    let mut src = BackendClient::connect(&src_cfg).await.map_err(|e| format!("source connect: {}", e))?;
+    let mut tgt = BackendClient::connect(&tgt_cfg).await.map_err(|e| format!("target connect: {}", e))?;
+
+    let mut report = Vec::new();
+    for table in tables {
+        let qt = quote_ident(table);
+        let res = src
+            .simple_query(&format!("SELECT * FROM {}", qt))
+            .await
+            .map_err(|e| format!("read {}: {}", table, e))?;
+
+        // CREATE TABLE IF NOT EXISTS on the target from the source columns.
+        let cols_ddl: Vec<String> = res
+            .columns
+            .iter()
+            .map(|c| format!("{} {}", quote_ident(&c.name), oid_type(c.type_oid)))
+            .collect();
+        let create = format!("CREATE TABLE IF NOT EXISTS {} ({})", qt, cols_ddl.join(", "));
+        tgt.execute(&create).await.map_err(|e| format!("create {} on target: {}", table, e))?;
+
+        let col_list = res.columns.iter().map(|c| quote_ident(&c.name)).collect::<Vec<_>>().join(", ");
+        let placeholders = (1..=res.columns.len()).map(|i| format!("${}", i)).collect::<Vec<_>>().join(", ");
+        let insert = format!("INSERT INTO {} ({}) VALUES ({})", qt, col_list, placeholders);
+
+        let mut copied = 0u64;
+        for row in &res.rows {
+            let params: Vec<ParamValue> = row
+                .iter()
+                .map(|v| match v {
+                    TextValue::Null => ParamValue::Null,
+                    TextValue::Text(s) => ParamValue::Text(s.clone()),
+                })
+                .collect();
+            tgt.query_with_params(&insert, &params)
+                .await
+                .map_err(|e| format!("insert into {}: {}", table, e))?;
+            copied += 1;
+        }
+        report.push(TableSnapshot { table: table.clone(), source_rows: res.rows.len() as u64, copied });
+    }
+    src.close().await;
+    tgt.close().await;
+    Ok(report)
 }
 
 async fn worker(config: MirrorConfig, mut rx: mpsc::Receiver<String>, metrics: Arc<MirrorMetrics>) {
