@@ -102,6 +102,9 @@ pub struct AdminState {
     /// Traffic-mirror / migration info for `/api/migration/status`. `Some`
     /// when `[mirror] enabled`.
     pub migration: RwLock<Option<MigrationInfo>>,
+    /// Branch-database config for `/api/branch`. `Some` when `[branch]
+    /// enabled`.
+    pub branch: RwLock<Option<crate::config::BranchConfig>>,
 }
 
 /// What the admin API needs to report migration status, without owning the
@@ -587,6 +590,50 @@ impl AdminServer {
                         let total: u64 = rep.iter().map(|t| t.copied).sum();
                         Ok((200, serde_json::json!({ "ok": true, "tables": rep, "rows_copied": total })))
                     }
+                    Err(e) => Ok((500, serde_json::json!({ "ok": false, "error": e }))),
+                }
+            }
+
+            // Branch databases: list / create / drop.
+            ("GET", p) if p == "/api/branch" || p == "/branch" || p.starts_with("/api/branch?") => {
+                let cfg = state.branch.read().await.clone();
+                let Some(cfg) = cfg else {
+                    return Ok((503, serde_json::json!({ "error": "branch databases not enabled" })));
+                };
+                match crate::branch::list(&cfg).await {
+                    Ok(branches) => Ok((200, serde_json::json!({ "branches": branches }))),
+                    Err(e) => Ok((500, serde_json::json!({ "error": e }))),
+                }
+            }
+            ("POST", p) if p == "/api/branch" || p == "/branch" => {
+                let cfg = state.branch.read().await.clone();
+                let Some(cfg) = cfg else {
+                    return Ok((503, serde_json::json!({ "error": "branch databases not enabled" })));
+                };
+                let req: serde_json::Value =
+                    serde_json::from_str(body.unwrap_or("{}")).map_err(|e| ProxyError::Internal(format!("invalid JSON: {}", e)))?;
+                let name = req.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if name.is_empty() {
+                    return Ok((400, serde_json::json!({ "error": "provide 'name'" })));
+                }
+                let base = req.get("base").and_then(|v| v.as_str());
+                match crate::branch::create(&cfg, name, base).await {
+                    Ok(()) => Ok((200, serde_json::json!({ "ok": true, "branch": name,
+                        "base": base.unwrap_or(&cfg.base_database) }))),
+                    Err(e) => Ok((500, serde_json::json!({ "ok": false, "error": e }))),
+                }
+            }
+            ("DELETE", p) if p.starts_with("/api/branch") || p.starts_with("/branch") => {
+                let cfg = state.branch.read().await.clone();
+                let Some(cfg) = cfg else {
+                    return Ok((503, serde_json::json!({ "error": "branch databases not enabled" })));
+                };
+                let name = p.find("name=").map(|i| &p[i + 5..]).unwrap_or("");
+                if name.is_empty() {
+                    return Ok((400, serde_json::json!({ "error": "provide ?name=<branch>" })));
+                }
+                match crate::branch::drop(&cfg, name).await {
+                    Ok(()) => Ok((200, serde_json::json!({ "ok": true, "dropped": name }))),
                     Err(e) => Ok((500, serde_json::json!({ "ok": false, "error": e }))),
                 }
             }
@@ -1498,6 +1545,7 @@ impl AdminState {
             edge_registry: RwLock::new(None),
             auth_token: RwLock::new(None),
             migration: RwLock::new(None),
+            branch: RwLock::new(None),
         }
     }
 
@@ -1509,6 +1557,11 @@ impl AdminState {
     /// Attach traffic-mirror info so `/api/migration/status` can report it.
     pub async fn with_migration(&self, info: MigrationInfo) {
         *self.migration.write().await = Some(info);
+    }
+
+    /// Attach branch-database config so `/api/branch` can provision.
+    pub async fn with_branch(&self, cfg: crate::config::BranchConfig) {
+        *self.branch.write().await = Some(cfg);
     }
 
     /// Attach an anomaly detector. Mirror of with_replay_engine /

@@ -65,6 +65,7 @@ pub mod agent_contract;
 pub mod mcp;
 pub mod http_gateway;
 pub mod mirror;
+pub mod branch;
 pub mod config;
 pub mod server;
 pub mod protocol;

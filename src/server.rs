@@ -687,6 +687,11 @@ impl ProxyServer {
             // Require a Bearer token on admin requests when configured.
             admin_state.with_auth_token(config.admin_token.clone()).await;
 
+            // Branch-database provisioning surface.
+            if config.branch.enabled {
+                admin_state.with_branch(config.branch.clone()).await;
+            }
+
             // Surface traffic-mirror / migration status when mirroring is on.
             if let Some(ref mirror) = state.mirror {
                 admin_state
