@@ -203,6 +203,66 @@ pub struct ProxyConfig {
     /// relays the client's auth to the backend, current behaviour).
     #[serde(default)]
     pub auth: AuthConfig,
+    /// MCP (Model Context Protocol) agent gateway. Disabled by default.
+    #[serde(default)]
+    pub mcp: McpConfig,
+}
+
+/// MCP agent-gateway configuration. When enabled, the proxy exposes a native
+/// MCP server so AI agents call `query`/`list_tables`/`explain` tools instead
+/// of opening raw SQL connections — each call gated by the gateway's policy
+/// (read-only by default) and logged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// HTTP listen address for the MCP JSON-RPC endpoint.
+    #[serde(default = "default_mcp_listen")]
+    pub listen_address: String,
+    /// Backend the gateway runs tool SQL against.
+    #[serde(default = "default_localhost")]
+    pub backend_host: String,
+    #[serde(default = "default_pg_port")]
+    pub backend_port: u16,
+    #[serde(default = "default_pg_user")]
+    pub backend_user: String,
+    pub backend_password: Option<String>,
+    pub backend_database: Option<String>,
+    /// When true (default), the gateway refuses write/DDL statements — agents
+    /// get a read-only database surface.
+    #[serde(default = "default_true_bool")]
+    pub read_only: bool,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_address: default_mcp_listen(),
+            backend_host: default_localhost(),
+            backend_port: default_pg_port(),
+            backend_user: default_pg_user(),
+            backend_password: None,
+            backend_database: None,
+            read_only: true,
+        }
+    }
+}
+
+fn default_mcp_listen() -> String {
+    "127.0.0.1:9092".to_string()
+}
+fn default_localhost() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_pg_port() -> u16 {
+    5432
+}
+fn default_pg_user() -> String {
+    "postgres".to_string()
+}
+fn default_true_bool() -> bool {
+    true
 }
 
 /// Client-side authentication configuration.
@@ -286,6 +346,7 @@ impl Default for ProxyConfig {
             plugins: PluginToml::default(),
             hba: Vec::new(),
             auth: AuthConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 }

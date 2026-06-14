@@ -97,6 +97,7 @@ impl MessageType {
             b'f' => MessageType::CopyFail,
             b'F' => MessageType::FunctionCall,
             b'p' => MessageType::Password,
+            b'R' => MessageType::AuthRequest,
             b'K' => MessageType::BackendKeyData,
             // Note: server-side D/E/C/S tags (DataRow, ErrorResponse,
             // CommandComplete, ParameterStatus) collide with client-side
@@ -135,6 +136,7 @@ impl MessageType {
             MessageType::CopyFail => Some(b'f'),
             MessageType::FunctionCall => Some(b'F'),
             MessageType::Password => Some(b'p'),
+            MessageType::AuthRequest => Some(b'R'),
             MessageType::BackendKeyData => Some(b'K'),
             MessageType::ParameterStatus => Some(b'S'),
             MessageType::ReadyForQuery => Some(b'Z'),
@@ -752,6 +754,14 @@ mod tests {
                 assert_eq!(decoded, msg_type);
             }
         }
+    }
+
+    #[test]
+    fn test_auth_request_tag_mapping() {
+        // Regression: 'R' (AuthenticationRequest) must decode to AuthRequest,
+        // not Unknown(82) — the backend client matches on this to authenticate.
+        assert_eq!(MessageType::from_tag(b'R'), MessageType::AuthRequest);
+        assert_eq!(MessageType::AuthRequest.to_tag(), Some(b'R'));
     }
 
     #[test]
