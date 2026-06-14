@@ -193,6 +193,35 @@ pub struct ProxyConfig {
     /// (current behaviour preserved).
     #[serde(default)]
     pub hba: Vec<HbaRule>,
+    /// Client authentication mode. Absent/default = pass-through (the proxy
+    /// relays the client's auth to the backend, current behaviour).
+    #[serde(default)]
+    pub auth: AuthConfig,
+}
+
+/// Client-side authentication configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AuthConfig {
+    /// `passthrough` (default) relays client auth to the backend.
+    /// `scram` makes the proxy terminate SCRAM-SHA-256 itself against
+    /// `auth_file`, becoming the auth boundary (foundation for pooling).
+    #[serde(default)]
+    pub mode: AuthMode,
+    /// Path to a pgbouncer-style user list (`user:secret`, secret = plaintext
+    /// or a `SCRAM-SHA-256$...` verifier). Required when `mode = "scram"`.
+    #[serde(default)]
+    pub auth_file: Option<String>,
+}
+
+/// Proxy client-authentication mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    /// Relay the client's auth exchange straight to the backend.
+    #[default]
+    Passthrough,
+    /// Terminate SCRAM-SHA-256 at the proxy against `auth_file`.
+    Scram,
 }
 
 /// A single pg_hba-style admission rule. The first rule whose `user`,
@@ -249,6 +278,7 @@ impl Default for ProxyConfig {
             write_timeout_secs: default_write_timeout_secs(),
             plugins: PluginToml::default(),
             hba: Vec::new(),
+            auth: AuthConfig::default(),
         }
     }
 }

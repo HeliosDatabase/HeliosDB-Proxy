@@ -157,6 +157,10 @@ struct ServerState {
     /// Client-facing TLS acceptor, built from `[tls]` config when enabled.
     /// `None` => the proxy rejects SSLRequests with `N` (plaintext only).
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    /// Proxy-terminated SCRAM auth state. `Some` when `[auth] mode = "scram"`:
+    /// the proxy authenticates clients itself against this user list instead
+    /// of relaying their credentials to the backend.
+    auth_file: Option<Arc<crate::auth_scram::AuthFile>>,
     /// Load balancer state
     lb_state: LoadBalancerState,
     /// Pool manager for Session/Transaction/Statement modes
@@ -480,12 +484,27 @@ impl ProxyServer {
             _ => None,
         };
 
+        // Load the SCRAM auth_file when proxy-terminated auth is requested.
+        // Misconfiguration is fatal at startup (fail fast).
+        let auth_file = if config.auth.mode == crate::config::AuthMode::Scram {
+            let path = config.auth.auth_file.as_ref().ok_or_else(|| {
+                ProxyError::Config("auth mode 'scram' requires auth_file".to_string())
+            })?;
+            let af = crate::auth_scram::AuthFile::load(path)
+                .map_err(|e| ProxyError::Config(format!("auth_file: {}", e)))?;
+            tracing::info!(users = %(!af.is_empty()), "proxy SCRAM auth enabled");
+            Some(Arc::new(af))
+        } else {
+            None
+        };
+
         let state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
             health: ArcSwap::from_pointee(health),
             metrics: ServerMetrics::default(),
             cancel_map: Arc::new(DashMap::new()),
             tls_acceptor,
+            auth_file,
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
             },
@@ -1155,6 +1174,122 @@ impl ProxyServer {
         }
     }
 
+    /// Run a proxy-terminated SCRAM-SHA-256 server exchange against the
+    /// client, validating its password with the configured `auth_file`. On
+    /// success the client is authenticated by the proxy (no AuthenticationOk
+    /// is sent here — the backend's is forwarded later). On any failure
+    /// returns Err; the caller emits an ErrorResponse and closes.
+    async fn proxy_scram_auth(
+        client: &mut ClientStream,
+        user: &str,
+        state: &Arc<ServerState>,
+    ) -> std::result::Result<(), String> {
+        use crate::auth_scram::ScramServer;
+        let auth_file = state.auth_file.as_ref().ok_or("scram not configured")?;
+
+        // 1. AuthenticationSASL: advertise SCRAM-SHA-256.
+        let mut sasl = BytesMut::new();
+        sasl.put_i32(10); // SASL
+        sasl.extend_from_slice(b"SCRAM-SHA-256\0");
+        sasl.put_u8(0); // end of mechanism list
+        Self::write_auth_frame(client, &sasl).await?;
+
+        // 2. Read SASLInitialResponse ('p'): mechanism cstring + i32 len + data.
+        let init = Self::read_password_message(client).await?;
+        let mech_end = init
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or("malformed SASLInitialResponse (no mechanism)")?;
+        if init.len() < mech_end + 5 {
+            return Err("short SASLInitialResponse".into());
+        }
+        let client_first = std::str::from_utf8(&init[mech_end + 5..])
+            .map_err(|_| "client-first not UTF-8")?;
+
+        // 3. Look up the verifier (unknown user -> generic failure).
+        let verifier = auth_file
+            .get(user)
+            .ok_or("no such user")?
+            .clone();
+
+        // 4. server-first.
+        let server_nonce = Self::random_nonce();
+        let (server, server_first) = ScramServer::start(verifier, client_first, &server_nonce)?;
+
+        // 5. AuthenticationSASLContinue.
+        let mut cont = BytesMut::new();
+        cont.put_i32(11);
+        cont.extend_from_slice(server_first.as_bytes());
+        Self::write_auth_frame(client, &cont).await?;
+
+        // 6. Read SASLResponse ('p'): payload = client-final.
+        let client_final_raw = Self::read_password_message(client).await?;
+        let client_final = std::str::from_utf8(&client_final_raw)
+            .map_err(|_| "client-final not UTF-8")?;
+
+        // 7. Verify -> server-final.
+        let server_final = server.finish(client_final)?;
+
+        // 8. AuthenticationSASLFinal (no AuthenticationOk — backend's follows).
+        let mut fin = BytesMut::new();
+        fin.put_i32(12);
+        fin.extend_from_slice(server_final.as_bytes());
+        Self::write_auth_frame(client, &fin).await?;
+        Ok(())
+    }
+
+    /// Write an AuthenticationRequest ('R') frame with the given payload.
+    async fn write_auth_frame(
+        client: &mut ClientStream,
+        payload: &[u8],
+    ) -> std::result::Result<(), String> {
+        let mut frame = BytesMut::with_capacity(payload.len() + 5);
+        frame.put_u8(b'R');
+        frame.put_u32((payload.len() + 4) as u32);
+        frame.extend_from_slice(payload);
+        client
+            .write_all(&frame)
+            .await
+            .map_err(|e| format!("client write: {}", e))
+    }
+
+    /// Read one Password/SASL ('p') message from the client, returning its
+    /// payload. Errors on EOF or any non-'p' frame.
+    async fn read_password_message(
+        client: &mut ClientStream,
+    ) -> std::result::Result<BytesMut, String> {
+        let codec = ProtocolCodec::new();
+        let mut buffer = BytesMut::with_capacity(1024);
+        let mut read_buf = vec![0u8; 1024];
+        loop {
+            if let Some(msg) = codec
+                .decode_message(&mut buffer)
+                .map_err(|e| format!("decode: {}", e))?
+            {
+                if msg.msg_type == MessageType::Password {
+                    return Ok(msg.payload);
+                }
+                return Err(format!("expected SASL response, got {:?}", msg.msg_type));
+            }
+            let n = client
+                .read(&mut read_buf)
+                .await
+                .map_err(|e| format!("client read: {}", e))?;
+            if n == 0 {
+                return Err("client closed during SASL".into());
+            }
+            buffer.extend_from_slice(&read_buf[..n]);
+        }
+    }
+
+    /// A fresh random SCRAM server nonce (printable, no comma).
+    fn random_nonce() -> String {
+        use rand::Rng;
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut rng = rand::thread_rng();
+        (0..24).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect()
+    }
+
     /// Connect to backend and handle authentication
     async fn connect_and_authenticate(
         client_stream: &mut ClientStream,
@@ -1175,6 +1310,21 @@ impl ProxyServer {
             );
             let _ = client_stream.write_all(&err).await;
             return Ok((None, String::new()));
+        }
+
+        // Proxy-terminated SCRAM-SHA-256: when an auth_file is configured the
+        // proxy authenticates the client itself (becoming the auth boundary)
+        // instead of relaying credentials to the backend. On success it falls
+        // through to the normal backend connect, whose AuthenticationOk +
+        // session messages are forwarded to the already-authenticated client.
+        if state.auth_file.is_some() {
+            if let Err(e) = Self::proxy_scram_auth(client_stream, user, state).await {
+                tracing::info!(%user, error = %e, "proxy SCRAM auth failed");
+                let err = Self::create_error_response("28P01", &format!("authentication failed: {}", e));
+                let _ = client_stream.write_all(&err).await;
+                return Ok((None, String::new()));
+            }
+            tracing::debug!(%user, "client authenticated by proxy SCRAM");
         }
 
         // Plugin Authenticate hook — may deny the connection outright or
@@ -2976,6 +3126,7 @@ mod tests {
             metrics: ServerMetrics::default(),
             cancel_map: Arc::new(DashMap::new()),
             tls_acceptor: None,
+            auth_file: None,
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
             },

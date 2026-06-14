@@ -221,13 +221,13 @@ impl Scram {
 
 // ---- crypto primitives --------------------------------------------------
 
-fn sha256(data: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(data);
     h.finalize().into()
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac =
         HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
@@ -237,7 +237,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     out
 }
 
-fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iters: u32) -> [u8; 32] {
+pub(crate) fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iters: u32) -> [u8; 32] {
     // Single-block PBKDF2 (dkLen == hLen == 32) — exactly what SCRAM
     // requires.
     let mut mac = HmacSha256::new_from_slice(password)
