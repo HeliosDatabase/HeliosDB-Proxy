@@ -332,11 +332,17 @@ pub struct StatementLog {
 struct BackendConn {
     stream: TcpStream,
     prepared: HashSet<String>,
+    /// Signature (query text + parameter-type OIDs) of the *unnamed* prepared
+    /// statement currently established on this socket, if any. When the client
+    /// re-sends an identical unnamed `Parse`, the proxy can skip forwarding it
+    /// (the backend's unnamed statement already holds that SQL) and synthesize
+    /// the `ParseComplete` locally — the unnamed-Parse promotion (Batch H).
+    unnamed_sig: Option<bytes::Bytes>,
 }
 
 impl BackendConn {
     fn new(stream: TcpStream) -> Self {
-        Self { stream, prepared: HashSet::new() }
+        Self { stream, prepared: HashSet::new(), unnamed_sig: None }
     }
 }
 
@@ -1211,6 +1217,13 @@ impl ProxyServer {
         let mut batch_defines: Vec<String> = Vec::new();
         let mut batch_refs: Vec<String> = Vec::new();
         let mut batch_closes: Vec<String> = Vec::new();
+        // Unnamed-`Parse` promotion (Batch H). `held_unnamed` parks an unnamed
+        // Parse that is the FIRST message of a batch (so the batch stays the
+        // clean Parse→Bind→…→Sync shape) — it is NOT appended to `pending`; the
+        // decision to forward or skip it is taken at the batch boundary once the
+        // target connection is known. Holds (full Parse message, signature).
+        let promote_unnamed = config.optimize_unnamed_parse;
+        let mut held_unnamed: Option<(bytes::Bytes, bytes::Bytes)> = None;
         loop {
             // Read from client
             let n = stream
@@ -1304,13 +1317,18 @@ impl ProxyServer {
                     | MessageType::Describe
                     | MessageType::Execute
                     | MessageType::Close => {
+                        // Whether this message is appended to `pending`. An
+                        // unnamed Parse held aside for promotion is the lone
+                        // exception (resolved at the batch boundary).
+                        let mut add_to_pending = true;
                         match msg.msg_type {
                             MessageType::Parse => {
                                 // Register named statements so they can be
                                 // re-prepared on a different backend later, and
                                 // borrow the query (2nd cstring) for routing.
                                 let name = Self::parse_stmt_name(&msg.payload);
-                                if !name.is_empty() {
+                                let unnamed = name.is_empty();
+                                if !unnamed {
                                     let name = name.to_string();
                                     stmt_registry.insert(name.clone(), msg.encode().freeze());
                                     batch_defines.push(name);
@@ -1327,6 +1345,26 @@ impl ProxyServer {
                                             }
                                         }
                                     }
+                                }
+                                // Promotion: park an unnamed Parse that opens a
+                                // fresh batch. Its signature is the payload after
+                                // the empty statement-name NUL (query + param
+                                // types). Anything that breaks the clean shape
+                                // (a second Parse, a non-empty `pending`) un-parks
+                                // it back into `pending` to preserve wire order.
+                                if promote_unnamed
+                                    && unnamed
+                                    && pending.is_empty()
+                                    && held_unnamed.is_none()
+                                {
+                                    let sig = bytes::Bytes::copy_from_slice(&msg.payload[1..]);
+                                    held_unnamed = Some((msg.encode().freeze(), sig));
+                                    add_to_pending = false;
+                                } else if let Some((held_msg, _)) = held_unnamed.take() {
+                                    let mut combined = BytesMut::with_capacity(held_msg.len() + pending.len());
+                                    combined.extend_from_slice(&held_msg);
+                                    combined.extend_from_slice(&pending);
+                                    pending = combined;
                                 }
                             }
                             MessageType::Bind => {
@@ -1346,7 +1384,9 @@ impl ProxyServer {
                             }
                             _ => {}
                         }
-                        pending.extend_from_slice(&msg.encode());
+                        if add_to_pending {
+                            pending.extend_from_slice(&msg.encode());
+                        }
                     }
 
                     // ---- Extended batch boundary ----
@@ -1372,6 +1412,7 @@ impl ProxyServer {
                             &stmt_registry,
                             &reprepare,
                             &batch_defines,
+                            held_unnamed.take(),
                             session,
                             state,
                             config,
@@ -2126,6 +2167,7 @@ impl ProxyServer {
         registry: &HashMap<String, bytes::Bytes>,
         reprepare: &[String],
         defines: &[String],
+        unnamed: Option<(bytes::Bytes, bytes::Bytes)>,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,
@@ -2170,6 +2212,31 @@ impl ProxyServer {
             }
         }
 
+        // Unnamed-`Parse` promotion: if the held unnamed Parse matches what this
+        // connection's unnamed statement already holds, skip forwarding it and
+        // synthesize its `ParseComplete` to the client; otherwise forward it
+        // first (re-establishing the connection's unnamed statement) and record
+        // its signature. A fresh/redialed connection has no signature, so the
+        // Parse is always (re)forwarded there — correctness is preserved.
+        let mut inject_parse_complete = false;
+        let mut new_unnamed_sig: Option<bytes::Bytes> = None;
+        if let Some((parse_msg, sig)) = unnamed.as_ref() {
+            if backend.unnamed_sig.as_deref() == Some(&sig[..]) {
+                inject_parse_complete = true;
+            } else {
+                if let Err(e) = backend
+                    .stream
+                    .write_all(parse_msg)
+                    .await
+                    .map_err(|e| ProxyError::Network(format!("Backend write error: {}", e)))
+                {
+                    conns.remove(&target);
+                    return Err(e);
+                }
+                new_unnamed_sig = Some(sig.clone());
+            }
+        }
+
         if let Err(e) = backend
             .stream
             .write_all(batch)
@@ -2178,6 +2245,21 @@ impl ProxyServer {
         {
             conns.remove(&target);
             return Err(e);
+        }
+
+        // The client expects `ParseComplete` first; the backend won't send one
+        // for a skipped Parse, so emit it here before relaying the response.
+        let mut injected: u64 = 0;
+        if inject_parse_complete {
+            if let Err(e) = client
+                .write_all(&[b'1', 0, 0, 0, 4])
+                .await
+                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))
+            {
+                conns.remove(&target);
+                return Err(e);
+            }
+            injected = 5;
         }
 
         let r = if wait_ready {
@@ -2191,7 +2273,11 @@ impl ProxyServer {
                 for name in defines {
                     backend.prepared.insert(name.clone());
                 }
-                Ok((Some(target), sent))
+                // ...and the (re)forwarded unnamed statement.
+                if let Some(sig) = new_unnamed_sig {
+                    backend.unnamed_sig = Some(sig);
+                }
+                Ok((Some(target), sent + injected))
             }
             Err(e) => {
                 conns.remove(&target);

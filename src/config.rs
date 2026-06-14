@@ -222,6 +222,14 @@ pub struct ProxyConfig {
     /// CREATE DATABASE ... TEMPLATE clones through the proxy.
     #[serde(default)]
     pub branch: BranchConfig,
+    /// Proxy-side unnamed-`Parse` promotion (Batch H). When a client re-sends an
+    /// identical unnamed extended `Parse` (the dominant pgbench/ORM pattern),
+    /// the proxy skips forwarding it to a backend that already holds that exact
+    /// unnamed statement and synthesizes the `ParseComplete` locally — cutting
+    /// the per-cycle re-`Parse` overhead. Default on; a kill-switch for drivers
+    /// that somehow depend on the redundant round trip.
+    #[serde(default = "default_true")]
+    pub optimize_unnamed_parse: bool,
 }
 
 /// Branch-database configuration: the maintenance connection the proxy uses
@@ -520,6 +528,7 @@ impl Default for ProxyConfig {
             http_gateway: HttpGatewayConfig::default(),
             mirror: MirrorConfig::default(),
             branch: BranchConfig::default(),
+            optimize_unnamed_parse: true,
         }
     }
 }
