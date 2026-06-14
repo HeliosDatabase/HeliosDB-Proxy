@@ -624,6 +624,84 @@ impl ProxyServer {
         HangupNever
     }
 
+    /// A stream that yields once per `SIGUSR2` — the graceful binary-handoff
+    /// drain trigger. Never yields on non-Unix platforms.
+    #[cfg(unix)]
+    fn usr2_stream() -> tokio::signal::unix::Signal {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
+            .expect("failed to install SIGUSR2 handler")
+    }
+    #[cfg(not(unix))]
+    fn usr2_stream() -> HangupNever {
+        HangupNever
+    }
+
+    /// Bind a TCP listener with `SO_REUSEADDR` + `SO_REUSEPORT` so a second
+    /// process can bind the same address concurrently (the kernel then
+    /// load-balances new connections across both). This is what lets a new
+    /// binary take over new connections while the old one drains.
+    fn bind_reuseport(addr: &str) -> Result<TcpListener> {
+        use socket2::{Domain, Protocol, Socket, Type};
+        let sockaddr: SocketAddr = addr
+            .parse()
+            .map_err(|e| ProxyError::Config(format!("invalid listen address '{}': {}", addr, e)))?;
+        let domain = if sockaddr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+            .map_err(|e| ProxyError::Network(format!("socket(): {}", e)))?;
+        socket
+            .set_reuse_address(true)
+            .map_err(|e| ProxyError::Network(format!("SO_REUSEADDR: {}", e)))?;
+        #[cfg(all(unix, not(target_os = "solaris")))]
+        socket
+            .set_reuse_port(true)
+            .map_err(|e| ProxyError::Network(format!("SO_REUSEPORT: {}", e)))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| ProxyError::Network(format!("set_nonblocking: {}", e)))?;
+        socket
+            .bind(&sockaddr.into())
+            .map_err(|e| ProxyError::Network(format!("Failed to bind {}: {}", addr, e)))?;
+        socket
+            .listen(1024)
+            .map_err(|e| ProxyError::Network(format!("listen(): {}", e)))?;
+        let std_listener: std::net::TcpListener = socket.into();
+        TcpListener::from_std(std_listener)
+            .map_err(|e| ProxyError::Network(format!("from_std listener: {}", e)))
+    }
+
+    /// Wait for in-flight client connections to finish, up to `timeout`. Used by
+    /// the graceful drain after the listener is closed — the session map is the
+    /// live active-connection gauge (one entry per accepted connection).
+    async fn drain_connections(state: &Arc<ServerState>, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let active = state.sessions.read().await.len();
+            if active == 0 {
+                tracing::info!("drain complete — all in-flight connections finished");
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    active,
+                    "drain timeout reached — exiting with connections still open"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Graceful-drain timeout: how long to keep serving in-flight connections
+    /// after SIGUSR2 before exiting. Overridable via `HELIOS_DRAIN_TIMEOUT_SECS`
+    /// (a config field is a trivial follow-on); defaults to 60s.
+    fn drain_timeout() -> Duration {
+        let secs = std::env::var("HELIOS_DRAIN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(60);
+        Duration::from_secs(secs)
+    }
+
     /// Re-read the config file and hot-swap the live config (Batch H).
     ///
     /// New connections immediately use the reloaded config; in-flight sessions
@@ -708,11 +786,14 @@ impl ProxyServer {
 
     /// Run the proxy server
     pub async fn run(&self) -> Result<()> {
-        let listener = TcpListener::bind(&self.config.listen_address)
-            .await
-            .map_err(|e| ProxyError::Network(format!("Failed to bind: {}", e)))?;
+        // Bind with SO_REUSEPORT so a freshly-started binary can bind the SAME
+        // listen address concurrently — the kernel load-balances new
+        // connections across both processes. That is the mechanism behind the
+        // zero-downtime binary handoff: start the new binary, then SIGUSR2 the
+        // old one to close its listener and drain (Batch H, item 84).
+        let listener = Self::bind_reuseport(&self.config.listen_address)?;
 
-        tracing::info!("Proxy listening on {}", self.config.listen_address);
+        tracing::info!("Proxy listening on {} (SO_REUSEPORT)", self.config.listen_address);
 
         // Start background tasks
         let health_task = self.spawn_health_checker();
@@ -755,14 +836,25 @@ impl ProxyServer {
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        // SIGHUP -> zero-downtime config reload (Batch H). On platforms without
-        // Unix signals this is simply never readable.
+        // SIGHUP -> zero-downtime config reload; SIGUSR2 -> graceful drain for
+        // binary handoff (Batch H). On platforms without Unix signals these are
+        // simply never readable.
         let mut sighup = Self::hangup_stream();
+        let mut sigusr2 = Self::usr2_stream();
+        let mut graceful = false;
 
         loop {
             tokio::select! {
                 _ = sighup.recv() => {
                     self.reload_config().await;
+                }
+                _ = sigusr2.recv() => {
+                    tracing::info!(
+                        "SIGUSR2: graceful binary-handoff drain — closing the listener so new \
+                         connections route to the sibling process; finishing in-flight connections"
+                    );
+                    graceful = true;
+                    break;
                 }
                 accept_result = listener.accept() => {
                     match accept_result {
@@ -795,6 +887,19 @@ impl ProxyServer {
                     break;
                 }
             }
+        }
+
+        // Close the listening socket so the kernel stops routing new connections
+        // to this process's accept queue (with SO_REUSEPORT they would otherwise
+        // sit unaccepted) — all new connections now go to the sibling listener.
+        drop(listener);
+
+        // On a graceful handoff, keep serving in-flight connections until they
+        // finish (or the drain deadline), so nothing in flight is dropped.
+        if graceful {
+            let timeout = Self::drain_timeout();
+            tracing::info!(timeout_secs = timeout.as_secs(), "draining in-flight connections");
+            Self::drain_connections(&self.state, timeout).await;
         }
 
         // Wait for background tasks
