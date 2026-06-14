@@ -230,6 +230,17 @@ pub struct ProxyConfig {
     /// that somehow depend on the redundant round trip.
     #[serde(default = "default_true")]
     pub optimize_unnamed_parse: bool,
+    /// How long a graceful binary-handoff drain (SIGUSR2) keeps serving
+    /// in-flight connections before the old process exits (Batch H). After this
+    /// many seconds, any still-open connections are dropped so the handoff
+    /// completes in bounded time. Overridable at runtime via the
+    /// `HELIOS_DRAIN_TIMEOUT_SECS` env var.
+    #[serde(default = "default_drain_timeout_secs")]
+    pub shutdown_drain_timeout_secs: u64,
+}
+
+fn default_drain_timeout_secs() -> u64 {
+    60
 }
 
 /// Branch-database configuration: the maintenance connection the proxy uses
@@ -529,6 +540,7 @@ impl Default for ProxyConfig {
             mirror: MirrorConfig::default(),
             branch: BranchConfig::default(),
             optimize_unnamed_parse: true,
+            shutdown_drain_timeout_secs: default_drain_timeout_secs(),
         }
     }
 }
