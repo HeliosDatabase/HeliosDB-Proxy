@@ -71,5 +71,20 @@ sed "s|\"signature\": \"$SIG\"|\"signature\": \"$EVILSIG\"|" "$REG/index.json" >
 out=$("$BIN" install colmask --registry "$REG/evil.json" --dest "$DEST" --trust-root "$TRUST" 2>&1)
 if echo "$out" | grep -qi "signature verification failed" && [ ! -f "$DEST/colmask.wasm" ]; then ok "reject: untrusted signer blocks install"; else bad "untrusted: $out"; fi
 
+# 7. verify a freshly-installed artefact against the trust root (sidecar .sig).
+rm -rf "$DEST"/*
+"$BIN" install colmask --registry "$REG/index.json" --dest "$DEST" --trust-root "$TRUST" >/dev/null 2>&1
+out=$("$BIN" verify "$DEST/colmask.wasm" --trust-root "$TRUST" 2>&1)
+echo "$out" | grep -q "verified by 'official'" && ok "verify: installed artefact verifies (sidecar .sig)" || bad "verify: $out"
+
+# 8. verify with no trust root -> digest only, exit 0.
+out=$("$BIN" verify "$DEST/colmask.wasm" 2>&1)
+{ echo "$out" | grep -q "$SHA" && echo "$out" | grep -q "not checked"; } && ok "verify: digest-only without trust root" || bad "verify digest: $out"
+
+# 9. verify a tampered artefact -> fails (non-zero exit).
+cp "$DEST/colmask.wasm" "$OUT/tampered.wasm"; printf 'x' >> "$OUT/tampered.wasm"
+out=$("$BIN" verify "$OUT/tampered.wasm" --trust-root "$TRUST" --sig "$DEST/colmask.sig" 2>&1); rc=$?
+{ [ "$rc" -ne 0 ] && echo "$out" | grep -qi "verification failed"; } && ok "verify: tampered artefact rejected (exit $rc)" || bad "verify tampered: rc=$rc out=$out"
+
 echo "== plugin-install test: PASS=$PASS FAIL=$FAIL =="
 exit $FAIL
