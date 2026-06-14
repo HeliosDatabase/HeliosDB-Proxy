@@ -161,6 +161,9 @@ struct ServerState {
     /// the proxy authenticates clients itself against this user list instead
     /// of relaying their credentials to the backend.
     auth_file: Option<Arc<crate::auth_scram::AuthFile>>,
+    /// Traffic-mirror handle. `Some` when `[mirror] enabled`: the data path
+    /// offers write statements to a background mirror worker.
+    mirror: Option<crate::mirror::MirrorHandle>,
     /// Load balancer state
     lb_state: LoadBalancerState,
     /// Pool manager for Session/Transaction/Statement modes
@@ -498,6 +501,16 @@ impl ProxyServer {
             None
         };
 
+        // Spawn the traffic-mirror worker when enabled (we are inside the
+        // tokio runtime here — main is #[tokio::main]).
+        let mirror = if config.mirror.enabled {
+            tracing::info!(target = %format!("{}:{}", config.mirror.backend_host, config.mirror.backend_port),
+                writes_only = config.mirror.writes_only, "traffic mirroring enabled");
+            Some(crate::mirror::spawn(config.mirror.clone()))
+        } else {
+            None
+        };
+
         let state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
             health: ArcSwap::from_pointee(health),
@@ -505,6 +518,7 @@ impl ProxyServer {
             cancel_map: Arc::new(DashMap::new()),
             tls_acceptor,
             auth_file,
+            mirror,
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
             },
@@ -946,6 +960,15 @@ impl ProxyServer {
                                 Err(e) => {
                                     tracing::warn!(error = %e, "failed to synthesise cached response; falling back to backend");
                                 }
+                            }
+                        }
+
+                        // Traffic mirror: offer the (final, post-rewrite)
+                        // statement to the secondary backend. Non-blocking —
+                        // never delays the client path.
+                        if let Some(ref mirror) = state.mirror {
+                            if let Some(sql) = crate::protocol::query_text(&msg.payload) {
+                                mirror.offer(sql, Self::is_write_query(sql));
                             }
                         }
 
@@ -3168,6 +3191,7 @@ mod tests {
             cancel_map: Arc::new(DashMap::new()),
             tls_acceptor: None,
             auth_file: None,
+            mirror: None,
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
             },
