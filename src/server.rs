@@ -48,6 +48,21 @@ pub struct ProxyServer {
     config: ProxyConfig,
     state: Arc<ServerState>,
     shutdown_tx: broadcast::Sender<()>,
+    /// Path the config was loaded from, retained so `SIGHUP` can re-read it
+    /// for a zero-downtime reload (Batch H). `None` when the config was built
+    /// from CLI flags/defaults rather than a file.
+    config_path: Option<String>,
+}
+
+/// Stand-in "signal stream" on platforms without Unix signals: its `recv()`
+/// never resolves, so the `SIGHUP` select arm is simply inert there.
+#[cfg(not(unix))]
+struct HangupNever;
+#[cfg(not(unix))]
+impl HangupNever {
+    async fn recv(&mut self) -> Option<()> {
+        std::future::pending().await
+    }
 }
 
 /// Build the BackendConfig template the time-travel replay engine
@@ -146,6 +161,13 @@ struct ServerState {
     // lock-free atomic load with no await, no semaphore, no guard held
     // across the routing awaits.
     health: ArcSwap<HashMap<String, NodeHealth>>,
+    /// Live, reloadable proxy configuration (Batch H). The accept loop snapshots
+    /// this per new connection and the health checker reads it each tick, so a
+    /// SIGHUP that swaps it takes effect for new connections and node health
+    /// without dropping any in-flight session. The fields that can only be
+    /// applied at startup (listen/admin socket addresses) are ignored on reload
+    /// with a warning. Existing connections keep the snapshot they started with.
+    live_config: ArcSwap<ProxyConfig>,
     /// Metrics
     metrics: ServerMetrics,
     /// Query-cancellation routing. Maps the BackendKeyData (pid, secret)
@@ -541,6 +563,7 @@ impl ProxyServer {
         let state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
             health: ArcSwap::from_pointee(health),
+            live_config: ArcSwap::from_pointee(config.clone()),
             metrics: ServerMetrics::default(),
             cancel_map: Arc::new(DashMap::new()),
             tls_acceptor,
@@ -577,7 +600,110 @@ impl ProxyServer {
             config,
             state,
             shutdown_tx,
+            config_path: None,
         })
+    }
+
+    /// Record the config file path so `SIGHUP` can re-read it for a live
+    /// reload (Batch H). Without a path (config built from CLI flags/defaults)
+    /// a `SIGHUP` is logged and ignored — there is nothing to re-read.
+    pub fn with_config_path(mut self, path: Option<String>) -> Self {
+        self.config_path = path;
+        self
+    }
+
+    /// A stream that yields once per `SIGHUP`. On non-Unix platforms it never
+    /// yields (config reload is Unix-signal driven).
+    #[cfg(unix)]
+    fn hangup_stream() -> tokio::signal::unix::Signal {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .expect("failed to install SIGHUP handler")
+    }
+    #[cfg(not(unix))]
+    fn hangup_stream() -> HangupNever {
+        HangupNever
+    }
+
+    /// Re-read the config file and hot-swap the live config (Batch H).
+    ///
+    /// New connections immediately use the reloaded config; in-flight sessions
+    /// keep the snapshot they began with, so nothing is dropped. A parse error
+    /// keeps the running config untouched. Socket-bound fields (listen/admin
+    /// address) cannot change on an already-bound listener and are reported but
+    /// not applied. The node set is reconciled into the health map so routing
+    /// sees additions/removals at once.
+    async fn reload_config(&self) {
+        let Some(path) = self.config_path.as_deref() else {
+            tracing::warn!(
+                "SIGHUP received but config was not loaded from a file — nothing to reload"
+            );
+            return;
+        };
+        tracing::info!(path, "SIGHUP: reloading configuration");
+        let new_config = match ProxyConfig::from_file(path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(path, error = %e, "SIGHUP reload failed to parse — keeping current config");
+                return;
+            }
+        };
+        let old = self.state.live_config.load_full();
+        if new_config.listen_address != old.listen_address {
+            tracing::warn!(old = %old.listen_address, new = %new_config.listen_address,
+                "listen_address change needs a restart/handoff; the bound socket is kept");
+        }
+        if new_config.admin_address != old.admin_address {
+            tracing::warn!(old = %old.admin_address, new = %new_config.admin_address,
+                "admin_address change needs a restart; the bound socket is kept");
+        }
+        // Reconcile node health to the new node set before publishing the
+        // config, so the first connection on the new config can route to it.
+        Self::reconcile_health(&self.state, &new_config);
+        let nodes = new_config.nodes.len();
+        let hba_rules = new_config.hba.len();
+        let pool_max = new_config.pool.max_connections;
+        self.state.live_config.store(Arc::new(new_config));
+        tracing::info!(
+            nodes,
+            hba_rules,
+            pool_max,
+            "SIGHUP: configuration reloaded — applies to new connections"
+        );
+    }
+
+    /// Rebuild the health map for `config`'s node set: surviving nodes keep
+    /// their current health; new nodes are seeded healthy (immediately
+    /// routable, the next check confirms); removed nodes are dropped.
+    fn reconcile_health(state: &Arc<ServerState>, config: &ProxyConfig) {
+        let current = state.health.load_full();
+        let mut next: HashMap<String, NodeHealth> = HashMap::new();
+        for node in &config.nodes {
+            let addr = node.address();
+            match current.get(&addr) {
+                Some(existing) => {
+                    next.insert(addr, existing.clone());
+                }
+                None => {
+                    tracing::info!(node = %addr, "SIGHUP: new node added — seeding healthy");
+                    next.insert(
+                        addr.clone(),
+                        NodeHealth {
+                            address: addr,
+                            healthy: true,
+                            last_check: chrono::Utc::now(),
+                            failure_count: 0,
+                            last_error: None,
+                            latency_ms: 0.0,
+                            replication_lag_bytes: None,
+                        },
+                    );
+                }
+            }
+        }
+        for gone in current.keys().filter(|k| !next.contains_key(*k)) {
+            tracing::info!(node = %gone, "SIGHUP: node removed from config");
+        }
+        state.health.store(Arc::new(next));
     }
 
     /// Run the proxy server
@@ -629,8 +755,15 @@ impl ProxyServer {
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
+        // SIGHUP -> zero-downtime config reload (Batch H). On platforms without
+        // Unix signals this is simply never readable.
+        let mut sighup = Self::hangup_stream();
+
         loop {
             tokio::select! {
+                _ = sighup.recv() => {
+                    self.reload_config().await;
+                }
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, addr)) => {
@@ -640,7 +773,10 @@ impl ProxyServer {
                             let _ = stream.set_nodelay(true);
                             self.state.metrics.connections_accepted.fetch_add(1, Ordering::Relaxed);
                             let state = self.state.clone();
-                            let config = self.config.clone();
+                            // Snapshot the *live* config so a SIGHUP reload
+                            // applies to new connections; in-flight sessions
+                            // keep the snapshot they began with (Batch H).
+                            let config = (*self.state.live_config.load_full()).clone();
                             let shutdown_tx = self.shutdown_tx.clone();
 
                             tokio::spawn(async move {
@@ -2884,16 +3020,19 @@ impl ProxyServer {
     /// Spawn health checker background task
     fn spawn_health_checker(&self) -> tokio::task::JoinHandle<()> {
         let state = self.state.clone();
-        let config = self.config.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(config.health.check_interval_secs));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                state.live_config.load().health.check_interval_secs,
+            ));
 
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
+                        // Read the live config each tick so a SIGHUP that
+                        // adds/removes nodes is checked on the next sweep.
+                        let config = state.live_config.load_full();
                         Self::check_all_nodes(&state, &config).await;
                     }
                     _ = shutdown_rx.recv() => {
@@ -3441,6 +3580,7 @@ mod tests {
         let augmented_state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
             health: ArcSwap::from_pointee(HashMap::new()),
+            live_config: ArcSwap::from_pointee(ProxyConfig::default()),
             metrics: ServerMetrics::default(),
             cancel_map: Arc::new(DashMap::new()),
             tls_acceptor: None,
