@@ -210,6 +210,51 @@ pub struct ProxyConfig {
     /// MCP gateway (`[mcp] contract`). Empty by default.
     #[serde(default)]
     pub agent_contracts: Vec<crate::agent_contract::AgentContract>,
+    /// HTTP SQL gateway (Neon-serverless-driver compatible). Disabled by
+    /// default — lets edge/serverless clients run SQL over HTTP.
+    #[serde(default)]
+    pub http_gateway: HttpGatewayConfig,
+}
+
+/// HTTP SQL gateway configuration. A Neon-`@neondatabase/serverless`-style
+/// `POST /sql` endpoint that runs one statement over the backend PG-wire
+/// client and returns `{ command, rowCount, rows, fields }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpGatewayConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_http_gw_listen")]
+    pub listen_address: String,
+    #[serde(default = "default_localhost")]
+    pub backend_host: String,
+    #[serde(default = "default_pg_port")]
+    pub backend_port: u16,
+    #[serde(default = "default_pg_user")]
+    pub backend_user: String,
+    pub backend_password: Option<String>,
+    pub backend_database: Option<String>,
+    /// Optional Bearer token required on requests.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+impl Default for HttpGatewayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_address: default_http_gw_listen(),
+            backend_host: default_localhost(),
+            backend_port: default_pg_port(),
+            backend_user: default_pg_user(),
+            backend_password: None,
+            backend_database: None,
+            auth_token: None,
+        }
+    }
+}
+
+fn default_http_gw_listen() -> String {
+    "127.0.0.1:9093".to_string()
 }
 
 /// MCP agent-gateway configuration. When enabled, the proxy exposes a native
@@ -357,6 +402,7 @@ impl Default for ProxyConfig {
             auth: AuthConfig::default(),
             mcp: McpConfig::default(),
             agent_contracts: Vec::new(),
+            http_gateway: HttpGatewayConfig::default(),
         }
     }
 }

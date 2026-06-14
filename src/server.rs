@@ -573,6 +573,18 @@ impl ProxyServer {
             None
         };
 
+        // Start the HTTP SQL gateway (Neon-serverless compatible) when enabled.
+        let http_gw_task = if self.config.http_gateway.enabled {
+            let gw_cfg = self.config.http_gateway.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = crate::http_gateway::HttpGateway::new(gw_cfg).run().await {
+                    tracing::error!("HTTP gateway error: {}", e);
+                }
+            }))
+        } else {
+            None
+        };
+
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         loop {
@@ -612,6 +624,9 @@ impl ProxyServer {
         pool_task.abort();
         admin_task.abort();
         if let Some(t) = mcp_task {
+            t.abort();
+        }
+        if let Some(t) = http_gw_task {
             t.abort();
         }
 
