@@ -164,6 +164,10 @@ struct ServerState {
     /// Traffic-mirror handle. `Some` when `[mirror] enabled`: the data path
     /// offers write statements to a background mirror worker.
     mirror: Option<crate::mirror::MirrorHandle>,
+    /// Migration cutover switch. When `Some`, NEW client connections are
+    /// transparently redirected to the promoted target (the former mirror)
+    /// instead of the configured primary. Set via POST /api/migration/cutover.
+    cutover: Arc<ArcSwap<Option<Arc<crate::mirror::CutoverTarget>>>>,
     /// Load balancer state
     lb_state: LoadBalancerState,
     /// Pool manager for Session/Transaction/Statement modes
@@ -519,6 +523,7 @@ impl ProxyServer {
             tls_acceptor,
             auth_file,
             mirror,
+            cutover: Arc::new(ArcSwap::from_pointee(None)),
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
             },
@@ -690,6 +695,13 @@ impl ProxyServer {
                         writes_only: mirror.writes_only(),
                         metrics: mirror.metrics.clone(),
                         config: config.mirror.clone(),
+                        cutover: state.cutover.clone(),
+                        cutover_target: crate::mirror::CutoverTarget {
+                            addr: format!("{}:{}", config.mirror.backend_host, config.mirror.backend_port),
+                            user: config.mirror.backend_user.clone(),
+                            password: config.mirror.backend_password.clone(),
+                            database: config.mirror.backend_database.clone(),
+                        },
                     })
                     .await;
             }
@@ -1410,8 +1422,23 @@ impl ProxyServer {
         // backend side.
         Self::apply_authenticate_hook(params, session, state).await?;
 
-        // Select initial backend node (primary for now)
-        let node_addr = Self::select_node(session, state, config).await?;
+        // Migration cutover: when active, redirect this connection to the
+        // promoted target, substituting the target's credentials/database for
+        // the client's so the cutover is transparent to the application.
+        let cutover = state.cutover.load_full();
+        let (node_addr, effective_params) = if let Some(t) = cutover.as_ref() {
+            let mut p = params.clone();
+            p.insert("user".to_string(), t.user.clone());
+            if let Some(ref db) = t.database {
+                p.insert("database".to_string(), db.clone());
+            } else {
+                p.remove("database");
+            }
+            tracing::debug!(target = %t.addr, "routing connection to cutover target");
+            (t.addr.clone(), p)
+        } else {
+            (Self::select_node(session, state, config).await?, params.clone())
+        };
 
         // Connect to backend
         let mut backend = tokio::time::timeout(
@@ -1424,6 +1451,7 @@ impl ProxyServer {
         let _ = backend.set_nodelay(true);
 
         // Build and send startup message to backend
+        let params = &effective_params;
         let startup_bytes = Self::build_startup_message(params);
         backend
             .write_all(&startup_bytes)
@@ -1610,6 +1638,11 @@ impl ProxyServer {
         state: &Arc<ServerState>,
         config: &ProxyConfig,
     ) -> Result<String> {
+        // After a migration cutover, every request stays on the promoted
+        // target — never route back to the former primary.
+        if let Some(t) = state.cutover.load_full().as_ref() {
+            return Ok(t.addr.clone());
+        }
         let need_switch = if let Some(ref forced) = forced_target {
             let health = state.health.load_full();
             let reuse = current_node
@@ -3204,6 +3237,7 @@ mod tests {
             tls_acceptor: None,
             auth_file: None,
             mirror: None,
+            cutover: Arc::new(ArcSwap::from_pointee(None)),
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
             },
