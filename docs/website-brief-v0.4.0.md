@@ -30,13 +30,13 @@ Repository naming after the v0.4.0 rename:
 
 | canonical name | role |
 |---|---|
-| `dimensigon/HDB-HeliosDB-Proxy` | core proxy (this is where most files live) |
-| `dimensigon/HDB-HeliosDB-Proxy-Operator` | Kubernetes operator |
-| `dimensigon/HDB-HeliosDB-Proxy-Plugins` | first-party WASM plugins + CLI |
-| `dimensigon/terraform-provider-HDB-HeliosDB-Proxy` | Terraform provider |
-| `dimensigon/pulumi-HDB-HeliosDB-Proxy` | Pulumi provider |
+| `HeliosDatabase/HDB-HeliosDB-Proxy` | core proxy (this is where most files live) |
+| `HeliosDatabase/HDB-HeliosDB-Proxy-Operator` | Kubernetes operator |
+| `HeliosDatabase/HDB-HeliosDB-Proxy-Plugins` | first-party WASM plugins + CLI |
+| `HeliosDatabase/terraform-provider-HDB-HeliosDB-Proxy` | Terraform provider |
+| `HeliosDatabase/pulumi-HDB-HeliosDB-Proxy` | Pulumi provider |
 
-Container image: `ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.0`.
+Container image: `ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.0`.
 
 ---
 
@@ -994,7 +994,7 @@ resource "heliosproxy_pool_profile" "default" {
 resource "heliosproxy_instance" "analytics" {
   name     = "analytics"
   replicas = 2
-  image    = "ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.0"
+  image    = "ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.0"
   pool_profile_ref = heliosproxy_pool_profile.default.name
   nodes = [
     { host = "pg-primary.db.svc",   port = 5432, role = "primary", weight = 100 },

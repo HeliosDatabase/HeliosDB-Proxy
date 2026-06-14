@@ -27,7 +27,7 @@ minimal; opt in to feature flags explicitly.
 | `cargo install heliosdb-proxy` | Production / operator install — pulls from crates.io |
 | `cargo install --git github.com/HeliosDatabase/HeliosDB-Proxy` | Pre-release / unreleased commit |
 | `git clone … && cargo build --release` | Developer install with `--features` matrix |
-| `ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.1` | Container deploy (Docker/K8s) |
+| `ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.1` | Container deploy (Docker/K8s) |
 
 ## Recipes
 
@@ -94,8 +94,8 @@ cargo build --features wasm-plugins,ha-tr,anomaly-detection
 ### Recipe 5: Docker image
 
 ```bash
-docker pull ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.1
-docker run --rm ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.1 --version
+docker pull ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.1
+docker run --rm ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.1 --version
 ```
 
 The image is published by `.github/workflows/docker.yml` on every
@@ -141,5 +141,5 @@ ls $(dirname $(which heliosdb-proxy))  # confirm it's on PATH
 - `heliosproxy-release` — how new versions land on crates.io
 - crates.io: <https://crates.io/crates/heliosdb-proxy>
 - docs.rs: <https://docs.rs/heliosdb-proxy>
-- Container: `ghcr.io/dimensigon/hdb-heliosdb-proxy`
+- Container: `ghcr.io/heliosdatabase/hdb-heliosdb-proxy`
 - Code: [`Cargo.toml`](../../Cargo.toml) (feature flag list)

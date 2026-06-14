@@ -157,6 +157,23 @@ Eight signed WASM plugins (shipped in the companion `HDB-HeliosDB-Proxy-Plugins`
 
 ---
 
+## Ecosystem
+
+HeliosDB is maintained under the **HeliosDatabase** organization. The database
+editions, SDKs, proxy data-plane, and MCP knowledge tooling are designed to work
+together across the same family.
+
+- **[HeliosDatabase/HeliosDB-SDKs](https://github.com/HeliosDatabase/HeliosDB-SDKs)** — Official client SDKs (Python, TypeScript, Rust, Go) + integrations (VS Code, n8n, Zapier, Make, Retool, AutoGen) + cross-platform CLI. Apache 2.0.
+- **[HeliosDatabase/HeliosDB-Nano](https://github.com/HeliosDatabase/HeliosDB-Nano)** — Single-binary embedded database with PostgreSQL/MySQL wire compatibility, HNSW vector search, branching, time-travel, and MCP endpoint support. Apache 2.0.
+- **[HeliosDatabase/HeliosDB-Lite](https://github.com/HeliosDatabase/HeliosDB-Lite)** — Production self-hosted database with HeliosProxy + HeliosCore baked in. SSPL-1.0.
+- **[HeliosDatabase/HeliosDB-Full](https://github.com/HeliosDatabase/HeliosDB-Full)** — Distributed enterprise database with 14 native wire protocols. SSPL-1.0.
+- **[HeliosDatabase/HeliosDB-Proxy](https://github.com/HeliosDatabase/HeliosDB-Proxy)** — Programmable Postgres data-plane (PgBouncer drop-in + WASM plugins + zero-downtime PG-12->17 upgrade). Apache 2.0.
+- **[HeliosDatabase/HeliosDB-Proxy-Plugins](https://github.com/HeliosDatabase/HeliosDB-Proxy-Plugins)** · **[Operator](https://github.com/HeliosDatabase/HeliosDB-Proxy-Operator)** · **[Terraform](https://github.com/HeliosDatabase/terraform-provider-HeliosDB-Proxy)** · **[Pulumi](https://github.com/HeliosDatabase/pulumi-HeliosDB-Proxy)** — Proxy ecosystem.
+
+**[HeliosDatabase/HeliosDB-CodeKB-MCP](https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP)** provides an MCP server that turns HeliosDB codebases and docs into queryable technical knowledge for Claude Code, Codex, and other MCP clients.
+
+---
+
 ## Quick Start
 
 ### Connect to a PostgreSQL Cluster

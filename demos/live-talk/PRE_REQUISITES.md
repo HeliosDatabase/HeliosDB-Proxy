@@ -73,7 +73,7 @@ pgbench --version
 The demos may pull or build these images:
 
 - `postgres:14-alpine`, `postgres:16-alpine`, `postgres:17-alpine`
-- `ghcr.io/HeliosDatabase/hdb-heliosdb-proxy:*` for existing v0.4 demos
+- `ghcr.io/heliosdatabase/hdb-heliosdb-proxy:*` for existing v0.4 demos
 - A local HeliosProxy image built from `docker/Dockerfile` for integration demos
 
 Have network access and enough local Docker resources. Practical minimum:

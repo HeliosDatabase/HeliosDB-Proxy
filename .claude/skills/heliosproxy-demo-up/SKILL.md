@@ -140,7 +140,7 @@ Edit the demo's `docker-compose.yml`:
 # Before
 image: postgres:17-alpine
 # After
-image: dimensigon/heliosdb-lite:latest
+image: heliosdatabase/heliosdb-lite:latest
 ```
 
 The wire protocol is identical; the rest of the demo runs unchanged.
@@ -154,7 +154,7 @@ for the swap recipe.
   is the source of port mappings — edit if needed.
 - **`docker compose up` builds the proxy from a `build:` context** —
   in the released demos, the compose files reference
-  `ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.1`. If you're testing
+  `ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.1`. If you're testing
   an unreleased build, swap `image:` for `build: ../../..`.
 - **Plugin builds are slow first time.** The wasm target downloads
   + compiles wasmtime deps. Subsequent demos reuse the cargo cache.
@@ -171,4 +171,4 @@ for the swap recipe.
 - `heliosproxy-overview` — pick the right skill before running a demo
 - [`demos/v0.4.0/README.md`](../../demos/v0.4.0/README.md) — top-level index
 - [`demos/v0.4.0/_shared/`](../../demos/v0.4.0/_shared/) — shared scaffolding
-- Container image: `ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.1`
+- Container image: `ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.1`

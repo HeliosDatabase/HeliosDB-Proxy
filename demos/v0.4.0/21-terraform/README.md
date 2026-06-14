@@ -39,7 +39,7 @@ make install
 cat <<EOF >> ~/.terraformrc
 provider_installation {
   dev_overrides {
-    "dimensigon/heliosproxy" = "$(go env GOBIN)"
+    "heliosdatabase/heliosproxy" = "$(go env GOBIN)"
   }
   direct {}
 }
@@ -56,7 +56,7 @@ terraform apply
 terraform {
   required_providers {
     heliosproxy = {
-      source  = "dimensigon/heliosproxy"
+      source  = "heliosdatabase/heliosproxy"
       version = "~> 0.1"
     }
   }
@@ -87,7 +87,7 @@ resource "heliosproxy_audit_policy" "pci" {
 resource "heliosproxy_instance" "analytics" {
   name     = "analytics"
   replicas = 2
-  image    = "ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.0"
+  image    = "ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.0"
 
   nodes = [
     { host = "pg-primary.db.svc",   port = 5432, role = "primary", weight = 100 },

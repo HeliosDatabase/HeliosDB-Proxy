@@ -82,5 +82,5 @@ kubectl get cm,deploy,svc -n data -l app.kubernetes.io/instance=analytics
 ## HeliosDB compatibility
 
 The operator is backend-agnostic — applies to PG and HeliosDB
-identically. The sample CR uses `image: ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.0`;
+identically. The sample CR uses `image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.0`;
 swap the `nodes:` host entries for HeliosDB-Lite endpoints.

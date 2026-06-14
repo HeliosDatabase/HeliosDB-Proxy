@@ -19,7 +19,7 @@ kind: HeliosProxy
 metadata:
   name: analytics
 spec:
-  image: ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.0
+  image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.0
   replicas: 2
   listenPort: 5432
   adminPort: 9090
@@ -178,7 +178,7 @@ for the underlying mechanics.
 Auto-generated from the CRDs. Minimum installation:
 
 ```sh
-helm repo add helios https://charts.dimensigon.com/
+helm repo add helios https://charts.heliosdatabase.com/
 helm install analytics helios/heliosproxy \
   --set nodes[0].host=pg-primary.db.svc \
   --set nodes[0].role=primary

@@ -19,7 +19,7 @@ services:
       retries: 30
 
   proxy-home:
-    image: ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.0
+    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.0
     depends_on:
       pg-primary:
         condition: service_healthy
@@ -34,7 +34,7 @@ services:
     command: ["--config", "/etc/helios/proxy.toml"]
 
   proxy-edge:
-    image: ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.0
+    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.0
     depends_on:
       proxy-home:
         condition: service_started
