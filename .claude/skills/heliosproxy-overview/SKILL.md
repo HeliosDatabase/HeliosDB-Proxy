@@ -21,7 +21,7 @@ PostgreSQL-wire-protocol-compatible connection router and intelligent
 query proxy. Sits between an application and a PG-compatible cluster
 (PostgreSQL ≥12, HeliosDB, CockroachDB, YugabyteDB, AlloyDB,
 TimescaleDB, Citus). Crate name: `heliosdb-proxy`. Binary name:
-`heliosdb-proxy`. Repo: `dimensigon/HDB-HeliosDB-Proxy`. Default
+`heliosdb-proxy`. Repo: `HeliosDatabase/HDB-HeliosDB-Proxy`. Default
 listen ports: PG `6432`, admin `9090`.
 
 24+ feature-gated modules including pool modes (Session/Transaction/

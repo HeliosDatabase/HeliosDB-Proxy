@@ -88,7 +88,7 @@ Paths below are relative to `/home/app/Helios/Docs-Public/Lite/docs/website/` (b
 
 5. **Release-notes / changelog page (if the site has one)** — mirror the content of `CHANGELOG.md` §[0.3.1] verbatim. The canonical CHANGELOG lives at `https://github.com/HeliosDatabase/HeliosDB-Proxy/blob/main/CHANGELOG.md` (private repo — link only works for authenticated users).
 
-6. **Download / install page** — bump the latest version string to `0.3.1`. Docker tag: `ghcr.io/dimensigon/heliosdb-proxy:0.3.1` (once the release workflow runs; verify the tag exists before publishing the copy).
+6. **Download / install page** — bump the latest version string to `0.3.1`. Docker tag: `ghcr.io/heliosdatabase/heliosdb-proxy:0.3.1` (once the release workflow runs; verify the tag exists before publishing the copy).
 
 ---
 

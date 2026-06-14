@@ -15,7 +15,7 @@ Kubernetes cluster where the operator is installed.
 terraform {
   required_providers {
     heliosproxy = {
-      source  = "dimensigon/heliosproxy"
+      source  = "heliosdatabase/heliosproxy"
       version = "~> 0.3"
     }
   }
@@ -36,7 +36,7 @@ provider "heliosproxy" {
 resource "heliosproxy_instance" "analytics" {
   name     = "analytics"
   replicas = 2
-  image    = "ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.0"
+  image    = "ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.0"
 
   node {
     host   = "pg-primary.db.svc"
@@ -142,7 +142,7 @@ resource "heliosproxy_tenant_quota" "free_tier" {
 
 ```hcl
 module "helios_3node" {
-  source  = "dimensigon/heliosproxy/heliosproxy"
+  source  = "heliosdatabase/heliosproxy/heliosproxy"
   version = "~> 0.3"
 
   name     = "app-db"

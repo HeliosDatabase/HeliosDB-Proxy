@@ -30,7 +30,7 @@ itself.
 
 ```bash
 # 1. Install CRDs + operator (Helm chart)
-helm repo add heliosproxy https://dimensigon.github.io/HDB-HeliosDB-Proxy-Operator
+helm repo add heliosproxy https://heliosdatabase.github.io/HDB-HeliosDB-Proxy-Operator
 helm repo update
 helm install heliosproxy heliosproxy/heliosproxy-operator \
   --namespace heliosproxy --create-namespace
@@ -40,13 +40,13 @@ Wait for the operator pod to be Ready, then declare a `HeliosProxy`:
 
 ```yaml
 # heliosproxy.yaml
-apiVersion: heliosproxy.dimensigon.io/v1
+apiVersion: heliosproxy.heliosdatabase.io/v1
 kind: HeliosProxy
 metadata:
   name: prod-proxy
   namespace: heliosproxy
 spec:
-  image: ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.1
+  image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.1
   replicas: 2
   features: ["pool-modes", "ha-tr", "wasm-plugins", "anomaly-detection"]
   nodes:
@@ -90,7 +90,7 @@ status.
 terraform {
   required_providers {
     heliosproxy = {
-      source  = "dimensigon/heliosproxy"
+      source  = "heliosdatabase/heliosproxy"
       version = "~> 0.4"
     }
   }
@@ -103,7 +103,7 @@ provider "heliosproxy" {
 
 resource "heliosproxy_instance" "prod" {
   name      = "prod-proxy"
-  image     = "ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.1"
+  image     = "ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.1"
   replicas  = 2
   features  = ["pool-modes", "ha-tr"]
 
@@ -139,10 +139,10 @@ owns reconciliation.
 ### Recipe 3: Pulumi (TypeScript)
 
 ```ts
-import * as helios from "@dimensigon/pulumi-heliosproxy";
+import * as helios from "@heliosdatabase/pulumi-heliosproxy";
 
 const prod = new helios.Instance("prod-proxy", {
-  image:    "ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.1",
+  image:    "ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.1",
   replicas: 2,
   features: ["pool-modes", "ha-tr"],
   nodes: [
@@ -183,7 +183,7 @@ With the operator (k8s-native rollout):
 ```bash
 kubectl -n heliosproxy patch heliosproxy prod-proxy \
   --type merge \
-  -p '{"spec":{"image":"ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.2"}}'
+  -p '{"spec":{"image":"ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.2"}}'
 ```
 
 The operator handles the rolling update with respect for
@@ -194,7 +194,7 @@ With Terraform:
 
 ```hcl
 resource "heliosproxy_instance" "prod" {
-  image = "ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.2"
+  image = "ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.2"
 }
 ```
 
@@ -212,7 +212,7 @@ The TF provider patches the CR; the operator reconciles.
 - **Image must match the features.** If the CR sets
   `features: ["wasm-plugins"]` but the image was built without
   that feature, plugin endpoints return 503 at runtime. The
-  default `ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.1` image is
+  default `ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.1` image is
   built with `--features all-features`.
 - **Operator version vs proxy version.** They don't have to match
   exactly, but the operator declares minimum + tested proxy

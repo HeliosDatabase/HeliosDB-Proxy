@@ -11,7 +11,7 @@ Tag-driven publish. Pushing a `vX.Y.Z` tag whose number matches
 `Cargo.toml`'s `version` triggers
 [`.github/workflows/crates-io.yml`](../../.github/workflows/crates-io.yml),
 which runs `cargo publish --locked`. Repo secret
-`CARGO_REGISTRY_TOKEN` (set at the `dimensigon` org level) provides
+`CARGO_REGISTRY_TOKEN` (set at the `HeliosDatabase` org level) provides
 the crates.io credential.
 
 🟡 Mutating, irreversible — once a version is published, it cannot
@@ -76,13 +76,13 @@ The tag push triggers the workflow. ETA ~1 min.
 ### Recipe 2: Watch the publish run
 
 ```bash
-gh run watch --workflow crates-io.yml -R dimensigon/HDB-HeliosDB-Proxy
+gh run watch --workflow crates-io.yml -R HeliosDatabase/HDB-HeliosDB-Proxy
 ```
 
 Or list recent runs:
 
 ```bash
-gh run list --workflow crates-io.yml -R dimensigon/HDB-HeliosDB-Proxy --limit 3
+gh run list --workflow crates-io.yml -R HeliosDatabase/HDB-HeliosDB-Proxy --limit 3
 # in_progress    release: 0.4.2  Publish to crates.io  v0.4.2  push
 ```
 
@@ -113,7 +113,7 @@ without re-tagging:
 
 ```bash
 gh workflow run crates-io.yml \
-  -R dimensigon/HDB-HeliosDB-Proxy \
+  -R HeliosDatabase/HDB-HeliosDB-Proxy \
   -f tag=v0.4.2
 ```
 

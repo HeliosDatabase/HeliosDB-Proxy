@@ -67,13 +67,13 @@ cd <demo-dir>
 Every demo uses **`postgres:17-alpine`** as the default backend so
 `docker compose up` works on any laptop. The wire protocol is
 identical between PG and HeliosDB; swap the `image:` line for
-`dimensigon/heliosdb-lite:latest` (or your local build) and every
+`heliosdatabase/heliosdb-lite:latest` (or your local build) and every
 demo behaves the same. See [_shared/README.md](_shared/README.md)
 for the swap recipe.
 
 ## Container image
 
-All demos pull `ghcr.io/dimensigon/hdb-heliosdb-proxy:0.4.0`. The
+All demos pull `ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.0`. The
 image is published by the docker workflow on tag pushes; if you're
 running against an unreleased build, swap the `image:` line for
 `build:` pointing at your local proxy repo.
