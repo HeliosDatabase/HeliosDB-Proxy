@@ -192,6 +192,119 @@ impl BackendClient {
         Ok(res.command_tag)
     }
 
+    /// Bulk-load rows via `COPY <table> [(cols)] FROM STDIN` (text format).
+    /// `data` is the pre-encoded COPY text payload (rows already tab-delimited,
+    /// escaped, and newline-terminated; no trailing `\.`). Returns the row count
+    /// from the `COPY n` command tag.
+    ///
+    /// On ANY failure the connection is drained back to `ReadyForQuery`, so a
+    /// caller can fall back to per-row INSERTs cleanly — `COPY` is atomic, so a
+    /// failed load leaves zero rows behind (no double-insert risk).
+    pub async fn copy_in(&mut self, copy_sql: &str, data: &[u8]) -> BackendResult<u64> {
+        // Bulk loads can run long; give COPY a generous ceiling vs the 30s
+        // management-query default.
+        let t = Duration::from_secs(600);
+        tokio::time::timeout(t, Self::copy_in_inner(&mut self.stream, copy_sql, data))
+            .await
+            .map_err(|_| {
+                BackendError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("COPY exceeded {:?}", t),
+                ))
+            })?
+    }
+
+    async fn copy_in_inner(stream: &mut Stream, copy_sql: &str, data: &[u8]) -> BackendResult<u64> {
+        // 1. Send the COPY ... FROM STDIN command as a simple Query.
+        let mut payload = BytesMut::with_capacity(copy_sql.len() + 1);
+        payload.extend_from_slice(copy_sql.as_bytes());
+        payload.put_u8(0);
+        stream
+            .write_all(&Message::new(MessageType::Query, payload).encode())
+            .await?;
+
+        let mut buffer = BytesMut::with_capacity(8192);
+        let codec = ProtocolCodec::new();
+
+        // 2. Expect CopyInResponse. Its tag 'G' isn't in the shared decoder, so
+        //    it surfaces as Unknown(b'G'). An ErrorResponse here means the
+        //    backend rejected COPY (e.g. unsupported) — drain to RFQ and surface
+        //    a recoverable error so the caller falls back to INSERTs.
+        loop {
+            let msg = read_one(stream, &mut buffer, &codec).await?;
+            match msg.msg_type {
+                MessageType::Unknown(b'G') => break,
+                MessageType::ErrorResponse => {
+                    let e = error_message(&msg.payload);
+                    Self::drain_to_ready(stream, &mut buffer, &codec).await?;
+                    return Err(BackendError::BackendError(e));
+                }
+                MessageType::ReadyForQuery => {
+                    return Err(BackendError::Protocol(
+                        "COPY: ReadyForQuery before CopyInResponse".into(),
+                    ));
+                }
+                _ => {} // NoticeResponse / ParameterStatus / etc — keep waiting
+            }
+        }
+
+        // 3. Stream the payload as CopyData frames, then CopyDone.
+        const CHUNK: usize = 64 * 1024;
+        let mut off = 0;
+        while off < data.len() {
+            let end = (off + CHUNK).min(data.len());
+            let mut p = BytesMut::with_capacity(end - off);
+            p.extend_from_slice(&data[off..end]);
+            stream
+                .write_all(&Message::new(MessageType::CopyData, p).encode())
+                .await?;
+            off = end;
+        }
+        stream
+            .write_all(&Message::new(MessageType::CopyDone, BytesMut::new()).encode())
+            .await?;
+
+        // 4. Read to ReadyForQuery: CommandComplete "COPY n" or ErrorResponse.
+        let mut tag = String::new();
+        let mut last_error = None;
+        loop {
+            let msg = read_one(stream, &mut buffer, &codec).await?;
+            match msg.msg_type {
+                MessageType::CommandComplete | MessageType::Close => {
+                    tag = parse_cstring(&msg.payload);
+                }
+                MessageType::ErrorResponse => {
+                    last_error = Some(error_message(&msg.payload));
+                }
+                MessageType::ReadyForQuery => {
+                    if let Some(e) = last_error {
+                        return Err(BackendError::BackendError(e));
+                    }
+                    // "COPY n" -> n
+                    let n = tag
+                        .rsplit(' ')
+                        .next()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    return Ok(n);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn drain_to_ready(
+        stream: &mut Stream,
+        buffer: &mut BytesMut,
+        codec: &ProtocolCodec,
+    ) -> BackendResult<()> {
+        loop {
+            if read_one(stream, buffer, codec).await?.msg_type == MessageType::ReadyForQuery {
+                return Ok(());
+            }
+        }
+    }
+
     async fn run_query(&mut self, sql: &str) -> BackendResult<QueryResult> {
         let t = self.stream_query_timeout();
         tokio::time::timeout(t, Self::run_query_inner(&mut self.stream, sql))

@@ -176,6 +176,27 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Encode one value into a buffer in PostgreSQL `COPY ... FROM STDIN` text
+/// format: `NULL` is `\N`; backslash/tab/newline/carriage-return are escaped.
+/// Source values arrive as their text representation already, so this is just
+/// the COPY-level escaping.
+fn encode_copy_field(out: &mut Vec<u8>, v: &TextValue) {
+    match v {
+        TextValue::Null => out.extend_from_slice(b"\\N"),
+        TextValue::Text(s) => {
+            for &b in s.as_bytes() {
+                match b {
+                    b'\\' => out.extend_from_slice(b"\\\\"),
+                    b'\t' => out.extend_from_slice(b"\\t"),
+                    b'\n' => out.extend_from_slice(b"\\n"),
+                    b'\r' => out.extend_from_slice(b"\\r"),
+                    _ => out.push(b),
+                }
+            }
+        }
+    }
+}
+
 /// Map a PostgreSQL type OID to a portable column type for the snapshot's
 /// `CREATE TABLE` on the secondary. Unknown OIDs fall back to `text`.
 fn oid_type(oid: u32) -> &'static str {
@@ -229,23 +250,63 @@ pub async fn snapshot_tables(cfg: &MirrorConfig, tables: &[String]) -> Result<Ve
         tgt.execute(&create).await.map_err(|e| format!("create {} on target: {}", table, e))?;
 
         let col_list = res.columns.iter().map(|c| quote_ident(&c.name)).collect::<Vec<_>>().join(", ");
-        let placeholders = (1..=res.columns.len()).map(|i| format!("${}", i)).collect::<Vec<_>>().join(", ");
-        let insert = format!("INSERT INTO {} ({}) VALUES ({})", qt, col_list, placeholders);
 
-        let mut copied = 0u64;
-        for row in &res.rows {
-            let params: Vec<ParamValue> = row
-                .iter()
-                .map(|v| match v {
-                    TextValue::Null => ParamValue::Null,
-                    TextValue::Text(s) => ParamValue::Text(s.clone()),
-                })
-                .collect();
-            tgt.query_with_params(&insert, &params)
-                .await
-                .map_err(|e| format!("insert into {}: {}", table, e))?;
-            copied += 1;
+        // Primary path: a single COPY ... FROM STDIN bulk-load. `HELIOS_SNAPSHOT_USE_COPY=0`
+        // forces the INSERT path (ops kill-switch / fallback test).
+        let use_copy =
+            std::env::var("HELIOS_SNAPSHOT_USE_COPY").map(|v| v != "0").unwrap_or(true);
+
+        let mut copied: Option<u64> = None;
+        if use_copy {
+            let mut copy_buf: Vec<u8> = Vec::new();
+            for row in &res.rows {
+                for (i, v) in row.iter().enumerate() {
+                    if i > 0 {
+                        copy_buf.push(b'\t');
+                    }
+                    encode_copy_field(&mut copy_buf, v);
+                }
+                copy_buf.push(b'\n');
+            }
+            let copy_sql = format!("COPY {} ({}) FROM STDIN", qt, col_list);
+            match tgt.copy_in(&copy_sql, &copy_buf).await {
+                Ok(n) => copied = Some(n),
+                Err(e) => {
+                    // COPY rejected/unsupported leaves the connection clean and
+                    // zero rows loaded (COPY is atomic) — fall through to INSERT.
+                    tracing::warn!(
+                        table = %table,
+                        error = %e,
+                        "COPY snapshot failed; falling back to per-row INSERT"
+                    );
+                }
+            }
         }
+
+        // Fallback path (preserved): per-row parameterised INSERTs.
+        let copied = match copied {
+            Some(n) => n,
+            None => {
+                let placeholders =
+                    (1..=res.columns.len()).map(|i| format!("${}", i)).collect::<Vec<_>>().join(", ");
+                let insert = format!("INSERT INTO {} ({}) VALUES ({})", qt, col_list, placeholders);
+                let mut copied = 0u64;
+                for row in &res.rows {
+                    let params: Vec<ParamValue> = row
+                        .iter()
+                        .map(|v| match v {
+                            TextValue::Null => ParamValue::Null,
+                            TextValue::Text(s) => ParamValue::Text(s.clone()),
+                        })
+                        .collect();
+                    tgt.query_with_params(&insert, &params)
+                        .await
+                        .map_err(|e| format!("insert into {}: {}", table, e))?;
+                    copied += 1;
+                }
+                copied
+            }
+        };
         report.push(TableSnapshot { table: table.clone(), source_rows: res.rows.len() as u64, copied });
     }
     src.close().await;
@@ -294,4 +355,32 @@ async fn worker(config: MirrorConfig, mut rx: mpsc::Receiver<String>, metrics: A
         }
     }
     tracing::info!("traffic mirror worker stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enc(v: &TextValue) -> String {
+        let mut out = Vec::new();
+        encode_copy_field(&mut out, v);
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn copy_field_encoding() {
+        // NULL -> \N (distinct from an empty string).
+        assert_eq!(enc(&TextValue::Null), "\\N");
+        assert_eq!(enc(&TextValue::Text(String::new())), "");
+        // Plain text passes through.
+        assert_eq!(enc(&TextValue::Text("alice".into())), "alice");
+        // Tab / newline / CR / backslash are escaped so they can't break the
+        // tab-delimited, newline-terminated COPY framing.
+        assert_eq!(enc(&TextValue::Text("a\tb".into())), "a\\tb");
+        assert_eq!(enc(&TextValue::Text("a\nb".into())), "a\\nb");
+        assert_eq!(enc(&TextValue::Text("a\rb".into())), "a\\rb");
+        assert_eq!(enc(&TextValue::Text("a\\b".into())), "a\\\\b");
+        // A literal backslash-N in data must not be confused with NULL.
+        assert_eq!(enc(&TextValue::Text("\\N".into())), "\\\\N");
+    }
 }
