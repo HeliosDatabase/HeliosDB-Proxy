@@ -64,6 +64,7 @@ pub mod auth_scram;
 pub mod agent_contract;
 pub mod mcp;
 pub mod http_gateway;
+pub mod mirror;
 pub mod config;
 pub mod server;
 pub mod protocol;

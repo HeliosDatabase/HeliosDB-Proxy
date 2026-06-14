@@ -214,6 +214,60 @@ pub struct ProxyConfig {
     /// default — lets edge/serverless clients run SQL over HTTP.
     #[serde(default)]
     pub http_gateway: HttpGatewayConfig,
+    /// Continuous traffic mirroring to a secondary backend. Disabled by
+    /// default — the on-ramp to a PG->Nano migration mirror.
+    #[serde(default)]
+    pub mirror: MirrorConfig,
+}
+
+/// Traffic-mirror configuration: replay a sampled share of live (simple-query)
+/// writes to a secondary backend, asynchronously and off the client hot path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MirrorConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Fraction of eligible statements to mirror, 0.0..=1.0.
+    #[serde(default = "default_sample_rate")]
+    pub sample_rate: f64,
+    /// Mirror only write/DDL statements (default). When false, all simple
+    /// queries are mirrored.
+    #[serde(default = "default_true_bool")]
+    pub writes_only: bool,
+    /// Bounded queue depth; when full, statements are dropped (and counted)
+    /// rather than blocking the client path.
+    #[serde(default = "default_mirror_queue")]
+    pub queue_size: usize,
+    #[serde(default = "default_localhost")]
+    pub backend_host: String,
+    #[serde(default = "default_pg_port")]
+    pub backend_port: u16,
+    #[serde(default = "default_pg_user")]
+    pub backend_user: String,
+    pub backend_password: Option<String>,
+    pub backend_database: Option<String>,
+}
+
+impl Default for MirrorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sample_rate: 1.0,
+            writes_only: true,
+            queue_size: 10_000,
+            backend_host: default_localhost(),
+            backend_port: default_pg_port(),
+            backend_user: default_pg_user(),
+            backend_password: None,
+            backend_database: None,
+        }
+    }
+}
+
+fn default_sample_rate() -> f64 {
+    1.0
+}
+fn default_mirror_queue() -> usize {
+    10_000
 }
 
 /// HTTP SQL gateway configuration. A Neon-`@neondatabase/serverless`-style
@@ -403,6 +457,7 @@ impl Default for ProxyConfig {
             mcp: McpConfig::default(),
             agent_contracts: Vec::new(),
             http_gateway: HttpGatewayConfig::default(),
+            mirror: MirrorConfig::default(),
         }
     }
 }
