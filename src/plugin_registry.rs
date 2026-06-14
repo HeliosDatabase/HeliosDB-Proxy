@@ -11,10 +11,12 @@
 //! trust root (reusing [`SignatureVerifier`]), and drops `<name>.wasm` (plus a
 //! `<name>.sig` sidecar when signed) into the destination plugins directory.
 //!
-//! This offline slice resolves **local / `file://` artefacts** — exactly what a
-//! private registry on a shared filesystem or an air-gapped mirror needs, and
-//! what is testable without a network. Resolving `https://` artefacts (a public
-//! registry over GitHub Releases) is a thin follow-on at the fetch step.
+//! Artefacts are resolved from **local / `file://` paths** (a private registry
+//! on a shared filesystem or an air-gapped mirror) or fetched over **`http://`**
+//! (a mirror, or a localhost TLS-terminating proxy). Because the index is a
+//! local trusted file, its `sha256` makes a plain-HTTP fetch integrity-safe — so
+//! no TLS stack is pulled in. `https://` artefacts return a clear error pointing
+//! at those options (a direct TLS client is the remaining follow-on).
 
 use std::path::{Path, PathBuf};
 
@@ -142,6 +144,53 @@ fn resolve_artifact_path(index_path: &Path, artifact: &str) -> Result<PathBuf, S
     }
 }
 
+/// Minimal blocking HTTP/1.1 GET for `http://host[:port]/path`, returning the
+/// response body. Dependency-free (std::net only) and intentionally tiny — the
+/// artefact's integrity comes from the index `sha256`, not the transport, so
+/// this needs no TLS and no redirect/keep-alive handling. `Connection: close`
+/// lets us read to EOF instead of parsing Content-Length / chunked encoding.
+fn http_get(url: &str) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Write};
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("not an http:// url: {url}"))?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let connect_addr = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{authority}:80")
+    };
+    let mut stream = std::net::TcpStream::connect(&connect_addr)
+        .map_err(|e| format!("connect {connect_addr}: {e}"))?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: helios-plugin\r\n\
+         Accept: */*\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("send request: {e}"))?;
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read response from {connect_addr}: {e}"))?;
+
+    let sep = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| "malformed HTTP response (no header terminator)".to_string())?;
+    let status_line_end = buf.iter().position(|&b| b == b'\r').unwrap_or(0);
+    let status_line = std::str::from_utf8(&buf[..status_line_end]).unwrap_or("");
+    let code = status_line.split_whitespace().nth(1).unwrap_or("");
+    if code != "200" {
+        return Err(format!("HTTP {} fetching {url}", status_line.trim()));
+    }
+    Ok(buf[sep + 4..].to_vec())
+}
+
 /// Find an entry by name (optionally pinned to an exact version).
 pub fn find_entry<'a>(
     index: &'a RegistryIndex,
@@ -172,9 +221,24 @@ pub fn install(
     let index = load_index(index_path)?;
     let entry = find_entry(&index, name, version)?.clone();
 
-    let artifact_path = resolve_artifact_path(index_path, &entry.artifact)?;
-    let bytes = std::fs::read(&artifact_path)
-        .map_err(|e| format!("read artefact {}: {}", artifact_path.display(), e))?;
+    // Fetch the artefact bytes. Local / file:// are read from disk; http:// is
+    // fetched over the network. Because the index is a *local, trusted* file
+    // (a `--registry` path), the `sha256` it pins makes a plain-HTTP fetch
+    // integrity-safe — a tampered download fails the hash check below.
+    let bytes = if entry.artifact.starts_with("http://") {
+        http_get(&entry.artifact)?
+    } else if entry.artifact.starts_with("https://") {
+        return Err(format!(
+            "https:// artefact fetch is not supported in this build ({}); use an \
+             http:// URL (e.g. a localhost TLS-terminating mirror) or a file:// / local \
+             artefact — the index sha256 verifies the bytes regardless of transport",
+            entry.artifact
+        ));
+    } else {
+        let artifact_path = resolve_artifact_path(index_path, &entry.artifact)?;
+        std::fs::read(&artifact_path)
+            .map_err(|e| format!("read artefact {}: {}", artifact_path.display(), e))?
+    };
 
     // Integrity: the bytes must match the SHA-256 the index advertises.
     let actual = sha256_hex(&bytes);
@@ -400,6 +464,20 @@ mod tests {
     fn rejects_remote_artifact_offline() {
         let p = resolve_artifact_path(Path::new("/tmp/index.json"), "https://example/colmask.wasm");
         assert!(p.unwrap_err().contains("remote"));
+    }
+
+    #[test]
+    fn install_rejects_https_artifact() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let index = src.path().join("idx.json");
+        std::fs::write(
+            &index,
+            r#"{"plugins":[{"name":"x","artifact":"https://example/x.wasm","sha256":"00"}]}"#,
+        )
+        .unwrap();
+        let err = install(&index, "x", None, dst.path(), None).unwrap_err();
+        assert!(err.contains("https://"), "{err}");
     }
 
     #[test]

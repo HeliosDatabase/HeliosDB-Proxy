@@ -86,5 +86,30 @@ cp "$DEST/colmask.wasm" "$OUT/tampered.wasm"; printf 'x' >> "$OUT/tampered.wasm"
 out=$("$BIN" verify "$OUT/tampered.wasm" --trust-root "$TRUST" --sig "$DEST/colmask.sig" 2>&1); rc=$?
 { [ "$rc" -ne 0 ] && echo "$out" | grep -qi "verification failed"; } && ok "verify: tampered artefact rejected (exit $rc)" || bad "verify tampered: rc=$rc out=$out"
 
+# 10. http:// remote fetch — LOCAL trusted index, artefact served over plain HTTP.
+if command -v python3 >/dev/null 2>&1; then
+  PORT=18399
+  ( cd "$REG" && exec python3 -m http.server "$PORT" --bind 127.0.0.1 >/dev/null 2>&1 ) & HTTPD=$!
+  for i in $(seq 1 25); do curl -s -o /dev/null "http://127.0.0.1:$PORT/colmask.wasm" && break; sleep 0.2; done
+  cat > "$REG/http-index.json" <<EOF
+{ "schema_version":"1", "plugins":[
+  { "name":"colmask","version":"0.1.0","artifact":"http://127.0.0.1:$PORT/colmask.wasm","sha256":"$SHA","signature":"$SIG" } ] }
+EOF
+  rm -rf "$DEST"/*
+  out=$("$BIN" install colmask --registry "$REG/http-index.json" --dest "$DEST" --trust-root "$TRUST" 2>&1)
+  { echo "$out" | grep -q "verified by 'official'" && cmp -s "$DEST/colmask.wasm" "$REG/colmask.wasm"; } \
+    && ok "http fetch: artefact pulled over HTTP, verified + deployed" || bad "http install: $out"
+
+  # 11. http fetch + wrong sha256 in the index -> rejected (transport-tamper guard).
+  sed "s/$SHA/$(printf '%064d' 0)/" "$REG/http-index.json" > "$REG/http-bad.json"
+  rm -rf "$DEST"/*
+  out=$("$BIN" install colmask --registry "$REG/http-bad.json" --dest "$DEST" 2>&1)
+  { echo "$out" | grep -qi "sha256 mismatch" && [ ! -f "$DEST/colmask.wasm" ]; } \
+    && ok "http fetch: sha256 mismatch blocks a tampered download" || bad "http sha: $out"
+  kill "$HTTPD" 2>/dev/null; wait "$HTTPD" 2>/dev/null
+else
+  printf '  \033[33mSKIP\033[0m http-fetch (python3 unavailable)\n'
+fi
+
 echo "== plugin-install test: PASS=$PASS FAIL=$FAIL =="
 exit $FAIL
