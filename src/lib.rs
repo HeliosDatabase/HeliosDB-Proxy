@@ -66,6 +66,7 @@ pub mod mcp;
 pub mod http_gateway;
 pub mod mirror;
 pub mod branch;
+pub mod plugin_registry;
 pub mod config;
 pub mod server;
 pub mod protocol;
