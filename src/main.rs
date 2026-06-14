@@ -132,7 +132,8 @@ async fn main() -> Result<()> {
     tracing::info!("HeliosDB Proxy v{} starting...", VERSION);
 
     let config = load_config(&cli)?;
-    let server = ProxyServer::new(config)?;
+    // Retain the config path so SIGHUP can re-read it for a live reload.
+    let server = ProxyServer::new(config)?.with_config_path(cli.config.clone());
 
     tracing::info!("Starting proxy server on {}", cli.listen);
     server.run().await?;
