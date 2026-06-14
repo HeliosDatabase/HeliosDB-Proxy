@@ -460,10 +460,23 @@ async fn read_one(
     codec: &ProtocolCodec,
 ) -> BackendResult<Message> {
     loop {
-        if let Some(msg) = codec
+        if let Some(mut msg) = codec
             .decode_message(buffer)
             .map_err(|e| BackendError::Protocol(e.to_string()))?
         {
+            // The shared tag decoder is direction-agnostic and resolves the
+            // tags that collide between client and server frames to their
+            // CLIENT-side meaning. `read_one` only ever reads SERVER frames,
+            // so remap those collisions to their server semantics:
+            //   'S' Sync->ParameterStatus, 'D' Describe->DataRow,
+            //   'E' Execute->ErrorResponse, 'C' Close->CommandComplete.
+            msg.msg_type = match msg.msg_type {
+                MessageType::Sync => MessageType::ParameterStatus,
+                MessageType::Describe => MessageType::DataRow,
+                MessageType::Execute => MessageType::ErrorResponse,
+                MessageType::Close => MessageType::CommandComplete,
+                other => other,
+            };
             return Ok(msg);
         }
         let mut tmp = vec![0u8; 4096];

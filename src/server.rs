@@ -553,6 +553,18 @@ impl ProxyServer {
         // Start admin server
         let admin_task = self.spawn_admin_server();
 
+        // Start the MCP agent gateway when enabled.
+        let mcp_task = if self.config.mcp.enabled {
+            let mcp_cfg = self.config.mcp.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = crate::mcp::McpServer::new(mcp_cfg).run().await {
+                    tracing::error!("MCP gateway error: {}", e);
+                }
+            }))
+        } else {
+            None
+        };
+
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         loop {
@@ -591,6 +603,9 @@ impl ProxyServer {
         health_task.abort();
         pool_task.abort();
         admin_task.abort();
+        if let Some(t) = mcp_task {
+            t.abort();
+        }
 
         Ok(())
     }
