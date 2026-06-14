@@ -138,6 +138,17 @@ pub fn spawn(config: MirrorConfig) -> MirrorHandle {
     handle
 }
 
+/// Target the proxy redirects client traffic to after a migration cutover.
+/// New connections route here (with these credentials/database substituted
+/// for the client's), making the cutover transparent to the application.
+#[derive(Debug, Clone)]
+pub struct CutoverTarget {
+    pub addr: String,
+    pub user: String,
+    pub password: Option<String>,
+    pub database: Option<String>,
+}
+
 /// Per-table snapshot result.
 #[derive(Debug, Clone, Serialize)]
 pub struct TableSnapshot {

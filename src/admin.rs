@@ -113,6 +113,9 @@ pub struct MigrationInfo {
     pub metrics: Arc<crate::mirror::MirrorMetrics>,
     /// Mirror config (source + target) for snapshot bootstrap.
     pub config: crate::config::MirrorConfig,
+    /// The proxy's cutover switch and the target to promote to.
+    pub cutover: Arc<arc_swap::ArcSwap<Option<Arc<crate::mirror::CutoverTarget>>>>,
+    pub cutover_target: crate::mirror::CutoverTarget,
 }
 
 /// Chaos override applied to a single node. Today only the
@@ -522,10 +525,44 @@ impl AdminServer {
                 match state.migration.read().await.as_ref() {
                     Some(info) => {
                         let st = crate::mirror::status(&info.target, info.writes_only, &info.metrics);
-                        Ok((200, serde_json::to_value(st)?))
+                        let mut v = serde_json::to_value(st)?;
+                        let cut = info.cutover.load_full().is_some();
+                        v["cutover_active"] = serde_json::json!(cut);
+                        Ok((200, v))
                     }
                     None => Ok((503, serde_json::json!({ "error": "traffic mirroring not enabled" }))),
                 }
+            }
+
+            // Promote the mirror target to primary: new connections route there.
+            ("POST", "/api/migration/cutover") | ("POST", "/migration/cutover") => {
+                let info = state.migration.read().await.clone();
+                let Some(info) = info else {
+                    return Ok((503, serde_json::json!({ "error": "traffic mirroring not enabled" })));
+                };
+                let force = path.contains("force=true")
+                    || body.map(|b| b.contains("\"force\":true")).unwrap_or(false);
+                let st = crate::mirror::status(&info.target, info.writes_only, &info.metrics);
+                if !st.migration_ready && !force {
+                    return Ok((409, serde_json::json!({
+                        "ok": false,
+                        "error": "not migration_ready (backlog/drops present); pass force=true to override",
+                        "status": st,
+                    })));
+                }
+                info.cutover.store(Arc::new(Some(Arc::new(info.cutover_target.clone()))));
+                tracing::warn!(target = %info.cutover_target.addr, "migration cutover: new connections now route to the promoted target");
+                Ok((200, serde_json::json!({ "ok": true, "promoted_to": info.cutover_target.addr })))
+            }
+
+            // Roll a cutover back to the original primary.
+            ("POST", "/api/migration/cutover/rollback") | ("POST", "/migration/cutover/rollback") => {
+                let info = state.migration.read().await.clone();
+                let Some(info) = info else {
+                    return Ok((503, serde_json::json!({ "error": "traffic mirroring not enabled" })));
+                };
+                info.cutover.store(Arc::new(None));
+                Ok((200, serde_json::json!({ "ok": true, "rolled_back": true })))
             }
 
             // Snapshot-bootstrap named tables from the source into the mirror.
