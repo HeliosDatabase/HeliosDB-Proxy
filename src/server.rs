@@ -346,6 +346,40 @@ impl BackendConn {
     }
 }
 
+/// Bind a TCP listener with `SO_REUSEADDR` + `SO_REUSEPORT` so a second process
+/// can bind the same address concurrently (the kernel then load-balances new
+/// connections across both). This is what lets a new binary take over new
+/// connections while the old one drains — used for both the client and admin
+/// listeners so a binary handoff can re-bind every address (Batch H).
+pub(crate) fn bind_reuseport(addr: &str) -> Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sockaddr: SocketAddr = addr
+        .parse()
+        .map_err(|e| ProxyError::Config(format!("invalid listen address '{}': {}", addr, e)))?;
+    let domain = if sockaddr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|e| ProxyError::Network(format!("socket(): {}", e)))?;
+    socket
+        .set_reuse_address(true)
+        .map_err(|e| ProxyError::Network(format!("SO_REUSEADDR: {}", e)))?;
+    #[cfg(all(unix, not(target_os = "solaris")))]
+    socket
+        .set_reuse_port(true)
+        .map_err(|e| ProxyError::Network(format!("SO_REUSEPORT: {}", e)))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| ProxyError::Network(format!("set_nonblocking: {}", e)))?;
+    socket
+        .bind(&sockaddr.into())
+        .map_err(|e| ProxyError::Network(format!("Failed to bind {}: {}", addr, e)))?;
+    socket
+        .listen(1024)
+        .map_err(|e| ProxyError::Network(format!("listen(): {}", e)))?;
+    let std_listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(std_listener)
+        .map_err(|e| ProxyError::Network(format!("from_std listener: {}", e)))
+}
+
 /// Disposition produced by the pre-query plugin hook stage.
 ///
 /// When the `wasm-plugins` feature is off, only `Forward` is ever produced —
@@ -642,39 +676,6 @@ impl ProxyServer {
         HangupNever
     }
 
-    /// Bind a TCP listener with `SO_REUSEADDR` + `SO_REUSEPORT` so a second
-    /// process can bind the same address concurrently (the kernel then
-    /// load-balances new connections across both). This is what lets a new
-    /// binary take over new connections while the old one drains.
-    fn bind_reuseport(addr: &str) -> Result<TcpListener> {
-        use socket2::{Domain, Protocol, Socket, Type};
-        let sockaddr: SocketAddr = addr
-            .parse()
-            .map_err(|e| ProxyError::Config(format!("invalid listen address '{}': {}", addr, e)))?;
-        let domain = if sockaddr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
-        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-            .map_err(|e| ProxyError::Network(format!("socket(): {}", e)))?;
-        socket
-            .set_reuse_address(true)
-            .map_err(|e| ProxyError::Network(format!("SO_REUSEADDR: {}", e)))?;
-        #[cfg(all(unix, not(target_os = "solaris")))]
-        socket
-            .set_reuse_port(true)
-            .map_err(|e| ProxyError::Network(format!("SO_REUSEPORT: {}", e)))?;
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| ProxyError::Network(format!("set_nonblocking: {}", e)))?;
-        socket
-            .bind(&sockaddr.into())
-            .map_err(|e| ProxyError::Network(format!("Failed to bind {}: {}", addr, e)))?;
-        socket
-            .listen(1024)
-            .map_err(|e| ProxyError::Network(format!("listen(): {}", e)))?;
-        let std_listener: std::net::TcpListener = socket.into();
-        TcpListener::from_std(std_listener)
-            .map_err(|e| ProxyError::Network(format!("from_std listener: {}", e)))
-    }
-
     /// Wait for in-flight client connections to finish, up to `timeout`. Used by
     /// the graceful drain after the listener is closed — the session map is the
     /// live active-connection gauge (one entry per accepted connection).
@@ -797,7 +798,7 @@ impl ProxyServer {
         // connections across both processes. That is the mechanism behind the
         // zero-downtime binary handoff: start the new binary, then SIGUSR2 the
         // old one to close its listener and drain (Batch H, item 84).
-        let listener = Self::bind_reuseport(&self.config.listen_address)?;
+        let listener = bind_reuseport(&self.config.listen_address)?;
 
         tracing::info!("Proxy listening on {} (SO_REUSEPORT)", self.config.listen_address);
 
