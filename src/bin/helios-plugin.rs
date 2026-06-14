@@ -47,6 +47,19 @@ enum Cmd {
         #[arg(long)]
         registry: PathBuf,
     },
+    /// Verify a local plugin artefact (SHA-256, and signature against a trust
+    /// root) without installing it — a pre-deploy / audit check.
+    Verify {
+        /// Path to the `.wasm` artefact.
+        wasm: PathBuf,
+        /// Ed25519 trust root (dir of `*.pub` keys). Omit to print only the
+        /// SHA-256 digest.
+        #[arg(long)]
+        trust_root: Option<PathBuf>,
+        /// Signature file (base64 Ed25519). Default: a `<name>.sig` sidecar.
+        #[arg(long)]
+        sig: Option<PathBuf>,
+    },
     /// Scaffold a new plugin source skeleton.
     New {
         /// Plugin name.
@@ -92,6 +105,17 @@ fn main() -> ExitCode {
                 println!("{:<24} {:<10} {:<8} {}", e.name, e.version, sig, e.description);
             }
         }),
+        Cmd::Verify { wasm, trust_root, sig } => {
+            plugin_registry::verify(&wasm, trust_root.as_deref(), sig.as_deref()).map(|r| {
+                println!("{}", wasm.display());
+                println!("  sha256: {}", r.sha256);
+                match r.signed_by {
+                    Some(k) => println!("  signature: verified by '{k}'"),
+                    None if trust_root.is_some() => unreachable!(),
+                    None => println!("  signature: not checked (no trust root)"),
+                }
+            })
+        }
         Cmd::New { name, dir } => plugin_registry::scaffold(&name, &dir).map(|root| {
             println!("scaffolded plugin at {}", root.display());
         }),

@@ -221,6 +221,44 @@ pub fn install(
     })
 }
 
+/// What a [`verify`] produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyReport {
+    pub sha256: String,
+    /// Trust-root key label that verified the signature, when a trust root was
+    /// supplied (otherwise `None` — only the digest was computed).
+    pub signed_by: Option<String>,
+}
+
+/// Verify a local plugin artefact already on disk (a pre-deploy / audit check,
+/// distinct from `install`): compute its SHA-256 and, when a trust root is
+/// given, check its Ed25519 signature. The signature is read from `sig_path`,
+/// or a `<name>.sig` sidecar next to the artefact (the convention the loader
+/// uses: `path.with_extension("sig")`).
+pub fn verify(
+    wasm_path: &Path,
+    trust_root: Option<&Path>,
+    sig_path: Option<&Path>,
+) -> Result<VerifyReport, String> {
+    let bytes = std::fs::read(wasm_path)
+        .map_err(|e| format!("read {}: {}", wasm_path.display(), e))?;
+    let sha256 = sha256_hex(&bytes);
+
+    let mut signed_by = None;
+    if let Some(root) = trust_root {
+        let sig_file = match sig_path {
+            Some(p) => p.to_path_buf(),
+            None => wasm_path.with_extension("sig"),
+        };
+        let sig = std::fs::read_to_string(&sig_file)
+            .map_err(|e| format!("read signature {}: {}", sig_file.display(), e))?;
+        let label = verify_against_trust_root(&bytes, sig.trim(), root)
+            .map_err(|e| format!("signature verification failed: {e}"))?;
+        signed_by = Some(label);
+    }
+    Ok(VerifyReport { sha256, signed_by })
+}
+
 /// Scaffold a new plugin source skeleton under `dir/<name>/`.
 ///
 /// Writes a `plugin.yaml` manifest, a minimal Rust `src/lib.rs` hook stub, and a
@@ -362,6 +400,48 @@ mod tests {
     fn rejects_remote_artifact_offline() {
         let p = resolve_artifact_path(Path::new("/tmp/index.json"), "https://example/colmask.wasm");
         assert!(p.unwrap_err().contains("remote"));
+    }
+
+    #[test]
+    fn verify_digest_only_without_trust_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm = dir.path().join("p.wasm");
+        std::fs::write(&wasm, WASM).unwrap();
+        let r = verify(&wasm, None, None).unwrap();
+        assert_eq!(r.sha256, sha256_hex(WASM));
+        assert!(r.signed_by.is_none());
+    }
+
+    #[test]
+    fn verify_signature_via_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        std::fs::write(trust.path().join("official.pub"), b64(&key.verifying_key().to_bytes()))
+            .unwrap();
+        let wasm = dir.path().join("p.wasm");
+        std::fs::write(&wasm, WASM).unwrap();
+        // `p.wasm` -> `p.sig` sidecar (with_extension), matching the loader.
+        std::fs::write(dir.path().join("p.sig"), b64(&key.sign(WASM).to_bytes())).unwrap();
+
+        let r = verify(&wasm, Some(trust.path()), None).unwrap();
+        assert_eq!(r.signed_by.as_deref(), Some("official"));
+    }
+
+    #[test]
+    fn verify_rejects_tampered_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let trust = tempfile::tempdir().unwrap();
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        std::fs::write(trust.path().join("official.pub"), b64(&key.verifying_key().to_bytes()))
+            .unwrap();
+        let wasm = dir.path().join("p.wasm");
+        // Sign the real bytes, but write tampered bytes to disk.
+        std::fs::write(dir.path().join("p.sig"), b64(&key.sign(WASM).to_bytes())).unwrap();
+        std::fs::write(&wasm, b"tampered-wasm").unwrap();
+
+        let err = verify(&wasm, Some(trust.path()), None).unwrap_err();
+        assert!(err.contains("signature verification failed"), "{err}");
     }
 
     #[test]
