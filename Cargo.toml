@@ -220,6 +220,10 @@ tempfile = "3"
 name = "heliosdb-proxy"
 path = "src/main.rs"
 
+[[bin]]
+name = "helios-plugin"
+path = "src/bin/helios-plugin.rs"
+
 [lib]
 name = "heliosdb_proxy"
 path = "src/lib.rs"
