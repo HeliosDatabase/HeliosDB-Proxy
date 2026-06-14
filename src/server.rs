@@ -16,7 +16,7 @@ use crate::{ProxyError, Result};
 use arc_swap::ArcSwap;
 use bytes::{BufMut, BytesMut};
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -293,6 +293,29 @@ pub struct StatementLog {
     pub result_checksum: Option<u64>,
     /// Execution time
     pub executed_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A cached per-session backend connection plus the set of *named* prepared
+/// statements known to be live on **this** socket.
+///
+/// Tying the prepared-statement set to the socket (rather than to the node
+/// address) is what makes prepared statements survive a backend switch: when a
+/// connection is dropped and redialed, or when a session is routed to a
+/// different node, the fresh `BackendConn` starts with an empty set, so the
+/// proxy transparently re-issues the original `Parse` for any named statement
+/// the target connection is missing before forwarding a `Bind`/`Describe` that
+/// references it (Batch F.4). The session keeps the canonical `Parse` bytes in
+/// a separate registry; this set is just "what does *this* socket already
+/// know".
+struct BackendConn {
+    stream: TcpStream,
+    prepared: HashSet<String>,
+}
+
+impl BackendConn {
+    fn new(stream: TcpStream) -> Self {
+        Self { stream, prepared: HashSet::new() }
+    }
 }
 
 /// Disposition produced by the pre-query plugin hook stage.
@@ -899,11 +922,11 @@ impl ProxyServer {
         // (auth is pass-through), so they are private to this session —
         // cross-client transaction pooling additionally needs proxy-side
         // backend auth and is deferred to the auth batch.
-        let mut conns: HashMap<String, TcpStream> = HashMap::new();
+        let mut conns: HashMap<String, BackendConn> = HashMap::new();
         let mut current_node: Option<String> =
             match Self::handle_startup(stream, &mut buffer, &codec, pre, session, state, config).await {
                 Ok((Some(stream_conn), node_addr)) => {
-                    conns.insert(node_addr.clone(), stream_conn);
+                    conns.insert(node_addr.clone(), BackendConn::new(stream_conn));
                     Some(node_addr)
                 }
                 Ok((None, _)) => {
@@ -936,6 +959,17 @@ impl ProxyServer {
         let mut read_buf = vec![0u8; 16384];
         let mut pending = BytesMut::new();
         let mut pending_route_sql: Option<String> = None;
+        // Prepared-statement tracking (Batch F.4). `stmt_registry` is the
+        // session's canonical record of every *named* `Parse` the client has
+        // issued (name -> full Parse message bytes) so the proxy can re-prepare
+        // a statement on any backend connection that is missing it. `batch_*`
+        // accumulate, for the in-flight extended batch, which named statements
+        // it defines (Parse), references (Bind/Describe-S), and closes
+        // (Close-S) — resolved at the Sync/Flush boundary.
+        let mut stmt_registry: HashMap<String, bytes::Bytes> = HashMap::new();
+        let mut batch_defines: Vec<String> = Vec::new();
+        let mut batch_refs: Vec<String> = Vec::new();
+        let mut batch_closes: Vec<String> = Vec::new();
         loop {
             // Read from client
             let n = stream
@@ -1029,20 +1063,47 @@ impl ProxyServer {
                     | MessageType::Describe
                     | MessageType::Execute
                     | MessageType::Close => {
-                        if msg.msg_type == MessageType::Parse && pending_route_sql.is_none() {
-                            // Parse payload = statement-name cstring + query
-                            // cstring; borrow the query for routing.
-                            if let Some(end) = msg.payload.iter().position(|&b| b == 0) {
-                                if let Some(q) = crate::protocol::query_text(&msg.payload[end + 1..]) {
-                                    if !q.is_empty() {
-                                        pending_route_sql = Some(q.to_string());
+                        match msg.msg_type {
+                            MessageType::Parse => {
+                                // Register named statements so they can be
+                                // re-prepared on a different backend later, and
+                                // borrow the query (2nd cstring) for routing.
+                                let name = Self::parse_stmt_name(&msg.payload);
+                                if !name.is_empty() {
+                                    let name = name.to_string();
+                                    stmt_registry.insert(name.clone(), msg.encode().freeze());
+                                    batch_defines.push(name);
+                                }
+                                if pending_route_sql.is_none() {
+                                    if let Some(end) = msg.payload.iter().position(|&b| b == 0) {
+                                        if let Some(q) =
+                                            crate::protocol::query_text(&msg.payload[end + 1..])
+                                        {
+                                            if !q.is_empty() {
+                                                pending_route_sql = Some(q.to_string());
+                                                #[cfg(feature = "anomaly-detection")]
+                                                Self::record_anomaly_sql(q, state, session);
+                                            }
+                                        }
                                     }
                                 }
                             }
-                            #[cfg(feature = "anomaly-detection")]
-                            if let Some(ref q) = pending_route_sql {
-                                Self::record_anomaly_sql(q, state, session);
+                            MessageType::Bind => {
+                                if let Some(name) = Self::bind_stmt_ref(&msg.payload) {
+                                    batch_refs.push(name.to_string());
+                                }
                             }
+                            MessageType::Describe => {
+                                if let Some(name) = Self::stmt_kind_name(&msg.payload) {
+                                    batch_refs.push(name.to_string());
+                                }
+                            }
+                            MessageType::Close => {
+                                if let Some(name) = Self::stmt_kind_name(&msg.payload) {
+                                    batch_closes.push(name.to_string());
+                                }
+                            }
+                            _ => {}
                         }
                         pending.extend_from_slice(&msg.encode());
                     }
@@ -1052,6 +1113,14 @@ impl ProxyServer {
                         let wait_ready = msg.msg_type == MessageType::Sync;
                         pending.extend_from_slice(&msg.encode());
                         let batch = pending.split().freeze();
+                        // Re-prepare any named statement this batch references
+                        // but does not itself define, in case the target
+                        // connection (after a switch/redial) is missing it.
+                        let reprepare: Vec<String> = batch_refs
+                            .iter()
+                            .filter(|r| !batch_defines.contains(r))
+                            .cloned()
+                            .collect();
                         let (used_node, sent) = Self::forward_extended_batch(
                             stream,
                             &batch,
@@ -1059,6 +1128,9 @@ impl ProxyServer {
                             wait_ready,
                             &mut conns,
                             current_node.as_deref(),
+                            &stmt_registry,
+                            &reprepare,
+                            &batch_defines,
                             session,
                             state,
                             config,
@@ -1068,11 +1140,18 @@ impl ProxyServer {
                             current_node = Some(n);
                         }
                         state.metrics.bytes_sent.fetch_add(sent, Ordering::Relaxed);
+                        // Closed statements are deallocated everywhere — forget
+                        // their canonical Parse so they are never re-prepared.
+                        for name in batch_closes.drain(..) {
+                            stmt_registry.remove(&name);
+                        }
                         if wait_ready {
                             // Sync ends the extended cycle; reset routing so the
                             // next Parse can re-route. Flush leaves it intact so
                             // the rest of the in-flight sequence stays put.
                             pending_route_sql = None;
+                            batch_defines.clear();
+                            batch_refs.clear();
                             state.metrics.queries_processed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -1081,11 +1160,11 @@ impl ProxyServer {
                     MessageType::CopyData | MessageType::CopyDone | MessageType::CopyFail => {
                         if let Some(node) = current_node.clone() {
                             if let Some(b) = conns.get_mut(&node) {
-                                b.write_all(&msg.encode()).await.map_err(|e| {
+                                b.stream.write_all(&msg.encode()).await.map_err(|e| {
                                     ProxyError::Network(format!("Backend copy write error: {}", e))
                                 })?;
                                 if matches!(msg.msg_type, MessageType::CopyDone | MessageType::CopyFail) {
-                                    let r = Self::stream_until_ready(stream, b, session, state).await;
+                                    let r = Self::stream_until_ready(stream, &mut b.stream, session, state).await;
                                     match r {
                                         Ok(sent) => {
                                             state.metrics.bytes_sent.fetch_add(sent, Ordering::Relaxed);
@@ -1104,7 +1183,7 @@ impl ProxyServer {
                     _ => {
                         if let Some(ref node) = current_node {
                             if let Some(b) = conns.get_mut(node) {
-                                let _ = b.write_all(&msg.encode()).await;
+                                let _ = b.stream.write_all(&msg.encode()).await;
                             }
                         }
                     }
@@ -1692,7 +1771,7 @@ impl ProxyServer {
     /// client's pass-through credentials) only if absent. The cached
     /// connection is then reused across read/write route switches.
     async fn ensure_conn(
-        conns: &mut HashMap<String, TcpStream>,
+        conns: &mut HashMap<String, BackendConn>,
         target: &str,
         session: &Arc<ClientSession>,
         config: &ProxyConfig,
@@ -1717,7 +1796,7 @@ impl ProxyServer {
             .map_err(|e| ProxyError::Network(format!("Backend startup error: {}", e)))?;
         Self::complete_backend_auth(&mut backend).await?;
         tracing::debug!(node = %target, "opened backend connection");
-        conns.insert(target.to_string(), backend);
+        conns.insert(target.to_string(), BackendConn::new(backend));
         Ok(())
     }
 
@@ -1729,7 +1808,7 @@ impl ProxyServer {
     async fn forward_simple_query(
         client: &mut ClientStream,
         msg: &Message,
-        conns: &mut HashMap<String, TcpStream>,
+        conns: &mut HashMap<String, BackendConn>,
         current_node: Option<&str>,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
@@ -1768,11 +1847,12 @@ impl ProxyServer {
         let backend = conns.get_mut(&target).expect("just ensured");
 
         backend
+            .stream
             .write_all(&msg.encode())
             .await
             .map_err(|e| ProxyError::Network(format!("Backend write error: {}", e)))?;
 
-        match Self::stream_until_ready(client, backend, session, state).await {
+        match Self::stream_until_ready(client, &mut backend.stream, session, state).await {
             Ok(sent) => Ok((Some(target), sent)),
             Err(e) => {
                 // Drop the broken connection so the next use redials.
@@ -1787,13 +1867,24 @@ impl ProxyServer {
     /// Routing is taken from `route_sql` (the first Parse's SQL); when it is
     /// `None` (a re-Bind/Execute of a named prepared statement) the request
     /// stays on the connection the statement was prepared on — no switch.
+    ///
+    /// `reprepare` lists named statements this batch references but does not
+    /// itself define; any that the chosen connection has not seen are
+    /// re-prepared from `registry` (their original `Parse`) before the batch is
+    /// sent, so a named statement survives a backend switch/redial (Batch F.4).
+    /// `defines` are the named statements this batch's own `Parse`s create —
+    /// recorded against the connection once it accepts the batch.
+    #[allow(clippy::too_many_arguments)]
     async fn forward_extended_batch(
         client: &mut ClientStream,
         batch: &[u8],
         route_sql: Option<&str>,
         wait_ready: bool,
-        conns: &mut HashMap<String, TcpStream>,
+        conns: &mut HashMap<String, BackendConn>,
         current_node: Option<&str>,
+        registry: &HashMap<String, bytes::Bytes>,
+        reprepare: &[String],
+        defines: &[String],
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,
@@ -1816,23 +1907,136 @@ impl ProxyServer {
         Self::ensure_conn(conns, &target, session, config).await?;
         let backend = conns.get_mut(&target).expect("just ensured");
 
-        backend
+        // Transparently re-prepare any referenced named statement this socket
+        // is missing. Each is sent as its original `Parse` + `Flush`; the
+        // resulting `ParseComplete` is consumed here so the client never sees
+        // the extra round trip. A re-prepare failure recycles the connection.
+        for name in reprepare {
+            if backend.prepared.contains(name) {
+                continue;
+            }
+            let Some(parse_bytes) = registry.get(name) else {
+                continue; // unknown statement — let the batch surface the error
+            };
+            match Self::reprepare_statement(&mut backend.stream, parse_bytes).await {
+                Ok(()) => {
+                    backend.prepared.insert(name.clone());
+                }
+                Err(e) => {
+                    conns.remove(&target);
+                    return Err(e);
+                }
+            }
+        }
+
+        if let Err(e) = backend
+            .stream
             .write_all(batch)
             .await
-            .map_err(|e| ProxyError::Network(format!("Backend write error: {}", e)))?;
+            .map_err(|e| ProxyError::Network(format!("Backend write error: {}", e)))
+        {
+            conns.remove(&target);
+            return Err(e);
+        }
 
         let r = if wait_ready {
-            Self::stream_until_ready(client, backend, session, state).await
+            Self::stream_until_ready(client, &mut backend.stream, session, state).await
         } else {
-            Self::stream_flush(client, backend, session, state).await
+            Self::stream_flush(client, &mut backend.stream, session, state).await
         };
         match r {
-            Ok(sent) => Ok((Some(target), sent)),
+            Ok(sent) => {
+                // The connection now holds these named statements.
+                for name in defines {
+                    backend.prepared.insert(name.clone());
+                }
+                Ok((Some(target), sent))
+            }
             Err(e) => {
                 conns.remove(&target);
                 Err(e)
             }
         }
+    }
+
+    /// Re-issue one named `Parse` on a backend socket out-of-band: send the
+    /// original `Parse` bytes followed by a `Flush`, then read and discard the
+    /// single `ParseComplete` the backend emits. The statement persists on the
+    /// connection (the implicit transaction is closed later by the real
+    /// batch's `Sync`). An `ErrorResponse` means the re-prepare failed.
+    async fn reprepare_statement<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+        backend: &mut S,
+        parse_bytes: &[u8],
+    ) -> Result<()> {
+        backend
+            .write_all(parse_bytes)
+            .await
+            .map_err(|e| ProxyError::Network(format!("re-prepare write error: {}", e)))?;
+        // Flush: 'H' + length 4.
+        backend
+            .write_all(&[b'H', 0, 0, 0, 4])
+            .await
+            .map_err(|e| ProxyError::Network(format!("re-prepare flush error: {}", e)))?;
+        let mtype = Self::read_one_frame_type(backend).await?;
+        match mtype {
+            b'1' => Ok(()), // ParseComplete
+            b'E' => Err(ProxyError::Protocol("re-prepare rejected by backend".to_string())),
+            other => Err(ProxyError::Protocol(format!(
+                "unexpected re-prepare reply: {}",
+                other as char
+            ))),
+        }
+    }
+
+    /// Read exactly one backend message frame (5-byte header + body) and return
+    /// its type byte, discarding the body. Used to consume the `ParseComplete`
+    /// produced by an out-of-band re-prepare.
+    async fn read_one_frame_type<S: AsyncReadExt + Unpin>(backend: &mut S) -> Result<u8> {
+        let mut header = [0u8; 5];
+        backend
+            .read_exact(&mut header)
+            .await
+            .map_err(|e| ProxyError::Network(format!("re-prepare read error: {}", e)))?;
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let body_len = len.saturating_sub(4);
+        if body_len > 0 {
+            let mut body = vec![0u8; body_len];
+            backend
+                .read_exact(&mut body)
+                .await
+                .map_err(|e| ProxyError::Network(format!("re-prepare body read error: {}", e)))?;
+        }
+        Ok(header[0])
+    }
+
+    /// Name a `Parse` defines: its first cstring. `""` is the unnamed
+    /// statement, which is per-protocol transient and never tracked.
+    fn parse_stmt_name(payload: &[u8]) -> &str {
+        let end = payload.iter().position(|&b| b == 0).unwrap_or(0);
+        std::str::from_utf8(&payload[..end]).unwrap_or("")
+    }
+
+    /// Prepared-statement name a `Bind` references: the *second* cstring
+    /// (portal name first, then statement name). `None` for the unnamed
+    /// statement.
+    fn bind_stmt_ref(payload: &[u8]) -> Option<&str> {
+        let portal_end = payload.iter().position(|&b| b == 0)?;
+        let rest = &payload[portal_end + 1..];
+        let stmt_end = rest.iter().position(|&b| b == 0)?;
+        let name = std::str::from_utf8(&rest[..stmt_end]).ok()?;
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// Statement name a `Describe`/`Close` targets — only when it is
+    /// statement-kind (`'S'`, not portal `'P'`). `None` otherwise.
+    fn stmt_kind_name(payload: &[u8]) -> Option<&str> {
+        if payload.first() != Some(&b'S') {
+            return None;
+        }
+        let rest = &payload[1..];
+        let end = rest.iter().position(|&b| b == 0)?;
+        let name = std::str::from_utf8(&rest[..end]).ok()?;
+        (!name.is_empty()).then_some(name)
     }
 
     /// Stream backend response frames to the client until ReadyForQuery (end
@@ -3278,5 +3482,94 @@ mod tests {
         assert!(ident.is_none());
         // Unused bindings for the sync-state build path.
         let _ = server;
+    }
+
+    // ---- Batch F.4: prepared-statement tracking across backend switches ----
+
+    fn cstr(s: &str) -> Vec<u8> {
+        let mut v = s.as_bytes().to_vec();
+        v.push(0);
+        v
+    }
+
+    #[test]
+    fn parse_stmt_name_extracts_named_and_unnamed() {
+        // Parse payload = stmt-name cstring + query cstring + int16 nparams.
+        let mut named = cstr("ps1");
+        named.extend_from_slice(&cstr("SELECT 1"));
+        named.extend_from_slice(&[0, 0]);
+        assert_eq!(ProxyServer::parse_stmt_name(&named), "ps1");
+
+        let mut unnamed = cstr("");
+        unnamed.extend_from_slice(&cstr("SELECT 1"));
+        unnamed.extend_from_slice(&[0, 0]);
+        assert_eq!(ProxyServer::parse_stmt_name(&unnamed), "");
+    }
+
+    #[test]
+    fn bind_stmt_ref_reads_second_cstring() {
+        // Bind payload = portal cstring + statement cstring + ...
+        let mut named = cstr("portal_a");
+        named.extend_from_slice(&cstr("ps1"));
+        named.extend_from_slice(&[0, 0]); // 0 param-format codes, 0 params
+        assert_eq!(ProxyServer::bind_stmt_ref(&named), Some("ps1"));
+
+        // Unnamed statement (empty second cstring) is not tracked.
+        let mut unnamed = cstr("");
+        unnamed.extend_from_slice(&cstr(""));
+        assert_eq!(ProxyServer::bind_stmt_ref(&unnamed), None);
+    }
+
+    #[test]
+    fn stmt_kind_name_only_matches_statement_kind() {
+        // Describe/Close 'S' (statement) carries a trackable name.
+        let mut stmt = vec![b'S'];
+        stmt.extend_from_slice(&cstr("ps1"));
+        assert_eq!(ProxyServer::stmt_kind_name(&stmt), Some("ps1"));
+
+        // 'P' (portal) is not a statement reference.
+        let mut portal = vec![b'P'];
+        portal.extend_from_slice(&cstr("portal_a"));
+        assert_eq!(ProxyServer::stmt_kind_name(&portal), None);
+
+        // Statement-kind but unnamed -> nothing to track.
+        let mut empty = vec![b'S'];
+        empty.extend_from_slice(&cstr(""));
+        assert_eq!(ProxyServer::stmt_kind_name(&empty), None);
+    }
+
+    #[tokio::test]
+    async fn read_one_frame_type_consumes_full_frame() {
+        // ParseComplete '1' with empty body, followed by a second frame to
+        // prove only the first frame is consumed.
+        let (mut a, mut b) = tokio::io::duplex(64);
+        // frame 1: '1' + len(4) + no body; frame 2: 'Z' + len(5) + 'I'.
+        let bytes = [b'1', 0, 0, 0, 4, b'Z', 0, 0, 0, 5, b'I'];
+        b.write_all(&bytes).await.unwrap();
+        let t = ProxyServer::read_one_frame_type(&mut a).await.unwrap();
+        assert_eq!(t, b'1');
+        // The next frame's type byte is still readable -> we stopped cleanly.
+        let t2 = ProxyServer::read_one_frame_type(&mut a).await.unwrap();
+        assert_eq!(t2, b'Z');
+    }
+
+    #[tokio::test]
+    async fn reprepare_statement_accepts_parse_complete_and_rejects_error() {
+        // Backend answers ParseComplete -> Ok.
+        let (mut client, mut backend) = tokio::io::duplex(64);
+        backend.write_all(&[b'1', 0, 0, 0, 4]).await.unwrap();
+        let parse = {
+            let mut p = vec![b'P', 0, 0, 0, 0];
+            p.extend_from_slice(&cstr("ps1"));
+            p.extend_from_slice(&cstr("SELECT 1"));
+            p.extend_from_slice(&[0, 0]);
+            p
+        };
+        assert!(ProxyServer::reprepare_statement(&mut client, &parse).await.is_ok());
+
+        // Backend answers ErrorResponse -> Err.
+        let (mut client2, mut backend2) = tokio::io::duplex(64);
+        backend2.write_all(&[b'E', 0, 0, 0, 4]).await.unwrap();
+        assert!(ProxyServer::reprepare_statement(&mut client2, &parse).await.is_err());
     }
 }
