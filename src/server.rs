@@ -699,13 +699,14 @@ impl ProxyServer {
     }
 
     /// Graceful-drain timeout: how long to keep serving in-flight connections
-    /// after SIGUSR2 before exiting. Overridable via `HELIOS_DRAIN_TIMEOUT_SECS`
-    /// (a config field is a trivial follow-on); defaults to 60s.
-    fn drain_timeout() -> Duration {
+    /// after SIGUSR2 before exiting. Sourced from `shutdown_drain_timeout_secs`
+    /// in the live config, with the `HELIOS_DRAIN_TIMEOUT_SECS` env var as a
+    /// runtime override.
+    fn drain_timeout(config_secs: u64) -> Duration {
         let secs = std::env::var("HELIOS_DRAIN_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(60);
+            .unwrap_or(config_secs);
         Duration::from_secs(secs)
     }
 
@@ -904,7 +905,8 @@ impl ProxyServer {
         // On a graceful handoff, keep serving in-flight connections until they
         // finish (or the drain deadline), so nothing in flight is dropped.
         if graceful {
-            let timeout = Self::drain_timeout();
+            let timeout =
+                Self::drain_timeout(self.state.live_config.load().shutdown_drain_timeout_secs);
             tracing::info!(timeout_secs = timeout.as_secs(), "draining in-flight connections");
             Self::drain_connections(&self.state, timeout).await;
         }
