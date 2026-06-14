@@ -27,12 +27,13 @@ Verification backends throughout: **PostgreSQL 18.4** (`codex-pg184-bench`, 127.
 | **G2** | Snapshot bootstrap of existing data | `bac104b` | `snapshot-test.sh` (PG rows → Nano) |
 | **G2** | Transparent cutover + rollback | `54b6384` | `cutover-test.sh` 5/5 (`version()` flips PG↔Nano on one client) |
 | **H.1** | Zero-downtime SIGHUP config reload | `f78cd86` | `reload-test.sh` 6/6 (in-flight conn survives; new conn sees reload; bad config rejected) |
+| **H.2** | Plugin registry + `helios-plugin install` | `6f4c524` | `plugin-install-test.sh` 7/7 (signed install verified, sha256/untrusted-signer rejected) + 7 unit tests |
 | — | 2×2 scalability matrix (2 proxy × 2 Nano) | `9b9e2f5` | `SCALABILITY-MATRIX.md` + Nano v3.57 recs |
 
-## Deferred by decision (2026-06-14)
+## Remaining
 
-- **Item 84 — binary handoff** (SO_REUSEPORT + session adoption via `switchover_buffer`/`session_migrate`): Effort L. H.1 landed the SIGHUP config-apply half; the live-binary-swap half remains.
-- **Item 78 — plugin registry + `helios-plugin install`**: audit rated S but presumes a `helios-plugin` CLI that does not exist in this repo (only `heliosdb-proxy` builds here; `loader.rs` has the `SignatureVerifier`/Ed25519 trust-root + `PluginManifest`, no CLI). A testable offline slice = `install` from a `file://` registry index reusing `SignatureVerifier` + a `new` scaffold.
+- **Item 84 — binary handoff** (SO_REUSEPORT + session adoption via `switchover_buffer`/`session_migrate`): Effort L, the one outstanding roadmap item. H.1 landed the SIGHUP config-apply half; the live-binary-swap half (a new process adopts sockets *and* serialized sessions, including prepared statements) remains.
+- Item 78's **`https://` artefact fetch** (public registry over GitHub Releases) is a thin follow-on at the install fetch step; the offline `file://` slice with full SHA-256 + Ed25519 verification shipped (`6f4c524`).
 
 ## Cross-team finding (HeliosDB-Nano)
 
