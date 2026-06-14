@@ -99,6 +99,18 @@ pub struct AdminState {
     /// Bearer token required on admin requests (except liveness probes).
     /// `None` = open. Set once at startup from `config.admin_token`.
     pub auth_token: RwLock<Option<String>>,
+    /// Traffic-mirror / migration info for `/api/migration/status`. `Some`
+    /// when `[mirror] enabled`.
+    pub migration: RwLock<Option<MigrationInfo>>,
+}
+
+/// What the admin API needs to report migration status, without owning the
+/// mirror worker.
+#[derive(Clone)]
+pub struct MigrationInfo {
+    pub target: String,
+    pub writes_only: bool,
+    pub metrics: Arc<crate::mirror::MirrorMetrics>,
 }
 
 /// Chaos override applied to a single node. Today only the
@@ -501,6 +513,17 @@ impl AdminServer {
             ("GET", "/api/chaos") => {
                 let overrides = state.chaos_overrides.read().await.clone();
                 Ok((200, serde_json::to_value(overrides)?))
+            }
+
+            // Migration / traffic-mirror status
+            ("GET", "/api/migration/status") | ("GET", "/migration/status") => {
+                match state.migration.read().await.as_ref() {
+                    Some(info) => {
+                        let st = crate::mirror::status(&info.target, info.writes_only, &info.metrics);
+                        Ok((200, serde_json::to_value(st)?))
+                    }
+                    None => Ok((503, serde_json::json!({ "error": "traffic mirroring not enabled" }))),
+                }
             }
 
             // Configuration
@@ -1409,12 +1432,18 @@ impl AdminState {
             #[cfg(feature = "edge-proxy")]
             edge_registry: RwLock::new(None),
             auth_token: RwLock::new(None),
+            migration: RwLock::new(None),
         }
     }
 
     /// Set the admin Bearer token (wired by the server at startup).
     pub async fn with_auth_token(&self, token: Option<String>) {
         *self.auth_token.write().await = token;
+    }
+
+    /// Attach traffic-mirror info so `/api/migration/status` can report it.
+    pub async fn with_migration(&self, info: MigrationInfo) {
+        *self.migration.write().await = Some(info);
     }
 
     /// Attach an anomaly detector. Mirror of with_replay_engine /
