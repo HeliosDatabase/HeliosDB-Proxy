@@ -145,6 +145,9 @@ dashmap = "5"
 parking_lot = "0.12"
 # Lock-free read-mostly snapshots (node-health map on the per-query path)
 arc-swap = "1"
+# SO_REUSEPORT for zero-downtime binary handoff (a new process binds the same
+# listen address while the old one drains).
+socket2 = "0.5"
 
 # Configuration
 config = "0.14"
