@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::{broadcast, RwLock};
 
 /// Static admin UI (vanilla HTML + JS). Compiled into the binary via
@@ -174,11 +174,11 @@ impl AdminServer {
 
     /// Run the admin server
     pub async fn run(&self) -> Result<()> {
-        let listener = TcpListener::bind(&self.listen_address)
-            .await
-            .map_err(|e| ProxyError::Network(format!("Failed to bind admin: {}", e)))?;
+        // SO_REUSEPORT like the client listener, so a binary handoff can re-bind
+        // the admin address concurrently while the old process drains (Batch H).
+        let listener = crate::server::bind_reuseport(&self.listen_address)?;
 
-        tracing::info!("Admin API listening on {}", self.listen_address);
+        tracing::info!("Admin API listening on {} (SO_REUSEPORT)", self.listen_address);
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
