@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::backend::{tls::default_client_config, BackendClient, BackendConfig, TlsMode};
@@ -24,9 +25,52 @@ use crate::config::MirrorConfig;
 /// Counters surfaced for observability.
 #[derive(Default)]
 pub struct MirrorMetrics {
+    /// Statements accepted into the queue.
+    pub enqueued: AtomicU64,
+    /// Statements successfully applied to the mirror backend.
     pub mirrored: AtomicU64,
+    /// Statements dropped because the queue was full.
     pub dropped: AtomicU64,
+    /// Apply/connect failures.
     pub errors: AtomicU64,
+}
+
+/// Operator-facing migration status (served at `/api/migration/status`).
+#[derive(Debug, Clone, Serialize)]
+pub struct MigrationStatus {
+    pub enabled: bool,
+    pub target: String,
+    pub writes_only: bool,
+    pub enqueued: u64,
+    pub mirrored: u64,
+    pub dropped: u64,
+    pub errors: u64,
+    /// Statements accepted but not yet applied (queue backlog).
+    pub lag: u64,
+    /// True when the mirror is enabled, the backlog is drained, and nothing
+    /// has been dropped — i.e. the secondary is caught up and a cutover is
+    /// safe with respect to the mirrored write set.
+    pub migration_ready: bool,
+}
+
+/// Compute a migration status snapshot from the live counters.
+pub fn status(target: &str, writes_only: bool, m: &MirrorMetrics) -> MigrationStatus {
+    let enqueued = m.enqueued.load(Ordering::Relaxed);
+    let mirrored = m.mirrored.load(Ordering::Relaxed);
+    let dropped = m.dropped.load(Ordering::Relaxed);
+    let errors = m.errors.load(Ordering::Relaxed);
+    let lag = enqueued.saturating_sub(mirrored).saturating_sub(errors);
+    MigrationStatus {
+        enabled: true,
+        target: target.to_string(),
+        writes_only,
+        enqueued,
+        mirrored,
+        dropped,
+        errors,
+        lag,
+        migration_ready: lag == 0 && dropped == 0,
+    }
 }
 
 /// Handle held by the server: a bounded sender plus the sampling policy.
@@ -34,7 +78,21 @@ pub struct MirrorHandle {
     tx: mpsc::Sender<String>,
     sample_rate: f64,
     writes_only: bool,
+    target: String,
     pub metrics: Arc<MirrorMetrics>,
+}
+
+impl MirrorHandle {
+    /// A snapshot of migration status for the admin API.
+    pub fn status(&self) -> MigrationStatus {
+        status(&self.target, self.writes_only, &self.metrics)
+    }
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+    pub fn writes_only(&self) -> bool {
+        self.writes_only
+    }
 }
 
 impl MirrorHandle {
@@ -53,7 +111,9 @@ impl MirrorHandle {
             }
         }
         match self.tx.try_send(sql.to_string()) {
-            Ok(()) => {}
+            Ok(()) => {
+                self.metrics.enqueued.fetch_add(1, Ordering::Relaxed);
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
             }
@@ -70,6 +130,7 @@ pub fn spawn(config: MirrorConfig) -> MirrorHandle {
         tx,
         sample_rate: config.sample_rate.clamp(0.0, 1.0),
         writes_only: config.writes_only,
+        target: format!("{}:{}", config.backend_host, config.backend_port),
         metrics: metrics.clone(),
     };
     tokio::spawn(worker(config, rx, metrics));

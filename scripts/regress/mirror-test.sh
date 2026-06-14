@@ -99,6 +99,17 @@ sleep 1
 after=$(nano "SELECT count(*) FROM _mirtest" | tr -d '[:space:]')
 [ "$before" = "$after" ] && ok "reads_not_mirrored: SELECT did not alter mirror" || bad "reads leaked: $before -> $after"
 
+# Migration status API: after the backlog drains, migration_ready=true.
+st=""
+for i in $(seq 1 30); do
+  st=$(curl -s "http://127.0.0.1:9099/api/migration/status")
+  echo "$st" | grep -q '"migration_ready":true' && break
+  sleep 0.3
+done
+echo "--- /api/migration/status ---"; echo "$st"
+echo "$st" | grep -q '"migration_ready":true' && ok "status: migration_ready=true after backlog drained" || bad "status: $st"
+echo "$st" | grep -qE '"mirrored":[1-9]' && echo "$st" | grep -q '"lag":0' && ok "status: mirrored>0 and lag=0" || bad "status counters: $st"
+
 # cleanup mirror side
 nano "DROP TABLE IF EXISTS _mirtest" >/dev/null 2>&1
 echo "== mirror test: PASS=$PASS FAIL=$FAIL =="

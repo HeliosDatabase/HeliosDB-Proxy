@@ -682,6 +682,17 @@ impl ProxyServer {
             // Require a Bearer token on admin requests when configured.
             admin_state.with_auth_token(config.admin_token.clone()).await;
 
+            // Surface traffic-mirror / migration status when mirroring is on.
+            if let Some(ref mirror) = state.mirror {
+                admin_state
+                    .with_migration(crate::admin::MigrationInfo {
+                        target: mirror.target().to_string(),
+                        writes_only: mirror.writes_only(),
+                        metrics: mirror.metrics.clone(),
+                    })
+                    .await;
+            }
+
             // Attach the plugin manager so /plugins + the admin UI
             // surface real loaded modules. Cheap Arc-clone — no
             // duplicate state, both AdminState and ServerState hold
