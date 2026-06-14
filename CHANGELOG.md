@@ -5,6 +5,63 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-14
+
+Minor release: the 2026-06 deep-audit batches (A–H + G2). Table-stakes
+security/protocol features, an AI/agent data-plane, a continuous PostgreSQL→
+HeliosDB-Nano migration mirror, zero-downtime operations, and hot-path
+performance work — all live-verified against PostgreSQL 18.4 and HeliosDB-Nano.
+
+### Added
+
+- **Client-facing TLS termination + mTLS** — `[tls]` config; rustls server
+  handshake, optional client-certificate verification.
+- **Proxy-terminated SCRAM-SHA-256** — `[auth] mode = "scram"` with a pgbouncer-
+  style auth file; the proxy authenticates clients itself.
+- **pg_hba-style admission rules** — `[[hba]]` allow/reject by user / database /
+  IP-CIDR, evaluated before any backend connection.
+- **Query cancellation forwarding** — `CancelRequest` routed to the backend that
+  owns the session's `BackendKeyData`.
+- **Prepared statements survive backend switches** — named statements are
+  transparently re-prepared on a new connection after a failover / redial.
+- **Native MCP agent gateway** — JSON-RPC 2.0 over HTTP (`query` / `list_tables`
+  / `explain`), backend-agnostic, read-only by default.
+- **Per-agent scoped grants + SQL contract validator** — verb/table/predicate/
+  row-limit policy with machine-readable repair hints.
+- **Neon-serverless-compatible HTTP SQL gateway** — `POST /sql`.
+- **Continuous traffic mirroring** and a **PostgreSQL→Nano migration mirror**:
+  snapshot bootstrap (COPY-based bulk load with INSERT fallback + a non-empty-
+  target idempotency fence), `migration_ready` status, and transparent cutover
+  with rollback.
+- **Instant branch databases** — `CREATE DATABASE … TEMPLATE` provisioning via
+  `POST/GET/DELETE /api/branch`.
+- **Admin API Bearer-token authentication** — closes the unauthenticated-admin
+  release blocker.
+- **Zero-downtime operations** — `SIGHUP` config reload (nodes / pools / limits /
+  hba without dropping connections) and a `SIGUSR2` binary handoff over
+  SO_REUSEPORT with graceful drain (client + admin listeners).
+- **Plugin registry + `helios-plugin` CLI** — `install` (from a local/`file://`/
+  `http://` index, SHA-256 + Ed25519 verified), `list`, `new`, `verify`.
+
+### Changed
+
+- **Extended-protocol streaming relay** — large result sets stream frame-by-frame
+  with bounded proxy memory (≈100 MB result → flat RSS).
+- **Per-session multi-node backend connection cache** — reuses authenticated
+  connections across read/write routing switches.
+- **WASM plugin runtime** — `InstancePre` reuse, epoch-based timeout enforcement,
+  sharded metrics.
+- **Lock-free hot path** — node-health map and live config behind `ArcSwap`;
+  parallel health sweep.
+- **Unnamed-`Parse` promotion** — an identical re-`Parse` is not re-forwarded to a
+  backend that already holds that unnamed statement (fewer backend round trips).
+
+### Fixed
+
+- Wire-protocol tag mapping: `'R'` → `AuthRequest`, and server→client tag-collision
+  remapping in the backend client (fixes management/replay queries against real
+  backends).
+
 ## [0.4.2] - 2026-05-01
 
 Patch release: ship the operator skill bundle inside the binary so
