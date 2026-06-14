@@ -218,6 +218,51 @@ pub struct ProxyConfig {
     /// default — the on-ramp to a PG->Nano migration mirror.
     #[serde(default)]
     pub mirror: MirrorConfig,
+    /// Instant branch databases. Disabled by default — provisions
+    /// CREATE DATABASE ... TEMPLATE clones through the proxy.
+    #[serde(default)]
+    pub branch: BranchConfig,
+}
+
+/// Branch-database configuration: the maintenance connection the proxy uses
+/// to provision `CREATE DATABASE <branch> TEMPLATE <base>` clones.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_localhost")]
+    pub backend_host: String,
+    #[serde(default = "default_pg_port")]
+    pub backend_port: u16,
+    /// A role with CREATEDB privilege.
+    #[serde(default = "default_pg_user")]
+    pub admin_user: String,
+    pub admin_password: Option<String>,
+    /// Maintenance database to issue CREATE/DROP DATABASE against (not the
+    /// branch itself). Defaults to "postgres".
+    #[serde(default = "default_admin_db")]
+    pub admin_database: String,
+    /// Default template database to branch from when a request omits `base`.
+    #[serde(default = "default_admin_db")]
+    pub base_database: String,
+}
+
+impl Default for BranchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend_host: default_localhost(),
+            backend_port: default_pg_port(),
+            admin_user: default_pg_user(),
+            admin_password: None,
+            admin_database: default_admin_db(),
+            base_database: default_admin_db(),
+        }
+    }
+}
+
+fn default_admin_db() -> String {
+    "postgres".to_string()
 }
 
 /// Traffic-mirror configuration: replay a sampled share of live (simple-query)
@@ -474,6 +519,7 @@ impl Default for ProxyConfig {
             agent_contracts: Vec::new(),
             http_gateway: HttpGatewayConfig::default(),
             mirror: MirrorConfig::default(),
+            branch: BranchConfig::default(),
         }
     }
 }
