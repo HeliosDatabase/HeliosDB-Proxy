@@ -627,6 +627,9 @@ impl ProxyServer {
             // Set proxy config for SQL routing
             admin_state.set_proxy_config(config.clone()).await;
 
+            // Require a Bearer token on admin requests when configured.
+            admin_state.with_auth_token(config.admin_token.clone()).await;
+
             // Attach the plugin manager so /plugins + the admin UI
             // surface real loaded modules. Cheap Arc-clone — no
             // duplicate state, both AdminState and ServerState hold
