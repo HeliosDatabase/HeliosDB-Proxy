@@ -162,6 +162,12 @@ pub struct ProxyConfig {
     pub listen_address: String,
     /// Admin API address
     pub admin_address: String,
+    /// Bearer token required on admin API requests. When set, every admin
+    /// endpoint except liveness probes (`/health*`, `/livez`, `/readyz`)
+    /// requires `Authorization: Bearer <token>`. Absent (default) = open
+    /// (current behaviour) — set this for any non-loopback deployment.
+    #[serde(default)]
+    pub admin_token: Option<String>,
     /// Enable TR (Transaction Replay)
     pub tr_enabled: bool,
     /// TR mode
@@ -267,6 +273,7 @@ impl Default for ProxyConfig {
         Self {
             listen_address: "0.0.0.0:5432".to_string(),
             admin_address: "0.0.0.0:9090".to_string(),
+            admin_token: None,
             tr_enabled: true,
             tr_mode: TrMode::Session,
             pool: PoolConfig::default(),

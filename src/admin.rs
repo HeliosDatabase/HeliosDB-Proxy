@@ -31,6 +31,19 @@ use tokio::sync::{broadcast, RwLock};
 const ADMIN_UI_HTML: &str = include_str!("admin_ui.html");
 
 /// Admin API server
+/// Constant-time string comparison (admin token check).
+fn constant_time_eq_str(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
 pub struct AdminServer {
     /// Listen address
     listen_address: String,
@@ -83,6 +96,9 @@ pub struct AdminState {
     pub edge_cache: RwLock<Option<Arc<EdgeCache>>>,
     #[cfg(feature = "edge-proxy")]
     pub edge_registry: RwLock<Option<Arc<EdgeRegistry>>>,
+    /// Bearer token required on admin requests (except liveness probes).
+    /// `None` = open. Set once at startup from `config.admin_token`.
+    pub auth_token: RwLock<Option<String>>,
 }
 
 /// Chaos override applied to a single node. Today only the
@@ -226,6 +242,28 @@ impl AdminServer {
         let method = parts[0];
         let path = parts[1];
 
+        // Bearer-token gate. Liveness probes stay open so orchestrators can
+        // health-check without the token; everything else is rejected with
+        // 401 unless `Authorization: Bearer <token>` matches.
+        {
+            let required = state.auth_token.read().await.clone();
+            if let Some(token) = required {
+                let path_only = path.split('?').next().unwrap_or(path);
+                let is_liveness = method == "GET"
+                    && matches!(path_only, "/health" | "/healthz" | "/livez" | "/readyz");
+                if !is_liveness && !Self::admin_authorized(&headers, &token) {
+                    Self::send_response(
+                        &mut writer,
+                        401,
+                        "Unauthorized",
+                        "{\"error\":\"missing or invalid admin bearer token\"}",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        }
+
         // Read request body for POST/PUT requests
         let body = if content_length > 0 && (method == "POST" || method == "PUT") {
             let mut body_buf = vec![0u8; content_length];
@@ -259,6 +297,21 @@ impl AdminServer {
         }
 
         Ok(())
+    }
+
+    /// True if the request carries `Authorization: Bearer <token>` matching
+    /// the configured admin token (constant-time compare).
+    fn admin_authorized(headers: &[String], token: &str) -> bool {
+        let expected = format!("Bearer {}", token);
+        for h in headers {
+            let mut sp = h.splitn(2, ':');
+            let name = sp.next().unwrap_or("").trim();
+            if name.eq_ignore_ascii_case("authorization") {
+                let value = sp.next().unwrap_or("").trim();
+                return constant_time_eq_str(value, &expected);
+            }
+        }
+        false
     }
 
     /// Serve a text/html HTTP response. Used by the admin UI route.
@@ -1355,7 +1408,13 @@ impl AdminState {
             edge_cache: RwLock::new(None),
             #[cfg(feature = "edge-proxy")]
             edge_registry: RwLock::new(None),
+            auth_token: RwLock::new(None),
         }
+    }
+
+    /// Set the admin Bearer token (wired by the server at startup).
+    pub async fn with_auth_token(&self, token: Option<String>) {
+        *self.auth_token.write().await = token;
     }
 
     /// Attach an anomaly detector. Mirror of with_replay_engine /
@@ -1697,6 +1756,25 @@ mod tests {
         let state = AdminState::new();
         let sessions = state.active_sessions.read().await;
         assert_eq!(*sessions, 0);
+    }
+
+    #[test]
+    fn test_admin_authorized() {
+        let h = |s: &str| vec!["GET /topology HTTP/1.1".to_string(), s.to_string()];
+        assert!(AdminServer::admin_authorized(&h("Authorization: Bearer s3cret"), "s3cret"));
+        // case-insensitive header name, exact token
+        assert!(AdminServer::admin_authorized(&h("authorization: Bearer s3cret"), "s3cret"));
+        // wrong token / wrong scheme / missing header all rejected
+        assert!(!AdminServer::admin_authorized(&h("Authorization: Bearer nope"), "s3cret"));
+        assert!(!AdminServer::admin_authorized(&h("Authorization: Basic s3cret"), "s3cret"));
+        assert!(!AdminServer::admin_authorized(&["GET / HTTP/1.1".to_string()], "s3cret"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_str() {
+        assert!(constant_time_eq_str("abc", "abc"));
+        assert!(!constant_time_eq_str("abc", "abd"));
+        assert!(!constant_time_eq_str("abc", "abcd"));
     }
 
     #[tokio::test]
