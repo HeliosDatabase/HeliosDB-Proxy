@@ -1,34 +1,58 @@
 # HeliosProxy configuration — Bank Ledger Demo
 # Transaction pooling with Transaction Replay for failover safety.
+# 20 concurrent workers perform random DEBIT+CREDIT transfers while the
+# primary is killed 5 times. The ledger sum must always equal $1,000,000.
 
-[general]
-host = "0.0.0.0"
-port = 6432
-admin_host = "0.0.0.0"
-admin_port = 9090
-connect_timeout = 5000
-idle_timeout = 30000
-pool_mode = "transaction"
+listen_address = "0.0.0.0:6432"
+admin_address  = "0.0.0.0:9090"
 
-[transaction_replay]
+tr_enabled = true
+tr_mode    = "transaction"
+
+write_timeout_secs = 20
+
+[pool]
+min_connections      = 5
+max_connections      = 50
+idle_timeout_secs    = 300
+max_lifetime_secs    = 1800
+acquire_timeout_secs = 10
+test_on_acquire      = true
+
+[pool_mode]
+mode                    = "transaction"
+max_pool_size           = 50
+min_idle                = 5
+idle_timeout_secs       = 300
+max_lifetime_secs       = 1800
+acquire_timeout_secs    = 5
+reset_query             = "DISCARD ALL"
+prepared_statement_mode = "track"
+
+[load_balancer]
+read_strategy        = "least_connections"
+read_write_split     = true
+latency_threshold_ms = 50
+
+[health]
+check_interval_secs = 2
+check_timeout_secs  = 2
+failure_threshold   = 2
+success_threshold   = 2
+check_query         = "SELECT 1"
+
+[[nodes]]
+host    = "pg-primary"
+port    = 5432
+role    = "primary"
+weight  = 100
 enabled = true
-mode = "transaction"
+name    = "primary"
 
-[pools.bankdb]
-pool_size = 30
-default_role = "primary"
-
-[pools.bankdb.users.app]
-password = "apppass"
-
-[pools.bankdb.shards.0]
-database = "bankdb"
-servers = [
-  ["pg-primary", 5432, "primary"],
-  ["pg-standby", 5432, "replica"],
-]
-sync_standby_preferred = true
-
-[healthcheck]
-delay = 2000
-timeout = 1000
+[[nodes]]
+host    = "pg-standby"
+port    = 5432
+role    = "standby"
+weight  = 100
+enabled = true
+name    = "standby"

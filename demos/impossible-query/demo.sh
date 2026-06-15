@@ -127,7 +127,7 @@ pause
 step 1 "Starting PostgreSQL cluster + HeliosProxy"
 
 info "Building and starting containers..."
-docker compose up -d --build 2>&1 | while read -r line; do
+docker compose up -d 2>&1 | while read -r line; do
     echo -e "  ${DIM}${line}${RESET}"
 done
 

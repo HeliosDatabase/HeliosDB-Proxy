@@ -5,7 +5,7 @@
 #   - HeliosProxy with full HA features
 #
 # Usage:
-#   docker compose up -d --build
+#   docker compose up -d
 #   # Terminal 1: ./workload.sh
 #   # Terminal 2: ./chaos.sh 300
 #   # Terminal 3: ./dashboard.sh
@@ -54,12 +54,13 @@ services:
       - "password_encryption=md5"
     volumes:
       - primary-data:/var/lib/postgresql/data
+      - ./init-hba.sh:/docker-entrypoint-initdb.d/01-hba-replication.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U app -d appdb"]
       interval: 2s
-      timeout: 2s
-      retries: 10
-      start_period: 10s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
 
   # ─────────────────────────────────────────────────────────────────────
   # Synchronous Standby
@@ -75,6 +76,7 @@ services:
     environment:
       PGUSER: app
       PGPASSWORD: apppass
+    user: postgres
     entrypoint: /bin/bash
     command:
       - -c
@@ -88,6 +90,7 @@ services:
           PGPASSWORD=apppass pg_basebackup \
             -h pg-primary -U app -D /var/lib/postgresql/data \
             -Fp -Xs -P -R
+          chmod 750 /var/lib/postgresql/data
         fi
         exec postgres \
           -c hot_standby=on \
@@ -120,6 +123,7 @@ services:
     environment:
       PGUSER: app
       PGPASSWORD: apppass
+    user: postgres
     entrypoint: /bin/bash
     command:
       - -c
@@ -133,6 +137,7 @@ services:
           PGPASSWORD=apppass pg_basebackup \
             -h pg-primary -U app -D /var/lib/postgresql/data \
             -Fp -Xs -P -R
+          chmod 750 /var/lib/postgresql/data
         fi
         exec postgres \
           -c hot_standby=on \
@@ -155,9 +160,7 @@ services:
   # HeliosProxy — Full HA configuration
   # ─────────────────────────────────────────────────────────────────────
   heliosproxy:
-    build:
-      context: ../../
-      dockerfile: docker/Dockerfile
+    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.0
     container_name: chaos-proxy
     hostname: heliosproxy
     networks:

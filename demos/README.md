@@ -31,10 +31,12 @@ cd impossible-query && docker compose up -d && ./demo.sh
 cd chaos-failover && docker compose up -d && ./chaos.sh
 
 # Demo 3: Bank Ledger (ACID integrity proof)
-cd bank-ledger && docker compose up -d && ./demo.sh
+cd bank-ledger && docker compose up -d
+docker compose exec pg-primary psql -U app -d bankdb -f /dev/stdin < schema.sql
+./workers.sh 20 120 & ./chaos.sh 5; wait; ./audit.sh
 
 # Demo 4: vs PgBouncer (competitive comparison)
-cd vs-pgbouncer && docker compose up -d && ./compare.sh
+cd vs-pgbouncer && ./run-compare.sh
 
 # Demo 5: Lag-Aware Routing (educational)
 cd lag-aware-routing && docker compose up -d && ./observe.sh

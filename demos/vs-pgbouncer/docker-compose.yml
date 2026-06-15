@@ -47,19 +47,18 @@ services:
       - "-c"
       - "synchronous_commit=on"
       - "-c"
-      - "synchronous_standby_names='*'"
-      - "-c"
       - "listen_addresses=*"
       - "-c"
       - "password_encryption=md5"
     volumes:
       - hp-primary-data:/var/lib/postgresql/data
+      - ./init-hba.sh:/docker-entrypoint-initdb.d/01-hba-replication.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d benchdb"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U app -d benchdb"]
       interval: 2s
-      timeout: 2s
-      retries: 10
-      start_period: 10s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
 
   hp-standby:
     image: postgres:16-alpine
@@ -72,6 +71,7 @@ services:
     environment:
       PGUSER: app
       PGPASSWORD: apppass
+    user: postgres
     entrypoint: /bin/bash
     command:
       - -c
@@ -85,6 +85,7 @@ services:
           PGPASSWORD=apppass pg_basebackup \
             -h hp-primary -U app -D /var/lib/postgresql/data \
             -Fp -Xs -P -R
+          chmod 750 /var/lib/postgresql/data
         fi
         exec postgres \
           -c hot_standby=on \
@@ -104,9 +105,7 @@ services:
       start_period: 30s
 
   heliosproxy:
-    build:
-      context: ../../
-      dockerfile: docker/Dockerfile
+    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.0
     container_name: cmp-heliosproxy
     hostname: heliosproxy
     networks:
@@ -159,19 +158,18 @@ services:
       - "-c"
       - "synchronous_commit=on"
       - "-c"
-      - "synchronous_standby_names='*'"
-      - "-c"
       - "listen_addresses=*"
       - "-c"
       - "password_encryption=md5"
     volumes:
       - pb-primary-data:/var/lib/postgresql/data
+      - ./init-hba.sh:/docker-entrypoint-initdb.d/01-hba-replication.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d benchdb"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U app -d benchdb"]
       interval: 2s
-      timeout: 2s
-      retries: 10
-      start_period: 10s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
 
   pb-standby:
     image: postgres:16-alpine
@@ -184,6 +182,7 @@ services:
     environment:
       PGUSER: app
       PGPASSWORD: apppass
+    user: postgres
     entrypoint: /bin/bash
     command:
       - -c
@@ -197,6 +196,7 @@ services:
           PGPASSWORD=apppass pg_basebackup \
             -h pb-primary -U app -D /var/lib/postgresql/data \
             -Fp -Xs -P -R
+          chmod 750 /var/lib/postgresql/data
         fi
         exec postgres \
           -c hot_standby=on \
