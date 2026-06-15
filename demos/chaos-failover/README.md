@@ -39,7 +39,7 @@ The chaos monkey kills nodes with weighted probability: 50% primary, 25% each st
 ### 1. Start the cluster
 
 ```bash
-docker compose up -d --build
+docker compose up -d
 ```
 
 Wait for all services to be healthy:

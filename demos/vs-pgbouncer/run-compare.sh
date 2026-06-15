@@ -26,7 +26,7 @@ echo ""
 
 # ─── Step 1: Start both clusters ─────────────────────────────────────
 echo "[Step 1] Starting both clusters..."
-docker compose up -d --build
+docker compose up -d
 
 echo "Waiting for all services to be healthy..."
 for svc in hp-primary hp-standby pb-primary pb-standby; do

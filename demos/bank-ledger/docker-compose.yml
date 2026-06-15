@@ -49,19 +49,18 @@ services:
       - "-c"
       - "synchronous_commit=on"
       - "-c"
-      - "synchronous_standby_names='*'"
-      - "-c"
       - "listen_addresses=*"
       - "-c"
       - "password_encryption=md5"
     volumes:
       - primary-data:/var/lib/postgresql/data
+      - ./init-hba.sh:/docker-entrypoint-initdb.d/01-hba-replication.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d bankdb"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U app -d bankdb"]
       interval: 2s
-      timeout: 2s
-      retries: 10
-      start_period: 10s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
 
   # ─────────────────────────────────────────────────────────────────────
   # Standby PostgreSQL (streaming replication)
@@ -77,6 +76,7 @@ services:
     environment:
       PGUSER: app
       PGPASSWORD: apppass
+    user: postgres
     entrypoint: /bin/bash
     command:
       - -c
@@ -90,6 +90,7 @@ services:
           PGPASSWORD=apppass pg_basebackup \
             -h pg-primary -U app -D /var/lib/postgresql/data \
             -Fp -Xs -P -R
+          chmod 750 /var/lib/postgresql/data
         fi
         exec postgres \
           -c hot_standby=on \
@@ -112,9 +113,7 @@ services:
   # HeliosProxy — Transaction Replay enabled
   # ─────────────────────────────────────────────────────────────────────
   heliosproxy:
-    build:
-      context: ../../
-      dockerfile: docker/Dockerfile
+    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.0
     container_name: bl-proxy
     hostname: heliosproxy
     networks:

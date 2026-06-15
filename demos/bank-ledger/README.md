@@ -16,7 +16,7 @@ will be wrong.
 
 ```bash
 # 1. Start the cluster
-docker compose up -d --build
+docker compose up -d
 docker compose exec pg-primary psql -U app -d bankdb -f /dev/stdin < schema.sql
 
 # 2. Run workers and chaos in parallel
