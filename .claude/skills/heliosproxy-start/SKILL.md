@@ -92,7 +92,7 @@ to close) a chance to finish before systemd hard-kills.
 # docker-compose.yml
 services:
   heliosproxy:
-    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.0
+    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1
     volumes:
       - ./proxy.toml:/etc/heliosproxy/proxy.toml:ro
     ports:

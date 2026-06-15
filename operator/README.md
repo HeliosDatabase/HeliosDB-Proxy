@@ -19,7 +19,7 @@ kind: HeliosProxy
 metadata:
   name: analytics
 spec:
-  image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.0
+  image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1
   replicas: 2
   listenPort: 5432
   adminPort: 9090
