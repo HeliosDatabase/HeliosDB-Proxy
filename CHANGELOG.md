@@ -5,6 +5,28 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-06-15
+
+Maintenance release — operational/packaging tooling and docs. No proxy code or
+runtime behavior changes.
+
+### Fixed
+
+- **Docker image publishing now works.** The `docker.yml` workflow had three
+  bugs that failed every build: a non-existent action name, an uppercase image
+  name ghcr rejects, and the wrong Dockerfile path. It now builds and pushes
+  `ghcr.io/heliosdatabase/hdb-heliosdb-proxy` (linux/amd64).
+
+### Changed
+
+- Demo / skill / IaC examples reference the current `:0.6.0` image (the prior
+  `:0.4.x` tags were never built).
+- Build linux/amd64 only (dropped the slow/flaky emulated linux/arm64 leg).
+- README uses stable "Connection-Routing Tier" / "Platform Tier" wording instead
+  of version-pinned module counts.
+- Internal working docs consolidated under `docs/internal/` (excluded from the
+  published crate).
+
 ## [0.5.1] - 2026-06-14
 
 Docs/branding patch. No code or behavior changes.
