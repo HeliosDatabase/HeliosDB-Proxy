@@ -12,7 +12,10 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # Lowercase, and the image name the demos/skills/docs reference
+  # (`github.repository` is `HeliosDatabase/HeliosDB-Proxy` — uppercase, which
+  # ghcr rejects, and the wrong name).
+  IMAGE_NAME: heliosdatabase/hdb-heliosdb-proxy
 
 jobs:
   docker:
@@ -46,9 +49,10 @@ jobs:
             type=sha
 
       - name: Build and push
-        uses: docker/build-and-push-action@v5
+        uses: docker/build-push-action@v5
         with:
           context: .
+          file: docker/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
