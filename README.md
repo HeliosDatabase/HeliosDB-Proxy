@@ -8,7 +8,7 @@ HeliosProxy operates at the PostgreSQL wire protocol level, making it compatible
 
 ## Overview
 
-HeliosProxy sits between your application and your database cluster, providing transparent connection pooling, automatic failover, intelligent query routing, and 46 enterprise-grade feature modules — all without application code changes.
+HeliosProxy sits between your application and your database cluster, providing transparent connection pooling, automatic failover, intelligent query routing, programmable plugins, and operations tooling without application code changes.
 
 ```
 ┌──────────────┐     ┌─────────────────────────────────────────────────┐     ┌──────────────┐
@@ -49,9 +49,9 @@ All 46 feature modules operate at the PostgreSQL wire protocol level. They inspe
 
 ## Feature Modules
 
-HeliosProxy ships **46 feature modules**, grouped into two tiers: the **24 connection-routing modules** introduced through v0.3 and the **22 platform modules** added in v0.4 (plugin-host extensions, admin surface, first-party plugins, and companion projects). Each module is independently enabled via Cargo feature flags — enable only what you need, from a lightweight connection pooler to a full programmable data-plane.
+HeliosProxy features are grouped into a connection-routing tier and a programmable platform tier. Each module is independently enabled via Cargo feature flags, so deployments can range from a lightweight connection pooler to a full programmable data-plane.
 
-## v0.3 — Connection-routing tier (24 modules)
+## Connection-Routing Tier
 
 ### Connection Management
 
@@ -102,9 +102,9 @@ HeliosProxy ships **46 feature modules**, grouped into two tiers: the **24 conne
 | **WASM Plugins** | `wasm-plugins` | Sandboxed WebAssembly plugin runtime with hot-reload, host function bindings, and per-plugin resource limits |
 | **GraphQL Gateway** | `graphql-gateway` | GraphQL-to-SQL translation layer with automatic schema introspection, DataLoader batching, and query validation |
 
-## v0.4 — Platform tier (22 modules)
+## Platform Tier
 
-The v0.4 release builds a programmable platform on top of the connection-routing core: a hardened WASM plugin host, an operations/observability surface (anomaly detection, edge cache, chaos engineering, shadow execution, time-travel replay), eight signed first-party plugins, and an IaC companion ecosystem.
+The platform tier builds on the connection-routing core with a hardened WASM plugin host, an operations and observability surface, first-party plugins, and infrastructure-as-code companion projects.
 
 ### Detection & Edge
 
@@ -129,7 +129,7 @@ The v0.4 release builds a programmable platform on top of the connection-routing
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
 | **Admin Web UI** | *(core)* | Single embedded HTML dashboard at `/` and `/ui`. Ten auto-refreshing panels: Nodes, Topology, Plugins, Anomalies, Edge Mode, Chaos Mode, Shadow Execution, Time-Travel Replay, SQL Console, and Traffic |
-| **Admin REST v2** | *(core)* | Endpoints surfacing every v0.4 capability: `/topology`, `/plugins`, `/anomalies`, `/api/edge*`, `/api/chaos`, `/api/shadow`, `/api/replay`. Operator and UI consume the same JSON |
+| **Admin REST** | *(core)* | Endpoints surfacing platform capabilities: `/topology`, `/plugins`, `/anomalies`, `/api/edge*`, `/api/chaos`, `/api/shadow`, `/api/replay`. Operator and UI consume the same JSON |
 
 ### First-Party Plugins
 
@@ -318,7 +318,7 @@ curl -X POST http://localhost:9090/failover
 curl -X POST http://localhost:9090/nodes/{id}/drain
 ```
 
-### v0.4 platform endpoints
+### Platform endpoints
 
 ```bash
 # Cluster topology for external controllers (currentPrimary, healthy/unhealthy nodes)
