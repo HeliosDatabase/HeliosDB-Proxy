@@ -73,7 +73,7 @@ for the swap recipe.
 
 ## Container image
 
-All demos pull `ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.0`. The
+All demos pull `ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1`. The
 image is published by the docker workflow on tag pushes; if you're
 running against an unreleased build, swap the `image:` line for
 `build:` pointing at your local proxy repo.

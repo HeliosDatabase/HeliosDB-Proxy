@@ -17,7 +17,7 @@ services:
       retries: 30
 
   proxy:
-    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.0
+    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1
     depends_on:
       pg-primary:
         condition: service_healthy

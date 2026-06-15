@@ -5,6 +5,27 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-06-15
+
+Patch release — demo infrastructure fixes. No proxy code or runtime behavior changes.
+
+### Fixed
+
+- **All 5 legacy demos now work end-to-end with the published Docker image.**
+  They previously assumed a local `build: context` that no longer exists.
+  - Replaced `build: context: ../../` with `image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1`
+  - Fixed `pg_isready` healthcheck to probe TCP (`-h 127.0.0.1`) so standbys
+    don't start `pg_basebackup` before the primary TCP listener is ready.
+  - Added `init-hba.sh` to each demo's `initdb.d` to allow Docker bridge-network
+    replication connections (pg_hba `host replication all all trust`).
+  - Added `user: postgres` to standby containers (postgres refuses root execution).
+  - Added `chmod 750` after `pg_basebackup` to satisfy PostgreSQL permissions check.
+  - Removed `synchronous_standby_names` from primary command blocks — it blocks
+    `CREATE DATABASE` indefinitely when no standbys exist at init time.
+  - Updated `demo.sh` and `run-compare.sh` to drop `--build`; updated READMEs.
+  - Rewrote `proxy.toml` in bank-ledger and vs-pgbouncer from stale PgBouncer
+    format to current HeliosProxy format.
+
 ## [0.6.0] - 2026-06-15
 
 Maintenance release — operational/packaging tooling and docs. No proxy code or

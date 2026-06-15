@@ -113,7 +113,7 @@ services:
   # HeliosProxy — Transaction Replay enabled
   # ─────────────────────────────────────────────────────────────────────
   heliosproxy:
-    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.0
+    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1
     container_name: bl-proxy
     hostname: heliosproxy
     networks:

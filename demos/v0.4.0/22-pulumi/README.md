@@ -43,7 +43,7 @@ const audit = new heliosproxy.AuditPolicy("pci", {
 export const analytics = new heliosproxy.Instance("analytics", {
   name: "analytics",
   replicas: 2,
-  image: "ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.0",
+  image: "ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1",
   nodes: [
     { host: "pg-primary.db.svc",   port: 5432, role: "primary", weight: 100 },
     { host: "pg-standby.db.svc",   port: 5432, role: "standby", weight: 100 },

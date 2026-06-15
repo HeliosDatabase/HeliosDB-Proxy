@@ -105,7 +105,7 @@ services:
       start_period: 30s
 
   heliosproxy:
-    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.0
+    image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1
     container_name: cmp-heliosproxy
     hostname: heliosproxy
     networks:

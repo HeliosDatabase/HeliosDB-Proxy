@@ -46,7 +46,7 @@ metadata:
   name: prod-proxy
   namespace: heliosproxy
 spec:
-  image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.0
+  image: ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1
   replicas: 2
   features: ["pool-modes", "ha-tr", "wasm-plugins", "anomaly-detection"]
   nodes:
@@ -103,7 +103,7 @@ provider "heliosproxy" {
 
 resource "heliosproxy_instance" "prod" {
   name      = "prod-proxy"
-  image     = "ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.0"
+  image     = "ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1"
   replicas  = 2
   features  = ["pool-modes", "ha-tr"]
 
@@ -142,7 +142,7 @@ owns reconciliation.
 import * as helios from "@heliosdatabase/pulumi-heliosproxy";
 
 const prod = new helios.Instance("prod-proxy", {
-  image:    "ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.0",
+  image:    "ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1",
   replicas: 2,
   features: ["pool-modes", "ha-tr"],
   nodes: [
@@ -183,7 +183,7 @@ With the operator (k8s-native rollout):
 ```bash
 kubectl -n heliosproxy patch heliosproxy prod-proxy \
   --type merge \
-  -p '{"spec":{"image":"ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.0"}}'
+  -p '{"spec":{"image":"ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1"}}'
 ```
 
 The operator handles the rolling update with respect for
@@ -194,7 +194,7 @@ With Terraform:
 
 ```hcl
 resource "heliosproxy_instance" "prod" {
-  image = "ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.0"
+  image = "ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1"
 }
 ```
 
@@ -212,7 +212,7 @@ The TF provider patches the CR; the operator reconciles.
 - **Image must match the features.** If the CR sets
   `features: ["wasm-plugins"]` but the image was built without
   that feature, plugin endpoints return 503 at runtime. The
-  default `ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.0` image is
+  default `ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.1` image is
   built with `--features all-features`.
 - **Operator version vs proxy version.** They don't have to match
   exactly, but the operator declares minimum + tested proxy
