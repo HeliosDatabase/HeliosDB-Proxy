@@ -384,11 +384,11 @@ curl http://localhost:9090/pools
 
 ---
 
-## Version
+## Build Info
 
 ### GET /version
 
-Returns proxy version and build information.
+Returns proxy build information.
 
 ```bash
 curl http://localhost:9090/version
@@ -398,8 +398,8 @@ curl http://localhost:9090/version
 
 ```json
 {
-  "version": "0.3.0",
-  "build_time": "0.3.0"
+  "version": "<build-version>",
+  "build_time": "<build-time>"
 }
 ```
 
