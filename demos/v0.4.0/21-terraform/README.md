@@ -87,7 +87,7 @@ resource "heliosproxy_audit_policy" "pci" {
 resource "heliosproxy_instance" "analytics" {
   name     = "analytics"
   replicas = 2
-  image    = "ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.4.0"
+  image    = "ghcr.io/heliosdatabase/hdb-heliosdb-proxy:0.6.0"
 
   nodes = [
     { host = "pg-primary.db.svc",   port = 5432, role = "primary", weight = 100 },
