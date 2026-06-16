@@ -6,7 +6,6 @@
 //! - TTL-based expiration
 
 use std::collections::HashSet;
-use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
@@ -27,7 +26,7 @@ impl BloomFilter {
         // Calculate optimal size and hash count
         let bits_per_item = 10; // ~1% false positive rate
         let num_bits = capacity * bits_per_item;
-        let num_words = (num_bits + 63) / 64;
+        let num_words = num_bits.div_ceil(64);
 
         Self {
             bits: vec![0; num_words],
@@ -104,6 +103,7 @@ pub struct WarmCache {
     hits: AtomicU64,
     misses: AtomicU64,
     compressed_size: AtomicU64,
+    #[allow(dead_code)]
     uncompressed_size: AtomicU64,
 }
 
@@ -113,6 +113,7 @@ struct EntryMetadata {
     /// Size of compressed data
     compressed_size: usize,
     /// Size of uncompressed data
+    #[allow(dead_code)]
     uncompressed_size: usize,
     /// Creation timestamp
     created_at: u64,

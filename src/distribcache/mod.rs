@@ -310,6 +310,7 @@ pub struct HeliosDistribCache {
     semantic_cache: Arc<SemanticQueryCache>,
 
     /// Metrics
+    #[allow(dead_code)]
     metrics: Arc<DistribCacheMetrics>,
 
     /// Configuration

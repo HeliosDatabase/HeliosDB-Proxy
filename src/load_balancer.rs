@@ -61,8 +61,10 @@ pub enum RoutingStrategy {
 /// during failover, allowing for graceful degradation rather than
 /// binary healthy/unhealthy transitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum NodeHealth {
     /// Node is operating normally - can serve all traffic
+    #[default]
     Healthy,
     /// Node is degraded (high latency or replication lag) but still usable for reads
     Degraded,
@@ -89,11 +91,6 @@ impl NodeHealth {
     }
 }
 
-impl Default for NodeHealth {
-    fn default() -> Self {
-        NodeHealth::Healthy
-    }
-}
 
 /// Node state for load balancing
 #[derive(Debug, Clone)]
@@ -412,6 +409,7 @@ impl LoadBalancer {
     }
 
     /// Update node health based on combined metrics
+    #[allow(clippy::if_same_then_else)]
     pub async fn update_node_metrics(&self, node_id: &NodeId, latency_ms: f64, replication_lag_ms: u64, failure_rate: f64) {
         if let Some(node) = self.nodes.write().await.get_mut(node_id) {
             // Update metrics
@@ -442,7 +440,7 @@ impl LoadBalancer {
     /// Check if latency indicates node is responsive
     fn is_responsive(latency_ms: f64) -> bool {
         // Consider non-responsive if latency exceeds 5 seconds or is negative (timeout)
-        latency_ms >= 0.0 && latency_ms < 5000.0
+        (0.0..5000.0).contains(&latency_ms)
     }
 
     /// Increment connection count for a node

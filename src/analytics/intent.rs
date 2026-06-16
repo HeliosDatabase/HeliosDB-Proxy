@@ -117,6 +117,7 @@ impl QueryClassifier {
     }
 
     /// Classify query intent
+    #[allow(clippy::if_same_then_else)]
     pub fn classify(&self, query: &str) -> QueryIntent {
         let upper = query.trim().to_uppercase();
         let lower = query.to_lowercase();

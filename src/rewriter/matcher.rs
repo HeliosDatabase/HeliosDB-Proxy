@@ -221,27 +221,27 @@ mod tests {
 
     fn test_rules() -> Vec<RewriteRule> {
         vec![
-            RewriteRule::new("fp_match")
+            RewriteRule::build("fp_match")
                 .pattern(QueryPattern::Fingerprint(12345))
                 .transform(Transformation::NoOp)
                 .priority(100)
                 .build(),
-            RewriteRule::new("regex_match")
+            RewriteRule::build("regex_match")
                 .pattern(QueryPattern::Regex(r"SELECT .* FROM users".to_string()))
                 .transform(Transformation::NoOp)
                 .priority(50)
                 .build(),
-            RewriteRule::new("table_match")
+            RewriteRule::build("table_match")
                 .pattern(QueryPattern::Table("orders".to_string()))
                 .transform(Transformation::NoOp)
                 .priority(75)
                 .build(),
-            RewriteRule::new("all_match")
+            RewriteRule::build("all_match")
                 .pattern(QueryPattern::All)
                 .transform(Transformation::AddLimit(1000))
                 .priority(10)
                 .build(),
-            RewriteRule::new("ast_match")
+            RewriteRule::build("ast_match")
                 .pattern(QueryPattern::Ast(AstPattern::SelectStar))
                 .transform(Transformation::NoOp)
                 .priority(60)

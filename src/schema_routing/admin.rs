@@ -152,11 +152,11 @@ impl SchemaRoutingAdmin {
             .ok_or_else(|| AdminError::NotFound(format!("Table not found: {}", request.table_name)))?;
 
         // Update classifications
-        let old_temperature = table.temperature.clone();
-        let old_workload = table.workload.clone();
+        let old_temperature = table.temperature;
+        let old_workload = table.workload;
 
-        table.temperature = temperature.clone();
-        table.workload = workload.clone();
+        table.temperature = temperature;
+        table.workload = workload;
 
         // Re-register with new classification
         self.registry.register_table(table);

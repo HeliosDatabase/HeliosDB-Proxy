@@ -80,7 +80,7 @@ impl GraphQLSchema {
         sdl.push_str("scalar JSON\n");
         sdl.push_str("scalar Decimal\n");
         sdl.push_str("scalar BigInt\n");
-        sdl.push_str("\n");
+        sdl.push('\n');
 
         // Enum types
         for enum_type in &self.enum_types {

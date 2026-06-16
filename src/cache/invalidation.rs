@@ -113,13 +113,13 @@ impl InvalidationManager {
         // Add to table -> keys mapping
         self.table_keys
             .entry(table.to_string())
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(key.clone());
 
         // Add to key -> tables mapping
         self.key_tables
             .entry(key.clone())
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(table.to_string());
     }
 

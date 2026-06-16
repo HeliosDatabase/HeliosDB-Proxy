@@ -153,6 +153,7 @@ pub struct QueryCache {
     metrics: Arc<CacheMetrics>,
 
     /// Request coalescing for cache stampede prevention
+    #[allow(dead_code)]
     pending_requests: DashMap<CacheKey, Arc<tokio::sync::Notify>>,
 }
 

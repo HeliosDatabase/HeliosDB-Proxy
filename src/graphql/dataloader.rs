@@ -265,8 +265,7 @@ where
         };
 
         // Split into batches if needed
-        let _batch_count = (unique_keys.len() + self.config.max_batch_size - 1)
-            / self.config.max_batch_size;
+        let _batch_count = unique_keys.len().div_ceil(self.config.max_batch_size);
 
         let mut all_results = HashMap::new();
 

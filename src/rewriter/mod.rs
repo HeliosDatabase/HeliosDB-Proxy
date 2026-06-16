@@ -31,12 +31,12 @@
 //! use heliosdb::proxy::rewriter::{QueryRewriter, RewriteRule, QueryPattern, Transformation};
 //!
 //! let mut rewriter = QueryRewriter::builder()
-//!     .rule(RewriteRule::new("expand_star")
+//!     .rule(RewriteRule::build("expand_star")
 //!         .pattern(QueryPattern::table("users"))
 //!         .transform(Transformation::ExpandSelectStar {
 //!             columns: vec!["id", "name", "email"]
 //!         }))
-//!     .rule(RewriteRule::new("add_limit")
+//!     .rule(RewriteRule::build("add_limit")
 //!         .pattern(QueryPattern::all())
 //!         .transform(Transformation::AddLimit(1000)))
 //!     .build();
@@ -506,7 +506,7 @@ mod tests {
     fn test_rewriter_add_limit() {
         let rewriter = QueryRewriter::builder()
             .enabled(true)
-            .rule(RewriteRule::new("add_limit")
+            .rule(RewriteRule::build("add_limit")
                 .pattern(QueryPattern::All)
                 .transform(Transformation::AddLimit(100))
                 .condition(Condition::NoExistingLimit))
@@ -521,7 +521,7 @@ mod tests {
     fn test_rewriter_skip_existing_limit() {
         let rewriter = QueryRewriter::builder()
             .enabled(true)
-            .rule(RewriteRule::new("add_limit")
+            .rule(RewriteRule::build("add_limit")
                 .pattern(QueryPattern::All)
                 .transform(Transformation::AddLimit(100))
                 .condition(Condition::NoExistingLimit))
@@ -535,7 +535,7 @@ mod tests {
     fn test_rewriter_replace_query() {
         let rewriter = QueryRewriter::builder()
             .enabled(true)
-            .rule(RewriteRule::new("replace")
+            .rule(RewriteRule::build("replace")
                 .pattern(QueryPattern::Fingerprint(12345))
                 .transform(Transformation::Replace("SELECT 1".to_string())))
             .build();
@@ -553,7 +553,7 @@ mod tests {
 
         assert!(rewriter.get_rules().is_empty());
 
-        rewriter.add_rule(RewriteRule::new("test")
+        rewriter.add_rule(RewriteRule::build("test")
             .pattern(QueryPattern::All)
             .transform(Transformation::AddLimit(100)));
 
@@ -567,7 +567,7 @@ mod tests {
     fn test_update_rule() {
         let rewriter = QueryRewriter::builder()
             .enabled(true)
-            .rule(RewriteRule::new("test")
+            .rule(RewriteRule::build("test")
                 .pattern(QueryPattern::All)
                 .transform(Transformation::AddLimit(100)))
             .build();

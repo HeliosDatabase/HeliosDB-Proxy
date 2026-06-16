@@ -182,7 +182,7 @@ impl SessionManager {
         self.tokens.write().insert(token.clone(), session_id.clone());
         self.user_sessions.write()
             .entry(identity.user_id.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(session_id);
 
         // Cleanup old sessions periodically

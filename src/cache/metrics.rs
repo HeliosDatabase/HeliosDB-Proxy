@@ -126,7 +126,7 @@ impl CacheStats {
 
         CacheStatsLevelSnapshot {
             hits,
-            avg_latency_us: if hits > 0 { total_latency / hits } else { 0 },
+            avg_latency_us: total_latency.checked_div(hits).unwrap_or(0),
             min_latency_us: if min_latency == u64::MAX { 0 } else { min_latency },
             max_latency_us: max_latency,
             entry_count: self.entry_count.load(Ordering::Relaxed),

@@ -29,10 +29,12 @@ pub enum CacheTier {
 
 /// Eviction policy for cache tiers
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum EvictionPolicy {
     /// Least Recently Used
     LRU,
     /// Least Frequently Used
+    #[default]
     LFU,
     /// Adaptive (switches between LRU and LFU based on access patterns)
     Adaptive,
@@ -40,28 +42,20 @@ pub enum EvictionPolicy {
     FIFO,
 }
 
-impl Default for EvictionPolicy {
-    fn default() -> Self {
-        Self::LFU
-    }
-}
 
 /// Compression type for L2 cache
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CompressionType {
     /// No compression
     None,
     /// LZ4 (fast, moderate compression)
+    #[default]
     Lz4,
     /// Zstd (slower, better compression)
     Zstd,
 }
 
-impl Default for CompressionType {
-    fn default() -> Self {
-        Self::Lz4
-    }
-}
 
 /// Cache key for entry lookup
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -281,6 +275,7 @@ pub struct LFUEviction {
     /// Access counts per key
     counts: dashmap::DashMap<u64, u64>,
     /// Minimum frequency for fast eviction
+    #[allow(dead_code)]
     min_freq: AtomicU64,
 }
 

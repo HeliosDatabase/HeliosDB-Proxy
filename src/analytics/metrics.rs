@@ -53,11 +53,7 @@ impl OperationMetrics {
         let errors = self.errors.load(Ordering::Relaxed);
         let rows = self.rows.load(Ordering::Relaxed);
 
-        let avg_time_us = if count > 0 {
-            total_time_us / count
-        } else {
-            0
-        };
+        let avg_time_us = total_time_us.checked_div(count).unwrap_or(0);
 
         OperationSnapshot {
             count,
@@ -328,11 +324,7 @@ impl AnalyticsMetrics {
                 0.0
             },
             qps: 0.0, // Would need time tracking for accurate QPS
-            avg_time: if total_queries > 0 {
-                Duration::from_micros(total_time_us / total_queries)
-            } else {
-                Duration::ZERO
-            },
+            avg_time: Duration::from_micros(total_time_us.checked_div(total_queries).unwrap_or(0)),
             by_operation: operations,
             by_user: users,
             by_database: databases,

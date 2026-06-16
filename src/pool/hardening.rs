@@ -409,6 +409,7 @@ pub struct ExhaustionStats {
 
 /// Combined hardening features
 #[derive(Debug)]
+#[derive(Default)]
 pub struct PoolHardening {
     /// Transaction leak detector
     pub leak_detector: TransactionLeakDetector,
@@ -420,16 +421,6 @@ pub struct PoolHardening {
     pub exhaustion_monitor: PoolExhaustionMonitor,
 }
 
-impl Default for PoolHardening {
-    fn default() -> Self {
-        Self {
-            leak_detector: TransactionLeakDetector::default(),
-            health_validator: ConnectionHealthValidator::default(),
-            stale_cleaner: StaleLeaseCleaner::default(),
-            exhaustion_monitor: PoolExhaustionMonitor::default(),
-        }
-    }
-}
 
 impl PoolHardening {
     /// Create with custom configuration

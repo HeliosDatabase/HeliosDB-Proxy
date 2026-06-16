@@ -255,6 +255,7 @@ impl FilterOperator {
 #[derive(Debug)]
 pub struct SqlGenerator {
     /// Schema reference
+    #[allow(dead_code)]
     schema: Arc<GraphQLSchema>,
     /// Quote identifier character
     quote_char: char,

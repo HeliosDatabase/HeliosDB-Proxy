@@ -223,10 +223,12 @@ fn load_config(cli: &Cli) -> Result<ProxyConfig> {
         return ProxyConfig::from_file(path);
     }
 
-    let mut config = ProxyConfig::default();
-    config.listen_address = cli.listen.clone();
-    config.admin_address = cli.admin.clone();
-    config.tr_enabled = cli.tr;
+    let mut config = ProxyConfig {
+        listen_address: cli.listen.clone(),
+        admin_address: cli.admin.clone(),
+        tr_enabled: cli.tr,
+        ..ProxyConfig::default()
+    };
 
     if let Some(ref primary) = cli.primary {
         config.add_node(primary, "primary")?;

@@ -20,11 +20,13 @@ use std::time::Duration;
 use crate::pool::PoolingMode;
 
 /// Compiled regex for hint parsing
+#[allow(clippy::incompatible_msrv)]
 static HINT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"/\*\s*helios:([^*]+)\*/").expect("Invalid hint regex")
 });
 
 /// Key-value pair regex
+#[allow(clippy::incompatible_msrv)]
 static KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(\w+)\s*=\s*([^,\s]+)").expect("Invalid key-value regex")
 });
@@ -418,8 +420,10 @@ impl FromStr for CacheBehavior {
 
 /// Query priority levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Default)]
 pub enum QueryPriority {
     Low = 0,
+    #[default]
     Normal = 1,
     High = 2,
     Critical = 3,
@@ -439,28 +443,20 @@ impl FromStr for QueryPriority {
     }
 }
 
-impl Default for QueryPriority {
-    fn default() -> Self {
-        QueryPriority::Normal
-    }
-}
 
 /// Retry behavior
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub enum RetryBehavior {
     /// No retry
     None,
     /// Automatic retry with default count
+    #[default]
     Auto,
     /// Retry specific number of times
     Count(u32),
 }
 
-impl Default for RetryBehavior {
-    fn default() -> Self {
-        RetryBehavior::Auto
-    }
-}
 
 #[cfg(test)]
 mod tests {

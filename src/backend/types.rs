@@ -177,7 +177,7 @@ impl TextValue {
                 // sign, digits, optional single dot, optional exponent.
                 let bytes = s.as_bytes();
                 let mut i = 0;
-                if bytes.first().map_or(false, |&b| b == b'+' || b == b'-') {
+                if bytes.first().is_some_and(|&b| b == b'+' || b == b'-') {
                     i += 1;
                 }
                 let mut saw_digit = false;

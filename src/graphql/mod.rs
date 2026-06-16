@@ -93,6 +93,7 @@ pub enum RelationType {
 
 impl RelationType {
     /// Parse from string
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "one_to_one" | "onetoone" | "1:1" => Some(RelationType::OneToOne),
@@ -233,6 +234,7 @@ impl Default for BranchContext {
 
 /// GraphQL execution context
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct ExecutionContext {
     /// User identity (if authenticated)
     pub user_id: Option<String>,
@@ -248,18 +250,6 @@ pub struct ExecutionContext {
     pub metadata: HashMap<String, String>,
 }
 
-impl Default for ExecutionContext {
-    fn default() -> Self {
-        Self {
-            user_id: None,
-            roles: Vec::new(),
-            branch: BranchContext::default(),
-            consistency: ConsistencyLevel::default(),
-            headers: HashMap::new(),
-            metadata: HashMap::new(),
-        }
-    }
-}
 
 impl ExecutionContext {
     /// Create a new execution context

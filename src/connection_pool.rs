@@ -216,11 +216,8 @@ impl ConnectionPool {
     /// Add a node to the pool (skeleton mode — no real backend).
     pub async fn add_node(&self, node_id: NodeId) {
         let mut pools = self.pools.write().await;
-        if !pools.contains_key(&node_id) {
-            pools.insert(
-                node_id,
-                NodePool::new(self.config.max_connections),
-            );
+        if let std::collections::hash_map::Entry::Vacant(e) = pools.entry(node_id) {
+            e.insert(NodePool::new(self.config.max_connections));
             tracing::debug!("Added node {:?} to connection pool", node_id);
         }
     }
@@ -235,10 +232,10 @@ impl ConnectionPool {
         port: u16,
     ) {
         let mut pools = self.pools.write().await;
-        if !pools.contains_key(&node_id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = pools.entry(node_id) {
             let mut np = NodePool::new(self.config.max_connections);
             np.endpoint = Some((host.into(), port));
-            pools.insert(node_id, np);
+            e.insert(np);
             tracing::debug!("Added node {:?} to connection pool (with endpoint)", node_id);
         }
     }

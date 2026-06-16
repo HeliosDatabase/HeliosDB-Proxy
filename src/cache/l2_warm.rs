@@ -273,7 +273,7 @@ impl L2WarmCache {
         };
 
         let mut storage = mmap.write()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Lock poisoned"))?;
+            .map_err(|_| std::io::Error::other("Lock poisoned"))?;
 
         let mut count = 0;
         for entry in self.memory_entries.iter() {
@@ -294,7 +294,7 @@ impl L2WarmCache {
         };
 
         let storage = mmap.read()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Lock poisoned"))?;
+            .map_err(|_| std::io::Error::other("Lock poisoned"))?;
 
         Ok(storage.entry_count())
     }
@@ -344,6 +344,7 @@ impl MmapStorage {
             None => {
                 self.file = OpenOptions::new()
                     .create(true)
+                    .truncate(true)
                     .read(true)
                     .write(true)
                     .open(&self.path)

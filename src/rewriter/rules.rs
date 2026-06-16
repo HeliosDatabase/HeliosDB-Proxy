@@ -33,8 +33,8 @@ pub struct RewriteRule {
 }
 
 impl RewriteRule {
-    /// Create a new rule
-    pub fn new(id: impl Into<String>) -> RewriteRuleBuilder {
+    /// Create a new rule builder
+    pub fn build(id: impl Into<String>) -> RewriteRuleBuilder {
         RewriteRuleBuilder::new(id)
     }
 
@@ -433,6 +433,7 @@ impl Condition {
     }
 
     /// NOT condition
+    #[allow(clippy::should_implement_trait)]
     pub fn not(condition: Condition) -> Self {
         Self::Not(Box::new(condition))
     }
@@ -444,7 +445,7 @@ mod tests {
 
     #[test]
     fn test_rule_builder() {
-        let rule = RewriteRule::new("test")
+        let rule = RewriteRule::build("test")
             .description("Test rule")
             .pattern(QueryPattern::All)
             .transform(Transformation::AddLimit(100))
@@ -500,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_rule_matches() {
-        let rule = RewriteRule::new("test")
+        let rule = RewriteRule::build("test")
             .pattern(QueryPattern::Table("users".to_string()))
             .transform(Transformation::AddLimit(100))
             .build();

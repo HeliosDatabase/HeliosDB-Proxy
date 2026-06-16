@@ -12,6 +12,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
 /// A backend connection stream.
+#[allow(clippy::large_enum_variant)]
 pub enum Stream {
     Plain(TcpStream),
     Tls(TlsStream<TcpStream>),

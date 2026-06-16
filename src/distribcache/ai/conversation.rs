@@ -112,6 +112,7 @@ impl ConversationContext {
 /// LRU cache for conversation eviction
 struct LruTracker {
     order: Mutex<VecDeque<ConversationId>>,
+    #[allow(dead_code)]
     max_size: usize,
 }
 

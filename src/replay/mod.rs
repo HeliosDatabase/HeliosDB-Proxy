@@ -12,11 +12,10 @@
 //! client (added in the T0-TR sequence) — no new infrastructure.
 
 use crate::backend::{BackendClient, BackendConfig, ParamValue};
-use crate::transaction_journal::{JournalEntry, JournalValue, TransactionJournal};
+use crate::transaction_journal::{JournalValue, TransactionJournal};
 use crate::{ProxyError, Result};
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
-use uuid::Uuid;
 
 /// A request to replay a window of journal activity.
 #[derive(Debug, Clone)]

@@ -376,11 +376,10 @@ impl FailoverController {
         let mut sorted: Vec<_> = candidates.values().cloned().collect();
         sorted.sort_by(|a, b| {
             // Prefer sync standbys
-            if self.config.prefer_sync_standby {
-                if a.is_sync != b.is_sync {
+            if self.config.prefer_sync_standby
+                && a.is_sync != b.is_sync {
                     return b.is_sync.cmp(&a.is_sync);
                 }
-            }
             // Then by lag
             if a.lag_bytes != b.lag_bytes {
                 return a.lag_bytes.cmp(&b.lag_bytes);
@@ -489,7 +488,7 @@ impl FailoverController {
             }
         };
 
-        let wait_secs = self.config.failover_timeout.as_secs().max(10).min(300);
+        let wait_secs = self.config.failover_timeout.as_secs().clamp(10, 300);
         let mut client = BackendClient::connect(&cfg)
             .await
             .map_err(|e| ProxyError::FailoverFailed(format!("connect to promote: {}", e)))?;

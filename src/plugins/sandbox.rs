@@ -51,6 +51,7 @@ pub enum Permission {
 
 impl Permission {
     /// Parse permission from string
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "query_execute" | "query" => Some(Permission::QueryExecute),
@@ -228,9 +229,8 @@ impl PluginSandbox {
 
         // Check if host matches allowed patterns
         self.policy.allowed_hosts.iter().any(|allowed| {
-            if allowed.starts_with('*') {
+            if let Some(suffix) = allowed.strip_prefix('*') {
                 // Wildcard matching
-                let suffix = &allowed[1..];
                 host.ends_with(suffix)
             } else {
                 host == allowed

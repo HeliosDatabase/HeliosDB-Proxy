@@ -56,6 +56,7 @@ static STRING_LITERAL: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"'(?:[^'\\]|\\.)*'"#).unwrap()
 });
 
+#[allow(dead_code)]
 static DOUBLE_QUOTED: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#""(?:[^"\\]|\\.)*""#).unwrap()
 });
@@ -155,7 +156,7 @@ impl QueryNormalizer {
             if let Some(table_match) = cap.get(1) {
                 let table = table_match.as_str().to_lowercase();
                 // Remove schema prefix if present
-                let table_name = table.split('.').last().unwrap_or(&table);
+                let table_name = table.split('.').next_back().unwrap_or(&table);
                 if !tables.contains(&table_name.to_string()) {
                     tables.push(table_name.to_string());
                 }

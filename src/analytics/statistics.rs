@@ -414,12 +414,12 @@ impl StatisticsStore {
         let mut all: Vec<_> = self.stats.iter().map(|r| r.to_stats()).collect();
 
         match order_by {
-            OrderBy::TotalTime => all.sort_by(|a, b| b.total_time.cmp(&a.total_time)),
-            OrderBy::AvgTime => all.sort_by(|a, b| b.avg_time.cmp(&a.avg_time)),
-            OrderBy::Calls => all.sort_by(|a, b| b.calls.cmp(&a.calls)),
-            OrderBy::Errors => all.sort_by(|a, b| b.errors.cmp(&a.errors)),
-            OrderBy::P99Time => all.sort_by(|a, b| b.p99.cmp(&a.p99)),
-            OrderBy::Rows => all.sort_by(|a, b| b.rows.cmp(&a.rows)),
+            OrderBy::TotalTime => all.sort_by_key(|b| std::cmp::Reverse(b.total_time)),
+            OrderBy::AvgTime => all.sort_by_key(|b| std::cmp::Reverse(b.avg_time)),
+            OrderBy::Calls => all.sort_by_key(|b| std::cmp::Reverse(b.calls)),
+            OrderBy::Errors => all.sort_by_key(|b| std::cmp::Reverse(b.errors)),
+            OrderBy::P99Time => all.sort_by_key(|b| std::cmp::Reverse(b.p99)),
+            OrderBy::Rows => all.sort_by_key(|b| std::cmp::Reverse(b.rows)),
         }
 
         all.truncate(limit);

@@ -115,6 +115,7 @@ impl ApiKey {
 /// API key manager
 pub struct ApiKeyManager {
     /// Configuration
+    #[allow(dead_code)]
     config: ApiKeyConfig,
 
     /// Key store by ID

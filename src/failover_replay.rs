@@ -107,6 +107,7 @@ pub enum ReplayState {
 #[derive(Debug)]
 struct ActiveReplay {
     /// Transaction ID
+    #[allow(dead_code)]
     tx_id: Uuid,
     /// Target node
     target_node: NodeId,
@@ -117,6 +118,7 @@ struct ActiveReplay {
     /// Current position (statement index)
     position: usize,
     /// Start time
+    #[allow(dead_code)]
     started_at: chrono::DateTime<chrono::Utc>,
     /// Results so far
     results: Vec<StatementReplayResult>,

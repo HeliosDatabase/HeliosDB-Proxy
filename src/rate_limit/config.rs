@@ -9,10 +9,12 @@ use super::limiter::LimiterKey;
 
 /// Priority levels for queries
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Default)]
 pub enum PriorityLevel {
     /// Low priority - accept more throttling
     Low = 0,
     /// Normal priority (default)
+    #[default]
     Normal = 1,
     /// High priority - bypass some limits
     High = 2,
@@ -20,11 +22,6 @@ pub enum PriorityLevel {
     Critical = 3,
 }
 
-impl Default for PriorityLevel {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
 
 impl std::fmt::Display for PriorityLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -53,8 +50,10 @@ impl std::str::FromStr for PriorityLevel {
 
 /// Action to take when rate limit is exceeded
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub enum ExceededAction {
     /// Return error immediately
+    #[default]
     Reject,
 
     /// Queue and wait (up to max_wait)
@@ -67,11 +66,6 @@ pub enum ExceededAction {
     Warn,
 }
 
-impl Default for ExceededAction {
-    fn default() -> Self {
-        Self::Reject
-    }
-}
 
 impl std::fmt::Display for ExceededAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -116,11 +110,10 @@ fn parse_duration_from_str(s: &str) -> Option<u64> {
     let end = s.find(')')?;
     let duration_str = &s[start + 1..end];
 
-    if duration_str.ends_with("ms") {
-        duration_str[..duration_str.len() - 2].parse().ok()
-    } else if duration_str.ends_with('s') {
-        duration_str[..duration_str.len() - 1]
-            .parse::<u64>()
+    if let Some(s) = duration_str.strip_suffix("ms") {
+        s.parse().ok()
+    } else if let Some(s) = duration_str.strip_suffix('s') {
+        s.parse::<u64>()
             .ok()
             .map(|s| s * 1000)
     } else {

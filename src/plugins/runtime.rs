@@ -134,6 +134,7 @@ pub struct LoadedPlugin {
     instance_pre: OnceLock<InstancePre<StoreCtx>>,
 
     /// Security sandbox
+    #[allow(dead_code)]
     sandbox: PluginSandbox,
 
     /// Instance data (mock for non-wasmtime builds)
@@ -158,6 +159,7 @@ struct PluginInstanceData {
     fuel_consumed: u64,
 
     /// Custom state from plugin
+    #[allow(dead_code)]
     state: HashMap<String, Vec<u8>>,
 }
 
@@ -190,6 +192,7 @@ impl LoadedPlugin {
     /// Borrow the compiled module (Arc-cheap clone available via
     /// `plugin.module.clone()` if the caller needs to outlive the
     /// borrow).
+    #[allow(dead_code)]
     pub(crate) fn module(&self) -> &Module {
         &self.module
     }
@@ -240,6 +243,7 @@ pub struct WasmPluginRuntime {
     epoch_stop: Arc<AtomicBool>,
 
     /// Host function registry
+    #[allow(dead_code)]
     host_functions: Arc<HostFunctionRegistry>,
 
     /// Per-plugin KV backend bridged into wasmtime imports. Survives
@@ -339,6 +343,7 @@ impl WasmPluginRuntime {
 
     /// Expose the engine so tests + the plugin manager can build new
     /// `Store`s against it.
+    #[allow(dead_code)]
     pub(crate) fn engine(&self) -> &Engine {
         &self.engine
     }
@@ -581,7 +586,7 @@ impl WasmPluginRuntime {
             }
         }
         plugin.instance_data.write().memory_used =
-            (memory.data_size(&store)) as usize;
+            memory.data_size(&store);
 
         Ok(result_bytes)
     }

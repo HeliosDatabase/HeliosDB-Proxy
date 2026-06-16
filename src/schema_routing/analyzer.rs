@@ -48,8 +48,7 @@ impl QueryAnalyzer {
     /// Normalize query for analysis
     fn normalize_query(&self, query: &str) -> String {
         query.to_uppercase()
-            .replace('\n', " ")
-            .replace('\t', " ")
+            .replace(['\n', '\t'], " ")
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")

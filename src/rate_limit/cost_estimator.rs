@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 /// Type of database operation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum OperationType {
     /// SELECT query
     Select,
@@ -27,14 +28,10 @@ pub enum OperationType {
     /// Administrative queries (ANALYZE, VACUUM, etc.)
     Administrative,
     /// Unknown/other
+    #[default]
     Unknown,
 }
 
-impl Default for OperationType {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
 
 impl std::fmt::Display for OperationType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

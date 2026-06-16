@@ -94,6 +94,7 @@ impl WorkloadQueue {
 /// Workload scheduler
 pub struct WorkloadScheduler {
     /// Configuration
+    #[allow(dead_code)]
     config: DistribCacheConfig,
 
     /// Queues per workload type
@@ -261,7 +262,7 @@ impl WorkloadScheduler {
         let hour = chrono::Utc::now().hour();
 
         // Business hours (9-18): prioritize OLTP
-        let priority = if hour >= 9 && hour < 18 {
+        let priority = if (9..18).contains(&hour) {
             match query.workload_type {
                 WorkloadType::OLTP | WorkloadType::AIAgent => QueryPriority::High,
                 WorkloadType::OLAP => QueryPriority::Low,

@@ -9,9 +9,11 @@ use crate::backend::{tls::default_client_config, BackendConfig, TlsMode};
 use crate::client_tls::{build_tls_acceptor, ClientStream};
 use crate::config::{HbaAction, HbaRule, NodeConfig, NodeRole, ProxyConfig, TrMode};
 use crate::protocol::{
-    ErrorResponse, Message, MessageType, ProtocolCodec, QueryMessage,
+    ErrorResponse, Message, MessageType, ProtocolCodec,
     StartupMessage, TransactionStatus,
 };
+#[cfg(feature = "wasm-plugins")]
+use crate::protocol::QueryMessage;
 use crate::{ProxyError, Result};
 use arc_swap::ArcSwap;
 use bytes::{BufMut, BytesMut};
@@ -1510,7 +1512,7 @@ impl ProxyServer {
         match first {
             StartupMessage::SSLRequest => match state.tls_acceptor.as_ref() {
                 Some(acceptor) => {
-                    tcp.write_all(&[b'S'])
+                    tcp.write_all(b"S")
                         .await
                         .map_err(|e| ProxyError::Network(format!("SSL accept write: {}", e)))?;
                     let tls = acceptor
@@ -1523,7 +1525,7 @@ impl ProxyServer {
                     Ok((ClientStream::Tls(Box::new(tls)), None))
                 }
                 None => {
-                    tcp.write_all(&[b'N'])
+                    tcp.write_all(b"N")
                         .await
                         .map_err(|e| ProxyError::Network(format!("SSL reject write: {}", e)))?;
                     Ok((ClientStream::Plain(tcp), None))
@@ -1572,7 +1574,7 @@ impl ProxyServer {
                 // SSL is negotiated upstream; a second SSLRequest here is a
                 // protocol error — reject defensively.
                 client_stream
-                    .write_all(&[b'N'])
+                    .write_all(b"N")
                     .await
                     .map_err(|e| ProxyError::Network(format!("SSL reject error: {}", e)))?;
                 Err(ProxyError::Protocol("unexpected SSLRequest after startup".to_string()))
@@ -1940,11 +1942,11 @@ impl ProxyServer {
             // once) straight out of the buffer — no clone needed.
             while let Some(msg) = codec.decode_message(&mut backend_buffer)? {
                 match msg.msg_type {
-                    MessageType::BackendKeyData => {
+                    MessageType::BackendKeyData
                         // The backend told the client how to cancel its
                         // queries; remember which backend owns that key so
                         // an out-of-band CancelRequest can be forwarded.
-                        if msg.payload.len() >= 8 {
+                        if msg.payload.len() >= 8 => {
                             let pid = u32::from_be_bytes([
                                 msg.payload[0], msg.payload[1], msg.payload[2], msg.payload[3],
                             ]);
@@ -1953,17 +1955,15 @@ impl ProxyServer {
                             ]);
                             Self::register_cancel_key(state, pid, key, node_addr);
                         }
-                    }
-                    MessageType::AuthRequest => {
+                    MessageType::AuthRequest
                         // Check if auth OK
-                        if msg.payload.len() >= 4 {
+                        if msg.payload.len() >= 4 => {
                             let auth_type =
                                 i32::from_be_bytes([msg.payload[0], msg.payload[1], msg.payload[2], msg.payload[3]]);
                             if auth_type == 0 {
                                 // AuthenticationOk - continue to read ReadyForQuery
                             }
                         }
-                    }
                     MessageType::ReadyForQuery => {
                         // Authentication complete
                         return Ok(());
@@ -2976,8 +2976,10 @@ impl ProxyServer {
     #[cfg(feature = "wasm-plugins")]
     fn build_query_context(query: &str, session: &Arc<ClientSession>) -> QueryContext {
         let is_read_only = !Self::is_write_query(query);
-        let mut hook_context = HookContext::default();
-        hook_context.client_id = Some(session.id.to_string());
+        let hook_context = HookContext {
+            client_id: Some(session.id.to_string()),
+            ..HookContext::default()
+        };
         QueryContext {
             query: query.to_string(),
             normalized: query.to_string(),
@@ -3449,6 +3451,8 @@ pub struct PoolModeStatsSnapshot {
 mod tests {
     use super::*;
     use crate::config::{HealthConfig, LoadBalancerConfig, PoolConfig};
+    #[cfg(not(feature = "wasm-plugins"))]
+    use crate::protocol::QueryMessage;
 
     fn test_config() -> ProxyConfig {
         let mut config = ProxyConfig::default();

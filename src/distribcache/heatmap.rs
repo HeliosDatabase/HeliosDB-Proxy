@@ -318,7 +318,7 @@ impl CacheHeatmap {
             .collect();
 
         // Sort by total accesses (descending)
-        tables.sort_by(|a, b| b.total_accesses.cmp(&a.total_accesses));
+        tables.sort_by_key(|b| std::cmp::Reverse(b.total_accesses));
 
         let time_series = self.get_time_series();
         let recommendations = self.generate_recommendations();

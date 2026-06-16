@@ -226,6 +226,7 @@ pub struct AuthenticationHandler {
 #[derive(Debug, Clone)]
 struct ApiKeyEntry {
     /// Key ID
+    #[allow(dead_code)]
     key_id: String,
 
     /// Hashed key value
@@ -235,6 +236,7 @@ struct ApiKeyEntry {
     identity: Identity,
 
     /// Creation time
+    #[allow(dead_code)]
     created_at: chrono::DateTime<chrono::Utc>,
 
     /// Expiration time
@@ -244,9 +246,11 @@ struct ApiKeyEntry {
     active: bool,
 
     /// Allowed scopes
+    #[allow(dead_code)]
     scopes: Vec<String>,
 
     /// Rate limit override
+    #[allow(dead_code)]
     rate_limit: Option<u32>,
 }
 

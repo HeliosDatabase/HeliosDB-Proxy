@@ -72,7 +72,7 @@ impl HostFunctionRegistry {
         let mut functions = self.functions.write();
         functions
             .entry(namespace.to_string())
-            .or_insert_with(HashMap::new)
+            .or_default()
             .insert(name.to_string(), function);
     }
 
@@ -114,7 +114,7 @@ impl HostFunctionRegistry {
         let mut stats = self.stats.write();
         let key = format!("{}:{}", namespace, name);
 
-        let entry = stats.calls.entry(key).or_insert_with(FunctionCallStats::default);
+        let entry = stats.calls.entry(key).or_default();
         entry.total_calls += 1;
         entry.total_duration += duration;
 

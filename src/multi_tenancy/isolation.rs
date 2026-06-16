@@ -35,6 +35,7 @@ pub struct RoutingDecision {
 
 impl RoutingDecision {
     /// Create a default routing decision (no special routing)
+    #[allow(clippy::should_implement_trait)]
     pub fn default() -> Self {
         Self {
             database: None,

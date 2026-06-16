@@ -40,6 +40,7 @@ pub enum WorkloadType {
 /// Query history entry for session-based classification
 #[derive(Debug, Clone)]
 struct QueryHistoryEntry {
+    #[allow(dead_code)]
     fingerprint: QueryFingerprint,
     workload: WorkloadType,
     timestamp: Instant,
@@ -146,6 +147,7 @@ pub struct ClassificationRule {
 /// Workload classifier
 pub struct WorkloadClassifier {
     /// Configuration
+    #[allow(dead_code)]
     config: DistribCacheConfig,
 
     /// Classification rules (priority-ordered)
@@ -329,7 +331,7 @@ impl WorkloadClassifier {
 
         // Check rules in priority order
         let mut sorted_rules = self.rules.clone();
-        sorted_rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+        sorted_rules.sort_by_key(|b| std::cmp::Reverse(b.priority));
 
         for rule in &sorted_rules {
             for pattern in &rule.patterns {

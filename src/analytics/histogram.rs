@@ -278,7 +278,7 @@ impl HistogramSnapshot {
             } else {
                 0
             };
-            let bar: String = std::iter::repeat('#').take(bar_len).collect();
+            let bar: String = "#".repeat(bar_len);
             output.push_str(&format!("{:>8} | {:6} | {}\n", label, bucket.count, bar));
         }
 
