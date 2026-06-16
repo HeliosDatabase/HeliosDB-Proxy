@@ -2,10 +2,10 @@
 //!
 //! Efficient matching of queries against rewrite rules.
 
-use super::rules::{RewriteRule, QueryPattern, AstPattern};
 use super::parser::ParsedQuery;
-use std::collections::HashMap;
+use super::rules::{AstPattern, QueryPattern, RewriteRule};
 use regex::Regex;
+use std::collections::HashMap;
 
 /// Rule matcher for efficient query matching
 pub struct RuleMatcher {
@@ -75,7 +75,11 @@ impl RuleMatcher {
     }
 
     /// Match a query against rules
-    pub fn match_query<'a>(&self, parsed: &ParsedQuery, rules: &'a [RewriteRule]) -> Vec<&'a RewriteRule> {
+    pub fn match_query<'a>(
+        &self,
+        parsed: &ParsedQuery,
+        rules: &'a [RewriteRule],
+    ) -> Vec<&'a RewriteRule> {
         let mut matched_indices: Vec<usize> = Vec::new();
 
         // Check fingerprint matches (fast path)
@@ -137,9 +141,7 @@ impl RuleMatcher {
     fn matches_ast(&self, pattern: &AstPattern, parsed: &ParsedQuery) -> bool {
         match pattern {
             AstPattern::SelectStar => parsed.has_select_star,
-            AstPattern::SelectFrom { table } => {
-                parsed.is_select && parsed.tables.contains(table)
-            }
+            AstPattern::SelectFrom { table } => parsed.is_select && parsed.tables.contains(table),
             AstPattern::NoLimit => !parsed.has_limit,
             AstPattern::NoWhere => !parsed.has_where,
             AstPattern::Insert => parsed.is_insert,
@@ -151,15 +153,9 @@ impl RuleMatcher {
                 // Simplified: just check if table is accessed
                 parsed.tables.contains(table) && !parsed.has_limit
             }
-            AstPattern::FullTableScan => {
-                parsed.is_select && !parsed.has_where
-            }
-            AstPattern::And(patterns) => {
-                patterns.iter().all(|p| self.matches_ast(p, parsed))
-            }
-            AstPattern::Or(patterns) => {
-                patterns.iter().any(|p| self.matches_ast(p, parsed))
-            }
+            AstPattern::FullTableScan => parsed.is_select && !parsed.has_where,
+            AstPattern::And(patterns) => patterns.iter().all(|p| self.matches_ast(p, parsed)),
+            AstPattern::Or(patterns) => patterns.iter().any(|p| self.matches_ast(p, parsed)),
         }
     }
 
@@ -210,14 +206,18 @@ pub struct MatcherStats {
 impl MatcherStats {
     /// Total rules indexed
     pub fn total(&self) -> usize {
-        self.fingerprint_rules + self.regex_rules + self.table_rules + self.all_rules + self.ast_rules
+        self.fingerprint_rules
+            + self.regex_rules
+            + self.table_rules
+            + self.all_rules
+            + self.ast_rules
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::rules::{RewriteRule, Transformation};
     use super::*;
-    use super::super::rules::{Transformation, RewriteRule};
 
     fn test_rules() -> Vec<RewriteRule> {
         vec![

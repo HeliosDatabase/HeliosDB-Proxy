@@ -236,7 +236,10 @@ impl ConnectionPool {
             let mut np = NodePool::new(self.config.max_connections);
             np.endpoint = Some((host.into(), port));
             e.insert(np);
-            tracing::debug!("Added node {:?} to connection pool (with endpoint)", node_id);
+            tracing::debug!(
+                "Added node {:?} to connection pool (with endpoint)",
+                node_id
+            );
         }
     }
 
@@ -463,11 +466,7 @@ impl ConnectionPool {
     /// Run a reset query on a connection (if live) before returning it
     /// to the pool. Used by pool-modes `release` for Transaction and
     /// Statement modes.
-    pub async fn run_reset_query(
-        &self,
-        conn: &mut PooledConnection,
-        query: &str,
-    ) -> Result<()> {
+    pub async fn run_reset_query(&self, conn: &mut PooledConnection, query: &str) -> Result<()> {
         if let Some(client) = conn.client.as_mut() {
             client
                 .execute(query)
@@ -708,7 +707,8 @@ mod tests {
     async fn test_add_node_with_endpoint_but_no_template_returns_skeleton_client() {
         let pool = ConnectionPool::new(PoolConfig::default());
         let node_id = NodeId::new();
-        pool.add_node_with_endpoint(node_id, "127.0.0.1", 5432).await;
+        pool.add_node_with_endpoint(node_id, "127.0.0.1", 5432)
+            .await;
 
         let conn = pool.get_connection(&node_id).await.expect("acquire");
         assert!(conn.client.is_none(), "no template → no live client");
@@ -733,7 +733,10 @@ mod tests {
         // Pool now has one idle connection. Re-acquire must succeed without
         // creating a new connection (and without timing out).
         let c2 = pool.get_connection(&node_id).await.expect("reacquire");
-        assert!(c2.permit.is_some(), "reused connection must carry its permit");
+        assert!(
+            c2.permit.is_some(),
+            "reused connection must carry its permit"
+        );
 
         let metrics = pool.metrics().await;
         assert_eq!(

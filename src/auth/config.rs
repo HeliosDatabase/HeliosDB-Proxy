@@ -430,7 +430,10 @@ pub enum RoleCondition {
 #[derive(Debug, Clone)]
 pub enum RoleMappingCondition {
     /// Match a specific claim value
-    HasClaim { claim: String, value: Option<String> },
+    HasClaim {
+        claim: String,
+        value: Option<String>,
+    },
 
     /// Match group membership
     InGroup { group: String },
@@ -451,13 +454,19 @@ pub enum RoleMappingCondition {
     UsernamePattern { pattern: String },
 
     /// All conditions must match
-    And { conditions: Vec<RoleMappingCondition> },
+    And {
+        conditions: Vec<RoleMappingCondition>,
+    },
 
     /// Any condition must match
-    Or { conditions: Vec<RoleMappingCondition> },
+    Or {
+        conditions: Vec<RoleMappingCondition>,
+    },
 
     /// Negate a condition
-    Not { condition: Box<RoleMappingCondition> },
+    Not {
+        condition: Box<RoleMappingCondition>,
+    },
 }
 
 impl RoleMappingCondition {
@@ -478,9 +487,7 @@ impl RoleMappingCondition {
 
     /// Create a HasRole condition
     pub fn has_role(role: impl Into<String>) -> Self {
-        Self::HasRole {
-            role: role.into(),
-        }
+        Self::HasRole { role: role.into() }
     }
 
     /// Create an AuthMethod condition
@@ -997,11 +1004,13 @@ mod tests {
     #[test]
     fn test_auth_config_builder() {
         let config = AuthConfig::builder()
-            .jwt(JwtConfig::new("https://auth.example.com/.well-known/jwks.json"))
-            .add_role_mapping(RoleMappingRule::new(
-                RoleCondition::jwt_claim("role", "admin"),
-                "db_admin",
-            ).with_priority(100))
+            .jwt(JwtConfig::new(
+                "https://auth.example.com/.well-known/jwks.json",
+            ))
+            .add_role_mapping(
+                RoleMappingRule::new(RoleCondition::jwt_claim("role", "admin"), "db_admin")
+                    .with_priority(100),
+            )
             .default_role("db_minimal")
             .build();
 
@@ -1039,8 +1048,7 @@ mod tests {
 
     #[test]
     fn test_credentials() {
-        let creds = Credentials::new("dbuser", "password123")
-            .with_ttl(Duration::from_secs(3600));
+        let creds = Credentials::new("dbuser", "password123").with_ttl(Duration::from_secs(3600));
 
         assert_eq!(creds.username, "dbuser");
         assert!(creds.ttl.is_some());
@@ -1048,10 +1056,8 @@ mod tests {
 
     #[test]
     fn test_role_mapping() {
-        let rule = RoleMappingRule::new(
-            RoleCondition::group("developers"),
-            "db_readwrite",
-        ).with_priority(50);
+        let rule = RoleMappingRule::new(RoleCondition::group("developers"), "db_readwrite")
+            .with_priority(50);
 
         assert_eq!(rule.db_role, "db_readwrite");
         assert_eq!(rule.priority, 50);

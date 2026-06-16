@@ -252,9 +252,10 @@ impl PluginSandbox {
         }
 
         // Check if path is under allowed directories
-        self.policy.allowed_paths.iter().any(|allowed| {
-            path.starts_with(allowed)
-        })
+        self.policy
+            .allowed_paths
+            .iter()
+            .any(|allowed| path.starts_with(allowed))
     }
 
     /// Deny a host
@@ -452,9 +453,18 @@ mod tests {
 
     #[test]
     fn test_permission_from_str() {
-        assert_eq!(Permission::from_str("http_fetch"), Some(Permission::HttpFetch));
-        assert_eq!(Permission::from_str("cache_read"), Some(Permission::CacheRead));
-        assert_eq!(Permission::from_str("unknown"), Some(Permission::Custom("unknown".to_string())));
+        assert_eq!(
+            Permission::from_str("http_fetch"),
+            Some(Permission::HttpFetch)
+        );
+        assert_eq!(
+            Permission::from_str("cache_read"),
+            Some(Permission::CacheRead)
+        );
+        assert_eq!(
+            Permission::from_str("unknown"),
+            Some(Permission::Custom("unknown".to_string()))
+        );
     }
 
     #[test]
@@ -528,7 +538,9 @@ mod tests {
         assert!(sandbox.validate_resources(512 * 1024, Some(500)).is_ok());
 
         // Memory exceeded
-        assert!(sandbox.validate_resources(2 * 1024 * 1024, Some(500)).is_err());
+        assert!(sandbox
+            .validate_resources(2 * 1024 * 1024, Some(500))
+            .is_err());
 
         // Fuel exceeded
         assert!(sandbox.validate_resources(512 * 1024, Some(2000)).is_err());

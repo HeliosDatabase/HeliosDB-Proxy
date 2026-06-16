@@ -40,7 +40,8 @@ impl PrefetchQueue {
         let mut queue = self.queue.lock().unwrap();
 
         // Insert by priority (higher priority first)
-        let pos = queue.iter()
+        let pos = queue
+            .iter()
             .position(|r| r.priority < request.priority)
             .unwrap_or(queue.len());
 
@@ -106,15 +107,13 @@ impl TemporalPatternStore {
         }
 
         let patterns = &self.hourly_patterns[hour];
-        let mut predictions: Vec<_> = patterns.iter()
+        let mut predictions: Vec<_> = patterns
+            .iter()
             .map(|e| (e.key().clone(), *e.value()))
             .collect();
 
         predictions.sort_by_key(|b| std::cmp::Reverse(b.1));
-        predictions.into_iter()
-            .take(10)
-            .map(|(fp, _)| fp)
-            .collect()
+        predictions.into_iter().take(10).map(|(fp, _)| fp).collect()
     }
 }
 
@@ -163,7 +162,8 @@ impl PredictivePrefetcher {
     /// Record a query for pattern learning
     pub fn record(&self, session: &SessionId, fingerprint: QueryFingerprint) {
         // Get or create session sequence
-        let mut seq = self.session_sequences
+        let mut seq = self
+            .session_sequences
             .entry(session.clone())
             .or_insert_with(|| VecDeque::with_capacity(100));
 
@@ -219,7 +219,10 @@ impl PredictivePrefetcher {
         let hour = chrono::Utc::now().hour() as usize;
         let temporal_predictions = self.temporal_patterns.predict_for_hour(hour);
 
-        for fingerprint in temporal_predictions.into_iter().take(self.config.prefetch_lookahead as usize) {
+        for fingerprint in temporal_predictions
+            .into_iter()
+            .take(self.config.prefetch_lookahead as usize)
+        {
             self.prefetch_queue.enqueue(PrefetchRequest {
                 fingerprint,
                 priority: 50, // Medium priority for temporal
@@ -228,7 +231,10 @@ impl PredictivePrefetcher {
     }
 
     /// Get top predictions with confidence scores
-    fn get_top_predictions(&self, next_queries: &[QueryFingerprint]) -> Vec<(QueryFingerprint, f32)> {
+    fn get_top_predictions(
+        &self,
+        next_queries: &[QueryFingerprint],
+    ) -> Vec<(QueryFingerprint, f32)> {
         // Count occurrences
         let mut counts: HashMap<&QueryFingerprint, u32> = HashMap::new();
         for fp in next_queries {
@@ -238,12 +244,14 @@ impl PredictivePrefetcher {
         let total = next_queries.len() as f32;
 
         // Calculate confidence and sort
-        let mut predictions: Vec<_> = counts.into_iter()
+        let mut predictions: Vec<_> = counts
+            .into_iter()
             .map(|(fp, count)| (fp.clone(), count as f32 / total))
             .collect();
 
         predictions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        predictions.into_iter()
+        predictions
+            .into_iter()
             .take(self.config.prefetch_lookahead as usize)
             .collect()
     }
@@ -295,7 +303,9 @@ impl PredictivePrefetcher {
         // For now, just limit total sessions
         if self.session_sequences.len() > 10000 {
             // Remove random entries to stay under limit
-            let to_remove: Vec<_> = self.session_sequences.iter()
+            let to_remove: Vec<_> = self
+                .session_sequences
+                .iter()
                 .take(1000)
                 .map(|e| e.key().clone())
                 .collect();
@@ -335,9 +345,18 @@ mod tests {
         let fp3 = QueryFingerprint::from_query("SELECT 3");
 
         // Add with different priorities
-        queue.enqueue(PrefetchRequest { fingerprint: fp1.clone(), priority: 50 });
-        queue.enqueue(PrefetchRequest { fingerprint: fp2.clone(), priority: 100 });
-        queue.enqueue(PrefetchRequest { fingerprint: fp3.clone(), priority: 25 });
+        queue.enqueue(PrefetchRequest {
+            fingerprint: fp1.clone(),
+            priority: 50,
+        });
+        queue.enqueue(PrefetchRequest {
+            fingerprint: fp2.clone(),
+            priority: 100,
+        });
+        queue.enqueue(PrefetchRequest {
+            fingerprint: fp3.clone(),
+            priority: 25,
+        });
 
         assert_eq!(queue.len(), 3);
     }

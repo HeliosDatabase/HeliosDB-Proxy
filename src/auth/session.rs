@@ -158,10 +158,12 @@ impl SessionManager {
         let token = self.generate_token();
 
         let now = chrono::Utc::now();
-        let expires_at = now + chrono::Duration::from_std(self.config.idle_timeout)
-            .unwrap_or(chrono::Duration::hours(1));
-        let absolute_expires_at = now + chrono::Duration::from_std(self.config.absolute_timeout)
-            .unwrap_or(chrono::Duration::hours(24));
+        let expires_at = now
+            + chrono::Duration::from_std(self.config.idle_timeout)
+                .unwrap_or(chrono::Duration::hours(1));
+        let absolute_expires_at = now
+            + chrono::Duration::from_std(self.config.absolute_timeout)
+                .unwrap_or(chrono::Duration::hours(24));
 
         let session = Session {
             id: session_id.clone(),
@@ -178,9 +180,14 @@ impl SessionManager {
         };
 
         // Store session
-        self.sessions.write().insert(session_id.clone(), session.clone());
-        self.tokens.write().insert(token.clone(), session_id.clone());
-        self.user_sessions.write()
+        self.sessions
+            .write()
+            .insert(session_id.clone(), session.clone());
+        self.tokens
+            .write()
+            .insert(token.clone(), session_id.clone());
+        self.user_sessions
+            .write()
             .entry(identity.user_id.clone())
             .or_default()
             .push(session_id);
@@ -193,12 +200,16 @@ impl SessionManager {
 
     /// Get session by token
     pub fn get_session(&self, token: &str) -> Result<Session, SessionError> {
-        let session_id = self.tokens.read()
+        let session_id = self
+            .tokens
+            .read()
             .get(token)
             .cloned()
             .ok_or(SessionError::NotFound)?;
 
-        let session = self.sessions.read()
+        let session = self
+            .sessions
+            .read()
             .get(&session_id)
             .cloned()
             .ok_or(SessionError::NotFound)?;
@@ -216,7 +227,9 @@ impl SessionManager {
 
     /// Get session by ID
     pub fn get_session_by_id(&self, session_id: &str) -> Result<Session, SessionError> {
-        let session = self.sessions.read()
+        let session = self
+            .sessions
+            .read()
             .get(session_id)
             .cloned()
             .ok_or(SessionError::NotFound)?;
@@ -240,13 +253,16 @@ impl SessionManager {
 
     /// Refresh session (extend expiration)
     pub fn refresh_session(&self, token: &str) -> Result<Session, SessionError> {
-        let session_id = self.tokens.read()
+        let session_id = self
+            .tokens
+            .read()
             .get(token)
             .cloned()
             .ok_or(SessionError::NotFound)?;
 
         let mut sessions = self.sessions.write();
-        let session = sessions.get_mut(&session_id)
+        let session = sessions
+            .get_mut(&session_id)
             .ok_or(SessionError::NotFound)?;
 
         if !session.active {
@@ -262,8 +278,9 @@ impl SessionManager {
         session.last_activity = now;
 
         // Extend idle timeout but not beyond absolute timeout
-        let new_expires = now + chrono::Duration::from_std(self.config.idle_timeout)
-            .unwrap_or(chrono::Duration::hours(1));
+        let new_expires = now
+            + chrono::Duration::from_std(self.config.idle_timeout)
+                .unwrap_or(chrono::Duration::hours(1));
         session.expires_at = new_expires.min(session.absolute_expires_at);
 
         Ok(session.clone())
@@ -271,7 +288,9 @@ impl SessionManager {
 
     /// Invalidate a session
     pub fn invalidate_session(&self, token: &str) -> Result<(), SessionError> {
-        let session_id = self.tokens.read()
+        let session_id = self
+            .tokens
+            .read()
             .get(token)
             .cloned()
             .ok_or(SessionError::NotFound)?;
@@ -282,8 +301,7 @@ impl SessionManager {
     /// Invalidate session by ID
     pub fn invalidate_session_by_id(&self, session_id: &str) -> Result<(), SessionError> {
         let mut sessions = self.sessions.write();
-        let session = sessions.get_mut(session_id)
-            .ok_or(SessionError::NotFound)?;
+        let session = sessions.get_mut(session_id).ok_or(SessionError::NotFound)?;
 
         session.active = false;
 
@@ -302,7 +320,9 @@ impl SessionManager {
 
     /// Invalidate all sessions for a user
     pub fn invalidate_user_sessions(&self, user_id: &str) {
-        let session_ids: Vec<String> = self.user_sessions.read()
+        let session_ids: Vec<String> = self
+            .user_sessions
+            .read()
             .get(user_id)
             .cloned()
             .unwrap_or_default();
@@ -314,13 +334,16 @@ impl SessionManager {
 
     /// List all sessions for a user
     pub fn list_user_sessions(&self, user_id: &str) -> Vec<Session> {
-        let session_ids: Vec<String> = self.user_sessions.read()
+        let session_ids: Vec<String> = self
+            .user_sessions
+            .read()
             .get(user_id)
             .cloned()
             .unwrap_or_default();
 
         let sessions = self.sessions.read();
-        session_ids.iter()
+        session_ids
+            .iter()
             .filter_map(|id| sessions.get(id).cloned())
             .filter(|s| s.is_valid())
             .collect()
@@ -333,13 +356,16 @@ impl SessionManager {
         key: impl Into<String>,
         value: impl Into<String>,
     ) -> Result<(), SessionError> {
-        let session_id = self.tokens.read()
+        let session_id = self
+            .tokens
+            .read()
             .get(token)
             .cloned()
             .ok_or(SessionError::NotFound)?;
 
         let mut sessions = self.sessions.write();
-        let session = sessions.get_mut(&session_id)
+        let session = sessions
+            .get_mut(&session_id)
             .ok_or(SessionError::NotFound)?;
 
         session.metadata.insert(key.into(), value.into());
@@ -365,7 +391,8 @@ impl SessionManager {
     pub fn cleanup(&self) {
         let expired_ids: Vec<String> = {
             let sessions = self.sessions.read();
-            sessions.iter()
+            sessions
+                .iter()
                 .filter(|(_, s)| s.is_expired() || !s.active)
                 .map(|(id, _)| id.clone())
                 .collect()
@@ -397,10 +424,12 @@ impl SessionManager {
         use std::hash::{BuildHasher, Hasher};
 
         let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u128(std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos());
+        hasher.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
         hasher.write_usize(std::process::id() as usize);
 
         let hash1 = hasher.finish();
@@ -416,10 +445,12 @@ impl SessionManager {
         use std::hash::{BuildHasher, Hasher};
 
         let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u128(std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos());
+        hasher.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
 
         let mut token_bytes = Vec::new();
         for _ in 0..4 {
@@ -620,11 +651,9 @@ mod tests {
             .absolute_timeout(Duration::from_secs(86400))
             .build();
 
-        let session = manager.create_session(
-            test_identity(),
-            None,
-            Some("Test Agent".to_string()),
-        ).unwrap();
+        let session = manager
+            .create_session(test_identity(), None, Some("Test Agent".to_string()))
+            .unwrap();
 
         assert!(session.is_valid());
         assert!(session.active);
@@ -677,9 +706,7 @@ mod tests {
 
     #[test]
     fn test_session_limit() {
-        let manager = SessionManager::builder()
-            .max_sessions_per_user(2)
-            .build();
+        let manager = SessionManager::builder().max_sessions_per_user(2).build();
 
         let _ = manager.create_session(test_identity(), None, None).unwrap();
         let _ = manager.create_session(test_identity(), None, None).unwrap();
@@ -730,7 +757,9 @@ mod tests {
         let manager = SessionManager::new(SessionConfig::default());
 
         let session = manager.create_session(test_identity(), None, None).unwrap();
-        manager.update_metadata(&session.token, "key", "value").unwrap();
+        manager
+            .update_metadata(&session.token, "key", "value")
+            .unwrap();
 
         let updated = manager.get_session(&session.token).unwrap();
         assert_eq!(updated.metadata.get("key"), Some(&"value".to_string()));

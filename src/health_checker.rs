@@ -152,7 +152,10 @@ impl HealthChecker {
 
         tokio::spawn(async move {
             nodes.write().await.insert(node_id, endpoint);
-            health.write().await.insert(node_id, NodeHealth::new(node_id));
+            health
+                .write()
+                .await
+                .insert(node_id, NodeHealth::new(node_id));
         });
     }
 
@@ -248,8 +251,7 @@ impl HealthChecker {
     ) {
         let start = std::time::Instant::now();
         let check_result =
-            Self::perform_check(endpoint.as_ref(), backend_template.as_ref(), config)
-                .await;
+            Self::perform_check(endpoint.as_ref(), backend_template.as_ref(), config).await;
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         let mut health_guard = health.write().await;
@@ -274,14 +276,15 @@ impl HealthChecker {
                         && node_health.consecutive_successes >= config.success_threshold
                     {
                         node_health.healthy = true;
-                        let _ = event_tx
-                            .send(HealthEvent::NodeHealthy { node_id })
-                            .await;
+                        let _ = event_tx.send(HealthEvent::NodeHealthy { node_id }).await;
                         tracing::info!("Node {:?} marked healthy", node_id);
                     }
 
                     let _ = event_tx
-                        .send(HealthEvent::CheckCompleted { node_id, latency_ms })
+                        .send(HealthEvent::CheckCompleted {
+                            node_id,
+                            latency_ms,
+                        })
                         .await;
                 }
                 Err(error) => {
@@ -354,10 +357,7 @@ impl HealthChecker {
 
         match outcome {
             Ok(inner) => inner,
-            Err(_) => Err(format!(
-                "health check exceeded {:?}",
-                config.check_timeout
-            )),
+            Err(_) => Err(format!("health check exceeded {:?}", config.check_timeout)),
         }
     }
 
@@ -547,9 +547,7 @@ mod tests {
             tls_config: default_client_config(),
         };
 
-        let result =
-            HealthChecker::perform_check(Some(&endpoint), Some(&template), &config)
-                .await;
+        let result = HealthChecker::perform_check(Some(&endpoint), Some(&template), &config).await;
         assert!(result.is_err(), "expected failure, got {:?}", result);
         // Error should mention either "connect" (refused / unreachable)
         // or the timeout message.

@@ -24,7 +24,6 @@ struct Cli {
     command: Option<Command>,
 
     // ── Daemon-mode flags (used when `command` is None) ──────────
-
     /// Configuration file path
     #[arg(short, long)]
     config: Option<String>,
@@ -165,7 +164,11 @@ fn run_install_skills(args: SkillsArgs) -> Result<()> {
             "{}{} entries {}:",
             prefix,
             report.installed.len(),
-            if args.dry_run { "would be installed" } else { "installed" }
+            if args.dry_run {
+                "would be installed"
+            } else {
+                "installed"
+            }
         );
         for p in &report.installed {
             println!("  + {}", p.display());
@@ -176,7 +179,11 @@ fn run_install_skills(args: SkillsArgs) -> Result<()> {
             "{}{} entries {}:",
             prefix,
             report.overwrote.len(),
-            if args.dry_run { "would be overwritten" } else { "overwritten" }
+            if args.dry_run {
+                "would be overwritten"
+            } else {
+                "overwritten"
+            }
         );
         for p in &report.overwrote {
             println!("  ~ {}", p.display());
@@ -212,9 +219,7 @@ fn init_logging(level: &str, json: bool) {
             .with(tracing_subscriber::fmt::layer().json())
             .init();
     } else {
-        subscriber
-            .with(tracing_subscriber::fmt::layer())
-            .init();
+        subscriber.with(tracing_subscriber::fmt::layer()).init();
     }
 }
 

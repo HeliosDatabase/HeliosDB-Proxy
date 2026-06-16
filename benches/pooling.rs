@@ -142,8 +142,8 @@ fn bench_node_endpoint(c: &mut Criterion) {
     });
 
     group.bench_function("address", |b| {
-        let endpoint = NodeEndpoint::new("pg-primary.example.com", 5432)
-            .with_role(NodeRole::Primary);
+        let endpoint =
+            NodeEndpoint::new("pg-primary.example.com", 5432).with_role(NodeRole::Primary);
         b.iter(|| {
             black_box(endpoint.address());
         });

@@ -3,12 +3,12 @@
 //! Batches multiple INSERT statements into combined bulk operations for
 //! improved throughput. Reduces round-trips and enables lock-free bulk ingestion.
 
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use dashmap::DashMap;
 use tokio::sync::oneshot;
-use serde::{Deserialize, Serialize};
 
 /// Table identifier
 pub type TableId = String;
@@ -199,9 +199,9 @@ impl PendingBatch {
     }
 
     fn should_flush(&self, config: &BatchConfig) -> bool {
-        self.row_count >= config.max_batch_size ||
-        self.byte_count >= config.max_batch_bytes ||
-        self.first_submitted.elapsed().as_millis() as u64 >= config.max_wait_ms
+        self.row_count >= config.max_batch_size
+            || self.byte_count >= config.max_batch_bytes
+            || self.first_submitted.elapsed().as_millis() as u64 >= config.max_wait_ms
     }
 
     fn drain(&mut self) -> (Vec<InsertRequest>, usize) {
@@ -257,9 +257,7 @@ impl InsertBatcher {
         }
 
         // Check if table should be batched
-        if !self.config.batch_tables.is_empty() &&
-           !self.config.batch_tables.contains(&table)
-        {
+        if !self.config.batch_tables.is_empty() && !self.config.batch_tables.contains(&table) {
             return Err(BatchError::Disabled);
         }
 
@@ -286,7 +284,10 @@ impl InsertBatcher {
 
         // Add to pending batch
         let should_flush = {
-            let mut batch = self.pending.entry(table.clone()).or_insert_with(PendingBatch::new);
+            let mut batch = self
+                .pending
+                .entry(table.clone())
+                .or_insert_with(PendingBatch::new);
             batch.add(request);
             batch.should_flush(&self.config)
         };
@@ -369,11 +370,7 @@ impl InsertBatcher {
         let table = &first.table;
         let columns = &first.columns;
 
-        let mut sql = format!(
-            "INSERT INTO {} ({}) VALUES ",
-            table,
-            columns.join(", ")
-        );
+        let mut sql = format!("INSERT INTO {} ({}) VALUES ", table, columns.join(", "));
 
         let mut value_parts: Vec<String> = Vec::new();
 
@@ -398,10 +395,7 @@ impl InsertBatcher {
 
     /// Get the current batch size for a table
     pub fn batch_size(&self, table: &str) -> usize {
-        self.pending
-            .get(table)
-            .map(|b| b.row_count)
-            .unwrap_or(0)
+        self.pending.get(table).map(|b| b.row_count).unwrap_or(0)
     }
 
     /// Get statistics snapshot
@@ -430,7 +424,8 @@ impl InsertBatcher {
                 }
 
                 // Check each batch for timeout
-                let tables: Vec<TableId> = self.pending
+                let tables: Vec<TableId> = self
+                    .pending
                     .iter()
                     .filter(|r| {
                         r.first_submitted.elapsed().as_millis() as u64 >= self.config.max_wait_ms
@@ -455,12 +450,14 @@ mod tests {
     async fn test_batch_add() {
         let batcher = InsertBatcher::new(BatchConfig::default());
 
-        let ticket = batcher.add(
-            "users".to_string(),
-            vec!["id".to_string(), "name".to_string()],
-            vec![vec!["1".to_string(), "'Alice'".to_string()]],
-            "INSERT INTO users (id, name) VALUES (1, 'Alice')".to_string(),
-        ).unwrap();
+        let ticket = batcher
+            .add(
+                "users".to_string(),
+                vec!["id".to_string(), "name".to_string()],
+                vec![vec!["1".to_string(), "'Alice'".to_string()]],
+                "INSERT INTO users (id, name) VALUES (1, 'Alice')".to_string(),
+            )
+            .unwrap();
 
         assert_eq!(batcher.batch_size("users"), 1);
     }
@@ -474,22 +471,26 @@ mod tests {
         let batcher = InsertBatcher::new(config);
 
         // Add first INSERT
-        batcher.add(
-            "users".to_string(),
-            vec!["id".to_string()],
-            vec![vec!["1".to_string()]],
-            "INSERT INTO users VALUES (1)".to_string(),
-        ).unwrap();
+        batcher
+            .add(
+                "users".to_string(),
+                vec!["id".to_string()],
+                vec![vec!["1".to_string()]],
+                "INSERT INTO users VALUES (1)".to_string(),
+            )
+            .unwrap();
 
         assert_eq!(batcher.batch_size("users"), 1);
 
         // Add second INSERT - should trigger flush
-        batcher.add(
-            "users".to_string(),
-            vec!["id".to_string()],
-            vec![vec!["2".to_string()]],
-            "INSERT INTO users VALUES (2)".to_string(),
-        ).unwrap();
+        batcher
+            .add(
+                "users".to_string(),
+                vec!["id".to_string()],
+                vec![vec!["2".to_string()]],
+                "INSERT INTO users VALUES (2)".to_string(),
+            )
+            .unwrap();
 
         // Batch should be flushed
         assert_eq!(batcher.batch_size("users"), 0);
@@ -528,12 +529,14 @@ mod tests {
     fn test_batch_stats() {
         let batcher = InsertBatcher::new(BatchConfig::default());
 
-        batcher.add(
-            "users".to_string(),
-            vec!["id".to_string()],
-            vec![vec!["1".to_string()], vec!["2".to_string()]],
-            "INSERT INTO users VALUES (1), (2)".to_string(),
-        ).unwrap();
+        batcher
+            .add(
+                "users".to_string(),
+                vec!["id".to_string()],
+                vec![vec!["1".to_string()], vec!["2".to_string()]],
+                "INSERT INTO users VALUES (1), (2)".to_string(),
+            )
+            .unwrap();
 
         let stats = batcher.stats();
         assert_eq!(stats.inserts_received, 1);

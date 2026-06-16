@@ -232,12 +232,8 @@ impl HostFunction {
             HostFunction::GetConfig => "get_config(key_ptr: i32, key_len: i32) -> i32",
             HostFunction::GetTime => "get_time() -> i64",
 
-            HostFunction::QueryExecute => {
-                "query_execute(query_ptr: i32, query_len: i32) -> i32"
-            }
-            HostFunction::QueryPrepare => {
-                "query_prepare(query_ptr: i32, query_len: i32) -> i32"
-            }
+            HostFunction::QueryExecute => "query_execute(query_ptr: i32, query_len: i32) -> i32",
+            HostFunction::QueryPrepare => "query_prepare(query_ptr: i32, query_len: i32) -> i32",
             HostFunction::QueryGetTables => {
                 "query_get_tables(query_ptr: i32, query_len: i32) -> i32"
             }

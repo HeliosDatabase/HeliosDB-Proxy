@@ -52,8 +52,8 @@ pub struct PeerId(pub u64);
 
 impl PeerId {
     pub fn new(addr: &SocketAddr) -> Self {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         addr.hash(&mut hasher);
@@ -102,7 +102,10 @@ impl HashRing {
         let mut seen = std::collections::HashSet::new();
 
         // Find first node >= key_hash
-        let iter = self.ring.range(key_hash..).chain(self.ring.range(..key_hash));
+        let iter = self
+            .ring
+            .range(key_hash..)
+            .chain(self.ring.range(..key_hash));
 
         for (_, peer) in iter {
             if !seen.contains(peer) {
@@ -118,8 +121,8 @@ impl HashRing {
     }
 
     fn hash_peer(peer: PeerId, vnode: usize) -> u64 {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         peer.0.hash(&mut hasher);
@@ -128,8 +131,8 @@ impl HashRing {
     }
 
     fn hash_key(key: &[u8]) -> u64 {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
@@ -217,8 +220,14 @@ impl PeerConnection {
             return Err("Failed to read response header");
         }
 
-        let _msg_type = MessageType::try_from(resp_header[0]).map_err(|_| "Invalid message type")?;
-        let length = u32::from_le_bytes([resp_header[1], resp_header[2], resp_header[3], resp_header[4]]) as usize;
+        let _msg_type =
+            MessageType::try_from(resp_header[0]).map_err(|_| "Invalid message type")?;
+        let length = u32::from_le_bytes([
+            resp_header[1],
+            resp_header[2],
+            resp_header[3],
+            resp_header[4],
+        ]) as usize;
 
         if length == 0 {
             return Err("Entry not found");
@@ -230,13 +239,18 @@ impl PeerConnection {
         }
 
         // Deserialize entry
-        let entry: CacheEntry = bincode::deserialize(&data).map_err(|_| "Deserialization failed")?;
+        let entry: CacheEntry =
+            bincode::deserialize(&data).map_err(|_| "Deserialization failed")?;
 
         Ok(entry)
     }
 
     /// Insert entry to peer via TCP
-    pub async fn insert(&self, fingerprint: QueryFingerprint, entry: CacheEntry) -> Result<(), &'static str> {
+    pub async fn insert(
+        &self,
+        fingerprint: QueryFingerprint,
+        entry: CacheEntry,
+    ) -> Result<(), &'static str> {
         // Try to connect with timeout
         let stream = match tokio::time::timeout(
             std::time::Duration::from_millis(self.timeout_ms),
@@ -332,7 +346,10 @@ impl PeerConnection {
         message.extend_from_slice(&fp_bytes);
 
         let (_, mut writer) = stream.into_split();
-        writer.write_all(&message).await.map_err(|_| "Write failed")?;
+        writer
+            .write_all(&message)
+            .await
+            .map_err(|_| "Write failed")?;
 
         Ok(())
     }
@@ -544,8 +561,8 @@ impl DistributedCache {
 
     /// Convert fingerprint to hash key
     fn fingerprint_to_hash(&self, fingerprint: &QueryFingerprint) -> u64 {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         fingerprint.template.hash(&mut hasher);
@@ -557,9 +574,7 @@ impl DistributedCache {
 
     /// Get cache statistics
     pub fn stats(&self) -> TierStats {
-        let local_size: usize = self.local.iter()
-            .map(|e| e.value().size())
-            .sum();
+        let local_size: usize = self.local.iter().map(|e| e.value().size()).sum();
 
         TierStats {
             size_bytes: local_size as u64,
@@ -576,9 +591,7 @@ impl DistributedCache {
 
     /// Get peer addresses
     pub fn peer_addrs(&self) -> Vec<SocketAddr> {
-        self.peers.iter()
-            .map(|p| p.value().addr)
-            .collect()
+        self.peers.iter().map(|p| p.value().addr).collect()
     }
 
     /// Copy valid entries to another cache (for branch merging)
@@ -683,10 +696,12 @@ mod tests {
         let fp1 = QueryFingerprint::from_query("SELECT * FROM users");
         let fp2 = QueryFingerprint::from_query("SELECT * FROM orders");
 
-        cache.insert(
-            fp1.clone(),
-            CacheEntry::new(vec![1], vec![], 1).with_ttl(Duration::from_secs(300)),
-        ).await;
+        cache
+            .insert(
+                fp1.clone(),
+                CacheEntry::new(vec![1], vec![], 1).with_ttl(Duration::from_secs(300)),
+            )
+            .await;
 
         cache.get(&fp1).await; // Hit
         cache.get(&fp2).await; // Miss

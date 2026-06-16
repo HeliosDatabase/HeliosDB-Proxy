@@ -22,8 +22,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use heliosdb_proxy::plugins::{
-    HookContext, HookType, PluginManifest, PluginRuntimeConfig, QueryContext,
-    WasmPluginRuntime,
+    HookContext, HookType, PluginManifest, PluginRuntimeConfig, QueryContext, WasmPluginRuntime,
 };
 
 /// Locate a plugin .wasm built by the sibling plugins workspace.
@@ -94,8 +93,7 @@ fn cost_governor_plugin_loads_and_runs_pre_query() {
         .call_hook(&plugin, HookType::PreQuery, &ctx_json)
         .expect("pre_query call");
 
-    let v: serde_json::Value =
-        serde_json::from_slice(&response_bytes).expect("decode result");
+    let v: serde_json::Value = serde_json::from_slice(&response_bytes).expect("decode result");
     assert_eq!(v["kind"], "continue", "got {:?}", v);
 }
 

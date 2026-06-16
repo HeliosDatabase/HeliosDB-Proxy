@@ -35,7 +35,11 @@ fn admin_cfg(cfg: &BranchConfig) -> BackendConfig {
 fn valid_ident(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 63
-        && name.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+        && name
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_')
+            .unwrap_or(false)
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -43,7 +47,10 @@ fn valid_ident(name: &str) -> bool {
 pub async fn create(cfg: &BranchConfig, name: &str, base: Option<&str>) -> Result<(), String> {
     let base = base.unwrap_or(&cfg.base_database);
     if !valid_ident(name) {
-        return Err(format!("invalid branch name '{}' (use [A-Za-z_][A-Za-z0-9_]*)", name));
+        return Err(format!(
+            "invalid branch name '{}' (use [A-Za-z_][A-Za-z0-9_]*)",
+            name
+        ));
     }
     if !valid_ident(base) {
         return Err(format!("invalid base name '{}'", base));
@@ -52,7 +59,10 @@ pub async fn create(cfg: &BranchConfig, name: &str, base: Option<&str>) -> Resul
         .await
         .map_err(|e| format!("admin connect: {}", e))?;
     let sql = format!("CREATE DATABASE \"{}\" TEMPLATE \"{}\"", name, base);
-    let r = c.execute(&sql).await.map_err(|e| format!("create branch: {}", e));
+    let r = c
+        .execute(&sql)
+        .await
+        .map_err(|e| format!("create branch: {}", e));
     c.close().await;
     r.map(|_| ())
 }

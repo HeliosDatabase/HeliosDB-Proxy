@@ -283,7 +283,10 @@ impl HistogramSnapshot {
         }
 
         if self.overflow > 0 {
-            output.push_str(&format!("{:>8} | {:6} | (overflow)\n", ">max", self.overflow));
+            output.push_str(&format!(
+                "{:>8} | {:6} | (overflow)\n",
+                ">max", self.overflow
+            ));
         }
 
         output
@@ -379,8 +382,8 @@ mod tests {
     fn test_custom_buckets() {
         let hist = LatencyHistogram::with_buckets(&[100, 1000, 10000]);
 
-        hist.record(Duration::from_micros(50));   // bucket 0 (< 100)
-        hist.record(Duration::from_micros(500));  // bucket 1 (< 1000)
+        hist.record(Duration::from_micros(50)); // bucket 0 (< 100)
+        hist.record(Duration::from_micros(500)); // bucket 1 (< 1000)
         hist.record(Duration::from_micros(5000)); // bucket 2 (< 10000)
         hist.record(Duration::from_micros(50000)); // overflow
 

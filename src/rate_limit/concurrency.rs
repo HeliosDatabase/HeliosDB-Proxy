@@ -111,7 +111,8 @@ impl ConcurrencyLimiter {
 
         // Record wait time
         let wait_ns = start.elapsed().as_nanos() as u64;
-        self.total_wait_time_ns.fetch_add(wait_ns, Ordering::Relaxed);
+        self.total_wait_time_ns
+            .fetch_add(wait_ns, Ordering::Relaxed);
 
         // Acquire slot (should succeed now)
         self.active.fetch_add(1, Ordering::Release);
@@ -124,7 +125,10 @@ impl ConcurrencyLimiter {
     }
 
     /// Acquire with timeout
-    pub async fn acquire_timeout(&self, timeout: Duration) -> Result<ConcurrencyGuard<'_>, ConcurrencyExceeded> {
+    pub async fn acquire_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<ConcurrencyGuard<'_>, ConcurrencyExceeded> {
         let start = Instant::now();
 
         // Try immediate acquisition
@@ -158,7 +162,8 @@ impl ConcurrencyLimiter {
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(())) => {
                 let wait_ns = start.elapsed().as_nanos() as u64;
-                self.total_wait_time_ns.fetch_add(wait_ns, Ordering::Relaxed);
+                self.total_wait_time_ns
+                    .fetch_add(wait_ns, Ordering::Relaxed);
 
                 self.active.fetch_add(1, Ordering::Release);
                 self.total_processed.fetch_add(1, Ordering::Relaxed);
@@ -424,7 +429,9 @@ mod tests {
         // Start timed acquire in background
         let limiter_clone = limiter.clone();
         let handle = tokio::spawn(async move {
-            let result = limiter_clone.acquire_timeout(Duration::from_millis(100)).await;
+            let result = limiter_clone
+                .acquire_timeout(Duration::from_millis(100))
+                .await;
             result.is_ok()
         });
 

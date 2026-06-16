@@ -6,8 +6,7 @@
 use std::collections::HashMap;
 
 /// Type of database operation
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum OperationType {
     /// SELECT query
     Select,
@@ -31,7 +30,6 @@ pub enum OperationType {
     #[default]
     Unknown,
 }
-
 
 impl std::fmt::Display for OperationType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -117,7 +115,8 @@ impl QueryCostEstimator {
 
     /// Add a pattern-based cost
     pub fn with_pattern_cost(mut self, pattern: impl Into<String>, cost: u32) -> Self {
-        self.pattern_costs.push((pattern.into().to_uppercase(), cost));
+        self.pattern_costs
+            .push((pattern.into().to_uppercase(), cost));
         self
     }
 
@@ -171,9 +170,9 @@ impl QueryCostEstimator {
     pub fn estimate_write_cost_sync_mode(&self, sync_mode: crate::lag::SyncMode) -> u32 {
         use crate::lag::SyncMode;
         match sync_mode {
-            SyncMode::Sync => 5,      // Waits for standby ACK
-            SyncMode::SemiSync => 3,  // Bounded wait
-            SyncMode::Async => 1,     // Fire and forget
+            SyncMode::Sync => 5,     // Waits for standby ACK
+            SyncMode::SemiSync => 3, // Bounded wait
+            SyncMode::Async => 1,    // Fire and forget
             SyncMode::Unknown => 2,
         }
     }
@@ -491,10 +490,7 @@ mod tests {
             estimator.extract_cost_hint("/*cost:5*/ SELECT * FROM users"),
             Some(5)
         );
-        assert_eq!(
-            estimator.extract_cost_hint("SELECT * FROM users"),
-            None
-        );
+        assert_eq!(estimator.extract_cost_hint("SELECT * FROM users"), None);
     }
 
     #[test]
@@ -502,7 +498,8 @@ mod tests {
         let estimator = QueryCostEstimator::new();
 
         // With hint - use hint value
-        let hint_cost = estimator.estimate_cost_with_hint("/*helios:cost=100*/ SELECT * FROM users");
+        let hint_cost =
+            estimator.estimate_cost_with_hint("/*helios:cost=100*/ SELECT * FROM users");
         assert_eq!(hint_cost, 100);
 
         // Without hint - estimate
@@ -512,8 +509,7 @@ mod tests {
 
     #[test]
     fn test_custom_operation_cost() {
-        let estimator = QueryCostEstimator::new()
-            .with_operation_cost(OperationType::Select, 5.0);
+        let estimator = QueryCostEstimator::new().with_operation_cost(OperationType::Select, 5.0);
 
         // SELECT should now cost 5x base
         let cost = estimator.estimate_cost("SELECT id FROM users WHERE id = 1");
@@ -522,8 +518,7 @@ mod tests {
 
     #[test]
     fn test_custom_pattern_cost() {
-        let estimator = QueryCostEstimator::new()
-            .with_pattern_cost("EXPENSIVE_TABLE", 20);
+        let estimator = QueryCostEstimator::new().with_pattern_cost("EXPENSIVE_TABLE", 20);
 
         // Query matching pattern should have extra cost
         let cost = estimator.estimate_cost("SELECT * FROM EXPENSIVE_TABLE WHERE id = 1");
@@ -532,8 +527,8 @@ mod tests {
 
     #[test]
     fn test_minimum_cost() {
-        let estimator = QueryCostEstimator::new()
-            .with_operation_cost(OperationType::TransactionControl, 0.0);
+        let estimator =
+            QueryCostEstimator::new().with_operation_cost(OperationType::TransactionControl, 0.0);
 
         // Even with 0 multiplier, should have minimum cost of 1
         let cost = estimator.estimate_cost("BEGIN");
@@ -545,9 +540,8 @@ mod tests {
         let estimator = QueryCostEstimator::new();
 
         // CTE query should be detected as SELECT
-        let op = estimator.detect_operation(
-            "WITH cte AS (SELECT * FROM users) SELECT * FROM cte WHERE id = 1"
-        );
+        let op = estimator
+            .detect_operation("WITH cte AS (SELECT * FROM users) SELECT * FROM cte WHERE id = 1");
         assert_eq!(op, OperationType::Select);
     }
 

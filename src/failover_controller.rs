@@ -3,9 +3,9 @@
 //! Orchestrates failover operations including primary detection,
 //! automatic rerouting, and transaction replay coordination.
 
-use super::{NodeEndpoint, NodeId, ProxyError, Result};
 #[cfg(test)]
 use super::NodeRole;
+use super::{NodeEndpoint, NodeId, ProxyError, Result};
 use crate::backend::{BackendClient, BackendConfig};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -259,11 +259,10 @@ impl FailoverController {
 
     /// Initiate failover to best candidate
     pub async fn initiate_failover(&self) -> Result<()> {
-        let old_primary = self
-            .current_primary
-            .read()
-            .await
-            .ok_or_else(|| ProxyError::FailoverFailed("No primary to failover from".to_string()))?;
+        let old_primary =
+            self.current_primary.read().await.ok_or_else(|| {
+                ProxyError::FailoverFailed("No primary to failover from".to_string())
+            })?;
 
         // Select best candidate
         let candidate = self.select_best_candidate().await?;
@@ -333,14 +332,14 @@ impl FailoverController {
 
         let _ = self
             .event_tx
-            .send(FailoverEvent::StandbyPromoted {
-                new_primary,
-            })
+            .send(FailoverEvent::StandbyPromoted { new_primary })
             .await;
 
         let _ = self
             .event_tx
-            .send(FailoverEvent::FailoverCompleted { duration_ms: duration })
+            .send(FailoverEvent::FailoverCompleted {
+                duration_ms: duration,
+            })
             .await;
 
         tracing::info!(
@@ -376,10 +375,9 @@ impl FailoverController {
         let mut sorted: Vec<_> = candidates.values().cloned().collect();
         sorted.sort_by(|a, b| {
             // Prefer sync standbys
-            if self.config.prefer_sync_standby
-                && a.is_sync != b.is_sync {
-                    return b.is_sync.cmp(&a.is_sync);
-                }
+            if self.config.prefer_sync_standby && a.is_sync != b.is_sync {
+                return b.is_sync.cmp(&a.is_sync);
+            }
             // Then by lag
             if a.lag_bytes != b.lag_bytes {
                 return a.lag_bytes.cmp(&b.lag_bytes);
@@ -594,9 +592,7 @@ impl FailoverController {
 
         match BackendClient::connect(&cfg).await {
             Ok(mut client) => {
-                let in_recovery_result = client
-                    .query_scalar("SELECT pg_is_in_recovery()")
-                    .await;
+                let in_recovery_result = client.query_scalar("SELECT pg_is_in_recovery()").await;
                 client.close().await;
                 if let Ok(tv) = in_recovery_result {
                     if let Ok(Some(false)) = tv.as_bool("pg_is_in_recovery") {
@@ -706,10 +702,15 @@ impl FailoverController {
         tracing::info!("Found {} active transactions to replay", affected_txs.len());
 
         // 2. Get the maximum LSN we need to wait for
-        let max_lsn = affected_txs.iter().map(|tx| tx.start_lsn).max().unwrap_or(0);
+        let max_lsn = affected_txs
+            .iter()
+            .map(|tx| tx.start_lsn)
+            .max()
+            .unwrap_or(0);
 
         // 3. Wait for the new primary to catch up to this LSN
-        self.wait_for_lsn_catchup(new_primary_endpoint.id, max_lsn).await?;
+        self.wait_for_lsn_catchup(new_primary_endpoint.id, max_lsn)
+            .await?;
 
         // 4. Create replay manager and replay each transaction
         let replay_manager = FailoverReplay::new(ReplayConfig {
@@ -729,43 +730,48 @@ impl FailoverController {
         for tx_journal in affected_txs {
             let tx_id = tx_journal.tx_id;
 
-            tracing::debug!("Replaying transaction {:?} with {} entries", tx_id, tx_journal.entries.len());
+            tracing::debug!(
+                "Replaying transaction {:?} with {} entries",
+                tx_id,
+                tx_journal.entries.len()
+            );
 
             // Start and execute replay
-            match replay_manager.start_replay(tx_journal, new_primary_endpoint.id).await {
-                Ok(_) => {
-                    match replay_manager.execute_replay(tx_id).await {
-                        Ok(result) => {
-                            if result.success {
-                                successful_replays += 1;
-                                tracing::debug!("Transaction {:?} replayed successfully", tx_id);
-                            } else {
-                                failed_replays += 1;
-                                tracing::warn!(
-                                    "Transaction {:?} replay failed: {:?}",
-                                    tx_id,
-                                    result.error
-                                );
-                            }
-                            transaction_results.push(result);
-                        }
-                        Err(e) => {
+            match replay_manager
+                .start_replay(tx_journal, new_primary_endpoint.id)
+                .await
+            {
+                Ok(_) => match replay_manager.execute_replay(tx_id).await {
+                    Ok(result) => {
+                        if result.success {
+                            successful_replays += 1;
+                            tracing::debug!("Transaction {:?} replayed successfully", tx_id);
+                        } else {
                             failed_replays += 1;
-                            tracing::error!("Failed to execute replay for {:?}: {}", tx_id, e);
-                            transaction_results.push(ReplayResult {
+                            tracing::warn!(
+                                "Transaction {:?} replay failed: {:?}",
                                 tx_id,
-                                success: false,
-                                statements_replayed: 0,
-                                statements_skipped: 0,
-                                statements_failed: 0,
-                                verification_failures: 0,
-                                duration_ms: 0,
-                                error: Some(e.to_string()),
-                                statement_results: vec![],
-                            });
+                                result.error
+                            );
                         }
+                        transaction_results.push(result);
                     }
-                }
+                    Err(e) => {
+                        failed_replays += 1;
+                        tracing::error!("Failed to execute replay for {:?}: {}", tx_id, e);
+                        transaction_results.push(ReplayResult {
+                            tx_id,
+                            success: false,
+                            statements_replayed: 0,
+                            statements_skipped: 0,
+                            statements_failed: 0,
+                            verification_failures: 0,
+                            duration_ms: 0,
+                            error: Some(e.to_string()),
+                            statement_results: vec![],
+                        });
+                    }
+                },
                 Err(e) => {
                     failed_replays += 1;
                     tracing::error!("Failed to start replay for {:?}: {}", tx_id, e);
@@ -810,7 +816,11 @@ impl FailoverController {
             return Ok(());
         }
 
-        tracing::debug!("Waiting for node {:?} to catch up to LSN {}", node, target_lsn);
+        tracing::debug!(
+            "Waiting for node {:?} to catch up to LSN {}",
+            node,
+            target_lsn
+        );
 
         // Use configured timeout
         let timeout = self.config.failover_timeout;
@@ -987,38 +997,47 @@ mod tests {
     #[cfg(feature = "ha-tr")]
     #[tokio::test]
     async fn test_coordinate_failover_replay_with_transactions() {
-        use super::super::transaction_journal::{TransactionJournal, JournalEntry, JournalValue, StatementType};
+        use super::super::transaction_journal::{
+            JournalEntry, JournalValue, StatementType, TransactionJournal,
+        };
         use uuid::Uuid;
 
         let controller = FailoverController::new(FailoverConfig::default());
         let journal = TransactionJournal::new();
         let failed_node = NodeId::new();
         let new_primary_id = NodeId::new();
-        let new_primary = NodeEndpoint::new("new-primary", 5432)
-            .with_role(NodeRole::Primary);
+        let new_primary = NodeEndpoint::new("new-primary", 5432).with_role(NodeRole::Primary);
 
         // Register the new primary as a candidate with zero lag
-        controller.register_candidate(FailoverCandidate {
-            node_id: new_primary.id,
-            endpoint: new_primary.clone(),
-            is_sync: true,
-            lag_bytes: 0,
-            priority: 1,
-            last_heartbeat: None,
-        }).await;
+        controller
+            .register_candidate(FailoverCandidate {
+                node_id: new_primary.id,
+                endpoint: new_primary.clone(),
+                is_sync: true,
+                lag_bytes: 0,
+                priority: 1,
+                last_heartbeat: None,
+            })
+            .await;
 
         // Create a transaction on the failed node
         let tx_id = Uuid::new_v4();
         let session_id = Uuid::new_v4();
-        journal.begin_transaction(tx_id, session_id, failed_node, 100).await.unwrap();
-        journal.log_statement(
-            tx_id,
-            "INSERT INTO users (name) VALUES ('test')".to_string(),
-            vec![JournalValue::Text("test".to_string())],
-            Some(12345),
-            Some(1),
-            10,
-        ).await.unwrap();
+        journal
+            .begin_transaction(tx_id, session_id, failed_node, 100)
+            .await
+            .unwrap();
+        journal
+            .log_statement(
+                tx_id,
+                "INSERT INTO users (name) VALUES ('test')".to_string(),
+                vec![JournalValue::Text("test".to_string())],
+                Some(12345),
+                Some(1),
+                10,
+            )
+            .await
+            .unwrap();
 
         // Coordinate replay
         let result = controller

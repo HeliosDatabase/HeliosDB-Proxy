@@ -11,10 +11,9 @@ use parking_lot::RwLock;
 use thiserror::Error;
 
 use super::config::{
-    AuthConfig, Identity, AuthMethod, JwtConfig, OAuthConfig,
-    LdapConfig, ApiKeyConfig,
+    ApiKeyConfig, AuthConfig, AuthMethod, Identity, JwtConfig, LdapConfig, OAuthConfig,
 };
-use super::jwt::{JwtValidator, JwtError};
+use super::jwt::{JwtError, JwtValidator};
 
 /// Authentication errors
 #[derive(Debug, Error)]
@@ -126,7 +125,8 @@ impl AuthRequest {
 
     /// Get Authorization header
     pub fn authorization_header(&self) -> Option<&str> {
-        self.headers.get("authorization")
+        self.headers
+            .get("authorization")
             .or_else(|| self.headers.get("Authorization"))
             .map(|s| s.as_str())
     }
@@ -140,7 +140,8 @@ impl AuthRequest {
 
     /// Get API key from header
     pub fn api_key(&self, header_name: &str) -> Option<&str> {
-        self.headers.get(header_name)
+        self.headers
+            .get(header_name)
             .or_else(|| self.headers.get(&header_name.to_lowercase()))
             .map(|s| s.as_str())
     }
@@ -338,23 +339,28 @@ impl AuthCache {
         if self.entries.len() >= self.max_size {
             self.evict_expired();
         }
-        self.entries.insert(key, CachedAuth {
-            result,
-            cached_at: Instant::now(),
-        });
+        self.entries.insert(
+            key,
+            CachedAuth {
+                result,
+                cached_at: Instant::now(),
+            },
+        );
     }
 
     fn evict_expired(&mut self) {
-        self.entries.retain(|_, cached| cached.cached_at.elapsed() < self.ttl);
+        self.entries
+            .retain(|_, cached| cached.cached_at.elapsed() < self.ttl);
     }
 }
 
 impl AuthenticationHandler {
     /// Create a new authentication handler
     pub fn new(config: AuthConfig) -> Self {
-        let jwt_validator = config.jwt.as_ref().map(|jwt_config| {
-            JwtValidator::new(jwt_config.clone())
-        });
+        let jwt_validator = config
+            .jwt
+            .as_ref()
+            .map(|jwt_config| JwtValidator::new(jwt_config.clone()));
 
         let oauth_enabled = config.oauth.is_some();
         let ldap_enabled = config.ldap.is_some();
@@ -370,10 +376,7 @@ impl AuthenticationHandler {
                 by_user: HashMap::new(),
                 last_cleanup: Instant::now(),
             })),
-            auth_cache: Arc::new(RwLock::new(AuthCache::new(
-                1000,
-                Duration::from_secs(60),
-            ))),
+            auth_cache: Arc::new(RwLock::new(AuthCache::new(1000, Duration::from_secs(60)))),
         }
     }
 
@@ -429,10 +432,13 @@ impl AuthenticationHandler {
 
     /// Authenticate using JWT
     async fn authenticate_jwt(&self, request: &AuthRequest) -> Result<AuthResult, AuthError> {
-        let validator = self.jwt_validator.as_ref()
+        let validator = self
+            .jwt_validator
+            .as_ref()
             .ok_or(AuthError::Configuration("JWT not configured".to_string()))?;
 
-        let token = request.bearer_token()
+        let token = request
+            .bearer_token()
             .ok_or(AuthError::AuthenticationRequired)?;
 
         // Check cache first
@@ -445,7 +451,9 @@ impl AuthenticationHandler {
         let result = AuthResult::new(identity);
 
         // Cache result
-        self.auth_cache.write().insert(token.to_string(), result.clone());
+        self.auth_cache
+            .write()
+            .insert(token.to_string(), result.clone());
 
         Ok(result)
     }
@@ -456,7 +464,8 @@ impl AuthenticationHandler {
             return Err(AuthError::Configuration("OAuth not configured".to_string()));
         }
 
-        let token = request.bearer_token()
+        let token = request
+            .bearer_token()
             .ok_or(AuthError::AuthenticationRequired)?;
 
         // Check cache first
@@ -479,7 +488,9 @@ impl AuthenticationHandler {
         };
 
         let result = AuthResult::new(identity);
-        self.auth_cache.write().insert(token.to_string(), result.clone());
+        self.auth_cache
+            .write()
+            .insert(token.to_string(), result.clone());
 
         Ok(result)
     }
@@ -490,9 +501,13 @@ impl AuthenticationHandler {
             return Err(AuthError::Configuration("LDAP not configured".to_string()));
         }
 
-        let username = request.username.as_ref()
+        let username = request
+            .username
+            .as_ref()
             .ok_or(AuthError::AuthenticationRequired)?;
-        let password = request.password.as_ref()
+        let password = request
+            .password
+            .as_ref()
             .ok_or(AuthError::AuthenticationRequired)?;
 
         // In a real implementation, this would bind to LDAP and verify credentials
@@ -518,11 +533,17 @@ impl AuthenticationHandler {
 
     /// Authenticate using API key
     async fn authenticate_api_key(&self, request: &AuthRequest) -> Result<AuthResult, AuthError> {
-        let api_key_config = self.config.api_keys.as_ref()
-            .ok_or(AuthError::Configuration("API keys not configured".to_string()))?;
+        let api_key_config = self
+            .config
+            .api_keys
+            .as_ref()
+            .ok_or(AuthError::Configuration(
+                "API keys not configured".to_string(),
+            ))?;
 
         let header_name = &api_key_config.header_name;
-        let key = request.api_key(header_name)
+        let key = request
+            .api_key(header_name)
             .ok_or(AuthError::AuthenticationRequired)?;
 
         // Check cache first
@@ -532,7 +553,8 @@ impl AuthenticationHandler {
 
         // Validate API key
         let api_keys = self.api_keys.read();
-        let entry = api_keys.values()
+        let entry = api_keys
+            .values()
             .find(|e| self.verify_api_key(key, &e.key_hash) && e.active)
             .ok_or(AuthError::InvalidCredentials)?;
 
@@ -544,14 +566,17 @@ impl AuthenticationHandler {
         }
 
         let result = AuthResult::new(entry.identity.clone());
-        self.auth_cache.write().insert(key.to_string(), result.clone());
+        self.auth_cache
+            .write()
+            .insert(key.to_string(), result.clone());
 
         Ok(result)
     }
 
     /// Authenticate using HTTP Basic auth
     async fn authenticate_basic(&self, request: &AuthRequest) -> Result<AuthResult, AuthError> {
-        let auth_header = request.authorization_header()
+        let auth_header = request
+            .authorization_header()
             .ok_or(AuthError::AuthenticationRequired)?;
 
         if !auth_header.starts_with("Basic ") {
@@ -559,10 +584,8 @@ impl AuthenticationHandler {
         }
 
         let encoded = &auth_header[6..];
-        let decoded = base64_decode(encoded)
-            .map_err(|_| AuthError::InvalidCredentials)?;
-        let credentials = String::from_utf8(decoded)
-            .map_err(|_| AuthError::InvalidCredentials)?;
+        let decoded = base64_decode(encoded).map_err(|_| AuthError::InvalidCredentials)?;
+        let credentials = String::from_utf8(decoded).map_err(|_| AuthError::InvalidCredentials)?;
 
         let parts: Vec<&str> = credentials.splitn(2, ':').collect();
         if parts.len() != 2 {
@@ -596,7 +619,9 @@ impl AuthenticationHandler {
     /// Trust-based authentication (e.g., for internal services)
     fn authenticate_trust(&self, request: &AuthRequest) -> Result<AuthResult, AuthError> {
         // Trust authentication based on username or other context
-        let username = request.username.as_ref()
+        let username = request
+            .username
+            .as_ref()
             .unwrap_or(&"anonymous".to_string())
             .clone();
 
@@ -627,8 +652,12 @@ impl AuthenticationHandler {
         // Cleanup old entries periodically
         if limiter.last_cleanup.elapsed() > Duration::from_secs(60) {
             let window = Duration::from_secs(config.window_seconds);
-            limiter.by_ip.retain(|_, b| b.window_start.elapsed() < window);
-            limiter.by_user.retain(|_, b| b.window_start.elapsed() < window);
+            limiter
+                .by_ip
+                .retain(|_, b| b.window_start.elapsed() < window);
+            limiter
+                .by_user
+                .retain(|_, b| b.window_start.elapsed() < window);
             limiter.last_cleanup = Instant::now();
         }
 
@@ -639,17 +668,24 @@ impl AuthenticationHandler {
             let bucket = limiter.by_ip.entry(ip).or_insert_with(RateLimitBucket::new);
             let count = bucket.increment(window);
             if count > config.max_requests_per_ip {
-                let retry_after = window.as_secs().saturating_sub(bucket.window_start.elapsed().as_secs());
+                let retry_after = window
+                    .as_secs()
+                    .saturating_sub(bucket.window_start.elapsed().as_secs());
                 return Err(AuthError::RateLimited(retry_after));
             }
         }
 
         // Check user rate limit
         if let Some(username) = &request.username {
-            let bucket = limiter.by_user.entry(username.clone()).or_insert_with(RateLimitBucket::new);
+            let bucket = limiter
+                .by_user
+                .entry(username.clone())
+                .or_insert_with(RateLimitBucket::new);
             let count = bucket.increment(window);
             if count > config.max_requests_per_user {
-                let retry_after = window.as_secs().saturating_sub(bucket.window_start.elapsed().as_secs());
+                let retry_after = window
+                    .as_secs()
+                    .saturating_sub(bucket.window_start.elapsed().as_secs());
                 return Err(AuthError::RateLimited(retry_after));
             }
         }
@@ -884,16 +920,14 @@ mod tests {
 
     #[test]
     fn test_bearer_token_extraction() {
-        let request = AuthRequest::new()
-            .with_header("Authorization", "Bearer my-jwt-token");
+        let request = AuthRequest::new().with_header("Authorization", "Bearer my-jwt-token");
 
         assert_eq!(request.bearer_token(), Some("my-jwt-token"));
     }
 
     #[test]
     fn test_api_key_extraction() {
-        let request = AuthRequest::new()
-            .with_header("X-API-Key", "secret-key-123");
+        let request = AuthRequest::new().with_header("X-API-Key", "secret-key-123");
 
         assert_eq!(request.api_key("X-API-Key"), Some("secret-key-123"));
     }
@@ -934,8 +968,7 @@ mod tests {
         );
 
         // Authenticate with the key
-        let request = AuthRequest::new()
-            .with_header("X-API-Key", "secret123");
+        let request = AuthRequest::new().with_header("X-API-Key", "secret123");
 
         let result = handler.authenticate(&request).await.unwrap();
         assert_eq!(result.identity.user_id, "api_user");

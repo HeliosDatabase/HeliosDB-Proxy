@@ -20,9 +20,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use crate::agent_contract::{self, AgentContract};
-use crate::backend::{tls::default_client_config, BackendClient, BackendConfig, TlsMode};
 use crate::backend::client::QueryResult;
 use crate::backend::types::TextValue;
+use crate::backend::{tls::default_client_config, BackendClient, BackendConfig, TlsMode};
 use crate::config::McpConfig;
 use crate::{ProxyError, Result};
 
@@ -43,7 +43,9 @@ impl McpServer {
     pub async fn run(self) -> Result<()> {
         let listener = TcpListener::bind(&self.config.listen_address)
             .await
-            .map_err(|e| ProxyError::Network(format!("MCP bind {}: {}", self.config.listen_address, e)))?;
+            .map_err(|e| {
+                ProxyError::Network(format!("MCP bind {}: {}", self.config.listen_address, e))
+            })?;
         tracing::info!(addr = %self.config.listen_address, read_only = self.config.read_only,
             contract = ?self.contract.as_ref().map(|c| &c.id), "MCP agent gateway listening");
         let cfg = Arc::new(self.config);
@@ -118,10 +120,20 @@ impl McpServer {
     }
 
     /// Dispatch one JSON-RPC request. Returns `None` for notifications.
-    async fn dispatch(body: &str, cfg: &McpConfig, contract: Option<&AgentContract>) -> Option<Value> {
+    async fn dispatch(
+        body: &str,
+        cfg: &McpConfig,
+        contract: Option<&AgentContract>,
+    ) -> Option<Value> {
         let req: Value = match serde_json::from_str(body) {
             Ok(v) => v,
-            Err(e) => return Some(rpc_error(Value::Null, -32700, &format!("parse error: {}", e))),
+            Err(e) => {
+                return Some(rpc_error(
+                    Value::Null,
+                    -32700,
+                    &format!("parse error: {}", e),
+                ))
+            }
         };
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
@@ -141,7 +153,11 @@ impl McpServer {
             "ping" => Some(rpc_ok(id, json!({}))),
             "tools/list" => Some(rpc_ok(id, json!({ "tools": Self::tool_defs(cfg) }))),
             "tools/call" => Some(Self::handle_tool_call(id, &params, cfg, contract).await),
-            other => Some(rpc_error(id, -32601, &format!("method not found: {}", other))),
+            other => Some(rpc_error(
+                id,
+                -32601,
+                &format!("method not found: {}", other),
+            )),
         }
     }
 
@@ -189,7 +205,11 @@ impl McpServer {
 
         let result: std::result::Result<String, String> = match name {
             "query" => {
-                let sql = args.get("sql").and_then(|s| s.as_str()).unwrap_or("").trim();
+                let sql = args
+                    .get("sql")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .trim();
                 if sql.is_empty() {
                     Err("missing 'sql'".to_string())
                 } else {
@@ -206,7 +226,11 @@ impl McpServer {
                 Self::run_sql(cfg, sql).await.map(|r| format_result(&r))
             }
             "explain" => {
-                let sql = args.get("sql").and_then(|s| s.as_str()).unwrap_or("").trim();
+                let sql = args
+                    .get("sql")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .trim();
                 if sql.is_empty() {
                     Err("missing 'sql'".to_string())
                 } else {

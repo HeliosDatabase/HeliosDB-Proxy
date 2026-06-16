@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{GraphQLSchema, RelationType, to_snake_case};
+use super::{to_snake_case, GraphQLSchema, RelationType};
 
 /// SQL query with parameters
 #[derive(Debug, Clone)]
@@ -157,7 +157,11 @@ pub struct Filter {
 
 impl Filter {
     /// Create a new filter
-    pub fn new(field: impl Into<String>, operator: FilterOperator, value: serde_json::Value) -> Self {
+    pub fn new(
+        field: impl Into<String>,
+        operator: FilterOperator,
+        value: serde_json::Value,
+    ) -> Self {
         Self {
             field: field.into(),
             operator,
@@ -299,15 +303,28 @@ impl SqlGenerator {
     /// Generate SQL from a query plan
     pub fn generate(&self, plan: &QueryPlan) -> Result<Vec<SqlQuery>, SqlGeneratorError> {
         match plan {
-            QueryPlan::Single { selection, filters, limit, offset } => {
-                Ok(vec![self.generate_single(selection, filters, *limit, *offset)?])
-            }
-            QueryPlan::Relationship { parent, child, relation_type, join_column, parent_column } => {
-                self.generate_relationship(parent, child, *relation_type, join_column, parent_column)
-            }
-            QueryPlan::Batch { queries } => {
-                self.generate_batch(queries)
-            }
+            QueryPlan::Single {
+                selection,
+                filters,
+                limit,
+                offset,
+            } => Ok(vec![
+                self.generate_single(selection, filters, *limit, *offset)?
+            ]),
+            QueryPlan::Relationship {
+                parent,
+                child,
+                relation_type,
+                join_column,
+                parent_column,
+            } => self.generate_relationship(
+                parent,
+                child,
+                *relation_type,
+                join_column,
+                parent_column,
+            ),
+            QueryPlan::Batch { queries } => self.generate_batch(queries),
             QueryPlan::Multiple { plans } => {
                 let mut results = Vec::new();
                 for p in plans {
@@ -333,7 +350,9 @@ impl SqlGenerator {
         let columns = if selection.fields.is_empty() {
             "*".to_string()
         } else {
-            selection.fields.iter()
+            selection
+                .fields
+                .iter()
                 .map(|f| self.quote_identifier(&to_snake_case(f)))
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -346,13 +365,19 @@ impl SqlGenerator {
         let where_clause = if filters.is_empty() {
             String::new()
         } else {
-            let conditions: Vec<String> = filters.iter()
+            let conditions: Vec<String> = filters
+                .iter()
                 .map(|f| {
                     let col = self.quote_identifier(&to_snake_case(&f.field));
                     if f.operator.needs_value() {
                         param_index += 1;
                         params.push(self.prepare_value(&f.operator, &f.value));
-                        format!("{} {} {}", col, f.operator.to_sql(), self.placeholder(param_index - 1))
+                        format!(
+                            "{} {} {}",
+                            col,
+                            f.operator.to_sql(),
+                            self.placeholder(param_index - 1)
+                        )
                     } else {
                         format!("{} {}", col, f.operator.to_sql())
                     }
@@ -372,10 +397,7 @@ impl SqlGenerator {
 
         let sql = format!(
             "SELECT {} FROM {}{}{}",
-            columns,
-            table,
-            where_clause,
-            limit_offset
+            columns, table, where_clause, limit_offset
         );
 
         Ok(SqlQuery {
@@ -398,11 +420,21 @@ impl SqlGenerator {
         match relation_type {
             RelationType::OneToOne | RelationType::ManyToOne => {
                 // Use JOIN for *-to-one relationships
-                Ok(vec![self.generate_with_join(parent, child, join_column, parent_column)?])
+                Ok(vec![self.generate_with_join(
+                    parent,
+                    child,
+                    join_column,
+                    parent_column,
+                )?])
             }
             RelationType::OneToMany | RelationType::ManyToMany => {
                 // Use LATERAL for *-to-many relationships
-                Ok(vec![self.generate_with_lateral(parent, child, join_column, parent_column)?])
+                Ok(vec![self.generate_with_lateral(
+                    parent,
+                    child,
+                    join_column,
+                    parent_column,
+                )?])
             }
         }
     }
@@ -421,16 +453,32 @@ impl SqlGenerator {
         let parent_cols: Vec<String> = if parent.fields.is_empty() {
             vec![format!("{}.*", parent_alias)]
         } else {
-            parent.fields.iter()
-                .map(|f| format!("{}.{}", parent_alias, self.quote_identifier(&to_snake_case(f))))
+            parent
+                .fields
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{}.{}",
+                        parent_alias,
+                        self.quote_identifier(&to_snake_case(f))
+                    )
+                })
                 .collect()
         };
 
         let child_cols: Vec<String> = if child.fields.is_empty() {
             vec![format!("{}.*", child_alias)]
         } else {
-            child.fields.iter()
-                .map(|f| format!("{}.{}", child_alias, self.quote_identifier(&to_snake_case(f))))
+            child
+                .fields
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{}.{}",
+                        child_alias,
+                        self.quote_identifier(&to_snake_case(f))
+                    )
+                })
                 .collect()
         };
 
@@ -466,15 +514,25 @@ impl SqlGenerator {
         let parent_cols: Vec<String> = if parent.fields.is_empty() {
             vec![format!("{}.*", parent_alias)]
         } else {
-            parent.fields.iter()
-                .map(|f| format!("{}.{}", parent_alias, self.quote_identifier(&to_snake_case(f))))
+            parent
+                .fields
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{}.{}",
+                        parent_alias,
+                        self.quote_identifier(&to_snake_case(f))
+                    )
+                })
                 .collect()
         };
 
         let child_cols: Vec<String> = if child.fields.is_empty() {
             vec!["*".to_string()]
         } else {
-            child.fields.iter()
+            child
+                .fields
+                .iter()
                 .map(|f| self.quote_identifier(&to_snake_case(f)))
                 .collect()
         };
@@ -528,7 +586,11 @@ impl SqlGenerator {
     }
 
     /// Prepare a value for a filter
-    fn prepare_value(&self, operator: &FilterOperator, value: &serde_json::Value) -> serde_json::Value {
+    fn prepare_value(
+        &self,
+        operator: &FilterOperator,
+        value: &serde_json::Value,
+    ) -> serde_json::Value {
         match operator {
             FilterOperator::Contains => {
                 if let serde_json::Value::String(s) = value {
@@ -556,20 +618,30 @@ impl SqlGenerator {
     }
 
     /// Generate a count query
-    pub fn generate_count(&self, table: &str, filters: &[Filter]) -> Result<SqlQuery, SqlGeneratorError> {
+    pub fn generate_count(
+        &self,
+        table: &str,
+        filters: &[Filter],
+    ) -> Result<SqlQuery, SqlGeneratorError> {
         let mut params = Vec::new();
         let mut param_index = 0;
 
         let where_clause = if filters.is_empty() {
             String::new()
         } else {
-            let conditions: Vec<String> = filters.iter()
+            let conditions: Vec<String> = filters
+                .iter()
                 .map(|f| {
                     let col = self.quote_identifier(&to_snake_case(&f.field));
                     if f.operator.needs_value() {
                         param_index += 1;
                         params.push(self.prepare_value(&f.operator, &f.value));
-                        format!("{} {} {}", col, f.operator.to_sql(), self.placeholder(param_index - 1))
+                        format!(
+                            "{} {} {}",
+                            col,
+                            f.operator.to_sql(),
+                            self.placeholder(param_index - 1)
+                        )
                     } else {
                         format!("{} {}", col, f.operator.to_sql())
                     }
@@ -602,13 +674,12 @@ impl SqlGenerator {
             return Err(SqlGeneratorError::EmptyValues);
         }
 
-        let columns: Vec<String> = values.keys()
+        let columns: Vec<String> = values
+            .keys()
             .map(|k| self.quote_identifier(&to_snake_case(k)))
             .collect();
 
-        let placeholders: Vec<String> = (0..values.len())
-            .map(|i| self.placeholder(i))
-            .collect();
+        let placeholders: Vec<String> = (0..values.len()).map(|i| self.placeholder(i)).collect();
 
         let params: Vec<serde_json::Value> = values.values().cloned().collect();
 
@@ -638,9 +709,16 @@ impl SqlGenerator {
             return Err(SqlGeneratorError::EmptyValues);
         }
 
-        let set_clauses: Vec<String> = values.keys()
+        let set_clauses: Vec<String> = values
+            .keys()
             .enumerate()
-            .map(|(i, k)| format!("{} = {}", self.quote_identifier(&to_snake_case(k)), self.placeholder(i)))
+            .map(|(i, k)| {
+                format!(
+                    "{} = {}",
+                    self.quote_identifier(&to_snake_case(k)),
+                    self.placeholder(i)
+                )
+            })
             .collect();
 
         let mut params: Vec<serde_json::Value> = values.values().cloned().collect();
@@ -665,7 +743,11 @@ impl SqlGenerator {
     }
 
     /// Generate a DELETE query
-    pub fn generate_delete(&self, table: &str, id: &serde_json::Value) -> Result<SqlQuery, SqlGeneratorError> {
+    pub fn generate_delete(
+        &self,
+        table: &str,
+        id: &serde_json::Value,
+    ) -> Result<SqlQuery, SqlGeneratorError> {
         let sql = format!(
             "DELETE FROM {} WHERE {} = {} RETURNING {}",
             self.quote_identifier(table),
@@ -702,7 +784,9 @@ impl std::fmt::Display for SqlGeneratorError {
             SqlGeneratorError::EmptyValues => write!(f, "No values provided"),
             SqlGeneratorError::InvalidFilter(msg) => write!(f, "Invalid filter: {}", msg),
             SqlGeneratorError::UnknownTable(table) => write!(f, "Unknown table: {}", table),
-            SqlGeneratorError::InvalidRelationship(msg) => write!(f, "Invalid relationship: {}", msg),
+            SqlGeneratorError::InvalidRelationship(msg) => {
+                write!(f, "Invalid relationship: {}", msg)
+            }
         }
     }
 }
@@ -722,9 +806,7 @@ mod tests {
     #[test]
     fn test_generate_simple_select() {
         let generator = create_generator();
-        let selection = Selection::new("users")
-            .field("id")
-            .field("name");
+        let selection = Selection::new("users").field("id").field("name");
 
         let plan = QueryPlan::Single {
             selection,
@@ -746,9 +828,7 @@ mod tests {
 
         let plan = QueryPlan::Single {
             selection,
-            filters: vec![
-                Filter::eq("id", serde_json::json!("123")),
-            ],
+            filters: vec![Filter::eq("id", serde_json::json!("123"))],
             limit: None,
             offset: None,
         };
@@ -845,7 +925,9 @@ mod tests {
         let mut values = HashMap::new();
         values.insert("name".to_string(), serde_json::json!("Jane"));
 
-        let query = generator.generate_update("users", &serde_json::json!("123"), &values).unwrap();
+        let query = generator
+            .generate_update("users", &serde_json::json!("123"), &values)
+            .unwrap();
 
         assert!(query.sql.contains("UPDATE"));
         assert!(query.sql.contains("SET"));
@@ -856,7 +938,9 @@ mod tests {
     #[test]
     fn test_generate_delete() {
         let generator = create_generator();
-        let query = generator.generate_delete("users", &serde_json::json!("123")).unwrap();
+        let query = generator
+            .generate_delete("users", &serde_json::json!("123"))
+            .unwrap();
 
         assert!(query.sql.contains("DELETE FROM"));
         assert!(query.sql.contains("WHERE"));
@@ -877,22 +961,15 @@ mod tests {
     fn test_like_pattern_preparation() {
         let generator = create_generator();
 
-        let contains = generator.prepare_value(
-            &FilterOperator::Contains,
-            &serde_json::json!("test")
-        );
+        let contains =
+            generator.prepare_value(&FilterOperator::Contains, &serde_json::json!("test"));
         assert_eq!(contains, serde_json::json!("%test%"));
 
-        let starts = generator.prepare_value(
-            &FilterOperator::StartsWith,
-            &serde_json::json!("test")
-        );
+        let starts =
+            generator.prepare_value(&FilterOperator::StartsWith, &serde_json::json!("test"));
         assert_eq!(starts, serde_json::json!("test%"));
 
-        let ends = generator.prepare_value(
-            &FilterOperator::EndsWith,
-            &serde_json::json!("test")
-        );
+        let ends = generator.prepare_value(&FilterOperator::EndsWith, &serde_json::json!("test"));
         assert_eq!(ends, serde_json::json!("%test"));
     }
 

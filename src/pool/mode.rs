@@ -236,10 +236,7 @@ mod tests {
             PoolingMode::Statement
         );
         assert_eq!(PoolingMode::from_str_lossy("stmt"), PoolingMode::Statement);
-        assert_eq!(
-            PoolingMode::from_str_lossy("unknown"),
-            PoolingMode::Session
-        );
+        assert_eq!(PoolingMode::from_str_lossy("unknown"), PoolingMode::Session);
     }
 
     #[test]

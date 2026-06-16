@@ -15,9 +15,9 @@
 //!   to detect primary changes (feature-gated behind `postgres-topology`).
 //! - **Manual/Standalone**: Programmatic set/clear via API calls.
 
+use parking_lot::RwLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use parking_lot::RwLock;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -187,10 +187,7 @@ impl PostgresTopologyProvider {
     ///
     /// Returns `Ok(true)` if the node is a standby, `Ok(false)` for a
     /// primary. Errors propagate as `BackendError`.
-    async fn probe_recovery(
-        &self,
-        node: &PostgresNode,
-    ) -> crate::backend::BackendResult<bool> {
+    async fn probe_recovery(&self, node: &PostgresNode) -> crate::backend::BackendResult<bool> {
         use crate::backend::{BackendClient, BackendConfig};
 
         let cfg = BackendConfig {
@@ -207,13 +204,9 @@ impl PostgresTopologyProvider {
         };
 
         let mut client = BackendClient::connect(&cfg).await?;
-        let value = client
-            .query_scalar("SELECT pg_is_in_recovery()")
-            .await?;
+        let value = client.query_scalar("SELECT pg_is_in_recovery()").await?;
         client.close().await;
-        Ok(value
-            .as_bool("pg_is_in_recovery")?
-            .unwrap_or(false))
+        Ok(value.as_bool("pg_is_in_recovery")?.unwrap_or(false))
     }
 }
 
@@ -228,11 +221,14 @@ impl TopologyProvider for PostgresTopologyProvider {
     }
 
     fn get_node(&self, id: Uuid) -> Option<TopologyNodeInfo> {
-        self.nodes.iter().find(|n| n.node_id == id).map(|n| TopologyNodeInfo {
-            node_id: n.node_id,
-            client_addr: format!("{}:{}", n.host, n.port),
-            is_healthy: true, // Would be checked via actual connection
-        })
+        self.nodes
+            .iter()
+            .find(|n| n.node_id == id)
+            .map(|n| TopologyNodeInfo {
+                node_id: n.node_id,
+                client_addr: format!("{}:{}", n.host, n.port),
+                is_healthy: true, // Would be checked via actual connection
+            })
     }
 }
 
@@ -386,7 +382,10 @@ impl PrimaryTracker {
 
     /// Get current primary address.
     pub fn get_primary_address(&self) -> Option<String> {
-        self.current_primary.read().as_ref().map(|p| p.address.clone())
+        self.current_primary
+            .read()
+            .as_ref()
+            .map(|p| p.address.clone())
     }
 
     /// Check if we have a healthy primary.
@@ -413,7 +412,10 @@ impl PrimaryTracker {
             address,
         });
 
-        tracing::info!("Primary tracker: set primary to {} (pending confirmation)", node_id);
+        tracing::info!(
+            "Primary tracker: set primary to {} (pending confirmation)",
+            node_id
+        );
     }
 
     /// Confirm the current primary (called after switchover completes).
@@ -424,7 +426,9 @@ impl PrimaryTracker {
             let node_id = info.node_id;
             drop(guard);
 
-            let _ = self.event_tx.send(PrimaryChangeEvent::Confirmed { node_id });
+            let _ = self
+                .event_tx
+                .send(PrimaryChangeEvent::Confirmed { node_id });
             tracing::info!("Primary tracker: confirmed primary {}", node_id);
         }
     }
@@ -434,7 +438,9 @@ impl PrimaryTracker {
         let old_primary = self.current_primary.write().take();
 
         if let Some(info) = old_primary {
-            let _ = self.event_tx.send(PrimaryChangeEvent::Lost { old: info.node_id });
+            let _ = self
+                .event_tx
+                .send(PrimaryChangeEvent::Lost { old: info.node_id });
             tracing::warn!("Primary tracker: lost primary {}", info.node_id);
         }
     }
@@ -522,11 +528,9 @@ impl PrimaryTracker {
 
         *self.current_primary.write() = Some(info);
 
-        let _ = self.event_tx.send(PrimaryChangeEvent::Changed {
-            old,
-            new,
-            address,
-        });
+        let _ = self
+            .event_tx
+            .send(PrimaryChangeEvent::Changed { old, new, address });
 
         tracing::info!("Primary tracker: primary changed from {:?} to {}", old, new);
     }
@@ -579,7 +583,10 @@ mod tests {
 
         assert!(tracker.has_primary());
         assert_eq!(tracker.get_primary_id(), Some(node_id));
-        assert_eq!(tracker.get_primary_address(), Some("localhost:5432".to_string()));
+        assert_eq!(
+            tracker.get_primary_address(),
+            Some("localhost:5432".to_string())
+        );
 
         // Not confirmed yet
         let info = tracker.get_primary().unwrap();
@@ -664,7 +671,10 @@ mod tests {
         tracker.detect_primary_from_provider(topo.as_ref());
 
         assert!(tracker.has_primary());
-        assert_eq!(tracker.get_primary_address(), Some("pg-primary:5432".to_string()));
+        assert_eq!(
+            tracker.get_primary_address(),
+            Some("pg-primary:5432".to_string())
+        );
 
         // Subscribe to events
         let mut rx = tracker.subscribe();
@@ -680,7 +690,10 @@ mod tests {
         // New primary detected (sync standby promoted)
         tracker.set_primary(pg_sync, "pg-sync:5432".to_string());
         assert!(tracker.has_primary());
-        assert_eq!(tracker.get_primary_address(), Some("pg-sync:5432".to_string()));
+        assert_eq!(
+            tracker.get_primary_address(),
+            Some("pg-sync:5432".to_string())
+        );
         assert!(!tracker.get_primary().unwrap().is_confirmed);
 
         // Confirm after pg_basebackup / replication catchup
@@ -704,7 +717,10 @@ mod tests {
         impl PatroniProvider {
             fn new() -> Self {
                 let (tx, _) = broadcast::channel(16);
-                Self { leader: RwLock::new(None), event_tx: tx }
+                Self {
+                    leader: RwLock::new(None),
+                    event_tx: tx,
+                }
             }
             fn set_leader(&self, id: Uuid, addr: &str) {
                 *self.leader.write() = Some(TopologyNodeInfo {
@@ -723,7 +739,11 @@ mod tests {
                 self.leader.read().clone()
             }
             fn get_node(&self, id: Uuid) -> Option<TopologyNodeInfo> {
-                self.leader.read().as_ref().filter(|n| n.node_id == id).cloned()
+                self.leader
+                    .read()
+                    .as_ref()
+                    .filter(|n| n.node_id == id)
+                    .cloned()
             }
         }
 
@@ -767,8 +787,8 @@ mod tests {
             },
         ];
 
-        let provider = PostgresTopologyProvider::new(nodes)
-            .with_poll_interval(Duration::from_millis(200));
+        let provider =
+            PostgresTopologyProvider::new(nodes).with_poll_interval(Duration::from_millis(200));
         let mut rx = provider.event_tx.subscribe();
 
         // Run exactly one poll round.
@@ -783,7 +803,9 @@ mod tests {
         let mut health_events = 0;
         for _ in 0..10 {
             match rx.try_recv() {
-                Ok(TopologyEvent::HealthChanged { is_healthy: false, .. }) => {
+                Ok(TopologyEvent::HealthChanged {
+                    is_healthy: false, ..
+                }) => {
                     health_events += 1;
                 }
                 Ok(_) => {}

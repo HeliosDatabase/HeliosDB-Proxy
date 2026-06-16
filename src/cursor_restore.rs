@@ -158,8 +158,7 @@ impl CursorRestore {
         {
             let session_cursors = self.session_cursors.read().await;
             if let Some(cursors) = session_cursors.get(&session_id) {
-                if cursors.len() >= self.max_cursors_per_session
-                    && !cursors.contains(&cursor_name)
+                if cursors.len() >= self.max_cursors_per_session && !cursors.contains(&cursor_name)
                 {
                     return Err(ProxyError::CursorRestore(format!(
                         "Maximum cursors ({}) per session exceeded",
@@ -170,7 +169,10 @@ impl CursorRestore {
         }
 
         // Save cursor
-        self.cursors.write().await.insert(cursor_name.clone(), state);
+        self.cursors
+            .write()
+            .await
+            .insert(cursor_name.clone(), state);
 
         // Update session mapping
         self.session_cursors
@@ -274,7 +276,9 @@ impl CursorRestore {
         // 4. Update internal state
 
         let rows_to_skip = cursor.position;
-        let result = self.recreate_cursor(&cursor, target_node, rows_to_skip).await;
+        let result = self
+            .recreate_cursor(&cursor, target_node, rows_to_skip)
+            .await;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -348,9 +352,9 @@ impl CursorRestore {
             }
         };
 
-        let mut client = BackendClient::connect(&cfg).await.map_err(|e| {
-            ProxyError::CursorRestore(format!("connect: {}", e))
-        })?;
+        let mut client = BackendClient::connect(&cfg)
+            .await
+            .map_err(|e| ProxyError::CursorRestore(format!("connect: {}", e)))?;
 
         // Substitute $N parameters in the query with text literals.
         let interpolated_query = interpolate_cursor_params(&cursor.query, &cursor.parameters)?;
@@ -363,9 +367,10 @@ impl CursorRestore {
 
         if !cursor.with_hold {
             // Non-HOLD cursors require an enclosing transaction.
-            client.execute("BEGIN").await.map_err(|e| {
-                ProxyError::CursorRestore(format!("BEGIN: {}", e))
-            })?;
+            client
+                .execute("BEGIN")
+                .await
+                .map_err(|e| ProxyError::CursorRestore(format!("BEGIN: {}", e)))?;
         }
 
         let declare = format!(
@@ -375,9 +380,10 @@ impl CursorRestore {
             with_hold,
             interpolated_query
         );
-        client.execute(&declare).await.map_err(|e| {
-            ProxyError::CursorRestore(format!("DECLARE: {}", e))
-        })?;
+        client
+            .execute(&declare)
+            .await
+            .map_err(|e| ProxyError::CursorRestore(format!("DECLARE: {}", e)))?;
 
         if skip_rows > 0 {
             let move_sql = format!(
@@ -385,9 +391,10 @@ impl CursorRestore {
                 skip_rows,
                 quote_ident(&cursor.name)
             );
-            client.execute(&move_sql).await.map_err(|e| {
-                ProxyError::CursorRestore(format!("MOVE: {}", e))
-            })?;
+            client
+                .execute(&move_sql)
+                .await
+                .map_err(|e| ProxyError::CursorRestore(format!("MOVE: {}", e)))?;
         }
 
         client.close().await;
@@ -478,10 +485,7 @@ fn quote_ident(name: &str) -> String {
 /// Substitute `$N` placeholders in a cursor's declared query with
 /// text-format literals taken from `params`. Reuses PG's simple-query
 /// convention — single-quoted strings with doubled quotes for escape.
-fn interpolate_cursor_params(
-    query: &str,
-    params: &[CursorParam],
-) -> Result<String> {
+fn interpolate_cursor_params(query: &str, params: &[CursorParam]) -> Result<String> {
     // Sort params by index (1-based) to match $N ordering.
     let mut sorted: Vec<&CursorParam> = params.iter().collect();
     sorted.sort_by_key(|p| p.index);
@@ -665,8 +669,14 @@ mod tests {
         let restore = CursorRestore::new();
         let session_id = Uuid::new_v4();
 
-        restore.save_cursor(make_cursor_state("cursor1", session_id)).await.unwrap();
-        restore.save_cursor(make_cursor_state("cursor2", session_id)).await.unwrap();
+        restore
+            .save_cursor(make_cursor_state("cursor1", session_id))
+            .await
+            .unwrap();
+        restore
+            .save_cursor(make_cursor_state("cursor2", session_id))
+            .await
+            .unwrap();
 
         let cursors = restore.get_session_cursors(&session_id).await;
         assert_eq!(cursors.len(), 2);
@@ -677,8 +687,14 @@ mod tests {
         let restore = CursorRestore::new();
         let session_id = Uuid::new_v4();
 
-        restore.save_cursor(make_cursor_state("cursor1", session_id)).await.unwrap();
-        restore.save_cursor(make_cursor_state("cursor2", session_id)).await.unwrap();
+        restore
+            .save_cursor(make_cursor_state("cursor1", session_id))
+            .await
+            .unwrap();
+        restore
+            .save_cursor(make_cursor_state("cursor2", session_id))
+            .await
+            .unwrap();
 
         restore.clear_session(&session_id).await;
 
@@ -708,7 +724,10 @@ mod tests {
         let restore = CursorRestore::new();
         let session_id = Uuid::new_v4();
 
-        restore.save_cursor(make_cursor_state("cursor1", session_id)).await.unwrap();
+        restore
+            .save_cursor(make_cursor_state("cursor1", session_id))
+            .await
+            .unwrap();
 
         let stats = restore.stats().await;
         assert_eq!(stats.total_cursors, 1);
@@ -724,8 +743,7 @@ mod tests {
 
     #[test]
     fn test_interpolate_cursor_params_no_params() {
-        let out =
-            interpolate_cursor_params("SELECT * FROM users", &[]).unwrap();
+        let out = interpolate_cursor_params("SELECT * FROM users", &[]).unwrap();
         assert_eq!(out, "SELECT * FROM users");
     }
 
@@ -743,11 +761,9 @@ mod tests {
                 type_name: "int4".into(),
             },
         ];
-        let out = interpolate_cursor_params(
-            "SELECT * FROM t WHERE name = $1 AND age = $2",
-            &params,
-        )
-        .unwrap();
+        let out =
+            interpolate_cursor_params("SELECT * FROM t WHERE name = $1 AND age = $2", &params)
+                .unwrap();
         assert_eq!(out, "SELECT * FROM t WHERE name = 'alice' AND age = '42'");
     }
 
@@ -758,8 +774,7 @@ mod tests {
             value: b"o'brien".to_vec(),
             type_name: "text".into(),
         }];
-        let out =
-            interpolate_cursor_params("SELECT $1", &params).unwrap();
+        let out = interpolate_cursor_params("SELECT $1", &params).unwrap();
         assert_eq!(out, "SELECT 'o''brien'");
     }
 
@@ -770,8 +785,7 @@ mod tests {
             value: vec![0xDE, 0xAD, 0xBE, 0xEF],
             type_name: "bytea".into(),
         }];
-        let out =
-            interpolate_cursor_params("SELECT $1", &params).unwrap();
+        let out = interpolate_cursor_params("SELECT $1", &params).unwrap();
         // Bytes that aren't valid UTF-8 on their own — but this case IS
         // valid UTF-8 when viewed as arbitrary text, so we get a text
         // literal. Validate by checking it's wrapped in single quotes.
@@ -796,8 +810,7 @@ mod tests {
             value: b"a".to_vec(),
             type_name: "text".into(),
         }];
-        let err =
-            interpolate_cursor_params("SELECT $2", &params).unwrap_err();
+        let err = interpolate_cursor_params("SELECT $2", &params).unwrap_err();
         assert!(matches!(err, ProxyError::CursorRestore(_)));
     }
 }

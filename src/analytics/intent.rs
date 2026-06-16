@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use parking_lot::RwLock;
 
 use super::statistics::QueryExecution;
-use super::{CostReport, UserCost, AgentCost};
+use super::{AgentCost, CostReport, UserCost};
 
 /// Query intent classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -180,7 +180,8 @@ impl QueryClassifier {
             || lower.contains("l2_distance")
             || lower.contains("inner_product")
             || lower.contains("<->")  // pgvector operator
-            || lower.contains("<=>")  // pgvector operator
+            || lower.contains("<=>")
+        // pgvector operator
         {
             return QueryIntent::Embedding;
         }
@@ -190,9 +191,7 @@ impl QueryClassifier {
             return QueryIntent::Retrieval;
         }
 
-        if upper.starts_with("INSERT")
-            || upper.starts_with("UPDATE")
-            || upper.starts_with("DELETE")
+        if upper.starts_with("INSERT") || upper.starts_with("UPDATE") || upper.starts_with("DELETE")
         {
             return QueryIntent::Storage;
         }
@@ -426,10 +425,13 @@ impl WorkflowTracer {
         let classifier = QueryClassifier::new();
         let intent = classifier.classify(&execution.query);
 
-        let mut workflow = self.workflows.entry(workflow_id.to_string()).or_insert_with(|| {
-            self.total_workflows.fetch_add(1, Ordering::Relaxed);
-            WorkflowTrace::new(workflow_id, &execution.user)
-        });
+        let mut workflow = self
+            .workflows
+            .entry(workflow_id.to_string())
+            .or_insert_with(|| {
+                self.total_workflows.fetch_add(1, Ordering::Relaxed);
+                WorkflowTrace::new(workflow_id, &execution.user)
+            });
 
         let step = WorkflowStep {
             index: workflow.steps.len(),
@@ -565,11 +567,7 @@ impl CostAttribution {
         // Track by agent (if workflow is present, use as agent ID)
         if let Some(ref workflow_id) = execution.workflow_id {
             // Extract agent ID from workflow ID (e.g., "agent-123-workflow-456" -> "agent-123")
-            let agent_id = workflow_id
-                .split('-')
-                .take(2)
-                .collect::<Vec<_>>()
-                .join("-");
+            let agent_id = workflow_id.split('-').take(2).collect::<Vec<_>>().join("-");
 
             self.agents
                 .entry(agent_id)
@@ -754,8 +752,8 @@ mod tests {
     fn test_workflow_tracer() {
         let tracer = WorkflowTracer::new();
 
-        let execution = QueryExecution::new("SELECT 1", Duration::from_millis(5))
-            .with_user("alice");
+        let execution =
+            QueryExecution::new("SELECT 1", Duration::from_millis(5)).with_user("alice");
 
         tracer.record_step("workflow-1", &execution);
         tracer.record_step("workflow-1", &execution);
@@ -776,8 +774,7 @@ mod tests {
     fn test_cost_attribution() {
         let cost = CostAttribution::new();
 
-        let execution = QueryExecution::new("SELECT 1", Duration::from_secs(1))
-            .with_user("alice");
+        let execution = QueryExecution::new("SELECT 1", Duration::from_secs(1)).with_user("alice");
 
         cost.record(&execution);
         cost.record(&execution);
@@ -785,7 +782,10 @@ mod tests {
         let report = cost.report();
         assert_eq!(report.total_queries, 2);
         assert!((report.total_time_seconds - 2.0).abs() < 0.001);
-        assert!(report.by_user.iter().any(|u| u.user == "alice" && u.queries == 2));
+        assert!(report
+            .by_user
+            .iter()
+            .any(|u| u.user == "alice" && u.queries == 2));
     }
 
     #[test]

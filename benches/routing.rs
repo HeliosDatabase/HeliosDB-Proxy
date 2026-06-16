@@ -8,9 +8,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 #[cfg(feature = "routing-hints")]
 mod routing_benches {
     use super::*;
-    use heliosdb_proxy::routing::{
-        HintParser, NodeInfo, QueryRouter, RoutingConfig, SyncMode,
-    };
+    use heliosdb_proxy::routing::{HintParser, NodeInfo, QueryRouter, RoutingConfig, SyncMode};
 
     // ── Hint parsing ─────────────────────────────────────────────────
 
@@ -26,9 +24,9 @@ mod routing_benches {
 
         group.bench_function("single_hint", |b| {
             b.iter(|| {
-                black_box(parser.parse(
-                    "/*helios:route=primary*/ SELECT * FROM users WHERE id = 42",
-                ));
+                black_box(
+                    parser.parse("/*helios:route=primary*/ SELECT * FROM users WHERE id = 42"),
+                );
             });
         });
 
@@ -73,17 +71,19 @@ mod routing_benches {
 
         group.bench_function("single_hint", |b| {
             b.iter(|| {
-                black_box(parser.strip(
-                    "/*helios:route=primary*/ SELECT * FROM users WHERE id = 42",
-                ));
+                black_box(
+                    parser.strip("/*helios:route=primary*/ SELECT * FROM users WHERE id = 42"),
+                );
             });
         });
 
         group.bench_function("two_hints", |b| {
             b.iter(|| {
-                black_box(parser.strip(
-                    "/*helios:route=standby*/ SELECT * /*helios:cache=skip*/ FROM users",
-                ));
+                black_box(
+                    parser.strip(
+                        "/*helios:route=standby*/ SELECT * /*helios:cache=skip*/ FROM users",
+                    ),
+                );
             });
         });
 
@@ -98,24 +98,26 @@ mod routing_benches {
 
         let queries = vec![
             ("select", "SELECT * FROM users WHERE id = 1"),
-            ("insert", "INSERT INTO users (name, email) VALUES ('test', 'test@test.com')"),
+            (
+                "insert",
+                "INSERT INTO users (name, email) VALUES ('test', 'test@test.com')",
+            ),
             ("update", "UPDATE users SET name = 'new' WHERE id = 1"),
             ("delete", "DELETE FROM users WHERE id = 1"),
             ("begin", "BEGIN"),
-            ("create_table", "CREATE TABLE test (id INT PRIMARY KEY, name TEXT)"),
+            (
+                "create_table",
+                "CREATE TABLE test (id INT PRIMARY KEY, name TEXT)",
+            ),
             ("with_cte", "WITH cte AS (SELECT 1) SELECT * FROM cte"),
         ];
 
         for (name, query) in queries {
-            group.bench_with_input(
-                BenchmarkId::from_parameter(name),
-                &query,
-                |b, q| {
-                    b.iter(|| {
-                        black_box(router.is_write_query(q));
-                    });
-                },
-            );
+            group.bench_with_input(BenchmarkId::from_parameter(name), &query, |b, q| {
+                b.iter(|| {
+                    black_box(router.is_write_query(q));
+                });
+            });
         }
 
         group.finish();
@@ -130,9 +132,7 @@ mod routing_benches {
 
         let router = rt.block_on(async {
             let router = QueryRouter::new(RoutingConfig::default());
-            router
-                .add_node(NodeInfo::primary("primary"))
-                .await;
+            router.add_node(NodeInfo::primary("primary")).await;
             router
                 .add_node(NodeInfo::standby("standby-sync-1", SyncMode::Sync))
                 .await;

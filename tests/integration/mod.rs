@@ -19,11 +19,7 @@ const ADMIN_ADDR: &str = "127.0.0.1:9090";
 
 /// Helper: check if a TCP port is accepting connections.
 fn port_is_open(addr: &str, timeout: Duration) -> bool {
-    TcpStream::connect_timeout(
-        &addr.parse().expect("invalid socket address"),
-        timeout,
-    )
-    .is_ok()
+    TcpStream::connect_timeout(&addr.parse().expect("invalid socket address"), timeout).is_ok()
 }
 
 // ── Test: proxy starts and listens ───────────────────────────────────
@@ -70,7 +66,9 @@ fn test_proxy_health_endpoint() {
         "GET /health HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
         ADMIN_ADDR
     );
-    stream.write_all(request.as_bytes()).expect("Failed to send HTTP request");
+    stream
+        .write_all(request.as_bytes())
+        .expect("Failed to send HTTP request");
 
     let mut response = String::new();
     stream

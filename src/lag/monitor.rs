@@ -18,8 +18,7 @@ use super::SyncMode;
 pub type NodeId = String;
 
 /// Lag trend indicating whether lag is improving, stable, or degrading
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LagTrend {
     /// Lag is decreasing
     Improving,
@@ -31,7 +30,6 @@ pub enum LagTrend {
     #[default]
     Unknown,
 }
-
 
 impl std::fmt::Display for LagTrend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -256,17 +254,15 @@ impl LagMonitor {
     }
 
     /// Update lag info for a standby node
-    pub fn update_standby_lag(
-        &self,
-        node_id: &str,
-        current_lsn: u64,
-        time_lag: Option<Duration>,
-    ) {
+    pub fn update_standby_lag(&self, node_id: &str, current_lsn: u64, time_lag: Option<Duration>) {
         let primary_lsn = self.primary_lsn.load(Ordering::SeqCst);
         let lag_bytes = primary_lsn.saturating_sub(current_lsn);
 
         // Calculate lag time using configured method
-        let lag_time = self.config.lag_calculation.calculate_lag(lag_bytes, time_lag);
+        let lag_time = self
+            .config
+            .lag_calculation
+            .calculate_lag(lag_bytes, time_lag);
 
         // Determine if node is healthy
         let healthy = lag_time <= self.config.stale_threshold;
@@ -291,10 +287,10 @@ impl LagMonitor {
                     lag_bytes
                 };
 
-                let effective_lag_time = self.config.lag_calculation.calculate_lag(
-                    effective_lag_bytes,
-                    time_lag,
-                );
+                let effective_lag_time = self
+                    .config
+                    .lag_calculation
+                    .calculate_lag(effective_lag_bytes, time_lag);
 
                 // Update lag info
                 data.info = LagInfo {
@@ -532,8 +528,7 @@ mod tests {
 
     #[test]
     fn test_lag_monitor_freshest_standby() {
-        let config = LagRoutingConfig::new()
-            .with_lag_calculation(LagCalculation::time());
+        let config = LagRoutingConfig::new().with_lag_calculation(LagCalculation::time());
         let monitor = LagMonitor::new(config);
         monitor.update_primary_lsn(1000);
 

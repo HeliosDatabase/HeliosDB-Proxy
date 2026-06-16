@@ -37,7 +37,12 @@ impl ScramVerifier {
         let client_key = hmac_sha256(&salted, b"Client Key");
         let stored_key = sha256(&client_key);
         let server_key = hmac_sha256(&salted, b"Server Key");
-        Self { salt, iterations, stored_key, server_key }
+        Self {
+            salt,
+            iterations,
+            stored_key,
+            server_key,
+        }
     }
 
     /// Parse a PostgreSQL-format verifier string:
@@ -59,7 +64,12 @@ impl ScramVerifier {
         stored_key.copy_from_slice(&stored);
         let mut server_key = [0u8; 32];
         server_key.copy_from_slice(&server);
-        Some(Self { salt, iterations, stored_key, server_key })
+        Some(Self {
+            salt,
+            iterations,
+            stored_key,
+            server_key,
+        })
     }
 }
 
@@ -94,9 +104,8 @@ impl AuthFile {
             let user = unquote(user.trim());
             let secret = unquote(secret.trim());
             let verifier = if secret.starts_with("SCRAM-SHA-256$") {
-                ScramVerifier::parse(&secret).ok_or_else(|| {
-                    format!("{}:{}: malformed SCRAM verifier", path, lineno + 1)
-                })?
+                ScramVerifier::parse(&secret)
+                    .ok_or_else(|| format!("{}:{}: malformed SCRAM verifier", path, lineno + 1))?
             } else {
                 // Plaintext: derive a verifier with a fixed salt derived
                 // from the username (stable across restarts so the same
@@ -164,7 +173,10 @@ impl ScramServer {
 
         let combined_nonce = format!("{}{}", client_nonce, server_nonce);
         let salt_b64 = BASE64.encode(&verifier.salt);
-        let server_first = format!("r={},s={},i={}", combined_nonce, salt_b64, verifier.iterations);
+        let server_first = format!(
+            "r={},s={},i={}",
+            combined_nonce, salt_b64, verifier.iterations
+        );
 
         Ok((
             Self {
@@ -275,8 +287,12 @@ mod tests {
         let (server, server_first) =
             ScramServer::start(verifier.clone(), client_first, "serverNONCE456").unwrap();
 
-        let client_final = client.client_final(server_first.as_bytes(), password).unwrap();
-        let server_final = server.finish(std::str::from_utf8(&client_final.0).unwrap()).unwrap();
+        let client_final = client
+            .client_final(server_first.as_bytes(), password)
+            .unwrap();
+        let server_final = server
+            .finish(std::str::from_utf8(&client_final.0).unwrap())
+            .unwrap();
 
         // The client verifies the server signature -> mutual auth complete.
         client.verify_server(server_final.as_bytes()).unwrap();
@@ -292,7 +308,9 @@ mod tests {
         let (server, server_first) =
             ScramServer::start(verifier, client_first, "nonceBBB").unwrap();
         // Client uses the WRONG password.
-        let client_final = client.client_final(server_first.as_bytes(), "wrongpw").unwrap();
+        let client_final = client
+            .client_final(server_first.as_bytes(), "wrongpw")
+            .unwrap();
         let res = server.finish(std::str::from_utf8(&client_final.0).unwrap());
         assert!(res.is_err(), "wrong password must be rejected");
     }
@@ -307,7 +325,10 @@ mod tests {
             BASE64.encode(v.stored_key),
             BASE64.encode(v.server_key),
         );
-        let body = format!("# comment\nalice:secret\n\nbob:\"quoted\"\n{}\n", verifier_line);
+        let body = format!(
+            "# comment\nalice:secret\n\nbob:\"quoted\"\n{}\n",
+            verifier_line
+        );
         let af = AuthFile::parse_str(&body, "test").unwrap();
         assert!(af.get("alice").is_some());
         assert!(af.get("bob").is_some());

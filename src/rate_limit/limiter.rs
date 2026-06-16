@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
-use super::config::{ExceededAction, PriorityLevel, RateLimitConfig};
 use super::concurrency::ConcurrencyLimiter;
+use super::config::{ExceededAction, PriorityLevel, RateLimitConfig};
 use super::cost_estimator::QueryCostEstimator;
 use super::metrics::RateLimitMetrics;
 use super::sliding_window::{SlidingWindow, SlidingWindowExceeded};
@@ -270,12 +270,16 @@ impl RateLimiter {
             return result;
         }
 
-        self.metrics.record_decision(key, &RateLimitResult::Allowed, start.elapsed());
+        self.metrics
+            .record_decision(key, &RateLimitResult::Allowed, start.elapsed());
         RateLimitResult::Allowed
     }
 
     /// Check and acquire concurrency slot
-    pub fn check_concurrency(&self, key: &LimiterKey) -> Result<Arc<ConcurrencyLimiter>, RateLimitExceeded> {
+    pub fn check_concurrency(
+        &self,
+        key: &LimiterKey,
+    ) -> Result<Arc<ConcurrencyLimiter>, RateLimitExceeded> {
         let config = self.config.read();
 
         if !config.enabled {
@@ -360,7 +364,10 @@ impl RateLimiter {
         let mut stats = HashMap::new();
 
         if let Some(bucket) = self.token_buckets.get(key) {
-            stats.insert("tokens_available".to_string(), bucket.current_tokens() as u64);
+            stats.insert(
+                "tokens_available".to_string(),
+                bucket.current_tokens() as u64,
+            );
             stats.insert("bucket_capacity".to_string(), bucket.capacity() as u64);
         }
 
@@ -370,8 +377,14 @@ impl RateLimiter {
         }
 
         if let Some(limiter) = self.concurrency.get(key) {
-            stats.insert("active_concurrent".to_string(), limiter.active_count() as u64);
-            stats.insert("max_concurrent".to_string(), limiter.max_concurrent() as u64);
+            stats.insert(
+                "active_concurrent".to_string(),
+                limiter.active_count() as u64,
+            );
+            stats.insert(
+                "max_concurrent".to_string(),
+                limiter.max_concurrent() as u64,
+            );
             stats.insert("queued".to_string(), limiter.queue_length() as u64);
         }
 
@@ -476,9 +489,7 @@ impl RateLimiter {
                 let wait = error.retry_after.min(*max_wait);
                 RateLimitResult::Queued(wait)
             }
-            ExceededAction::Throttle { delay } => {
-                RateLimitResult::Throttled(*delay)
-            }
+            ExceededAction::Throttle { delay } => RateLimitResult::Throttled(*delay),
             ExceededAction::Warn => {
                 RateLimitResult::Warned(format!("Rate limit warning: {}", error))
             }
@@ -561,7 +572,9 @@ mod tests {
 
         // High priority gets 2x limit (20 burst)
         for _ in 0..20 {
-            assert!(limiter.check_with_priority(&key, 1, PriorityLevel::High).is_allowed());
+            assert!(limiter
+                .check_with_priority(&key, 1, PriorityLevel::High)
+                .is_allowed());
         }
     }
 
@@ -700,22 +713,24 @@ mod tests {
     #[test]
     fn test_limiter_key_display() {
         assert_eq!(LimiterKey::Global.to_string(), "global");
-        assert_eq!(LimiterKey::User("alice".to_string()).to_string(), "user:alice");
-        assert_eq!(LimiterKey::Database("mydb".to_string()).to_string(), "db:mydb");
+        assert_eq!(
+            LimiterKey::User("alice".to_string()).to_string(),
+            "user:alice"
+        );
+        assert_eq!(
+            LimiterKey::Database("mydb".to_string()).to_string(),
+            "db:mydb"
+        );
     }
 
     #[test]
     fn test_update_config() {
-        let config = RateLimitConfig::builder()
-            .default_qps(100)
-            .build();
+        let config = RateLimitConfig::builder().default_qps(100).build();
         let limiter = RateLimiter::new(config);
 
         assert_eq!(limiter.config().default_qps, 100);
 
-        let new_config = RateLimitConfig::builder()
-            .default_qps(200)
-            .build();
+        let new_config = RateLimitConfig::builder().default_qps(200).build();
         limiter.update_config(new_config);
 
         assert_eq!(limiter.config().default_qps, 200);
@@ -723,9 +738,7 @@ mod tests {
 
     #[test]
     fn test_concurrency_check() {
-        let config = RateLimitConfig::builder()
-            .default_concurrency(10)
-            .build();
+        let config = RateLimitConfig::builder().default_concurrency(10).build();
         let limiter = RateLimiter::new(config);
 
         let key = LimiterKey::User("test".to_string());

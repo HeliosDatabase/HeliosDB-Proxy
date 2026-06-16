@@ -153,10 +153,13 @@ impl InvalidationManager {
     /// Invalidate all cache entries for a table
     pub fn invalidate_table(&self, table: &str) {
         // Record invalidation time
-        self.last_invalidation.insert(table.to_string(), Instant::now());
+        self.last_invalidation
+            .insert(table.to_string(), Instant::now());
 
         // Send event
-        let _ = self.event_tx.send(InvalidationEvent::Tables(vec![table.to_string()]));
+        let _ = self
+            .event_tx
+            .send(InvalidationEvent::Tables(vec![table.to_string()]));
 
         // Clear table -> keys mapping
         if let Some((_, keys)) = self.table_keys.remove(table) {
@@ -214,7 +217,8 @@ impl InvalidationManager {
                 Err(_) => return,
             };
 
-            let pending_count = self.pending_invalidations
+            let pending_count = self
+                .pending_invalidations
                 .read()
                 .map(|p| p.len())
                 .unwrap_or(0);
@@ -248,12 +252,14 @@ impl InvalidationManager {
 
     /// Check if WAL is connected
     pub fn is_wal_connected(&self) -> bool {
-        self.wal_connected.load(std::sync::atomic::Ordering::Relaxed)
+        self.wal_connected
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Set WAL connection status
     pub fn set_wal_connected(&self, connected: bool) {
-        self.wal_connected.store(connected, std::sync::atomic::Ordering::Relaxed);
+        self.wal_connected
+            .store(connected, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get invalidation mode
@@ -268,15 +274,13 @@ impl InvalidationManager {
 
     /// Get statistics
     pub fn stats(&self) -> InvalidationStats {
-        let total_keys: usize = self.table_keys
-            .iter()
-            .map(|e| e.value().len())
-            .sum();
+        let total_keys: usize = self.table_keys.iter().map(|e| e.value().len()).sum();
 
         InvalidationStats {
             tracked_tables: self.table_keys.len(),
             tracked_keys: total_keys,
-            pending_invalidations: self.pending_invalidations
+            pending_invalidations: self
+                .pending_invalidations
                 .read()
                 .map(|p| p.len())
                 .unwrap_or(0),

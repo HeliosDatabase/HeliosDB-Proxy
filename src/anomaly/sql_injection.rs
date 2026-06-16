@@ -51,10 +51,15 @@ fn matches_classic_or(lower: &str) -> bool {
     // Match OR <token> = <same token> with optional quotes.
     // Looking for: " or 1=1", " or '1'='1'", " or \"a\"=\"a\"", " or true"
     let needles = [
-        " or 1=1", " or 1 = 1",
-        " or '1'='1'", " or '1' = '1'",
-        " or true", " or true--", " or true#",
-        "' or '1'='1", "\" or \"1\"=\"1",
+        " or 1=1",
+        " or 1 = 1",
+        " or '1'='1'",
+        " or '1' = '1'",
+        " or true",
+        " or true--",
+        " or true#",
+        "' or '1'='1",
+        "\" or \"1\"=\"1",
     ];
     needles.iter().any(|n| lower.contains(n))
 }
@@ -101,9 +106,23 @@ fn matches_stacked_queries(sql: &str) -> bool {
     let trimmed = sql.trim_end().trim_end_matches(';').trim();
     let lower = trimmed.to_lowercase();
     let verbs = [
-        "select ", "insert ", "update ", "delete ", "drop ", "create ",
-        "alter ", "truncate ", "grant ", "revoke ", "exec ", "execute ",
-        "begin ", "commit ", "rollback ", "set ", "with ",
+        "select ",
+        "insert ",
+        "update ",
+        "delete ",
+        "drop ",
+        "create ",
+        "alter ",
+        "truncate ",
+        "grant ",
+        "revoke ",
+        "exec ",
+        "execute ",
+        "begin ",
+        "commit ",
+        "rollback ",
+        "set ",
+        "with ",
     ];
     let mut idx = 0;
     while let Some(off) = lower[idx..].find(';') {
@@ -146,28 +165,41 @@ mod tests {
 
     #[test]
     fn classic_or_one_eq_one_caught() {
-        assert!(scan("SELECT * FROM users WHERE id = 1 OR 1=1").contains(&"classic_or_payload".to_string()));
-        assert!(scan("SELECT * FROM users WHERE id = 1 OR 1 = 1").contains(&"classic_or_payload".to_string()));
-        assert!(scan("SELECT * FROM users WHERE name = 'a' OR '1'='1'").contains(&"classic_or_payload".to_string()));
-        assert!(scan("SELECT * FROM users WHERE id = 1 OR TRUE").contains(&"classic_or_payload".to_string()));
+        assert!(scan("SELECT * FROM users WHERE id = 1 OR 1=1")
+            .contains(&"classic_or_payload".to_string()));
+        assert!(scan("SELECT * FROM users WHERE id = 1 OR 1 = 1")
+            .contains(&"classic_or_payload".to_string()));
+        assert!(scan("SELECT * FROM users WHERE name = 'a' OR '1'='1'")
+            .contains(&"classic_or_payload".to_string()));
+        assert!(scan("SELECT * FROM users WHERE id = 1 OR TRUE")
+            .contains(&"classic_or_payload".to_string()));
     }
 
     #[test]
     fn classic_or_legit_query_clean() {
         // Legitimate disjunction across actual columns shouldn't fire.
-        assert!(!scan("SELECT * FROM users WHERE id = 1 OR id = 2").contains(&"classic_or_payload".to_string()));
-        assert!(!scan("SELECT * FROM logs WHERE level = 'error' OR level = 'warn'").contains(&"classic_or_payload".to_string()));
+        assert!(!scan("SELECT * FROM users WHERE id = 1 OR id = 2")
+            .contains(&"classic_or_payload".to_string()));
+        assert!(
+            !scan("SELECT * FROM logs WHERE level = 'error' OR level = 'warn'")
+                .contains(&"classic_or_payload".to_string())
+        );
     }
 
     #[test]
     fn union_select_caught() {
         assert!(scan("' UNION SELECT NULL,NULL,NULL --").contains(&"union_select".to_string()));
-        assert!(scan("foo' UNION ALL SELECT username,password FROM users").contains(&"union_select".to_string()));
+        assert!(scan("foo' UNION ALL SELECT username,password FROM users")
+            .contains(&"union_select".to_string()));
     }
 
     #[test]
     fn union_legit_query_clean() {
-        assert!(!scan("SELECT id FROM users UNION SELECT id FROM admins").contains(&"union_select".to_string()) == false);
+        assert!(
+            !scan("SELECT id FROM users UNION SELECT id FROM admins")
+                .contains(&"union_select".to_string())
+                == false
+        );
         // Note: above is intentional — UNION across legit tables IS
         // ambiguous from a pattern-matcher's view. We accept the
         // false positive on " union select" since that's what the
@@ -185,7 +217,9 @@ mod tests {
 
     #[test]
     fn stacked_queries_caught() {
-        assert!(scan("SELECT * FROM users; DROP TABLE logs;").contains(&"stacked_queries".to_string()));
+        assert!(
+            scan("SELECT * FROM users; DROP TABLE logs;").contains(&"stacked_queries".to_string())
+        );
         assert!(scan("'); DELETE FROM users WHERE 1=1;--").contains(&"stacked_queries".to_string()));
     }
 
@@ -204,14 +238,19 @@ mod tests {
     #[test]
     fn time_based_blind_caught() {
         assert!(scan("'; SELECT pg_sleep(5)--").contains(&"time_based_blind".to_string()));
-        assert!(scan("SELECT BENCHMARK(1000000, MD5('a'))").contains(&"time_based_blind".to_string()));
+        assert!(
+            scan("SELECT BENCHMARK(1000000, MD5('a'))").contains(&"time_based_blind".to_string())
+        );
     }
 
     #[test]
     fn information_schema_probe_caught() {
-        assert!(scan("' UNION SELECT table_name FROM information_schema.tables --")
+        assert!(
+            scan("' UNION SELECT table_name FROM information_schema.tables --")
+                .contains(&"information_schema_probe".to_string())
+        );
+        assert!(scan("SELECT * FROM pg_catalog.pg_tables")
             .contains(&"information_schema_probe".to_string()));
-        assert!(scan("SELECT * FROM pg_catalog.pg_tables").contains(&"information_schema_probe".to_string()));
     }
 
     #[test]
@@ -219,13 +258,27 @@ mod tests {
         // A single SQLi payload can match several patterns at once.
         // Use a comment_escape-bearing variant: `';--` immediately
         // after the closing quote.
-        let r = scan(
-            "foo' OR 1=1 UNION SELECT 1,2,3 FROM information_schema.tables';--",
+        let r = scan("foo' OR 1=1 UNION SELECT 1,2,3 FROM information_schema.tables';--");
+        assert!(
+            r.contains(&"classic_or_payload".to_string()),
+            "missing classic_or in {:?}",
+            r
         );
-        assert!(r.contains(&"classic_or_payload".to_string()), "missing classic_or in {:?}", r);
-        assert!(r.contains(&"union_select".to_string()), "missing union_select in {:?}", r);
-        assert!(r.contains(&"comment_escape".to_string()), "missing comment_escape in {:?}", r);
-        assert!(r.contains(&"information_schema_probe".to_string()), "missing schema probe in {:?}", r);
+        assert!(
+            r.contains(&"union_select".to_string()),
+            "missing union_select in {:?}",
+            r
+        );
+        assert!(
+            r.contains(&"comment_escape".to_string()),
+            "missing comment_escape in {:?}",
+            r
+        );
+        assert!(
+            r.contains(&"information_schema_probe".to_string()),
+            "missing schema probe in {:?}",
+            r
+        );
     }
 
     #[test]

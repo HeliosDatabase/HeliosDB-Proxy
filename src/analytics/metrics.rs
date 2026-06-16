@@ -9,9 +9,9 @@ use std::time::Duration;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
-use super::fingerprinter::{QueryFingerprint, OperationType};
-use super::statistics::QueryExecution;
+use super::fingerprinter::{OperationType, QueryFingerprint};
 use super::intent::QueryIntent;
+use super::statistics::QueryExecution;
 
 /// Per-operation metrics
 struct OperationMetrics {
@@ -438,11 +438,14 @@ mod tests {
         let fp = QueryFingerprinter::new();
 
         let fingerprint = fp.fingerprint("SELECT * FROM users WHERE id = 1");
-        let execution = QueryExecution::new("SELECT * FROM users WHERE id = 1", Duration::from_millis(10))
-            .with_user("alice")
-            .with_database("mydb")
-            .with_node("primary")
-            .with_rows(1);
+        let execution = QueryExecution::new(
+            "SELECT * FROM users WHERE id = 1",
+            Duration::from_millis(10),
+        )
+        .with_user("alice")
+        .with_database("mydb")
+        .with_node("primary")
+        .with_rows(1);
 
         metrics.record(&fingerprint, &execution, QueryIntent::Retrieval);
 
@@ -465,7 +468,10 @@ mod tests {
 
         // Record storage query
         let fingerprint = fp.fingerprint("INSERT INTO users VALUES (1, 'Alice')");
-        let execution = QueryExecution::new("INSERT INTO users VALUES (1, 'Alice')", Duration::from_millis(10));
+        let execution = QueryExecution::new(
+            "INSERT INTO users VALUES (1, 'Alice')",
+            Duration::from_millis(10),
+        );
         metrics.record(&fingerprint, &execution, QueryIntent::Storage);
 
         let by_intent = metrics.by_intent();

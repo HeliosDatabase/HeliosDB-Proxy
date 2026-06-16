@@ -2,8 +2,8 @@
 //!
 //! Configuration for query analytics, slow query log, and pattern detection.
 
-use std::time::Duration;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Analytics configuration
 #[derive(Debug, Clone)]

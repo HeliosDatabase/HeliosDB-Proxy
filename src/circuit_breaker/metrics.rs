@@ -68,7 +68,10 @@ impl CircuitMetrics {
         self.get_or_create_node(node_id).record_close();
     }
 
-    fn get_or_create_node(&self, node_id: &str) -> dashmap::mapref::one::RefMut<'_, String, NodeMetrics> {
+    fn get_or_create_node(
+        &self,
+        node_id: &str,
+    ) -> dashmap::mapref::one::RefMut<'_, String, NodeMetrics> {
         if !self.node_metrics.contains_key(node_id) {
             self.node_metrics
                 .insert(node_id.to_string(), NodeMetrics::new());
@@ -116,9 +119,7 @@ impl CircuitMetrics {
 
     /// Get metrics snapshot for a specific node
     pub fn get_node_metrics(&self, node_id: &str) -> Option<NodeMetricsSnapshot> {
-        self.node_metrics
-            .get(node_id)
-            .map(|m| m.snapshot())
+        self.node_metrics.get(node_id).map(|m| m.snapshot())
     }
 
     /// Get all node metrics

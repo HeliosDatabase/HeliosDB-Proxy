@@ -444,7 +444,10 @@ mod tests {
         });
 
         assert_eq!(result.results.len(), 3);
-        assert_eq!(result.get(&"key1".to_string()), Some(&"value_key1".to_string()));
+        assert_eq!(
+            result.get(&"key1".to_string()),
+            Some(&"value_key1".to_string())
+        );
 
         let stats = loader.stats();
         assert_eq!(stats.batch_loads, 1);
@@ -452,9 +455,8 @@ mod tests {
 
     #[test]
     fn test_dataloader_deduplication() {
-        let loader: DataLoader<String, i32> = DataLoader::new(
-            DataLoaderConfig::default().max_batch_size(100)
-        );
+        let loader: DataLoader<String, i32> =
+            DataLoader::new(DataLoaderConfig::default().max_batch_size(100));
 
         // Add duplicate keys
         loader.load("key1".to_string());
@@ -475,18 +477,15 @@ mod tests {
 
     #[test]
     fn test_dataloader_batch_splitting() {
-        let loader: DataLoader<i32, i32> = DataLoader::new(
-            DataLoaderConfig::default().max_batch_size(2)
-        );
+        let loader: DataLoader<i32, i32> =
+            DataLoader::new(DataLoaderConfig::default().max_batch_size(2));
 
         // Add 5 keys
         for i in 0..5 {
             loader.load(i);
         }
 
-        let result = loader.execute_batch(|keys| {
-            keys.into_iter().map(|k| (k, k * 10)).collect()
-        });
+        let result = loader.execute_batch(|keys| keys.into_iter().map(|k| (k, k * 10)).collect());
 
         assert_eq!(result.results.len(), 5);
 
@@ -542,9 +541,8 @@ mod tests {
 
     #[test]
     fn test_dataloader_cache_disabled() {
-        let loader: DataLoader<String, String> = DataLoader::new(
-            DataLoaderConfig::default().cache(false)
-        );
+        let loader: DataLoader<String, String> =
+            DataLoader::new(DataLoaderConfig::default().cache(false));
 
         loader.prime("key1".to_string(), "value1".to_string());
 
@@ -559,8 +557,7 @@ mod tests {
         results.insert("a".to_string(), 1);
         results.insert("b".to_string(), 2);
 
-        let batch = BatchResult::new(results)
-            .with_missing(vec!["c".to_string()]);
+        let batch = BatchResult::new(results).with_missing(vec!["c".to_string()]);
 
         assert_eq!(batch.get(&"a".to_string()), Some(&1));
         assert_eq!(batch.get(&"c".to_string()), None);
@@ -570,16 +567,13 @@ mod tests {
 
     #[test]
     fn test_dataloader_factory() {
-        let factory = DataLoaderFactory::new(
-            DataLoaderConfig::default().max_batch_size(50)
-        );
+        let factory = DataLoaderFactory::new(DataLoaderConfig::default().max_batch_size(50));
 
         let loader: DataLoader<String, i32> = factory.create();
         assert_eq!(loader.config().max_batch_size, 50);
 
-        let custom_loader: DataLoader<String, i32> = factory.create_with_config(
-            DataLoaderConfig::default().max_batch_size(100)
-        );
+        let custom_loader: DataLoader<String, i32> =
+            factory.create_with_config(DataLoaderConfig::default().max_batch_size(100));
         assert_eq!(custom_loader.config().max_batch_size, 100);
     }
 
@@ -589,12 +583,12 @@ mod tests {
 
         loader.prime("key1".to_string(), "value1".to_string());
 
-        let results = loader.load_many(vec![
-            "key1".to_string(),
-            "key2".to_string(),
-        ]);
+        let results = loader.load_many(vec!["key1".to_string(), "key2".to_string()]);
 
-        assert_eq!(results.get(&"key1".to_string()), Some(&Some("value1".to_string())));
+        assert_eq!(
+            results.get(&"key1".to_string()),
+            Some(&Some("value1".to_string()))
+        );
         assert_eq!(results.get(&"key2".to_string()), Some(&None));
     }
 }

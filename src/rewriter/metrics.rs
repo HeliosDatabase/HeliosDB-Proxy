@@ -2,10 +2,10 @@
 //!
 //! Metrics collection for query rewriting.
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use parking_lot::RwLock;
 
 /// Rewrite metrics collector
 pub struct RewriteMetrics {
@@ -50,7 +50,8 @@ impl RewriteMetrics {
         }
 
         let nanos = duration.as_nanos() as u64;
-        self.total_rewrite_time_ns.fetch_add(nanos, Ordering::Relaxed);
+        self.total_rewrite_time_ns
+            .fetch_add(nanos, Ordering::Relaxed);
 
         self.latency_buckets.write().record(duration);
     }
@@ -61,7 +62,8 @@ impl RewriteMetrics {
         self.no_match_queries.fetch_add(1, Ordering::Relaxed);
 
         let nanos = duration.as_nanos() as u64;
-        self.total_rewrite_time_ns.fetch_add(nanos, Ordering::Relaxed);
+        self.total_rewrite_time_ns
+            .fetch_add(nanos, Ordering::Relaxed);
 
         self.latency_buckets.write().record(duration);
     }
@@ -88,7 +90,9 @@ impl RewriteMetrics {
             0.0
         };
 
-        let rule_stats: HashMap<String, RuleStatsSnapshot> = self.rule_stats.read()
+        let rule_stats: HashMap<String, RuleStatsSnapshot> = self
+            .rule_stats
+            .read()
             .iter()
             .map(|(k, v)| (k.clone(), v.snapshot()))
             .collect();
@@ -258,7 +262,9 @@ impl LatencyHistogram {
             return LatencyPercentiles::default();
         }
 
-        let cumulative: Vec<u64> = self.counts.iter()
+        let cumulative: Vec<u64> = self
+            .counts
+            .iter()
             .scan(0u64, |acc, c| {
                 *acc += c.load(Ordering::Relaxed);
                 Some(*acc)
@@ -272,7 +278,9 @@ impl LatencyHistogram {
                     if i < self.boundaries.len() {
                         return Duration::from_micros(self.boundaries[i]);
                     } else {
-                        return Duration::from_micros(self.boundaries.last().copied().unwrap_or(10000) * 2);
+                        return Duration::from_micros(
+                            self.boundaries.last().copied().unwrap_or(10000) * 2,
+                        );
                     }
                 }
             }

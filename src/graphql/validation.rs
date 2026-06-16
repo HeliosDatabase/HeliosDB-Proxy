@@ -5,8 +5,8 @@
 use std::sync::Arc;
 
 use super::{
-    GraphQLConfig, GraphQLSchema, GraphQLError, ErrorCode,
-    engine::ParsedDocument, engine::ParsedSelection,
+    engine::ParsedDocument, engine::ParsedSelection, ErrorCode, GraphQLConfig, GraphQLError,
+    GraphQLSchema,
 };
 
 /// Query validator
@@ -68,7 +68,8 @@ impl QueryValidator {
             return Err(GraphQLError::new(
                 format!(
                     "Query has {} root fields, maximum allowed is {}",
-                    document.selections.len(), self.config.limits.max_root_fields
+                    document.selections.len(),
+                    self.config.limits.max_root_fields
                 ),
                 ErrorCode::QueryTooComplex,
             ));
@@ -155,7 +156,8 @@ impl QueryValidator {
             if type_name != "Query" && type_name != "Mutation" {
                 if let Some(type_def) = type_def {
                     let field_exists = type_def.get_field(&selection.name).is_some();
-                    let rel_exists = schema.get_relationships_for(type_name)
+                    let rel_exists = schema
+                        .get_relationships_for(type_name)
                         .iter()
                         .any(|r| r.field_name == selection.name);
 
@@ -182,7 +184,12 @@ impl QueryValidator {
     }
 
     /// Get the type of a field
-    fn get_field_type(&self, field_name: &str, parent_type: &str, schema: &GraphQLSchema) -> Option<String> {
+    fn get_field_type(
+        &self,
+        field_name: &str,
+        parent_type: &str,
+        schema: &GraphQLSchema,
+    ) -> Option<String> {
         // Check direct fields
         if let Some(type_def) = schema.get_type(parent_type) {
             if let Some(field) = type_def.get_field(field_name) {
@@ -337,7 +344,10 @@ impl RuleValidator for UnknownFieldValidator {
                     if let Some(type_def) = schema.get_type(type_name) {
                         if type_def.get_field(&selection.name).is_none() {
                             return Err(ValidationError::new(
-                                format!("Unknown field '{}' on type '{}'", selection.name, type_name),
+                                format!(
+                                    "Unknown field '{}' on type '{}'",
+                                    selection.name, type_name
+                                ),
                                 ValidationRule::UnknownField,
                             ));
                         }
@@ -377,10 +387,17 @@ impl RuleValidator for DepthValidator {
         document: &ParsedDocument,
         _schema: &GraphQLSchema,
     ) -> Result<(), ValidationError> {
-        fn check_depth(selections: &[ParsedSelection], current_depth: u32, max_depth: u32) -> Result<(), ValidationError> {
+        fn check_depth(
+            selections: &[ParsedSelection],
+            current_depth: u32,
+            max_depth: u32,
+        ) -> Result<(), ValidationError> {
             if current_depth > max_depth {
                 return Err(ValidationError::new(
-                    format!("Query depth {} exceeds maximum {}", current_depth, max_depth),
+                    format!(
+                        "Query depth {} exceeds maximum {}",
+                        current_depth, max_depth
+                    ),
                     ValidationRule::QueryTooDeep,
                 ));
             }
@@ -431,7 +448,10 @@ impl RuleValidator for AliasValidator {
         let alias_count = count_aliases(&document.selections);
         if alias_count > self.max_aliases {
             return Err(ValidationError::new(
-                format!("Query has {} aliases, maximum is {}", alias_count, self.max_aliases),
+                format!(
+                    "Query has {} aliases, maximum is {}",
+                    alias_count, self.max_aliases
+                ),
                 ValidationRule::TooManyAliases,
             ));
         }
@@ -496,14 +516,20 @@ impl ValidationPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graphql::{OperationType, introspector::*};
+    use crate::graphql::{introspector::*, OperationType};
 
     fn create_test_schema() -> GraphQLSchema {
         let mut schema = GraphQLSchema::new();
 
         let mut user_type = GraphQLType::new("User");
-        user_type.add_field(GraphQLField::new("id", FieldType::scalar(crate::graphql::GraphQLScalar::ID)));
-        user_type.add_field(GraphQLField::new("name", FieldType::scalar(crate::graphql::GraphQLScalar::String)));
+        user_type.add_field(GraphQLField::new(
+            "id",
+            FieldType::scalar(crate::graphql::GraphQLScalar::ID),
+        ));
+        user_type.add_field(GraphQLField::new(
+            "name",
+            FieldType::scalar(crate::graphql::GraphQLScalar::String),
+        ));
         schema.add_type(user_type);
 
         schema
@@ -525,30 +551,28 @@ mod tests {
         let validator = QueryValidator::new(config);
         let schema = create_test_schema();
 
-        let document = create_test_document(vec![
-            ParsedSelection {
-                name: "users".to_string(),
-                alias: None,
-                arguments: HashMap::new(),
-                selections: vec![
-                    ParsedSelection {
-                        name: "id".to_string(),
-                        alias: None,
-                        arguments: HashMap::new(),
-                        selections: vec![],
-                        directives: vec![],
-                    },
-                    ParsedSelection {
-                        name: "name".to_string(),
-                        alias: None,
-                        arguments: HashMap::new(),
-                        selections: vec![],
-                        directives: vec![],
-                    },
-                ],
-                directives: vec![],
-            },
-        ]);
+        let document = create_test_document(vec![ParsedSelection {
+            name: "users".to_string(),
+            alias: None,
+            arguments: HashMap::new(),
+            selections: vec![
+                ParsedSelection {
+                    name: "id".to_string(),
+                    alias: None,
+                    arguments: HashMap::new(),
+                    selections: vec![],
+                    directives: vec![],
+                },
+                ParsedSelection {
+                    name: "name".to_string(),
+                    alias: None,
+                    arguments: HashMap::new(),
+                    selections: vec![],
+                    directives: vec![],
+                },
+            ],
+            directives: vec![],
+        }]);
 
         let result = validator.calculate_complexity(&document, &schema).unwrap();
 
@@ -566,15 +590,13 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("limit".to_string(), serde_json::json!(10));
 
-        let document = create_test_document(vec![
-            ParsedSelection {
-                name: "users".to_string(),
-                alias: None,
-                arguments: args,
-                selections: vec![],
-                directives: vec![],
-            },
-        ]);
+        let document = create_test_document(vec![ParsedSelection {
+            name: "users".to_string(),
+            alias: None,
+            arguments: args,
+            selections: vec![],
+            directives: vec![],
+        }]);
 
         let result = validator.calculate_complexity(&document, &schema).unwrap();
 
@@ -588,23 +610,19 @@ mod tests {
         let validator = QueryValidator::new(config);
         let schema = create_test_schema();
 
-        let document = create_test_document(vec![
-            ParsedSelection {
-                name: "users".to_string(),
-                alias: Some("allUsers".to_string()),
+        let document = create_test_document(vec![ParsedSelection {
+            name: "users".to_string(),
+            alias: Some("allUsers".to_string()),
+            arguments: HashMap::new(),
+            selections: vec![ParsedSelection {
+                name: "id".to_string(),
+                alias: Some("userId".to_string()),
                 arguments: HashMap::new(),
-                selections: vec![
-                    ParsedSelection {
-                        name: "id".to_string(),
-                        alias: Some("userId".to_string()),
-                        arguments: HashMap::new(),
-                        selections: vec![],
-                        directives: vec![],
-                    },
-                ],
+                selections: vec![],
                 directives: vec![],
-            },
-        ]);
+            }],
+            directives: vec![],
+        }]);
 
         let result = validator.calculate_complexity(&document, &schema).unwrap();
 
@@ -617,43 +635,35 @@ mod tests {
         let schema = create_test_schema();
 
         // Depth 1 - should pass
-        let shallow = create_test_document(vec![
-            ParsedSelection {
-                name: "users".to_string(),
-                alias: None,
-                arguments: HashMap::new(),
-                selections: vec![],
-                directives: vec![],
-            },
-        ]);
+        let shallow = create_test_document(vec![ParsedSelection {
+            name: "users".to_string(),
+            alias: None,
+            arguments: HashMap::new(),
+            selections: vec![],
+            directives: vec![],
+        }]);
         assert!(validator.validate(&shallow, &schema).is_ok());
 
         // Depth 3 - should fail
-        let deep = create_test_document(vec![
-            ParsedSelection {
-                name: "users".to_string(),
+        let deep = create_test_document(vec![ParsedSelection {
+            name: "users".to_string(),
+            alias: None,
+            arguments: HashMap::new(),
+            selections: vec![ParsedSelection {
+                name: "posts".to_string(),
                 alias: None,
                 arguments: HashMap::new(),
-                selections: vec![
-                    ParsedSelection {
-                        name: "posts".to_string(),
-                        alias: None,
-                        arguments: HashMap::new(),
-                        selections: vec![
-                            ParsedSelection {
-                                name: "comments".to_string(),
-                                alias: None,
-                                arguments: HashMap::new(),
-                                selections: vec![],
-                                directives: vec![],
-                            },
-                        ],
-                        directives: vec![],
-                    },
-                ],
+                selections: vec![ParsedSelection {
+                    name: "comments".to_string(),
+                    alias: None,
+                    arguments: HashMap::new(),
+                    selections: vec![],
+                    directives: vec![],
+                }],
                 directives: vec![],
-            },
-        ]);
+            }],
+            directives: vec![],
+        }]);
         assert!(validator.validate(&deep, &schema).is_err());
     }
 
@@ -663,50 +673,44 @@ mod tests {
         let schema = create_test_schema();
 
         // 2 aliases - should pass
-        let within_limit = create_test_document(vec![
-            ParsedSelection {
-                name: "users".to_string(),
-                alias: Some("a1".to_string()),
+        let within_limit = create_test_document(vec![ParsedSelection {
+            name: "users".to_string(),
+            alias: Some("a1".to_string()),
+            arguments: HashMap::new(),
+            selections: vec![ParsedSelection {
+                name: "id".to_string(),
+                alias: Some("a2".to_string()),
                 arguments: HashMap::new(),
-                selections: vec![
-                    ParsedSelection {
-                        name: "id".to_string(),
-                        alias: Some("a2".to_string()),
-                        arguments: HashMap::new(),
-                        selections: vec![],
-                        directives: vec![],
-                    },
-                ],
+                selections: vec![],
                 directives: vec![],
-            },
-        ]);
+            }],
+            directives: vec![],
+        }]);
         assert!(validator.validate(&within_limit, &schema).is_ok());
 
         // 3 aliases - should fail
-        let exceeds_limit = create_test_document(vec![
-            ParsedSelection {
-                name: "users".to_string(),
-                alias: Some("a1".to_string()),
-                arguments: HashMap::new(),
-                selections: vec![
-                    ParsedSelection {
-                        name: "id".to_string(),
-                        alias: Some("a2".to_string()),
-                        arguments: HashMap::new(),
-                        selections: vec![],
-                        directives: vec![],
-                    },
-                    ParsedSelection {
-                        name: "name".to_string(),
-                        alias: Some("a3".to_string()),
-                        arguments: HashMap::new(),
-                        selections: vec![],
-                        directives: vec![],
-                    },
-                ],
-                directives: vec![],
-            },
-        ]);
+        let exceeds_limit = create_test_document(vec![ParsedSelection {
+            name: "users".to_string(),
+            alias: Some("a1".to_string()),
+            arguments: HashMap::new(),
+            selections: vec![
+                ParsedSelection {
+                    name: "id".to_string(),
+                    alias: Some("a2".to_string()),
+                    arguments: HashMap::new(),
+                    selections: vec![],
+                    directives: vec![],
+                },
+                ParsedSelection {
+                    name: "name".to_string(),
+                    alias: Some("a3".to_string()),
+                    arguments: HashMap::new(),
+                    selections: vec![],
+                    directives: vec![],
+                },
+            ],
+            directives: vec![],
+        }]);
         assert!(validator.validate(&exceeds_limit, &schema).is_err());
     }
 
@@ -716,15 +720,13 @@ mod tests {
         let pipeline = ValidationPipeline::default_pipeline(&config);
         let schema = create_test_schema();
 
-        let document = create_test_document(vec![
-            ParsedSelection {
-                name: "users".to_string(),
-                alias: None,
-                arguments: HashMap::new(),
-                selections: vec![],
-                directives: vec![],
-            },
-        ]);
+        let document = create_test_document(vec![ParsedSelection {
+            name: "users".to_string(),
+            alias: None,
+            arguments: HashMap::new(),
+            selections: vec![],
+            directives: vec![],
+        }]);
 
         assert!(pipeline.validate(&document, &schema).is_ok());
     }

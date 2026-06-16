@@ -87,7 +87,8 @@ impl CacheStats {
         self.hits.fetch_add(1, Ordering::Relaxed);
 
         let latency_us = latency.as_micros() as u64;
-        self.total_latency_us.fetch_add(latency_us, Ordering::Relaxed);
+        self.total_latency_us
+            .fetch_add(latency_us, Ordering::Relaxed);
 
         // Update min
         let mut current = self.min_latency_us.load(Ordering::Relaxed);
@@ -127,7 +128,11 @@ impl CacheStats {
         CacheStatsLevelSnapshot {
             hits,
             avg_latency_us: total_latency.checked_div(hits).unwrap_or(0),
-            min_latency_us: if min_latency == u64::MAX { 0 } else { min_latency },
+            min_latency_us: if min_latency == u64::MAX {
+                0
+            } else {
+                min_latency
+            },
             max_latency_us: max_latency,
             entry_count: self.entry_count.load(Ordering::Relaxed),
             memory_bytes: self.memory_bytes.load(Ordering::Relaxed),
@@ -181,7 +186,8 @@ impl CacheMetrics {
     /// Record cache invalidation
     pub fn record_invalidation(&self, table_count: usize) {
         self.invalidations.fetch_add(1, Ordering::Relaxed);
-        self.tables_invalidated.fetch_add(table_count as u64, Ordering::Relaxed);
+        self.tables_invalidated
+            .fetch_add(table_count as u64, Ordering::Relaxed);
     }
 
     /// Record cache clear

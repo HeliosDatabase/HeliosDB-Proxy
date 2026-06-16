@@ -254,10 +254,7 @@ mod tests {
         let mut lease = ConnectionLease::new(conn, PoolingMode::Session, ClientId::new());
 
         // Statement outside transaction
-        assert_eq!(
-            lease.on_statement_complete("SELECT 1"),
-            LeaseAction::Hold
-        );
+        assert_eq!(lease.on_statement_complete("SELECT 1"), LeaseAction::Hold);
 
         // Transaction
         assert_eq!(lease.on_statement_complete("BEGIN"), LeaseAction::Hold);

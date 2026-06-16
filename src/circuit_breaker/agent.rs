@@ -111,11 +111,7 @@ impl AgentRetryStrategy {
     }
 
     /// Create with custom configuration
-    pub fn with_config(
-        base_delay: Duration,
-        max_delay: Duration,
-        max_attempts: u32,
-    ) -> Self {
+    pub fn with_config(base_delay: Duration, max_delay: Duration, max_attempts: u32) -> Self {
         Self {
             base_delay,
             max_delay,
@@ -183,10 +179,7 @@ impl AgentRetryStrategy {
     pub fn should_retry(&self, error: &str, attempt: u32) -> RetryDecision {
         if attempt >= self.max_attempts {
             return RetryDecision::Fail {
-                reason: format!(
-                    "Maximum retry attempts ({}) exceeded",
-                    self.max_attempts
-                ),
+                reason: format!("Maximum retry attempts ({}) exceeded", self.max_attempts),
             };
         }
 
@@ -442,11 +435,8 @@ mod tests {
 
     #[test]
     fn test_retry_strategy_should_retry() {
-        let strategy = AgentRetryStrategy::with_config(
-            Duration::from_millis(100),
-            Duration::from_secs(10),
-            3,
-        );
+        let strategy =
+            AgentRetryStrategy::with_config(Duration::from_millis(100), Duration::from_secs(10), 3);
 
         // Should retry circuit_open
         let decision = strategy.should_retry("circuit_open", 0);
@@ -489,10 +479,7 @@ mod tests {
 
     #[test]
     fn test_conversation_fallback_expired() {
-        let fallback = ConversationFallback::with_config(
-            Duration::from_millis(10),
-            100,
-        );
+        let fallback = ConversationFallback::with_config(Duration::from_millis(10), 100);
 
         fallback.update_context("conv-1", "query1", "result1");
         assert!(fallback.has_context("conv-1"));
@@ -507,10 +494,11 @@ mod tests {
         fallback.update_context("conv-1", "query", "cached_result");
 
         // Successful execution
-        let result: Result<String, &str> =
-            fallback.execute_with_fallback("conv-1", || Ok("new_result".to_string()), |_| {
-                "fallback".to_string()
-            });
+        let result: Result<String, &str> = fallback.execute_with_fallback(
+            "conv-1",
+            || Ok("new_result".to_string()),
+            |_| "fallback".to_string(),
+        );
         assert_eq!(result.unwrap(), "new_result");
     }
 }

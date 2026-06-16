@@ -96,12 +96,7 @@ impl ConversationContext {
     }
 
     fn get_recent(&self, count: usize) -> Vec<Turn> {
-        self.turns.iter()
-            .rev()
-            .take(count)
-            .rev()
-            .cloned()
-            .collect()
+        self.turns.iter().rev().take(count).rev().cloned().collect()
     }
 
     fn size(&self) -> usize {
@@ -197,7 +192,8 @@ impl ConversationContextCache {
         }
 
         // Get or create context
-        let mut ctx = self.contexts
+        let mut ctx = self
+            .contexts
             .entry(conv_id.to_string())
             .or_insert_with(|| ConversationContext::new(conv_id.to_string(), self.max_turns));
 
@@ -216,9 +212,7 @@ impl ConversationContextCache {
 
     /// Get total tokens cached
     pub fn total_tokens(&self) -> usize {
-        self.contexts.iter()
-            .map(|ctx| ctx.total_tokens)
-            .sum()
+        self.contexts.iter().map(|ctx| ctx.total_tokens).sum()
     }
 
     /// Get stats
@@ -279,11 +273,10 @@ mod tests {
         let cache = ConversationContextCache::new(100, 3);
 
         for i in 0..5 {
-            cache.append_turn("conv-1", Turn::new(
-                format!("{}", i),
-                "user",
-                format!("Message {}", i),
-            ));
+            cache.append_turn(
+                "conv-1",
+                Turn::new(format!("{}", i), "user", format!("Message {}", i)),
+            );
         }
 
         let context = cache.get_full_context("conv-1").unwrap();

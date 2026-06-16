@@ -80,9 +80,8 @@ use std::sync::Arc;
 use dashmap::DashMap;
 
 pub use config::{
-    IdentificationMethod, IsolationStrategy, MultiTenancyConfig, TenantAiConfig,
-    TenantConfig, TenantConfigBuilder, TenantId, TenantPermissions, TenantPoolConfig,
-    TenantRateLimits,
+    IdentificationMethod, IsolationStrategy, MultiTenancyConfig, TenantAiConfig, TenantConfig,
+    TenantConfigBuilder, TenantId, TenantPermissions, TenantPoolConfig, TenantRateLimits,
 };
 pub use identifier::{
     create_identifier, CompositeIdentifier, DatabaseNameIdentifier, HeaderTenantIdentifier,
@@ -91,12 +90,12 @@ pub use identifier::{
 };
 pub use isolation::{
     create_handler, BranchIsolationHandler, DatabaseIsolationHandler, IsolationHandler,
-    IsolationRouter, RowIsolationHandler, RoutingDecision, SchemaIsolationHandler,
+    IsolationRouter, RoutingDecision, RowIsolationHandler, SchemaIsolationHandler,
     TenantProvisioner,
 };
 pub use metrics::{
-    AggregateMetricsSnapshot, TenantCostEntry, TenantCostReport, TenantCostTracker,
-    TenantMetrics, TenantMetricsSnapshot, TenantStats,
+    AggregateMetricsSnapshot, TenantCostEntry, TenantCostReport, TenantCostTracker, TenantMetrics,
+    TenantMetricsSnapshot, TenantStats,
 };
 pub use pool::{
     AcquireResult, AggregatePoolStats, ConnectionState, PooledConnection, TenantConnectionLease,
@@ -170,8 +169,7 @@ impl TenantManager {
         let tenant_id = config.id.clone();
 
         // Register isolation handler
-        self.isolation_router
-            .register_from_config(&config);
+        self.isolation_router.register_from_config(&config);
 
         // Create connection pool
         self.pool_manager
@@ -388,10 +386,7 @@ impl TenantManager {
 
     /// Check if tenant is enabled
     pub fn is_tenant_enabled(&self, tenant: &TenantId) -> bool {
-        self.tenants
-            .get(tenant)
-            .map(|c| c.enabled)
-            .unwrap_or(false)
+        self.tenants.get(tenant).map(|c| c.enabled).unwrap_or(false)
     }
 }
 
@@ -595,8 +590,7 @@ mod tests {
 
     #[test]
     fn test_query_transformation() {
-        let transformer = TenantQueryTransformer::new()
-            .register_table("users", "tenant_id");
+        let transformer = TenantQueryTransformer::new().register_table("users", "tenant_id");
 
         let mut manager = TenantManager::new();
         manager.query_transformer = transformer;
@@ -609,10 +603,7 @@ mod tests {
 
         manager.register_tenant(config);
 
-        let result = manager.transform_query(
-            "SELECT * FROM users",
-            &TenantId::new("acme"),
-        );
+        let result = manager.transform_query("SELECT * FROM users", &TenantId::new("acme"));
 
         assert!(result.transformed);
         assert!(result.query.contains("tenant_id = 'acme'"));

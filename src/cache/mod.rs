@@ -50,25 +50,25 @@
 //! ```
 
 pub mod config;
+pub mod hints;
+pub mod invalidation;
 pub mod l1_hot;
 pub mod l2_warm;
 pub mod l3_semantic;
-pub mod normalizer;
-pub mod invalidation;
 pub mod metrics;
-pub mod hints;
+pub mod normalizer;
 pub mod result;
 
 // Re-exports
 pub use config::{CacheConfig, L1Config, L2Config, L3Config, StorageBackend};
+pub use hints::{parse_cache_hints, CacheHint};
+pub use invalidation::{InvalidationManager, InvalidationMode};
 pub use l1_hot::L1HotCache;
 pub use l2_warm::L2WarmCache;
 pub use l3_semantic::L3SemanticCache;
-pub use normalizer::{QueryNormalizer, NormalizedQuery};
-pub use invalidation::{InvalidationManager, InvalidationMode};
-pub use metrics::{CacheMetrics, CacheStatsSnapshot, CacheStatsLevelSnapshot};
-pub use hints::{CacheHint, parse_cache_hints};
-pub use result::{CachedResult, CacheKey};
+pub use metrics::{CacheMetrics, CacheStatsLevelSnapshot, CacheStatsSnapshot};
+pub use normalizer::{NormalizedQuery, QueryNormalizer};
+pub use result::{CacheKey, CachedResult};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -254,7 +254,8 @@ impl QueryCache {
         if hints.semantic_cache {
             if let Some(ref l3) = self.l3_cache {
                 if let Some(result) = l3.get(query, context).await {
-                    self.metrics.record_hit(CacheLevel::L3Semantic, start.elapsed());
+                    self.metrics
+                        .record_hit(CacheLevel::L3Semantic, start.elapsed());
                     return CacheLookup::Hit {
                         result,
                         level: CacheLevel::L3Semantic,
@@ -288,9 +289,9 @@ impl QueryCache {
         let normalized = self.normalizer.normalize(query);
 
         // Determine TTL
-        let ttl = hints.ttl.unwrap_or_else(|| {
-            self.get_table_ttl(&normalized.tables)
-        });
+        let ttl = hints
+            .ttl
+            .unwrap_or_else(|| self.get_table_ttl(&normalized.tables));
 
         // Check size limit
         if data.len() > self.config.max_result_size {

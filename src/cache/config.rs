@@ -59,8 +59,14 @@ impl CacheConfig {
         Self {
             enabled: true,
             l1: L1Config::default(),
-            l2: L2Config { enabled: false, ..Default::default() },
-            l3: L3Config { enabled: false, ..Default::default() },
+            l2: L2Config {
+                enabled: false,
+                ..Default::default()
+            },
+            l3: L3Config {
+                enabled: false,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -79,7 +85,10 @@ impl CacheConfig {
                 ttl: Duration::from_secs(600),
                 ..Default::default()
             },
-            l3: L3Config { enabled: false, ..Default::default() },
+            l3: L3Config {
+                enabled: false,
+                ..Default::default()
+            },
             default_ttl: Duration::from_secs(300),
             ..Default::default()
         }
@@ -178,8 +187,7 @@ impl Default for L2Config {
 }
 
 /// Storage backend for L2 cache
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum StorageBackend {
     /// In-process memory (lost on restart)
     #[default]
@@ -187,7 +195,6 @@ pub enum StorageBackend {
     /// Memory-mapped file (survives restarts)
     Mmap,
 }
-
 
 /// L3 semantic cache configuration
 #[derive(Debug, Clone)]

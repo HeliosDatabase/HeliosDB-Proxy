@@ -12,9 +12,9 @@
 //! /* helios:cache_refresh */       -- Force cache refresh
 //! ```
 
-use std::time::Duration;
-use regex::Regex;
 use once_cell::sync::Lazy;
+use regex::Regex;
+use std::time::Duration;
 
 /// Parsed cache hints from a SQL query
 #[derive(Debug, Clone, Default)]
@@ -52,13 +52,11 @@ pub enum CacheLevelHint {
 }
 
 // Regex patterns for hint parsing
-static HINT_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"/\*\s*helios:(\w+)(?:=([^*]+))?\s*\*/").unwrap()
-});
+static HINT_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"/\*\s*helios:(\w+)(?:=([^*]+))?\s*\*/").unwrap());
 
-static HINT_PATTERN_DOUBLE_DASH: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"--\s*helios:(\w+)(?:=(\S+))?").unwrap()
-});
+static HINT_PATTERN_DOUBLE_DASH: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"--\s*helios:(\w+)(?:=(\S+))?").unwrap());
 
 /// Parse cache hints from a SQL query
 pub fn parse_cache_hints(sql: &str) -> CacheHint {
@@ -261,7 +259,10 @@ mod tests {
     fn test_parse_tables_hint() {
         let sql = "/* helios:cache_tables=users,sessions */ SELECT u.* FROM users u JOIN sessions s ON u.id = s.user_id";
         let hint = parse_cache_hints(sql);
-        assert_eq!(hint.tables, Some(vec!["users".to_string(), "sessions".to_string()]));
+        assert_eq!(
+            hint.tables,
+            Some(vec!["users".to_string(), "sessions".to_string()])
+        );
     }
 
     #[test]
@@ -301,7 +302,9 @@ mod tests {
     fn test_is_cacheable_query() {
         assert!(is_cacheable_query("SELECT * FROM users"));
         assert!(is_cacheable_query("  select id from users  "));
-        assert!(is_cacheable_query("WITH cte AS (SELECT 1) SELECT * FROM cte"));
+        assert!(is_cacheable_query(
+            "WITH cte AS (SELECT 1) SELECT * FROM cte"
+        ));
         assert!(is_cacheable_query("VALUES (1, 2), (3, 4)"));
         assert!(is_cacheable_query("TABLE users"));
 

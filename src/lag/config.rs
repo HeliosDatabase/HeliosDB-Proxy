@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn test_lag_calculation_hybrid() {
         let calc = LagCalculation::hybrid(1000); // 1000 bytes/sec
-                                                  // WAL lag = 5s, time lag = 3s -> max = 5s
+                                                 // WAL lag = 5s, time lag = 3s -> max = 5s
         let lag = calc.calculate_lag(5000, Some(Duration::from_secs(3)));
         assert_eq!(lag, Duration::from_secs(5));
 

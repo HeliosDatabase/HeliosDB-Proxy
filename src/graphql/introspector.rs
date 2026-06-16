@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use super::{GraphQLScalar, RelationType, to_pascal_case, to_camel_case};
+use super::{to_camel_case, to_pascal_case, GraphQLScalar, RelationType};
 
 /// GraphQL schema generated from database introspection
 #[derive(Debug, Clone)]
@@ -63,7 +63,8 @@ impl GraphQLSchema {
 
     /// Get relationships for a type
     pub fn get_relationships_for(&self, type_name: &str) -> Vec<&Relationship> {
-        self.relationships.iter()
+        self.relationships
+            .iter()
             .filter(|r| r.from_type == type_name)
             .collect()
     }
@@ -142,7 +143,9 @@ impl GraphQLSchema {
         // Query type
         sdl.push_str("type Query {\n");
         for query in &self.queries {
-            let args: Vec<String> = query.arguments.iter()
+            let args: Vec<String> = query
+                .arguments
+                .iter()
                 .map(|a| {
                     let type_str = if a.nullable {
                         a.graphql_type.to_string()
@@ -173,7 +176,9 @@ impl GraphQLSchema {
         if !self.mutations.is_empty() {
             sdl.push_str("type Mutation {\n");
             for mutation in &self.mutations {
-                let args: Vec<String> = mutation.arguments.iter()
+                let args: Vec<String> = mutation
+                    .arguments
+                    .iter()
                     .map(|a| {
                         let type_str = if a.nullable {
                             a.graphql_type.to_string()
@@ -190,7 +195,10 @@ impl GraphQLSchema {
                     format!("({})", args.join(", "))
                 };
 
-                sdl.push_str(&format!("  {}{}: {}\n", mutation.name, args_str, mutation.return_type));
+                sdl.push_str(&format!(
+                    "  {}{}: {}\n",
+                    mutation.name, args_str, mutation.return_type
+                ));
             }
             sdl.push_str("}\n");
         }
@@ -438,7 +446,11 @@ pub struct MutationDefinition {
 
 impl MutationDefinition {
     /// Create a new mutation definition
-    pub fn new(name: impl Into<String>, return_type: impl Into<String>, kind: MutationKind) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        return_type: impl Into<String>,
+        kind: MutationKind,
+    ) -> Self {
         Self {
             name: name.into(),
             arguments: Vec::new(),
@@ -579,10 +591,7 @@ impl SchemaIntrospector {
     /// Create a new introspector
     pub fn new() -> Self {
         Self {
-            excluded_tables: vec![
-                "pg_catalog".to_string(),
-                "information_schema".to_string(),
-            ],
+            excluded_tables: vec!["pg_catalog".to_string(), "information_schema".to_string()],
             excluded_columns: HashMap::new(),
             type_names: HashMap::new(),
         }
@@ -623,37 +632,73 @@ impl SchemaIntrospector {
             // Generate queries
             schema.add_query(
                 QueryDefinition::new(to_camel_case(&table.name), &type_name)
-                    .arg(ArgumentDefinition::new("id", FieldType::scalar(GraphQLScalar::ID)).required())
-                    .from_table(&table.name)
+                    .arg(
+                        ArgumentDefinition::new("id", FieldType::scalar(GraphQLScalar::ID))
+                            .required(),
+                    )
+                    .from_table(&table.name),
             );
 
             schema.add_query(
                 QueryDefinition::new(format!("{}s", to_camel_case(&table.name)), &type_name)
-                    .arg(ArgumentDefinition::new("limit", FieldType::scalar(GraphQLScalar::Int)))
-                    .arg(ArgumentDefinition::new("offset", FieldType::scalar(GraphQLScalar::Int)))
-                    .arg(ArgumentDefinition::new("where", FieldType::object(format!("{}Filter", type_name))))
+                    .arg(ArgumentDefinition::new(
+                        "limit",
+                        FieldType::scalar(GraphQLScalar::Int),
+                    ))
+                    .arg(ArgumentDefinition::new(
+                        "offset",
+                        FieldType::scalar(GraphQLScalar::Int),
+                    ))
+                    .arg(ArgumentDefinition::new(
+                        "where",
+                        FieldType::object(format!("{}Filter", type_name)),
+                    ))
                     .returns_list(true)
-                    .from_table(&table.name)
+                    .from_table(&table.name),
             );
 
             // Generate mutations
             schema.add_mutation(
-                MutationDefinition::new(format!("create{}", type_name), &type_name, MutationKind::Create)
-                    .arg(ArgumentDefinition::new("input", FieldType::object(format!("Create{}Input", type_name))).required())
-                    .from_table(&table.name)
+                MutationDefinition::new(
+                    format!("create{}", type_name),
+                    &type_name,
+                    MutationKind::Create,
+                )
+                .arg(
+                    ArgumentDefinition::new(
+                        "input",
+                        FieldType::object(format!("Create{}Input", type_name)),
+                    )
+                    .required(),
+                )
+                .from_table(&table.name),
             );
 
             schema.add_mutation(
-                MutationDefinition::new(format!("update{}", type_name), &type_name, MutationKind::Update)
-                    .arg(ArgumentDefinition::new("id", FieldType::scalar(GraphQLScalar::ID)).required())
-                    .arg(ArgumentDefinition::new("input", FieldType::object(format!("Update{}Input", type_name))).required())
-                    .from_table(&table.name)
+                MutationDefinition::new(
+                    format!("update{}", type_name),
+                    &type_name,
+                    MutationKind::Update,
+                )
+                .arg(ArgumentDefinition::new("id", FieldType::scalar(GraphQLScalar::ID)).required())
+                .arg(
+                    ArgumentDefinition::new(
+                        "input",
+                        FieldType::object(format!("Update{}Input", type_name)),
+                    )
+                    .required(),
+                )
+                .from_table(&table.name),
             );
 
             schema.add_mutation(
-                MutationDefinition::new(format!("delete{}", type_name), "Boolean".to_string(), MutationKind::Delete)
-                    .arg(ArgumentDefinition::new("id", FieldType::scalar(GraphQLScalar::ID)).required())
-                    .from_table(&table.name)
+                MutationDefinition::new(
+                    format!("delete{}", type_name),
+                    "Boolean".to_string(),
+                    MutationKind::Delete,
+                )
+                .arg(ArgumentDefinition::new("id", FieldType::scalar(GraphQLScalar::ID)).required())
+                .from_table(&table.name),
             );
 
             // Generate filter input type
@@ -679,7 +724,7 @@ impl SchemaIntrospector {
                 schema.add_relationship(
                     Relationship::new(&fk.name, &from_type, &to_type, RelationType::ManyToOne)
                         .columns(&fk.column, &fk.referenced_column)
-                        .field(to_camel_case(&fk.name))
+                        .field(to_camel_case(&fk.name)),
                 );
 
                 // Reverse one-to-many relationship
@@ -687,7 +732,7 @@ impl SchemaIntrospector {
                 schema.add_relationship(
                     Relationship::new(&reverse_name, &to_type, &from_type, RelationType::OneToMany)
                         .columns(&fk.referenced_column, &fk.column)
-                        .field(&reverse_name)
+                        .field(&reverse_name),
                 );
             }
         }
@@ -698,8 +743,7 @@ impl SchemaIntrospector {
     /// Generate GraphQL type from table
     fn generate_type(&self, table: &TableDefinition) -> GraphQLType {
         let type_name = self.get_type_name(&table.name);
-        let mut type_def = GraphQLType::new(&type_name)
-            .from_table(&table.name);
+        let mut type_def = GraphQLType::new(&type_name).from_table(&table.name);
 
         let excluded = self.excluded_columns.get(&table.name);
 
@@ -711,12 +755,9 @@ impl SchemaIntrospector {
             }
 
             let scalar = GraphQLScalar::from_sql_type(&column.data_type);
-            let field = GraphQLField::new(
-                to_camel_case(&column.name),
-                FieldType::scalar(scalar),
-            )
-            .nullable(column.nullable)
-            .from_column(&column.name);
+            let field = GraphQLField::new(to_camel_case(&column.name), FieldType::scalar(scalar))
+                .nullable(column.nullable)
+                .from_column(&column.name);
 
             type_def.add_field(field);
         }
@@ -769,10 +810,10 @@ impl SchemaIntrospector {
             }
 
             let scalar = GraphQLScalar::from_sql_type(&column.data_type);
-            input.fields.push(GraphQLField::new(
-                to_camel_case(&column.name),
-                FieldType::scalar(scalar),
-            ).nullable(column.nullable || column.has_default));
+            input.fields.push(
+                GraphQLField::new(to_camel_case(&column.name), FieldType::scalar(scalar))
+                    .nullable(column.nullable || column.has_default),
+            );
         }
 
         input
@@ -946,7 +987,9 @@ mod tests {
                 .column(ColumnDefinition::new("title", "varchar(255)").nullable(false))
                 .column(ColumnDefinition::new("content", "text"))
                 .column(ColumnDefinition::new("user_id", "integer").nullable(false))
-                .foreign_key(ForeignKeyDefinition::new("author", "user_id", "users", "id")),
+                .foreign_key(ForeignKeyDefinition::new(
+                    "author", "user_id", "users", "id",
+                )),
         ]
     }
 
@@ -1037,9 +1080,15 @@ mod tests {
 
     #[test]
     fn test_field_type_display() {
-        assert_eq!(FieldType::scalar(GraphQLScalar::String).to_string(), "String");
+        assert_eq!(
+            FieldType::scalar(GraphQLScalar::String).to_string(),
+            "String"
+        );
         assert_eq!(FieldType::object("User").to_string(), "User");
-        assert_eq!(FieldType::list(FieldType::object("User")).to_string(), "[User]");
+        assert_eq!(
+            FieldType::list(FieldType::object("User")).to_string(),
+            "[User]"
+        );
         assert_eq!(
             FieldType::non_null(FieldType::list(FieldType::object("User"))).to_string(),
             "[User]!"

@@ -152,7 +152,10 @@ impl LagMetrics {
             let avg = sorted.iter().sum::<u64>() / sorted.len() as u64;
             let p50 = sorted[sorted.len() / 2];
             let p99_idx = (sorted.len() as f64 * 0.99) as usize;
-            let p99 = sorted.get(p99_idx).copied().unwrap_or(sorted[sorted.len() - 1]);
+            let p99 = sorted
+                .get(p99_idx)
+                .copied()
+                .unwrap_or(sorted[sorted.len() - 1]);
 
             (avg, p50, p99)
         };
@@ -210,7 +213,10 @@ impl Default for LagMetrics {
 impl std::fmt::Debug for LagMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LagMetrics")
-            .field("total_decisions", &self.total_decisions.load(Ordering::Relaxed))
+            .field(
+                "total_decisions",
+                &self.total_decisions.load(Ordering::Relaxed),
+            )
             .field("node_count", &self.node_stats.len())
             .finish()
     }

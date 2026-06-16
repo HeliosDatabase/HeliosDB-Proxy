@@ -143,10 +143,7 @@ impl LagAwareRouter {
     }
 
     /// Create with shared components
-    pub fn with_shared(
-        lag_monitor: Arc<LagMonitor>,
-        config: LagRoutingConfig,
-    ) -> Self {
+    pub fn with_shared(lag_monitor: Arc<LagMonitor>, config: LagRoutingConfig) -> Self {
         let ryw_tracker = Arc::new(ReadYourWritesTracker::new(config.ryw_retention));
         Self::new(lag_monitor, ryw_tracker, config)
     }
@@ -200,11 +197,7 @@ impl LagAwareRouter {
     }
 
     /// Route requiring a specific LSN (for read-your-writes)
-    fn route_with_lsn_requirement(
-        &self,
-        required_lsn: u64,
-        start: Instant,
-    ) -> LagRoutingDecision {
+    fn route_with_lsn_requirement(&self, required_lsn: u64, start: Instant) -> LagRoutingDecision {
         // Find standbys that have replayed past required LSN
         let eligible = self.lag_monitor.get_nodes_at_lsn(required_lsn);
 
@@ -221,9 +214,7 @@ impl LagAwareRouter {
             }
 
             return LagRoutingDecision::primary(
-                LagRoutingReason::NoEligibleNodes(
-                    "No standby caught up for RYW".to_string(),
-                ),
+                LagRoutingReason::NoEligibleNodes("No standby caught up for RYW".to_string()),
                 start.elapsed(),
             );
         }
@@ -365,15 +356,12 @@ impl LagAwareRouter {
             }
         }
 
-        best.map(|(id, info, _)| (id, info))
-            .unwrap_or_else(|| {
-                (
-                    eligible[0].clone(),
-                    self.lag_monitor
-                        .get_lag(&eligible[0])
-                        .unwrap_or_default(),
-                )
-            })
+        best.map(|(id, info, _)| (id, info)).unwrap_or_else(|| {
+            (
+                eligible[0].clone(),
+                self.lag_monitor.get_lag(&eligible[0]).unwrap_or_default(),
+            )
+        })
     }
 
     /// Record a write operation for read-your-writes tracking
@@ -557,8 +545,7 @@ mod tests {
 
     #[test]
     fn test_select_best_node_prefers_lower_lag() {
-        let config = LagRoutingConfig::new()
-            .with_lag_calculation(LagCalculation::time());
+        let config = LagRoutingConfig::new().with_lag_calculation(LagCalculation::time());
 
         let monitor = Arc::new(LagMonitor::new(config.clone()));
         monitor.update_primary_lsn(10000);

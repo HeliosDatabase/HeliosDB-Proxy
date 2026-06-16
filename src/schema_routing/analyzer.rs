@@ -5,9 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use super::registry::{
-    SchemaRegistry, TableSchema, AccessPattern, WorkloadType,
-};
+use super::registry::{AccessPattern, SchemaRegistry, TableSchema, WorkloadType};
 
 /// Query analyzer for schema-aware routing
 #[derive(Debug)]
@@ -47,7 +45,8 @@ impl QueryAnalyzer {
 
     /// Normalize query for analysis
     fn normalize_query(&self, query: &str) -> String {
-        query.to_uppercase()
+        query
+            .to_uppercase()
             .replace(['\n', '\t'], " ")
             .split_whitespace()
             .collect::<Vec<_>>()
@@ -155,28 +154,38 @@ impl QueryAnalyzer {
 
     /// Check for range predicates
     fn has_range_predicate(&self, query: &str) -> bool {
-        query.contains(" > ") || query.contains(" < ")
-            || query.contains(" >= ") || query.contains(" <= ")
+        query.contains(" > ")
+            || query.contains(" < ")
+            || query.contains(" >= ")
+            || query.contains(" <= ")
             || query.contains(" BETWEEN ")
     }
 
     /// Check for vector operators
     fn has_vector_operator(&self, query: &str) -> bool {
-        query.contains("<->") || query.contains("<#>") || query.contains("<=>")
-            || query.contains("VECTOR") || query.contains("EMBEDDING")
-            || query.contains("COSINE_DISTANCE") || query.contains("L2_DISTANCE")
+        query.contains("<->")
+            || query.contains("<#>")
+            || query.contains("<=>")
+            || query.contains("VECTOR")
+            || query.contains("EMBEDDING")
+            || query.contains("COSINE_DISTANCE")
+            || query.contains("L2_DISTANCE")
     }
 
     /// Check for time-series append pattern
     fn is_time_series_append(&self, query: &str) -> bool {
-        query.starts_with("INSERT") && (
-            query.contains("TIMESTAMP") || query.contains("CREATED_AT")
-                || query.contains("EVENT_TIME")
-        )
+        query.starts_with("INSERT")
+            && (query.contains("TIMESTAMP")
+                || query.contains("CREATED_AT")
+                || query.contains("EVENT_TIME"))
     }
 
     /// Extract shard keys from query
-    fn extract_shard_keys(&self, query: &str, tables: &[TableRef]) -> HashMap<String, ShardKeyValue> {
+    fn extract_shard_keys(
+        &self,
+        query: &str,
+        tables: &[TableRef],
+    ) -> HashMap<String, ShardKeyValue> {
         let mut shard_keys = HashMap::new();
 
         for table in tables {
@@ -230,7 +239,10 @@ impl QueryAnalyzer {
         }
 
         // OLAP indicators
-        if self.has_aggregations(query) || self.has_group_by(query) || self.has_window_functions(query) {
+        if self.has_aggregations(query)
+            || self.has_group_by(query)
+            || self.has_window_functions(query)
+        {
             return WorkloadType::OLAP;
         }
 
@@ -253,8 +265,10 @@ impl QueryAnalyzer {
 
     /// Check if query has aggregations
     pub fn has_aggregations(&self, query: &str) -> bool {
-        query.contains("COUNT(") || query.contains("SUM(")
-            || query.contains("AVG(") || query.contains("MIN(")
+        query.contains("COUNT(")
+            || query.contains("SUM(")
+            || query.contains("AVG(")
+            || query.contains("MIN(")
             || query.contains("MAX(")
     }
 
@@ -265,9 +279,12 @@ impl QueryAnalyzer {
 
     /// Check if query has window functions
     fn has_window_functions(&self, query: &str) -> bool {
-        query.contains("OVER(") || query.contains("OVER (")
-            || query.contains("ROW_NUMBER") || query.contains("RANK()")
-            || query.contains("DENSE_RANK") || query.contains("LAG(")
+        query.contains("OVER(")
+            || query.contains("OVER (")
+            || query.contains("ROW_NUMBER")
+            || query.contains("RANK()")
+            || query.contains("DENSE_RANK")
+            || query.contains("LAG(")
             || query.contains("LEAD(")
     }
 
@@ -278,22 +295,21 @@ impl QueryAnalyzer {
             && !self.has_subqueries(query)
             && !self.has_aggregations(query);
 
-        let is_simple_insert = query.starts_with("INSERT")
-            && !query.contains("SELECT");
+        let is_simple_insert = query.starts_with("INSERT") && !query.contains("SELECT");
 
-        let is_simple_update = query.starts_with("UPDATE")
-            && query.contains("WHERE");
+        let is_simple_update = query.starts_with("UPDATE") && query.contains("WHERE");
 
-        let is_simple_delete = query.starts_with("DELETE")
-            && query.contains("WHERE");
+        let is_simple_delete = query.starts_with("DELETE") && query.contains("WHERE");
 
         is_simple_select || is_simple_insert || is_simple_update || is_simple_delete
     }
 
     /// Check if query is read-only
     pub fn is_read_only(&self, query: &str) -> bool {
-        query.starts_with("SELECT") || query.starts_with("WITH")
-            || query.starts_with("EXPLAIN") || query.starts_with("SHOW")
+        query.starts_with("SELECT")
+            || query.starts_with("WITH")
+            || query.starts_with("EXPLAIN")
+            || query.starts_with("SHOW")
     }
 
     /// Check if query has joins
@@ -397,14 +413,64 @@ impl QueryAnalyzer {
 /// Check if a word is a SQL keyword
 fn is_keyword(word: &str) -> bool {
     let keywords = [
-        "SELECT", "FROM", "WHERE", "JOIN", "ON", "AND", "OR", "NOT",
-        "IN", "IS", "NULL", "AS", "ORDER", "BY", "GROUP", "HAVING",
-        "LIMIT", "OFFSET", "INSERT", "INTO", "VALUES", "UPDATE", "SET",
-        "DELETE", "CREATE", "DROP", "ALTER", "INDEX", "TABLE", "LEFT",
-        "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "NATURAL", "USING",
-        "DISTINCT", "ALL", "UNION", "INTERSECT", "EXCEPT", "CASE",
-        "WHEN", "THEN", "ELSE", "END", "BETWEEN", "LIKE", "ILIKE",
-        "EXISTS", "WITH", "RECURSIVE", "ASC", "DESC", "NULLS", "FIRST", "LAST",
+        "SELECT",
+        "FROM",
+        "WHERE",
+        "JOIN",
+        "ON",
+        "AND",
+        "OR",
+        "NOT",
+        "IN",
+        "IS",
+        "NULL",
+        "AS",
+        "ORDER",
+        "BY",
+        "GROUP",
+        "HAVING",
+        "LIMIT",
+        "OFFSET",
+        "INSERT",
+        "INTO",
+        "VALUES",
+        "UPDATE",
+        "SET",
+        "DELETE",
+        "CREATE",
+        "DROP",
+        "ALTER",
+        "INDEX",
+        "TABLE",
+        "LEFT",
+        "RIGHT",
+        "INNER",
+        "OUTER",
+        "FULL",
+        "CROSS",
+        "NATURAL",
+        "USING",
+        "DISTINCT",
+        "ALL",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "CASE",
+        "WHEN",
+        "THEN",
+        "ELSE",
+        "END",
+        "BETWEEN",
+        "LIKE",
+        "ILIKE",
+        "EXISTS",
+        "WITH",
+        "RECURSIVE",
+        "ASC",
+        "DESC",
+        "NULLS",
+        "FIRST",
+        "LAST",
     ];
     keywords.contains(&word.to_uppercase().as_str())
 }
@@ -601,7 +667,9 @@ mod tests {
         let query = "SELECT * FROM users WHERE id = 1";
         let analysis = analyzer.analyze(query);
 
-        assert!(analysis.access_patterns.contains(&AccessPattern::PointLookup));
+        assert!(analysis
+            .access_patterns
+            .contains(&AccessPattern::PointLookup));
     }
 
     #[test]

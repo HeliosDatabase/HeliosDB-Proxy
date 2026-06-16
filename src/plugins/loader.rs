@@ -229,9 +229,8 @@ impl SignatureVerifier {
             if p.extension().and_then(|s| s.to_str()) != Some("pub") {
                 continue;
             }
-            let raw = fs::read_to_string(&p).map_err(|e| {
-                PluginLoadError::IoError(format!("read {}: {}", p.display(), e))
-            })?;
+            let raw = fs::read_to_string(&p)
+                .map_err(|e| PluginLoadError::IoError(format!("read {}: {}", p.display(), e)))?;
             let raw = raw.trim();
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(raw)
@@ -277,9 +276,7 @@ impl SignatureVerifier {
 
         let sig_bytes = base64::engine::general_purpose::STANDARD
             .decode(sig_b64.trim())
-            .map_err(|e| {
-                PluginLoadError::SignatureInvalid(format!("base64 decode: {}", e))
-            })?;
+            .map_err(|e| PluginLoadError::SignatureInvalid(format!("base64 decode: {}", e)))?;
         if sig_bytes.len() != 64 {
             return Err(PluginLoadError::SignatureInvalid(format!(
                 "signature should be 64 bytes, got {}",
@@ -416,22 +413,21 @@ impl PluginLoader {
         let mut wasm_bytes: Option<Vec<u8>> = None;
         let mut sig_bytes: Option<Vec<u8>> = None;
 
-        let entries = archive.entries().map_err(|e| {
-            PluginLoadError::InvalidFormat(format!("tar entries: {}", e))
-        })?;
+        let entries = archive
+            .entries()
+            .map_err(|e| PluginLoadError::InvalidFormat(format!("tar entries: {}", e)))?;
         for entry in entries {
-            let mut entry = entry.map_err(|e| {
-                PluginLoadError::InvalidFormat(format!("tar entry: {}", e))
-            })?;
+            let mut entry =
+                entry.map_err(|e| PluginLoadError::InvalidFormat(format!("tar entry: {}", e)))?;
             let entry_path = entry
                 .path()
                 .map_err(|e| PluginLoadError::InvalidFormat(format!("tar path: {}", e)))?
                 .to_string_lossy()
                 .to_string();
             let mut buf = Vec::new();
-            entry.read_to_end(&mut buf).map_err(|e| {
-                PluginLoadError::IoError(format!("tar read entry: {}", e))
-            })?;
+            entry
+                .read_to_end(&mut buf)
+                .map_err(|e| PluginLoadError::IoError(format!("tar read entry: {}", e)))?;
             match entry_path.as_str() {
                 "manifest.json" => manifest_json = Some(buf),
                 "plugin.wasm" => wasm_bytes = Some(buf),
@@ -441,9 +437,7 @@ impl PluginLoader {
         }
 
         let manifest_json = manifest_json.ok_or_else(|| {
-            PluginLoadError::InvalidFormat(
-                "artefact missing manifest.json".to_string(),
-            )
+            PluginLoadError::InvalidFormat("artefact missing manifest.json".to_string())
         })?;
         let wasm = wasm_bytes.ok_or_else(|| {
             PluginLoadError::InvalidFormat("artefact missing plugin.wasm".to_string())
@@ -451,9 +445,8 @@ impl PluginLoader {
 
         // Parse the artefact manifest. Field names mirror the helios-
         // plugin CLI's Manifest type one-for-one.
-        let art: ArtefactManifest = serde_json::from_slice(&manifest_json).map_err(|e| {
-            PluginLoadError::ManifestError(format!("manifest.json: {}", e))
-        })?;
+        let art: ArtefactManifest = serde_json::from_slice(&manifest_json)
+            .map_err(|e| PluginLoadError::ManifestError(format!("manifest.json: {}", e)))?;
 
         // Major-version compatibility (today: only "1.x" understood).
         let major_ok = art
@@ -495,10 +488,7 @@ impl PluginLoader {
                 )
             })?;
             let sig_str = std::str::from_utf8(&sig).map_err(|e| {
-                PluginLoadError::SignatureInvalid(format!(
-                    "signature must be UTF-8 base64: {}",
-                    e
-                ))
+                PluginLoadError::SignatureInvalid(format!("signature must be UTF-8 base64: {}", e))
             })?;
             let label = verifier.verify(&wasm, sig_str)?;
             tracing::info!(
@@ -534,7 +524,11 @@ impl PluginLoader {
     }
 
     /// Load plugin manifest
-    fn load_manifest(&self, wasm_path: &Path, wasm_bytes: &[u8]) -> Result<PluginManifest, PluginLoadError> {
+    fn load_manifest(
+        &self,
+        wasm_path: &Path,
+        wasm_bytes: &[u8],
+    ) -> Result<PluginManifest, PluginLoadError> {
         // Try sidecar YAML manifest
         let yaml_path = wasm_path.with_extension("yaml");
         if yaml_path.exists() {
@@ -557,7 +551,11 @@ impl PluginLoader {
     }
 
     /// Parse YAML manifest
-    fn parse_yaml_manifest(&self, yaml_path: &Path, wasm_path: &Path) -> Result<PluginManifest, PluginLoadError> {
+    fn parse_yaml_manifest(
+        &self,
+        yaml_path: &Path,
+        wasm_path: &Path,
+    ) -> Result<PluginManifest, PluginLoadError> {
         let content = fs::read_to_string(yaml_path)?;
 
         // Simple YAML parsing (in production, would use serde_yaml)
@@ -630,7 +628,11 @@ impl PluginLoader {
     }
 
     /// Parse JSON manifest
-    fn parse_json_manifest(&self, json_path: &Path, wasm_path: &Path) -> Result<PluginManifest, PluginLoadError> {
+    fn parse_json_manifest(
+        &self,
+        json_path: &Path,
+        wasm_path: &Path,
+    ) -> Result<PluginManifest, PluginLoadError> {
         let content = fs::read_to_string(json_path)?;
 
         // Parse JSON
@@ -746,7 +748,11 @@ impl PluginLoader {
         }
 
         // Validate name format (alphanumeric + hyphens)
-        if !manifest.name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        if !manifest
+            .name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
             return Err(PluginLoadError::ValidationError(
                 "Plugin name must be alphanumeric (hyphens and underscores allowed)".to_string(),
             ));
@@ -945,8 +951,7 @@ mod tests {
 
         let wasm = b"\x00asm\x01\x00\x00\x00pretend-real-wasm";
         let sig = key.sign(wasm);
-        let sig_b64 =
-            base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
 
         let label = verifier.verify(wasm, &sig_b64).unwrap();
         assert_eq!(label, "official");
@@ -961,8 +966,7 @@ mod tests {
 
         let wasm = b"\x00asm\x01\x00\x00\x00pretend-real-wasm";
         let sig = key.sign(wasm);
-        let sig_b64 =
-            base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
 
         let tampered = b"\x00asm\x01\x00\x00\x00pretend-real-wasn"; // 'm' → 'n'
         let err = verifier.verify(tampered, &sig_b64).unwrap_err();
@@ -980,8 +984,7 @@ mod tests {
         let attacker = SigningKey::from_bytes(&[0xAB; 32]);
         let wasm = b"\x00asm\x01\x00\x00\x00pretend-real-wasm";
         let sig = attacker.sign(wasm);
-        let sig_b64 =
-            base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
 
         let err = verifier.verify(wasm, &sig_b64).unwrap_err();
         assert!(matches!(err, PluginLoadError::SignatureInvalid(_)));
@@ -1013,8 +1016,7 @@ mod tests {
 
         let wasm = b"\x00asm\x01\x00\x00\x00abc";
         let sig = k2.sign(wasm); // signed by the SECOND publisher
-        let sig_b64 =
-            base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
 
         let label = verifier.verify(wasm, &sig_b64).unwrap();
         assert_eq!(label, "publisher-b");
@@ -1065,12 +1067,7 @@ mod tests {
         s
     }
 
-    fn pack_tarball(
-        dir: &Path,
-        name: &str,
-        wasm: &[u8],
-        sig: Option<&[u8]>,
-    ) -> std::path::PathBuf {
+    fn pack_tarball(dir: &Path, name: &str, wasm: &[u8], sig: Option<&[u8]>) -> std::path::PathBuf {
         let manifest = serde_json::json!({
             "schema_version": "1.0",
             "name": name,
@@ -1229,9 +1226,7 @@ mod tests {
         write_pub_key(trust_dir.path(), "official", &key);
 
         let loader = PluginLoader::new()
-            .with_signature_verifier(
-                SignatureVerifier::from_trust_root(trust_dir.path()).unwrap(),
-            );
+            .with_signature_verifier(SignatureVerifier::from_trust_root(trust_dir.path()).unwrap());
         let (manifest, bytes) = loader.load(&path).unwrap();
         assert_eq!(manifest.name, "signed-plugin");
         assert_eq!(bytes, wasm);
@@ -1248,9 +1243,7 @@ mod tests {
         write_pub_key(trust_dir.path(), "official", &key);
 
         let loader = PluginLoader::new()
-            .with_signature_verifier(
-                SignatureVerifier::from_trust_root(trust_dir.path()).unwrap(),
-            );
+            .with_signature_verifier(SignatureVerifier::from_trust_root(trust_dir.path()).unwrap());
         let err = loader.load(&path).unwrap_err();
         assert!(matches!(err, PluginLoadError::SignatureInvalid(_)));
     }

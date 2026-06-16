@@ -42,8 +42,8 @@ pub mod transaction;
 // Re-exports
 pub use config::PoolModeConfig;
 pub use hardening::{
-    PoolHardening, TransactionLeakDetector, ConnectionHealthValidator,
-    StaleLeaseCleaner, PoolExhaustionMonitor, HardeningStats,
+    ConnectionHealthValidator, HardeningStats, PoolExhaustionMonitor, PoolHardening,
+    StaleLeaseCleaner, TransactionLeakDetector,
 };
 pub use lease::{ConnectionLease, LeaseAction};
 pub use manager::ConnectionPoolManager;

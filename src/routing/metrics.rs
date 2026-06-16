@@ -53,12 +53,7 @@ impl RoutingMetrics {
     }
 
     /// Record a routing decision
-    pub fn record_routing(
-        &self,
-        target: Option<RouteTarget>,
-        had_hints: bool,
-        elapsed: Duration,
-    ) {
+    pub fn record_routing(&self, target: Option<RouteTarget>, had_hints: bool, elapsed: Duration) {
         self.total_routed.fetch_add(1, Ordering::SeqCst);
 
         if had_hints {
@@ -217,9 +212,7 @@ pub struct HintUsageStats {
 impl HintUsageStats {
     /// Get most used hints
     pub fn top_hints(&self, n: usize) -> Vec<(String, u64)> {
-        let mut hints: Vec<_> = self.by_hint.iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
+        let mut hints: Vec<_> = self.by_hint.iter().map(|(k, v)| (k.clone(), *v)).collect();
         hints.sort_by_key(|b| std::cmp::Reverse(b.1));
         hints.truncate(n);
         hints
@@ -324,14 +317,16 @@ mod tests {
         let metrics = RoutingMetrics::new();
 
         for i in 0..5 {
-            metrics.record_decision(RoutingDecisionRecord::new(
-                &format!("SELECT {}", i),
-                Some("node".to_string()),
-                Some(RouteTarget::Standby),
-                vec!["route".to_string()],
-                "test".to_string(),
-                Duration::from_micros(100),
-            )).await;
+            metrics
+                .record_decision(RoutingDecisionRecord::new(
+                    &format!("SELECT {}", i),
+                    Some("node".to_string()),
+                    Some(RouteTarget::Standby),
+                    vec!["route".to_string()],
+                    "test".to_string(),
+                    Duration::from_micros(100),
+                ))
+                .await;
         }
 
         let recent = metrics.recent_decisions(3).await;

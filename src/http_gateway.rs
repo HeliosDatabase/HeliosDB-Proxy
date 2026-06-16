@@ -21,7 +21,9 @@ use tokio::net::TcpListener;
 
 use crate::backend::client::QueryResult;
 use crate::backend::types::TextValue;
-use crate::backend::{tls::default_client_config, BackendClient, BackendConfig, ParamValue, TlsMode};
+use crate::backend::{
+    tls::default_client_config, BackendClient, BackendConfig, ParamValue, TlsMode,
+};
 use crate::config::HttpGatewayConfig;
 use crate::{ProxyError, Result};
 
@@ -35,9 +37,14 @@ impl HttpGateway {
     }
 
     pub async fn run(self) -> Result<()> {
-        let listener = TcpListener::bind(&self.config.listen_address).await.map_err(|e| {
-            ProxyError::Network(format!("HTTP gateway bind {}: {}", self.config.listen_address, e))
-        })?;
+        let listener = TcpListener::bind(&self.config.listen_address)
+            .await
+            .map_err(|e| {
+                ProxyError::Network(format!(
+                    "HTTP gateway bind {}: {}",
+                    self.config.listen_address, e
+                ))
+            })?;
         tracing::info!(addr = %self.config.listen_address, "HTTP SQL gateway listening");
         let cfg = Arc::new(self.config);
         loop {
@@ -86,9 +93,17 @@ impl HttpGateway {
             }
             let lower = line.to_ascii_lowercase();
             if lower.starts_with("content-length:") {
-                content_length = line.split(':').nth(1).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+                content_length = line
+                    .split(':')
+                    .nth(1)
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
             } else if lower.starts_with("neon-array-mode:") {
-                array_mode = line.split(':').nth(1).map(|v| v.trim().eq_ignore_ascii_case("true")).unwrap_or(false);
+                array_mode = line
+                    .split(':')
+                    .nth(1)
+                    .map(|v| v.trim().eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
             } else if lower.starts_with("authorization:") {
                 if let Some(tok) = cfg.auth_token.as_ref() {
                     let v = line.split_once(':').map(|x| x.1).unwrap_or("").trim();
@@ -117,9 +132,20 @@ impl HttpGateway {
         }
         let req: Value = match serde_json::from_slice(&body_buf) {
             Ok(v) => v,
-            Err(e) => return Self::respond(&mut writer, 400, &json!({"error": format!("invalid JSON: {}", e)})).await,
+            Err(e) => {
+                return Self::respond(
+                    &mut writer,
+                    400,
+                    &json!({"error": format!("invalid JSON: {}", e)}),
+                )
+                .await
+            }
         };
-        let sql = req.get("query").and_then(|q| q.as_str()).unwrap_or("").trim();
+        let sql = req
+            .get("query")
+            .and_then(|q| q.as_str())
+            .unwrap_or("")
+            .trim();
         if sql.is_empty() {
             return Self::respond(&mut writer, 400, &json!({"error":"missing 'query'"})).await;
         }
@@ -180,8 +206,14 @@ impl HttpGateway {
             "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             status, status_text, payload.len()
         );
-        writer.write_all(head.as_bytes()).await.map_err(|e| ProxyError::Network(format!("write: {}", e)))?;
-        writer.write_all(&payload).await.map_err(|e| ProxyError::Network(format!("write: {}", e)))?;
+        writer
+            .write_all(head.as_bytes())
+            .await
+            .map_err(|e| ProxyError::Network(format!("write: {}", e)))?;
+        writer
+            .write_all(&payload)
+            .await
+            .map_err(|e| ProxyError::Network(format!("write: {}", e)))?;
         Ok(())
     }
 }
@@ -264,8 +296,14 @@ mod tests {
     fn qr() -> QueryResult {
         QueryResult {
             columns: vec![
-                ColumnMeta { name: "id".into(), type_oid: 23 },
-                ColumnMeta { name: "name".into(), type_oid: 25 },
+                ColumnMeta {
+                    name: "id".into(),
+                    type_oid: 23,
+                },
+                ColumnMeta {
+                    name: "name".into(),
+                    type_oid: 25,
+                },
             ],
             rows: vec![
                 vec![TextValue::Text("1".into()), TextValue::Text("alice".into())],

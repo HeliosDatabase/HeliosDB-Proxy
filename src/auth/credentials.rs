@@ -93,11 +93,7 @@ impl DatabaseCredential {
 
         format!(
             "postgresql://{}:{}@{}:{}/{}",
-            self.username,
-            self.password,
-            host,
-            port,
-            database
+            self.username, self.password, host, port, database
         )
     }
 }
@@ -199,11 +195,14 @@ impl CredentialCache {
         }
 
         let ttl = ttl.unwrap_or(self.default_ttl);
-        self.entries.insert(key, CachedCredential {
-            credential,
-            cached_at: Instant::now(),
-            ttl,
-        });
+        self.entries.insert(
+            key,
+            CachedCredential {
+                credential,
+                cached_at: Instant::now(),
+                ttl,
+            },
+        );
     }
 
     fn evict_expired(&mut self) {
@@ -256,12 +255,15 @@ impl CredentialManager {
             match provider.get_credential(key) {
                 Ok(credential) => {
                     // Calculate cache TTL based on credential expiration
-                    let ttl = credential.time_until_expiration()
+                    let ttl = credential
+                        .time_until_expiration()
                         .map(|d| d.min(self.config.cache_ttl))
                         .or(Some(self.config.cache_ttl));
 
                     // Cache and return
-                    self.cache.write().insert(key.to_string(), credential.clone(), ttl);
+                    self.cache
+                        .write()
+                        .insert(key.to_string(), credential.clone(), ttl);
                     return Ok(credential);
                 }
                 Err(CredentialError::NotFound(_)) => continue,
@@ -278,7 +280,8 @@ impl CredentialManager {
         key: &str,
         provider_name: &str,
     ) -> Result<DatabaseCredential, CredentialError> {
-        let provider = self.providers
+        let provider = self
+            .providers
             .iter()
             .find(|p| p.provider_name() == provider_name)
             .ok_or_else(|| CredentialError::ProviderUnavailable(provider_name.to_string()))?;
@@ -295,11 +298,14 @@ impl CredentialManager {
         for provider in &self.providers {
             match provider.refresh_credential(key) {
                 Ok(credential) => {
-                    let ttl = credential.time_until_expiration()
+                    let ttl = credential
+                        .time_until_expiration()
                         .map(|d| d.min(self.config.cache_ttl))
                         .or(Some(self.config.cache_ttl));
 
-                    self.cache.write().insert(key.to_string(), credential.clone(), ttl);
+                    self.cache
+                        .write()
+                        .insert(key.to_string(), credential.clone(), ttl);
                     return Ok(credential);
                 }
                 Err(CredentialError::NotFound(_)) => continue,
@@ -374,26 +380,34 @@ impl CredentialManagerBuilder {
     }
 
     /// Add static provider
-    pub fn with_static_credentials(mut self, credentials: HashMap<String, DatabaseCredential>) -> Self {
-        self.providers.push(Box::new(StaticCredentialProvider::new(credentials)));
+    pub fn with_static_credentials(
+        mut self,
+        credentials: HashMap<String, DatabaseCredential>,
+    ) -> Self {
+        self.providers
+            .push(Box::new(StaticCredentialProvider::new(credentials)));
         self
     }
 
     /// Add environment provider
     pub fn with_environment(mut self, prefix: &str) -> Self {
-        self.providers.push(Box::new(EnvironmentCredentialProvider::new(prefix)));
+        self.providers
+            .push(Box::new(EnvironmentCredentialProvider::new(prefix)));
         self
     }
 
     /// Add Vault provider
     pub fn with_vault(mut self, address: &str, token: &str, mount: &str) -> Self {
-        self.providers.push(Box::new(VaultCredentialProvider::new(address, token, mount)));
+        self.providers.push(Box::new(VaultCredentialProvider::new(
+            address, token, mount,
+        )));
         self
     }
 
     /// Add AWS Secrets Manager provider
     pub fn with_aws_secrets_manager(mut self, region: &str) -> Self {
-        self.providers.push(Box::new(AwsSecretsManagerProvider::new(region)));
+        self.providers
+            .push(Box::new(AwsSecretsManagerProvider::new(region)));
         self
     }
 

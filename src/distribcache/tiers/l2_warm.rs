@@ -58,8 +58,8 @@ impl BloomFilter {
     }
 
     fn hash(&self, data: &[u8], seed: usize) -> u64 {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         seed.hash(&mut hasher);
@@ -242,9 +242,12 @@ impl WarmCache {
         // Store
         self.index.insert(key, metadata);
         self.data.insert(key, compressed);
-        self.current_size.fetch_add(compressed_size as u64, Ordering::Relaxed);
-        self.compressed_size.fetch_add(compressed_size as u64, Ordering::Relaxed);
-        self.uncompressed_size.fetch_add(uncompressed_size as u64, Ordering::Relaxed);
+        self.current_size
+            .fetch_add(compressed_size as u64, Ordering::Relaxed);
+        self.compressed_size
+            .fetch_add(compressed_size as u64, Ordering::Relaxed);
+        self.uncompressed_size
+            .fetch_add(uncompressed_size as u64, Ordering::Relaxed);
     }
 
     /// Invalidate entries for a table
@@ -266,7 +269,8 @@ impl WarmCache {
     fn remove_entry(&self, key: u64) {
         if let Some((_, metadata)) = self.index.remove(&key) {
             self.data.remove(&key);
-            self.current_size.fetch_sub(metadata.compressed_size as u64, Ordering::Relaxed);
+            self.current_size
+                .fetch_sub(metadata.compressed_size as u64, Ordering::Relaxed);
 
             // Clean up table index
             for table in &metadata.tables {
@@ -311,7 +315,7 @@ impl WarmCache {
                 // In production, add lz4_flex crate for native LZ4
                 let mut output = Vec::with_capacity(data.len() + 1);
                 output.push(0x01); // LZ4 marker
-                // Use simple compression for now
+                                   // Use simple compression for now
                 output.extend_from_slice(data);
                 Some(output)
             }
@@ -342,14 +346,14 @@ impl WarmCache {
                 // Real zstd decompression
                 zstd::stream::decode_all(payload).ok()
             }
-            _ => Some(data.to_vec()),       // Unknown, return as-is
+            _ => Some(data.to_vec()), // Unknown, return as-is
         }
     }
 
     /// Convert fingerprint to hash key
     fn fingerprint_to_hash(&self, fingerprint: &QueryFingerprint) -> u64 {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         fingerprint.template.hash(&mut hasher);

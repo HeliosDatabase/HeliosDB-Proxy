@@ -288,7 +288,12 @@ pub struct L3Entry {
 
 impl L3Entry {
     /// Create a new L3 cache entry
-    pub fn new(query: String, embedding: Vec<f32>, context: CacheContext, result: CachedResult) -> Self {
+    pub fn new(
+        query: String,
+        embedding: Vec<f32>,
+        context: CacheContext,
+        result: CachedResult,
+    ) -> Self {
         Self {
             result,
             query,

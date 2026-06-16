@@ -74,7 +74,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// 32-byte Ed25519 public key — the same trust-root format the plugin loader
 /// uses). Returns the matching key's label. Self-contained so `install` needs
 /// no WASM runtime / `wasm-plugins` feature.
-fn verify_against_trust_root(bytes: &[u8], sig_b64: &str, trust_root: &Path) -> Result<String, String> {
+fn verify_against_trust_root(
+    bytes: &[u8],
+    sig_b64: &str,
+    trust_root: &Path,
+) -> Result<String, String> {
     use base64::Engine as _;
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
@@ -104,16 +108,23 @@ fn verify_against_trust_root(bytes: &[u8], sig_b64: &str, trust_root: &Path) -> 
             .as_slice()
             .try_into()
             .map_err(|_| format!("{} must hold a 32-byte pubkey", p.display()))?;
-        let vk =
-            VerifyingKey::from_bytes(&karr).map_err(|e| format!("{} invalid pubkey: {e}", p.display()))?;
+        let vk = VerifyingKey::from_bytes(&karr)
+            .map_err(|e| format!("{} invalid pubkey: {e}", p.display()))?;
         any = true;
         if vk.verify(bytes, &sig).is_ok() {
-            let label = p.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+            let label = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string();
             return Ok(label);
         }
     }
     if !any {
-        return Err(format!("trust root {} has no *.pub keys", trust_root.display()));
+        return Err(format!(
+            "trust root {} has no *.pub keys",
+            trust_root.display()
+        ));
     }
     Err("signature does not match any trusted key".to_string())
 }
@@ -202,7 +213,9 @@ pub fn find_entry<'a>(
         Some(v) => matches
             .find(|e| e.version == v)
             .ok_or_else(|| format!("no plugin '{name}' at version '{v}' in registry")),
-        None => matches.next().ok_or_else(|| format!("no plugin '{name}' in registry")),
+        None => matches
+            .next()
+            .ok_or_else(|| format!("no plugin '{name}' in registry")),
     }
 }
 
@@ -253,9 +266,10 @@ pub fn install(
     // signature against it.
     let mut signed_by = None;
     if let Some(root) = trust_root {
-        let sig = entry.signature.as_deref().ok_or_else(|| {
-            format!("'{name}' has no signature but a trust root was supplied")
-        })?;
+        let sig = entry
+            .signature
+            .as_deref()
+            .ok_or_else(|| format!("'{name}' has no signature but a trust root was supplied"))?;
         let label = verify_against_trust_root(&bytes, sig, root)
             .map_err(|e| format!("signature verification failed for '{name}': {e}"))?;
         signed_by = Some(label);
@@ -304,8 +318,8 @@ pub fn verify(
     trust_root: Option<&Path>,
     sig_path: Option<&Path>,
 ) -> Result<VerifyReport, String> {
-    let bytes = std::fs::read(wasm_path)
-        .map_err(|e| format!("read {}: {}", wasm_path.display(), e))?;
+    let bytes =
+        std::fs::read(wasm_path).map_err(|e| format!("read {}: {}", wasm_path.display(), e))?;
     let sha256 = sha256_hex(&bytes);
 
     let mut signed_by = None;
@@ -328,7 +342,11 @@ pub fn verify(
 /// Writes a `plugin.yaml` manifest, a minimal Rust `src/lib.rs` hook stub, and a
 /// README so `helios-plugin new <name>` gives a buildable starting point.
 pub fn scaffold(name: &str, dir: &Path) -> Result<PathBuf, String> {
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(format!("invalid plugin name '{name}' (use [A-Za-z0-9_-])"));
     }
     let root = dir.join(name);
@@ -351,8 +369,7 @@ pub fn scaffold(name: &str, dir: &Path) -> Result<PathBuf, String> {
     let readme = format!(
         "# {name}\n\nA HeliosProxy WASM plugin.\n\n## Build\n\n```\ncargo build --release --target wasm32-unknown-unknown\n```\n\nThen pack + sign the resulting `.wasm` and add it to your registry index so\n`helios-plugin install {name}` can deploy it.\n"
     );
-    std::fs::write(root.join("README.md"), readme)
-        .map_err(|e| format!("write README.md: {e}"))?;
+    std::fs::write(root.join("README.md"), readme).map_err(|e| format!("write README.md: {e}"))?;
 
     Ok(root)
 }
@@ -418,8 +435,11 @@ mod tests {
 
         // Trusted publisher signs the artefact.
         let key = SigningKey::from_bytes(&[7u8; 32]);
-        std::fs::write(trust.path().join("official.pub"), b64(&key.verifying_key().to_bytes()))
-            .unwrap();
+        std::fs::write(
+            trust.path().join("official.pub"),
+            b64(&key.verifying_key().to_bytes()),
+        )
+        .unwrap();
         let sig = b64(&key.sign(WASM).to_bytes());
         let index = make_registry(src.path(), Some(&sig));
 
@@ -436,8 +456,11 @@ mod tests {
 
         // Trust root holds the official key; an attacker signs with another.
         let official = SigningKey::from_bytes(&[7u8; 32]);
-        std::fs::write(trust.path().join("official.pub"), b64(&official.verifying_key().to_bytes()))
-            .unwrap();
+        std::fs::write(
+            trust.path().join("official.pub"),
+            b64(&official.verifying_key().to_bytes()),
+        )
+        .unwrap();
         let attacker = SigningKey::from_bytes(&[0xABu8; 32]);
         let sig = b64(&attacker.sign(WASM).to_bytes());
         let index = make_registry(src.path(), Some(&sig));
@@ -452,8 +475,11 @@ mod tests {
         let dst = tempfile::tempdir().unwrap();
         let trust = tempfile::tempdir().unwrap();
         let key = SigningKey::from_bytes(&[7u8; 32]);
-        std::fs::write(trust.path().join("official.pub"), b64(&key.verifying_key().to_bytes()))
-            .unwrap();
+        std::fs::write(
+            trust.path().join("official.pub"),
+            b64(&key.verifying_key().to_bytes()),
+        )
+        .unwrap();
         let index = make_registry(src.path(), None); // unsigned entry
 
         let err = install(&index, "colmask", None, dst.path(), Some(trust.path())).unwrap_err();
@@ -495,8 +521,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let trust = tempfile::tempdir().unwrap();
         let key = SigningKey::from_bytes(&[7u8; 32]);
-        std::fs::write(trust.path().join("official.pub"), b64(&key.verifying_key().to_bytes()))
-            .unwrap();
+        std::fs::write(
+            trust.path().join("official.pub"),
+            b64(&key.verifying_key().to_bytes()),
+        )
+        .unwrap();
         let wasm = dir.path().join("p.wasm");
         std::fs::write(&wasm, WASM).unwrap();
         // `p.wasm` -> `p.sig` sidecar (with_extension), matching the loader.
@@ -511,8 +540,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let trust = tempfile::tempdir().unwrap();
         let key = SigningKey::from_bytes(&[7u8; 32]);
-        std::fs::write(trust.path().join("official.pub"), b64(&key.verifying_key().to_bytes()))
-            .unwrap();
+        std::fs::write(
+            trust.path().join("official.pub"),
+            b64(&key.verifying_key().to_bytes()),
+        )
+        .unwrap();
         let wasm = dir.path().join("p.wasm");
         // Sign the real bytes, but write tampered bytes to disk.
         std::fs::write(dir.path().join("p.sig"), b64(&key.sign(WASM).to_bytes())).unwrap();

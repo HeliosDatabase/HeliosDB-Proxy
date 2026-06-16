@@ -7,7 +7,7 @@
 
 use dashmap::DashMap;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::{CacheEntry, EvictionPolicy, LFUEviction, TierStats};
@@ -113,7 +113,8 @@ impl HotCache {
 
         // Remove old entry if exists
         if let Some((_, old_entry)) = self.cache.remove(&key) {
-            self.current_size.fetch_sub(old_entry.size(), Ordering::Relaxed);
+            self.current_size
+                .fetch_sub(old_entry.size(), Ordering::Relaxed);
             self.eviction.remove(key);
         }
 
@@ -127,10 +128,7 @@ impl HotCache {
 
         // Track session affinity
         if let Some(sid) = session {
-            self.session_affinity
-                .entry(sid)
-                .or_default()
-                .insert(key);
+            self.session_affinity.entry(sid).or_default().insert(key);
         }
 
         // Insert entry
@@ -205,8 +203,8 @@ impl HotCache {
 
     /// Convert fingerprint to hash key
     fn fingerprint_to_hash(&self, fingerprint: &QueryFingerprint) -> u64 {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         fingerprint.template.hash(&mut hasher);
@@ -250,7 +248,9 @@ impl HotCache {
     }
 
     /// Iterate over all entries (for L3 invalidation broadcast)
-    pub fn iter(&self) -> impl Iterator<Item = dashmap::mapref::multiple::RefMulti<'_, u64, CacheEntry>> {
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<Item = dashmap::mapref::multiple::RefMulti<'_, u64, CacheEntry>> {
         self.cache.iter()
     }
 
@@ -285,8 +285,10 @@ mod tests {
         // Small cache to force eviction
         let cache = HotCache::new(200, 100, EvictionPolicy::LFU);
 
-        let table_names = ["alpha", "bravo", "charlie", "delta", "echo",
-                           "foxtrot", "golf", "hotel", "india", "juliet"];
+        let table_names = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+            "juliet",
+        ];
         for name in &table_names {
             let fp = QueryFingerprint::from_query(&format!("SELECT * FROM {}", name));
             let entry = CacheEntry::new(vec![0; 50], vec![], 1);

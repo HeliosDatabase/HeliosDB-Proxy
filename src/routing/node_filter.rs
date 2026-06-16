@@ -2,9 +2,7 @@
 //!
 //! Filters nodes based on routing hints and consistency requirements.
 
-use super::{
-    ConsistencyLevel, ParsedHints, RouteTarget, RoutingConfig, RoutingError, Result,
-};
+use super::{ConsistencyLevel, ParsedHints, Result, RouteTarget, RoutingConfig, RoutingError};
 use std::time::Duration;
 
 /// Node information for filtering
@@ -114,9 +112,11 @@ impl SyncMode {
             RouteTarget::Sync => *self == SyncMode::Sync,
             RouteTarget::SemiSync => *self == SyncMode::SemiSync,
             RouteTarget::Async => *self == SyncMode::Async,
-            RouteTarget::Standby => matches!(self, SyncMode::Sync | SyncMode::SemiSync | SyncMode::Async),
+            RouteTarget::Standby => {
+                matches!(self, SyncMode::Sync | SyncMode::SemiSync | SyncMode::Async)
+            }
             RouteTarget::Any => true,
-            RouteTarget::Local => true, // Handled separately
+            RouteTarget::Local => true,  // Handled separately
             RouteTarget::Vector => true, // Handled via tags
         }
     }
@@ -147,14 +147,9 @@ impl NodeFilter {
     }
 
     /// Filter nodes based on criteria
-    pub fn filter<'a>(
-        &self,
-        nodes: &'a [NodeInfo],
-        criteria: &NodeCriteria,
-    ) -> FilterResult<'a> {
-        let mut eligible: Vec<&NodeInfo> = nodes.iter()
-            .filter(|n| n.healthy && n.enabled)
-            .collect();
+    pub fn filter<'a>(&self, nodes: &'a [NodeInfo], criteria: &NodeCriteria) -> FilterResult<'a> {
+        let mut eligible: Vec<&NodeInfo> =
+            nodes.iter().filter(|n| n.healthy && n.enabled).collect();
 
         let mut reasons = Vec::new();
 
@@ -207,7 +202,8 @@ impl NodeFilter {
         // Handle local routing
         if criteria.route == Some(RouteTarget::Local) {
             if let Some(ref local_zone) = self.local_zone {
-                let local_nodes: Vec<_> = eligible.iter()
+                let local_nodes: Vec<_> = eligible
+                    .iter()
                     .filter(|n| n.zone.as_ref() == Some(local_zone))
                     .copied()
                     .collect();
@@ -221,7 +217,8 @@ impl NodeFilter {
 
         // Handle vector routing
         if criteria.route == Some(RouteTarget::Vector) {
-            let vector_nodes: Vec<_> = eligible.iter()
+            let vector_nodes: Vec<_> = eligible
+                .iter()
                 .filter(|n| n.has_tag("vector"))
                 .copied()
                 .collect();
@@ -265,14 +262,21 @@ impl NodeFilter {
     }
 
     /// Check if node meets consistency requirements
-    fn meets_consistency(&self, node: &NodeInfo, level: ConsistencyLevel, max_lag: Option<Duration>) -> bool {
+    fn meets_consistency(
+        &self,
+        node: &NodeInfo,
+        level: ConsistencyLevel,
+        max_lag: Option<Duration>,
+    ) -> bool {
         let config = match self.config.get_consistency_config(level) {
             Some(c) => c,
             None => return true, // No config = allow all
         };
 
         // Check if node name matches allowed patterns
-        if !config.allows_node(&node.name) && !config.allows_node(&format!("{:?}", node.role).to_lowercase()) {
+        if !config.allows_node(&node.name)
+            && !config.allows_node(&format!("{:?}", node.role).to_lowercase())
+        {
             return false;
         }
 
@@ -490,10 +494,10 @@ mod tests {
     #[test]
     fn test_filter_with_alias() {
         let mut config = RoutingConfig::default();
-        config.add_alias("analytics", vec![
-            "standby-async-1".to_string(),
-            "standby-async-2".to_string(),
-        ]);
+        config.add_alias(
+            "analytics",
+            vec!["standby-async-1".to_string(), "standby-async-2".to_string()],
+        );
 
         let filter = NodeFilter::new(config);
         let nodes = test_nodes();
@@ -508,8 +512,7 @@ mod tests {
 
     #[test]
     fn test_local_zone_preference() {
-        let filter = NodeFilter::new(RoutingConfig::default())
-            .with_local_zone("us-west-1");
+        let filter = NodeFilter::new(RoutingConfig::default()).with_local_zone("us-west-1");
 
         let nodes = vec![
             NodeInfo::standby("standby-1", SyncMode::Async).with_zone("us-east-1"),

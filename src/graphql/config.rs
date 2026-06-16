@@ -371,8 +371,7 @@ impl TableConfig {
 }
 
 /// Table authorization configuration
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct AuthorizationConfig {
     /// Roles that can read
     pub read_roles: Vec<String>,
@@ -385,7 +384,6 @@ pub struct AuthorizationConfig {
     /// Row-level security filter expression
     pub row_filter: Option<String>,
 }
-
 
 /// Relationship configuration
 #[derive(Debug, Clone)]

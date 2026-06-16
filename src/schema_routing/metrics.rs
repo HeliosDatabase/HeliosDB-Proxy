@@ -10,8 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use super::{
-    DataTemperature, WorkloadType, AccessPattern,
-    RoutingDecision, AIWorkloadType, RAGStage,
+    AIWorkloadType, AccessPattern, DataTemperature, RAGStage, RoutingDecision, WorkloadType,
 };
 
 /// Schema routing metrics collector
@@ -69,7 +68,12 @@ impl TableStats {
     }
 
     /// Record a query
-    pub fn record_query(&mut self, pattern: AccessPattern, workload: WorkloadType, latency_us: u64) {
+    pub fn record_query(
+        &mut self,
+        pattern: AccessPattern,
+        workload: WorkloadType,
+        latency_us: u64,
+    ) {
         self.total_queries += 1;
         *self.by_access_pattern.entry(pattern).or_insert(0) += 1;
         *self.by_workload.entry(workload).or_insert(0) += 1;
@@ -162,25 +166,42 @@ pub struct AIWorkloadStats {
 
 impl AIWorkloadStats {
     /// Record an AI workload query
-    pub fn record(&mut self, workload_type: AIWorkloadType, vector_dims: Option<u64>, top_k: Option<u64>) {
+    pub fn record(
+        &mut self,
+        workload_type: AIWorkloadType,
+        vector_dims: Option<u64>,
+        top_k: Option<u64>,
+    ) {
         self.total_queries += 1;
 
         match workload_type {
             AIWorkloadType::EmbeddingRetrieval => {
                 self.embedding_retrieval += 1;
-                *self.by_type.entry("embedding_retrieval".to_string()).or_insert(0) += 1;
+                *self
+                    .by_type
+                    .entry("embedding_retrieval".to_string())
+                    .or_insert(0) += 1;
             }
             AIWorkloadType::ContextLookup => {
                 self.context_lookup += 1;
-                *self.by_type.entry("context_lookup".to_string()).or_insert(0) += 1;
+                *self
+                    .by_type
+                    .entry("context_lookup".to_string())
+                    .or_insert(0) += 1;
             }
             AIWorkloadType::KnowledgeBase => {
                 self.knowledge_base += 1;
-                *self.by_type.entry("knowledge_base".to_string()).or_insert(0) += 1;
+                *self
+                    .by_type
+                    .entry("knowledge_base".to_string())
+                    .or_insert(0) += 1;
             }
             AIWorkloadType::ToolExecution => {
                 self.tool_execution += 1;
-                *self.by_type.entry("tool_execution".to_string()).or_insert(0) += 1;
+                *self
+                    .by_type
+                    .entry("tool_execution".to_string())
+                    .or_insert(0) += 1;
             }
         }
 
@@ -226,7 +247,8 @@ impl RAGStats {
                 if self.avg_retrieval_latency_us == 0 {
                     self.avg_retrieval_latency_us = latency_us;
                 } else {
-                    self.avg_retrieval_latency_us = (self.avg_retrieval_latency_us * 9 + latency_us) / 10;
+                    self.avg_retrieval_latency_us =
+                        (self.avg_retrieval_latency_us * 9 + latency_us) / 10;
                 }
             }
             RAGStage::Fetch => {
@@ -386,27 +408,38 @@ impl SchemaRoutingMetrics {
 
     /// Record a routing decision
     pub async fn record_routing(&self, decision: &RoutingDecision, latency_us: u64) {
-        self.routing_stats.total_queries.fetch_add(1, Ordering::Relaxed);
+        self.routing_stats
+            .total_queries
+            .fetch_add(1, Ordering::Relaxed);
 
         match &decision.target {
             super::RouteTarget::Primary => {
-                self.routing_stats.primary_routes.fetch_add(1, Ordering::Relaxed);
+                self.routing_stats
+                    .primary_routes
+                    .fetch_add(1, Ordering::Relaxed);
             }
             super::RouteTarget::Node(_) => {
-                self.routing_stats.replica_routes.fetch_add(1, Ordering::Relaxed);
+                self.routing_stats
+                    .replica_routes
+                    .fetch_add(1, Ordering::Relaxed);
             }
             super::RouteTarget::Shard(_) => {
-                self.routing_stats.shard_targeted.fetch_add(1, Ordering::Relaxed);
+                self.routing_stats
+                    .shard_targeted
+                    .fetch_add(1, Ordering::Relaxed);
             }
             super::RouteTarget::ScatterGather => {
-                self.routing_stats.scatter_gather.fetch_add(1, Ordering::Relaxed);
+                self.routing_stats
+                    .scatter_gather
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
 
         // Update node stats if routed to specific node
         if let super::RouteTarget::Node(node_id) = &decision.target {
             let mut node_stats = self.node_stats.write().await;
-            let stats = node_stats.entry(node_id.clone())
+            let stats = node_stats
+                .entry(node_id.clone())
                 .or_insert_with(|| NodeStats {
                     node_id: node_id.clone(),
                     ..Default::default()
@@ -436,20 +469,32 @@ impl SchemaRoutingMetrics {
         latency_us: u64,
     ) {
         let mut table_stats = self.table_stats.write().await;
-        let stats = table_stats.entry(table.to_string())
+        let stats = table_stats
+            .entry(table.to_string())
             .or_insert_with(|| TableStats::new(table));
         stats.record_query(pattern, workload, latency_us);
     }
 
     /// Record a workload routing
-    pub async fn record_workload(&self, workload: WorkloadType, to_primary: bool, is_scatter: bool, latency_us: u64) {
+    pub async fn record_workload(
+        &self,
+        workload: WorkloadType,
+        to_primary: bool,
+        is_scatter: bool,
+        latency_us: u64,
+    ) {
         let mut workload_stats = self.workload_stats.write().await;
         let stats = workload_stats.entry(workload).or_default();
         stats.record(to_primary, is_scatter, latency_us);
     }
 
     /// Record an AI workload query
-    pub async fn record_ai_workload(&self, workload_type: AIWorkloadType, vector_dims: Option<u64>, top_k: Option<u64>) {
+    pub async fn record_ai_workload(
+        &self,
+        workload_type: AIWorkloadType,
+        vector_dims: Option<u64>,
+        top_k: Option<u64>,
+    ) {
         self.routing_stats.ai_routes.fetch_add(1, Ordering::Relaxed);
         let mut ai_stats = self.ai_stats.write().await;
         ai_stats.record(workload_type, vector_dims, top_k);
@@ -457,7 +502,9 @@ impl SchemaRoutingMetrics {
 
     /// Record a RAG stage execution
     pub async fn record_rag_stage(&self, stage: RAGStage, latency_us: u64) {
-        self.routing_stats.rag_routes.fetch_add(1, Ordering::Relaxed);
+        self.routing_stats
+            .rag_routes
+            .fetch_add(1, Ordering::Relaxed);
         let mut rag_stats = self.rag_stats.write().await;
         rag_stats.record_stage(stage, latency_us);
     }
@@ -465,15 +512,21 @@ impl SchemaRoutingMetrics {
     /// Record a classification cache hit or miss
     pub fn record_classification_lookup(&self, hit: bool) {
         if hit {
-            self.routing_stats.classification_hits.fetch_add(1, Ordering::Relaxed);
+            self.routing_stats
+                .classification_hits
+                .fetch_add(1, Ordering::Relaxed);
         } else {
-            self.routing_stats.classification_misses.fetch_add(1, Ordering::Relaxed);
+            self.routing_stats
+                .classification_misses
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// Record a routing error
     pub fn record_error(&self) {
-        self.routing_stats.routing_errors.fetch_add(1, Ordering::Relaxed);
+        self.routing_stats
+            .routing_errors
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get overall routing stats
@@ -547,18 +600,36 @@ impl SchemaRoutingMetrics {
 
         // Reset atomic counters
         self.routing_stats.total_queries.store(0, Ordering::Relaxed);
-        self.routing_stats.schema_aware_routes.store(0, Ordering::Relaxed);
-        self.routing_stats.fallback_routes.store(0, Ordering::Relaxed);
-        self.routing_stats.shard_targeted.store(0, Ordering::Relaxed);
-        self.routing_stats.scatter_gather.store(0, Ordering::Relaxed);
-        self.routing_stats.primary_routes.store(0, Ordering::Relaxed);
-        self.routing_stats.replica_routes.store(0, Ordering::Relaxed);
+        self.routing_stats
+            .schema_aware_routes
+            .store(0, Ordering::Relaxed);
+        self.routing_stats
+            .fallback_routes
+            .store(0, Ordering::Relaxed);
+        self.routing_stats
+            .shard_targeted
+            .store(0, Ordering::Relaxed);
+        self.routing_stats
+            .scatter_gather
+            .store(0, Ordering::Relaxed);
+        self.routing_stats
+            .primary_routes
+            .store(0, Ordering::Relaxed);
+        self.routing_stats
+            .replica_routes
+            .store(0, Ordering::Relaxed);
         self.routing_stats.ai_routes.store(0, Ordering::Relaxed);
         self.routing_stats.rag_routes.store(0, Ordering::Relaxed);
         self.routing_stats.vector_routes.store(0, Ordering::Relaxed);
-        self.routing_stats.classification_hits.store(0, Ordering::Relaxed);
-        self.routing_stats.classification_misses.store(0, Ordering::Relaxed);
-        self.routing_stats.routing_errors.store(0, Ordering::Relaxed);
+        self.routing_stats
+            .classification_hits
+            .store(0, Ordering::Relaxed);
+        self.routing_stats
+            .classification_misses
+            .store(0, Ordering::Relaxed);
+        self.routing_stats
+            .routing_errors
+            .store(0, Ordering::Relaxed);
     }
 
     /// Generate metrics report
@@ -591,7 +662,9 @@ impl SchemaRoutingMetrics {
             error_rate: if routing.total_queries() == 0 {
                 0.0
             } else {
-                (routing.routing_errors.load(Ordering::Relaxed) as f64 / routing.total_queries() as f64) * 100.0
+                (routing.routing_errors.load(Ordering::Relaxed) as f64
+                    / routing.total_queries() as f64)
+                    * 100.0
             },
         }
     }
@@ -613,15 +686,21 @@ impl SchemaRoutingMetrics {
             Ok(h) => {
                 let stats = h.block_on(async {
                     let guard = table_stats.read().await;
-                    guard.iter().map(|(name, stats)| {
-                        (name.clone(), TableStatsForAdmin {
-                            query_count: stats.total_queries,
-                            avg_latency_ms: stats.avg_latency_us as f64 / 1000.0,
-                            cache_hit_rate: stats.cache_hit_rate,
-                            temperature: infer_temperature_from_count(stats.total_queries),
-                            workload: infer_workload_from_stats(stats),
+                    guard
+                        .iter()
+                        .map(|(name, stats)| {
+                            (
+                                name.clone(),
+                                TableStatsForAdmin {
+                                    query_count: stats.total_queries,
+                                    avg_latency_ms: stats.avg_latency_us as f64 / 1000.0,
+                                    cache_hit_rate: stats.cache_hit_rate,
+                                    temperature: infer_temperature_from_count(stats.total_queries),
+                                    workload: infer_workload_from_stats(stats),
+                                },
+                            )
                         })
-                    }).collect::<Vec<_>>()
+                        .collect::<Vec<_>>()
                 });
                 stats
             }
@@ -634,19 +713,23 @@ impl SchemaRoutingMetrics {
         let workload_stats = self.workload_stats.clone();
         let handle = tokio::runtime::Handle::try_current();
         match handle {
-            Ok(h) => {
-                h.block_on(async {
-                    let guard = workload_stats.read().await;
-                    guard.iter().map(|(workload, stats)| {
-                        (*workload, WorkloadStatsForAdmin {
-                            query_count: stats.total_queries,
-                            avg_latency_ms: stats.avg_latency_us as f64 / 1000.0,
-                            queries_to_primary: stats.routed_to_primary,
-                            queries_to_replica: stats.routed_to_replica,
-                        })
-                    }).collect::<Vec<_>>()
-                })
-            }
+            Ok(h) => h.block_on(async {
+                let guard = workload_stats.read().await;
+                guard
+                    .iter()
+                    .map(|(workload, stats)| {
+                        (
+                            *workload,
+                            WorkloadStatsForAdmin {
+                                query_count: stats.total_queries,
+                                avg_latency_ms: stats.avg_latency_us as f64 / 1000.0,
+                                queries_to_primary: stats.routed_to_primary,
+                                queries_to_replica: stats.routed_to_replica,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            }),
             Err(_) => Vec::new(),
         }
     }
@@ -656,18 +739,16 @@ impl SchemaRoutingMetrics {
         let ai_stats = self.ai_stats.clone();
         let handle = tokio::runtime::Handle::try_current();
         match handle {
-            Ok(h) => {
-                h.block_on(async {
-                    let guard = ai_stats.read().await;
-                    AIWorkloadStatsForAdmin {
-                        embedding_retrieval_count: guard.embedding_retrieval,
-                        context_lookup_count: guard.context_lookup,
-                        knowledge_base_count: guard.knowledge_base,
-                        tool_execution_count: guard.tool_execution,
-                        avg_vector_dimensions: guard.avg_vector_dimensions as f64,
-                    }
-                })
-            }
+            Ok(h) => h.block_on(async {
+                let guard = ai_stats.read().await;
+                AIWorkloadStatsForAdmin {
+                    embedding_retrieval_count: guard.embedding_retrieval,
+                    context_lookup_count: guard.context_lookup,
+                    knowledge_base_count: guard.knowledge_base,
+                    tool_execution_count: guard.tool_execution,
+                    avg_vector_dimensions: guard.avg_vector_dimensions as f64,
+                }
+            }),
             Err(_) => AIWorkloadStatsForAdmin::default(),
         }
     }
@@ -677,23 +758,20 @@ impl SchemaRoutingMetrics {
         let rag_stats = self.rag_stats.clone();
         let handle = tokio::runtime::Handle::try_current();
         match handle {
-            Ok(h) => {
-                h.block_on(async {
-                    let guard = rag_stats.read().await;
-                    RAGStatsForAdmin {
-                        retrieval_count: guard.retrieval_count,
-                        avg_retrieval_latency_ms: guard.avg_retrieval_latency_us as f64 / 1000.0,
-                        fetch_count: guard.fetch_count,
-                        avg_fetch_latency_ms: guard.avg_fetch_latency_us as f64 / 1000.0,
-                        total_pipeline_executions: guard.total_queries,
-                        avg_total_latency_ms: guard.avg_pipeline_latency_us as f64 / 1000.0,
-                    }
-                })
-            }
+            Ok(h) => h.block_on(async {
+                let guard = rag_stats.read().await;
+                RAGStatsForAdmin {
+                    retrieval_count: guard.retrieval_count,
+                    avg_retrieval_latency_ms: guard.avg_retrieval_latency_us as f64 / 1000.0,
+                    fetch_count: guard.fetch_count,
+                    avg_fetch_latency_ms: guard.avg_fetch_latency_us as f64 / 1000.0,
+                    total_pipeline_executions: guard.total_queries,
+                    avg_total_latency_ms: guard.avg_pipeline_latency_us as f64 / 1000.0,
+                }
+            }),
             Err(_) => RAGStatsForAdmin::default(),
         }
     }
-
 }
 
 /// Infer temperature from query count
@@ -711,9 +789,21 @@ fn infer_temperature_from_count(query_count: u64) -> DataTemperature {
 
 /// Infer workload from stats
 fn infer_workload_from_stats(stats: &TableStats) -> WorkloadType {
-    let olap_count = stats.by_access_pattern.get(&AccessPattern::FullScan).copied().unwrap_or(0);
-    let vector_count = stats.by_access_pattern.get(&AccessPattern::VectorSearch).copied().unwrap_or(0);
-    let point_count = stats.by_access_pattern.get(&AccessPattern::PointLookup).copied().unwrap_or(0);
+    let olap_count = stats
+        .by_access_pattern
+        .get(&AccessPattern::FullScan)
+        .copied()
+        .unwrap_or(0);
+    let vector_count = stats
+        .by_access_pattern
+        .get(&AccessPattern::VectorSearch)
+        .copied()
+        .unwrap_or(0);
+    let point_count = stats
+        .by_access_pattern
+        .get(&AccessPattern::PointLookup)
+        .copied()
+        .unwrap_or(0);
 
     if vector_count > stats.total_queries / 3 {
         WorkloadType::Vector
@@ -758,8 +848,10 @@ pub struct AIWorkloadStatsForAdmin {
 impl AIWorkloadStatsForAdmin {
     /// Get total AI queries
     pub fn total_ai_queries(&self) -> u64 {
-        self.embedding_retrieval_count + self.context_lookup_count +
-            self.knowledge_base_count + self.tool_execution_count
+        self.embedding_retrieval_count
+            + self.context_lookup_count
+            + self.knowledge_base_count
+            + self.tool_execution_count
     }
 }
 
@@ -801,8 +893,8 @@ pub struct MetricsReport {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{RouteTarget, RoutingReason};
+    use super::*;
 
     fn sample_decision() -> RoutingDecision {
         RoutingDecision {
@@ -828,29 +920,52 @@ mod tests {
         metrics.record_routing(&decision, 1000).await;
 
         assert_eq!(metrics.get_routing_stats().total_queries(), 1);
-        assert_eq!(metrics.get_routing_stats().primary_routes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics
+                .get_routing_stats()
+                .primary_routes
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test]
     async fn test_record_table_query() {
         let metrics = SchemaRoutingMetrics::new();
 
-        metrics.record_table_query("users", AccessPattern::PointLookup, WorkloadType::OLTP, 500).await;
-        metrics.record_table_query("users", AccessPattern::PointLookup, WorkloadType::OLTP, 600).await;
+        metrics
+            .record_table_query("users", AccessPattern::PointLookup, WorkloadType::OLTP, 500)
+            .await;
+        metrics
+            .record_table_query("users", AccessPattern::PointLookup, WorkloadType::OLTP, 600)
+            .await;
 
         let stats = metrics.get_table_stats("users").await.unwrap();
         assert_eq!(stats.total_queries, 2);
-        assert_eq!(*stats.by_access_pattern.get(&AccessPattern::PointLookup).unwrap(), 2);
+        assert_eq!(
+            *stats
+                .by_access_pattern
+                .get(&AccessPattern::PointLookup)
+                .unwrap(),
+            2
+        );
     }
 
     #[tokio::test]
     async fn test_record_workload() {
         let metrics = SchemaRoutingMetrics::new();
 
-        metrics.record_workload(WorkloadType::OLTP, true, false, 100).await;
-        metrics.record_workload(WorkloadType::OLTP, false, false, 200).await;
+        metrics
+            .record_workload(WorkloadType::OLTP, true, false, 100)
+            .await;
+        metrics
+            .record_workload(WorkloadType::OLTP, false, false, 200)
+            .await;
 
-        let stats = metrics.get_workload_stats(WorkloadType::OLTP).await.unwrap();
+        let stats = metrics
+            .get_workload_stats(WorkloadType::OLTP)
+            .await
+            .unwrap();
         assert_eq!(stats.total_queries, 2);
         assert_eq!(stats.routed_to_primary, 1);
         assert_eq!(stats.routed_to_replica, 1);
@@ -860,8 +975,12 @@ mod tests {
     async fn test_record_ai_workload() {
         let metrics = SchemaRoutingMetrics::new();
 
-        metrics.record_ai_workload(AIWorkloadType::EmbeddingRetrieval, Some(1536), Some(10)).await;
-        metrics.record_ai_workload(AIWorkloadType::ContextLookup, None, None).await;
+        metrics
+            .record_ai_workload(AIWorkloadType::EmbeddingRetrieval, Some(1536), Some(10))
+            .await;
+        metrics
+            .record_ai_workload(AIWorkloadType::ContextLookup, None, None)
+            .await;
 
         let stats = metrics.get_ai_stats().await;
         assert_eq!(stats.total_queries, 2);
@@ -927,7 +1046,10 @@ mod tests {
         metrics.record_classification_lookup(true);
         metrics.record_classification_lookup(false);
 
-        assert_eq!(metrics.get_routing_stats().classification_hit_rate(), 2.0 / 3.0);
+        assert_eq!(
+            metrics.get_routing_stats().classification_hit_rate(),
+            2.0 / 3.0
+        );
     }
 
     #[tokio::test]
@@ -937,7 +1059,13 @@ mod tests {
         metrics.record_error();
         metrics.record_error();
 
-        assert_eq!(metrics.get_routing_stats().routing_errors.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            metrics
+                .get_routing_stats()
+                .routing_errors
+                .load(Ordering::Relaxed),
+            2
+        );
     }
 
     #[tokio::test]
@@ -946,8 +1074,12 @@ mod tests {
 
         // Record some data
         metrics.record_routing(&sample_decision(), 1000).await;
-        metrics.record_table_query("users", AccessPattern::PointLookup, WorkloadType::OLTP, 500).await;
-        metrics.record_ai_workload(AIWorkloadType::EmbeddingRetrieval, None, None).await;
+        metrics
+            .record_table_query("users", AccessPattern::PointLookup, WorkloadType::OLTP, 500)
+            .await;
+        metrics
+            .record_ai_workload(AIWorkloadType::EmbeddingRetrieval, None, None)
+            .await;
 
         // Reset
         metrics.reset().await;
@@ -966,8 +1098,12 @@ mod tests {
         for _ in 0..10 {
             metrics.record_routing(&sample_decision(), 1000).await;
         }
-        metrics.record_table_query("users", AccessPattern::PointLookup, WorkloadType::OLTP, 500).await;
-        metrics.record_ai_workload(AIWorkloadType::EmbeddingRetrieval, None, None).await;
+        metrics
+            .record_table_query("users", AccessPattern::PointLookup, WorkloadType::OLTP, 500)
+            .await;
+        metrics
+            .record_ai_workload(AIWorkloadType::EmbeddingRetrieval, None, None)
+            .await;
         metrics.record_rag_stage(RAGStage::Retrieval, 5000).await;
 
         let report = metrics.generate_report().await;
@@ -1006,8 +1142,20 @@ mod tests {
         stats.record_query(AccessPattern::RangeScan, WorkloadType::OLTP, 200);
 
         assert_eq!(stats.total_queries, 2);
-        assert_eq!(*stats.by_access_pattern.get(&AccessPattern::PointLookup).unwrap(), 1);
-        assert_eq!(*stats.by_access_pattern.get(&AccessPattern::RangeScan).unwrap(), 1);
+        assert_eq!(
+            *stats
+                .by_access_pattern
+                .get(&AccessPattern::PointLookup)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            *stats
+                .by_access_pattern
+                .get(&AccessPattern::RangeScan)
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

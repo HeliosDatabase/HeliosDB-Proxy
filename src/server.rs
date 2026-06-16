@@ -8,12 +8,11 @@ use crate::admin::{AdminServer, AdminState, ConfigSnapshot, NodeSnapshot};
 use crate::backend::{tls::default_client_config, BackendConfig, TlsMode};
 use crate::client_tls::{build_tls_acceptor, ClientStream};
 use crate::config::{HbaAction, HbaRule, NodeConfig, NodeRole, ProxyConfig, TrMode};
-use crate::protocol::{
-    ErrorResponse, Message, MessageType, ProtocolCodec,
-    StartupMessage, TransactionStatus,
-};
 #[cfg(feature = "wasm-plugins")]
 use crate::protocol::QueryMessage;
+use crate::protocol::{
+    ErrorResponse, Message, MessageType, ProtocolCodec, StartupMessage, TransactionStatus,
+};
 use crate::{ProxyError, Result};
 use arc_swap::ArcSwap;
 use bytes::{BufMut, BytesMut};
@@ -30,11 +29,9 @@ use uuid::Uuid;
 
 // Pool-modes feature imports
 #[cfg(feature = "pool-modes")]
-use crate::pool::{
-    ConnectionPoolManager, PoolModeConfig, PoolingMode,
-};
-#[cfg(feature = "pool-modes")]
 use crate::pool::lease::ClientId;
+#[cfg(feature = "pool-modes")]
+use crate::pool::{ConnectionPoolManager, PoolModeConfig, PoolingMode};
 #[cfg(feature = "pool-modes")]
 use crate::NodeEndpoint;
 
@@ -344,7 +341,11 @@ struct BackendConn {
 
 impl BackendConn {
     fn new(stream: TcpStream) -> Self {
-        Self { stream, prepared: HashSet::new(), unnamed_sig: None }
+        Self {
+            stream,
+            prepared: HashSet::new(),
+            unnamed_sig: None,
+        }
     }
 }
 
@@ -358,7 +359,11 @@ pub(crate) fn bind_reuseport(addr: &str) -> Result<TcpListener> {
     let sockaddr: SocketAddr = addr
         .parse()
         .map_err(|e| ProxyError::Config(format!("invalid listen address '{}': {}", addr, e)))?;
-    let domain = if sockaddr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let domain = if sockaddr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
         .map_err(|e| ProxyError::Network(format!("socket(): {}", e)))?;
     socket
@@ -537,12 +542,8 @@ impl ProxyServer {
                     crate::config::PreparedStatementMode::Disable => {
                         PoolPreparedStatementMode::Disable
                     }
-                    crate::config::PreparedStatementMode::Track => {
-                        PoolPreparedStatementMode::Track
-                    }
-                    crate::config::PreparedStatementMode::Named => {
-                        PoolPreparedStatementMode::Named
-                    }
+                    crate::config::PreparedStatementMode::Track => PoolPreparedStatementMode::Track,
+                    crate::config::PreparedStatementMode::Named => PoolPreparedStatementMode::Named,
                 },
                 test_on_acquire: config.pool.test_on_acquire,
                 validation_query: "SELECT 1".to_string(),
@@ -620,15 +621,11 @@ impl ProxyServer {
             #[cfg(feature = "wasm-plugins")]
             plugin_manager,
             #[cfg(feature = "ha-tr")]
-            transaction_journal: Arc::new(
-                crate::transaction_journal::TransactionJournal::new(),
-            ),
+            transaction_journal: Arc::new(crate::transaction_journal::TransactionJournal::new()),
             #[cfg(feature = "anomaly-detection")]
-            anomaly_detector: Arc::new(
-                crate::anomaly::AnomalyDetector::new(
-                    crate::anomaly::AnomalyConfig::default(),
-                ),
-            ),
+            anomaly_detector: Arc::new(crate::anomaly::AnomalyDetector::new(
+                crate::anomaly::AnomalyConfig::default(),
+            )),
             #[cfg(feature = "edge-proxy")]
             edge_cache: Arc::new(crate::edge::EdgeCache::new(10_000)),
             #[cfg(feature = "edge-proxy")]
@@ -803,7 +800,10 @@ impl ProxyServer {
         // old one to close its listener and drain (Batch H, item 84).
         let listener = bind_reuseport(&self.config.listen_address)?;
 
-        tracing::info!("Proxy listening on {} (SO_REUSEPORT)", self.config.listen_address);
+        tracing::info!(
+            "Proxy listening on {} (SO_REUSEPORT)",
+            self.config.listen_address
+        );
 
         // Start background tasks
         let health_task = self.spawn_health_checker();
@@ -909,7 +909,10 @@ impl ProxyServer {
         if graceful {
             let timeout =
                 Self::drain_timeout(self.state.live_config.load().shutdown_drain_timeout_secs);
-            tracing::info!(timeout_secs = timeout.as_secs(), "draining in-flight connections");
+            tracing::info!(
+                timeout_secs = timeout.as_secs(),
+                "draining in-flight connections"
+            );
             Self::drain_connections(&self.state, timeout).await;
         }
 
@@ -947,12 +950,16 @@ impl ProxyServer {
                     tr_mode: format!("{:?}", config.tr_mode),
                     pool_min_connections: config.pool.min_connections,
                     pool_max_connections: config.pool.max_connections,
-                    nodes: config.nodes.iter().map(|n| NodeSnapshot {
-                        address: n.address(),
-                        role: format!("{:?}", n.role),
-                        weight: n.weight,
-                        enabled: n.enabled,
-                    }).collect(),
+                    nodes: config
+                        .nodes
+                        .iter()
+                        .map(|n| NodeSnapshot {
+                            address: n.address(),
+                            role: format!("{:?}", n.role),
+                            weight: n.weight,
+                            enabled: n.enabled,
+                        })
+                        .collect(),
                 };
             }
 
@@ -960,7 +967,9 @@ impl ProxyServer {
             admin_state.set_proxy_config(config.clone()).await;
 
             // Require a Bearer token on admin requests when configured.
-            admin_state.with_auth_token(config.admin_token.clone()).await;
+            admin_state
+                .with_auth_token(config.admin_token.clone())
+                .await;
 
             // Branch-database provisioning surface.
             if config.branch.enabled {
@@ -977,7 +986,10 @@ impl ProxyServer {
                         config: config.mirror.clone(),
                         cutover: state.cutover.clone(),
                         cutover_target: crate::mirror::CutoverTarget {
-                            addr: format!("{}:{}", config.mirror.backend_host, config.mirror.backend_port),
+                            addr: format!(
+                                "{}:{}",
+                                config.mirror.backend_host, config.mirror.backend_port
+                            ),
                             user: config.mirror.backend_user.clone(),
                             password: config.mirror.backend_password.clone(),
                             database: config.mirror.backend_database.clone(),
@@ -1047,10 +1059,22 @@ impl ProxyServer {
                     // Sync metrics
                     {
                         let metrics = ServerMetricsSnapshot {
-                            connections_accepted: server_state.metrics.connections_accepted.load(Ordering::Relaxed),
-                            connections_closed: server_state.metrics.connections_closed.load(Ordering::Relaxed),
-                            queries_processed: server_state.metrics.queries_processed.load(Ordering::Relaxed),
-                            bytes_received: server_state.metrics.bytes_received.load(Ordering::Relaxed),
+                            connections_accepted: server_state
+                                .metrics
+                                .connections_accepted
+                                .load(Ordering::Relaxed),
+                            connections_closed: server_state
+                                .metrics
+                                .connections_closed
+                                .load(Ordering::Relaxed),
+                            queries_processed: server_state
+                                .metrics
+                                .queries_processed
+                                .load(Ordering::Relaxed),
+                            bytes_received: server_state
+                                .metrics
+                                .bytes_received
+                                .load(Ordering::Relaxed),
                             bytes_sent: server_state.metrics.bytes_sent.load(Ordering::Relaxed),
                             failovers: server_state.metrics.failovers.load(Ordering::Relaxed),
                         };
@@ -1176,7 +1200,9 @@ impl ProxyServer {
         // backend auth and is deferred to the auth batch.
         let mut conns: HashMap<String, BackendConn> = HashMap::new();
         let mut current_node: Option<String> =
-            match Self::handle_startup(stream, &mut buffer, &codec, pre, session, state, config).await {
+            match Self::handle_startup(stream, &mut buffer, &codec, pre, session, state, config)
+                .await
+            {
                 Ok((Some(stream_conn), node_addr)) => {
                     conns.insert(node_addr.clone(), BackendConn::new(stream_conn));
                     Some(node_addr)
@@ -1188,7 +1214,8 @@ impl ProxyServer {
                 Err(e) => {
                     tracing::error!("Startup failed: {}", e);
                     // Send error to client
-                    let err_msg = Self::create_error_response("08006", &format!("Startup failed: {}", e));
+                    let err_msg =
+                        Self::create_error_response("08006", &format!("Startup failed: {}", e));
                     let _ = stream.write_all(&err_msg).await;
                     return Err(e);
                 }
@@ -1242,7 +1269,10 @@ impl ProxyServer {
             }
 
             buffer.extend_from_slice(&read_buf[..n]);
-            state.metrics.bytes_received.fetch_add(n as u64, Ordering::Relaxed);
+            state
+                .metrics
+                .bytes_received
+                .fetch_add(n as u64, Ordering::Relaxed);
 
             // Process all complete messages in buffer
             while let Some(msg) = codec.decode_message(&mut buffer)? {
@@ -1264,7 +1294,10 @@ impl ProxyServer {
                         if let PreQueryAction::Block(reason) = &action {
                             tracing::info!(reason = %reason, "pre-query plugin blocked query");
                             Self::send_block_response(stream, reason, state).await?;
-                            state.metrics.queries_processed.fetch_add(1, Ordering::Relaxed);
+                            state
+                                .metrics
+                                .queries_processed
+                                .fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
 
@@ -1275,8 +1308,14 @@ impl ProxyServer {
                                     stream.write_all(&reply).await.map_err(|e| {
                                         ProxyError::Network(format!("Write error: {}", e))
                                     })?;
-                                    state.metrics.bytes_sent.fetch_add(reply.len() as u64, Ordering::Relaxed);
-                                    state.metrics.queries_processed.fetch_add(1, Ordering::Relaxed);
+                                    state
+                                        .metrics
+                                        .bytes_sent
+                                        .fetch_add(reply.len() as u64, Ordering::Relaxed);
+                                    state
+                                        .metrics
+                                        .queries_processed
+                                        .fetch_add(1, Ordering::Relaxed);
                                     continue;
                                 }
                                 Err(e) => {
@@ -1307,13 +1346,22 @@ impl ProxyServer {
                         )
                         .await;
                         #[cfg(feature = "wasm-plugins")]
-                        Self::fire_post_query_hook(&msg, session, state, &fr, forward_start.elapsed());
+                        Self::fire_post_query_hook(
+                            &msg,
+                            session,
+                            state,
+                            &fr,
+                            forward_start.elapsed(),
+                        );
                         let (used_node, sent) = fr?;
                         if let Some(n) = used_node {
                             current_node = Some(n);
                         }
                         state.metrics.bytes_sent.fetch_add(sent, Ordering::Relaxed);
-                        state.metrics.queries_processed.fetch_add(1, Ordering::Relaxed);
+                        state
+                            .metrics
+                            .queries_processed
+                            .fetch_add(1, Ordering::Relaxed);
                     }
 
                     // ---- Extended query protocol: accumulate until Sync/Flush ----
@@ -1366,7 +1414,8 @@ impl ProxyServer {
                                     held_unnamed = Some((msg.encode().freeze(), sig));
                                     add_to_pending = false;
                                 } else if let Some((held_msg, _)) = held_unnamed.take() {
-                                    let mut combined = BytesMut::with_capacity(held_msg.len() + pending.len());
+                                    let mut combined =
+                                        BytesMut::with_capacity(held_msg.len() + pending.len());
                                     combined.extend_from_slice(&held_msg);
                                     combined.extend_from_slice(&pending);
                                     pending = combined;
@@ -1439,7 +1488,10 @@ impl ProxyServer {
                             pending_route_sql = None;
                             batch_defines.clear();
                             batch_refs.clear();
-                            state.metrics.queries_processed.fetch_add(1, Ordering::Relaxed);
+                            state
+                                .metrics
+                                .queries_processed
+                                .fetch_add(1, Ordering::Relaxed);
                         }
                     }
 
@@ -1450,11 +1502,23 @@ impl ProxyServer {
                                 b.stream.write_all(&msg.encode()).await.map_err(|e| {
                                     ProxyError::Network(format!("Backend copy write error: {}", e))
                                 })?;
-                                if matches!(msg.msg_type, MessageType::CopyDone | MessageType::CopyFail) {
-                                    let r = Self::stream_until_ready(stream, &mut b.stream, session, state).await;
+                                if matches!(
+                                    msg.msg_type,
+                                    MessageType::CopyDone | MessageType::CopyFail
+                                ) {
+                                    let r = Self::stream_until_ready(
+                                        stream,
+                                        &mut b.stream,
+                                        session,
+                                        state,
+                                    )
+                                    .await;
                                     match r {
                                         Ok(sent) => {
-                                            state.metrics.bytes_sent.fetch_add(sent, Ordering::Relaxed);
+                                            state
+                                                .metrics
+                                                .bytes_sent
+                                                .fetch_add(sent, Ordering::Relaxed);
                                         }
                                         Err(e) => {
                                             conns.remove(&node);
@@ -1504,7 +1568,9 @@ impl ProxyServer {
                 .await
                 .map_err(|e| ProxyError::Network(format!("Startup read error: {}", e)))?;
             if n == 0 {
-                return Err(ProxyError::Connection("client closed before startup".to_string()));
+                return Err(ProxyError::Connection(
+                    "client closed before startup".to_string(),
+                ));
             }
             buffer.extend_from_slice(&read_buf[..n]);
         };
@@ -1577,7 +1643,9 @@ impl ProxyServer {
                     .write_all(b"N")
                     .await
                     .map_err(|e| ProxyError::Network(format!("SSL reject error: {}", e)))?;
-                Err(ProxyError::Protocol("unexpected SSLRequest after startup".to_string()))
+                Err(ProxyError::Protocol(
+                    "unexpected SSLRequest after startup".to_string(),
+                ))
             }
             Some(StartupMessage::CancelRequest { pid, key }) => {
                 // Forward the cancel to the backend that owns this key, then
@@ -1588,7 +1656,9 @@ impl ProxyServer {
             Some(StartupMessage::Startup { params, .. }) => {
                 Self::connect_and_authenticate(client_stream, &params, session, state, config).await
             }
-            None => Err(ProxyError::Protocol("Incomplete startup message".to_string())),
+            None => Err(ProxyError::Protocol(
+                "Incomplete startup message".to_string(),
+            )),
         }
     }
 
@@ -1619,11 +1689,19 @@ impl ProxyServer {
             };
             match (net.parse::<IpAddr>(), ip) {
                 (Ok(IpAddr::V4(n)), IpAddr::V4(i)) if bits <= 32 => {
-                    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+                    let mask = if bits == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - bits)
+                    };
                     (u32::from(n) & mask) == (u32::from(i) & mask)
                 }
                 (Ok(IpAddr::V6(n)), IpAddr::V6(i)) if bits <= 128 => {
-                    let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+                    let mask = if bits == 0 {
+                        0
+                    } else {
+                        u128::MAX << (128 - bits)
+                    };
                     (u128::from(n) & mask) == (u128::from(i) & mask)
                 }
                 _ => false,
@@ -1662,14 +1740,11 @@ impl ProxyServer {
         if init.len() < mech_end + 5 {
             return Err("short SASLInitialResponse".into());
         }
-        let client_first = std::str::from_utf8(&init[mech_end + 5..])
-            .map_err(|_| "client-first not UTF-8")?;
+        let client_first =
+            std::str::from_utf8(&init[mech_end + 5..]).map_err(|_| "client-first not UTF-8")?;
 
         // 3. Look up the verifier (unknown user -> generic failure).
-        let verifier = auth_file
-            .get(user)
-            .ok_or("no such user")?
-            .clone();
+        let verifier = auth_file.get(user).ok_or("no such user")?.clone();
 
         // 4. server-first.
         let server_nonce = Self::random_nonce();
@@ -1683,8 +1758,8 @@ impl ProxyServer {
 
         // 6. Read SASLResponse ('p'): payload = client-final.
         let client_final_raw = Self::read_password_message(client).await?;
-        let client_final = std::str::from_utf8(&client_final_raw)
-            .map_err(|_| "client-final not UTF-8")?;
+        let client_final =
+            std::str::from_utf8(&client_final_raw).map_err(|_| "client-final not UTF-8")?;
 
         // 7. Verify -> server-final.
         let server_final = server.finish(client_final)?;
@@ -1746,7 +1821,9 @@ impl ProxyServer {
         use rand::Rng;
         const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
         let mut rng = rand::thread_rng();
-        (0..24).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect()
+        (0..24)
+            .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+            .collect()
     }
 
     /// Connect to backend and handle authentication
@@ -1779,7 +1856,8 @@ impl ProxyServer {
         if state.auth_file.is_some() {
             if let Err(e) = Self::proxy_scram_auth(client_stream, user, state).await {
                 tracing::info!(%user, error = %e, "proxy SCRAM auth failed");
-                let err = Self::create_error_response("28P01", &format!("authentication failed: {}", e));
+                let err =
+                    Self::create_error_response("28P01", &format!("authentication failed: {}", e));
                 let _ = client_stream.write_all(&err).await;
                 return Ok((None, String::new()));
             }
@@ -1808,7 +1886,10 @@ impl ProxyServer {
             tracing::debug!(target = %t.addr, "routing connection to cutover target");
             (t.addr.clone(), p)
         } else {
-            (Self::select_node(session, state, config).await?, params.clone())
+            (
+                Self::select_node(session, state, config).await?,
+                params.clone(),
+            )
         };
 
         // Connect to backend
@@ -1818,7 +1899,9 @@ impl ProxyServer {
         )
         .await
         .map_err(|_| ProxyError::Connection(format!("Connection timeout to {}", node_addr)))?
-        .map_err(|e| ProxyError::Connection(format!("Failed to connect to {}: {}", node_addr, e)))?;
+        .map_err(|e| {
+            ProxyError::Connection(format!("Failed to connect to {}: {}", node_addr, e))
+        })?;
         let _ = backend.set_nodelay(true);
 
         // Build and send startup message to backend
@@ -1902,7 +1985,9 @@ impl ProxyServer {
                 }
                 // PG closes the connection after handling a CancelRequest.
             }
-            other => tracing::warn!(node = %addr, ?other, "could not connect to forward CancelRequest"),
+            other => {
+                tracing::warn!(node = %addr, ?other, "could not connect to forward CancelRequest")
+            }
         }
     }
 
@@ -1926,7 +2011,9 @@ impl ProxyServer {
                 .map_err(|e| ProxyError::Network(format!("Backend auth read error: {}", e)))?;
 
             if n == 0 {
-                return Err(ProxyError::Connection("Backend closed during auth".to_string()));
+                return Err(ProxyError::Connection(
+                    "Backend closed during auth".to_string(),
+                ));
             }
 
             backend_buffer.extend_from_slice(&read_buf[..n]);
@@ -1980,8 +2067,11 @@ impl ProxyServer {
 
             // If backend requires password, forward client's response
             // Read password from client if needed
-            let n = tokio::time::timeout(Duration::from_millis(100), client_stream.read(&mut read_buf))
-                .await;
+            let n = tokio::time::timeout(
+                Duration::from_millis(100),
+                client_stream.read(&mut read_buf),
+            )
+            .await;
 
             if let Ok(Ok(n)) = n {
                 if n > 0 {
@@ -1989,7 +2079,9 @@ impl ProxyServer {
                     backend_stream
                         .write_all(&read_buf[..n])
                         .await
-                        .map_err(|e| ProxyError::Network(format!("Backend password write error: {}", e)))?;
+                        .map_err(|e| {
+                            ProxyError::Network(format!("Backend password write error: {}", e))
+                        })?;
                 }
             }
         }
@@ -2064,13 +2156,13 @@ impl ProxyServer {
         if conns.contains_key(target) {
             return Ok(());
         }
-        let mut backend = tokio::time::timeout(
-            config.pool.acquire_timeout(),
-            TcpStream::connect(target),
-        )
-        .await
-        .map_err(|_| ProxyError::Connection(format!("Connection timeout to {}", target)))?
-        .map_err(|e| ProxyError::Connection(format!("Failed to connect to {}: {}", target, e)))?;
+        let mut backend =
+            tokio::time::timeout(config.pool.acquire_timeout(), TcpStream::connect(target))
+                .await
+                .map_err(|_| ProxyError::Connection(format!("Connection timeout to {}", target)))?
+                .map_err(|e| {
+                    ProxyError::Connection(format!("Failed to connect to {}: {}", target, e))
+                })?;
         let _ = backend.set_nodelay(true);
 
         let params = session.variables.read().await.clone();
@@ -2125,9 +2217,15 @@ impl ProxyServer {
             RouteOverride::Block(_) => unreachable!("handled above"),
         };
 
-        let target =
-            Self::choose_target_node(is_write, forced_target, current_node, session, state, config)
-                .await?;
+        let target = Self::choose_target_node(
+            is_write,
+            forced_target,
+            current_node,
+            session,
+            state,
+            config,
+        )
+        .await?;
         Self::ensure_conn(conns, &target, session, config).await?;
         let backend = conns.get_mut(&target).expect("just ensured");
 
@@ -2310,7 +2408,9 @@ impl ProxyServer {
         let mtype = Self::read_one_frame_type(backend).await?;
         match mtype {
             b'1' => Ok(()), // ParseComplete
-            b'E' => Err(ProxyError::Protocol("re-prepare rejected by backend".to_string())),
+            b'E' => Err(ProxyError::Protocol(
+                "re-prepare rejected by backend".to_string(),
+            )),
             other => Err(ProxyError::Protocol(format!(
                 "unexpected re-prepare reply: {}",
                 other as char
@@ -2441,7 +2541,9 @@ impl ProxyServer {
                 .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
                 .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
             if n == 0 {
-                return Err(ProxyError::Connection("Backend closed mid-response".to_string()));
+                return Err(ProxyError::Connection(
+                    "Backend closed mid-response".to_string(),
+                ));
             }
             buf.extend_from_slice(&read_buf[..n]);
         }
@@ -2462,9 +2564,14 @@ impl ProxyServer {
         let mut read_buf = vec![0u8; 16384];
         let mut sent: u64 = 0;
         loop {
-            match tokio::time::timeout(Duration::from_millis(200), backend.read(&mut read_buf)).await
+            match tokio::time::timeout(Duration::from_millis(200), backend.read(&mut read_buf))
+                .await
             {
-                Ok(Ok(0)) => return Err(ProxyError::Connection("Backend closed mid-flush".to_string())),
+                Ok(Ok(0)) => {
+                    return Err(ProxyError::Connection(
+                        "Backend closed mid-flush".to_string(),
+                    ))
+                }
                 Ok(Ok(n)) => {
                     client
                         .write_all(&read_buf[..n])
@@ -2472,7 +2579,9 @@ impl ProxyServer {
                         .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
                     sent += n as u64;
                 }
-                Ok(Err(e)) => return Err(ProxyError::Network(format!("Backend read error: {}", e))),
+                Ok(Err(e)) => {
+                    return Err(ProxyError::Network(format!("Backend read error: {}", e)))
+                }
                 Err(_) => return Ok(sent), // idle: backend has emitted all flush output
             }
         }
@@ -2618,10 +2727,7 @@ impl ProxyServer {
             .filter(|n| {
                 n.enabled
                     && (n.role == NodeRole::Standby || n.role == NodeRole::ReadReplica)
-                    && health
-                        .get(&n.address())
-                        .map(|h| h.healthy)
-                        .unwrap_or(false)
+                    && health.get(&n.address()).map(|h| h.healthy).unwrap_or(false)
             })
             .collect();
 
@@ -2651,7 +2757,9 @@ impl ProxyServer {
 
         loop {
             if start.elapsed() > timeout {
-                return Err(ProxyError::Auth("Backend authentication timeout".to_string()));
+                return Err(ProxyError::Auth(
+                    "Backend authentication timeout".to_string(),
+                ));
             }
 
             let n = tokio::time::timeout(Duration::from_secs(5), backend.read(&mut read_buf))
@@ -2660,7 +2768,9 @@ impl ProxyServer {
                 .map_err(|e| ProxyError::Network(format!("Backend auth read error: {}", e)))?;
 
             if n == 0 {
-                return Err(ProxyError::Connection("Backend closed during auth".to_string()));
+                return Err(ProxyError::Connection(
+                    "Backend closed during auth".to_string(),
+                ));
             }
 
             buffer.extend_from_slice(&read_buf[..n]);
@@ -2767,9 +2877,8 @@ impl ProxyServer {
             25 // text
         }
 
-        let payload: CachedPayload = serde_json::from_slice(bytes).map_err(|e| {
-            ProxyError::Protocol(format!("invalid cached payload JSON: {}", e))
-        })?;
+        let payload: CachedPayload = serde_json::from_slice(bytes)
+            .map_err(|e| ProxyError::Protocol(format!("invalid cached payload JSON: {}", e)))?;
 
         if payload.columns.is_empty() {
             return Err(ProxyError::Protocol(
@@ -2948,10 +3057,8 @@ impl ProxyServer {
         reason: &str,
         state: &Arc<ServerState>,
     ) -> Result<()> {
-        let err = Self::create_error_response(
-            "42000",
-            &format!("Query blocked by plugin: {}", reason),
-        );
+        let err =
+            Self::create_error_response("42000", &format!("Query blocked by plugin: {}", reason));
         stream
             .write_all(&err)
             .await
@@ -3178,13 +3285,7 @@ impl ProxyServer {
         let healthy_nodes: Vec<&NodeConfig> = config
             .nodes
             .iter()
-            .filter(|n| {
-                n.enabled
-                    && health
-                        .get(&n.address())
-                        .map(|h| h.healthy)
-                        .unwrap_or(false)
-            })
+            .filter(|n| n.enabled && health.get(&n.address()).map(|h| h.healthy).unwrap_or(false))
             .collect();
 
         if healthy_nodes.is_empty() {
@@ -3301,7 +3402,9 @@ impl ProxyServer {
         let _stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
             .await
             .map_err(|_| ProxyError::HealthCheck(format!("Timeout connecting to {}", addr)))?
-            .map_err(|e| ProxyError::HealthCheck(format!("Failed to connect to {}: {}", addr, e)))?;
+            .map_err(|e| {
+                ProxyError::HealthCheck(format!("Failed to connect to {}: {}", addr, e))
+            })?;
         let latency = start.elapsed().as_secs_f64() * 1000.0;
         Ok(latency)
     }
@@ -3396,8 +3499,16 @@ impl ProxyServer {
     /// Get server metrics
     pub fn metrics(&self) -> ServerMetricsSnapshot {
         ServerMetricsSnapshot {
-            connections_accepted: self.state.metrics.connections_accepted.load(Ordering::Relaxed),
-            connections_closed: self.state.metrics.connections_closed.load(Ordering::Relaxed),
+            connections_accepted: self
+                .state
+                .metrics
+                .connections_accepted
+                .load(Ordering::Relaxed),
+            connections_closed: self
+                .state
+                .metrics
+                .connections_closed
+                .load(Ordering::Relaxed),
             queries_processed: self.state.metrics.queries_processed.load(Ordering::Relaxed),
             bytes_received: self.state.metrics.bytes_received.load(Ordering::Relaxed),
             bytes_sent: self.state.metrics.bytes_sent.load(Ordering::Relaxed),
@@ -3457,9 +3568,7 @@ mod tests {
     fn test_config() -> ProxyConfig {
         let mut config = ProxyConfig::default();
         config.listen_address = "127.0.0.1:0".to_string();
-        config
-            .add_node("127.0.0.1:5432", "primary")
-            .unwrap();
+        config.add_node("127.0.0.1:5432", "primary").unwrap();
         config
     }
 
@@ -3479,11 +3588,23 @@ mod tests {
         // CIDR membership
         assert!(ProxyServer::hba_addr_matches("10.0.0.0/8", v4("10.1.2.3")));
         assert!(!ProxyServer::hba_addr_matches("10.0.0.0/8", v4("11.1.2.3")));
-        assert!(ProxyServer::hba_addr_matches("127.0.0.1/32", v4("127.0.0.1")));
-        assert!(!ProxyServer::hba_addr_matches("127.0.0.1/32", v4("127.0.0.2")));
+        assert!(ProxyServer::hba_addr_matches(
+            "127.0.0.1/32",
+            v4("127.0.0.1")
+        ));
+        assert!(!ProxyServer::hba_addr_matches(
+            "127.0.0.1/32",
+            v4("127.0.0.2")
+        ));
         // bare IP exact match
-        assert!(ProxyServer::hba_addr_matches("192.168.1.1", v4("192.168.1.1")));
-        assert!(!ProxyServer::hba_addr_matches("192.168.1.1", v4("192.168.1.2")));
+        assert!(ProxyServer::hba_addr_matches(
+            "192.168.1.1",
+            v4("192.168.1.1")
+        ));
+        assert!(!ProxyServer::hba_addr_matches(
+            "192.168.1.1",
+            v4("192.168.1.2")
+        ));
         // IPv6 CIDR + /0 catch-all
         assert!(ProxyServer::hba_addr_matches("::1/128", v4("::1")));
         assert!(ProxyServer::hba_addr_matches("0.0.0.0/0", v4("8.8.8.8")));
@@ -3507,11 +3628,26 @@ mod tests {
         assert!(ProxyServer::hba_admits(&rules, ip, "alice", "benchdb"));
         // First match wins: allow bench from 10/8, reject everything else
         let rules = vec![
-            HbaRule { action: HbaAction::Allow, user: "bench".into(), database: "all".into(), address: "10.0.0.0/8".into() },
-            HbaRule { action: HbaAction::Reject, user: "all".into(), database: "all".into(), address: "all".into() },
+            HbaRule {
+                action: HbaAction::Allow,
+                user: "bench".into(),
+                database: "all".into(),
+                address: "10.0.0.0/8".into(),
+            },
+            HbaRule {
+                action: HbaAction::Reject,
+                user: "all".into(),
+                database: "all".into(),
+                address: "all".into(),
+            },
         ];
         assert!(ProxyServer::hba_admits(&rules, ip, "bench", "benchdb"));
-        assert!(!ProxyServer::hba_admits(&rules, "192.168.0.1".parse().unwrap(), "bench", "benchdb"));
+        assert!(!ProxyServer::hba_admits(
+            &rules,
+            "192.168.0.1".parse().unwrap(),
+            "bench",
+            "benchdb"
+        ));
         assert!(!ProxyServer::hba_admits(&rules, ip, "alice", "benchdb"));
     }
 
@@ -3660,8 +3796,7 @@ mod tests {
         params.insert("user".to_string(), "alice".to_string());
         params.insert("database".to_string(), "app".to_string());
 
-        let result =
-            ProxyServer::apply_authenticate_hook(&params, &session, &server.state).await;
+        let result = ProxyServer::apply_authenticate_hook(&params, &session, &server.state).await;
         assert!(result.is_ok());
 
         // No plugin → no identity stored.
@@ -3692,8 +3827,7 @@ mod tests {
                 ["2", null]
             ]
         }"#;
-        let reply =
-            ProxyServer::synthesise_cached_response(payload).expect("synthesis");
+        let reply = ProxyServer::synthesise_cached_response(payload).expect("synthesis");
 
         // Walk the concatenation frame-by-frame via length prefixes.
         // Each PG message: tag(1) + length(4, big-endian, includes self) + payload.
@@ -3701,21 +3835,13 @@ mod tests {
         let mut i = 0;
         while i < reply.len() {
             let tag = reply[i];
-            let len = u32::from_be_bytes([
-                reply[i + 1],
-                reply[i + 2],
-                reply[i + 3],
-                reply[i + 4],
-            ]) as usize;
+            let len = u32::from_be_bytes([reply[i + 1], reply[i + 2], reply[i + 3], reply[i + 4]])
+                as usize;
             tags.push(tag);
             i += 1 + len;
         }
         assert_eq!(i, reply.len(), "no trailing bytes");
-        assert_eq!(
-            tags,
-            vec![b'T', b'D', b'D', b'C', b'Z'],
-            "wire frame order"
-        );
+        assert_eq!(tags, vec![b'T', b'D', b'D', b'C', b'Z'], "wire frame order");
 
         // Spot-check the final ReadyForQuery payload is 'I' (idle).
         assert_eq!(*reply.last().unwrap(), b'I');
@@ -3792,15 +3918,11 @@ mod tests {
             pool_manager: None,
             plugin_manager: Some(pm),
             #[cfg(feature = "ha-tr")]
-            transaction_journal: Arc::new(
-                crate::transaction_journal::TransactionJournal::new(),
-            ),
+            transaction_journal: Arc::new(crate::transaction_journal::TransactionJournal::new()),
             #[cfg(feature = "anomaly-detection")]
-            anomaly_detector: Arc::new(
-                crate::anomaly::AnomalyDetector::new(
-                    crate::anomaly::AnomalyConfig::default(),
-                ),
-            ),
+            anomaly_detector: Arc::new(crate::anomaly::AnomalyDetector::new(
+                crate::anomaly::AnomalyConfig::default(),
+            )),
             #[cfg(feature = "edge-proxy")]
             edge_cache: Arc::new(crate::edge::EdgeCache::new(10_000)),
             #[cfg(feature = "edge-proxy")]
@@ -3903,11 +4025,15 @@ mod tests {
             p.extend_from_slice(&[0, 0]);
             p
         };
-        assert!(ProxyServer::reprepare_statement(&mut client, &parse).await.is_ok());
+        assert!(ProxyServer::reprepare_statement(&mut client, &parse)
+            .await
+            .is_ok());
 
         // Backend answers ErrorResponse -> Err.
         let (mut client2, mut backend2) = tokio::io::duplex(64);
         backend2.write_all(&[b'E', 0, 0, 0, 4]).await.unwrap();
-        assert!(ProxyServer::reprepare_statement(&mut client2, &parse).await.is_err());
+        assert!(ProxyServer::reprepare_statement(&mut client2, &parse)
+            .await
+            .is_err());
     }
 }

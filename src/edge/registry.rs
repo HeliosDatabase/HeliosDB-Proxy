@@ -153,8 +153,7 @@ impl EdgeRegistry {
             g.remove(id);
         }
         for sub in g.values_mut() {
-            sub.node.invalidations_sent =
-                sub.node.invalidations_sent.saturating_add(1);
+            sub.node.invalidations_sent = sub.node.invalidations_sent.saturating_add(1);
             sub.last_seen_inst = Instant::now();
         }
         (sent, dead.len() as u32)
@@ -163,11 +162,7 @@ impl EdgeRegistry {
     /// Read-only snapshot of currently-registered edges. Used by
     /// the admin UI / `/api/edge` endpoint.
     pub fn list(&self) -> Vec<EdgeNode> {
-        self.inner
-            .read()
-            .values()
-            .map(|s| s.node.clone())
-            .collect()
+        self.inner.read().values().map(|s| s.node.clone()).collect()
     }
 
     pub fn count(&self) -> usize {

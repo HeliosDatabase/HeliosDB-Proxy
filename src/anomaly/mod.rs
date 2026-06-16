@@ -201,8 +201,7 @@ impl AnomalyDetector {
 
         // Novel-query detector. The common already-seen path takes only a
         // shard read; a fresh fingerprint upgrades to a shard write.
-        if self.config.emit_novel_queries
-            && !self.seen_fingerprints.contains_key(&ctx.fingerprint)
+        if self.config.emit_novel_queries && !self.seen_fingerprints.contains_key(&ctx.fingerprint)
         {
             // Bound the set so unique-SQL traffic can't leak memory.
             if self.seen_fingerprints.len() >= MAX_SEEN_FINGERPRINTS {
@@ -431,7 +430,9 @@ mod tests {
             last = d.record_auth("alice", "10.0.0.1", false, now, "ts");
         }
         match last {
-            Some(AnomalyEvent::AuthBurst { failures, severity, .. }) => {
+            Some(AnomalyEvent::AuthBurst {
+                failures, severity, ..
+            }) => {
                 assert_eq!(failures, 6);
                 assert_eq!(severity, Severity::Warning);
             }
@@ -448,7 +449,9 @@ mod tests {
             last = d.record_auth("alice", "10.0.0.1", false, now, "ts");
         }
         match last {
-            Some(AnomalyEvent::AuthBurst { failures, severity, .. }) => {
+            Some(AnomalyEvent::AuthBurst {
+                failures, severity, ..
+            }) => {
                 assert_eq!(failures, 12);
                 assert_eq!(severity, Severity::Critical);
             }

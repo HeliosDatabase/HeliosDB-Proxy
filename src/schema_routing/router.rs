@@ -5,9 +5,9 @@
 use std::sync::Arc;
 
 use super::{
-    NodeInfo, SyncMode, SchemaRoutingConfig,
-    registry::{SchemaRegistry, NodeCapabilities, DataTemperature, WorkloadType, AccessPattern},
-    analyzer::{QueryAnalyzer, QueryAnalysis},
+    analyzer::{QueryAnalysis, QueryAnalyzer},
+    registry::{AccessPattern, DataTemperature, NodeCapabilities, SchemaRegistry, WorkloadType},
+    NodeInfo, SchemaRoutingConfig, SyncMode,
 };
 
 /// Schema-aware query router
@@ -144,7 +144,8 @@ impl SchemaAwareRouter {
     /// Route RAG query
     pub fn route_rag(&self, stage: RAGStage, query: &str) -> RoutingDecision {
         let analysis = self.analyzer.analyze(query);
-        self.rag_router.route_rag_query(stage, &analysis, &self.nodes)
+        self.rag_router
+            .route_rag_query(stage, &analysis, &self.nodes)
     }
 
     /// Get required capabilities based on query analysis
@@ -152,7 +153,10 @@ impl SchemaAwareRouter {
         let mut caps = NodeCapabilities::default();
 
         // Vector queries need vector-capable nodes
-        if analysis.access_patterns.contains(&AccessPattern::VectorSearch) {
+        if analysis
+            .access_patterns
+            .contains(&AccessPattern::VectorSearch)
+        {
             caps.vector_search = true;
             caps.gpu_acceleration = true; // Prefer GPU nodes
         }
@@ -195,9 +199,10 @@ impl SchemaAwareRouter {
                                 // Multiple values = scatter-gather
                                 return Some(RoutingDecision {
                                     target: RouteTarget::ScatterGather,
-                                    shards: v.iter().filter_map(|val| {
-                                        self.schema.get_shard(shard_key, val)
-                                    }).collect(),
+                                    shards: v
+                                        .iter()
+                                        .filter_map(|val| self.schema.get_shard(shard_key, val))
+                                        .collect(),
                                     reason: RoutingReason::ShardKey,
                                     ..Default::default()
                                 });
@@ -293,7 +298,8 @@ impl SchemaAwareRouter {
 
         // Sort by: GPU first, then lower load
         vector_nodes.sort_by(|a, b| {
-            b.capabilities.gpu_acceleration
+            b.capabilities
+                .gpu_acceleration
                 .cmp(&a.capabilities.gpu_acceleration)
                 .then_with(|| a.current_load.partial_cmp(&b.current_load).unwrap())
         });
@@ -350,16 +356,19 @@ impl SchemaAwareRouter {
     }
 
     /// Route to nodes with specific temperature
-    fn route_to_temperature_nodes(&self, temp: DataTemperature, analysis: &QueryAnalysis) -> RoutingDecision {
+    fn route_to_temperature_nodes(
+        &self,
+        temp: DataTemperature,
+        analysis: &QueryAnalysis,
+    ) -> RoutingDecision {
         // Find nodes that host tables with matching temperature
-        let matching_nodes: Vec<_> = self.nodes
+        let matching_nodes: Vec<_> = self
+            .nodes
             .iter()
-            .filter(|n| {
-                match temp {
-                    DataTemperature::Hot => n.capabilities.in_memory,
-                    DataTemperature::Warm => !n.capabilities.in_memory && !self.is_cold_storage(n),
-                    DataTemperature::Cold | DataTemperature::Frozen => self.is_cold_storage(n),
-                }
+            .filter(|n| match temp {
+                DataTemperature::Hot => n.capabilities.in_memory,
+                DataTemperature::Warm => !n.capabilities.in_memory && !self.is_cold_storage(n),
+                DataTemperature::Cold | DataTemperature::Frozen => self.is_cold_storage(n),
             })
             .cloned()
             .collect();
@@ -402,10 +411,15 @@ impl SchemaAwareRouter {
     }
 
     /// Apply routing preference
-    fn apply_preference(&self, preference: RoutingPreference, analysis: &QueryAnalysis) -> RoutingDecision {
+    fn apply_preference(
+        &self,
+        preference: RoutingPreference,
+        analysis: &QueryAnalysis,
+    ) -> RoutingDecision {
         match preference {
             RoutingPreference::VectorNodes { prefer_gpu } => {
-                let nodes: Vec<_> = self.nodes
+                let nodes: Vec<_> = self
+                    .nodes
                     .iter()
                     .filter(|n| n.capabilities.vector_search)
                     .filter(|n| !prefer_gpu || n.capabilities.gpu_acceleration)
@@ -414,7 +428,8 @@ impl SchemaAwareRouter {
                 self.select_best(&nodes, analysis)
             }
             RoutingPreference::LowLatency { max_lag_ms } => {
-                let nodes: Vec<_> = self.nodes
+                let nodes: Vec<_> = self
+                    .nodes
                     .iter()
                     .filter(|n| n.current_latency_ms <= max_lag_ms)
                     .cloned()
@@ -422,20 +437,19 @@ impl SchemaAwareRouter {
                 self.select_best(&nodes, analysis)
             }
             RoutingPreference::HighThroughput => {
-                let nodes: Vec<_> = self.nodes
+                let nodes: Vec<_> = self
+                    .nodes
                     .iter()
                     .filter(|n| n.sync_mode == SyncMode::Async)
                     .cloned()
                     .collect();
                 self.select_best(&nodes, analysis)
             }
-            RoutingPreference::Primary => {
-                RoutingDecision {
-                    target: RouteTarget::Primary,
-                    reason: RoutingReason::AIWorkload,
-                    ..Default::default()
-                }
-            }
+            RoutingPreference::Primary => RoutingDecision {
+                target: RouteTarget::Primary,
+                reason: RoutingReason::AIWorkload,
+                ..Default::default()
+            },
         }
     }
 }
@@ -443,8 +457,11 @@ impl SchemaAwareRouter {
 impl NodeCapabilities {
     /// Check if there are any requirements
     fn has_requirements(&self) -> bool {
-        self.vector_search || self.gpu_acceleration || self.columnar_storage
-            || self.in_memory || self.content_addressed
+        self.vector_search
+            || self.gpu_acceleration
+            || self.columnar_storage
+            || self.in_memory
+            || self.content_addressed
     }
 }
 
@@ -589,15 +606,42 @@ impl AIWorkloadDetector {
     pub fn new() -> Self {
         Self {
             patterns: vec![
-                AIPattern { keyword: "<->".to_string(), workload_type: AIWorkloadType::EmbeddingRetrieval },
-                AIPattern { keyword: "VECTOR".to_string(), workload_type: AIWorkloadType::EmbeddingRetrieval },
-                AIPattern { keyword: "EMBEDDING".to_string(), workload_type: AIWorkloadType::EmbeddingRetrieval },
-                AIPattern { keyword: "CONVERSATION".to_string(), workload_type: AIWorkloadType::ContextLookup },
-                AIPattern { keyword: "TURNS".to_string(), workload_type: AIWorkloadType::ContextLookup },
-                AIPattern { keyword: "DOCUMENTS".to_string(), workload_type: AIWorkloadType::KnowledgeBase },
-                AIPattern { keyword: "CHUNKS".to_string(), workload_type: AIWorkloadType::KnowledgeBase },
-                AIPattern { keyword: "TOOL_RESULTS".to_string(), workload_type: AIWorkloadType::ToolExecution },
-                AIPattern { keyword: "ACTIONS".to_string(), workload_type: AIWorkloadType::ToolExecution },
+                AIPattern {
+                    keyword: "<->".to_string(),
+                    workload_type: AIWorkloadType::EmbeddingRetrieval,
+                },
+                AIPattern {
+                    keyword: "VECTOR".to_string(),
+                    workload_type: AIWorkloadType::EmbeddingRetrieval,
+                },
+                AIPattern {
+                    keyword: "EMBEDDING".to_string(),
+                    workload_type: AIWorkloadType::EmbeddingRetrieval,
+                },
+                AIPattern {
+                    keyword: "CONVERSATION".to_string(),
+                    workload_type: AIWorkloadType::ContextLookup,
+                },
+                AIPattern {
+                    keyword: "TURNS".to_string(),
+                    workload_type: AIWorkloadType::ContextLookup,
+                },
+                AIPattern {
+                    keyword: "DOCUMENTS".to_string(),
+                    workload_type: AIWorkloadType::KnowledgeBase,
+                },
+                AIPattern {
+                    keyword: "CHUNKS".to_string(),
+                    workload_type: AIWorkloadType::KnowledgeBase,
+                },
+                AIPattern {
+                    keyword: "TOOL_RESULTS".to_string(),
+                    workload_type: AIWorkloadType::ToolExecution,
+                },
+                AIPattern {
+                    keyword: "ACTIONS".to_string(),
+                    workload_type: AIWorkloadType::ToolExecution,
+                },
             ],
         }
     }
@@ -621,15 +665,9 @@ impl AIWorkloadDetector {
             AIWorkloadType::EmbeddingRetrieval => {
                 RoutingPreference::VectorNodes { prefer_gpu: true }
             }
-            AIWorkloadType::ContextLookup => {
-                RoutingPreference::LowLatency { max_lag_ms: 100 }
-            }
-            AIWorkloadType::KnowledgeBase => {
-                RoutingPreference::HighThroughput
-            }
-            AIWorkloadType::ToolExecution => {
-                RoutingPreference::Primary
-            }
+            AIWorkloadType::ContextLookup => RoutingPreference::LowLatency { max_lag_ms: 100 },
+            AIWorkloadType::KnowledgeBase => RoutingPreference::HighThroughput,
+            AIWorkloadType::ToolExecution => RoutingPreference::Primary,
         }
     }
 }
@@ -658,7 +696,12 @@ impl RAGRouter {
     }
 
     /// Route RAG query based on stage
-    pub fn route_rag_query(&self, stage: RAGStage, analysis: &QueryAnalysis, nodes: &[NodeInfo]) -> RoutingDecision {
+    pub fn route_rag_query(
+        &self,
+        stage: RAGStage,
+        analysis: &QueryAnalysis,
+        nodes: &[NodeInfo],
+    ) -> RoutingDecision {
         match stage {
             RAGStage::Retrieval => {
                 // Vector search on embeddings
@@ -730,33 +773,34 @@ mod tests {
             TableSchema::new("users")
                 .with_workload(WorkloadType::OLTP)
                 .with_access_pattern(AccessPattern::PointLookup)
-                .with_primary_key(vec!["id".to_string()])
+                .with_primary_key(vec!["id".to_string()]),
         );
 
         registry.register_table(
             TableSchema::new("events")
                 .with_workload(WorkloadType::OLAP)
-                .with_temperature(DataTemperature::Cold)
+                .with_temperature(DataTemperature::Cold),
         );
 
-        registry.register_table(
-            TableSchema::new("embeddings")
-                .with_workload(WorkloadType::Vector)
-        );
+        registry.register_table(TableSchema::new("embeddings").with_workload(WorkloadType::Vector));
 
         let config = SchemaRoutingConfig::default();
         let mut router = SchemaAwareRouter::new(config, registry);
 
         // Add test nodes
         router.add_node(NodeInfo::new("primary", "primary").as_primary());
-        router.add_node(NodeInfo::new("standby-sync", "standby-sync")
-            .with_sync_mode(SyncMode::Sync));
-        router.add_node(NodeInfo::new("standby-async", "standby-async")
-            .with_sync_mode(SyncMode::Async)
-            .with_capabilities(NodeCapabilities::analytics_node()));
-        router.add_node(NodeInfo::new("vector-node", "vector-node")
-            .with_sync_mode(SyncMode::Async)
-            .with_capabilities(NodeCapabilities::vector_node()));
+        router
+            .add_node(NodeInfo::new("standby-sync", "standby-sync").with_sync_mode(SyncMode::Sync));
+        router.add_node(
+            NodeInfo::new("standby-async", "standby-async")
+                .with_sync_mode(SyncMode::Async)
+                .with_capabilities(NodeCapabilities::analytics_node()),
+        );
+        router.add_node(
+            NodeInfo::new("vector-node", "vector-node")
+                .with_sync_mode(SyncMode::Async)
+                .with_capabilities(NodeCapabilities::vector_node()),
+        );
 
         router
     }
@@ -781,9 +825,15 @@ mod tests {
     #[test]
     fn test_route_vector_query() {
         let router = create_test_setup();
-        let decision = router.route("SELECT * FROM embeddings ORDER BY embedding <-> '[1,2,3]' LIMIT 10");
+        let decision =
+            router.route("SELECT * FROM embeddings ORDER BY embedding <-> '[1,2,3]' LIMIT 10");
 
-        assert!(matches!(decision.reason, RoutingReason::VectorCapable | RoutingReason::BestCandidate) || decision.is_primary());
+        assert!(
+            matches!(
+                decision.reason,
+                RoutingReason::VectorCapable | RoutingReason::BestCandidate
+            ) || decision.is_primary()
+        );
     }
 
     #[test]
@@ -792,7 +842,13 @@ mod tests {
         let decision = router.route("SELECT COUNT(*), SUM(amount) FROM events GROUP BY date");
 
         // Should prefer columnar storage or async nodes
-        assert!(!decision.is_primary() || matches!(decision.reason, RoutingReason::ColumnarStorage | RoutingReason::Default));
+        assert!(
+            !decision.is_primary()
+                || matches!(
+                    decision.reason,
+                    RoutingReason::ColumnarStorage | RoutingReason::Default
+                )
+        );
     }
 
     #[test]
@@ -803,8 +859,14 @@ mod tests {
         let context = "SELECT * FROM conversation WHERE session_id = $1";
         let tool = "INSERT INTO tool_results (result) VALUES ($1)";
 
-        assert_eq!(detector.detect(embedding), Some(AIWorkloadType::EmbeddingRetrieval));
-        assert_eq!(detector.detect(context), Some(AIWorkloadType::ContextLookup));
+        assert_eq!(
+            detector.detect(embedding),
+            Some(AIWorkloadType::EmbeddingRetrieval)
+        );
+        assert_eq!(
+            detector.detect(context),
+            Some(AIWorkloadType::ContextLookup)
+        );
         assert_eq!(detector.detect(tool), Some(AIWorkloadType::ToolExecution));
     }
 
@@ -813,7 +875,10 @@ mod tests {
         let router = create_test_setup();
 
         let retrieval = router.route_rag(RAGStage::Retrieval, "SELECT embedding FROM docs");
-        let fetch = router.route_rag(RAGStage::Fetch, "SELECT content FROM docs WHERE id IN (1,2,3)");
+        let fetch = router.route_rag(
+            RAGStage::Fetch,
+            "SELECT content FROM docs WHERE id IN (1,2,3)",
+        );
 
         // Retrieval should prefer vector nodes
         // Fetch should prefer high throughput

@@ -667,7 +667,8 @@ impl ProxyConfig {
             )));
         }
 
-        let port: u16 = parts[0].parse()
+        let port: u16 = parts[0]
+            .parse()
             .map_err(|_| ProxyError::Config(format!("Invalid port: {}", parts[0])))?;
 
         let host = parts[1].to_string();
@@ -696,7 +697,9 @@ impl ProxyConfig {
     pub fn validate(&self) -> Result<()> {
         // Must have at least one node
         if self.nodes.is_empty() {
-            return Err(ProxyError::Config("No backend nodes configured".to_string()));
+            return Err(ProxyError::Config(
+                "No backend nodes configured".to_string(),
+            ));
         }
 
         // Must have a primary node
@@ -717,12 +720,15 @@ impl ProxyConfig {
 
     /// Get primary node
     pub fn primary_node(&self) -> Option<&NodeConfig> {
-        self.nodes.iter().find(|n| n.role == NodeRole::Primary && n.enabled)
+        self.nodes
+            .iter()
+            .find(|n| n.role == NodeRole::Primary && n.enabled)
     }
 
     /// Get standby nodes
     pub fn standby_nodes(&self) -> Vec<&NodeConfig> {
-        self.nodes.iter()
+        self.nodes
+            .iter()
             .filter(|n| n.role == NodeRole::Standby && n.enabled)
             .collect()
     }
@@ -748,7 +754,6 @@ pub enum TrMode {
     /// Full transaction replay
     Transaction,
 }
-
 
 /// Connection pool configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1014,7 +1019,10 @@ mod tests {
     fn test_pool_mode_statement() {
         let config = PoolModeConfig::statement_mode();
         assert_eq!(config.mode, PoolingMode::Statement);
-        assert_eq!(config.prepared_statement_mode, PreparedStatementMode::Disable);
+        assert_eq!(
+            config.prepared_statement_mode,
+            PreparedStatementMode::Disable
+        );
     }
 
     #[test]

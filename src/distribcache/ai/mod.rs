@@ -8,22 +8,23 @@
 //! - Cross-feature AI integration
 
 mod conversation;
-mod rag;
-mod tools;
-mod semantic;
 mod integration;
+mod rag;
+mod semantic;
+mod tools;
 
-pub use conversation::{ConversationContextCache, ConversationContext, Turn, ConversationCacheStats};
-pub use rag::{RagChunkCache, Chunk, ChunkId, RagCacheStatsSnapshot};
-pub use tools::{ToolResultCache, ToolCallKey, ToolResult, ToolCacheStatsSnapshot};
-pub use semantic::{
-    SemanticQueryCache, SemanticEntry, SemanticCacheStatsSnapshot, cosine_similarity,
-    BranchContext, BranchId, AIWorkloadContext, VectorId, Embedding,
-    SemanticIndex, SemanticIndexConfig, SimilarityResult,
+pub use conversation::{
+    ConversationCacheStats, ConversationContext, ConversationContextCache, Turn,
 };
+pub use rag::{Chunk, ChunkId, RagCacheStatsSnapshot, RagChunkCache};
+pub use semantic::{
+    cosine_similarity, AIWorkloadContext, BranchContext, BranchId, Embedding,
+    SemanticCacheStatsSnapshot, SemanticEntry, SemanticIndex, SemanticIndexConfig,
+    SemanticQueryCache, SimilarityResult, VectorId,
+};
+pub use tools::{ToolCacheStatsSnapshot, ToolCallKey, ToolResult, ToolResultCache};
 // Note: SessionId is defined as a newtype struct in the parent distribcache module
 pub use integration::{
-    AIIntegrationCoordinator, AIIntegrationConfig, AIIntegrationStatsSnapshot,
-    AIWorkloadDetection, SessionTrackingInfo, CacheRecommendation,
-    CachePriority, RecommendedTier,
+    AIIntegrationConfig, AIIntegrationCoordinator, AIIntegrationStatsSnapshot, AIWorkloadDetection,
+    CachePriority, CacheRecommendation, RecommendedTier, SessionTrackingInfo,
 };

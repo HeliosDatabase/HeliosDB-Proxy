@@ -43,27 +43,26 @@
 //! }
 //! ```
 
-pub mod config;
-pub mod token_bucket;
-pub mod sliding_window;
-pub mod concurrency;
-pub mod limiter;
-pub mod cost_estimator;
-pub mod metrics;
 pub mod agent;
+pub mod concurrency;
+pub mod config;
+pub mod cost_estimator;
+pub mod limiter;
+pub mod metrics;
+pub mod sliding_window;
+pub mod token_bucket;
 
 // Re-exports for convenience
+pub use agent::{AgentTokenBudget, BudgetExceeded, QuotaExceeded, WorkflowQuota, WorkflowToken};
+pub use concurrency::{ConcurrencyGuard, ConcurrencyLimiter};
 pub use config::{
-    RateLimitConfig, LimitOverride, ExceededAction, PriorityLevel,
-    RateLimitConfigBuilder,
+    ExceededAction, LimitOverride, PriorityLevel, RateLimitConfig, RateLimitConfigBuilder,
 };
-pub use token_bucket::TokenBucket;
+pub use cost_estimator::{OperationType, QueryCostEstimator};
+pub use limiter::{LimiterKey, RateLimitExceeded, RateLimitResult, RateLimiter};
+pub use metrics::{KeyStats, RateLimitMetrics, RateLimitStats};
 pub use sliding_window::SlidingWindow;
-pub use concurrency::{ConcurrencyLimiter, ConcurrencyGuard};
-pub use limiter::{RateLimiter, LimiterKey, RateLimitResult, RateLimitExceeded};
-pub use cost_estimator::{QueryCostEstimator, OperationType};
-pub use metrics::{RateLimitMetrics, RateLimitStats, KeyStats};
-pub use agent::{AgentTokenBudget, WorkflowQuota, WorkflowToken, BudgetExceeded, QuotaExceeded};
+pub use token_bucket::TokenBucket;
 
 #[cfg(test)]
 mod tests {
@@ -89,7 +88,10 @@ mod tests {
         map.insert(LimiterKey::Database("db1".to_string()), 200);
 
         assert_eq!(map.get(&LimiterKey::User("user1".to_string())), Some(&100));
-        assert_eq!(map.get(&LimiterKey::Database("db1".to_string())), Some(&200));
+        assert_eq!(
+            map.get(&LimiterKey::Database("db1".to_string())),
+            Some(&200)
+        );
     }
 
     #[test]

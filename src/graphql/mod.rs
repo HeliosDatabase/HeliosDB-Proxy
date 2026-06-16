@@ -38,22 +38,22 @@
 //! ```
 
 pub mod config;
+pub mod dataloader;
 pub mod engine;
 pub mod introspector;
-pub mod sql_generator;
-pub mod dataloader;
-pub mod resolver;
-pub mod validation;
 pub mod metrics;
+pub mod resolver;
+pub mod sql_generator;
+pub mod validation;
 
-pub use config::{GraphQLConfig, GraphQLConfigBuilder, TableConfig, RelationshipConfig};
-pub use engine::{GraphQLEngine, GraphQLRequest, GraphQLResponse, GraphQLError};
-pub use introspector::{SchemaIntrospector, GraphQLSchema, GraphQLType, GraphQLField};
-pub use sql_generator::{SqlGenerator, SqlQuery, QueryPlan, Selection, Filter};
-pub use dataloader::{DataLoader, DataLoaderConfig, BatchResult};
+pub use config::{GraphQLConfig, GraphQLConfigBuilder, RelationshipConfig, TableConfig};
+pub use dataloader::{BatchResult, DataLoader, DataLoaderConfig};
+pub use engine::{GraphQLEngine, GraphQLError, GraphQLRequest, GraphQLResponse};
+pub use introspector::{GraphQLField, GraphQLSchema, GraphQLType, SchemaIntrospector};
+pub use metrics::{GraphQLMetrics, OperationMetrics, QueryStats};
 pub use resolver::{FieldResolver, ResolverContext, ResolverResult};
-pub use validation::{QueryValidator, ValidationError, ComplexityResult};
-pub use metrics::{GraphQLMetrics, QueryStats, OperationMetrics};
+pub use sql_generator::{Filter, QueryPlan, Selection, SqlGenerator, SqlQuery};
+pub use validation::{ComplexityResult, QueryValidator, ValidationError};
 
 use std::collections::HashMap;
 
@@ -233,8 +233,7 @@ impl Default for BranchContext {
 }
 
 /// GraphQL execution context
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ExecutionContext {
     /// User identity (if authenticated)
     pub user_id: Option<String>,
@@ -249,7 +248,6 @@ pub struct ExecutionContext {
     /// Custom metadata
     pub metadata: HashMap<String, String>,
 }
-
 
 impl ExecutionContext {
     /// Create a new execution context
@@ -387,10 +385,16 @@ mod tests {
 
     #[test]
     fn test_relation_type_from_str() {
-        assert_eq!(RelationType::from_str("one_to_one"), Some(RelationType::OneToOne));
+        assert_eq!(
+            RelationType::from_str("one_to_one"),
+            Some(RelationType::OneToOne)
+        );
         assert_eq!(RelationType::from_str("1:n"), Some(RelationType::OneToMany));
         assert_eq!(RelationType::from_str("n:1"), Some(RelationType::ManyToOne));
-        assert_eq!(RelationType::from_str("many_to_many"), Some(RelationType::ManyToMany));
+        assert_eq!(
+            RelationType::from_str("many_to_many"),
+            Some(RelationType::ManyToMany)
+        );
         assert_eq!(RelationType::from_str("invalid"), None);
     }
 
@@ -407,12 +411,24 @@ mod tests {
         assert_eq!(GraphQLScalar::from_sql_type("serial"), GraphQLScalar::ID);
         assert_eq!(GraphQLScalar::from_sql_type("UUID"), GraphQLScalar::ID);
         assert_eq!(GraphQLScalar::from_sql_type("INTEGER"), GraphQLScalar::Int);
-        assert_eq!(GraphQLScalar::from_sql_type("BIGINT"), GraphQLScalar::BigInt);
+        assert_eq!(
+            GraphQLScalar::from_sql_type("BIGINT"),
+            GraphQLScalar::BigInt
+        );
         assert_eq!(GraphQLScalar::from_sql_type("FLOAT"), GraphQLScalar::Float);
-        assert_eq!(GraphQLScalar::from_sql_type("BOOLEAN"), GraphQLScalar::Boolean);
-        assert_eq!(GraphQLScalar::from_sql_type("TIMESTAMP"), GraphQLScalar::DateTime);
+        assert_eq!(
+            GraphQLScalar::from_sql_type("BOOLEAN"),
+            GraphQLScalar::Boolean
+        );
+        assert_eq!(
+            GraphQLScalar::from_sql_type("TIMESTAMP"),
+            GraphQLScalar::DateTime
+        );
         assert_eq!(GraphQLScalar::from_sql_type("JSONB"), GraphQLScalar::JSON);
-        assert_eq!(GraphQLScalar::from_sql_type("VARCHAR"), GraphQLScalar::String);
+        assert_eq!(
+            GraphQLScalar::from_sql_type("VARCHAR"),
+            GraphQLScalar::String
+        );
     }
 
     #[test]

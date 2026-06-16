@@ -32,23 +32,23 @@
 //! SELECT * FROM debug_logs;
 //! ```
 
-pub mod hint_parser;
-pub mod query_router;
-pub mod node_filter;
-pub mod metrics;
 pub mod config;
+pub mod hint_parser;
+pub mod metrics;
+pub mod node_filter;
+pub mod query_router;
 
+pub use config::{AliasConfig, ConsistencyConfig, HintConfig, RoutingConfig};
 pub use hint_parser::{
-    HintParser, RoutingHint, RouteTarget, ConsistencyLevel,
-    QueryPriority, CacheBehavior, ParsedHints,
+    CacheBehavior, ConsistencyLevel, HintParser, ParsedHints, QueryPriority, RouteTarget,
+    RoutingHint,
 };
+pub use metrics::{HintUsageStats, RoutingMetrics, RoutingStats};
+pub use node_filter::{FilterResult, NodeCriteria, NodeFilter, NodeInfo, NodeRole, SyncMode};
 pub use query_router::{QueryRouter, RoutingDecision, RoutingReason};
-pub use node_filter::{NodeFilter, NodeCriteria, FilterResult, NodeInfo, NodeRole, SyncMode};
-pub use metrics::{RoutingMetrics, RoutingStats, HintUsageStats};
-pub use config::{RoutingConfig, HintConfig, ConsistencyConfig, AliasConfig};
 
-use thiserror::Error;
 use std::time::Duration;
+use thiserror::Error;
 
 /// Routing errors
 #[derive(Debug, Error)]
@@ -82,7 +82,9 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
     } else if let Some(num) = s.strip_suffix('m') {
         num.parse::<u64>().ok().map(|m| Duration::from_secs(m * 60))
     } else if let Some(num) = s.strip_suffix('h') {
-        num.parse::<u64>().ok().map(|h| Duration::from_secs(h * 3600))
+        num.parse::<u64>()
+            .ok()
+            .map(|h| Duration::from_secs(h * 3600))
     } else {
         // Try parsing as milliseconds by default
         s.parse::<u64>().ok().map(Duration::from_millis)

@@ -187,12 +187,7 @@ impl L1HotCache {
         // First, try to evict expired entries
         let expired: Vec<String> = lru
             .iter()
-            .filter(|(q, _)| {
-                entries
-                    .get(q)
-                    .map(|e| e.is_expired())
-                    .unwrap_or(true)
-            })
+            .filter(|(q, _)| entries.get(q).map(|e| e.is_expired()).unwrap_or(true))
             .map(|(q, _)| q.clone())
             .collect();
 

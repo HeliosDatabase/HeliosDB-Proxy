@@ -108,25 +108,38 @@ pub struct IntrospectionResponse {
 impl IntrospectionResponse {
     /// Convert to Identity
     pub fn to_identity(&self) -> Identity {
-        let roles = self.scope
+        let roles = self
+            .scope
             .as_ref()
             .map(|s| s.split_whitespace().map(String::from).collect())
             .unwrap_or_default();
 
         Identity {
-            user_id: self.sub.clone()
+            user_id: self
+                .sub
+                .clone()
                 .or_else(|| self.username.clone())
                 .unwrap_or_else(|| "unknown".to_string()),
             name: self.username.clone(),
-            email: self.extra.get("email")
+            email: self
+                .extra
+                .get("email")
                 .and_then(|v| v.as_str())
                 .map(String::from),
             roles,
-            groups: self.extra.get("groups")
+            groups: self
+                .extra
+                .get("groups")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default(),
-            tenant_id: self.extra.get("tenant_id")
+            tenant_id: self
+                .extra
+                .get("tenant_id")
                 .and_then(|v| v.as_str())
                 .map(String::from),
             claims: self.extra.clone(),
@@ -210,14 +223,18 @@ impl TokenCache {
         if self.entries.len() >= self.max_size {
             self.evict_expired();
         }
-        self.entries.insert(token, CachedToken {
-            response,
-            cached_at: Instant::now(),
-        });
+        self.entries.insert(
+            token,
+            CachedToken {
+                response,
+                cached_at: Instant::now(),
+            },
+        );
     }
 
     fn evict_expired(&mut self) {
-        self.entries.retain(|_, cached| cached.cached_at.elapsed() < self.ttl);
+        self.entries
+            .retain(|_, cached| cached.cached_at.elapsed() < self.ttl);
     }
 
     fn invalidate(&mut self, token: &str) {
@@ -266,7 +283,9 @@ impl OAuthClient {
         }
 
         // Cache successful response
-        self.cache.write().insert(token.to_string(), response.clone());
+        self.cache
+            .write()
+            .insert(token.to_string(), response.clone());
 
         Ok(response)
     }
@@ -406,9 +425,7 @@ impl TokenExchange {
         let scope = scopes.join(" ");
         format!(
             "{}?response_type=code&client_id={}&state={}&scope={}",
-            self.config.authorization_url
-                .as_deref()
-                .unwrap_or(""),
+            self.config.authorization_url.as_deref().unwrap_or(""),
             self.config.client_id,
             state,
             urlencoding::encode(&scope),

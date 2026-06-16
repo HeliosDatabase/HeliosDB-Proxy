@@ -25,45 +25,35 @@ impl TransformationEngine {
     }
 
     /// Apply a transformation to a query
-    pub fn apply(&self, query: &str, transformation: &Transformation) -> Result<String, TransformError> {
+    pub fn apply(
+        &self,
+        query: &str,
+        transformation: &Transformation,
+    ) -> Result<String, TransformError> {
         match transformation {
             Transformation::NoOp => Ok(query.to_string()),
 
-            Transformation::Replace(replacement) => {
-                Ok(replacement.clone())
-            }
+            Transformation::Replace(replacement) => Ok(replacement.clone()),
 
             Transformation::AddIndexHint { table, index } => {
                 self.add_index_hint(query, table, index)
             }
 
-            Transformation::ExpandSelectStar { columns } => {
-                self.expand_select_star(query, columns)
-            }
+            Transformation::ExpandSelectStar { columns } => self.expand_select_star(query, columns),
 
-            Transformation::AddLimit(limit) => {
-                self.add_limit(query, *limit)
-            }
+            Transformation::AddLimit(limit) => self.add_limit(query, *limit),
 
-            Transformation::AddWhereClause(condition) => {
-                self.add_where_clause(query, condition)
-            }
+            Transformation::AddWhereClause(condition) => self.add_where_clause(query, condition),
 
-            Transformation::AppendWhereAnd(condition) => {
-                self.append_where_and(query, condition)
-            }
+            Transformation::AppendWhereAnd(condition) => self.append_where_and(query, condition),
 
-            Transformation::ReplaceTable { from, to } => {
-                self.replace_table(query, from, to)
-            }
+            Transformation::ReplaceTable { from, to } => self.replace_table(query, from, to),
 
             Transformation::AddOrderBy { column, descending } => {
                 self.add_order_by(query, column, *descending)
             }
 
-            Transformation::AddHint(hint) => {
-                Ok(format!("/*{}*/ {}", hint, query))
-            }
+            Transformation::AddHint(hint) => Ok(format!("/*{}*/ {}", hint, query)),
 
             Transformation::AddBranchHint(branch) => {
                 Ok(format!("/*helios:branch={}*/ {}", branch, query))
@@ -93,7 +83,12 @@ impl TransformationEngine {
     }
 
     /// Add index hint to query
-    fn add_index_hint(&self, query: &str, table: &str, index: &str) -> Result<String, TransformError> {
+    fn add_index_hint(
+        &self,
+        query: &str,
+        table: &str,
+        index: &str,
+    ) -> Result<String, TransformError> {
         // PostgreSQL style: /*+ IndexScan(table index) */
         // Insert after SELECT keyword
         let upper = query.to_uppercase();
@@ -112,7 +107,11 @@ impl TransformationEngine {
     }
 
     /// Expand SELECT * to column list
-    fn expand_select_star(&self, query: &str, columns: &[String]) -> Result<String, TransformError> {
+    fn expand_select_star(
+        &self,
+        query: &str,
+        columns: &[String],
+    ) -> Result<String, TransformError> {
         // Find SELECT * pattern and replace with column list
         let re = Regex::new(r"(?i)SELECT\s+(\*|DISTINCT\s+\*|ALL\s+\*)")
             .map_err(|e| TransformError::RegexError(e.to_string()))?;
@@ -220,14 +219,18 @@ impl TransformationEngine {
     fn replace_table(&self, query: &str, from: &str, to: &str) -> Result<String, TransformError> {
         // Use word-boundary aware replacement
         let pattern = format!(r"\b{}\b", regex::escape(from));
-        let re = Regex::new(&pattern)
-            .map_err(|e| TransformError::RegexError(e.to_string()))?;
+        let re = Regex::new(&pattern).map_err(|e| TransformError::RegexError(e.to_string()))?;
 
         Ok(re.replace_all(query, to).to_string())
     }
 
     /// Add ORDER BY clause
-    fn add_order_by(&self, query: &str, column: &str, descending: bool) -> Result<String, TransformError> {
+    fn add_order_by(
+        &self,
+        query: &str,
+        column: &str,
+        descending: bool,
+    ) -> Result<String, TransformError> {
         let upper = query.to_uppercase();
         let trimmed = query.trim_end_matches(';').trim();
 
@@ -251,7 +254,10 @@ impl TransformationEngine {
         }
 
         let (before, after) = trimmed.split_at(insert_pos);
-        Ok(format!("{} ORDER BY {} {}{};", before, column, direction, after))
+        Ok(format!(
+            "{} ORDER BY {} {}{};",
+            before, column, direction, after
+        ))
     }
 }
 
@@ -308,7 +314,9 @@ mod tests {
         assert!(result.contains("LIMIT 100"));
 
         // Should not add duplicate LIMIT
-        let result2 = engine.add_limit("SELECT * FROM users LIMIT 50", 100).unwrap();
+        let result2 = engine
+            .add_limit("SELECT * FROM users LIMIT 50", 100)
+            .unwrap();
         assert!(result2.contains("LIMIT 50"));
         assert!(!result2.contains("LIMIT 100"));
     }
@@ -317,11 +325,15 @@ mod tests {
     fn test_add_where() {
         let engine = TransformationEngine::new();
 
-        let result = engine.add_where_clause("SELECT * FROM users", "active = true").unwrap();
+        let result = engine
+            .add_where_clause("SELECT * FROM users", "active = true")
+            .unwrap();
         assert!(result.contains("WHERE active = true"));
 
         // Should add AND to existing WHERE
-        let result2 = engine.add_where_clause("SELECT * FROM users WHERE id = 1", "active = true").unwrap();
+        let result2 = engine
+            .add_where_clause("SELECT * FROM users WHERE id = 1", "active = true")
+            .unwrap();
         assert!(result2.contains("AND (active = true)"));
     }
 
@@ -329,7 +341,9 @@ mod tests {
     fn test_replace_table() {
         let engine = TransformationEngine::new();
 
-        let result = engine.replace_table("SELECT * FROM old_users", "old_users", "users_v2").unwrap();
+        let result = engine
+            .replace_table("SELECT * FROM old_users", "old_users", "users_v2")
+            .unwrap();
         assert!(result.contains("users_v2"));
         assert!(!result.contains("old_users"));
     }
@@ -338,10 +352,12 @@ mod tests {
     fn test_expand_select_star() {
         let engine = TransformationEngine::new();
 
-        let result = engine.expand_select_star(
-            "SELECT * FROM users",
-            &["id".to_string(), "name".to_string(), "email".to_string()]
-        ).unwrap();
+        let result = engine
+            .expand_select_star(
+                "SELECT * FROM users",
+                &["id".to_string(), "name".to_string(), "email".to_string()],
+            )
+            .unwrap();
 
         assert!(result.contains("id, name, email"));
         assert!(!result.contains("*"));
@@ -351,10 +367,12 @@ mod tests {
     fn test_expand_select_distinct_star() {
         let engine = TransformationEngine::new();
 
-        let result = engine.expand_select_star(
-            "SELECT DISTINCT * FROM users",
-            &["id".to_string(), "name".to_string()]
-        ).unwrap();
+        let result = engine
+            .expand_select_star(
+                "SELECT DISTINCT * FROM users",
+                &["id".to_string(), "name".to_string()],
+            )
+            .unwrap();
 
         assert!(result.contains("SELECT DISTINCT id, name"));
     }
@@ -363,7 +381,9 @@ mod tests {
     fn test_add_index_hint() {
         let engine = TransformationEngine::new();
 
-        let result = engine.add_index_hint("SELECT * FROM users WHERE id = 1", "users", "idx_users_id").unwrap();
+        let result = engine
+            .add_index_hint("SELECT * FROM users WHERE id = 1", "users", "idx_users_id")
+            .unwrap();
         assert!(result.contains("IndexScan(users idx_users_id)"));
     }
 
@@ -371,7 +391,9 @@ mod tests {
     fn test_add_order_by() {
         let engine = TransformationEngine::new();
 
-        let result = engine.add_order_by("SELECT * FROM users", "created_at", true).unwrap();
+        let result = engine
+            .add_order_by("SELECT * FROM users", "created_at", true)
+            .unwrap();
         assert!(result.contains("ORDER BY created_at DESC"));
     }
 
@@ -379,7 +401,12 @@ mod tests {
     fn test_add_hint() {
         let engine = TransformationEngine::new();
 
-        let result = engine.apply("SELECT * FROM users", &Transformation::AddHint("parallel=4".to_string())).unwrap();
+        let result = engine
+            .apply(
+                "SELECT * FROM users",
+                &Transformation::AddHint("parallel=4".to_string()),
+            )
+            .unwrap();
         assert!(result.contains("/*parallel=4*/"));
     }
 
@@ -387,7 +414,12 @@ mod tests {
     fn test_add_branch_hint() {
         let engine = TransformationEngine::new();
 
-        let result = engine.apply("SELECT * FROM analytics", &Transformation::AddBranchHint("analytics".to_string())).unwrap();
+        let result = engine
+            .apply(
+                "SELECT * FROM analytics",
+                &Transformation::AddBranchHint("analytics".to_string()),
+            )
+            .unwrap();
         assert!(result.contains("/*helios:branch=analytics*/"));
     }
 
@@ -395,16 +427,18 @@ mod tests {
     fn test_chain_transformations() {
         let engine = TransformationEngine::new();
 
-        let result = engine.apply(
-            "SELECT * FROM users",
-            &Transformation::Chain(vec![
-                Transformation::AddLimit(100),
-                Transformation::AddOrderBy {
-                    column: "id".to_string(),
-                    descending: false,
-                },
-            ])
-        ).unwrap();
+        let result = engine
+            .apply(
+                "SELECT * FROM users",
+                &Transformation::Chain(vec![
+                    Transformation::AddLimit(100),
+                    Transformation::AddOrderBy {
+                        column: "id".to_string(),
+                        descending: false,
+                    },
+                ]),
+            )
+            .unwrap();
 
         assert!(result.contains("LIMIT 100"));
         assert!(result.contains("ORDER BY id ASC"));

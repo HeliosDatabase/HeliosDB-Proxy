@@ -141,25 +141,23 @@ impl ConnectionPoolManager {
 
         // Try to acquire connection
         let acquire_start = Instant::now();
-        let connection = match tokio::time::timeout(
-            self.config.acquire_timeout(),
-            pool.get_connection(node_id),
-        )
-        .await
-        {
-            Ok(Ok(conn)) => conn,
-            Ok(Err(e)) => {
-                self.metrics.record_acquire_failure();
-                return Err(e);
-            }
-            Err(_) => {
-                self.metrics.record_acquire_timeout();
-                return Err(ProxyError::Timeout(format!(
-                    "Timeout acquiring connection for node {:?}",
-                    node_id
-                )));
-            }
-        };
+        let connection =
+            match tokio::time::timeout(self.config.acquire_timeout(), pool.get_connection(node_id))
+                .await
+            {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(e)) => {
+                    self.metrics.record_acquire_failure();
+                    return Err(e);
+                }
+                Err(_) => {
+                    self.metrics.record_acquire_timeout();
+                    return Err(ProxyError::Timeout(format!(
+                        "Timeout acquiring connection for node {:?}",
+                        node_id
+                    )));
+                }
+            };
 
         let _acquire_duration = acquire_start.elapsed();
 
@@ -212,10 +210,7 @@ impl ConnectionPoolManager {
                     let reset_query = self.config.reset_query.as_str();
                     match pool.run_reset_query(&mut connection, reset_query).await {
                         Ok(()) => {
-                            tracing::trace!(
-                                query = reset_query,
-                                "reset query executed on release"
-                            );
+                            tracing::trace!(query = reset_query, "reset query executed on release");
                             self.metrics.record_reset(true);
                         }
                         Err(e) => {

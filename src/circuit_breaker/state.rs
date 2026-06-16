@@ -109,27 +109,15 @@ impl fmt::Display for StateTransition {
 #[derive(Debug, Clone)]
 pub enum TransitionReason {
     /// Failures exceeded threshold
-    FailureThresholdExceeded {
-        failure_count: u32,
-        threshold: u32,
-    },
+    FailureThresholdExceeded { failure_count: u32, threshold: u32 },
     /// Cooldown period elapsed
-    CooldownElapsed {
-        cooldown: Duration,
-    },
+    CooldownElapsed { cooldown: Duration },
     /// Probe succeeded in half-open
-    ProbeSucceeded {
-        success_count: u32,
-        threshold: u32,
-    },
+    ProbeSucceeded { success_count: u32, threshold: u32 },
     /// Probe failed in half-open
-    ProbeFailed {
-        error: String,
-    },
+    ProbeFailed { error: String },
     /// Manual intervention (admin force)
-    ManualForce {
-        admin: Option<String>,
-    },
+    ManualForce { admin: Option<String> },
     /// Reset requested
     Reset,
     /// Adaptive threshold adjusted
@@ -138,10 +126,7 @@ pub enum TransitionReason {
         new_threshold: u32,
     },
     /// Replication lag exceeded threshold
-    ReplicationLagExceeded {
-        lag: Duration,
-        threshold: Duration,
-    },
+    ReplicationLagExceeded { lag: Duration, threshold: Duration },
 }
 
 impl fmt::Display for TransitionReason {
@@ -213,10 +198,7 @@ pub enum CircuitEvent {
         failure_count: u32,
     },
     /// Probe attempt
-    ProbeAttempt {
-        node_id: String,
-        attempt: u32,
-    },
+    ProbeAttempt { node_id: String, attempt: u32 },
     /// Probe result
     ProbeResult {
         node_id: String,
@@ -369,7 +351,10 @@ mod tests {
 
     #[test]
     fn test_circuit_state_parse() {
-        assert_eq!("closed".parse::<CircuitState>().unwrap(), CircuitState::Closed);
+        assert_eq!(
+            "closed".parse::<CircuitState>().unwrap(),
+            CircuitState::Closed
+        );
         assert_eq!("OPEN".parse::<CircuitState>().unwrap(), CircuitState::Open);
         assert_eq!(
             "half_open".parse::<CircuitState>().unwrap(),

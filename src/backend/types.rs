@@ -80,12 +80,14 @@ impl TextValue {
     pub fn as_i64(&self, column: &str) -> BackendResult<Option<i64>> {
         match self {
             TextValue::Null => Ok(None),
-            TextValue::Text(s) => s.parse::<i64>().map(Some).map_err(|e| {
-                BackendError::ParseValue {
-                    column: column.to_string(),
-                    reason: format!("i64: {}", e),
-                }
-            }),
+            TextValue::Text(s) => {
+                s.parse::<i64>()
+                    .map(Some)
+                    .map_err(|e| BackendError::ParseValue {
+                        column: column.to_string(),
+                        reason: format!("i64: {}", e),
+                    })
+            }
         }
     }
 
@@ -93,21 +95,20 @@ impl TextValue {
     pub fn as_f64(&self, column: &str) -> BackendResult<Option<f64>> {
         match self {
             TextValue::Null => Ok(None),
-            TextValue::Text(s) => s.parse::<f64>().map(Some).map_err(|e| {
-                BackendError::ParseValue {
-                    column: column.to_string(),
-                    reason: format!("f64: {}", e),
-                }
-            }),
+            TextValue::Text(s) => {
+                s.parse::<f64>()
+                    .map(Some)
+                    .map_err(|e| BackendError::ParseValue {
+                        column: column.to_string(),
+                        reason: format!("f64: {}", e),
+                    })
+            }
         }
     }
 
     /// Decode as `DateTime<FixedOffset>` (TIMESTAMPTZ). PG text format
     /// with a timezone offset: `2026-04-24 12:34:56.789+00`.
-    pub fn as_timestamptz(
-        &self,
-        column: &str,
-    ) -> BackendResult<Option<DateTime<FixedOffset>>> {
+    pub fn as_timestamptz(&self, column: &str) -> BackendResult<Option<DateTime<FixedOffset>>> {
         match self {
             TextValue::Null => Ok(None),
             TextValue::Text(s) => {
@@ -119,17 +120,16 @@ impl TextValue {
                     s.clone()
                 };
                 // Append minutes to a bare hour offset: "+00" -> "+00:00".
-                let normalised =
-                    if let Some(idx) = normalised.rfind(['+', '-']) {
-                        let off = &normalised[idx + 1..];
-                        if off.len() == 2 && off.bytes().all(|b| b.is_ascii_digit()) {
-                            format!("{}:00", normalised)
-                        } else {
-                            normalised
-                        }
+                let normalised = if let Some(idx) = normalised.rfind(['+', '-']) {
+                    let off = &normalised[idx + 1..];
+                    if off.len() == 2 && off.bytes().all(|b| b.is_ascii_digit()) {
+                        format!("{}:00", normalised)
                     } else {
                         normalised
-                    };
+                    }
+                } else {
+                    normalised
+                };
                 DateTime::parse_from_rfc3339(&normalised)
                     .map(Some)
                     .map_err(|e| BackendError::ParseValue {
@@ -151,9 +151,8 @@ impl TextValue {
             TextValue::Text(s) => {
                 // Validate shape: H[H..]/H[H..]
                 if let Some((hi, lo)) = s.split_once('/') {
-                    let hex_ok = |p: &str| {
-                        !p.is_empty() && p.bytes().all(|b| b.is_ascii_hexdigit())
-                    };
+                    let hex_ok =
+                        |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_hexdigit());
                     if hex_ok(hi) && hex_ok(lo) {
                         return Ok(Some(s.clone()));
                     }
@@ -321,7 +320,10 @@ mod tests {
     fn test_text_value_timestamptz_pg_format() {
         let v = TextValue::Text("2026-04-24 12:34:56.789+00".to_string());
         let parsed = v.as_timestamptz("ts").unwrap().expect("some");
-        assert_eq!(parsed.to_rfc3339().starts_with("2026-04-24T12:34:56.789"), true);
+        assert_eq!(
+            parsed.to_rfc3339().starts_with("2026-04-24T12:34:56.789"),
+            true
+        );
     }
 
     #[test]
@@ -346,7 +348,10 @@ mod tests {
     fn test_text_value_numeric_accepts_valid() {
         for s in ["0", "1", "-42", "3.14", "+1.0", "1e10", "-2.5E-3", "NaN"] {
             assert!(
-                TextValue::Text(s.to_string()).as_numeric("x").unwrap().is_some(),
+                TextValue::Text(s.to_string())
+                    .as_numeric("x")
+                    .unwrap()
+                    .is_some(),
                 "should accept {:?}",
                 s
             );
@@ -374,8 +379,14 @@ mod tests {
 
     #[test]
     fn test_encode_literal_text_escapes_single_quote() {
-        assert_eq!(encode_literal(&ParamValue::Text("a'b".to_string())), "'a''b'");
-        assert_eq!(encode_literal(&ParamValue::Text("plain".to_string())), "'plain'");
+        assert_eq!(
+            encode_literal(&ParamValue::Text("a'b".to_string())),
+            "'a''b'"
+        );
+        assert_eq!(
+            encode_literal(&ParamValue::Text("plain".to_string())),
+            "'plain'"
+        );
     }
 
     #[test]

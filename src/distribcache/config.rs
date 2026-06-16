@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::tiers::{EvictionPolicy, CompressionType};
+use super::tiers::{CompressionType, EvictionPolicy};
 
 /// Main configuration for Helios-DistribCache
 #[derive(Debug, Clone)]

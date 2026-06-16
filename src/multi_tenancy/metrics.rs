@@ -58,13 +58,7 @@ impl TenantMetrics {
     }
 
     /// Record a query execution
-    pub fn record_query(
-        &self,
-        tenant: &TenantId,
-        duration: Duration,
-        rows: u64,
-        success: bool,
-    ) {
+    pub fn record_query(&self, tenant: &TenantId, duration: Duration, rows: u64, success: bool) {
         self.total_queries.fetch_add(1, Ordering::Relaxed);
         if !success {
             self.total_errors.fetch_add(1, Ordering::Relaxed);
@@ -344,12 +338,8 @@ impl TenantStats {
     fn update_min(&self, atomic: &AtomicU64, value: u64) {
         let mut current = atomic.load(Ordering::Relaxed);
         while value < current {
-            match atomic.compare_exchange_weak(
-                current,
-                value,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match atomic.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => break,
                 Err(c) => current = c,
             }
@@ -360,12 +350,8 @@ impl TenantStats {
     fn update_max(&self, atomic: &AtomicU64, value: u64) {
         let mut current = atomic.load(Ordering::Relaxed);
         while value > current {
-            match atomic.compare_exchange_weak(
-                current,
-                value,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match atomic.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => break,
                 Err(c) => current = c,
             }
@@ -541,11 +527,11 @@ impl TenantCostTracker {
     /// Create with default pricing
     pub fn new() -> Self {
         Self {
-            cost_per_query: 0.000001,      // $0.001 per 1000 queries
-            cost_per_1000_rows: 0.00001,   // $0.01 per million rows
-            cost_per_mb_read: 0.00001,     // $0.01 per GB read
-            cost_per_mb_written: 0.0001,   // $0.10 per GB written
-            cost_per_conn_second: 0.0,     // Free connections by default
+            cost_per_query: 0.000001,    // $0.001 per 1000 queries
+            cost_per_1000_rows: 0.00001, // $0.01 per million rows
+            cost_per_mb_read: 0.00001,   // $0.01 per GB read
+            cost_per_mb_written: 0.0001, // $0.10 per GB written
+            cost_per_conn_second: 0.0,   // Free connections by default
             costs: DashMap::new(),
         }
     }
@@ -636,7 +622,7 @@ impl Default for TenantCostTracker {
 
 /// Accumulated cost for a tenant
 struct TenantCost {
-    total: std::sync::atomic::AtomicU64,  // Stored as cost * 1_000_000 for precision
+    total: std::sync::atomic::AtomicU64, // Stored as cost * 1_000_000 for precision
     queries: AtomicU64,
 }
 

@@ -52,7 +52,11 @@ impl StatementModeHandler {
     }
 
     /// Create a lease for this mode
-    pub fn create_lease(&self, connection: PooledConnection, client_id: ClientId) -> ConnectionLease {
+    pub fn create_lease(
+        &self,
+        connection: PooledConnection,
+        client_id: ClientId,
+    ) -> ConnectionLease {
         ConnectionLease::new(connection, PoolingMode::Statement, client_id)
     }
 
@@ -155,14 +159,20 @@ impl StatementModeHandler {
         let upper = sql.trim().to_uppercase();
 
         if upper.starts_with("LISTEN") || upper.starts_with("UNLISTEN") {
-            return Some("LISTEN/UNLISTEN not supported in statement mode - notifications will be lost");
+            return Some(
+                "LISTEN/UNLISTEN not supported in statement mode - notifications will be lost",
+            );
         }
 
-        if upper.starts_with("PREPARE") || upper.starts_with("EXECUTE") || upper.starts_with("DEALLOCATE") {
+        if upper.starts_with("PREPARE")
+            || upper.starts_with("EXECUTE")
+            || upper.starts_with("DEALLOCATE")
+        {
             return Some("Prepared statements not supported in statement mode");
         }
 
-        if upper.starts_with("DECLARE") || upper.starts_with("FETCH") || upper.starts_with("CLOSE") {
+        if upper.starts_with("DECLARE") || upper.starts_with("FETCH") || upper.starts_with("CLOSE")
+        {
             return Some("Cursors not supported in statement mode outside explicit transactions");
         }
 
@@ -170,7 +180,10 @@ impl StatementModeHandler {
             return Some("Temporary tables may not persist correctly in statement mode");
         }
 
-        if upper.starts_with("SET ") && !upper.starts_with("SET LOCAL") && !upper.starts_with("SET TRANSACTION") {
+        if upper.starts_with("SET ")
+            && !upper.starts_with("SET LOCAL")
+            && !upper.starts_with("SET TRANSACTION")
+        {
             return Some("Session variables may not persist in statement mode - use SET LOCAL within transaction");
         }
 
@@ -275,12 +288,18 @@ mod tests {
         let handler = StatementModeHandler::new();
 
         assert!(handler.get_query_warning("LISTEN channel").is_some());
-        assert!(handler.get_query_warning("PREPARE stmt AS SELECT 1").is_some());
-        assert!(handler.get_query_warning("CREATE TEMP TABLE t (id int)").is_some());
+        assert!(handler
+            .get_query_warning("PREPARE stmt AS SELECT 1")
+            .is_some());
+        assert!(handler
+            .get_query_warning("CREATE TEMP TABLE t (id int)")
+            .is_some());
         assert!(handler.get_query_warning("SET work_mem = '1GB'").is_some());
 
         assert!(handler.get_query_warning("SELECT 1").is_none());
-        assert!(handler.get_query_warning("SET LOCAL work_mem = '1GB'").is_none());
+        assert!(handler
+            .get_query_warning("SET LOCAL work_mem = '1GB'")
+            .is_none());
     }
 
     #[test]

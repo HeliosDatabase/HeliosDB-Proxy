@@ -389,7 +389,10 @@ impl TenantPermissions {
 
     /// Check if table access is allowed
     pub fn is_table_allowed(&self, table: &str) -> bool {
-        !self.blocked_tables.iter().any(|t| t.eq_ignore_ascii_case(table))
+        !self
+            .blocked_tables
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(table))
     }
 }
 
@@ -491,7 +494,9 @@ impl TenantConfig {
 
     /// Get effective max connections considering pool config
     pub fn effective_max_connections(&self) -> u32 {
-        self.pool.max_connections.min(self.rate_limits.max_connections)
+        self.pool
+            .max_connections
+            .min(self.rate_limits.max_connections)
     }
 }
 
@@ -864,13 +869,20 @@ mod tests {
     #[test]
     fn test_identification_methods() {
         let header = IdentificationMethod::header("X-Tenant-Id");
-        assert!(matches!(header, IdentificationMethod::Header { header_name } if header_name == "X-Tenant-Id"));
+        assert!(
+            matches!(header, IdentificationMethod::Header { header_name } if header_name == "X-Tenant-Id")
+        );
 
         let prefix = IdentificationMethod::username_prefix('.');
-        assert!(matches!(prefix, IdentificationMethod::UsernamePrefix { separator: '.' }));
+        assert!(matches!(
+            prefix,
+            IdentificationMethod::UsernamePrefix { separator: '.' }
+        ));
 
         let jwt = IdentificationMethod::jwt_claim("tenant_id");
-        assert!(matches!(jwt, IdentificationMethod::JwtClaim { claim_name, .. } if claim_name == "tenant_id"));
+        assert!(
+            matches!(jwt, IdentificationMethod::JwtClaim { claim_name, .. } if claim_name == "tenant_id")
+        );
     }
 
     #[test]

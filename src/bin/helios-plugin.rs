@@ -16,7 +16,10 @@ use clap::{Parser, Subcommand};
 use heliosdb_proxy::plugin_registry;
 
 #[derive(Parser)]
-#[command(name = "helios-plugin", about = "HeliosProxy plugin registry + install")]
+#[command(
+    name = "helios-plugin",
+    about = "HeliosProxy plugin registry + install"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -73,7 +76,13 @@ enum Cmd {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.cmd {
-        Cmd::Install { name, registry, dest, trust_root, version } => {
+        Cmd::Install {
+            name,
+            registry,
+            dest,
+            trust_root,
+            version,
+        } => {
             match plugin_registry::install(
                 &registry,
                 &name,
@@ -85,7 +94,11 @@ fn main() -> ExitCode {
                     println!(
                         "installed {} v{} -> {}",
                         r.name,
-                        if r.version.is_empty() { "?" } else { &r.version },
+                        if r.version.is_empty() {
+                            "?"
+                        } else {
+                            &r.version
+                        },
                         r.wasm_path.display()
                     );
                     println!("  sha256: {}", r.sha256);
@@ -101,21 +114,30 @@ fn main() -> ExitCode {
         }
         Cmd::List { registry } => plugin_registry::load_index(&registry).map(|idx| {
             for e in &idx.plugins {
-                let sig = if e.signature.is_some() { "signed" } else { "unsigned" };
-                println!("{:<24} {:<10} {:<8} {}", e.name, e.version, sig, e.description);
+                let sig = if e.signature.is_some() {
+                    "signed"
+                } else {
+                    "unsigned"
+                };
+                println!(
+                    "{:<24} {:<10} {:<8} {}",
+                    e.name, e.version, sig, e.description
+                );
             }
         }),
-        Cmd::Verify { wasm, trust_root, sig } => {
-            plugin_registry::verify(&wasm, trust_root.as_deref(), sig.as_deref()).map(|r| {
-                println!("{}", wasm.display());
-                println!("  sha256: {}", r.sha256);
-                match r.signed_by {
-                    Some(k) => println!("  signature: verified by '{k}'"),
-                    None if trust_root.is_some() => unreachable!(),
-                    None => println!("  signature: not checked (no trust root)"),
-                }
-            })
-        }
+        Cmd::Verify {
+            wasm,
+            trust_root,
+            sig,
+        } => plugin_registry::verify(&wasm, trust_root.as_deref(), sig.as_deref()).map(|r| {
+            println!("{}", wasm.display());
+            println!("  sha256: {}", r.sha256);
+            match r.signed_by {
+                Some(k) => println!("  signature: verified by '{k}'"),
+                None if trust_root.is_some() => unreachable!(),
+                None => println!("  signature: not checked (no trust root)"),
+            }
+        }),
         Cmd::New { name, dir } => plugin_registry::scaffold(&name, &dir).map(|root| {
             println!("scaffolded plugin at {}", root.display());
         }),

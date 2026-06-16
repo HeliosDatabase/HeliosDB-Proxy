@@ -226,9 +226,7 @@ impl CircuitBreakerInner {
     }
 
     fn transition_to_open(&self, reason: TransitionReason) {
-        let prev = self
-            .state
-            .swap(CircuitState::Open as u8, Ordering::SeqCst);
+        let prev = self.state.swap(CircuitState::Open as u8, Ordering::SeqCst);
         if prev != CircuitState::Open as u8 {
             self.opened_at.store(self.now_nanos(), Ordering::SeqCst);
             self.open_count.fetch_add(1, Ordering::SeqCst);
@@ -323,12 +321,7 @@ impl CircuitBreakerInner {
         }
     }
 
-    fn record_transition(
-        &self,
-        from: CircuitState,
-        to: CircuitState,
-        reason: TransitionReason,
-    ) {
+    fn record_transition(&self, from: CircuitState, to: CircuitState, reason: TransitionReason) {
         let transition = super::state::StateTransition::new(from, to, reason);
         let mut history = self.history.write();
         history.push(transition);
@@ -448,26 +441,23 @@ impl CircuitBreaker {
                     self.inner.transition_to_half_open();
                     Ok(RequestGuard::new_probe(Arc::clone(&self.inner)))
                 } else {
-                    Err(CircuitOpen::new(
-                        &self.inner.node_id,
-                        self.inner.time_until_half_open(),
+                    Err(
+                        CircuitOpen::new(&self.inner.node_id, self.inner.time_until_half_open())
+                            .with_failure_count(self.inner.failure_counter.count())
+                            .with_last_error(
+                                self.inner.last_error.read().clone().unwrap_or_default(),
+                            ),
                     )
-                    .with_failure_count(self.inner.failure_counter.count())
-                    .with_last_error(
-                        self.inner
-                            .last_error
-                            .read()
-                            .clone()
-                            .unwrap_or_default(),
-                    ))
                 }
             }
             CircuitState::HalfOpen => {
                 if self.inner.can_probe() {
                     Ok(RequestGuard::new_probe(Arc::clone(&self.inner)))
                 } else {
-                    Err(CircuitOpen::new(&self.inner.node_id, Duration::from_millis(100))
-                        .with_failure_count(self.inner.failure_counter.count()))
+                    Err(
+                        CircuitOpen::new(&self.inner.node_id, Duration::from_millis(100))
+                            .with_failure_count(self.inner.failure_counter.count()),
+                    )
                 }
             }
         }
@@ -490,16 +480,18 @@ impl CircuitBreaker {
 
     /// Force circuit to open state
     pub fn force_open(&self, admin: Option<&str>) {
-        self.inner.transition_to_open(TransitionReason::ManualForce {
-            admin: admin.map(String::from),
-        });
+        self.inner
+            .transition_to_open(TransitionReason::ManualForce {
+                admin: admin.map(String::from),
+            });
     }
 
     /// Force circuit to closed state
     pub fn force_close(&self, admin: Option<&str>) {
-        self.inner.transition_to_closed(TransitionReason::ManualForce {
-            admin: admin.map(String::from),
-        });
+        self.inner
+            .transition_to_closed(TransitionReason::ManualForce {
+                admin: admin.map(String::from),
+            });
     }
 
     /// Reset circuit breaker (close and clear counters)
@@ -602,9 +594,7 @@ mod tests {
 
     #[test]
     fn test_circuit_breaker_open_on_failures() {
-        let config = CircuitBreakerConfig::builder()
-            .failure_threshold(3)
-            .build();
+        let config = CircuitBreakerConfig::builder().failure_threshold(3).build();
         let breaker = CircuitBreaker::new("test-node", config);
 
         breaker.record_failure("error 1");
@@ -644,9 +634,7 @@ mod tests {
 
     #[test]
     fn test_reset() {
-        let config = CircuitBreakerConfig::builder()
-            .failure_threshold(2)
-            .build();
+        let config = CircuitBreakerConfig::builder().failure_threshold(2).build();
         let breaker = CircuitBreaker::new("test-node", config);
 
         breaker.record_failure("error 1");

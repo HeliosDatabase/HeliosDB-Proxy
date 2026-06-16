@@ -6,10 +6,10 @@
 //! - Extracting table names
 //! - Computing stable hashes
 
+use once_cell::sync::Lazy;
+use regex::Regex;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use regex::Regex;
-use once_cell::sync::Lazy;
 
 /// Normalized query representation
 #[derive(Debug, Clone)]
@@ -52,34 +52,23 @@ pub struct QueryNormalizer {
 }
 
 // Regex patterns for normalization
-static STRING_LITERAL: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"'(?:[^'\\]|\\.)*'"#).unwrap()
-});
+static STRING_LITERAL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"'(?:[^'\\]|\\.)*'"#).unwrap());
 
 #[allow(dead_code)]
-static DOUBLE_QUOTED: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#""(?:[^"\\]|\\.)*""#).unwrap()
-});
+static DOUBLE_QUOTED: Lazy<Regex> = Lazy::new(|| Regex::new(r#""(?:[^"\\]|\\.)*""#).unwrap());
 
-static NUMBER_LITERAL: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\b\d+(?:\.\d+)?(?:e[+-]?\d+)?\b").unwrap()
-});
+static NUMBER_LITERAL: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b\d+(?:\.\d+)?(?:e[+-]?\d+)?\b").unwrap());
 
-static WHITESPACE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\s+").unwrap()
-});
+static WHITESPACE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 
 static TABLE_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)").unwrap()
 });
 
-static HINT_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"/\*[^*]*\*/").unwrap()
-});
+static HINT_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"/\*[^*]*\*/").unwrap());
 
-static COMMENT_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"--[^\n]*").unwrap()
-});
+static COMMENT_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"--[^\n]*").unwrap());
 
 impl QueryNormalizer {
     /// Create a new query normalizer
@@ -111,7 +100,7 @@ impl QueryNormalizer {
         let sql = STRING_LITERAL.replace_all(&sql, |caps: &regex::Captures| {
             let value = caps.get(0).unwrap().as_str();
             // Remove quotes and store the value
-            let inner = &value[1..value.len()-1];
+            let inner = &value[1..value.len() - 1];
             parameters.push(inner.to_string());
             "?"
         });
@@ -239,7 +228,10 @@ mod tests {
         let query = "SELECT * FROM users WHERE age > 18 AND status = 'active' AND score < 100";
         let normalized = normalizer.normalize(query);
 
-        assert_eq!(normalized.fingerprint, "SELECT * FROM USERS WHERE AGE > ? AND STATUS = ? AND SCORE < ?");
+        assert_eq!(
+            normalized.fingerprint,
+            "SELECT * FROM USERS WHERE AGE > ? AND STATUS = ? AND SCORE < ?"
+        );
         assert_eq!(normalized.parameters.len(), 3);
     }
 

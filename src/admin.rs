@@ -135,7 +135,6 @@ pub struct ChaosOverride {
     pub note: String,
 }
 
-
 /// Command handler type
 type CommandHandler = Arc<dyn Fn(&[&str]) -> Result<String> + Send + Sync>;
 
@@ -178,7 +177,10 @@ impl AdminServer {
         // the admin address concurrently while the old process drains (Batch H).
         let listener = crate::server::bind_reuseport(&self.listen_address)?;
 
-        tracing::info!("Admin API listening on {} (SO_REUSEPORT)", self.listen_address);
+        tracing::info!(
+            "Admin API listening on {} (SO_REUSEPORT)",
+            self.listen_address
+        );
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
@@ -287,7 +289,9 @@ impl AdminServer {
         // Read request body for POST/PUT requests
         let body = if content_length > 0 && (method == "POST" || method == "PUT") {
             let mut body_buf = vec![0u8; content_length];
-            reader.read_exact(&mut body_buf).await
+            reader
+                .read_exact(&mut body_buf)
+                .await
                 .map_err(|e| ProxyError::Network(format!("Body read error: {}", e)))?;
             Some(String::from_utf8_lossy(&body_buf).to_string())
         } else {
@@ -368,9 +372,7 @@ impl AdminServer {
     ) -> Result<(u16, serde_json::Value)> {
         match (method, path) {
             // SQL API - Execute SQL with TWR (Transparent Write Routing)
-            ("POST", "/api/sql") => {
-                Self::handle_sql_request(body, state).await
-            }
+            ("POST", "/api/sql") => Self::handle_sql_request(body, state).await,
 
             // Health endpoints
             ("GET", "/health") => {
@@ -419,7 +421,10 @@ impl AdminServer {
                 let node_addr = path.trim_start_matches("/nodes/");
                 let health = state.node_health.read().await;
                 match health.get(node_addr) {
-                    Some(h) => Ok((200, serde_json::to_value(NodeHealthResponse::from(h.clone()))?)),
+                    Some(h) => Ok((
+                        200,
+                        serde_json::to_value(NodeHealthResponse::from(h.clone()))?,
+                    )),
                     None => Ok((404, serde_json::json!({ "error": "Node not found" }))),
                 }
             }
@@ -497,13 +502,9 @@ impl AdminServer {
             #[cfg(feature = "edge-proxy")]
             ("GET", "/api/edge") => Self::handle_edge_status(state).await,
             #[cfg(feature = "edge-proxy")]
-            ("POST", "/api/edge/register") => {
-                Self::handle_edge_register(body, state).await
-            }
+            ("POST", "/api/edge/register") => Self::handle_edge_register(body, state).await,
             #[cfg(feature = "edge-proxy")]
-            ("POST", "/api/edge/invalidate") => {
-                Self::handle_edge_invalidate(body, state).await
-            }
+            ("POST", "/api/edge/invalidate") => Self::handle_edge_invalidate(body, state).await,
             #[cfg(not(feature = "edge-proxy"))]
             ("GET", "/api/edge")
             | ("POST", "/api/edge/register")
@@ -527,13 +528,17 @@ impl AdminServer {
             ("GET", "/api/migration/status") | ("GET", "/migration/status") => {
                 match state.migration.read().await.as_ref() {
                     Some(info) => {
-                        let st = crate::mirror::status(&info.target, info.writes_only, &info.metrics);
+                        let st =
+                            crate::mirror::status(&info.target, info.writes_only, &info.metrics);
                         let mut v = serde_json::to_value(st)?;
                         let cut = info.cutover.load_full().is_some();
                         v["cutover_active"] = serde_json::json!(cut);
                         Ok((200, v))
                     }
-                    None => Ok((503, serde_json::json!({ "error": "traffic mirroring not enabled" }))),
+                    None => Ok((
+                        503,
+                        serde_json::json!({ "error": "traffic mirroring not enabled" }),
+                    )),
                 }
             }
 
@@ -541,28 +546,42 @@ impl AdminServer {
             ("POST", "/api/migration/cutover") | ("POST", "/migration/cutover") => {
                 let info = state.migration.read().await.clone();
                 let Some(info) = info else {
-                    return Ok((503, serde_json::json!({ "error": "traffic mirroring not enabled" })));
+                    return Ok((
+                        503,
+                        serde_json::json!({ "error": "traffic mirroring not enabled" }),
+                    ));
                 };
                 let force = path.contains("force=true")
                     || body.map(|b| b.contains("\"force\":true")).unwrap_or(false);
                 let st = crate::mirror::status(&info.target, info.writes_only, &info.metrics);
                 if !st.migration_ready && !force {
-                    return Ok((409, serde_json::json!({
-                        "ok": false,
-                        "error": "not migration_ready (backlog/drops present); pass force=true to override",
-                        "status": st,
-                    })));
+                    return Ok((
+                        409,
+                        serde_json::json!({
+                            "ok": false,
+                            "error": "not migration_ready (backlog/drops present); pass force=true to override",
+                            "status": st,
+                        }),
+                    ));
                 }
-                info.cutover.store(Arc::new(Some(Arc::new(info.cutover_target.clone()))));
+                info.cutover
+                    .store(Arc::new(Some(Arc::new(info.cutover_target.clone()))));
                 tracing::warn!(target = %info.cutover_target.addr, "migration cutover: new connections now route to the promoted target");
-                Ok((200, serde_json::json!({ "ok": true, "promoted_to": info.cutover_target.addr })))
+                Ok((
+                    200,
+                    serde_json::json!({ "ok": true, "promoted_to": info.cutover_target.addr }),
+                ))
             }
 
             // Roll a cutover back to the original primary.
-            ("POST", "/api/migration/cutover/rollback") | ("POST", "/migration/cutover/rollback") => {
+            ("POST", "/api/migration/cutover/rollback")
+            | ("POST", "/migration/cutover/rollback") => {
                 let info = state.migration.read().await.clone();
                 let Some(info) = info else {
-                    return Ok((503, serde_json::json!({ "error": "traffic mirroring not enabled" })));
+                    return Ok((
+                        503,
+                        serde_json::json!({ "error": "traffic mirroring not enabled" }),
+                    ));
                 };
                 info.cutover.store(Arc::new(None));
                 Ok((200, serde_json::json!({ "ok": true, "rolled_back": true })))
@@ -572,7 +591,10 @@ impl AdminServer {
             ("POST", "/api/migration/snapshot") | ("POST", "/migration/snapshot") => {
                 let info = state.migration.read().await.clone();
                 let Some(info) = info else {
-                    return Ok((503, serde_json::json!({ "error": "traffic mirroring not enabled" })));
+                    return Ok((
+                        503,
+                        serde_json::json!({ "error": "traffic mirroring not enabled" }),
+                    ));
                 };
                 let body = body.unwrap_or("{}");
                 let req: serde_json::Value = serde_json::from_str(body)
@@ -580,15 +602,25 @@ impl AdminServer {
                 let tables: Vec<String> = req
                     .get("tables")
                     .and_then(|t| t.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 if tables.is_empty() {
-                    return Ok((400, serde_json::json!({ "error": "provide a non-empty 'tables' array" })));
+                    return Ok((
+                        400,
+                        serde_json::json!({ "error": "provide a non-empty 'tables' array" }),
+                    ));
                 }
                 match crate::mirror::snapshot_tables(&info.config, &tables).await {
                     Ok(rep) => {
                         let total: u64 = rep.iter().map(|t| t.copied).sum();
-                        Ok((200, serde_json::json!({ "ok": true, "tables": rep, "rows_copied": total })))
+                        Ok((
+                            200,
+                            serde_json::json!({ "ok": true, "tables": rep, "rows_copied": total }),
+                        ))
                     }
                     Err(e) => Ok((500, serde_json::json!({ "ok": false, "error": e }))),
                 }
@@ -598,7 +630,10 @@ impl AdminServer {
             ("GET", p) if p == "/api/branch" || p == "/branch" || p.starts_with("/api/branch?") => {
                 let cfg = state.branch.read().await.clone();
                 let Some(cfg) = cfg else {
-                    return Ok((503, serde_json::json!({ "error": "branch databases not enabled" })));
+                    return Ok((
+                        503,
+                        serde_json::json!({ "error": "branch databases not enabled" }),
+                    ));
                 };
                 match crate::branch::list(&cfg).await {
                     Ok(branches) => Ok((200, serde_json::json!({ "branches": branches }))),
@@ -608,29 +643,41 @@ impl AdminServer {
             ("POST", p) if p == "/api/branch" || p == "/branch" => {
                 let cfg = state.branch.read().await.clone();
                 let Some(cfg) = cfg else {
-                    return Ok((503, serde_json::json!({ "error": "branch databases not enabled" })));
+                    return Ok((
+                        503,
+                        serde_json::json!({ "error": "branch databases not enabled" }),
+                    ));
                 };
-                let req: serde_json::Value =
-                    serde_json::from_str(body.unwrap_or("{}")).map_err(|e| ProxyError::Internal(format!("invalid JSON: {}", e)))?;
+                let req: serde_json::Value = serde_json::from_str(body.unwrap_or("{}"))
+                    .map_err(|e| ProxyError::Internal(format!("invalid JSON: {}", e)))?;
                 let name = req.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 if name.is_empty() {
                     return Ok((400, serde_json::json!({ "error": "provide 'name'" })));
                 }
                 let base = req.get("base").and_then(|v| v.as_str());
                 match crate::branch::create(&cfg, name, base).await {
-                    Ok(()) => Ok((200, serde_json::json!({ "ok": true, "branch": name,
-                        "base": base.unwrap_or(&cfg.base_database) }))),
+                    Ok(()) => Ok((
+                        200,
+                        serde_json::json!({ "ok": true, "branch": name,
+                        "base": base.unwrap_or(&cfg.base_database) }),
+                    )),
                     Err(e) => Ok((500, serde_json::json!({ "ok": false, "error": e }))),
                 }
             }
             ("DELETE", p) if p.starts_with("/api/branch") || p.starts_with("/branch") => {
                 let cfg = state.branch.read().await.clone();
                 let Some(cfg) = cfg else {
-                    return Ok((503, serde_json::json!({ "error": "branch databases not enabled" })));
+                    return Ok((
+                        503,
+                        serde_json::json!({ "error": "branch databases not enabled" }),
+                    ));
                 };
                 let name = p.find("name=").map(|i| &p[i + 5..]).unwrap_or("");
                 if name.is_empty() {
-                    return Ok((400, serde_json::json!({ "error": "provide ?name=<branch>" })));
+                    return Ok((
+                        400,
+                        serde_json::json!({ "error": "provide ?name=<branch>" }),
+                    ));
                 }
                 match crate::branch::drop(&cfg, name).await {
                     Ok(()) => Ok((200, serde_json::json!({ "ok": true, "dropped": name }))),
@@ -694,7 +741,8 @@ impl AdminServer {
 
         // Get proxy config
         let proxy_config = state.proxy_config.read().await;
-        let config = proxy_config.as_ref()
+        let config = proxy_config
+            .as_ref()
             .ok_or_else(|| ProxyError::Internal("Proxy config not initialized".to_string()))?;
 
         // Get node health
@@ -780,7 +828,9 @@ impl AdminServer {
         config: &'a ProxyConfig,
         health: &HashMap<String, NodeHealth>,
     ) -> Result<&'a NodeConfig> {
-        config.nodes.iter()
+        config
+            .nodes
+            .iter()
             .find(|n| {
                 n.role == NodeRole::Primary
                     && n.enabled
@@ -796,17 +846,22 @@ impl AdminServer {
         state: &AdminState,
     ) -> Result<&'a NodeConfig> {
         // Get all healthy nodes (primary, standby, or replica)
-        let healthy_nodes: Vec<&NodeConfig> = config.nodes.iter()
+        let healthy_nodes: Vec<&NodeConfig> = config
+            .nodes
+            .iter()
             .filter(|n| n.enabled && health.get(&n.address()).map(|h| h.healthy).unwrap_or(false))
             .collect();
 
         if healthy_nodes.is_empty() {
-            return Err(ProxyError::Internal("No healthy nodes available".to_string()));
+            return Err(ProxyError::Internal(
+                "No healthy nodes available".to_string(),
+            ));
         }
 
         // If read/write splitting is enabled and there are standbys, prefer them
         if config.load_balancer.read_write_split {
-            let read_nodes: Vec<&NodeConfig> = healthy_nodes.iter()
+            let read_nodes: Vec<&NodeConfig> = healthy_nodes
+                .iter()
                 .filter(|n| n.role == NodeRole::Standby || n.role == NodeRole::ReadReplica)
                 .copied()
                 .collect();
@@ -846,8 +901,9 @@ impl AdminServer {
         };
 
         // Connect to backend
-        let stream = TcpStream::connect(host_port).await
-            .map_err(|e| ProxyError::Network(format!("Failed to connect to {}: {}", host_port, e)))?;
+        let stream = TcpStream::connect(host_port).await.map_err(|e| {
+            ProxyError::Network(format!("Failed to connect to {}: {}", host_port, e))
+        })?;
 
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
@@ -860,9 +916,13 @@ impl AdminServer {
             body_bytes.len()
         );
 
-        writer.write_all(request.as_bytes()).await
+        writer
+            .write_all(request.as_bytes())
+            .await
             .map_err(|e| ProxyError::Network(format!("Write error: {}", e)))?;
-        writer.write_all(&body_bytes).await
+        writer
+            .write_all(&body_bytes)
+            .await
             .map_err(|e| ProxyError::Network(format!("Write body error: {}", e)))?;
 
         // Read response headers
@@ -872,7 +932,9 @@ impl AdminServer {
 
         loop {
             line.clear();
-            let bytes_read = reader.read_line(&mut line).await
+            let bytes_read = reader
+                .read_line(&mut line)
+                .await
                 .map_err(|e| ProxyError::Network(format!("Response read error: {}", e)))?;
 
             if bytes_read == 0 || line == "\r\n" {
@@ -891,15 +953,21 @@ impl AdminServer {
         // Read response body
         let mut body_buf = vec![0u8; content_length];
         if content_length > 0 {
-            reader.read_exact(&mut body_buf).await
+            reader
+                .read_exact(&mut body_buf)
+                .await
                 .map_err(|e| ProxyError::Network(format!("Response body read error: {}", e)))?;
         }
 
         let response_body = String::from_utf8_lossy(&body_buf);
 
         // Parse JSON response
-        serde_json::from_str(&response_body)
-            .map_err(|e| ProxyError::Internal(format!("Invalid JSON response: {} - body: {}", e, response_body)))
+        serde_json::from_str(&response_body).map_err(|e| {
+            ProxyError::Internal(format!(
+                "Invalid JSON response: {} - body: {}",
+                e, response_body
+            ))
+        })
     }
 
     /// Check if proxy is ready to accept connections
@@ -911,7 +979,11 @@ impl AdminServer {
     }
 
     /// Set node enabled status
-    async fn set_node_enabled(state: &Arc<AdminState>, node_addr: &str, enabled: bool) -> Result<()> {
+    async fn set_node_enabled(
+        state: &Arc<AdminState>,
+        node_addr: &str,
+        enabled: bool,
+    ) -> Result<()> {
         let mut health = state.node_health.write().await;
 
         if let Some(node_health) = health.get_mut(node_addr) {
@@ -936,9 +1008,8 @@ impl AdminServer {
         body: Option<&str>,
         state: &Arc<AdminState>,
     ) -> Result<(u16, serde_json::Value)> {
-        let raw = body.ok_or_else(|| {
-            ProxyError::Internal("replay: empty request body".to_string())
-        })?;
+        let raw =
+            body.ok_or_else(|| ProxyError::Internal("replay: empty request body".to_string()))?;
         let req: ReplayRequestBody = match serde_json::from_str(raw) {
             Ok(r) => r,
             Err(e) => {
@@ -978,19 +1049,20 @@ impl AdminServer {
     /// `GET /api/edge` — surfaces edge-mode state: cache stats +
     /// the list of registered edges (when running in home mode).
     #[cfg(feature = "edge-proxy")]
-    async fn handle_edge_status(
-        state: &Arc<AdminState>,
-    ) -> Result<(u16, serde_json::Value)> {
+    async fn handle_edge_status(state: &Arc<AdminState>) -> Result<(u16, serde_json::Value)> {
         let cache_stats = state.edge_cache.read().await.clone().map(|c| c.stats());
         let edges = match state.edge_registry.read().await.clone() {
             Some(r) => r.list(),
             None => Vec::new(),
         };
-        Ok((200, serde_json::json!({
-            "cache":          cache_stats,
-            "registered":     edges,
-            "edge_count":     edges.len(),
-        })))
+        Ok((
+            200,
+            serde_json::json!({
+                "cache":          cache_stats,
+                "registered":     edges,
+                "edge_count":     edges.len(),
+            }),
+        ))
     }
 
     /// `POST /api/edge/register` — edges call this once at boot to
@@ -1002,9 +1074,8 @@ impl AdminServer {
         body: Option<&str>,
         state: &Arc<AdminState>,
     ) -> Result<(u16, serde_json::Value)> {
-        let raw = body.ok_or_else(|| {
-            ProxyError::Internal("edge register: empty body".to_string())
-        })?;
+        let raw =
+            body.ok_or_else(|| ProxyError::Internal("edge register: empty body".to_string()))?;
         let req: EdgeRegisterBody = match serde_json::from_str(raw) {
             Ok(r) => r,
             Err(e) => {
@@ -1031,17 +1102,17 @@ impl AdminServer {
                 // lifetime. For the JSON endpoint, we acknowledge
                 // the registration and the edge polls /api/edge for
                 // invalidations until SSE is wired.
-                Ok((201, serde_json::json!({
-                    "edge_id":  req.edge_id,
-                    "region":   req.region,
-                    "base_url": req.base_url,
-                    "registered_at": now,
-                })))
+                Ok((
+                    201,
+                    serde_json::json!({
+                        "edge_id":  req.edge_id,
+                        "region":   req.region,
+                        "base_url": req.base_url,
+                        "registered_at": now,
+                    }),
+                ))
             }
-            Err(e) => Ok((
-                503,
-                serde_json::json!({ "error": e.to_string() }),
-            )),
+            Err(e) => Ok((503, serde_json::json!({ "error": e.to_string() }))),
         }
     }
 
@@ -1056,9 +1127,8 @@ impl AdminServer {
         body: Option<&str>,
         state: &Arc<AdminState>,
     ) -> Result<(u16, serde_json::Value)> {
-        let raw = body.ok_or_else(|| {
-            ProxyError::Internal("edge invalidate: empty body".to_string())
-        })?;
+        let raw =
+            body.ok_or_else(|| ProxyError::Internal("edge invalidate: empty body".to_string()))?;
         let req: EdgeInvalidateBody = match serde_json::from_str(raw) {
             Ok(r) => r,
             Err(e) => {
@@ -1096,13 +1166,16 @@ impl AdminServer {
             committed_at: chrono::Utc::now().to_rfc3339(),
         };
         let (sent, pruned) = registry.broadcast(ev).await;
-        Ok((200, serde_json::json!({
-            "version":         version,
-            "tables":          req.tables,
-            "dropped_local":   dropped_local,
-            "edges_notified":  sent,
-            "edges_pruned":    pruned,
-        })))
+        Ok((
+            200,
+            serde_json::json!({
+                "version":         version,
+                "tables":          req.tables,
+                "dropped_local":   dropped_local,
+                "edges_notified":  sent,
+                "edges_pruned":    pruned,
+            }),
+        ))
     }
 
     /// Handle `GET /anomalies`. Returns the anomaly detector's
@@ -1125,12 +1198,15 @@ impl AdminServer {
             }
         };
         let events = det.recent_events(limit);
-        Ok((200, serde_json::json!({
-            "count":     events.len(),
-            "limit":     limit,
-            "events":    events,
-            "buffer_total": det.event_count(),
-        })))
+        Ok((
+            200,
+            serde_json::json!({
+                "count":     events.len(),
+                "limit":     limit,
+                "events":    events,
+                "buffer_total": det.event_count(),
+            }),
+        ))
     }
 
     /// Handle `POST /api/shadow`. Body is a JSON `ShadowRequestBody`.
@@ -1143,15 +1219,14 @@ impl AdminServer {
     ///   500 — source connect failure (shadow connect failures end up
     ///         in the report rather than the HTTP status)
     #[cfg(feature = "ha-tr")]
-    async fn handle_shadow_request(
-        body: Option<&str>,
-    ) -> Result<(u16, serde_json::Value)> {
-        use crate::backend::{tls::default_client_config, BackendClient, BackendConfig, ParamValue, TlsMode};
+    async fn handle_shadow_request(body: Option<&str>) -> Result<(u16, serde_json::Value)> {
+        use crate::backend::{
+            tls::default_client_config, BackendClient, BackendConfig, ParamValue, TlsMode,
+        };
         use crate::shadow_execute::shadow_execute;
 
-        let raw = body.ok_or_else(|| {
-            ProxyError::Internal("shadow: empty request body".to_string())
-        })?;
+        let raw =
+            body.ok_or_else(|| ProxyError::Internal("shadow: empty request body".to_string()))?;
         let req: ShadowRequestBody = match serde_json::from_str(raw) {
             Ok(r) => r,
             Err(e) => {
@@ -1164,7 +1239,11 @@ impl AdminServer {
 
         // Build the two configs from the request. TLS off + 5s
         // connect / 30s query timeouts mirror the replay defaults.
-        let mk_cfg = |host: String, port: u16, user: Option<String>, password: Option<String>, database: Option<String>| BackendConfig {
+        let mk_cfg = |host: String,
+                      port: u16,
+                      user: Option<String>,
+                      password: Option<String>,
+                      database: Option<String>| BackendConfig {
             host,
             port,
             user: user.unwrap_or_else(|| "postgres".into()),
@@ -1215,17 +1294,20 @@ impl AdminServer {
         source.close().await;
 
         match outcome {
-            Ok((_qr, report)) => Ok((200, serde_json::json!({
-                "sql":                report.sql,
-                "both_succeeded":     report.both_succeeded,
-                "row_count_match":    report.row_count_match,
-                "row_hash_match":     report.row_hash_match,
-                "primary_elapsed_us": report.primary_elapsed_us,
-                "shadow_elapsed_us":  report.shadow_elapsed_us,
-                "primary_error":      report.primary_error,
-                "shadow_error":       report.shadow_error,
-                "is_clean":           report.is_clean(),
-            }))),
+            Ok((_qr, report)) => Ok((
+                200,
+                serde_json::json!({
+                    "sql":                report.sql,
+                    "both_succeeded":     report.both_succeeded,
+                    "row_count_match":    report.row_count_match,
+                    "row_hash_match":     report.row_hash_match,
+                    "primary_elapsed_us": report.primary_elapsed_us,
+                    "shadow_elapsed_us":  report.shadow_elapsed_us,
+                    "primary_error":      report.primary_error,
+                    "shadow_error":       report.shadow_error,
+                    "is_clean":           report.is_clean(),
+                }),
+            )),
             Err(e) => Ok((
                 500,
                 serde_json::json!({ "error": format!("shadow execute: {}", e) }),
@@ -1252,9 +1334,8 @@ impl AdminServer {
         body: Option<&str>,
         state: &Arc<AdminState>,
     ) -> Result<(u16, serde_json::Value)> {
-        let raw = body.ok_or_else(|| {
-            ProxyError::Internal("chaos: empty request body".to_string())
-        })?;
+        let raw =
+            body.ok_or_else(|| ProxyError::Internal("chaos: empty request body".to_string()))?;
         let action: ChaosAction = match serde_json::from_str(raw) {
             Ok(a) => a,
             Err(e) => {
@@ -1267,10 +1348,7 @@ impl AdminServer {
         match action {
             ChaosAction::ForceUnhealthy { target_node } => {
                 if let Err(e) = Self::set_node_enabled(state, &target_node, false).await {
-                    return Ok((
-                        404,
-                        serde_json::json!({ "error": e.to_string() }),
-                    ));
+                    return Ok((404, serde_json::json!({ "error": e.to_string() })));
                 }
                 state.chaos_overrides.write().await.insert(
                     target_node.clone(),
@@ -1280,22 +1358,25 @@ impl AdminServer {
                         note: "forced unhealthy via chaos endpoint".to_string(),
                     },
                 );
-                Ok((200, serde_json::json!({
-                    "applied":     "force_unhealthy",
-                    "target_node": target_node,
-                })))
+                Ok((
+                    200,
+                    serde_json::json!({
+                        "applied":     "force_unhealthy",
+                        "target_node": target_node,
+                    }),
+                ))
             }
             ChaosAction::Restore { target_node } => {
                 if let Err(e) = Self::set_node_enabled(state, &target_node, true).await {
-                    return Ok((
-                        404,
-                        serde_json::json!({ "error": e.to_string() }),
-                    ));
+                    return Ok((404, serde_json::json!({ "error": e.to_string() })));
                 }
                 state.chaos_overrides.write().await.remove(&target_node);
-                Ok((200, serde_json::json!({
-                    "restored":    target_node,
-                })))
+                Ok((
+                    200,
+                    serde_json::json!({
+                        "restored":    target_node,
+                    }),
+                ))
             }
             ChaosAction::Reset => {
                 let overrides: Vec<String> =
@@ -1306,10 +1387,13 @@ impl AdminServer {
                     restored.push(addr);
                 }
                 state.chaos_overrides.write().await.clear();
-                Ok((200, serde_json::json!({
-                    "reset":      true,
-                    "restored":   restored,
-                })))
+                Ok((
+                    200,
+                    serde_json::json!({
+                        "reset":      true,
+                        "restored":   restored,
+                    }),
+                ))
             }
         }
     }
@@ -1905,13 +1989,28 @@ mod tests {
     #[test]
     fn test_admin_authorized() {
         let h = |s: &str| vec!["GET /topology HTTP/1.1".to_string(), s.to_string()];
-        assert!(AdminServer::admin_authorized(&h("Authorization: Bearer s3cret"), "s3cret"));
+        assert!(AdminServer::admin_authorized(
+            &h("Authorization: Bearer s3cret"),
+            "s3cret"
+        ));
         // case-insensitive header name, exact token
-        assert!(AdminServer::admin_authorized(&h("authorization: Bearer s3cret"), "s3cret"));
+        assert!(AdminServer::admin_authorized(
+            &h("authorization: Bearer s3cret"),
+            "s3cret"
+        ));
         // wrong token / wrong scheme / missing header all rejected
-        assert!(!AdminServer::admin_authorized(&h("Authorization: Bearer nope"), "s3cret"));
-        assert!(!AdminServer::admin_authorized(&h("Authorization: Basic s3cret"), "s3cret"));
-        assert!(!AdminServer::admin_authorized(&["GET / HTTP/1.1".to_string()], "s3cret"));
+        assert!(!AdminServer::admin_authorized(
+            &h("Authorization: Bearer nope"),
+            "s3cret"
+        ));
+        assert!(!AdminServer::admin_authorized(
+            &h("Authorization: Basic s3cret"),
+            "s3cret"
+        ));
+        assert!(!AdminServer::admin_authorized(
+            &["GET / HTTP/1.1".to_string()],
+            "s3cret"
+        ));
     }
 
     #[test]
@@ -2008,9 +2107,7 @@ mod tests {
 
     /// Helper: build an AdminState with the given (address, role,
     /// healthy) tuples seeded into config + node_health.
-    async fn topology_state(
-        nodes: &[(&str, &str, bool)],
-    ) -> Arc<AdminState> {
+    async fn topology_state(nodes: &[(&str, &str, bool)]) -> Arc<AdminState> {
         let state = Arc::new(AdminState::new());
         {
             let mut cfg = state.config_snapshot.write().await;
@@ -2088,10 +2185,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_topology_role_match_is_case_insensitive() {
-        let state = topology_state(&[
-            ("primary.svc:5432", "PRIMARY", true),
-        ])
-        .await;
+        let state = topology_state(&[("primary.svc:5432", "PRIMARY", true)]).await;
         let topo = AdminServer::compute_topology(&state).await;
         assert_eq!(topo.current_primary.as_deref(), Some("primary.svc:5432"));
     }
@@ -2182,7 +2276,11 @@ mod tests {
         // Health flag flipped.
         assert!(!state.node_health.read().await["primary.svc:5432"].healthy);
         // Override recorded.
-        assert!(state.chaos_overrides.read().await.contains_key("primary.svc:5432"));
+        assert!(state
+            .chaos_overrides
+            .read()
+            .await
+            .contains_key("primary.svc:5432"));
     }
 
     #[tokio::test]
@@ -2226,12 +2324,10 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let (status, value) = AdminServer::handle_chaos_request(
-            Some(r#"{"action":"reset"}"#),
-            &state,
-        )
-        .await
-        .unwrap();
+        let (status, value) =
+            AdminServer::handle_chaos_request(Some(r#"{"action":"reset"}"#), &state)
+                .await
+                .unwrap();
         assert_eq!(status, 200);
         assert_eq!(value["reset"], true);
         let restored = value["restored"].as_array().unwrap();
@@ -2316,10 +2412,9 @@ mod tests {
     #[tokio::test]
     async fn test_anomalies_returns_503_when_detector_unattached() {
         let state = Arc::new(AdminState::new());
-        let (status, value) =
-            AdminServer::handle_anomalies_list("/anomalies", &state)
-                .await
-                .expect("handler returns Ok");
+        let (status, value) = AdminServer::handle_anomalies_list("/anomalies", &state)
+            .await
+            .expect("handler returns Ok");
         assert_eq!(status, 503);
         assert_eq!(value["error"], "anomaly detector not attached");
     }
@@ -2339,10 +2434,9 @@ mod tests {
         });
         state.with_anomaly_detector(det.clone()).await;
 
-        let (status, value) =
-            AdminServer::handle_anomalies_list("/anomalies", &state)
-                .await
-                .expect("handler returns Ok");
+        let (status, value) = AdminServer::handle_anomalies_list("/anomalies", &state)
+            .await
+            .expect("handler returns Ok");
         assert_eq!(status, 200);
         let count = value["count"].as_u64().expect("count field");
         assert!(count > 0, "expected at least one event, got {}", count);
@@ -2365,10 +2459,9 @@ mod tests {
         }
         state.with_anomaly_detector(det).await;
 
-        let (status, value) =
-            AdminServer::handle_anomalies_list("/anomalies?limit=5", &state)
-                .await
-                .expect("handler returns Ok");
+        let (status, value) = AdminServer::handle_anomalies_list("/anomalies?limit=5", &state)
+            .await
+            .expect("handler returns Ok");
         assert_eq!(status, 200);
         assert_eq!(value["limit"].as_u64().unwrap(), 5);
         assert_eq!(value["events"].as_array().unwrap().len(), 5);
@@ -2381,7 +2474,10 @@ mod tests {
         assert_eq!(parse_limit_query("/anomalies?limit=42", 100, 1024), 42);
         assert_eq!(parse_limit_query("/anomalies?limit=99999", 100, 1024), 1024);
         assert_eq!(parse_limit_query("/anomalies?limit=abc", 100, 1024), 100);
-        assert_eq!(parse_limit_query("/anomalies?other=x&limit=7", 100, 1024), 7);
+        assert_eq!(
+            parse_limit_query("/anomalies?other=x&limit=7", 100, 1024),
+            7
+        );
     }
 
     #[cfg(feature = "edge-proxy")]
@@ -2420,10 +2516,7 @@ mod tests {
         let (status2, value2) = AdminServer::handle_edge_status(&s).await.unwrap();
         assert_eq!(status2, 200);
         assert_eq!(value2["edge_count"].as_u64().unwrap(), 1);
-        assert_eq!(
-            value2["registered"][0]["edge_id"].as_str().unwrap(),
-            "e1"
-        );
+        assert_eq!(value2["registered"][0]["edge_id"].as_str().unwrap(), "e1");
     }
 
     #[cfg(feature = "edge-proxy")]

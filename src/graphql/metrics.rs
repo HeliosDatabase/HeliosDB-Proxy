@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use super::{OperationType, ErrorCode};
+use super::{ErrorCode, OperationType};
 
 /// GraphQL metrics collector
 #[derive(Debug)]
@@ -209,7 +209,8 @@ impl QueryStats {
         }
 
         // Update duration stats
-        self.total_duration_us.fetch_add(duration_us, Ordering::Relaxed);
+        self.total_duration_us
+            .fetch_add(duration_us, Ordering::Relaxed);
 
         // Update min
         let mut current_min = self.min_duration_us.load(Ordering::Relaxed);
@@ -342,7 +343,8 @@ impl OperationMetrics {
     /// Record an execution
     pub fn record(&self, duration: Duration) {
         self.call_count.fetch_add(1, Ordering::Relaxed);
-        self.total_duration_us.fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+        self.total_duration_us
+            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
     }
 
     /// Record an error
@@ -420,7 +422,9 @@ impl LatencyHistogram {
     /// Record a value
     fn record(&mut self, value_us: u64) {
         // Update bucket
-        let bucket = self.boundaries.iter()
+        let bucket = self
+            .boundaries
+            .iter()
             .position(|&b| value_us <= b)
             .unwrap_or(self.boundaries.len());
         self.counts[bucket] += 1;
@@ -484,8 +488,14 @@ impl MetricsReporter for ConsoleReporter {
 
         println!("=== GraphQL Metrics ===");
         println!("Queries: {}", stats.query_count.load(Ordering::Relaxed));
-        println!("Mutations: {}", stats.mutation_count.load(Ordering::Relaxed));
-        println!("Subscriptions: {}", stats.subscription_count.load(Ordering::Relaxed));
+        println!(
+            "Mutations: {}",
+            stats.mutation_count.load(Ordering::Relaxed)
+        );
+        println!(
+            "Subscriptions: {}",
+            stats.subscription_count.load(Ordering::Relaxed)
+        );
 
         if let Some(avg) = stats.average_duration() {
             println!("Avg latency: {:?}", avg);

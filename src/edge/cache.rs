@@ -196,10 +196,7 @@ impl EdgeCache {
             hits: self.inner.hits.load(Ordering::Relaxed),
             misses: self.inner.misses.load(Ordering::Relaxed),
             inserts: self.inner.inserts.load(Ordering::Relaxed),
-            invalidations_received: self
-                .inner
-                .invalidations
-                .load(Ordering::Relaxed),
+            invalidations_received: self.inner.invalidations.load(Ordering::Relaxed),
             entries_evicted: self.inner.evictions.load(Ordering::Relaxed),
             current_entries: self.inner.map.read().len(),
         }
@@ -228,7 +225,10 @@ mod tests {
     fn insert_then_get_returns_value() {
         let c = EdgeCache::new(10);
         let k = CacheKey::new("fp1", "p1");
-        c.insert(k.clone(), entry(1, b"row", &["users"], Duration::from_secs(60)));
+        c.insert(
+            k.clone(),
+            entry(1, b"row", &["users"], Duration::from_secs(60)),
+        );
         let got = c.get(&k).expect("hit");
         assert_eq!(got.response_bytes, b"row");
     }

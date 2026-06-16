@@ -162,10 +162,7 @@ pub struct UpgradeOrchestrator {
 }
 
 impl UpgradeOrchestrator {
-    pub fn new(
-        switchover: Arc<SwitchoverBuffer>,
-        backend_template: BackendConfig,
-    ) -> Self {
+    pub fn new(switchover: Arc<SwitchoverBuffer>, backend_template: BackendConfig) -> Self {
         Self {
             jobs: Arc::new(RwLock::new(HashMap::new())),
             switchover,
@@ -261,9 +258,9 @@ impl UpgradeOrchestrator {
 
         // Step 1a: publication on source.
         let source_cfg = self.backend_for(&job.from_address)?;
-        let mut source = BackendClient::connect(&source_cfg).await.map_err(|e| {
-            ProxyError::FailoverFailed(format!("connect source: {}", e))
-        })?;
+        let mut source = BackendClient::connect(&source_cfg)
+            .await
+            .map_err(|e| ProxyError::FailoverFailed(format!("connect source: {}", e)))?;
         // Idempotent — drop+create so reruns don't error on residue.
         let _ = source
             .execute(&format!(
@@ -277,9 +274,7 @@ impl UpgradeOrchestrator {
                 quote_ident(&pub_name)
             ))
             .await
-            .map_err(|e| {
-                ProxyError::FailoverFailed(format!("CREATE PUBLICATION: {}", e))
-            })?;
+            .map_err(|e| ProxyError::FailoverFailed(format!("CREATE PUBLICATION: {}", e)))?;
         source.close().await;
 
         // Step 1b: subscription on target. The CONNECTION string
@@ -290,9 +285,9 @@ impl UpgradeOrchestrator {
         // the SQL portable across PG 14-17.
         let target_cfg = self.backend_for(&job.to_address)?;
         let conninfo = source_conninfo(&source_cfg);
-        let mut target = BackendClient::connect(&target_cfg).await.map_err(|e| {
-            ProxyError::FailoverFailed(format!("connect target: {}", e))
-        })?;
+        let mut target = BackendClient::connect(&target_cfg)
+            .await
+            .map_err(|e| ProxyError::FailoverFailed(format!("connect target: {}", e)))?;
         let _ = target
             .execute(&format!(
                 "DROP SUBSCRIPTION IF EXISTS {}",
@@ -307,9 +302,7 @@ impl UpgradeOrchestrator {
                 quote_ident(&pub_name)
             ))
             .await
-            .map_err(|e| {
-                ProxyError::FailoverFailed(format!("CREATE SUBSCRIPTION: {}", e))
-            })?;
+            .map_err(|e| ProxyError::FailoverFailed(format!("CREATE SUBSCRIPTION: {}", e)))?;
         target.close().await;
 
         tracing::info!(job = %job.id, pub_name = %pub_name, "stage 1: replication created");
@@ -324,9 +317,9 @@ impl UpgradeOrchestrator {
     /// subscription is active, which is correct under steady state.
     async fn stage_wait_catchup(&self, job: &UpgradeJob) -> Result<UpgradeState> {
         let target_cfg = self.backend_for(&job.to_address)?;
-        let mut target = BackendClient::connect(&target_cfg).await.map_err(|e| {
-            ProxyError::FailoverFailed(format!("connect target: {}", e))
-        })?;
+        let mut target = BackendClient::connect(&target_cfg)
+            .await
+            .map_err(|e| ProxyError::FailoverFailed(format!("connect target: {}", e)))?;
         let pub_name = publication_name(job.id);
         let row = target
             .query_scalar(&format!(
@@ -334,16 +327,12 @@ impl UpgradeOrchestrator {
                 pub_name.replace('\'', "''")
             ))
             .await
-            .map_err(|e| {
-                ProxyError::FailoverFailed(format!("subscription probe: {}", e))
-            })?;
+            .map_err(|e| ProxyError::FailoverFailed(format!("subscription probe: {}", e)))?;
         target.close().await;
 
         let enabled = row
             .as_bool("subenabled")
-            .map_err(|e| {
-                ProxyError::FailoverFailed(format!("subenabled value: {}", e))
-            })?
+            .map_err(|e| ProxyError::FailoverFailed(format!("subenabled value: {}", e)))?
             .unwrap_or(false);
         if !enabled {
             return Err(ProxyError::FailoverFailed(format!(
@@ -481,10 +470,7 @@ impl UpgradeOrchestrator {
         let job = jobs
             .get_mut(&id)
             .ok_or_else(|| ProxyError::Internal(format!("upgrade job {} not found", id)))?;
-        if matches!(
-            job.state,
-            UpgradeState::Complete | UpgradeState::Failed
-        ) {
+        if matches!(job.state, UpgradeState::Complete | UpgradeState::Failed) {
             return Err(ProxyError::Internal(format!(
                 "job {} already terminal: {:?}",
                 id, job.state
@@ -544,12 +530,12 @@ fn source_conninfo(cfg: &BackendConfig) -> String {
 /// than silently defaulting — the orchestrator depends on these
 /// being correct.
 fn parse_addr(addr: &str) -> Result<(String, u16)> {
-    let (host, port) = addr.rsplit_once(':').ok_or_else(|| {
-        ProxyError::Configuration(format!("expected host:port, got {:?}", addr))
-    })?;
-    let port: u16 = port.parse().map_err(|_| {
-        ProxyError::Configuration(format!("invalid port in {:?}", addr))
-    })?;
+    let (host, port) = addr
+        .rsplit_once(':')
+        .ok_or_else(|| ProxyError::Configuration(format!("expected host:port, got {:?}", addr)))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| ProxyError::Configuration(format!("invalid port in {:?}", addr)))?;
     Ok((host.to_string(), port))
 }
 
@@ -647,7 +633,9 @@ mod tests {
         // Either the source connect or the publication SQL trips it;
         // both surface a "connect" or "FailoverFailed" message.
         assert!(
-            err.contains("connect") || err.contains("FailoverFailed") || err.contains("PUBLICATION"),
+            err.contains("connect")
+                || err.contains("FailoverFailed")
+                || err.contains("PUBLICATION"),
             "expected connect/SQL error, got {}",
             err
         );

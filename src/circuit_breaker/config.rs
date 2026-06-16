@@ -165,7 +165,9 @@ impl CircuitBreakerConfigBuilder {
             half_open_max_probes: self
                 .half_open_max_probes
                 .unwrap_or(default.half_open_max_probes),
-            failure_conditions: self.failure_conditions.unwrap_or(default.failure_conditions),
+            failure_conditions: self
+                .failure_conditions
+                .unwrap_or(default.failure_conditions),
             adaptive_enabled: self.adaptive_enabled.unwrap_or(default.adaptive_enabled),
             sync_mode_thresholds: self.sync_mode_thresholds,
         }
@@ -446,6 +448,9 @@ mod tests {
         let merged = override_.apply_to(&base);
         assert_eq!(merged.failure_threshold, 20);
         assert_eq!(merged.cooldown, Duration::from_secs(60));
-        assert_eq!(merged.half_open_success_threshold, base.half_open_success_threshold);
+        assert_eq!(
+            merged.half_open_success_threshold,
+            base.half_open_success_threshold
+        );
     }
 }

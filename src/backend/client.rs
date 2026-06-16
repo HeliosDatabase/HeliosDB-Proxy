@@ -74,16 +74,21 @@ impl BackendClient {
     pub async fn connect(cfg: &BackendConfig) -> BackendResult<Self> {
         tokio::time::timeout(cfg.connect_timeout, Self::connect_inner(cfg))
             .await
-            .map_err(|_| BackendError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("connect to {} exceeded {:?}", cfg.address(), cfg.connect_timeout),
-            )))?
+            .map_err(|_| {
+                BackendError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "connect to {} exceeded {:?}",
+                        cfg.address(),
+                        cfg.connect_timeout
+                    ),
+                ))
+            })?
     }
 
     async fn connect_inner(cfg: &BackendConfig) -> BackendResult<Self> {
         let tcp = TcpStream::connect(cfg.address()).await?;
-        let mut stream =
-            negotiate(tcp, cfg.tls_mode, cfg.tls_config.clone(), &cfg.host).await?;
+        let mut stream = negotiate(tcp, cfg.tls_mode, cfg.tls_config.clone(), &cfg.host).await?;
 
         // Send StartupMessage (protocol 3.0).
         let startup = build_startup(cfg);
@@ -100,13 +105,7 @@ impl BackendClient {
             let msg = read_one(&mut stream, &mut buffer, &codec).await?;
             match msg.msg_type {
                 MessageType::AuthRequest => {
-                    handle_auth(
-                        &mut stream,
-                        &msg,
-                        cfg,
-                        &mut scram_state,
-                    )
-                    .await?;
+                    handle_auth(&mut stream, &msg, cfg, &mut scram_state).await?;
                 }
                 MessageType::ParameterStatus => {
                     if let Some((k, v)) = parse_parameter_status(&msg.payload) {
@@ -115,12 +114,10 @@ impl BackendClient {
                 }
                 MessageType::BackendKeyData => {
                     if msg.payload.len() >= 8 {
-                        backend_pid = Some(u32::from_be_bytes(
-                            msg.payload[0..4].try_into().unwrap(),
-                        ));
-                        backend_secret = Some(u32::from_be_bytes(
-                            msg.payload[4..8].try_into().unwrap(),
-                        ));
+                        backend_pid =
+                            Some(u32::from_be_bytes(msg.payload[0..4].try_into().unwrap()));
+                        backend_secret =
+                            Some(u32::from_be_bytes(msg.payload[4..8].try_into().unwrap()));
                     }
                 }
                 MessageType::ReadyForQuery => {
@@ -182,7 +179,14 @@ impl BackendClient {
                 res.columns.len()
             )));
         }
-        Ok(res.rows.into_iter().next().unwrap().into_iter().next().unwrap())
+        Ok(res
+            .rows
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap())
     }
 
     /// Run a statement with no result set (DDL, SET, DO). Returns the
@@ -309,10 +313,12 @@ impl BackendClient {
         let t = self.stream_query_timeout();
         tokio::time::timeout(t, Self::run_query_inner(&mut self.stream, sql))
             .await
-            .map_err(|_| BackendError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("query exceeded {:?}: {}", t, truncate(sql, 64)),
-            )))?
+            .map_err(|_| {
+                BackendError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("query exceeded {:?}: {}", t, truncate(sql, 64)),
+                ))
+            })?
     }
 
     fn stream_query_timeout(&self) -> Duration {
@@ -450,9 +456,7 @@ fn build_startup(cfg: &BackendConfig) -> Vec<u8> {
     put_cstring(&mut payload, "application_name");
     put_cstring(
         &mut payload,
-        cfg.application_name
-            .as_deref()
-            .unwrap_or("heliosdb-proxy"),
+        cfg.application_name.as_deref().unwrap_or("heliosdb-proxy"),
     );
     put_cstring(&mut payload, "client_encoding");
     put_cstring(&mut payload, "UTF8");
@@ -470,7 +474,10 @@ fn put_cstring(buf: &mut BytesMut, s: &str) {
 }
 
 fn parse_cstring(payload: &[u8]) -> String {
-    let end = payload.iter().position(|&b| b == 0).unwrap_or(payload.len());
+    let end = payload
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(payload.len());
     String::from_utf8_lossy(&payload[..end]).into_owned()
 }
 
@@ -529,9 +536,7 @@ fn parse_data_row(payload: &[u8], column_count: usize) -> BackendResult<Vec<Text
         } else {
             let len = len as usize;
             if p.remaining() < len {
-                return Err(BackendError::Protocol(
-                    "truncated DataRow value".into(),
-                ));
+                return Err(BackendError::Protocol("truncated DataRow value".into()));
             }
             let bytes = p.split_to(len);
             out.push(TextValue::Text(
@@ -612,8 +617,12 @@ async fn handle_auth(
             "AuthRequest payload < 4 bytes".into(),
         ));
     }
-    let code =
-        u32::from_be_bytes([msg.payload[0], msg.payload[1], msg.payload[2], msg.payload[3]]);
+    let code = u32::from_be_bytes([
+        msg.payload[0],
+        msg.payload[1],
+        msg.payload[2],
+        msg.payload[3],
+    ]);
     match code {
         0 => Ok(()), // AuthenticationOk
         5 => {
@@ -659,20 +668,21 @@ async fn handle_auth(
         }
         11 => {
             // AuthenticationSASLContinue: server-first bytes.
-            let scram = scram_state.as_mut().ok_or_else(|| {
-                BackendError::Auth("SASLContinue before SASL start".into())
-            })?;
-            let password = cfg.password.as_deref().ok_or_else(|| {
-                BackendError::Auth("SCRAM requires a password".into())
-            })?;
+            let scram = scram_state
+                .as_mut()
+                .ok_or_else(|| BackendError::Auth("SASLContinue before SASL start".into()))?;
+            let password = cfg
+                .password
+                .as_deref()
+                .ok_or_else(|| BackendError::Auth("SCRAM requires a password".into()))?;
             let out = scram.client_final(&msg.payload[4..], password)?;
             write_password_message(stream, &out.0).await
         }
         12 => {
             // AuthenticationSASLFinal: v=<signature>
-            let scram = scram_state.as_ref().ok_or_else(|| {
-                BackendError::Auth("SASLFinal before SASL start".into())
-            })?;
+            let scram = scram_state
+                .as_ref()
+                .ok_or_else(|| BackendError::Auth("SASLFinal before SASL start".into()))?;
             scram.verify_server(&msg.payload[4..])
         }
         other => Err(BackendError::Auth(format!(
@@ -682,10 +692,7 @@ async fn handle_auth(
     }
 }
 
-async fn write_password_message(
-    stream: &mut Stream,
-    payload: &[u8],
-) -> BackendResult<()> {
+async fn write_password_message(stream: &mut Stream, payload: &[u8]) -> BackendResult<()> {
     let mut buf = BytesMut::with_capacity(payload.len() + 5);
     buf.put_u8(b'p');
     buf.put_u32((payload.len() + 4) as u32);
@@ -762,10 +769,7 @@ fn interpolate_params(sql: &str, params: &[ParamValue]) -> BackendResult<String>
                 .unwrap()
                 .parse()
                 .map_err(|_| {
-                    BackendError::Protocol(format!(
-                        "invalid parameter reference at byte {}",
-                        i
-                    ))
+                    BackendError::Protocol(format!("invalid parameter reference at byte {}", i))
                 })?;
             if idx == 0 || idx > params.len() {
                 return Err(BackendError::Protocol(format!(
@@ -816,20 +820,13 @@ mod tests {
             u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
             196608
         );
-        assert!(bytes
-            .windows(5)
-            .any(|w| w == b"user\0"));
-        assert!(bytes
-            .windows(10)
-            .any(|w| w == b"database\0a"));
+        assert!(bytes.windows(5).any(|w| w == b"user\0"));
+        assert!(bytes.windows(10).any(|w| w == b"database\0a"));
     }
 
     #[test]
     fn test_interpolate_params_basic() {
-        let params = vec![
-            ParamValue::Int(42),
-            ParamValue::Text("alice".into()),
-        ];
+        let params = vec![ParamValue::Int(42), ParamValue::Text("alice".into())];
         let sql = "SELECT * FROM t WHERE id = $1 AND name = $2";
         let out = interpolate_params(sql, &params).unwrap();
         assert_eq!(out, "SELECT * FROM t WHERE id = 42 AND name = 'alice'");
@@ -838,8 +835,7 @@ mod tests {
     #[test]
     fn test_interpolate_params_escapes_quotes() {
         let params = vec![ParamValue::Text("o'brien".into())];
-        let out =
-            interpolate_params("SELECT * FROM t WHERE name = $1", &params).unwrap();
+        let out = interpolate_params("SELECT * FROM t WHERE name = $1", &params).unwrap();
         assert_eq!(out, "SELECT * FROM t WHERE name = 'o''brien'");
     }
 
@@ -929,7 +925,9 @@ mod tests {
     #[test]
     fn test_generate_nonce_is_url_safe() {
         let n = generate_nonce();
-        assert!(n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(n
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
         assert!(n.len() >= 18);
     }
 

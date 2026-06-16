@@ -387,8 +387,10 @@ impl TenantConnectionPool {
 
     /// Create a tenant-specific pool
     pub fn create_tenant_pool(&self, tenant: &TenantId, config: TenantPoolConfig) {
-        self.pools
-            .insert(tenant.clone(), Arc::new(TenantPool::new(tenant.clone(), config)));
+        self.pools.insert(
+            tenant.clone(),
+            Arc::new(TenantPool::new(tenant.clone(), config)),
+        );
     }
 
     /// Remove a tenant pool
