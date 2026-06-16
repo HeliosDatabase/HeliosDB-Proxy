@@ -458,6 +458,7 @@ impl GraphQLEngine {
     }
 
     /// Parse a GraphQL query string
+    #[allow(clippy::result_large_err)]
     fn parse(&self, query: &str) -> Result<ParsedDocument, GraphQLError> {
         // Simple parser for basic queries
         // In production, would use a proper GraphQL parser
@@ -506,6 +507,7 @@ impl GraphQLEngine {
     }
 
     /// Parse a selection set
+    #[allow(clippy::result_large_err)]
     fn parse_selection_set(&self, input: &str) -> Result<Vec<ParsedSelection>, GraphQLError> {
         let input = input.trim();
 
@@ -539,6 +541,7 @@ impl GraphQLEngine {
     }
 
     /// Parse fields in a selection set
+    #[allow(clippy::result_large_err)]
     fn parse_fields(&self, input: &str) -> Result<Vec<ParsedSelection>, GraphQLError> {
         let mut selections = Vec::new();
         let mut current_pos = 0;
@@ -658,6 +661,7 @@ impl GraphQLEngine {
     }
 
     /// Parse arguments
+    #[allow(clippy::result_large_err)]
     fn parse_arguments(&self, input: &str) -> Result<HashMap<String, serde_json::Value>, GraphQLError> {
         let mut arguments = HashMap::new();
 
@@ -680,6 +684,7 @@ impl GraphQLEngine {
     }
 
     /// Parse a GraphQL value
+    #[allow(clippy::result_large_err)]
     fn parse_value(&self, input: &str) -> Result<serde_json::Value, GraphQLError> {
         let input = input.trim();
 
@@ -702,11 +707,13 @@ impl GraphQLEngine {
     }
 
     /// Validate a parsed document
+    #[allow(clippy::result_large_err)]
     fn validate(&self, document: &ParsedDocument) -> Result<(), GraphQLError> {
         self.validator.validate(document, &self.schema)
     }
 
     /// Check authorization
+    #[allow(clippy::result_large_err)]
     fn authorize(&self, _document: &ParsedDocument, _context: &ExecutionContext) -> Result<(), GraphQLError> {
         // Authorization checks would go here
         // For now, allow all queries
@@ -714,6 +721,7 @@ impl GraphQLEngine {
     }
 
     /// Plan query execution
+    #[allow(clippy::result_large_err)]
     fn plan(
         &self,
         document: &ParsedDocument,
@@ -820,6 +828,7 @@ impl GraphQLEngine {
     }
 
     /// Shape the response according to the GraphQL query
+    #[allow(clippy::result_large_err)]
     fn shape_response(
         &self,
         document: &ParsedDocument,

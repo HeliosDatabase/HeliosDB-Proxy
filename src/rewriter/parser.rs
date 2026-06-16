@@ -8,6 +8,7 @@ use std::hash::{Hash, Hasher};
 /// SQL parser
 pub struct SqlParser {
     /// Dialect-specific settings
+    #[allow(dead_code)]
     dialect: SqlDialect,
 }
 
@@ -150,7 +151,7 @@ impl SqlParser {
                     let table = table.trim_matches(|c| c == ',' || c == '(' || c == ')' || c == ';');
                     if !table.is_empty() && !is_keyword(table) {
                         // Handle schema.table format
-                        let table_name = table.split('.').last().unwrap_or(table);
+                        let table_name = table.split('.').next_back().unwrap_or(table);
                         tables.push(table_name.to_string());
                     }
                 }
@@ -176,15 +177,13 @@ impl SqlParser {
             if trimmed.starts_with("*") {
                 return true;
             }
-            if trimmed.starts_with("DISTINCT") {
-                let after_distinct = trimmed[8..].trim_start();
-                if after_distinct.starts_with("*") {
+            if let Some(after_distinct) = trimmed.strip_prefix("DISTINCT") {
+                if after_distinct.trim_start().starts_with('*') {
                     return true;
                 }
             }
-            if trimmed.starts_with("ALL") {
-                let after_all = trimmed[3..].trim_start();
-                if after_all.starts_with("*") {
+            if let Some(after_all) = trimmed.strip_prefix("ALL") {
+                if after_all.trim_start().starts_with('*') {
                     return true;
                 }
             }
@@ -280,7 +279,7 @@ pub enum SqlStatement {
 impl SqlStatement {
     /// Parse from SQL string
     pub fn from_sql(sql: &str) -> Self {
-        let first_word = sql.trim().split_whitespace().next().unwrap_or("");
+        let first_word = sql.split_whitespace().next().unwrap_or("");
         match first_word.to_uppercase().as_str() {
             "SELECT" => Self::Select,
             "INSERT" => Self::Insert,

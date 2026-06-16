@@ -347,8 +347,10 @@ impl ColumnSchema {
 
 /// Column storage type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum StorageType {
     /// Traditional row storage
+    #[default]
     Row,
     /// Columnar storage (for analytics)
     Columnar,
@@ -358,11 +360,6 @@ pub enum StorageType {
     Vector,
 }
 
-impl Default for StorageType {
-    fn default() -> Self {
-        StorageType::Row
-    }
-}
 
 /// Index schema information
 #[derive(Debug, Clone)]
@@ -412,8 +409,10 @@ impl IndexSchema {
 
 /// Index type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum IndexType {
     /// B-tree index
+    #[default]
     BTree,
     /// Hash index
     Hash,
@@ -425,14 +424,10 @@ pub enum IndexType {
     Vector,
 }
 
-impl Default for IndexType {
-    fn default() -> Self {
-        IndexType::BTree
-    }
-}
 
 /// Access pattern classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum AccessPattern {
     /// Point lookups by primary key
     PointLookup,
@@ -445,17 +440,14 @@ pub enum AccessPattern {
     /// Time-series append
     TimeSeriesAppend,
     /// Mixed patterns
+    #[default]
     Mixed,
 }
 
-impl Default for AccessPattern {
-    fn default() -> Self {
-        AccessPattern::Mixed
-    }
-}
 
 impl AccessPattern {
     /// Parse from string
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "point_lookup" | "pointlookup" => Some(AccessPattern::PointLookup),
@@ -471,10 +463,12 @@ impl AccessPattern {
 
 /// Data temperature classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum DataTemperature {
     /// Frequently accessed, keep in memory
     Hot,
     /// Occasionally accessed
+    #[default]
     Warm,
     /// Rarely accessed, can be on slower storage
     Cold,
@@ -482,14 +476,10 @@ pub enum DataTemperature {
     Frozen,
 }
 
-impl Default for DataTemperature {
-    fn default() -> Self {
-        DataTemperature::Warm
-    }
-}
 
 impl DataTemperature {
     /// Parse from string
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "hot" => Some(DataTemperature::Hot),
@@ -503,6 +493,7 @@ impl DataTemperature {
 
 /// Workload type classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum WorkloadType {
     /// Online Transaction Processing
     OLTP,
@@ -513,17 +504,14 @@ pub enum WorkloadType {
     /// Vector/AI workloads
     Vector,
     /// Mixed workload
+    #[default]
     Mixed,
 }
 
-impl Default for WorkloadType {
-    fn default() -> Self {
-        WorkloadType::Mixed
-    }
-}
 
 impl WorkloadType {
     /// Parse from string
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "oltp" => Some(WorkloadType::OLTP),

@@ -33,11 +33,14 @@ use wasmtime::{Caller, Linker, Memory};
 
 use super::runtime::PluginError;
 
+/// KV store type alias: plugin-name -> (key -> value)
+type KvStore = HashMap<String, HashMap<Vec<u8>, Vec<u8>>>;
+
 /// In-memory KV backend, namespaced by plugin name. The outer map
 /// is keyed by plugin name; the inner map by user-supplied key.
 #[derive(Clone, Default)]
 pub struct KvBackend {
-    inner: Arc<RwLock<HashMap<String, HashMap<Vec<u8>, Vec<u8>>>>>,
+    inner: Arc<RwLock<KvStore>>,
 }
 
 impl KvBackend {

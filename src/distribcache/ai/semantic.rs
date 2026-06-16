@@ -84,6 +84,7 @@ impl Default for BranchContext {
 
 /// AI workload context for cache optimization
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum AIWorkloadContext {
     /// RAG retrieval phase - fast, high-throughput
     RAGRetrieval,
@@ -94,14 +95,10 @@ pub enum AIWorkloadContext {
     /// Tool call caching - deterministic
     ToolResult,
     /// General semantic query
+    #[default]
     General,
 }
 
-impl Default for AIWorkloadContext {
-    fn default() -> Self {
-        Self::General
-    }
-}
 
 /// Query embedding vector
 pub type Embedding = Vec<f32>;
@@ -270,6 +267,7 @@ pub struct SemanticIndex {
     vectors: DashMap<VectorId, Embedding>,
 
     /// Index configuration
+    #[allow(dead_code)]
     config: SemanticIndexConfig,
 
     /// Next ID
@@ -801,6 +799,7 @@ impl SemanticQueryCache {
     /// This is the recommended insertion method for AI/Agent workloads
     /// as it enables branch-aware caching, session affinity, and
     /// workload-specific TTL management.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_with_context(
         &self,
         query: impl Into<String>,

@@ -4,9 +4,8 @@
 //! Uses embeddings to find semantically similar queries.
 
 use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::sync::Semaphore;
 

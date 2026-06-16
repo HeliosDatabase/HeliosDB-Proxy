@@ -736,10 +736,12 @@ impl ProxyConfig {
 /// TR (Transaction Replay) mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum TrMode {
     /// No transaction replay
     None,
     /// Re-establish session only
+    #[default]
     Session,
     /// Re-execute SELECT queries
     Select,
@@ -747,11 +749,6 @@ pub enum TrMode {
     Transaction,
 }
 
-impl Default for TrMode {
-    fn default() -> Self {
-        TrMode::Session
-    }
-}
 
 /// Connection pool configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

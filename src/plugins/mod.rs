@@ -162,6 +162,7 @@ impl HookType {
     }
 
     /// Parse from string
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "pre_query" | "prequery" => Some(HookType::PreQuery),
@@ -289,6 +290,7 @@ pub enum AuthResult {
 
 /// User identity from authentication
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct Identity {
     /// User ID
     pub user_id: String,
@@ -306,17 +308,6 @@ pub struct Identity {
     pub claims: HashMap<String, String>,
 }
 
-impl Default for Identity {
-    fn default() -> Self {
-        Self {
-            user_id: String::new(),
-            username: String::new(),
-            roles: Vec::new(),
-            tenant_id: None,
-            claims: HashMap::new(),
-        }
-    }
-}
 
 /// Result of routing hook
 #[derive(Debug, Clone)]
@@ -356,6 +347,7 @@ pub struct PluginManager {
     hooks: RwLock<HashMap<HookType, Vec<String>>>,
 
     /// Configuration
+    #[allow(dead_code)]
     config: PluginRuntimeConfig,
 
     /// Hot reloader (if enabled)
@@ -408,7 +400,7 @@ impl PluginManager {
             for hook in &manifest.hooks {
                 hooks
                     .entry(*hook)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(manifest.name.clone());
             }
         }
@@ -465,7 +457,7 @@ impl PluginManager {
         self.hooks
             .read()
             .get(&hook)
-            .map_or(false, |names| !names.is_empty())
+            .is_some_and(|names| !names.is_empty())
     }
 
     /// Execute pre-query hooks

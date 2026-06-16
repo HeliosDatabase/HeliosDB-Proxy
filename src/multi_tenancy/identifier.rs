@@ -381,10 +381,9 @@ impl JwtClaimIdentifier {
         let after_colon = after_colon.trim_start();
 
         // Extract quoted value
-        if after_colon.starts_with('"') {
-            let value_start = 1;
-            let value_end = after_colon[1..].find('"')? + 1;
-            Some(after_colon[value_start..value_end].to_string())
+        if let Some(inner) = after_colon.strip_prefix('"') {
+            let value_end = inner.find('"')?;
+            Some(inner[..value_end].to_string())
         } else {
             None
         }
@@ -422,6 +421,7 @@ impl CompositeIdentifier {
     }
 
     /// Add an identifier to try
+    #[allow(clippy::should_implement_trait)]
     pub fn add<I: TenantIdentifier + 'static>(mut self, identifier: I) -> Self {
         self.identifiers.push(Arc::new(identifier));
         self

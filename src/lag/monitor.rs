@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
-use super::config::{LagCalculation, LagRoutingConfig};
+use super::config::LagRoutingConfig;
 use super::SyncMode;
 
 /// Unique identifier for a node
@@ -19,6 +19,7 @@ pub type NodeId = String;
 
 /// Lag trend indicating whether lag is improving, stable, or degrading
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum LagTrend {
     /// Lag is decreasing
     Improving,
@@ -27,14 +28,10 @@ pub enum LagTrend {
     /// Lag is increasing
     Degrading,
     /// Not enough samples to determine trend
+    #[default]
     Unknown,
 }
 
-impl Default for LagTrend {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
 
 impl std::fmt::Display for LagTrend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

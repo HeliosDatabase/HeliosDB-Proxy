@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use super::config::{Identity, RoleCondition, RoleMappingRule, RoleMappingCondition};
+use super::config::{Identity, RoleMappingRule, RoleMappingCondition};
 
 /// Role mapper
 pub struct RoleMapper {
@@ -93,11 +93,10 @@ impl RoleMapper {
         let roles = self.map_roles(identity);
 
         for rule in &self.rules {
-            if roles.iter().any(|r| rule.assign_roles.contains(r)) {
-                if rule.permissions.contains(&permission.to_string()) {
+            if roles.iter().any(|r| rule.assign_roles.contains(r))
+                && rule.permissions.contains(&permission.to_string()) {
                     return true;
                 }
-            }
         }
 
         false
@@ -127,7 +126,7 @@ impl RoleMapper {
         let mut static_roles = self.static_roles.write();
         static_roles
             .entry(user_id)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(role);
     }
 
@@ -268,7 +267,7 @@ impl RoleMapperBuilder {
 
         self.group_roles
             .entry(group)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(role);
         self
     }
@@ -342,6 +341,7 @@ pub enum Operation {
 
 impl Operation {
     /// Parse operation from string
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "SELECT" => Some(Self::Select),

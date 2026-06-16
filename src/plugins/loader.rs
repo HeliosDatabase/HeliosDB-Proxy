@@ -561,8 +561,10 @@ impl PluginLoader {
         let content = fs::read_to_string(yaml_path)?;
 
         // Simple YAML parsing (in production, would use serde_yaml)
-        let mut manifest = PluginManifest::default();
-        manifest.path = wasm_path.to_path_buf();
+        let mut manifest = PluginManifest {
+            path: wasm_path.to_path_buf(),
+            ..PluginManifest::default()
+        };
 
         for line in content.lines() {
             let line = line.trim();
@@ -635,8 +637,10 @@ impl PluginLoader {
         let json: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| PluginLoadError::ManifestError(e.to_string()))?;
 
-        let mut manifest = PluginManifest::default();
-        manifest.path = wasm_path.to_path_buf();
+        let mut manifest = PluginManifest {
+            path: wasm_path.to_path_buf(),
+            ..PluginManifest::default()
+        };
 
         if let Some(name) = json.get("name").and_then(|v| v.as_str()) {
             manifest.name = name.to_string();

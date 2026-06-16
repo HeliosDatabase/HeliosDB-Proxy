@@ -185,11 +185,10 @@ impl JwtValidator {
 
     /// Validate issuer claim
     fn validate_issuer(&self, claims: &JwtClaims) -> Result<(), JwtError> {
-        if !self.config.allowed_issuers.is_empty() {
-            if !self.config.allowed_issuers.contains(&claims.iss) {
+        if !self.config.allowed_issuers.is_empty()
+            && !self.config.allowed_issuers.contains(&claims.iss) {
                 return Err(JwtError::InvalidIssuer);
             }
-        }
 
         Ok(())
     }

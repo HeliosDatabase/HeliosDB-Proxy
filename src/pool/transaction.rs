@@ -131,7 +131,7 @@ impl TransactionModeHandler {
                 // Track execution count
                 let parts: Vec<&str> = sql.split_whitespace().collect();
                 if parts.len() >= 2 {
-                    let name = parts[1].trim_end_matches(|c| c == '(' || c == ';');
+                    let name = parts[1].trim_end_matches(['(', ';']);
                     tracker.record_execution(name);
                 }
             }

@@ -158,7 +158,7 @@ impl TenantMetrics {
     /// Get top tenants by query count
     pub fn top_by_queries(&self, limit: usize) -> Vec<TenantMetricsSnapshot> {
         let mut snapshots: Vec<_> = self.snapshot_all();
-        snapshots.sort_by(|a, b| b.queries.cmp(&a.queries));
+        snapshots.sort_by_key(|b| std::cmp::Reverse(b.queries));
         snapshots.truncate(limit);
         snapshots
     }
@@ -166,7 +166,7 @@ impl TenantMetrics {
     /// Get top tenants by total time
     pub fn top_by_time(&self, limit: usize) -> Vec<TenantMetricsSnapshot> {
         let mut snapshots: Vec<_> = self.snapshot_all();
-        snapshots.sort_by(|a, b| b.total_time.cmp(&a.total_time));
+        snapshots.sort_by_key(|b| std::cmp::Reverse(b.total_time));
         snapshots.truncate(limit);
         snapshots
     }
@@ -174,7 +174,7 @@ impl TenantMetrics {
     /// Get top tenants by error count
     pub fn top_by_errors(&self, limit: usize) -> Vec<TenantMetricsSnapshot> {
         let mut snapshots: Vec<_> = self.snapshot_all();
-        snapshots.sort_by(|a, b| b.errors.cmp(&a.errors));
+        snapshots.sort_by_key(|b| std::cmp::Reverse(b.errors));
         snapshots.truncate(limit);
         snapshots
     }
@@ -315,11 +315,7 @@ impl TenantStats {
             queries,
             errors: self.errors.load(Ordering::Relaxed),
             total_time: Duration::from_micros(total_time_us),
-            avg_time: if queries > 0 {
-                Duration::from_micros(total_time_us / queries)
-            } else {
-                Duration::ZERO
-            },
+            avg_time: Duration::from_micros(total_time_us.checked_div(queries).unwrap_or(0)),
             min_time,
             max_time: Duration::from_micros(self.max_time_us.load(Ordering::Relaxed)),
             rows_processed: self.rows_processed.load(Ordering::Relaxed),
@@ -534,6 +530,7 @@ pub struct TenantCostTracker {
     cost_per_mb_written: f64,
 
     /// Cost per connection-second
+    #[allow(dead_code)]
     cost_per_conn_second: f64,
 
     /// Per-tenant accumulated costs

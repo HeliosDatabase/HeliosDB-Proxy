@@ -179,18 +179,15 @@ impl Default for L2Config {
 
 /// Storage backend for L2 cache
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum StorageBackend {
     /// In-process memory (lost on restart)
+    #[default]
     Memory,
     /// Memory-mapped file (survives restarts)
     Mmap,
 }
 
-impl Default for StorageBackend {
-    fn default() -> Self {
-        Self::Memory
-    }
-}
 
 /// L3 semantic cache configuration
 #[derive(Debug, Clone)]

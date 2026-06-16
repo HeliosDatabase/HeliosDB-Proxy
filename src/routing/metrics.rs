@@ -124,7 +124,7 @@ impl RoutingMetrics {
             invalid_hints: self.invalid_hints.load(Ordering::SeqCst),
             fallback_count: self.fallback_count.load(Ordering::SeqCst),
             no_nodes_count: self.no_nodes_count.load(Ordering::SeqCst),
-            avg_routing_time_us: if total > 0 { total_time_us / total } else { 0 },
+            avg_routing_time_us: total_time_us.checked_div(total).unwrap_or(0),
         }
     }
 
@@ -220,7 +220,7 @@ impl HintUsageStats {
         let mut hints: Vec<_> = self.by_hint.iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
-        hints.sort_by(|a, b| b.1.cmp(&a.1));
+        hints.sort_by_key(|b| std::cmp::Reverse(b.1));
         hints.truncate(n);
         hints
     }

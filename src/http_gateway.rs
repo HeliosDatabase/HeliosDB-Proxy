@@ -91,7 +91,7 @@ impl HttpGateway {
                 array_mode = line.split(':').nth(1).map(|v| v.trim().eq_ignore_ascii_case("true")).unwrap_or(false);
             } else if lower.starts_with("authorization:") {
                 if let Some(tok) = cfg.auth_token.as_ref() {
-                    let v = line.splitn(2, ':').nth(1).unwrap_or("").trim();
+                    let v = line.split_once(':').map(|x| x.1).unwrap_or("").trim();
                     authorized = v == format!("Bearer {}", tok);
                 }
             }

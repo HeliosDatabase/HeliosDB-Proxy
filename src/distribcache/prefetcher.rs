@@ -110,7 +110,7 @@ impl TemporalPatternStore {
             .map(|e| (e.key().clone(), *e.value()))
             .collect();
 
-        predictions.sort_by(|a, b| b.1.cmp(&a.1));
+        predictions.sort_by_key(|b| std::cmp::Reverse(b.1));
         predictions.into_iter()
             .take(10)
             .map(|(fp, _)| fp)
@@ -168,7 +168,7 @@ impl PredictivePrefetcher {
             .or_insert_with(|| VecDeque::with_capacity(100));
 
         // Learn pattern from sequence
-        if seq.len() >= 1 {
+        if !seq.is_empty() {
             if let Some(prev) = seq.back() {
                 self.patterns
                     .entry(prev.clone())

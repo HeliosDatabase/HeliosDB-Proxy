@@ -224,13 +224,12 @@ impl AIIntegrationCoordinator {
         }
 
         // Vector search patterns (only if not already classified as RAG)
-        if workload_type != WorkloadType::RAG {
-            if query_lower.contains("embedding") || query_lower.contains("vector") || query_lower.contains("similarity") {
+        if workload_type != WorkloadType::RAG
+            && (query_lower.contains("embedding") || query_lower.contains("vector") || query_lower.contains("similarity")) {
                 patterns.push("Vector search".to_string());
                 confidence = confidence.max(0.75);
                 workload_type = WorkloadType::Vector;
             }
-        }
 
         // OLAP patterns
         if self.is_olap_pattern(&query_lower) {

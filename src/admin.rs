@@ -981,10 +981,7 @@ impl AdminServer {
     async fn handle_edge_status(
         state: &Arc<AdminState>,
     ) -> Result<(u16, serde_json::Value)> {
-        let cache_stats = match state.edge_cache.read().await.clone() {
-            Some(c) => Some(c.stats()),
-            None => None,
-        };
+        let cache_stats = state.edge_cache.read().await.clone().map(|c| c.stats());
         let edges = match state.edge_registry.read().await.clone() {
             Some(r) => r.list(),
             None => Vec::new(),
@@ -1211,7 +1208,7 @@ impl AdminServer {
             .params
             .unwrap_or_default()
             .into_iter()
-            .map(|s| ParamValue::Text(s))
+            .map(ParamValue::Text)
             .collect();
 
         let outcome = shadow_execute(&mut source, &shadow_cfg, &req.sql, &params).await;
@@ -1280,7 +1277,7 @@ impl AdminServer {
                     ChaosOverride {
                         since: chrono::Utc::now().to_rfc3339(),
                         kind: "force_unhealthy".to_string(),
-                        note: format!("forced unhealthy via chaos endpoint"),
+                        note: "forced unhealthy via chaos endpoint".to_string(),
                     },
                 );
                 Ok((200, serde_json::json!({

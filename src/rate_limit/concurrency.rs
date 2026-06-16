@@ -240,11 +240,7 @@ impl ConcurrencyLimiter {
         let total = self.total_processed.load(Ordering::Relaxed);
         let wait_ns = self.total_wait_time_ns.load(Ordering::Relaxed);
 
-        if total == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_nanos(wait_ns / total)
-        }
+        Duration::from_nanos(wait_ns.checked_div(total).unwrap_or(0))
     }
 
     /// Update max concurrent (for dynamic limits)

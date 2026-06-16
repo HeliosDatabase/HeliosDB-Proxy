@@ -157,6 +157,7 @@ pub struct CredentialManager {
     cache: Arc<RwLock<CredentialCache>>,
 
     /// Default provider index
+    #[allow(dead_code)]
     default_provider: usize,
 }
 

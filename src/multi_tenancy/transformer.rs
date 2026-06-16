@@ -417,7 +417,6 @@ impl TenantQueryTransformer {
             if let Some(set_pos) = after_update.to_uppercase().find(" SET ") {
                 let table_section = &after_update[..set_pos];
                 let table = table_section
-                    .trim()
                     .split_whitespace()
                     .next()?
                     .trim_matches(|c| c == '"' || c == '`');
@@ -436,7 +435,6 @@ impl TenantQueryTransformer {
                 .unwrap_or(after_from.len());
             let table_section = &after_from[..end_pos];
             let table = table_section
-                .trim()
                 .split_whitespace()
                 .next()?
                 .trim_matches(|c| c == '"' || c == '`');

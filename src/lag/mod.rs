@@ -66,6 +66,7 @@ pub use ryw::{
 
 /// SyncMode enum for replica synchronization classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum SyncMode {
     /// Synchronous replication - zero data loss guarantee
     Sync,
@@ -74,14 +75,10 @@ pub enum SyncMode {
     /// Asynchronous - eventual consistency
     Async,
     /// Unknown or unclassified
+    #[default]
     Unknown,
 }
 
-impl Default for SyncMode {
-    fn default() -> Self {
-        Self::Unknown
-    }
-}
 
 impl std::fmt::Display for SyncMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

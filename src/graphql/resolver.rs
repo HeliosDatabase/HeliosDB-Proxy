@@ -372,6 +372,7 @@ impl ResolverChain {
     }
 
     /// Add a resolver to the chain
+    #[allow(clippy::should_implement_trait)]
     pub fn add(mut self, resolver: impl FieldResolver + 'static) -> Self {
         self.resolvers.push(Arc::new(resolver));
         self

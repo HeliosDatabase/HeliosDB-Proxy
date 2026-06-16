@@ -404,7 +404,7 @@ impl RateLimitStats {
     /// Get keys with most requests
     pub fn top_request_keys(&self, n: usize) -> Vec<(&String, &KeyStatsSnapshot)> {
         let mut entries: Vec<_> = self.key_stats.iter().collect();
-        entries.sort_by(|a, b| b.1.total.cmp(&a.1.total));
+        entries.sort_by_key(|b| std::cmp::Reverse(b.1.total));
         entries.truncate(n);
         entries
     }

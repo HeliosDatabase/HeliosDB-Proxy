@@ -321,6 +321,7 @@ pub struct TenantConnectionPool {
     shared_pool: Arc<TenantPool>,
 
     /// Default pool configuration
+    #[allow(dead_code)]
     default_config: TenantPoolConfig,
 
     /// Connection ID counter

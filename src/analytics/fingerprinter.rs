@@ -170,6 +170,7 @@ impl QueryFingerprinter {
     }
 
     /// Detect operation type
+    #[allow(clippy::if_same_then_else)]
     fn detect_operation(&self, query: &str) -> OperationType {
         let trimmed = query.trim().to_uppercase();
 

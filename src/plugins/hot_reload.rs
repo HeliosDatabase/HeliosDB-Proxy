@@ -136,7 +136,7 @@ impl HotReloader {
 
         // Check for new files
         let file_times = self.file_times.read();
-        for (path, _) in &current_files {
+        for path in current_files.keys() {
             if !file_times.contains_key(path) {
                 // New file detected - add to pending
                 self.add_pending_event(path.clone(), ReloadEventType::Added);
@@ -271,6 +271,7 @@ impl HotReloader {
 enum ReloadEventType {
     Modified,
     Added,
+    #[allow(dead_code)]
     Removed,
 }
 
@@ -281,6 +282,7 @@ pub enum ReloadEvent {
     Modified(String),
 
     /// Plugin file was removed
+    #[allow(dead_code)]
     Removed(String),
 
     /// New plugin file was added

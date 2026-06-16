@@ -372,6 +372,7 @@ impl TableConfig {
 
 /// Table authorization configuration
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct AuthorizationConfig {
     /// Roles that can read
     pub read_roles: Vec<String>,
@@ -385,17 +386,6 @@ pub struct AuthorizationConfig {
     pub row_filter: Option<String>,
 }
 
-impl Default for AuthorizationConfig {
-    fn default() -> Self {
-        Self {
-            read_roles: Vec::new(),
-            create_roles: Vec::new(),
-            update_roles: Vec::new(),
-            delete_roles: Vec::new(),
-            row_filter: None,
-        }
-    }
-}
 
 /// Relationship configuration
 #[derive(Debug, Clone)]

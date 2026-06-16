@@ -2,7 +2,6 @@
 //!
 //! Validates GraphQL queries against schema and complexity limits.
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::{
@@ -24,6 +23,7 @@ impl QueryValidator {
     }
 
     /// Validate a parsed document
+    #[allow(clippy::result_large_err)]
     pub fn validate(
         &self,
         document: &ParsedDocument,
@@ -81,6 +81,7 @@ impl QueryValidator {
     }
 
     /// Calculate query complexity
+    #[allow(clippy::result_large_err)]
     pub fn calculate_complexity(
         &self,
         document: &ParsedDocument,
@@ -96,6 +97,7 @@ impl QueryValidator {
     }
 
     /// Calculate complexity for a selection
+    #[allow(clippy::result_large_err)]
     fn calculate_selection_complexity(
         &self,
         selection: &ParsedSelection,
@@ -133,6 +135,7 @@ impl QueryValidator {
     }
 
     /// Validate fields against schema
+    #[allow(clippy::result_large_err)]
     fn validate_fields(
         &self,
         selections: &[ParsedSelection],
@@ -150,7 +153,7 @@ impl QueryValidator {
 
             // Check if field exists (for non-Query types)
             if type_name != "Query" && type_name != "Mutation" {
-                if let Some(ref type_def) = type_def {
+                if let Some(type_def) = type_def {
                     let field_exists = type_def.get_field(&selection.name).is_some();
                     let rel_exists = schema.get_relationships_for(type_name)
                         .iter()
@@ -454,6 +457,7 @@ impl ValidationPipeline {
     }
 
     /// Add a validator
+    #[allow(clippy::should_implement_trait)]
     pub fn add(mut self, validator: impl RuleValidator + 'static) -> Self {
         self.validators.push(Box::new(validator));
         self

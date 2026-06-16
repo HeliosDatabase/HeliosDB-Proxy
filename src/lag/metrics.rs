@@ -295,7 +295,7 @@ impl NodeLagStats {
         let min = self.min_lag_ms.load(Ordering::Relaxed);
         let max = self.max_lag_ms.load(Ordering::Relaxed);
 
-        let avg = if total > 0 { total_lag / total } else { 0 };
+        let avg = total_lag.checked_div(total).unwrap_or(0);
 
         NodeLagStatsSnapshot {
             sync_mode: self.sync_mode,

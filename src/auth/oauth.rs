@@ -46,6 +46,7 @@ pub struct OAuthClient {
 
     /// HTTP client (placeholder - would use reqwest in real impl)
     client_id: String,
+    #[allow(dead_code)]
     client_secret: String,
 }
 

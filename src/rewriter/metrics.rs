@@ -69,7 +69,7 @@ impl RewriteMetrics {
     /// Record a rule match
     pub fn record_rule_match(&self, rule_id: &str) {
         let mut stats = self.rule_stats.write();
-        let entry = stats.entry(rule_id.to_string()).or_insert_with(RuleStats::new);
+        let entry = stats.entry(rule_id.to_string()).or_default();
         entry.matches.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -80,11 +80,7 @@ impl RewriteMetrics {
         let no_match = self.no_match_queries.load(Ordering::Relaxed);
         let total_time_ns = self.total_rewrite_time_ns.load(Ordering::Relaxed);
 
-        let avg_time = if total > 0 {
-            Duration::from_nanos(total_time_ns / total)
-        } else {
-            Duration::ZERO
-        };
+        let avg_time = Duration::from_nanos(total_time_ns.checked_div(total).unwrap_or(0));
 
         let rewrite_ratio = if total > 0 {
             rewritten as f64 / total as f64

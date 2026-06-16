@@ -66,20 +66,25 @@ pub struct WalEntry {
 /// WAL stream subscriber with TCP connection
 pub struct WalStreamer {
     /// Endpoint address (host:port)
+    #[allow(dead_code)]
     endpoint: String,
     /// TCP connection to WAL server
     connection: Option<TcpStream>,
     /// Running flag
     running: Arc<AtomicBool>,
     /// Current LSN
+    #[allow(dead_code)]
     current_lsn: AtomicU64,
     /// Last heartbeat received
     last_heartbeat: Instant,
     /// Reconnection attempts
+    #[allow(dead_code)]
     reconnect_attempts: u32,
     /// Maximum reconnection attempts
+    #[allow(dead_code)]
     max_reconnect_attempts: u32,
     /// Reconnect delay
+    #[allow(dead_code)]
     reconnect_delay: Duration,
 }
 
@@ -166,6 +171,7 @@ impl WalStreamer {
     }
 
     /// Attempt to reconnect to the WAL endpoint
+    #[allow(dead_code)]
     async fn reconnect(&mut self) -> CacheResult<bool> {
         if self.reconnect_attempts >= self.max_reconnect_attempts {
             return Ok(false);
@@ -199,6 +205,7 @@ impl WalStreamer {
         }
     }
 
+    #[allow(dead_code)]
     fn disconnect(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         if let Some(stream) = self.connection.take() {
@@ -207,6 +214,7 @@ impl WalStreamer {
     }
 
     /// Check if connected
+    #[allow(dead_code)]
     fn is_connected(&self) -> bool {
         self.connection.is_some()
     }
@@ -420,6 +428,7 @@ pub type InvalidationCallback = Arc<dyn Fn(&InvalidationTarget) + Send + Sync>;
 /// WAL-based cache invalidator
 pub struct WalInvalidator {
     /// Configuration
+    #[allow(dead_code)]
     config: DistribCacheConfig,
 
     /// WAL stream

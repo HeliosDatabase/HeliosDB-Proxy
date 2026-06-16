@@ -48,7 +48,7 @@ impl LearningClassifier {
     pub fn record(&self, table: &str, query_type: QueryType, latency: Duration) {
         let mut history = self.history
             .entry(table.to_string())
-            .or_insert_with(QueryHistory::new);
+            .or_default();
 
         history.record(query_type, latency);
 
@@ -210,6 +210,7 @@ pub struct QueryHistory {
     /// Recent queries per minute samples
     qpm_samples: Vec<(Instant, u64)>,
     /// Created time
+    #[allow(dead_code)]
     created: Instant,
     /// Last updated
     last_updated: Instant,
@@ -472,7 +473,7 @@ impl ClassificationModel {
 
         // Clear patterns = higher confidence
         let rw_ratio = history.read_write_ratio();
-        let pattern_factor = if rw_ratio > 10.0 || rw_ratio < 2.0 {
+        let pattern_factor = if !(2.0..=10.0).contains(&rw_ratio) {
             0.8
         } else {
             0.5
