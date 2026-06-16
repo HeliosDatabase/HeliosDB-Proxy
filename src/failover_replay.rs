@@ -3,7 +3,9 @@
 //! Replays transactions on a new node after failover.
 //! Ensures transaction continuity with verification.
 
-use super::transaction_journal::{JournalEntry, JournalValue, StatementType, TransactionJournalEntry};
+use super::transaction_journal::{
+    JournalEntry, JournalValue, StatementType, TransactionJournalEntry,
+};
 use super::{NodeEndpoint, NodeId, ProxyError, Result};
 use crate::backend::{BackendClient, BackendConfig, ParamValue};
 use std::collections::HashMap;
@@ -200,7 +202,11 @@ impl FailoverReplay {
 
         self.active_replays.write().await.insert(tx_id, replay);
 
-        tracing::info!("Starting replay for transaction {:?} on node {:?}", tx_id, target_node);
+        tracing::info!(
+            "Starting replay for transaction {:?} on node {:?}",
+            tx_id,
+            target_node
+        );
 
         Ok(tx_id)
     }
@@ -218,7 +224,8 @@ impl FailoverReplay {
         // Wait for WAL sync if configured
         if self.config.wait_for_wal_sync {
             replay.state = ReplayState::WaitingForWal;
-            self.wait_for_wal_sync(replay.target_node, replay.journal.start_lsn).await?;
+            self.wait_for_wal_sync(replay.target_node, replay.journal.start_lsn)
+                .await?;
         }
 
         replay.state = ReplayState::Replaying;
@@ -346,7 +353,9 @@ impl FailoverReplay {
                 return Ok(StatementReplayResult {
                     sequence: entry.sequence,
                     success,
-                    checksum_matched: if self.config.verify_results && entry.result_checksum.is_some() {
+                    checksum_matched: if self.config.verify_results
+                        && entry.result_checksum.is_some()
+                    {
                         Some(checksum_matched)
                     } else {
                         None
@@ -360,9 +369,7 @@ impl FailoverReplay {
                     error: if success {
                         None
                     } else {
-                        Some(error_msg.unwrap_or_else(|| {
-                            "statement execution failed".to_string()
-                        }))
+                        Some(error_msg.unwrap_or_else(|| "statement execution failed".to_string()))
                     },
                     retries,
                 });
@@ -395,8 +402,11 @@ impl FailoverReplay {
             Err(e) => return (false, false, false, Some(format!("connect: {}", e))),
         };
 
-        let params: Vec<ParamValue> =
-            entry.parameters.iter().map(journal_value_to_param).collect();
+        let params: Vec<ParamValue> = entry
+            .parameters
+            .iter()
+            .map(journal_value_to_param)
+            .collect();
 
         let result = if params.is_empty() {
             client.simple_query(&entry.statement).await
@@ -481,18 +491,16 @@ impl FailoverReplay {
 
     /// Get replay state
     pub async fn get_state(&self, tx_id: &Uuid) -> Option<ReplayState> {
-        self.active_replays
-            .read()
-            .await
-            .get(tx_id)
-            .map(|r| r.state)
+        self.active_replays.read().await.get(tx_id).map(|r| r.state)
     }
 
     /// Get replay progress (statements completed / total)
     pub async fn get_progress(&self, tx_id: &Uuid) -> Option<(usize, usize)> {
-        self.active_replays.read().await.get(tx_id).map(|r| {
-            (r.position, r.journal.entries.len())
-        })
+        self.active_replays
+            .read()
+            .await
+            .get(tx_id)
+            .map(|r| (r.position, r.journal.entries.len()))
     }
 
     /// Cancel an active replay
@@ -577,8 +585,8 @@ pub struct ReplayStats {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::transaction_journal::TransactionJournalEntry;
+    use super::*;
 
     fn make_journal() -> TransactionJournalEntry {
         let tx_id = Uuid::new_v4();
@@ -627,10 +635,7 @@ mod tests {
         assert_eq!(pg_lsn_to_u64("0/0"), Some(0));
         assert_eq!(pg_lsn_to_u64("0/1"), Some(1));
         assert_eq!(pg_lsn_to_u64("0/FFFFFFFF"), Some(0xFFFFFFFF));
-        assert_eq!(
-            pg_lsn_to_u64("1/0"),
-            Some(1u64 << 32)
-        );
+        assert_eq!(pg_lsn_to_u64("1/0"), Some(1u64 << 32));
         assert_eq!(
             pg_lsn_to_u64("16/B3780A90"),
             Some((0x16u64 << 32) | 0xB3780A90u64)

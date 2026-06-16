@@ -3,13 +3,13 @@
 //! Provides request pipelining to reduce latency by sending multiple requests
 //! without waiting for responses. Supports PostgreSQL protocol pipelining.
 
+use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use dashmap::DashMap;
 use tokio::sync::oneshot;
-use serde::{Deserialize, Serialize};
 
 /// Connection ID type
 pub type ConnectionId = u64;
@@ -203,7 +203,9 @@ impl RequestPipeline {
         }
 
         if self.shutdown.load(Ordering::Relaxed) {
-            return Err(PipelineError::ConnectionError("Pipeline shutdown".to_string()));
+            return Err(PipelineError::ConnectionError(
+                "Pipeline shutdown".to_string(),
+            ));
         }
 
         let request_id = RequestId::new(self.next_request_id.fetch_add(1, Ordering::Relaxed));
@@ -244,7 +246,14 @@ impl RequestPipeline {
     }
 
     /// Complete a request with a response
-    pub fn complete(&self, conn_id: ConnectionId, request_id: RequestId, data: Vec<u8>, success: bool, error: Option<String>) {
+    pub fn complete(
+        &self,
+        conn_id: ConnectionId,
+        request_id: RequestId,
+        data: Vec<u8>,
+        success: bool,
+        error: Option<String>,
+    ) {
         if let Some(mut pipeline) = self.connections.get_mut(&conn_id) {
             // Find and remove the matching request
             if let Some(pos) = pipeline.pending.iter().position(|r| r.id == request_id) {
@@ -262,7 +271,8 @@ impl RequestPipeline {
                         if stats.avg_response_time_ms == 0.0 {
                             stats.avg_response_time_ms = ms;
                         } else {
-                            stats.avg_response_time_ms = stats.avg_response_time_ms * 0.9 + ms * 0.1;
+                            stats.avg_response_time_ms =
+                                stats.avg_response_time_ms * 0.9 + ms * 0.1;
                         }
                     }
 
@@ -282,7 +292,13 @@ impl RequestPipeline {
     }
 
     /// Complete the next pending request in order (FIFO)
-    pub fn complete_next(&self, conn_id: ConnectionId, data: Vec<u8>, success: bool, error: Option<String>) {
+    pub fn complete_next(
+        &self,
+        conn_id: ConnectionId,
+        data: Vec<u8>,
+        success: bool,
+        error: Option<String>,
+    ) {
         if let Some(mut pipeline) = self.connections.get_mut(&conn_id) {
             if let Some(mut req) = pipeline.pending.pop_front() {
                 let response_time = req.submitted_at.elapsed();
@@ -337,7 +353,8 @@ impl RequestPipeline {
         let mut stats = self.stats.read().clone();
 
         // Calculate peak pipeline depth across all connections
-        stats.peak_pipeline_depth = self.connections
+        stats.peak_pipeline_depth = self
+            .connections
             .iter()
             .map(|p| p.peak_depth)
             .max()

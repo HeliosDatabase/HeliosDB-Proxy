@@ -93,7 +93,8 @@ impl SlidingWindow {
         // Check if we have room
         let current_count = events.len() as u32;
         if current_count + count > self.max_events {
-            self.rejected_events.fetch_add(count as u64, Ordering::Relaxed);
+            self.rejected_events
+                .fetch_add(count as u64, Ordering::Relaxed);
 
             let wait_time = if let Some(&oldest) = events.front() {
                 let expires_at = oldest + window_nanos;

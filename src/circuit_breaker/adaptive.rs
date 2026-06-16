@@ -86,11 +86,8 @@ impl RollingStats {
             return None;
         }
 
-        let variance: f64 = values
-            .iter()
-            .map(|(_, v)| (v - avg).powi(2))
-            .sum::<f64>()
-            / (values.len() - 1) as f64;
+        let variance: f64 =
+            values.iter().map(|(_, v)| (v - avg).powi(2)).sum::<f64>() / (values.len() - 1) as f64;
 
         Some(variance.sqrt())
     }
@@ -112,17 +109,19 @@ impl RollingStats {
     /// Get minimum value
     pub fn min(&self) -> Option<f64> {
         let values = self.values.read();
-        values.iter().map(|(_, v)| *v).fold(None, |min, v| {
-            Some(min.map_or(v, |m: f64| m.min(v)))
-        })
+        values
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(None, |min, v| Some(min.map_or(v, |m: f64| m.min(v))))
     }
 
     /// Get maximum value
     pub fn max(&self) -> Option<f64> {
         let values = self.values.read();
-        values.iter().map(|(_, v)| *v).fold(None, |max, v| {
-            Some(max.map_or(v, |m: f64| m.max(v)))
-        })
+        values
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(None, |max, v| Some(max.map_or(v, |m: f64| m.max(v))))
     }
 
     /// Get percentile value (0.0 - 1.0)
@@ -333,8 +332,7 @@ impl AdaptiveStats {
             return 0.0;
         }
 
-        ((self.computed_threshold as f64 - self.base_threshold as f64)
-            / self.base_threshold as f64)
+        ((self.computed_threshold as f64 - self.base_threshold as f64) / self.base_threshold as f64)
             * 100.0
     }
 }
@@ -395,13 +393,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_threshold_with_data() {
-        let adaptive = AdaptiveThreshold::with_config(
-            5,
-            Duration::from_secs(3600),
-            2,
-            100,
-            3.0,
-        );
+        let adaptive = AdaptiveThreshold::with_config(5, Duration::from_secs(3600), 2, 100, 3.0);
 
         // Add consistent failure counts
         for _ in 0..20 {
@@ -418,13 +410,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_threshold_high_variance() {
-        let adaptive = AdaptiveThreshold::with_config(
-            5,
-            Duration::from_secs(3600),
-            2,
-            100,
-            3.0,
-        );
+        let adaptive = AdaptiveThreshold::with_config(5, Duration::from_secs(3600), 2, 100, 3.0);
 
         // Add highly variable failure counts
         for i in 0..20 {

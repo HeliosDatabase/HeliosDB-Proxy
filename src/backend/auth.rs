@@ -115,9 +115,8 @@ impl Scram {
         server_first: &[u8],
         password: &str,
     ) -> BackendResult<ScramMessage> {
-        let server_first_str = std::str::from_utf8(server_first).map_err(|e| {
-            BackendError::Auth(format!("server-first is not UTF-8: {}", e))
-        })?;
+        let server_first_str = std::str::from_utf8(server_first)
+            .map_err(|e| BackendError::Auth(format!("server-first is not UTF-8: {}", e)))?;
 
         // Parse r=<combined-nonce>,s=<salt-base64>,i=<iteration-count>
         let mut server_nonce = None;
@@ -132,10 +131,10 @@ impl Scram {
                 iterations = rest.parse().ok();
             }
         }
-        let server_nonce = server_nonce
-            .ok_or_else(|| BackendError::Auth("missing r= in server-first".into()))?;
-        let salt_b64 = salt_b64
-            .ok_or_else(|| BackendError::Auth("missing s= in server-first".into()))?;
+        let server_nonce =
+            server_nonce.ok_or_else(|| BackendError::Auth("missing r= in server-first".into()))?;
+        let salt_b64 =
+            salt_b64.ok_or_else(|| BackendError::Auth("missing s= in server-first".into()))?;
         let iterations = iterations
             .ok_or_else(|| BackendError::Auth("missing/invalid i= in server-first".into()))?;
 
@@ -162,8 +161,7 @@ impl Scram {
         // channel-binding: "c=" + base64("n,,")
         let channel_binding = BASE64.encode(b"n,,");
 
-        let client_final_without_proof =
-            format!("c={},r={}", channel_binding, server_nonce);
+        let client_final_without_proof = format!("c={},r={}", channel_binding, server_nonce);
         self.auth_message = format!(
             "{},{},{}",
             self.client_first_bare, server_first_str, client_final_without_proof
@@ -194,9 +192,8 @@ impl Scram {
                 "verify_server called before client_final".into(),
             ));
         }
-        let s = std::str::from_utf8(server_final).map_err(|e| {
-            BackendError::Auth(format!("server-final is not UTF-8: {}", e))
-        })?;
+        let s = std::str::from_utf8(server_final)
+            .map_err(|e| BackendError::Auth(format!("server-final is not UTF-8: {}", e)))?;
         // Server may send `e=<error>` on failure.
         if let Some(err) = s.strip_prefix("e=") {
             return Err(BackendError::Auth(format!("server reported: {}", err)));
@@ -228,8 +225,7 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac =
-        HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
     let tag = mac.finalize().into_bytes();
     let mut out = [0u8; 32];
@@ -240,15 +236,13 @@ pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 pub(crate) fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iters: u32) -> [u8; 32] {
     // Single-block PBKDF2 (dkLen == hLen == 32) — exactly what SCRAM
     // requires.
-    let mut mac = HmacSha256::new_from_slice(password)
-        .expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(password).expect("HMAC accepts any key length");
     mac.update(salt);
     mac.update(&1u32.to_be_bytes());
     let mut u: [u8; 32] = mac.finalize().into_bytes().into();
     let mut out = u;
     for _ in 1..iters {
-        let mut mac = HmacSha256::new_from_slice(password)
-            .expect("HMAC accepts any key length");
+        let mut mac = HmacSha256::new_from_slice(password).expect("HMAC accepts any key length");
         mac.update(&u);
         u = mac.finalize().into_bytes().into();
         for i in 0..32 {
@@ -273,7 +267,7 @@ mod tests {
         let body = std::str::from_utf8(&got[..got.len() - 1]).unwrap();
         assert!(body.starts_with("md5"));
         assert_eq!(body.len(), 3 + 32); // "md5" + 32 hex chars
-        // Re-derive and compare.
+                                        // Re-derive and compare.
         let inner = md5_hex(b"secretalice");
         let mut combined = inner.into_bytes();
         combined.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
@@ -287,9 +281,9 @@ mod tests {
     fn test_pbkdf2_hmac_sha256_rfc_vector() {
         let got = pbkdf2_hmac_sha256(b"password", b"salt", 1);
         let expected = [
-            0x12, 0x0f, 0xb6, 0xcf, 0xfc, 0xf8, 0xb3, 0x2c, 0x43, 0xe7, 0x22, 0x52,
-            0x56, 0xc4, 0xf8, 0x37, 0xa8, 0x65, 0x48, 0xc9, 0x2c, 0xcc, 0x35, 0x48,
-            0x08, 0x05, 0x98, 0x7c, 0xb7, 0x0b, 0xe1, 0x7b,
+            0x12, 0x0f, 0xb6, 0xcf, 0xfc, 0xf8, 0xb3, 0x2c, 0x43, 0xe7, 0x22, 0x52, 0x56, 0xc4,
+            0xf8, 0x37, 0xa8, 0x65, 0x48, 0xc9, 0x2c, 0xcc, 0x35, 0x48, 0x08, 0x05, 0x98, 0x7c,
+            0xb7, 0x0b, 0xe1, 0x7b,
         ];
         assert_eq!(got, expected);
     }
@@ -300,9 +294,9 @@ mod tests {
     fn test_pbkdf2_hmac_sha256_high_iters() {
         let got = pbkdf2_hmac_sha256(b"password", b"salt", 4096);
         let expected = [
-            0xc5, 0xe4, 0x78, 0xd5, 0x92, 0x88, 0xc8, 0x41, 0xaa, 0x53, 0x0d, 0xb6,
-            0x84, 0x5c, 0x4c, 0x8d, 0x96, 0x28, 0x93, 0xa0, 0x01, 0xce, 0x4e, 0x11,
-            0xa4, 0x96, 0x38, 0x73, 0xaa, 0x98, 0x13, 0x4a,
+            0xc5, 0xe4, 0x78, 0xd5, 0x92, 0x88, 0xc8, 0x41, 0xaa, 0x53, 0x0d, 0xb6, 0x84, 0x5c,
+            0x4c, 0x8d, 0x96, 0x28, 0x93, 0xa0, 0x01, 0xce, 0x4e, 0x11, 0xa4, 0x96, 0x38, 0x73,
+            0xaa, 0x98, 0x13, 0x4a,
         ];
         assert_eq!(got, expected);
     }
@@ -321,27 +315,21 @@ mod tests {
         let msg = &first.0;
         let mech_end = msg.iter().position(|&b| b == 0).unwrap();
         assert_eq!(&msg[..mech_end], b"SCRAM-SHA-256");
-        let len =
-            u32::from_be_bytes(msg[mech_end + 1..mech_end + 5].try_into().unwrap())
-                as usize;
+        let len = u32::from_be_bytes(msg[mech_end + 1..mech_end + 5].try_into().unwrap()) as usize;
         let cfirst = &msg[mech_end + 5..mech_end + 5 + len];
         let cfirst_str = std::str::from_utf8(cfirst).unwrap();
         assert!(cfirst_str.starts_with("n,,n=,r=fyko+d2lbbFgONRv9qkxdawL"));
 
         // ---- synthetic server ----
         let server_nonce_suffix = "3rfcNHYJY1ZVvWVs7j";
-        let combined_nonce =
-            format!("fyko+d2lbbFgONRv9qkxdawL{}", server_nonce_suffix);
+        let combined_nonce = format!("fyko+d2lbbFgONRv9qkxdawL{}", server_nonce_suffix);
         let salt: [u8; 16] = [
-            0x41, 0x25, 0xc2, 0x47, 0xe4, 0x3a, 0xb1, 0xe9, 0x3c, 0x6d, 0xff, 0x76,
-            0xd1, 0x22, 0x3a, 0x10,
+            0x41, 0x25, 0xc2, 0x47, 0xe4, 0x3a, 0xb1, 0xe9, 0x3c, 0x6d, 0xff, 0x76, 0xd1, 0x22,
+            0x3a, 0x10,
         ];
         let iterations = 4096u32;
         let salt_b64 = BASE64.encode(salt);
-        let server_first = format!(
-            "r={},s={},i={}",
-            combined_nonce, salt_b64, iterations
-        );
+        let server_first = format!("r={},s={},i={}", combined_nonce, salt_b64, iterations);
 
         let password = "pencil";
         let client_final = scram
@@ -379,7 +367,9 @@ mod tests {
     fn test_scram_rejects_nonce_mismatch() {
         let (mut scram, _) = Scram::client_first("client-nonce");
         let server_first = "r=OTHER-nonce,s=QUJD,i=4096";
-        let err = scram.client_final(server_first.as_bytes(), "pw").unwrap_err();
+        let err = scram
+            .client_final(server_first.as_bytes(), "pw")
+            .unwrap_err();
         assert!(matches!(err, BackendError::Auth(_)));
     }
 

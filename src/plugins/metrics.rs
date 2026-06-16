@@ -430,10 +430,7 @@ impl MetricsExporter {
             "# HELP {}_total_calls Total hook calls\n",
             self.prefix
         ));
-        output.push_str(&format!(
-            "# TYPE {}_total_calls counter\n",
-            self.prefix
-        ));
+        output.push_str(&format!("# TYPE {}_total_calls counter\n", self.prefix));
         output.push_str(&format!(
             "{}_total_calls {}\n",
             self.prefix,
@@ -444,10 +441,7 @@ impl MetricsExporter {
             "# HELP {}_total_errors Total errors\n",
             self.prefix
         ));
-        output.push_str(&format!(
-            "# TYPE {}_total_errors counter\n",
-            self.prefix
-        ));
+        output.push_str(&format!("# TYPE {}_total_errors counter\n", self.prefix));
         output.push_str(&format!(
             "{}_total_errors {}\n",
             self.prefix,

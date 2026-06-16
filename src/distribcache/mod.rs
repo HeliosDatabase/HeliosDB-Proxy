@@ -38,41 +38,63 @@
 //! - **Heatmap Analytics**: Visual cache utilization and recommendations
 //! - **AI/Agent Caches**: Conversation context, RAG chunks, tool results, semantic queries
 
-pub mod config;
-pub mod classifier;
-pub mod tiers;
-pub mod prefetcher;
-pub mod invalidator;
-pub mod heatmap;
-pub mod scheduler;
 pub mod ai;
+pub mod classifier;
+pub mod config;
+pub mod heatmap;
+pub mod invalidator;
 pub mod metrics;
+pub mod prefetcher;
+pub mod scheduler;
+pub mod tiers;
 
-pub use config::*;
-pub use classifier::*;
-pub use tiers::{
-    HotCache, WarmCache, DistributedCache,
-    CacheEntry, CacheKey, CacheTier, TierStats,
-    EvictionPolicy, CompressionType,
-};
-pub use prefetcher::*;
-pub use invalidator::*;
-pub use heatmap::*;
-pub use scheduler::*;
 pub use ai::{
-    ConversationContextCache, ConversationContext, Turn, ConversationCacheStats,
-    RagChunkCache, Chunk, ChunkId, RagCacheStatsSnapshot,
-    ToolResultCache, ToolCallKey, ToolResult, ToolCacheStatsSnapshot,
-    SemanticQueryCache, SemanticEntry, SemanticCacheStatsSnapshot, cosine_similarity,
-    // Branch-aware and session-aware types (SessionId is defined locally as newtype)
-    BranchContext, BranchId, AIWorkloadContext, VectorId, Embedding,
-    SemanticIndex, SemanticIndexConfig, SimilarityResult,
+    cosine_similarity,
+    AIIntegrationConfig,
     // Cross-feature AI integration
-    AIIntegrationCoordinator, AIIntegrationConfig, AIIntegrationStatsSnapshot,
-    AIWorkloadDetection, SessionTrackingInfo, CacheRecommendation,
-    CachePriority, RecommendedTier,
+    AIIntegrationCoordinator,
+    AIIntegrationStatsSnapshot,
+    AIWorkloadContext,
+    AIWorkloadDetection,
+    // Branch-aware and session-aware types (SessionId is defined locally as newtype)
+    BranchContext,
+    BranchId,
+    CachePriority,
+    CacheRecommendation,
+    Chunk,
+    ChunkId,
+    ConversationCacheStats,
+    ConversationContext,
+    ConversationContextCache,
+    Embedding,
+    RagCacheStatsSnapshot,
+    RagChunkCache,
+    RecommendedTier,
+    SemanticCacheStatsSnapshot,
+    SemanticEntry,
+    SemanticIndex,
+    SemanticIndexConfig,
+    SemanticQueryCache,
+    SessionTrackingInfo,
+    SimilarityResult,
+    ToolCacheStatsSnapshot,
+    ToolCallKey,
+    ToolResult,
+    ToolResultCache,
+    Turn,
+    VectorId,
 };
-pub use metrics::{DistribCacheMetrics, InvalidationSource, ErrorType};
+pub use classifier::*;
+pub use config::*;
+pub use heatmap::*;
+pub use invalidator::*;
+pub use metrics::{DistribCacheMetrics, ErrorType, InvalidationSource};
+pub use prefetcher::*;
+pub use scheduler::*;
+pub use tiers::{
+    CacheEntry, CacheKey, CacheTier, CompressionType, DistributedCache, EvictionPolicy, HotCache,
+    TierStats, WarmCache,
+};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -148,8 +170,8 @@ impl QueryFingerprint {
 
     /// Create fingerprint with parameter binding
     pub fn with_params(mut self, params: &[&str]) -> Self {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         for param in params {
@@ -394,7 +416,9 @@ impl HeliosDistribCache {
         let start = Instant::now();
 
         // Classify workload for scheduling
-        let _workload = self.classifier.classify_query(&fingerprint.template, context);
+        let _workload = self
+            .classifier
+            .classify_query(&fingerprint.template, context);
 
         // Check L1 hot cache first
         if let Some(entry) = self.l1_hot.get(fingerprint, context.session_id.clone()) {
@@ -438,11 +462,13 @@ impl HeliosDistribCache {
 
         // Cache miss
         self.stats.total_misses.fetch_add(1, Ordering::Relaxed);
-        self.heatmap.record_access(fingerprint, false, Duration::ZERO);
+        self.heatmap
+            .record_access(fingerprint, false, Duration::ZERO);
 
         // Trigger prefetching for related queries
         if self.config.prefetch_enabled {
-            self.prefetcher.predict_and_prefetch(fingerprint, &context.session_id);
+            self.prefetcher
+                .predict_and_prefetch(fingerprint, &context.session_id);
         }
 
         Err(CacheError::Miss)
@@ -455,7 +481,9 @@ impl HeliosDistribCache {
         entry: CacheEntry,
         context: &QueryContext,
     ) -> CacheResult<()> {
-        let workload = self.classifier.classify_query(&fingerprint.template, context);
+        let workload = self
+            .classifier
+            .classify_query(&fingerprint.template, context);
         let ttl = self.get_ttl_for_workload(workload);
 
         let entry = entry.with_ttl(ttl);
@@ -474,7 +502,9 @@ impl HeliosDistribCache {
 
         // Insert into L3 for shared caching
         if self.config.l3_enabled && !matches!(workload, WorkloadType::OLTP) {
-            self.l3_distributed.insert(fingerprint.clone(), entry.clone()).await;
+            self.l3_distributed
+                .insert(fingerprint.clone(), entry.clone())
+                .await;
         }
 
         // Record for prefetcher learning
@@ -522,10 +552,9 @@ impl HeliosDistribCache {
             CacheTier::L3 => Duration::from_millis(5),
         };
 
-        self.stats.time_saved_us.fetch_add(
-            time_saved.as_micros() as u64,
-            Ordering::Relaxed,
-        );
+        self.stats
+            .time_saved_us
+            .fetch_add(time_saved.as_micros() as u64, Ordering::Relaxed);
         self.stats.queries_avoided.fetch_add(1, Ordering::Relaxed);
         self.heatmap.record_access(fingerprint, true, time_saved);
     }
@@ -567,7 +596,8 @@ impl HeliosDistribCache {
             } else {
                 0.0
             },
-            time_saved_seconds: self.stats.time_saved_us.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            time_saved_seconds: self.stats.time_saved_us.load(Ordering::Relaxed) as f64
+                / 1_000_000.0,
             queries_avoided: self.stats.queries_avoided.load(Ordering::Relaxed),
         }
     }

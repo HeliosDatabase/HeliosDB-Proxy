@@ -8,8 +8,7 @@ use std::time::Duration;
 use super::limiter::LimiterKey;
 
 /// Priority levels for queries
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum PriorityLevel {
     /// Low priority - accept more throttling
     Low = 0,
@@ -21,7 +20,6 @@ pub enum PriorityLevel {
     /// Critical priority - minimal throttling
     Critical = 3,
 }
-
 
 impl std::fmt::Display for PriorityLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -49,8 +47,7 @@ impl std::str::FromStr for PriorityLevel {
 }
 
 /// Action to take when rate limit is exceeded
-#[derive(Debug, Clone, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum ExceededAction {
     /// Return error immediately
     #[default]
@@ -65,7 +62,6 @@ pub enum ExceededAction {
     /// Log warning but allow
     Warn,
 }
-
 
 impl std::fmt::Display for ExceededAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -113,9 +109,7 @@ fn parse_duration_from_str(s: &str) -> Option<u64> {
     if let Some(s) = duration_str.strip_suffix("ms") {
         s.parse().ok()
     } else if let Some(s) = duration_str.strip_suffix('s') {
-        s.parse::<u64>()
-            .ok()
-            .map(|s| s * 1000)
+        s.parse::<u64>().ok().map(|s| s * 1000)
     } else {
         duration_str.parse().ok()
     }
@@ -476,16 +470,31 @@ mod tests {
     #[test]
     fn test_priority_level_parsing() {
         assert_eq!("low".parse::<PriorityLevel>().unwrap(), PriorityLevel::Low);
-        assert_eq!("normal".parse::<PriorityLevel>().unwrap(), PriorityLevel::Normal);
-        assert_eq!("high".parse::<PriorityLevel>().unwrap(), PriorityLevel::High);
-        assert_eq!("critical".parse::<PriorityLevel>().unwrap(), PriorityLevel::Critical);
+        assert_eq!(
+            "normal".parse::<PriorityLevel>().unwrap(),
+            PriorityLevel::Normal
+        );
+        assert_eq!(
+            "high".parse::<PriorityLevel>().unwrap(),
+            PriorityLevel::High
+        );
+        assert_eq!(
+            "critical".parse::<PriorityLevel>().unwrap(),
+            PriorityLevel::Critical
+        );
         assert!("invalid".parse::<PriorityLevel>().is_err());
     }
 
     #[test]
     fn test_exceeded_action_parsing() {
-        assert_eq!("reject".parse::<ExceededAction>().unwrap(), ExceededAction::Reject);
-        assert_eq!("warn".parse::<ExceededAction>().unwrap(), ExceededAction::Warn);
+        assert_eq!(
+            "reject".parse::<ExceededAction>().unwrap(),
+            ExceededAction::Reject
+        );
+        assert_eq!(
+            "warn".parse::<ExceededAction>().unwrap(),
+            ExceededAction::Warn
+        );
 
         match "queue(5s)".parse::<ExceededAction>().unwrap() {
             ExceededAction::Queue { max_wait } => {
@@ -516,9 +525,7 @@ mod tests {
 
     #[test]
     fn test_effective_qps_with_priority() {
-        let config = RateLimitConfig::builder()
-            .default_qps(100)
-            .build();
+        let config = RateLimitConfig::builder().default_qps(100).build();
 
         let key = LimiterKey::User("test".to_string());
 
@@ -573,6 +580,8 @@ mod tests {
         config.cleanup_expired();
 
         assert_eq!(config.overrides.len(), 1);
-        assert!(config.overrides.contains_key(&LimiterKey::User("perm".to_string())));
+        assert!(config
+            .overrides
+            .contains_key(&LimiterKey::User("perm".to_string())));
     }
 }

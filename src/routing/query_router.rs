@@ -3,9 +3,8 @@
 //! Routes queries to appropriate nodes based on hints and policies.
 
 use super::{
-    HintParser, ParsedHints, RouteTarget,
-    NodeFilter, NodeCriteria, NodeInfo, FilterResult,
-    RoutingConfig, RoutingError, RoutingMetrics, Result,
+    FilterResult, HintParser, NodeCriteria, NodeFilter, NodeInfo, ParsedHints, Result, RouteTarget,
+    RoutingConfig, RoutingError, RoutingMetrics,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -79,11 +78,8 @@ impl QueryRouter {
         // Build decision
         let decision = if filter_result.has_matches() {
             let selected = self.select_node(&filter_result);
-            self.metrics.record_routing(
-                criteria.route,
-                !hints.is_empty(),
-                start.elapsed(),
-            );
+            self.metrics
+                .record_routing(criteria.route, !hints.is_empty(), start.elapsed());
 
             RoutingDecision {
                 target_node: Some(selected.name.clone()),
@@ -148,10 +144,26 @@ impl QueryRouter {
 
         matches!(
             first_word,
-            "INSERT" | "UPDATE" | "DELETE" | "CREATE" | "ALTER" | "DROP" |
-            "TRUNCATE" | "GRANT" | "REVOKE" | "MERGE" | "UPSERT" |
-            "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" |
-            "LOCK" | "PREPARE" | "EXECUTE" | "DEALLOCATE"
+            "INSERT"
+                | "UPDATE"
+                | "DELETE"
+                | "CREATE"
+                | "ALTER"
+                | "DROP"
+                | "TRUNCATE"
+                | "GRANT"
+                | "REVOKE"
+                | "MERGE"
+                | "UPSERT"
+                | "BEGIN"
+                | "START"
+                | "COMMIT"
+                | "ROLLBACK"
+                | "SAVEPOINT"
+                | "LOCK"
+                | "PREPARE"
+                | "EXECUTE"
+                | "DEALLOCATE"
         )
     }
 
@@ -166,7 +178,9 @@ impl QueryRouter {
         }
 
         // Simple round-robin for now
-        let idx = self.rr_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let idx = self
+            .rr_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let selected_idx = (idx as usize) % result.eligible.len();
         result.eligible[selected_idx]
     }
@@ -175,7 +189,9 @@ impl QueryRouter {
     fn try_fallback<'a>(&self, nodes: &'a [NodeInfo], is_write: bool) -> Option<&'a NodeInfo> {
         if is_write {
             // For writes, only primary is acceptable
-            nodes.iter().find(|n| n.role == super::node_filter::NodeRole::Primary && n.healthy)
+            nodes
+                .iter()
+                .find(|n| n.role == super::node_filter::NodeRole::Primary && n.healthy)
         } else {
             // For reads, try any healthy node
             nodes.iter().find(|n| n.healthy && n.enabled)
@@ -304,17 +320,11 @@ pub enum RoutingReason {
         filters_applied: Vec<String>,
     },
     /// Fallback used due to no matches
-    Fallback {
-        original_filters: Vec<String>,
-    },
+    Fallback { original_filters: Vec<String> },
     /// No nodes available
-    NoNodes {
-        filters: Vec<String>,
-    },
+    NoNodes { filters: Vec<String> },
     /// Error occurred
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 impl std::fmt::Display for RoutingReason {
@@ -338,19 +348,23 @@ impl std::fmt::Display for RoutingReason {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::node_filter::SyncMode;
+    use super::*;
 
     async fn setup_router() -> QueryRouter {
         let router = QueryRouter::new(RoutingConfig::default());
 
         // Add test nodes
         router.add_node(NodeInfo::primary("primary")).await;
-        router.add_node(NodeInfo::standby("standby-sync-1", SyncMode::Sync)).await;
-        router.add_node(NodeInfo::standby("standby-async-1", SyncMode::Async)
-            .with_lag(100)).await;
-        router.add_node(NodeInfo::standby("standby-async-2", SyncMode::Async)
-            .with_lag(200)).await;
+        router
+            .add_node(NodeInfo::standby("standby-sync-1", SyncMode::Sync))
+            .await;
+        router
+            .add_node(NodeInfo::standby("standby-async-1", SyncMode::Async).with_lag(100))
+            .await;
+        router
+            .add_node(NodeInfo::standby("standby-async-2", SyncMode::Async).with_lag(200))
+            .await;
 
         router
     }
@@ -369,7 +383,9 @@ mod tests {
     async fn test_route_write_query() {
         let router = setup_router().await;
 
-        let decision = router.route("INSERT INTO users (name) VALUES ('test')").await;
+        let decision = router
+            .route("INSERT INTO users (name) VALUES ('test')")
+            .await;
 
         assert!(decision.is_success());
         assert!(decision.is_write);
@@ -380,7 +396,9 @@ mod tests {
     async fn test_route_with_primary_hint() {
         let router = setup_router().await;
 
-        let decision = router.route("/*helios:route=primary*/ SELECT * FROM users").await;
+        let decision = router
+            .route("/*helios:route=primary*/ SELECT * FROM users")
+            .await;
 
         assert!(decision.is_success());
         assert_eq!(decision.target_node.as_deref(), Some("primary"));
@@ -390,7 +408,9 @@ mod tests {
     async fn test_route_with_sync_hint() {
         let router = setup_router().await;
 
-        let decision = router.route("/*helios:route=sync*/ SELECT * FROM users").await;
+        let decision = router
+            .route("/*helios:route=sync*/ SELECT * FROM users")
+            .await;
 
         assert!(decision.is_success());
         assert_eq!(decision.target_node.as_deref(), Some("standby-sync-1"));
@@ -400,7 +420,9 @@ mod tests {
     async fn test_route_with_node_hint() {
         let router = setup_router().await;
 
-        let decision = router.route("/*helios:node=standby-async-1*/ SELECT * FROM users").await;
+        let decision = router
+            .route("/*helios:node=standby-async-1*/ SELECT * FROM users")
+            .await;
 
         assert!(decision.is_success());
         assert_eq!(decision.target_node.as_deref(), Some("standby-async-1"));
@@ -410,7 +432,9 @@ mod tests {
     async fn test_route_with_lag_hint() {
         let router = setup_router().await;
 
-        let decision = router.route("/*helios:route=async,lag=150ms*/ SELECT * FROM users").await;
+        let decision = router
+            .route("/*helios:route=async,lag=150ms*/ SELECT * FROM users")
+            .await;
 
         assert!(decision.is_success());
         // Should only match standby-async-1 (100ms lag)
@@ -421,7 +445,9 @@ mod tests {
     async fn test_route_no_matching_nodes() {
         let router = setup_router().await;
 
-        let decision = router.route("/*helios:node=nonexistent*/ SELECT * FROM users").await;
+        let decision = router
+            .route("/*helios:node=nonexistent*/ SELECT * FROM users")
+            .await;
 
         // Should fallback
         assert!(decision.is_success()); // Fallback finds a node
@@ -454,9 +480,9 @@ mod tests {
     async fn test_invalid_hint_combination() {
         let router = setup_router().await;
 
-        let decision = router.route(
-            "/*helios:route=async,consistency=strong*/ SELECT * FROM users"
-        ).await;
+        let decision = router
+            .route("/*helios:route=async,consistency=strong*/ SELECT * FROM users")
+            .await;
 
         // Should return error due to invalid combination
         assert!(!decision.is_success());
@@ -468,7 +494,9 @@ mod tests {
 
         // Make some routing decisions
         router.route("SELECT * FROM users").await;
-        router.route("/*helios:route=primary*/ SELECT * FROM accounts").await;
+        router
+            .route("/*helios:route=primary*/ SELECT * FROM accounts")
+            .await;
         router.route("INSERT INTO users VALUES (1)").await;
 
         let stats = router.metrics().snapshot();

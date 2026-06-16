@@ -104,7 +104,11 @@ impl SqlParser {
                 // Numbers
                 '0'..='9' => {
                     result.push('?');
-                    while chars.peek().map(|c| c.is_ascii_digit() || *c == '.').unwrap_or(false) {
+                    while chars
+                        .peek()
+                        .map(|c| c.is_ascii_digit() || *c == '.')
+                        .unwrap_or(false)
+                    {
                         chars.next();
                     }
                 }
@@ -122,17 +126,22 @@ impl SqlParser {
 
         // Collapse whitespace
         let mut prev_space = false;
-        result.chars().filter(|&c| {
-            if c.is_whitespace() {
-                if prev_space {
-                    return false;
+        result
+            .chars()
+            .filter(|&c| {
+                if c.is_whitespace() {
+                    if prev_space {
+                        return false;
+                    }
+                    prev_space = true;
+                } else {
+                    prev_space = false;
                 }
-                prev_space = true;
-            } else {
-                prev_space = false;
-            }
-            true
-        }).collect::<String>().trim().to_string()
+                true
+            })
+            .collect::<String>()
+            .trim()
+            .to_string()
     }
 
     /// Extract table names from query
@@ -148,7 +157,8 @@ impl SqlParser {
         for (i, word) in upper_words.iter().enumerate() {
             if table_keywords.contains(&word.trim_end_matches(',')) {
                 if let Some(table) = words.get(i + 1) {
-                    let table = table.trim_matches(|c| c == ',' || c == '(' || c == ')' || c == ';');
+                    let table =
+                        table.trim_matches(|c| c == ',' || c == '(' || c == ')' || c == ';');
                     if !table.is_empty() && !is_keyword(table) {
                         // Handle schema.table format
                         let table_name = table.split('.').next_back().unwrap_or(table);
@@ -295,7 +305,16 @@ impl SqlStatement {
 
     /// Check if statement modifies data
     pub fn is_write(&self) -> bool {
-        matches!(self, Self::Insert | Self::Update | Self::Delete | Self::Create | Self::Alter | Self::Drop | Self::Truncate)
+        matches!(
+            self,
+            Self::Insert
+                | Self::Update
+                | Self::Delete
+                | Self::Create
+                | Self::Alter
+                | Self::Drop
+                | Self::Truncate
+        )
     }
 }
 
@@ -333,15 +352,60 @@ impl From<ParseError> for super::RewriteError {
 /// Check if a word is a SQL keyword
 fn is_keyword(word: &str) -> bool {
     let upper = word.to_uppercase();
-    matches!(upper.as_str(),
-        "SELECT" | "FROM" | "WHERE" | "AND" | "OR" | "NOT" |
-        "INSERT" | "INTO" | "VALUES" | "UPDATE" | "SET" | "DELETE" |
-        "CREATE" | "ALTER" | "DROP" | "TABLE" | "INDEX" | "VIEW" |
-        "JOIN" | "LEFT" | "RIGHT" | "INNER" | "OUTER" | "CROSS" | "ON" |
-        "GROUP" | "BY" | "ORDER" | "HAVING" | "LIMIT" | "OFFSET" |
-        "UNION" | "INTERSECT" | "EXCEPT" | "AS" | "DISTINCT" | "ALL" |
-        "NULL" | "TRUE" | "FALSE" | "CASE" | "WHEN" | "THEN" | "ELSE" | "END" |
-        "EXISTS" | "IN" | "BETWEEN" | "LIKE" | "IS" | "ASC" | "DESC"
+    matches!(
+        upper.as_str(),
+        "SELECT"
+            | "FROM"
+            | "WHERE"
+            | "AND"
+            | "OR"
+            | "NOT"
+            | "INSERT"
+            | "INTO"
+            | "VALUES"
+            | "UPDATE"
+            | "SET"
+            | "DELETE"
+            | "CREATE"
+            | "ALTER"
+            | "DROP"
+            | "TABLE"
+            | "INDEX"
+            | "VIEW"
+            | "JOIN"
+            | "LEFT"
+            | "RIGHT"
+            | "INNER"
+            | "OUTER"
+            | "CROSS"
+            | "ON"
+            | "GROUP"
+            | "BY"
+            | "ORDER"
+            | "HAVING"
+            | "LIMIT"
+            | "OFFSET"
+            | "UNION"
+            | "INTERSECT"
+            | "EXCEPT"
+            | "AS"
+            | "DISTINCT"
+            | "ALL"
+            | "NULL"
+            | "TRUE"
+            | "FALSE"
+            | "CASE"
+            | "WHEN"
+            | "THEN"
+            | "ELSE"
+            | "END"
+            | "EXISTS"
+            | "IN"
+            | "BETWEEN"
+            | "LIKE"
+            | "IS"
+            | "ASC"
+            | "DESC"
     )
 }
 
@@ -364,7 +428,9 @@ mod tests {
     #[test]
     fn test_parse_insert() {
         let parser = SqlParser::new();
-        let parsed = parser.parse("INSERT INTO users (name) VALUES ('test')").unwrap();
+        let parsed = parser
+            .parse("INSERT INTO users (name) VALUES ('test')")
+            .unwrap();
 
         assert!(parsed.is_insert);
         assert!(parsed.tables.contains(&"users".to_string()));
@@ -397,11 +463,14 @@ mod tests {
     fn test_extract_tables() {
         let parser = SqlParser::new();
 
-        let parsed = parser.parse(
-            "SELECT u.*, o.total FROM users u JOIN orders o ON u.id = o.user_id"
-        ).unwrap();
+        let parsed = parser
+            .parse("SELECT u.*, o.total FROM users u JOIN orders o ON u.id = o.user_id")
+            .unwrap();
 
-        assert!(parsed.tables.contains(&"u".to_string()) || parsed.tables.contains(&"users".to_string()));
+        assert!(
+            parsed.tables.contains(&"u".to_string())
+                || parsed.tables.contains(&"users".to_string())
+        );
     }
 
     #[test]
@@ -422,10 +491,25 @@ mod tests {
 
     #[test]
     fn test_sql_statement_type() {
-        assert_eq!(SqlStatement::from_sql("SELECT * FROM users"), SqlStatement::Select);
-        assert_eq!(SqlStatement::from_sql("INSERT INTO users"), SqlStatement::Insert);
-        assert_eq!(SqlStatement::from_sql("UPDATE users SET"), SqlStatement::Update);
-        assert_eq!(SqlStatement::from_sql("DELETE FROM users"), SqlStatement::Delete);
-        assert_eq!(SqlStatement::from_sql("CREATE TABLE users"), SqlStatement::Create);
+        assert_eq!(
+            SqlStatement::from_sql("SELECT * FROM users"),
+            SqlStatement::Select
+        );
+        assert_eq!(
+            SqlStatement::from_sql("INSERT INTO users"),
+            SqlStatement::Insert
+        );
+        assert_eq!(
+            SqlStatement::from_sql("UPDATE users SET"),
+            SqlStatement::Update
+        );
+        assert_eq!(
+            SqlStatement::from_sql("DELETE FROM users"),
+            SqlStatement::Delete
+        );
+        assert_eq!(
+            SqlStatement::from_sql("CREATE TABLE users"),
+            SqlStatement::Create
+        );
     }
 }

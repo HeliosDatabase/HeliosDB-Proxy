@@ -87,7 +87,11 @@ impl TokenBucket {
     }
 
     /// Acquire tokens, blocking until available (with timeout)
-    pub fn acquire_blocking(&self, tokens: u32, timeout: Duration) -> Result<(), TokenBucketExceeded> {
+    pub fn acquire_blocking(
+        &self,
+        tokens: u32,
+        timeout: Duration,
+    ) -> Result<(), TokenBucketExceeded> {
         let deadline = Instant::now() + timeout;
 
         loop {
@@ -195,8 +199,10 @@ impl TokenBucket {
 
     /// Reset bucket to full capacity
     pub fn reset(&self) {
-        self.tokens.store((self.capacity as u64) * 1000, Ordering::Release);
-        self.last_refill.store(self.epoch.elapsed().as_nanos() as u64, Ordering::Release);
+        self.tokens
+            .store((self.capacity as u64) * 1000, Ordering::Release);
+        self.last_refill
+            .store(self.epoch.elapsed().as_nanos() as u64, Ordering::Release);
     }
 
     /// Update capacity (for dynamic limits)

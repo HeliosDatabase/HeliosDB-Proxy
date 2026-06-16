@@ -84,8 +84,10 @@ impl Violation {
 
 static TABLE_RE: Lazy<Regex> = Lazy::new(|| {
     // FROM/JOIN/INTO/UPDATE <table> — captures schema-qualified identifiers.
-    Regex::new(r"(?i)\b(?:FROM|JOIN|INTO|UPDATE)\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)")
-        .expect("valid table regex")
+    Regex::new(
+        r"(?i)\b(?:FROM|JOIN|INTO|UPDATE)\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)",
+    )
+    .expect("valid table regex")
 });
 
 /// Extract the leading SQL verb (upper-case), e.g. "SELECT".
@@ -113,9 +115,24 @@ fn tables_of(sql: &str) -> Vec<String> {
 fn is_write_verb(verb: &str) -> bool {
     matches!(
         verb,
-        "INSERT" | "UPDATE" | "DELETE" | "CREATE" | "DROP" | "ALTER" | "TRUNCATE" | "GRANT"
-            | "REVOKE" | "MERGE" | "CALL" | "DO" | "COPY" | "VACUUM" | "REINDEX" | "CLUSTER"
-            | "LOCK" | "COMMENT"
+        "INSERT"
+            | "UPDATE"
+            | "DELETE"
+            | "CREATE"
+            | "DROP"
+            | "ALTER"
+            | "TRUNCATE"
+            | "GRANT"
+            | "REVOKE"
+            | "MERGE"
+            | "CALL"
+            | "DO"
+            | "COPY"
+            | "VACUUM"
+            | "REINDEX"
+            | "CLUSTER"
+            | "LOCK"
+            | "COMMENT"
     )
 }
 
@@ -129,7 +146,10 @@ pub fn validate(sql: &str, contract: &AgentContract) -> Result<(), Violation> {
     if contract.read_only && is_write_verb(&verb) {
         return Err(Violation {
             violation: "write_forbidden".into(),
-            detail: format!("agent '{}' is read-only; '{}' statements are not permitted", contract.id, verb),
+            detail: format!(
+                "agent '{}' is read-only; '{}' statements are not permitted",
+                contract.id, verb
+            ),
             offending: sql.to_string(),
             suggested_rewrite: None,
         });
@@ -140,7 +160,10 @@ pub fn validate(sql: &str, contract: &AgentContract) -> Result<(), Violation> {
         if !verbs.iter().any(|v| v.eq_ignore_ascii_case(&verb)) {
             return Err(Violation {
                 violation: "verb_forbidden".into(),
-                detail: format!("verb '{}' not in this agent's allowed set {:?}", verb, verbs),
+                detail: format!(
+                    "verb '{}' not in this agent's allowed set {:?}",
+                    verb, verbs
+                ),
                 offending: sql.to_string(),
                 suggested_rewrite: None,
             });
@@ -151,7 +174,11 @@ pub fn validate(sql: &str, contract: &AgentContract) -> Result<(), Violation> {
 
     // 3. denied tables (highest precedence)
     for t in &tables {
-        if contract.denied_tables.iter().any(|d| d.eq_ignore_ascii_case(t)) {
+        if contract
+            .denied_tables
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(t))
+        {
             return Err(Violation {
                 violation: "table_forbidden".into(),
                 detail: format!("table '{}' is denied to agent '{}'", t, contract.id),
@@ -167,7 +194,10 @@ pub fn validate(sql: &str, contract: &AgentContract) -> Result<(), Violation> {
             if !allowed.iter().any(|a| a.eq_ignore_ascii_case(t)) {
                 return Err(Violation {
                     violation: "table_not_allowed".into(),
-                    detail: format!("table '{}' not in this agent's allowed set {:?}", t, allowed),
+                    detail: format!(
+                        "table '{}' not in this agent's allowed set {:?}",
+                        t, allowed
+                    ),
                     offending: sql.to_string(),
                     suggested_rewrite: None,
                 });
@@ -177,7 +207,9 @@ pub fn validate(sql: &str, contract: &AgentContract) -> Result<(), Violation> {
 
     // 5. required predicates per touched table
     for rule in &contract.require_predicate_on {
-        if tables.iter().any(|t| t.eq_ignore_ascii_case(&rule.table)) && !mentions_predicate(trimmed, &rule.column) {
+        if tables.iter().any(|t| t.eq_ignore_ascii_case(&rule.table))
+            && !mentions_predicate(trimmed, &rule.column)
+        {
             let rewrite = inject_predicate(trimmed, &rule.column);
             return Err(Violation {
                 violation: "missing_predicate".into(),
@@ -192,13 +224,21 @@ pub fn validate(sql: &str, contract: &AgentContract) -> Result<(), Violation> {
     }
 
     // 6. require LIMIT on SELECT
-    if contract.require_limit && verb == "SELECT" && !contains_ci(trimmed, " LIMIT ") && !ends_with_limit(trimmed) {
+    if contract.require_limit
+        && verb == "SELECT"
+        && !contains_ci(trimmed, " LIMIT ")
+        && !ends_with_limit(trimmed)
+    {
         let cap = contract.max_rows.unwrap_or(1000);
         return Err(Violation {
             violation: "missing_limit".into(),
             detail: format!("SELECTs must be bounded; add LIMIT {} or fewer", cap),
             offending: sql.to_string(),
-            suggested_rewrite: Some(format!("{} LIMIT {}", trimmed.trim_end_matches(';').trim_end(), cap)),
+            suggested_rewrite: Some(format!(
+                "{} LIMIT {}",
+                trimmed.trim_end_matches(';').trim_end(),
+                cap
+            )),
         });
     }
 
@@ -230,7 +270,10 @@ fn ends_with_limit(sql: &str) -> bool {
 /// already exists) so the agent has a concrete statement to retry.
 fn inject_predicate(sql: &str, column: &str) -> String {
     let trimmed = sql.trim().trim_end_matches(';').trim_end();
-    if starts_with_ci(trimmed, "SELECT") || starts_with_ci(trimmed, "UPDATE") || starts_with_ci(trimmed, "DELETE") {
+    if starts_with_ci(trimmed, "SELECT")
+        || starts_with_ci(trimmed, "UPDATE")
+        || starts_with_ci(trimmed, "DELETE")
+    {
         if contains_ci(trimmed, " WHERE ") {
             format!("{} AND {} = $1", trimmed, column)
         } else {
@@ -241,7 +284,12 @@ fn inject_predicate(sql: &str, column: &str) -> String {
                 .filter_map(|kw| up.find(kw))
                 .min();
             match cut {
-                Some(pos) => format!("{} WHERE {} = $1 {}", trimmed[..pos].trim_end(), column, &trimmed[pos..]),
+                Some(pos) => format!(
+                    "{} WHERE {} = $1 {}",
+                    trimmed[..pos].trim_end(),
+                    column,
+                    &trimmed[pos..]
+                ),
                 None => format!("{} WHERE {} = $1", trimmed, column),
             }
         }
@@ -261,7 +309,10 @@ mod tests {
             allowed_verbs: None,
             allowed_tables: Some(vec!["users".into(), "orders".into()]),
             denied_tables: vec!["secrets".into()],
-            require_predicate_on: vec![PredicateRule { table: "orders".into(), column: "tenant_id".into() }],
+            require_predicate_on: vec![PredicateRule {
+                table: "orders".into(),
+                column: "tenant_id".into(),
+            }],
             require_limit: true,
             max_rows: Some(1000),
         }
@@ -303,7 +354,11 @@ mod tests {
     fn requires_limit_with_rewrite() {
         let v = validate("SELECT id FROM users WHERE id = 1", &contract()).unwrap_err();
         assert_eq!(v.violation, "missing_limit");
-        assert!(v.suggested_rewrite.unwrap().to_uppercase().contains("LIMIT 1000"));
+        assert!(v
+            .suggested_rewrite
+            .unwrap()
+            .to_uppercase()
+            .contains("LIMIT 1000"));
     }
 
     #[test]

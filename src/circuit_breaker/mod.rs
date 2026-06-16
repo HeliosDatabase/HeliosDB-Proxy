@@ -47,27 +47,27 @@
 //! }
 //! ```
 
-pub mod config;
-pub mod state;
-pub mod breaker;
-pub mod manager;
-pub mod sliding_counter;
-pub mod metrics;
 pub mod adaptive;
 pub mod agent;
+pub mod breaker;
+pub mod config;
+pub mod manager;
+pub mod metrics;
+pub mod sliding_counter;
+pub mod state;
 
 // Re-exports for public API
-pub use config::{
-    CircuitBreakerConfig, CircuitBreakerConfigBuilder, FailureConditions,
-    SyncModeThresholds, NodeOverride,
-};
-pub use state::{CircuitState, StateTransition, TransitionReason};
-pub use breaker::{CircuitBreaker, CircuitOpen, RequestGuard};
-pub use manager::{CircuitBreakerManager, ManagerConfig};
-pub use sliding_counter::SlidingWindowCounter;
-pub use metrics::{CircuitMetrics, CircuitStats, NodeCircuitStats};
 pub use adaptive::{AdaptiveThreshold, RollingStats};
-pub use agent::{AgentRetryStrategy, RetryDecision, ConversationFallback};
+pub use agent::{AgentRetryStrategy, ConversationFallback, RetryDecision};
+pub use breaker::{CircuitBreaker, CircuitOpen, RequestGuard};
+pub use config::{
+    CircuitBreakerConfig, CircuitBreakerConfigBuilder, FailureConditions, NodeOverride,
+    SyncModeThresholds,
+};
+pub use manager::{CircuitBreakerManager, ManagerConfig};
+pub use metrics::{CircuitMetrics, CircuitStats, NodeCircuitStats};
+pub use sliding_counter::SlidingWindowCounter;
+pub use state::{CircuitState, StateTransition, TransitionReason};
 
 #[cfg(test)]
 mod tests {
@@ -110,7 +110,9 @@ mod tests {
 
         // Open -> Half-Open (after cooldown)
         std::thread::sleep(Duration::from_millis(50));
-        let guard = breaker.allow_request().expect("should allow request after cooldown");
+        let guard = breaker
+            .allow_request()
+            .expect("should allow request after cooldown");
         assert_eq!(breaker.get_state(), CircuitState::HalfOpen);
         guard.success(); // Mark as successful to avoid auto-failure on drop
 
@@ -132,7 +134,9 @@ mod tests {
         // Go to half-open
         breaker.record_failure_direct();
         std::thread::sleep(Duration::from_millis(50));
-        let guard = breaker.allow_request().expect("should allow after cooldown");
+        let guard = breaker
+            .allow_request()
+            .expect("should allow after cooldown");
         assert_eq!(breaker.get_state(), CircuitState::HalfOpen);
 
         // Failure in half-open goes back to open

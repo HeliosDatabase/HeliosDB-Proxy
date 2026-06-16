@@ -57,9 +57,7 @@ impl KvBackend {
     /// Insert / overwrite.
     pub fn set(&self, plugin: &str, key: Vec<u8>, value: Vec<u8>) {
         let mut g = self.inner.write();
-        g.entry(plugin.to_string())
-            .or_default()
-            .insert(key, value);
+        g.entry(plugin.to_string()).or_default().insert(key, value);
     }
 
     /// Delete; idempotent.
@@ -73,11 +71,7 @@ impl KvBackend {
     /// Returns the number of keys in the plugin's namespace.
     /// Useful for tests and the future admin endpoint.
     pub fn len(&self, plugin: &str) -> usize {
-        self.inner
-            .read()
-            .get(plugin)
-            .map(|m| m.len())
-            .unwrap_or(0)
+        self.inner.read().get(plugin).map(|m| m.len()).unwrap_or(0)
     }
 }
 
@@ -98,7 +92,12 @@ pub fn register_kv_imports(linker: &mut Linker<StoreCtx>) -> Result<(), PluginEr
         .func_wrap(
             "env",
             "kv_get",
-            |mut caller: Caller<'_, StoreCtx>, key_ptr: i32, key_len: i32, val_out_ptr: i32, val_max_len: i32| -> i32 {
+            |mut caller: Caller<'_, StoreCtx>,
+             key_ptr: i32,
+             key_len: i32,
+             val_out_ptr: i32,
+             val_max_len: i32|
+             -> i32 {
                 let memory = match get_memory(&mut caller) {
                     Some(m) => m,
                     None => return -1,
@@ -128,7 +127,12 @@ pub fn register_kv_imports(linker: &mut Linker<StoreCtx>) -> Result<(), PluginEr
         .func_wrap(
             "env",
             "kv_set",
-            |mut caller: Caller<'_, StoreCtx>, key_ptr: i32, key_len: i32, val_ptr: i32, val_len: i32| -> i32 {
+            |mut caller: Caller<'_, StoreCtx>,
+             key_ptr: i32,
+             key_len: i32,
+             val_ptr: i32,
+             val_len: i32|
+             -> i32 {
                 let memory = match get_memory(&mut caller) {
                     Some(m) => m,
                     None => return -1,
@@ -208,7 +212,7 @@ pub fn register_crypto_imports(linker: &mut Linker<StoreCtx>) -> Result<(), Plug
                 let mut hex = [0u8; 64];
                 const HEX: &[u8; 16] = b"0123456789abcdef";
                 for (i, b) in digest.iter().enumerate() {
-                    hex[i * 2]     = HEX[(b >> 4) as usize];
+                    hex[i * 2] = HEX[(b >> 4) as usize];
                     hex[i * 2 + 1] = HEX[(b & 0x0f) as usize];
                 }
                 if write_bytes(&memory, &mut caller, out_ptr, &hex).is_err() {
@@ -225,7 +229,12 @@ fn get_memory(caller: &mut Caller<'_, StoreCtx>) -> Option<Memory> {
     caller.get_export("memory").and_then(|e| e.into_memory())
 }
 
-fn read_bytes(memory: &Memory, caller: &Caller<'_, StoreCtx>, ptr: i32, len: i32) -> Option<Vec<u8>> {
+fn read_bytes(
+    memory: &Memory,
+    caller: &Caller<'_, StoreCtx>,
+    ptr: i32,
+    len: i32,
+) -> Option<Vec<u8>> {
     if len < 0 {
         return None;
     }

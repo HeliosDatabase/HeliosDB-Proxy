@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use super::config::{Identity, RoleMappingRule, RoleMappingCondition};
+use super::config::{Identity, RoleMappingCondition, RoleMappingRule};
 
 /// Role mapper
 pub struct RoleMapper {
@@ -94,9 +94,10 @@ impl RoleMapper {
 
         for rule in &self.rules {
             if roles.iter().any(|r| rule.assign_roles.contains(r))
-                && rule.permissions.contains(&permission.to_string()) {
-                    return true;
-                }
+                && rule.permissions.contains(&permission.to_string())
+            {
+                return true;
+            }
         }
 
         false
@@ -124,10 +125,7 @@ impl RoleMapper {
         let role = role.into();
 
         let mut static_roles = self.static_roles.write();
-        static_roles
-            .entry(user_id)
-            .or_default()
-            .push(role);
+        static_roles.entry(user_id).or_default().push(role);
     }
 
     /// Remove a static role assignment
@@ -170,40 +168,33 @@ impl RoleMapper {
                 }
             }
 
-            RoleMappingCondition::InGroup { group } => {
-                identity.groups.contains(group)
-            }
+            RoleMappingCondition::InGroup { group } => identity.groups.contains(group),
 
-            RoleMappingCondition::HasRole { role } => {
-                identity.roles.contains(role)
-            }
+            RoleMappingCondition::HasRole { role } => identity.roles.contains(role),
 
             RoleMappingCondition::FromTenant { tenant_id } => {
                 identity.tenant_id.as_ref() == Some(tenant_id)
             }
 
-            RoleMappingCondition::AuthMethod { method } => {
-                &identity.auth_method == method
-            }
+            RoleMappingCondition::AuthMethod { method } => &identity.auth_method == method,
 
-            RoleMappingCondition::EmailDomain { domain } => {
-                identity.email
-                    .as_ref()
-                    .map(|e| e.ends_with(&format!("@{}", domain)))
-                    .unwrap_or(false)
-            }
+            RoleMappingCondition::EmailDomain { domain } => identity
+                .email
+                .as_ref()
+                .map(|e| e.ends_with(&format!("@{}", domain)))
+                .unwrap_or(false),
 
             RoleMappingCondition::UsernamePattern { pattern } => {
                 self.match_pattern(&identity.user_id, pattern)
             }
 
-            RoleMappingCondition::And { conditions } => {
-                conditions.iter().all(|c| self.evaluate_condition(c, identity))
-            }
+            RoleMappingCondition::And { conditions } => conditions
+                .iter()
+                .all(|c| self.evaluate_condition(c, identity)),
 
-            RoleMappingCondition::Or { conditions } => {
-                conditions.iter().any(|c| self.evaluate_condition(c, identity))
-            }
+            RoleMappingCondition::Or { conditions } => conditions
+                .iter()
+                .any(|c| self.evaluate_condition(c, identity)),
 
             RoleMappingCondition::Not { condition } => {
                 !self.evaluate_condition(condition, identity)
@@ -265,10 +256,7 @@ impl RoleMapperBuilder {
         let group = group.into();
         let role = role.into();
 
-        self.group_roles
-            .entry(group)
-            .or_default()
-            .push(role);
+        self.group_roles.entry(group).or_default().push(role);
         self
     }
 
@@ -510,12 +498,10 @@ mod tests {
                 name: "admin_from_claim".to_string(),
                 condition: RoleCondition::Always,
                 db_role: String::new(),
-                conditions: vec![
-                    RoleMappingCondition::HasClaim {
-                        claim: "department".to_string(),
-                        value: Some("engineering".to_string()),
-                    }
-                ],
+                conditions: vec![RoleMappingCondition::HasClaim {
+                    claim: "department".to_string(),
+                    value: Some("engineering".to_string()),
+                }],
                 assign_roles: vec!["db_admin".to_string()],
                 permissions: vec!["read".to_string(), "write".to_string()],
                 priority: 1,
@@ -535,11 +521,9 @@ mod tests {
                 name: "tenant1_role".to_string(),
                 condition: RoleCondition::Always,
                 db_role: String::new(),
-                conditions: vec![
-                    RoleMappingCondition::FromTenant {
-                        tenant_id: "tenant1".to_string(),
-                    }
-                ],
+                conditions: vec![RoleMappingCondition::FromTenant {
+                    tenant_id: "tenant1".to_string(),
+                }],
                 assign_roles: vec!["tenant1_user".to_string()],
                 permissions: Vec::new(),
                 priority: 1,
@@ -559,11 +543,9 @@ mod tests {
                 name: "example_domain".to_string(),
                 condition: RoleCondition::Always,
                 db_role: String::new(),
-                conditions: vec![
-                    RoleMappingCondition::EmailDomain {
-                        domain: "example.com".to_string(),
-                    }
-                ],
+                conditions: vec![RoleMappingCondition::EmailDomain {
+                    domain: "example.com".to_string(),
+                }],
                 assign_roles: vec!["internal_user".to_string()],
                 permissions: Vec::new(),
                 priority: 1,
@@ -583,14 +565,16 @@ mod tests {
                 name: "combined".to_string(),
                 condition: RoleCondition::Always,
                 db_role: String::new(),
-                conditions: vec![
-                    RoleMappingCondition::And {
-                        conditions: vec![
-                            RoleMappingCondition::HasRole { role: "user".to_string() },
-                            RoleMappingCondition::InGroup { group: "developers".to_string() },
-                        ],
-                    }
-                ],
+                conditions: vec![RoleMappingCondition::And {
+                    conditions: vec![
+                        RoleMappingCondition::HasRole {
+                            role: "user".to_string(),
+                        },
+                        RoleMappingCondition::InGroup {
+                            group: "developers".to_string(),
+                        },
+                    ],
+                }],
                 assign_roles: vec!["power_user".to_string()],
                 permissions: Vec::new(),
                 priority: 1,
@@ -610,14 +594,16 @@ mod tests {
                 name: "either".to_string(),
                 condition: RoleCondition::Always,
                 db_role: String::new(),
-                conditions: vec![
-                    RoleMappingCondition::Or {
-                        conditions: vec![
-                            RoleMappingCondition::HasRole { role: "admin".to_string() },
-                            RoleMappingCondition::HasRole { role: "user".to_string() },
-                        ],
-                    }
-                ],
+                conditions: vec![RoleMappingCondition::Or {
+                    conditions: vec![
+                        RoleMappingCondition::HasRole {
+                            role: "admin".to_string(),
+                        },
+                        RoleMappingCondition::HasRole {
+                            role: "user".to_string(),
+                        },
+                    ],
+                }],
                 assign_roles: vec!["authenticated".to_string()],
                 permissions: Vec::new(),
                 priority: 1,
@@ -637,13 +623,11 @@ mod tests {
                 name: "not_admin".to_string(),
                 condition: RoleCondition::Always,
                 db_role: String::new(),
-                conditions: vec![
-                    RoleMappingCondition::Not {
-                        condition: Box::new(RoleMappingCondition::HasRole {
-                            role: "admin".to_string(),
-                        }),
-                    }
-                ],
+                conditions: vec![RoleMappingCondition::Not {
+                    condition: Box::new(RoleMappingCondition::HasRole {
+                        role: "admin".to_string(),
+                    }),
+                }],
                 assign_roles: vec!["regular_user".to_string()],
                 permissions: Vec::new(),
                 priority: 1,
@@ -669,9 +653,7 @@ mod tests {
 
     #[test]
     fn test_default_roles() {
-        let mapper = RoleMapper::builder()
-            .default_role("guest")
-            .build();
+        let mapper = RoleMapper::builder().default_role("guest").build();
 
         // Empty identity with no roles
         let identity = Identity {
@@ -737,6 +719,9 @@ mod tests {
             .with_context("client_ip", "192.168.1.1");
 
         assert!(ctx.is_allowed(&Operation::Select, "any_table"));
-        assert_eq!(ctx.context.get("client_ip"), Some(&"192.168.1.1".to_string()));
+        assert_eq!(
+            ctx.context.get("client_ip"),
+            Some(&"192.168.1.1".to_string())
+        );
     }
 }

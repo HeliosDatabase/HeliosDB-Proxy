@@ -102,7 +102,10 @@ impl StatementType {
     pub fn is_mutation(&self) -> bool {
         matches!(
             self,
-            StatementType::Insert | StatementType::Update | StatementType::Delete | StatementType::Ddl
+            StatementType::Insert
+                | StatementType::Update
+                | StatementType::Delete
+                | StatementType::Ddl
         )
     }
 }
@@ -340,11 +343,15 @@ impl TransactionJournal {
 
         // Check limits
         if journal.entries.len() >= self.max_entries {
-            return Err(ProxyError::Internal("Transaction journal entries limit exceeded".to_string()));
+            return Err(ProxyError::Internal(
+                "Transaction journal entries limit exceeded".to_string(),
+            ));
         }
 
         if journal.total_size() >= self.max_size {
-            return Err(ProxyError::Internal("Transaction journal size limit exceeded".to_string()));
+            return Err(ProxyError::Internal(
+                "Transaction journal size limit exceeded".to_string(),
+            ));
         }
 
         let sequence = journal.current_sequence + 1;
@@ -409,7 +416,10 @@ impl TransactionJournal {
     /// Rollback transaction (clear journal)
     pub async fn rollback_transaction(&self, tx_id: Uuid) -> Result<()> {
         self.journals.write().await.remove(&tx_id);
-        tracing::debug!("Rolled back and cleared journal for transaction {:?}", tx_id);
+        tracing::debug!(
+            "Rolled back and cleared journal for transaction {:?}",
+            tx_id
+        );
         Ok(())
     }
 
@@ -487,13 +497,31 @@ mod tests {
 
     #[test]
     fn test_statement_type_detection() {
-        assert_eq!(StatementType::from_sql("SELECT * FROM users"), StatementType::Select);
-        assert_eq!(StatementType::from_sql("INSERT INTO users VALUES (1)"), StatementType::Insert);
-        assert_eq!(StatementType::from_sql("UPDATE users SET name = 'x'"), StatementType::Update);
-        assert_eq!(StatementType::from_sql("DELETE FROM users"), StatementType::Delete);
-        assert_eq!(StatementType::from_sql("CREATE TABLE foo (id INT)"), StatementType::Ddl);
+        assert_eq!(
+            StatementType::from_sql("SELECT * FROM users"),
+            StatementType::Select
+        );
+        assert_eq!(
+            StatementType::from_sql("INSERT INTO users VALUES (1)"),
+            StatementType::Insert
+        );
+        assert_eq!(
+            StatementType::from_sql("UPDATE users SET name = 'x'"),
+            StatementType::Update
+        );
+        assert_eq!(
+            StatementType::from_sql("DELETE FROM users"),
+            StatementType::Delete
+        );
+        assert_eq!(
+            StatementType::from_sql("CREATE TABLE foo (id INT)"),
+            StatementType::Ddl
+        );
         assert_eq!(StatementType::from_sql("BEGIN"), StatementType::Transaction);
-        assert_eq!(StatementType::from_sql("SET search_path = public"), StatementType::Set);
+        assert_eq!(
+            StatementType::from_sql("SET search_path = public"),
+            StatementType::Set
+        );
     }
 
     #[test]
@@ -514,26 +542,35 @@ mod tests {
         let node_id = NodeId::new();
 
         // Begin transaction
-        journal.begin_transaction(tx_id, session_id, node_id, 0).await.unwrap();
+        journal
+            .begin_transaction(tx_id, session_id, node_id, 0)
+            .await
+            .unwrap();
 
         // Log statements
-        journal.log_statement(
-            tx_id,
-            "SELECT * FROM users".to_string(),
-            vec![],
-            Some(12345),
-            None,
-            10,
-        ).await.unwrap();
+        journal
+            .log_statement(
+                tx_id,
+                "SELECT * FROM users".to_string(),
+                vec![],
+                Some(12345),
+                None,
+                10,
+            )
+            .await
+            .unwrap();
 
-        journal.log_statement(
-            tx_id,
-            "INSERT INTO users (name) VALUES ($1)".to_string(),
-            vec![JournalValue::Text("test".to_string())],
-            None,
-            Some(1),
-            5,
-        ).await.unwrap();
+        journal
+            .log_statement(
+                tx_id,
+                "INSERT INTO users (name) VALUES ($1)".to_string(),
+                vec![JournalValue::Text("test".to_string())],
+                None,
+                Some(1),
+                5,
+            )
+            .await
+            .unwrap();
 
         // Check journal
         let j = journal.get_journal(&tx_id).await.unwrap();
@@ -552,33 +589,45 @@ mod tests {
         let session_id = Uuid::new_v4();
         let node_id = NodeId::new();
 
-        journal.begin_transaction(tx_id, session_id, node_id, 0).await.unwrap();
+        journal
+            .begin_transaction(tx_id, session_id, node_id, 0)
+            .await
+            .unwrap();
 
         // Log some statements
         for i in 0..3 {
-            journal.log_statement(
-                tx_id,
-                format!("INSERT INTO t VALUES ({})", i),
-                vec![],
-                None,
-                Some(1),
-                1,
-            ).await.unwrap();
+            journal
+                .log_statement(
+                    tx_id,
+                    format!("INSERT INTO t VALUES ({})", i),
+                    vec![],
+                    None,
+                    Some(1),
+                    1,
+                )
+                .await
+                .unwrap();
         }
 
         // Create savepoint
-        journal.create_savepoint(tx_id, "sp1".to_string()).await.unwrap();
+        journal
+            .create_savepoint(tx_id, "sp1".to_string())
+            .await
+            .unwrap();
 
         // Log more
         for i in 3..5 {
-            journal.log_statement(
-                tx_id,
-                format!("INSERT INTO t VALUES ({})", i),
-                vec![],
-                None,
-                Some(1),
-                1,
-            ).await.unwrap();
+            journal
+                .log_statement(
+                    tx_id,
+                    format!("INSERT INTO t VALUES ({})", i),
+                    vec![],
+                    None,
+                    Some(1),
+                    1,
+                )
+                .await
+                .unwrap();
         }
 
         let j = journal.get_journal(&tx_id).await.unwrap();
@@ -598,15 +647,14 @@ mod tests {
         let session_id = Uuid::new_v4();
         let node_id = NodeId::new();
 
-        journal.begin_transaction(tx_id, session_id, node_id, 0).await.unwrap();
-        journal.log_statement(
-            tx_id,
-            "SELECT 1".to_string(),
-            vec![],
-            None,
-            None,
-            1,
-        ).await.unwrap();
+        journal
+            .begin_transaction(tx_id, session_id, node_id, 0)
+            .await
+            .unwrap();
+        journal
+            .log_statement(tx_id, "SELECT 1".to_string(), vec![], None, None, 1)
+            .await
+            .unwrap();
 
         let stats = journal.stats().await;
         assert_eq!(stats.active_transactions, 1);

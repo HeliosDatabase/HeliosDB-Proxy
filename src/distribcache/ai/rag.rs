@@ -67,17 +67,17 @@ impl Chunk {
 
     /// Approximate size in bytes
     pub fn size(&self) -> usize {
-        self.content.len() +
-        self.document_id.len() +
-        self.embedding.as_ref().map(|e| e.len() * 4).unwrap_or(0) +
-        64
+        self.content.len()
+            + self.document_id.len()
+            + self.embedding.as_ref().map(|e| e.len() * 4).unwrap_or(0)
+            + 64
     }
 }
 
 /// Hash an embedding vector
 pub fn hash_embedding(embedding: &[f32]) -> EmbeddingHash {
-    use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
 
@@ -151,9 +151,12 @@ impl RagChunkCache {
         let hash = hash_embedding(embedding);
 
         if let Some(chunk_ids) = self.embedding_to_chunks.get(&hash) {
-            self.stats.embedding_cache_hits.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .embedding_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
 
-            let chunks: Vec<_> = chunk_ids.iter()
+            let chunks: Vec<_> = chunk_ids
+                .iter()
                 .filter_map(|id| self.chunks.get(id).map(|c| c.clone()))
                 .take(k)
                 .collect();
@@ -223,7 +226,8 @@ impl RagChunkCache {
     /// Remove a chunk
     pub fn remove_chunk(&self, id: ChunkId) {
         if let Some((_, chunk)) = self.chunks.remove(&id) {
-            self.current_size.fetch_sub(chunk.size() as u64, Ordering::Relaxed);
+            self.current_size
+                .fetch_sub(chunk.size() as u64, Ordering::Relaxed);
 
             // Remove from document index
             if let Some(mut ids) = self.document_to_chunks.get_mut(&chunk.document_id) {
@@ -274,7 +278,11 @@ impl RagChunkCache {
             embedding_cache_hit_rate: {
                 let lookups = self.stats.embedding_lookups.load(Ordering::Relaxed);
                 let hits = self.stats.embedding_cache_hits.load(Ordering::Relaxed);
-                if lookups > 0 { hits as f64 / lookups as f64 } else { 0.0 }
+                if lookups > 0 {
+                    hits as f64 / lookups as f64
+                } else {
+                    0.0
+                }
             },
         }
     }
@@ -307,8 +315,7 @@ mod tests {
 
     #[test]
     fn test_chunk_creation() {
-        let chunk = Chunk::new(1, "doc-1", "This is a test chunk")
-            .with_position(0);
+        let chunk = Chunk::new(1, "doc-1", "This is a test chunk").with_position(0);
 
         assert_eq!(chunk.id, 1);
         assert_eq!(chunk.document_id, "doc-1");
@@ -347,8 +354,7 @@ mod tests {
         let cache = RagChunkCache::new(10);
 
         let embedding = vec![0.1, 0.2, 0.3];
-        let chunk = Chunk::new(1, "doc-1", "Embedded content")
-            .with_embedding(embedding.clone());
+        let chunk = Chunk::new(1, "doc-1", "Embedded content").with_embedding(embedding.clone());
 
         cache.insert_chunk(chunk);
 

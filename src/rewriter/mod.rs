@@ -46,22 +46,24 @@
 //! ```
 
 pub mod config;
-pub mod rules;
 pub mod matcher;
-pub mod transformer;
-pub mod parser;
 pub mod metrics;
+pub mod parser;
+pub mod rules;
+pub mod transformer;
 
 // Re-export main types
 pub use config::{RewriterConfig, RewriterConfigBuilder};
-pub use rules::{RewriteRule, RewriteRuleBuilder, QueryPattern, AstPattern, Transformation, Condition};
-pub use matcher::{RuleMatcher, MatchResult};
-pub use transformer::{TransformationEngine, TransformError};
-pub use parser::{SqlParser, ParsedQuery, SqlStatement};
+pub use matcher::{MatchResult, RuleMatcher};
 pub use metrics::{RewriteMetrics, RewriteStats, RuleStats};
+pub use parser::{ParsedQuery, SqlParser, SqlStatement};
+pub use rules::{
+    AstPattern, Condition, QueryPattern, RewriteRule, RewriteRuleBuilder, Transformation,
+};
+pub use transformer::{TransformError, TransformationEngine};
 
-use std::sync::Arc;
 use parking_lot::RwLock;
+use std::sync::Arc;
 
 /// Query rewriter
 ///
@@ -175,7 +177,8 @@ impl QueryRewriter {
         }
 
         let duration = start.elapsed();
-        self.metrics.record_rewrite(duration, !applied_rules.is_empty());
+        self.metrics
+            .record_rewrite(duration, !applied_rules.is_empty());
 
         if applied_rules.is_empty() {
             Ok(RewriteResult::unchanged(query))
@@ -297,12 +300,8 @@ impl QueryRewriter {
     /// Evaluate a condition
     fn evaluate_condition(&self, condition: &Condition, query: &str) -> bool {
         match condition {
-            Condition::NoExistingLimit => {
-                !query.to_uppercase().contains("LIMIT")
-            }
-            Condition::NoExistingOrderBy => {
-                !query.to_uppercase().contains("ORDER BY")
-            }
+            Condition::NoExistingLimit => !query.to_uppercase().contains("LIMIT"),
+            Condition::NoExistingOrderBy => !query.to_uppercase().contains("ORDER BY"),
             Condition::HasSelectStar => {
                 let upper = query.to_uppercase();
                 upper.contains("SELECT *") || upper.contains("SELECT  *")
@@ -326,9 +325,7 @@ impl QueryRewriter {
             Condition::Or(conditions) => {
                 conditions.iter().any(|c| self.evaluate_condition(c, query))
             }
-            Condition::Not(condition) => {
-                !self.evaluate_condition(condition, query)
-            }
+            Condition::Not(condition) => !self.evaluate_condition(condition, query),
         }
     }
 }
@@ -493,9 +490,7 @@ mod tests {
 
     #[test]
     fn test_rewriter_disabled() {
-        let rewriter = QueryRewriter::builder()
-            .enabled(false)
-            .build();
+        let rewriter = QueryRewriter::builder().enabled(false).build();
 
         let result = rewriter.rewrite("SELECT * FROM users").unwrap();
         assert!(!result.was_rewritten());
@@ -506,10 +501,12 @@ mod tests {
     fn test_rewriter_add_limit() {
         let rewriter = QueryRewriter::builder()
             .enabled(true)
-            .rule(RewriteRule::build("add_limit")
-                .pattern(QueryPattern::All)
-                .transform(Transformation::AddLimit(100))
-                .condition(Condition::NoExistingLimit))
+            .rule(
+                RewriteRule::build("add_limit")
+                    .pattern(QueryPattern::All)
+                    .transform(Transformation::AddLimit(100))
+                    .condition(Condition::NoExistingLimit),
+            )
             .build();
 
         let result = rewriter.rewrite("SELECT * FROM users").unwrap();
@@ -521,10 +518,12 @@ mod tests {
     fn test_rewriter_skip_existing_limit() {
         let rewriter = QueryRewriter::builder()
             .enabled(true)
-            .rule(RewriteRule::build("add_limit")
-                .pattern(QueryPattern::All)
-                .transform(Transformation::AddLimit(100))
-                .condition(Condition::NoExistingLimit))
+            .rule(
+                RewriteRule::build("add_limit")
+                    .pattern(QueryPattern::All)
+                    .transform(Transformation::AddLimit(100))
+                    .condition(Condition::NoExistingLimit),
+            )
             .build();
 
         let result = rewriter.rewrite("SELECT * FROM users LIMIT 50").unwrap();
@@ -535,9 +534,11 @@ mod tests {
     fn test_rewriter_replace_query() {
         let rewriter = QueryRewriter::builder()
             .enabled(true)
-            .rule(RewriteRule::build("replace")
-                .pattern(QueryPattern::Fingerprint(12345))
-                .transform(Transformation::Replace("SELECT 1".to_string())))
+            .rule(
+                RewriteRule::build("replace")
+                    .pattern(QueryPattern::Fingerprint(12345))
+                    .transform(Transformation::Replace("SELECT 1".to_string())),
+            )
             .build();
 
         // This won't match because fingerprint doesn't match
@@ -547,15 +548,15 @@ mod tests {
 
     #[test]
     fn test_add_remove_rule() {
-        let rewriter = QueryRewriter::builder()
-            .enabled(true)
-            .build();
+        let rewriter = QueryRewriter::builder().enabled(true).build();
 
         assert!(rewriter.get_rules().is_empty());
 
-        rewriter.add_rule(RewriteRule::build("test")
-            .pattern(QueryPattern::All)
-            .transform(Transformation::AddLimit(100)));
+        rewriter.add_rule(
+            RewriteRule::build("test")
+                .pattern(QueryPattern::All)
+                .transform(Transformation::AddLimit(100)),
+        );
 
         assert_eq!(rewriter.get_rules().len(), 1);
 
@@ -567,9 +568,11 @@ mod tests {
     fn test_update_rule() {
         let rewriter = QueryRewriter::builder()
             .enabled(true)
-            .rule(RewriteRule::build("test")
-                .pattern(QueryPattern::All)
-                .transform(Transformation::AddLimit(100)))
+            .rule(
+                RewriteRule::build("test")
+                    .pattern(QueryPattern::All)
+                    .transform(Transformation::AddLimit(100)),
+            )
             .build();
 
         assert!(rewriter.get_rule("test").unwrap().enabled);

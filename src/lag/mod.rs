@@ -48,25 +48,14 @@ pub mod router;
 pub mod ryw;
 
 // Re-exports for convenience
-pub use config::{
-    LagCalculation, LagRoutingConfig, SyncModeLagConfig,
-};
-pub use metrics::{
-    LagMetrics, LagStatsSnapshot, NodeLagStats,
-};
-pub use monitor::{
-    LagInfo, LagMonitor, LagTrend, NodeLagData,
-};
-pub use router::{
-    LagAwareRouter, LagRoutingDecision, LagRoutingReason,
-};
-pub use ryw::{
-    ReadYourWritesTracker, RywSession, WorkflowConsistency, WorkflowTracker,
-};
+pub use config::{LagCalculation, LagRoutingConfig, SyncModeLagConfig};
+pub use metrics::{LagMetrics, LagStatsSnapshot, NodeLagStats};
+pub use monitor::{LagInfo, LagMonitor, LagTrend, NodeLagData};
+pub use router::{LagAwareRouter, LagRoutingDecision, LagRoutingReason};
+pub use ryw::{ReadYourWritesTracker, RywSession, WorkflowConsistency, WorkflowTracker};
 
 /// SyncMode enum for replica synchronization classification
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SyncMode {
     /// Synchronous replication - zero data loss guarantee
     Sync,
@@ -78,7 +67,6 @@ pub enum SyncMode {
     #[default]
     Unknown,
 }
-
 
 impl std::fmt::Display for SyncMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

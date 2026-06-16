@@ -225,11 +225,14 @@ impl AIIntegrationCoordinator {
 
         // Vector search patterns (only if not already classified as RAG)
         if workload_type != WorkloadType::RAG
-            && (query_lower.contains("embedding") || query_lower.contains("vector") || query_lower.contains("similarity")) {
-                patterns.push("Vector search".to_string());
-                confidence = confidence.max(0.75);
-                workload_type = WorkloadType::Vector;
-            }
+            && (query_lower.contains("embedding")
+                || query_lower.contains("vector")
+                || query_lower.contains("similarity"))
+        {
+            patterns.push("Vector search".to_string());
+            confidence = confidence.max(0.75);
+            workload_type = WorkloadType::Vector;
+        }
 
         // OLAP patterns
         if self.is_olap_pattern(&query_lower) {
@@ -253,8 +256,15 @@ impl AIIntegrationCoordinator {
         // - Chunk retrieval
         // - Document lookups
         let rag_patterns = [
-            "chunk", "retrieve", "context", "passage", "document",
-            "semantic", "similarity", "cosine", "embedding",
+            "chunk",
+            "retrieve",
+            "context",
+            "passage",
+            "document",
+            "semantic",
+            "similarity",
+            "cosine",
+            "embedding",
         ];
 
         rag_patterns.iter().any(|p| query.contains(p))
@@ -283,8 +293,13 @@ impl AIIntegrationCoordinator {
     /// Check if query matches tool result patterns
     fn is_tool_pattern(&self, query: &str) -> bool {
         let tool_patterns = [
-            "tool_", "function_", "api_result", "calculate",
-            "format_", "convert_", "lookup_",
+            "tool_",
+            "function_",
+            "api_result",
+            "calculate",
+            "format_",
+            "convert_",
+            "lookup_",
         ];
 
         tool_patterns.iter().any(|p| query.contains(p))
@@ -293,8 +308,16 @@ impl AIIntegrationCoordinator {
     /// Check if query matches OLAP patterns
     fn is_olap_pattern(&self, query: &str) -> bool {
         let olap_patterns = [
-            "group by", "having", "aggregate", "sum(", "count(",
-            "avg(", "window", "partition by", "rollup", "cube",
+            "group by",
+            "having",
+            "aggregate",
+            "sum(",
+            "count(",
+            "avg(",
+            "window",
+            "partition by",
+            "rollup",
+            "cube",
         ];
 
         olap_patterns.iter().any(|p| query.contains(p))
@@ -314,8 +337,7 @@ impl AIIntegrationCoordinator {
             self.cleanup_idle_sessions();
         }
 
-        let mut info = SessionTrackingInfo::new(sid.0.clone())
-            .with_ai_context(ai_context);
+        let mut info = SessionTrackingInfo::new(sid.0.clone()).with_ai_context(ai_context);
 
         if let Some(b) = branch {
             info = info.with_branch(b);
@@ -331,7 +353,9 @@ impl AIIntegrationCoordinator {
             info.record_query();
             if cache_hit {
                 info.record_cache_hit();
-                self.stats.cross_feature_hits.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .cross_feature_hits
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -392,29 +416,27 @@ impl AIIntegrationCoordinator {
                 priority: CachePriority::Low,
                 tier: RecommendedTier::L2,
             },
-            AIWorkloadContext::General => {
-                match detection.workload_type {
-                    WorkloadType::OLTP => CacheRecommendation {
-                        should_cache: true,
-                        ttl: Duration::from_secs(60),
-                        priority: CachePriority::High,
-                        tier: RecommendedTier::L1,
-                    },
-                    WorkloadType::OLAP => CacheRecommendation {
-                        should_cache: true,
-                        ttl: Duration::from_secs(3600),
-                        priority: CachePriority::Low,
-                        tier: RecommendedTier::L3,
-                    },
-                    WorkloadType::Vector => CacheRecommendation {
-                        should_cache: true,
-                        ttl: Duration::from_secs(600),
-                        priority: CachePriority::Medium,
-                        tier: RecommendedTier::L2,
-                    },
-                    _ => CacheRecommendation::default(),
-                }
-            }
+            AIWorkloadContext::General => match detection.workload_type {
+                WorkloadType::OLTP => CacheRecommendation {
+                    should_cache: true,
+                    ttl: Duration::from_secs(60),
+                    priority: CachePriority::High,
+                    tier: RecommendedTier::L1,
+                },
+                WorkloadType::OLAP => CacheRecommendation {
+                    should_cache: true,
+                    ttl: Duration::from_secs(3600),
+                    priority: CachePriority::Low,
+                    tier: RecommendedTier::L3,
+                },
+                WorkloadType::Vector => CacheRecommendation {
+                    should_cache: true,
+                    ttl: Duration::from_secs(600),
+                    priority: CachePriority::Medium,
+                    tier: RecommendedTier::L2,
+                },
+                _ => CacheRecommendation::default(),
+            },
         }
     }
 
@@ -438,7 +460,8 @@ impl AIIntegrationCoordinator {
     /// Cleanup idle sessions
     pub fn cleanup_idle_sessions(&self) {
         let timeout = self.config.session_idle_timeout;
-        let to_remove: Vec<_> = self.sessions
+        let to_remove: Vec<_> = self
+            .sessions
             .iter()
             .filter(|e| e.is_idle(timeout))
             .map(|e| e.key().clone())
@@ -553,7 +576,9 @@ mod tests {
         );
 
         assert_eq!(detection.ai_context, AIWorkloadContext::AgentConversation);
-        assert!(detection.patterns.contains(&"Agent conversation".to_string()));
+        assert!(detection
+            .patterns
+            .contains(&"Agent conversation".to_string()));
     }
 
     #[test]
@@ -679,7 +704,8 @@ mod tests {
             vec!["users".to_string()],
         );
 
-        let coordinator = AIIntegrationCoordinator::new(cache.clone(), AIIntegrationConfig::default());
+        let coordinator =
+            AIIntegrationCoordinator::new(cache.clone(), AIIntegrationConfig::default());
 
         // Invalidate by table
         let removed = coordinator.invalidate_table("users");

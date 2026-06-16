@@ -108,8 +108,8 @@ pub async fn shadow_execute(
         shadow_error: shadow_outcome.0.err().map(|e| e.to_string()),
     };
 
-    let qr = primary_outcome
-        .map_err(|e| ProxyError::Internal(format!("primary execute: {}", e)))?;
+    let qr =
+        primary_outcome.map_err(|e| ProxyError::Internal(format!("primary execute: {}", e)))?;
     Ok((qr, report))
 }
 
@@ -186,8 +186,14 @@ mod tests {
 
     #[test]
     fn identical_row_sets_hash_equal() {
-        let a = vec![row(&[Some("1"), Some("alice")]), row(&[Some("2"), Some("bob")])];
-        let b = vec![row(&[Some("1"), Some("alice")]), row(&[Some("2"), Some("bob")])];
+        let a = vec![
+            row(&[Some("1"), Some("alice")]),
+            row(&[Some("2"), Some("bob")]),
+        ];
+        let b = vec![
+            row(&[Some("1"), Some("alice")]),
+            row(&[Some("2"), Some("bob")]),
+        ];
         assert_eq!(row_set_hash(&a), row_set_hash(&b));
     }
 

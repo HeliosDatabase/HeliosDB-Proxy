@@ -2,9 +2,9 @@
 //!
 //! Manages metadata about tables, indexes, and relationships for routing decisions.
 
-use std::collections::HashMap;
 use dashmap::DashMap;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 
 /// Schema registry for routing decisions
 #[derive(Debug)]
@@ -71,7 +71,8 @@ impl SchemaRegistry {
 
     /// Get vector index for a table
     pub fn get_vector_index(&self, table: &str) -> Option<IndexSchema> {
-        self.indexes.iter()
+        self.indexes
+            .iter()
             .find(|entry| entry.table == table && entry.index_type == IndexType::Vector)
             .map(|entry| entry.clone())
     }
@@ -105,7 +106,8 @@ impl SchemaRegistry {
 
     /// Register node capabilities
     pub fn register_node_capabilities(&self, node_id: &str, capabilities: NodeCapabilities) {
-        self.node_capabilities.insert(node_id.to_string(), capabilities);
+        self.node_capabilities
+            .insert(node_id.to_string(), capabilities);
     }
 
     /// Get node capabilities
@@ -346,8 +348,7 @@ impl ColumnSchema {
 }
 
 /// Column storage type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum StorageType {
     /// Traditional row storage
     #[default]
@@ -359,7 +360,6 @@ pub enum StorageType {
     /// Vector storage
     Vector,
 }
-
 
 /// Index schema information
 #[derive(Debug, Clone)]
@@ -408,8 +408,7 @@ impl IndexSchema {
 }
 
 /// Index type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum IndexType {
     /// B-tree index
     #[default]
@@ -424,10 +423,8 @@ pub enum IndexType {
     Vector,
 }
 
-
 /// Access pattern classification
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum AccessPattern {
     /// Point lookups by primary key
     PointLookup,
@@ -443,7 +440,6 @@ pub enum AccessPattern {
     #[default]
     Mixed,
 }
-
 
 impl AccessPattern {
     /// Parse from string
@@ -462,8 +458,7 @@ impl AccessPattern {
 }
 
 /// Data temperature classification
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DataTemperature {
     /// Frequently accessed, keep in memory
     Hot,
@@ -475,7 +470,6 @@ pub enum DataTemperature {
     /// Archive, acceptable to be slow
     Frozen,
 }
-
 
 impl DataTemperature {
     /// Parse from string
@@ -492,8 +486,7 @@ impl DataTemperature {
 }
 
 /// Workload type classification
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum WorkloadType {
     /// Online Transaction Processing
     OLTP,
@@ -507,7 +500,6 @@ pub enum WorkloadType {
     #[default]
     Mixed,
 }
-
 
 impl WorkloadType {
     /// Parse from string
@@ -627,7 +619,8 @@ impl ShardingConfig {
 
     /// Register a table's shard key
     pub fn register_table_shard_key(&mut self, table: &str, shard_key: &str) {
-        self.table_shard_keys.insert(table.to_string(), shard_key.to_string());
+        self.table_shard_keys
+            .insert(table.to_string(), shard_key.to_string());
     }
 }
 
@@ -715,9 +708,11 @@ mod tests {
     fn test_update_classification() {
         let registry = SchemaRegistry::new();
 
-        registry.register_table(TableSchema::new("events")
-            .with_temperature(DataTemperature::Warm)
-            .with_workload(WorkloadType::Mixed));
+        registry.register_table(
+            TableSchema::new("events")
+                .with_temperature(DataTemperature::Warm)
+                .with_workload(WorkloadType::Mixed),
+        );
 
         registry.update_classification("events", DataTemperature::Cold, WorkloadType::OLAP);
 
@@ -756,16 +751,28 @@ mod tests {
 
     #[test]
     fn test_access_pattern_from_str() {
-        assert_eq!(AccessPattern::from_str("point_lookup"), Some(AccessPattern::PointLookup));
-        assert_eq!(AccessPattern::from_str("vector"), Some(AccessPattern::VectorSearch));
+        assert_eq!(
+            AccessPattern::from_str("point_lookup"),
+            Some(AccessPattern::PointLookup)
+        );
+        assert_eq!(
+            AccessPattern::from_str("vector"),
+            Some(AccessPattern::VectorSearch)
+        );
         assert_eq!(AccessPattern::from_str("invalid"), None);
     }
 
     #[test]
     fn test_data_temperature_from_str() {
         assert_eq!(DataTemperature::from_str("hot"), Some(DataTemperature::Hot));
-        assert_eq!(DataTemperature::from_str("cold"), Some(DataTemperature::Cold));
-        assert_eq!(DataTemperature::from_str("archive"), Some(DataTemperature::Frozen));
+        assert_eq!(
+            DataTemperature::from_str("cold"),
+            Some(DataTemperature::Cold)
+        );
+        assert_eq!(
+            DataTemperature::from_str("archive"),
+            Some(DataTemperature::Frozen)
+        );
     }
 
     #[test]

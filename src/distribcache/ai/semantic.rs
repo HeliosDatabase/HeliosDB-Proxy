@@ -70,7 +70,7 @@ impl BranchContext {
         match (self.snapshot_at, other.snapshot_at) {
             (None, None) => true,
             (Some(entry_snap), Some(query_snap)) => entry_snap <= query_snap,
-            (None, Some(_)) => true, // Current data valid for any snapshot
+            (None, Some(_)) => true,  // Current data valid for any snapshot
             (Some(_), None) => false, // Historical entry not valid for current query
         }
     }
@@ -83,8 +83,7 @@ impl Default for BranchContext {
 }
 
 /// AI workload context for cache optimization
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AIWorkloadContext {
     /// RAG retrieval phase - fast, high-throughput
     RAGRetrieval,
@@ -98,7 +97,6 @@ pub enum AIWorkloadContext {
     #[default]
     General,
 }
-
 
 /// Query embedding vector
 pub type Embedding = Vec<f32>;
@@ -217,13 +215,17 @@ impl SemanticEntry {
 
     /// Approximate size in bytes
     pub fn size(&self) -> usize {
-        self.query.len() +
-        self.embedding.len() * 4 +
-        self.result.to_string().len() +
-        self.tables.iter().map(|t| t.len()).sum::<usize>() +
-        self.session_id.as_ref().map(|s| s.len()).unwrap_or(0) +
-        self.branch_context.as_ref().map(|b| b.branch.len() + 8).unwrap_or(0) +
-        96
+        self.query.len()
+            + self.embedding.len() * 4
+            + self.result.to_string().len()
+            + self.tables.iter().map(|t| t.len()).sum::<usize>()
+            + self.session_id.as_ref().map(|s| s.len()).unwrap_or(0)
+            + self
+                .branch_context
+                .as_ref()
+                .map(|b| b.branch.len() + 8)
+                .unwrap_or(0)
+            + 96
     }
 }
 
@@ -255,7 +257,9 @@ impl PartialOrd for SimilarityResult {
 impl Ord for SimilarityResult {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Reverse order for min-heap (we want highest similarity)
-        other.similarity.partial_cmp(&self.similarity)
+        other
+            .similarity
+            .partial_cmp(&self.similarity)
             .unwrap_or(std::cmp::Ordering::Equal)
     }
 }
@@ -334,7 +338,8 @@ impl SemanticIndex {
         }
 
         // Extract results in descending similarity order
-        let mut results: Vec<_> = heap.into_iter()
+        let mut results: Vec<_> = heap
+            .into_iter()
             .map(|(std::cmp::Reverse(sim), id)| (id, sim as f32 / 1_000_000.0))
             .collect();
 
@@ -429,7 +434,11 @@ impl SemanticQueryCache {
     }
 
     /// Create with custom index config
-    pub fn with_config(threshold: f32, max_entries: usize, index_config: SemanticIndexConfig) -> Self {
+    pub fn with_config(
+        threshold: f32,
+        max_entries: usize,
+        index_config: SemanticIndexConfig,
+    ) -> Self {
         Self {
             index: SemanticIndex::new(index_config),
             entries: DashMap::new(),
@@ -475,7 +484,11 @@ impl SemanticQueryCache {
     }
 
     /// Lookup with custom threshold
-    pub fn lookup_with_threshold(&self, embedding: &[f32], threshold: f32) -> Option<SimilarityResult> {
+    pub fn lookup_with_threshold(
+        &self,
+        embedding: &[f32],
+        threshold: f32,
+    ) -> Option<SimilarityResult> {
         let results = self.index.search(embedding, 1);
 
         if let Some((id, similarity)) = results.first() {
@@ -499,7 +512,8 @@ impl SemanticQueryCache {
     pub fn find_similar(&self, embedding: &[f32], k: usize) -> Vec<SimilarityResult> {
         let results = self.index.search(embedding, k);
 
-        results.into_iter()
+        results
+            .into_iter()
             .filter_map(|(id, similarity)| {
                 self.entries.get(&id).and_then(|entry| {
                     if !entry.is_expired() {
@@ -704,7 +718,8 @@ impl SemanticQueryCache {
         // Search for more candidates since we'll filter
         let results = self.index.search(embedding, k * 3);
 
-        results.into_iter()
+        results
+            .into_iter()
             .filter_map(|(id, similarity)| {
                 self.entries.get(&id).and_then(|entry| {
                     if !entry.is_expired() && entry.matches_branch(branch) {
@@ -726,7 +741,9 @@ impl SemanticQueryCache {
     ///
     /// Used when WAL invalidation detects changes to a table.
     pub fn invalidate_by_table(&self, table: &str) -> usize {
-        let to_remove: Vec<_> = self.entries.iter()
+        let to_remove: Vec<_> = self
+            .entries
+            .iter()
             .filter(|e| e.tables.iter().any(|t| t == table))
             .map(|e| *e.key())
             .collect();
@@ -740,9 +757,12 @@ impl SemanticQueryCache {
 
     /// Invalidate entries by branch
     pub fn invalidate_branch(&self, branch: &BranchId) -> usize {
-        let to_remove: Vec<_> = self.entries.iter()
+        let to_remove: Vec<_> = self
+            .entries
+            .iter()
             .filter(|e| {
-                e.branch_context.as_ref()
+                e.branch_context
+                    .as_ref()
                     .map(|b| &b.branch == branch)
                     .unwrap_or(false)
             })
@@ -757,7 +777,12 @@ impl SemanticQueryCache {
     }
 
     /// Insert a new entry
-    pub fn insert(&self, query: impl Into<String>, embedding: Embedding, result: serde_json::Value) -> VectorId {
+    pub fn insert(
+        &self,
+        query: impl Into<String>,
+        embedding: Embedding,
+        result: serde_json::Value,
+    ) -> VectorId {
         // Evict if at capacity
         while self.entries.len() >= self.max_entries {
             self.evict_one();
@@ -920,7 +945,9 @@ impl SemanticQueryCache {
 
     /// Remove expired entries
     pub fn cleanup_expired(&self) {
-        let expired: Vec<_> = self.entries.iter()
+        let expired: Vec<_> = self
+            .entries
+            .iter()
             .filter(|e| e.is_expired())
             .map(|e| *e.key())
             .collect();
@@ -957,7 +984,11 @@ impl SemanticQueryCache {
             threshold: self.threshold,
             hits,
             misses,
-            hit_rate: if total > 0 { hits as f64 / total as f64 } else { 0.0 },
+            hit_rate: if total > 0 {
+                hits as f64 / total as f64
+            } else {
+                0.0
+            },
             semantic_hits: self.stats.semantic_hits.load(Ordering::Relaxed),
             exact_hits: self.stats.exact_hits.load(Ordering::Relaxed),
             insertions: self.stats.insertions.load(Ordering::Relaxed),
@@ -1112,11 +1143,7 @@ mod tests {
 
         // Fill cache
         for i in 0..3 {
-            cache.insert(
-                format!("query{}", i),
-                vec![i as f32, 0.0, 0.0],
-                json!(i),
-            );
+            cache.insert(format!("query{}", i), vec![i as f32, 0.0, 0.0], json!(i));
         }
 
         assert_eq!(cache.len(), 3);
@@ -1195,12 +1222,31 @@ mod tests {
         // Lookup for main should find main entry
         let main_result = cache.lookup_with_branch(&embedding, &BranchContext::main());
         assert!(main_result.is_some());
-        assert_eq!(main_result.unwrap().entry.branch_context.as_ref().unwrap().branch, "main");
+        assert_eq!(
+            main_result
+                .unwrap()
+                .entry
+                .branch_context
+                .as_ref()
+                .unwrap()
+                .branch,
+            "main"
+        );
 
         // Lookup for feature should find feature entry
-        let feature_result = cache.lookup_with_branch(&embedding2, &BranchContext::new("feature-x"));
+        let feature_result =
+            cache.lookup_with_branch(&embedding2, &BranchContext::new("feature-x"));
         assert!(feature_result.is_some());
-        assert_eq!(feature_result.unwrap().entry.branch_context.as_ref().unwrap().branch, "feature-x");
+        assert_eq!(
+            feature_result
+                .unwrap()
+                .entry
+                .branch_context
+                .as_ref()
+                .unwrap()
+                .branch,
+            "feature-x"
+        );
     }
 
     #[test]
@@ -1232,7 +1278,10 @@ mod tests {
         // Lookup with session 1 should prefer session 1 entry
         let result = cache.lookup_with_session(&embedding, &session1);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().entry.session_id.as_ref().unwrap(), &session1);
+        assert_eq!(
+            result.unwrap().entry.session_id.as_ref().unwrap(),
+            &session1
+        );
     }
 
     #[test]
@@ -1263,12 +1312,8 @@ mod tests {
         assert!(result.is_some());
 
         // Different workload still matches (lower priority)
-        let result2 = cache.lookup_with_context(
-            &embedding,
-            Some(&branch),
-            None,
-            AIWorkloadContext::General,
-        );
+        let result2 =
+            cache.lookup_with_context(&embedding, Some(&branch), None, AIWorkloadContext::General);
         assert!(result2.is_some());
     }
 

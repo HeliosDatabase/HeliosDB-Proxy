@@ -58,20 +58,14 @@ impl AsyncWrite for Stream {
         }
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Stream::Plain(s) => Pin::new(s).poll_flush(cx),
             Stream::Tls(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Stream::Plain(s) => Pin::new(s).poll_shutdown(cx),
             Stream::Tls(s) => Pin::new(s).poll_shutdown(cx),

@@ -9,11 +9,11 @@
 use super::lease::ClientId;
 use super::mode::PoolingMode;
 use crate::{ProxyError, Result};
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use parking_lot::RwLock;
-use tracing::{warn, info, debug};
+use tracing::{debug, info, warn};
 
 /// Transaction leak detector
 ///
@@ -261,7 +261,9 @@ impl StaleLeaseCleaner {
 
     /// Record activity for a lease
     pub fn record_activity(&self, client_id: ClientId) {
-        self.lease_activity.write().insert(client_id, Instant::now());
+        self.lease_activity
+            .write()
+            .insert(client_id, Instant::now());
     }
 
     /// Remove tracking for a lease
@@ -291,7 +293,8 @@ impl StaleLeaseCleaner {
             for client_id in &stale {
                 activity.remove(client_id);
             }
-            self.cleaned_count.fetch_add(count as u64, Ordering::Relaxed);
+            self.cleaned_count
+                .fetch_add(count as u64, Ordering::Relaxed);
 
             info!(
                 "Cleaned {} stale leases (idle > {:?})",
@@ -408,8 +411,7 @@ pub struct ExhaustionStats {
 }
 
 /// Combined hardening features
-#[derive(Debug)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct PoolHardening {
     /// Transaction leak detector
     pub leak_detector: TransactionLeakDetector,
@@ -420,7 +422,6 @@ pub struct PoolHardening {
     /// Pool exhaustion monitor
     pub exhaustion_monitor: PoolExhaustionMonitor,
 }
-
 
 impl PoolHardening {
     /// Create with custom configuration
@@ -434,7 +435,10 @@ impl PoolHardening {
         enable_backpressure: bool,
     ) -> Self {
         Self {
-            leak_detector: TransactionLeakDetector::new(tx_warning_threshold, tx_critical_threshold),
+            leak_detector: TransactionLeakDetector::new(
+                tx_warning_threshold,
+                tx_critical_threshold,
+            ),
             health_validator: ConnectionHealthValidator::new(validation_query, validation_timeout),
             stale_cleaner: StaleLeaseCleaner::new(max_lease_idle),
             exhaustion_monitor: PoolExhaustionMonitor::new(max_queue_size, enable_backpressure),
@@ -489,16 +493,18 @@ mod tests {
 
     #[test]
     fn test_transaction_leak_detector() {
-        let detector = TransactionLeakDetector::new(
-            Duration::from_millis(10),
-            Duration::from_millis(50),
-        );
+        let detector =
+            TransactionLeakDetector::new(Duration::from_millis(10), Duration::from_millis(50));
 
         let client1 = ClientId::new();
         let client2 = ClientId::new();
 
         // Start two transactions
-        detector.transaction_started(client1, PoolingMode::Transaction, "BEGIN; SELECT * FROM users");
+        detector.transaction_started(
+            client1,
+            PoolingMode::Transaction,
+            "BEGIN; SELECT * FROM users",
+        );
         detector.transaction_started(client2, PoolingMode::Statement, "SELECT 1");
 
         // No leaks immediately

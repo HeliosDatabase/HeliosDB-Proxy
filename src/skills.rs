@@ -234,10 +234,9 @@ fn copy_entry(entry: &DirEntry<'_>, dest: &Path) -> io::Result<()> {
         DirEntry::Dir(d) => {
             fs::create_dir_all(dest)?;
             for child in d.entries() {
-                let child_name = child
-                    .path()
-                    .file_name()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing file name"))?;
+                let child_name = child.path().file_name().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "missing file name")
+                })?;
                 copy_entry(child, &dest.join(child_name))?;
             }
         }
@@ -296,7 +295,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, DirEntry::Dir(d) if d.path().file_name().and_then(|f| f.to_str()).map(|n| n.starts_with("heliosproxy-")).unwrap_or(false)))
             .count();
-        assert_eq!(n, 22, "expected 22 heliosproxy-* skill directories in the bundle");
+        assert_eq!(
+            n, 22,
+            "expected 22 heliosproxy-* skill directories in the bundle"
+        );
     }
 
     #[test]
@@ -318,11 +320,18 @@ mod tests {
     fn install_copy_mode_writes_skill_files() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join(".claude")).unwrap();
-        let report =
-            install_skills_at(tmp.path(), InstallTarget::Claude, InstallMode::Copy, false, false)
-                .unwrap();
+        let report = install_skills_at(
+            tmp.path(),
+            InstallTarget::Claude,
+            InstallMode::Copy,
+            false,
+            false,
+        )
+        .unwrap();
         assert!(report.changes() >= 22);
-        let f = tmp.path().join(".claude/skills/heliosproxy-overview/SKILL.md");
+        let f = tmp
+            .path()
+            .join(".claude/skills/heliosproxy-overview/SKILL.md");
         assert!(f.exists());
         let body = fs::read_to_string(&f).unwrap();
         assert!(body.contains("HeliosProxy"));
@@ -332,10 +341,18 @@ mod tests {
     fn install_skips_existing_without_force() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join(".claude/skills/heliosproxy-overview")).unwrap();
-        let report =
-            install_skills_at(tmp.path(), InstallTarget::Claude, InstallMode::Copy, false, false)
-                .unwrap();
-        assert!(report.skipped.iter().any(|p| p.ends_with("heliosproxy-overview")));
+        let report = install_skills_at(
+            tmp.path(),
+            InstallTarget::Claude,
+            InstallMode::Copy,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(report
+            .skipped
+            .iter()
+            .any(|p| p.ends_with("heliosproxy-overview")));
     }
 
     #[test]
@@ -344,10 +361,18 @@ mod tests {
         let pre = tmp.path().join(".claude/skills/heliosproxy-overview");
         fs::create_dir_all(&pre).unwrap();
         fs::write(pre.join("stale.txt"), b"old").unwrap();
-        let report =
-            install_skills_at(tmp.path(), InstallTarget::Claude, InstallMode::Copy, true, false)
-                .unwrap();
-        assert!(report.overwrote.iter().any(|p| p.ends_with("heliosproxy-overview")));
+        let report = install_skills_at(
+            tmp.path(),
+            InstallTarget::Claude,
+            InstallMode::Copy,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(report
+            .overwrote
+            .iter()
+            .any(|p| p.ends_with("heliosproxy-overview")));
         assert!(!pre.join("stale.txt").exists());
         assert!(pre.join("SKILL.md").exists());
     }
@@ -356,11 +381,19 @@ mod tests {
     fn dry_run_writes_nothing() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join(".claude")).unwrap();
-        let report =
-            install_skills_at(tmp.path(), InstallTarget::Claude, InstallMode::Copy, false, true)
-                .unwrap();
+        let report = install_skills_at(
+            tmp.path(),
+            InstallTarget::Claude,
+            InstallMode::Copy,
+            false,
+            true,
+        )
+        .unwrap();
         assert!(report.changes() >= 22);
-        assert!(!tmp.path().join(".claude/skills/heliosproxy-overview").exists());
+        assert!(!tmp
+            .path()
+            .join(".claude/skills/heliosproxy-overview")
+            .exists());
     }
 
     #[cfg(unix)]
@@ -414,7 +447,7 @@ mod tests {
             tmp.path(),
             InstallTarget::Claude,
             InstallMode::Symlink,
-            true,  // force on the second run
+            true, // force on the second run
             false,
         )
         .unwrap();

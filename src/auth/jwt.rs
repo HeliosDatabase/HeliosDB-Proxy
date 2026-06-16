@@ -112,8 +112,7 @@ impl JwtValidator {
         let decoded = base64_decode_url_safe(header_b64)
             .map_err(|e| JwtError::DecodeFailed(e.to_string()))?;
 
-        serde_json::from_slice(&decoded)
-            .map_err(|e| JwtError::DecodeFailed(e.to_string()))
+        serde_json::from_slice(&decoded).map_err(|e| JwtError::DecodeFailed(e.to_string()))
     }
 
     /// Decode JWT claims
@@ -121,8 +120,7 @@ impl JwtValidator {
         let decoded = base64_decode_url_safe(claims_b64)
             .map_err(|e| JwtError::DecodeFailed(e.to_string()))?;
 
-        serde_json::from_slice(&decoded)
-            .map_err(|e| JwtError::DecodeFailed(e.to_string()))
+        serde_json::from_slice(&decoded).map_err(|e| JwtError::DecodeFailed(e.to_string()))
     }
 
     /// Get signing key by key ID
@@ -186,9 +184,10 @@ impl JwtValidator {
     /// Validate issuer claim
     fn validate_issuer(&self, claims: &JwtClaims) -> Result<(), JwtError> {
         if !self.config.allowed_issuers.is_empty()
-            && !self.config.allowed_issuers.contains(&claims.iss) {
-                return Err(JwtError::InvalidIssuer);
-            }
+            && !self.config.allowed_issuers.contains(&claims.iss)
+        {
+            return Err(JwtError::InvalidIssuer);
+        }
 
         Ok(())
     }

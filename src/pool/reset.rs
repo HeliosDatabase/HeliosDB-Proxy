@@ -269,7 +269,10 @@ mod tests {
             "DEALLOCATE ALL".to_string(),
             "RESET ALL".to_string(),
         ]);
-        assert_eq!(executor.reset_queries(), vec!["DEALLOCATE ALL", "RESET ALL"]);
+        assert_eq!(
+            executor.reset_queries(),
+            vec!["DEALLOCATE ALL", "RESET ALL"]
+        );
         assert_eq!(executor.build_reset_sql(), "DEALLOCATE ALL; RESET ALL");
     }
 

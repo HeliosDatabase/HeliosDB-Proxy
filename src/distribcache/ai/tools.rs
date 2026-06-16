@@ -20,8 +20,8 @@ pub struct ToolCallKey {
 impl ToolCallKey {
     /// Create a new tool call key
     pub fn new(tool: &str, params: &serde_json::Value) -> Self {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         params.to_string().hash(&mut hasher);
@@ -155,10 +155,9 @@ impl ToolResultCache {
             }
 
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
-            self.stats.time_saved_ms.fetch_add(
-                result.execution_time.as_millis() as u64,
-                Ordering::Relaxed,
-            );
+            self.stats
+                .time_saved_ms
+                .fetch_add(result.execution_time.as_millis() as u64, Ordering::Relaxed);
 
             Some(result.clone())
         } else {
@@ -242,7 +241,11 @@ impl ToolResultCache {
             deterministic_tools: self.deterministic_tools.len(),
             hits,
             misses,
-            hit_rate: if total > 0 { hits as f64 / total as f64 } else { 0.0 },
+            hit_rate: if total > 0 {
+                hits as f64 / total as f64
+            } else {
+                0.0
+            },
             cached_executions: self.stats.cached_executions.load(Ordering::Relaxed),
             time_saved_ms: self.stats.time_saved_ms.load(Ordering::Relaxed),
         }
@@ -323,8 +326,8 @@ mod tests {
         let cache = ToolResultCache::new();
 
         let key = ToolCallKey::new("calculate", &json!({}));
-        let result = ToolResult::new(json!(1), Duration::from_millis(1))
-            .with_ttl(Duration::from_millis(1));
+        let result =
+            ToolResult::new(json!(1), Duration::from_millis(1)).with_ttl(Duration::from_millis(1));
 
         cache.put(key.clone(), result);
 
@@ -362,16 +365,20 @@ mod tests {
         let mut call_count = 0;
 
         // First call - executes
-        let result1 = cache.execute_with_cache("calculate", &params, || {
-            call_count += 1;
-            async { json!(8) }
-        }).await;
+        let result1 = cache
+            .execute_with_cache("calculate", &params, || {
+                call_count += 1;
+                async { json!(8) }
+            })
+            .await;
 
         // Second call - cached
-        let result2 = cache.execute_with_cache("calculate", &params, || {
-            call_count += 1;
-            async { json!(8) }
-        }).await;
+        let result2 = cache
+            .execute_with_cache("calculate", &params, || {
+                call_count += 1;
+                async { json!(8) }
+            })
+            .await;
 
         assert_eq!(result1.data, json!(8));
         assert_eq!(result2.data, json!(8));

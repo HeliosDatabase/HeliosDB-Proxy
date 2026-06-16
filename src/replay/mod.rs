@@ -82,14 +82,9 @@ impl ReplayEngine {
     /// Individual failures are logged and counted; they do NOT abort
     /// the replay, because partial replay is the common case when a
     /// target schema diverges from the source's.
-    pub async fn replay_window(
-        &self,
-        req: &TimeTravelRequest,
-    ) -> Result<ReplaySummary> {
+    pub async fn replay_window(&self, req: &TimeTravelRequest) -> Result<ReplaySummary> {
         if req.from > req.to {
-            return Err(ProxyError::Internal(
-                "replay window: from > to".to_string(),
-            ));
+            return Err(ProxyError::Internal("replay window: from > to".to_string()));
         }
 
         let entries = self.journal.entries_in_window(req.from, req.to).await;
@@ -116,17 +111,20 @@ impl ReplayEngine {
         }
 
         let start = std::time::Instant::now();
-        let mut client = BackendClient::connect(&cfg).await.map_err(|e| {
-            ProxyError::ReplayFailed(format!("connect to target: {}", e))
-        })?;
+        let mut client = BackendClient::connect(&cfg)
+            .await
+            .map_err(|e| ProxyError::ReplayFailed(format!("connect to target: {}", e)))?;
 
         let mut statements_replayed: u64 = 0;
         let mut failures: u64 = 0;
         let mut first_error: Option<String> = None;
 
         for (tx_id, entry) in entries {
-            let params: Vec<ParamValue> =
-                entry.parameters.iter().map(journal_value_to_param).collect();
+            let params: Vec<ParamValue> = entry
+                .parameters
+                .iter()
+                .map(journal_value_to_param)
+                .collect();
 
             let outcome = if params.is_empty() {
                 client.simple_query(&entry.statement).await
@@ -141,10 +139,7 @@ impl ReplayEngine {
                 Err(e) => {
                     failures += 1;
                     if first_error.is_none() {
-                        first_error = Some(format!(
-                            "tx {} seq {}: {}",
-                            tx_id, entry.sequence, e
-                        ));
+                        first_error = Some(format!("tx {} seq {}: {}", tx_id, entry.sequence, e));
                     }
                     tracing::warn!(
                         tx = %tx_id,
@@ -214,11 +209,7 @@ mod tests {
         }
     }
 
-    fn make_entry(
-        sequence: u64,
-        statement: &str,
-        timestamp: DateTime<Utc>,
-    ) -> JournalEntry {
+    fn make_entry(sequence: u64, statement: &str, timestamp: DateTime<Utc>) -> JournalEntry {
         JournalEntry {
             sequence,
             statement: statement.to_string(),
@@ -296,14 +287,7 @@ mod tests {
         // now() and choose a window that encloses exactly now().
         let _ = base; // suppress unused
         journal
-            .log_statement(
-                tx_id,
-                "SELECT 1".to_string(),
-                vec![],
-                None,
-                None,
-                1,
-            )
+            .log_statement(tx_id, "SELECT 1".to_string(), vec![], None, None, 1)
             .await
             .unwrap();
 

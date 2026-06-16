@@ -6,12 +6,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::{
-    GraphQLConfig, GraphQLSchema, SqlGenerator, QueryValidator,
-    GraphQLMetrics, ExecutionContext, ErrorCode, OperationType,
-    QueryPlan, Selection, Filter,
-};
 use super::sql_generator::FilterOperator;
+use super::{
+    ErrorCode, ExecutionContext, Filter, GraphQLConfig, GraphQLMetrics, GraphQLSchema,
+    OperationType, QueryPlan, QueryValidator, Selection, SqlGenerator,
+};
 
 /// GraphQL request
 #[derive(Debug, Clone)]
@@ -125,7 +124,8 @@ impl GraphQLResponse {
             result.insert(
                 "extensions".to_string(),
                 serde_json::Value::Object(
-                    extensions.iter()
+                    extensions
+                        .iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect(),
                 ),
@@ -210,15 +210,24 @@ impl GraphQLError {
     /// Convert to JSON
     pub fn to_json(&self) -> serde_json::Value {
         let mut result = serde_json::Map::new();
-        result.insert("message".to_string(), serde_json::Value::String(self.message.clone()));
+        result.insert(
+            "message".to_string(),
+            serde_json::Value::String(self.message.clone()),
+        );
 
         if let Some(ref locations) = self.locations {
-            let loc_array: Vec<_> = locations.iter().map(|l| {
-                let mut loc = serde_json::Map::new();
-                loc.insert("line".to_string(), serde_json::Value::Number(l.line.into()));
-                loc.insert("column".to_string(), serde_json::Value::Number(l.column.into()));
-                serde_json::Value::Object(loc)
-            }).collect();
+            let loc_array: Vec<_> = locations
+                .iter()
+                .map(|l| {
+                    let mut loc = serde_json::Map::new();
+                    loc.insert("line".to_string(), serde_json::Value::Number(l.line.into()));
+                    loc.insert(
+                        "column".to_string(),
+                        serde_json::Value::Number(l.column.into()),
+                    );
+                    serde_json::Value::Object(loc)
+                })
+                .collect();
             result.insert("locations".to_string(), serde_json::Value::Array(loc_array));
         }
 
@@ -379,7 +388,8 @@ impl GraphQLEngine {
 
     /// Execute a GraphQL request
     pub async fn execute(&self, request: GraphQLRequest) -> GraphQLResponse {
-        self.execute_with_context(request, ExecutionContext::default()).await
+        self.execute_with_context(request, ExecutionContext::default())
+            .await
     }
 
     /// Execute a GraphQL request with context
@@ -451,10 +461,12 @@ impl GraphQLEngine {
         let elapsed = start.elapsed();
         self.metrics.record_query(elapsed, document.operation_type);
 
-        GraphQLResponse::success(data)
-            .with_extension("timing", serde_json::json!({
+        GraphQLResponse::success(data).with_extension(
+            "timing",
+            serde_json::json!({
                 "durationMs": elapsed.as_millis()
-            }))
+            }),
+        )
     }
 
     /// Parse a GraphQL query string
@@ -466,11 +478,20 @@ impl GraphQLEngine {
 
         // Detect operation type
         let (operation_type, remaining) = if query.starts_with("mutation") {
-            (OperationType::Mutation, query.strip_prefix("mutation").unwrap_or(query))
+            (
+                OperationType::Mutation,
+                query.strip_prefix("mutation").unwrap_or(query),
+            )
         } else if query.starts_with("subscription") {
-            (OperationType::Subscription, query.strip_prefix("subscription").unwrap_or(query))
+            (
+                OperationType::Subscription,
+                query.strip_prefix("subscription").unwrap_or(query),
+            )
         } else if query.starts_with("query") {
-            (OperationType::Query, query.strip_prefix("query").unwrap_or(query))
+            (
+                OperationType::Query,
+                query.strip_prefix("query").unwrap_or(query),
+            )
         } else if query.starts_with("{") {
             (OperationType::Query, query)
         } else {
@@ -662,7 +683,10 @@ impl GraphQLEngine {
 
     /// Parse arguments
     #[allow(clippy::result_large_err)]
-    fn parse_arguments(&self, input: &str) -> Result<HashMap<String, serde_json::Value>, GraphQLError> {
+    fn parse_arguments(
+        &self,
+        input: &str,
+    ) -> Result<HashMap<String, serde_json::Value>, GraphQLError> {
         let mut arguments = HashMap::new();
 
         for part in input.split(',') {
@@ -695,7 +719,9 @@ impl GraphQLEngine {
         } else if input == "false" {
             Ok(serde_json::Value::Bool(false))
         } else if input.starts_with('"') && input.ends_with('"') {
-            Ok(serde_json::Value::String(input[1..input.len() - 1].to_string()))
+            Ok(serde_json::Value::String(
+                input[1..input.len() - 1].to_string(),
+            ))
         } else if let Ok(n) = input.parse::<i64>() {
             Ok(serde_json::Value::Number(n.into()))
         } else if let Ok(n) = input.parse::<f64>() {
@@ -714,7 +740,11 @@ impl GraphQLEngine {
 
     /// Check authorization
     #[allow(clippy::result_large_err)]
-    fn authorize(&self, _document: &ParsedDocument, _context: &ExecutionContext) -> Result<(), GraphQLError> {
+    fn authorize(
+        &self,
+        _document: &ParsedDocument,
+        _context: &ExecutionContext,
+    ) -> Result<(), GraphQLError> {
         // Authorization checks would go here
         // For now, allow all queries
         Ok(())
@@ -728,7 +758,9 @@ impl GraphQLEngine {
         _variables: &Option<HashMap<String, serde_json::Value>>,
     ) -> Result<QueryPlan, GraphQLError> {
         // Convert parsed document to query plan
-        let selections: Vec<_> = document.selections.iter()
+        let selections: Vec<_> = document
+            .selections
+            .iter()
             .map(|s| self.selection_to_plan(s))
             .collect();
 
@@ -741,21 +773,29 @@ impl GraphQLEngine {
         let filters = self.extract_filters(&selection.arguments);
 
         // Get limit/offset from arguments
-        let limit = selection.arguments.get("limit")
+        let limit = selection
+            .arguments
+            .get("limit")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
-        let offset = selection.arguments.get("offset")
+        let offset = selection
+            .arguments
+            .get("offset")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
 
         // Build selection
         let sel = Selection {
             table_name: super::to_snake_case(&selection.name),
-            fields: selection.selections.iter()
+            fields: selection
+                .selections
+                .iter()
                 .filter(|s| s.selections.is_empty())
                 .map(|s| s.name.clone())
                 .collect(),
-            relationships: selection.selections.iter()
+            relationships: selection
+                .selections
+                .iter()
                 .filter(|s| !s.selections.is_empty())
                 .map(|s| (s.name.clone(), self.selection_to_plan(s)))
                 .collect(),
@@ -1015,9 +1055,18 @@ mod tests {
         let engine = create_test_engine();
 
         assert_eq!(engine.parse_value("null").unwrap(), serde_json::Value::Null);
-        assert_eq!(engine.parse_value("true").unwrap(), serde_json::Value::Bool(true));
-        assert_eq!(engine.parse_value("false").unwrap(), serde_json::Value::Bool(false));
-        assert_eq!(engine.parse_value("\"hello\"").unwrap(), serde_json::Value::String("hello".to_string()));
+        assert_eq!(
+            engine.parse_value("true").unwrap(),
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            engine.parse_value("false").unwrap(),
+            serde_json::Value::Bool(false)
+        );
+        assert_eq!(
+            engine.parse_value("\"hello\"").unwrap(),
+            serde_json::Value::String("hello".to_string())
+        );
         assert_eq!(engine.parse_value("42").unwrap(), serde_json::json!(42));
     }
 }

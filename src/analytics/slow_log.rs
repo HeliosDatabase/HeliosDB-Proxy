@@ -195,11 +195,7 @@ impl SlowQueryLog {
     /// Create new slow query log
     pub fn new(config: SlowQueryConfig) -> Self {
         let file_writer = if let Some(ref path) = config.log_file {
-            match OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
+            match OpenOptions::new().create(true).append(true).open(path) {
                 Ok(file) => Some(file),
                 Err(e) => {
                     eprintln!("Failed to open slow query log file {:?}: {}", path, e);
@@ -228,11 +224,8 @@ impl SlowQueryLog {
             return;
         }
 
-        let entry = SlowQueryEntry::from_execution(
-            execution,
-            fingerprint,
-            self.config.max_query_length,
-        );
+        let entry =
+            SlowQueryEntry::from_execution(execution, fingerprint, self.config.max_query_length);
 
         self.log_entry(entry);
     }
@@ -264,12 +257,7 @@ impl SlowQueryLog {
     /// Get recent slow queries
     pub fn recent(&self, limit: usize) -> Vec<SlowQueryEntry> {
         let recent = self.recent.read();
-        recent
-            .iter()
-            .rev()
-            .take(limit)
-            .cloned()
-            .collect()
+        recent.iter().rev().take(limit).cloned().collect()
     }
 
     /// Get all recent entries
@@ -342,10 +330,7 @@ impl SlowQueryReader {
     /// Read entries slower than threshold
     pub fn read_slower_than(&self, threshold: Duration) -> std::io::Result<Vec<SlowQueryEntry>> {
         let all = self.read_all()?;
-        Ok(all
-            .into_iter()
-            .filter(|e| e.duration > threshold)
-            .collect())
+        Ok(all.into_iter().filter(|e| e.duration > threshold).collect())
     }
 
     /// Read last N entries
@@ -442,8 +427,8 @@ mod tests {
 
         // Fast query - should not be logged
         let fast_exec = QueryExecution::new("SELECT 1", Duration::from_millis(50));
-        let fingerprint = super::super::fingerprinter::QueryFingerprinter::new()
-            .fingerprint("SELECT 1");
+        let fingerprint =
+            super::super::fingerprinter::QueryFingerprinter::new().fingerprint("SELECT 1");
         log.log_if_slow(&fast_exec, &fingerprint);
         assert_eq!(log.count(), 0);
 

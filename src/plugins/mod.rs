@@ -37,27 +37,27 @@
 //! ```
 
 pub mod config;
-pub mod runtime;
-pub mod loader;
 pub mod host_functions;
 pub mod host_imports;
-pub mod sandbox;
 pub mod hot_reload;
+pub mod loader;
 pub mod metrics;
+pub mod runtime;
+pub mod sandbox;
 
-pub use config::{PluginRuntimeConfig, PluginRuntimeConfigBuilder, PluginConfig};
-pub use runtime::{WasmPluginRuntime, LoadedPlugin, PluginState, PluginError};
-pub use loader::{PluginLoader, PluginManifest, PluginLoadError, SignatureVerifier};
+pub use config::{PluginConfig, PluginRuntimeConfig, PluginRuntimeConfigBuilder};
 pub use host_functions::HostFunctionRegistry;
-pub use sandbox::{PluginSandbox, SecurityPolicy, Permission, ResourceLimits};
-pub use hot_reload::{HotReloader, ReloadEvent, ReloadError};
-pub use metrics::{PluginMetrics, PluginStats, HookLatency};
+pub use hot_reload::{HotReloader, ReloadError, ReloadEvent};
+pub use loader::{PluginLoadError, PluginLoader, PluginManifest, SignatureVerifier};
+pub use metrics::{HookLatency, PluginMetrics, PluginStats};
+pub use runtime::{LoadedPlugin, PluginError, PluginState, WasmPluginRuntime};
+pub use sandbox::{Permission, PluginSandbox, ResourceLimits, SecurityPolicy};
 
+use dashmap::DashMap;
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use parking_lot::RwLock;
-use dashmap::DashMap;
 
 /// Plugin metadata
 #[derive(Debug, Clone)]
@@ -289,8 +289,7 @@ pub enum AuthResult {
 }
 
 /// User identity from authentication
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Identity {
     /// User ID
     pub user_id: String,
@@ -307,7 +306,6 @@ pub struct Identity {
     /// Additional claims
     pub claims: HashMap<String, String>,
 }
-
 
 /// Result of routing hook
 #[derive(Debug, Clone)]
@@ -398,10 +396,7 @@ impl PluginManager {
         {
             let mut hooks = self.hooks.write();
             for hook in &manifest.hooks {
-                hooks
-                    .entry(*hook)
-                    .or_default()
-                    .push(manifest.name.clone());
+                hooks.entry(*hook).or_default().push(manifest.name.clone());
             }
         }
 
@@ -533,7 +528,10 @@ impl PluginManager {
             if let Some(plugin) = self.plugins.get(&plugin_name) {
                 let start = std::time::Instant::now();
 
-                match self.runtime.call_hook(&plugin, HookType::PostQuery, &payload) {
+                match self
+                    .runtime
+                    .call_hook(&plugin, HookType::PostQuery, &payload)
+                {
                     Ok(_) => {
                         self.metrics.record_hook_call(
                             &plugin_name,
@@ -563,7 +561,10 @@ impl PluginManager {
     /// Execute authentication hooks
     pub fn execute_authenticate(&self, request: &AuthRequest) -> AuthResult {
         let hooks = self.hooks.read();
-        let plugin_names = hooks.get(&HookType::Authenticate).cloned().unwrap_or_default();
+        let plugin_names = hooks
+            .get(&HookType::Authenticate)
+            .cloned()
+            .unwrap_or_default();
         drop(hooks);
 
         for plugin_name in plugin_names {
@@ -788,7 +789,10 @@ mod tests {
     #[test]
     fn test_hook_type_from_str() {
         assert_eq!(HookType::from_str("pre_query"), Some(HookType::PreQuery));
-        assert_eq!(HookType::from_str("authenticate"), Some(HookType::Authenticate));
+        assert_eq!(
+            HookType::from_str("authenticate"),
+            Some(HookType::Authenticate)
+        );
         assert_eq!(HookType::from_str("unknown"), None);
     }
 
@@ -879,8 +883,8 @@ mod tests {
     /// yield `Continue` so the proxy's main loop forwards normally.
     #[test]
     fn test_execute_pre_query_no_plugins_returns_continue() {
-        let pm = PluginManager::new(PluginRuntimeConfig::default())
-            .expect("construct PluginManager");
+        let pm =
+            PluginManager::new(PluginRuntimeConfig::default()).expect("construct PluginManager");
         let ctx = QueryContext {
             query: "SELECT 1".to_string(),
             normalized: "SELECT 1".to_string(),
@@ -888,7 +892,10 @@ mod tests {
             is_read_only: true,
             hook_context: HookContext::default(),
         };
-        assert!(matches!(pm.execute_pre_query(&ctx), PreQueryResult::Continue));
+        assert!(matches!(
+            pm.execute_pre_query(&ctx),
+            PreQueryResult::Continue
+        ));
     }
 
     /// `PostQueryOutcome` must serialise cleanly — post-hook plugins

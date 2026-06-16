@@ -94,8 +94,7 @@ impl TenantQueryTransformer {
     pub fn register_tables(mut self, tables: &[&str], column: impl Into<String>) -> Self {
         let col = column.into();
         for table in tables {
-            self.tenant_tables
-                .insert(table.to_lowercase(), col.clone());
+            self.tenant_tables.insert(table.to_lowercase(), col.clone());
         }
         self
     }
@@ -246,18 +245,11 @@ impl TenantQueryTransformer {
     }
 
     /// Build a filter clause for multiple tables
-    fn build_filter(
-        &self,
-        tenant: &TenantId,
-        default_column: &str,
-        tables: &[String],
-    ) -> String {
+    fn build_filter(&self, tenant: &TenantId, default_column: &str, tables: &[String]) -> String {
         let filters: Vec<String> = tables
             .iter()
             .map(|table| {
-                let column = self
-                    .get_tenant_column(table)
-                    .unwrap_or(default_column);
+                let column = self.get_tenant_column(table).unwrap_or(default_column);
                 if self.use_parameters {
                     format!("{}.{} = $1", table, column)
                 } else {
@@ -371,8 +363,10 @@ impl TenantQueryTransformer {
             let after_from = &query[from_pos + 6..];
 
             // Find end of table list
-            let end_markers = [" WHERE ", " JOIN ", " LEFT ", " RIGHT ", " INNER ", " OUTER ",
-                " GROUP ", " ORDER ", " LIMIT ", " HAVING "];
+            let end_markers = [
+                " WHERE ", " JOIN ", " LEFT ", " RIGHT ", " INNER ", " OUTER ", " GROUP ",
+                " ORDER ", " LIMIT ", " HAVING ",
+            ];
             let end_pos = end_markers
                 .iter()
                 .filter_map(|m| after_from.to_uppercase().find(m))
@@ -385,8 +379,8 @@ impl TenantQueryTransformer {
             for part in table_section.split(',') {
                 let trimmed = part.trim();
                 if let Some(table) = trimmed.split_whitespace().next() {
-                    let clean = table
-                        .trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
+                    let clean =
+                        table.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
                     if !clean.is_empty() {
                         tables.push(clean.to_string());
                     }
@@ -398,8 +392,8 @@ impl TenantQueryTransformer {
         let words: Vec<&str> = query.split_whitespace().collect();
         for (i, word) in words.iter().enumerate() {
             if word.to_uppercase() == "JOIN" && i + 1 < words.len() {
-                let table = words[i + 1]
-                    .trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
+                let table =
+                    words[i + 1].trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
                 if !table.is_empty() && !tables.contains(&table.to_string()) {
                     tables.push(table.to_string());
                 }
@@ -431,7 +425,9 @@ impl TenantQueryTransformer {
         let upper = query.to_uppercase();
         if let Some(from_pos) = upper.find(" FROM ") {
             let after_from = &query[from_pos + 6..];
-            let end_pos = after_from.to_uppercase().find(" WHERE ")
+            let end_pos = after_from
+                .to_uppercase()
+                .find(" WHERE ")
                 .unwrap_or(after_from.len());
             let table_section = &after_from[..end_pos];
             let table = table_section
@@ -448,7 +444,8 @@ impl TenantQueryTransformer {
         let upper = query.to_uppercase();
         if let Some(into_pos) = upper.find(" INTO ") {
             let after_into = &query[into_pos + 6..];
-            let end_pos = after_into.find(|c: char| c == '(' || c.is_whitespace())
+            let end_pos = after_into
+                .find(|c: char| c == '(' || c.is_whitespace())
                 .unwrap_or(after_into.len());
             let table = after_into[..end_pos]
                 .trim()
@@ -531,10 +528,9 @@ pub fn validate_query(query: &str, _tenant: &TenantId, config: &TenantConfig) ->
                     && !schema.eq_ignore_ascii_case("information_schema")
                 {
                     validation.valid = false;
-                    validation.violations.push(format!(
-                        "Cross-schema access not allowed: {}",
-                        part
-                    ));
+                    validation
+                        .violations
+                        .push(format!("Cross-schema access not allowed: {}", part));
                 }
             }
         }
@@ -574,11 +570,8 @@ mod tests {
         let tenant = TenantId::new("acme");
         let config = create_row_config("acme");
 
-        let result = transformer.transform(
-            "SELECT * FROM users WHERE active = true",
-            &tenant,
-            &config,
-        );
+        let result =
+            transformer.transform("SELECT * FROM users WHERE active = true", &tenant, &config);
 
         assert!(result.transformed);
         assert!(result.query.contains("tenant_id = 'acme'"));
@@ -587,17 +580,12 @@ mod tests {
 
     #[test]
     fn test_transform_select_no_where() {
-        let transformer = TenantQueryTransformer::new()
-            .register_table("users", "tenant_id");
+        let transformer = TenantQueryTransformer::new().register_table("users", "tenant_id");
 
         let tenant = TenantId::new("acme");
         let config = create_row_config("acme");
 
-        let result = transformer.transform(
-            "SELECT * FROM users ORDER BY id",
-            &tenant,
-            &config,
-        );
+        let result = transformer.transform("SELECT * FROM users ORDER BY id", &tenant, &config);
 
         assert!(result.transformed);
         assert!(result.query.contains("WHERE users.tenant_id = 'acme'"));
@@ -606,8 +594,7 @@ mod tests {
 
     #[test]
     fn test_transform_update() {
-        let transformer = TenantQueryTransformer::new()
-            .register_table("users", "tenant_id");
+        let transformer = TenantQueryTransformer::new().register_table("users", "tenant_id");
 
         let tenant = TenantId::new("acme");
         let config = create_row_config("acme");
@@ -624,17 +611,12 @@ mod tests {
 
     #[test]
     fn test_transform_delete() {
-        let transformer = TenantQueryTransformer::new()
-            .register_table("users", "tenant_id");
+        let transformer = TenantQueryTransformer::new().register_table("users", "tenant_id");
 
         let tenant = TenantId::new("acme");
         let config = create_row_config("acme");
 
-        let result = transformer.transform(
-            "DELETE FROM users WHERE id = 1",
-            &tenant,
-            &config,
-        );
+        let result = transformer.transform("DELETE FROM users WHERE id = 1", &tenant, &config);
 
         assert!(result.transformed);
         assert!(result.query.contains("tenant_id = 'acme'"));
@@ -642,25 +624,20 @@ mod tests {
 
     #[test]
     fn test_no_transform_for_unregistered_table() {
-        let transformer = TenantQueryTransformer::new()
-            .register_table("users", "tenant_id");
+        let transformer = TenantQueryTransformer::new().register_table("users", "tenant_id");
 
         let tenant = TenantId::new("acme");
         let config = create_row_config("acme");
 
-        let result = transformer.transform(
-            "SELECT * FROM logs WHERE level = 'error'",
-            &tenant,
-            &config,
-        );
+        let result =
+            transformer.transform("SELECT * FROM logs WHERE level = 'error'", &tenant, &config);
 
         assert!(!result.transformed);
     }
 
     #[test]
     fn test_no_transform_for_schema_isolation() {
-        let transformer = TenantQueryTransformer::new()
-            .register_table("users", "tenant_id");
+        let transformer = TenantQueryTransformer::new().register_table("users", "tenant_id");
 
         let tenant = TenantId::new("acme");
         let config = TenantConfig::builder()
@@ -669,11 +646,7 @@ mod tests {
             .schema_isolation("shared", "acme")
             .build();
 
-        let result = transformer.transform(
-            "SELECT * FROM users",
-            &tenant,
-            &config,
-        );
+        let result = transformer.transform("SELECT * FROM users", &tenant, &config);
 
         assert!(!result.transformed);
     }
@@ -688,11 +661,7 @@ mod tests {
         let tenant = TenantId::new("acme");
         let config = create_row_config("acme");
 
-        let result = transformer.transform(
-            "SELECT * FROM audit_log",
-            &tenant,
-            &config,
-        );
+        let result = transformer.transform("SELECT * FROM audit_log", &tenant, &config);
 
         assert!(!result.transformed);
     }
@@ -701,15 +670,13 @@ mod tests {
     fn test_extract_tables() {
         let transformer = TenantQueryTransformer::new();
 
-        let tables = transformer.extract_tables(
-            "SELECT * FROM users u, orders o WHERE u.id = o.user_id"
-        );
+        let tables =
+            transformer.extract_tables("SELECT * FROM users u, orders o WHERE u.id = o.user_id");
         assert!(tables.contains(&"users".to_string()));
         assert!(tables.contains(&"orders".to_string()));
 
-        let tables = transformer.extract_tables(
-            "SELECT * FROM users JOIN orders ON users.id = orders.user_id"
-        );
+        let tables = transformer
+            .extract_tables("SELECT * FROM users JOIN orders ON users.id = orders.user_id");
         assert!(tables.contains(&"users".to_string()));
         assert!(tables.contains(&"orders".to_string()));
     }

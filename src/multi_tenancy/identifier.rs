@@ -471,9 +471,7 @@ pub fn create_identifier(method: &IdentificationMethod) -> Box<dyn TenantIdentif
             }
             Box::new(identifier)
         }
-        IdentificationMethod::DatabaseName => {
-            Box::new(DatabaseNameIdentifier::new())
-        }
+        IdentificationMethod::DatabaseName => Box::new(DatabaseNameIdentifier::new()),
         IdentificationMethod::SqlContext { variable_name } => {
             Box::new(SqlContextIdentifier::new(variable_name))
         }

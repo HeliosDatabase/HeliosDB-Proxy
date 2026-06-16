@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use super::{DistribCacheConfig, QueryContext, SessionId, QueryFingerprint};
+use super::{DistribCacheConfig, QueryContext, QueryFingerprint, SessionId};
 
 /// Workload types for cache strategy selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,8 +97,8 @@ impl SessionHistory {
     }
 
     fn determine_primary_workload(&self) -> Option<WorkloadType> {
-        let total = self.oltp_count + self.olap_count + self.vector_count +
-                    self.ai_count + self.rag_count;
+        let total =
+            self.oltp_count + self.olap_count + self.vector_count + self.ai_count + self.rag_count;
 
         if total < 10 {
             return None; // Not enough data
@@ -110,7 +110,10 @@ impl SessionHistory {
             self.vector_count,
             self.ai_count,
             self.rag_count,
-        ].iter().max().unwrap();
+        ]
+        .iter()
+        .max()
+        .unwrap();
 
         // Need > 50% to be considered primary
         if max as f64 / total as f64 > 0.5 {
@@ -356,8 +359,8 @@ impl WorkloadClassifier {
         let upper = query.to_uppercase();
 
         // Simple heuristics
-        if upper.starts_with("INSERT") || upper.starts_with("UPDATE") ||
-           upper.starts_with("DELETE") {
+        if upper.starts_with("INSERT") || upper.starts_with("UPDATE") || upper.starts_with("DELETE")
+        {
             return WorkloadType::OLTP;
         }
 
@@ -426,10 +429,10 @@ impl WorkloadClassifier {
             ai_count: self.stats.ai_count.load(Ordering::Relaxed),
             rag_count: self.stats.rag_count.load(Ordering::Relaxed),
             mixed_count: self.stats.mixed_count.load(Ordering::Relaxed),
-            rule_hit_rate: self.stats.rule_hits.load(Ordering::Relaxed) as f64 /
-                          self.stats.total_classified.load(Ordering::Relaxed).max(1) as f64,
-            session_hit_rate: self.stats.session_hits.load(Ordering::Relaxed) as f64 /
-                             self.stats.total_classified.load(Ordering::Relaxed).max(1) as f64,
+            rule_hit_rate: self.stats.rule_hits.load(Ordering::Relaxed) as f64
+                / self.stats.total_classified.load(Ordering::Relaxed).max(1) as f64,
+            session_hit_rate: self.stats.session_hits.load(Ordering::Relaxed) as f64
+                / self.stats.total_classified.load(Ordering::Relaxed).max(1) as f64,
         }
     }
 
@@ -487,16 +490,11 @@ mod tests {
         let classifier = WorkloadClassifier::new(config);
         let ctx = make_context();
 
-        let workload = classifier.classify(
-            "SELECT region, COUNT(*) FROM orders GROUP BY region",
-            &ctx
-        );
+        let workload =
+            classifier.classify("SELECT region, COUNT(*) FROM orders GROUP BY region", &ctx);
         assert_eq!(workload, WorkloadType::OLAP);
 
-        let workload = classifier.classify(
-            "SELECT AVG(amount), SUM(quantity) FROM sales",
-            &ctx
-        );
+        let workload = classifier.classify("SELECT AVG(amount), SUM(quantity) FROM sales", &ctx);
         assert_eq!(workload, WorkloadType::OLAP);
     }
 
@@ -508,7 +506,7 @@ mod tests {
 
         let workload = classifier.classify(
             "SELECT * FROM embeddings ORDER BY vector <-> $1 LIMIT 10",
-            &ctx
+            &ctx,
         );
         assert_eq!(workload, WorkloadType::Vector);
     }
@@ -521,13 +519,13 @@ mod tests {
 
         let workload = classifier.classify(
             "SELECT * FROM conversation_turns WHERE conversation_id = $1",
-            &ctx
+            &ctx,
         );
         assert_eq!(workload, WorkloadType::AIAgent);
 
         let workload = classifier.classify(
             "INSERT INTO agent_memory (key, value) VALUES ($1, $2)",
-            &ctx
+            &ctx,
         );
         assert_eq!(workload, WorkloadType::AIAgent);
     }
@@ -540,7 +538,7 @@ mod tests {
 
         let workload = classifier.classify(
             "SELECT content FROM documents WHERE id IN (SELECT doc_id FROM chunks WHERE ...)",
-            &ctx
+            &ctx,
         );
         assert_eq!(workload, WorkloadType::RAG);
     }
@@ -564,7 +562,10 @@ mod tests {
 
         // Run many OLAP queries to establish session pattern
         for _ in 0..20 {
-            classifier.classify("SELECT COUNT(*) FROM analytics GROUP BY region", &ctx.clone());
+            classifier.classify(
+                "SELECT COUNT(*) FROM analytics GROUP BY region",
+                &ctx.clone(),
+            );
         }
 
         // Now an ambiguous query should be classified as OLAP based on session history

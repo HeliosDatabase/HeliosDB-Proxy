@@ -309,7 +309,10 @@ impl WorkflowQuota {
     }
 
     /// Begin a new workflow
-    pub fn begin_workflow(&self, workflow_id: impl Into<String>) -> Result<WorkflowToken, QuotaExceeded> {
+    pub fn begin_workflow(
+        &self,
+        workflow_id: impl Into<String>,
+    ) -> Result<WorkflowToken, QuotaExceeded> {
         self.maybe_reset();
 
         let count = self.workflow_count.fetch_add(1, Ordering::SeqCst);
@@ -494,14 +497,24 @@ pub enum QuotaExceeded {
 impl std::fmt::Display for QuotaExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            QuotaExceeded::HourlyLimit { current, limit, resets_in } => {
+            QuotaExceeded::HourlyLimit {
+                current,
+                limit,
+                resets_in,
+            } => {
                 write!(
                     f,
                     "Hourly workflow limit exceeded: {}/{} workflows, resets in {}s",
-                    current, limit, resets_in.as_secs()
+                    current,
+                    limit,
+                    resets_in.as_secs()
                 )
             }
-            QuotaExceeded::StepLimit { workflow_id, steps_executed, max_steps } => {
+            QuotaExceeded::StepLimit {
+                workflow_id,
+                steps_executed,
+                max_steps,
+            } => {
                 write!(
                     f,
                     "Workflow '{}' step limit exceeded: {}/{} steps",
@@ -518,15 +531,25 @@ impl QuotaExceeded {
     /// Get LLM-friendly error message
     pub fn to_llm_message(&self) -> String {
         match self {
-            QuotaExceeded::HourlyLimit { current, limit, resets_in } => {
+            QuotaExceeded::HourlyLimit {
+                current,
+                limit,
+                resets_in,
+            } => {
                 format!(
                     "{{\"error\": \"workflow_quota_exceeded\", \"type\": \"hourly_limit\", \
                      \"current\": {}, \"limit\": {}, \"resets_in_seconds\": {}, \
                      \"suggestion\": \"Wait for quota reset or optimize workflow count\"}}",
-                    current, limit, resets_in.as_secs()
+                    current,
+                    limit,
+                    resets_in.as_secs()
                 )
             }
-            QuotaExceeded::StepLimit { workflow_id, steps_executed, max_steps } => {
+            QuotaExceeded::StepLimit {
+                workflow_id,
+                steps_executed,
+                max_steps,
+            } => {
                 format!(
                     "{{\"error\": \"workflow_quota_exceeded\", \"type\": \"step_limit\", \
                      \"workflow_id\": \"{}\", \"steps_executed\": {}, \"max_steps\": {}, \
@@ -584,8 +607,7 @@ mod tests {
 
     #[test]
     fn test_token_budget_warning() {
-        let budget = AgentTokenBudget::daily("agent-1", 100)
-            .with_warning_threshold(0.8);
+        let budget = AgentTokenBudget::daily("agent-1", 100).with_warning_threshold(0.8);
 
         assert!(!budget.is_warning());
 

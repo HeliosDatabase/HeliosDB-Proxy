@@ -9,23 +9,26 @@
 
 pub mod config;
 pub mod fingerprinter;
-pub mod statistics;
-pub mod slow_log;
-pub mod patterns;
 pub mod histogram;
-pub mod metrics;
 pub mod intent;
+pub mod metrics;
+pub mod patterns;
+pub mod slow_log;
+pub mod statistics;
 
 // Re-exports
-pub use config::{AnalyticsConfig, AnalyticsConfigBuilder, SlowQueryConfig, PatternConfig, SamplingConfig};
-pub use fingerprinter::{QueryFingerprinter, QueryFingerprint, OperationType};
-pub use statistics::{QueryStatistics, QueryExecution, StatisticsStore, QueryStats};
-pub use slow_log::{SlowQueryLog, SlowQueryEntry, SlowQueryReader};
-pub use patterns::{PatternDetector, NplusOnePattern, QueryBurst, PatternAlert};
-pub use histogram::{LatencyHistogram, HistogramBucket, HistogramSnapshot};
+pub use config::{
+    AnalyticsConfig, AnalyticsConfigBuilder, PatternConfig, SamplingConfig, SlowQueryConfig,
+};
+pub use fingerprinter::{OperationType, QueryFingerprint, QueryFingerprinter};
+pub use histogram::{HistogramBucket, HistogramSnapshot, LatencyHistogram};
+pub use intent::{
+    CostAttribution, QueryClassifier, QueryIntent, RagAnalytics, WorkflowTrace, WorkflowTracer,
+};
 pub use metrics::{AnalyticsMetrics, AnalyticsSnapshot, QueryMetricEntry};
-pub use intent::{QueryClassifier, QueryIntent, RagAnalytics, WorkflowTracer, WorkflowTrace, CostAttribution};
-
+pub use patterns::{NplusOnePattern, PatternAlert, PatternDetector, QueryBurst};
+pub use slow_log::{SlowQueryEntry, SlowQueryLog, SlowQueryReader};
+pub use statistics::{QueryExecution, QueryStatistics, QueryStats, StatisticsStore};
 
 /// Main analytics engine
 pub struct QueryAnalytics {
@@ -104,7 +107,8 @@ impl QueryAnalytics {
 
         // Detect patterns
         if let Some(session) = &execution.session_id {
-            self.patterns.record_query(session, &execution, &fingerprint);
+            self.patterns
+                .record_query(session, &execution, &fingerprint);
         }
 
         // Classify intent

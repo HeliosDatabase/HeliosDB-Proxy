@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use parking_lot::RwLock;
 use thiserror::Error;
 
-use super::config::{Identity, ApiKeyConfig};
+use super::config::{ApiKeyConfig, Identity};
 
 /// API key errors
 #[derive(Debug, Error)]
@@ -197,7 +197,8 @@ impl ApiKeyManager {
         // Generate key ID
         let key_id = self.generate_key_id();
 
-        let expires_at = expires_in.map(|d| chrono::Utc::now() + chrono::Duration::from_std(d).unwrap());
+        let expires_at =
+            expires_in.map(|d| chrono::Utc::now() + chrono::Duration::from_std(d).unwrap());
 
         let api_key = ApiKey {
             id: key_id.clone(),
@@ -216,7 +217,9 @@ impl ApiKeyManager {
         };
 
         // Store the key
-        self.keys_by_id.write().insert(key_id.clone(), api_key.clone());
+        self.keys_by_id
+            .write()
+            .insert(key_id.clone(), api_key.clone());
         self.keys_by_hash.write().insert(key_hash, key_id);
 
         Ok((api_key, full_key))
@@ -232,14 +235,15 @@ impl ApiKeyManager {
         let key_hash = self.hash_key(key);
 
         // Look up by hash
-        let key_id = self.keys_by_hash.read()
+        let key_id = self
+            .keys_by_hash
+            .read()
             .get(&key_hash)
             .cloned()
             .ok_or(ApiKeyError::NotFound)?;
 
         let mut keys = self.keys_by_id.write();
-        let api_key = keys.get_mut(&key_id)
-            .ok_or(ApiKeyError::NotFound)?;
+        let api_key = keys.get_mut(&key_id).ok_or(ApiKeyError::NotFound)?;
 
         // Check if active
         if !api_key.active {
@@ -307,8 +311,7 @@ impl ApiKeyManager {
     /// Revoke an API key
     pub fn revoke(&self, key_id: &str) -> Result<(), ApiKeyError> {
         let mut keys = self.keys_by_id.write();
-        let api_key = keys.get_mut(key_id)
-            .ok_or(ApiKeyError::NotFound)?;
+        let api_key = keys.get_mut(key_id).ok_or(ApiKeyError::NotFound)?;
 
         api_key.active = false;
         Ok(())
@@ -316,7 +319,10 @@ impl ApiKeyManager {
 
     /// Delete an API key
     pub fn delete(&self, key_id: &str) -> Result<(), ApiKeyError> {
-        let api_key = self.keys_by_id.write().remove(key_id)
+        let api_key = self
+            .keys_by_id
+            .write()
+            .remove(key_id)
             .ok_or(ApiKeyError::NotFound)?;
 
         self.keys_by_hash.write().remove(&api_key.key_hash);
@@ -332,7 +338,8 @@ impl ApiKeyManager {
 
     /// List all API keys for a user
     pub fn list_by_user(&self, user_id: &str) -> Vec<ApiKey> {
-        self.keys_by_id.read()
+        self.keys_by_id
+            .read()
             .values()
             .filter(|k| k.identity.user_id == user_id)
             .cloned()
@@ -341,7 +348,8 @@ impl ApiKeyManager {
 
     /// List all active API keys
     pub fn list_active(&self) -> Vec<ApiKey> {
-        self.keys_by_id.read()
+        self.keys_by_id
+            .read()
             .values()
             .filter(|k| k.is_valid())
             .cloned()
@@ -355,8 +363,7 @@ impl ApiKeyManager {
         metadata: HashMap<String, String>,
     ) -> Result<(), ApiKeyError> {
         let mut keys = self.keys_by_id.write();
-        let api_key = keys.get_mut(key_id)
-            .ok_or(ApiKeyError::NotFound)?;
+        let api_key = keys.get_mut(key_id).ok_or(ApiKeyError::NotFound)?;
 
         api_key.metadata.extend(metadata);
         Ok(())
@@ -365,8 +372,7 @@ impl ApiKeyManager {
     /// Update API key scopes
     pub fn update_scopes(&self, key_id: &str, scopes: Vec<String>) -> Result<(), ApiKeyError> {
         let mut keys = self.keys_by_id.write();
-        let api_key = keys.get_mut(key_id)
-            .ok_or(ApiKeyError::NotFound)?;
+        let api_key = keys.get_mut(key_id).ok_or(ApiKeyError::NotFound)?;
 
         api_key.scopes = scopes;
         Ok(())
@@ -379,8 +385,7 @@ impl ApiKeyManager {
         ips: Vec<std::net::IpAddr>,
     ) -> Result<(), ApiKeyError> {
         let mut keys = self.keys_by_id.write();
-        let api_key = keys.get_mut(key_id)
-            .ok_or(ApiKeyError::NotFound)?;
+        let api_key = keys.get_mut(key_id).ok_or(ApiKeyError::NotFound)?;
 
         api_key.allowed_ips = ips;
         Ok(())
@@ -421,9 +426,14 @@ impl ApiKeyManager {
         let keys = self.keys_by_id.read();
         let total = keys.len();
         let active = keys.values().filter(|k| k.active).count();
-        let expired = keys.values().filter(|k| {
-            k.expires_at.map(|e| chrono::Utc::now() > e).unwrap_or(false)
-        }).count();
+        let expired = keys
+            .values()
+            .filter(|k| {
+                k.expires_at
+                    .map(|e| chrono::Utc::now() > e)
+                    .unwrap_or(false)
+            })
+            .count();
 
         ApiKeyStats {
             total,
@@ -435,10 +445,14 @@ impl ApiKeyManager {
 
     /// Cleanup expired keys
     pub fn cleanup_expired(&self) {
-        let expired_ids: Vec<String> = self.keys_by_id.read()
+        let expired_ids: Vec<String> = self
+            .keys_by_id
+            .read()
             .iter()
             .filter(|(_, k)| {
-                k.expires_at.map(|e| chrono::Utc::now() > e).unwrap_or(false)
+                k.expires_at
+                    .map(|e| chrono::Utc::now() > e)
+                    .unwrap_or(false)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -451,7 +465,8 @@ impl ApiKeyManager {
     /// Check rate limit for a key
     fn check_rate_limit(&self, key_id: &str, limit: u32) -> bool {
         let mut limits = self.rate_limits.write();
-        let state = limits.entry(key_id.to_string())
+        let state = limits
+            .entry(key_id.to_string())
             .or_insert_with(RateLimitState::new);
         state.check_and_increment(limit)
     }
@@ -462,10 +477,12 @@ impl ApiKeyManager {
         use std::hash::{BuildHasher, Hasher};
 
         let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u128(std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos());
+        hasher.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
         hasher.write_usize(std::process::id() as usize);
 
         let hash1 = hasher.finish();
@@ -482,10 +499,12 @@ impl ApiKeyManager {
         use std::hash::{BuildHasher, Hasher};
 
         let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u128(std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos());
+        hasher.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
 
         format!("key_{:016x}", hasher.finish())
     }
@@ -597,7 +616,10 @@ impl ApiKeyBuilder {
         api_key.metadata = self.metadata;
 
         // Update the stored key
-        manager.keys_by_id.write().insert(api_key.id.clone(), api_key.clone());
+        manager
+            .keys_by_id
+            .write()
+            .insert(api_key.id.clone(), api_key.clone());
 
         Ok((api_key, key_value))
     }
@@ -633,13 +655,15 @@ mod tests {
     #[test]
     fn test_generate_key() {
         let manager = ApiKeyManager::new(test_config());
-        let (api_key, key_value) = manager.generate_key(
-            test_identity(),
-            "Test Key".to_string(),
-            vec!["read".to_string()],
-            None,
-            None,
-        ).unwrap();
+        let (api_key, key_value) = manager
+            .generate_key(
+                test_identity(),
+                "Test Key".to_string(),
+                vec!["read".to_string()],
+                None,
+                None,
+            )
+            .unwrap();
 
         assert!(key_value.starts_with("hdb_test_"));
         assert!(api_key.active);
@@ -649,13 +673,15 @@ mod tests {
     #[test]
     fn test_validate_key() {
         let manager = ApiKeyManager::new(test_config());
-        let (_, key_value) = manager.generate_key(
-            test_identity(),
-            "Test Key".to_string(),
-            vec!["read".to_string()],
-            None,
-            None,
-        ).unwrap();
+        let (_, key_value) = manager
+            .generate_key(
+                test_identity(),
+                "Test Key".to_string(),
+                vec!["read".to_string()],
+                None,
+                None,
+            )
+            .unwrap();
 
         let validated = manager.validate(&key_value).unwrap();
         assert_eq!(validated.identity.user_id, "user123");
@@ -671,13 +697,15 @@ mod tests {
     #[test]
     fn test_revoke_key() {
         let manager = ApiKeyManager::new(test_config());
-        let (api_key, key_value) = manager.generate_key(
-            test_identity(),
-            "Test Key".to_string(),
-            vec!["read".to_string()],
-            None,
-            None,
-        ).unwrap();
+        let (api_key, key_value) = manager
+            .generate_key(
+                test_identity(),
+                "Test Key".to_string(),
+                vec!["read".to_string()],
+                None,
+                None,
+            )
+            .unwrap();
 
         manager.revoke(&api_key.id).unwrap();
 
@@ -688,13 +716,15 @@ mod tests {
     #[test]
     fn test_key_expiration() {
         let manager = ApiKeyManager::new(test_config());
-        let (_, key_value) = manager.generate_key(
-            test_identity(),
-            "Test Key".to_string(),
-            vec!["read".to_string()],
-            Some(Duration::from_secs(0)), // Expired immediately
-            None,
-        ).unwrap();
+        let (_, key_value) = manager
+            .generate_key(
+                test_identity(),
+                "Test Key".to_string(),
+                vec!["read".to_string()],
+                Some(Duration::from_secs(0)), // Expired immediately
+                None,
+            )
+            .unwrap();
 
         // Give it a moment to expire
         std::thread::sleep(Duration::from_millis(10));
@@ -706,13 +736,15 @@ mod tests {
     #[test]
     fn test_scope_validation() {
         let manager = ApiKeyManager::new(test_config());
-        let (_, key_value) = manager.generate_key(
-            test_identity(),
-            "Test Key".to_string(),
-            vec!["read".to_string()],
-            None,
-            None,
-        ).unwrap();
+        let (_, key_value) = manager
+            .generate_key(
+                test_identity(),
+                "Test Key".to_string(),
+                vec!["read".to_string()],
+                None,
+                None,
+            )
+            .unwrap();
 
         // Should succeed for read
         assert!(manager.validate_with_scopes(&key_value, &["read"]).is_ok());
@@ -732,8 +764,12 @@ mod tests {
         let mut identity2 = test_identity();
         identity2.user_id = "user456".to_string();
 
-        let _ = manager.generate_key(identity1, "Key 1".to_string(), vec![], None, None).unwrap();
-        let _ = manager.generate_key(identity2, "Key 2".to_string(), vec![], None, None).unwrap();
+        let _ = manager
+            .generate_key(identity1, "Key 1".to_string(), vec![], None, None)
+            .unwrap();
+        let _ = manager
+            .generate_key(identity2, "Key 2".to_string(), vec![], None, None)
+            .unwrap();
 
         let user_keys = manager.list_by_user("user123");
         assert_eq!(user_keys.len(), 1);
@@ -743,21 +779,13 @@ mod tests {
     fn test_key_stats() {
         let manager = ApiKeyManager::new(test_config());
 
-        let (key1, _) = manager.generate_key(
-            test_identity(),
-            "Key 1".to_string(),
-            vec![],
-            None,
-            None,
-        ).unwrap();
+        let (key1, _) = manager
+            .generate_key(test_identity(), "Key 1".to_string(), vec![], None, None)
+            .unwrap();
 
-        let _ = manager.generate_key(
-            test_identity(),
-            "Key 2".to_string(),
-            vec![],
-            None,
-            None,
-        ).unwrap();
+        let _ = manager
+            .generate_key(test_identity(), "Key 2".to_string(), vec![], None, None)
+            .unwrap();
 
         manager.revoke(&key1.id).unwrap();
 
@@ -769,13 +797,15 @@ mod tests {
     #[test]
     fn test_rotate_key() {
         let manager = ApiKeyManager::new(test_config());
-        let (api_key, old_key) = manager.generate_key(
-            test_identity(),
-            "Test Key".to_string(),
-            vec!["read".to_string()],
-            None,
-            None,
-        ).unwrap();
+        let (api_key, old_key) = manager
+            .generate_key(
+                test_identity(),
+                "Test Key".to_string(),
+                vec!["read".to_string()],
+                None,
+                None,
+            )
+            .unwrap();
 
         // Rotate
         let new_key = manager.rotate(&api_key.id).unwrap();

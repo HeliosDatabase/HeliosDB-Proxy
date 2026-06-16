@@ -108,7 +108,9 @@ impl WalStreamer {
 
         // Attempt TCP connection
         match TcpStream::connect_timeout(
-            &endpoint.parse().map_err(|_| CacheError::ConnectionError("Invalid endpoint address".to_string()))?,
+            &endpoint
+                .parse()
+                .map_err(|_| CacheError::ConnectionError("Invalid endpoint address".to_string()))?,
             Duration::from_secs(5),
         ) {
             Ok(stream) => {
@@ -138,12 +140,15 @@ impl WalStreamer {
             let lsn = start_lsn.unwrap_or(0);
             let mut request = vec![WalMessageType::Subscribe as u8];
             request.extend_from_slice(&(8u32).to_be_bytes()); // payload length
-            request.extend_from_slice(&lsn.to_be_bytes());     // start LSN
+            request.extend_from_slice(&lsn.to_be_bytes()); // start LSN
 
             // Send subscription request
             if let Err(e) = stream.write_all(&request) {
                 tracing::error!("Failed to send subscription request: {}", e);
-                return Err(CacheError::ConnectionError(format!("Subscription failed: {}", e)));
+                return Err(CacheError::ConnectionError(format!(
+                    "Subscription failed: {}",
+                    e
+                )));
             }
 
             // Wait for subscription ack
@@ -153,7 +158,9 @@ impl WalStreamer {
                     if header[0] == WalMessageType::SubscribeAck as u8 {
                         tracing::info!("WAL subscription acknowledged");
                     } else if header[0] == WalMessageType::Error as u8 {
-                        return Err(CacheError::ConnectionError("Subscription rejected by server".to_string()));
+                        return Err(CacheError::ConnectionError(
+                            "Subscription rejected by server".to_string(),
+                        ));
                     }
                 }
                 Err(e) => {
@@ -181,10 +188,16 @@ impl WalStreamer {
         let delay = self.reconnect_delay * self.reconnect_attempts;
         tokio::time::sleep(delay).await;
 
-        tracing::info!("Attempting WAL reconnection (attempt {})", self.reconnect_attempts);
+        tracing::info!(
+            "Attempting WAL reconnection (attempt {})",
+            self.reconnect_attempts
+        );
 
         match TcpStream::connect_timeout(
-            &self.endpoint.parse().map_err(|_| CacheError::ConnectionError("Invalid endpoint".to_string()))?,
+            &self
+                .endpoint
+                .parse()
+                .map_err(|_| CacheError::ConnectionError("Invalid endpoint".to_string()))?,
             Duration::from_secs(5),
         ) {
             Ok(stream) => {
@@ -266,7 +279,8 @@ impl WalSubscription {
             }
 
             let msg_type = header[0];
-            let payload_len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+            let payload_len =
+                u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
 
             // Handle heartbeat messages
             if msg_type == WalMessageType::Heartbeat as u8 {
@@ -307,12 +321,24 @@ impl WalSubscription {
             }
 
             let lsn = u64::from_be_bytes([
-                self.buffer[0], self.buffer[1], self.buffer[2], self.buffer[3],
-                self.buffer[4], self.buffer[5], self.buffer[6], self.buffer[7],
+                self.buffer[0],
+                self.buffer[1],
+                self.buffer[2],
+                self.buffer[3],
+                self.buffer[4],
+                self.buffer[5],
+                self.buffer[6],
+                self.buffer[7],
             ]);
             let timestamp = u64::from_be_bytes([
-                self.buffer[8], self.buffer[9], self.buffer[10], self.buffer[11],
-                self.buffer[12], self.buffer[13], self.buffer[14], self.buffer[15],
+                self.buffer[8],
+                self.buffer[9],
+                self.buffer[10],
+                self.buffer[11],
+                self.buffer[12],
+                self.buffer[13],
+                self.buffer[14],
+                self.buffer[15],
             ]);
             let op_type = self.buffer[16];
             let data = &self.buffer[17..];
@@ -355,12 +381,19 @@ impl WalSubscription {
                     let table_name = String::from_utf8_lossy(&data[2..2 + name_len]).to_string();
                     let counter_offset = 2 + name_len;
                     let counter = u64::from_be_bytes([
-                        data[counter_offset], data[counter_offset + 1],
-                        data[counter_offset + 2], data[counter_offset + 3],
-                        data[counter_offset + 4], data[counter_offset + 5],
-                        data[counter_offset + 6], data[counter_offset + 7],
+                        data[counter_offset],
+                        data[counter_offset + 1],
+                        data[counter_offset + 2],
+                        data[counter_offset + 3],
+                        data[counter_offset + 4],
+                        data[counter_offset + 5],
+                        data[counter_offset + 6],
+                        data[counter_offset + 7],
                     ]);
-                    WalOperation::UpdateCounter { table_name, counter }
+                    WalOperation::UpdateCounter {
+                        table_name,
+                        counter,
+                    }
                 }
                 0x04 => {
                     // Schema change: [table_name_len: 2][table_name]
@@ -380,8 +413,7 @@ impl WalSubscription {
                         continue;
                     }
                     let txn_id = u64::from_be_bytes([
-                        data[0], data[1], data[2], data[3],
-                        data[4], data[5], data[6], data[7],
+                        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                     ]);
                     WalOperation::Commit { txn_id }
                 }
@@ -498,7 +530,10 @@ impl WalInvalidator {
                 tracing::info!("WAL invalidator started, connected to {}", wal_endpoint);
             }
             Err(e) => {
-                tracing::warn!("Failed to subscribe to WAL stream: {}. Running in degraded mode.", e);
+                tracing::warn!(
+                    "Failed to subscribe to WAL stream: {}. Running in degraded mode.",
+                    e
+                );
                 // Still mark as running - can accept manual invalidations
             }
         }
@@ -616,7 +651,9 @@ impl WalInvalidator {
 
     /// Process a WAL entry
     async fn process_wal_entry(&self, entry: WalEntry) {
-        self.stats.wal_entries_processed.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .wal_entries_processed
+            .fetch_add(1, Ordering::Relaxed);
 
         let (table, row_key) = match &entry.operation {
             WalOperation::Put { key, .. } => (self.extract_table(key), Some(key.clone())),
@@ -642,7 +679,9 @@ impl WalInvalidator {
 
     /// Invalidate entries for a table
     async fn invalidate_table(&self, table: &str, all_entries: bool) {
-        self.stats.tables_invalidated.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .tables_invalidated
+            .fetch_add(1, Ordering::Relaxed);
 
         let target = InvalidationTarget {
             table: table.to_string(),
@@ -658,10 +697,9 @@ impl WalInvalidator {
 
         // Track invalidated entries
         if let Some(entries) = self.table_index.get(table) {
-            self.stats.entries_invalidated.fetch_add(
-                entries.len() as u64,
-                Ordering::Relaxed,
-            );
+            self.stats
+                .entries_invalidated
+                .fetch_add(entries.len() as u64, Ordering::Relaxed);
         }
     }
 
@@ -753,11 +791,13 @@ mod tests {
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
 
-        invalidator.add_callback(Arc::new(move |target| {
-            if target.table == "users" {
-                called_clone.store(true, Ordering::SeqCst);
-            }
-        })).await;
+        invalidator
+            .add_callback(Arc::new(move |target| {
+                if target.table == "users" {
+                    called_clone.store(true, Ordering::SeqCst);
+                }
+            }))
+            .await;
 
         invalidator.invalidate_table_manual("users", false).await;
 

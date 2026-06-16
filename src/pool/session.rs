@@ -44,7 +44,11 @@ impl SessionModeHandler {
     }
 
     /// Create a lease for this mode
-    pub fn create_lease(&self, connection: PooledConnection, client_id: ClientId) -> ConnectionLease {
+    pub fn create_lease(
+        &self,
+        connection: PooledConnection,
+        client_id: ClientId,
+    ) -> ConnectionLease {
         ConnectionLease::new(connection, PoolingMode::Session, client_id)
     }
 

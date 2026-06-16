@@ -14,7 +14,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 
 use super::config::{L2Config, StorageBackend};
-use super::result::{CachedResult, CacheKey, L2Entry};
+use super::result::{CacheKey, CachedResult, L2Entry};
 
 /// L2 warm cache (shared across connections)
 ///
@@ -70,9 +70,10 @@ impl L2WarmCache {
     /// Create a new L2 warm cache
     pub fn new(config: L2Config) -> Self {
         let mmap_storage = if config.storage == StorageBackend::Mmap {
-            config.mmap_path.as_ref().map(|path| {
-                RwLock::new(MmapStorage::new(path.clone()))
-            })
+            config
+                .mmap_path
+                .as_ref()
+                .map(|path| RwLock::new(MmapStorage::new(path.clone())))
         } else {
             None
         };
@@ -141,7 +142,8 @@ impl L2WarmCache {
         let entry_memory = entry.memory_size;
 
         self.memory_entries.insert(hash, entry);
-        self.memory_usage.fetch_add(entry_memory, std::sync::atomic::Ordering::Relaxed);
+        self.memory_usage
+            .fetch_add(entry_memory, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Remove an entry from the cache
@@ -149,7 +151,8 @@ impl L2WarmCache {
         let hash = key.hash_value();
 
         if let Some((_, entry)) = self.memory_entries.remove(&hash) {
-            self.memory_usage.fetch_sub(entry.memory_size, std::sync::atomic::Ordering::Relaxed);
+            self.memory_usage
+                .fetch_sub(entry.memory_size, std::sync::atomic::Ordering::Relaxed);
         }
 
         // Also remove from mmap if present
@@ -163,7 +166,8 @@ impl L2WarmCache {
     /// Clear all entries
     pub async fn clear(&self) {
         self.memory_entries.clear();
-        self.memory_usage.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.memory_usage
+            .store(0, std::sync::atomic::Ordering::Relaxed);
 
         if let Some(ref mmap) = self.mmap_storage {
             if let Ok(mut storage) = mmap.write() {
@@ -189,10 +193,7 @@ impl L2WarmCache {
 
     /// Get cache statistics
     pub fn stats(&self) -> L2CacheStats {
-        let total_access: u64 = self.memory_entries
-            .iter()
-            .map(|e| e.access_count)
-            .sum();
+        let total_access: u64 = self.memory_entries.iter().map(|e| e.access_count).sum();
 
         L2CacheStats {
             entry_count: self.memory_entries.len(),
@@ -209,7 +210,8 @@ impl L2WarmCache {
         let target = max_bytes.saturating_sub(required_bytes);
 
         // First, evict expired entries
-        let expired: Vec<u64> = self.memory_entries
+        let expired: Vec<u64> = self
+            .memory_entries
             .iter()
             .filter(|e| e.is_expired())
             .map(|e| *e.key())
@@ -217,14 +219,16 @@ impl L2WarmCache {
 
         for hash in expired {
             if let Some((_, entry)) = self.memory_entries.remove(&hash) {
-                self.memory_usage.fetch_sub(entry.memory_size, std::sync::atomic::Ordering::Relaxed);
+                self.memory_usage
+                    .fetch_sub(entry.memory_size, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
         // If still over limit, evict LRU entries
         while self.memory_usage.load(std::sync::atomic::Ordering::Relaxed) > target {
             // Find LRU entry
-            let lru_hash = self.memory_entries
+            let lru_hash = self
+                .memory_entries
                 .iter()
                 .min_by_key(|e| e.last_access)
                 .map(|e| *e.key());
@@ -238,7 +242,8 @@ impl L2WarmCache {
                 }
 
                 if let Some((_, entry)) = self.memory_entries.remove(&hash) {
-                    self.memory_usage.fetch_sub(entry.memory_size, std::sync::atomic::Ordering::Relaxed);
+                    self.memory_usage
+                        .fetch_sub(entry.memory_size, std::sync::atomic::Ordering::Relaxed);
                 }
             } else {
                 break;
@@ -254,7 +259,8 @@ impl L2WarmCache {
         let entry_memory = entry.memory_size;
 
         self.memory_entries.insert(hash, entry);
-        self.memory_usage.fetch_add(entry_memory, std::sync::atomic::Ordering::Relaxed);
+        self.memory_usage
+            .fetch_add(entry_memory, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Demote an entry to mmap storage
@@ -272,7 +278,8 @@ impl L2WarmCache {
             return Ok(0);
         };
 
-        let mut storage = mmap.write()
+        let mut storage = mmap
+            .write()
             .map_err(|_| std::io::Error::other("Lock poisoned"))?;
 
         let mut count = 0;
@@ -293,7 +300,8 @@ impl L2WarmCache {
             return Ok(0);
         };
 
-        let storage = mmap.read()
+        let storage = mmap
+            .read()
             .map_err(|_| std::io::Error::other("Lock poisoned"))?;
 
         Ok(storage.entry_count())
@@ -328,7 +336,8 @@ impl MmapStorage {
         let mut buffer = vec![0u8; entry.size];
 
         use std::io::Seek;
-        file.seek(std::io::SeekFrom::Start(entry.offset as u64)).ok()?;
+        file.seek(std::io::SeekFrom::Start(entry.offset as u64))
+            .ok()?;
         file.read_exact(&mut buffer).ok()?;
 
         // Deserialize (simple format: ttl_secs:row_count:data)
@@ -369,11 +378,14 @@ impl MmapStorage {
                 .map(|d| d.as_secs() + result.ttl.as_secs())
                 .unwrap_or(0);
 
-            self.index.insert(hash, MmapEntry {
-                offset,
-                size: data.len(),
-                expires_at,
-            });
+            self.index.insert(
+                hash,
+                MmapEntry {
+                    offset,
+                    size: data.len(),
+                    expires_at,
+                },
+            );
             self.file_size += data.len();
         }
     }
@@ -470,9 +482,9 @@ pub struct L2CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-    use crate::cache::CacheContext;
     use crate::cache::normalizer::NormalizedQuery;
+    use crate::cache::CacheContext;
+    use std::time::Duration;
 
     fn create_result(data: &str) -> CachedResult {
         CachedResult::new(
@@ -485,12 +497,7 @@ mod tests {
     }
 
     fn create_key(query_hash: u64) -> CacheKey {
-        CacheKey::from_parts(
-            query_hash,
-            "test".to_string(),
-            None,
-            None,
-        )
+        CacheKey::from_parts(query_hash, "test".to_string(), None, None)
     }
 
     #[tokio::test]

@@ -2,17 +2,16 @@
 //!
 //! REST API endpoints for managing schema-aware routing.
 
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
-use super::{
-    SchemaRegistry, LearningClassifier, SchemaDiscovery,
-    DataTemperature, WorkloadType, AccessPattern,
-    SchemaRoutingMetrics,
-};
-use super::registry::{TableSchema, ColumnSchema, StorageType};
+use super::registry::{ColumnSchema, StorageType, TableSchema};
 use super::router::SchemaAwareRouter;
+use super::{
+    AccessPattern, DataTemperature, LearningClassifier, SchemaDiscovery, SchemaRegistry,
+    SchemaRoutingMetrics, WorkloadType,
+};
 
 /// Admin API for schema routing
 pub struct SchemaRoutingAdmin {
@@ -49,15 +48,18 @@ impl SchemaRoutingAdmin {
     pub fn list_tables(&self) -> TablesResponse {
         let tables = self.registry.list_tables();
         TablesResponse {
-            tables: tables.into_iter().map(|t| TableSummary {
-                name: t.name.clone(),
-                temperature: format!("{:?}", t.temperature),
-                workload: format!("{:?}", t.workload),
-                access_pattern: format!("{:?}", t.access_pattern),
-                column_count: t.columns.len(),
-                shard_key: t.shard_key.clone(),
-                row_count_estimate: Some(t.estimated_rows),
-            }).collect(),
+            tables: tables
+                .into_iter()
+                .map(|t| TableSummary {
+                    name: t.name.clone(),
+                    temperature: format!("{:?}", t.temperature),
+                    workload: format!("{:?}", t.workload),
+                    access_pattern: format!("{:?}", t.access_pattern),
+                    column_count: t.columns.len(),
+                    shard_key: t.shard_key.clone(),
+                    row_count_estimate: Some(t.estimated_rows),
+                })
+                .collect(),
             total: self.registry.table_count(),
         }
     }
@@ -66,15 +68,19 @@ impl SchemaRoutingAdmin {
     pub fn get_table(&self, name: &str) -> Option<TableDetails> {
         self.registry.get_table(name).map(|t| TableDetails {
             name: t.name.clone(),
-            columns: t.columns.iter().map(|c| ColumnDetails {
-                name: c.name.clone(),
-                data_type: c.data_type.clone(),
-                nullable: c.nullable,
-                is_primary_key: c.is_primary_key,
-                is_indexed: c.is_indexed,
-                default_value: None, // ColumnSchema doesn't have default_value
-                storage_type: Some(format!("{:?}", c.storage_type)),
-            }).collect(),
+            columns: t
+                .columns
+                .iter()
+                .map(|c| ColumnDetails {
+                    name: c.name.clone(),
+                    data_type: c.data_type.clone(),
+                    nullable: c.nullable,
+                    is_primary_key: c.is_primary_key,
+                    is_indexed: c.is_indexed,
+                    default_value: None, // ColumnSchema doesn't have default_value
+                    storage_type: Some(format!("{:?}", c.storage_type)),
+                })
+                .collect(),
             temperature: format!("{:?}", t.temperature),
             workload: format!("{:?}", t.workload),
             access_pattern: format!("{:?}", t.access_pattern),
@@ -87,24 +93,37 @@ impl SchemaRoutingAdmin {
     }
 
     /// POST /schema/tables - Register a new table
-    pub fn register_table(&self, request: RegisterTableRequest) -> Result<TableDetails, AdminError> {
-        let temperature = DataTemperature::from_str(&request.temperature)
-            .ok_or_else(|| AdminError::InvalidInput(format!("Invalid temperature: {}", request.temperature)))?;
+    pub fn register_table(
+        &self,
+        request: RegisterTableRequest,
+    ) -> Result<TableDetails, AdminError> {
+        let temperature = DataTemperature::from_str(&request.temperature).ok_or_else(|| {
+            AdminError::InvalidInput(format!("Invalid temperature: {}", request.temperature))
+        })?;
 
-        let workload = WorkloadType::from_str(&request.workload)
-            .ok_or_else(|| AdminError::InvalidInput(format!("Invalid workload: {}", request.workload)))?;
+        let workload = WorkloadType::from_str(&request.workload).ok_or_else(|| {
+            AdminError::InvalidInput(format!("Invalid workload: {}", request.workload))
+        })?;
 
-        let access_pattern = parse_access_pattern(&request.access_pattern)
-            .ok_or_else(|| AdminError::InvalidInput(format!("Invalid access pattern: {}", request.access_pattern)))?;
+        let access_pattern = parse_access_pattern(&request.access_pattern).ok_or_else(|| {
+            AdminError::InvalidInput(format!(
+                "Invalid access pattern: {}",
+                request.access_pattern
+            ))
+        })?;
 
-        let columns: Vec<ColumnSchema> = request.columns.iter().map(|c| ColumnSchema {
-            name: c.name.clone(),
-            data_type: c.data_type.clone(),
-            nullable: c.nullable,
-            is_primary_key: c.is_primary_key,
-            is_indexed: c.is_indexed.unwrap_or(false),
-            storage_type: StorageType::Row,
-        }).collect();
+        let columns: Vec<ColumnSchema> = request
+            .columns
+            .iter()
+            .map(|c| ColumnSchema {
+                name: c.name.clone(),
+                data_type: c.data_type.clone(),
+                nullable: c.nullable,
+                is_primary_key: c.is_primary_key,
+                is_indexed: c.is_indexed.unwrap_or(false),
+                storage_type: StorageType::Row,
+            })
+            .collect();
 
         let table = TableSchema {
             name: request.name.clone(),
@@ -140,16 +159,25 @@ impl SchemaRoutingAdmin {
     // =========================================================================
 
     /// POST /schema/classify - Manually classify a table
-    pub fn classify_table(&self, request: ClassifyRequest) -> Result<ClassificationResult, AdminError> {
-        let temperature = DataTemperature::from_str(&request.temperature)
-            .ok_or_else(|| AdminError::InvalidInput(format!("Invalid temperature: {}", request.temperature)))?;
+    pub fn classify_table(
+        &self,
+        request: ClassifyRequest,
+    ) -> Result<ClassificationResult, AdminError> {
+        let temperature = DataTemperature::from_str(&request.temperature).ok_or_else(|| {
+            AdminError::InvalidInput(format!("Invalid temperature: {}", request.temperature))
+        })?;
 
-        let workload = WorkloadType::from_str(&request.workload)
-            .ok_or_else(|| AdminError::InvalidInput(format!("Invalid workload: {}", request.workload)))?;
+        let workload = WorkloadType::from_str(&request.workload).ok_or_else(|| {
+            AdminError::InvalidInput(format!("Invalid workload: {}", request.workload))
+        })?;
 
         // Get existing table
-        let mut table = self.registry.get_table(&request.table_name)
-            .ok_or_else(|| AdminError::NotFound(format!("Table not found: {}", request.table_name)))?;
+        let mut table = self
+            .registry
+            .get_table(&request.table_name)
+            .ok_or_else(|| {
+                AdminError::NotFound(format!("Table not found: {}", request.table_name))
+            })?;
 
         // Update classifications
         let old_temperature = table.temperature;
@@ -171,12 +199,18 @@ impl SchemaRoutingAdmin {
     }
 
     /// GET /schema/classify/:table - Get classifier suggestions
-    pub fn get_classification_suggestion(&self, table_name: &str) -> Result<ClassificationSuggestion, AdminError> {
+    pub fn get_classification_suggestion(
+        &self,
+        table_name: &str,
+    ) -> Result<ClassificationSuggestion, AdminError> {
         // Get history from classifier
         let history = self.classifier.get_history(table_name);
 
         if history.is_none() {
-            return Err(AdminError::NotFound(format!("No query history for table: {}", table_name)));
+            return Err(AdminError::NotFound(format!(
+                "No query history for table: {}",
+                table_name
+            )));
         }
 
         let hist = history.expect("history checked above");
@@ -208,18 +242,26 @@ impl SchemaRoutingAdmin {
         let analysis = analyzer.analyze(&query);
 
         // Get primary access pattern from the list
-        let access_pattern = analysis.access_patterns.first()
+        let access_pattern = analysis
+            .access_patterns
+            .first()
             .map(|p| format!("{:?}", p))
             .unwrap_or_else(|| "Mixed".to_string());
 
-        let detected_workload = self.classifier.classify_query(&query)
+        let detected_workload = self
+            .classifier
+            .classify_query(&query)
             .map(|w| format!("{:?}", w));
 
         AnalysisResult {
             query,
             tables: analysis.tables.iter().map(|t| t.name.clone()).collect(),
             access_pattern,
-            shard_keys: analysis.shard_keys.iter().map(|(k, v)| format!("{}={:?}", k, v)).collect(),
+            shard_keys: analysis
+                .shard_keys
+                .iter()
+                .map(|(k, v)| format!("{}={:?}", k, v))
+                .collect(),
             is_read_only: analysis.is_read_only,
             estimated_complexity: analysis.complexity,
             estimated_selectivity: analysis.selectivity,
@@ -267,27 +309,33 @@ impl SchemaRoutingAdmin {
     pub fn get_table_stats(&self) -> Vec<TableStatsResponse> {
         let stats = self.metrics.get_table_stats_for_admin();
 
-        stats.into_iter().map(|(name, s)| TableStatsResponse {
-            table_name: name,
-            query_count: s.query_count,
-            avg_latency_ms: s.avg_latency_ms,
-            hit_rate: s.cache_hit_rate,
-            temperature: format!("{:?}", s.temperature),
-            workload: format!("{:?}", s.workload),
-        }).collect()
+        stats
+            .into_iter()
+            .map(|(name, s)| TableStatsResponse {
+                table_name: name,
+                query_count: s.query_count,
+                avg_latency_ms: s.avg_latency_ms,
+                hit_rate: s.cache_hit_rate,
+                temperature: format!("{:?}", s.temperature),
+                workload: format!("{:?}", s.workload),
+            })
+            .collect()
     }
 
     /// GET /schema/stats/workloads - Get per-workload statistics
     pub fn get_workload_stats(&self) -> Vec<WorkloadStatsResponse> {
         let stats = self.metrics.get_workload_stats_for_admin();
 
-        stats.into_iter().map(|(workload, s)| WorkloadStatsResponse {
-            workload: format!("{:?}", workload),
-            query_count: s.query_count,
-            avg_latency_ms: s.avg_latency_ms,
-            queries_to_primary: s.queries_to_primary,
-            queries_to_replica: s.queries_to_replica,
-        }).collect()
+        stats
+            .into_iter()
+            .map(|(workload, s)| WorkloadStatsResponse {
+                workload: format!("{:?}", workload),
+                query_count: s.query_count,
+                avg_latency_ms: s.avg_latency_ms,
+                queries_to_primary: s.queries_to_primary,
+                queries_to_replica: s.queries_to_replica,
+            })
+            .collect()
     }
 
     // =========================================================================
@@ -296,7 +344,10 @@ impl SchemaRoutingAdmin {
 
     /// POST /schema/discover - Trigger schema discovery
     pub async fn trigger_discovery(&self) -> Result<DiscoveryResult, AdminError> {
-        let tables = self.discovery.discover().await
+        let tables = self
+            .discovery
+            .discover()
+            .await
             .map_err(|e| AdminError::DiscoveryError(e.to_string()))?;
 
         // Register discovered tables
@@ -312,7 +363,9 @@ impl SchemaRoutingAdmin {
 
     /// POST /schema/refresh - Refresh schema cache
     pub async fn refresh_schema(&self) -> Result<RefreshResult, AdminError> {
-        self.discovery.refresh().await
+        self.discovery
+            .refresh()
+            .await
             .map_err(|e| AdminError::DiscoveryError(e.to_string()))?;
 
         Ok(RefreshResult {
@@ -592,10 +645,22 @@ mod tests {
 
     #[test]
     fn test_parse_access_pattern() {
-        assert_eq!(parse_access_pattern("PointLookup"), Some(AccessPattern::PointLookup));
-        assert_eq!(parse_access_pattern("POINT_LOOKUP"), Some(AccessPattern::PointLookup));
-        assert_eq!(parse_access_pattern("RangeScan"), Some(AccessPattern::RangeScan));
-        assert_eq!(parse_access_pattern("VectorSearch"), Some(AccessPattern::VectorSearch));
+        assert_eq!(
+            parse_access_pattern("PointLookup"),
+            Some(AccessPattern::PointLookup)
+        );
+        assert_eq!(
+            parse_access_pattern("POINT_LOOKUP"),
+            Some(AccessPattern::PointLookup)
+        );
+        assert_eq!(
+            parse_access_pattern("RangeScan"),
+            Some(AccessPattern::RangeScan)
+        );
+        assert_eq!(
+            parse_access_pattern("VectorSearch"),
+            Some(AccessPattern::VectorSearch)
+        );
         assert_eq!(parse_access_pattern("Mixed"), Some(AccessPattern::Mixed));
         assert_eq!(parse_access_pattern("Invalid"), None);
     }

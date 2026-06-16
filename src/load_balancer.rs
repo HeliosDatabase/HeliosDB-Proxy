@@ -60,8 +60,7 @@ pub enum RoutingStrategy {
 /// This enum enables the load balancer to handle intermediate states
 /// during failover, allowing for graceful degradation rather than
 /// binary healthy/unhealthy transitions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NodeHealth {
     /// Node is operating normally - can serve all traffic
     #[default]
@@ -90,7 +89,6 @@ impl NodeHealth {
         !matches!(self, NodeHealth::Unhealthy)
     }
 }
-
 
 /// Node state for load balancing
 #[derive(Debug, Clone)]
@@ -171,12 +169,12 @@ impl LoadBalancer {
         // Use blocking for sync compatibility
         let rt = tokio::runtime::Handle::try_current();
         let nodes_guard = match rt {
-            Ok(handle) => {
-                handle.block_on(async { self.nodes.read().await })
-            }
+            Ok(handle) => handle.block_on(async { self.nodes.read().await }),
             Err(_) => {
                 // Fallback: return error if no runtime
-                return Err(ProxyError::Routing("No async runtime available".to_string()));
+                return Err(ProxyError::Routing(
+                    "No async runtime available".to_string(),
+                ));
             }
         };
 
@@ -222,18 +220,20 @@ impl LoadBalancer {
 
         let rt = tokio::runtime::Handle::try_current();
         let nodes_guard = match rt {
-            Ok(handle) => {
-                handle.block_on(async { self.nodes.read().await })
-            }
+            Ok(handle) => handle.block_on(async { self.nodes.read().await }),
             Err(_) => {
-                return Err(ProxyError::Routing("No async runtime available".to_string()));
+                return Err(ProxyError::Routing(
+                    "No async runtime available".to_string(),
+                ));
             }
         };
 
         // For writes, require fully healthy primary (not degraded)
-        let primary = nodes_guard
-            .values()
-            .find(|n| n.endpoint.role == NodeRole::Primary && n.health.can_serve_writes() && n.endpoint.enabled);
+        let primary = nodes_guard.values().find(|n| {
+            n.endpoint.role == NodeRole::Primary
+                && n.health.can_serve_writes()
+                && n.endpoint.enabled
+        });
 
         match primary {
             Some(node) => Ok(node.endpoint.clone()),
@@ -248,13 +248,11 @@ impl LoadBalancer {
         strategy: RoutingStrategy,
     ) -> Result<&'a NodeState> {
         match strategy {
-            RoutingStrategy::PrimaryOnly => {
-                nodes
-                    .iter()
-                    .find(|n| n.endpoint.role == NodeRole::Primary)
-                    .copied()
-                    .ok_or(ProxyError::NoHealthyNodes)
-            }
+            RoutingStrategy::PrimaryOnly => nodes
+                .iter()
+                .find(|n| n.endpoint.role == NodeRole::Primary)
+                .copied()
+                .ok_or(ProxyError::NoHealthyNodes),
             RoutingStrategy::RoundRobin => {
                 let idx = self.rr_counter.fetch_add(1, Ordering::SeqCst) as usize;
                 Ok(nodes[idx % nodes.len()])
@@ -278,24 +276,20 @@ impl LoadBalancer {
 
                 Ok(nodes[0])
             }
-            RoutingStrategy::LeastConnections => {
-                nodes
-                    .iter()
-                    .min_by_key(|n| n.connections)
-                    .copied()
-                    .ok_or(ProxyError::NoHealthyNodes)
-            }
-            RoutingStrategy::LatencyBased => {
-                nodes
-                    .iter()
-                    .min_by(|a, b| {
-                        a.avg_latency_ms
-                            .partial_cmp(&b.avg_latency_ms)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .copied()
-                    .ok_or(ProxyError::NoHealthyNodes)
-            }
+            RoutingStrategy::LeastConnections => nodes
+                .iter()
+                .min_by_key(|n| n.connections)
+                .copied()
+                .ok_or(ProxyError::NoHealthyNodes),
+            RoutingStrategy::LatencyBased => nodes
+                .iter()
+                .min_by(|a, b| {
+                    a.avg_latency_ms
+                        .partial_cmp(&b.avg_latency_ms)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .copied()
+                .ok_or(ProxyError::NoHealthyNodes),
             RoutingStrategy::Random => {
                 use std::time::{SystemTime, UNIX_EPOCH};
                 let seed = SystemTime::now()
@@ -323,19 +317,29 @@ impl LoadBalancer {
         if let Some(node) = self.nodes.write().await.get_mut(node_id) {
             let old_health = node.health;
             node.health = health;
-            tracing::debug!("Node {:?} health changed: {:?} -> {:?}", node_id, old_health, health);
+            tracing::debug!(
+                "Node {:?} health changed: {:?} -> {:?}",
+                node_id,
+                old_health,
+                health
+            );
         }
     }
 
     /// Legacy method for backward compatibility
     pub async fn set_node_healthy(&self, node_id: &NodeId, healthy: bool) {
-        let health = if healthy { NodeHealth::Healthy } else { NodeHealth::Unhealthy };
+        let health = if healthy {
+            NodeHealth::Healthy
+        } else {
+            NodeHealth::Unhealthy
+        };
         self.set_node_health(node_id, health).await;
     }
 
     /// Mark node as transitioning (failover in progress)
     pub async fn set_node_transitioning(&self, node_id: &NodeId) {
-        self.set_node_health(node_id, NodeHealth::Transitioning).await;
+        self.set_node_health(node_id, NodeHealth::Transitioning)
+            .await;
     }
 
     /// Update node latency and adjust health state accordingly
@@ -365,7 +369,9 @@ impl LoadBalancer {
                         node_id,
                         latency_ms
                     );
-                } else if node.health == NodeHealth::Degraded || node.health == NodeHealth::Unhealthy {
+                } else if node.health == NodeHealth::Degraded
+                    || node.health == NodeHealth::Unhealthy
+                {
                     // Recovery: if latency is back to normal, restore to healthy
                     node.health = NodeHealth::Healthy;
                     tracing::info!("Node {:?} recovered, marked healthy", node_id);
@@ -377,7 +383,7 @@ impl LoadBalancer {
     /// Update node replication lag and adjust health state
     pub async fn update_replication_lag(&self, node_id: &NodeId, lag_ms: u64) {
         // Thresholds for replication lag (configurable in production)
-        const DEGRADED_LAG_MS: u64 = 5000;   // 5 seconds = degraded
+        const DEGRADED_LAG_MS: u64 = 5000; // 5 seconds = degraded
         const UNHEALTHY_LAG_MS: u64 = 30000; // 30 seconds = unhealthy
 
         if let Some(node) = self.nodes.write().await.get_mut(node_id) {
@@ -399,7 +405,9 @@ impl LoadBalancer {
                         node_id,
                         lag_ms
                     );
-                } else if node.health == NodeHealth::Degraded && node.avg_latency_ms < self.config.latency_threshold_ms as f64 * 0.7 {
+                } else if node.health == NodeHealth::Degraded
+                    && node.avg_latency_ms < self.config.latency_threshold_ms as f64 * 0.7
+                {
                     // Recovery: lag is acceptable and latency is good
                     node.health = NodeHealth::Healthy;
                     tracing::info!("Node {:?} recovered from lag, marked healthy", node_id);
@@ -410,7 +418,13 @@ impl LoadBalancer {
 
     /// Update node health based on combined metrics
     #[allow(clippy::if_same_then_else)]
-    pub async fn update_node_metrics(&self, node_id: &NodeId, latency_ms: f64, replication_lag_ms: u64, failure_rate: f64) {
+    pub async fn update_node_metrics(
+        &self,
+        node_id: &NodeId,
+        latency_ms: f64,
+        replication_lag_ms: u64,
+        failure_rate: f64,
+    ) {
         if let Some(node) = self.nodes.write().await.get_mut(node_id) {
             // Update metrics
             node.avg_latency_ms = 0.2 * latency_ms + 0.8 * node.avg_latency_ms;
@@ -423,14 +437,22 @@ impl LoadBalancer {
                     NodeHealth::Unhealthy
                 } else if replication_lag_ms > 30000 {
                     NodeHealth::Unhealthy
-                } else if replication_lag_ms > 5000 || failure_rate > 0.5 || latency_ms > self.config.latency_threshold_ms as f64 {
+                } else if replication_lag_ms > 5000
+                    || failure_rate > 0.5
+                    || latency_ms > self.config.latency_threshold_ms as f64
+                {
                     NodeHealth::Degraded
                 } else {
                     NodeHealth::Healthy
                 };
 
                 if new_health != node.health {
-                    tracing::debug!("Node {:?} health: {:?} -> {:?}", node_id, node.health, new_health);
+                    tracing::debug!(
+                        "Node {:?} health: {:?} -> {:?}",
+                        node_id,
+                        node.health,
+                        new_health
+                    );
                     node.health = new_health;
                 }
             }

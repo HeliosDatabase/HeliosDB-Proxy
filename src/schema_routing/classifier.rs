@@ -2,13 +2,13 @@
 //!
 //! Automatically learns and updates table classifications from query patterns.
 
+use dashmap::DashMap;
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use dashmap::DashMap;
-use parking_lot::RwLock;
 
-use super::registry::{SchemaRegistry, DataTemperature, WorkloadType};
+use super::registry::{DataTemperature, SchemaRegistry, WorkloadType};
 
 /// Learning-based table classifier
 #[derive(Debug)]
@@ -46,9 +46,7 @@ impl LearningClassifier {
 
     /// Record a query execution
     pub fn record(&self, table: &str, query_type: QueryType, latency: Duration) {
-        let mut history = self.history
-            .entry(table.to_string())
-            .or_default();
+        let mut history = self.history.entry(table.to_string()).or_default();
 
         history.record(query_type, latency);
 
@@ -74,7 +72,8 @@ impl LearningClassifier {
         let workload = model.classify_workload(&history);
 
         // Update schema registry
-        self.schema.update_classification(table, temperature, workload);
+        self.schema
+            .update_classification(table, temperature, workload);
     }
 
     /// Get current classification for a table
@@ -262,7 +261,8 @@ impl QueryHistory {
         let now = Instant::now();
 
         // Remove old samples (older than 5 minutes)
-        self.qpm_samples.retain(|(t, _)| now.duration_since(*t) < Duration::from_secs(300));
+        self.qpm_samples
+            .retain(|(t, _)| now.duration_since(*t) < Duration::from_secs(300));
 
         // Add current count
         self.qpm_samples.push((now, self.total_count));
@@ -319,7 +319,10 @@ impl QueryHistory {
         sorted.sort();
 
         let idx = (sorted.len() as f64 * 0.95) as usize;
-        sorted.get(idx.min(sorted.len() - 1)).copied().unwrap_or(Duration::ZERO)
+        sorted
+            .get(idx.min(sorted.len() - 1))
+            .copied()
+            .unwrap_or(Duration::ZERO)
     }
 
     /// Get last updated time
@@ -369,9 +372,13 @@ pub enum QueryType {
 impl QueryType {
     /// Check if this is a read query
     pub fn is_read(&self) -> bool {
-        matches!(self,
-            QueryType::SimpleSelect | QueryType::AggregateSelect |
-            QueryType::JoinSelect | QueryType::VectorSearch)
+        matches!(
+            self,
+            QueryType::SimpleSelect
+                | QueryType::AggregateSelect
+                | QueryType::JoinSelect
+                | QueryType::VectorSearch
+        )
     }
 
     /// Check if this is a write query
@@ -553,12 +560,27 @@ mod tests {
 
     #[test]
     fn test_query_type_detection() {
-        assert_eq!(QueryType::from_sql("INSERT INTO users VALUES (1)"), QueryType::Insert);
-        assert_eq!(QueryType::from_sql("UPDATE users SET name = 'x'"), QueryType::Update);
+        assert_eq!(
+            QueryType::from_sql("INSERT INTO users VALUES (1)"),
+            QueryType::Insert
+        );
+        assert_eq!(
+            QueryType::from_sql("UPDATE users SET name = 'x'"),
+            QueryType::Update
+        );
         assert_eq!(QueryType::from_sql("DELETE FROM users"), QueryType::Delete);
-        assert_eq!(QueryType::from_sql("SELECT COUNT(*) FROM users"), QueryType::AggregateSelect);
-        assert_eq!(QueryType::from_sql("SELECT * FROM users"), QueryType::SimpleSelect);
-        assert_eq!(QueryType::from_sql("SELECT * FROM a JOIN b ON a.id = b.id"), QueryType::JoinSelect);
+        assert_eq!(
+            QueryType::from_sql("SELECT COUNT(*) FROM users"),
+            QueryType::AggregateSelect
+        );
+        assert_eq!(
+            QueryType::from_sql("SELECT * FROM users"),
+            QueryType::SimpleSelect
+        );
+        assert_eq!(
+            QueryType::from_sql("SELECT * FROM a JOIN b ON a.id = b.id"),
+            QueryType::JoinSelect
+        );
     }
 
     #[test]
@@ -609,7 +631,12 @@ mod tests {
         // QPM calculation needs a time window; in tests all queries are instantaneous
         // so QPM may be 0, resulting in Frozen classification
         let temp = model.classify_temperature(&history);
-        assert!(temp == DataTemperature::Hot || temp == DataTemperature::Warm || temp == DataTemperature::Cold || temp == DataTemperature::Frozen);
+        assert!(
+            temp == DataTemperature::Hot
+                || temp == DataTemperature::Warm
+                || temp == DataTemperature::Cold
+                || temp == DataTemperature::Frozen
+        );
     }
 
     #[test]

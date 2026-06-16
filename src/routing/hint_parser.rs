@@ -10,7 +10,7 @@
 //! /*helios:key1=value1,key2=value2*/
 //! ```
 
-use super::{parse_duration, RoutingError, Result};
+use super::{parse_duration, Result, RoutingError};
 use regex::Regex;
 use std::str::FromStr;
 use std::sync::LazyLock;
@@ -21,15 +21,13 @@ use crate::pool::PoolingMode;
 
 /// Compiled regex for hint parsing
 #[allow(clippy::incompatible_msrv)]
-static HINT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"/\*\s*helios:([^*]+)\*/").expect("Invalid hint regex")
-});
+static HINT_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"/\*\s*helios:([^*]+)\*/").expect("Invalid hint regex"));
 
 /// Key-value pair regex
 #[allow(clippy::incompatible_msrv)]
-static KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(\w+)\s*=\s*([^,\s]+)").expect("Invalid key-value regex")
-});
+static KV_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\w+)\s*=\s*([^,\s]+)").expect("Invalid key-value regex"));
 
 /// Hint parser for SQL routing hints
 #[derive(Debug, Clone, Default)]
@@ -75,19 +73,29 @@ impl HintParser {
         match key.to_lowercase().as_str() {
             "route" => RouteTarget::from_str(value).ok().map(RoutingHint::Route),
             "node" => Some(RoutingHint::Node(value.to_string())),
-            "consistency" => ConsistencyLevel::from_str(value).ok().map(RoutingHint::Consistency),
+            "consistency" => ConsistencyLevel::from_str(value)
+                .ok()
+                .map(RoutingHint::Consistency),
             "pool" => PoolingModeHint::from_str(value).ok().map(RoutingHint::Pool),
             "cache" => CacheBehavior::from_str(value).ok().map(RoutingHint::Cache),
             "timeout" => parse_duration(value).map(RoutingHint::Timeout),
-            "priority" => QueryPriority::from_str(value).ok().map(RoutingHint::Priority),
+            "priority" => QueryPriority::from_str(value)
+                .ok()
+                .map(RoutingHint::Priority),
             "lag" => parse_duration(value).map(RoutingHint::MaxLag),
             "retry" => self.parse_retry(value).map(RoutingHint::Retry),
             "branch" => Some(RoutingHint::Branch(value.to_string())),
-            "twr" => value.parse::<bool>().ok().map(RoutingHint::TransparentWriteRouting),
+            "twr" => value
+                .parse::<bool>()
+                .ok()
+                .map(RoutingHint::TransparentWriteRouting),
             "tool" => Some(RoutingHint::AgentTool(value.to_string())),
             "workflow" => Some(RoutingHint::WorkflowStep(value.to_string())),
             "prefetch" => value.parse::<bool>().ok().map(RoutingHint::Prefetch),
-            "cache_ttl" => value.parse::<u64>().ok().map(|s| RoutingHint::CacheTtl(Duration::from_secs(s))),
+            "cache_ttl" => value
+                .parse::<u64>()
+                .ok()
+                .map(|s| RoutingHint::CacheTtl(Duration::from_secs(s))),
             _ => None,
         }
     }
@@ -191,8 +199,10 @@ impl ParsedHints {
     pub fn is_standby_route(&self) -> bool {
         matches!(
             self.route,
-            Some(RouteTarget::Standby) | Some(RouteTarget::Sync) |
-            Some(RouteTarget::SemiSync) | Some(RouteTarget::Async)
+            Some(RouteTarget::Standby)
+                | Some(RouteTarget::Sync)
+                | Some(RouteTarget::SemiSync)
+                | Some(RouteTarget::Async)
         )
     }
 
@@ -299,7 +309,10 @@ impl FromStr for RouteTarget {
             "any" | "all" => Ok(RouteTarget::Any),
             "local" | "nearest" => Ok(RouteTarget::Local),
             "vector" => Ok(RouteTarget::Vector),
-            _ => Err(RoutingError::ParseError(format!("Unknown route target: {}", s))),
+            _ => Err(RoutingError::ParseError(format!(
+                "Unknown route target: {}",
+                s
+            ))),
         }
     }
 }
@@ -338,7 +351,10 @@ impl FromStr for ConsistencyLevel {
             "strong" | "strict" | "linearizable" => Ok(ConsistencyLevel::Strong),
             "bounded" | "session" | "read-your-writes" => Ok(ConsistencyLevel::Bounded),
             "eventual" | "weak" => Ok(ConsistencyLevel::Eventual),
-            _ => Err(RoutingError::ParseError(format!("Unknown consistency level: {}", s))),
+            _ => Err(RoutingError::ParseError(format!(
+                "Unknown consistency level: {}",
+                s
+            ))),
         }
     }
 }
@@ -369,7 +385,10 @@ impl FromStr for PoolingModeHint {
             "session" => Ok(PoolingModeHint::Session),
             "transaction" | "tx" => Ok(PoolingModeHint::Transaction),
             "statement" | "stmt" | "query" => Ok(PoolingModeHint::Statement),
-            _ => Err(RoutingError::ParseError(format!("Unknown pool mode: {}", s))),
+            _ => Err(RoutingError::ParseError(format!(
+                "Unknown pool mode: {}",
+                s
+            ))),
         }
     }
 }
@@ -413,14 +432,16 @@ impl FromStr for CacheBehavior {
             "semantic" | "l3" | "vector" => Ok(CacheBehavior::Semantic),
             "l1" | "hot" => Ok(CacheBehavior::L1Only),
             "l2" | "warm" => Ok(CacheBehavior::L2Only),
-            _ => Err(RoutingError::ParseError(format!("Unknown cache behavior: {}", s))),
+            _ => Err(RoutingError::ParseError(format!(
+                "Unknown cache behavior: {}",
+                s
+            ))),
         }
     }
 }
 
 /// Query priority levels
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum QueryPriority {
     Low = 0,
     #[default]
@@ -443,10 +464,8 @@ impl FromStr for QueryPriority {
     }
 }
 
-
 /// Retry behavior
-#[derive(Debug, Clone, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum RetryBehavior {
     /// No retry
     None,
@@ -456,7 +475,6 @@ pub enum RetryBehavior {
     /// Retry specific number of times
     Count(u32),
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -475,7 +493,7 @@ mod tests {
     fn test_parse_multiple_hints() {
         let parser = HintParser::new();
         let hints = parser.parse(
-            "/*helios:route=standby,consistency=eventual,timeout=5s*/ SELECT * FROM products"
+            "/*helios:route=standby,consistency=eventual,timeout=5s*/ SELECT * FROM products",
         );
 
         assert_eq!(hints.len(), 3);
@@ -554,10 +572,22 @@ mod tests {
 
     #[test]
     fn test_route_target_parsing() {
-        assert_eq!(RouteTarget::from_str("primary").unwrap(), RouteTarget::Primary);
-        assert_eq!(RouteTarget::from_str("master").unwrap(), RouteTarget::Primary);
-        assert_eq!(RouteTarget::from_str("standby").unwrap(), RouteTarget::Standby);
-        assert_eq!(RouteTarget::from_str("replica").unwrap(), RouteTarget::Standby);
+        assert_eq!(
+            RouteTarget::from_str("primary").unwrap(),
+            RouteTarget::Primary
+        );
+        assert_eq!(
+            RouteTarget::from_str("master").unwrap(),
+            RouteTarget::Primary
+        );
+        assert_eq!(
+            RouteTarget::from_str("standby").unwrap(),
+            RouteTarget::Standby
+        );
+        assert_eq!(
+            RouteTarget::from_str("replica").unwrap(),
+            RouteTarget::Standby
+        );
         assert_eq!(RouteTarget::from_str("sync").unwrap(), RouteTarget::Sync);
         assert_eq!(RouteTarget::from_str("async").unwrap(), RouteTarget::Async);
         assert_eq!(RouteTarget::from_str("local").unwrap(), RouteTarget::Local);
@@ -565,9 +595,18 @@ mod tests {
 
     #[test]
     fn test_consistency_level_parsing() {
-        assert_eq!(ConsistencyLevel::from_str("strong").unwrap(), ConsistencyLevel::Strong);
-        assert_eq!(ConsistencyLevel::from_str("bounded").unwrap(), ConsistencyLevel::Bounded);
-        assert_eq!(ConsistencyLevel::from_str("eventual").unwrap(), ConsistencyLevel::Eventual);
+        assert_eq!(
+            ConsistencyLevel::from_str("strong").unwrap(),
+            ConsistencyLevel::Strong
+        );
+        assert_eq!(
+            ConsistencyLevel::from_str("bounded").unwrap(),
+            ConsistencyLevel::Bounded
+        );
+        assert_eq!(
+            ConsistencyLevel::from_str("eventual").unwrap(),
+            ConsistencyLevel::Eventual
+        );
     }
 
     #[test]
@@ -588,8 +627,14 @@ mod tests {
         assert_eq!(hints.route, Some(RouteTarget::Async));
 
         // Check for tool and workflow hints in the list
-        let has_tool = hints.hints().iter().any(|h| matches!(h, RoutingHint::AgentTool(t) if t == "knowledge_search"));
-        let has_workflow = hints.hints().iter().any(|h| matches!(h, RoutingHint::WorkflowStep(w) if w == "planning"));
+        let has_tool = hints
+            .hints()
+            .iter()
+            .any(|h| matches!(h, RoutingHint::AgentTool(t) if t == "knowledge_search"));
+        let has_workflow = hints
+            .hints()
+            .iter()
+            .any(|h| matches!(h, RoutingHint::WorkflowStep(w) if w == "planning"));
 
         assert!(has_tool);
         assert!(has_workflow);

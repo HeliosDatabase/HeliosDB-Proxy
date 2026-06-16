@@ -153,9 +153,15 @@ impl DistribCacheMetrics {
     pub fn record_hit(&self, tier: CacheTier) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
         match tier {
-            CacheTier::L1 => { self.l1_hits.fetch_add(1, Ordering::Relaxed); }
-            CacheTier::L2 => { self.l2_hits.fetch_add(1, Ordering::Relaxed); }
-            CacheTier::L3 => { self.l3_hits.fetch_add(1, Ordering::Relaxed); }
+            CacheTier::L1 => {
+                self.l1_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            CacheTier::L2 => {
+                self.l2_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            CacheTier::L3 => {
+                self.l3_hits.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -163,9 +169,15 @@ impl DistribCacheMetrics {
     pub fn record_miss(&self, tier: CacheTier) {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
         match tier {
-            CacheTier::L1 => { self.l1_misses.fetch_add(1, Ordering::Relaxed); }
-            CacheTier::L2 => { self.l2_misses.fetch_add(1, Ordering::Relaxed); }
-            CacheTier::L3 => { self.l3_misses.fetch_add(1, Ordering::Relaxed); }
+            CacheTier::L1 => {
+                self.l1_misses.fetch_add(1, Ordering::Relaxed);
+            }
+            CacheTier::L2 => {
+                self.l2_misses.fetch_add(1, Ordering::Relaxed);
+            }
+            CacheTier::L3 => {
+                self.l3_misses.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -183,9 +195,15 @@ impl DistribCacheMetrics {
     pub fn record_invalidation(&self, source: InvalidationSource) {
         self.cache_invalidations.fetch_add(1, Ordering::Relaxed);
         match source {
-            InvalidationSource::WAL => { self.wal_invalidations.fetch_add(1, Ordering::Relaxed); }
-            InvalidationSource::TTL => { self.ttl_invalidations.fetch_add(1, Ordering::Relaxed); }
-            InvalidationSource::Manual => { self.manual_invalidations.fetch_add(1, Ordering::Relaxed); }
+            InvalidationSource::WAL => {
+                self.wal_invalidations.fetch_add(1, Ordering::Relaxed);
+            }
+            InvalidationSource::TTL => {
+                self.ttl_invalidations.fetch_add(1, Ordering::Relaxed);
+            }
+            InvalidationSource::Manual => {
+                self.manual_invalidations.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -211,12 +229,24 @@ impl DistribCacheMetrics {
     /// Record workload type
     pub fn record_workload(&self, workload: WorkloadType) {
         match workload {
-            WorkloadType::OLTP => { self.oltp_queries.fetch_add(1, Ordering::Relaxed); }
-            WorkloadType::OLAP => { self.olap_queries.fetch_add(1, Ordering::Relaxed); }
-            WorkloadType::Vector => { self.vector_queries.fetch_add(1, Ordering::Relaxed); }
-            WorkloadType::AIAgent => { self.ai_agent_queries.fetch_add(1, Ordering::Relaxed); }
-            WorkloadType::RAG => { self.rag_queries.fetch_add(1, Ordering::Relaxed); }
-            WorkloadType::Mixed => { self.mixed_queries.fetch_add(1, Ordering::Relaxed); }
+            WorkloadType::OLTP => {
+                self.oltp_queries.fetch_add(1, Ordering::Relaxed);
+            }
+            WorkloadType::OLAP => {
+                self.olap_queries.fetch_add(1, Ordering::Relaxed);
+            }
+            WorkloadType::Vector => {
+                self.vector_queries.fetch_add(1, Ordering::Relaxed);
+            }
+            WorkloadType::AIAgent => {
+                self.ai_agent_queries.fetch_add(1, Ordering::Relaxed);
+            }
+            WorkloadType::RAG => {
+                self.rag_queries.fetch_add(1, Ordering::Relaxed);
+            }
+            WorkloadType::Mixed => {
+                self.mixed_queries.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -242,8 +272,12 @@ impl DistribCacheMetrics {
     pub fn record_error(&self, error_type: ErrorType) {
         self.cache_errors.fetch_add(1, Ordering::Relaxed);
         match error_type {
-            ErrorType::Timeout => { self.timeout_errors.fetch_add(1, Ordering::Relaxed); }
-            ErrorType::Serialization => { self.serialization_errors.fetch_add(1, Ordering::Relaxed); }
+            ErrorType::Timeout => {
+                self.timeout_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            ErrorType::Serialization => {
+                self.serialization_errors.fetch_add(1, Ordering::Relaxed);
+            }
             ErrorType::Other => {}
         }
     }
@@ -356,15 +390,15 @@ impl DistribCacheMetrics {
              distribcache_latency_bucket{{le=\"0.1\"}} {}\n\
              distribcache_latency_bucket{{le=\"+Inf\"}} {}\n\n",
             self.latency_under_100us.load(Ordering::Relaxed),
-            self.latency_under_100us.load(Ordering::Relaxed) +
-                self.latency_100us_1ms.load(Ordering::Relaxed),
-            self.latency_under_100us.load(Ordering::Relaxed) +
-                self.latency_100us_1ms.load(Ordering::Relaxed) +
-                self.latency_1ms_10ms.load(Ordering::Relaxed),
-            self.latency_under_100us.load(Ordering::Relaxed) +
-                self.latency_100us_1ms.load(Ordering::Relaxed) +
-                self.latency_1ms_10ms.load(Ordering::Relaxed) +
-                self.latency_10ms_100ms.load(Ordering::Relaxed),
+            self.latency_under_100us.load(Ordering::Relaxed)
+                + self.latency_100us_1ms.load(Ordering::Relaxed),
+            self.latency_under_100us.load(Ordering::Relaxed)
+                + self.latency_100us_1ms.load(Ordering::Relaxed)
+                + self.latency_1ms_10ms.load(Ordering::Relaxed),
+            self.latency_under_100us.load(Ordering::Relaxed)
+                + self.latency_100us_1ms.load(Ordering::Relaxed)
+                + self.latency_1ms_10ms.load(Ordering::Relaxed)
+                + self.latency_10ms_100ms.load(Ordering::Relaxed),
             self.latency_count.load(Ordering::Relaxed),
         ));
 
@@ -606,9 +640,9 @@ mod tests {
     fn test_record_latency() {
         let metrics = DistribCacheMetrics::new();
 
-        metrics.record_latency(Duration::from_micros(50));   // under 100us
-        metrics.record_latency(Duration::from_micros(500));  // 100us-1ms
-        metrics.record_latency(Duration::from_millis(5));    // 1ms-10ms
+        metrics.record_latency(Duration::from_micros(50)); // under 100us
+        metrics.record_latency(Duration::from_micros(500)); // 100us-1ms
+        metrics.record_latency(Duration::from_millis(5)); // 1ms-10ms
 
         assert_eq!(metrics.latency_under_100us.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.latency_100us_1ms.load(Ordering::Relaxed), 1);

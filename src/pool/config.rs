@@ -183,9 +183,7 @@ impl PoolModeConfig {
         if self.default_mode == PoolingMode::Statement
             && self.prepared_statement_mode == PreparedStatementMode::Named
         {
-            return Err(
-                "Statement mode cannot use named prepared statements".to_string()
-            );
+            return Err("Statement mode cannot use named prepared statements".to_string());
         }
 
         Ok(())

@@ -197,8 +197,7 @@ impl BucketedCounter {
         let elapsed = now.duration_since(*last_update);
 
         // How many bucket periods have elapsed?
-        let buckets_to_clear =
-            (elapsed.as_nanos() / self.bucket_duration.as_nanos()) as usize;
+        let buckets_to_clear = (elapsed.as_nanos() / self.bucket_duration.as_nanos()) as usize;
 
         if buckets_to_clear > 0 {
             let mut buckets = self.buckets.lock().expect("lock poisoned");

@@ -175,10 +175,7 @@ impl SessionHistory {
 
     fn count_in_window(&self, window: Duration) -> usize {
         let cutoff = Instant::now() - window;
-        self.query_times
-            .iter()
-            .filter(|t| **t > cutoff)
-            .count()
+        self.query_times.iter().filter(|t| **t > cutoff).count()
     }
 
     fn count_fingerprint_in_window(&self, hash: u64, window: Duration) -> usize {
@@ -189,7 +186,10 @@ impl SessionHistory {
             .count()
     }
 
-    fn get_repeated_fingerprints(&self, threshold: usize) -> Vec<(u64, usize, String, Vec<String>)> {
+    fn get_repeated_fingerprints(
+        &self,
+        threshold: usize,
+    ) -> Vec<(u64, usize, String, Vec<String>)> {
         let mut counts: std::collections::HashMap<u64, (usize, String, Vec<String>)> =
             std::collections::HashMap::new();
 
@@ -380,9 +380,8 @@ impl PatternDetector {
 
         // Remove inactive sessions
         let timeout = self.config.session_timeout;
-        self.sessions.retain(|_, session| {
-            now.duration_since(session.last_activity) < timeout
-        });
+        self.sessions
+            .retain(|_, session| now.duration_since(session.last_activity) < timeout);
 
         // Enforce max sessions
         while self.sessions.len() > self.config.max_sessions {
@@ -457,10 +456,8 @@ mod tests {
         for i in 0..5 {
             let query = format!("SELECT * FROM users WHERE id = {}", i);
             let fingerprint = fp.fingerprint(&query);
-            let execution = super::super::statistics::QueryExecution::new(
-                query,
-                Duration::from_millis(5),
-            );
+            let execution =
+                super::super::statistics::QueryExecution::new(query, Duration::from_millis(5));
             detector.record_query(session_id, &execution, &fingerprint);
         }
 
@@ -485,10 +482,8 @@ mod tests {
         for i in 0..10 {
             let query = format!("SELECT * FROM table_{}", i);
             let fingerprint = fp.fingerprint(&query);
-            let execution = super::super::statistics::QueryExecution::new(
-                query,
-                Duration::from_millis(1),
-            );
+            let execution =
+                super::super::statistics::QueryExecution::new(query, Duration::from_millis(1));
             detector.record_query(session_id, &execution, &fingerprint);
         }
 
@@ -524,10 +519,8 @@ mod tests {
 
         // Record query in session
         let fingerprint = fp.fingerprint("SELECT 1");
-        let execution = super::super::statistics::QueryExecution::new(
-            "SELECT 1",
-            Duration::from_millis(1),
-        );
+        let execution =
+            super::super::statistics::QueryExecution::new("SELECT 1", Duration::from_millis(1));
         detector.record_query("session-1", &execution, &fingerprint);
 
         assert_eq!(detector.session_count(), 1);
@@ -549,10 +542,8 @@ mod tests {
         let fp = QueryFingerprinter::new();
 
         let fingerprint = fp.fingerprint("SELECT 1");
-        let execution = super::super::statistics::QueryExecution::new(
-            "SELECT 1",
-            Duration::from_millis(1),
-        );
+        let execution =
+            super::super::statistics::QueryExecution::new("SELECT 1", Duration::from_millis(1));
         detector.record_query("session-1", &execution, &fingerprint);
 
         detector.reset();

@@ -71,9 +71,8 @@ pub async fn negotiate(
 
     match reply[0] {
         b'S' => {
-            let dns = ServerName::try_from(sni.to_string()).map_err(|_| {
-                BackendError::Tls(format!("invalid SNI hostname: {:?}", sni))
-            })?;
+            let dns = ServerName::try_from(sni.to_string())
+                .map_err(|_| BackendError::Tls(format!("invalid SNI hostname: {:?}", sni)))?;
             let connector = TlsConnector::from(config);
             let tls = connector
                 .connect(dns, tcp)

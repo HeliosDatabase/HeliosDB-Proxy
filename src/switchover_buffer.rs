@@ -23,13 +23,13 @@
 //! If switchover takes longer than `buffer_timeout`, buffered queries
 //! will fail with a timeout error rather than blocking indefinitely.
 
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use parking_lot::Mutex;
 use tokio::sync::{broadcast, oneshot};
 
-use super::{Result, ProxyError};
+use super::{ProxyError, Result};
 
 /// Buffer configuration
 #[derive(Debug, Clone)]
@@ -154,10 +154,13 @@ impl SwitchoverBuffer {
     /// Start buffering (called when switchover begins)
     pub fn start_buffering(&self) {
         self.is_buffering.store(true, Ordering::SeqCst);
-        self.state.store(BufferState::Buffering as u64, Ordering::SeqCst);
+        self.state
+            .store(BufferState::Buffering as u64, Ordering::SeqCst);
         *self.buffering_started.lock() = Some(Instant::now());
 
-        self.stats.buffering_sessions.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .buffering_sessions
+            .fetch_add(1, Ordering::Relaxed);
 
         let _ = self.state_tx.send(BufferState::Buffering);
 
@@ -167,9 +170,12 @@ impl SwitchoverBuffer {
     /// Stop buffering (called when switchover completes or fails)
     pub fn stop_buffering(&self) {
         self.is_buffering.store(false, Ordering::SeqCst);
-        self.state.store(BufferState::Draining as u64, Ordering::SeqCst);
+        self.state
+            .store(BufferState::Draining as u64, Ordering::SeqCst);
 
-        let duration = self.buffering_started.lock()
+        let duration = self
+            .buffering_started
+            .lock()
             .map(|start| start.elapsed())
             .unwrap_or_default();
 
@@ -213,7 +219,9 @@ impl SwitchoverBuffer {
         let current_memory = self.buffer_memory.load(Ordering::Relaxed) as usize;
         if current_memory + query_size > self.config.max_buffer_memory {
             self.stats.rejected_queries.fetch_add(1, Ordering::Relaxed);
-            return Err(ProxyError::PoolExhausted("Buffer memory exhausted".to_string()));
+            return Err(ProxyError::PoolExhausted(
+                "Buffer memory exhausted".to_string(),
+            ));
         }
 
         // Create response channel
@@ -230,7 +238,8 @@ impl SwitchoverBuffer {
 
         // Add to buffer
         self.buffer.lock().push_back(buffered);
-        self.buffer_memory.fetch_add(query_size as u64, Ordering::Relaxed);
+        self.buffer_memory
+            .fetch_add(query_size as u64, Ordering::Relaxed);
         self.stats.buffered_queries.fetch_add(1, Ordering::Relaxed);
 
         Ok(response_rx)
@@ -280,12 +289,19 @@ impl SwitchoverBuffer {
             }
         }
 
-        self.stats.replayed_queries.fetch_add(success, Ordering::Relaxed);
-        self.stats.failed_replays.fetch_add(failed, Ordering::Relaxed);
-        self.stats.timed_out_queries.fetch_add(timed_out, Ordering::Relaxed);
+        self.stats
+            .replayed_queries
+            .fetch_add(success, Ordering::Relaxed);
+        self.stats
+            .failed_replays
+            .fetch_add(failed, Ordering::Relaxed);
+        self.stats
+            .timed_out_queries
+            .fetch_add(timed_out, Ordering::Relaxed);
 
         // Return to passthrough mode
-        self.state.store(BufferState::Passthrough as u64, Ordering::SeqCst);
+        self.state
+            .store(BufferState::Passthrough as u64, Ordering::SeqCst);
         let _ = self.state_tx.send(BufferState::Passthrough);
 
         tracing::info!(
@@ -311,10 +327,13 @@ impl SwitchoverBuffer {
             let _ = query.response_tx.send(BufferResult::SwitchoverFailed);
         }
 
-        self.stats.failed_replays.fetch_add(query_count as u64, Ordering::Relaxed);
+        self.stats
+            .failed_replays
+            .fetch_add(query_count as u64, Ordering::Relaxed);
 
         // Return to passthrough mode
-        self.state.store(BufferState::Passthrough as u64, Ordering::SeqCst);
+        self.state
+            .store(BufferState::Passthrough as u64, Ordering::SeqCst);
         let _ = self.state_tx.send(BufferState::Passthrough);
 
         tracing::warn!(
@@ -405,7 +424,9 @@ mod tests {
         buffer.start_buffering();
 
         // Now can buffer
-        let rx = buffer.buffer_query("INSERT INTO t VALUES (1)".to_string(), vec![], 1).unwrap();
+        let rx = buffer
+            .buffer_query("INSERT INTO t VALUES (1)".to_string(), vec![], 1)
+            .unwrap();
         assert_eq!(buffer.len(), 1);
 
         // Drain buffer

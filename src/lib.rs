@@ -58,28 +58,28 @@
 //! ```
 
 // ── Core modules (always available) ──────────────────────────────────
-pub mod backend;
-pub mod client_tls;
-pub mod auth_scram;
-pub mod agent_contract;
-pub mod mcp;
-pub mod http_gateway;
-pub mod mirror;
-pub mod branch;
-pub mod plugin_registry;
-pub mod config;
-pub mod server;
-pub mod protocol;
 pub mod admin;
-pub mod connection_pool;
-pub mod load_balancer;
-pub mod health_checker;
-pub mod failover_controller;
-pub mod switchover_buffer;
-pub mod primary_tracker;
-pub mod pipeline;
+pub mod agent_contract;
+pub mod auth_scram;
+pub mod backend;
 pub mod batch;
+pub mod branch;
+pub mod client_tls;
+pub mod config;
+pub mod connection_pool;
+pub mod failover_controller;
+pub mod health_checker;
+pub mod http_gateway;
+pub mod load_balancer;
+pub mod mcp;
+pub mod mirror;
+pub mod pipeline;
+pub mod plugin_registry;
+pub mod primary_tracker;
+pub mod protocol;
 pub mod request;
+pub mod server;
+pub mod switchover_buffer;
 
 // ── Connection pooling modes (Session/Transaction/Statement) ─────────
 #[cfg(feature = "pool-modes")]
@@ -87,15 +87,15 @@ pub mod pool;
 
 // ── TR (Transaction Replay) modules ─────────────────────────────────
 #[cfg(feature = "ha-tr")]
-pub mod transaction_journal;
+pub mod cursor_restore;
 #[cfg(feature = "ha-tr")]
 pub mod failover_replay;
 #[cfg(feature = "ha-tr")]
-pub mod cursor_restore;
+pub mod replay;
 #[cfg(feature = "ha-tr")]
 pub mod session_migrate;
 #[cfg(feature = "ha-tr")]
-pub mod replay;
+pub mod transaction_journal;
 
 // ── Zero-downtime PG major-version upgrade orchestrator (T2.1) ─────
 #[cfg(feature = "ha-tr")]
@@ -336,10 +336,10 @@ mod postgresql_compat_tests {
     /// All core types work for PostgreSQL endpoints.
     #[test]
     fn test_pg_node_endpoints() {
-        let primary = NodeEndpoint::new("pg-primary.example.com", 5432)
-            .with_role(NodeRole::Primary);
-        let standby = NodeEndpoint::new("pg-standby-1.example.com", 5432)
-            .with_role(NodeRole::Standby);
+        let primary =
+            NodeEndpoint::new("pg-primary.example.com", 5432).with_role(NodeRole::Primary);
+        let standby =
+            NodeEndpoint::new("pg-standby-1.example.com", 5432).with_role(NodeRole::Standby);
         let replica = NodeEndpoint::new("pg-replica-1.example.com", 5433)
             .with_role(NodeRole::ReadReplica)
             .with_weight(50);
@@ -402,24 +402,28 @@ mod postgresql_compat_tests {
 
         // Register candidates
         let sync_standby = NodeId::new();
-        controller.register_candidate(FailoverCandidate {
-            node_id: sync_standby,
-            endpoint: NodeEndpoint::new("pg-sync", 5432).with_role(NodeRole::Standby),
-            is_sync: true,
-            lag_bytes: 0,
-            priority: 1,
-            last_heartbeat: None,
-        }).await;
+        controller
+            .register_candidate(FailoverCandidate {
+                node_id: sync_standby,
+                endpoint: NodeEndpoint::new("pg-sync", 5432).with_role(NodeRole::Standby),
+                is_sync: true,
+                lag_bytes: 0,
+                priority: 1,
+                last_heartbeat: None,
+            })
+            .await;
 
         let async_standby = NodeId::new();
-        controller.register_candidate(FailoverCandidate {
-            node_id: async_standby,
-            endpoint: NodeEndpoint::new("pg-async", 5432).with_role(NodeRole::Standby),
-            is_sync: false,
-            lag_bytes: 1024,
-            priority: 2,
-            last_heartbeat: None,
-        }).await;
+        controller
+            .register_candidate(FailoverCandidate {
+                node_id: async_standby,
+                endpoint: NodeEndpoint::new("pg-async", 5432).with_role(NodeRole::Standby),
+                is_sync: false,
+                lag_bytes: 1024,
+                priority: 2,
+                last_heartbeat: None,
+            })
+            .await;
 
         // Verify state
         assert_eq!(controller.state().await, FailoverState::Normal);
@@ -463,11 +467,9 @@ mod postgresql_compat_tests {
         buffer.start_buffering();
         assert!(buffer.is_buffering());
 
-        let rx = buffer.buffer_query(
-            "INSERT INTO orders VALUES (1)".to_string(),
-            vec![],
-            1,
-        ).unwrap();
+        let rx = buffer
+            .buffer_query("INSERT INTO orders VALUES (1)".to_string(), vec![], 1)
+            .unwrap();
 
         // Simulate promotion complete
         buffer.stop_buffering();
@@ -518,31 +520,36 @@ mod postgresql_compat_tests {
         let node = NodeId::new();
 
         // Journal a PostgreSQL transaction
-        journal.begin_transaction(tx_id, session_id, node, 0).await.unwrap();
-        journal.log_statement(
-            tx_id,
-            "BEGIN".to_string(),
-            vec![],
-            None,
-            None,
-            1,
-        ).await.unwrap();
-        journal.log_statement(
-            tx_id,
-            "INSERT INTO accounts (id, balance) VALUES ($1, $2)".to_string(),
-            vec![JournalValue::Int64(1), JournalValue::Float64(100.0)],
-            Some(12345),
-            Some(1),
-            5,
-        ).await.unwrap();
-        journal.log_statement(
-            tx_id,
-            "UPDATE accounts SET balance = balance - $1 WHERE id = $2".to_string(),
-            vec![JournalValue::Float64(25.0), JournalValue::Int64(1)],
-            Some(67890),
-            Some(1),
-            3,
-        ).await.unwrap();
+        journal
+            .begin_transaction(tx_id, session_id, node, 0)
+            .await
+            .unwrap();
+        journal
+            .log_statement(tx_id, "BEGIN".to_string(), vec![], None, None, 1)
+            .await
+            .unwrap();
+        journal
+            .log_statement(
+                tx_id,
+                "INSERT INTO accounts (id, balance) VALUES ($1, $2)".to_string(),
+                vec![JournalValue::Int64(1), JournalValue::Float64(100.0)],
+                Some(12345),
+                Some(1),
+                5,
+            )
+            .await
+            .unwrap();
+        journal
+            .log_statement(
+                tx_id,
+                "UPDATE accounts SET balance = balance - $1 WHERE id = $2".to_string(),
+                vec![JournalValue::Float64(25.0), JournalValue::Int64(1)],
+                Some(67890),
+                Some(1),
+                3,
+            )
+            .await
+            .unwrap();
 
         let j = journal.get_journal(&tx_id).await.unwrap();
         assert_eq!(j.entries.len(), 3);
@@ -568,12 +575,8 @@ mod postgresql_compat_tests {
         let session_id = uuid::Uuid::new_v4();
         let node = NodeId::new();
 
-        let mut state = SessionState::new(
-            session_id,
-            "postgres".to_string(),
-            "mydb".to_string(),
-            node,
-        );
+        let mut state =
+            SessionState::new(session_id, "postgres".to_string(), "mydb".to_string(), node);
 
         // Set PostgreSQL-specific session parameters
         state.set_parameter("timezone".to_string(), "America/New_York".to_string());
@@ -597,7 +600,9 @@ mod postgresql_compat_tests {
 
         assert!(restore_stmts.iter().any(|s| s.contains("America/New_York")));
         assert!(restore_stmts.iter().any(|s| s.contains("search_path")));
-        assert!(restore_stmts.iter().any(|s| s.contains("statement_timeout")));
+        assert!(restore_stmts
+            .iter()
+            .any(|s| s.contains("statement_timeout")));
         assert!(restore_stmts.iter().any(|s| s.contains("PREPARE get_user")));
     }
 
@@ -615,7 +620,9 @@ mod postgresql_compat_tests {
         let conn_id = 1;
 
         // Simulate pipelined Parse/Bind/Execute sequence
-        let t1 = pipeline.submit(conn_id, b"Parse: SELECT $1::int".to_vec()).unwrap();
+        let t1 = pipeline
+            .submit(conn_id, b"Parse: SELECT $1::int".to_vec())
+            .unwrap();
         let t2 = pipeline.submit(conn_id, b"Bind: [42]".to_vec()).unwrap();
         let t3 = pipeline.submit(conn_id, b"Execute".to_vec()).unwrap();
 
@@ -643,12 +650,14 @@ mod postgresql_compat_tests {
         };
         let batcher = InsertBatcher::new(config);
 
-        batcher.add(
-            "orders".to_string(),
-            vec!["id".to_string(), "total".to_string()],
-            vec![vec!["1".to_string(), "99.99".to_string()]],
-            "INSERT INTO orders (id, total) VALUES (1, 99.99)".to_string(),
-        ).unwrap();
+        batcher
+            .add(
+                "orders".to_string(),
+                vec!["id".to_string(), "total".to_string()],
+                vec![vec!["1".to_string(), "99.99".to_string()]],
+                "INSERT INTO orders (id, total) VALUES (1, 99.99)".to_string(),
+            )
+            .unwrap();
 
         assert_eq!(batcher.batch_size("orders"), 1);
 

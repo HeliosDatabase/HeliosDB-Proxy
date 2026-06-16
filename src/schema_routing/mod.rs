@@ -36,30 +36,31 @@
 //! let decision = router.route("SELECT * FROM users WHERE id = 1").await;
 //! ```
 
-pub mod registry;
+pub mod admin;
 pub mod analyzer;
-pub mod router;
 pub mod classifier;
 pub mod discovery;
 pub mod metrics;
-pub mod admin;
+pub mod registry;
+pub mod router;
 
-pub use registry::{
-    SchemaRegistry, TableSchema, ColumnSchema, IndexSchema,
-    AccessPattern, DataTemperature, WorkloadType, ShardingConfig,
-    NodeCapabilities, PartitionKey, Relationship,
+pub use admin::{AdminError, SchemaRoutingAdmin};
+pub use analyzer::{QueryAnalysis, QueryAnalyzer, ShardKeyValue, TableRef};
+pub use classifier::{
+    ClassificationModel, LearningClassifier, QueryHistory, QueryType, TableClassification,
 };
-pub use analyzer::{QueryAnalyzer, QueryAnalysis, TableRef, ShardKeyValue};
-pub use router::{
-    SchemaAwareRouter, RoutingDecision, RoutingPreference,
-    RAGStage, AIWorkloadType, RouteTarget, RoutingReason,
-};
-pub use classifier::{LearningClassifier, ClassificationModel, QueryHistory, QueryType, TableClassification};
-pub use admin::{SchemaRoutingAdmin, AdminError};
-pub use discovery::{SchemaDiscovery, DiscoveryConfig, DiscoveryError};
+pub use discovery::{DiscoveryConfig, DiscoveryError, SchemaDiscovery};
 pub use metrics::{
-    SchemaRoutingMetrics, RoutingStats, TableStats, WorkloadStats,
-    AIWorkloadStats, RAGStats, MetricsReport,
+    AIWorkloadStats, MetricsReport, RAGStats, RoutingStats, SchemaRoutingMetrics, TableStats,
+    WorkloadStats,
+};
+pub use registry::{
+    AccessPattern, ColumnSchema, DataTemperature, IndexSchema, NodeCapabilities, PartitionKey,
+    Relationship, SchemaRegistry, ShardingConfig, TableSchema, WorkloadType,
+};
+pub use router::{
+    AIWorkloadType, RAGStage, RouteTarget, RoutingDecision, RoutingPreference, RoutingReason,
+    SchemaAwareRouter,
 };
 
 use std::collections::HashMap;
@@ -165,7 +166,11 @@ impl SchemaRoutingConfigBuilder {
     }
 
     /// Add node capability configuration
-    pub fn add_node_capability(mut self, node_name: impl Into<String>, caps: NodeCapabilities) -> Self {
+    pub fn add_node_capability(
+        mut self,
+        node_name: impl Into<String>,
+        caps: NodeCapabilities,
+    ) -> Self {
         self.config.node_capabilities.insert(node_name.into(), caps);
         self
     }

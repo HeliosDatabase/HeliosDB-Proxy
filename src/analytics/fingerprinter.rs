@@ -32,7 +32,10 @@ impl QueryFingerprinter {
             numeric_literal_re: Regex::new(r"\b\d+(\.\d+)?\b").expect("Invalid regex"),
             in_list_re: Regex::new(r"(?i)IN\s*\([^)]+\)").expect("Invalid regex"),
             whitespace_re: Regex::new(r"\s+").expect("Invalid regex"),
-            uuid_re: Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}").expect("Invalid regex"),
+            uuid_re: Regex::new(
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            )
+            .expect("Invalid regex"),
             hex_re: Regex::new(r"0x[0-9a-fA-F]+").expect("Invalid regex"),
         }
     }
@@ -62,13 +65,22 @@ impl QueryFingerprinter {
         normalized = self.hex_re.replace_all(&normalized, "?").to_string();
 
         // Replace string literals with ?
-        normalized = self.string_literal_re.replace_all(&normalized, "?").to_string();
+        normalized = self
+            .string_literal_re
+            .replace_all(&normalized, "?")
+            .to_string();
 
         // Replace numeric literals with ?
-        normalized = self.numeric_literal_re.replace_all(&normalized, "?").to_string();
+        normalized = self
+            .numeric_literal_re
+            .replace_all(&normalized, "?")
+            .to_string();
 
         // Replace IN lists with (?)
-        normalized = self.in_list_re.replace_all(&normalized, "IN (?)").to_string();
+        normalized = self
+            .in_list_re
+            .replace_all(&normalized, "IN (?)")
+            .to_string();
 
         // Normalize whitespace
         normalized = self.whitespace_re.replace_all(&normalized, " ").to_string();
@@ -98,7 +110,13 @@ impl QueryFingerprinter {
         }
 
         // JOIN clauses
-        for keyword in ["JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "OUTER JOIN"] {
+        for keyword in [
+            "JOIN",
+            "INNER JOIN",
+            "LEFT JOIN",
+            "RIGHT JOIN",
+            "OUTER JOIN",
+        ] {
             let mut search_pos = 0;
             while let Some(pos) = query_upper[search_pos..].find(keyword) {
                 let absolute_pos = search_pos + pos + keyword.len();
@@ -302,7 +320,8 @@ mod tests {
     fn test_normalize_uuid() {
         let fp = QueryFingerprinter::new();
 
-        let normalized = fp.normalize("SELECT * FROM users WHERE id = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'");
+        let normalized =
+            fp.normalize("SELECT * FROM users WHERE id = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'");
         assert!(normalized.contains("?"));
     }
 
@@ -343,11 +362,26 @@ mod tests {
     fn test_detect_operation() {
         let fp = QueryFingerprinter::new();
 
-        assert_eq!(fp.detect_operation("SELECT * FROM users"), OperationType::Select);
-        assert_eq!(fp.detect_operation("INSERT INTO users VALUES (1)"), OperationType::Insert);
-        assert_eq!(fp.detect_operation("UPDATE users SET name = 'Bob'"), OperationType::Update);
-        assert_eq!(fp.detect_operation("DELETE FROM users WHERE id = 1"), OperationType::Delete);
-        assert_eq!(fp.detect_operation("CREATE TABLE foo (id INT)"), OperationType::Ddl);
+        assert_eq!(
+            fp.detect_operation("SELECT * FROM users"),
+            OperationType::Select
+        );
+        assert_eq!(
+            fp.detect_operation("INSERT INTO users VALUES (1)"),
+            OperationType::Insert
+        );
+        assert_eq!(
+            fp.detect_operation("UPDATE users SET name = 'Bob'"),
+            OperationType::Update
+        );
+        assert_eq!(
+            fp.detect_operation("DELETE FROM users WHERE id = 1"),
+            OperationType::Delete
+        );
+        assert_eq!(
+            fp.detect_operation("CREATE TABLE foo (id INT)"),
+            OperationType::Ddl
+        );
         assert_eq!(fp.detect_operation("BEGIN"), OperationType::Transaction);
     }
 

@@ -20,7 +20,9 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::backend::types::TextValue;
-use crate::backend::{tls::default_client_config, BackendClient, BackendConfig, ParamValue, TlsMode};
+use crate::backend::{
+    tls::default_client_config, BackendClient, BackendConfig, ParamValue, TlsMode,
+};
 use crate::config::MirrorConfig;
 
 /// Counters surfaced for observability.
@@ -157,7 +159,14 @@ pub struct TableSnapshot {
     pub copied: u64,
 }
 
-fn backend_cfg(host: &str, port: u16, user: &str, pass: Option<&str>, db: Option<&str>, app: &str) -> BackendConfig {
+fn backend_cfg(
+    host: &str,
+    port: u16,
+    user: &str,
+    pass: Option<&str>,
+    db: Option<&str>,
+    app: &str,
+) -> BackendConfig {
     BackendConfig {
         host: host.to_string(),
         port,
@@ -220,17 +229,32 @@ fn oid_type(oid: u32) -> &'static str {
 /// the table there if needed. Returns a per-table report. Used by
 /// `POST /api/migration/snapshot` to seed a migration with existing data
 /// before/alongside the continuous write tail.
-pub async fn snapshot_tables(cfg: &MirrorConfig, tables: &[String]) -> Result<Vec<TableSnapshot>, String> {
+pub async fn snapshot_tables(
+    cfg: &MirrorConfig,
+    tables: &[String],
+) -> Result<Vec<TableSnapshot>, String> {
     let src_cfg = backend_cfg(
-        &cfg.source_host, cfg.source_port, &cfg.source_user,
-        cfg.source_password.as_deref(), cfg.source_database.as_deref(), "heliosproxy-snapshot-src",
+        &cfg.source_host,
+        cfg.source_port,
+        &cfg.source_user,
+        cfg.source_password.as_deref(),
+        cfg.source_database.as_deref(),
+        "heliosproxy-snapshot-src",
     );
     let tgt_cfg = backend_cfg(
-        &cfg.backend_host, cfg.backend_port, &cfg.backend_user,
-        cfg.backend_password.as_deref(), cfg.backend_database.as_deref(), "heliosproxy-snapshot-tgt",
+        &cfg.backend_host,
+        cfg.backend_port,
+        &cfg.backend_user,
+        cfg.backend_password.as_deref(),
+        cfg.backend_database.as_deref(),
+        "heliosproxy-snapshot-tgt",
     );
-    let mut src = BackendClient::connect(&src_cfg).await.map_err(|e| format!("source connect: {}", e))?;
-    let mut tgt = BackendClient::connect(&tgt_cfg).await.map_err(|e| format!("target connect: {}", e))?;
+    let mut src = BackendClient::connect(&src_cfg)
+        .await
+        .map_err(|e| format!("source connect: {}", e))?;
+    let mut tgt = BackendClient::connect(&tgt_cfg)
+        .await
+        .map_err(|e| format!("target connect: {}", e))?;
 
     // Idempotency fence (default, non-destructive): refuse the whole snapshot if
     // ANY target table already has rows — silently appending would duplicate.
@@ -240,7 +264,10 @@ pub async fn snapshot_tables(cfg: &MirrorConfig, tables: &[String]) -> Result<Ve
     let mut blocked: Vec<String> = Vec::new();
     for table in tables {
         let qt = quote_ident(table);
-        if let Ok(res) = tgt.simple_query(&format!("SELECT 1 FROM {} LIMIT 1", qt)).await {
+        if let Ok(res) = tgt
+            .simple_query(&format!("SELECT 1 FROM {} LIMIT 1", qt))
+            .await
+        {
             if !res.rows.is_empty() {
                 blocked.push(table.clone());
             }
@@ -270,15 +297,27 @@ pub async fn snapshot_tables(cfg: &MirrorConfig, tables: &[String]) -> Result<Ve
             .iter()
             .map(|c| format!("{} {}", quote_ident(&c.name), oid_type(c.type_oid)))
             .collect();
-        let create = format!("CREATE TABLE IF NOT EXISTS {} ({})", qt, cols_ddl.join(", "));
-        tgt.execute(&create).await.map_err(|e| format!("create {} on target: {}", table, e))?;
+        let create = format!(
+            "CREATE TABLE IF NOT EXISTS {} ({})",
+            qt,
+            cols_ddl.join(", ")
+        );
+        tgt.execute(&create)
+            .await
+            .map_err(|e| format!("create {} on target: {}", table, e))?;
 
-        let col_list = res.columns.iter().map(|c| quote_ident(&c.name)).collect::<Vec<_>>().join(", ");
+        let col_list = res
+            .columns
+            .iter()
+            .map(|c| quote_ident(&c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         // Primary path: a single COPY ... FROM STDIN bulk-load. `HELIOS_SNAPSHOT_USE_COPY=0`
         // forces the INSERT path (ops kill-switch / fallback test).
-        let use_copy =
-            std::env::var("HELIOS_SNAPSHOT_USE_COPY").map(|v| v != "0").unwrap_or(true);
+        let use_copy = std::env::var("HELIOS_SNAPSHOT_USE_COPY")
+            .map(|v| v != "0")
+            .unwrap_or(true);
 
         let mut copied: Option<u64> = None;
         if use_copy {
@@ -311,9 +350,14 @@ pub async fn snapshot_tables(cfg: &MirrorConfig, tables: &[String]) -> Result<Ve
         let copied = match copied {
             Some(n) => n,
             None => {
-                let placeholders =
-                    (1..=res.columns.len()).map(|i| format!("${}", i)).collect::<Vec<_>>().join(", ");
-                let insert = format!("INSERT INTO {} ({}) VALUES ({})", qt, col_list, placeholders);
+                let placeholders = (1..=res.columns.len())
+                    .map(|i| format!("${}", i))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let insert = format!(
+                    "INSERT INTO {} ({}) VALUES ({})",
+                    qt, col_list, placeholders
+                );
                 let mut copied = 0u64;
                 for row in &res.rows {
                     let params: Vec<ParamValue> = row
@@ -331,7 +375,11 @@ pub async fn snapshot_tables(cfg: &MirrorConfig, tables: &[String]) -> Result<Ve
                 copied
             }
         };
-        report.push(TableSnapshot { table: table.clone(), source_rows: res.rows.len() as u64, copied });
+        report.push(TableSnapshot {
+            table: table.clone(),
+            source_rows: res.rows.len() as u64,
+            copied,
+        });
     }
     src.close().await;
     tgt.close().await;

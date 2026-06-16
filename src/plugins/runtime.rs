@@ -32,15 +32,14 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
-use wasmtime::{Engine, Instance, InstancePre, Linker, Module, Store, TypedFunc, Memory};
+use wasmtime::{Engine, Instance, InstancePre, Linker, Memory, Module, Store, TypedFunc};
 
 use super::config::PluginRuntimeConfig;
 use super::host_functions::HostFunctionRegistry;
 use super::host_imports::{register_crypto_imports, register_kv_imports, KvBackend, StoreCtx};
-use super::sandbox::{PluginSandbox, SecurityPolicy, ResourceLimits};
+use super::sandbox::{PluginSandbox, ResourceLimits, SecurityPolicy};
 use super::{
-    AuthRequest, AuthResult, HookType, PluginMetadata, PreQueryResult,
-    QueryContext, RouteResult,
+    AuthRequest, AuthResult, HookType, PluginMetadata, PreQueryResult, QueryContext, RouteResult,
 };
 
 /// Error types for plugin operations
@@ -204,7 +203,8 @@ impl LoadedPlugin {
 
     /// Get invocation count
     pub fn invocation_count(&self) -> u64 {
-        self.invocation_count.load(std::sync::atomic::Ordering::Relaxed)
+        self.invocation_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get uptime
@@ -219,7 +219,8 @@ impl LoadedPlugin {
 
     /// Record an invocation
     pub fn record_invocation(&self) {
-        self.invocation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.invocation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         *self.last_invoked.write() = Some(Instant::now());
     }
 }
@@ -274,9 +275,8 @@ impl WasmPluginRuntime {
         // polling fuel from inside the call.
         engine_config.epoch_interruption(true);
 
-        let engine = Engine::new(&engine_config).map_err(|e| {
-            PluginError::RuntimeError(format!("wasmtime engine init: {}", e))
-        })?;
+        let engine = Engine::new(&engine_config)
+            .map_err(|e| PluginError::RuntimeError(format!("wasmtime engine init: {}", e)))?;
 
         // Build the host-import linker once. The KV/crypto imports read
         // their state from each call's `Store` data (Caller<StoreCtx>), so
@@ -368,7 +368,9 @@ impl WasmPluginRuntime {
 
         // WASM magic number: 0x00 0x61 0x73 0x6d (\\0asm)
         if &wasm_bytes[0..4] != b"\x00asm" {
-            return Err(PluginError::LoadError("Invalid WASM magic number".to_string()));
+            return Err(PluginError::LoadError(
+                "Invalid WASM magic number".to_string(),
+            ));
         }
 
         // Build metadata from manifest
@@ -404,9 +406,8 @@ impl WasmPluginRuntime {
 
         // Compile via wasmtime — this validates the module and produces
         // an Arc-wrapped Module ready for repeated instantiation.
-        let module = Module::from_binary(&self.engine, wasm_bytes).map_err(|e| {
-            PluginError::InstantiationError(format!("wasmtime compile: {}", e))
-        })?;
+        let module = Module::from_binary(&self.engine, wasm_bytes)
+            .map_err(|e| PluginError::InstantiationError(format!("wasmtime compile: {}", e)))?;
 
         // Cache the compiled Module (cheap clone on hit).
         {
@@ -472,21 +473,16 @@ impl WasmPluginRuntime {
         let mut store: Store<StoreCtx> = Store::new(&self.engine, store_ctx);
         if self.config.fuel_metering {
             // wasmtime's set_fuel returns Result; cap is per-call.
-            store.set_fuel(self.config.fuel_limit).map_err(|e| {
-                PluginError::RuntimeError(format!("set_fuel: {}", e))
-            })?;
+            store
+                .set_fuel(self.config.fuel_limit)
+                .map_err(|e| PluginError::RuntimeError(format!("set_fuel: {}", e)))?;
         }
         // Epoch interruption was enabled at engine init and a background
         // ticker bumps the engine epoch every ~1ms. Set the deadline to
         // `timeout` worth of ticks so a runaway plugin traps at its
         // configured wall-clock timeout instead of blocking the caller
         // indefinitely. (Set after Store::new, before the call.)
-        let deadline_ticks = self
-            .config
-            .timeout
-            .as_millis()
-            .max(1)
-            .min(u64::MAX as u128) as u64;
+        let deadline_ticks = self.config.timeout.as_millis().max(1).min(u64::MAX as u128) as u64;
         store.set_epoch_deadline(deadline_ticks);
 
         // Instantiate from the plugin's pre-resolved plan, computed once
@@ -509,10 +505,7 @@ impl WasmPluginRuntime {
             }
         };
         let instance = instance_pre.instantiate(&mut store).map_err(|e| {
-            PluginError::InstantiationError(format!(
-                "instantiate {}: {}",
-                plugin.metadata.name, e
-            ))
+            PluginError::InstantiationError(format!("instantiate {}: {}", plugin.metadata.name, e))
         })?;
 
         let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| {
@@ -528,9 +521,9 @@ impl WasmPluginRuntime {
         // Allocate input slot inside the plugin's address space and
         // copy `args` in.
         let in_len = args.len() as i32;
-        let in_ptr = alloc.call(&mut store, in_len).map_err(|e| {
-            PluginError::ExecutionError(format!("alloc({}): {}", in_len, e))
-        })?;
+        let in_ptr = alloc
+            .call(&mut store, in_len)
+            .map_err(|e| PluginError::ExecutionError(format!("alloc({}): {}", in_len, e)))?;
         if in_len > 0 {
             write_memory(&memory, &mut store, in_ptr, args)?;
         }
@@ -538,13 +531,11 @@ impl WasmPluginRuntime {
         // Try the result-returning ABI first; if the export has the
         // observer ABI (no return), fall back to that.
         let export_name = hook.export_name();
-        let result_bytes = match get_typed::<_, (i32, i32), i64>(&instance, &mut store, export_name) {
+        let result_bytes = match get_typed::<_, (i32, i32), i64>(&instance, &mut store, export_name)
+        {
             Ok(hook_fn) => {
                 let packed = hook_fn.call(&mut store, (in_ptr, in_len)).map_err(|e| {
-                    PluginError::ExecutionError(format!(
-                        "hook {} call: {}",
-                        export_name, e
-                    ))
+                    PluginError::ExecutionError(format!("hook {} call: {}", export_name, e))
                 })?;
                 let out_ptr = (packed >> 32) as i32;
                 let out_len = (packed & 0xFFFF_FFFF) as i32;
@@ -559,11 +550,7 @@ impl WasmPluginRuntime {
             }
             Err(_) => {
                 // Observer ABI: (i32, i32) → ()
-                let observer = get_typed::<_, (i32, i32), ()>(
-                    &instance,
-                    &mut store,
-                    export_name,
-                )?;
+                let observer = get_typed::<_, (i32, i32), ()>(&instance, &mut store, export_name)?;
                 observer.call(&mut store, (in_ptr, in_len)).map_err(|e| {
                     PluginError::ExecutionError(format!(
                         "observer hook {} call: {}",
@@ -585,8 +572,7 @@ impl WasmPluginRuntime {
                 plugin.instance_data.write().fuel_consumed = consumed;
             }
         }
-        plugin.instance_data.write().memory_used =
-            memory.data_size(&store);
+        plugin.instance_data.write().memory_used = memory.data_size(&store);
 
         Ok(result_bytes)
     }
@@ -747,9 +733,9 @@ fn write_memory<T>(
     ptr: i32,
     bytes: &[u8],
 ) -> Result<(), PluginError> {
-    memory.write(store, ptr as usize, bytes).map_err(|e| {
-        PluginError::ExecutionError(format!("memory.write @ {}: {}", ptr, e))
-    })
+    memory
+        .write(store, ptr as usize, bytes)
+        .map_err(|e| PluginError::ExecutionError(format!("memory.write @ {}: {}", ptr, e)))
 }
 
 /// Copy `len` bytes out of plugin memory starting at `ptr`.
@@ -802,15 +788,9 @@ impl<'de> serde::Deserialize<'de> for PreQueryResult {
         let helper = Helper::deserialize(deserializer)?;
         match helper.action.as_str() {
             "continue" => Ok(PreQueryResult::Continue),
-            "rewrite" => Ok(PreQueryResult::Rewrite(
-                helper.value.unwrap_or_default(),
-            )),
-            "block" => Ok(PreQueryResult::Block(
-                helper.value.unwrap_or_default(),
-            )),
-            "cached" => Ok(PreQueryResult::Cached(
-                helper.data.unwrap_or_default(),
-            )),
+            "rewrite" => Ok(PreQueryResult::Rewrite(helper.value.unwrap_or_default())),
+            "block" => Ok(PreQueryResult::Block(helper.value.unwrap_or_default())),
+            "cached" => Ok(PreQueryResult::Cached(helper.data.unwrap_or_default())),
             _ => Ok(PreQueryResult::Continue),
         }
     }
@@ -857,9 +837,7 @@ impl<'de> serde::Deserialize<'de> for AuthResult {
                     claims: std::collections::HashMap::new(),
                 }))
             }
-            "denied" => Ok(AuthResult::Denied(
-                helper.message.unwrap_or_default(),
-            )),
+            "denied" => Ok(AuthResult::Denied(helper.message.unwrap_or_default())),
             "defer" => Ok(AuthResult::Defer),
             _ => Ok(AuthResult::Defer),
         }
@@ -891,7 +869,9 @@ impl<'de> serde::Deserialize<'de> for RouteResult {
             // it doesn't overload `target` (which is a node identifier
             // for the other variants).
             "block" => Ok(RouteResult::Block(
-                helper.reason.unwrap_or_else(|| "blocked by plugin".to_string()),
+                helper
+                    .reason
+                    .unwrap_or_else(|| "blocked by plugin".to_string()),
             )),
             _ => Ok(RouteResult::Default),
         }
@@ -912,10 +892,7 @@ mod tests {
     /// and a `post_query` observer hook.
     fn build_test_module(engine: &Engine) -> Module {
         const PAYLOAD: &[u8] = b"hello-from-wasm";
-        let payload_hex: String = PAYLOAD
-            .iter()
-            .map(|b| format!("\\{:02x}", b))
-            .collect();
+        let payload_hex: String = PAYLOAD.iter().map(|b| format!("\\{:02x}", b)).collect();
         let wat = format!(
             r#"
             (module

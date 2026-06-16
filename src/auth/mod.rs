@@ -92,54 +92,46 @@
 //! };
 //! ```
 
-pub mod config;
-pub mod jwt;
-pub mod handler;
-pub mod oauth;
 pub mod api_keys;
-pub mod role_mapper;
+pub mod config;
 pub mod credentials;
+pub mod handler;
+pub mod jwt;
+pub mod oauth;
+pub mod role_mapper;
 pub mod session;
 
 // Re-export main types
 pub use config::{
-    AuthConfig, AuthMethod, Identity, AgentIdentity, AgentQuota,
-    JwtConfig, JwtClaims, OAuthConfig, LdapConfig, ApiKeyConfig,
-    RoleMappingRule, RoleMappingCondition, CredentialConfig, SessionConfig,
-    AuthRateLimitConfig,
+    AgentIdentity, AgentQuota, ApiKeyConfig, AuthConfig, AuthMethod, AuthRateLimitConfig,
+    CredentialConfig, Identity, JwtClaims, JwtConfig, LdapConfig, OAuthConfig,
+    RoleMappingCondition, RoleMappingRule, SessionConfig,
 };
 
-pub use jwt::{JwtValidator, JwtError, JwtHeader, Jwks, Jwk, TokenCache};
+pub use jwt::{Jwk, Jwks, JwtError, JwtHeader, JwtValidator, TokenCache};
 
 pub use handler::{
-    AuthenticationHandler, AuthenticationHandlerBuilder,
-    AuthRequest, AuthResult, AuthError, CacheStats,
+    AuthError, AuthRequest, AuthResult, AuthenticationHandler, AuthenticationHandlerBuilder,
+    CacheStats,
 };
 
-pub use oauth::{
-    OAuthClient, OAuthError, IntrospectionResponse,
-    TokenExchange, TokenResponse,
-};
+pub use oauth::{IntrospectionResponse, OAuthClient, OAuthError, TokenExchange, TokenResponse};
 
-pub use api_keys::{
-    ApiKeyManager, ApiKey, ApiKeyError, ApiKeyStats, ApiKeyBuilder,
-};
+pub use api_keys::{ApiKey, ApiKeyBuilder, ApiKeyError, ApiKeyManager, ApiKeyStats};
 
 pub use role_mapper::{
-    RoleMapper, RoleMapperBuilder, PermissionSet, Operation,
-    AuthorizationContext,
+    AuthorizationContext, Operation, PermissionSet, RoleMapper, RoleMapperBuilder,
 };
 
 pub use credentials::{
-    CredentialManager, CredentialManagerBuilder, CredentialProvider,
-    DatabaseCredential, CredentialSource, CredentialError,
-    StaticCredentialProvider, EnvironmentCredentialProvider,
-    VaultCredentialProvider, AwsSecretsManagerProvider,
+    AwsSecretsManagerProvider, CredentialError, CredentialManager, CredentialManagerBuilder,
+    CredentialProvider, CredentialSource, DatabaseCredential, EnvironmentCredentialProvider,
+    StaticCredentialProvider, VaultCredentialProvider,
 };
 
 pub use session::{
-    SessionManager, SessionManagerBuilder, Session, SessionError,
-    SessionStats, CookieOptions, SameSite,
+    CookieOptions, SameSite, Session, SessionError, SessionManager, SessionManagerBuilder,
+    SessionStats,
 };
 
 /// Authentication proxy facade
@@ -192,18 +184,22 @@ impl AuthProxy {
     ) -> Result<(AuthResult, Session), AuthError> {
         let result = self.handler.authenticate(request).await?;
 
-        let session = self.session_manager.create_session(
-            result.identity.clone(),
-            request.client_ip,
-            request.headers.get("user-agent").cloned(),
-        ).map_err(|e| AuthError::Session(e.to_string()))?;
+        let session = self
+            .session_manager
+            .create_session(
+                result.identity.clone(),
+                request.client_ip,
+                request.headers.get("user-agent").cloned(),
+            )
+            .map_err(|e| AuthError::Session(e.to_string()))?;
 
         Ok((result, session))
     }
 
     /// Validate session token
     pub fn validate_session(&self, token: &str) -> Result<Identity, AuthError> {
-        self.session_manager.validate_token(token)
+        self.session_manager
+            .validate_token(token)
             .map_err(|e| AuthError::Session(e.to_string()))
     }
 
@@ -216,14 +212,17 @@ impl AuthProxy {
     pub fn get_credentials(&self, key: &str) -> Result<DatabaseCredential, AuthError> {
         self.credential_manager
             .as_ref()
-            .ok_or_else(|| AuthError::Configuration("Credential manager not configured".to_string()))?
+            .ok_or_else(|| {
+                AuthError::Configuration("Credential manager not configured".to_string())
+            })?
             .get_credential(key)
             .map_err(|e| AuthError::Configuration(e.to_string()))
     }
 
     /// Invalidate session
     pub fn invalidate_session(&self, token: &str) -> Result<(), AuthError> {
-        self.session_manager.invalidate_session(token)
+        self.session_manager
+            .invalidate_session(token)
             .map_err(|e| AuthError::Session(e.to_string()))
     }
 
@@ -288,19 +287,15 @@ impl AuthProxyBuilder {
 
     /// Build the auth proxy
     pub fn build(self) -> AuthProxy {
-        let handler = self.handler.unwrap_or_else(|| {
-            AuthenticationHandler::builder()
-                .enabled(false)
-                .build()
-        });
+        let handler = self
+            .handler
+            .unwrap_or_else(|| AuthenticationHandler::builder().enabled(false).build());
 
-        let role_mapper = self.role_mapper.unwrap_or_else(|| {
-            RoleMapper::new()
-        });
+        let role_mapper = self.role_mapper.unwrap_or_else(|| RoleMapper::new());
 
-        let session_manager = self.session_manager.unwrap_or_else(|| {
-            SessionManager::new(SessionConfig::default())
-        });
+        let session_manager = self
+            .session_manager
+            .unwrap_or_else(|| SessionManager::new(SessionConfig::default()));
 
         let mut proxy = AuthProxy::new(handler, role_mapper, session_manager);
         proxy.credential_manager = self.credential_manager;
@@ -350,7 +345,7 @@ mod tests {
             .role_mapper(
                 RoleMapper::builder()
                     .group_role("developers", "db_developer")
-                    .build()
+                    .build(),
             )
             .build();
 
@@ -371,15 +366,12 @@ mod tests {
     #[test]
     fn test_session_integration() {
         let proxy = AuthProxy::builder()
-            .session_manager(
-                SessionManager::builder()
-                    .max_sessions_per_user(5)
-                    .build()
-            )
+            .session_manager(SessionManager::builder().max_sessions_per_user(5).build())
             .build();
 
         // Create session directly via session manager
-        let session = proxy.session_manager()
+        let session = proxy
+            .session_manager()
             .create_session(test_identity(), None, None)
             .unwrap();
 

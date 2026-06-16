@@ -280,10 +280,7 @@ impl SessionMigrate {
 
     /// Attach a backend-connection template so session migration can
     /// run `SET`, `PREPARE`, and `CREATE TEMP TABLE` against the target.
-    pub fn with_backend_template(
-        mut self,
-        template: crate::backend::BackendConfig,
-    ) -> Self {
+    pub fn with_backend_template(mut self, template: crate::backend::BackendConfig) -> Self {
         self.backend_template = Some(template);
         self
     }
@@ -293,10 +290,7 @@ impl SessionMigrate {
         self.endpoints.write().await.insert(node_id, endpoint);
     }
 
-    fn build_config(
-        &self,
-        endpoint: &NodeEndpoint,
-    ) -> Option<crate::backend::BackendConfig> {
+    fn build_config(&self, endpoint: &NodeEndpoint) -> Option<crate::backend::BackendConfig> {
         self.backend_template.as_ref().map(|t| {
             let mut c = t.clone();
             c.host = endpoint.host.clone();
@@ -342,12 +336,7 @@ impl SessionMigrate {
     }
 
     /// Update session parameter
-    pub async fn set_parameter(
-        &self,
-        session_id: Uuid,
-        name: String,
-        value: String,
-    ) -> Result<()> {
+    pub async fn set_parameter(&self, session_id: Uuid, name: String, value: String) -> Result<()> {
         if !self.enabled {
             return Ok(());
         }
@@ -463,11 +452,7 @@ impl SessionMigrate {
                     Ok(()) => temp_tables_migrated += 1,
                     Err(e) => {
                         temp_tables_failed += 1;
-                        tracing::warn!(
-                            "Failed to migrate temp table {}: {}",
-                            table.name,
-                            e
-                        );
+                        tracing::warn!("Failed to migrate temp table {}: {}", table.name, e);
                     }
                 }
             }
@@ -540,11 +525,7 @@ impl SessionMigrate {
     /// dead primary, and resurrecting its uncommitted data is unsafe.
     /// Callers that need data migration should journal writes into the
     /// temp table and use failover replay (T0-TR5) instead.
-    async fn migrate_temp_table(
-        &self,
-        node: NodeId,
-        table: &TempTableInfo,
-    ) -> Result<()> {
+    async fn migrate_temp_table(&self, node: NodeId, table: &TempTableInfo) -> Result<()> {
         let endpoint = self.endpoints.read().await.get(&node).cloned();
         let cfg = match endpoint.as_ref().and_then(|e| self.build_config(e)) {
             Some(c) => c,
@@ -588,9 +569,9 @@ impl SessionMigrate {
             .map_err(|e| ProxyError::SessionMigration(format!("connect: {}", e)))?;
         let outcome = client.execute(&stmt).await;
         client.close().await;
-        outcome.map(|_| ()).map_err(|e| {
-            ProxyError::SessionMigration(format!("create temp table: {}", e))
-        })?;
+        outcome
+            .map(|_| ())
+            .map_err(|e| ProxyError::SessionMigration(format!("create temp table: {}", e)))?;
 
         if table.has_data {
             tracing::warn!(
@@ -605,10 +586,7 @@ impl SessionMigrate {
     pub async fn stats(&self) -> SessionMigrateStats {
         let sessions = self.sessions.read().await;
 
-        let total_prepared: usize = sessions
-            .values()
-            .map(|s| s.prepared_statements.len())
-            .sum();
+        let total_prepared: usize = sessions.values().map(|s| s.prepared_statements.len()).sum();
 
         let total_temp_tables: usize = sessions.values().map(|s| s.temp_tables.len()).sum();
 
@@ -669,10 +647,16 @@ mod tests {
         );
 
         state.set_parameter("timezone".to_string(), "America/New_York".to_string());
-        assert_eq!(state.get_parameter("timezone"), Some("America/New_York".to_string()));
+        assert_eq!(
+            state.get_parameter("timezone"),
+            Some("America/New_York".to_string())
+        );
 
         state.set_parameter("custom_param".to_string(), "custom_value".to_string());
-        assert_eq!(state.get_parameter("custom_param"), Some("custom_value".to_string()));
+        assert_eq!(
+            state.get_parameter("custom_param"),
+            Some("custom_value".to_string())
+        );
     }
 
     #[test]
@@ -702,7 +686,12 @@ mod tests {
     async fn test_register_session() {
         let migrate = SessionMigrate::new();
         let session_id = Uuid::new_v4();
-        let state = SessionState::new(session_id, "user".to_string(), "db".to_string(), NodeId::new());
+        let state = SessionState::new(
+            session_id,
+            "user".to_string(),
+            "db".to_string(),
+            NodeId::new(),
+        );
 
         migrate.register_session(state).await.unwrap();
 
@@ -714,11 +703,20 @@ mod tests {
     async fn test_set_parameter() {
         let migrate = SessionMigrate::new();
         let session_id = Uuid::new_v4();
-        let state = SessionState::new(session_id, "user".to_string(), "db".to_string(), NodeId::new());
+        let state = SessionState::new(
+            session_id,
+            "user".to_string(),
+            "db".to_string(),
+            NodeId::new(),
+        );
 
         migrate.register_session(state).await.unwrap();
         migrate
-            .set_parameter(session_id, "timezone".to_string(), "Europe/London".to_string())
+            .set_parameter(
+                session_id,
+                "timezone".to_string(),
+                "Europe/London".to_string(),
+            )
             .await
             .unwrap();
 
@@ -730,7 +728,12 @@ mod tests {
     async fn test_migrate_session() {
         let migrate = SessionMigrate::new();
         let session_id = Uuid::new_v4();
-        let state = SessionState::new(session_id, "user".to_string(), "db".to_string(), NodeId::new());
+        let state = SessionState::new(
+            session_id,
+            "user".to_string(),
+            "db".to_string(),
+            NodeId::new(),
+        );
 
         migrate.register_session(state).await.unwrap();
 
@@ -745,7 +748,12 @@ mod tests {
     async fn test_close_session() {
         let migrate = SessionMigrate::new();
         let session_id = Uuid::new_v4();
-        let state = SessionState::new(session_id, "user".to_string(), "db".to_string(), NodeId::new());
+        let state = SessionState::new(
+            session_id,
+            "user".to_string(),
+            "db".to_string(),
+            NodeId::new(),
+        );
 
         migrate.register_session(state).await.unwrap();
         migrate.close_session(&session_id).await;
@@ -757,7 +765,12 @@ mod tests {
     async fn test_stats() {
         let migrate = SessionMigrate::new();
         let session_id = Uuid::new_v4();
-        let mut state = SessionState::new(session_id, "user".to_string(), "db".to_string(), NodeId::new());
+        let mut state = SessionState::new(
+            session_id,
+            "user".to_string(),
+            "db".to_string(),
+            NodeId::new(),
+        );
 
         state.add_prepared_statement(PreparedStatementInfo {
             name: "ps1".to_string(),

@@ -125,10 +125,9 @@ pub fn build_tls_acceptor(tls: &TlsConfig) -> Result<TlsAcceptor, String> {
                 .add(ca)
                 .map_err(|e| format!("adding ca cert: {}", e))?;
         }
-        let verifier =
-            rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-                .build()
-                .map_err(|e| format!("building client verifier: {}", e))?;
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|e| format!("building client verifier: {}", e))?;
         builder
             .with_client_cert_verifier(verifier)
             .with_single_cert(cert_chain, key)

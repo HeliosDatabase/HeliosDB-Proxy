@@ -382,7 +382,9 @@ mod tests {
         assert!(params.is_empty());
         assert_eq!(query, "SELECT 1");
 
-        let result = parse_prepare_statement("PREPARE stmt2 (integer, text) AS SELECT * FROM t WHERE id = $1 AND name = $2");
+        let result = parse_prepare_statement(
+            "PREPARE stmt2 (integer, text) AS SELECT * FROM t WHERE id = $1 AND name = $2",
+        );
         assert!(result.is_some());
         let (name, params, query) = result.unwrap();
         assert_eq!(name, "stmt2");
@@ -392,10 +394,7 @@ mod tests {
 
     #[test]
     fn test_parse_deallocate_statement() {
-        assert_eq!(
-            parse_deallocate_statement("DEALLOCATE ALL"),
-            Some(None)
-        );
+        assert_eq!(parse_deallocate_statement("DEALLOCATE ALL"), Some(None));
         assert_eq!(
             parse_deallocate_statement("DEALLOCATE stmt1"),
             Some(Some("stmt1".to_string()))

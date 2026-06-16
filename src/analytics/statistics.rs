@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 
-use super::fingerprinter::{QueryFingerprint, OperationType};
+use super::fingerprinter::{OperationType, QueryFingerprint};
 use super::histogram::LatencyHistogram;
 use super::OrderBy;
 
@@ -181,7 +181,8 @@ impl QueryStatistics {
 
         let duration_us = execution.duration.as_micros() as u64;
         self.total_time_us.fetch_add(duration_us, Ordering::Relaxed);
-        self.rows.fetch_add(execution.rows as u64, Ordering::Relaxed);
+        self.rows
+            .fetch_add(execution.rows as u64, Ordering::Relaxed);
 
         if execution.error.is_some() {
             self.errors.fetch_add(1, Ordering::Relaxed);
@@ -392,13 +393,14 @@ impl StatisticsStore {
     pub fn record(&self, fingerprint: &QueryFingerprint, execution: &QueryExecution) {
         // Enforce max fingerprints before entering the entry API
         // (reading len() inside or_insert_with would deadlock on DashMap)
-        if !self.stats.contains_key(&fingerprint.hash)
-            && self.stats.len() >= self.max_fingerprints
+        if !self.stats.contains_key(&fingerprint.hash) && self.stats.len() >= self.max_fingerprints
         {
             self.evict_oldest();
         }
 
-        let stats = self.stats.entry(fingerprint.hash)
+        let stats = self
+            .stats
+            .entry(fingerprint.hash)
             .or_insert_with(|| QueryStatistics::new(fingerprint.clone()));
 
         stats.record(execution);
@@ -487,8 +489,9 @@ mod tests {
         let fingerprint = fp.fingerprint("SELECT * FROM users WHERE id = 1");
         let stats = QueryStatistics::new(fingerprint);
 
-        let exec = QueryExecution::new("SELECT * FROM users WHERE id = 1", Duration::from_millis(5))
-            .with_rows(1);
+        let exec =
+            QueryExecution::new("SELECT * FROM users WHERE id = 1", Duration::from_millis(5))
+                .with_rows(1);
 
         stats.record(&exec);
         stats.record(&exec);
@@ -505,7 +508,8 @@ mod tests {
         let fp = QueryFingerprinter::new();
 
         let fingerprint = fp.fingerprint("SELECT * FROM users WHERE id = 1");
-        let exec = QueryExecution::new("SELECT * FROM users WHERE id = 1", Duration::from_millis(5));
+        let exec =
+            QueryExecution::new("SELECT * FROM users WHERE id = 1", Duration::from_millis(5));
 
         store.record(&fingerprint, &exec);
         store.record(&fingerprint, &exec);

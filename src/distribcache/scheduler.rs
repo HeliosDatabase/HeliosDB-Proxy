@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::RwLock;
 
-use super::DistribCacheConfig;
 use super::classifier::WorkloadType;
 use super::config::SchedulingPolicy;
+use super::DistribCacheConfig;
 
 /// Scheduled query
 #[derive(Debug, Clone)]
@@ -145,35 +145,50 @@ impl WorkloadScheduler {
     pub fn new(config: DistribCacheConfig) -> Self {
         let mut limits = HashMap::new();
 
-        limits.insert(WorkloadType::OLTP, ResourceLimit {
-            max_concurrent: config.max_concurrent_oltp,
-            max_cache_mb: 64,
-            priority_weight: config.oltp_priority,
-        });
+        limits.insert(
+            WorkloadType::OLTP,
+            ResourceLimit {
+                max_concurrent: config.max_concurrent_oltp,
+                max_cache_mb: 64,
+                priority_weight: config.oltp_priority,
+            },
+        );
 
-        limits.insert(WorkloadType::OLAP, ResourceLimit {
-            max_concurrent: config.max_concurrent_olap,
-            max_cache_mb: 128,
-            priority_weight: config.olap_priority,
-        });
+        limits.insert(
+            WorkloadType::OLAP,
+            ResourceLimit {
+                max_concurrent: config.max_concurrent_olap,
+                max_cache_mb: 128,
+                priority_weight: config.olap_priority,
+            },
+        );
 
-        limits.insert(WorkloadType::Vector, ResourceLimit {
-            max_concurrent: config.max_concurrent_vector,
-            max_cache_mb: 96,
-            priority_weight: config.vector_priority,
-        });
+        limits.insert(
+            WorkloadType::Vector,
+            ResourceLimit {
+                max_concurrent: config.max_concurrent_vector,
+                max_cache_mb: 96,
+                priority_weight: config.vector_priority,
+            },
+        );
 
-        limits.insert(WorkloadType::AIAgent, ResourceLimit {
-            max_concurrent: config.max_concurrent_ai,
-            max_cache_mb: 64,
-            priority_weight: config.ai_agent_priority,
-        });
+        limits.insert(
+            WorkloadType::AIAgent,
+            ResourceLimit {
+                max_concurrent: config.max_concurrent_ai,
+                max_cache_mb: 64,
+                priority_weight: config.ai_agent_priority,
+            },
+        );
 
-        limits.insert(WorkloadType::RAG, ResourceLimit {
-            max_concurrent: config.max_concurrent_ai,
-            max_cache_mb: 64,
-            priority_weight: config.ai_agent_priority,
-        });
+        limits.insert(
+            WorkloadType::RAG,
+            ResourceLimit {
+                max_concurrent: config.max_concurrent_ai,
+                max_cache_mb: 64,
+                priority_weight: config.ai_agent_priority,
+            },
+        );
 
         limits.insert(WorkloadType::Mixed, ResourceLimit::default());
 
@@ -310,14 +325,16 @@ impl WorkloadScheduler {
 
     /// Get current concurrency for a workload
     fn get_current_concurrency(&self, workload: &WorkloadType) -> u32 {
-        self.queues.get(workload)
+        self.queues
+            .get(workload)
             .map(|q| q.read().unwrap().active.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
 
     /// Get queue position
     fn queue_position(&self, workload: &WorkloadType) -> usize {
-        self.queues.get(workload)
+        self.queues
+            .get(workload)
             .map(|q| q.read().unwrap().pending.len())
             .unwrap_or(0)
     }

@@ -8,11 +8,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+use super::registry::{IndexType, RelationshipType, StorageType};
 use super::{
-    TableSchema, ColumnSchema, IndexSchema, AccessPattern,
-    DataTemperature, WorkloadType, Relationship,
+    AccessPattern, ColumnSchema, DataTemperature, IndexSchema, Relationship, TableSchema,
+    WorkloadType,
 };
-use super::registry::{StorageType, IndexType, RelationshipType};
 
 /// Configuration for schema discovery
 #[derive(Debug, Clone)]
@@ -191,7 +191,10 @@ impl SchemaDiscovery {
     }
 
     /// Discover indexes for a table
-    pub async fn discover_indexes(&self, table_name: &str) -> Result<Vec<IndexSchema>, DiscoveryError> {
+    pub async fn discover_indexes(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<IndexSchema>, DiscoveryError> {
         if !self.config.discover_indexes {
             return Ok(Vec::new());
         }
@@ -224,7 +227,9 @@ impl SchemaDiscovery {
 
         // Cache the results
         let mut cache = self.cache.write().await;
-        cache.indexes.insert(table_name.to_string(), indexes.clone());
+        cache
+            .indexes
+            .insert(table_name.to_string(), indexes.clone());
 
         Ok(indexes)
     }
@@ -269,7 +274,10 @@ impl SchemaDiscovery {
     }
 
     /// Get table statistics for temperature inference
-    pub async fn get_statistics(&self, table_name: &str) -> Result<TableStatistics, DiscoveryError> {
+    pub async fn get_statistics(
+        &self,
+        table_name: &str,
+    ) -> Result<TableStatistics, DiscoveryError> {
         if !self.config.sample_statistics {
             return Err(DiscoveryError::StatisticsDisabled);
         }
@@ -299,7 +307,9 @@ impl SchemaDiscovery {
 
         // Cache the results
         let mut cache = self.cache.write().await;
-        cache.statistics.insert(table_name.to_string(), stats.clone());
+        cache
+            .statistics
+            .insert(table_name.to_string(), stats.clone());
 
         Ok(stats)
     }
@@ -415,7 +425,10 @@ impl SchemaDiscovery {
         let schemas_filter = if self.config.schemas.is_empty() {
             String::new()
         } else {
-            let schemas = self.config.schemas.iter()
+            let schemas = self
+                .config
+                .schemas
+                .iter()
                 .map(|s| format!("'{}'", s))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -448,7 +461,8 @@ impl SchemaDiscovery {
                 column_default
             FROM information_schema.columns
             ORDER BY table_schema, table_name, ordinal_position
-            "#.to_string()
+            "#
+            .to_string(),
         );
 
         // Indexes query (PostgreSQL specific)
@@ -461,7 +475,8 @@ impl SchemaDiscovery {
                 indexdef
             FROM pg_indexes
             ORDER BY schemaname, tablename, indexname
-            "#.to_string()
+            "#
+            .to_string(),
         );
 
         // Foreign keys query
@@ -481,7 +496,8 @@ impl SchemaDiscovery {
                 JOIN information_schema.constraint_column_usage AS ccu
                     ON ccu.constraint_name = tc.constraint_name
                 WHERE tc.constraint_type = 'FOREIGN KEY'
-                "#.to_string()
+                "#
+                .to_string(),
             );
         }
 
@@ -501,7 +517,8 @@ impl SchemaDiscovery {
                     last_vacuum,
                     last_analyze
                 FROM pg_stat_user_tables
-                "#.to_string()
+                "#
+                .to_string(),
             );
         }
 
@@ -617,7 +634,8 @@ mod tests {
         let rels = discovery.discover_relationships().await.unwrap();
         assert!(!rels.is_empty());
 
-        let order_user = rels.iter()
+        let order_user = rels
+            .iter()
             .find(|r| r.from_table == "orders" && r.to_table == "users")
             .unwrap();
         assert_eq!(order_user.relationship_type, RelationshipType::ManyToOne);
@@ -652,7 +670,10 @@ mod tests {
             last_vacuum: None,
             last_analyze: None,
         };
-        assert_eq!(discovery.infer_temperature(&hot_stats), DataTemperature::Hot);
+        assert_eq!(
+            discovery.infer_temperature(&hot_stats),
+            DataTemperature::Hot
+        );
 
         // Cold table
         let cold_stats = TableStatistics {
@@ -668,7 +689,10 @@ mod tests {
             last_vacuum: None,
             last_analyze: None,
         };
-        assert_eq!(discovery.infer_temperature(&cold_stats), DataTemperature::Cold);
+        assert_eq!(
+            discovery.infer_temperature(&cold_stats),
+            DataTemperature::Cold
+        );
     }
 
     #[tokio::test]
@@ -690,7 +714,10 @@ mod tests {
             last_vacuum: None,
             last_analyze: None,
         };
-        assert_eq!(discovery.infer_access_pattern(&point_stats), AccessPattern::PointLookup);
+        assert_eq!(
+            discovery.infer_access_pattern(&point_stats),
+            AccessPattern::PointLookup
+        );
 
         // Full scan pattern
         let scan_stats = TableStatistics {
@@ -706,7 +733,10 @@ mod tests {
             last_vacuum: None,
             last_analyze: None,
         };
-        assert_eq!(discovery.infer_access_pattern(&scan_stats), AccessPattern::FullScan);
+        assert_eq!(
+            discovery.infer_access_pattern(&scan_stats),
+            AccessPattern::FullScan
+        );
     }
 
     #[tokio::test]

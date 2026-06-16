@@ -128,12 +128,7 @@ impl L3SemanticCache {
         };
 
         // Create entry
-        let mut entry = L3Entry::new(
-            query.to_string(),
-            embedding,
-            context.clone(),
-            result,
-        );
+        let mut entry = L3Entry::new(query.to_string(), embedding, context.clone(), result);
 
         // Enforce TTL from config
         if entry.result.ttl > self.config.ttl {
@@ -264,12 +259,7 @@ impl EmbeddingClient {
             "prompt": text
         });
 
-        let response = self.client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await
-            .ok()?;
+        let response = self.client.post(&url).json(&request).send().await.ok()?;
 
         if !response.status().is_success() {
             return None;
@@ -277,7 +267,8 @@ impl EmbeddingClient {
 
         let body: serde_json::Value = response.json().await.ok()?;
 
-        let embedding = body.get("embedding")?
+        let embedding = body
+            .get("embedding")?
             .as_array()?
             .iter()
             .filter_map(|v| v.as_f64().map(|f| f as f32))
@@ -316,7 +307,8 @@ impl EmbeddingClient {
         let response = self.client.get(&url).send().await.ok()?;
         let body: serde_json::Value = response.json().await.ok()?;
 
-        let models = body.get("models")?
+        let models = body
+            .get("models")?
             .as_array()?
             .iter()
             .filter_map(|m| m.get("name")?.as_str().map(String::from))
@@ -333,7 +325,8 @@ impl EmbeddingClient {
             "name": self.model
         });
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .json(&request)
             .send()
@@ -559,12 +552,7 @@ mod tests {
                 let result = create_result(&format!("result_{}", i));
                 let embedding = random_embedding(384);
 
-                entries.push(L3Entry::new(
-                    format!("query_{}", i),
-                    embedding,
-                    ctx,
-                    result,
-                ));
+                entries.push(L3Entry::new(format!("query_{}", i), embedding, ctx, result));
 
                 // Evict if needed
                 cache.evict(&mut entries);

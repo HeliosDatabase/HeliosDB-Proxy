@@ -333,12 +333,9 @@ pub enum StartupMessage {
 /// On `BytesMut`, `split_to` is O(1), and `BytesMut -> Vec<u8>` is
 /// zero-copy when (as here) the split-off buffer has a single owner.
 fn read_cstring(buf: &mut BytesMut) -> Result<String> {
-    let end = buf
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or_else(|| ProxyError::Protocol(
-            "unterminated cstring in protocol buffer".to_string(),
-        ))?;
+    let end = buf.iter().position(|&b| b == 0).ok_or_else(|| {
+        ProxyError::Protocol("unterminated cstring in protocol buffer".to_string())
+    })?;
 
     let bytes = buf.split_to(end);
     buf.advance(1); // consume the null terminator
@@ -809,7 +806,10 @@ mod tests {
             TransactionStatus::from_byte(b'T'),
             TransactionStatus::InTransaction
         );
-        assert_eq!(TransactionStatus::from_byte(b'E'), TransactionStatus::Failed);
+        assert_eq!(
+            TransactionStatus::from_byte(b'E'),
+            TransactionStatus::Failed
+        );
 
         assert_eq!(TransactionStatus::Idle.to_byte(), b'I');
         assert_eq!(TransactionStatus::InTransaction.to_byte(), b'T');

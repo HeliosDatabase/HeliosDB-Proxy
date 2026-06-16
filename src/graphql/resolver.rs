@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{GraphQLSchema, ExecutionContext};
+use super::{ExecutionContext, GraphQLSchema};
 
 /// Resolver context passed to field resolvers
 #[derive(Debug, Clone)]
@@ -59,7 +59,10 @@ impl ResolverContext {
     }
 
     /// Get a required argument
-    pub fn required_arg<T: serde::de::DeserializeOwned>(&self, name: &str) -> Result<T, ResolverError> {
+    pub fn required_arg<T: serde::de::DeserializeOwned>(
+        &self,
+        name: &str,
+    ) -> Result<T, ResolverError> {
         self.arg(name)
             .ok_or_else(|| ResolverError::MissingArgument(name.to_string()))
     }
@@ -159,7 +162,9 @@ pub enum ResolverError {
 impl std::fmt::Display for ResolverError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ResolverError::MissingArgument(name) => write!(f, "Missing required argument: {}", name),
+            ResolverError::MissingArgument(name) => {
+                write!(f, "Missing required argument: {}", name)
+            }
             ResolverError::InvalidArgument(name, msg) => {
                 write!(f, "Invalid argument '{}': {}", name, msg)
             }
@@ -226,9 +231,7 @@ impl DefaultResolver {
 impl FieldResolver for DefaultResolver {
     fn resolve(&self, ctx: &ResolverContext) -> ResolverResult {
         match &ctx.parent {
-            Some(parent) => {
-                parent.get(&self.column_name).cloned().into()
-            }
+            Some(parent) => parent.get(&self.column_name).cloned().into(),
             None => ResolverResult::Null,
         }
     }
@@ -465,10 +468,12 @@ mod tests {
     #[test]
     fn test_computed_resolver() {
         let resolver = ComputedResolver::new("User", "fullName", |ctx| {
-            let first = ctx.parent_field("firstName")
+            let first = ctx
+                .parent_field("firstName")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let last = ctx.parent_field("lastName")
+            let last = ctx
+                .parent_field("lastName")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             ResolverResult::value(format!("{} {}", first, last))
@@ -567,10 +572,7 @@ mod tests {
             ResolverResult::value("test").to_json(),
             serde_json::json!("test")
         );
-        assert_eq!(
-            ResolverResult::null().to_json(),
-            serde_json::Value::Null
-        );
+        assert_eq!(ResolverResult::null().to_json(), serde_json::Value::Null);
         assert_eq!(
             ResolverResult::error("err").to_json(),
             serde_json::Value::Null

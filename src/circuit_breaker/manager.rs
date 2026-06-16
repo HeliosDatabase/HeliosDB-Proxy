@@ -157,7 +157,9 @@ impl CircuitBreakerManager {
         F: FnOnce() -> Result<T, E>,
         E: std::fmt::Display,
     {
-        let guard = self.allow_request(node_id).map_err(WrapError::CircuitOpen)?;
+        let guard = self
+            .allow_request(node_id)
+            .map_err(WrapError::CircuitOpen)?;
 
         match f() {
             Ok(result) => {
@@ -182,7 +184,9 @@ impl CircuitBreakerManager {
         Fut: std::future::Future<Output = Result<T, E>>,
         E: std::fmt::Display,
     {
-        let guard = self.allow_request(node_id).map_err(WrapError::CircuitOpen)?;
+        let guard = self
+            .allow_request(node_id)
+            .map_err(WrapError::CircuitOpen)?;
 
         match f().await {
             Ok(result) => {
@@ -436,11 +440,8 @@ mod tests {
 
     #[test]
     fn test_manager_healthy_nodes() {
-        let config = ManagerConfig::new(
-            CircuitBreakerConfig::builder()
-                .failure_threshold(2)
-                .build(),
-        );
+        let config =
+            ManagerConfig::new(CircuitBreakerConfig::builder().failure_threshold(2).build());
         let manager = CircuitBreakerManager::new(config);
 
         // Create some nodes
@@ -481,14 +482,9 @@ mod tests {
 
     #[test]
     fn test_manager_node_overrides() {
-        let config = ManagerConfig::new(
-            CircuitBreakerConfig::builder()
-                .failure_threshold(5)
-                .build(),
-        )
-        .with_node_override(
-            NodeOverride::new("special-node").with_failure_threshold(10),
-        );
+        let config =
+            ManagerConfig::new(CircuitBreakerConfig::builder().failure_threshold(5).build())
+                .with_node_override(NodeOverride::new("special-node").with_failure_threshold(10));
 
         let manager = CircuitBreakerManager::new(config);
 
@@ -515,11 +511,8 @@ mod tests {
 
     #[test]
     fn test_manager_reset_all() {
-        let config = ManagerConfig::new(
-            CircuitBreakerConfig::builder()
-                .failure_threshold(1)
-                .build(),
-        );
+        let config =
+            ManagerConfig::new(CircuitBreakerConfig::builder().failure_threshold(1).build());
         let manager = CircuitBreakerManager::new(config);
 
         // Open some circuits

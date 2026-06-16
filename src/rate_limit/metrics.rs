@@ -135,7 +135,10 @@ impl RateLimitMetrics {
             let avg = sorted.iter().sum::<u64>() / sorted.len() as u64;
             let p50 = sorted[sorted.len() / 2];
             let p99_idx = ((sorted.len() as f64) * 0.99) as usize;
-            let p99 = sorted.get(p99_idx).copied().unwrap_or(sorted[sorted.len() - 1]);
+            let p99 = sorted
+                .get(p99_idx)
+                .copied()
+                .unwrap_or(sorted[sorted.len() - 1]);
 
             (avg, p50, p99)
         };
@@ -216,7 +219,10 @@ impl Default for RateLimitMetrics {
 impl std::fmt::Debug for RateLimitMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RateLimitMetrics")
-            .field("total_requests", &self.total_requests.load(Ordering::Relaxed))
+            .field(
+                "total_requests",
+                &self.total_requests.load(Ordering::Relaxed),
+            )
             .field("denied", &self.denied.load(Ordering::Relaxed))
             .field("key_count", &self.key_stats.len())
             .finish()
@@ -256,8 +262,10 @@ impl KeyStats {
         self.total.fetch_add(1, Ordering::Relaxed);
 
         match result {
-            RateLimitResult::Allowed | RateLimitResult::Queued(_) |
-            RateLimitResult::Throttled(_) | RateLimitResult::Warned(_) => {
+            RateLimitResult::Allowed
+            | RateLimitResult::Queued(_)
+            | RateLimitResult::Throttled(_)
+            | RateLimitResult::Warned(_) => {
                 self.allowed.fetch_add(1, Ordering::Relaxed);
             }
             RateLimitResult::Denied(_) => {
@@ -265,10 +273,8 @@ impl KeyStats {
             }
         }
 
-        self.last_request_ns.store(
-            self.epoch.elapsed().as_nanos() as u64,
-            Ordering::Relaxed,
-        );
+        self.last_request_ns
+            .store(self.epoch.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> KeyStatsSnapshot {
@@ -450,7 +456,11 @@ mod tests {
             message: "test".to_string(),
         };
 
-        metrics.record_decision(&key, &RateLimitResult::Denied(error), Duration::from_micros(10));
+        metrics.record_decision(
+            &key,
+            &RateLimitResult::Denied(error),
+            Duration::from_micros(10),
+        );
 
         let stats = metrics.get_stats();
         assert_eq!(stats.total_requests, 1);
@@ -462,9 +472,21 @@ mod tests {
         let metrics = RateLimitMetrics::new();
         let key = LimiterKey::User("test".to_string());
 
-        metrics.record_decision(&key, &RateLimitResult::Queued(Duration::from_secs(1)), Duration::from_micros(10));
-        metrics.record_decision(&key, &RateLimitResult::Throttled(Duration::from_secs(1)), Duration::from_micros(10));
-        metrics.record_decision(&key, &RateLimitResult::Warned("test".to_string()), Duration::from_micros(10));
+        metrics.record_decision(
+            &key,
+            &RateLimitResult::Queued(Duration::from_secs(1)),
+            Duration::from_micros(10),
+        );
+        metrics.record_decision(
+            &key,
+            &RateLimitResult::Throttled(Duration::from_secs(1)),
+            Duration::from_micros(10),
+        );
+        metrics.record_decision(
+            &key,
+            &RateLimitResult::Warned("test".to_string()),
+            Duration::from_micros(10),
+        );
 
         let stats = metrics.get_stats();
         assert_eq!(stats.total_requests, 3);
@@ -510,7 +532,11 @@ mod tests {
         };
 
         for _ in 0..2 {
-            metrics.record_decision(&key, &RateLimitResult::Denied(error.clone()), Duration::from_micros(10));
+            metrics.record_decision(
+                &key,
+                &RateLimitResult::Denied(error.clone()),
+                Duration::from_micros(10),
+            );
         }
 
         let rate = metrics.denial_rate();
@@ -523,7 +549,11 @@ mod tests {
         let key = LimiterKey::User("test".to_string());
 
         for i in 1..=100 {
-            metrics.record_decision(&key, &RateLimitResult::Allowed, Duration::from_micros(i * 10));
+            metrics.record_decision(
+                &key,
+                &RateLimitResult::Allowed,
+                Duration::from_micros(i * 10),
+            );
         }
 
         let stats = metrics.get_stats();
@@ -591,26 +621,35 @@ mod tests {
     fn test_top_keys() {
         let mut key_stats = HashMap::new();
 
-        key_stats.insert("user:high".to_string(), KeyStatsSnapshot {
-            total: 100,
-            allowed: 50,
-            denied: 50,
-            last_request_age: None,
-        });
+        key_stats.insert(
+            "user:high".to_string(),
+            KeyStatsSnapshot {
+                total: 100,
+                allowed: 50,
+                denied: 50,
+                last_request_age: None,
+            },
+        );
 
-        key_stats.insert("user:low".to_string(), KeyStatsSnapshot {
-            total: 100,
-            allowed: 90,
-            denied: 10,
-            last_request_age: None,
-        });
+        key_stats.insert(
+            "user:low".to_string(),
+            KeyStatsSnapshot {
+                total: 100,
+                allowed: 90,
+                denied: 10,
+                last_request_age: None,
+            },
+        );
 
-        key_stats.insert("user:most".to_string(), KeyStatsSnapshot {
-            total: 1000,
-            allowed: 900,
-            denied: 100,
-            last_request_age: None,
-        });
+        key_stats.insert(
+            "user:most".to_string(),
+            KeyStatsSnapshot {
+                total: 1000,
+                allowed: 900,
+                denied: 100,
+                last_request_age: None,
+            },
+        );
 
         let stats = RateLimitStats {
             total_requests: 1200,

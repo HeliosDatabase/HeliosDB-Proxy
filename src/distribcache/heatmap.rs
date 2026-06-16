@@ -37,10 +37,8 @@ impl Default for AccessStats {
 impl AccessStats {
     fn record_hit(&self, time_saved: Duration) {
         self.hits.fetch_add(1, Ordering::Relaxed);
-        self.total_time_saved_us.fetch_add(
-            time_saved.as_micros() as u64,
-            Ordering::Relaxed,
-        );
+        self.total_time_saved_us
+            .fetch_add(time_saved.as_micros() as u64, Ordering::Relaxed);
         self.update_last_access();
     }
 
@@ -194,9 +192,7 @@ impl CacheHeatmap {
     pub fn record_access(&self, fingerprint: &QueryFingerprint, hit: bool, time_saved: Duration) {
         // Update table stats
         for table in &fingerprint.tables {
-            let stats = self.table_accesses
-                .entry(table.clone())
-                .or_default();
+            let stats = self.table_accesses.entry(table.clone()).or_default();
 
             if hit {
                 stats.record_hit(time_saved);
@@ -206,9 +202,7 @@ impl CacheHeatmap {
         }
 
         // Update query stats
-        let query_stats = self.query_accesses
-            .entry(fingerprint.clone())
-            .or_default();
+        let query_stats = self.query_accesses.entry(fingerprint.clone()).or_default();
 
         if hit {
             query_stats.record_hit(time_saved);
@@ -235,10 +229,14 @@ impl CacheHeatmap {
             let mut buckets = self.time_buckets.write().unwrap();
 
             // Calculate hit ratio for completed bucket
-            let total_hits: u64 = self.table_accesses.iter()
+            let total_hits: u64 = self
+                .table_accesses
+                .iter()
                 .map(|e| e.value().hits.load(Ordering::Relaxed))
                 .sum();
-            let total_misses: u64 = self.table_accesses.iter()
+            let total_misses: u64 = self
+                .table_accesses
+                .iter()
                 .map(|e| e.value().misses.load(Ordering::Relaxed))
                 .sum();
 
@@ -274,7 +272,9 @@ impl CacheHeatmap {
     /// Calculate temperature from access count
     fn calculate_temperature(&self, accesses: u64) -> Temperature {
         // Get percentiles from all tables
-        let mut all_accesses: Vec<u64> = self.table_accesses.iter()
+        let mut all_accesses: Vec<u64> = self
+            .table_accesses
+            .iter()
             .map(|e| e.value().total_accesses())
             .collect();
         all_accesses.sort();
@@ -283,9 +283,18 @@ impl CacheHeatmap {
             return Temperature::Cold;
         }
 
-        let p75 = all_accesses.get(all_accesses.len() * 3 / 4).copied().unwrap_or(0);
-        let p50 = all_accesses.get(all_accesses.len() / 2).copied().unwrap_or(0);
-        let p25 = all_accesses.get(all_accesses.len() / 4).copied().unwrap_or(0);
+        let p75 = all_accesses
+            .get(all_accesses.len() * 3 / 4)
+            .copied()
+            .unwrap_or(0);
+        let p50 = all_accesses
+            .get(all_accesses.len() / 2)
+            .copied()
+            .unwrap_or(0);
+        let p25 = all_accesses
+            .get(all_accesses.len() / 4)
+            .copied()
+            .unwrap_or(0);
 
         if accesses >= p75 {
             Temperature::Hot
@@ -300,7 +309,9 @@ impl CacheHeatmap {
 
     /// Generate heatmap visualization data
     pub fn generate_heatmap(&self) -> HeatmapData {
-        let mut tables: Vec<TableHeat> = self.table_accesses.iter()
+        let mut tables: Vec<TableHeat> = self
+            .table_accesses
+            .iter()
             .map(|entry| {
                 let stats = entry.value();
                 let hits = stats.hits.load(Ordering::Relaxed);
@@ -438,9 +449,7 @@ mod tests {
         let data = heatmap.generate_heatmap();
         assert!(!data.tables.is_empty());
 
-        let users_heat = data.tables.iter()
-            .find(|t| t.name == "USERS")
-            .unwrap();
+        let users_heat = data.tables.iter().find(|t| t.name == "USERS").unwrap();
 
         assert_eq!(users_heat.total_accesses, 3);
         assert!((users_heat.hit_ratio - 0.666).abs() < 0.01);
@@ -482,7 +491,9 @@ mod tests {
 
         // Should have a recommendation for low hit ratio
         assert!(!data.recommendations.is_empty());
-        let rec = data.recommendations.iter()
+        let rec = data
+            .recommendations
+            .iter()
             .find(|r| r.issue.contains("hit ratio"));
         assert!(rec.is_some());
     }

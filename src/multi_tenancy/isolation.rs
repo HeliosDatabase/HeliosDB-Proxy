@@ -387,10 +387,7 @@ impl TenantProvisioner {
                 shared_database.unwrap_or("shared"),
                 self.generate_schema_name(tenant),
             ),
-            "row" => IsolationStrategy::row(
-                shared_database.unwrap_or("shared"),
-                "tenant_id",
-            ),
+            "row" => IsolationStrategy::row(shared_database.unwrap_or("shared"), "tenant_id"),
             "branch" => IsolationStrategy::branch(self.generate_branch_name(tenant)),
             _ => IsolationStrategy::schema("public", self.generate_schema_name(tenant)),
         }
@@ -401,10 +398,7 @@ impl TenantProvisioner {
         let db_name = self.generate_database_name(tenant);
         vec![
             format!("CREATE DATABASE {} WITH OWNER = postgres", db_name),
-            format!(
-                "GRANT ALL PRIVILEGES ON DATABASE {} TO postgres",
-                db_name
-            ),
+            format!("GRANT ALL PRIVILEGES ON DATABASE {} TO postgres", db_name),
         ]
     }
 
@@ -441,10 +435,7 @@ mod tests {
     use super::*;
     use crate::multi_tenancy::config::{TenantConfig, TenantPermissions};
 
-    fn create_test_config(
-        id: &str,
-        isolation: IsolationStrategy,
-    ) -> TenantConfig {
+    fn create_test_config(id: &str, isolation: IsolationStrategy) -> TenantConfig {
         TenantConfig::builder()
             .id(id)
             .name(format!("Test {}", id))
@@ -473,10 +464,7 @@ mod tests {
     #[test]
     fn test_database_isolation_handler() {
         let handler = DatabaseIsolationHandler::new();
-        let config = create_test_config(
-            "tenant_a",
-            IsolationStrategy::database("tenant_a_db"),
-        );
+        let config = create_test_config("tenant_a", IsolationStrategy::database("tenant_a_db"));
 
         let routing = handler.get_routing(&TenantId::new("tenant_a"), &config);
         assert_eq!(routing.database, Some("tenant_a_db".to_string()));
@@ -509,10 +497,8 @@ mod tests {
             .register_table("users", "tenant_id")
             .register_table("orders", "tenant_id");
 
-        let config = create_test_config(
-            "tenant_a",
-            IsolationStrategy::row("shared_db", "tenant_id"),
-        );
+        let config =
+            create_test_config("tenant_a", IsolationStrategy::row("shared_db", "tenant_id"));
 
         let routing = handler.get_routing(&TenantId::new("tenant_a"), &config);
         assert_eq!(routing.database, Some("shared_db".to_string()));
@@ -523,10 +509,7 @@ mod tests {
     #[test]
     fn test_branch_isolation_handler() {
         let handler = BranchIsolationHandler::new();
-        let config = create_test_config(
-            "tenant_a",
-            IsolationStrategy::branch("tenant_a_branch"),
-        );
+        let config = create_test_config("tenant_a", IsolationStrategy::branch("tenant_a_branch"));
 
         let routing = handler.get_routing(&TenantId::new("tenant_a"), &config);
         assert_eq!(routing.branch, Some("tenant_a_branch".to_string()));
@@ -537,14 +520,9 @@ mod tests {
     fn test_isolation_router() {
         let router = IsolationRouter::new();
 
-        let config_a = create_test_config(
-            "tenant_a",
-            IsolationStrategy::database("tenant_a_db"),
-        );
-        let config_b = create_test_config(
-            "tenant_b",
-            IsolationStrategy::schema("shared", "tenant_b"),
-        );
+        let config_a = create_test_config("tenant_a", IsolationStrategy::database("tenant_a_db"));
+        let config_b =
+            create_test_config("tenant_b", IsolationStrategy::schema("shared", "tenant_b"));
 
         router.register_from_config(&config_a);
         router.register_from_config(&config_b);
@@ -562,7 +540,10 @@ mod tests {
         let provisioner = TenantProvisioner::new();
         let tenant = TenantId::new("acme");
 
-        assert_eq!(provisioner.generate_database_name(&tenant), "tenant_acme_db");
+        assert_eq!(
+            provisioner.generate_database_name(&tenant),
+            "tenant_acme_db"
+        );
         assert_eq!(provisioner.generate_schema_name(&tenant), "tenant_acme");
         assert_eq!(provisioner.generate_branch_name(&tenant), "tenant_acme");
 

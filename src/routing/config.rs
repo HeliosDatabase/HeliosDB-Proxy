@@ -2,7 +2,7 @@
 //!
 //! Configuration for query routing hints and policies.
 
-use super::{RouteTarget, ConsistencyLevel};
+use super::{ConsistencyLevel, RouteTarget};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -24,18 +24,31 @@ pub struct RoutingConfig {
 impl Default for RoutingConfig {
     fn default() -> Self {
         let mut consistency = HashMap::new();
-        consistency.insert(ConsistencyLevel::Strong, ConsistencyConfig {
-            allowed_nodes: vec!["primary".to_string(), "standby-sync".to_string()],
-            max_lag_ms: 0,
-        });
-        consistency.insert(ConsistencyLevel::Bounded, ConsistencyConfig {
-            allowed_nodes: vec!["primary".to_string(), "standby-sync".to_string(), "standby-semisync".to_string()],
-            max_lag_ms: 1000,
-        });
-        consistency.insert(ConsistencyLevel::Eventual, ConsistencyConfig {
-            allowed_nodes: vec!["*".to_string()],
-            max_lag_ms: u64::MAX,
-        });
+        consistency.insert(
+            ConsistencyLevel::Strong,
+            ConsistencyConfig {
+                allowed_nodes: vec!["primary".to_string(), "standby-sync".to_string()],
+                max_lag_ms: 0,
+            },
+        );
+        consistency.insert(
+            ConsistencyLevel::Bounded,
+            ConsistencyConfig {
+                allowed_nodes: vec![
+                    "primary".to_string(),
+                    "standby-sync".to_string(),
+                    "standby-semisync".to_string(),
+                ],
+                max_lag_ms: 1000,
+            },
+        );
+        consistency.insert(
+            ConsistencyLevel::Eventual,
+            ConsistencyConfig {
+                allowed_nodes: vec!["*".to_string()],
+                max_lag_ms: u64::MAX,
+            },
+        );
 
         Self {
             default: DefaultPolicy::default(),
@@ -159,7 +172,7 @@ impl ConsistencyConfig {
             if pattern == "*" {
                 true
             } else if pattern.ends_with('*') {
-                node_name.starts_with(&pattern[..pattern.len()-1])
+                node_name.starts_with(&pattern[..pattern.len() - 1])
             } else {
                 node_name == pattern
             }
@@ -243,18 +256,28 @@ mod tests {
     fn test_consistency_config() {
         let config = RoutingConfig::default();
 
-        let strong = config.get_consistency_config(ConsistencyLevel::Strong).unwrap();
+        let strong = config
+            .get_consistency_config(ConsistencyLevel::Strong)
+            .unwrap();
         assert_eq!(strong.max_lag_ms, 0);
         assert!(strong.allowed_nodes.contains(&"primary".to_string()));
 
-        let eventual = config.get_consistency_config(ConsistencyLevel::Eventual).unwrap();
+        let eventual = config
+            .get_consistency_config(ConsistencyLevel::Eventual)
+            .unwrap();
         assert!(eventual.allows_node("any-node"));
     }
 
     #[test]
     fn test_alias_resolution() {
         let mut config = RoutingConfig::default();
-        config.add_alias("vector", vec!["standby-vector-1".to_string(), "standby-vector-2".to_string()]);
+        config.add_alias(
+            "vector",
+            vec![
+                "standby-vector-1".to_string(),
+                "standby-vector-2".to_string(),
+            ],
+        );
 
         let nodes = config.resolve_alias("vector").unwrap();
         assert_eq!(nodes.len(), 2);

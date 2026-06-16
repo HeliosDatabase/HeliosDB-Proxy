@@ -46,11 +46,9 @@ impl RewriteRule {
 
         match &self.pattern {
             QueryPattern::Fingerprint(fp) => *fp == fingerprint,
-            QueryPattern::Regex(pattern) => {
-                regex::Regex::new(pattern)
-                    .map(|re| re.is_match(query))
-                    .unwrap_or(false)
-            }
+            QueryPattern::Regex(pattern) => regex::Regex::new(pattern)
+                .map(|re| re.is_match(query))
+                .unwrap_or(false),
             QueryPattern::Table(table) => tables.contains(table),
             QueryPattern::TableAny(table_patterns) => {
                 tables.iter().any(|t| table_patterns.contains(t))
@@ -261,15 +259,10 @@ pub enum Transformation {
     Replace(String),
 
     /// Add index hint
-    AddIndexHint {
-        table: String,
-        index: String,
-    },
+    AddIndexHint { table: String, index: String },
 
     /// Rewrite SELECT * to specific columns
-    ExpandSelectStar {
-        columns: Vec<String>,
-    },
+    ExpandSelectStar { columns: Vec<String> },
 
     /// Add LIMIT clause
     AddLimit(u32),
@@ -281,16 +274,10 @@ pub enum Transformation {
     AppendWhereAnd(String),
 
     /// Replace table name
-    ReplaceTable {
-        from: String,
-        to: String,
-    },
+    ReplaceTable { from: String, to: String },
 
     /// Add ORDER BY clause
-    AddOrderBy {
-        column: String,
-        descending: bool,
-    },
+    AddOrderBy { column: String, descending: bool },
 
     /// Add query hint comment
     AddHint(String),
@@ -366,20 +353,13 @@ pub enum Condition {
     HasSelectStar,
 
     /// Session variable check
-    SessionVar {
-        name: String,
-        exists: bool,
-    },
+    SessionVar { name: String, exists: bool },
 
     /// Client type check
-    ClientType {
-        client_type: String,
-    },
+    ClientType { client_type: String },
 
     /// Table exists in schema
-    TableExists {
-        table: String,
-    },
+    TableExists { table: String },
 
     /// All conditions must match
     And(Vec<Condition>),
@@ -488,10 +468,7 @@ mod tests {
 
     #[test]
     fn test_condition_and() {
-        let condition = Condition::and(vec![
-            Condition::NoExistingLimit,
-            Condition::HasSelectStar,
-        ]);
+        let condition = Condition::and(vec![Condition::NoExistingLimit, Condition::HasSelectStar]);
 
         match condition {
             Condition::And(c) => assert_eq!(c.len(), 2),

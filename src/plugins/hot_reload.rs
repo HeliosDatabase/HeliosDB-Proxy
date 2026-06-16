@@ -242,7 +242,9 @@ impl HotReloader {
         }
 
         // Fall back to filename
-        path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string())
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
     }
 
     /// Set debounce duration
@@ -337,7 +339,8 @@ impl HotReloadWatcher {
     where
         F: Fn(Vec<ReloadEvent>) + Send + 'static,
     {
-        self.running.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         let reloader = self.reloader.clone();
         let running = self.running.clone();
@@ -357,7 +360,8 @@ impl HotReloadWatcher {
 
     /// Stop watching
     pub fn stop(&self) {
-        self.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Check if running

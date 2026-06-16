@@ -28,8 +28,7 @@ pub enum CacheTier {
 }
 
 /// Eviction policy for cache tiers
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EvictionPolicy {
     /// Least Recently Used
     LRU,
@@ -42,10 +41,8 @@ pub enum EvictionPolicy {
     FIFO,
 }
 
-
 /// Compression type for L2 cache
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionType {
     /// No compression
     None,
@@ -55,7 +52,6 @@ pub enum CompressionType {
     /// Zstd (slower, better compression)
     Zstd,
 }
-
 
 /// Cache key for entry lookup
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -73,8 +69,8 @@ pub struct CacheKey {
 impl CacheKey {
     /// Create a new cache key from a query fingerprint
     pub fn from_fingerprint(fingerprint: &super::QueryFingerprint) -> Self {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         fingerprint.template.hash(&mut hasher);
