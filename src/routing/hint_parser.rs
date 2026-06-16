@@ -11,23 +11,21 @@
 //! ```
 
 use super::{parse_duration, Result, RoutingError};
+use once_cell::sync::Lazy;
 use regex::Regex;
 use std::str::FromStr;
-use std::sync::LazyLock;
 use std::time::Duration;
 
 #[cfg(feature = "pool-modes")]
 use crate::pool::PoolingMode;
 
 /// Compiled regex for hint parsing
-#[allow(clippy::incompatible_msrv)]
-static HINT_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"/\*\s*helios:([^*]+)\*/").expect("Invalid hint regex"));
+static HINT_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"/\*\s*helios:([^*]+)\*/").expect("Invalid hint regex"));
 
 /// Key-value pair regex
-#[allow(clippy::incompatible_msrv)]
-static KV_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(\w+)\s*=\s*([^,\s]+)").expect("Invalid key-value regex"));
+static KV_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(\w+)\s*=\s*([^,\s]+)").expect("Invalid key-value regex"));
 
 /// Hint parser for SQL routing hints
 #[derive(Debug, Clone, Default)]

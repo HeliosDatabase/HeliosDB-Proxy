@@ -12,6 +12,8 @@
 //! client (added in the T0-TR sequence) — no new infrastructure.
 
 use crate::backend::{BackendClient, BackendConfig, ParamValue};
+#[cfg(test)]
+use crate::transaction_journal::JournalEntry;
 use crate::transaction_journal::{JournalValue, TransactionJournal};
 use crate::{ProxyError, Result};
 use chrono::{DateTime, Utc};
