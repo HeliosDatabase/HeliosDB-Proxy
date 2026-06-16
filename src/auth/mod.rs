@@ -291,7 +291,7 @@ impl AuthProxyBuilder {
             .handler
             .unwrap_or_else(|| AuthenticationHandler::builder().enabled(false).build());
 
-        let role_mapper = self.role_mapper.unwrap_or_else(|| RoleMapper::new());
+        let role_mapper = self.role_mapper.unwrap_or_default();
 
         let session_manager = self
             .session_manager

@@ -103,20 +103,18 @@ jobs:
 
   # ── MSRV check ──────────────────────────────────────────────────────
   msrv:
-    name: MSRV (rust 1.75)
+    name: MSRV (rust 1.86)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.75"
+          toolchain: "1.86"
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
       - name: cargo check (MSRV)
-        run: |
-          rm -f Cargo.lock
-          cargo check --features all-features
+        run: cargo check --locked --features msrv-features
 
   # ── Benchmarks (compile only, no run) ───────────────────────────────
   bench-compile:

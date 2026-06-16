@@ -2,7 +2,7 @@
 name = "heliosdb-proxy"
 version = "0.6.1"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.86"
 description = "HeliosProxy - Intelligent connection router and failover manager for HeliosDB and PostgreSQL"
 license = "Apache-2.0"
 authors = ["HeliosDB Team"]
@@ -111,6 +111,17 @@ all-features = [
     "rate-limiting", "circuit-breaker", "query-analytics",
     "multi-tenancy", "auth-proxy", "query-rewriting",
     "wasm-plugins", "graphql-gateway", "schema-routing",
+    "distribcache", "anomaly-detection", "edge-proxy",
+]
+
+# MSRV verification bundle: same as all-features but excludes wasm-plugins
+# so the MSRV CI step compiles in reasonable time (wasmtime adds ~30s).
+msrv-features = [
+    "pool-modes", "ha-tr",
+    "query-cache", "routing-hints", "lag-routing",
+    "rate-limiting", "circuit-breaker", "query-analytics",
+    "multi-tenancy", "auth-proxy", "query-rewriting",
+    "graphql-gateway", "schema-routing",
     "distribcache", "anomaly-detection", "edge-proxy",
 ]
 
