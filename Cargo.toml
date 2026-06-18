@@ -229,6 +229,9 @@ wat = "1"
 # trust-root scaffolding stays inside cargo test's tempdir without
 # polluting the workspace.
 tempfile = "3"
+# PostgreSQL wire-protocol client used by integration tests to connect
+# through the proxy and run queries against a live backend.
+tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4"] }
 
 [[bin]]
 name = "heliosdb-proxy"
