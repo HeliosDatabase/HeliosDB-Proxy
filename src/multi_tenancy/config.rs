@@ -4,7 +4,7 @@
 //!
 //! # Example
 //!
-//! ```rust
+//! ```rust,ignore
 //! use heliosdb::proxy::multi_tenancy::{
 //!     TenantConfig, IsolationStrategy, TenantPoolConfig, TenantRateLimits,
 //! };

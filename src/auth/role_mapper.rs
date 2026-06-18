@@ -458,6 +458,7 @@ impl AuthorizationContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::config::RoleCondition;
 
     fn test_identity() -> Identity {
         Identity {

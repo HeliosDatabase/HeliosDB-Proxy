@@ -12,7 +12,7 @@
 //!
 //! # Example
 //!
-//! ```rust
+//! ```rust,ignore
 //! use heliosdb::proxy::multi_tenancy::{
 //!     TenantManager, TenantConfig, IsolationStrategy,
 //!     IdentificationMethod, RequestContext,

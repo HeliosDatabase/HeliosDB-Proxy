@@ -517,6 +517,7 @@ impl ValidationPipeline {
 mod tests {
     use super::*;
     use crate::graphql::{introspector::*, OperationType};
+    use std::collections::HashMap;
 
     fn create_test_schema() -> GraphQLSchema {
         let mut schema = GraphQLSchema::new();
