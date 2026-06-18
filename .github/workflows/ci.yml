@@ -127,3 +127,84 @@ jobs:
         with:
           key: bench
       - run: cargo bench --features all-features --no-run
+
+  # ── Integration tests (pg18 / nano3.58) ─────────────────────────────
+  integrate:
+    name: Integration (pg18 / nano3.58)
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test]
+    permissions:
+      packages: read
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: helios_test
+          POSTGRES_USER: helios
+          POSTGRES_PASSWORD: helios_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U helios -d helios_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+      nano:
+        image: ghcr.io/heliosdatabase/hdb-heliosdb-nano:3.58
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          NANO_PASSWORD: heliosdb
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -p 5432 || true"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 10s
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: integrate
+
+      - name: Build proxy binary
+        run: cargo build --features "all-features,postgres-topology"
+
+      - name: Integration tests against PostgreSQL 18
+        continue-on-error: false
+        env:
+          HELIOS_TEST_BACKEND: postgres
+          HELIOS_TEST_PG_HOST: localhost
+          HELIOS_TEST_PG_PORT: "5432"
+          HELIOS_TEST_PG_USER: helios
+          HELIOS_TEST_PG_PASSWORD: helios_test
+          HELIOS_TEST_PG_DB: helios_test
+        run: >-
+          cargo test --test integration
+          --features "all-features,postgres-topology"
+          -- --include-ignored
+
+      - name: Integration tests against HeliosDB Nano 3.58
+        continue-on-error: false
+        env:
+          HELIOS_TEST_BACKEND: nano
+          HELIOS_TEST_PG_HOST: localhost
+          HELIOS_TEST_PG_PORT: "5433"
+          HELIOS_TEST_PG_USER: postgres
+          HELIOS_TEST_PG_PASSWORD: heliosdb
+          HELIOS_TEST_PG_DB: postgres
+        run: >-
+          cargo test --test integration
+          --features "all-features,postgres-topology"
+          -- --include-ignored
