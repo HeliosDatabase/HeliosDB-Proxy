@@ -432,6 +432,7 @@ impl LagMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lag::LagCalculation;
 
     #[test]
     fn test_lag_info_default() {

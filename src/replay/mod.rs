@@ -195,6 +195,7 @@ mod tests {
     use crate::transaction_journal::StatementType;
     use crate::NodeId;
     use std::time::Duration;
+    use uuid::Uuid;
 
     fn test_template() -> BackendConfig {
         BackendConfig {

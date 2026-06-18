@@ -211,6 +211,7 @@ impl EdgeCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn entry(version: u64, body: &[u8], tables: &[&str], ttl: Duration) -> CacheEntry {
         CacheEntry {

@@ -420,6 +420,7 @@ fn random_embedding(dim: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     fn create_result(data: &str) -> CachedResult {
         CachedResult::new(
