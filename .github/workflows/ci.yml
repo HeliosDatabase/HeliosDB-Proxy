@@ -165,6 +165,35 @@ jobs:
           --health-timeout 10s
           --health-retries 20
           --health-start-period 10s
+      # ── HA standbys (modules 06/08/09/10) ──────────────────────────
+      pg-standby:
+        image: postgres:18
+        env:
+          POSTGRES_DB: helios_test
+          POSTGRES_USER: helios
+          POSTGRES_PASSWORD: helios_test
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U helios -d helios_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+      nano-standby:
+        image: ghcr.io/heliosdatabase/hdb-heliosdb-nano:3.58
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          NANO_PASSWORD: heliosdb
+        ports:
+          - 5435:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -p 5432 || true"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 10s
 
     steps:
       - name: Checkout
@@ -204,6 +233,45 @@ jobs:
           HELIOS_TEST_PG_USER: postgres
           HELIOS_TEST_PG_PASSWORD: heliosdb
           HELIOS_TEST_PG_DB: postgres
+        run: >-
+          cargo test --test integration
+          --features "all-features,postgres-topology"
+          -- --include-ignored
+
+      # ── HA tests: modules 06 / 08 / 09 / 10 with live standby ─────
+      - name: HA integration tests — PG 18 primary + standby (modules 06/08/09/10)
+        continue-on-error: false
+        env:
+          HELIOS_TEST_BACKEND: postgres
+          HELIOS_TEST_PG_HOST: localhost
+          HELIOS_TEST_PG_PORT: "5432"
+          HELIOS_TEST_PG_USER: helios
+          HELIOS_TEST_PG_PASSWORD: helios_test
+          HELIOS_TEST_PG_DB: helios_test
+          HELIOS_TEST_STANDBY_HOST: localhost
+          HELIOS_TEST_STANDBY_PORT: "5434"
+          HELIOS_TEST_STANDBY_USER: helios
+          HELIOS_TEST_STANDBY_PASSWORD: helios_test
+          HELIOS_TEST_STANDBY_DB: helios_test
+        run: >-
+          cargo test --test integration
+          --features "all-features,postgres-topology"
+          -- --include-ignored
+
+      - name: HA integration tests — Nano 3.58 primary + standby (modules 06/08/09/10)
+        continue-on-error: false
+        env:
+          HELIOS_TEST_BACKEND: nano
+          HELIOS_TEST_PG_HOST: localhost
+          HELIOS_TEST_PG_PORT: "5433"
+          HELIOS_TEST_PG_USER: postgres
+          HELIOS_TEST_PG_PASSWORD: heliosdb
+          HELIOS_TEST_PG_DB: postgres
+          HELIOS_TEST_STANDBY_HOST: localhost
+          HELIOS_TEST_STANDBY_PORT: "5435"
+          HELIOS_TEST_STANDBY_USER: postgres
+          HELIOS_TEST_STANDBY_PASSWORD: heliosdb
+          HELIOS_TEST_STANDBY_DB: postgres
         run: >-
           cargo test --test integration
           --features "all-features,postgres-topology"

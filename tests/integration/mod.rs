@@ -180,12 +180,90 @@ fn test_module_05_batch_operations_config() {
 
 /// Module 06 — Failover Controller.
 ///
-/// Ignored: requires a live standby node to exercise automatic promotion.
-#[test]
-#[ignore = "requires standby node — not present in standard CI"]
-fn test_module_06_failover_controller_config() {
-    // Covered by postgresql_compat_tests in lib.rs; this marker
-    // documents the CI exclusion rationale.
+/// In-process: exercises the full state-machine (register candidate →
+/// on_primary_failed → auto-promote → Completed) with no backend
+/// connection needed (backend_template = None → promote_standby is a no-op).
+/// Appends a live routing check through an HA proxy when standby env vars
+/// are present.
+#[tokio::test]
+async fn test_module_06_failover_controller_config() {
+    use heliosdb_proxy::failover_controller::{
+        FailoverCandidate, FailoverConfig, FailoverController, FailoverState,
+    };
+    use heliosdb_proxy::{NodeEndpoint, NodeId};
+
+    // ── In-process state-machine test ──────────────────────────────
+    let cfg = FailoverConfig {
+        auto_failover: true,
+        prefer_sync_standby: false,
+        detection_time: std::time::Duration::from_millis(10),
+        failover_timeout: std::time::Duration::from_secs(5),
+        max_lag_bytes: 16 * 1024 * 1024,
+        retry_failed: false,
+        max_retries: 0,
+    };
+    let controller = FailoverController::new(cfg);
+
+    let primary_id = NodeId::new();
+    controller.set_primary(primary_id).await;
+    assert_eq!(controller.get_primary().await, Some(primary_id));
+    assert!(matches!(controller.state().await, FailoverState::Normal));
+
+    // Register a standby candidate (lag = 0 → no wait_for_sync)
+    let standby_id = NodeId::new();
+    controller
+        .register_candidate(FailoverCandidate {
+            node_id: standby_id,
+            endpoint: NodeEndpoint::new("127.0.0.1", 5434),
+            is_sync: false,
+            lag_bytes: 0,
+            priority: 100,
+            last_heartbeat: None,
+        })
+        .await;
+
+    // Trigger failover (promote_standby is a no-op without backend_template)
+    controller
+        .on_primary_failed(primary_id)
+        .await
+        .expect("on_primary_failed");
+
+    assert_eq!(
+        controller.get_primary().await,
+        Some(standby_id),
+        "standby promoted to primary"
+    );
+    assert!(matches!(controller.state().await, FailoverState::Completed));
+    assert_eq!(controller.failover_count(), 1);
+
+    let history = controller.history().await;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].old_primary, primary_id);
+    assert_eq!(history[0].new_primary, Some(standby_id));
+    assert!(history[0].success);
+    assert!(history[0].ended_at.is_some());
+
+    // Old-primary recovered path (split-brain guard)
+    controller.on_old_primary_recovered(primary_id).await;
+
+    // ── Live routing check (skipped when no standby configured) ────
+    if let Some(fx) = fixture::start_proxy_ha().await {
+        let (client, conn) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user={} password={} dbname={}",
+                fx.proxy_port, fx.primary.user, fx.primary.password, fx.primary.dbname
+            ),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .expect("connect through HA proxy");
+        tokio::spawn(conn);
+        let rows = client
+            .query("SELECT 1 AS n", &[])
+            .await
+            .expect("query through HA proxy");
+        assert_eq!(rows[0].get::<_, i32>("n"), 1);
+    }
 }
 
 /// Module 07 — Transaction Replay (journal + replay).
@@ -235,19 +313,258 @@ fn test_module_07_transaction_replay_config() {
 }
 
 /// Module 08 — Session Migration.
+///
+/// Registers a session with parameters and a prepared statement, verifies
+/// `generate_restore_statements()` output, then calls `migrate_session()`.
+/// Without `backend_template`, `execute_statement` is a no-op, so the
+/// migration succeeds with counts = 0 but `success = true`.
+/// Appends a live SET/SHOW round-trip through an HA proxy when configured.
+#[cfg(feature = "ha-tr")]
+#[tokio::test]
+async fn test_module_08_session_migration_config() {
+    use heliosdb_proxy::session_migrate::{PreparedStatementInfo, SessionMigrate, SessionState};
+    use heliosdb_proxy::NodeId;
+
+    // ── In-process state test ───────────────────────────────────────
+    let mut migrate = SessionMigrate::new().with_max_sessions(100);
+    migrate.set_enabled(true);
+
+    let session_id = uuid::Uuid::new_v4();
+    let primary_id = NodeId::new();
+    let standby_id = NodeId::new();
+
+    let mut state = SessionState::new(
+        session_id,
+        "helios".into(),
+        "helios_test".into(),
+        primary_id,
+    );
+    state.set_parameter("search_path".into(), "public,ext".into());
+    state.set_parameter("timezone".into(), "UTC".into());
+    state.add_prepared_statement(PreparedStatementInfo {
+        name: "get_user".into(),
+        query: "SELECT id, name FROM users WHERE id = $1".into(),
+        param_types: vec!["int4".into()],
+        created_at: chrono::Utc::now(),
+    });
+
+    migrate
+        .register_session(state)
+        .await
+        .expect("register_session");
+
+    let s = migrate
+        .get_session(&session_id)
+        .await
+        .expect("get_session");
+    assert_eq!(s.user, "helios");
+    // SessionState stores the value verbatim; generate_restore_statements
+    // feeds it straight into SET search_path = <value>.
+    let sp = s.get_parameter("search_path").expect("search_path param");
+    assert!(
+        sp.contains("public") && sp.contains("ext"),
+        "search_path must contain both schemas: {sp:?}"
+    );
+    assert_eq!(s.prepared_statements.len(), 1);
+
+    let stmts = s.generate_restore_statements();
+    assert!(
+        stmts.iter().any(|s| s.starts_with("SET ")),
+        "restore stmts must include SET commands: {stmts:?}"
+    );
+    assert!(
+        stmts.iter().any(|s| s.starts_with("PREPARE ")),
+        "restore stmts must include PREPARE commands: {stmts:?}"
+    );
+
+    // migrate_session: execute_statement is a no-op (no backend_template)
+    let result = migrate
+        .migrate_session(session_id, standby_id)
+        .await
+        .expect("migrate_session");
+    assert!(result.success, "migration must succeed: {:?}", result.error);
+    assert_eq!(result.target_node, standby_id);
+
+    let stats = migrate.stats().await;
+    assert!(stats.enabled);
+
+    // ── Live HA check (skipped when no standby configured) ──────────
+    if let Some(fx) = fixture::start_proxy_ha().await {
+        let (client, conn) = tokio_postgres::connect(
+            &format!(
+                "host=127.0.0.1 port={} user={} password={} dbname={}",
+                fx.proxy_port, fx.primary.user, fx.primary.password, fx.primary.dbname
+            ),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .expect("connect through HA proxy");
+        tokio::spawn(conn);
+        client
+            .execute("SET application_name = 'ha-migration-test'", &[])
+            .await
+            .expect("SET application_name");
+        let rows = client
+            .query("SHOW application_name", &[])
+            .await
+            .expect("SHOW application_name");
+        assert_eq!(rows[0].get::<_, &str>(0), "ha-migration-test");
+    }
+}
+
+/// Module 08 stub when ha-tr feature is off.
+#[cfg(not(feature = "ha-tr"))]
 #[test]
-#[ignore = "requires standby node — not present in standard CI"]
-fn test_module_08_session_migration_config() {}
+fn test_module_08_session_migration_config() {
+    let cfg = heliosdb_proxy::config::ProxyConfig::default();
+    let _ = cfg.tr_enabled;
+}
 
 /// Module 09 — Cursor Restore.
+///
+/// Saves a cursor, updates its fetch position, gets it back, then calls
+/// `restore_cursor()`. Without `backend_template`, `recreate_cursor` is
+/// a no-op that returns `success = true`.
+#[cfg(feature = "ha-tr")]
+#[tokio::test]
+async fn test_module_09_cursor_restore_config() {
+    use heliosdb_proxy::cursor_restore::{CursorDirection, CursorRestore, CursorState};
+    use heliosdb_proxy::NodeId;
+
+    // ── In-process state test ───────────────────────────────────────
+    let mut restore = CursorRestore::new().with_max_cursors(100);
+    restore.set_enabled(true);
+
+    let session_id = uuid::Uuid::new_v4();
+    let standby_id = NodeId::new();
+
+    let cursor = CursorState {
+        name: "cur_users".into(),
+        session_id,
+        query: "SELECT id, name FROM users ORDER BY id".into(),
+        parameters: vec![],
+        total_rows: Some(500),
+        position: 0,
+        scrollable: false,
+        with_hold: true,
+        direction: CursorDirection::Forward,
+        fetch_size: 50,
+        created_at: chrono::Utc::now(),
+        last_fetch: None,
+        closed: false,
+    };
+
+    restore.save_cursor(cursor).await.expect("save_cursor");
+    restore
+        .update_position("cur_users", 50)
+        .await
+        .expect("update_position");
+
+    let got = restore
+        .get_cursor("cur_users")
+        .await
+        .expect("get_cursor");
+    assert_eq!(got.position, 50);
+    assert_eq!(got.name, "cur_users");
+    assert_eq!(got.query, "SELECT id, name FROM users ORDER BY id");
+    assert!(got.with_hold);
+
+    let session_cursors = restore.get_session_cursors(&session_id).await;
+    assert_eq!(session_cursors.len(), 1);
+
+    // restore_cursor: recreate_cursor is a no-op (no backend_template)
+    let result = restore
+        .restore_cursor("cur_users", standby_id)
+        .await
+        .expect("restore_cursor");
+    assert!(result.success, "restore must succeed: {:?}", result.error);
+    assert_eq!(result.name, "cur_users");
+
+    let stats = restore.stats().await;
+    assert!(stats.enabled);
+    assert_eq!(stats.active_cursors, 1);
+
+    // close and verify
+    restore.close_cursor("cur_users").await.expect("close_cursor");
+    let stats2 = restore.stats().await;
+    assert_eq!(stats2.active_cursors, 0);
+}
+
+/// Module 09 stub when ha-tr feature is off.
+#[cfg(not(feature = "ha-tr"))]
 #[test]
-#[ignore = "requires standby node — not present in standard CI"]
-fn test_module_09_cursor_restore_config() {}
+fn test_module_09_cursor_restore_config() {
+    let cfg = heliosdb_proxy::config::ProxyConfig::default();
+    let _ = cfg.tr_enabled;
+}
 
 /// Module 10 — Switchover Buffer.
-#[test]
-#[ignore = "requires planned switchover — not present in standard CI"]
-fn test_module_10_switchover_buffer_config() {}
+///
+/// Exercises the full planned-switchover lifecycle in-process:
+/// Passthrough → start_buffering → buffer 3 queries → stop_buffering
+/// → drain (no-op executor) → back to Passthrough.
+/// Verifies stats counters at each phase.
+#[tokio::test]
+async fn test_module_10_switchover_buffer_config() {
+    use heliosdb_proxy::switchover_buffer::{BufferConfig, BufferState, SwitchoverBuffer};
+
+    // ── In-process lifecycle test ───────────────────────────────────
+    let cfg = BufferConfig {
+        buffer_timeout: std::time::Duration::from_secs(30),
+        max_buffered_queries: 1000,
+        max_buffer_memory: 64 * 1024 * 1024,
+        allow_queries_during_drain: false,
+    };
+    let buf = SwitchoverBuffer::new(cfg);
+
+    // Initial state: passthrough
+    assert_eq!(buf.state(), BufferState::Passthrough);
+    assert!(!buf.is_buffering());
+    assert!(buf.is_empty());
+
+    // Begin planned switchover
+    buf.start_buffering();
+    assert!(buf.is_buffering());
+    assert_eq!(buf.state(), BufferState::Buffering);
+
+    // Buffer three client queries
+    let _rx1 = buf
+        .buffer_query("SELECT 1".into(), vec![], 1)
+        .expect("buffer query 1");
+    let _rx2 = buf
+        .buffer_query("SELECT 2".into(), vec![], 2)
+        .expect("buffer query 2");
+    let _rx3 = buf
+        .buffer_query("INSERT INTO t VALUES (42)".into(), vec![], 3)
+        .expect("buffer query 3");
+
+    assert_eq!(buf.len(), 3);
+    let snap = buf.stats();
+    assert_eq!(snap.buffered_queries, 3);
+    assert_eq!(snap.replayed_queries, 0);
+
+    // Switchover complete: drain to new primary (success stub)
+    buf.stop_buffering();
+    assert_eq!(buf.state(), BufferState::Draining);
+
+    buf.drain(|_sql, _params| async { Ok(()) }).await;
+
+    assert_eq!(buf.state(), BufferState::Passthrough);
+    assert!(buf.is_empty());
+
+    let final_stats = buf.stats();
+    assert_eq!(final_stats.replayed_queries, 3);
+    assert_eq!(final_stats.failed_replays, 0);
+    assert_eq!(final_stats.timed_out_queries, 0);
+
+    // fail_all path: start → buffer 1 → fail (simulates aborted switchover)
+    buf.start_buffering();
+    let _rx4 = buf
+        .buffer_query("SELECT 99".into(), vec![], 4)
+        .expect("buffer query 4");
+    buf.fail_all("switchover aborted");
+    assert!(buf.is_empty());
+}
 
 /// Module 11 — Primary Tracker (pluggable topology discovery).
 #[test]
@@ -615,7 +932,7 @@ fn test_module_23_wasm_plugin_config() {
 #[cfg(feature = "graphql-gateway")]
 #[test]
 fn test_module_24_graphql_gateway_config() {
-    use heliosdb_proxy::graphql::{GraphQLConfig, GraphQLSchema, SchemaIntrospector};
+    use heliosdb_proxy::graphql::{GraphQLConfig, SchemaIntrospector};
 
     let cfg = GraphQLConfig::default();
     let _ = cfg;
