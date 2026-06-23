@@ -353,10 +353,7 @@ async fn test_module_08_session_migration_config() {
         .await
         .expect("register_session");
 
-    let s = migrate
-        .get_session(&session_id)
-        .await
-        .expect("get_session");
+    let s = migrate.get_session(&session_id).await.expect("get_session");
     assert_eq!(s.user, "helios");
     // SessionState stores the value verbatim; generate_restore_statements
     // feeds it straight into SET search_path = <value>.
@@ -460,10 +457,7 @@ async fn test_module_09_cursor_restore_config() {
         .await
         .expect("update_position");
 
-    let got = restore
-        .get_cursor("cur_users")
-        .await
-        .expect("get_cursor");
+    let got = restore.get_cursor("cur_users").await.expect("get_cursor");
     assert_eq!(got.position, 50);
     assert_eq!(got.name, "cur_users");
     assert_eq!(got.query, "SELECT id, name FROM users ORDER BY id");
@@ -485,7 +479,10 @@ async fn test_module_09_cursor_restore_config() {
     assert_eq!(stats.active_cursors, 1);
 
     // close and verify
-    restore.close_cursor("cur_users").await.expect("close_cursor");
+    restore
+        .close_cursor("cur_users")
+        .await
+        .expect("close_cursor");
     let stats2 = restore.stats().await;
     assert_eq!(stats2.active_cursors, 0);
 }
