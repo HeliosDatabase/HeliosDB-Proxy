@@ -128,9 +128,9 @@ jobs:
           key: bench
       - run: cargo bench --features all-features --no-run
 
-  # ── Integration tests (pg18 / nano3.58) ─────────────────────────────
+  # ── Integration tests (pg18 / nano3.58.1) ───────────────────────────
   integrate:
-    name: Integration (pg18 / nano3.58)
+    name: Integration (pg18 / nano3.58.1)
     runs-on: ubuntu-latest
     needs: [fmt, clippy, test]
     permissions:
@@ -151,7 +151,7 @@ jobs:
           --health-timeout 5s
           --health-retries 15
       nano:
-        image: ghcr.io/heliosdatabase/hdb-heliosdb-nano:3.58
+        image: ghcr.io/heliosdatabase/heliosdb-nano:v3.58.1
         credentials:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
@@ -180,7 +180,7 @@ jobs:
           --health-timeout 5s
           --health-retries 15
       nano-standby:
-        image: ghcr.io/heliosdatabase/hdb-heliosdb-nano:3.58
+        image: ghcr.io/heliosdatabase/heliosdb-nano:v3.58.1
         credentials:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
