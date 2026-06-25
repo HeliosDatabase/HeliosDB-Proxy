@@ -229,6 +229,11 @@ pub struct ProxyConfig {
     /// `routing-hints` feature is compiled in; parsed-and-ignored otherwise.
     #[serde(default)]
     pub routing_hints: RoutingHintsConfig,
+    /// Multi-dimensional rate limiting (token bucket + concurrency). Disabled
+    /// by default. Only enforced when the `rate-limiting` feature is compiled
+    /// in; parsed-and-ignored otherwise.
+    #[serde(default)]
+    pub rate_limit: RateLimitToml,
     /// Proxy-side unnamed-`Parse` promotion (Batch H). When a client re-sends an
     /// identical unnamed extended `Parse` (the dominant pgbench/ORM pattern),
     /// the proxy skips forwarding it to a backend that already holds that exact
@@ -523,6 +528,52 @@ fn default_write_timeout_secs() -> u64 {
     30 // 30 seconds default write timeout during failover
 }
 
+/// How rate-limit buckets are keyed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitKeyBy {
+    /// One bucket per authenticated user (startup `user` param).
+    #[default]
+    User,
+    /// One bucket per client IP address.
+    ClientIp,
+    /// One bucket per target database.
+    Database,
+    /// A single global bucket for the whole proxy.
+    Global,
+}
+
+/// Rate-limiting configuration (TOML-friendly, always present so configs
+/// round-trip on any build). Converted to `crate::rate_limit::RateLimitConfig`
+/// at startup and only enforced when the `rate-limiting` feature is compiled
+/// in AND `enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RateLimitToml {
+    /// Enforce rate limits. Default `false`.
+    pub enabled: bool,
+    /// Sustained queries per second per bucket.
+    pub default_qps: u32,
+    /// Burst capacity (token-bucket depth) per bucket.
+    pub default_burst: u32,
+    /// Max concurrent in-flight queries per bucket (0 = use the engine default).
+    pub max_concurrent: u32,
+    /// What each bucket is keyed on.
+    pub key_by: RateLimitKeyBy,
+}
+
+impl Default for RateLimitToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_qps: 1000,
+            default_burst: 2000,
+            max_concurrent: 0,
+            key_by: RateLimitKeyBy::User,
+        }
+    }
+}
+
 /// SQL-comment routing-hint configuration.
 ///
 /// Always present on `ProxyConfig` so configs round-trip on any build, but the
@@ -573,6 +624,7 @@ impl Default for ProxyConfig {
             mirror: MirrorConfig::default(),
             branch: BranchConfig::default(),
             routing_hints: RoutingHintsConfig::default(),
+            rate_limit: RateLimitToml::default(),
             optimize_unnamed_parse: true,
             shutdown_drain_timeout_secs: default_drain_timeout_secs(),
         }

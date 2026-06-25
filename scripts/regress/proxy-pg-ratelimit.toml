@@ -1,0 +1,42 @@
+# Regression harness — single-node PG18.4 with rate limiting enabled.
+# Tiny token bucket (qps=1, burst=2) keyed per user so a rapid burst of
+# queries from one client deterministically trips the limit.
+listen_address = "127.0.0.1:6432"
+admin_address  = "127.0.0.1:9099"
+tr_enabled = false
+tr_mode    = "none"
+write_timeout_secs = 30
+
+[pool]
+min_connections = 1
+max_connections = 20
+idle_timeout_secs = 300
+max_lifetime_secs = 1800
+acquire_timeout_secs = 5
+test_on_acquire = true
+
+[load_balancer]
+read_strategy = "round_robin"
+read_write_split = false
+latency_threshold_ms = 100
+
+[health]
+check_interval_secs = 5
+check_timeout_secs = 3
+failure_threshold = 3
+success_threshold = 2
+check_query = "SELECT 1"
+
+[rate_limit]
+enabled = true
+default_qps = 1
+default_burst = 2
+key_by = "user"
+
+[[nodes]]
+host = "127.0.0.1"
+port = 25433
+role = "primary"
+weight = 100
+enabled = true
+name = "pg-primary"
