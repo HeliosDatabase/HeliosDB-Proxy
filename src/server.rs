@@ -197,6 +197,10 @@ struct ServerState {
     /// Applied per query, taking precedence over default verb routing.
     #[cfg(feature = "routing-hints")]
     hint_parser: Option<crate::routing::HintParser>,
+    /// Multi-dimensional rate limiter. `Some` when `[rate_limit] enabled`;
+    /// every query is checked against it before being forwarded to a backend.
+    #[cfg(feature = "rate-limiting")]
+    rate_limiter: Option<Arc<crate::rate_limit::RateLimiter>>,
     /// Pool manager for Session/Transaction/Statement modes
     #[cfg(feature = "pool-modes")]
     pool_manager: Option<Arc<ConnectionPoolManager>>,
@@ -609,6 +613,32 @@ impl ProxyServer {
             None
         };
 
+        // Build the rate limiter from the TOML config when enabled.
+        #[cfg(feature = "rate-limiting")]
+        let rate_limiter = if config.rate_limit.enabled {
+            let rl = &config.rate_limit;
+            tracing::info!(
+                qps = rl.default_qps,
+                burst = rl.default_burst,
+                key_by = ?rl.key_by,
+                "rate limiting enabled"
+            );
+            let rlc = crate::rate_limit::RateLimitConfig {
+                enabled: true,
+                default_qps: rl.default_qps,
+                default_burst: rl.default_burst,
+                default_concurrency: if rl.max_concurrent > 0 {
+                    rl.max_concurrent
+                } else {
+                    crate::rate_limit::RateLimitConfig::default().default_concurrency
+                },
+                ..Default::default()
+            };
+            Some(Arc::new(crate::rate_limit::RateLimiter::new(rlc)))
+        } else {
+            None
+        };
+
         let state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
             health: ArcSwap::from_pointee(health),
@@ -636,6 +666,8 @@ impl ProxyServer {
             } else {
                 None
             },
+            #[cfg(feature = "rate-limiting")]
+            rate_limiter,
             #[cfg(feature = "pool-modes")]
             pool_manager,
             #[cfg(feature = "wasm-plugins")]
@@ -2221,6 +2253,17 @@ impl ProxyServer {
         state: &Arc<ServerState>,
         config: &ProxyConfig,
     ) -> Result<(Option<String>, u64)> {
+        // Rate-limit gate: deny before any backend selection.
+        #[cfg(feature = "rate-limiting")]
+        if let Some(mut resp) = Self::rate_limit_check(session, state, config).await {
+            resp.extend_from_slice(&Self::create_ready_for_query(b'I'));
+            client
+                .write_all(&resp)
+                .await
+                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+            return Ok((None, resp.len() as u64));
+        }
+
         let default_is_write = Self::is_write_message(msg);
         let plugin_override = Self::apply_route_hook(msg, state, session);
 
@@ -2318,6 +2361,21 @@ impl ProxyServer {
         state: &Arc<ServerState>,
         config: &ProxyConfig,
     ) -> Result<(Option<String>, u64)> {
+        // Rate-limit gate. The terminating ReadyForQuery is only appended when
+        // the batch carried a Sync (`wait_ready`); a Flush-terminated batch
+        // expects an ErrorResponse with no ReadyForQuery.
+        #[cfg(feature = "rate-limiting")]
+        if let Some(mut resp) = Self::rate_limit_check(session, state, config).await {
+            if wait_ready {
+                resp.extend_from_slice(&Self::create_ready_for_query(b'I'));
+            }
+            client
+                .write_all(&resp)
+                .await
+                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+            return Ok((None, resp.len() as u64));
+        }
+
         let target = match route_sql {
             Some(sql) => {
                 // Routing-hints, when active, can override the verb-based
@@ -2703,6 +2761,67 @@ impl ProxyServer {
         }
 
         false
+    }
+
+    /// Derive the rate-limit bucket key for a session per the configured
+    /// keying dimension.
+    #[cfg(feature = "rate-limiting")]
+    async fn rate_limit_key(
+        session: &Arc<ClientSession>,
+        config: &ProxyConfig,
+    ) -> crate::rate_limit::LimiterKey {
+        use crate::config::RateLimitKeyBy;
+        use crate::rate_limit::LimiterKey;
+        match config.rate_limit.key_by {
+            RateLimitKeyBy::Global => LimiterKey::Global,
+            RateLimitKeyBy::ClientIp => LimiterKey::ClientIp(session.client_addr.ip()),
+            RateLimitKeyBy::Database => {
+                let vars = session.variables.read().await;
+                LimiterKey::Database(vars.get("database").cloned().unwrap_or_default())
+            }
+            RateLimitKeyBy::User => {
+                let vars = session.variables.read().await;
+                LimiterKey::User(vars.get("user").cloned().unwrap_or_default())
+            }
+        }
+    }
+
+    /// Check rate limits before a query is forwarded. Returns `Some(bytes)` —
+    /// a PG `ErrorResponse` WITHOUT a trailing `ReadyForQuery` (the caller
+    /// appends one as the protocol requires) — when the query is denied; `None`
+    /// when it may proceed. A throttle/queue verdict is honored by sleeping for
+    /// the engine-supplied delay (real backpressure, capped) and then allowing.
+    #[cfg(feature = "rate-limiting")]
+    async fn rate_limit_check(
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+    ) -> Option<Vec<u8>> {
+        use crate::rate_limit::RateLimitResult;
+        let limiter = state.rate_limiter.as_ref()?;
+        let key = Self::rate_limit_key(session, config).await;
+        match limiter.check(&key, 1) {
+            RateLimitResult::Allowed => None,
+            RateLimitResult::Warned(msg) => {
+                tracing::warn!(key = %key, reason = %msg, "rate limit warning");
+                None
+            }
+            RateLimitResult::Throttled(d) | RateLimitResult::Queued(d) => {
+                // Cap the backpressure sleep so a misconfiguration can't pin a
+                // connection task indefinitely.
+                tokio::time::sleep(d.min(Duration::from_secs(5))).await;
+                None
+            }
+            RateLimitResult::Denied(exc) => {
+                tracing::info!(key = %key, "rate limit exceeded");
+                let msg = format!(
+                    "rate limit exceeded: {} (retry after {}ms)",
+                    exc.message,
+                    exc.retry_after.as_millis()
+                );
+                Some(Self::create_error_response("53400", &msg))
+            }
+        }
     }
 
     /// Select primary node with write timeout during failover
@@ -4058,6 +4177,8 @@ mod tests {
             },
             #[cfg(feature = "routing-hints")]
             hint_parser: None,
+            #[cfg(feature = "rate-limiting")]
+            rate_limiter: None,
             #[cfg(feature = "pool-modes")]
             pool_manager: None,
             plugin_manager: Some(pm),
@@ -4269,6 +4390,60 @@ mod tests {
                 parser.strip("/*helios:route=standby*/ SELECT 42"),
                 "SELECT 42"
             );
+        }
+    }
+
+    // ---- rate-limiting: the burst-then-deny contract the gate relies on ----
+
+    #[cfg(feature = "rate-limiting")]
+    mod rate_limiting {
+        use crate::rate_limit::{LimiterKey, RateLimitConfig, RateLimitResult, RateLimiter};
+
+        #[test]
+        fn burst_allows_then_denies() {
+            // Mirror the wiring's config conversion: tiny bucket, reject on
+            // exceed (the engine default).
+            let cfg = RateLimitConfig {
+                enabled: true,
+                default_qps: 1,
+                default_burst: 2,
+                ..Default::default()
+            };
+            let limiter = RateLimiter::new(cfg);
+            let key = LimiterKey::User("u".to_string());
+
+            // The first `burst` checks are admitted.
+            assert!(matches!(limiter.check(&key, 1), RateLimitResult::Allowed));
+            assert!(matches!(limiter.check(&key, 1), RateLimitResult::Allowed));
+
+            // Rapid over-burst checks must produce at least one hard denial.
+            let mut denied = false;
+            for _ in 0..5 {
+                if matches!(limiter.check(&key, 1), RateLimitResult::Denied(_)) {
+                    denied = true;
+                }
+            }
+            assert!(denied, "over-burst checks must yield a Denied verdict");
+        }
+
+        #[test]
+        fn distinct_keys_have_independent_buckets() {
+            let cfg = RateLimitConfig {
+                enabled: true,
+                default_qps: 1,
+                default_burst: 1,
+                ..Default::default()
+            };
+            let limiter = RateLimiter::new(cfg);
+            // Each user gets its own bucket: both first checks are admitted.
+            assert!(matches!(
+                limiter.check(&LimiterKey::User("a".to_string()), 1),
+                RateLimitResult::Allowed
+            ));
+            assert!(matches!(
+                limiter.check(&LimiterKey::User("b".to_string()), 1),
+                RateLimitResult::Allowed
+            ));
         }
     }
 }
