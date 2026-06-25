@@ -222,6 +222,13 @@ pub struct ProxyConfig {
     /// CREATE DATABASE ... TEMPLATE clones through the proxy.
     #[serde(default)]
     pub branch: BranchConfig,
+    /// SQL-comment routing hints (`/*helios:route=primary*/`). Disabled by
+    /// default — when enabled, the proxy parses hints from query SQL and
+    /// applies them as a route override that wins over the default verb
+    /// routing (but never over a plugin `Block`). Only consumed when the
+    /// `routing-hints` feature is compiled in; parsed-and-ignored otherwise.
+    #[serde(default)]
+    pub routing_hints: RoutingHintsConfig,
     /// Proxy-side unnamed-`Parse` promotion (Batch H). When a client re-sends an
     /// identical unnamed extended `Parse` (the dominant pgbench/ORM pattern),
     /// the proxy skips forwarding it to a backend that already holds that exact
@@ -516,6 +523,32 @@ fn default_write_timeout_secs() -> u64 {
     30 // 30 seconds default write timeout during failover
 }
 
+/// SQL-comment routing-hint configuration.
+///
+/// Always present on `ProxyConfig` so configs round-trip on any build, but the
+/// hints are only parsed and honored when the `routing-hints` feature is
+/// compiled in AND `enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoutingHintsConfig {
+    /// Parse and honor `/*helios:...*/` routing hints. Default `false`
+    /// (preserves the pure verb-based routing behaviour).
+    pub enabled: bool,
+    /// Strip the hint comment from the SQL before forwarding to the backend.
+    /// Default `true`. Hint comments are valid SQL comments, so leaving them
+    /// in is harmless; stripping keeps backend query logs clean.
+    pub strip_hints: bool,
+}
+
+impl Default for RoutingHintsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strip_hints: true,
+        }
+    }
+}
+
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
@@ -539,6 +572,7 @@ impl Default for ProxyConfig {
             http_gateway: HttpGatewayConfig::default(),
             mirror: MirrorConfig::default(),
             branch: BranchConfig::default(),
+            routing_hints: RoutingHintsConfig::default(),
             optimize_unnamed_parse: true,
             shutdown_drain_timeout_secs: default_drain_timeout_secs(),
         }
