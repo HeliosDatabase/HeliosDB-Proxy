@@ -191,6 +191,12 @@ struct ServerState {
     cutover: Arc<ArcSwap<Option<Arc<crate::mirror::CutoverTarget>>>>,
     /// Load balancer state
     lb_state: LoadBalancerState,
+    /// SQL-comment routing-hint parser. `Some` when `[routing_hints] enabled`
+    /// and the `routing-hints` feature is compiled in; the parser's own
+    /// `strip_hints` flag records whether to rewrite the SQL before forwarding.
+    /// Applied per query, taking precedence over default verb routing.
+    #[cfg(feature = "routing-hints")]
+    hint_parser: Option<crate::routing::HintParser>,
     /// Pool manager for Session/Transaction/Statement modes
     #[cfg(feature = "pool-modes")]
     pool_manager: Option<Arc<ConnectionPoolManager>>,
@@ -615,6 +621,20 @@ impl ProxyServer {
             cutover: Arc::new(ArcSwap::from_pointee(None)),
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
+            },
+            #[cfg(feature = "routing-hints")]
+            hint_parser: if config.routing_hints.enabled {
+                tracing::info!(
+                    strip = config.routing_hints.strip_hints,
+                    "SQL-comment routing hints enabled"
+                );
+                Some(if config.routing_hints.strip_hints {
+                    crate::routing::HintParser::new()
+                } else {
+                    crate::routing::HintParser::without_stripping()
+                })
+            } else {
+                None
             },
             #[cfg(feature = "pool-modes")]
             pool_manager,
@@ -2131,7 +2151,17 @@ impl ProxyServer {
         };
 
         if let Some(forced) = forced_target {
-            Ok(forced)
+            // Resolve a node *name* to its address; an address is passed
+            // through unchanged. This lets `/*helios:node=pg-standby*/` (and a
+            // plugin `Node("name")`) target a node by its configured name
+            // rather than requiring the raw host:port.
+            let resolved = config
+                .nodes
+                .iter()
+                .find(|n| n.name.as_deref() == Some(forced.as_str()) || n.address() == forced)
+                .map(|n| n.address())
+                .unwrap_or(forced);
+            Ok(resolved)
         } else if need_switch {
             if is_write {
                 Self::select_primary_with_timeout(session, state, config).await
@@ -2192,10 +2222,10 @@ impl ProxyServer {
         config: &ProxyConfig,
     ) -> Result<(Option<String>, u64)> {
         let default_is_write = Self::is_write_message(msg);
-        let route_override = Self::apply_route_hook(msg, state, session);
+        let plugin_override = Self::apply_route_hook(msg, state, session);
 
         // Block short-circuits before any backend selection.
-        if let RouteOverride::Block(reason) = route_override {
+        if let RouteOverride::Block(reason) = plugin_override {
             let mut response = Vec::with_capacity(64 + reason.len());
             response.extend_from_slice(&Self::create_error_response(
                 "42000",
@@ -2209,6 +2239,16 @@ impl ProxyServer {
             return Ok((None, response.len() as u64));
         }
 
+        // SQL-comment routing hints (feature + `[routing_hints] enabled`)
+        // refine the override, recompute the write flag on the stripped SQL,
+        // and may rewrite the message to drop the hint comment.
+        #[cfg(feature = "routing-hints")]
+        let (route_override, default_is_write, stripped_msg) =
+            Self::resolve_simple_route(msg, plugin_override, default_is_write, state);
+        #[cfg(not(feature = "routing-hints"))]
+        let (route_override, stripped_msg): (RouteOverride, Option<Message>) =
+            (plugin_override, None);
+
         let (is_write, forced_target) = match route_override {
             RouteOverride::None => (default_is_write, None),
             RouteOverride::Primary => (true, None),
@@ -2216,6 +2256,10 @@ impl ProxyServer {
             RouteOverride::Node(name) => (default_is_write, Some(name)),
             RouteOverride::Block(_) => unreachable!("handled above"),
         };
+
+        // Forward the stripped message when routing-hints rewrote it, else the
+        // original (borrowed, no copy).
+        let forward_msg = stripped_msg.as_ref().unwrap_or(msg);
 
         let target = Self::choose_target_node(
             is_write,
@@ -2226,12 +2270,13 @@ impl ProxyServer {
             config,
         )
         .await?;
+        tracing::debug!(target: "helios::routing", node = %target, is_write, "routed simple query");
         Self::ensure_conn(conns, &target, session, config).await?;
         let backend = conns.get_mut(&target).expect("just ensured");
 
         backend
             .stream
-            .write_all(&msg.encode())
+            .write_all(&forward_msg.encode())
             .await
             .map_err(|e| ProxyError::Network(format!("Backend write error: {}", e)))?;
 
@@ -2275,8 +2320,14 @@ impl ProxyServer {
     ) -> Result<(Option<String>, u64)> {
         let target = match route_sql {
             Some(sql) => {
-                let is_write = Self::is_write_query(sql);
-                Self::choose_target_node(is_write, None, current_node, session, state, config)
+                // Routing-hints, when active, can override the verb-based
+                // target (and recompute the write flag on the stripped SQL).
+                #[cfg(feature = "routing-hints")]
+                let (is_write, forced) = Self::extended_hint_route(state, sql)
+                    .unwrap_or_else(|| (Self::is_write_query(sql), None));
+                #[cfg(not(feature = "routing-hints"))]
+                let (is_write, forced): (bool, Option<String>) = (Self::is_write_query(sql), None);
+                Self::choose_target_node(is_write, forced, current_node, session, state, config)
                     .await?
             }
             // No Parse in this batch: stay on the prepared-statement /
@@ -3215,6 +3266,97 @@ impl ProxyServer {
         }
     }
 
+    /// Map parsed SQL-comment hints to a `RouteOverride`. Precedence:
+    /// `node=` > `route=` > `consistency=strong`. Read-tier route targets
+    /// (standby/sync/semisync/async/local) all map to the read path; `any`
+    /// and `vector` impose no constraint. `lag=` / `consistency=bounded`
+    /// freshness enforcement arrives with the lag-routing feature.
+    #[cfg(feature = "routing-hints")]
+    fn hint_to_override(hints: &crate::routing::ParsedHints) -> RouteOverride {
+        use crate::routing::{ConsistencyLevel, RouteTarget};
+        if let Some(node) = &hints.node {
+            return RouteOverride::Node(node.clone());
+        }
+        if let Some(route) = hints.route {
+            return match route {
+                RouteTarget::Primary => RouteOverride::Primary,
+                RouteTarget::Standby
+                | RouteTarget::Sync
+                | RouteTarget::SemiSync
+                | RouteTarget::Async
+                | RouteTarget::Local => RouteOverride::Standby,
+                RouteTarget::Any | RouteTarget::Vector => RouteOverride::None,
+            };
+        }
+        if hints.consistency == Some(ConsistencyLevel::Strong) {
+            return RouteOverride::Primary;
+        }
+        RouteOverride::None
+    }
+
+    /// Resolve the effective routing for a simple `Query` when the
+    /// routing-hints feature is active. Returns `(override, is_write,
+    /// forward_msg)`: the write flag is recomputed on the hint-stripped SQL so
+    /// a leading hint comment never masks the verb, and `forward_msg` is a
+    /// rebuilt `Query` (hint removed) when stripping is on. An explicit
+    /// positional hint wins over a plugin route override; a plugin `Block` is
+    /// handled by the caller before this runs.
+    #[cfg(feature = "routing-hints")]
+    fn resolve_simple_route(
+        msg: &Message,
+        plugin_override: RouteOverride,
+        default_is_write: bool,
+        state: &Arc<ServerState>,
+    ) -> (RouteOverride, bool, Option<Message>) {
+        let parser = match state.hint_parser.as_ref() {
+            Some(p) => p,
+            None => return (plugin_override, default_is_write, None),
+        };
+        let sql = match crate::protocol::query_text(&msg.payload) {
+            Some(s) => s,
+            None => return (plugin_override, default_is_write, None),
+        };
+        let hints = parser.parse(sql);
+        if hints.is_empty() {
+            return (plugin_override, default_is_write, None);
+        }
+        let stripped = parser.strip(sql);
+        let is_write = Self::is_write_query(&stripped);
+        let effective = match Self::hint_to_override(&hints) {
+            RouteOverride::None => plugin_override,
+            hint_override => hint_override,
+        };
+        let forward = if parser.strip_hints {
+            Some(crate::protocol::QueryMessage { query: stripped }.encode())
+        } else {
+            None
+        };
+        (effective, is_write, forward)
+    }
+
+    /// Resolve hint-driven routing for an extended-protocol batch from the
+    /// first Parse's SQL. `Some((is_write, forced_node))` when hints are
+    /// present (write flag computed on the stripped SQL), else `None` so the
+    /// caller uses verb-based defaults. The hint comment is left in the
+    /// forwarded `Parse` (a no-op SQL comment); rewriting the batch buffer is
+    /// unnecessary for correctness.
+    #[cfg(feature = "routing-hints")]
+    fn extended_hint_route(state: &Arc<ServerState>, sql: &str) -> Option<(bool, Option<String>)> {
+        let parser = state.hint_parser.as_ref()?;
+        let hints = parser.parse(sql);
+        if hints.is_empty() {
+            return None;
+        }
+        let stripped = parser.strip(sql);
+        let is_write = Self::is_write_query(&stripped);
+        match Self::hint_to_override(&hints) {
+            RouteOverride::Primary => Some((true, None)),
+            RouteOverride::Standby => Some((false, None)),
+            RouteOverride::Node(n) => Some((is_write, Some(n))),
+            _ => Some((is_write, None)),
+        }
+    }
+
     /// Fire post-query hooks after a message has been forwarded (or failed
     /// to forward). Best-effort; errors from individual plugins are logged
     /// by the plugin manager and never surface here.
@@ -3914,6 +4056,8 @@ mod tests {
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
             },
+            #[cfg(feature = "routing-hints")]
+            hint_parser: None,
             #[cfg(feature = "pool-modes")]
             pool_manager: None,
             plugin_manager: Some(pm),
@@ -4035,5 +4179,96 @@ mod tests {
         assert!(ProxyServer::reprepare_statement(&mut client2, &parse)
             .await
             .is_err());
+    }
+
+    // ---- routing-hints: SQL-comment hint → RouteOverride mapping ----
+
+    #[cfg(feature = "routing-hints")]
+    mod routing_hints {
+        use super::*;
+        use crate::routing::HintParser;
+
+        fn over(sql: &str) -> RouteOverride {
+            let hints = HintParser::new().parse(sql);
+            ProxyServer::hint_to_override(&hints)
+        }
+
+        #[test]
+        fn route_primary_maps_to_primary() {
+            assert!(matches!(
+                over("/*helios:route=primary*/ SELECT 1"),
+                RouteOverride::Primary
+            ));
+        }
+
+        #[test]
+        fn read_tier_targets_map_to_standby() {
+            for t in ["standby", "sync", "semisync", "async", "local"] {
+                assert!(
+                    matches!(
+                        over(&format!("/*helios:route={t}*/ SELECT 1")),
+                        RouteOverride::Standby
+                    ),
+                    "route={t} should map to Standby"
+                );
+            }
+        }
+
+        #[test]
+        fn any_and_vector_impose_no_constraint() {
+            assert!(matches!(
+                over("/*helios:route=any*/ SELECT 1"),
+                RouteOverride::None
+            ));
+            assert!(matches!(
+                over("/*helios:route=vector*/ SELECT 1"),
+                RouteOverride::None
+            ));
+        }
+
+        #[test]
+        fn node_hint_maps_to_node_and_wins_over_route() {
+            // node= beats route= (precedence).
+            match over("/*helios:node=pg-standby,route=primary*/ SELECT 1") {
+                RouteOverride::Node(n) => assert_eq!(n, "pg-standby"),
+                other => panic!("expected Node, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn consistency_strong_forces_primary() {
+            assert!(matches!(
+                over("/*helios:consistency=strong*/ SELECT 1"),
+                RouteOverride::Primary
+            ));
+        }
+
+        #[test]
+        fn no_hint_yields_none() {
+            assert!(matches!(over("SELECT 1"), RouteOverride::None));
+        }
+
+        // The core correctness fix: a leading hint comment must NOT hide the
+        // verb from write-detection. Raw classification misfires; classifying
+        // on the stripped SQL is correct.
+        #[test]
+        fn write_verb_classified_after_strip() {
+            let parser = HintParser::new();
+            let raw = "/*helios:route=primary*/ INSERT INTO t VALUES (1)";
+            // Raw (unstripped) wrongly looks like a read because it starts
+            // with the comment.
+            assert!(!ProxyServer::is_write_query(raw));
+            // Stripped is correctly a write.
+            assert!(ProxyServer::is_write_query(&parser.strip(raw)));
+        }
+
+        #[test]
+        fn strip_removes_hint_comment() {
+            let parser = HintParser::new();
+            assert_eq!(
+                parser.strip("/*helios:route=standby*/ SELECT 42"),
+                "SELECT 42"
+            );
+        }
     }
 }

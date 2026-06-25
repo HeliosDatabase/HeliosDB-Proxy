@@ -1,0 +1,58 @@
+# Regression harness — 2-node read/write-split config with SQL-comment
+# routing hints enabled. Both nodes are the SAME PostgreSQL 18.4 instance
+# reached at two DISTINCT but equivalent addresses (127.0.0.1:25433 and
+# localhost:25433 — both the host-mapped port). They share data while giving
+# the two nodes distinct address strings, so hint-driven steering to a named
+# node is observable in the proxy's per-query routing log.
+listen_address = "127.0.0.1:6432"
+admin_address  = "127.0.0.1:9099"
+tr_enabled = false
+tr_mode    = "none"
+write_timeout_secs = 30
+
+[pool]
+min_connections = 2
+max_connections = 50
+idle_timeout_secs = 300
+max_lifetime_secs = 1800
+acquire_timeout_secs = 5
+test_on_acquire = true
+
+[load_balancer]
+read_strategy = "round_robin"
+read_write_split = true
+latency_threshold_ms = 100
+
+[health]
+check_interval_secs = 5
+check_timeout_secs = 3
+failure_threshold = 3
+success_threshold = 2
+check_query = "SELECT 1"
+
+# Honor /*helios:route=...*/ / /*helios:node=...*/ hints and strip the hint
+# comment before forwarding to the backend.
+[routing_hints]
+enabled = true
+strip_hints = true
+
+[[nodes]]
+host = "127.0.0.1"
+port = 25433
+role = "primary"
+weight = 100
+enabled = true
+name = "pg-primary"
+
+# Disabled standby: this dev env has only one real PG instance, so the standby
+# is present purely to give a node-NAME hint a distinct address to steer to
+# (a forced /*helios:node=pg-standby*/ resolves to it regardless of enabled,
+# and the routing decision is logged before the connect). Disabling it keeps
+# reads/readiness on the working primary so the suite is deterministic.
+[[nodes]]
+host = "localhost"
+port = 25433
+role = "standby"
+weight = 100
+enabled = false
+name = "pg-standby"
