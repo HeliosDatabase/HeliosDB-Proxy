@@ -214,6 +214,10 @@ struct ServerState {
     /// Read SELECTs are served from it; writes invalidate referenced tables.
     #[cfg(feature = "query-cache")]
     query_cache: Option<Arc<crate::cache::QueryCache>>,
+    /// SQL query rewriter. `Some` when `[query_rewrite] enabled` with rules.
+    /// Rewrites the query SQL on the path before forwarding.
+    #[cfg(feature = "query-rewriting")]
+    rewriter: Option<Arc<crate::rewriter::QueryRewriter>>,
     /// Pool manager for Session/Transaction/Statement modes
     #[cfg(feature = "pool-modes")]
     pool_manager: Option<Arc<ConnectionPoolManager>>,
@@ -733,6 +737,52 @@ impl ProxyServer {
             None
         };
 
+        // Build the SQL query rewriter from the configured rules.
+        #[cfg(feature = "query-rewriting")]
+        let rewriter = if config.query_rewrite.enabled && !config.query_rewrite.rules.is_empty() {
+            use crate::rewriter::{
+                QueryPattern, QueryRewriter, RewriteRule, RewriterConfig, Transformation,
+            };
+            let rw = QueryRewriter::new(RewriterConfig {
+                enabled: true,
+                ..Default::default()
+            });
+            let mut n = 0usize;
+            for (i, r) in config.query_rewrite.rules.iter().enumerate() {
+                let transformation =
+                    if let (Some(from), Some(to)) = (&r.match_table, &r.replace_table_with) {
+                        Transformation::ReplaceTable {
+                            from: from.clone(),
+                            to: to.clone(),
+                        }
+                    } else if let Some(w) = &r.append_where {
+                        Transformation::AppendWhereAnd(w.clone())
+                    } else if let Some(limit) = r.add_limit {
+                        Transformation::AddLimit(limit)
+                    } else {
+                        continue; // no transformation specified — skip
+                    };
+                let pattern = if let Some(t) = &r.match_table {
+                    QueryPattern::Table(t.clone())
+                } else if let Some(re) = &r.match_regex {
+                    QueryPattern::regex(re.clone())
+                } else {
+                    QueryPattern::All
+                };
+                rw.add_rule(
+                    RewriteRule::build(format!("rule-{i}"))
+                        .pattern(pattern)
+                        .transform(transformation)
+                        .build(),
+                );
+                n += 1;
+            }
+            tracing::info!(rules = n, "query rewriting enabled");
+            Some(Arc::new(rw))
+        } else {
+            None
+        };
+
         let state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
             health: ArcSwap::from_pointee(health),
@@ -768,6 +818,8 @@ impl ProxyServer {
             analytics,
             #[cfg(feature = "query-cache")]
             query_cache,
+            #[cfg(feature = "query-rewriting")]
+            rewriter,
             #[cfg(feature = "pool-modes")]
             pool_manager,
             #[cfg(feature = "wasm-plugins")]
@@ -2431,6 +2483,23 @@ impl ProxyServer {
         // Forward the stripped message when routing-hints rewrote it, else the
         // original (borrowed, no copy).
         let forward_msg = stripped_msg.as_ref().unwrap_or(msg);
+
+        // Query rewriting: apply rules to the SQL; if any rule fired, forward a
+        // rebuilt Query carrying the rewritten SQL (so caching + the backend
+        // both see the rewritten form).
+        #[cfg(feature = "query-rewriting")]
+        let rewritten_msg: Option<Message> = state.rewriter.as_ref().and_then(|rw| {
+            let sql = crate::protocol::query_text(&forward_msg.payload)?;
+            match rw.rewrite(sql) {
+                Ok(res) if res.was_rewritten() => {
+                    tracing::debug!(target: "helios::rewrite", rules = ?res.rules_applied, "query rewritten");
+                    Some(crate::protocol::QueryMessage { query: res.query().to_string() }.encode())
+                }
+                _ => None,
+            }
+        });
+        #[cfg(feature = "query-rewriting")]
+        let forward_msg = rewritten_msg.as_ref().unwrap_or(forward_msg);
 
         // Query cache: on a cacheable read, a hit is served from cache with no
         // backend round-trip; on a miss we keep the context to store the result.
@@ -4753,6 +4822,8 @@ mod tests {
             analytics: None,
             #[cfg(feature = "query-cache")]
             query_cache: None,
+            #[cfg(feature = "query-rewriting")]
+            rewriter: None,
             #[cfg(feature = "pool-modes")]
             pool_manager: None,
             plugin_manager: Some(pm),
@@ -5169,6 +5240,53 @@ mod tests {
             assert!(!ProxyServer::is_cacheable_read_sql("select now()"));
             assert!(!ProxyServer::is_cacheable_read_sql("select random()"));
             assert!(!ProxyServer::is_cacheable_read_sql("select nextval('s')"));
+        }
+    }
+
+    // ---- query-rewriting: the rules-engine rewrite contract ----
+
+    #[cfg(feature = "query-rewriting")]
+    mod query_rewriting {
+        use crate::rewriter::{
+            QueryPattern, QueryRewriter, RewriteRule, RewriterConfig, Transformation,
+        };
+
+        fn rw_with_table_replace() -> QueryRewriter {
+            let rw = QueryRewriter::new(RewriterConfig {
+                enabled: true,
+                ..Default::default()
+            });
+            rw.add_rule(
+                RewriteRule::build("t")
+                    .pattern(QueryPattern::Table("a".to_string()))
+                    .transform(Transformation::ReplaceTable {
+                        from: "a".to_string(),
+                        to: "b".to_string(),
+                    })
+                    .build(),
+            );
+            rw
+        }
+
+        #[test]
+        fn matching_query_is_rewritten() {
+            let res = rw_with_table_replace().rewrite("select * from a").unwrap();
+            assert!(res.was_rewritten(), "rule did not fire");
+            assert!(res.query().contains('b'), "rewritten: {}", res.query());
+            assert!(
+                !res.query().contains("from a"),
+                "still references a: {}",
+                res.query()
+            );
+        }
+
+        #[test]
+        fn unmatched_query_is_unchanged() {
+            let res = rw_with_table_replace()
+                .rewrite("select * from other")
+                .unwrap();
+            assert!(!res.was_rewritten());
+            assert_eq!(res.query(), "select * from other");
         }
     }
 }
