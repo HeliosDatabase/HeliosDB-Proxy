@@ -5,6 +5,20 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-06-26
+
+Minor release — platform-tier wiring wave 5: multi-tenancy.
+
+### Added
+
+- **Multi-tenancy row isolation (`multi-tenancy`).** `[multi_tenancy]` config
+  (off by default): `identify_by` (a startup parameter such as
+  `application_name`/`user`, or `database`) selects the tenant; queries against
+  the configured `tenant_tables` get a `WHERE <tenant_column> = '<tenant>'`
+  filter injected so each tenant sees only its own rows. The filter is applied
+  before the cache lookup, so cached results are tenant-scoped (no cross-tenant
+  leakage). Injection logs to the `helios::tenant` target.
+
 ## [0.11.0] - 2026-06-26
 
 **Security release** — the auth subsystem (`auth-proxy`) no longer accepts
