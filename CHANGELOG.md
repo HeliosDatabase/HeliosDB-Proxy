@@ -5,6 +5,28 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-06-26
+
+Minor release — platform-tier wiring wave 3: query-result caching.
+
+### Added
+
+- **Query-result cache (`query-cache`).** `[cache]` config (off by default;
+  `ttl_secs`, `max_result_bytes`). A cacheable read (a plain, deterministic,
+  non-transactional `SELECT` — not `WITH`/`FOR UPDATE`/volatile) is served from
+  an in-memory L1 hot (per-connection) + L2 warm (shared, normalized) cache with
+  no backend round-trip; on a miss the response is captured while streaming and
+  stored. A write invalidates cached reads referencing its tables. Cache hits
+  log to the `helios::cache` target.
+
+### Notes
+
+- L1 hot + L2 warm tiers are live-verified (a read served the stale cached value
+  while the backend held a newer one; a write invalidated it). The L3 semantic
+  (vector-similarity) tier remains opt-in via the `/*helios:cache=semantic*/`
+  hint and is not yet live-verified — it needs an embedding source, tracked as a
+  follow-on.
+
 ## [0.8.0] - 2026-06-26
 
 Minor release — platform-tier wiring wave 2: observability + read-scaling. Two
