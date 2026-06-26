@@ -5,6 +5,35 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-06-26
+
+Minor release — `pool-modes` now does real work on the data path.
+
+### Added
+
+- **Transaction / Statement connection pooling (`pool-modes`).** Previously the
+  pool manager was never exercised on the query path — every client stayed 1:1
+  session-pinned regardless of the configured mode. A new raw-stream
+  `BackendIdlePool`, keyed by `(node, user, database)` identity, now backs the
+  data path: `ensure_conn` leases a parked, identity-matched connection before
+  dialing fresh; at each idle transaction boundary the connection is
+  `DISCARD ALL`-reset and parked for reuse; on disconnect idle connections are
+  retained (not dropped) for cross-session reuse. Session mode and feature-off
+  builds are unchanged.
+
+### Notes
+
+- Live-verified vs PostgreSQL 18.4 (`scripts/regress/pool-modes-test.sh`):
+  connection reuse fires on every post-first query, the `DISCARD ALL` reset is
+  proven by a temp table vanishing between pooled statements, results are
+  correct, and connections are parked on disconnect.
+- Bounded scope (reported, not faded): connection reuse + a shared identity-keyed
+  idle pool with correct reset are delivered. The first connection of each
+  session still authenticates through the startup path, so concurrent backend
+  connections are not yet reduced below the concurrent-client count; true N:M
+  startup-level multiplexing needs proxy-terminated backend auth and is the
+  documented next increment.
+
 ## [1.0.0] - 2026-06-26
 
 First stable release. Every feature flag now ships genuinely-working, tested
