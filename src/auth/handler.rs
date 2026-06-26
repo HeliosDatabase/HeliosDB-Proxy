@@ -211,7 +211,9 @@ pub struct AuthenticationHandler {
     /// per-request against `config.oauth.introspection_url`).
     oauth_enabled: bool,
 
-    /// LDAP client (not implemented — `authenticate_ldap` denies by default).
+    /// Whether LDAP is configured. With the `ldap-auth` feature,
+    /// `authenticate_ldap` performs a real search + bind against the directory;
+    /// without it, LDAP denies by default.
     ldap_enabled: bool,
 
     /// API key store
@@ -611,13 +613,130 @@ impl AuthenticationHandler {
             .as_ref()
             .ok_or(AuthError::AuthenticationRequired)?;
 
-        // Real LDAP authentication binds to the directory with the supplied
-        // credentials. Until that is wired, deny rather than accept any
-        // non-empty password.
-        let _ = (username, password);
-        Err(AuthError::Configuration(
-            "LDAP bind not implemented; configure a real LDAP backend".to_string(),
-        ))
+        #[cfg(feature = "ldap-auth")]
+        {
+            let cfg = self
+                .config
+                .ldap
+                .as_ref()
+                .ok_or_else(|| AuthError::Configuration("LDAP not configured".to_string()))?;
+            let groups = self.ldap_search_and_bind(cfg, username, password).await?;
+            let mut identity = Identity::new(username.clone(), "ldap");
+            identity.groups = groups;
+            Ok(AuthResult::new(identity))
+        }
+
+        // Without the `ldap-auth` feature there is no LDAP client compiled in;
+        // deny rather than accept any password (never a fabricated success).
+        #[cfg(not(feature = "ldap-auth"))]
+        {
+            let _ = (username, password);
+            Err(AuthError::Configuration(
+                "LDAP bind not implemented (build with the `ldap-auth` feature)".to_string(),
+            ))
+        }
+    }
+
+    /// Authenticate a user against an LDAP directory using the standard
+    /// search-then-bind flow:
+    ///
+    /// 1. Bind as the configured service account (anonymous if `bind_dn` is
+    ///    empty) and search `user_search_base` with `user_filter` (with `{0}`
+    ///    replaced by the RFC 4515-escaped username) to resolve the user's DN.
+    /// 2. Open a fresh connection and bind as that DN with the supplied
+    ///    password — a successful bind is proof the credentials are valid.
+    ///
+    /// Returns the user's group memberships (values of `group_attribute`).
+    /// An unknown user, an empty password (which would be an unauthenticated
+    /// bind per RFC 4513), or a failed user bind all map to
+    /// [`AuthError::InvalidCredentials`].
+    #[cfg(feature = "ldap-auth")]
+    async fn ldap_search_and_bind(
+        &self,
+        cfg: &LdapConfig,
+        username: &str,
+        password: &str,
+    ) -> Result<Vec<String>, AuthError> {
+        use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
+
+        // ldap3's rustls 0.23 backend builds its TLS connector eagerly (even
+        // for plain ldap://) and needs a process-default crypto provider, or
+        // the connection driver dies with "channel closed". Install the ring
+        // provider once; ignore the error if another component already set one.
+        static LDAP_TLS_PROVIDER: std::sync::Once = std::sync::Once::new();
+        LDAP_TLS_PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+
+        let settings = LdapConnSettings::new()
+            .set_starttls(cfg.starttls)
+            .set_conn_timeout(cfg.timeout);
+
+        // --- Phase 1: service bind + search for the user DN -----------------
+        let (conn, mut ldap) = LdapConnAsync::with_settings(settings.clone(), &cfg.server_url)
+            .await
+            .map_err(|e| AuthError::Ldap(format!("connect {}: {}", cfg.server_url, e)))?;
+        ldap3::drive!(conn);
+
+        if !cfg.bind_dn.is_empty() {
+            ldap.simple_bind(&cfg.bind_dn, &cfg.bind_password)
+                .await
+                .map_err(|e| AuthError::Ldap(format!("service bind: {}", e)))?
+                .success()
+                .map_err(|e| AuthError::Ldap(format!("service bind rejected: {}", e)))?;
+        }
+
+        let filter = cfg.user_filter.replace("{0}", &ldap3::ldap_escape(username));
+        let (entries, _res) = ldap
+            .search(
+                &cfg.user_search_base,
+                Scope::Subtree,
+                &filter,
+                vec![cfg.group_attribute.as_str()],
+            )
+            .await
+            .map_err(|e| AuthError::Ldap(format!("search: {}", e)))?
+            .success()
+            .map_err(|e| AuthError::Ldap(format!("search rejected: {}", e)))?;
+
+        let entry = match entries.into_iter().next() {
+            Some(e) => SearchEntry::construct(e),
+            // No such user — deny without leaking which half failed.
+            None => {
+                let _ = ldap.unbind().await;
+                return Err(AuthError::InvalidCredentials);
+            }
+        };
+        let user_dn = entry.dn.clone();
+        let groups = entry
+            .attrs
+            .get(&cfg.group_attribute)
+            .cloned()
+            .unwrap_or_default();
+        let _ = ldap.unbind().await;
+
+        if user_dn.is_empty() {
+            return Err(AuthError::InvalidCredentials);
+        }
+        // Reject empty passwords up front: an empty password is an
+        // "unauthenticated bind" that some servers report as success.
+        if password.is_empty() {
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        // --- Phase 2: bind AS the user to verify the password ---------------
+        let (conn2, mut ldap2) = LdapConnAsync::with_settings(settings, &cfg.server_url)
+            .await
+            .map_err(|e| AuthError::Ldap(format!("connect (user bind): {}", e)))?;
+        ldap3::drive!(conn2);
+        let bind = ldap2
+            .simple_bind(&user_dn, password)
+            .await
+            .map_err(|e| AuthError::Ldap(format!("user bind: {}", e)))?;
+        let _ = ldap2.unbind().await;
+        bind.success().map_err(|_| AuthError::InvalidCredentials)?;
+
+        Ok(groups)
     }
 
     /// Authenticate using API key
@@ -1191,6 +1310,83 @@ mod tests {
         assert!(
             matches!(err, AuthError::InsufficientPermissions(_)),
             "missing required scope must deny, got {err:?}"
+        );
+    }
+
+    // --- LDAP search + bind (live, against a real directory) --------------
+
+    /// Live LDAP search-and-bind test against a real directory server. Gated
+    /// on `HELIOS_LDAP_URL` (e.g. `ldap://127.0.0.1:1389`); skips when unset so
+    /// CI without a directory stays green. `scripts/regress/ldap-test.sh`
+    /// stands up an OpenLDAP container, seeds a user, and exports the env.
+    ///
+    /// Asserts: the right user+password authenticates and yields an `ldap`
+    /// identity; a wrong password is denied; an unknown user is denied.
+    #[cfg(feature = "ldap-auth")]
+    #[tokio::test]
+    async fn ldap_live_search_and_bind() {
+        use std::time::Duration;
+
+        let url = match std::env::var("HELIOS_LDAP_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("skipping ldap_live_search_and_bind: set HELIOS_LDAP_URL");
+                return;
+            }
+        };
+        let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+        let cfg = LdapConfig {
+            server_url: url,
+            bind_dn: env("HELIOS_LDAP_BIND_DN", ""),
+            bind_password: env("HELIOS_LDAP_BIND_PW", ""),
+            user_search_base: env("HELIOS_LDAP_BASE", "ou=users,dc=example,dc=org"),
+            user_filter: env("HELIOS_LDAP_FILTER", "(uid={0})"),
+            group_search_base: None,
+            group_attribute: "memberOf".to_string(),
+            timeout: Duration::from_secs(5),
+            starttls: false,
+        };
+        let user = env("HELIOS_LDAP_USER", "alice");
+        let pass = env("HELIOS_LDAP_PASS", "alicepw");
+
+        let handler = AuthenticationHandlerBuilder::new()
+            .enabled(true)
+            .with_ldap(cfg)
+            .build();
+
+        // 1. Correct credentials authenticate.
+        let ok_req = AuthRequest::new()
+            .with_username(user.clone())
+            .with_password(pass.clone());
+        let result = handler
+            .authenticate_ldap(&ok_req)
+            .await
+            .expect("valid LDAP credentials must authenticate");
+        assert_eq!(result.identity.user_id, user);
+        assert_eq!(result.identity.auth_method, "ldap");
+
+        // 2. Wrong password is denied.
+        let bad_pw = AuthRequest::new()
+            .with_username(user.clone())
+            .with_password("definitely-wrong");
+        assert!(
+            matches!(
+                handler.authenticate_ldap(&bad_pw).await,
+                Err(AuthError::InvalidCredentials)
+            ),
+            "wrong password must be denied"
+        );
+
+        // 3. Unknown user is denied.
+        let unknown = AuthRequest::new()
+            .with_username("nosuchuser")
+            .with_password("whatever");
+        assert!(
+            matches!(
+                handler.authenticate_ldap(&unknown).await,
+                Err(AuthError::InvalidCredentials)
+            ),
+            "unknown user must be denied"
         );
     }
 }
