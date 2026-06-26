@@ -176,8 +176,10 @@ bincode = "1"
 # Random (used by rate_limit, circuit_breaker)
 rand = "0.8"
 
-# HTTP (used by auth OAuth, optional)
-reqwest = { version = "0.11", features = ["json"], default-features = false }
+# HTTP (used by auth OAuth introspection + the L3 semantic cache). rustls-tls
+# so HTTPS identity providers (RFC 7662 introspection) work without OpenSSL —
+# consistent with the crate's pure-Rust rustls stack.
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
 
 # Compression (used by distribcache tiers)
 zstd = "0.13"
