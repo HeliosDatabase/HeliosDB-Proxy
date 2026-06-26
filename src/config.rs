@@ -252,6 +252,10 @@ pub struct ProxyConfig {
     /// when the `query-cache` feature is compiled in.
     #[serde(default)]
     pub cache: CacheToml,
+    /// SQL query rewriting (rules engine). Disabled by default. Only active
+    /// when the `query-rewriting` feature is compiled in.
+    #[serde(default)]
+    pub query_rewrite: QueryRewriteToml,
     /// Proxy-side unnamed-`Parse` promotion (Batch H). When a client re-sends an
     /// identical unnamed extended `Parse` (the dominant pgbench/ORM pattern),
     /// the proxy skips forwarding it to a backend that already holds that exact
@@ -546,6 +550,36 @@ fn default_write_timeout_secs() -> u64 {
     30 // 30 seconds default write timeout during failover
 }
 
+/// A single SQL-rewrite rule in TOML form. Maps to a `rewriter::RewriteRule`:
+/// `match_table`/`match_regex` choose which queries it applies to (default: all),
+/// and the first set transformation field is applied.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RewriteRuleToml {
+    /// Apply to queries referencing this table.
+    pub match_table: Option<String>,
+    /// Apply to queries matching this regex.
+    pub match_regex: Option<String>,
+    /// Rewrite `match_table` -> this table name.
+    pub replace_table_with: Option<String>,
+    /// Append `AND <expr>` to the query's WHERE clause.
+    pub append_where: Option<String>,
+    /// Add a `LIMIT n` to an unbounded query.
+    pub add_limit: Option<u32>,
+}
+
+/// SQL query-rewriting configuration (always present). Converted to a
+/// `rewriter::QueryRewriter` at startup; only active when the `query-rewriting`
+/// feature is compiled in AND `enabled = true`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueryRewriteToml {
+    /// Rewrite query SQL on the path per the rules below. Default `false`.
+    pub enabled: bool,
+    /// Ordered rewrite rules.
+    pub rules: Vec<RewriteRuleToml>,
+}
+
 /// Query-result cache configuration (TOML-friendly, always present). Converted
 /// to `crate::cache::CacheConfig` at startup and only active when the
 /// `query-cache` feature is compiled in AND `enabled = true`.
@@ -751,6 +785,7 @@ impl Default for ProxyConfig {
             analytics: AnalyticsToml::default(),
             lag_routing: LagRoutingToml::default(),
             cache: CacheToml::default(),
+            query_rewrite: QueryRewriteToml::default(),
             optimize_unnamed_parse: true,
             shutdown_drain_timeout_secs: default_drain_timeout_secs(),
         }
