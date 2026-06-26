@@ -218,6 +218,10 @@ struct ServerState {
     /// Rewrites the query SQL on the path before forwarding.
     #[cfg(feature = "query-rewriting")]
     rewriter: Option<Arc<crate::rewriter::QueryRewriter>>,
+    /// Multi-tenancy manager. `Some` when `[multi_tenancy] enabled`. Identifies
+    /// the tenant for a session and injects a row-level tenant filter.
+    #[cfg(feature = "multi-tenancy")]
+    tenant_manager: Option<Arc<crate::multi_tenancy::TenantManager>>,
     /// Pool manager for Session/Transaction/Statement modes
     #[cfg(feature = "pool-modes")]
     pool_manager: Option<Arc<ConnectionPoolManager>>,
@@ -783,6 +787,50 @@ impl ProxyServer {
             None
         };
 
+        // Build the multi-tenancy manager from the configured tenants.
+        #[cfg(feature = "multi-tenancy")]
+        let tenant_manager =
+            if config.multi_tenancy.enabled && !config.multi_tenancy.tenants.is_empty() {
+                use crate::multi_tenancy::{
+                    IdentificationMethod, IsolationStrategy, MultiTenancyConfig, TenantConfig,
+                    TenantId, TenantManagerBuilder, TenantQueryTransformer,
+                };
+                let mt = &config.multi_tenancy;
+                let identification = match mt.identify_by.as_str() {
+                    "database" => IdentificationMethod::DatabaseName,
+                    param => IdentificationMethod::Header {
+                        header_name: param.to_string(),
+                    },
+                };
+                let mtc = MultiTenancyConfig {
+                    enabled: true,
+                    identification,
+                    ..Default::default()
+                };
+                // Configure which tables are tenant-scoped + the filter column.
+                let table_refs: Vec<&str> = mt.tenant_tables.iter().map(|s| s.as_str()).collect();
+                let transformer = TenantQueryTransformer::new()
+                    .register_tables(&table_refs, mt.tenant_column.clone());
+                let tm = TenantManagerBuilder::new()
+                    .config(mtc)
+                    .query_transformer(transformer)
+                    .build();
+                for id in &mt.tenants {
+                    tm.register_tenant(TenantConfig::new(
+                        TenantId::new(id.clone()),
+                        IsolationStrategy::row("public", mt.tenant_column.clone()),
+                    ));
+                }
+                tracing::info!(
+                    tenants = mt.tenants.len(),
+                    identify_by = %mt.identify_by,
+                    "multi-tenancy enabled"
+                );
+                Some(Arc::new(tm))
+            } else {
+                None
+            };
+
         let state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
             health: ArcSwap::from_pointee(health),
@@ -820,6 +868,8 @@ impl ProxyServer {
             query_cache,
             #[cfg(feature = "query-rewriting")]
             rewriter,
+            #[cfg(feature = "multi-tenancy")]
+            tenant_manager,
             #[cfg(feature = "pool-modes")]
             pool_manager,
             #[cfg(feature = "wasm-plugins")]
@@ -2501,6 +2551,35 @@ impl ProxyServer {
         #[cfg(feature = "query-rewriting")]
         let forward_msg = rewritten_msg.as_ref().unwrap_or(forward_msg);
 
+        // Multi-tenancy: resolve the session's tenant and inject a row-level
+        // tenant filter. Done BEFORE the cache lookup so each tenant's results
+        // are cached under their own (filtered) SQL — no cross-tenant leakage.
+        #[cfg(feature = "multi-tenancy")]
+        let tenant_msg: Option<Message> = if let Some(tm) = state.tenant_manager.as_ref() {
+            match crate::protocol::query_text(&forward_msg.payload) {
+                Some(sql) => {
+                    let ctx = Self::tenant_request_ctx(session).await;
+                    match tm.identify_tenant(&ctx) {
+                        Some(tenant) => {
+                            let res = tm.transform_query(sql, &tenant);
+                            if res.transformed {
+                                tracing::debug!(target: "helios::tenant", tenant = %tenant.0, "tenant filter injected");
+                                Some(crate::protocol::QueryMessage { query: res.query }.encode())
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        #[cfg(feature = "multi-tenancy")]
+        let forward_msg = tenant_msg.as_ref().unwrap_or(forward_msg);
+
         // Query cache: on a cacheable read, a hit is served from cache with no
         // backend round-trip; on a miss we keep the context to store the result.
         #[cfg(feature = "query-cache")]
@@ -3413,6 +3492,25 @@ impl ProxyServer {
             branch: None,
             connection_id: Some(session.id.as_u64_pair().0),
         })
+    }
+
+    /// Build a multi-tenancy `RequestContext` from the session's startup
+    /// parameters (user, database, application_name, ...) so the configured
+    /// identifier can resolve the tenant.
+    #[cfg(feature = "multi-tenancy")]
+    async fn tenant_request_ctx(
+        session: &Arc<ClientSession>,
+    ) -> crate::multi_tenancy::RequestContext {
+        let vars = session.variables.read().await;
+        crate::multi_tenancy::RequestContext {
+            headers: vars.clone(),
+            username: vars.get("user").cloned(),
+            database: vars.get("database").cloned(),
+            auth_token: None,
+            sql_context: HashMap::new(),
+            client_ip: Some(session.client_addr.ip().to_string()),
+            connection_id: Some(session.id.as_u64_pair().0),
+        }
     }
 
     /// Record a forwarded query on the analytics engine (fingerprint, latency,
@@ -4824,6 +4922,8 @@ mod tests {
             query_cache: None,
             #[cfg(feature = "query-rewriting")]
             rewriter: None,
+            #[cfg(feature = "multi-tenancy")]
+            tenant_manager: None,
             #[cfg(feature = "pool-modes")]
             pool_manager: None,
             plugin_manager: Some(pm),
@@ -5287,6 +5387,53 @@ mod tests {
                 .unwrap();
             assert!(!res.was_rewritten());
             assert_eq!(res.query(), "select * from other");
+        }
+    }
+
+    // ---- multi-tenancy: row-filter injection per tenant ----
+
+    #[cfg(feature = "multi-tenancy")]
+    mod multi_tenancy {
+        use crate::multi_tenancy::{
+            IdentificationMethod, IsolationStrategy, MultiTenancyConfig, TenantConfig, TenantId,
+            TenantManager, TenantManagerBuilder, TenantQueryTransformer,
+        };
+
+        fn manager() -> TenantManager {
+            let transformer = TenantQueryTransformer::new().register_tables(&["t"], "tid");
+            let tm = TenantManagerBuilder::new()
+                .config(MultiTenancyConfig {
+                    enabled: true,
+                    identification: IdentificationMethod::Header {
+                        header_name: "application_name".to_string(),
+                    },
+                    ..Default::default()
+                })
+                .query_transformer(transformer)
+                .build();
+            tm.register_tenant(TenantConfig::new(
+                TenantId::new("acme"),
+                IsolationStrategy::row("public", "tid"),
+            ));
+            tm
+        }
+
+        #[test]
+        fn tenant_table_gets_filter() {
+            let res = manager().transform_query("select * from t", &TenantId::new("acme"));
+            assert!(res.transformed, "expected a tenant filter to be injected");
+            let q = res.query.to_lowercase();
+            assert!(
+                q.contains("tid") && q.contains("acme"),
+                "filter missing: {}",
+                res.query
+            );
+        }
+
+        #[test]
+        fn non_tenant_table_passes_through() {
+            let res = manager().transform_query("select * from other", &TenantId::new("acme"));
+            assert!(!res.transformed);
         }
     }
 }

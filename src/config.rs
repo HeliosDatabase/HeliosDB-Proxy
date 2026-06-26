@@ -256,6 +256,11 @@ pub struct ProxyConfig {
     /// when the `query-rewriting` feature is compiled in.
     #[serde(default)]
     pub query_rewrite: QueryRewriteToml,
+    /// Multi-tenancy (per-tenant row isolation via injected predicates).
+    /// Disabled by default. Only active when the `multi-tenancy` feature is
+    /// compiled in.
+    #[serde(default)]
+    pub multi_tenancy: MultiTenancyToml,
     /// Proxy-side unnamed-`Parse` promotion (Batch H). When a client re-sends an
     /// identical unnamed extended `Parse` (the dominant pgbench/ORM pattern),
     /// the proxy skips forwarding it to a backend that already holds that exact
@@ -550,6 +555,38 @@ fn default_write_timeout_secs() -> u64 {
     30 // 30 seconds default write timeout during failover
 }
 
+/// Multi-tenancy configuration (always present). Converted to a
+/// `multi_tenancy::TenantManager` at startup; only active when the
+/// `multi-tenancy` feature is compiled in AND `enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MultiTenancyToml {
+    /// Enforce per-tenant row isolation. Default `false`.
+    pub enabled: bool,
+    /// Which connection attribute names the tenant: a startup parameter name
+    /// (e.g. `application_name`, `user`) or the literal `database`.
+    pub identify_by: String,
+    /// The row-level tenant column injected into queries (e.g. `tenant_id`).
+    pub tenant_column: String,
+    /// Tables that are tenant-scoped (get the filter injected). Other tables
+    /// pass through unchanged.
+    pub tenant_tables: Vec<String>,
+    /// Known tenant ids.
+    pub tenants: Vec<String>,
+}
+
+impl Default for MultiTenancyToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            identify_by: "application_name".to_string(),
+            tenant_column: "tenant_id".to_string(),
+            tenant_tables: Vec::new(),
+            tenants: Vec::new(),
+        }
+    }
+}
+
 /// A single SQL-rewrite rule in TOML form. Maps to a `rewriter::RewriteRule`:
 /// `match_table`/`match_regex` choose which queries it applies to (default: all),
 /// and the first set transformation field is applied.
@@ -786,6 +823,7 @@ impl Default for ProxyConfig {
             lag_routing: LagRoutingToml::default(),
             cache: CacheToml::default(),
             query_rewrite: QueryRewriteToml::default(),
+            multi_tenancy: MultiTenancyToml::default(),
             optimize_unnamed_parse: true,
             shutdown_drain_timeout_secs: default_drain_timeout_secs(),
         }
