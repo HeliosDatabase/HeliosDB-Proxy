@@ -5,6 +5,51 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-06-26
+
+Minor release — the first wave of **platform-tier wiring**. Three feature flags
+that previously compiled but did nothing on the query path are now genuinely
+enforced, each live-verified against PostgreSQL 18.4. This release also formally
+owns two prior unreleased source changes (an MSRV bump and one breaking
+public-API rename).
+
+### Added
+
+- **SQL-comment routing hints (`routing-hints`) are now honored.**
+  `[routing_hints]` config (off by default). `/*helios:route=primary|standby|…*/`,
+  `/*helios:node=<name>*/`, and `consistency=strong` steer routing on both the
+  simple- and extended-query paths, taking precedence over default verb routing
+  (but never over a plugin `Block`). A `node=<name>` hint resolves the node name
+  to its address; the hint comment is optionally stripped before forwarding.
+- **Rate limiting (`rate-limiting`) is now enforced.** `[rate_limit]` config
+  (off by default; token bucket + concurrency, keyed per user / client-ip /
+  database / global). Over-limit queries receive a clean `ErrorResponse`
+  (SQLSTATE 53400); throttle/queue verdicts apply real backpressure; the
+  connection is not dropped.
+- **Per-node circuit breaker (`circuit-breaker`) is now active.**
+  `[circuit_breaker]` config (off by default). Repeated backend failures trip a
+  node's circuit; while open the proxy fast-fails with `ErrorResponse` SQLSTATE
+  08006 instead of retrying the dead node, and read selection routes around it.
+  A half-open probe closes the circuit on recovery.
+
+### Fixed
+
+- **Write detection is no longer fooled by a leading hint comment.**
+  `is_write_query` is evaluated on the hint-stripped SQL, so
+  `/*helios:…*/ INSERT …` is correctly classified as a write. The `node=<name>`
+  route path (hint and plugin) now resolves a node name to its address instead
+  of dialing a literal hostname.
+
+### Changed
+
+- **MSRV is now Rust 1.86** (was 1.75), to match the transitive dependency floor.
+
+### Breaking
+
+- `rewriter::RewriteRule::new` (the builder entry point, under the
+  `query-rewriting` feature) was renamed to `RewriteRule::build`. Callers using
+  `RewriteRule::new(id)` must switch to `RewriteRule::build(id)`.
+
 ## [0.6.1] - 2026-06-15
 
 Patch release — demo infrastructure fixes. No proxy code or runtime behavior changes.
