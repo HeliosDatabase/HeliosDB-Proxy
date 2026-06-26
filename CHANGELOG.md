@@ -5,6 +5,28 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-06-26
+
+Minor release — OAuth token introspection is now real.
+
+### Added
+
+- **OAuth RFC 7662 introspection (`auth-proxy`).** `authenticate_oauth`
+  previously denied every request as "not implemented". It now POSTs the bearer
+  token to the configured introspection endpoint (HTTP Basic client auth),
+  requires an explicit `"active": true`, enforces optional issuer / audience /
+  required-scope checks, and mints an `Identity` (subject + scopes→roles +
+  expiry). Results are cached. A token is never trusted without the round-trip.
+- `reqwest` now enables `rustls-tls`, so HTTPS identity providers work without
+  OpenSSL (also benefits the L3 semantic cache).
+
+### Notes
+
+- Implemented + real auth methods: **JWT (HS256)**, **API key** (SHA-256 +
+  constant-time compare), **OAuth introspection**. **LDAP** remains
+  deny-by-default — `authenticate_ldap` returns an error rather than faking
+  acceptance; a real bind needs an `ldap3` client + a live directory.
+
 ## [0.18.0] - 2026-06-26
 
 Minor release — three orphan stubs made real.
