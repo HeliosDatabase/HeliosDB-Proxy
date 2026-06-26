@@ -265,6 +265,10 @@ pub struct ProxyConfig {
     /// Disabled by default. Only active when the `schema-routing` feature is on.
     #[serde(default)]
     pub schema_routing: SchemaRoutingToml,
+    /// GraphQL-to-SQL gateway (separate HTTP listener). Disabled by default.
+    /// Only active when the `graphql-gateway` feature is compiled in.
+    #[serde(default)]
+    pub graphql_gateway: GraphqlGatewayConfig,
     /// Proxy-side unnamed-`Parse` promotion (Batch H). When a client re-sends an
     /// identical unnamed extended `Parse` (the dominant pgbench/ORM pattern),
     /// the proxy skips forwarding it to a backend that already holds that exact
@@ -559,6 +563,51 @@ fn default_write_timeout_secs() -> u64 {
     30 // 30 seconds default write timeout during failover
 }
 
+/// A table exposed by the GraphQL gateway, with its selectable columns.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GqlTableToml {
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
+/// GraphQL-to-SQL gateway configuration. A separate HTTP listener; only active
+/// when the `graphql-gateway` feature is compiled in AND `enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GraphqlGatewayConfig {
+    /// Serve the GraphQL gateway. Default `false`.
+    pub enabled: bool,
+    /// HTTP listen address (e.g. `0.0.0.0:9091`).
+    pub listen_address: String,
+    /// Backend the generated SQL runs against.
+    pub backend_host: String,
+    pub backend_port: u16,
+    pub backend_user: String,
+    pub backend_password: Option<String>,
+    pub backend_database: Option<String>,
+    /// Optional Bearer token required on requests.
+    pub auth_token: Option<String>,
+    /// Tables exposed as GraphQL types.
+    pub tables: Vec<GqlTableToml>,
+}
+
+impl Default for GraphqlGatewayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_address: "0.0.0.0:9091".to_string(),
+            backend_host: "127.0.0.1".to_string(),
+            backend_port: 5432,
+            backend_user: "postgres".to_string(),
+            backend_password: None,
+            backend_database: None,
+            auth_token: None,
+            tables: Vec::new(),
+        }
+    }
+}
+
 /// Schema/workload-aware routing configuration (always present). Only active
 /// when the `schema-routing` feature is compiled in AND `enabled = true`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -841,6 +890,7 @@ impl Default for ProxyConfig {
             query_rewrite: QueryRewriteToml::default(),
             multi_tenancy: MultiTenancyToml::default(),
             schema_routing: SchemaRoutingToml::default(),
+            graphql_gateway: GraphqlGatewayConfig::default(),
             optimize_unnamed_parse: true,
             shutdown_drain_timeout_secs: default_drain_timeout_secs(),
         }
