@@ -157,6 +157,8 @@ pub mod plugins;
 // ── GraphQL-to-SQL gateway ──────────────────────────────────────────
 #[cfg(feature = "graphql-gateway")]
 pub mod graphql;
+#[cfg(feature = "graphql-gateway")]
+pub mod graphql_gateway;
 
 // ── Schema-aware routing ────────────────────────────────────────────
 #[cfg(feature = "schema-routing")]

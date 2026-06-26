@@ -1120,6 +1120,22 @@ impl ProxyServer {
             None
         };
 
+        // Start the GraphQL-to-SQL gateway when enabled.
+        #[cfg(feature = "graphql-gateway")]
+        let _graphql_gw_task = if self.config.graphql_gateway.enabled {
+            let gw_cfg = self.config.graphql_gateway.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = crate::graphql_gateway::GraphqlGateway::new(gw_cfg)
+                    .run()
+                    .await
+                {
+                    tracing::error!("GraphQL gateway error: {}", e);
+                }
+            }))
+        } else {
+            None
+        };
+
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         // SIGHUP -> zero-downtime config reload; SIGUSR2 -> graceful drain for
