@@ -1299,6 +1299,13 @@ impl ProxyServer {
                 admin_state.with_plugin_manager(pm.clone()).await;
             }
 
+            // Attach the pool manager so /api/pools surfaces real per-node
+            // pool statistics instead of an empty list.
+            #[cfg(feature = "pool-modes")]
+            if let Some(ref pm) = state.pool_manager {
+                admin_state.with_pool_manager(pm.clone()).await;
+            }
+
             // Attach the time-travel replay engine. The engine reads
             // windows from the shared TransactionJournal and replays
             // statements against a target backend supplied per-request.
@@ -4488,6 +4495,8 @@ impl ProxyServer {
 
     /// Spawn pool manager background task
     fn spawn_pool_manager(&self) -> tokio::task::JoinHandle<()> {
+        // Only referenced by the pool-modes eviction/cleanup arms below.
+        #[cfg(feature = "pool-modes")]
         let state = self.state.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 

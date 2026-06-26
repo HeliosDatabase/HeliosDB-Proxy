@@ -157,6 +157,9 @@ pub struct BatchStats {
     pub size_triggered_flushes: u64,
     /// Batches flushed due to time limit
     pub time_triggered_flushes: u64,
+    /// Batches whose combined INSERT failed to execute (no backend,
+    /// connect error, or SQL error).
+    pub flush_failures: u64,
 }
 
 /// Pending batch for a table
@@ -226,6 +229,19 @@ pub struct InsertBatcher {
     stats: Arc<parking_lot::RwLock<BatchStats>>,
     /// Shutdown flag
     shutdown: AtomicBool,
+    /// Backend the combined INSERTs actually execute against. When
+    /// `None` the batcher still batches/seals but cannot execute — it
+    /// reports an honest failure to waiters rather than claiming a
+    /// silent success.
+    backend: Option<crate::backend::BackendConfig>,
+}
+
+/// A batch sealed out of `pending` and ready to execute: the drained
+/// requests, the row count, and the combined bulk-INSERT SQL.
+struct SealedBatch {
+    requests: Vec<InsertRequest>,
+    row_count: usize,
+    sql: String,
 }
 
 impl InsertBatcher {
@@ -237,12 +253,25 @@ impl InsertBatcher {
             next_ticket_id: AtomicU64::new(1),
             stats: Arc::new(parking_lot::RwLock::new(BatchStats::default())),
             shutdown: AtomicBool::new(false),
+            backend: None,
         }
     }
 
-    /// Add an INSERT to the batch
+    /// Attach the backend the combined INSERTs execute against. Without
+    /// it the batcher seals and combines but cannot run the SQL.
+    pub fn with_backend(mut self, backend: crate::backend::BackendConfig) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
+    /// Add an INSERT to the batch.
+    ///
+    /// Takes `&Arc<Self>` so a size-triggered flush can seal the batch
+    /// synchronously (callers observing `batch_size` see it drop
+    /// immediately) and then execute the combined INSERT for real on a
+    /// spawned task. Must be called from within a Tokio runtime.
     pub fn add(
-        &self,
+        self: &Arc<Self>,
         table: String,
         columns: Vec<String>,
         values: Vec<Vec<String>>,
@@ -292,71 +321,120 @@ impl InsertBatcher {
             batch.should_flush(&self.config)
         };
 
-        // Trigger flush if needed
+        // Trigger flush if needed. Seal synchronously so `batch_size`
+        // reflects the flush immediately, then execute the combined
+        // INSERT for real on a spawned task.
         if should_flush {
-            self.flush_batch(&table);
+            if let Some(sealed) = self.seal(&table) {
+                let me = Arc::clone(self);
+                tokio::spawn(async move {
+                    me.execute_sealed(sealed).await;
+                });
+            }
         }
 
         Ok(BatchTicket { id: ticket_id, rx })
     }
 
-    /// Flush a batch for a table
-    pub fn flush_batch(&self, table: &str) {
-        if let Some((_, mut batch)) = self.pending.remove(table) {
-            if batch.is_empty() {
-                return;
-            }
+    /// Seal a table's pending batch: remove it from `pending`, drain it,
+    /// and combine the rows into one bulk INSERT. Synchronous, so
+    /// observers of `batch_size` see the flush immediately. Returns
+    /// `None` if there was nothing pending.
+    fn seal(&self, table: &str) -> Option<SealedBatch> {
+        let (_, mut batch) = self.pending.remove(table)?;
+        if batch.is_empty() {
+            return None;
+        }
+        let (requests, row_count) = batch.drain();
+        let sql = self.combine_inserts(&requests);
+        Some(SealedBatch {
+            requests,
+            row_count,
+            sql,
+        })
+    }
 
-            let (requests, row_count) = batch.drain();
-            let execution_start = Instant::now();
+    /// Execute a sealed batch's combined INSERT against the backend and
+    /// notify every waiting request with the real outcome. When no
+    /// backend is configured (or the connection/execution fails) the
+    /// waiters receive `success = false` with the reason — never a
+    /// fabricated success.
+    async fn execute_sealed(&self, sealed: SealedBatch) {
+        let SealedBatch {
+            requests,
+            row_count,
+            sql,
+        } = sealed;
+        let execution_start = Instant::now();
 
-            // Combine into a single bulk INSERT
-            let _combined_sql = self.combine_inserts(&requests);
+        // Actually run the combined INSERT.
+        let (success, error) = match &self.backend {
+            Some(cfg) => match crate::backend::BackendClient::connect(cfg).await {
+                Ok(mut client) => {
+                    let outcome = client.execute(&sql).await;
+                    client.close().await;
+                    match outcome {
+                        Ok(_tag) => (true, None),
+                        Err(e) => (false, Some(format!("execute: {}", e))),
+                    }
+                }
+                Err(e) => (false, Some(format!("connect: {}", e))),
+            },
+            None => (false, Some("no backend configured".to_string())),
+        };
 
-            // Execute the combined INSERT
-            // In production, this would call the backend
-            let success = true; // Placeholder
-            let error: Option<String> = None;
+        let execution_time = execution_start.elapsed();
 
-            let execution_time = execution_start.elapsed();
-
-            // Update statistics
-            {
-                let mut stats = self.stats.write();
-                stats.batches_flushed += 1;
+        // Update statistics (only count rows that actually landed).
+        {
+            let mut stats = self.stats.write();
+            stats.batches_flushed += 1;
+            if success {
                 stats.rows_inserted += row_count as u64;
-
-                // Update average batch size
-                if stats.batches_flushed == 1 {
-                    stats.avg_batch_size = row_count as f64;
-                } else {
-                    stats.avg_batch_size = stats.avg_batch_size * 0.9 + row_count as f64 * 0.1;
-                }
-
-                // Update average execution time
-                let exec_ms = execution_time.as_millis() as f64;
-                if stats.batches_flushed == 1 {
-                    stats.avg_execution_time_ms = exec_ms;
-                } else {
-                    stats.avg_execution_time_ms = stats.avg_execution_time_ms * 0.9 + exec_ms * 0.1;
-                }
+            } else {
+                stats.flush_failures += 1;
             }
 
-            // Send responses to all waiting requests
-            for mut req in requests {
-                let wait_time = req.submitted_at.elapsed() - execution_time;
-
-                if let Some(tx) = req.response_tx.take() {
-                    let _ = tx.send(BatchResult {
-                        ticket_id: BatchTicketId(0), // Individual tickets not tracked
-                        rows_inserted: req.values.len() as u64,
-                        success,
-                        error: error.clone(),
-                        wait_time,
-                        execution_time,
-                    });
-                }
+            if stats.batches_flushed == 1 {
+                stats.avg_batch_size = row_count as f64;
+            } else {
+                stats.avg_batch_size = stats.avg_batch_size * 0.9 + row_count as f64 * 0.1;
             }
+
+            let exec_ms = execution_time.as_millis() as f64;
+            if stats.batches_flushed == 1 {
+                stats.avg_execution_time_ms = exec_ms;
+            } else {
+                stats.avg_execution_time_ms = stats.avg_execution_time_ms * 0.9 + exec_ms * 0.1;
+            }
+        }
+
+        // Send responses to all waiting requests.
+        for mut req in requests {
+            let wait_time = req
+                .submitted_at
+                .elapsed()
+                .checked_sub(execution_time)
+                .unwrap_or_default();
+
+            if let Some(tx) = req.response_tx.take() {
+                let _ = tx.send(BatchResult {
+                    ticket_id: BatchTicketId(0), // Individual tickets not tracked
+                    rows_inserted: if success { req.values.len() as u64 } else { 0 },
+                    success,
+                    error: error.clone(),
+                    wait_time,
+                    execution_time,
+                });
+            }
+        }
+    }
+
+    /// Flush a single table's batch: seal it and execute the combined
+    /// INSERT against the backend.
+    pub async fn flush_batch(&self, table: &str) {
+        if let Some(sealed) = self.seal(table) {
+            self.execute_sealed(sealed).await;
         }
     }
 
@@ -385,11 +463,11 @@ impl InsertBatcher {
         sql
     }
 
-    /// Flush all pending batches
-    pub fn flush_all(&self) {
+    /// Flush all pending batches, executing each combined INSERT.
+    pub async fn flush_all(&self) {
         let tables: Vec<TableId> = self.pending.iter().map(|r| r.key().clone()).collect();
         for table in tables {
-            self.flush_batch(&table);
+            self.flush_batch(&table).await;
         }
     }
 
@@ -403,10 +481,11 @@ impl InsertBatcher {
         self.stats.read().clone()
     }
 
-    /// Shutdown the batcher
-    pub fn shutdown(&self) {
+    /// Shutdown the batcher: stop accepting work and flush whatever is
+    /// pending (executing each combined INSERT).
+    pub async fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        self.flush_all();
+        self.flush_all().await;
     }
 
     /// Start auto-flush background task
@@ -434,7 +513,7 @@ impl InsertBatcher {
                     .collect();
 
                 for table in tables {
-                    self.flush_batch(&table);
+                    self.flush_batch(&table).await;
                     self.stats.write().time_triggered_flushes += 1;
                 }
             }
@@ -448,9 +527,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_add() {
-        let batcher = InsertBatcher::new(BatchConfig::default());
+        let batcher = Arc::new(InsertBatcher::new(BatchConfig::default()));
 
-        let ticket = batcher
+        let _ticket = batcher
             .add(
                 "users".to_string(),
                 vec!["id".to_string(), "name".to_string()],
@@ -468,7 +547,7 @@ mod tests {
             max_batch_size: 2,
             ..Default::default()
         };
-        let batcher = InsertBatcher::new(config);
+        let batcher = Arc::new(InsertBatcher::new(config));
 
         // Add first INSERT
         batcher
@@ -527,7 +606,9 @@ mod tests {
 
     #[test]
     fn test_batch_stats() {
-        let batcher = InsertBatcher::new(BatchConfig::default());
+        // Default config won't trigger a size/time flush for 2 rows, so no
+        // task is spawned and this stays a plain (non-async) test.
+        let batcher = Arc::new(InsertBatcher::new(BatchConfig::default()));
 
         batcher
             .add(
@@ -541,5 +622,89 @@ mod tests {
         let stats = batcher.stats();
         assert_eq!(stats.inserts_received, 1);
         assert_eq!(stats.rows_received, 2);
+    }
+
+    /// Live proof that a flushed batch's combined INSERT actually
+    /// executes against PostgreSQL and the rows land. Gated on
+    /// `HELIOS_LIVE_PG` (`host:port`, e.g. `127.0.0.1:25433`); skips when
+    /// unset so CI without a backend stays green. Before this change the
+    /// flush discarded the SQL and faked success — this test would then
+    /// find zero rows.
+    #[tokio::test]
+    async fn flush_executes_against_live_backend() {
+        use crate::backend::{tls::default_client_config, BackendClient, BackendConfig, TlsMode};
+
+        let addr = match std::env::var("HELIOS_LIVE_PG") {
+            Ok(a) if !a.is_empty() => a,
+            _ => {
+                eprintln!("skipping flush_executes_against_live_backend: set HELIOS_LIVE_PG");
+                return;
+            }
+        };
+        let (host, port_s) = addr.rsplit_once(':').unwrap();
+        let port: u16 = port_s.parse().unwrap();
+        let user = std::env::var("HELIOS_LIVE_USER").unwrap_or_else(|_| "bench".into());
+        let pass = std::env::var("HELIOS_LIVE_PASS").unwrap_or_else(|_| "benchpass".into());
+        let db = std::env::var("HELIOS_LIVE_DB").unwrap_or_else(|_| "benchdb".into());
+
+        let cfg = BackendConfig {
+            host: host.to_string(),
+            port,
+            user,
+            password: Some(pass),
+            database: Some(db),
+            application_name: Some("helios-batch-test".into()),
+            tls_mode: TlsMode::Disable,
+            connect_timeout: Duration::from_secs(5),
+            query_timeout: Duration::from_secs(5),
+            tls_config: default_client_config(),
+        };
+
+        // Seed a clean probe table.
+        let mut seed = BackendClient::connect(&cfg).await.expect("connect seed");
+        seed.execute("DROP TABLE IF EXISTS batch_probe").await.unwrap();
+        seed.execute("CREATE TABLE batch_probe(id int, total numeric)")
+            .await
+            .unwrap();
+        seed.close().await;
+
+        // Large batch size so nothing auto-flushes; we flush explicitly
+        // and await the real execution.
+        let batcher = Arc::new(
+            InsertBatcher::new(BatchConfig {
+                max_batch_size: 1000,
+                max_wait_ms: 60_000,
+                ..Default::default()
+            })
+            .with_backend(cfg.clone()),
+        );
+        batcher
+            .add(
+                "batch_probe".to_string(),
+                vec!["id".to_string(), "total".to_string()],
+                vec![
+                    vec!["1".to_string(), "99.99".to_string()],
+                    vec!["2".to_string(), "12.50".to_string()],
+                ],
+                String::new(),
+            )
+            .unwrap();
+        batcher.flush_batch("batch_probe").await;
+
+        // The two rows must actually be in PostgreSQL now.
+        let mut verify = BackendClient::connect(&cfg).await.expect("connect verify");
+        let n = verify
+            .query_scalar("SELECT count(*) AS n FROM batch_probe")
+            .await
+            .unwrap()
+            .as_i64("n")
+            .unwrap()
+            .unwrap_or(0);
+        let _ = verify.execute("DROP TABLE IF EXISTS batch_probe").await;
+        verify.close().await;
+
+        assert_eq!(n, 2, "expected 2 batched rows to land, found {}", n);
+        assert_eq!(batcher.stats().rows_inserted, 2);
+        assert_eq!(batcher.stats().flush_failures, 0);
     }
 }
