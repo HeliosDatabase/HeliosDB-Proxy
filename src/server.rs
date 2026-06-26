@@ -222,6 +222,10 @@ struct ServerState {
     /// the tenant for a session and injects a row-level tenant filter.
     #[cfg(feature = "multi-tenancy")]
     tenant_manager: Option<Arc<crate::multi_tenancy::TenantManager>>,
+    /// Schema/workload query analyzer. `Some` when `[schema_routing] enabled`;
+    /// analytical (OLAP) queries are routed to the configured analytics node.
+    #[cfg(feature = "schema-routing")]
+    schema_analyzer: Option<Arc<crate::schema_routing::QueryAnalyzer>>,
     /// Pool manager for Session/Transaction/Statement modes
     #[cfg(feature = "pool-modes")]
     pool_manager: Option<Arc<ConnectionPoolManager>>,
@@ -831,6 +835,22 @@ impl ProxyServer {
                 None
             };
 
+        // Build the schema/workload query analyzer when enabled.
+        #[cfg(feature = "schema-routing")]
+        let schema_analyzer =
+            if config.schema_routing.enabled && !config.schema_routing.analytics_node.is_empty() {
+                tracing::info!(
+                    analytics_node = %config.schema_routing.analytics_node,
+                    "schema/workload routing enabled (OLAP -> analytics node)"
+                );
+                let registry = Arc::new(crate::schema_routing::SchemaRegistry::new());
+                Some(Arc::new(crate::schema_routing::QueryAnalyzer::new(
+                    registry,
+                )))
+            } else {
+                None
+            };
+
         let state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
             health: ArcSwap::from_pointee(health),
@@ -870,6 +890,8 @@ impl ProxyServer {
             rewriter,
             #[cfg(feature = "multi-tenancy")]
             tenant_manager,
+            #[cfg(feature = "schema-routing")]
+            schema_analyzer,
             #[cfg(feature = "pool-modes")]
             pool_manager,
             #[cfg(feature = "wasm-plugins")]
@@ -2604,6 +2626,26 @@ impl ProxyServer {
             }
         } else {
             None
+        };
+
+        // Schema/workload routing: pin an analytical (OLAP) read to the
+        // configured analytics node, unless something already forced a target.
+        #[cfg(feature = "schema-routing")]
+        let forced_target = match state.schema_analyzer.as_ref() {
+            Some(analyzer)
+                if forced_target.is_none()
+                    && !is_write
+                    && !config.schema_routing.analytics_node.is_empty() =>
+            {
+                match crate::protocol::query_text(&forward_msg.payload) {
+                    Some(sql) if analyzer.analyze(sql).is_analytics() => {
+                        tracing::debug!(target: "helios::schema", "OLAP query routed to analytics node");
+                        Some(config.schema_routing.analytics_node.clone())
+                    }
+                    _ => forced_target,
+                }
+            }
+            _ => forced_target,
         };
 
         // Analytics: capture the forwarded SQL + start the latency timer.
@@ -4949,6 +4991,8 @@ mod tests {
             rewriter: None,
             #[cfg(feature = "multi-tenancy")]
             tenant_manager: None,
+            #[cfg(feature = "schema-routing")]
+            schema_analyzer: None,
             #[cfg(feature = "pool-modes")]
             pool_manager: None,
             plugin_manager: Some(pm),
@@ -5491,6 +5535,34 @@ mod tests {
             let entries = j.entries_in_window(from, to).await;
             assert_eq!(entries.len(), 1, "journaled statement should be in window");
             assert!(entries[0].1.statement.contains("insert"));
+        }
+    }
+
+    // ---- schema-routing: OLAP vs OLTP workload classification ----
+
+    #[cfg(feature = "schema-routing")]
+    mod schema_routing {
+        use crate::schema_routing::{QueryAnalyzer, SchemaRegistry};
+        use std::sync::Arc;
+
+        fn analyzer() -> QueryAnalyzer {
+            QueryAnalyzer::new(Arc::new(SchemaRegistry::new()))
+        }
+
+        #[test]
+        fn aggregation_group_by_is_analytics() {
+            let a = analyzer();
+            assert!(a
+                .analyze("select count(*) from orders group by region")
+                .is_analytics());
+        }
+
+        #[test]
+        fn simple_point_query_is_not_analytics() {
+            let a = analyzer();
+            assert!(!a
+                .analyze("select * from orders where id = 1")
+                .is_analytics());
         }
     }
 }
