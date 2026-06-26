@@ -1,0 +1,58 @@
+# Regression harness — circuit breaker. A working primary (used for the client
+# session/auth and default routing) plus a DEAD node (127.0.0.1:9 = connection
+# refused) reachable only via a /*helios:node=pg-dead*/ hint. Forced queries to
+# the dead node accumulate failures on its breaker; after the threshold the
+# circuit opens and the proxy fast-fails (clean ErrorResponse) instead of
+# dropping the connection. The dead node is disabled so default reads stay on
+# the working primary (a forced node hint bypasses the enabled check).
+listen_address = "127.0.0.1:6432"
+admin_address  = "127.0.0.1:9099"
+tr_enabled = false
+tr_mode    = "none"
+write_timeout_secs = 30
+
+[pool]
+min_connections = 1
+max_connections = 20
+idle_timeout_secs = 300
+max_lifetime_secs = 1800
+acquire_timeout_secs = 5
+test_on_acquire = true
+
+[load_balancer]
+read_strategy = "round_robin"
+read_write_split = true
+latency_threshold_ms = 100
+
+[health]
+check_interval_secs = 5
+check_timeout_secs = 3
+failure_threshold = 3
+success_threshold = 2
+check_query = "SELECT 1"
+
+[routing_hints]
+enabled = true
+strip_hints = true
+
+[circuit_breaker]
+enabled = true
+failure_threshold = 3
+open_secs = 5
+success_threshold = 2
+
+[[nodes]]
+host = "127.0.0.1"
+port = 25433
+role = "primary"
+weight = 100
+enabled = true
+name = "pg-primary"
+
+[[nodes]]
+host = "127.0.0.1"
+port = 9
+role = "standby"
+weight = 100
+enabled = false
+name = "pg-dead"
