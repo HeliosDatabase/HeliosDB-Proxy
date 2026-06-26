@@ -5,6 +5,25 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-06-26
+
+Minor release — second of the 1.0.0 wiring set: the GraphQL gateway is now real.
+
+### Added
+
+- **GraphQL-to-SQL gateway (`graphql-gateway`).** `[graphql_gateway]` config
+  (off by default; `listen_address`, `backend_*`, `tables`). A new HTTP listener
+  accepts `POST {"query": "<graphql>"}`, generates SQL from the configured
+  schema, executes it over the backend PG-wire client, and returns a real
+  GraphQL response. The engine previously returned `null`/empty for every field
+  and had no listener at all.
+
+### Notes
+
+- Real SQL execution + flat top-level response shaping is delivered and
+  live-verified. Nested-relationship shaping (joins), mutations, and the SQL
+  generator's table-name derivation + `id` primary-key assumption are follow-ons.
+
 ## [0.14.0] - 2026-06-26
 
 Minor release — first of the 1.0.0 wiring set: schema/workload-aware routing.
