@@ -1,0 +1,43 @@
+# Regression harness — Transaction-mode connection pooling (feature: pool-modes)
+# over PG18.4. The proxy returns the backend connection to a shared,
+# identity-keyed idle pool at each transaction boundary (DISCARD ALL reset),
+# and reuses a parked connection on the next query instead of redialing.
+listen_address = "127.0.0.1:6432"
+admin_address  = "127.0.0.1:9099"
+tr_enabled = false
+tr_mode    = "none"
+write_timeout_secs = 30
+
+[pool]
+min_connections = 1
+max_connections = 20
+idle_timeout_secs = 300
+max_lifetime_secs = 1800
+acquire_timeout_secs = 5
+test_on_acquire = true
+
+# Transaction pooling: release + reset + park at every idle boundary.
+[pool_mode]
+mode = "transaction"
+max_pool_size = 10
+reset_query = "DISCARD ALL"
+
+[load_balancer]
+read_strategy = "round_robin"
+read_write_split = false
+latency_threshold_ms = 100
+
+[health]
+check_interval_secs = 30
+check_timeout_secs = 3
+failure_threshold = 3
+success_threshold = 2
+check_query = "SELECT 1"
+
+[[nodes]]
+host = "127.0.0.1"
+port = 25433
+role = "primary"
+weight = 100
+enabled = true
+name = "pg-primary"

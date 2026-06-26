@@ -27,6 +27,7 @@
 //! manager.release(lease).await;
 //! ```
 
+pub mod backend_pool;
 pub mod config;
 pub mod hardening;
 pub mod lease;
@@ -40,6 +41,7 @@ pub mod statement;
 pub mod transaction;
 
 // Re-exports
+pub use backend_pool::{pool_key, BackendIdlePool};
 pub use config::PoolModeConfig;
 pub use hardening::{
     ConnectionHealthValidator, HardeningStats, PoolExhaustionMonitor, PoolHardening,
