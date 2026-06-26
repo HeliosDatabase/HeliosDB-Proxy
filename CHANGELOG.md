@@ -5,6 +5,27 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-06-26
+
+Minor release — real LDAP authentication.
+
+### Added
+
+- **LDAP authentication (`ldap-auth` feature).** A new optional feature (off by
+  default; implies `auth-proxy`) implements the standard search-then-bind flow:
+  service-bind + search to resolve the user DN, then bind as that DN with the
+  supplied password to verify it. Group memberships become identity groups;
+  StartTLS / ldaps are supported. Previously `authenticate_ldap` denied by
+  default. Without the feature it still denies — never a fabricated success.
+
+### Notes
+
+- Live-verified against a real OpenLDAP container
+  (`scripts/regress/ldap-test.sh`, local-only): correct credentials
+  authenticate, wrong password and unknown user are denied.
+- All implemented auth methods are now genuinely real: JWT (HS256), API key,
+  OAuth RFC 7662 introspection, and **LDAP**.
+
 ## [1.1.0] - 2026-06-26
 
 Minor release — `pool-modes` now does real work on the data path.
