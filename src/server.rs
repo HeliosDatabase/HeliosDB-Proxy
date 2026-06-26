@@ -296,6 +296,12 @@ pub struct ClientSession {
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// TR mode for this session
     pub tr_mode: TrMode,
+    /// Wall-clock instant of this session's most recent write, for
+    /// read-your-writes routing: reads within the configured window after a
+    /// write are pinned to the primary so the client observes its own writes
+    /// despite replica lag.
+    #[cfg(feature = "lag-routing")]
+    pub last_write_at: RwLock<Option<std::time::Instant>>,
     /// Client ID for pool-modes lease tracking
     #[cfg(feature = "pool-modes")]
     pub pool_client_id: ClientId,
@@ -1243,6 +1249,8 @@ impl ProxyServer {
             variables: RwLock::new(HashMap::new()),
             created_at: chrono::Utc::now(),
             tr_mode: config.tr_mode,
+            #[cfg(feature = "lag-routing")]
+            last_write_at: RwLock::new(None),
             #[cfg(feature = "pool-modes")]
             pool_client_id: ClientId::new(),
             #[cfg(feature = "wasm-plugins")]
@@ -2221,6 +2229,19 @@ impl ProxyServer {
         if let Some(t) = state.cutover.load_full().as_ref() {
             return Ok(t.addr.clone());
         }
+
+        // Read-your-writes: within the window after a write, a read is pinned to
+        // the primary (overriding the reuse-of-a-standby path) so the client
+        // observes its own writes despite replica lag.
+        #[cfg(feature = "lag-routing")]
+        if !is_write && forced_target.is_none() && config.lag_routing.enabled {
+            let last_write = *session.last_write_at.read().await;
+            if Self::ryw_pins_primary(last_write, config.lag_routing.ryw_window_ms) {
+                tracing::debug!(target: "helios::routing", "read-your-writes: pinning read to primary");
+                return Self::select_primary_with_timeout(session, state, config).await;
+            }
+        }
+
         let need_switch = if let Some(ref forced) = forced_target {
             let health = state.health.load_full();
             let reuse = current_node
@@ -2365,6 +2386,13 @@ impl ProxyServer {
             RouteOverride::Block(_) => unreachable!("handled above"),
         };
 
+        // Read-your-writes: stamp the session on a write so subsequent reads
+        // pin to the primary for the configured window.
+        #[cfg(feature = "lag-routing")]
+        if is_write && config.lag_routing.enabled {
+            *session.last_write_at.write().await = Some(std::time::Instant::now());
+        }
+
         // Forward the stripped message when routing-hints rewrote it, else the
         // original (borrowed, no copy).
         let forward_msg = stripped_msg.as_ref().unwrap_or(msg);
@@ -2507,6 +2535,10 @@ impl ProxyServer {
                     .unwrap_or_else(|| (Self::is_write_query(sql), None));
                 #[cfg(not(feature = "routing-hints"))]
                 let (is_write, forced): (bool, Option<String>) = (Self::is_write_query(sql), None);
+                #[cfg(feature = "lag-routing")]
+                if is_write && config.lag_routing.enabled {
+                    *session.last_write_at.write().await = Some(std::time::Instant::now());
+                }
                 Self::choose_target_node(is_write, forced, current_node, session, state, config)
                     .await?
             }
@@ -3028,6 +3060,24 @@ impl ProxyServer {
         }
     }
 
+    /// Read-your-writes decision: should reads be pinned to the primary given
+    /// the session's last write and the configured window? Pure for testing.
+    #[cfg(feature = "lag-routing")]
+    fn ryw_pins_primary(last_write: Option<std::time::Instant>, window_ms: u64) -> bool {
+        window_ms > 0
+            && last_write
+                .map(|t| t.elapsed() < Duration::from_millis(window_ms))
+                .unwrap_or(false)
+    }
+
+    /// Lag-exclusion decision: should a standby be dropped from read routing
+    /// given its measured lag and the configured ceiling? `max=0` disables
+    /// exclusion; unknown lag (None) never excludes. Pure for testing.
+    #[cfg(feature = "lag-routing")]
+    fn lag_excludes_standby(lag_bytes: Option<u64>, max_lag_bytes: u64) -> bool {
+        max_lag_bytes > 0 && lag_bytes.map(|l| l > max_lag_bytes).unwrap_or(false)
+    }
+
     /// Record a forwarded query on the analytics engine (fingerprint, latency,
     /// slow-query log, pattern detection). No-op when analytics is disabled.
     #[cfg(feature = "query-analytics")]
@@ -3136,6 +3186,15 @@ impl ProxyServer {
                 // Drop a standby whose circuit is open so reads avoid it.
                 #[cfg(feature = "circuit-breaker")]
                 let base = base && !Self::circuit_is_open(state, &n.address());
+                // Drop a standby lagging beyond the configured byte threshold.
+                #[cfg(feature = "lag-routing")]
+                let base = base
+                    && !Self::lag_excludes_standby(
+                        health
+                            .get(&n.address())
+                            .and_then(|h| h.replication_lag_bytes),
+                        config.lag_routing.max_lag_bytes,
+                    );
                 base
             })
             .collect();
@@ -4193,6 +4252,8 @@ mod tests {
             variables: RwLock::new(HashMap::new()),
             created_at: chrono::Utc::now(),
             tr_mode: crate::config::TrMode::default(),
+            #[cfg(feature = "lag-routing")]
+            last_write_at: RwLock::new(None),
             #[cfg(feature = "pool-modes")]
             pool_client_id: crate::pool::lease::ClientId::default(),
             #[cfg(feature = "wasm-plugins")]
@@ -4758,6 +4819,52 @@ mod tests {
                     .map(|s| (s.normalized.clone(), s.calls))
                     .collect::<Vec<_>>()
             );
+        }
+    }
+
+    // ---- lag-routing: read-your-writes window + lag-exclusion decisions ----
+
+    #[cfg(feature = "lag-routing")]
+    mod lag_routing {
+        use super::ProxyServer;
+
+        #[test]
+        fn ryw_pins_recent_write() {
+            // A write "now" falls inside a 1s window -> pin to primary.
+            assert!(ProxyServer::ryw_pins_primary(
+                Some(std::time::Instant::now()),
+                1000
+            ));
+        }
+
+        #[test]
+        fn ryw_releases_old_write() {
+            let old = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(10))
+                .unwrap();
+            assert!(!ProxyServer::ryw_pins_primary(Some(old), 1000));
+        }
+
+        #[test]
+        fn ryw_no_write_or_disabled() {
+            assert!(!ProxyServer::ryw_pins_primary(None, 1000));
+            // window=0 disables read-your-writes entirely.
+            assert!(!ProxyServer::ryw_pins_primary(
+                Some(std::time::Instant::now()),
+                0
+            ));
+        }
+
+        #[test]
+        fn lag_exclusion_thresholds() {
+            // max=0 disables exclusion.
+            assert!(!ProxyServer::lag_excludes_standby(Some(999_999), 0));
+            // unknown lag never excludes.
+            assert!(!ProxyServer::lag_excludes_standby(None, 1000));
+            // within ceiling stays in rotation.
+            assert!(!ProxyServer::lag_excludes_standby(Some(500), 1000));
+            // beyond ceiling is dropped.
+            assert!(ProxyServer::lag_excludes_standby(Some(2000), 1000));
         }
     }
 }
