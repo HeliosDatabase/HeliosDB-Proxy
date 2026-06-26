@@ -181,6 +181,9 @@ reqwest = { version = "0.11", features = ["json"], default-features = false }
 
 # Compression (used by distribcache tiers)
 zstd = "0.13"
+# LZ4 block compression for the DistribCache L2 tier (fast, moderate ratio).
+# Pure-Rust, safe-decode; the default tier compressor where latency matters.
+lz4_flex = "0.13"
 
 # Backend PG client (src/backend/) — auth + TLS + text-format I/O.
 # Kept lightweight: ring for crypto, no BoringSSL, no tokio-postgres.
