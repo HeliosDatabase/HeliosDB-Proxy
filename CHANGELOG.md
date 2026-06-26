@@ -5,6 +5,32 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-06-26
+
+Minor release — third of the 1.0.0 wiring set: the DistribCache internals are
+now real.
+
+### Added
+
+- **L3 distributed-cache peer server (`distribcache`).** `DistributedCache`
+  now serves the GET/PUT/PING/INVALIDATE wire protocol it already spoke as a
+  client (`serve` / `serve_on`). Replication PUTs and remote GETs from peers
+  previously reached nothing — the mesh can now actually replicate and serve
+  cross-node reads.
+
+### Changed
+
+- **L2 LZ4 compression is real.** The `Lz4` tier compressor (the default) was a
+  no-op that copied bytes behind a marker; it now uses `lz4_flex` block
+  compression. Round-trip + measurable shrink are covered by tests.
+
+### Notes
+
+- These make the DistribCache subsystem genuinely functional. It is not yet
+  mounted on the proxy's per-query data path — the `query-cache` feature is the
+  data-path cache; wiring DistribCache in as an optional proxy backend is a
+  follow-on.
+
 ## [0.15.0] - 2026-06-26
 
 Minor release — second of the 1.0.0 wiring set: the GraphQL gateway is now real.
