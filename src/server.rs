@@ -210,6 +210,10 @@ struct ServerState {
     /// forwarded query is recorded (fingerprint, latency, slow-query log).
     #[cfg(feature = "query-analytics")]
     analytics: Option<Arc<crate::analytics::QueryAnalytics>>,
+    /// Query-result cache (L1 hot / L2 warm). `Some` when `[cache] enabled`.
+    /// Read SELECTs are served from it; writes invalidate referenced tables.
+    #[cfg(feature = "query-cache")]
+    query_cache: Option<Arc<crate::cache::QueryCache>>,
     /// Pool manager for Session/Transaction/Statement modes
     #[cfg(feature = "pool-modes")]
     pool_manager: Option<Arc<ConnectionPoolManager>>,
@@ -700,6 +704,35 @@ impl ProxyServer {
             None
         };
 
+        // Build the query-result cache when enabled.
+        #[cfg(feature = "query-cache")]
+        let query_cache = if config.cache.enabled {
+            let c = &config.cache;
+            tracing::info!(
+                ttl_secs = c.ttl_secs,
+                max_result_bytes = c.max_result_bytes,
+                "query cache enabled (L1 hot + L2 warm)"
+            );
+            let ttl = Duration::from_secs(c.ttl_secs);
+            let cc = crate::cache::CacheConfig {
+                enabled: true,
+                default_ttl: ttl,
+                max_result_size: c.max_result_bytes,
+                l1: crate::cache::L1Config {
+                    ttl,
+                    ..Default::default()
+                },
+                l2: crate::cache::L2Config {
+                    ttl,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            Some(Arc::new(crate::cache::QueryCache::new(cc)))
+        } else {
+            None
+        };
+
         let state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
             health: ArcSwap::from_pointee(health),
@@ -733,6 +766,8 @@ impl ProxyServer {
             circuit_breaker,
             #[cfg(feature = "query-analytics")]
             analytics,
+            #[cfg(feature = "query-cache")]
+            query_cache,
             #[cfg(feature = "pool-modes")]
             pool_manager,
             #[cfg(feature = "wasm-plugins")]
@@ -2397,6 +2432,32 @@ impl ProxyServer {
         // original (borrowed, no copy).
         let forward_msg = stripped_msg.as_ref().unwrap_or(msg);
 
+        // Query cache: on a cacheable read, a hit is served from cache with no
+        // backend round-trip; on a miss we keep the context to store the result.
+        #[cfg(feature = "query-cache")]
+        let cache_ctx: Option<crate::cache::CacheContext> = if is_write {
+            None
+        } else if let Some(qc) = state.query_cache.as_ref() {
+            let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
+            match Self::cacheable_read_ctx(session, sql).await {
+                Some(ctx) => {
+                    if let crate::cache::CacheLookup::Hit { result, level } =
+                        qc.get(sql, &ctx).await
+                    {
+                        tracing::debug!(target: "helios::cache", level = %level, "cache hit");
+                        client.write_all(&result.data).await.map_err(|e| {
+                            ProxyError::Network(format!("Client write error: {}", e))
+                        })?;
+                        return Ok((None, result.data.len() as u64));
+                    }
+                    Some(ctx)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         // Analytics: capture the forwarded SQL + start the latency timer.
         #[cfg(feature = "query-analytics")]
         let analytics_sql =
@@ -2444,10 +2505,62 @@ impl ProxyServer {
             return Err(e);
         }
 
+        // Cacheable read miss: capture the response frames and store them so a
+        // later identical read is served from cache without a backend hit.
+        #[cfg(feature = "query-cache")]
+        if let (Some(ctx), Some(qc)) = (cache_ctx.as_ref(), state.query_cache.as_ref()) {
+            return match Self::stream_until_ready_capture(client, &mut backend.stream, session)
+                .await
+            {
+                Ok((sent, captured, cacheable, rows)) => {
+                    #[cfg(feature = "circuit-breaker")]
+                    Self::circuit_record(state, &target, true, "");
+                    if cacheable && !captured.is_empty() {
+                        let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
+                        qc.put(
+                            sql,
+                            ctx,
+                            bytes::Bytes::from(captured),
+                            rows,
+                            std::time::Duration::ZERO,
+                        )
+                        .await;
+                    }
+                    #[cfg(feature = "query-analytics")]
+                    if let Some(sql) = analytics_sql.as_deref() {
+                        Self::record_analytics(
+                            state,
+                            session,
+                            sql,
+                            &target,
+                            started.elapsed(),
+                            None,
+                        )
+                        .await;
+                    }
+                    Ok((Some(target), sent))
+                }
+                Err(e) => {
+                    conns.remove(&target);
+                    #[cfg(feature = "circuit-breaker")]
+                    Self::circuit_record(state, &target, false, &e.to_string());
+                    Err(e)
+                }
+            };
+        }
+
         match Self::stream_until_ready(client, &mut backend.stream, session, state).await {
             Ok(sent) => {
                 #[cfg(feature = "circuit-breaker")]
                 Self::circuit_record(state, &target, true, "");
+                // Invalidate cached reads referencing tables this write touched.
+                #[cfg(feature = "query-cache")]
+                if is_write {
+                    if let Some(qc) = state.query_cache.as_ref() {
+                        let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
+                        qc.invalidate_query(sql).await;
+                    }
+                }
                 #[cfg(feature = "query-analytics")]
                 if let Some(sql) = analytics_sql.as_deref() {
                     Self::record_analytics(state, session, sql, &target, started.elapsed(), None)
@@ -2852,6 +2965,101 @@ impl ProxyServer {
         }
     }
 
+    /// Like `stream_until_ready` but also captures the full response bytes for
+    /// caching. Returns `(bytes_sent, captured, cacheable, row_count)`.
+    /// `cacheable` is false if the response carried an `ErrorResponse`, ended in
+    /// a non-idle transaction status, or yielded for COPY — none of which may
+    /// be cached.
+    #[cfg(feature = "query-cache")]
+    async fn stream_until_ready_capture(
+        client: &mut ClientStream,
+        backend: &mut TcpStream,
+        session: &Arc<ClientSession>,
+    ) -> Result<(u64, Vec<u8>, bool, usize)> {
+        let mut buf = BytesMut::with_capacity(16384);
+        let mut read_buf = vec![0u8; 16384];
+        let mut sent: u64 = 0;
+        let mut captured: Vec<u8> = Vec::with_capacity(4096);
+        let mut had_error = false;
+        let mut row_count: usize = 0;
+
+        loop {
+            let mut consumed = 0usize;
+            let mut ready_status: Option<u8> = None;
+            let mut yield_for_copy = false;
+            loop {
+                let rem = &buf[consumed..];
+                if rem.len() < 5 {
+                    break;
+                }
+                let len = u32::from_be_bytes([rem[1], rem[2], rem[3], rem[4]]) as usize;
+                if len < 4 || rem.len() < len + 1 {
+                    break;
+                }
+                let frame_total = len + 1;
+                let mtype = rem[0];
+                if mtype == b'E' {
+                    had_error = true;
+                }
+                if mtype == b'C' {
+                    // CommandComplete tag, e.g. "SELECT 5" — take the row count.
+                    if let Some(tag) = rem.get(5..frame_total) {
+                        if let Some(end) = tag.iter().position(|&b| b == 0) {
+                            if let Ok(s) = std::str::from_utf8(&tag[..end]) {
+                                if let Some(n) =
+                                    s.rsplit(' ').next().and_then(|x| x.parse::<usize>().ok())
+                                {
+                                    row_count = n;
+                                }
+                            }
+                        }
+                    }
+                }
+                consumed += frame_total;
+                if mtype == b'Z' {
+                    ready_status = Some(if frame_total >= 6 { rem[5] } else { b'I' });
+                    break;
+                }
+                if mtype == b'G' || mtype == b'W' {
+                    yield_for_copy = true;
+                    break;
+                }
+            }
+
+            if consumed > 0 {
+                client
+                    .write_all(&buf[..consumed])
+                    .await
+                    .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+                captured.extend_from_slice(&buf[..consumed]);
+                sent += consumed as u64;
+                let _ = buf.split_to(consumed);
+            }
+
+            if let Some(status) = ready_status {
+                let st = TransactionStatus::from_byte(status);
+                let mut tx = session.tx_state.write().await;
+                tx.in_transaction = st != TransactionStatus::Idle;
+                let cacheable = !had_error && status == b'I';
+                return Ok((sent, captured, cacheable, row_count));
+            }
+            if yield_for_copy {
+                return Ok((sent, captured, false, row_count));
+            }
+
+            let n = tokio::time::timeout(Duration::from_secs(30), backend.read(&mut read_buf))
+                .await
+                .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
+                .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
+            if n == 0 {
+                return Err(ProxyError::Connection(
+                    "Backend closed mid-response".to_string(),
+                ));
+            }
+            buf.extend_from_slice(&read_buf[..n]);
+        }
+    }
+
     /// Stream whatever the backend has produced in response to a `Flush`
     /// (which, unlike `Sync`, produces no ReadyForQuery). Relays available
     /// bytes and returns once the backend goes briefly idle, so the loop can
@@ -3076,6 +3284,66 @@ impl ProxyServer {
     #[cfg(feature = "lag-routing")]
     fn lag_excludes_standby(lag_bytes: Option<u64>, max_lag_bytes: u64) -> bool {
         max_lag_bytes > 0 && lag_bytes.map(|l| l > max_lag_bytes).unwrap_or(false)
+    }
+
+    /// Pure predicate: is `sql` a plain, deterministic SELECT safe to cache?
+    /// (Not WITH/locking/volatile.) Transaction state is checked separately.
+    #[cfg(feature = "query-cache")]
+    fn is_cacheable_read_sql(sql: &str) -> bool {
+        use crate::protocol::{contains_ci, starts_with_ci};
+        let t = sql.trim_start();
+        if !starts_with_ci(t, "SELECT") {
+            return false;
+        }
+        if contains_ci(t, "FOR UPDATE") || contains_ci(t, "FOR SHARE") {
+            return false;
+        }
+        // Non-deterministic reads must not be reused.
+        const VOLATILE: [&str; 10] = [
+            "now(",
+            "current_timestamp",
+            "current_date",
+            "current_time",
+            "clock_timestamp",
+            "statement_timestamp",
+            "random(",
+            "nextval(",
+            "uuid_generate",
+            "gen_random_uuid",
+        ];
+        !VOLATILE.iter().any(|v| contains_ci(t, v))
+    }
+
+    /// Decide whether a read query is safe to serve from / store in the cache,
+    /// and build its `CacheContext`. Returns `None` for anything not a plain,
+    /// deterministic, non-transactional SELECT.
+    #[cfg(feature = "query-cache")]
+    async fn cacheable_read_ctx(
+        session: &Arc<ClientSession>,
+        sql: &str,
+    ) -> Option<crate::cache::CacheContext> {
+        if !Self::is_cacheable_read_sql(sql) {
+            return None;
+        }
+        // Never cache mid-transaction (visibility would be wrong).
+        if session.tx_state.read().await.in_transaction {
+            return None;
+        }
+        let (user, database) = {
+            let vars = session.variables.read().await;
+            (
+                vars.get("user").cloned(),
+                vars.get("database")
+                    .cloned()
+                    .unwrap_or_else(|| "default".to_string()),
+            )
+        };
+        Some(crate::cache::CacheContext {
+            database,
+            user,
+            branch: None,
+            connection_id: Some(session.id.as_u64_pair().0),
+        })
     }
 
     /// Record a forwarded query on the analytics engine (fingerprint, latency,
@@ -4483,6 +4751,8 @@ mod tests {
             circuit_breaker: None,
             #[cfg(feature = "query-analytics")]
             analytics: None,
+            #[cfg(feature = "query-cache")]
+            query_cache: None,
             #[cfg(feature = "pool-modes")]
             pool_manager: None,
             plugin_manager: Some(pm),
@@ -4865,6 +5135,40 @@ mod tests {
             assert!(!ProxyServer::lag_excludes_standby(Some(500), 1000));
             // beyond ceiling is dropped.
             assert!(ProxyServer::lag_excludes_standby(Some(2000), 1000));
+        }
+    }
+
+    // ---- query-cache: which read SQL is safe to cache ----
+
+    #[cfg(feature = "query-cache")]
+    mod query_cache {
+        use super::ProxyServer;
+
+        #[test]
+        fn plain_selects_are_cacheable() {
+            assert!(ProxyServer::is_cacheable_read_sql("select v from t"));
+            assert!(ProxyServer::is_cacheable_read_sql(
+                "  SELECT a, b FROM users WHERE id = 5"
+            ));
+        }
+
+        #[test]
+        fn writes_and_non_selects_are_not_cacheable() {
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "insert into t values (1)"
+            ));
+            assert!(!ProxyServer::is_cacheable_read_sql("update t set v = 1"));
+            assert!(!ProxyServer::is_cacheable_read_sql("show search_path"));
+        }
+
+        #[test]
+        fn locking_and_volatile_selects_are_not_cacheable() {
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "select * from t for update"
+            ));
+            assert!(!ProxyServer::is_cacheable_read_sql("select now()"));
+            assert!(!ProxyServer::is_cacheable_read_sql("select random()"));
+            assert!(!ProxyServer::is_cacheable_read_sql("select nextval('s')"));
         }
     }
 }
