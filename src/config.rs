@@ -248,6 +248,10 @@ pub struct ProxyConfig {
     /// enforced when the `lag-routing` feature is compiled in.
     #[serde(default)]
     pub lag_routing: LagRoutingToml,
+    /// Query-result cache (L1 hot / L2 warm). Disabled by default. Only active
+    /// when the `query-cache` feature is compiled in.
+    #[serde(default)]
+    pub cache: CacheToml,
     /// Proxy-side unnamed-`Parse` promotion (Batch H). When a client re-sends an
     /// identical unnamed extended `Parse` (the dominant pgbench/ORM pattern),
     /// the proxy skips forwarding it to a backend that already holds that exact
@@ -542,6 +546,30 @@ fn default_write_timeout_secs() -> u64 {
     30 // 30 seconds default write timeout during failover
 }
 
+/// Query-result cache configuration (TOML-friendly, always present). Converted
+/// to `crate::cache::CacheConfig` at startup and only active when the
+/// `query-cache` feature is compiled in AND `enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheToml {
+    /// Serve read SELECT results from an in-process L1/L2 cache. Default `false`.
+    pub enabled: bool,
+    /// Time-to-live for cached results, seconds.
+    pub ttl_secs: u64,
+    /// Maximum single result size to cache, bytes (larger results bypass).
+    pub max_result_bytes: usize,
+}
+
+impl Default for CacheToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl_secs: 300,
+            max_result_bytes: 1024 * 1024,
+        }
+    }
+}
+
 /// Replica-lag-aware routing + read-your-writes configuration (always present;
 /// only enforced when the `lag-routing` feature is compiled in AND enabled).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -722,6 +750,7 @@ impl Default for ProxyConfig {
             circuit_breaker: CircuitBreakerToml::default(),
             analytics: AnalyticsToml::default(),
             lag_routing: LagRoutingToml::default(),
+            cache: CacheToml::default(),
             optimize_unnamed_parse: true,
             shutdown_drain_timeout_secs: default_drain_timeout_secs(),
         }
