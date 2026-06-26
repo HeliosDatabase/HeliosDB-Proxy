@@ -261,6 +261,10 @@ pub struct ProxyConfig {
     /// compiled in.
     #[serde(default)]
     pub multi_tenancy: MultiTenancyToml,
+    /// Schema/workload-aware routing (route OLAP queries to an analytics node).
+    /// Disabled by default. Only active when the `schema-routing` feature is on.
+    #[serde(default)]
+    pub schema_routing: SchemaRoutingToml,
     /// Proxy-side unnamed-`Parse` promotion (Batch H). When a client re-sends an
     /// identical unnamed extended `Parse` (the dominant pgbench/ORM pattern),
     /// the proxy skips forwarding it to a backend that already holds that exact
@@ -555,6 +559,18 @@ fn default_write_timeout_secs() -> u64 {
     30 // 30 seconds default write timeout during failover
 }
 
+/// Schema/workload-aware routing configuration (always present). Only active
+/// when the `schema-routing` feature is compiled in AND `enabled = true`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SchemaRoutingToml {
+    /// Route analytical (OLAP) queries — aggregations, GROUP BY, window
+    /// functions — to a dedicated node. Default `false`.
+    pub enabled: bool,
+    /// Name of the node analytical queries are routed to.
+    pub analytics_node: String,
+}
+
 /// Multi-tenancy configuration (always present). Converted to a
 /// `multi_tenancy::TenantManager` at startup; only active when the
 /// `multi-tenancy` feature is compiled in AND `enabled = true`.
@@ -824,6 +840,7 @@ impl Default for ProxyConfig {
             cache: CacheToml::default(),
             query_rewrite: QueryRewriteToml::default(),
             multi_tenancy: MultiTenancyToml::default(),
+            schema_routing: SchemaRoutingToml::default(),
             optimize_unnamed_parse: true,
             shutdown_drain_timeout_secs: default_drain_timeout_secs(),
         }
