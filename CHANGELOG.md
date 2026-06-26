@@ -5,6 +5,32 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] - 2026-06-26
+
+Minor release — three orphan stubs made real.
+
+### Changed
+
+- **INSERT batcher executes for real (`batch.rs`).** The flush built the
+  combined bulk INSERT, discarded it, and reported a fabricated success to every
+  waiter. It now executes the combined statement against an attached backend
+  (`with_backend`) and reports the true outcome — an honest failure (no backend
+  / connect / SQL error) instead of a silent success. Live-verified: batched
+  rows actually land in PostgreSQL.
+- **`PreferLocal` routing is real (`load_balancer.rs`).** Was "return the first
+  node". Now prefers the least-loaded node co-located with the proxy (loopback /
+  localhost), falling back to least-connections overall when none is local.
+- **`/api/pools` returns real pool stats (`admin.rs`).** `get_pool_stats`
+  returned an empty list; `AdminState` now holds the `ConnectionPoolManager`
+  (wired at startup) and reports real per-node active/idle/total connections.
+
+### Notes
+
+- The `InsertBatcher` is a standalone utility (not yet on the proxy's per-query
+  path); these changes make its execution real and honest. Per-node
+  pending/created/closed pool counters aren't tracked separately, so those
+  `/api/pools` fields are 0 while active/idle/total are live.
+
 ## [0.17.0] - 2026-06-26
 
 Minor release — fourth of the 1.0.0 wiring set: the upgrade orchestrator's
