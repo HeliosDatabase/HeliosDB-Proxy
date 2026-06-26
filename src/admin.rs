@@ -69,6 +69,11 @@ pub struct AdminState {
     read_lb_counter: AtomicUsize,
     /// Registered command handlers
     commands: RwLock<HashMap<String, CommandHandler>>,
+    /// Connection pool manager (Session/Transaction/Statement modes).
+    /// Attached at startup; `/api/pools` returns real per-node pool
+    /// stats when present, an empty list otherwise.
+    #[cfg(feature = "pool-modes")]
+    pub pool_manager: RwLock<Option<Arc<crate::pool::ConnectionPoolManager>>>,
     /// Time-travel replay engine. Optional so test fixtures don't have
     /// to wire a backend template; production startup attaches it via
     /// `with_replay_engine`. Endpoint returns 503 when missing.
@@ -1023,7 +1028,26 @@ impl AdminServer {
 
     /// Get pool statistics
     async fn get_pool_stats(_state: &Arc<AdminState>) -> Vec<PoolStatsResponse> {
-        // Placeholder - in real implementation would query pool state
+        // Real per-node pool stats from the attached pool manager. Returns
+        // an empty list when pool-modes is off or no manager is attached.
+        #[cfg(feature = "pool-modes")]
+        if let Some(mgr) = _state.pool_manager.read().await.clone() {
+            let stats = mgr.get_stats().await;
+            return stats
+                .node_stats
+                .into_iter()
+                .map(|ns| PoolStatsResponse {
+                    node: ns.node_id.0.to_string(),
+                    active_connections: ns.active as u64,
+                    idle_connections: ns.idle as u64,
+                    // Per-node pending/created/closed counters are not tracked
+                    // separately by the manager; total is the live pool size.
+                    pending_requests: 0,
+                    total_connections_created: ns.total as u64,
+                    total_connections_closed: 0,
+                })
+                .collect();
+        }
         Vec::new()
     }
 
@@ -1681,6 +1705,8 @@ impl AdminState {
             proxy_config: RwLock::new(None),
             read_lb_counter: AtomicUsize::new(0),
             commands: RwLock::new(HashMap::new()),
+            #[cfg(feature = "pool-modes")]
+            pool_manager: RwLock::new(None),
             #[cfg(feature = "ha-tr")]
             replay_engine: RwLock::new(None),
             #[cfg(feature = "wasm-plugins")]
@@ -1713,6 +1739,13 @@ impl AdminState {
     /// Attach branch-database config so `/api/branch` can provision.
     pub async fn with_branch(&self, cfg: crate::config::BranchConfig) {
         *self.branch.write().await = Some(cfg);
+    }
+
+    /// Attach the connection pool manager so `/api/pools` reports real
+    /// per-node pool statistics. Wired by the server at startup.
+    #[cfg(feature = "pool-modes")]
+    pub async fn with_pool_manager(&self, manager: Arc<crate::pool::ConnectionPoolManager>) {
+        *self.pool_manager.write().await = Some(manager);
     }
 
     /// Attach an anomaly detector. Mirror of with_replay_engine /

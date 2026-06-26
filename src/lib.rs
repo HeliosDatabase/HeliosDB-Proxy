@@ -650,7 +650,7 @@ mod postgresql_compat_tests {
             max_batch_size: 3,
             ..Default::default()
         };
-        let batcher = InsertBatcher::new(config);
+        let batcher = std::sync::Arc::new(InsertBatcher::new(config));
 
         batcher
             .add(
