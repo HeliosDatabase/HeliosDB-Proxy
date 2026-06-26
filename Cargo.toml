@@ -73,6 +73,11 @@ multi-tenancy = []
 # Authentication proxy (JWT, OAuth, API keys)
 auth-proxy = []
 
+# LDAP authentication (search + bind) — optional within auth-proxy because it
+# pulls the ldap3 client + its rustls stack. Off by default; enable for
+# directory-backed auth.
+ldap-auth = ["auth-proxy", "dep:ldap3"]
+
 # SQL query rewriting (rules engine)
 query-rewriting = []
 
@@ -109,7 +114,7 @@ all-features = [
     "pool-modes", "ha-tr",
     "query-cache", "routing-hints", "lag-routing",
     "rate-limiting", "circuit-breaker", "query-analytics",
-    "multi-tenancy", "auth-proxy", "query-rewriting",
+    "multi-tenancy", "auth-proxy", "ldap-auth", "query-rewriting",
     "wasm-plugins", "graphql-gateway", "schema-routing",
     "distribcache", "anomaly-detection", "edge-proxy",
 ]
@@ -197,6 +202,10 @@ webpki-roots = "0.26"
 sha2 = "0.10"
 hmac = "0.12"
 md-5 = "0.10"
+# LDAP client for directory-backed auth (search + bind). Optional — only
+# compiled with the `ldap-auth` feature. Pure-Rust rustls (ring provider) to
+# stay off OpenSSL, consistent with the rest of the crate.
+ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ring"], optional = true }
 # Ed25519 signature verification for the plugin loader's trust-root
 # checks (FU-23). The dalek crate is the standard pure-Rust impl;
 # `default-features = false` strips std-allocator-only paths we don't
