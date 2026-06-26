@@ -5,6 +5,24 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-06-26
+
+Minor release — first of the 1.0.0 wiring set: schema/workload-aware routing.
+
+### Added
+
+- **Schema/workload-aware routing (`schema-routing`).** `[schema_routing]`
+  config (off by default): a read classified as analytical (OLAP — aggregations,
+  GROUP BY, window functions) is routed to the configured `analytics_node`,
+  offloading analytics from the primary. Other queries use default routing.
+  Decisions log to the `helios::schema` target.
+
+### Notes
+
+- This wires the real (query-shape) workload classification. Table-level schema
+  discovery (data-temperature routing from `pg_catalog`/`information_schema`
+  introspection) needs a configured introspection credential and is a follow-on.
+
 ## [0.13.0] - 2026-06-26
 
 Minor release — platform-tier wiring wave 6: Transaction Replay journaling.
