@@ -2709,6 +2709,13 @@ impl ProxyServer {
                         qc.invalidate_query(sql).await;
                     }
                 }
+                // Transaction Replay: journal the write for failover/time-travel.
+                #[cfg(feature = "ha-tr")]
+                if is_write && config.tr_enabled {
+                    if let Some(sql) = crate::protocol::query_text(&forward_msg.payload) {
+                        Self::journal_write(state, session, sql).await;
+                    }
+                }
                 #[cfg(feature = "query-analytics")]
                 if let Some(sql) = analytics_sql.as_deref() {
                     Self::record_analytics(state, session, sql, &target, started.elapsed(), None)
@@ -3510,6 +3517,24 @@ impl ProxyServer {
             sql_context: HashMap::new(),
             client_ip: Some(session.client_addr.ip().to_string()),
             connection_id: Some(session.id.as_u64_pair().0),
+        }
+    }
+
+    /// Journal a successful write statement (Transaction Replay). Each write is
+    /// recorded as its own auto-commit transaction so the time-travel/failover
+    /// replay engine can re-apply it onto a promoted primary or a staging
+    /// target. Best-effort: journal errors never fail the client query.
+    #[cfg(feature = "ha-tr")]
+    async fn journal_write(state: &Arc<ServerState>, session: &Arc<ClientSession>, sql: &str) {
+        let tx_id = uuid::Uuid::new_v4();
+        let j = &state.transaction_journal;
+        if j.begin_transaction(tx_id, session.id, crate::NodeId::new(), 0)
+            .await
+            .is_ok()
+        {
+            let _ = j
+                .log_statement(tx_id, sql.to_string(), Vec::new(), None, None, 0)
+                .await;
         }
     }
 
@@ -5434,6 +5459,38 @@ mod tests {
         fn non_tenant_table_passes_through() {
             let res = manager().transform_query("select * from other", &TenantId::new("acme"));
             assert!(!res.transformed);
+        }
+    }
+
+    // ---- ha-tr: the journal records statements the replay engine reads ----
+
+    #[cfg(feature = "ha-tr")]
+    mod ha_tr {
+        use crate::transaction_journal::TransactionJournal;
+        use crate::NodeId;
+
+        #[tokio::test]
+        async fn journal_records_and_windows_a_statement() {
+            let j = TransactionJournal::new();
+            let from = chrono::Utc::now() - chrono::Duration::seconds(60);
+            let tx = uuid::Uuid::new_v4();
+            j.begin_transaction(tx, uuid::Uuid::new_v4(), NodeId::new(), 0)
+                .await
+                .unwrap();
+            j.log_statement(
+                tx,
+                "insert into t values (1)".to_string(),
+                Vec::new(),
+                None,
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+            let to = chrono::Utc::now() + chrono::Duration::seconds(60);
+            let entries = j.entries_in_window(from, to).await;
+            assert_eq!(entries.len(), 1, "journaled statement should be in window");
+            assert!(entries[0].1.statement.contains("insert"));
         }
     }
 }
