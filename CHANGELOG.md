@@ -5,6 +5,63 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-06-26
+
+First stable release. Every feature flag now ships genuinely-working, tested
+functionality — no scaffolding, no stubs that fake success. Where a capability
+is intentionally bounded, it is **documented here**, not hidden.
+
+This release is the culmination of the 0.7.0–0.19.0 wiring series: each proxy
+feature was taken from "compiles but inert" to wired onto the real data path (or,
+for standalone subsystems, to genuinely functional internals), with a unit test
+plus — wherever a backend was reachable — a live verification against
+PostgreSQL 18.4.
+
+### What is real and verified
+
+- **Routing & resilience** — routing hints (`/*+ route= */`), replica lag-aware
+  routing + read-your-writes, rate limiting, circuit breaker, schema-aware
+  (OLAP) routing. All on the per-query path; live-verified via the proxy log.
+- **Caching** — query cache (L1/L2/L3) on the path; DistribCache subsystem with
+  real LZ4 (`lz4_flex`) + zstd compression and a working L3 peer server
+  (replication/remote-reads over TCP).
+- **Query handling** — query rewriting (rules engine on the path), query
+  analytics / slow-query / N+1 detection, GraphQL-to-SQL gateway (real engine
+  execution + HTTP listener).
+- **Multi-tenancy** — tenant isolation + per-tenant query transformation on the
+  path.
+- **HA / Transaction Replay (`ha-tr`)** — failover replay, cursor restore,
+  session migration, and the zero-downtime major-version upgrade orchestrator
+  (real logical-replication setup, row-count parity validation, `pg_promote`
+  cutover, artefact cleanup).
+- **Auth (`auth-proxy`)** — JWT (HS256, constant-time verify), API keys
+  (SHA-256, constant-time compare), and OAuth RFC 7662 token introspection.
+- **Plugins, anomaly detection, edge proxy, observability** — as documented in
+  their modules.
+
+### Documented limitations (reported, not faded)
+
+- **LDAP auth** is deny-by-default: `authenticate_ldap` returns an error rather
+  than faking acceptance. A real bind needs an `ldap3` client and a live
+  directory.
+- **DistribCache** and the **INSERT batcher** are genuinely functional but are
+  standalone subsystems, not yet mounted on the proxy's per-query data path
+  (the `query-cache` feature is the data-path cache).
+- **Pool modes** (Session/Transaction/Statement) and the **auth connection
+  path** have working components; full data-path integration is staged for a
+  later minor.
+- The GraphQL generator keys the FROM table off the (pluralized) query field
+  name and assumes an `id` primary key; nested-relationship shaping and
+  mutations are follow-ons.
+- `/api/pools` reports live active/idle/total per node; per-node
+  pending/created/closed counters are not yet tracked.
+
+### Engineering
+
+- CI gate clean: `cargo clippy -D warnings` on `""`, `ha-tr`, `all-features`,
+  `all-features,postgres-topology` (and `--no-default-features`). 1391
+  all-features lib tests pass.
+
 ## [0.19.0] - 2026-06-26
 
 Minor release — OAuth token introspection is now real.
