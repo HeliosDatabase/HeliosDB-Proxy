@@ -234,6 +234,11 @@ pub struct ProxyConfig {
     /// in; parsed-and-ignored otherwise.
     #[serde(default)]
     pub rate_limit: RateLimitToml,
+    /// Per-node circuit breaker (trip failing backends out of rotation,
+    /// fast-fail while open). Disabled by default. Only enforced when the
+    /// `circuit-breaker` feature is compiled in.
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerToml,
     /// Proxy-side unnamed-`Parse` promotion (Batch H). When a client re-sends an
     /// identical unnamed extended `Parse` (the dominant pgbench/ORM pattern),
     /// the proxy skips forwarding it to a backend that already holds that exact
@@ -528,6 +533,34 @@ fn default_write_timeout_secs() -> u64 {
     30 // 30 seconds default write timeout during failover
 }
 
+/// Circuit-breaker configuration (TOML-friendly, always present). Converted to
+/// `crate::circuit_breaker::ManagerConfig` at startup and only enforced when
+/// the `circuit-breaker` feature is compiled in AND `enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CircuitBreakerToml {
+    /// Trip backends out of rotation after repeated failures. Default `false`.
+    pub enabled: bool,
+    /// Consecutive failures (within the failure window) that open a node's
+    /// circuit.
+    pub failure_threshold: u32,
+    /// How long a circuit stays open before a half-open probe is allowed.
+    pub open_secs: u64,
+    /// Successful probes required to close a half-open circuit.
+    pub success_threshold: u32,
+}
+
+impl Default for CircuitBreakerToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            failure_threshold: 5,
+            open_secs: 10,
+            success_threshold: 3,
+        }
+    }
+}
+
 /// How rate-limit buckets are keyed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -625,6 +658,7 @@ impl Default for ProxyConfig {
             branch: BranchConfig::default(),
             routing_hints: RoutingHintsConfig::default(),
             rate_limit: RateLimitToml::default(),
+            circuit_breaker: CircuitBreakerToml::default(),
             optimize_unnamed_parse: true,
             shutdown_drain_timeout_secs: default_drain_timeout_secs(),
         }

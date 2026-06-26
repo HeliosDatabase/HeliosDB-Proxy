@@ -201,6 +201,11 @@ struct ServerState {
     /// every query is checked against it before being forwarded to a backend.
     #[cfg(feature = "rate-limiting")]
     rate_limiter: Option<Arc<crate::rate_limit::RateLimiter>>,
+    /// Per-node circuit breaker manager. `Some` when `[circuit_breaker]
+    /// enabled`. Records per-node success/failure on the forward path, excludes
+    /// open nodes from read selection, and fast-fails queries to an open node.
+    #[cfg(feature = "circuit-breaker")]
+    circuit_breaker: Option<Arc<crate::circuit_breaker::CircuitBreakerManager>>,
     /// Pool manager for Session/Transaction/Statement modes
     #[cfg(feature = "pool-modes")]
     pool_manager: Option<Arc<ConnectionPoolManager>>,
@@ -639,6 +644,29 @@ impl ProxyServer {
             None
         };
 
+        // Build the per-node circuit breaker manager when enabled.
+        #[cfg(feature = "circuit-breaker")]
+        let circuit_breaker = if config.circuit_breaker.enabled {
+            let cb = &config.circuit_breaker;
+            tracing::info!(
+                failure_threshold = cb.failure_threshold,
+                open_secs = cb.open_secs,
+                "circuit breaker enabled"
+            );
+            let cbc = crate::circuit_breaker::CircuitBreakerConfig {
+                failure_threshold: cb.failure_threshold,
+                cooldown: Duration::from_secs(cb.open_secs),
+                half_open_success_threshold: cb.success_threshold,
+                ..Default::default()
+            };
+            let mgr = crate::circuit_breaker::CircuitBreakerManager::new(
+                crate::circuit_breaker::ManagerConfig::new(cbc),
+            );
+            Some(Arc::new(mgr))
+        } else {
+            None
+        };
+
         let state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
             health: ArcSwap::from_pointee(health),
@@ -668,6 +696,8 @@ impl ProxyServer {
             },
             #[cfg(feature = "rate-limiting")]
             rate_limiter,
+            #[cfg(feature = "circuit-breaker")]
+            circuit_breaker,
             #[cfg(feature = "pool-modes")]
             pool_manager,
             #[cfg(feature = "wasm-plugins")]
@@ -2314,20 +2344,47 @@ impl ProxyServer {
         )
         .await?;
         tracing::debug!(target: "helios::routing", node = %target, is_write, "routed simple query");
+
+        // Circuit breaker: fast-fail when the chosen node's circuit is open.
+        #[cfg(feature = "circuit-breaker")]
+        if let Some(mut resp) = Self::circuit_fast_fail(state, &target) {
+            resp.extend_from_slice(&Self::create_ready_for_query(b'I'));
+            client
+                .write_all(&resp)
+                .await
+                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+            return Ok((None, resp.len() as u64));
+        }
+
+        // A connect/auth failure trips the breaker (and is propagated as today).
+        #[cfg(feature = "circuit-breaker")]
+        if let Err(e) = Self::ensure_conn(conns, &target, session, config).await {
+            Self::circuit_record(state, &target, false, &e.to_string());
+            return Err(e);
+        }
+        #[cfg(not(feature = "circuit-breaker"))]
         Self::ensure_conn(conns, &target, session, config).await?;
         let backend = conns.get_mut(&target).expect("just ensured");
 
-        backend
-            .stream
-            .write_all(&forward_msg.encode())
-            .await
-            .map_err(|e| ProxyError::Network(format!("Backend write error: {}", e)))?;
+        if let Err(e) = backend.stream.write_all(&forward_msg.encode()).await {
+            let e = ProxyError::Network(format!("Backend write error: {}", e));
+            conns.remove(&target);
+            #[cfg(feature = "circuit-breaker")]
+            Self::circuit_record(state, &target, false, &e.to_string());
+            return Err(e);
+        }
 
         match Self::stream_until_ready(client, &mut backend.stream, session, state).await {
-            Ok(sent) => Ok((Some(target), sent)),
+            Ok(sent) => {
+                #[cfg(feature = "circuit-breaker")]
+                Self::circuit_record(state, &target, true, "");
+                Ok((Some(target), sent))
+            }
             Err(e) => {
                 // Drop the broken connection so the next use redials.
                 conns.remove(&target);
+                #[cfg(feature = "circuit-breaker")]
+                Self::circuit_record(state, &target, false, &e.to_string());
                 Err(e)
             }
         }
@@ -2397,6 +2454,25 @@ impl ProxyServer {
             },
         };
 
+        // Circuit breaker: fast-fail when the chosen node's circuit is open.
+        #[cfg(feature = "circuit-breaker")]
+        if let Some(mut resp) = Self::circuit_fast_fail(state, &target) {
+            if wait_ready {
+                resp.extend_from_slice(&Self::create_ready_for_query(b'I'));
+            }
+            client
+                .write_all(&resp)
+                .await
+                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+            return Ok((None, resp.len() as u64));
+        }
+
+        #[cfg(feature = "circuit-breaker")]
+        if let Err(e) = Self::ensure_conn(conns, &target, session, config).await {
+            Self::circuit_record(state, &target, false, &e.to_string());
+            return Err(e);
+        }
+        #[cfg(not(feature = "circuit-breaker"))]
         Self::ensure_conn(conns, &target, session, config).await?;
         let backend = conns.get_mut(&target).expect("just ensured");
 
@@ -2479,6 +2555,8 @@ impl ProxyServer {
         };
         match r {
             Ok(sent) => {
+                #[cfg(feature = "circuit-breaker")]
+                Self::circuit_record(state, &target, true, "");
                 // The connection now holds these named statements.
                 for name in defines {
                     backend.prepared.insert(name.clone());
@@ -2491,6 +2569,8 @@ impl ProxyServer {
             }
             Err(e) => {
                 conns.remove(&target);
+                #[cfg(feature = "circuit-breaker")]
+                Self::circuit_record(state, &target, false, &e.to_string());
                 Err(e)
             }
         }
@@ -2824,6 +2904,48 @@ impl ProxyServer {
         }
     }
 
+    /// True when `node`'s circuit is open (avoid it / fast-fail). A half-open
+    /// circuit returns false so a probe query is admitted.
+    #[cfg(feature = "circuit-breaker")]
+    fn circuit_is_open(state: &Arc<ServerState>, node: &str) -> bool {
+        state
+            .circuit_breaker
+            .as_ref()
+            .map(|cb| {
+                cb.get_breaker(node).get_state() == crate::circuit_breaker::CircuitState::Open
+            })
+            .unwrap_or(false)
+    }
+
+    /// Record the outcome of a forward to `node` on its circuit breaker.
+    #[cfg(feature = "circuit-breaker")]
+    fn circuit_record(state: &Arc<ServerState>, node: &str, success: bool, err: &str) {
+        if let Some(cb) = state.circuit_breaker.as_ref() {
+            let breaker = cb.get_breaker(node);
+            if success {
+                breaker.record_success();
+            } else {
+                breaker.record_failure(err);
+            }
+        }
+    }
+
+    /// If `node`'s circuit is open, build the fast-fail `ErrorResponse` (without
+    /// a trailing `ReadyForQuery` — the caller appends one). `None` when the
+    /// circuit is closed or half-open and the request may proceed.
+    #[cfg(feature = "circuit-breaker")]
+    fn circuit_fast_fail(state: &Arc<ServerState>, node: &str) -> Option<Vec<u8>> {
+        if Self::circuit_is_open(state, node) {
+            tracing::info!(node = %node, "circuit open — fast-failing");
+            Some(Self::create_error_response(
+                "08006",
+                &format!("circuit open for node {node}: backend temporarily unavailable"),
+            ))
+        } else {
+            None
+        }
+    }
+
     /// Select primary node with write timeout during failover
     async fn select_primary_with_timeout(
         session: &Arc<ClientSession>,
@@ -2895,9 +3017,13 @@ impl ProxyServer {
             .nodes
             .iter()
             .filter(|n| {
-                n.enabled
+                let base = n.enabled
                     && (n.role == NodeRole::Standby || n.role == NodeRole::ReadReplica)
-                    && health.get(&n.address()).map(|h| h.healthy).unwrap_or(false)
+                    && health.get(&n.address()).map(|h| h.healthy).unwrap_or(false);
+                // Drop a standby whose circuit is open so reads avoid it.
+                #[cfg(feature = "circuit-breaker")]
+                let base = base && !Self::circuit_is_open(state, &n.address());
+                base
             })
             .collect();
 
@@ -4179,6 +4305,8 @@ mod tests {
             hint_parser: None,
             #[cfg(feature = "rate-limiting")]
             rate_limiter: None,
+            #[cfg(feature = "circuit-breaker")]
+            circuit_breaker: None,
             #[cfg(feature = "pool-modes")]
             pool_manager: None,
             plugin_manager: Some(pm),
@@ -4444,6 +4572,48 @@ mod tests {
                 limiter.check(&LimiterKey::User("b".to_string()), 1),
                 RateLimitResult::Allowed
             ));
+        }
+    }
+
+    // ---- circuit-breaker: open-after-threshold contract the gate relies on ----
+
+    #[cfg(feature = "circuit-breaker")]
+    mod circuit_breaker {
+        use crate::circuit_breaker::{
+            CircuitBreakerConfig, CircuitBreakerManager, CircuitState, ManagerConfig,
+        };
+        use std::time::Duration;
+
+        fn mgr(threshold: u32) -> CircuitBreakerManager {
+            let cfg = CircuitBreakerConfig {
+                failure_threshold: threshold,
+                cooldown: Duration::from_secs(10),
+                ..Default::default()
+            };
+            CircuitBreakerManager::new(ManagerConfig::new(cfg))
+        }
+
+        #[test]
+        fn opens_after_threshold_failures() {
+            let m = mgr(3);
+            let b = m.get_breaker("n1");
+            assert_eq!(b.get_state(), CircuitState::Closed);
+            b.record_failure("boom");
+            b.record_failure("boom");
+            // Under threshold: still serving.
+            assert_eq!(b.get_state(), CircuitState::Closed);
+            // Threshold reached: tripped open.
+            b.record_failure("boom");
+            assert_eq!(b.get_state(), CircuitState::Open);
+        }
+
+        #[test]
+        fn healthy_node_stays_closed() {
+            let m = mgr(3);
+            let b = m.get_breaker("n2");
+            b.record_success();
+            b.record_success();
+            assert_eq!(b.get_state(), CircuitState::Closed);
         }
     }
 }
