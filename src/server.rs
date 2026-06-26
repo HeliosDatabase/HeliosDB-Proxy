@@ -229,6 +229,12 @@ struct ServerState {
     /// Pool manager for Session/Transaction/Statement modes
     #[cfg(feature = "pool-modes")]
     pool_manager: Option<Arc<ConnectionPoolManager>>,
+    /// Data-path idle backend-connection pool. `Some` only when pooling is
+    /// active (mode is Transaction or Statement); `None` leaves the 1:1
+    /// session-pinned path completely unchanged. This is the raw-stream pool
+    /// the data path actually leases from, keyed by `(node, user, database)`.
+    #[cfg(feature = "pool-modes")]
+    backend_pool: Option<Arc<crate::pool::BackendIdlePool>>,
     /// WASM plugin manager. `None` means no plugins loaded — the per-query
     /// hook path becomes a fast no-op. When `Some`, `PreQuery` / `PostQuery`
     /// hooks fire on every simple-query message.
@@ -594,6 +600,24 @@ impl ProxyServer {
             Some(Arc::new(ConnectionPoolManager::new(pool_config)))
         };
 
+        // The raw-stream data-path pool is only built when pooling is active
+        // (Transaction/Statement). Session mode leaves it `None` so the hot
+        // path is byte-for-byte unchanged.
+        #[cfg(feature = "pool-modes")]
+        let backend_pool = match config.pool_mode.mode {
+            crate::config::PoolingMode::Transaction | crate::config::PoolingMode::Statement => {
+                tracing::info!(
+                    mode = ?config.pool_mode.mode,
+                    max_idle_per_identity = config.pool_mode.max_pool_size,
+                    "pool-modes: data-path connection pooling enabled"
+                );
+                Some(Arc::new(crate::pool::BackendIdlePool::new(
+                    config.pool_mode.max_pool_size as usize,
+                )))
+            }
+            crate::config::PoolingMode::Session => None,
+        };
+
         // Initialize plugin manager if the wasm-plugins feature is enabled
         // AND plugins are turned on in config. Scans plugin_dir for `.wasm`
         // files and loads each; a missing directory is non-fatal and logs
@@ -894,6 +918,8 @@ impl ProxyServer {
             schema_analyzer,
             #[cfg(feature = "pool-modes")]
             pool_manager,
+            #[cfg(feature = "pool-modes")]
+            backend_pool,
             #[cfg(feature = "wasm-plugins")]
             plugin_manager,
             #[cfg(feature = "ha-tr")]
@@ -1502,9 +1528,15 @@ impl ProxyServer {
         // each node rather than dropping the socket and paying a fresh TCP
         // connect + startup + SCRAM handshake on every switch (Batch C).
         // Connections are authenticated with the client's own credentials
-        // (auth is pass-through), so they are private to this session —
-        // cross-client transaction pooling additionally needs proxy-side
-        // backend auth and is deferred to the auth batch.
+        // (auth is pass-through). In Transaction/Statement pooling mode they
+        // are returned to a shared, identity-keyed idle pool at each
+        // transaction boundary (DISCARD ALL reset on release) and reused by the
+        // next same-identity acquisition — see `release_to_pool_if_idle` /
+        // `ensure_conn`. The first connection of a session is still
+        // established through the authenticated startup path; drawing the
+        // startup connection from the pool (to reduce *concurrent* backend
+        // connections below the client count) additionally needs
+        // proxy-terminated backend auth and is the documented next increment.
         let mut conns: HashMap<String, BackendConn> = HashMap::new();
         let mut current_node: Option<String> =
             match Self::handle_startup(stream, &mut buffer, &codec, pre, session, state, config)
@@ -1664,6 +1696,17 @@ impl ProxyServer {
                         if let Some(n) = used_node {
                             current_node = Some(n);
                         }
+                        // Transaction/Statement pooling: park the connection
+                        // back to the shared pool once the session is idle.
+                        #[cfg(feature = "pool-modes")]
+                        Self::release_to_pool_if_idle(
+                            &mut conns,
+                            current_node.as_deref(),
+                            session,
+                            state,
+                            config,
+                        )
+                        .await;
                         state.metrics.bytes_sent.fetch_add(sent, Ordering::Relaxed);
                         state
                             .metrics
@@ -1782,6 +1825,20 @@ impl ProxyServer {
                         if let Some(n) = used_node {
                             current_node = Some(n);
                         }
+                        // A `Sync` is the extended-protocol transaction/statement
+                        // boundary (it yields ReadyForQuery); a `Flush` is not, so
+                        // only a Sync triggers a pool release.
+                        #[cfg(feature = "pool-modes")]
+                        if wait_ready {
+                            Self::release_to_pool_if_idle(
+                                &mut conns,
+                                current_node.as_deref(),
+                                session,
+                                state,
+                                config,
+                            )
+                            .await;
+                        }
                         state.metrics.bytes_sent.fetch_add(sent, Ordering::Relaxed);
                         // Closed statements are deallocated everywhere — forget
                         // their canonical Parse so they are never re-prepared.
@@ -1846,6 +1903,24 @@ impl ProxyServer {
                         }
                     }
                 }
+            }
+        }
+
+        // On disconnect, park this session's still-idle connections so a later
+        // same-identity client can reuse them (cross-client pooling). Anything
+        // mid-transaction is left to drop (closed → backend rolls back).
+        #[cfg(feature = "pool-modes")]
+        if state.backend_pool.is_some() {
+            let nodes: Vec<String> = conns.keys().cloned().collect();
+            for node in nodes {
+                Self::release_to_pool_if_idle(
+                    &mut conns,
+                    Some(node.as_str()),
+                    session,
+                    state,
+                    config,
+                )
+                .await;
             }
         }
 
@@ -2482,10 +2557,30 @@ impl ProxyServer {
         target: &str,
         session: &Arc<ClientSession>,
         config: &ProxyConfig,
+        _state: &Arc<ServerState>,
     ) -> Result<()> {
         if conns.contains_key(target) {
             return Ok(());
         }
+
+        // Transaction/Statement pooling: lease a parked, identity-matched
+        // connection before paying for a fresh TCP connect + startup + auth.
+        // The parked connection was `DISCARD ALL`-reset on release, so it is
+        // clean for this (same-identity) client.
+        #[cfg(feature = "pool-modes")]
+        if let Some(pool) = _state.backend_pool.as_ref() {
+            let key = Self::pool_key_for(target, session).await;
+            if let Some(stream) = pool.checkout(&key) {
+                tracing::info!(
+                    target: "helios::pool",
+                    node = %target,
+                    "reused pooled backend connection"
+                );
+                conns.insert(target.to_string(), BackendConn::new(stream));
+                return Ok(());
+            }
+        }
+
         let mut backend =
             tokio::time::timeout(config.pool.acquire_timeout(), TcpStream::connect(target))
                 .await
@@ -2502,9 +2597,103 @@ impl ProxyServer {
             .await
             .map_err(|e| ProxyError::Network(format!("Backend startup error: {}", e)))?;
         Self::complete_backend_auth(&mut backend).await?;
+        #[cfg(feature = "pool-modes")]
+        if _state.backend_pool.is_some() {
+            tracing::debug!(target: "helios::pool", node = %target, "dialed fresh backend connection (pool miss)");
+        }
         tracing::debug!(node = %target, "opened backend connection");
         conns.insert(target.to_string(), BackendConn::new(backend));
         Ok(())
+    }
+
+    /// Build the `(node, user, database)` pool key for the current session's
+    /// connection identity. Connections are reused only within an identity, so
+    /// a borrower always matches the principal the parked connection was
+    /// authenticated as.
+    #[cfg(feature = "pool-modes")]
+    async fn pool_key_for(target: &str, session: &Arc<ClientSession>) -> String {
+        let vars = session.variables.read().await;
+        let user = vars.get("user").map(|s| s.as_str()).unwrap_or("");
+        // PostgreSQL defaults the database to the role name when unset.
+        let database = vars.get("database").map(|s| s.as_str()).unwrap_or(user);
+        crate::pool::pool_key(target, user, database)
+    }
+
+    /// Reset a backend connection to a clean session state before parking it
+    /// for reuse: runs the configured reset query (default `DISCARD ALL`,
+    /// which deallocates prepared statements, drops temp tables, resets GUCs
+    /// and advisory locks) and drains its response to `ReadyForQuery`. Returns
+    /// `Err` if the connection is unhealthy — the caller then drops (closes)
+    /// it instead of parking a poisoned connection.
+    #[cfg(feature = "pool-modes")]
+    async fn reset_backend(stream: &mut TcpStream, reset_sql: &str) -> Result<()> {
+        let msg = crate::protocol::QueryMessage {
+            query: reset_sql.to_string(),
+        }
+        .encode();
+        stream
+            .write_all(&msg.encode())
+            .await
+            .map_err(|e| ProxyError::Network(format!("reset write error: {}", e)))?;
+
+        let codec = ProtocolCodec::new();
+        let mut buffer = BytesMut::with_capacity(1024);
+        let mut read_buf = vec![0u8; 1024];
+        loop {
+            while let Some(m) = codec.decode_message(&mut buffer)? {
+                if m.msg_type == MessageType::ReadyForQuery {
+                    return Ok(());
+                }
+            }
+            let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut read_buf))
+                .await
+                .map_err(|_| ProxyError::Network("reset drain timeout".to_string()))?
+                .map_err(|e| ProxyError::Network(format!("reset drain read error: {}", e)))?;
+            if n == 0 {
+                return Err(ProxyError::Connection(
+                    "backend closed during reset".to_string(),
+                ));
+            }
+            buffer.extend_from_slice(&read_buf[..n]);
+        }
+    }
+
+    /// Transaction/Statement pooling release point: when the session is at an
+    /// idle boundary (`ReadyForQuery` reported not-in-transaction), reset the
+    /// just-used connection and park it for reuse by the next same-identity
+    /// client. A no-op in Session mode or when the feature is off. Never
+    /// releases mid-transaction.
+    #[cfg(feature = "pool-modes")]
+    async fn release_to_pool_if_idle(
+        conns: &mut HashMap<String, BackendConn>,
+        node: Option<&str>,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+    ) {
+        let Some(pool) = state.backend_pool.as_ref() else {
+            return;
+        };
+        let Some(node) = node else {
+            return;
+        };
+        // Only release at a clean transaction boundary.
+        if session.tx_state.read().await.in_transaction {
+            return;
+        }
+        let Some(mut bc) = conns.remove(node) else {
+            return;
+        };
+        if Self::reset_backend(&mut bc.stream, &config.pool_mode.reset_query)
+            .await
+            .is_ok()
+        {
+            let key = Self::pool_key_for(node, session).await;
+            if pool.checkin(&key, bc.stream) {
+                tracing::debug!(target: "helios::pool", node = %node, "parked backend connection for reuse");
+            }
+        }
+        // On reset failure the connection is dropped here (closed).
     }
 
     /// Forward a simple-query (`Query`) message and stream its response back
@@ -2702,12 +2891,12 @@ impl ProxyServer {
 
         // A connect/auth failure trips the breaker (and is propagated as today).
         #[cfg(feature = "circuit-breaker")]
-        if let Err(e) = Self::ensure_conn(conns, &target, session, config).await {
+        if let Err(e) = Self::ensure_conn(conns, &target, session, config, state).await {
             Self::circuit_record(state, &target, false, &e.to_string());
             return Err(e);
         }
         #[cfg(not(feature = "circuit-breaker"))]
-        Self::ensure_conn(conns, &target, session, config).await?;
+        Self::ensure_conn(conns, &target, session, config, state).await?;
         let backend = conns.get_mut(&target).expect("just ensured");
 
         if let Err(e) = backend.stream.write_all(&forward_msg.encode()).await {
@@ -2898,12 +3087,12 @@ impl ProxyServer {
         }
 
         #[cfg(feature = "circuit-breaker")]
-        if let Err(e) = Self::ensure_conn(conns, &target, session, config).await {
+        if let Err(e) = Self::ensure_conn(conns, &target, session, config, state).await {
             Self::circuit_record(state, &target, false, &e.to_string());
             return Err(e);
         }
         #[cfg(not(feature = "circuit-breaker"))]
-        Self::ensure_conn(conns, &target, session, config).await?;
+        Self::ensure_conn(conns, &target, session, config, state).await?;
         let backend = conns.get_mut(&target).expect("just ensured");
 
         // Transparently re-prepare any referenced named statement this socket
@@ -5020,6 +5209,8 @@ mod tests {
             schema_analyzer: None,
             #[cfg(feature = "pool-modes")]
             pool_manager: None,
+            #[cfg(feature = "pool-modes")]
+            backend_pool: None,
             plugin_manager: Some(pm),
             #[cfg(feature = "ha-tr")]
             transaction_journal: Arc::new(crate::transaction_journal::TransactionJournal::new()),
