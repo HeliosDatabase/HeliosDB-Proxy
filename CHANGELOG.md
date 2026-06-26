@@ -5,6 +5,29 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-06-26
+
+Minor release — platform-tier wiring wave 4: SQL query rewriting.
+
+### Added
+
+- **SQL query rewriting (`query-rewriting`).** `[query_rewrite]` config (off by
+  default) with a list of rules — each `{ match_table | match_regex }` selects
+  which queries it applies to and `{ replace_table_with | append_where |
+  add_limit }` is the transformation. Matching simple queries are rewritten on
+  the path before forwarding; the cache and backend both see the rewritten SQL.
+  Rewrites log to the `helios::rewrite` target.
+
+### Notes
+
+- Rewriting covers the simple-query path and the real string-based
+  transformations. The extended-protocol (Parse) path and the
+  AST-reserialization transform are follow-ons.
+- `pool-modes` has been resequenced to **after** `auth-proxy`: real connection
+  multiplexing requires proxy-held backend credentials (which `auth-proxy`
+  provides — passthrough auth cannot share a backend connection across clients)
+  plus a raw-connection transaction-pool on the data path.
+
 ## [0.9.0] - 2026-06-26
 
 Minor release — platform-tier wiring wave 3: query-result caching.
