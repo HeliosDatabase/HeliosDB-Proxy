@@ -5,6 +5,28 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-06-26
+
+Minor release — fourth of the 1.0.0 wiring set: the upgrade orchestrator's
+validation stage is now real.
+
+### Changed
+
+- **Upgrade-orchestrator stage 3 validation (`ha-tr`).** The validation stage
+  advertised a source≡target sample comparison but only slept and advanced. It
+  now lists a deterministic, bounded sample of the source's user tables and
+  compares `count(*)` on each between source and target over the backend
+  client; a mismatch fails the job, and the rows checked are recorded in
+  `validated_rows`. Stages 1/2/4/6 were already real. The stale module
+  doc-comment (which called every stage a stub) is corrected.
+
+### Notes
+
+- Row-count parity is the portable PG 14–18 check; a per-row checksum on top is
+  a follow-on. The validation SQL path is live-verified via self-compare
+  (`HELIOS_LIVE_PG`-gated test); a full two-major-version replication run needs
+  a two-node harness.
+
 ## [0.16.0] - 2026-06-26
 
 Minor release — third of the 1.0.0 wiring set: the DistribCache internals are
