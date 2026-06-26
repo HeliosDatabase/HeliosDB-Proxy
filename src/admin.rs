@@ -90,6 +90,10 @@ pub struct AdminState {
     /// ring buffer.
     #[cfg(feature = "anomaly-detection")]
     pub anomaly_detector: RwLock<Option<Arc<AnomalyDetector>>>,
+    /// Query-analytics engine — same Arc the server records on from the query
+    /// path. `/api/analytics` reads top queries + slow-query log from it.
+    #[cfg(feature = "query-analytics")]
+    pub analytics: RwLock<Option<Arc<crate::analytics::QueryAnalytics>>>,
     /// Edge proxy cache + registry. Cache surfaces stats; registry
     /// is the home-side fanout for invalidations.
     #[cfg(feature = "edge-proxy")]
@@ -495,6 +499,29 @@ impl AdminServer {
                 503,
                 serde_json::json!({ "error": "anomaly-detection feature not compiled in" }),
             )),
+
+            // Query analytics: top queries by call count + slow-query log.
+            #[cfg(feature = "query-analytics")]
+            ("GET", p)
+                if p == "/api/analytics"
+                    || p == "/analytics"
+                    || p.starts_with("/api/analytics?")
+                    || p.starts_with("/analytics?") =>
+            {
+                Self::handle_analytics(p, state).await
+            }
+            #[cfg(not(feature = "query-analytics"))]
+            ("GET", p)
+                if p == "/api/analytics"
+                    || p == "/analytics"
+                    || p.starts_with("/api/analytics?")
+                    || p.starts_with("/analytics?") =>
+            {
+                Ok((
+                    503,
+                    serde_json::json!({ "error": "query-analytics feature not compiled in" }),
+                ))
+            }
 
             // Edge mode (T3.2). Stats panel for the home; the home's
             // registered edges + cache stats; and a manual
@@ -1209,6 +1236,47 @@ impl AdminServer {
         ))
     }
 
+    /// `GET /api/analytics` — top queries by call count plus the slow-query
+    /// count. Returns 503 when analytics is not attached/enabled.
+    #[cfg(feature = "query-analytics")]
+    async fn handle_analytics(
+        path: &str,
+        state: &Arc<AdminState>,
+    ) -> Result<(u16, serde_json::Value)> {
+        use crate::analytics::OrderBy;
+        let limit = parse_limit_query(path, 50, 1024);
+        let a = match state.analytics.read().await.clone() {
+            Some(a) => a,
+            None => {
+                return Ok((503, serde_json::json!({ "error": "analytics not enabled" })));
+            }
+        };
+        let top: Vec<serde_json::Value> = a
+            .top_queries(OrderBy::Calls, limit)
+            .into_iter()
+            .map(|s| {
+                serde_json::json!({
+                    "fingerprint": s.fingerprint_hash,
+                    "normalized":  s.normalized,
+                    "calls":       s.calls,
+                    "avg_ms":      s.avg_time.as_secs_f64() * 1000.0,
+                    "p99_ms":      s.p99.as_secs_f64() * 1000.0,
+                    "rows":        s.rows,
+                    "errors":      s.errors,
+                })
+            })
+            .collect();
+        let slow_count = a.slow_queries(limit).len();
+        Ok((
+            200,
+            serde_json::json!({
+                "limit":            limit,
+                "top_queries":      top,
+                "slow_query_count": slow_count,
+            }),
+        ))
+    }
+
     /// Handle `POST /api/shadow`. Body is a JSON `ShadowRequestBody`.
     /// Connects to both source and shadow backends, runs the SQL on
     /// each, returns a `ShadowExecuteReport` with the diff.
@@ -1620,6 +1688,8 @@ impl AdminState {
             chaos_overrides: RwLock::new(HashMap::new()),
             #[cfg(feature = "anomaly-detection")]
             anomaly_detector: RwLock::new(None),
+            #[cfg(feature = "query-analytics")]
+            analytics: RwLock::new(None),
             #[cfg(feature = "edge-proxy")]
             edge_cache: RwLock::new(None),
             #[cfg(feature = "edge-proxy")]
@@ -1650,6 +1720,12 @@ impl AdminState {
     #[cfg(feature = "anomaly-detection")]
     pub async fn with_anomaly_detector(&self, detector: Arc<AnomalyDetector>) {
         *self.anomaly_detector.write().await = Some(detector);
+    }
+
+    /// Attach the query-analytics engine so `/api/analytics` can read it.
+    #[cfg(feature = "query-analytics")]
+    pub async fn with_analytics(&self, analytics: Arc<crate::analytics::QueryAnalytics>) {
+        *self.analytics.write().await = Some(analytics);
     }
 
     /// Attach edge cache + registry. Server calls this once at

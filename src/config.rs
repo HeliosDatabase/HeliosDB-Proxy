@@ -239,6 +239,11 @@ pub struct ProxyConfig {
     /// `circuit-breaker` feature is compiled in.
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerToml,
+    /// Query analytics (fingerprinting, per-query statistics, slow-query log,
+    /// pattern detection). Disabled by default. Only active when the
+    /// `query-analytics` feature is compiled in.
+    #[serde(default)]
+    pub analytics: AnalyticsToml,
     /// Proxy-side unnamed-`Parse` promotion (Batch H). When a client re-sends an
     /// identical unnamed extended `Parse` (the dominant pgbench/ORM pattern),
     /// the proxy skips forwarding it to a backend that already holds that exact
@@ -533,6 +538,31 @@ fn default_write_timeout_secs() -> u64 {
     30 // 30 seconds default write timeout during failover
 }
 
+/// Query-analytics configuration (TOML-friendly, always present). Converted to
+/// `crate::analytics::AnalyticsConfig` at startup and only active when the
+/// `query-analytics` feature is compiled in AND `enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnalyticsToml {
+    /// Record per-query statistics, slow-query log, and pattern detection.
+    /// Default `false`.
+    pub enabled: bool,
+    /// Queries slower than this (milliseconds) are added to the slow-query log.
+    pub slow_query_ms: u64,
+    /// Maximum distinct query fingerprints to track.
+    pub max_fingerprints: u32,
+}
+
+impl Default for AnalyticsToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            slow_query_ms: 1000,
+            max_fingerprints: 10000,
+        }
+    }
+}
+
 /// Circuit-breaker configuration (TOML-friendly, always present). Converted to
 /// `crate::circuit_breaker::ManagerConfig` at startup and only enforced when
 /// the `circuit-breaker` feature is compiled in AND `enabled = true`.
@@ -659,6 +689,7 @@ impl Default for ProxyConfig {
             routing_hints: RoutingHintsConfig::default(),
             rate_limit: RateLimitToml::default(),
             circuit_breaker: CircuitBreakerToml::default(),
+            analytics: AnalyticsToml::default(),
             optimize_unnamed_parse: true,
             shutdown_drain_timeout_secs: default_drain_timeout_secs(),
         }
