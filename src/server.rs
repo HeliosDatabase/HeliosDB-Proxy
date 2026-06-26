@@ -206,6 +206,10 @@ struct ServerState {
     /// open nodes from read selection, and fast-fails queries to an open node.
     #[cfg(feature = "circuit-breaker")]
     circuit_breaker: Option<Arc<crate::circuit_breaker::CircuitBreakerManager>>,
+    /// Query analytics engine. `Some` when `[analytics] enabled`. Every
+    /// forwarded query is recorded (fingerprint, latency, slow-query log).
+    #[cfg(feature = "query-analytics")]
+    analytics: Option<Arc<crate::analytics::QueryAnalytics>>,
     /// Pool manager for Session/Transaction/Statement modes
     #[cfg(feature = "pool-modes")]
     pool_manager: Option<Arc<ConnectionPoolManager>>,
@@ -667,6 +671,29 @@ impl ProxyServer {
             None
         };
 
+        // Build the query-analytics engine when enabled.
+        #[cfg(feature = "query-analytics")]
+        let analytics = if config.analytics.enabled {
+            let a = &config.analytics;
+            tracing::info!(
+                slow_query_ms = a.slow_query_ms,
+                max_fingerprints = a.max_fingerprints,
+                "query analytics enabled"
+            );
+            let ac = crate::analytics::AnalyticsConfig {
+                enabled: true,
+                max_fingerprints: a.max_fingerprints as usize,
+                slow_query: crate::analytics::SlowQueryConfig {
+                    threshold: Duration::from_millis(a.slow_query_ms),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            Some(Arc::new(crate::analytics::QueryAnalytics::new(ac)))
+        } else {
+            None
+        };
+
         let state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
             health: ArcSwap::from_pointee(health),
@@ -698,6 +725,8 @@ impl ProxyServer {
             rate_limiter,
             #[cfg(feature = "circuit-breaker")]
             circuit_breaker,
+            #[cfg(feature = "query-analytics")]
+            analytics,
             #[cfg(feature = "pool-modes")]
             pool_manager,
             #[cfg(feature = "wasm-plugins")]
@@ -1112,6 +1141,12 @@ impl ProxyServer {
             admin_state
                 .with_anomaly_detector(state.anomaly_detector.clone())
                 .await;
+
+            // Attach the query-analytics engine so /api/analytics can read it.
+            #[cfg(feature = "query-analytics")]
+            if let Some(a) = state.analytics.as_ref() {
+                admin_state.with_analytics(a.clone()).await;
+            }
 
             // Attach the edge cache + registry. Both surfaced via
             // /api/edge/* admin routes.
@@ -2334,6 +2369,13 @@ impl ProxyServer {
         // original (borrowed, no copy).
         let forward_msg = stripped_msg.as_ref().unwrap_or(msg);
 
+        // Analytics: capture the forwarded SQL + start the latency timer.
+        #[cfg(feature = "query-analytics")]
+        let analytics_sql =
+            crate::protocol::query_text(&forward_msg.payload).map(|s| s.to_string());
+        #[cfg(feature = "query-analytics")]
+        let started = std::time::Instant::now();
+
         let target = Self::choose_target_node(
             is_write,
             forced_target,
@@ -2378,6 +2420,11 @@ impl ProxyServer {
             Ok(sent) => {
                 #[cfg(feature = "circuit-breaker")]
                 Self::circuit_record(state, &target, true, "");
+                #[cfg(feature = "query-analytics")]
+                if let Some(sql) = analytics_sql.as_deref() {
+                    Self::record_analytics(state, session, sql, &target, started.elapsed(), None)
+                        .await;
+                }
                 Ok((Some(target), sent))
             }
             Err(e) => {
@@ -2385,6 +2432,18 @@ impl ProxyServer {
                 conns.remove(&target);
                 #[cfg(feature = "circuit-breaker")]
                 Self::circuit_record(state, &target, false, &e.to_string());
+                #[cfg(feature = "query-analytics")]
+                if let Some(sql) = analytics_sql.as_deref() {
+                    Self::record_analytics(
+                        state,
+                        session,
+                        sql,
+                        &target,
+                        started.elapsed(),
+                        Some(e.to_string()),
+                    )
+                    .await;
+                }
                 Err(e)
             }
         }
@@ -2432,6 +2491,12 @@ impl ProxyServer {
                 .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
             return Ok((None, resp.len() as u64));
         }
+
+        // Analytics: the routable SQL (first Parse) + latency timer.
+        #[cfg(feature = "query-analytics")]
+        let analytics_sql = route_sql.map(|s| s.to_string());
+        #[cfg(feature = "query-analytics")]
+        let started = std::time::Instant::now();
 
         let target = match route_sql {
             Some(sql) => {
@@ -2557,6 +2622,11 @@ impl ProxyServer {
             Ok(sent) => {
                 #[cfg(feature = "circuit-breaker")]
                 Self::circuit_record(state, &target, true, "");
+                #[cfg(feature = "query-analytics")]
+                if let Some(sql) = analytics_sql.as_deref() {
+                    Self::record_analytics(state, session, sql, &target, started.elapsed(), None)
+                        .await;
+                }
                 // The connection now holds these named statements.
                 for name in defines {
                     backend.prepared.insert(name.clone());
@@ -2571,6 +2641,18 @@ impl ProxyServer {
                 conns.remove(&target);
                 #[cfg(feature = "circuit-breaker")]
                 Self::circuit_record(state, &target, false, &e.to_string());
+                #[cfg(feature = "query-analytics")]
+                if let Some(sql) = analytics_sql.as_deref() {
+                    Self::record_analytics(
+                        state,
+                        session,
+                        sql,
+                        &target,
+                        started.elapsed(),
+                        Some(e.to_string()),
+                    )
+                    .await;
+                }
                 Err(e)
             }
         }
@@ -2944,6 +3026,37 @@ impl ProxyServer {
         } else {
             None
         }
+    }
+
+    /// Record a forwarded query on the analytics engine (fingerprint, latency,
+    /// slow-query log, pattern detection). No-op when analytics is disabled.
+    #[cfg(feature = "query-analytics")]
+    async fn record_analytics(
+        state: &Arc<ServerState>,
+        session: &Arc<ClientSession>,
+        sql: &str,
+        node: &str,
+        duration: Duration,
+        error: Option<String>,
+    ) {
+        let Some(analytics) = state.analytics.as_ref() else {
+            return;
+        };
+        let (user, database) = {
+            let vars = session.variables.read().await;
+            (
+                vars.get("user").cloned().unwrap_or_default(),
+                vars.get("database").cloned().unwrap_or_default(),
+            )
+        };
+        let mut exec = crate::analytics::QueryExecution::new(sql, duration);
+        exec.user = user;
+        exec.database = database;
+        exec.client_ip = session.client_addr.ip().to_string();
+        exec.node = node.to_string();
+        exec.session_id = Some(session.id.to_string());
+        exec.error = error;
+        analytics.record(exec);
     }
 
     /// Select primary node with write timeout during failover
@@ -4307,6 +4420,8 @@ mod tests {
             rate_limiter: None,
             #[cfg(feature = "circuit-breaker")]
             circuit_breaker: None,
+            #[cfg(feature = "query-analytics")]
+            analytics: None,
             #[cfg(feature = "pool-modes")]
             pool_manager: None,
             plugin_manager: Some(pm),
@@ -4614,6 +4729,35 @@ mod tests {
             b.record_success();
             b.record_success();
             assert_eq!(b.get_state(), CircuitState::Closed);
+        }
+    }
+
+    // ---- query-analytics: record + literal-collapsing normalizer ----
+
+    #[cfg(feature = "query-analytics")]
+    mod query_analytics {
+        use crate::analytics::{AnalyticsConfig, OrderBy, QueryAnalytics, QueryExecution};
+        use std::time::Duration;
+
+        #[test]
+        fn records_and_collapses_literals() {
+            let a = QueryAnalytics::new(AnalyticsConfig::default());
+            for n in [1, 2, 3] {
+                a.record(QueryExecution::new(
+                    format!("select {n}"),
+                    Duration::from_millis(1),
+                ));
+            }
+            let top = a.top_queries(OrderBy::Calls, 10);
+            assert!(!top.is_empty(), "no fingerprints recorded");
+            // The three literal variants collapse to one fingerprint (3 calls).
+            assert!(
+                top.iter().any(|s| s.calls >= 3),
+                "literals did not collapse: {:?}",
+                top.iter()
+                    .map(|s| (s.normalized.clone(), s.calls))
+                    .collect::<Vec<_>>()
+            );
         }
     }
 }
