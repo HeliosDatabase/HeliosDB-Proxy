@@ -207,10 +207,11 @@ pub struct AuthenticationHandler {
     /// JWT validator
     jwt_validator: Option<JwtValidator>,
 
-    /// OAuth client (placeholder - would use actual OAuth client)
+    /// Whether OAuth is configured (RFC 7662 introspection is performed
+    /// per-request against `config.oauth.introspection_url`).
     oauth_enabled: bool,
 
-    /// LDAP client (placeholder - would use actual LDAP client)
+    /// LDAP client (not implemented — `authenticate_ldap` denies by default).
     ldap_enabled: bool,
 
     /// API key store
@@ -473,15 +474,126 @@ impl AuthenticationHandler {
             return Ok(cached.clone());
         }
 
-        // Real OAuth introspection is an HTTP call to the configured
-        // introspection endpoint (RFC 7662). Until that is wired, deny rather
-        // than synthesize an identity — a bearer token must never be blindly
-        // trusted.
-        let _ = token;
-        Err(AuthError::Configuration(
-            "OAuth introspection not implemented; configure a real introspection endpoint"
-                .to_string(),
-        ))
+        let cfg = self
+            .config
+            .oauth
+            .as_ref()
+            .ok_or_else(|| AuthError::Configuration("OAuth not configured".to_string()))?;
+
+        // RFC 7662 token introspection: POST the token to the introspection
+        // endpoint with the client's credentials and trust only an explicit
+        // `"active": true`. A bearer token is never accepted without this
+        // round-trip.
+        let body = self.oauth_introspect(cfg, token).await?;
+
+        // `active` is REQUIRED by RFC 7662; anything but true is a denial.
+        if body.get("active").and_then(|v| v.as_bool()) != Some(true) {
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        // Optional issuer pin.
+        if !cfg.issuer.is_empty() {
+            if let Some(iss) = body.get("iss").and_then(|v| v.as_str()) {
+                if iss != cfg.issuer {
+                    return Err(AuthError::InvalidCredentials);
+                }
+            }
+        }
+
+        // Optional audience check (`aud` may be a string or an array).
+        if let Some(expected) = &cfg.audience {
+            let ok = match body.get("aud") {
+                Some(serde_json::Value::String(s)) => s == expected,
+                Some(serde_json::Value::Array(a)) => {
+                    a.iter().any(|v| v.as_str() == Some(expected.as_str()))
+                }
+                _ => false,
+            };
+            if !ok {
+                return Err(AuthError::InvalidCredentials);
+            }
+        }
+
+        // Scopes are a space-delimited string (RFC 7662 §2.2). Enforce any
+        // required scopes before minting an identity.
+        let scopes: Vec<String> = body
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .map(|s| s.split_whitespace().map(String::from).collect())
+            .unwrap_or_default();
+        for required in &cfg.required_scopes {
+            if !scopes.contains(required) {
+                return Err(AuthError::InsufficientPermissions(format!(
+                    "missing required scope: {}",
+                    required
+                )));
+            }
+        }
+
+        // Subject identifies the principal; fall back to `username`.
+        let subject = body
+            .get("sub")
+            .and_then(|v| v.as_str())
+            .or_else(|| body.get("username").and_then(|v| v.as_str()))
+            .ok_or_else(|| {
+                AuthError::OAuth("introspection response missing sub/username".to_string())
+            })?;
+
+        let mut identity = Identity::new(subject, "oauth");
+        identity.name = body
+            .get("username")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        identity.roles = scopes;
+
+        let mut result = AuthResult::new(identity);
+        if let Some(exp) = body
+            .get("exp")
+            .and_then(|v| v.as_i64())
+            .and_then(|e| chrono::DateTime::from_timestamp(e, 0))
+        {
+            result = result.with_expiration(exp);
+        }
+
+        // Cache the validated result (bounded by the cache's own TTL).
+        self.auth_cache
+            .write()
+            .insert(token.to_string(), result.clone());
+
+        Ok(result)
+    }
+
+    /// Perform an RFC 7662 introspection POST and return the parsed JSON
+    /// response body. Client authentication is HTTP Basic with the
+    /// configured client id/secret.
+    async fn oauth_introspect(
+        &self,
+        cfg: &OAuthConfig,
+        token: &str,
+    ) -> Result<serde_json::Value, AuthError> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| AuthError::ProviderUnavailable(format!("http client: {}", e)))?;
+
+        let resp = client
+            .post(&cfg.introspection_url)
+            .basic_auth(&cfg.client_id, Some(&cfg.client_secret))
+            .form(&[("token", token), ("token_type_hint", "access_token")])
+            .send()
+            .await
+            .map_err(|e| AuthError::ProviderUnavailable(format!("introspection request: {}", e)))?;
+
+        if !resp.status().is_success() {
+            return Err(AuthError::ProviderUnavailable(format!(
+                "introspection endpoint returned HTTP {}",
+                resp.status()
+            )));
+        }
+
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| AuthError::OAuth(format!("introspection response body: {}", e)))
     }
 
     /// Authenticate using LDAP
@@ -986,6 +1098,99 @@ mod tests {
         assert!(
             result.is_err(),
             "basic auth must deny without a user store, got {result:?}"
+        );
+    }
+
+    // --- OAuth RFC 7662 introspection -------------------------------------
+
+    /// Minimal HTTP/1.1 server that answers every request with a fixed JSON
+    /// body — stands in for an OAuth introspection endpoint. Returns its URL.
+    async fn spawn_introspection_mock(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                // Drain (best-effort) the request, then respond.
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{}/introspect", addr)
+    }
+
+    fn oauth_cfg(introspection_url: String, required_scopes: Vec<String>) -> OAuthConfig {
+        OAuthConfig {
+            introspection_url,
+            client_id: "proxy".into(),
+            client_secret: "secret".into(),
+            token_url: None,
+            scopes: Vec::new(),
+            cache_ttl: std::time::Duration::from_secs(60),
+            required_scopes,
+            issuer: String::new(),
+            authorization_url: None,
+            audience: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_introspection_accepts_active_token() {
+        let url = spawn_introspection_mock(
+            r#"{"active":true,"sub":"alice","username":"alice","scope":"read write"}"#,
+        )
+        .await;
+        let handler = AuthenticationHandlerBuilder::new()
+            .enabled(true)
+            .with_oauth(oauth_cfg(url, Vec::new()))
+            .build();
+        let req = AuthRequest::new().with_header("Authorization", "Bearer tok-abc");
+        let result = handler
+            .authenticate_oauth(&req)
+            .await
+            .expect("active token must authenticate");
+        assert_eq!(result.identity.user_id, "alice");
+        assert!(result.identity.roles.contains(&"read".to_string()));
+        assert!(result.identity.roles.contains(&"write".to_string()));
+    }
+
+    #[tokio::test]
+    async fn oauth_introspection_denies_inactive_token() {
+        let url = spawn_introspection_mock(r#"{"active":false}"#).await;
+        let handler = AuthenticationHandlerBuilder::new()
+            .enabled(true)
+            .with_oauth(oauth_cfg(url, Vec::new()))
+            .build();
+        let req = AuthRequest::new().with_header("Authorization", "Bearer dead");
+        let err = handler.authenticate_oauth(&req).await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::InvalidCredentials),
+            "inactive token must be denied, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_introspection_enforces_required_scopes() {
+        let url =
+            spawn_introspection_mock(r#"{"active":true,"sub":"bob","scope":"read"}"#).await;
+        let handler = AuthenticationHandlerBuilder::new()
+            .enabled(true)
+            .with_oauth(oauth_cfg(url, vec!["admin".to_string()]))
+            .build();
+        let req = AuthRequest::new().with_header("Authorization", "Bearer tok");
+        let err = handler.authenticate_oauth(&req).await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::InsufficientPermissions(_)),
+            "missing required scope must deny, got {err:?}"
         );
     }
 }
