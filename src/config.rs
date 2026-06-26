@@ -244,6 +244,10 @@ pub struct ProxyConfig {
     /// `query-analytics` feature is compiled in.
     #[serde(default)]
     pub analytics: AnalyticsToml,
+    /// Replica-lag-aware routing + read-your-writes. Disabled by default. Only
+    /// enforced when the `lag-routing` feature is compiled in.
+    #[serde(default)]
+    pub lag_routing: LagRoutingToml,
     /// Proxy-side unnamed-`Parse` promotion (Batch H). When a client re-sends an
     /// identical unnamed extended `Parse` (the dominant pgbench/ORM pattern),
     /// the proxy skips forwarding it to a backend that already holds that exact
@@ -538,6 +542,33 @@ fn default_write_timeout_secs() -> u64 {
     30 // 30 seconds default write timeout during failover
 }
 
+/// Replica-lag-aware routing + read-your-writes configuration (always present;
+/// only enforced when the `lag-routing` feature is compiled in AND enabled).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LagRoutingToml {
+    /// Enable lag-aware read routing + read-your-writes. Default `false`.
+    pub enabled: bool,
+    /// Reads issued within this many milliseconds after a write in the same
+    /// session are pinned to the primary (read-your-writes), so the client
+    /// observes its own writes despite replica lag. 0 disables the window.
+    pub ryw_window_ms: u64,
+    /// Exclude a standby from read routing when its measured replication lag
+    /// exceeds this many bytes. 0 = no lag-based exclusion (default; the proxy
+    /// does not yet populate per-node lag without a configured monitor).
+    pub max_lag_bytes: u64,
+}
+
+impl Default for LagRoutingToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ryw_window_ms: 500,
+            max_lag_bytes: 0,
+        }
+    }
+}
+
 /// Query-analytics configuration (TOML-friendly, always present). Converted to
 /// `crate::analytics::AnalyticsConfig` at startup and only active when the
 /// `query-analytics` feature is compiled in AND `enabled = true`.
@@ -690,6 +721,7 @@ impl Default for ProxyConfig {
             rate_limit: RateLimitToml::default(),
             circuit_breaker: CircuitBreakerToml::default(),
             analytics: AnalyticsToml::default(),
+            lag_routing: LagRoutingToml::default(),
             optimize_unnamed_parse: true,
             shutdown_drain_timeout_secs: default_drain_timeout_secs(),
         }
