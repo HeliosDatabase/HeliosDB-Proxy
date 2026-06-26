@@ -5,6 +5,33 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-06-26
+
+Minor release — platform-tier wiring wave 2: observability + read-scaling. Two
+more feature flags that previously did nothing on the query path are now active.
+
+### Added
+
+- **Query analytics (`query-analytics`) records every forwarded query.**
+  `[analytics]` config (off by default). Each query is fingerprinted +
+  normalized (literal-only differences collapse to one `select ?` fingerprint),
+  accumulating per-fingerprint call/latency/p99/error stats with a slow-query
+  log. New `GET /api/analytics` returns the top queries + slow-query count. The
+  real query normalizer now runs on the live path (it was previously a
+  stand-in).
+- **Read-your-writes (`lag-routing`).** `[lag_routing]` config (off by default).
+  Within `ryw_window_ms` after a write, a session's reads are pinned to the
+  primary so the client always observes its own writes despite replica lag. A
+  lag-aware read-exclusion filter (`max_lag_bytes`) drops standbys lagging
+  beyond a threshold.
+
+### Notes
+
+- Read-your-writes is live-verified. The lag-**exclusion** decision logic is
+  unit-tested and in place (safe-by-default, `max_lag_bytes=0`), but populating
+  per-node replication lag requires a background monitor with configured backend
+  credentials + a real standby — tracked as a follow-on.
+
 ## [0.7.0] - 2026-06-26
 
 Minor release — the first wave of **platform-tier wiring**. Three feature flags
