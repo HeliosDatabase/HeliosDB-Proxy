@@ -1,6 +1,6 @@
 [package]
 name = "heliosdb-proxy"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 rust-version = "1.86"
 description = "HeliosProxy - Intelligent connection router and failover manager for HeliosDB and PostgreSQL"

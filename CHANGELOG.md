@@ -5,6 +5,38 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-06-26
+
+**Security release** — the auth subsystem (`auth-proxy`) no longer accepts
+forged or arbitrary credentials.
+
+### Security
+
+- **JWT signatures are now actually verified.** `verify_signature` previously
+  returned success for *every* token. It now performs a constant-time HS256
+  (HMAC-SHA256) verification against a symmetric key, and **rejects any other
+  algorithm** (RS256/ES256 etc.) rather than trusting it — so a forged or
+  tampered JWT no longer validates.
+- **OAuth / LDAP / HTTP-Basic deny by default.** These previously synthesized an
+  accepted identity for any input (any password, any bearer token). They now
+  deny; real OIDC introspection / LDAP bind / user-store verification are
+  follow-ons requiring external infrastructure.
+- **API keys** are hashed with SHA-256 and compared in constant time (was the
+  non-cryptographic `DefaultHasher` with a `==` compare).
+
+### Breaking
+
+- `auth::jwt::Jwk` gains a `k` (symmetric key) field, and JWT validation now
+  rejects algorithms it cannot verify.
+
+### Notes
+
+- This closes the client-auth **crypto** holes (the deep-audit's #1 finding),
+  verified by unit tests. Wiring proxy-terminated client auth into the
+  connection path (a `[auth] mode` that verifies a client-presented JWT on
+  connect), RS256/ES256, and real OAuth/LDAP remain follow-ons. That
+  connection-path work is also the prerequisite for `pool-modes`.
+
 ## [0.10.0] - 2026-06-26
 
 Minor release — platform-tier wiring wave 4: SQL query rewriting.
