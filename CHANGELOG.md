@@ -5,6 +5,27 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-06-26
+
+Minor release — platform-tier wiring wave 6: Transaction Replay journaling.
+
+### Added
+
+- **Transaction Replay journaling (`ha-tr`).** With `tr_enabled`, write
+  statements are now journaled on the query path (they previously weren't, so
+  the replay engine had nothing to replay). The existing replay machinery —
+  `POST /api/replay` and the failover coordinator — can now re-apply journaled
+  writes onto a promoted primary or a staging target.
+
+### Notes
+
+- The journal-population half and the replay **mechanism** are live-verified
+  (writes journaled → table emptied → `/api/replay` re-applies them → rows
+  reappear). The failover-**triggered** auto-replay is coordinated by the
+  failover controller but is not live-verified here (no real standby in the dev
+  env). Follow-ons: extended-protocol write journaling, explicit-transaction
+  grouping, journal retention, array bind params in replay, cursor reposition.
+
 ## [0.12.0] - 2026-06-26
 
 Minor release — platform-tier wiring wave 5: multi-tenancy.
