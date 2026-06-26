@@ -473,26 +473,15 @@ impl AuthenticationHandler {
             return Ok(cached.clone());
         }
 
-        // In a real implementation, this would call the OAuth introspection endpoint
-        // For demonstration, we create a placeholder identity
-        let identity = Identity {
-            user_id: "oauth_user".to_string(),
-            name: Some("OAuth User".to_string()),
-            email: None,
-            roles: vec!["user".to_string()],
-            groups: Vec::new(),
-            tenant_id: None,
-            claims: HashMap::new(),
-            auth_method: "oauth".to_string(),
-            authenticated_at: chrono::Utc::now(),
-        };
-
-        let result = AuthResult::new(identity);
-        self.auth_cache
-            .write()
-            .insert(token.to_string(), result.clone());
-
-        Ok(result)
+        // Real OAuth introspection is an HTTP call to the configured
+        // introspection endpoint (RFC 7662). Until that is wired, deny rather
+        // than synthesize an identity — a bearer token must never be blindly
+        // trusted.
+        let _ = token;
+        Err(AuthError::Configuration(
+            "OAuth introspection not implemented; configure a real introspection endpoint"
+                .to_string(),
+        ))
     }
 
     /// Authenticate using LDAP
@@ -510,25 +499,13 @@ impl AuthenticationHandler {
             .as_ref()
             .ok_or(AuthError::AuthenticationRequired)?;
 
-        // In a real implementation, this would bind to LDAP and verify credentials
-        // For demonstration, we create a placeholder identity
-        if password.is_empty() {
-            return Err(AuthError::InvalidCredentials);
-        }
-
-        let identity = Identity {
-            user_id: username.clone(),
-            name: Some(username.clone()),
-            email: None,
-            roles: vec!["user".to_string()],
-            groups: Vec::new(),
-            tenant_id: None,
-            claims: HashMap::new(),
-            auth_method: "ldap".to_string(),
-            authenticated_at: chrono::Utc::now(),
-        };
-
-        Ok(AuthResult::new(identity))
+        // Real LDAP authentication binds to the directory with the supplied
+        // credentials. Until that is wired, deny rather than accept any
+        // non-empty password.
+        let _ = (username, password);
+        Err(AuthError::Configuration(
+            "LDAP bind not implemented; configure a real LDAP backend".to_string(),
+        ))
     }
 
     /// Authenticate using API key
@@ -595,25 +572,10 @@ impl AuthenticationHandler {
         let username = parts[0];
         let password = parts[1];
 
-        // In a real implementation, this would verify against a user store
-        // For demonstration, accept any non-empty password
-        if password.is_empty() {
-            return Err(AuthError::InvalidCredentials);
-        }
-
-        let identity = Identity {
-            user_id: username.to_string(),
-            name: Some(username.to_string()),
-            email: None,
-            roles: vec!["user".to_string()],
-            groups: Vec::new(),
-            tenant_id: None,
-            claims: HashMap::new(),
-            auth_method: "basic".to_string(),
-            authenticated_at: chrono::Utc::now(),
-        };
-
-        Ok(AuthResult::new(identity))
+        // No user store is wired, so HTTP Basic cannot verify a password.
+        // Deny rather than accept any non-empty password.
+        let _ = (username, password);
+        Err(AuthError::InvalidCredentials)
     }
 
     /// Trust-based authentication (e.g., for internal services)
@@ -693,21 +655,35 @@ impl AuthenticationHandler {
         Ok(())
     }
 
-    /// Verify API key against hash
+    /// Verify an API key against its stored hash using a constant-time
+    /// comparison (so verification time doesn't leak how much of the hash
+    /// matched).
     fn verify_api_key(&self, key: &str, hash: &str) -> bool {
-        // In production, use a proper constant-time comparison
-        // and secure hashing (e.g., Argon2, bcrypt)
-        let key_hash = self.hash_api_key(key);
-        key_hash == hash
+        let computed = self.hash_api_key(key);
+        let a = computed.as_bytes();
+        let b = hash.as_bytes();
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for (x, y) in a.iter().zip(b.iter()) {
+            diff |= x ^ y;
+        }
+        diff == 0
     }
 
-    /// Hash an API key
+    /// Hash an API key with SHA-256 (hex). Keys are high-entropy secrets, so a
+    /// fast cryptographic digest is appropriate (unlike user passwords, which
+    /// would warrant a slow KDF).
     fn hash_api_key(&self, key: &str) -> String {
-        // Placeholder: in production, use secure hashing
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut hasher);
-        format!("{:x}", hasher.finish())
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(key.as_bytes());
+        let mut out = String::with_capacity(64);
+        for b in digest {
+            use std::fmt::Write;
+            let _ = write!(out, "{:02x}", b);
+        }
+        out
     }
 
     /// Register an API key
@@ -992,5 +968,24 @@ mod tests {
             .build();
 
         assert!(handler.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn basic_auth_denies_without_user_store() {
+        // Hardening: HTTP Basic used to accept ANY non-empty password. With no
+        // user store wired it must now deny.
+        let mut config = AuthConfig::default();
+        config.enabled = true;
+        config.auth_methods = vec![AuthMethod::Basic];
+        let handler = AuthenticationHandler::new(config);
+
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let creds = STANDARD.encode("alice:any-password");
+        let request = AuthRequest::new().with_header("Authorization", format!("Basic {creds}"));
+        let result = handler.authenticate(&request).await;
+        assert!(
+            result.is_err(),
+            "basic auth must deny without a user store, got {result:?}"
+        );
     }
 }
