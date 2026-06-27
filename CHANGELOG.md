@@ -5,6 +5,59 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-06-27
+
+Minor release — reliability hardening across the data path, the pool, and
+observability.
+
+### Added
+
+- **In-band failure detection.** A query that fails against a backend now
+  demotes that node's health *immediately* — both on the forward path and at
+  connection establishment — instead of waiting up to a full health-check
+  interval. The demotion is narrowly scoped: a client-side error, or a merely
+  slow-but-healthy query (a backend read-timeout, indistinguishable from a large
+  sort / lock wait / bulk DML), never takes a healthy backend out of rotation;
+  only genuine backend faults do. Concurrent health writers are serialized so a
+  demotion can never be lost to a racing update. Live-verified: the node is
+  marked unhealthy within ~1 query, far ahead of the periodic checker.
+- **Protocol-level health probe.** The health check now performs a PostgreSQL
+  `SSLRequest` handshake (auth-free, un-logged) instead of a bare TCP connect,
+  so a wedged-but-connectable backend (stuck postmaster, out of slots) is
+  detected.
+- **`/api/circuit` admin endpoint** reporting live per-node circuit-breaker
+  state (closed / open / half-open).
+- **Idle-connection reaper + global ceiling** for the data-path backend pool:
+  parked connections older than the idle timeout are reaped, and a hard global
+  cap (enforced via an atomic reservation, so concurrent check-ins cannot
+  overshoot) bounds total file descriptors across all `(node,user,db)`
+  identities. An `idle_timeout_secs` of `0` disables the TTL reaper (PgBouncer
+  convention) rather than reaping every connection each cycle.
+
+### Changed
+
+- **Timeout coverage** added to backend forward writes, client streaming
+  writes, and the prepared-statement re-prepare exchange — a hung backend or
+  wedged client can no longer pin a session indefinitely (backend reads were
+  already bounded).
+- **Per-session resource caps** bound `stmt_registry` (prepared statements, by
+  both count *and* aggregate retained bytes), the un-flushed extended-protocol
+  `pending` buffer, and a single inbound message — a misbehaving client can no
+  longer grow proxy memory without limit.
+- **Cancel-key map** now FIFO-evicts its oldest entries at capacity instead of
+  clearing the whole map, so a busy proxy no longer loses every in-flight
+  cancel registration at once.
+
+### Notes
+
+- New live test `scripts/regress/reliability-test.sh` (5/5 vs PostgreSQL 18.4):
+  `/api/circuit` reporting, in-band demotion on backend death, fast clean-error
+  (no hang), and recovery after the backend returns.
+- Transparent *mid-query* failover remains out of scope for a streaming proxy
+  (a partially-streamed response cannot be retried); the proxy surfaces a clean
+  error and reroutes the next query. Single-primary-without-standby still
+  requires an external orchestrator.
+
 ## [1.2.0] - 2026-06-26
 
 Minor release — real LDAP authentication.
