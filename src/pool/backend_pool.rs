@@ -31,7 +31,8 @@
 //! rather than handed out.
 
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 
 /// Build the pool key for a `(node, user, database)` triple. NUL-delimited so
@@ -43,34 +44,47 @@ pub fn pool_key(node: &str, user: &str, database: &str) -> String {
 /// A bounded set of idle, authenticated backend connections, partitioned by
 /// connection identity. Cheap to clone-share behind an `Arc`.
 pub struct BackendIdlePool {
-    /// identity-key -> stack of idle authenticated streams.
-    idle: DashMap<String, Vec<TcpStream>>,
+    /// identity-key -> stack of (idle authenticated stream, park time).
+    idle: DashMap<String, Vec<(TcpStream, Instant)>>,
     /// Hard cap on idle connections parked per identity key.
     max_idle_per_key: usize,
+    /// Hard cap on idle connections parked across ALL identities — bounds total
+    /// file descriptors / memory regardless of how many distinct
+    /// `(node,user,db)` identities appear.
+    max_total_idle: usize,
+    /// Live count of parked connections (kept in step with `idle`) so the
+    /// global-cap check and `idle_count()` are O(1) instead of O(keys).
+    total_idle: AtomicUsize,
     /// Checkout hits — a parked connection was reused.
     reuses: AtomicU64,
     /// Connections parked (checked in) successfully.
     parked: AtomicU64,
-    /// Check-ins refused because the per-key idle cap was reached (the
-    /// connection is closed by the caller dropping it).
+    /// Check-ins refused because an idle cap (per-key or global) was reached —
+    /// the connection is closed by the caller dropping it.
     over_capacity: AtomicU64,
     /// Parked connections dropped at checkout because the peer had closed
     /// them (or left unexpected bytes) while idle.
     stale_evicted: AtomicU64,
+    /// Parked connections dropped by the idle reaper for exceeding the TTL.
+    reaped: AtomicU64,
 }
 
 impl BackendIdlePool {
     /// Create a pool that parks at most `max_idle_per_key` connections per
-    /// `(node,user,db)` identity. A floor of 1 is enforced so the pool always
-    /// retains at least one reusable connection.
-    pub fn new(max_idle_per_key: usize) -> Self {
+    /// `(node,user,db)` identity and `max_total_idle` across all identities.
+    /// A floor of 1 is enforced on each so the pool always retains at least one
+    /// reusable connection.
+    pub fn new(max_idle_per_key: usize, max_total_idle: usize) -> Self {
         Self {
             idle: DashMap::new(),
             max_idle_per_key: max_idle_per_key.max(1),
+            max_total_idle: max_total_idle.max(1),
+            total_idle: AtomicUsize::new(0),
             reuses: AtomicU64::new(0),
             parked: AtomicU64::new(0),
             over_capacity: AtomicU64::new(0),
             stale_evicted: AtomicU64::new(0),
+            reaped: AtomicU64::new(0),
         }
     }
 
@@ -79,7 +93,8 @@ impl BackendIdlePool {
     /// connections are evicted in passing.
     pub fn checkout(&self, key: &str) -> Option<TcpStream> {
         let mut guard = self.idle.get_mut(key)?;
-        while let Some(stream) = guard.pop() {
+        while let Some((stream, _parked_at)) = guard.pop() {
+            self.total_idle.fetch_sub(1, Ordering::Relaxed);
             if Self::probe_alive(&stream) {
                 self.reuses.fetch_add(1, Ordering::Relaxed);
                 return Some(stream);
@@ -91,18 +106,52 @@ impl BackendIdlePool {
     }
 
     /// Park a (freshly reset) connection for reuse under `key`. Returns `false`
-    /// when the per-key cap is already reached — in that case the connection is
-    /// dropped (closed) by being moved in and discarded, shedding excess
-    /// capacity.
+    /// when an idle cap (per-key OR global) is already reached — in that case
+    /// the connection is dropped (closed) by being moved in and discarded,
+    /// shedding excess capacity.
     pub fn checkin(&self, key: &str, stream: TcpStream) -> bool {
-        let mut entry = self.idle.entry(key.to_string()).or_default();
-        if entry.len() >= self.max_idle_per_key {
+        // Global ceiling first — bounds total FDs across all identities. Reserve
+        // the slot atomically (fetch_add, inspect the prior value) rather than
+        // load-then-act: a plain load outside the lock lets N concurrent
+        // check-ins to distinct keys each observe `cap - 1` and all push,
+        // overshooting the ceiling. With a reservation only one racer sees a
+        // prior value below the cap; the rest roll their increment back.
+        if self.total_idle.fetch_add(1, Ordering::Relaxed) >= self.max_total_idle {
+            self.total_idle.fetch_sub(1, Ordering::Relaxed);
             self.over_capacity.fetch_add(1, Ordering::Relaxed);
             return false; // `stream` dropped here → socket closed.
         }
-        entry.push(stream);
+        let mut entry = self.idle.entry(key.to_string()).or_default();
+        if entry.len() >= self.max_idle_per_key {
+            // Per-key cap reached — release the global slot we reserved.
+            self.total_idle.fetch_sub(1, Ordering::Relaxed);
+            self.over_capacity.fetch_add(1, Ordering::Relaxed);
+            return false; // `stream` dropped here → socket closed.
+        }
+        entry.push((stream, Instant::now()));
         self.parked.fetch_add(1, Ordering::Relaxed);
         true
+    }
+
+    /// Drop parked connections that have been idle longer than `max_age` so a
+    /// connection the backend has (or will) close on its own idle timeout is
+    /// not handed out stale, and idle capacity is released back to the OS.
+    /// Returns the number reaped. Intended to be called periodically by a
+    /// background task.
+    pub fn reap_idle(&self, max_age: Duration) -> usize {
+        let mut reaped = 0usize;
+        for mut entry in self.idle.iter_mut() {
+            let before = entry.value().len();
+            entry
+                .value_mut()
+                .retain(|(_, parked_at)| parked_at.elapsed() < max_age);
+            reaped += before - entry.value().len();
+        }
+        if reaped > 0 {
+            self.total_idle.fetch_sub(reaped, Ordering::Relaxed);
+            self.reaped.fetch_add(reaped as u64, Ordering::Relaxed);
+        }
+        reaped
     }
 
     /// Liveness probe for an idle parked connection: a clean idle backend has
@@ -117,9 +166,19 @@ impl BackendIdlePool {
         )
     }
 
-    /// Total idle connections currently parked across all identities.
+    /// Total idle connections currently parked across all identities (O(1)).
     pub fn idle_count(&self) -> usize {
-        self.idle.iter().map(|e| e.value().len()).sum()
+        self.total_idle.load(Ordering::Relaxed)
+    }
+
+    /// Global ceiling on parked idle connections.
+    pub fn max_total_idle(&self) -> usize {
+        self.max_total_idle
+    }
+
+    /// Number of parked connections dropped by the idle reaper (TTL).
+    pub fn reaped(&self) -> u64 {
+        self.reaped.load(Ordering::Relaxed)
     }
 
     /// Number of checkout hits (connections reused rather than dialed fresh).
@@ -170,7 +229,7 @@ mod tests {
     #[tokio::test]
     async fn checkin_then_checkout_reuses_same_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let pool = BackendIdlePool::new(4);
+        let pool = BackendIdlePool::new(4, 1000);
         let key = pool_key("127.0.0.1:5432", "bench", "benchdb");
 
         // Park a live connection, then check it back out.
@@ -191,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn distinct_identities_do_not_share() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let pool = BackendIdlePool::new(4);
+        let pool = BackendIdlePool::new(4, 1000);
         let alice = pool_key("n", "alice", "db");
         let bob = pool_key("n", "bob", "db");
 
@@ -204,7 +263,7 @@ mod tests {
     #[tokio::test]
     async fn per_key_cap_sheds_excess() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let pool = BackendIdlePool::new(2);
+        let pool = BackendIdlePool::new(2, 1000);
         let key = pool_key("n", "u", "d");
 
         assert!(pool.checkin(&key, live_stream(&listener).await));
@@ -218,7 +277,7 @@ mod tests {
     #[tokio::test]
     async fn checkout_evicts_a_closed_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let pool = BackendIdlePool::new(4);
+        let pool = BackendIdlePool::new(4, 1000);
         let key = pool_key("n", "u", "d");
 
         // Park a connection, then close the server side so the parked socket is
@@ -235,5 +294,40 @@ mod tests {
         // Checkout must not hand out the dead connection.
         assert!(pool.checkout(&key).is_none());
         assert_eq!(pool.stale_evicted(), 1);
+    }
+
+    #[tokio::test]
+    async fn global_cap_sheds_across_distinct_identities() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Per-key cap is generous (10) but the GLOBAL cap is 2.
+        let pool = BackendIdlePool::new(10, 2);
+        // Three different identities, one connection each.
+        assert!(pool.checkin(&pool_key("n", "a", "d"), live_stream(&listener).await));
+        assert!(pool.checkin(&pool_key("n", "b", "d"), live_stream(&listener).await));
+        // Third exceeds the global ceiling even though its per-key bucket is empty.
+        assert!(!pool.checkin(&pool_key("n", "c", "d"), live_stream(&listener).await));
+        assert_eq!(pool.idle_count(), 2);
+        assert_eq!(pool.over_capacity(), 1);
+    }
+
+    #[tokio::test]
+    async fn reaper_drops_aged_idle_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pool = BackendIdlePool::new(4, 100);
+        let key = pool_key("n", "u", "d");
+        pool.checkin(&key, live_stream(&listener).await);
+        assert_eq!(pool.idle_count(), 1);
+
+        // Nothing reaped while within the TTL.
+        assert_eq!(pool.reap_idle(std::time::Duration::from_secs(60)), 0);
+        assert_eq!(pool.idle_count(), 1);
+
+        // Let it age, then reap with a tiny TTL.
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        assert_eq!(pool.reap_idle(std::time::Duration::from_millis(5)), 1);
+        assert_eq!(pool.idle_count(), 0);
+        assert_eq!(pool.reaped(), 1);
+        // A subsequent checkout misses (it was reaped).
+        assert!(pool.checkout(&key).is_none());
     }
 }

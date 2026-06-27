@@ -74,6 +74,10 @@ pub struct AdminState {
     /// stats when present, an empty list otherwise.
     #[cfg(feature = "pool-modes")]
     pub pool_manager: RwLock<Option<Arc<crate::pool::ConnectionPoolManager>>>,
+    /// Circuit-breaker manager. Attached at startup; `/api/circuit` reports
+    /// each node's live circuit state (closed / open / half-open).
+    #[cfg(feature = "circuit-breaker")]
+    pub circuit_breaker: RwLock<Option<Arc<crate::circuit_breaker::CircuitBreakerManager>>>,
     /// Time-travel replay engine. Optional so test fixtures don't have
     /// to wire a backend template; production startup attaches it via
     /// `with_replay_engine`. Endpoint returns 503 when missing.
@@ -555,6 +559,16 @@ impl AdminServer {
                 let overrides = state.chaos_overrides.read().await.clone();
                 Ok((200, serde_json::to_value(overrides)?))
             }
+
+            // Live per-node circuit-breaker state (closed / open / half-open)
+            // so an operator can see which backends the breaker has tripped.
+            #[cfg(feature = "circuit-breaker")]
+            ("GET", "/api/circuit") => Self::handle_circuit_status(state).await,
+            #[cfg(not(feature = "circuit-breaker"))]
+            ("GET", "/api/circuit") => Ok((
+                503,
+                serde_json::json!({ "error": "circuit-breaker feature not enabled" }),
+            )),
 
             // Migration / traffic-mirror status
             ("GET", "/api/migration/status") | ("GET", "/migration/status") => {
@@ -1422,6 +1436,34 @@ impl AdminServer {
     ///                                      override entry.
     ///   reset                            — restore every overridden
     ///                                      node in one call.
+    /// `GET /api/circuit` — live per-node circuit-breaker state. Reports each
+    /// configured node's breaker as `closed` / `open` / `half_open` so an
+    /// operator can see which backends the breaker has tripped out of rotation.
+    #[cfg(feature = "circuit-breaker")]
+    async fn handle_circuit_status(state: &Arc<AdminState>) -> Result<(u16, serde_json::Value)> {
+        let mgr = match state.circuit_breaker.read().await.clone() {
+            Some(m) => m,
+            None => {
+                return Ok((
+                    503,
+                    serde_json::json!({ "error": "circuit breaker not attached" }),
+                ))
+            }
+        };
+        let nodes = state.config_snapshot.read().await.nodes.clone();
+        let circuits: Vec<serde_json::Value> = nodes
+            .iter()
+            .map(|n| {
+                let st = mgr.get_breaker(&n.address).get_state();
+                serde_json::json!({
+                    "node": n.address,
+                    "state": format!("{:?}", st).to_lowercase(),
+                })
+            })
+            .collect();
+        Ok((200, serde_json::json!({ "circuits": circuits })))
+    }
+
     async fn handle_chaos_request(
         body: Option<&str>,
         state: &Arc<AdminState>,
@@ -1707,6 +1749,8 @@ impl AdminState {
             commands: RwLock::new(HashMap::new()),
             #[cfg(feature = "pool-modes")]
             pool_manager: RwLock::new(None),
+            #[cfg(feature = "circuit-breaker")]
+            circuit_breaker: RwLock::new(None),
             #[cfg(feature = "ha-tr")]
             replay_engine: RwLock::new(None),
             #[cfg(feature = "wasm-plugins")]
@@ -1746,6 +1790,16 @@ impl AdminState {
     #[cfg(feature = "pool-modes")]
     pub async fn with_pool_manager(&self, manager: Arc<crate::pool::ConnectionPoolManager>) {
         *self.pool_manager.write().await = Some(manager);
+    }
+
+    /// Attach the circuit-breaker manager so `/api/circuit` reports live
+    /// per-node circuit state. Wired by the server at startup.
+    #[cfg(feature = "circuit-breaker")]
+    pub async fn with_circuit_breaker(
+        &self,
+        manager: Arc<crate::circuit_breaker::CircuitBreakerManager>,
+    ) {
+        *self.circuit_breaker.write().await = Some(manager);
     }
 
     /// Attach an anomaly detector. Mirror of with_replay_engine /
