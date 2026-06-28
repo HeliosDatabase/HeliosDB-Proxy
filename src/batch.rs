@@ -662,7 +662,9 @@ mod tests {
 
         // Seed a clean probe table.
         let mut seed = BackendClient::connect(&cfg).await.expect("connect seed");
-        seed.execute("DROP TABLE IF EXISTS batch_probe").await.unwrap();
+        seed.execute("DROP TABLE IF EXISTS batch_probe")
+            .await
+            .unwrap();
         seed.execute("CREATE TABLE batch_probe(id int, total numeric)")
             .await
             .unwrap();

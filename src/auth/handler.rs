@@ -686,7 +686,9 @@ impl AuthenticationHandler {
                 .map_err(|e| AuthError::Ldap(format!("service bind rejected: {}", e)))?;
         }
 
-        let filter = cfg.user_filter.replace("{0}", &ldap3::ldap_escape(username));
+        let filter = cfg
+            .user_filter
+            .replace("{0}", &ldap3::ldap_escape(username));
         let (entries, _res) = ldap
             .search(
                 &cfg.user_search_base,
@@ -1299,8 +1301,7 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_introspection_enforces_required_scopes() {
-        let url =
-            spawn_introspection_mock(r#"{"active":true,"sub":"bob","scope":"read"}"#).await;
+        let url = spawn_introspection_mock(r#"{"active":true,"sub":"bob","scope":"read"}"#).await;
         let handler = AuthenticationHandlerBuilder::new()
             .enabled(true)
             .with_oauth(oauth_cfg(url, vec!["admin".to_string()]))
