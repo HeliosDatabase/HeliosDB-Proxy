@@ -1,6 +1,6 @@
 [package]
 name = "heliosdb-proxy"
-version = "0.6.1"
+version = "1.3.0"
 edition = "2021"
 rust-version = "1.86"
 description = "HeliosProxy - Intelligent connection router and failover manager for HeliosDB and PostgreSQL"
@@ -73,6 +73,11 @@ multi-tenancy = []
 # Authentication proxy (JWT, OAuth, API keys)
 auth-proxy = []
 
+# LDAP authentication (search + bind) — optional within auth-proxy because it
+# pulls the ldap3 client + its rustls stack. Off by default; enable for
+# directory-backed auth.
+ldap-auth = ["auth-proxy", "dep:ldap3"]
+
 # SQL query rewriting (rules engine)
 query-rewriting = []
 
@@ -109,7 +114,7 @@ all-features = [
     "pool-modes", "ha-tr",
     "query-cache", "routing-hints", "lag-routing",
     "rate-limiting", "circuit-breaker", "query-analytics",
-    "multi-tenancy", "auth-proxy", "query-rewriting",
+    "multi-tenancy", "auth-proxy", "ldap-auth", "query-rewriting",
     "wasm-plugins", "graphql-gateway", "schema-routing",
     "distribcache", "anomaly-detection", "edge-proxy",
 ]
@@ -176,11 +181,16 @@ bincode = "1"
 # Random (used by rate_limit, circuit_breaker)
 rand = "0.8"
 
-# HTTP (used by auth OAuth, optional)
-reqwest = { version = "0.11", features = ["json"], default-features = false }
+# HTTP (used by auth OAuth introspection + the L3 semantic cache). rustls-tls
+# so HTTPS identity providers (RFC 7662 introspection) work without OpenSSL —
+# consistent with the crate's pure-Rust rustls stack.
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
 
 # Compression (used by distribcache tiers)
 zstd = "0.13"
+# LZ4 block compression for the DistribCache L2 tier (fast, moderate ratio).
+# Pure-Rust, safe-decode; the default tier compressor where latency matters.
+lz4_flex = "0.13"
 
 # Backend PG client (src/backend/) — auth + TLS + text-format I/O.
 # Kept lightweight: ring for crypto, no BoringSSL, no tokio-postgres.
@@ -192,6 +202,10 @@ webpki-roots = "0.26"
 sha2 = "0.10"
 hmac = "0.12"
 md-5 = "0.10"
+# LDAP client for directory-backed auth (search + bind). Optional — only
+# compiled with the `ldap-auth` feature. Pure-Rust rustls (ring provider) to
+# stay off OpenSSL, consistent with the rest of the crate.
+ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls-ring"], optional = true }
 # Ed25519 signature verification for the plugin loader's trust-root
 # checks (FU-23). The dalek crate is the standard pure-Rust impl;
 # `default-features = false` strips std-allocator-only paths we don't

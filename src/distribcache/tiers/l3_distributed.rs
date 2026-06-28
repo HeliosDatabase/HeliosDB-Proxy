@@ -10,8 +10,9 @@ use dashmap::DashMap;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 
 use super::{CacheEntry, TierStats};
 use crate::distribcache::QueryFingerprint;
@@ -602,6 +603,128 @@ impl DistributedCache {
             }
         }
     }
+
+    /// Run the peer server on `addr`: accept connections from other mesh nodes
+    /// and serve the GET / PUT / PING / INVALIDATE wire protocol against this
+    /// node's owned-key map. This is the server counterpart to
+    /// [`PeerConnection`] — without it, replication PUTs and remote GETs from
+    /// peers have nothing to answer them, so the L3 mesh cannot actually
+    /// replicate or serve cross-node reads. Returns when binding fails; loops
+    /// forever otherwise (spawn it as a background task).
+    pub async fn serve(self: Arc<Self>, addr: SocketAddr) -> std::io::Result<()> {
+        let listener = TcpListener::bind(addr).await?;
+        self.serve_on(listener).await;
+        Ok(())
+    }
+
+    /// Like [`serve`](Self::serve) but takes an already-bound listener — used by
+    /// tests that bind `127.0.0.1:0` and need the OS-assigned port first.
+    pub async fn serve_on(self: Arc<Self>, listener: TcpListener) {
+        while let Ok((stream, _peer)) = listener.accept().await {
+            let cache = Arc::clone(&self);
+            tokio::spawn(async move {
+                let _ = cache.handle_peer_conn(stream).await;
+            });
+        }
+    }
+
+    /// Handle one inbound peer connection: read the framed request and reply
+    /// with the matching response, mirroring [`PeerConnection`]'s framing.
+    async fn handle_peer_conn(&self, stream: TcpStream) -> std::io::Result<()> {
+        let (mut reader, mut writer) = stream.into_split();
+
+        let mut type_byte = [0u8; 1];
+        if reader.read_exact(&mut type_byte).await.is_err() {
+            return Ok(());
+        }
+        let msg_type = match MessageType::try_from(type_byte[0]) {
+            Ok(t) => t,
+            Err(_) => return Ok(()),
+        };
+
+        match msg_type {
+            MessageType::Get => {
+                let mut len_buf = [0u8; 4];
+                reader.read_exact(&mut len_buf).await?;
+                let fp_len = u32::from_le_bytes(len_buf) as usize;
+                let mut fp_bytes = vec![0u8; fp_len];
+                reader.read_exact(&mut fp_bytes).await?;
+
+                // Look up the requested fingerprint in the local owned map.
+                let payload = match bincode::deserialize::<QueryFingerprint>(&fp_bytes) {
+                    Ok(fp) => {
+                        let key = self.fingerprint_to_hash(&fp);
+                        self.local.get(&key).and_then(|e| {
+                            if e.is_expired() {
+                                None
+                            } else {
+                                bincode::serialize(e.value()).ok()
+                            }
+                        })
+                    }
+                    Err(_) => None,
+                };
+
+                let mut out = vec![MessageType::GetResponse as u8];
+                match payload {
+                    // length 0 signals "not found" to the client.
+                    Some(bytes) => {
+                        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                        out.extend_from_slice(&bytes);
+                    }
+                    None => out.extend_from_slice(&0u32.to_le_bytes()),
+                }
+                writer.write_all(&out).await?;
+            }
+            MessageType::Put => {
+                let mut len_buf = [0u8; 4];
+                reader.read_exact(&mut len_buf).await?;
+                let fp_len = u32::from_le_bytes(len_buf) as usize;
+                reader.read_exact(&mut len_buf).await?;
+                let entry_len = u32::from_le_bytes(len_buf) as usize;
+
+                let mut fp_bytes = vec![0u8; fp_len];
+                reader.read_exact(&mut fp_bytes).await?;
+                let mut entry_bytes = vec![0u8; entry_len];
+                reader.read_exact(&mut entry_bytes).await?;
+
+                if let (Ok(fp), Ok(entry)) = (
+                    bincode::deserialize::<QueryFingerprint>(&fp_bytes),
+                    bincode::deserialize::<CacheEntry>(&entry_bytes),
+                ) {
+                    let key = self.fingerprint_to_hash(&fp);
+                    self.local.insert(key, entry);
+                }
+
+                // Acknowledge (the client reads a 5-byte response header).
+                let mut out = vec![MessageType::PutResponse as u8];
+                out.extend_from_slice(&0u32.to_le_bytes());
+                writer.write_all(&out).await?;
+            }
+            MessageType::Ping => {
+                let mut len_buf = [0u8; 4];
+                let _ = reader.read_exact(&mut len_buf).await;
+                let mut out = vec![MessageType::Pong as u8];
+                out.extend_from_slice(&0u32.to_le_bytes());
+                writer.write_all(&out).await?;
+            }
+            MessageType::Invalidate => {
+                let mut len_buf = [0u8; 4];
+                reader.read_exact(&mut len_buf).await?;
+                let fp_len = u32::from_le_bytes(len_buf) as usize;
+                let mut fp_bytes = vec![0u8; fp_len];
+                reader.read_exact(&mut fp_bytes).await?;
+                if let Ok(fp) = bincode::deserialize::<QueryFingerprint>(&fp_bytes) {
+                    let key = self.fingerprint_to_hash(&fp);
+                    self.local.remove(&key);
+                }
+                // Invalidate is fire-and-forget; no response expected.
+            }
+            // Response-type frames are never received server-side.
+            MessageType::GetResponse | MessageType::PutResponse | MessageType::Pong => {}
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -710,5 +833,57 @@ mod tests {
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.entry_count, 1);
+    }
+
+    // End-to-end proof that the peer server actually answers the wire protocol:
+    // a PeerConnection client PUTs an entry over real TCP, the server stores it
+    // in its local map, and a subsequent GET round-trips the same bytes back.
+    // Before the server existed, replication PUTs reached nothing and remote
+    // GETs always failed to connect.
+    #[tokio::test]
+    async fn test_peer_server_put_get_roundtrip() {
+        // Bind the server to an OS-assigned port and start serving.
+        let server = Arc::new(DistributedCache::new(1, Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(Arc::clone(&server).serve_on(listener));
+
+        let client = PeerConnection::new(addr);
+        let fp = QueryFingerprint::from_query("SELECT * FROM accounts WHERE id = $1");
+        let entry = CacheEntry::new(vec![9, 8, 7], vec!["accounts".to_string()], 1)
+            .with_ttl(Duration::from_secs(300));
+
+        // PUT over TCP — must be acked, and must land in the server's local map.
+        client.insert(fp.clone(), entry.clone()).await.unwrap();
+        let key = server.fingerprint_to_hash(&fp);
+        assert!(
+            server.local.contains_key(&key),
+            "PUT did not land on server"
+        );
+
+        // GET over TCP — must return the same bytes the client stored.
+        let got = client.get(&fp).await.expect("remote GET failed");
+        assert_eq!(got.data, vec![9, 8, 7]);
+
+        // PING must get a Pong.
+        assert!(client.ping().await, "peer did not answer ping");
+
+        // INVALIDATE must remove it server-side; the next GET then misses.
+        client.invalidate(&fp).await.unwrap();
+        // brief await so the fire-and-forget invalidate is processed
+        for _ in 0..50 {
+            if !server.local.contains_key(&key) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !server.local.contains_key(&key),
+            "INVALIDATE did not remove entry"
+        );
+        assert!(
+            client.get(&fp).await.is_err(),
+            "GET should miss after invalidate"
+        );
     }
 }

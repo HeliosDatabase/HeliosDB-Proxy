@@ -16,16 +16,25 @@
 //!
 //! ## Status
 //!
-//! This module is the **state machine + public API**. Each transition
-//! is a stub that logs and advances state; the heavy lifting (logical
-//! replication setup, sample validation, cutover coordination) lands
-//! in subsequent commits as each stage is wired against the live
-//! cluster harness in `tests/docker/upgrade-matrix.yml`.
+//! Every stage performs real work against the live cluster:
 //!
-//! The shape is settled, the integration points are wired, the
-//! contract is testable.
+//! - **Stage 1** issues `CREATE PUBLICATION` on the source and
+//!   `CREATE SUBSCRIPTION` on the target over the backend client.
+//! - **Stage 2** polls `pg_subscription.subenabled` on the target.
+//! - **Stage 3** validates parity by comparing the row counts of a
+//!   deterministic sample of user tables between source and target,
+//!   accumulating the rows checked into `validated_rows`; a mismatch
+//!   fails the job.
+//! - **Stage 4** engages the `SwitchoverBuffer` and runs `pg_promote`.
+//! - **Stage 5** drains buffered writes onto the new primary.
+//! - **Stage 6** releases the buffer and drops the replication
+//!   artefacts.
+//!
+//! The orchestrator does not own the shadow workload (the runner drives
+//! pgbench / production traffic); a per-row checksum on top of the
+//! row-count parity check is a stricter follow-on.
 
-use crate::backend::{BackendClient, BackendConfig};
+use crate::backend::{BackendClient, BackendConfig, BackendResult, TextValue};
 use crate::switchover_buffer::SwitchoverBuffer;
 use crate::{ProxyError, Result};
 use chrono::{DateTime, Utc};
@@ -230,7 +239,14 @@ impl UpgradeOrchestrator {
         let outcome = match snap.state {
             UpgradeState::Pending => self.stage_create_replication(&snap).await,
             UpgradeState::StandbyCatchingUp => self.stage_wait_catchup(&snap).await,
-            UpgradeState::ShadowExecuting => self.stage_settle_shadow(&snap).await,
+            UpgradeState::ShadowExecuting => match self.stage_validate(&snap).await {
+                // Record how many rows the parity check actually compared.
+                Ok((next, rows)) => {
+                    snap.validated_rows = rows;
+                    Ok(next)
+                }
+                Err(e) => Err(e),
+            },
             UpgradeState::Validated => self.stage_cutover(&snap).await,
             UpgradeState::Cutover => self.stage_drain(&snap).await,
             UpgradeState::Draining => self.stage_retire(&snap).await,
@@ -344,17 +360,109 @@ impl UpgradeOrchestrator {
         Ok(UpgradeState::ShadowExecuting)
     }
 
-    /// Stage 3: shadow-execute settle. The orchestrator does not own
-    /// the workload — the runner runs pgbench (or production
-    /// traffic). Here we just sleep briefly so the workload's
-    /// drift-measurement window has time to land, then advance.
-    /// Operators that want stricter validation should query
-    /// `pg_stat_subscription.last_msg_receipt_time` themselves
-    /// before calling tick().
-    async fn stage_settle_shadow(&self, job: &UpgradeJob) -> Result<UpgradeState> {
-        tracing::info!(job = %job.id, "stage 3: shadow window settle");
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        Ok(UpgradeState::Validated)
+    /// Stage 3: validate — confirm the target has reached parity with
+    /// the source before we cut over. Lists a deterministic sample of
+    /// the source's user tables and compares `count(*)` on each between
+    /// source and target; a mismatch fails the job (replication has not
+    /// caught up or has diverged). Returns the next state plus the total
+    /// rows compared, which the caller records as `validated_rows`.
+    ///
+    /// Row-count parity is the portable, catalog-version-independent
+    /// check that behaves identically across PG 14-17. A per-row
+    /// checksum is a stricter follow-on; counts already catch the common
+    /// divergence modes (missing/extra rows from lag or a broken
+    /// subscription). The orchestrator does not own the workload, so the
+    /// runner is expected to quiesce writes (or accept eventual parity)
+    /// before driving this transition.
+    async fn stage_validate(&self, job: &UpgradeJob) -> Result<(UpgradeState, u64)> {
+        // Cap the sample so validation stays bounded on wide schemas.
+        const SAMPLE_TABLES: usize = 64;
+
+        let source_cfg = self.backend_for(&job.from_address)?;
+        let target_cfg = self.backend_for(&job.to_address)?;
+
+        let mut source = BackendClient::connect(&source_cfg)
+            .await
+            .map_err(|e| ProxyError::FailoverFailed(format!("connect source: {}", e)))?;
+        let mut target = BackendClient::connect(&target_cfg)
+            .await
+            .map_err(|e| ProxyError::FailoverFailed(format!("connect target: {}", e)))?;
+
+        // Deterministic table sample (ordered identically on both nodes).
+        let tables = match source
+            .simple_query(
+                "SELECT schemaname, tablename FROM pg_tables \
+                 WHERE schemaname NOT IN ('pg_catalog', 'information_schema') \
+                 ORDER BY schemaname, tablename",
+            )
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                source.close().await;
+                target.close().await;
+                return Err(ProxyError::FailoverFailed(format!("list tables: {}", e)));
+            }
+        };
+
+        let mut total_rows: u64 = 0;
+        let mut checked = 0usize;
+        for row in tables.rows.iter().take(SAMPLE_TABLES) {
+            let schema = row.first().and_then(|v| v.as_str()).unwrap_or("public");
+            let table = match row.get(1).and_then(|v| v.as_str()) {
+                Some(t) => t,
+                None => continue,
+            };
+            let qualified = format!("{}.{}", quote_ident(schema), quote_ident(table));
+            let count_sql = format!("SELECT count(*) AS n FROM {}", qualified);
+
+            let read_count = |res: BackendResult<TextValue>, side: &str| -> Result<i64> {
+                res.map_err(|e| {
+                    ProxyError::FailoverFailed(format!("{} count {}: {}", side, qualified, e))
+                })?
+                .as_i64("n")
+                .map_err(|e| ProxyError::FailoverFailed(format!("{}: {}", side, e)))
+                .map(|o| o.unwrap_or(0))
+            };
+
+            let s = match read_count(source.query_scalar(&count_sql).await, "source") {
+                Ok(v) => v,
+                Err(e) => {
+                    source.close().await;
+                    target.close().await;
+                    return Err(e);
+                }
+            };
+            let t = match read_count(target.query_scalar(&count_sql).await, "target") {
+                Ok(v) => v,
+                Err(e) => {
+                    source.close().await;
+                    target.close().await;
+                    return Err(e);
+                }
+            };
+
+            if s != t {
+                source.close().await;
+                target.close().await;
+                return Err(ProxyError::FailoverFailed(format!(
+                    "validation failed: {} row count source={} target={}",
+                    qualified, s, t
+                )));
+            }
+            total_rows += s.max(0) as u64;
+            checked += 1;
+        }
+
+        source.close().await;
+        target.close().await;
+        tracing::info!(
+            job = %job.id,
+            tables = checked,
+            rows = total_rows,
+            "stage 3: validation passed (row-count parity)"
+        );
+        Ok((UpgradeState::Validated, total_rows))
     }
 
     /// Stage 4: cutover — pause client writes via the switchover
@@ -476,7 +584,12 @@ impl UpgradeOrchestrator {
                 id, job.state
             )));
         }
-        // TODO: cleanup side effects per current state.
+        // Release the safety-critical side effect synchronously so client
+        // traffic can never stall after a cancel. Dropping the replication
+        // publication/subscription artefacts is best-effort and left to the
+        // operator (or a follow-up retire tick) since this entry point is
+        // sync; a Failed job's artefacts are harmless and idempotently
+        // re-creatable on a fresh run.
         self.switchover.stop_buffering();
         job.fail(format!("cancelled: {}", reason));
         Ok(job.clone())
@@ -761,5 +874,80 @@ mod tests {
         // No password / database in the test template.
         assert!(!s.contains("password="));
         assert!(!s.contains("dbname="));
+    }
+
+    /// Live exercise of the real stage-3 row-count parity validation
+    /// against an actual PostgreSQL backend. Gated on `HELIOS_LIVE_PG`
+    /// (`host:port`, e.g. `127.0.0.1:25433`) so CI without a backend
+    /// stays green. Source and target point at the SAME node, so every
+    /// table's count equals itself and the stage must pass — proving the
+    /// real path (list `pg_tables`, `count(*)` on both connections,
+    /// compare, accumulate `validated_rows`) works end-to-end over the
+    /// wire. Run with:
+    ///   HELIOS_LIVE_PG=127.0.0.1:25433 cargo test --lib \
+    ///     upgrade_orchestrator::tests::stage_validate_live -- --nocapture
+    #[tokio::test]
+    async fn stage_validate_live_row_count_parity() {
+        let addr = match std::env::var("HELIOS_LIVE_PG") {
+            Ok(a) if !a.is_empty() => a,
+            _ => {
+                eprintln!("skipping stage_validate_live: set HELIOS_LIVE_PG=host:port");
+                return;
+            }
+        };
+        let user = std::env::var("HELIOS_LIVE_USER").unwrap_or_else(|_| "bench".into());
+        let pass = std::env::var("HELIOS_LIVE_PASS").unwrap_or_else(|_| "benchpass".into());
+        let db = std::env::var("HELIOS_LIVE_DB").unwrap_or_else(|_| "benchdb".into());
+
+        let mut tmpl = template();
+        tmpl.user = user;
+        tmpl.password = Some(pass);
+        tmpl.database = Some(db);
+        tmpl.connect_timeout = Duration::from_secs(5);
+        tmpl.query_timeout = Duration::from_secs(5);
+
+        // Seed a deterministic probe table with 3 rows.
+        let (host, port) = parse_addr(&addr).unwrap();
+        let mut seed_cfg = tmpl.clone();
+        seed_cfg.host = host;
+        seed_cfg.port = port;
+        let mut seed = BackendClient::connect(&seed_cfg)
+            .await
+            .expect("connect to seed backend");
+        seed.execute("DROP TABLE IF EXISTS upgrade_validate_probe")
+            .await
+            .unwrap();
+        seed.execute("CREATE TABLE upgrade_validate_probe(id int)")
+            .await
+            .unwrap();
+        seed.execute("INSERT INTO upgrade_validate_probe VALUES (1),(2),(3)")
+            .await
+            .unwrap();
+        seed.close().await;
+
+        // Self-compare: source == target, so parity is guaranteed and the
+        // stage must report at least the 3 rows we seeded.
+        let orch = UpgradeOrchestrator::new(switchover(), tmpl);
+        let req = PlanRequest {
+            from_version: 14,
+            to_version: 17,
+            from_address: addr.clone(),
+            to_address: addr.clone(),
+        };
+        let job = UpgradeJob::new(&req);
+        let (next, rows) = orch
+            .stage_validate(&job)
+            .await
+            .expect("live validation should pass on a self-compare");
+        assert_eq!(next, UpgradeState::Validated);
+        assert!(rows >= 3, "expected >= 3 validated rows, got {}", rows);
+
+        // Cleanup.
+        if let Ok(mut c) = BackendClient::connect(&seed_cfg).await {
+            let _ = c
+                .execute("DROP TABLE IF EXISTS upgrade_validate_probe")
+                .await;
+            c.close().await;
+        }
     }
 }

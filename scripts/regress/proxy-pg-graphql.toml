@@ -1,0 +1,48 @@
+# Regression harness — GraphQL-to-SQL gateway over PG18.4. The gateway listens
+# on :9091 and runs generated SQL against the backend (bench/benchdb).
+listen_address = "127.0.0.1:6432"
+admin_address  = "127.0.0.1:9099"
+tr_enabled = false
+tr_mode    = "none"
+write_timeout_secs = 30
+
+[pool]
+min_connections = 1
+max_connections = 20
+idle_timeout_secs = 300
+max_lifetime_secs = 1800
+acquire_timeout_secs = 5
+test_on_acquire = true
+
+[load_balancer]
+read_strategy = "round_robin"
+read_write_split = false
+latency_threshold_ms = 100
+
+[health]
+check_interval_secs = 30
+check_timeout_secs = 3
+failure_threshold = 3
+success_threshold = 2
+check_query = "SELECT 1"
+
+[graphql_gateway]
+enabled = true
+listen_address = "127.0.0.1:19091"
+backend_host = "127.0.0.1"
+backend_port = 25433
+backend_user = "bench"
+backend_password = "benchpass"
+backend_database = "benchdb"
+
+[[graphql_gateway.tables]]
+name = "gqlitem"
+columns = ["id", "name"]
+
+[[nodes]]
+host = "127.0.0.1"
+port = 25433
+role = "primary"
+weight = 100
+enabled = true
+name = "pg-primary"

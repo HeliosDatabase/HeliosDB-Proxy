@@ -5,6 +5,483 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-06-27
+
+Minor release — reliability hardening across the data path, the pool, and
+observability.
+
+### Added
+
+- **In-band failure detection.** A query that fails against a backend now
+  demotes that node's health *immediately* — both on the forward path and at
+  connection establishment — instead of waiting up to a full health-check
+  interval. The demotion is narrowly scoped: a client-side error, or a merely
+  slow-but-healthy query (a backend read-timeout, indistinguishable from a large
+  sort / lock wait / bulk DML), never takes a healthy backend out of rotation;
+  only genuine backend faults do. Concurrent health writers are serialized so a
+  demotion can never be lost to a racing update. Live-verified: the node is
+  marked unhealthy within ~1 query, far ahead of the periodic checker.
+- **Protocol-level health probe.** The health check now performs a PostgreSQL
+  `SSLRequest` handshake (auth-free, un-logged) instead of a bare TCP connect,
+  so a wedged-but-connectable backend (stuck postmaster, out of slots) is
+  detected.
+- **`/api/circuit` admin endpoint** reporting live per-node circuit-breaker
+  state (closed / open / half-open).
+- **Idle-connection reaper + global ceiling** for the data-path backend pool:
+  parked connections older than the idle timeout are reaped, and a hard global
+  cap (enforced via an atomic reservation, so concurrent check-ins cannot
+  overshoot) bounds total file descriptors across all `(node,user,db)`
+  identities. An `idle_timeout_secs` of `0` disables the TTL reaper (PgBouncer
+  convention) rather than reaping every connection each cycle.
+
+### Changed
+
+- **Timeout coverage** added to backend forward writes, client streaming
+  writes, and the prepared-statement re-prepare exchange — a hung backend or
+  wedged client can no longer pin a session indefinitely (backend reads were
+  already bounded).
+- **Per-session resource caps** bound `stmt_registry` (prepared statements, by
+  both count *and* aggregate retained bytes), the un-flushed extended-protocol
+  `pending` buffer, and a single inbound message — a misbehaving client can no
+  longer grow proxy memory without limit.
+- **Cancel-key map** now FIFO-evicts its oldest entries at capacity instead of
+  clearing the whole map, so a busy proxy no longer loses every in-flight
+  cancel registration at once.
+
+### Notes
+
+- New live test `scripts/regress/reliability-test.sh` (5/5 vs PostgreSQL 18.4):
+  `/api/circuit` reporting, in-band demotion on backend death, fast clean-error
+  (no hang), and recovery after the backend returns.
+- Transparent *mid-query* failover remains out of scope for a streaming proxy
+  (a partially-streamed response cannot be retried); the proxy surfaces a clean
+  error and reroutes the next query. Single-primary-without-standby still
+  requires an external orchestrator.
+
+## [1.2.0] - 2026-06-26
+
+Minor release — real LDAP authentication.
+
+### Added
+
+- **LDAP authentication (`ldap-auth` feature).** A new optional feature (off by
+  default; implies `auth-proxy`) implements the standard search-then-bind flow:
+  service-bind + search to resolve the user DN, then bind as that DN with the
+  supplied password to verify it. Group memberships become identity groups;
+  StartTLS / ldaps are supported. Previously `authenticate_ldap` denied by
+  default. Without the feature it still denies — never a fabricated success.
+
+### Notes
+
+- Live-verified against a real OpenLDAP container
+  (`scripts/regress/ldap-test.sh`, local-only): correct credentials
+  authenticate, wrong password and unknown user are denied.
+- All implemented auth methods are now genuinely real: JWT (HS256), API key,
+  OAuth RFC 7662 introspection, and **LDAP**.
+
+## [1.1.0] - 2026-06-26
+
+Minor release — `pool-modes` now does real work on the data path.
+
+### Added
+
+- **Transaction / Statement connection pooling (`pool-modes`).** Previously the
+  pool manager was never exercised on the query path — every client stayed 1:1
+  session-pinned regardless of the configured mode. A new raw-stream
+  `BackendIdlePool`, keyed by `(node, user, database)` identity, now backs the
+  data path: `ensure_conn` leases a parked, identity-matched connection before
+  dialing fresh; at each idle transaction boundary the connection is
+  `DISCARD ALL`-reset and parked for reuse; on disconnect idle connections are
+  retained (not dropped) for cross-session reuse. Session mode and feature-off
+  builds are unchanged.
+
+### Notes
+
+- Live-verified vs PostgreSQL 18.4 (`scripts/regress/pool-modes-test.sh`):
+  connection reuse fires on every post-first query, the `DISCARD ALL` reset is
+  proven by a temp table vanishing between pooled statements, results are
+  correct, and connections are parked on disconnect.
+- Bounded scope (reported, not faded): connection reuse + a shared identity-keyed
+  idle pool with correct reset are delivered. The first connection of each
+  session still authenticates through the startup path, so concurrent backend
+  connections are not yet reduced below the concurrent-client count; true N:M
+  startup-level multiplexing needs proxy-terminated backend auth and is the
+  documented next increment.
+
+## [1.0.0] - 2026-06-26
+
+First stable release. Every feature flag now ships genuinely-working, tested
+functionality — no scaffolding, no stubs that fake success. Where a capability
+is intentionally bounded, it is **documented here**, not hidden.
+
+This release is the culmination of the 0.7.0–0.19.0 wiring series: each proxy
+feature was taken from "compiles but inert" to wired onto the real data path (or,
+for standalone subsystems, to genuinely functional internals), with a unit test
+plus — wherever a backend was reachable — a live verification against
+PostgreSQL 18.4.
+
+### What is real and verified
+
+- **Routing & resilience** — routing hints (`/*+ route= */`), replica lag-aware
+  routing + read-your-writes, rate limiting, circuit breaker, schema-aware
+  (OLAP) routing. All on the per-query path; live-verified via the proxy log.
+- **Caching** — query cache (L1/L2/L3) on the path; DistribCache subsystem with
+  real LZ4 (`lz4_flex`) + zstd compression and a working L3 peer server
+  (replication/remote-reads over TCP).
+- **Query handling** — query rewriting (rules engine on the path), query
+  analytics / slow-query / N+1 detection, GraphQL-to-SQL gateway (real engine
+  execution + HTTP listener).
+- **Multi-tenancy** — tenant isolation + per-tenant query transformation on the
+  path.
+- **HA / Transaction Replay (`ha-tr`)** — failover replay, cursor restore,
+  session migration, and the zero-downtime major-version upgrade orchestrator
+  (real logical-replication setup, row-count parity validation, `pg_promote`
+  cutover, artefact cleanup).
+- **Auth (`auth-proxy`)** — JWT (HS256, constant-time verify), API keys
+  (SHA-256, constant-time compare), and OAuth RFC 7662 token introspection.
+- **Plugins, anomaly detection, edge proxy, observability** — as documented in
+  their modules.
+
+### Documented limitations (reported, not faded)
+
+- **LDAP auth** is deny-by-default: `authenticate_ldap` returns an error rather
+  than faking acceptance. A real bind needs an `ldap3` client and a live
+  directory.
+- **DistribCache** and the **INSERT batcher** are genuinely functional but are
+  standalone subsystems, not yet mounted on the proxy's per-query data path
+  (the `query-cache` feature is the data-path cache).
+- **Pool modes** (Session/Transaction/Statement) and the **auth connection
+  path** have working components; full data-path integration is staged for a
+  later minor.
+- The GraphQL generator keys the FROM table off the (pluralized) query field
+  name and assumes an `id` primary key; nested-relationship shaping and
+  mutations are follow-ons.
+- `/api/pools` reports live active/idle/total per node; per-node
+  pending/created/closed counters are not yet tracked.
+
+### Engineering
+
+- CI gate clean: `cargo clippy -D warnings` on `""`, `ha-tr`, `all-features`,
+  `all-features,postgres-topology` (and `--no-default-features`). 1391
+  all-features lib tests pass.
+
+## [0.19.0] - 2026-06-26
+
+Minor release — OAuth token introspection is now real.
+
+### Added
+
+- **OAuth RFC 7662 introspection (`auth-proxy`).** `authenticate_oauth`
+  previously denied every request as "not implemented". It now POSTs the bearer
+  token to the configured introspection endpoint (HTTP Basic client auth),
+  requires an explicit `"active": true`, enforces optional issuer / audience /
+  required-scope checks, and mints an `Identity` (subject + scopes→roles +
+  expiry). Results are cached. A token is never trusted without the round-trip.
+- `reqwest` now enables `rustls-tls`, so HTTPS identity providers work without
+  OpenSSL (also benefits the L3 semantic cache).
+
+### Notes
+
+- Implemented + real auth methods: **JWT (HS256)**, **API key** (SHA-256 +
+  constant-time compare), **OAuth introspection**. **LDAP** remains
+  deny-by-default — `authenticate_ldap` returns an error rather than faking
+  acceptance; a real bind needs an `ldap3` client + a live directory.
+
+## [0.18.0] - 2026-06-26
+
+Minor release — three orphan stubs made real.
+
+### Changed
+
+- **INSERT batcher executes for real (`batch.rs`).** The flush built the
+  combined bulk INSERT, discarded it, and reported a fabricated success to every
+  waiter. It now executes the combined statement against an attached backend
+  (`with_backend`) and reports the true outcome — an honest failure (no backend
+  / connect / SQL error) instead of a silent success. Live-verified: batched
+  rows actually land in PostgreSQL.
+- **`PreferLocal` routing is real (`load_balancer.rs`).** Was "return the first
+  node". Now prefers the least-loaded node co-located with the proxy (loopback /
+  localhost), falling back to least-connections overall when none is local.
+- **`/api/pools` returns real pool stats (`admin.rs`).** `get_pool_stats`
+  returned an empty list; `AdminState` now holds the `ConnectionPoolManager`
+  (wired at startup) and reports real per-node active/idle/total connections.
+
+### Notes
+
+- The `InsertBatcher` is a standalone utility (not yet on the proxy's per-query
+  path); these changes make its execution real and honest. Per-node
+  pending/created/closed pool counters aren't tracked separately, so those
+  `/api/pools` fields are 0 while active/idle/total are live.
+
+## [0.17.0] - 2026-06-26
+
+Minor release — fourth of the 1.0.0 wiring set: the upgrade orchestrator's
+validation stage is now real.
+
+### Changed
+
+- **Upgrade-orchestrator stage 3 validation (`ha-tr`).** The validation stage
+  advertised a source≡target sample comparison but only slept and advanced. It
+  now lists a deterministic, bounded sample of the source's user tables and
+  compares `count(*)` on each between source and target over the backend
+  client; a mismatch fails the job, and the rows checked are recorded in
+  `validated_rows`. Stages 1/2/4/6 were already real. The stale module
+  doc-comment (which called every stage a stub) is corrected.
+
+### Notes
+
+- Row-count parity is the portable PG 14–18 check; a per-row checksum on top is
+  a follow-on. The validation SQL path is live-verified via self-compare
+  (`HELIOS_LIVE_PG`-gated test); a full two-major-version replication run needs
+  a two-node harness.
+
+## [0.16.0] - 2026-06-26
+
+Minor release — third of the 1.0.0 wiring set: the DistribCache internals are
+now real.
+
+### Added
+
+- **L3 distributed-cache peer server (`distribcache`).** `DistributedCache`
+  now serves the GET/PUT/PING/INVALIDATE wire protocol it already spoke as a
+  client (`serve` / `serve_on`). Replication PUTs and remote GETs from peers
+  previously reached nothing — the mesh can now actually replicate and serve
+  cross-node reads.
+
+### Changed
+
+- **L2 LZ4 compression is real.** The `Lz4` tier compressor (the default) was a
+  no-op that copied bytes behind a marker; it now uses `lz4_flex` block
+  compression. Round-trip + measurable shrink are covered by tests.
+
+### Notes
+
+- These make the DistribCache subsystem genuinely functional. It is not yet
+  mounted on the proxy's per-query data path — the `query-cache` feature is the
+  data-path cache; wiring DistribCache in as an optional proxy backend is a
+  follow-on.
+
+## [0.15.0] - 2026-06-26
+
+Minor release — second of the 1.0.0 wiring set: the GraphQL gateway is now real.
+
+### Added
+
+- **GraphQL-to-SQL gateway (`graphql-gateway`).** `[graphql_gateway]` config
+  (off by default; `listen_address`, `backend_*`, `tables`). A new HTTP listener
+  accepts `POST {"query": "<graphql>"}`, generates SQL from the configured
+  schema, executes it over the backend PG-wire client, and returns a real
+  GraphQL response. The engine previously returned `null`/empty for every field
+  and had no listener at all.
+
+### Notes
+
+- Real SQL execution + flat top-level response shaping is delivered and
+  live-verified. Nested-relationship shaping (joins), mutations, and the SQL
+  generator's table-name derivation + `id` primary-key assumption are follow-ons.
+
+## [0.14.0] - 2026-06-26
+
+Minor release — first of the 1.0.0 wiring set: schema/workload-aware routing.
+
+### Added
+
+- **Schema/workload-aware routing (`schema-routing`).** `[schema_routing]`
+  config (off by default): a read classified as analytical (OLAP — aggregations,
+  GROUP BY, window functions) is routed to the configured `analytics_node`,
+  offloading analytics from the primary. Other queries use default routing.
+  Decisions log to the `helios::schema` target.
+
+### Notes
+
+- This wires the real (query-shape) workload classification. Table-level schema
+  discovery (data-temperature routing from `pg_catalog`/`information_schema`
+  introspection) needs a configured introspection credential and is a follow-on.
+
+## [0.13.0] - 2026-06-26
+
+Minor release — platform-tier wiring wave 6: Transaction Replay journaling.
+
+### Added
+
+- **Transaction Replay journaling (`ha-tr`).** With `tr_enabled`, write
+  statements are now journaled on the query path (they previously weren't, so
+  the replay engine had nothing to replay). The existing replay machinery —
+  `POST /api/replay` and the failover coordinator — can now re-apply journaled
+  writes onto a promoted primary or a staging target.
+
+### Notes
+
+- The journal-population half and the replay **mechanism** are live-verified
+  (writes journaled → table emptied → `/api/replay` re-applies them → rows
+  reappear). The failover-**triggered** auto-replay is coordinated by the
+  failover controller but is not live-verified here (no real standby in the dev
+  env). Follow-ons: extended-protocol write journaling, explicit-transaction
+  grouping, journal retention, array bind params in replay, cursor reposition.
+
+## [0.12.0] - 2026-06-26
+
+Minor release — platform-tier wiring wave 5: multi-tenancy.
+
+### Added
+
+- **Multi-tenancy row isolation (`multi-tenancy`).** `[multi_tenancy]` config
+  (off by default): `identify_by` (a startup parameter such as
+  `application_name`/`user`, or `database`) selects the tenant; queries against
+  the configured `tenant_tables` get a `WHERE <tenant_column> = '<tenant>'`
+  filter injected so each tenant sees only its own rows. The filter is applied
+  before the cache lookup, so cached results are tenant-scoped (no cross-tenant
+  leakage). Injection logs to the `helios::tenant` target.
+
+## [0.11.0] - 2026-06-26
+
+**Security release** — the auth subsystem (`auth-proxy`) no longer accepts
+forged or arbitrary credentials.
+
+### Security
+
+- **JWT signatures are now actually verified.** `verify_signature` previously
+  returned success for *every* token. It now performs a constant-time HS256
+  (HMAC-SHA256) verification against a symmetric key, and **rejects any other
+  algorithm** (RS256/ES256 etc.) rather than trusting it — so a forged or
+  tampered JWT no longer validates.
+- **OAuth / LDAP / HTTP-Basic deny by default.** These previously synthesized an
+  accepted identity for any input (any password, any bearer token). They now
+  deny; real OIDC introspection / LDAP bind / user-store verification are
+  follow-ons requiring external infrastructure.
+- **API keys** are hashed with SHA-256 and compared in constant time (was the
+  non-cryptographic `DefaultHasher` with a `==` compare).
+
+### Breaking
+
+- `auth::jwt::Jwk` gains a `k` (symmetric key) field, and JWT validation now
+  rejects algorithms it cannot verify.
+
+### Notes
+
+- This closes the client-auth **crypto** holes (the deep-audit's #1 finding),
+  verified by unit tests. Wiring proxy-terminated client auth into the
+  connection path (a `[auth] mode` that verifies a client-presented JWT on
+  connect), RS256/ES256, and real OAuth/LDAP remain follow-ons. That
+  connection-path work is also the prerequisite for `pool-modes`.
+
+## [0.10.0] - 2026-06-26
+
+Minor release — platform-tier wiring wave 4: SQL query rewriting.
+
+### Added
+
+- **SQL query rewriting (`query-rewriting`).** `[query_rewrite]` config (off by
+  default) with a list of rules — each `{ match_table | match_regex }` selects
+  which queries it applies to and `{ replace_table_with | append_where |
+  add_limit }` is the transformation. Matching simple queries are rewritten on
+  the path before forwarding; the cache and backend both see the rewritten SQL.
+  Rewrites log to the `helios::rewrite` target.
+
+### Notes
+
+- Rewriting covers the simple-query path and the real string-based
+  transformations. The extended-protocol (Parse) path and the
+  AST-reserialization transform are follow-ons.
+- `pool-modes` has been resequenced to **after** `auth-proxy`: real connection
+  multiplexing requires proxy-held backend credentials (which `auth-proxy`
+  provides — passthrough auth cannot share a backend connection across clients)
+  plus a raw-connection transaction-pool on the data path.
+
+## [0.9.0] - 2026-06-26
+
+Minor release — platform-tier wiring wave 3: query-result caching.
+
+### Added
+
+- **Query-result cache (`query-cache`).** `[cache]` config (off by default;
+  `ttl_secs`, `max_result_bytes`). A cacheable read (a plain, deterministic,
+  non-transactional `SELECT` — not `WITH`/`FOR UPDATE`/volatile) is served from
+  an in-memory L1 hot (per-connection) + L2 warm (shared, normalized) cache with
+  no backend round-trip; on a miss the response is captured while streaming and
+  stored. A write invalidates cached reads referencing its tables. Cache hits
+  log to the `helios::cache` target.
+
+### Notes
+
+- L1 hot + L2 warm tiers are live-verified (a read served the stale cached value
+  while the backend held a newer one; a write invalidated it). The L3 semantic
+  (vector-similarity) tier remains opt-in via the `/*helios:cache=semantic*/`
+  hint and is not yet live-verified — it needs an embedding source, tracked as a
+  follow-on.
+
+## [0.8.0] - 2026-06-26
+
+Minor release — platform-tier wiring wave 2: observability + read-scaling. Two
+more feature flags that previously did nothing on the query path are now active.
+
+### Added
+
+- **Query analytics (`query-analytics`) records every forwarded query.**
+  `[analytics]` config (off by default). Each query is fingerprinted +
+  normalized (literal-only differences collapse to one `select ?` fingerprint),
+  accumulating per-fingerprint call/latency/p99/error stats with a slow-query
+  log. New `GET /api/analytics` returns the top queries + slow-query count. The
+  real query normalizer now runs on the live path (it was previously a
+  stand-in).
+- **Read-your-writes (`lag-routing`).** `[lag_routing]` config (off by default).
+  Within `ryw_window_ms` after a write, a session's reads are pinned to the
+  primary so the client always observes its own writes despite replica lag. A
+  lag-aware read-exclusion filter (`max_lag_bytes`) drops standbys lagging
+  beyond a threshold.
+
+### Notes
+
+- Read-your-writes is live-verified. The lag-**exclusion** decision logic is
+  unit-tested and in place (safe-by-default, `max_lag_bytes=0`), but populating
+  per-node replication lag requires a background monitor with configured backend
+  credentials + a real standby — tracked as a follow-on.
+
+## [0.7.0] - 2026-06-26
+
+Minor release — the first wave of **platform-tier wiring**. Three feature flags
+that previously compiled but did nothing on the query path are now genuinely
+enforced, each live-verified against PostgreSQL 18.4. This release also formally
+owns two prior unreleased source changes (an MSRV bump and one breaking
+public-API rename).
+
+### Added
+
+- **SQL-comment routing hints (`routing-hints`) are now honored.**
+  `[routing_hints]` config (off by default). `/*helios:route=primary|standby|…*/`,
+  `/*helios:node=<name>*/`, and `consistency=strong` steer routing on both the
+  simple- and extended-query paths, taking precedence over default verb routing
+  (but never over a plugin `Block`). A `node=<name>` hint resolves the node name
+  to its address; the hint comment is optionally stripped before forwarding.
+- **Rate limiting (`rate-limiting`) is now enforced.** `[rate_limit]` config
+  (off by default; token bucket + concurrency, keyed per user / client-ip /
+  database / global). Over-limit queries receive a clean `ErrorResponse`
+  (SQLSTATE 53400); throttle/queue verdicts apply real backpressure; the
+  connection is not dropped.
+- **Per-node circuit breaker (`circuit-breaker`) is now active.**
+  `[circuit_breaker]` config (off by default). Repeated backend failures trip a
+  node's circuit; while open the proxy fast-fails with `ErrorResponse` SQLSTATE
+  08006 instead of retrying the dead node, and read selection routes around it.
+  A half-open probe closes the circuit on recovery.
+
+### Fixed
+
+- **Write detection is no longer fooled by a leading hint comment.**
+  `is_write_query` is evaluated on the hint-stripped SQL, so
+  `/*helios:…*/ INSERT …` is correctly classified as a write. The `node=<name>`
+  route path (hint and plugin) now resolves a node name to its address instead
+  of dialing a literal hostname.
+
+### Changed
+
+- **MSRV is now Rust 1.86** (was 1.75), to match the transitive dependency floor.
+
+### Breaking
+
+- `rewriter::RewriteRule::new` (the builder entry point, under the
+  `query-rewriting` feature) was renamed to `RewriteRule::build`. Callers using
+  `RewriteRule::new(id)` must switch to `RewriteRule::build(id)`.
+
 ## [0.6.1] - 2026-06-15
 
 Patch release — demo infrastructure fixes. No proxy code or runtime behavior changes.

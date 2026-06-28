@@ -222,6 +222,53 @@ pub struct ProxyConfig {
     /// CREATE DATABASE ... TEMPLATE clones through the proxy.
     #[serde(default)]
     pub branch: BranchConfig,
+    /// SQL-comment routing hints (`/*helios:route=primary*/`). Disabled by
+    /// default — when enabled, the proxy parses hints from query SQL and
+    /// applies them as a route override that wins over the default verb
+    /// routing (but never over a plugin `Block`). Only consumed when the
+    /// `routing-hints` feature is compiled in; parsed-and-ignored otherwise.
+    #[serde(default)]
+    pub routing_hints: RoutingHintsConfig,
+    /// Multi-dimensional rate limiting (token bucket + concurrency). Disabled
+    /// by default. Only enforced when the `rate-limiting` feature is compiled
+    /// in; parsed-and-ignored otherwise.
+    #[serde(default)]
+    pub rate_limit: RateLimitToml,
+    /// Per-node circuit breaker (trip failing backends out of rotation,
+    /// fast-fail while open). Disabled by default. Only enforced when the
+    /// `circuit-breaker` feature is compiled in.
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerToml,
+    /// Query analytics (fingerprinting, per-query statistics, slow-query log,
+    /// pattern detection). Disabled by default. Only active when the
+    /// `query-analytics` feature is compiled in.
+    #[serde(default)]
+    pub analytics: AnalyticsToml,
+    /// Replica-lag-aware routing + read-your-writes. Disabled by default. Only
+    /// enforced when the `lag-routing` feature is compiled in.
+    #[serde(default)]
+    pub lag_routing: LagRoutingToml,
+    /// Query-result cache (L1 hot / L2 warm). Disabled by default. Only active
+    /// when the `query-cache` feature is compiled in.
+    #[serde(default)]
+    pub cache: CacheToml,
+    /// SQL query rewriting (rules engine). Disabled by default. Only active
+    /// when the `query-rewriting` feature is compiled in.
+    #[serde(default)]
+    pub query_rewrite: QueryRewriteToml,
+    /// Multi-tenancy (per-tenant row isolation via injected predicates).
+    /// Disabled by default. Only active when the `multi-tenancy` feature is
+    /// compiled in.
+    #[serde(default)]
+    pub multi_tenancy: MultiTenancyToml,
+    /// Schema/workload-aware routing (route OLAP queries to an analytics node).
+    /// Disabled by default. Only active when the `schema-routing` feature is on.
+    #[serde(default)]
+    pub schema_routing: SchemaRoutingToml,
+    /// GraphQL-to-SQL gateway (separate HTTP listener). Disabled by default.
+    /// Only active when the `graphql-gateway` feature is compiled in.
+    #[serde(default)]
+    pub graphql_gateway: GraphqlGatewayConfig,
     /// Proxy-side unnamed-`Parse` promotion (Batch H). When a client re-sends an
     /// identical unnamed extended `Parse` (the dominant pgbench/ORM pattern),
     /// the proxy skips forwarding it to a backend that already holds that exact
@@ -516,6 +563,301 @@ fn default_write_timeout_secs() -> u64 {
     30 // 30 seconds default write timeout during failover
 }
 
+/// A table exposed by the GraphQL gateway, with its selectable columns.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GqlTableToml {
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
+/// GraphQL-to-SQL gateway configuration. A separate HTTP listener; only active
+/// when the `graphql-gateway` feature is compiled in AND `enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GraphqlGatewayConfig {
+    /// Serve the GraphQL gateway. Default `false`.
+    pub enabled: bool,
+    /// HTTP listen address (e.g. `0.0.0.0:9091`).
+    pub listen_address: String,
+    /// Backend the generated SQL runs against.
+    pub backend_host: String,
+    pub backend_port: u16,
+    pub backend_user: String,
+    pub backend_password: Option<String>,
+    pub backend_database: Option<String>,
+    /// Optional Bearer token required on requests.
+    pub auth_token: Option<String>,
+    /// Tables exposed as GraphQL types.
+    pub tables: Vec<GqlTableToml>,
+}
+
+impl Default for GraphqlGatewayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_address: "0.0.0.0:9091".to_string(),
+            backend_host: "127.0.0.1".to_string(),
+            backend_port: 5432,
+            backend_user: "postgres".to_string(),
+            backend_password: None,
+            backend_database: None,
+            auth_token: None,
+            tables: Vec::new(),
+        }
+    }
+}
+
+/// Schema/workload-aware routing configuration (always present). Only active
+/// when the `schema-routing` feature is compiled in AND `enabled = true`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SchemaRoutingToml {
+    /// Route analytical (OLAP) queries — aggregations, GROUP BY, window
+    /// functions — to a dedicated node. Default `false`.
+    pub enabled: bool,
+    /// Name of the node analytical queries are routed to.
+    pub analytics_node: String,
+}
+
+/// Multi-tenancy configuration (always present). Converted to a
+/// `multi_tenancy::TenantManager` at startup; only active when the
+/// `multi-tenancy` feature is compiled in AND `enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MultiTenancyToml {
+    /// Enforce per-tenant row isolation. Default `false`.
+    pub enabled: bool,
+    /// Which connection attribute names the tenant: a startup parameter name
+    /// (e.g. `application_name`, `user`) or the literal `database`.
+    pub identify_by: String,
+    /// The row-level tenant column injected into queries (e.g. `tenant_id`).
+    pub tenant_column: String,
+    /// Tables that are tenant-scoped (get the filter injected). Other tables
+    /// pass through unchanged.
+    pub tenant_tables: Vec<String>,
+    /// Known tenant ids.
+    pub tenants: Vec<String>,
+}
+
+impl Default for MultiTenancyToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            identify_by: "application_name".to_string(),
+            tenant_column: "tenant_id".to_string(),
+            tenant_tables: Vec::new(),
+            tenants: Vec::new(),
+        }
+    }
+}
+
+/// A single SQL-rewrite rule in TOML form. Maps to a `rewriter::RewriteRule`:
+/// `match_table`/`match_regex` choose which queries it applies to (default: all),
+/// and the first set transformation field is applied.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RewriteRuleToml {
+    /// Apply to queries referencing this table.
+    pub match_table: Option<String>,
+    /// Apply to queries matching this regex.
+    pub match_regex: Option<String>,
+    /// Rewrite `match_table` -> this table name.
+    pub replace_table_with: Option<String>,
+    /// Append `AND <expr>` to the query's WHERE clause.
+    pub append_where: Option<String>,
+    /// Add a `LIMIT n` to an unbounded query.
+    pub add_limit: Option<u32>,
+}
+
+/// SQL query-rewriting configuration (always present). Converted to a
+/// `rewriter::QueryRewriter` at startup; only active when the `query-rewriting`
+/// feature is compiled in AND `enabled = true`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueryRewriteToml {
+    /// Rewrite query SQL on the path per the rules below. Default `false`.
+    pub enabled: bool,
+    /// Ordered rewrite rules.
+    pub rules: Vec<RewriteRuleToml>,
+}
+
+/// Query-result cache configuration (TOML-friendly, always present). Converted
+/// to `crate::cache::CacheConfig` at startup and only active when the
+/// `query-cache` feature is compiled in AND `enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheToml {
+    /// Serve read SELECT results from an in-process L1/L2 cache. Default `false`.
+    pub enabled: bool,
+    /// Time-to-live for cached results, seconds.
+    pub ttl_secs: u64,
+    /// Maximum single result size to cache, bytes (larger results bypass).
+    pub max_result_bytes: usize,
+}
+
+impl Default for CacheToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl_secs: 300,
+            max_result_bytes: 1024 * 1024,
+        }
+    }
+}
+
+/// Replica-lag-aware routing + read-your-writes configuration (always present;
+/// only enforced when the `lag-routing` feature is compiled in AND enabled).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LagRoutingToml {
+    /// Enable lag-aware read routing + read-your-writes. Default `false`.
+    pub enabled: bool,
+    /// Reads issued within this many milliseconds after a write in the same
+    /// session are pinned to the primary (read-your-writes), so the client
+    /// observes its own writes despite replica lag. 0 disables the window.
+    pub ryw_window_ms: u64,
+    /// Exclude a standby from read routing when its measured replication lag
+    /// exceeds this many bytes. 0 = no lag-based exclusion (default; the proxy
+    /// does not yet populate per-node lag without a configured monitor).
+    pub max_lag_bytes: u64,
+}
+
+impl Default for LagRoutingToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ryw_window_ms: 500,
+            max_lag_bytes: 0,
+        }
+    }
+}
+
+/// Query-analytics configuration (TOML-friendly, always present). Converted to
+/// `crate::analytics::AnalyticsConfig` at startup and only active when the
+/// `query-analytics` feature is compiled in AND `enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnalyticsToml {
+    /// Record per-query statistics, slow-query log, and pattern detection.
+    /// Default `false`.
+    pub enabled: bool,
+    /// Queries slower than this (milliseconds) are added to the slow-query log.
+    pub slow_query_ms: u64,
+    /// Maximum distinct query fingerprints to track.
+    pub max_fingerprints: u32,
+}
+
+impl Default for AnalyticsToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            slow_query_ms: 1000,
+            max_fingerprints: 10000,
+        }
+    }
+}
+
+/// Circuit-breaker configuration (TOML-friendly, always present). Converted to
+/// `crate::circuit_breaker::ManagerConfig` at startup and only enforced when
+/// the `circuit-breaker` feature is compiled in AND `enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CircuitBreakerToml {
+    /// Trip backends out of rotation after repeated failures. Default `false`.
+    pub enabled: bool,
+    /// Consecutive failures (within the failure window) that open a node's
+    /// circuit.
+    pub failure_threshold: u32,
+    /// How long a circuit stays open before a half-open probe is allowed.
+    pub open_secs: u64,
+    /// Successful probes required to close a half-open circuit.
+    pub success_threshold: u32,
+}
+
+impl Default for CircuitBreakerToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            failure_threshold: 5,
+            open_secs: 10,
+            success_threshold: 3,
+        }
+    }
+}
+
+/// How rate-limit buckets are keyed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitKeyBy {
+    /// One bucket per authenticated user (startup `user` param).
+    #[default]
+    User,
+    /// One bucket per client IP address.
+    ClientIp,
+    /// One bucket per target database.
+    Database,
+    /// A single global bucket for the whole proxy.
+    Global,
+}
+
+/// Rate-limiting configuration (TOML-friendly, always present so configs
+/// round-trip on any build). Converted to `crate::rate_limit::RateLimitConfig`
+/// at startup and only enforced when the `rate-limiting` feature is compiled
+/// in AND `enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RateLimitToml {
+    /// Enforce rate limits. Default `false`.
+    pub enabled: bool,
+    /// Sustained queries per second per bucket.
+    pub default_qps: u32,
+    /// Burst capacity (token-bucket depth) per bucket.
+    pub default_burst: u32,
+    /// Max concurrent in-flight queries per bucket (0 = use the engine default).
+    pub max_concurrent: u32,
+    /// What each bucket is keyed on.
+    pub key_by: RateLimitKeyBy,
+}
+
+impl Default for RateLimitToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_qps: 1000,
+            default_burst: 2000,
+            max_concurrent: 0,
+            key_by: RateLimitKeyBy::User,
+        }
+    }
+}
+
+/// SQL-comment routing-hint configuration.
+///
+/// Always present on `ProxyConfig` so configs round-trip on any build, but the
+/// hints are only parsed and honored when the `routing-hints` feature is
+/// compiled in AND `enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoutingHintsConfig {
+    /// Parse and honor `/*helios:...*/` routing hints. Default `false`
+    /// (preserves the pure verb-based routing behaviour).
+    pub enabled: bool,
+    /// Strip the hint comment from the SQL before forwarding to the backend.
+    /// Default `true`. Hint comments are valid SQL comments, so leaving them
+    /// in is harmless; stripping keeps backend query logs clean.
+    pub strip_hints: bool,
+}
+
+impl Default for RoutingHintsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strip_hints: true,
+        }
+    }
+}
+
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
@@ -539,6 +881,16 @@ impl Default for ProxyConfig {
             http_gateway: HttpGatewayConfig::default(),
             mirror: MirrorConfig::default(),
             branch: BranchConfig::default(),
+            routing_hints: RoutingHintsConfig::default(),
+            rate_limit: RateLimitToml::default(),
+            circuit_breaker: CircuitBreakerToml::default(),
+            analytics: AnalyticsToml::default(),
+            lag_routing: LagRoutingToml::default(),
+            cache: CacheToml::default(),
+            query_rewrite: QueryRewriteToml::default(),
+            multi_tenancy: MultiTenancyToml::default(),
+            schema_routing: SchemaRoutingToml::default(),
+            graphql_gateway: GraphqlGatewayConfig::default(),
             optimize_unnamed_parse: true,
             shutdown_drain_timeout_secs: default_drain_timeout_secs(),
         }

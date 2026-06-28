@@ -69,6 +69,15 @@ pub struct AdminState {
     read_lb_counter: AtomicUsize,
     /// Registered command handlers
     commands: RwLock<HashMap<String, CommandHandler>>,
+    /// Connection pool manager (Session/Transaction/Statement modes).
+    /// Attached at startup; `/api/pools` returns real per-node pool
+    /// stats when present, an empty list otherwise.
+    #[cfg(feature = "pool-modes")]
+    pub pool_manager: RwLock<Option<Arc<crate::pool::ConnectionPoolManager>>>,
+    /// Circuit-breaker manager. Attached at startup; `/api/circuit` reports
+    /// each node's live circuit state (closed / open / half-open).
+    #[cfg(feature = "circuit-breaker")]
+    pub circuit_breaker: RwLock<Option<Arc<crate::circuit_breaker::CircuitBreakerManager>>>,
     /// Time-travel replay engine. Optional so test fixtures don't have
     /// to wire a backend template; production startup attaches it via
     /// `with_replay_engine`. Endpoint returns 503 when missing.
@@ -90,6 +99,10 @@ pub struct AdminState {
     /// ring buffer.
     #[cfg(feature = "anomaly-detection")]
     pub anomaly_detector: RwLock<Option<Arc<AnomalyDetector>>>,
+    /// Query-analytics engine — same Arc the server records on from the query
+    /// path. `/api/analytics` reads top queries + slow-query log from it.
+    #[cfg(feature = "query-analytics")]
+    pub analytics: RwLock<Option<Arc<crate::analytics::QueryAnalytics>>>,
     /// Edge proxy cache + registry. Cache surfaces stats; registry
     /// is the home-side fanout for invalidations.
     #[cfg(feature = "edge-proxy")]
@@ -496,6 +509,29 @@ impl AdminServer {
                 serde_json::json!({ "error": "anomaly-detection feature not compiled in" }),
             )),
 
+            // Query analytics: top queries by call count + slow-query log.
+            #[cfg(feature = "query-analytics")]
+            ("GET", p)
+                if p == "/api/analytics"
+                    || p == "/analytics"
+                    || p.starts_with("/api/analytics?")
+                    || p.starts_with("/analytics?") =>
+            {
+                Self::handle_analytics(p, state).await
+            }
+            #[cfg(not(feature = "query-analytics"))]
+            ("GET", p)
+                if p == "/api/analytics"
+                    || p == "/analytics"
+                    || p.starts_with("/api/analytics?")
+                    || p.starts_with("/analytics?") =>
+            {
+                Ok((
+                    503,
+                    serde_json::json!({ "error": "query-analytics feature not compiled in" }),
+                ))
+            }
+
             // Edge mode (T3.2). Stats panel for the home; the home's
             // registered edges + cache stats; and a manual
             // invalidation endpoint for ops drills.
@@ -523,6 +559,16 @@ impl AdminServer {
                 let overrides = state.chaos_overrides.read().await.clone();
                 Ok((200, serde_json::to_value(overrides)?))
             }
+
+            // Live per-node circuit-breaker state (closed / open / half-open)
+            // so an operator can see which backends the breaker has tripped.
+            #[cfg(feature = "circuit-breaker")]
+            ("GET", "/api/circuit") => Self::handle_circuit_status(state).await,
+            #[cfg(not(feature = "circuit-breaker"))]
+            ("GET", "/api/circuit") => Ok((
+                503,
+                serde_json::json!({ "error": "circuit-breaker feature not enabled" }),
+            )),
 
             // Migration / traffic-mirror status
             ("GET", "/api/migration/status") | ("GET", "/migration/status") => {
@@ -996,7 +1042,26 @@ impl AdminServer {
 
     /// Get pool statistics
     async fn get_pool_stats(_state: &Arc<AdminState>) -> Vec<PoolStatsResponse> {
-        // Placeholder - in real implementation would query pool state
+        // Real per-node pool stats from the attached pool manager. Returns
+        // an empty list when pool-modes is off or no manager is attached.
+        #[cfg(feature = "pool-modes")]
+        if let Some(mgr) = _state.pool_manager.read().await.clone() {
+            let stats = mgr.get_stats().await;
+            return stats
+                .node_stats
+                .into_iter()
+                .map(|ns| PoolStatsResponse {
+                    node: ns.node_id.0.to_string(),
+                    active_connections: ns.active as u64,
+                    idle_connections: ns.idle as u64,
+                    // Per-node pending/created/closed counters are not tracked
+                    // separately by the manager; total is the live pool size.
+                    pending_requests: 0,
+                    total_connections_created: ns.total as u64,
+                    total_connections_closed: 0,
+                })
+                .collect();
+        }
         Vec::new()
     }
 
@@ -1209,6 +1274,47 @@ impl AdminServer {
         ))
     }
 
+    /// `GET /api/analytics` — top queries by call count plus the slow-query
+    /// count. Returns 503 when analytics is not attached/enabled.
+    #[cfg(feature = "query-analytics")]
+    async fn handle_analytics(
+        path: &str,
+        state: &Arc<AdminState>,
+    ) -> Result<(u16, serde_json::Value)> {
+        use crate::analytics::OrderBy;
+        let limit = parse_limit_query(path, 50, 1024);
+        let a = match state.analytics.read().await.clone() {
+            Some(a) => a,
+            None => {
+                return Ok((503, serde_json::json!({ "error": "analytics not enabled" })));
+            }
+        };
+        let top: Vec<serde_json::Value> = a
+            .top_queries(OrderBy::Calls, limit)
+            .into_iter()
+            .map(|s| {
+                serde_json::json!({
+                    "fingerprint": s.fingerprint_hash,
+                    "normalized":  s.normalized,
+                    "calls":       s.calls,
+                    "avg_ms":      s.avg_time.as_secs_f64() * 1000.0,
+                    "p99_ms":      s.p99.as_secs_f64() * 1000.0,
+                    "rows":        s.rows,
+                    "errors":      s.errors,
+                })
+            })
+            .collect();
+        let slow_count = a.slow_queries(limit).len();
+        Ok((
+            200,
+            serde_json::json!({
+                "limit":            limit,
+                "top_queries":      top,
+                "slow_query_count": slow_count,
+            }),
+        ))
+    }
+
     /// Handle `POST /api/shadow`. Body is a JSON `ShadowRequestBody`.
     /// Connects to both source and shadow backends, runs the SQL on
     /// each, returns a `ShadowExecuteReport` with the diff.
@@ -1330,6 +1436,34 @@ impl AdminServer {
     ///                                      override entry.
     ///   reset                            — restore every overridden
     ///                                      node in one call.
+    /// `GET /api/circuit` — live per-node circuit-breaker state. Reports each
+    /// configured node's breaker as `closed` / `open` / `half_open` so an
+    /// operator can see which backends the breaker has tripped out of rotation.
+    #[cfg(feature = "circuit-breaker")]
+    async fn handle_circuit_status(state: &Arc<AdminState>) -> Result<(u16, serde_json::Value)> {
+        let mgr = match state.circuit_breaker.read().await.clone() {
+            Some(m) => m,
+            None => {
+                return Ok((
+                    503,
+                    serde_json::json!({ "error": "circuit breaker not attached" }),
+                ))
+            }
+        };
+        let nodes = state.config_snapshot.read().await.nodes.clone();
+        let circuits: Vec<serde_json::Value> = nodes
+            .iter()
+            .map(|n| {
+                let st = mgr.get_breaker(&n.address).get_state();
+                serde_json::json!({
+                    "node": n.address,
+                    "state": format!("{:?}", st).to_lowercase(),
+                })
+            })
+            .collect();
+        Ok((200, serde_json::json!({ "circuits": circuits })))
+    }
+
     async fn handle_chaos_request(
         body: Option<&str>,
         state: &Arc<AdminState>,
@@ -1613,6 +1747,10 @@ impl AdminState {
             proxy_config: RwLock::new(None),
             read_lb_counter: AtomicUsize::new(0),
             commands: RwLock::new(HashMap::new()),
+            #[cfg(feature = "pool-modes")]
+            pool_manager: RwLock::new(None),
+            #[cfg(feature = "circuit-breaker")]
+            circuit_breaker: RwLock::new(None),
             #[cfg(feature = "ha-tr")]
             replay_engine: RwLock::new(None),
             #[cfg(feature = "wasm-plugins")]
@@ -1620,6 +1758,8 @@ impl AdminState {
             chaos_overrides: RwLock::new(HashMap::new()),
             #[cfg(feature = "anomaly-detection")]
             anomaly_detector: RwLock::new(None),
+            #[cfg(feature = "query-analytics")]
+            analytics: RwLock::new(None),
             #[cfg(feature = "edge-proxy")]
             edge_cache: RwLock::new(None),
             #[cfg(feature = "edge-proxy")]
@@ -1645,11 +1785,34 @@ impl AdminState {
         *self.branch.write().await = Some(cfg);
     }
 
+    /// Attach the connection pool manager so `/api/pools` reports real
+    /// per-node pool statistics. Wired by the server at startup.
+    #[cfg(feature = "pool-modes")]
+    pub async fn with_pool_manager(&self, manager: Arc<crate::pool::ConnectionPoolManager>) {
+        *self.pool_manager.write().await = Some(manager);
+    }
+
+    /// Attach the circuit-breaker manager so `/api/circuit` reports live
+    /// per-node circuit state. Wired by the server at startup.
+    #[cfg(feature = "circuit-breaker")]
+    pub async fn with_circuit_breaker(
+        &self,
+        manager: Arc<crate::circuit_breaker::CircuitBreakerManager>,
+    ) {
+        *self.circuit_breaker.write().await = Some(manager);
+    }
+
     /// Attach an anomaly detector. Mirror of with_replay_engine /
     /// with_plugin_manager — wired by the server at startup.
     #[cfg(feature = "anomaly-detection")]
     pub async fn with_anomaly_detector(&self, detector: Arc<AnomalyDetector>) {
         *self.anomaly_detector.write().await = Some(detector);
+    }
+
+    /// Attach the query-analytics engine so `/api/analytics` can read it.
+    #[cfg(feature = "query-analytics")]
+    pub async fn with_analytics(&self, analytics: Arc<crate::analytics::QueryAnalytics>) {
+        *self.analytics.write().await = Some(analytics);
     }
 
     /// Attach edge cache + registry. Server calls this once at

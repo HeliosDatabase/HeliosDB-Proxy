@@ -299,9 +299,20 @@ impl LoadBalancer {
                 Ok(nodes[seed % nodes.len()])
             }
             RoutingStrategy::PreferLocal => {
-                // For skeleton, just return first node
-                // In production, would check rack/zone affinity
-                nodes.first().copied().ok_or(ProxyError::NoHealthyNodes)
+                // "Local" = co-located with the proxy: a loopback / localhost
+                // host. Prefer the least-loaded local node; when none is
+                // local, fall back to the least-connections node overall
+                // rather than an arbitrary first pick.
+                fn is_local(host: &str) -> bool {
+                    matches!(host, "::1" | "[::1]" | "localhost") || host.starts_with("127.")
+                }
+                nodes
+                    .iter()
+                    .filter(|n| is_local(&n.endpoint.host))
+                    .min_by_key(|n| n.connections)
+                    .or_else(|| nodes.iter().min_by_key(|n| n.connections))
+                    .copied()
+                    .ok_or(ProxyError::NoHealthyNodes)
             }
         }
     }
@@ -713,5 +724,48 @@ mod tests {
         lb.decrement_connections(&node_id).await;
         let stats = lb.node_stats(&node_id).await.unwrap();
         assert_eq!(stats.connections, 1);
+    }
+
+    #[test]
+    fn prefer_local_routes_to_loopback_then_least_loaded() {
+        let lb = LoadBalancer::new(LoadBalancerConfig::default());
+        let mk = |host: &str, conns: u64| NodeState {
+            endpoint: NodeEndpoint::new(host, 5432),
+            health: NodeHealth::Healthy,
+            replication_lag_ms: 0,
+            connections: conns,
+            avg_latency_ms: 0.0,
+            requests: 0,
+            failures: 0,
+        };
+
+        // A local (loopback) node is preferred even though the remote one
+        // has fewer connections — locality wins over load.
+        let remote = mk("10.0.0.5", 1);
+        let local = mk("127.0.0.1", 9);
+        let refs = vec![&remote, &local];
+        let chosen = lb
+            .select_by_strategy(&refs, RoutingStrategy::PreferLocal)
+            .unwrap();
+        assert_eq!(chosen.endpoint.host, "127.0.0.1");
+
+        // Among multiple local nodes, the least-loaded wins.
+        let local_busy = mk("127.0.0.1", 9);
+        let local_free = mk("localhost", 2);
+        let refs2 = vec![&local_busy, &local_free];
+        let chosen2 = lb
+            .select_by_strategy(&refs2, RoutingStrategy::PreferLocal)
+            .unwrap();
+        assert_eq!(chosen2.endpoint.host, "localhost");
+
+        // With no local node, fall back to least-connections overall
+        // (not an arbitrary first pick).
+        let r1 = mk("10.0.0.1", 5);
+        let r2 = mk("10.0.0.2", 2);
+        let refs3 = vec![&r1, &r2];
+        let chosen3 = lb
+            .select_by_strategy(&refs3, RoutingStrategy::PreferLocal)
+            .unwrap();
+        assert_eq!(chosen3.endpoint.host, "10.0.0.2");
     }
 }

@@ -207,10 +207,13 @@ pub struct AuthenticationHandler {
     /// JWT validator
     jwt_validator: Option<JwtValidator>,
 
-    /// OAuth client (placeholder - would use actual OAuth client)
+    /// Whether OAuth is configured (RFC 7662 introspection is performed
+    /// per-request against `config.oauth.introspection_url`).
     oauth_enabled: bool,
 
-    /// LDAP client (placeholder - would use actual LDAP client)
+    /// Whether LDAP is configured. With the `ldap-auth` feature,
+    /// `authenticate_ldap` performs a real search + bind against the directory;
+    /// without it, LDAP denies by default.
     ldap_enabled: bool,
 
     /// API key store
@@ -473,26 +476,126 @@ impl AuthenticationHandler {
             return Ok(cached.clone());
         }
 
-        // In a real implementation, this would call the OAuth introspection endpoint
-        // For demonstration, we create a placeholder identity
-        let identity = Identity {
-            user_id: "oauth_user".to_string(),
-            name: Some("OAuth User".to_string()),
-            email: None,
-            roles: vec!["user".to_string()],
-            groups: Vec::new(),
-            tenant_id: None,
-            claims: HashMap::new(),
-            auth_method: "oauth".to_string(),
-            authenticated_at: chrono::Utc::now(),
-        };
+        let cfg = self
+            .config
+            .oauth
+            .as_ref()
+            .ok_or_else(|| AuthError::Configuration("OAuth not configured".to_string()))?;
 
-        let result = AuthResult::new(identity);
+        // RFC 7662 token introspection: POST the token to the introspection
+        // endpoint with the client's credentials and trust only an explicit
+        // `"active": true`. A bearer token is never accepted without this
+        // round-trip.
+        let body = self.oauth_introspect(cfg, token).await?;
+
+        // `active` is REQUIRED by RFC 7662; anything but true is a denial.
+        if body.get("active").and_then(|v| v.as_bool()) != Some(true) {
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        // Optional issuer pin.
+        if !cfg.issuer.is_empty() {
+            if let Some(iss) = body.get("iss").and_then(|v| v.as_str()) {
+                if iss != cfg.issuer {
+                    return Err(AuthError::InvalidCredentials);
+                }
+            }
+        }
+
+        // Optional audience check (`aud` may be a string or an array).
+        if let Some(expected) = &cfg.audience {
+            let ok = match body.get("aud") {
+                Some(serde_json::Value::String(s)) => s == expected,
+                Some(serde_json::Value::Array(a)) => {
+                    a.iter().any(|v| v.as_str() == Some(expected.as_str()))
+                }
+                _ => false,
+            };
+            if !ok {
+                return Err(AuthError::InvalidCredentials);
+            }
+        }
+
+        // Scopes are a space-delimited string (RFC 7662 §2.2). Enforce any
+        // required scopes before minting an identity.
+        let scopes: Vec<String> = body
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .map(|s| s.split_whitespace().map(String::from).collect())
+            .unwrap_or_default();
+        for required in &cfg.required_scopes {
+            if !scopes.contains(required) {
+                return Err(AuthError::InsufficientPermissions(format!(
+                    "missing required scope: {}",
+                    required
+                )));
+            }
+        }
+
+        // Subject identifies the principal; fall back to `username`.
+        let subject = body
+            .get("sub")
+            .and_then(|v| v.as_str())
+            .or_else(|| body.get("username").and_then(|v| v.as_str()))
+            .ok_or_else(|| {
+                AuthError::OAuth("introspection response missing sub/username".to_string())
+            })?;
+
+        let mut identity = Identity::new(subject, "oauth");
+        identity.name = body
+            .get("username")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        identity.roles = scopes;
+
+        let mut result = AuthResult::new(identity);
+        if let Some(exp) = body
+            .get("exp")
+            .and_then(|v| v.as_i64())
+            .and_then(|e| chrono::DateTime::from_timestamp(e, 0))
+        {
+            result = result.with_expiration(exp);
+        }
+
+        // Cache the validated result (bounded by the cache's own TTL).
         self.auth_cache
             .write()
             .insert(token.to_string(), result.clone());
 
         Ok(result)
+    }
+
+    /// Perform an RFC 7662 introspection POST and return the parsed JSON
+    /// response body. Client authentication is HTTP Basic with the
+    /// configured client id/secret.
+    async fn oauth_introspect(
+        &self,
+        cfg: &OAuthConfig,
+        token: &str,
+    ) -> Result<serde_json::Value, AuthError> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| AuthError::ProviderUnavailable(format!("http client: {}", e)))?;
+
+        let resp = client
+            .post(&cfg.introspection_url)
+            .basic_auth(&cfg.client_id, Some(&cfg.client_secret))
+            .form(&[("token", token), ("token_type_hint", "access_token")])
+            .send()
+            .await
+            .map_err(|e| AuthError::ProviderUnavailable(format!("introspection request: {}", e)))?;
+
+        if !resp.status().is_success() {
+            return Err(AuthError::ProviderUnavailable(format!(
+                "introspection endpoint returned HTTP {}",
+                resp.status()
+            )));
+        }
+
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| AuthError::OAuth(format!("introspection response body: {}", e)))
     }
 
     /// Authenticate using LDAP
@@ -510,25 +613,132 @@ impl AuthenticationHandler {
             .as_ref()
             .ok_or(AuthError::AuthenticationRequired)?;
 
-        // In a real implementation, this would bind to LDAP and verify credentials
-        // For demonstration, we create a placeholder identity
+        #[cfg(feature = "ldap-auth")]
+        {
+            let cfg = self
+                .config
+                .ldap
+                .as_ref()
+                .ok_or_else(|| AuthError::Configuration("LDAP not configured".to_string()))?;
+            let groups = self.ldap_search_and_bind(cfg, username, password).await?;
+            let mut identity = Identity::new(username.clone(), "ldap");
+            identity.groups = groups;
+            Ok(AuthResult::new(identity))
+        }
+
+        // Without the `ldap-auth` feature there is no LDAP client compiled in;
+        // deny rather than accept any password (never a fabricated success).
+        #[cfg(not(feature = "ldap-auth"))]
+        {
+            let _ = (username, password);
+            Err(AuthError::Configuration(
+                "LDAP bind not implemented (build with the `ldap-auth` feature)".to_string(),
+            ))
+        }
+    }
+
+    /// Authenticate a user against an LDAP directory using the standard
+    /// search-then-bind flow:
+    ///
+    /// 1. Bind as the configured service account (anonymous if `bind_dn` is
+    ///    empty) and search `user_search_base` with `user_filter` (with `{0}`
+    ///    replaced by the RFC 4515-escaped username) to resolve the user's DN.
+    /// 2. Open a fresh connection and bind as that DN with the supplied
+    ///    password — a successful bind is proof the credentials are valid.
+    ///
+    /// Returns the user's group memberships (values of `group_attribute`).
+    /// An unknown user, an empty password (which would be an unauthenticated
+    /// bind per RFC 4513), or a failed user bind all map to
+    /// [`AuthError::InvalidCredentials`].
+    #[cfg(feature = "ldap-auth")]
+    async fn ldap_search_and_bind(
+        &self,
+        cfg: &LdapConfig,
+        username: &str,
+        password: &str,
+    ) -> Result<Vec<String>, AuthError> {
+        use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
+
+        // ldap3's rustls 0.23 backend builds its TLS connector eagerly (even
+        // for plain ldap://) and needs a process-default crypto provider, or
+        // the connection driver dies with "channel closed". Install the ring
+        // provider once; ignore the error if another component already set one.
+        static LDAP_TLS_PROVIDER: std::sync::Once = std::sync::Once::new();
+        LDAP_TLS_PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+
+        let settings = LdapConnSettings::new()
+            .set_starttls(cfg.starttls)
+            .set_conn_timeout(cfg.timeout);
+
+        // --- Phase 1: service bind + search for the user DN -----------------
+        let (conn, mut ldap) = LdapConnAsync::with_settings(settings.clone(), &cfg.server_url)
+            .await
+            .map_err(|e| AuthError::Ldap(format!("connect {}: {}", cfg.server_url, e)))?;
+        ldap3::drive!(conn);
+
+        if !cfg.bind_dn.is_empty() {
+            ldap.simple_bind(&cfg.bind_dn, &cfg.bind_password)
+                .await
+                .map_err(|e| AuthError::Ldap(format!("service bind: {}", e)))?
+                .success()
+                .map_err(|e| AuthError::Ldap(format!("service bind rejected: {}", e)))?;
+        }
+
+        let filter = cfg
+            .user_filter
+            .replace("{0}", &ldap3::ldap_escape(username));
+        let (entries, _res) = ldap
+            .search(
+                &cfg.user_search_base,
+                Scope::Subtree,
+                &filter,
+                vec![cfg.group_attribute.as_str()],
+            )
+            .await
+            .map_err(|e| AuthError::Ldap(format!("search: {}", e)))?
+            .success()
+            .map_err(|e| AuthError::Ldap(format!("search rejected: {}", e)))?;
+
+        let entry = match entries.into_iter().next() {
+            Some(e) => SearchEntry::construct(e),
+            // No such user — deny without leaking which half failed.
+            None => {
+                let _ = ldap.unbind().await;
+                return Err(AuthError::InvalidCredentials);
+            }
+        };
+        let user_dn = entry.dn.clone();
+        let groups = entry
+            .attrs
+            .get(&cfg.group_attribute)
+            .cloned()
+            .unwrap_or_default();
+        let _ = ldap.unbind().await;
+
+        if user_dn.is_empty() {
+            return Err(AuthError::InvalidCredentials);
+        }
+        // Reject empty passwords up front: an empty password is an
+        // "unauthenticated bind" that some servers report as success.
         if password.is_empty() {
             return Err(AuthError::InvalidCredentials);
         }
 
-        let identity = Identity {
-            user_id: username.clone(),
-            name: Some(username.clone()),
-            email: None,
-            roles: vec!["user".to_string()],
-            groups: Vec::new(),
-            tenant_id: None,
-            claims: HashMap::new(),
-            auth_method: "ldap".to_string(),
-            authenticated_at: chrono::Utc::now(),
-        };
+        // --- Phase 2: bind AS the user to verify the password ---------------
+        let (conn2, mut ldap2) = LdapConnAsync::with_settings(settings, &cfg.server_url)
+            .await
+            .map_err(|e| AuthError::Ldap(format!("connect (user bind): {}", e)))?;
+        ldap3::drive!(conn2);
+        let bind = ldap2
+            .simple_bind(&user_dn, password)
+            .await
+            .map_err(|e| AuthError::Ldap(format!("user bind: {}", e)))?;
+        let _ = ldap2.unbind().await;
+        bind.success().map_err(|_| AuthError::InvalidCredentials)?;
 
-        Ok(AuthResult::new(identity))
+        Ok(groups)
     }
 
     /// Authenticate using API key
@@ -595,25 +805,10 @@ impl AuthenticationHandler {
         let username = parts[0];
         let password = parts[1];
 
-        // In a real implementation, this would verify against a user store
-        // For demonstration, accept any non-empty password
-        if password.is_empty() {
-            return Err(AuthError::InvalidCredentials);
-        }
-
-        let identity = Identity {
-            user_id: username.to_string(),
-            name: Some(username.to_string()),
-            email: None,
-            roles: vec!["user".to_string()],
-            groups: Vec::new(),
-            tenant_id: None,
-            claims: HashMap::new(),
-            auth_method: "basic".to_string(),
-            authenticated_at: chrono::Utc::now(),
-        };
-
-        Ok(AuthResult::new(identity))
+        // No user store is wired, so HTTP Basic cannot verify a password.
+        // Deny rather than accept any non-empty password.
+        let _ = (username, password);
+        Err(AuthError::InvalidCredentials)
     }
 
     /// Trust-based authentication (e.g., for internal services)
@@ -693,21 +888,35 @@ impl AuthenticationHandler {
         Ok(())
     }
 
-    /// Verify API key against hash
+    /// Verify an API key against its stored hash using a constant-time
+    /// comparison (so verification time doesn't leak how much of the hash
+    /// matched).
     fn verify_api_key(&self, key: &str, hash: &str) -> bool {
-        // In production, use a proper constant-time comparison
-        // and secure hashing (e.g., Argon2, bcrypt)
-        let key_hash = self.hash_api_key(key);
-        key_hash == hash
+        let computed = self.hash_api_key(key);
+        let a = computed.as_bytes();
+        let b = hash.as_bytes();
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for (x, y) in a.iter().zip(b.iter()) {
+            diff |= x ^ y;
+        }
+        diff == 0
     }
 
-    /// Hash an API key
+    /// Hash an API key with SHA-256 (hex). Keys are high-entropy secrets, so a
+    /// fast cryptographic digest is appropriate (unlike user passwords, which
+    /// would warrant a slow KDF).
     fn hash_api_key(&self, key: &str) -> String {
-        // Placeholder: in production, use secure hashing
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut hasher);
-        format!("{:x}", hasher.finish())
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(key.as_bytes());
+        let mut out = String::with_capacity(64);
+        for b in digest {
+            use std::fmt::Write;
+            let _ = write!(out, "{:02x}", b);
+        }
+        out
     }
 
     /// Register an API key
@@ -992,5 +1201,193 @@ mod tests {
             .build();
 
         assert!(handler.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn basic_auth_denies_without_user_store() {
+        // Hardening: HTTP Basic used to accept ANY non-empty password. With no
+        // user store wired it must now deny.
+        let mut config = AuthConfig::default();
+        config.enabled = true;
+        config.auth_methods = vec![AuthMethod::Basic];
+        let handler = AuthenticationHandler::new(config);
+
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let creds = STANDARD.encode("alice:any-password");
+        let request = AuthRequest::new().with_header("Authorization", format!("Basic {creds}"));
+        let result = handler.authenticate(&request).await;
+        assert!(
+            result.is_err(),
+            "basic auth must deny without a user store, got {result:?}"
+        );
+    }
+
+    // --- OAuth RFC 7662 introspection -------------------------------------
+
+    /// Minimal HTTP/1.1 server that answers every request with a fixed JSON
+    /// body — stands in for an OAuth introspection endpoint. Returns its URL.
+    async fn spawn_introspection_mock(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                // Drain (best-effort) the request, then respond.
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{}/introspect", addr)
+    }
+
+    fn oauth_cfg(introspection_url: String, required_scopes: Vec<String>) -> OAuthConfig {
+        OAuthConfig {
+            introspection_url,
+            client_id: "proxy".into(),
+            client_secret: "secret".into(),
+            token_url: None,
+            scopes: Vec::new(),
+            cache_ttl: std::time::Duration::from_secs(60),
+            required_scopes,
+            issuer: String::new(),
+            authorization_url: None,
+            audience: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_introspection_accepts_active_token() {
+        let url = spawn_introspection_mock(
+            r#"{"active":true,"sub":"alice","username":"alice","scope":"read write"}"#,
+        )
+        .await;
+        let handler = AuthenticationHandlerBuilder::new()
+            .enabled(true)
+            .with_oauth(oauth_cfg(url, Vec::new()))
+            .build();
+        let req = AuthRequest::new().with_header("Authorization", "Bearer tok-abc");
+        let result = handler
+            .authenticate_oauth(&req)
+            .await
+            .expect("active token must authenticate");
+        assert_eq!(result.identity.user_id, "alice");
+        assert!(result.identity.roles.contains(&"read".to_string()));
+        assert!(result.identity.roles.contains(&"write".to_string()));
+    }
+
+    #[tokio::test]
+    async fn oauth_introspection_denies_inactive_token() {
+        let url = spawn_introspection_mock(r#"{"active":false}"#).await;
+        let handler = AuthenticationHandlerBuilder::new()
+            .enabled(true)
+            .with_oauth(oauth_cfg(url, Vec::new()))
+            .build();
+        let req = AuthRequest::new().with_header("Authorization", "Bearer dead");
+        let err = handler.authenticate_oauth(&req).await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::InvalidCredentials),
+            "inactive token must be denied, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_introspection_enforces_required_scopes() {
+        let url = spawn_introspection_mock(r#"{"active":true,"sub":"bob","scope":"read"}"#).await;
+        let handler = AuthenticationHandlerBuilder::new()
+            .enabled(true)
+            .with_oauth(oauth_cfg(url, vec!["admin".to_string()]))
+            .build();
+        let req = AuthRequest::new().with_header("Authorization", "Bearer tok");
+        let err = handler.authenticate_oauth(&req).await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::InsufficientPermissions(_)),
+            "missing required scope must deny, got {err:?}"
+        );
+    }
+
+    // --- LDAP search + bind (live, against a real directory) --------------
+
+    /// Live LDAP search-and-bind test against a real directory server. Gated
+    /// on `HELIOS_LDAP_URL` (e.g. `ldap://127.0.0.1:1389`); skips when unset so
+    /// CI without a directory stays green. `scripts/regress/ldap-test.sh`
+    /// stands up an OpenLDAP container, seeds a user, and exports the env.
+    ///
+    /// Asserts: the right user+password authenticates and yields an `ldap`
+    /// identity; a wrong password is denied; an unknown user is denied.
+    #[cfg(feature = "ldap-auth")]
+    #[tokio::test]
+    async fn ldap_live_search_and_bind() {
+        use std::time::Duration;
+
+        let url = match std::env::var("HELIOS_LDAP_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("skipping ldap_live_search_and_bind: set HELIOS_LDAP_URL");
+                return;
+            }
+        };
+        let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+        let cfg = LdapConfig {
+            server_url: url,
+            bind_dn: env("HELIOS_LDAP_BIND_DN", ""),
+            bind_password: env("HELIOS_LDAP_BIND_PW", ""),
+            user_search_base: env("HELIOS_LDAP_BASE", "ou=users,dc=example,dc=org"),
+            user_filter: env("HELIOS_LDAP_FILTER", "(uid={0})"),
+            group_search_base: None,
+            group_attribute: "memberOf".to_string(),
+            timeout: Duration::from_secs(5),
+            starttls: false,
+        };
+        let user = env("HELIOS_LDAP_USER", "alice");
+        let pass = env("HELIOS_LDAP_PASS", "alicepw");
+
+        let handler = AuthenticationHandlerBuilder::new()
+            .enabled(true)
+            .with_ldap(cfg)
+            .build();
+
+        // 1. Correct credentials authenticate.
+        let ok_req = AuthRequest::new()
+            .with_username(user.clone())
+            .with_password(pass.clone());
+        let result = handler
+            .authenticate_ldap(&ok_req)
+            .await
+            .expect("valid LDAP credentials must authenticate");
+        assert_eq!(result.identity.user_id, user);
+        assert_eq!(result.identity.auth_method, "ldap");
+
+        // 2. Wrong password is denied.
+        let bad_pw = AuthRequest::new()
+            .with_username(user.clone())
+            .with_password("definitely-wrong");
+        assert!(
+            matches!(
+                handler.authenticate_ldap(&bad_pw).await,
+                Err(AuthError::InvalidCredentials)
+            ),
+            "wrong password must be denied"
+        );
+
+        // 3. Unknown user is denied.
+        let unknown = AuthRequest::new()
+            .with_username("nosuchuser")
+            .with_password("whatever");
+        assert!(
+            matches!(
+                handler.authenticate_ldap(&unknown).await,
+                Err(AuthError::InvalidCredentials)
+            ),
+            "unknown user must be denied"
+        );
     }
 }

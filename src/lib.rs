@@ -157,6 +157,8 @@ pub mod plugins;
 // ── GraphQL-to-SQL gateway ──────────────────────────────────────────
 #[cfg(feature = "graphql-gateway")]
 pub mod graphql;
+#[cfg(feature = "graphql-gateway")]
+pub mod graphql_gateway;
 
 // ── Schema-aware routing ────────────────────────────────────────────
 #[cfg(feature = "schema-routing")]
@@ -648,7 +650,7 @@ mod postgresql_compat_tests {
             max_batch_size: 3,
             ..Default::default()
         };
-        let batcher = InsertBatcher::new(config);
+        let batcher = std::sync::Arc::new(InsertBatcher::new(config));
 
         batcher
             .add(
