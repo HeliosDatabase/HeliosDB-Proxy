@@ -1992,7 +1992,11 @@ struct EdgeInvalidateBody {
 
 /// Parse `?limit=N` from a path. Returns clamped value, or `default`
 /// when the param is missing / unparseable.
-#[cfg(feature = "anomaly-detection")]
+///
+/// Shared by the `/anomalies` (`anomaly-detection`) and `/api/analytics`
+/// (`query-analytics`) handlers, so it must compile whenever *either* feature
+/// is enabled — not just `anomaly-detection`.
+#[cfg(any(feature = "anomaly-detection", feature = "query-analytics"))]
 fn parse_limit_query(path: &str, default: usize, max: usize) -> usize {
     let q = match path.find('?') {
         Some(i) => &path[i + 1..],
@@ -2630,7 +2634,7 @@ mod tests {
         assert_eq!(value["events"].as_array().unwrap().len(), 5);
     }
 
-    #[cfg(feature = "anomaly-detection")]
+    #[cfg(any(feature = "anomaly-detection", feature = "query-analytics"))]
     #[test]
     fn test_parse_limit_query_helper() {
         assert_eq!(parse_limit_query("/anomalies", 100, 1024), 100);
