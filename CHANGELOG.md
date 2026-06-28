@@ -5,6 +5,21 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-06-28
+
+Patch release — feature-gating fix.
+
+### Fixed
+
+- **`query-analytics` now compiles standalone.** `parse_limit_query` (in
+  `src/admin.rs`) was gated `#[cfg(feature = "anomaly-detection")]`, but the
+  `#[cfg(feature = "query-analytics")]` `/api/analytics` handler also calls it.
+  Because the two features are declared independently, building with
+  `--features query-analytics` alone failed to compile. The helper (and its unit
+  test) are now gated `any(feature = "anomaly-detection", feature =
+  "query-analytics")`, so it is available whenever either consumer is compiled —
+  without coupling the two features.
+
 ## [1.3.0] - 2026-06-27
 
 Minor release — reliability hardening across the data path, the pool, and
