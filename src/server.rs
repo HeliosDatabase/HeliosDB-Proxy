@@ -160,6 +160,11 @@ struct ServerState {
     // lock-free atomic load with no await, no semaphore, no guard held
     // across the routing awaits.
     health: ArcSwap<HashMap<String, NodeHealth>>,
+    /// Write-serialization lock for `health`. Every reader stays lock-free on
+    /// the ArcSwap; every *writer* (periodic checker, in-band demotion, SIGHUP
+    /// reconcile) holds this across its load → clone → mutate → store so the
+    /// non-atomic read-modify-write cannot lose updates under concurrency.
+    health_write: parking_lot::Mutex<()>,
     /// Live, reloadable proxy configuration (Batch H). The accept loop snapshots
     /// this per new connection and the health checker reads it each tick, so a
     /// SIGHUP that swaps it takes effect for new connections and node health
@@ -175,6 +180,10 @@ struct ServerState {
     /// fresh connection) can be forwarded to the right backend instead of
     /// being dropped. Bounded; best-effort.
     cancel_map: Arc<DashMap<(u32, u32), String>>,
+    /// Insertion order of `cancel_map` keys, so an overflow evicts the OLDEST
+    /// entries (FIFO) instead of clearing the whole map — a busy proxy no
+    /// longer loses every in-flight cancel registration at once.
+    cancel_order: Arc<parking_lot::Mutex<std::collections::VecDeque<(u32, u32)>>>,
     /// Client-facing TLS acceptor, built from `[tls]` config when enabled.
     /// `None` => the proxy rejects SSLRequests with `N` (plaintext only).
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
@@ -191,9 +200,50 @@ struct ServerState {
     cutover: Arc<ArcSwap<Option<Arc<crate::mirror::CutoverTarget>>>>,
     /// Load balancer state
     lb_state: LoadBalancerState,
+    /// SQL-comment routing-hint parser. `Some` when `[routing_hints] enabled`
+    /// and the `routing-hints` feature is compiled in; the parser's own
+    /// `strip_hints` flag records whether to rewrite the SQL before forwarding.
+    /// Applied per query, taking precedence over default verb routing.
+    #[cfg(feature = "routing-hints")]
+    hint_parser: Option<crate::routing::HintParser>,
+    /// Multi-dimensional rate limiter. `Some` when `[rate_limit] enabled`;
+    /// every query is checked against it before being forwarded to a backend.
+    #[cfg(feature = "rate-limiting")]
+    rate_limiter: Option<Arc<crate::rate_limit::RateLimiter>>,
+    /// Per-node circuit breaker manager. `Some` when `[circuit_breaker]
+    /// enabled`. Records per-node success/failure on the forward path, excludes
+    /// open nodes from read selection, and fast-fails queries to an open node.
+    #[cfg(feature = "circuit-breaker")]
+    circuit_breaker: Option<Arc<crate::circuit_breaker::CircuitBreakerManager>>,
+    /// Query analytics engine. `Some` when `[analytics] enabled`. Every
+    /// forwarded query is recorded (fingerprint, latency, slow-query log).
+    #[cfg(feature = "query-analytics")]
+    analytics: Option<Arc<crate::analytics::QueryAnalytics>>,
+    /// Query-result cache (L1 hot / L2 warm). `Some` when `[cache] enabled`.
+    /// Read SELECTs are served from it; writes invalidate referenced tables.
+    #[cfg(feature = "query-cache")]
+    query_cache: Option<Arc<crate::cache::QueryCache>>,
+    /// SQL query rewriter. `Some` when `[query_rewrite] enabled` with rules.
+    /// Rewrites the query SQL on the path before forwarding.
+    #[cfg(feature = "query-rewriting")]
+    rewriter: Option<Arc<crate::rewriter::QueryRewriter>>,
+    /// Multi-tenancy manager. `Some` when `[multi_tenancy] enabled`. Identifies
+    /// the tenant for a session and injects a row-level tenant filter.
+    #[cfg(feature = "multi-tenancy")]
+    tenant_manager: Option<Arc<crate::multi_tenancy::TenantManager>>,
+    /// Schema/workload query analyzer. `Some` when `[schema_routing] enabled`;
+    /// analytical (OLAP) queries are routed to the configured analytics node.
+    #[cfg(feature = "schema-routing")]
+    schema_analyzer: Option<Arc<crate::schema_routing::QueryAnalyzer>>,
     /// Pool manager for Session/Transaction/Statement modes
     #[cfg(feature = "pool-modes")]
     pool_manager: Option<Arc<ConnectionPoolManager>>,
+    /// Data-path idle backend-connection pool. `Some` only when pooling is
+    /// active (mode is Transaction or Statement); `None` leaves the 1:1
+    /// session-pinned path completely unchanged. This is the raw-stream pool
+    /// the data path actually leases from, keyed by `(node, user, database)`.
+    #[cfg(feature = "pool-modes")]
+    backend_pool: Option<Arc<crate::pool::BackendIdlePool>>,
     /// WASM plugin manager. `None` means no plugins loaded — the per-query
     /// hook path becomes a fast no-op. When `Some`, `PreQuery` / `PostQuery`
     /// hooks fire on every simple-query message.
@@ -277,6 +327,12 @@ pub struct ClientSession {
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// TR mode for this session
     pub tr_mode: TrMode,
+    /// Wall-clock instant of this session's most recent write, for
+    /// read-your-writes routing: reads within the configured window after a
+    /// write are pinned to the primary so the client observes its own writes
+    /// despite replica lag.
+    #[cfg(feature = "lag-routing")]
+    pub last_write_at: RwLock<Option<std::time::Instant>>,
     /// Client ID for pool-modes lease tracking
     #[cfg(feature = "pool-modes")]
     pub pool_client_id: ClientId,
@@ -553,6 +609,25 @@ impl ProxyServer {
             Some(Arc::new(ConnectionPoolManager::new(pool_config)))
         };
 
+        // The raw-stream data-path pool is only built when pooling is active
+        // (Transaction/Statement). Session mode leaves it `None` so the hot
+        // path is byte-for-byte unchanged.
+        #[cfg(feature = "pool-modes")]
+        let backend_pool = match config.pool_mode.mode {
+            crate::config::PoolingMode::Transaction | crate::config::PoolingMode::Statement => {
+                tracing::info!(
+                    mode = ?config.pool_mode.mode,
+                    max_idle_per_identity = config.pool_mode.max_pool_size,
+                    "pool-modes: data-path connection pooling enabled"
+                );
+                Some(Arc::new(crate::pool::BackendIdlePool::new(
+                    config.pool_mode.max_pool_size as usize,
+                    Self::MAX_TOTAL_IDLE_BACKEND_CONNS,
+                )))
+            }
+            crate::config::PoolingMode::Session => None,
+        };
+
         // Initialize plugin manager if the wasm-plugins feature is enabled
         // AND plugins are turned on in config. Scans plugin_dir for `.wasm`
         // files and loads each; a missing directory is non-fatal and logs
@@ -603,12 +678,221 @@ impl ProxyServer {
             None
         };
 
+        // Build the rate limiter from the TOML config when enabled.
+        #[cfg(feature = "rate-limiting")]
+        let rate_limiter = if config.rate_limit.enabled {
+            let rl = &config.rate_limit;
+            tracing::info!(
+                qps = rl.default_qps,
+                burst = rl.default_burst,
+                key_by = ?rl.key_by,
+                "rate limiting enabled"
+            );
+            let rlc = crate::rate_limit::RateLimitConfig {
+                enabled: true,
+                default_qps: rl.default_qps,
+                default_burst: rl.default_burst,
+                default_concurrency: if rl.max_concurrent > 0 {
+                    rl.max_concurrent
+                } else {
+                    crate::rate_limit::RateLimitConfig::default().default_concurrency
+                },
+                ..Default::default()
+            };
+            Some(Arc::new(crate::rate_limit::RateLimiter::new(rlc)))
+        } else {
+            None
+        };
+
+        // Build the per-node circuit breaker manager when enabled.
+        #[cfg(feature = "circuit-breaker")]
+        let circuit_breaker = if config.circuit_breaker.enabled {
+            let cb = &config.circuit_breaker;
+            tracing::info!(
+                failure_threshold = cb.failure_threshold,
+                open_secs = cb.open_secs,
+                "circuit breaker enabled"
+            );
+            let cbc = crate::circuit_breaker::CircuitBreakerConfig {
+                failure_threshold: cb.failure_threshold,
+                cooldown: Duration::from_secs(cb.open_secs),
+                half_open_success_threshold: cb.success_threshold,
+                ..Default::default()
+            };
+            let mgr = crate::circuit_breaker::CircuitBreakerManager::new(
+                crate::circuit_breaker::ManagerConfig::new(cbc),
+            );
+            Some(Arc::new(mgr))
+        } else {
+            None
+        };
+
+        // Build the query-analytics engine when enabled.
+        #[cfg(feature = "query-analytics")]
+        let analytics = if config.analytics.enabled {
+            let a = &config.analytics;
+            tracing::info!(
+                slow_query_ms = a.slow_query_ms,
+                max_fingerprints = a.max_fingerprints,
+                "query analytics enabled"
+            );
+            let ac = crate::analytics::AnalyticsConfig {
+                enabled: true,
+                max_fingerprints: a.max_fingerprints as usize,
+                slow_query: crate::analytics::SlowQueryConfig {
+                    threshold: Duration::from_millis(a.slow_query_ms),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            Some(Arc::new(crate::analytics::QueryAnalytics::new(ac)))
+        } else {
+            None
+        };
+
+        // Build the query-result cache when enabled.
+        #[cfg(feature = "query-cache")]
+        let query_cache = if config.cache.enabled {
+            let c = &config.cache;
+            tracing::info!(
+                ttl_secs = c.ttl_secs,
+                max_result_bytes = c.max_result_bytes,
+                "query cache enabled (L1 hot + L2 warm)"
+            );
+            let ttl = Duration::from_secs(c.ttl_secs);
+            let cc = crate::cache::CacheConfig {
+                enabled: true,
+                default_ttl: ttl,
+                max_result_size: c.max_result_bytes,
+                l1: crate::cache::L1Config {
+                    ttl,
+                    ..Default::default()
+                },
+                l2: crate::cache::L2Config {
+                    ttl,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            Some(Arc::new(crate::cache::QueryCache::new(cc)))
+        } else {
+            None
+        };
+
+        // Build the SQL query rewriter from the configured rules.
+        #[cfg(feature = "query-rewriting")]
+        let rewriter = if config.query_rewrite.enabled && !config.query_rewrite.rules.is_empty() {
+            use crate::rewriter::{
+                QueryPattern, QueryRewriter, RewriteRule, RewriterConfig, Transformation,
+            };
+            let rw = QueryRewriter::new(RewriterConfig {
+                enabled: true,
+                ..Default::default()
+            });
+            let mut n = 0usize;
+            for (i, r) in config.query_rewrite.rules.iter().enumerate() {
+                let transformation =
+                    if let (Some(from), Some(to)) = (&r.match_table, &r.replace_table_with) {
+                        Transformation::ReplaceTable {
+                            from: from.clone(),
+                            to: to.clone(),
+                        }
+                    } else if let Some(w) = &r.append_where {
+                        Transformation::AppendWhereAnd(w.clone())
+                    } else if let Some(limit) = r.add_limit {
+                        Transformation::AddLimit(limit)
+                    } else {
+                        continue; // no transformation specified — skip
+                    };
+                let pattern = if let Some(t) = &r.match_table {
+                    QueryPattern::Table(t.clone())
+                } else if let Some(re) = &r.match_regex {
+                    QueryPattern::regex(re.clone())
+                } else {
+                    QueryPattern::All
+                };
+                rw.add_rule(
+                    RewriteRule::build(format!("rule-{i}"))
+                        .pattern(pattern)
+                        .transform(transformation)
+                        .build(),
+                );
+                n += 1;
+            }
+            tracing::info!(rules = n, "query rewriting enabled");
+            Some(Arc::new(rw))
+        } else {
+            None
+        };
+
+        // Build the multi-tenancy manager from the configured tenants.
+        #[cfg(feature = "multi-tenancy")]
+        let tenant_manager =
+            if config.multi_tenancy.enabled && !config.multi_tenancy.tenants.is_empty() {
+                use crate::multi_tenancy::{
+                    IdentificationMethod, IsolationStrategy, MultiTenancyConfig, TenantConfig,
+                    TenantId, TenantManagerBuilder, TenantQueryTransformer,
+                };
+                let mt = &config.multi_tenancy;
+                let identification = match mt.identify_by.as_str() {
+                    "database" => IdentificationMethod::DatabaseName,
+                    param => IdentificationMethod::Header {
+                        header_name: param.to_string(),
+                    },
+                };
+                let mtc = MultiTenancyConfig {
+                    enabled: true,
+                    identification,
+                    ..Default::default()
+                };
+                // Configure which tables are tenant-scoped + the filter column.
+                let table_refs: Vec<&str> = mt.tenant_tables.iter().map(|s| s.as_str()).collect();
+                let transformer = TenantQueryTransformer::new()
+                    .register_tables(&table_refs, mt.tenant_column.clone());
+                let tm = TenantManagerBuilder::new()
+                    .config(mtc)
+                    .query_transformer(transformer)
+                    .build();
+                for id in &mt.tenants {
+                    tm.register_tenant(TenantConfig::new(
+                        TenantId::new(id.clone()),
+                        IsolationStrategy::row("public", mt.tenant_column.clone()),
+                    ));
+                }
+                tracing::info!(
+                    tenants = mt.tenants.len(),
+                    identify_by = %mt.identify_by,
+                    "multi-tenancy enabled"
+                );
+                Some(Arc::new(tm))
+            } else {
+                None
+            };
+
+        // Build the schema/workload query analyzer when enabled.
+        #[cfg(feature = "schema-routing")]
+        let schema_analyzer =
+            if config.schema_routing.enabled && !config.schema_routing.analytics_node.is_empty() {
+                tracing::info!(
+                    analytics_node = %config.schema_routing.analytics_node,
+                    "schema/workload routing enabled (OLAP -> analytics node)"
+                );
+                let registry = Arc::new(crate::schema_routing::SchemaRegistry::new());
+                Some(Arc::new(crate::schema_routing::QueryAnalyzer::new(
+                    registry,
+                )))
+            } else {
+                None
+            };
+
         let state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
             health: ArcSwap::from_pointee(health),
+            health_write: parking_lot::Mutex::new(()),
             live_config: ArcSwap::from_pointee(config.clone()),
             metrics: ServerMetrics::default(),
             cancel_map: Arc::new(DashMap::new()),
+            cancel_order: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
             tls_acceptor,
             auth_file,
             mirror,
@@ -616,8 +900,38 @@ impl ProxyServer {
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
             },
+            #[cfg(feature = "routing-hints")]
+            hint_parser: if config.routing_hints.enabled {
+                tracing::info!(
+                    strip = config.routing_hints.strip_hints,
+                    "SQL-comment routing hints enabled"
+                );
+                Some(if config.routing_hints.strip_hints {
+                    crate::routing::HintParser::new()
+                } else {
+                    crate::routing::HintParser::without_stripping()
+                })
+            } else {
+                None
+            },
+            #[cfg(feature = "rate-limiting")]
+            rate_limiter,
+            #[cfg(feature = "circuit-breaker")]
+            circuit_breaker,
+            #[cfg(feature = "query-analytics")]
+            analytics,
+            #[cfg(feature = "query-cache")]
+            query_cache,
+            #[cfg(feature = "query-rewriting")]
+            rewriter,
+            #[cfg(feature = "multi-tenancy")]
+            tenant_manager,
+            #[cfg(feature = "schema-routing")]
+            schema_analyzer,
             #[cfg(feature = "pool-modes")]
             pool_manager,
+            #[cfg(feature = "pool-modes")]
+            backend_pool,
             #[cfg(feature = "wasm-plugins")]
             plugin_manager,
             #[cfg(feature = "ha-tr")]
@@ -760,6 +1074,9 @@ impl ProxyServer {
     /// their current health; new nodes are seeded healthy (immediately
     /// routable, the next check confirms); removed nodes are dropped.
     fn reconcile_health(state: &Arc<ServerState>, config: &ProxyConfig) {
+        // Serialize against the periodic checker and in-band demotions so this
+        // rebuild neither clobbers nor is clobbered by a concurrent write.
+        let _writers = state.health_write.lock();
         let current = state.health.load_full();
         let mut next: HashMap<String, NodeHealth> = HashMap::new();
         for node in &config.nodes {
@@ -838,6 +1155,22 @@ impl ProxyServer {
             Some(tokio::spawn(async move {
                 if let Err(e) = crate::http_gateway::HttpGateway::new(gw_cfg).run().await {
                     tracing::error!("HTTP gateway error: {}", e);
+                }
+            }))
+        } else {
+            None
+        };
+
+        // Start the GraphQL-to-SQL gateway when enabled.
+        #[cfg(feature = "graphql-gateway")]
+        let _graphql_gw_task = if self.config.graphql_gateway.enabled {
+            let gw_cfg = self.config.graphql_gateway.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = crate::graphql_gateway::GraphqlGateway::new(gw_cfg)
+                    .run()
+                    .await
+                {
+                    tracing::error!("GraphQL gateway error: {}", e);
                 }
             }))
         } else {
@@ -1007,6 +1340,20 @@ impl ProxyServer {
                 admin_state.with_plugin_manager(pm.clone()).await;
             }
 
+            // Attach the pool manager so /api/pools surfaces real per-node
+            // pool statistics instead of an empty list.
+            #[cfg(feature = "pool-modes")]
+            if let Some(ref pm) = state.pool_manager {
+                admin_state.with_pool_manager(pm.clone()).await;
+            }
+
+            // Attach the circuit-breaker manager so /api/circuit reports live
+            // per-node breaker state.
+            #[cfg(feature = "circuit-breaker")]
+            if let Some(ref cb) = state.circuit_breaker {
+                admin_state.with_circuit_breaker(cb.clone()).await;
+            }
+
             // Attach the time-travel replay engine. The engine reads
             // windows from the shared TransactionJournal and replays
             // statements against a target backend supplied per-request.
@@ -1030,6 +1377,12 @@ impl ProxyServer {
             admin_state
                 .with_anomaly_detector(state.anomaly_detector.clone())
                 .await;
+
+            // Attach the query-analytics engine so /api/analytics can read it.
+            #[cfg(feature = "query-analytics")]
+            if let Some(a) = state.analytics.as_ref() {
+                admin_state.with_analytics(a.clone()).await;
+            }
 
             // Attach the edge cache + registry. Both surfaced via
             // /api/edge/* admin routes.
@@ -1126,6 +1479,8 @@ impl ProxyServer {
             variables: RwLock::new(HashMap::new()),
             created_at: chrono::Utc::now(),
             tr_mode: config.tr_mode,
+            #[cfg(feature = "lag-routing")]
+            last_write_at: RwLock::new(None),
             #[cfg(feature = "pool-modes")]
             pool_client_id: ClientId::new(),
             #[cfg(feature = "wasm-plugins")]
@@ -1195,9 +1550,15 @@ impl ProxyServer {
         // each node rather than dropping the socket and paying a fresh TCP
         // connect + startup + SCRAM handshake on every switch (Batch C).
         // Connections are authenticated with the client's own credentials
-        // (auth is pass-through), so they are private to this session —
-        // cross-client transaction pooling additionally needs proxy-side
-        // backend auth and is deferred to the auth batch.
+        // (auth is pass-through). In Transaction/Statement pooling mode they
+        // are returned to a shared, identity-keyed idle pool at each
+        // transaction boundary (DISCARD ALL reset on release) and reused by the
+        // next same-identity acquisition — see `release_to_pool_if_idle` /
+        // `ensure_conn`. The first connection of a session is still
+        // established through the authenticated startup path; drawing the
+        // startup connection from the pool (to reduce *concurrent* backend
+        // connections below the client count) additionally needs
+        // proxy-terminated backend auth and is the documented next increment.
         let mut conns: HashMap<String, BackendConn> = HashMap::new();
         let mut current_node: Option<String> =
             match Self::handle_startup(stream, &mut buffer, &codec, pre, session, state, config)
@@ -1246,6 +1607,9 @@ impl ProxyServer {
         // it defines (Parse), references (Bind/Describe-S), and closes
         // (Close-S) — resolved at the Sync/Flush boundary.
         let mut stmt_registry: HashMap<String, bytes::Bytes> = HashMap::new();
+        // Running sum of the bytes held in `stmt_registry`, kept in step with
+        // it so the aggregate-size cap is O(1) per Parse (see MAX_PREPARED_BYTES).
+        let mut stmt_registry_bytes: usize = 0;
         let mut batch_defines: Vec<String> = Vec::new();
         let mut batch_refs: Vec<String> = Vec::new();
         let mut batch_closes: Vec<String> = Vec::new();
@@ -1273,6 +1637,22 @@ impl ProxyServer {
                 .metrics
                 .bytes_received
                 .fetch_add(n as u64, Ordering::Relaxed);
+
+            // Bound a single in-flight message: refuse before the accumulation
+            // buffer for one (possibly malicious) oversized frame can exhaust
+            // memory. A legitimate client never needs a single >64 MiB message.
+            if buffer.len() > Self::MAX_PENDING_BYTES {
+                let emsg =
+                    Self::create_error_response("53400", "message exceeds per-session size limit");
+                let _ = stream.write_all(&emsg).await;
+                let _ = stream.write_all(&Self::create_ready_for_query(b'I')).await;
+                tracing::warn!(
+                    client = %session.client_addr,
+                    bytes = buffer.len(),
+                    "inbound message exceeds size cap; closing connection"
+                );
+                return Ok(());
+            }
 
             // Process all complete messages in buffer
             while let Some(msg) = codec.decode_message(&mut buffer)? {
@@ -1357,6 +1737,17 @@ impl ProxyServer {
                         if let Some(n) = used_node {
                             current_node = Some(n);
                         }
+                        // Transaction/Statement pooling: park the connection
+                        // back to the shared pool once the session is idle.
+                        #[cfg(feature = "pool-modes")]
+                        Self::release_to_pool_if_idle(
+                            &mut conns,
+                            current_node.as_deref(),
+                            session,
+                            state,
+                            config,
+                        )
+                        .await;
                         state.metrics.bytes_sent.fetch_add(sent, Ordering::Relaxed);
                         state
                             .metrics
@@ -1383,7 +1774,54 @@ impl ProxyServer {
                                 let unnamed = name.is_empty();
                                 if !unnamed {
                                     let name = name.to_string();
-                                    stmt_registry.insert(name.clone(), msg.encode().freeze());
+                                    let existed = stmt_registry.contains_key(&name);
+                                    // Cap distinct prepared statements per session so a
+                                    // client issuing unbounded named `Parse`s can't grow
+                                    // `stmt_registry` without limit.
+                                    if !existed
+                                        && stmt_registry.len() >= Self::MAX_PREPARED_STATEMENTS
+                                    {
+                                        let emsg = Self::create_error_response(
+                                            "54000",
+                                            "too many prepared statements for this session",
+                                        );
+                                        let _ = stream.write_all(&emsg).await;
+                                        let _ = stream
+                                            .write_all(&Self::create_ready_for_query(b'I'))
+                                            .await;
+                                        tracing::warn!(
+                                            client = %session.client_addr,
+                                            limit = Self::MAX_PREPARED_STATEMENTS,
+                                            "prepared-statement cap exceeded; closing connection"
+                                        );
+                                        return Ok(());
+                                    }
+                                    let encoded = msg.encode().freeze();
+                                    // Bound the AGGREGATE bytes retained, not just the
+                                    // count: a (possibly re-Parsed) statement that would
+                                    // push the session over the byte cap is refused.
+                                    let old_len =
+                                        stmt_registry.get(&name).map(|b| b.len()).unwrap_or(0);
+                                    let projected =
+                                        stmt_registry_bytes.saturating_sub(old_len) + encoded.len();
+                                    if projected > Self::MAX_PREPARED_BYTES {
+                                        let emsg = Self::create_error_response(
+                                            "54000",
+                                            "prepared-statement memory limit exceeded for this session",
+                                        );
+                                        let _ = stream.write_all(&emsg).await;
+                                        let _ = stream
+                                            .write_all(&Self::create_ready_for_query(b'I'))
+                                            .await;
+                                        tracing::warn!(
+                                            client = %session.client_addr,
+                                            limit = Self::MAX_PREPARED_BYTES,
+                                            "prepared-statement byte cap exceeded; closing connection"
+                                        );
+                                        return Ok(());
+                                    }
+                                    stmt_registry.insert(name.clone(), encoded);
+                                    stmt_registry_bytes = projected;
                                     batch_defines.push(name);
                                 }
                                 if pending_route_sql.is_none() {
@@ -1475,11 +1913,28 @@ impl ProxyServer {
                         if let Some(n) = used_node {
                             current_node = Some(n);
                         }
+                        // A `Sync` is the extended-protocol transaction/statement
+                        // boundary (it yields ReadyForQuery); a `Flush` is not, so
+                        // only a Sync triggers a pool release.
+                        #[cfg(feature = "pool-modes")]
+                        if wait_ready {
+                            Self::release_to_pool_if_idle(
+                                &mut conns,
+                                current_node.as_deref(),
+                                session,
+                                state,
+                                config,
+                            )
+                            .await;
+                        }
                         state.metrics.bytes_sent.fetch_add(sent, Ordering::Relaxed);
                         // Closed statements are deallocated everywhere — forget
                         // their canonical Parse so they are never re-prepared.
                         for name in batch_closes.drain(..) {
-                            stmt_registry.remove(&name);
+                            if let Some(removed) = stmt_registry.remove(&name) {
+                                stmt_registry_bytes =
+                                    stmt_registry_bytes.saturating_sub(removed.len());
+                            }
                         }
                         if wait_ready {
                             // Sync ends the extended cycle; reset routing so the
@@ -1539,6 +1994,42 @@ impl ProxyServer {
                         }
                     }
                 }
+            }
+
+            // Bound un-flushed extended-protocol accumulation: a client must
+            // reach a Sync/Flush boundary before this many bytes pile up in
+            // `pending` (otherwise a never-syncing client grows it unbounded).
+            if pending.len() > Self::MAX_PENDING_BYTES {
+                let emsg = Self::create_error_response(
+                    "53400",
+                    "un-flushed extended-protocol buffer exceeds per-session limit",
+                );
+                let _ = stream.write_all(&emsg).await;
+                let _ = stream.write_all(&Self::create_ready_for_query(b'I')).await;
+                tracing::warn!(
+                    client = %session.client_addr,
+                    pending = pending.len(),
+                    "pending extended-protocol buffer cap exceeded; closing connection"
+                );
+                return Ok(());
+            }
+        }
+
+        // On disconnect, park this session's still-idle connections so a later
+        // same-identity client can reuse them (cross-client pooling). Anything
+        // mid-transaction is left to drop (closed → backend rolls back).
+        #[cfg(feature = "pool-modes")]
+        if state.backend_pool.is_some() {
+            let nodes: Vec<String> = conns.keys().cloned().collect();
+            for node in nodes {
+                Self::release_to_pool_if_idle(
+                    &mut conns,
+                    Some(node.as_str()),
+                    session,
+                    state,
+                    config,
+                )
+                .await;
             }
         }
 
@@ -1892,16 +2383,28 @@ impl ProxyServer {
             )
         };
 
-        // Connect to backend
-        let mut backend = tokio::time::timeout(
+        // Connect to backend. A failure here (the node is down at the moment a
+        // new client connects) demotes the node in-band too — not just failures
+        // on the forward path — so a dead backend is detected on the very next
+        // connection instead of waiting for the periodic health checker.
+        let mut backend = match tokio::time::timeout(
             config.pool.acquire_timeout(),
             TcpStream::connect(&node_addr),
         )
         .await
-        .map_err(|_| ProxyError::Connection(format!("Connection timeout to {}", node_addr)))?
-        .map_err(|e| {
-            ProxyError::Connection(format!("Failed to connect to {}: {}", node_addr, e))
-        })?;
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                let msg = format!("Failed to connect to {}: {}", node_addr, e);
+                Self::note_backend_failure(state, &node_addr, &msg);
+                return Err(ProxyError::Connection(msg));
+            }
+            Err(_) => {
+                let msg = format!("Connection timeout to {}", node_addr);
+                Self::note_backend_failure(state, &node_addr, &msg);
+                return Err(ProxyError::Connection(msg));
+            }
+        };
         let _ = backend.set_nodelay(true);
 
         // Build and send startup message to backend
@@ -1952,14 +2455,62 @@ impl ProxyServer {
         msg.to_vec()
     }
 
-    /// Cap on the cancel-key map; cleared on overflow (a dropped stale
-    /// entry only means one best-effort cancel is not forwarded).
+    /// Cap on the cancel-key map; the oldest entries are evicted on overflow
+    /// (a dropped stale entry only means one best-effort cancel is not
+    /// forwarded).
     const MAX_CANCEL_KEYS: usize = 100_000;
+
+    /// Timeout for a single backend write on the forward path — a blackholed or
+    /// hung backend must never pin a client task indefinitely. Backend reads
+    /// are already bounded (30s); this bounds writes symmetrically.
+    const BACKEND_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+    /// Timeout for a single client write — a wedged or very slow client must
+    /// not pin a proxy task (and the backend connection it holds) forever.
+    const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+    /// Timeout for the out-of-band re-prepare exchange (write Parse+Flush, read
+    /// ParseComplete) performed on a backend connection switch.
+    const REPREPARE_TIMEOUT: Duration = Duration::from_secs(15);
+    /// Per-session cap on distinct named prepared statements — bounds the
+    /// `stmt_registry` against a client that issues unbounded `Parse`s.
+    const MAX_PREPARED_STATEMENTS: usize = 8192;
+    /// Per-session cap on the aggregate bytes retained in `stmt_registry`. The
+    /// count cap alone does not bound memory: each entry holds the full encoded
+    /// `Parse`, so 8192 large statements could still retain multiple GiB. This
+    /// bounds the total held bytes (statements are tiny in practice; a session
+    /// that approaches this is pathological).
+    const MAX_PREPARED_BYTES: usize = 64 * 1024 * 1024;
+    /// Per-session cap on the un-flushed extended-protocol `pending` buffer: a
+    /// client must reach a Sync/Flush boundary before this many bytes pile up.
+    const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
+    /// Global ceiling on idle connections parked in the data-path backend pool
+    /// across ALL `(node,user,db)` identities — bounds total file descriptors
+    /// regardless of how many distinct identities connect.
+    #[cfg(feature = "pool-modes")]
+    const MAX_TOTAL_IDLE_BACKEND_CONNS: usize = 8192;
+    /// How often the idle-connection reaper runs.
+    const POOL_REAP_INTERVAL: Duration = Duration::from_secs(30);
 
     /// Record the backend that owns a BackendKeyData (pid, secret) pair.
     fn register_cancel_key(state: &Arc<ServerState>, pid: u32, key: u32, node_addr: &str) {
-        if state.cancel_map.len() >= Self::MAX_CANCEL_KEYS {
-            state.cancel_map.clear();
+        // FIFO-evict the oldest registrations when at capacity, rather than
+        // dropping all of them. Evict a small batch so we don't churn the lock
+        // on every insert once full.
+        {
+            let mut order = state.cancel_order.lock();
+            while state.cancel_map.len() >= Self::MAX_CANCEL_KEYS {
+                match order.pop_front() {
+                    Some(old) => {
+                        state.cancel_map.remove(&old);
+                    }
+                    None => {
+                        // Order queue empty but map full (shouldn't happen) —
+                        // fall back to a clear to stay bounded.
+                        state.cancel_map.clear();
+                        break;
+                    }
+                }
+            }
+            order.push_back((pid, key));
         }
         state.cancel_map.insert((pid, key), node_addr.to_string());
     }
@@ -2104,6 +2655,19 @@ impl ProxyServer {
         if let Some(t) = state.cutover.load_full().as_ref() {
             return Ok(t.addr.clone());
         }
+
+        // Read-your-writes: within the window after a write, a read is pinned to
+        // the primary (overriding the reuse-of-a-standby path) so the client
+        // observes its own writes despite replica lag.
+        #[cfg(feature = "lag-routing")]
+        if !is_write && forced_target.is_none() && config.lag_routing.enabled {
+            let last_write = *session.last_write_at.read().await;
+            if Self::ryw_pins_primary(last_write, config.lag_routing.ryw_window_ms) {
+                tracing::debug!(target: "helios::routing", "read-your-writes: pinning read to primary");
+                return Self::select_primary_with_timeout(session, state, config).await;
+            }
+        }
+
         let need_switch = if let Some(ref forced) = forced_target {
             let health = state.health.load_full();
             let reuse = current_node
@@ -2131,7 +2695,17 @@ impl ProxyServer {
         };
 
         if let Some(forced) = forced_target {
-            Ok(forced)
+            // Resolve a node *name* to its address; an address is passed
+            // through unchanged. This lets `/*helios:node=pg-standby*/` (and a
+            // plugin `Node("name")`) target a node by its configured name
+            // rather than requiring the raw host:port.
+            let resolved = config
+                .nodes
+                .iter()
+                .find(|n| n.name.as_deref() == Some(forced.as_str()) || n.address() == forced)
+                .map(|n| n.address())
+                .unwrap_or(forced);
+            Ok(resolved)
         } else if need_switch {
             if is_write {
                 Self::select_primary_with_timeout(session, state, config).await
@@ -2152,10 +2726,30 @@ impl ProxyServer {
         target: &str,
         session: &Arc<ClientSession>,
         config: &ProxyConfig,
+        _state: &Arc<ServerState>,
     ) -> Result<()> {
         if conns.contains_key(target) {
             return Ok(());
         }
+
+        // Transaction/Statement pooling: lease a parked, identity-matched
+        // connection before paying for a fresh TCP connect + startup + auth.
+        // The parked connection was `DISCARD ALL`-reset on release, so it is
+        // clean for this (same-identity) client.
+        #[cfg(feature = "pool-modes")]
+        if let Some(pool) = _state.backend_pool.as_ref() {
+            let key = Self::pool_key_for(target, session).await;
+            if let Some(stream) = pool.checkout(&key) {
+                tracing::info!(
+                    target: "helios::pool",
+                    node = %target,
+                    "reused pooled backend connection"
+                );
+                conns.insert(target.to_string(), BackendConn::new(stream));
+                return Ok(());
+            }
+        }
+
         let mut backend =
             tokio::time::timeout(config.pool.acquire_timeout(), TcpStream::connect(target))
                 .await
@@ -2172,9 +2766,103 @@ impl ProxyServer {
             .await
             .map_err(|e| ProxyError::Network(format!("Backend startup error: {}", e)))?;
         Self::complete_backend_auth(&mut backend).await?;
+        #[cfg(feature = "pool-modes")]
+        if _state.backend_pool.is_some() {
+            tracing::debug!(target: "helios::pool", node = %target, "dialed fresh backend connection (pool miss)");
+        }
         tracing::debug!(node = %target, "opened backend connection");
         conns.insert(target.to_string(), BackendConn::new(backend));
         Ok(())
+    }
+
+    /// Build the `(node, user, database)` pool key for the current session's
+    /// connection identity. Connections are reused only within an identity, so
+    /// a borrower always matches the principal the parked connection was
+    /// authenticated as.
+    #[cfg(feature = "pool-modes")]
+    async fn pool_key_for(target: &str, session: &Arc<ClientSession>) -> String {
+        let vars = session.variables.read().await;
+        let user = vars.get("user").map(|s| s.as_str()).unwrap_or("");
+        // PostgreSQL defaults the database to the role name when unset.
+        let database = vars.get("database").map(|s| s.as_str()).unwrap_or(user);
+        crate::pool::pool_key(target, user, database)
+    }
+
+    /// Reset a backend connection to a clean session state before parking it
+    /// for reuse: runs the configured reset query (default `DISCARD ALL`,
+    /// which deallocates prepared statements, drops temp tables, resets GUCs
+    /// and advisory locks) and drains its response to `ReadyForQuery`. Returns
+    /// `Err` if the connection is unhealthy — the caller then drops (closes)
+    /// it instead of parking a poisoned connection.
+    #[cfg(feature = "pool-modes")]
+    async fn reset_backend(stream: &mut TcpStream, reset_sql: &str) -> Result<()> {
+        let msg = crate::protocol::QueryMessage {
+            query: reset_sql.to_string(),
+        }
+        .encode();
+        stream
+            .write_all(&msg.encode())
+            .await
+            .map_err(|e| ProxyError::Network(format!("reset write error: {}", e)))?;
+
+        let codec = ProtocolCodec::new();
+        let mut buffer = BytesMut::with_capacity(1024);
+        let mut read_buf = vec![0u8; 1024];
+        loop {
+            while let Some(m) = codec.decode_message(&mut buffer)? {
+                if m.msg_type == MessageType::ReadyForQuery {
+                    return Ok(());
+                }
+            }
+            let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut read_buf))
+                .await
+                .map_err(|_| ProxyError::Network("reset drain timeout".to_string()))?
+                .map_err(|e| ProxyError::Network(format!("reset drain read error: {}", e)))?;
+            if n == 0 {
+                return Err(ProxyError::Connection(
+                    "backend closed during reset".to_string(),
+                ));
+            }
+            buffer.extend_from_slice(&read_buf[..n]);
+        }
+    }
+
+    /// Transaction/Statement pooling release point: when the session is at an
+    /// idle boundary (`ReadyForQuery` reported not-in-transaction), reset the
+    /// just-used connection and park it for reuse by the next same-identity
+    /// client. A no-op in Session mode or when the feature is off. Never
+    /// releases mid-transaction.
+    #[cfg(feature = "pool-modes")]
+    async fn release_to_pool_if_idle(
+        conns: &mut HashMap<String, BackendConn>,
+        node: Option<&str>,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+    ) {
+        let Some(pool) = state.backend_pool.as_ref() else {
+            return;
+        };
+        let Some(node) = node else {
+            return;
+        };
+        // Only release at a clean transaction boundary.
+        if session.tx_state.read().await.in_transaction {
+            return;
+        }
+        let Some(mut bc) = conns.remove(node) else {
+            return;
+        };
+        if Self::reset_backend(&mut bc.stream, &config.pool_mode.reset_query)
+            .await
+            .is_ok()
+        {
+            let key = Self::pool_key_for(node, session).await;
+            if pool.checkin(&key, bc.stream) {
+                tracing::debug!(target: "helios::pool", node = %node, "parked backend connection for reuse");
+            }
+        }
+        // On reset failure the connection is dropped here (closed).
     }
 
     /// Forward a simple-query (`Query`) message and stream its response back
@@ -2191,11 +2879,22 @@ impl ProxyServer {
         state: &Arc<ServerState>,
         config: &ProxyConfig,
     ) -> Result<(Option<String>, u64)> {
+        // Rate-limit gate: deny before any backend selection.
+        #[cfg(feature = "rate-limiting")]
+        if let Some(mut resp) = Self::rate_limit_check(session, state, config).await {
+            resp.extend_from_slice(&Self::create_ready_for_query(b'I'));
+            client
+                .write_all(&resp)
+                .await
+                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+            return Ok((None, resp.len() as u64));
+        }
+
         let default_is_write = Self::is_write_message(msg);
-        let route_override = Self::apply_route_hook(msg, state, session);
+        let plugin_override = Self::apply_route_hook(msg, state, session);
 
         // Block short-circuits before any backend selection.
-        if let RouteOverride::Block(reason) = route_override {
+        if let RouteOverride::Block(reason) = plugin_override {
             let mut response = Vec::with_capacity(64 + reason.len());
             response.extend_from_slice(&Self::create_error_response(
                 "42000",
@@ -2209,6 +2908,16 @@ impl ProxyServer {
             return Ok((None, response.len() as u64));
         }
 
+        // SQL-comment routing hints (feature + `[routing_hints] enabled`)
+        // refine the override, recompute the write flag on the stripped SQL,
+        // and may rewrite the message to drop the hint comment.
+        #[cfg(feature = "routing-hints")]
+        let (route_override, default_is_write, stripped_msg) =
+            Self::resolve_simple_route(msg, plugin_override, default_is_write, state);
+        #[cfg(not(feature = "routing-hints"))]
+        let (route_override, stripped_msg): (RouteOverride, Option<Message>) =
+            (plugin_override, None);
+
         let (is_write, forced_target) = match route_override {
             RouteOverride::None => (default_is_write, None),
             RouteOverride::Primary => (true, None),
@@ -2216,6 +2925,116 @@ impl ProxyServer {
             RouteOverride::Node(name) => (default_is_write, Some(name)),
             RouteOverride::Block(_) => unreachable!("handled above"),
         };
+
+        // Read-your-writes: stamp the session on a write so subsequent reads
+        // pin to the primary for the configured window.
+        #[cfg(feature = "lag-routing")]
+        if is_write && config.lag_routing.enabled {
+            *session.last_write_at.write().await = Some(std::time::Instant::now());
+        }
+
+        // Forward the stripped message when routing-hints rewrote it, else the
+        // original (borrowed, no copy).
+        let forward_msg = stripped_msg.as_ref().unwrap_or(msg);
+
+        // Query rewriting: apply rules to the SQL; if any rule fired, forward a
+        // rebuilt Query carrying the rewritten SQL (so caching + the backend
+        // both see the rewritten form).
+        #[cfg(feature = "query-rewriting")]
+        let rewritten_msg: Option<Message> = state.rewriter.as_ref().and_then(|rw| {
+            let sql = crate::protocol::query_text(&forward_msg.payload)?;
+            match rw.rewrite(sql) {
+                Ok(res) if res.was_rewritten() => {
+                    tracing::debug!(target: "helios::rewrite", rules = ?res.rules_applied, "query rewritten");
+                    Some(crate::protocol::QueryMessage { query: res.query().to_string() }.encode())
+                }
+                _ => None,
+            }
+        });
+        #[cfg(feature = "query-rewriting")]
+        let forward_msg = rewritten_msg.as_ref().unwrap_or(forward_msg);
+
+        // Multi-tenancy: resolve the session's tenant and inject a row-level
+        // tenant filter. Done BEFORE the cache lookup so each tenant's results
+        // are cached under their own (filtered) SQL — no cross-tenant leakage.
+        #[cfg(feature = "multi-tenancy")]
+        let tenant_msg: Option<Message> = if let Some(tm) = state.tenant_manager.as_ref() {
+            match crate::protocol::query_text(&forward_msg.payload) {
+                Some(sql) => {
+                    let ctx = Self::tenant_request_ctx(session).await;
+                    match tm.identify_tenant(&ctx) {
+                        Some(tenant) => {
+                            let res = tm.transform_query(sql, &tenant);
+                            if res.transformed {
+                                tracing::debug!(target: "helios::tenant", tenant = %tenant.0, "tenant filter injected");
+                                Some(crate::protocol::QueryMessage { query: res.query }.encode())
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        #[cfg(feature = "multi-tenancy")]
+        let forward_msg = tenant_msg.as_ref().unwrap_or(forward_msg);
+
+        // Query cache: on a cacheable read, a hit is served from cache with no
+        // backend round-trip; on a miss we keep the context to store the result.
+        #[cfg(feature = "query-cache")]
+        let cache_ctx: Option<crate::cache::CacheContext> = if is_write {
+            None
+        } else if let Some(qc) = state.query_cache.as_ref() {
+            let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
+            match Self::cacheable_read_ctx(session, sql).await {
+                Some(ctx) => {
+                    if let crate::cache::CacheLookup::Hit { result, level } =
+                        qc.get(sql, &ctx).await
+                    {
+                        tracing::debug!(target: "helios::cache", level = %level, "cache hit");
+                        client.write_all(&result.data).await.map_err(|e| {
+                            ProxyError::Network(format!("Client write error: {}", e))
+                        })?;
+                        return Ok((None, result.data.len() as u64));
+                    }
+                    Some(ctx)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        // Schema/workload routing: pin an analytical (OLAP) read to the
+        // configured analytics node, unless something already forced a target.
+        #[cfg(feature = "schema-routing")]
+        let forced_target = match state.schema_analyzer.as_ref() {
+            Some(analyzer)
+                if forced_target.is_none()
+                    && !is_write
+                    && !config.schema_routing.analytics_node.is_empty() =>
+            {
+                match crate::protocol::query_text(&forward_msg.payload) {
+                    Some(sql) if analyzer.analyze(sql).is_analytics() => {
+                        tracing::debug!(target: "helios::schema", "OLAP query routed to analytics node");
+                        Some(config.schema_routing.analytics_node.clone())
+                    }
+                    _ => forced_target,
+                }
+            }
+            _ => forced_target,
+        };
+
+        // Analytics: capture the forwarded SQL + start the latency timer.
+        #[cfg(feature = "query-analytics")]
+        let analytics_sql =
+            crate::protocol::query_text(&forward_msg.payload).map(|s| s.to_string());
+        #[cfg(feature = "query-analytics")]
+        let started = std::time::Instant::now();
 
         let target = Self::choose_target_node(
             is_write,
@@ -2226,20 +3045,128 @@ impl ProxyServer {
             config,
         )
         .await?;
-        Self::ensure_conn(conns, &target, session, config).await?;
+        tracing::debug!(target: "helios::routing", node = %target, is_write, "routed simple query");
+
+        // Circuit breaker: fast-fail when the chosen node's circuit is open.
+        #[cfg(feature = "circuit-breaker")]
+        if let Some(mut resp) = Self::circuit_fast_fail(state, &target) {
+            resp.extend_from_slice(&Self::create_ready_for_query(b'I'));
+            client
+                .write_all(&resp)
+                .await
+                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+            return Ok((None, resp.len() as u64));
+        }
+
+        // A connect/auth failure trips the breaker (and is propagated as today).
+        if let Err(e) = Self::ensure_conn(conns, &target, session, config, state).await {
+            Self::record_backend_failure(state, &target, &e.to_string());
+            return Err(e);
+        }
         let backend = conns.get_mut(&target).expect("just ensured");
 
-        backend
-            .stream
-            .write_all(&msg.encode())
-            .await
-            .map_err(|e| ProxyError::Network(format!("Backend write error: {}", e)))?;
+        let backend_err = match tokio::time::timeout(
+            Self::BACKEND_WRITE_TIMEOUT,
+            backend.stream.write_all(&forward_msg.encode()),
+        )
+        .await
+        {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(format!("Backend write error: {}", e)),
+            Err(_) => Some("Backend write timeout".to_string()),
+        };
+        if let Some(msg) = backend_err {
+            let e = ProxyError::Network(msg);
+            conns.remove(&target);
+            Self::record_backend_failure(state, &target, &e.to_string());
+            return Err(e);
+        }
+
+        // Cacheable read miss: capture the response frames and store them so a
+        // later identical read is served from cache without a backend hit.
+        #[cfg(feature = "query-cache")]
+        if let (Some(ctx), Some(qc)) = (cache_ctx.as_ref(), state.query_cache.as_ref()) {
+            return match Self::stream_until_ready_capture(client, &mut backend.stream, session)
+                .await
+            {
+                Ok((sent, captured, cacheable, rows)) => {
+                    #[cfg(feature = "circuit-breaker")]
+                    Self::circuit_record(state, &target, true, "");
+                    if cacheable && !captured.is_empty() {
+                        let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
+                        qc.put(
+                            sql,
+                            ctx,
+                            bytes::Bytes::from(captured),
+                            rows,
+                            std::time::Duration::ZERO,
+                        )
+                        .await;
+                    }
+                    #[cfg(feature = "query-analytics")]
+                    if let Some(sql) = analytics_sql.as_deref() {
+                        Self::record_analytics(
+                            state,
+                            session,
+                            sql,
+                            &target,
+                            started.elapsed(),
+                            None,
+                        )
+                        .await;
+                    }
+                    Ok((Some(target), sent))
+                }
+                Err(e) => {
+                    conns.remove(&target);
+                    Self::record_backend_failure(state, &target, &e.to_string());
+                    Err(e)
+                }
+            };
+        }
 
         match Self::stream_until_ready(client, &mut backend.stream, session, state).await {
-            Ok(sent) => Ok((Some(target), sent)),
+            Ok(sent) => {
+                #[cfg(feature = "circuit-breaker")]
+                Self::circuit_record(state, &target, true, "");
+                // Invalidate cached reads referencing tables this write touched.
+                #[cfg(feature = "query-cache")]
+                if is_write {
+                    if let Some(qc) = state.query_cache.as_ref() {
+                        let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
+                        qc.invalidate_query(sql).await;
+                    }
+                }
+                // Transaction Replay: journal the write for failover/time-travel.
+                #[cfg(feature = "ha-tr")]
+                if is_write && config.tr_enabled {
+                    if let Some(sql) = crate::protocol::query_text(&forward_msg.payload) {
+                        Self::journal_write(state, session, sql).await;
+                    }
+                }
+                #[cfg(feature = "query-analytics")]
+                if let Some(sql) = analytics_sql.as_deref() {
+                    Self::record_analytics(state, session, sql, &target, started.elapsed(), None)
+                        .await;
+                }
+                Ok((Some(target), sent))
+            }
             Err(e) => {
                 // Drop the broken connection so the next use redials.
                 conns.remove(&target);
+                Self::record_backend_failure(state, &target, &e.to_string());
+                #[cfg(feature = "query-analytics")]
+                if let Some(sql) = analytics_sql.as_deref() {
+                    Self::record_analytics(
+                        state,
+                        session,
+                        sql,
+                        &target,
+                        started.elapsed(),
+                        Some(e.to_string()),
+                    )
+                    .await;
+                }
                 Err(e)
             }
         }
@@ -2273,10 +3200,41 @@ impl ProxyServer {
         state: &Arc<ServerState>,
         config: &ProxyConfig,
     ) -> Result<(Option<String>, u64)> {
+        // Rate-limit gate. The terminating ReadyForQuery is only appended when
+        // the batch carried a Sync (`wait_ready`); a Flush-terminated batch
+        // expects an ErrorResponse with no ReadyForQuery.
+        #[cfg(feature = "rate-limiting")]
+        if let Some(mut resp) = Self::rate_limit_check(session, state, config).await {
+            if wait_ready {
+                resp.extend_from_slice(&Self::create_ready_for_query(b'I'));
+            }
+            client
+                .write_all(&resp)
+                .await
+                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+            return Ok((None, resp.len() as u64));
+        }
+
+        // Analytics: the routable SQL (first Parse) + latency timer.
+        #[cfg(feature = "query-analytics")]
+        let analytics_sql = route_sql.map(|s| s.to_string());
+        #[cfg(feature = "query-analytics")]
+        let started = std::time::Instant::now();
+
         let target = match route_sql {
             Some(sql) => {
-                let is_write = Self::is_write_query(sql);
-                Self::choose_target_node(is_write, None, current_node, session, state, config)
+                // Routing-hints, when active, can override the verb-based
+                // target (and recompute the write flag on the stripped SQL).
+                #[cfg(feature = "routing-hints")]
+                let (is_write, forced) = Self::extended_hint_route(state, sql)
+                    .unwrap_or_else(|| (Self::is_write_query(sql), None));
+                #[cfg(not(feature = "routing-hints"))]
+                let (is_write, forced): (bool, Option<String>) = (Self::is_write_query(sql), None);
+                #[cfg(feature = "lag-routing")]
+                if is_write && config.lag_routing.enabled {
+                    *session.last_write_at.write().await = Some(std::time::Instant::now());
+                }
+                Self::choose_target_node(is_write, forced, current_node, session, state, config)
                     .await?
             }
             // No Parse in this batch: stay on the prepared-statement /
@@ -2288,7 +3246,23 @@ impl ProxyServer {
             },
         };
 
-        Self::ensure_conn(conns, &target, session, config).await?;
+        // Circuit breaker: fast-fail when the chosen node's circuit is open.
+        #[cfg(feature = "circuit-breaker")]
+        if let Some(mut resp) = Self::circuit_fast_fail(state, &target) {
+            if wait_ready {
+                resp.extend_from_slice(&Self::create_ready_for_query(b'I'));
+            }
+            client
+                .write_all(&resp)
+                .await
+                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+            return Ok((None, resp.len() as u64));
+        }
+
+        if let Err(e) = Self::ensure_conn(conns, &target, session, config, state).await {
+            Self::record_backend_failure(state, &target, &e.to_string());
+            return Err(e);
+        }
         let backend = conns.get_mut(&target).expect("just ensured");
 
         // Transparently re-prepare any referenced named statement this socket
@@ -2338,13 +3312,20 @@ impl ProxyServer {
             }
         }
 
-        if let Err(e) = backend
-            .stream
-            .write_all(batch)
-            .await
-            .map_err(|e| ProxyError::Network(format!("Backend write error: {}", e)))
+        let batch_err = match tokio::time::timeout(
+            Self::BACKEND_WRITE_TIMEOUT,
+            backend.stream.write_all(batch),
+        )
+        .await
         {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(format!("Backend write error: {}", e)),
+            Err(_) => Some("Backend write timeout".to_string()),
+        };
+        if let Some(msg) = batch_err {
+            let e = ProxyError::Network(msg);
             conns.remove(&target);
+            Self::record_backend_failure(state, &target, &e.to_string());
             return Err(e);
         }
 
@@ -2370,6 +3351,13 @@ impl ProxyServer {
         };
         match r {
             Ok(sent) => {
+                #[cfg(feature = "circuit-breaker")]
+                Self::circuit_record(state, &target, true, "");
+                #[cfg(feature = "query-analytics")]
+                if let Some(sql) = analytics_sql.as_deref() {
+                    Self::record_analytics(state, session, sql, &target, started.elapsed(), None)
+                        .await;
+                }
                 // The connection now holds these named statements.
                 for name in defines {
                     backend.prepared.insert(name.clone());
@@ -2382,6 +3370,19 @@ impl ProxyServer {
             }
             Err(e) => {
                 conns.remove(&target);
+                Self::record_backend_failure(state, &target, &e.to_string());
+                #[cfg(feature = "query-analytics")]
+                if let Some(sql) = analytics_sql.as_deref() {
+                    Self::record_analytics(
+                        state,
+                        session,
+                        sql,
+                        &target,
+                        started.elapsed(),
+                        Some(e.to_string()),
+                    )
+                    .await;
+                }
                 Err(e)
             }
         }
@@ -2396,16 +3397,22 @@ impl ProxyServer {
         backend: &mut S,
         parse_bytes: &[u8],
     ) -> Result<()> {
-        backend
-            .write_all(parse_bytes)
+        tokio::time::timeout(Self::REPREPARE_TIMEOUT, backend.write_all(parse_bytes))
             .await
+            .map_err(|_| ProxyError::Network("re-prepare write timeout".to_string()))?
             .map_err(|e| ProxyError::Network(format!("re-prepare write error: {}", e)))?;
         // Flush: 'H' + length 4.
-        backend
-            .write_all(&[b'H', 0, 0, 0, 4])
-            .await
-            .map_err(|e| ProxyError::Network(format!("re-prepare flush error: {}", e)))?;
-        let mtype = Self::read_one_frame_type(backend).await?;
+        tokio::time::timeout(
+            Self::REPREPARE_TIMEOUT,
+            backend.write_all(&[b'H', 0, 0, 0, 4]),
+        )
+        .await
+        .map_err(|_| ProxyError::Network("re-prepare flush timeout".to_string()))?
+        .map_err(|e| ProxyError::Network(format!("re-prepare flush error: {}", e)))?;
+        let mtype =
+            tokio::time::timeout(Self::REPREPARE_TIMEOUT, Self::read_one_frame_type(backend))
+                .await
+                .map_err(|_| ProxyError::Network("re-prepare read timeout".to_string()))??;
         match mtype {
             b'1' => Ok(()), // ParseComplete
             b'E' => Err(ProxyError::Protocol(
@@ -2518,10 +3525,13 @@ impl ProxyServer {
             }
 
             if consumed > 0 {
-                client
-                    .write_all(&buf[..consumed])
-                    .await
-                    .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+                tokio::time::timeout(
+                    Self::CLIENT_WRITE_TIMEOUT,
+                    client.write_all(&buf[..consumed]),
+                )
+                .await
+                .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
+                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
                 sent += consumed as u64;
                 let _ = buf.split_to(consumed);
             }
@@ -2534,6 +3544,104 @@ impl ProxyServer {
             }
             if yield_for_copy {
                 return Ok(sent);
+            }
+
+            let n = tokio::time::timeout(Duration::from_secs(30), backend.read(&mut read_buf))
+                .await
+                .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
+                .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
+            if n == 0 {
+                return Err(ProxyError::Connection(
+                    "Backend closed mid-response".to_string(),
+                ));
+            }
+            buf.extend_from_slice(&read_buf[..n]);
+        }
+    }
+
+    /// Like `stream_until_ready` but also captures the full response bytes for
+    /// caching. Returns `(bytes_sent, captured, cacheable, row_count)`.
+    /// `cacheable` is false if the response carried an `ErrorResponse`, ended in
+    /// a non-idle transaction status, or yielded for COPY — none of which may
+    /// be cached.
+    #[cfg(feature = "query-cache")]
+    async fn stream_until_ready_capture(
+        client: &mut ClientStream,
+        backend: &mut TcpStream,
+        session: &Arc<ClientSession>,
+    ) -> Result<(u64, Vec<u8>, bool, usize)> {
+        let mut buf = BytesMut::with_capacity(16384);
+        let mut read_buf = vec![0u8; 16384];
+        let mut sent: u64 = 0;
+        let mut captured: Vec<u8> = Vec::with_capacity(4096);
+        let mut had_error = false;
+        let mut row_count: usize = 0;
+
+        loop {
+            let mut consumed = 0usize;
+            let mut ready_status: Option<u8> = None;
+            let mut yield_for_copy = false;
+            loop {
+                let rem = &buf[consumed..];
+                if rem.len() < 5 {
+                    break;
+                }
+                let len = u32::from_be_bytes([rem[1], rem[2], rem[3], rem[4]]) as usize;
+                if len < 4 || rem.len() < len + 1 {
+                    break;
+                }
+                let frame_total = len + 1;
+                let mtype = rem[0];
+                if mtype == b'E' {
+                    had_error = true;
+                }
+                if mtype == b'C' {
+                    // CommandComplete tag, e.g. "SELECT 5" — take the row count.
+                    if let Some(tag) = rem.get(5..frame_total) {
+                        if let Some(end) = tag.iter().position(|&b| b == 0) {
+                            if let Ok(s) = std::str::from_utf8(&tag[..end]) {
+                                if let Some(n) =
+                                    s.rsplit(' ').next().and_then(|x| x.parse::<usize>().ok())
+                                {
+                                    row_count = n;
+                                }
+                            }
+                        }
+                    }
+                }
+                consumed += frame_total;
+                if mtype == b'Z' {
+                    ready_status = Some(if frame_total >= 6 { rem[5] } else { b'I' });
+                    break;
+                }
+                if mtype == b'G' || mtype == b'W' {
+                    yield_for_copy = true;
+                    break;
+                }
+            }
+
+            if consumed > 0 {
+                tokio::time::timeout(
+                    Self::CLIENT_WRITE_TIMEOUT,
+                    client.write_all(&buf[..consumed]),
+                )
+                .await
+                .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
+                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+                captured.extend_from_slice(&buf[..consumed]);
+                sent += consumed as u64;
+                let _ = buf.split_to(consumed);
+            }
+
+            if let Some(status) = ready_status {
+                let st = TransactionStatus::from_byte(status);
+                let mut tx = session.tx_state.write().await;
+                tx.in_transaction = st != TransactionStatus::Idle;
+                let cacheable = !had_error && status == b'I';
+                return Ok((sent, captured, cacheable, row_count));
+            }
+            if yield_for_copy {
+                return Ok((sent, captured, false, row_count));
             }
 
             let n = tokio::time::timeout(Duration::from_secs(30), backend.read(&mut read_buf))
@@ -2654,6 +3762,332 @@ impl ProxyServer {
         false
     }
 
+    /// Derive the rate-limit bucket key for a session per the configured
+    /// keying dimension.
+    #[cfg(feature = "rate-limiting")]
+    async fn rate_limit_key(
+        session: &Arc<ClientSession>,
+        config: &ProxyConfig,
+    ) -> crate::rate_limit::LimiterKey {
+        use crate::config::RateLimitKeyBy;
+        use crate::rate_limit::LimiterKey;
+        match config.rate_limit.key_by {
+            RateLimitKeyBy::Global => LimiterKey::Global,
+            RateLimitKeyBy::ClientIp => LimiterKey::ClientIp(session.client_addr.ip()),
+            RateLimitKeyBy::Database => {
+                let vars = session.variables.read().await;
+                LimiterKey::Database(vars.get("database").cloned().unwrap_or_default())
+            }
+            RateLimitKeyBy::User => {
+                let vars = session.variables.read().await;
+                LimiterKey::User(vars.get("user").cloned().unwrap_or_default())
+            }
+        }
+    }
+
+    /// Check rate limits before a query is forwarded. Returns `Some(bytes)` —
+    /// a PG `ErrorResponse` WITHOUT a trailing `ReadyForQuery` (the caller
+    /// appends one as the protocol requires) — when the query is denied; `None`
+    /// when it may proceed. A throttle/queue verdict is honored by sleeping for
+    /// the engine-supplied delay (real backpressure, capped) and then allowing.
+    #[cfg(feature = "rate-limiting")]
+    async fn rate_limit_check(
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+    ) -> Option<Vec<u8>> {
+        use crate::rate_limit::RateLimitResult;
+        let limiter = state.rate_limiter.as_ref()?;
+        let key = Self::rate_limit_key(session, config).await;
+        match limiter.check(&key, 1) {
+            RateLimitResult::Allowed => None,
+            RateLimitResult::Warned(msg) => {
+                tracing::warn!(key = %key, reason = %msg, "rate limit warning");
+                None
+            }
+            RateLimitResult::Throttled(d) | RateLimitResult::Queued(d) => {
+                // Cap the backpressure sleep so a misconfiguration can't pin a
+                // connection task indefinitely.
+                tokio::time::sleep(d.min(Duration::from_secs(5))).await;
+                None
+            }
+            RateLimitResult::Denied(exc) => {
+                tracing::info!(key = %key, "rate limit exceeded");
+                let msg = format!(
+                    "rate limit exceeded: {} (retry after {}ms)",
+                    exc.message,
+                    exc.retry_after.as_millis()
+                );
+                Some(Self::create_error_response("53400", &msg))
+            }
+        }
+    }
+
+    /// In-band failure feedback. When a query fails against a backend, demote
+    /// that node's health *immediately* — a copy-on-write update of the shared
+    /// health snapshot, the same structure the periodic health checker
+    /// maintains — so routing stops sending work to a dead node within one
+    /// query instead of waiting up to a full health-check interval (the
+    /// ~`check_interval` blind window). The periodic checker restores the node
+    /// on its next successful probe, so this only ever *accelerates* detection.
+    ///
+    /// True when `err` is evidence the backend itself is unhealthy — and so
+    /// should demote it in-band (and trip its circuit breaker) — as opposed to a
+    /// client-side problem or a merely slow but healthy query.
+    ///
+    /// Excluded (return `false`, no penalty):
+    /// * `Client …` — a failed or timed-out client write is the client's fault.
+    /// * `Backend read timeout` — a backend that emits no bytes within the
+    ///   streaming read window is indistinguishable from a legitimately slow but
+    ///   healthy query (large sort/aggregate, lock wait, bulk DML). Demoting the
+    ///   whole node — cluster-wide, for every session, bypassing the configured
+    ///   `failure_threshold` — over one slow query is a false positive; a
+    ///   genuinely unresponsive-but-connected backend is still caught by the
+    ///   periodic protocol-level health probe.
+    ///
+    /// Still faults (return `true`): a backend read/write *error* (reset, EOF,
+    /// broken pipe), a backend *write* timeout (the backend is not draining its
+    /// socket), and any connect-time failure.
+    fn is_backend_fault(err: &str) -> bool {
+        !err.contains("Client") && !err.contains("Backend read timeout")
+    }
+
+    /// Errors that do not demote a backend are filtered via `is_backend_fault`:
+    /// a client disconnecting mid-query, or one merely-slow query, must never
+    /// take a healthy backend out of rotation for every session.
+    fn note_backend_failure(state: &Arc<ServerState>, addr: &str, err: &str) {
+        if !Self::is_backend_fault(err) {
+            return;
+        }
+        // Serialize the read-modify-write of the shared health snapshot. ArcSwap
+        // makes only the final pointer swap atomic; without this lock two
+        // concurrent writers — in-band demotions for different nodes, or an
+        // in-band demotion racing the periodic checker's full-map rebuild — can
+        // each load the same snapshot and clobber the other's update (a lost
+        // update that resurrects a demoted node, or evicts a recovered one,
+        // until the next probe). The lock serializes writers only; every routing
+        // read stays lock-free on the ArcSwap.
+        let _writers = state.health_write.lock();
+        let snapshot = state.health.load_full();
+        // Only act (and pay the clone) when the node is currently marked
+        // healthy — avoids churning the snapshot on an already-down node.
+        if snapshot.get(addr).map(|h| h.healthy).unwrap_or(false) {
+            let mut next = (*snapshot).clone();
+            if let Some(nh) = next.get_mut(addr) {
+                nh.healthy = false;
+                nh.failure_count = nh.failure_count.saturating_add(1);
+                nh.last_error = Some(format!("in-band failure: {}", err));
+                tracing::warn!(
+                    node = %addr,
+                    error = %err,
+                    "in-band failure — node marked unhealthy for fast failover"
+                );
+            }
+            state.health.store(Arc::new(next));
+        }
+    }
+
+    /// Record a backend forward failure: demote the node's health in-band AND
+    /// (when the feature is on) trip its circuit breaker — the single place the
+    /// data path reports "this backend just failed". Both signals consult the
+    /// same `is_backend_fault` classifier, so they can never drift apart: a
+    /// client-side error or a slow-query read timeout penalizes neither.
+    fn record_backend_failure(state: &Arc<ServerState>, node: &str, err: &str) {
+        Self::note_backend_failure(state, node, err);
+        #[cfg(feature = "circuit-breaker")]
+        if Self::is_backend_fault(err) {
+            Self::circuit_record(state, node, false, err);
+        }
+    }
+
+    /// True when `node`'s circuit is open (avoid it / fast-fail). A half-open
+    /// circuit returns false so a probe query is admitted.
+    #[cfg(feature = "circuit-breaker")]
+    fn circuit_is_open(state: &Arc<ServerState>, node: &str) -> bool {
+        state
+            .circuit_breaker
+            .as_ref()
+            .map(|cb| {
+                cb.get_breaker(node).get_state() == crate::circuit_breaker::CircuitState::Open
+            })
+            .unwrap_or(false)
+    }
+
+    /// Record the outcome of a forward to `node` on its circuit breaker.
+    #[cfg(feature = "circuit-breaker")]
+    fn circuit_record(state: &Arc<ServerState>, node: &str, success: bool, err: &str) {
+        if let Some(cb) = state.circuit_breaker.as_ref() {
+            let breaker = cb.get_breaker(node);
+            if success {
+                breaker.record_success();
+            } else {
+                breaker.record_failure(err);
+            }
+        }
+    }
+
+    /// If `node`'s circuit is open, build the fast-fail `ErrorResponse` (without
+    /// a trailing `ReadyForQuery` — the caller appends one). `None` when the
+    /// circuit is closed or half-open and the request may proceed.
+    #[cfg(feature = "circuit-breaker")]
+    fn circuit_fast_fail(state: &Arc<ServerState>, node: &str) -> Option<Vec<u8>> {
+        if Self::circuit_is_open(state, node) {
+            tracing::info!(node = %node, "circuit open — fast-failing");
+            Some(Self::create_error_response(
+                "08006",
+                &format!("circuit open for node {node}: backend temporarily unavailable"),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Read-your-writes decision: should reads be pinned to the primary given
+    /// the session's last write and the configured window? Pure for testing.
+    #[cfg(feature = "lag-routing")]
+    fn ryw_pins_primary(last_write: Option<std::time::Instant>, window_ms: u64) -> bool {
+        window_ms > 0
+            && last_write
+                .map(|t| t.elapsed() < Duration::from_millis(window_ms))
+                .unwrap_or(false)
+    }
+
+    /// Lag-exclusion decision: should a standby be dropped from read routing
+    /// given its measured lag and the configured ceiling? `max=0` disables
+    /// exclusion; unknown lag (None) never excludes. Pure for testing.
+    #[cfg(feature = "lag-routing")]
+    fn lag_excludes_standby(lag_bytes: Option<u64>, max_lag_bytes: u64) -> bool {
+        max_lag_bytes > 0 && lag_bytes.map(|l| l > max_lag_bytes).unwrap_or(false)
+    }
+
+    /// Pure predicate: is `sql` a plain, deterministic SELECT safe to cache?
+    /// (Not WITH/locking/volatile.) Transaction state is checked separately.
+    #[cfg(feature = "query-cache")]
+    fn is_cacheable_read_sql(sql: &str) -> bool {
+        use crate::protocol::{contains_ci, starts_with_ci};
+        let t = sql.trim_start();
+        if !starts_with_ci(t, "SELECT") {
+            return false;
+        }
+        if contains_ci(t, "FOR UPDATE") || contains_ci(t, "FOR SHARE") {
+            return false;
+        }
+        // Non-deterministic reads must not be reused.
+        const VOLATILE: [&str; 10] = [
+            "now(",
+            "current_timestamp",
+            "current_date",
+            "current_time",
+            "clock_timestamp",
+            "statement_timestamp",
+            "random(",
+            "nextval(",
+            "uuid_generate",
+            "gen_random_uuid",
+        ];
+        !VOLATILE.iter().any(|v| contains_ci(t, v))
+    }
+
+    /// Decide whether a read query is safe to serve from / store in the cache,
+    /// and build its `CacheContext`. Returns `None` for anything not a plain,
+    /// deterministic, non-transactional SELECT.
+    #[cfg(feature = "query-cache")]
+    async fn cacheable_read_ctx(
+        session: &Arc<ClientSession>,
+        sql: &str,
+    ) -> Option<crate::cache::CacheContext> {
+        if !Self::is_cacheable_read_sql(sql) {
+            return None;
+        }
+        // Never cache mid-transaction (visibility would be wrong).
+        if session.tx_state.read().await.in_transaction {
+            return None;
+        }
+        let (user, database) = {
+            let vars = session.variables.read().await;
+            (
+                vars.get("user").cloned(),
+                vars.get("database")
+                    .cloned()
+                    .unwrap_or_else(|| "default".to_string()),
+            )
+        };
+        Some(crate::cache::CacheContext {
+            database,
+            user,
+            branch: None,
+            connection_id: Some(session.id.as_u64_pair().0),
+        })
+    }
+
+    /// Build a multi-tenancy `RequestContext` from the session's startup
+    /// parameters (user, database, application_name, ...) so the configured
+    /// identifier can resolve the tenant.
+    #[cfg(feature = "multi-tenancy")]
+    async fn tenant_request_ctx(
+        session: &Arc<ClientSession>,
+    ) -> crate::multi_tenancy::RequestContext {
+        let vars = session.variables.read().await;
+        crate::multi_tenancy::RequestContext {
+            headers: vars.clone(),
+            username: vars.get("user").cloned(),
+            database: vars.get("database").cloned(),
+            auth_token: None,
+            sql_context: HashMap::new(),
+            client_ip: Some(session.client_addr.ip().to_string()),
+            connection_id: Some(session.id.as_u64_pair().0),
+        }
+    }
+
+    /// Journal a successful write statement (Transaction Replay). Each write is
+    /// recorded as its own auto-commit transaction so the time-travel/failover
+    /// replay engine can re-apply it onto a promoted primary or a staging
+    /// target. Best-effort: journal errors never fail the client query.
+    #[cfg(feature = "ha-tr")]
+    async fn journal_write(state: &Arc<ServerState>, session: &Arc<ClientSession>, sql: &str) {
+        let tx_id = uuid::Uuid::new_v4();
+        let j = &state.transaction_journal;
+        if j.begin_transaction(tx_id, session.id, crate::NodeId::new(), 0)
+            .await
+            .is_ok()
+        {
+            let _ = j
+                .log_statement(tx_id, sql.to_string(), Vec::new(), None, None, 0)
+                .await;
+        }
+    }
+
+    /// Record a forwarded query on the analytics engine (fingerprint, latency,
+    /// slow-query log, pattern detection). No-op when analytics is disabled.
+    #[cfg(feature = "query-analytics")]
+    async fn record_analytics(
+        state: &Arc<ServerState>,
+        session: &Arc<ClientSession>,
+        sql: &str,
+        node: &str,
+        duration: Duration,
+        error: Option<String>,
+    ) {
+        let Some(analytics) = state.analytics.as_ref() else {
+            return;
+        };
+        let (user, database) = {
+            let vars = session.variables.read().await;
+            (
+                vars.get("user").cloned().unwrap_or_default(),
+                vars.get("database").cloned().unwrap_or_default(),
+            )
+        };
+        let mut exec = crate::analytics::QueryExecution::new(sql, duration);
+        exec.user = user;
+        exec.database = database;
+        exec.client_ip = session.client_addr.ip().to_string();
+        exec.node = node.to_string();
+        exec.session_id = Some(session.id.to_string());
+        exec.error = error;
+        analytics.record(exec);
+    }
+
     /// Select primary node with write timeout during failover
     async fn select_primary_with_timeout(
         session: &Arc<ClientSession>,
@@ -2725,9 +4159,22 @@ impl ProxyServer {
             .nodes
             .iter()
             .filter(|n| {
-                n.enabled
+                let base = n.enabled
                     && (n.role == NodeRole::Standby || n.role == NodeRole::ReadReplica)
-                    && health.get(&n.address()).map(|h| h.healthy).unwrap_or(false)
+                    && health.get(&n.address()).map(|h| h.healthy).unwrap_or(false);
+                // Drop a standby whose circuit is open so reads avoid it.
+                #[cfg(feature = "circuit-breaker")]
+                let base = base && !Self::circuit_is_open(state, &n.address());
+                // Drop a standby lagging beyond the configured byte threshold.
+                #[cfg(feature = "lag-routing")]
+                let base = base
+                    && !Self::lag_excludes_standby(
+                        health
+                            .get(&n.address())
+                            .and_then(|h| h.replication_lag_bytes),
+                        config.lag_routing.max_lag_bytes,
+                    );
+                base
             })
             .collect();
 
@@ -3215,6 +4662,97 @@ impl ProxyServer {
         }
     }
 
+    /// Map parsed SQL-comment hints to a `RouteOverride`. Precedence:
+    /// `node=` > `route=` > `consistency=strong`. Read-tier route targets
+    /// (standby/sync/semisync/async/local) all map to the read path; `any`
+    /// and `vector` impose no constraint. `lag=` / `consistency=bounded`
+    /// freshness enforcement arrives with the lag-routing feature.
+    #[cfg(feature = "routing-hints")]
+    fn hint_to_override(hints: &crate::routing::ParsedHints) -> RouteOverride {
+        use crate::routing::{ConsistencyLevel, RouteTarget};
+        if let Some(node) = &hints.node {
+            return RouteOverride::Node(node.clone());
+        }
+        if let Some(route) = hints.route {
+            return match route {
+                RouteTarget::Primary => RouteOverride::Primary,
+                RouteTarget::Standby
+                | RouteTarget::Sync
+                | RouteTarget::SemiSync
+                | RouteTarget::Async
+                | RouteTarget::Local => RouteOverride::Standby,
+                RouteTarget::Any | RouteTarget::Vector => RouteOverride::None,
+            };
+        }
+        if hints.consistency == Some(ConsistencyLevel::Strong) {
+            return RouteOverride::Primary;
+        }
+        RouteOverride::None
+    }
+
+    /// Resolve the effective routing for a simple `Query` when the
+    /// routing-hints feature is active. Returns `(override, is_write,
+    /// forward_msg)`: the write flag is recomputed on the hint-stripped SQL so
+    /// a leading hint comment never masks the verb, and `forward_msg` is a
+    /// rebuilt `Query` (hint removed) when stripping is on. An explicit
+    /// positional hint wins over a plugin route override; a plugin `Block` is
+    /// handled by the caller before this runs.
+    #[cfg(feature = "routing-hints")]
+    fn resolve_simple_route(
+        msg: &Message,
+        plugin_override: RouteOverride,
+        default_is_write: bool,
+        state: &Arc<ServerState>,
+    ) -> (RouteOverride, bool, Option<Message>) {
+        let parser = match state.hint_parser.as_ref() {
+            Some(p) => p,
+            None => return (plugin_override, default_is_write, None),
+        };
+        let sql = match crate::protocol::query_text(&msg.payload) {
+            Some(s) => s,
+            None => return (plugin_override, default_is_write, None),
+        };
+        let hints = parser.parse(sql);
+        if hints.is_empty() {
+            return (plugin_override, default_is_write, None);
+        }
+        let stripped = parser.strip(sql);
+        let is_write = Self::is_write_query(&stripped);
+        let effective = match Self::hint_to_override(&hints) {
+            RouteOverride::None => plugin_override,
+            hint_override => hint_override,
+        };
+        let forward = if parser.strip_hints {
+            Some(crate::protocol::QueryMessage { query: stripped }.encode())
+        } else {
+            None
+        };
+        (effective, is_write, forward)
+    }
+
+    /// Resolve hint-driven routing for an extended-protocol batch from the
+    /// first Parse's SQL. `Some((is_write, forced_node))` when hints are
+    /// present (write flag computed on the stripped SQL), else `None` so the
+    /// caller uses verb-based defaults. The hint comment is left in the
+    /// forwarded `Parse` (a no-op SQL comment); rewriting the batch buffer is
+    /// unnecessary for correctness.
+    #[cfg(feature = "routing-hints")]
+    fn extended_hint_route(state: &Arc<ServerState>, sql: &str) -> Option<(bool, Option<String>)> {
+        let parser = state.hint_parser.as_ref()?;
+        let hints = parser.parse(sql);
+        if hints.is_empty() {
+            return None;
+        }
+        let stripped = parser.strip(sql);
+        let is_write = Self::is_write_query(&stripped);
+        match Self::hint_to_override(&hints) {
+            RouteOverride::Primary => Some((true, None)),
+            RouteOverride::Standby => Some((false, None)),
+            RouteOverride::Node(n) => Some((is_write, Some(n))),
+            _ => Some((is_write, None)),
+        }
+    }
+
     /// Fire post-query hooks after a message has been forwarded (or failed
     /// to forward). Best-effort; errors from individual plugins are logged
     /// by the plugin manager and never surface here.
@@ -3366,6 +4904,11 @@ impl ProxyServer {
         }
 
         // Clone-and-modify the current snapshot, then atomically swap it in.
+        // Hold the write lock so a concurrent in-band demotion landing in this
+        // load→store window (or a SIGHUP reconcile) cannot clobber, or be
+        // clobbered by, this full-map rebuild. All node probing above already
+        // completed; no await is held under the guard.
+        let _writers = state.health_write.lock();
         let mut next = (*state.health.load_full()).clone();
         for (addr, result) in results {
             if let Some(node_health) = next.get_mut(&addr) {
@@ -3395,27 +4938,66 @@ impl ProxyServer {
         state.health.store(Arc::new(next));
     }
 
-    /// Check health of a single node by TCP-connect probe. Returns the
-    /// connect latency in milliseconds.
+    /// Check health of a single node with a protocol-level liveness probe.
+    ///
+    /// A bare TCP connect is not enough: a wedged backend (postmaster stuck,
+    /// out of backend slots, mid-crash-recovery) still *accepts* the socket but
+    /// never processes the wire protocol, so a connect-only probe reports it
+    /// healthy. Instead we connect, send a PostgreSQL `SSLRequest`, and require
+    /// the postmaster to answer (`S`/`N`) within the timeout. The SSLRequest is
+    /// auth-free and not logged, so it costs the backend essentially nothing,
+    /// yet it proves the server is actually servicing the protocol. Returns the
+    /// round-trip latency in milliseconds.
     async fn check_node_addr(addr: &str, timeout: Duration) -> Result<f64> {
+        // length(8) + SSLRequest code 80877103 (0x04D2162F).
+        const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F];
         let start = std::time::Instant::now();
-        let _stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
+        let mut stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
             .await
             .map_err(|_| ProxyError::HealthCheck(format!("Timeout connecting to {}", addr)))?
             .map_err(|e| {
                 ProxyError::HealthCheck(format!("Failed to connect to {}: {}", addr, e))
             })?;
+
+        let probe = async {
+            stream.write_all(&SSL_REQUEST).await?;
+            let mut resp = [0u8; 1];
+            stream.read_exact(&mut resp).await?;
+            Ok::<u8, std::io::Error>(resp[0])
+        };
+        // Budget whatever time is left after the connect for the handshake.
+        let remaining = timeout
+            .saturating_sub(start.elapsed())
+            .max(Duration::from_millis(1));
+        let byte = tokio::time::timeout(remaining, probe)
+            .await
+            .map_err(|_| {
+                ProxyError::HealthCheck(format!("{} did not answer protocol probe in time", addr))
+            })?
+            .map_err(|e| {
+                ProxyError::HealthCheck(format!("{} protocol probe error: {}", addr, e))
+            })?;
+        // 'S' (TLS available) or 'N' (not) both prove the postmaster is live and
+        // talking the protocol; anything else means a non-PostgreSQL listener.
+        if byte != b'S' && byte != b'N' {
+            return Err(ProxyError::HealthCheck(format!(
+                "{} sent unexpected probe reply {:#x}",
+                addr, byte
+            )));
+        }
         let latency = start.elapsed().as_secs_f64() * 1000.0;
         Ok(latency)
     }
 
     /// Spawn pool manager background task
     fn spawn_pool_manager(&self) -> tokio::task::JoinHandle<()> {
+        // Only referenced by the pool-modes eviction/cleanup arms below.
+        #[cfg(feature = "pool-modes")]
         let state = self.state.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut interval = tokio::time::interval(Self::POOL_REAP_INTERVAL);
 
             loop {
                 tokio::select! {
@@ -3425,6 +5007,34 @@ impl ProxyServer {
                         if let Some(ref pool_manager) = state.pool_manager {
                             pool_manager.evict_idle().await;
                             tracing::trace!("Pool-modes idle eviction completed");
+                        }
+                        // Reap data-path idle backend connections older than the
+                        // configured idle timeout, so a connection the backend
+                        // would close on its own idle timeout is never handed out
+                        // stale and idle FDs are returned to the OS.
+                        #[cfg(feature = "pool-modes")]
+                        if let Some(ref backend_pool) = state.backend_pool {
+                            let ttl = std::time::Duration::from_secs(
+                                state.live_config.load().pool_mode.idle_timeout_secs,
+                            );
+                            // idle_timeout_secs = 0 means "no idle TTL" (the
+                            // PgBouncer convention). Skip reaping entirely rather
+                            // than reaping every parked connection each cycle
+                            // (elapsed() < ZERO is always false → retain drops
+                            // all), which would defeat connection reuse.
+                            let n = if ttl.is_zero() {
+                                0
+                            } else {
+                                backend_pool.reap_idle(ttl)
+                            };
+                            if n > 0 {
+                                tracing::debug!(
+                                    target: "helios::pool",
+                                    reaped = n,
+                                    idle_remaining = backend_pool.idle_count(),
+                                    "reaped idle backend connections (TTL)"
+                                );
+                            }
                         }
                     }
                     _ = shutdown_rx.recv() => {
@@ -3580,6 +5190,33 @@ mod tests {
     }
 
     #[test]
+    fn is_backend_fault_excludes_client_and_slow_query_errors() {
+        // Real backend faults — these must demote the node in-band.
+        assert!(ProxyServer::is_backend_fault(
+            "Backend read error: connection reset"
+        ));
+        assert!(ProxyServer::is_backend_fault(
+            "Backend write error: broken pipe"
+        ));
+        assert!(ProxyServer::is_backend_fault("Backend write timeout"));
+        assert!(ProxyServer::is_backend_fault(
+            "Failed to connect to 127.0.0.1:5432: Connection refused"
+        ));
+        // Not backend faults — a client-side problem, or a merely slow but
+        // healthy query, must NEVER take a backend out of rotation cluster-wide.
+        assert!(!ProxyServer::is_backend_fault("Backend read timeout"));
+        assert!(!ProxyServer::is_backend_fault("Client write timeout"));
+        assert!(!ProxyServer::is_backend_fault(
+            "Client write error: broken pipe"
+        ));
+        // A backend READ timeout is exempt, but a backend read ERROR is a fault.
+        assert!(!ProxyServer::is_backend_fault("Backend read timeout"));
+        assert!(ProxyServer::is_backend_fault(
+            "Backend read error: timed out"
+        ));
+    }
+
+    #[test]
     fn test_hba_addr_matches() {
         use std::net::IpAddr;
         let v4 = |s: &str| s.parse::<IpAddr>().unwrap();
@@ -3693,6 +5330,8 @@ mod tests {
             variables: RwLock::new(HashMap::new()),
             created_at: chrono::Utc::now(),
             tr_mode: crate::config::TrMode::default(),
+            #[cfg(feature = "lag-routing")]
+            last_write_at: RwLock::new(None),
             #[cfg(feature = "pool-modes")]
             pool_client_id: crate::pool::lease::ClientId::default(),
             #[cfg(feature = "wasm-plugins")]
@@ -3904,9 +5543,11 @@ mod tests {
         let augmented_state = Arc::new(ServerState {
             sessions: RwLock::new(HashMap::new()),
             health: ArcSwap::from_pointee(HashMap::new()),
+            health_write: parking_lot::Mutex::new(()),
             live_config: ArcSwap::from_pointee(ProxyConfig::default()),
             metrics: ServerMetrics::default(),
             cancel_map: Arc::new(DashMap::new()),
+            cancel_order: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
             tls_acceptor: None,
             auth_file: None,
             mirror: None,
@@ -3914,8 +5555,26 @@ mod tests {
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
             },
+            #[cfg(feature = "routing-hints")]
+            hint_parser: None,
+            #[cfg(feature = "rate-limiting")]
+            rate_limiter: None,
+            #[cfg(feature = "circuit-breaker")]
+            circuit_breaker: None,
+            #[cfg(feature = "query-analytics")]
+            analytics: None,
+            #[cfg(feature = "query-cache")]
+            query_cache: None,
+            #[cfg(feature = "query-rewriting")]
+            rewriter: None,
+            #[cfg(feature = "multi-tenancy")]
+            tenant_manager: None,
+            #[cfg(feature = "schema-routing")]
+            schema_analyzer: None,
             #[cfg(feature = "pool-modes")]
             pool_manager: None,
+            #[cfg(feature = "pool-modes")]
+            backend_pool: None,
             plugin_manager: Some(pm),
             #[cfg(feature = "ha-tr")]
             transaction_journal: Arc::new(crate::transaction_journal::TransactionJournal::new()),
@@ -4035,5 +5694,455 @@ mod tests {
         assert!(ProxyServer::reprepare_statement(&mut client2, &parse)
             .await
             .is_err());
+    }
+
+    // ---- routing-hints: SQL-comment hint → RouteOverride mapping ----
+
+    #[cfg(feature = "routing-hints")]
+    mod routing_hints {
+        use super::*;
+        use crate::routing::HintParser;
+
+        fn over(sql: &str) -> RouteOverride {
+            let hints = HintParser::new().parse(sql);
+            ProxyServer::hint_to_override(&hints)
+        }
+
+        #[test]
+        fn route_primary_maps_to_primary() {
+            assert!(matches!(
+                over("/*helios:route=primary*/ SELECT 1"),
+                RouteOverride::Primary
+            ));
+        }
+
+        #[test]
+        fn read_tier_targets_map_to_standby() {
+            for t in ["standby", "sync", "semisync", "async", "local"] {
+                assert!(
+                    matches!(
+                        over(&format!("/*helios:route={t}*/ SELECT 1")),
+                        RouteOverride::Standby
+                    ),
+                    "route={t} should map to Standby"
+                );
+            }
+        }
+
+        #[test]
+        fn any_and_vector_impose_no_constraint() {
+            assert!(matches!(
+                over("/*helios:route=any*/ SELECT 1"),
+                RouteOverride::None
+            ));
+            assert!(matches!(
+                over("/*helios:route=vector*/ SELECT 1"),
+                RouteOverride::None
+            ));
+        }
+
+        #[test]
+        fn node_hint_maps_to_node_and_wins_over_route() {
+            // node= beats route= (precedence).
+            match over("/*helios:node=pg-standby,route=primary*/ SELECT 1") {
+                RouteOverride::Node(n) => assert_eq!(n, "pg-standby"),
+                other => panic!("expected Node, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn consistency_strong_forces_primary() {
+            assert!(matches!(
+                over("/*helios:consistency=strong*/ SELECT 1"),
+                RouteOverride::Primary
+            ));
+        }
+
+        #[test]
+        fn no_hint_yields_none() {
+            assert!(matches!(over("SELECT 1"), RouteOverride::None));
+        }
+
+        // The core correctness fix: a leading hint comment must NOT hide the
+        // verb from write-detection. Raw classification misfires; classifying
+        // on the stripped SQL is correct.
+        #[test]
+        fn write_verb_classified_after_strip() {
+            let parser = HintParser::new();
+            let raw = "/*helios:route=primary*/ INSERT INTO t VALUES (1)";
+            // Raw (unstripped) wrongly looks like a read because it starts
+            // with the comment.
+            assert!(!ProxyServer::is_write_query(raw));
+            // Stripped is correctly a write.
+            assert!(ProxyServer::is_write_query(&parser.strip(raw)));
+        }
+
+        #[test]
+        fn strip_removes_hint_comment() {
+            let parser = HintParser::new();
+            assert_eq!(
+                parser.strip("/*helios:route=standby*/ SELECT 42"),
+                "SELECT 42"
+            );
+        }
+    }
+
+    // ---- rate-limiting: the burst-then-deny contract the gate relies on ----
+
+    #[cfg(feature = "rate-limiting")]
+    mod rate_limiting {
+        use crate::rate_limit::{LimiterKey, RateLimitConfig, RateLimitResult, RateLimiter};
+
+        #[test]
+        fn burst_allows_then_denies() {
+            // Mirror the wiring's config conversion: tiny bucket, reject on
+            // exceed (the engine default).
+            let cfg = RateLimitConfig {
+                enabled: true,
+                default_qps: 1,
+                default_burst: 2,
+                ..Default::default()
+            };
+            let limiter = RateLimiter::new(cfg);
+            let key = LimiterKey::User("u".to_string());
+
+            // The first `burst` checks are admitted.
+            assert!(matches!(limiter.check(&key, 1), RateLimitResult::Allowed));
+            assert!(matches!(limiter.check(&key, 1), RateLimitResult::Allowed));
+
+            // Rapid over-burst checks must produce at least one hard denial.
+            let mut denied = false;
+            for _ in 0..5 {
+                if matches!(limiter.check(&key, 1), RateLimitResult::Denied(_)) {
+                    denied = true;
+                }
+            }
+            assert!(denied, "over-burst checks must yield a Denied verdict");
+        }
+
+        #[test]
+        fn distinct_keys_have_independent_buckets() {
+            let cfg = RateLimitConfig {
+                enabled: true,
+                default_qps: 1,
+                default_burst: 1,
+                ..Default::default()
+            };
+            let limiter = RateLimiter::new(cfg);
+            // Each user gets its own bucket: both first checks are admitted.
+            assert!(matches!(
+                limiter.check(&LimiterKey::User("a".to_string()), 1),
+                RateLimitResult::Allowed
+            ));
+            assert!(matches!(
+                limiter.check(&LimiterKey::User("b".to_string()), 1),
+                RateLimitResult::Allowed
+            ));
+        }
+    }
+
+    // ---- circuit-breaker: open-after-threshold contract the gate relies on ----
+
+    #[cfg(feature = "circuit-breaker")]
+    mod circuit_breaker {
+        use crate::circuit_breaker::{
+            CircuitBreakerConfig, CircuitBreakerManager, CircuitState, ManagerConfig,
+        };
+        use std::time::Duration;
+
+        fn mgr(threshold: u32) -> CircuitBreakerManager {
+            let cfg = CircuitBreakerConfig {
+                failure_threshold: threshold,
+                cooldown: Duration::from_secs(10),
+                ..Default::default()
+            };
+            CircuitBreakerManager::new(ManagerConfig::new(cfg))
+        }
+
+        #[test]
+        fn opens_after_threshold_failures() {
+            let m = mgr(3);
+            let b = m.get_breaker("n1");
+            assert_eq!(b.get_state(), CircuitState::Closed);
+            b.record_failure("boom");
+            b.record_failure("boom");
+            // Under threshold: still serving.
+            assert_eq!(b.get_state(), CircuitState::Closed);
+            // Threshold reached: tripped open.
+            b.record_failure("boom");
+            assert_eq!(b.get_state(), CircuitState::Open);
+        }
+
+        #[test]
+        fn healthy_node_stays_closed() {
+            let m = mgr(3);
+            let b = m.get_breaker("n2");
+            b.record_success();
+            b.record_success();
+            assert_eq!(b.get_state(), CircuitState::Closed);
+        }
+    }
+
+    // ---- query-analytics: record + literal-collapsing normalizer ----
+
+    #[cfg(feature = "query-analytics")]
+    mod query_analytics {
+        use crate::analytics::{AnalyticsConfig, OrderBy, QueryAnalytics, QueryExecution};
+        use std::time::Duration;
+
+        #[test]
+        fn records_and_collapses_literals() {
+            let a = QueryAnalytics::new(AnalyticsConfig::default());
+            for n in [1, 2, 3] {
+                a.record(QueryExecution::new(
+                    format!("select {n}"),
+                    Duration::from_millis(1),
+                ));
+            }
+            let top = a.top_queries(OrderBy::Calls, 10);
+            assert!(!top.is_empty(), "no fingerprints recorded");
+            // The three literal variants collapse to one fingerprint (3 calls).
+            assert!(
+                top.iter().any(|s| s.calls >= 3),
+                "literals did not collapse: {:?}",
+                top.iter()
+                    .map(|s| (s.normalized.clone(), s.calls))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // ---- lag-routing: read-your-writes window + lag-exclusion decisions ----
+
+    #[cfg(feature = "lag-routing")]
+    mod lag_routing {
+        use super::ProxyServer;
+
+        #[test]
+        fn ryw_pins_recent_write() {
+            // A write "now" falls inside a 1s window -> pin to primary.
+            assert!(ProxyServer::ryw_pins_primary(
+                Some(std::time::Instant::now()),
+                1000
+            ));
+        }
+
+        #[test]
+        fn ryw_releases_old_write() {
+            let old = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(10))
+                .unwrap();
+            assert!(!ProxyServer::ryw_pins_primary(Some(old), 1000));
+        }
+
+        #[test]
+        fn ryw_no_write_or_disabled() {
+            assert!(!ProxyServer::ryw_pins_primary(None, 1000));
+            // window=0 disables read-your-writes entirely.
+            assert!(!ProxyServer::ryw_pins_primary(
+                Some(std::time::Instant::now()),
+                0
+            ));
+        }
+
+        #[test]
+        fn lag_exclusion_thresholds() {
+            // max=0 disables exclusion.
+            assert!(!ProxyServer::lag_excludes_standby(Some(999_999), 0));
+            // unknown lag never excludes.
+            assert!(!ProxyServer::lag_excludes_standby(None, 1000));
+            // within ceiling stays in rotation.
+            assert!(!ProxyServer::lag_excludes_standby(Some(500), 1000));
+            // beyond ceiling is dropped.
+            assert!(ProxyServer::lag_excludes_standby(Some(2000), 1000));
+        }
+    }
+
+    // ---- query-cache: which read SQL is safe to cache ----
+
+    #[cfg(feature = "query-cache")]
+    mod query_cache {
+        use super::ProxyServer;
+
+        #[test]
+        fn plain_selects_are_cacheable() {
+            assert!(ProxyServer::is_cacheable_read_sql("select v from t"));
+            assert!(ProxyServer::is_cacheable_read_sql(
+                "  SELECT a, b FROM users WHERE id = 5"
+            ));
+        }
+
+        #[test]
+        fn writes_and_non_selects_are_not_cacheable() {
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "insert into t values (1)"
+            ));
+            assert!(!ProxyServer::is_cacheable_read_sql("update t set v = 1"));
+            assert!(!ProxyServer::is_cacheable_read_sql("show search_path"));
+        }
+
+        #[test]
+        fn locking_and_volatile_selects_are_not_cacheable() {
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "select * from t for update"
+            ));
+            assert!(!ProxyServer::is_cacheable_read_sql("select now()"));
+            assert!(!ProxyServer::is_cacheable_read_sql("select random()"));
+            assert!(!ProxyServer::is_cacheable_read_sql("select nextval('s')"));
+        }
+    }
+
+    // ---- query-rewriting: the rules-engine rewrite contract ----
+
+    #[cfg(feature = "query-rewriting")]
+    mod query_rewriting {
+        use crate::rewriter::{
+            QueryPattern, QueryRewriter, RewriteRule, RewriterConfig, Transformation,
+        };
+
+        fn rw_with_table_replace() -> QueryRewriter {
+            let rw = QueryRewriter::new(RewriterConfig {
+                enabled: true,
+                ..Default::default()
+            });
+            rw.add_rule(
+                RewriteRule::build("t")
+                    .pattern(QueryPattern::Table("a".to_string()))
+                    .transform(Transformation::ReplaceTable {
+                        from: "a".to_string(),
+                        to: "b".to_string(),
+                    })
+                    .build(),
+            );
+            rw
+        }
+
+        #[test]
+        fn matching_query_is_rewritten() {
+            let res = rw_with_table_replace().rewrite("select * from a").unwrap();
+            assert!(res.was_rewritten(), "rule did not fire");
+            assert!(res.query().contains('b'), "rewritten: {}", res.query());
+            assert!(
+                !res.query().contains("from a"),
+                "still references a: {}",
+                res.query()
+            );
+        }
+
+        #[test]
+        fn unmatched_query_is_unchanged() {
+            let res = rw_with_table_replace()
+                .rewrite("select * from other")
+                .unwrap();
+            assert!(!res.was_rewritten());
+            assert_eq!(res.query(), "select * from other");
+        }
+    }
+
+    // ---- multi-tenancy: row-filter injection per tenant ----
+
+    #[cfg(feature = "multi-tenancy")]
+    mod multi_tenancy {
+        use crate::multi_tenancy::{
+            IdentificationMethod, IsolationStrategy, MultiTenancyConfig, TenantConfig, TenantId,
+            TenantManager, TenantManagerBuilder, TenantQueryTransformer,
+        };
+
+        fn manager() -> TenantManager {
+            let transformer = TenantQueryTransformer::new().register_tables(&["t"], "tid");
+            let tm = TenantManagerBuilder::new()
+                .config(MultiTenancyConfig {
+                    enabled: true,
+                    identification: IdentificationMethod::Header {
+                        header_name: "application_name".to_string(),
+                    },
+                    ..Default::default()
+                })
+                .query_transformer(transformer)
+                .build();
+            tm.register_tenant(TenantConfig::new(
+                TenantId::new("acme"),
+                IsolationStrategy::row("public", "tid"),
+            ));
+            tm
+        }
+
+        #[test]
+        fn tenant_table_gets_filter() {
+            let res = manager().transform_query("select * from t", &TenantId::new("acme"));
+            assert!(res.transformed, "expected a tenant filter to be injected");
+            let q = res.query.to_lowercase();
+            assert!(
+                q.contains("tid") && q.contains("acme"),
+                "filter missing: {}",
+                res.query
+            );
+        }
+
+        #[test]
+        fn non_tenant_table_passes_through() {
+            let res = manager().transform_query("select * from other", &TenantId::new("acme"));
+            assert!(!res.transformed);
+        }
+    }
+
+    // ---- ha-tr: the journal records statements the replay engine reads ----
+
+    #[cfg(feature = "ha-tr")]
+    mod ha_tr {
+        use crate::transaction_journal::TransactionJournal;
+        use crate::NodeId;
+
+        #[tokio::test]
+        async fn journal_records_and_windows_a_statement() {
+            let j = TransactionJournal::new();
+            let from = chrono::Utc::now() - chrono::Duration::seconds(60);
+            let tx = uuid::Uuid::new_v4();
+            j.begin_transaction(tx, uuid::Uuid::new_v4(), NodeId::new(), 0)
+                .await
+                .unwrap();
+            j.log_statement(
+                tx,
+                "insert into t values (1)".to_string(),
+                Vec::new(),
+                None,
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+            let to = chrono::Utc::now() + chrono::Duration::seconds(60);
+            let entries = j.entries_in_window(from, to).await;
+            assert_eq!(entries.len(), 1, "journaled statement should be in window");
+            assert!(entries[0].1.statement.contains("insert"));
+        }
+    }
+
+    // ---- schema-routing: OLAP vs OLTP workload classification ----
+
+    #[cfg(feature = "schema-routing")]
+    mod schema_routing {
+        use crate::schema_routing::{QueryAnalyzer, SchemaRegistry};
+        use std::sync::Arc;
+
+        fn analyzer() -> QueryAnalyzer {
+            QueryAnalyzer::new(Arc::new(SchemaRegistry::new()))
+        }
+
+        #[test]
+        fn aggregation_group_by_is_analytics() {
+            let a = analyzer();
+            assert!(a
+                .analyze("select count(*) from orders group by region")
+                .is_analytics());
+        }
+
+        #[test]
+        fn simple_point_query_is_not_analytics() {
+            let a = analyzer();
+            assert!(!a
+                .analyze("select * from orders where id = 1")
+                .is_analytics());
+        }
     }
 }

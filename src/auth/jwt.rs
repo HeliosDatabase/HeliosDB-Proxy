@@ -140,19 +140,65 @@ impl JwtValidator {
         }
     }
 
-    /// Verify token signature
-    fn verify_signature(&self, _token: &str, _key: &Jwk) -> Result<(), JwtError> {
-        // In a real implementation, this would use a crypto library like
-        // ring or openssl to verify the signature.
-        //
-        // For now, we trust the signature (this is for demonstration).
-        // In production, you would:
-        // 1. Decode the signature from base64
-        // 2. Compute the expected signature using the key
-        // 3. Compare using constant-time comparison
+    /// Verify the token signature.
+    ///
+    /// HS256 is verified with a constant-time HMAC-SHA256 comparison against the
+    /// symmetric key (`kty = "oct"`, base64url `k`). Any other algorithm is
+    /// REJECTED with `UnsupportedAlgorithm` — a forged/tampered token can no
+    /// longer slip through (the previous implementation accepted every
+    /// signature unconditionally).
+    fn verify_signature(&self, token: &str, key: &Jwk) -> Result<(), JwtError> {
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(JwtError::InvalidFormat);
+        }
+        let header = self.decode_header(parts[0])?;
+        let provided_sig =
+            base64_decode_url_safe(parts[2]).map_err(|e| JwtError::DecodeFailed(e.to_string()))?;
+        // The JWS signing input is the raw `header.claims` base64url segments.
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
 
-        // Placeholder: always succeed for demo
-        Ok(())
+        match header.alg.as_str() {
+            "HS256" => {
+                use hmac::{Hmac, Mac};
+                use sha2::Sha256;
+                let secret = key
+                    .k
+                    .as_deref()
+                    .map(base64_decode_url_safe)
+                    .transpose()
+                    .map_err(|e| JwtError::DecodeFailed(e.to_string()))?
+                    .ok_or_else(|| JwtError::KeyNotFound("HS256 symmetric key".to_string()))?;
+                let mut mac = <Hmac<Sha256>>::new_from_slice(&secret)
+                    .map_err(|_| JwtError::InvalidSignature)?;
+                mac.update(signing_input.as_bytes());
+                // Constant-time verification.
+                mac.verify_slice(&provided_sig)
+                    .map_err(|_| JwtError::InvalidSignature)
+            }
+            // RS256 / ES256 (asymmetric JWKS) verification is a follow-on; until
+            // implemented they are rejected rather than blindly trusted.
+            other => Err(JwtError::UnsupportedAlgorithm(other.to_string())),
+        }
+    }
+
+    /// Install a static HS256 (symmetric) signing key so tokens can be verified
+    /// against a configured shared secret without a JWKS endpoint.
+    pub fn set_hs256_secret(&self, kid: Option<String>, secret: &[u8]) {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let jwk = Jwk {
+            kty: "oct".to_string(),
+            kid,
+            alg: Some("HS256".to_string()),
+            use_: Some("sig".to_string()),
+            n: None,
+            e: None,
+            x: None,
+            y: None,
+            crv: None,
+            k: Some(URL_SAFE_NO_PAD.encode(secret)),
+        };
+        *self.jwks.write() = Jwks { keys: vec![jwk] };
     }
 
     /// Validate expiration claim
@@ -223,6 +269,7 @@ impl JwtValidator {
                 x: None,
                 y: None,
                 crv: None,
+                k: None,
             }],
         };
 
@@ -319,6 +366,10 @@ pub struct Jwk {
 
     /// EC curve (for EC keys)
     pub crv: Option<String>,
+
+    /// Symmetric key material, base64url-encoded (for `kty = "oct"` / HMAC).
+    #[serde(default)]
+    pub k: Option<String>,
 }
 
 /// Base64 URL-safe decode helper
@@ -499,6 +550,102 @@ mod tests {
         assert!(matches!(
             validator.validate("only.two"),
             Err(JwtError::InvalidFormat)
+        ));
+    }
+
+    // ---- HS256 signature verification (real crypto; closes the accept-all hole) ----
+
+    fn b64(d: &[u8]) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        URL_SAFE_NO_PAD.encode(d)
+    }
+
+    /// Build a real HS256 JWT over `claims_json`, signed with `secret`.
+    fn hs256_token(secret: &[u8], claims_json: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let header = b64(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = b64(claims_json.as_bytes());
+        let signing_input = format!("{header}.{payload}");
+        let mut mac = <Hmac<Sha256>>::new_from_slice(secret).unwrap();
+        mac.update(signing_input.as_bytes());
+        let sig = b64(&mac.finalize().into_bytes());
+        format!("{signing_input}.{sig}")
+    }
+
+    fn hs256_validator(secret: &[u8]) -> JwtValidator {
+        let config = JwtConfig {
+            allowed_algorithms: vec!["HS256".to_string()],
+            ..Default::default()
+        };
+        let v = JwtValidator::new(config);
+        v.set_hs256_secret(None, secret);
+        v
+    }
+
+    fn future_claims() -> String {
+        let exp = chrono::Utc::now().timestamp() + 3600;
+        format!(r#"{{"sub":"alice","iss":"test","exp":{exp},"iat":0}}"#)
+    }
+
+    #[test]
+    fn hs256_valid_token_accepted() {
+        let v = hs256_validator(b"top-secret");
+        let token = hs256_token(b"top-secret", &future_claims());
+        let claims = v.validate(&token).expect("valid HS256 token");
+        assert_eq!(claims.sub, "alice");
+    }
+
+    #[test]
+    fn hs256_wrong_secret_rejected() {
+        let v = hs256_validator(b"top-secret");
+        let token = hs256_token(b"WRONG-secret", &future_claims());
+        assert!(matches!(
+            v.validate(&token),
+            Err(JwtError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn hs256_tampered_payload_rejected() {
+        let v = hs256_validator(b"top-secret");
+        let token = hs256_token(b"top-secret", &future_claims());
+        let parts: Vec<&str> = token.split('.').collect();
+        // Forge a privilege-escalated payload, keep the original signature.
+        let evil = b64(br#"{"sub":"attacker","iss":"test","exp":9999999999,"iat":0}"#);
+        let forged = format!("{}.{}.{}", parts[0], evil, parts[2]);
+        assert!(matches!(
+            v.validate(&forged),
+            Err(JwtError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn hs256_expired_token_rejected() {
+        let v = hs256_validator(b"top-secret");
+        let token = hs256_token(
+            b"top-secret",
+            r#"{"sub":"alice","iss":"test","exp":1000,"iat":0}"#,
+        );
+        assert!(matches!(v.validate(&token), Err(JwtError::Expired)));
+    }
+
+    #[test]
+    fn unsupported_alg_is_rejected_not_trusted() {
+        // RS256 is allowed by config but unimplemented -> it must be REJECTED
+        // (the old verify_signature returned Ok for every algorithm).
+        let config = JwtConfig {
+            allowed_algorithms: vec!["RS256".to_string()],
+            ..Default::default()
+        };
+        let v = JwtValidator::new(config);
+        v.set_hs256_secret(None, b"x"); // a key must exist to reach verify_signature
+        let header = b64(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = b64(future_claims().as_bytes());
+        let token = format!("{header}.{payload}.{}", b64(b"whatever"));
+        assert!(matches!(
+            v.validate(&token),
+            Err(JwtError::UnsupportedAlgorithm(_))
         ));
     }
 }

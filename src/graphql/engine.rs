@@ -369,6 +369,9 @@ pub struct GraphQLEngine {
     validator: QueryValidator,
     /// Metrics
     metrics: Arc<GraphQLMetrics>,
+    /// Backend the generated SQL is executed against. `None` => the engine runs
+    /// in offline mode and returns empty results (used in tests).
+    backend: Option<crate::backend::BackendConfig>,
 }
 
 impl GraphQLEngine {
@@ -383,7 +386,14 @@ impl GraphQLEngine {
             metrics: Arc::new(GraphQLMetrics::new()),
             config,
             schema,
+            backend: None,
         }
+    }
+
+    /// Attach the backend the generated SQL runs against.
+    pub fn with_backend(mut self, backend: crate::backend::BackendConfig) -> Self {
+        self.backend = Some(backend);
+        self
     }
 
     /// Execute a GraphQL request
@@ -856,34 +866,63 @@ impl GraphQLEngine {
         filters
     }
 
-    /// Execute SQL queries
+    /// Execute the generated SQL against the configured backend, returning one
+    /// vector of row-objects (`{column: value}`) per query. With no backend
+    /// attached the engine returns empty result sets.
     async fn execute_queries(
         &self,
         queries: &[super::SqlQuery],
         _context: &ExecutionContext,
     ) -> Result<Vec<Vec<serde_json::Value>>, GraphQLError> {
-        // Mock execution - in production would use database connection
-        // For now, return empty results
-        Ok(queries.iter().map(|_| Vec::new()).collect())
+        let Some(bcfg) = self.backend.clone() else {
+            return Ok(queries.iter().map(|_| Vec::new()).collect());
+        };
+        use crate::backend::BackendClient;
+
+        let mut out = Vec::with_capacity(queries.len());
+        for q in queries {
+            let mut client = BackendClient::connect(&bcfg)
+                .await
+                .map_err(|e| GraphQLError::internal(format!("backend connect: {}", e)))?;
+            let qr = client
+                .simple_query(&q.sql)
+                .await
+                .map_err(|e| GraphQLError::internal(format!("backend query: {}", e)))?;
+            let rows: Vec<serde_json::Value> = qr
+                .rows
+                .iter()
+                .map(|row| {
+                    let mut obj = serde_json::Map::new();
+                    for (i, c) in qr.columns.iter().enumerate() {
+                        let v = row
+                            .get(i)
+                            .map(graphql_cell_to_json)
+                            .unwrap_or(serde_json::Value::Null);
+                        obj.insert(c.name.clone(), v);
+                    }
+                    serde_json::Value::Object(obj)
+                })
+                .collect();
+            out.push(rows);
+        }
+        Ok(out)
     }
 
-    /// Shape the response according to the GraphQL query
+    /// Shape the response: each top-level selection is keyed by its response
+    /// key and carries the rows from its corresponding query as an array.
+    /// (Flat top-level selections; nested-relationship shaping is a follow-on.)
     #[allow(clippy::result_large_err)]
     fn shape_response(
         &self,
         document: &ParsedDocument,
-        _results: &[Vec<serde_json::Value>],
+        results: &[Vec<serde_json::Value>],
     ) -> Result<serde_json::Value, GraphQLError> {
-        // Build response structure from selections
         let mut data = serde_json::Map::new();
-
-        for selection in &document.selections {
+        for (i, selection) in document.selections.iter().enumerate() {
             let key = selection.response_key().to_string();
-            // In production, would match results to selections
-            // For now, return null for each field
-            data.insert(key, serde_json::Value::Null);
+            let rows = results.get(i).cloned().unwrap_or_default();
+            data.insert(key, serde_json::Value::Array(rows));
         }
-
         Ok(serde_json::Value::Object(data))
     }
 
@@ -908,6 +947,14 @@ impl GraphQLEngine {
     }
 }
 
+/// Convert a backend text-protocol cell to a JSON value.
+fn graphql_cell_to_json(v: &crate::backend::TextValue) -> serde_json::Value {
+    match v {
+        crate::backend::TextValue::Null => serde_json::Value::Null,
+        crate::backend::TextValue::Text(s) => serde_json::Value::String(s.clone()),
+    }
+}
+
 impl Clone for GraphQLEngine {
     fn clone(&self) -> Self {
         Self {
@@ -916,6 +963,7 @@ impl Clone for GraphQLEngine {
             sql_generator: self.sql_generator.clone(),
             validator: QueryValidator::new(self.config.clone()),
             metrics: self.metrics.clone(),
+            backend: self.backend.clone(),
         }
     }
 }
@@ -941,6 +989,43 @@ mod tests {
         assert_eq!(doc.selections.len(), 1);
         assert_eq!(doc.selections[0].name, "users");
         assert_eq!(doc.selections[0].selections.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn offline_execute_shapes_field_key() {
+        use crate::graphql::introspector::{ColumnDefinition, SchemaIntrospector, TableDefinition};
+        let tabledef = TableDefinition {
+            name: "gqlitem".to_string(),
+            schema: "public".to_string(),
+            columns: vec![ColumnDefinition {
+                name: "id".to_string(),
+                data_type: "text".to_string(),
+                nullable: true,
+                is_primary_key: true,
+                has_default: false,
+            }],
+            foreign_keys: Vec::new(),
+        };
+        let schema = SchemaIntrospector::new().build_schema(&[tabledef]);
+        // No backend attached -> offline mode -> empty result sets, but the
+        // pipeline (parse -> plan -> generate -> shape) must still key each
+        // top-level selection under its response key (an array).
+        let engine = GraphQLEngine::new(GraphQLConfig::default(), schema);
+        let resp = engine
+            .execute(GraphQLRequest::new("{ gqlitems { id } }"))
+            .await;
+        assert!(
+            resp.errors.is_none(),
+            "unexpected errors: {:?}",
+            resp.errors
+        );
+        let data = resp.data.expect("data present");
+        assert!(
+            data.get("gqlitems").is_some(),
+            "missing field key: {}",
+            data
+        );
+        assert!(data["gqlitems"].is_array(), "field should be an array");
     }
 
     #[test]

@@ -311,12 +311,13 @@ impl WarmCache {
                 Some(output)
             }
             CompressionType::Lz4 => {
-                // LZ4 compression using zstd as fallback since lz4_flex not available
-                // In production, add lz4_flex crate for native LZ4
-                let mut output = Vec::with_capacity(data.len() + 1);
+                // Real LZ4 block compression. compress_prepend_size writes the
+                // uncompressed length as a little-endian u32 prefix so the
+                // decoder can size its output buffer exactly.
+                let compressed = lz4_flex::block::compress_prepend_size(data);
+                let mut output = Vec::with_capacity(compressed.len() + 1);
                 output.push(0x01); // LZ4 marker
-                                   // Use simple compression for now
-                output.extend_from_slice(data);
+                output.extend_from_slice(&compressed);
                 Some(output)
             }
             CompressionType::Zstd => {
@@ -341,7 +342,11 @@ impl WarmCache {
 
         match marker {
             0x00 => Some(payload.to_vec()), // Uncompressed
-            0x01 => Some(payload.to_vec()), // LZ4 (not compressed in current impl)
+            0x01 => {
+                // Real LZ4 block decompression — reads the u32 size prefix
+                // written by compress_prepend_size.
+                lz4_flex::block::decompress_size_prepended(payload).ok()
+            }
             0x02 => {
                 // Real zstd decompression
                 zstd::stream::decode_all(payload).ok()
@@ -419,6 +424,42 @@ mod tests {
         let result = cache.get(&fp);
         assert!(result.is_some());
         assert_eq!(result.unwrap().data, vec![1, 2, 3]);
+    }
+
+    // Proves LZ4 is real now: it round-trips AND a compressible payload comes
+    // out strictly smaller than it went in. The previous impl just copied the
+    // bytes behind a marker, so this shrink assertion would have failed.
+    #[test]
+    fn test_lz4_compression_is_real() {
+        let cache = WarmCache::new(
+            1024 * 1024,
+            PathBuf::from("/tmp/test-cache-lz4"),
+            CompressionType::Lz4,
+        );
+
+        // Highly compressible: 4 KiB of a repeating pattern.
+        let original = b"helios-distribcache-".repeat(200);
+        let compressed = cache.compress(&original).expect("compress");
+        // marker byte + LZ4 block; must be meaningfully smaller than the input.
+        assert!(
+            compressed.len() < original.len(),
+            "LZ4 did not shrink data: {} -> {}",
+            original.len(),
+            compressed.len()
+        );
+
+        let restored = cache.decompress(&compressed).expect("decompress");
+        assert_eq!(restored, original, "LZ4 round-trip mismatch");
+
+        // Sanity: Zstd path round-trips too.
+        let zcache = WarmCache::new(
+            1024 * 1024,
+            PathBuf::from("/tmp/test-cache-zstd"),
+            CompressionType::Zstd,
+        );
+        let zc = zcache.compress(&original).expect("zstd compress");
+        assert!(zc.len() < original.len());
+        assert_eq!(zcache.decompress(&zc).expect("zstd decompress"), original);
     }
 
     #[test]

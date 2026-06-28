@@ -338,6 +338,16 @@ impl QueryCache {
         self.metrics.record_put();
     }
 
+    /// Invalidate any cached results that reference a table written by `sql`.
+    /// Normalizes the (write) query to extract its tables, then drops their
+    /// cached entries.
+    pub async fn invalidate_query(&self, sql: &str) {
+        let normalized = self.normalizer.normalize(sql);
+        if !normalized.tables.is_empty() {
+            self.invalidate_tables(&normalized.tables).await;
+        }
+    }
+
     /// Invalidate cache entries for specific tables
     pub async fn invalidate_tables(&self, tables: &[String]) {
         for table in tables {
