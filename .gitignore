@@ -9,3 +9,6 @@ __pycache__/
 .env
 *.key
 *.pem
+
+# Agent/FleetView scratch worktrees — never commit
+.claude/worktrees/
