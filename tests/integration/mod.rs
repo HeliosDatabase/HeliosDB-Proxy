@@ -158,7 +158,9 @@ fn test_module_05_batch_operations_config() {
         max_batch_size: 50,
         ..Default::default()
     };
-    let batcher = InsertBatcher::new(cfg);
+    // `add` takes `self: &Arc<Self>` (the batcher hands clones to its flush
+    // task), so the batcher must live behind an Arc.
+    let batcher = std::sync::Arc::new(InsertBatcher::new(cfg));
 
     batcher
         .add(
