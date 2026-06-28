@@ -416,9 +416,7 @@ impl UpgradeOrchestrator {
             let qualified = format!("{}.{}", quote_ident(schema), quote_ident(table));
             let count_sql = format!("SELECT count(*) AS n FROM {}", qualified);
 
-            let read_count = |res: BackendResult<TextValue>,
-                              side: &str|
-             -> Result<i64> {
+            let read_count = |res: BackendResult<TextValue>, side: &str| -> Result<i64> {
                 res.map_err(|e| {
                     ProxyError::FailoverFailed(format!("{} count {}: {}", side, qualified, e))
                 })?
@@ -946,7 +944,9 @@ mod tests {
 
         // Cleanup.
         if let Ok(mut c) = BackendClient::connect(&seed_cfg).await {
-            let _ = c.execute("DROP TABLE IF EXISTS upgrade_validate_probe").await;
+            let _ = c
+                .execute("DROP TABLE IF EXISTS upgrade_validate_probe")
+                .await;
             c.close().await;
         }
     }

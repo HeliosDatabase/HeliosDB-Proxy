@@ -1642,10 +1642,8 @@ impl ProxyServer {
             // buffer for one (possibly malicious) oversized frame can exhaust
             // memory. A legitimate client never needs a single >64 MiB message.
             if buffer.len() > Self::MAX_PENDING_BYTES {
-                let emsg = Self::create_error_response(
-                    "53400",
-                    "message exceeds per-session size limit",
-                );
+                let emsg =
+                    Self::create_error_response("53400", "message exceeds per-session size limit");
                 let _ = stream.write_all(&emsg).await;
                 let _ = stream.write_all(&Self::create_ready_for_query(b'I')).await;
                 tracing::warn!(
@@ -1802,13 +1800,10 @@ impl ProxyServer {
                                     // Bound the AGGREGATE bytes retained, not just the
                                     // count: a (possibly re-Parsed) statement that would
                                     // push the session over the byte cap is refused.
-                                    let old_len = stmt_registry
-                                        .get(&name)
-                                        .map(|b| b.len())
-                                        .unwrap_or(0);
-                                    let projected = stmt_registry_bytes
-                                        .saturating_sub(old_len)
-                                        + encoded.len();
+                                    let old_len =
+                                        stmt_registry.get(&name).map(|b| b.len()).unwrap_or(0);
+                                    let projected =
+                                        stmt_registry_bytes.saturating_sub(old_len) + encoded.len();
                                     if projected > Self::MAX_PREPARED_BYTES {
                                         let emsg = Self::create_error_response(
                                             "54000",
@@ -3407,13 +3402,17 @@ impl ProxyServer {
             .map_err(|_| ProxyError::Network("re-prepare write timeout".to_string()))?
             .map_err(|e| ProxyError::Network(format!("re-prepare write error: {}", e)))?;
         // Flush: 'H' + length 4.
-        tokio::time::timeout(Self::REPREPARE_TIMEOUT, backend.write_all(&[b'H', 0, 0, 0, 4]))
-            .await
-            .map_err(|_| ProxyError::Network("re-prepare flush timeout".to_string()))?
-            .map_err(|e| ProxyError::Network(format!("re-prepare flush error: {}", e)))?;
-        let mtype = tokio::time::timeout(Self::REPREPARE_TIMEOUT, Self::read_one_frame_type(backend))
-            .await
-            .map_err(|_| ProxyError::Network("re-prepare read timeout".to_string()))??;
+        tokio::time::timeout(
+            Self::REPREPARE_TIMEOUT,
+            backend.write_all(&[b'H', 0, 0, 0, 4]),
+        )
+        .await
+        .map_err(|_| ProxyError::Network("re-prepare flush timeout".to_string()))?
+        .map_err(|e| ProxyError::Network(format!("re-prepare flush error: {}", e)))?;
+        let mtype =
+            tokio::time::timeout(Self::REPREPARE_TIMEOUT, Self::read_one_frame_type(backend))
+                .await
+                .map_err(|_| ProxyError::Network("re-prepare read timeout".to_string()))??;
         match mtype {
             b'1' => Ok(()), // ParseComplete
             b'E' => Err(ProxyError::Protocol(
@@ -3526,10 +3525,13 @@ impl ProxyServer {
             }
 
             if consumed > 0 {
-                tokio::time::timeout(Self::CLIENT_WRITE_TIMEOUT, client.write_all(&buf[..consumed]))
-                    .await
-                    .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
-                    .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+                tokio::time::timeout(
+                    Self::CLIENT_WRITE_TIMEOUT,
+                    client.write_all(&buf[..consumed]),
+                )
+                .await
+                .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
+                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
                 sent += consumed as u64;
                 let _ = buf.split_to(consumed);
             }
@@ -3619,10 +3621,13 @@ impl ProxyServer {
             }
 
             if consumed > 0 {
-                tokio::time::timeout(Self::CLIENT_WRITE_TIMEOUT, client.write_all(&buf[..consumed]))
-                    .await
-                    .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
-                    .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+                tokio::time::timeout(
+                    Self::CLIENT_WRITE_TIMEOUT,
+                    client.write_all(&buf[..consumed]),
+                )
+                .await
+                .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
+                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
                 captured.extend_from_slice(&buf[..consumed]);
                 sent += consumed as u64;
                 let _ = buf.split_to(consumed);
@@ -4969,7 +4974,9 @@ impl ProxyServer {
             .map_err(|_| {
                 ProxyError::HealthCheck(format!("{} did not answer protocol probe in time", addr))
             })?
-            .map_err(|e| ProxyError::HealthCheck(format!("{} protocol probe error: {}", addr, e)))?;
+            .map_err(|e| {
+                ProxyError::HealthCheck(format!("{} protocol probe error: {}", addr, e))
+            })?;
         // 'S' (TLS available) or 'N' (not) both prove the postmaster is live and
         // talking the protocol; anything else means a non-PostgreSQL listener.
         if byte != b'S' && byte != b'N' {
@@ -5185,8 +5192,12 @@ mod tests {
     #[test]
     fn is_backend_fault_excludes_client_and_slow_query_errors() {
         // Real backend faults — these must demote the node in-band.
-        assert!(ProxyServer::is_backend_fault("Backend read error: connection reset"));
-        assert!(ProxyServer::is_backend_fault("Backend write error: broken pipe"));
+        assert!(ProxyServer::is_backend_fault(
+            "Backend read error: connection reset"
+        ));
+        assert!(ProxyServer::is_backend_fault(
+            "Backend write error: broken pipe"
+        ));
         assert!(ProxyServer::is_backend_fault("Backend write timeout"));
         assert!(ProxyServer::is_backend_fault(
             "Failed to connect to 127.0.0.1:5432: Connection refused"
@@ -5195,10 +5206,14 @@ mod tests {
         // healthy query, must NEVER take a backend out of rotation cluster-wide.
         assert!(!ProxyServer::is_backend_fault("Backend read timeout"));
         assert!(!ProxyServer::is_backend_fault("Client write timeout"));
-        assert!(!ProxyServer::is_backend_fault("Client write error: broken pipe"));
+        assert!(!ProxyServer::is_backend_fault(
+            "Client write error: broken pipe"
+        ));
         // A backend READ timeout is exempt, but a backend read ERROR is a fault.
         assert!(!ProxyServer::is_backend_fault("Backend read timeout"));
-        assert!(ProxyServer::is_backend_fault("Backend read error: timed out"));
+        assert!(ProxyServer::is_backend_fault(
+            "Backend read error: timed out"
+        ));
     }
 
     #[test]

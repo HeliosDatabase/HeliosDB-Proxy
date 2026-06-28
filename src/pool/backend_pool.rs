@@ -238,7 +238,9 @@ mod tests {
         assert!(pool.checkin(&key, s));
         assert_eq!(pool.idle_count(), 1);
 
-        let got = pool.checkout(&key).expect("a parked connection is reusable");
+        let got = pool
+            .checkout(&key)
+            .expect("a parked connection is reusable");
         assert_eq!(got.local_addr().unwrap(), parked_addr, "same socket reused");
         assert_eq!(pool.reuses(), 1);
         assert_eq!(pool.idle_count(), 0);
@@ -287,7 +289,7 @@ mod tests {
         let (server, _) = listener.accept().await.unwrap();
         pool.checkin(&key, client);
         drop(server); // peer closes
-        // Give the close a moment to propagate.
+                      // Give the close a moment to propagate.
         tokio::task::yield_now().await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 

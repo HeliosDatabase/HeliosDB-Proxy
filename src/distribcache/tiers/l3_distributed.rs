@@ -856,7 +856,10 @@ mod tests {
         // PUT over TCP — must be acked, and must land in the server's local map.
         client.insert(fp.clone(), entry.clone()).await.unwrap();
         let key = server.fingerprint_to_hash(&fp);
-        assert!(server.local.contains_key(&key), "PUT did not land on server");
+        assert!(
+            server.local.contains_key(&key),
+            "PUT did not land on server"
+        );
 
         // GET over TCP — must return the same bytes the client stored.
         let got = client.get(&fp).await.expect("remote GET failed");
@@ -878,6 +881,9 @@ mod tests {
             !server.local.contains_key(&key),
             "INVALIDATE did not remove entry"
         );
-        assert!(client.get(&fp).await.is_err(), "GET should miss after invalidate");
+        assert!(
+            client.get(&fp).await.is_err(),
+            "GET should miss after invalidate"
+        );
     }
 }
