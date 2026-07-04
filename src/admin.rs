@@ -224,6 +224,17 @@ impl AdminServer {
         Ok(())
     }
 
+    /// Overall deadline for reading one admin request (headers + body). Bounds
+    /// slow-loris clients on the default-open admin listener.
+    const ADMIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+    /// Max number of header lines accepted per admin request.
+    const MAX_ADMIN_HEADERS: usize = 100;
+    /// Max total bytes of the header section.
+    const MAX_ADMIN_HEADER_BYTES: usize = 64 * 1024;
+    /// Max admin request body. Admin payloads (config fragments, replay windows)
+    /// are small; this bounds the `vec![0u8; content_length]` allocation.
+    const MAX_ADMIN_BODY_BYTES: usize = 8 * 1024 * 1024;
+
     /// Handle an admin connection
     async fn handle_connection(
         mut stream: TcpStream,
@@ -239,16 +250,39 @@ impl AdminServer {
         // Read HTTP request headers
         let mut headers = Vec::new();
         let mut content_length: usize = 0;
+        let mut header_bytes: usize = 0;
 
         loop {
             line.clear();
-            let bytes_read = reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| ProxyError::Network(format!("Read error: {}", e)))?;
+            // Bound the whole request-read phase in time so a slow-loris client
+            // dribbling bytes cannot pin this admin task indefinitely. The admin
+            // listener is open by default, so this is unauthenticated input.
+            let bytes_read =
+                match tokio::time::timeout(Self::ADMIN_READ_TIMEOUT, reader.read_line(&mut line))
+                    .await
+                {
+                    Ok(r) => r.map_err(|e| ProxyError::Network(format!("Read error: {}", e)))?,
+                    Err(_) => return Ok(()), // read timeout — drop the connection
+                };
 
             if bytes_read == 0 || line == "\r\n" {
                 break;
+            }
+
+            // Bound header size + count so a client streaming header lines
+            // forever cannot grow memory without limit (unauthenticated DoS).
+            header_bytes += bytes_read;
+            if headers.len() >= Self::MAX_ADMIN_HEADERS
+                || header_bytes > Self::MAX_ADMIN_HEADER_BYTES
+            {
+                Self::send_response(
+                    &mut writer,
+                    431,
+                    "Request Header Fields Too Large",
+                    "header section too large",
+                )
+                .await?;
+                return Ok(());
             }
 
             // Parse Content-Length header
@@ -262,6 +296,21 @@ impl AdminServer {
         }
 
         if headers.is_empty() {
+            return Ok(());
+        }
+
+        // Reject an oversized declared body BEFORE allocating for it: the old
+        // `vec![0u8; content_length]` would zero-fill an attacker-chosen size
+        // (e.g. `Content-Length: 99999999999`) and OOM the whole process on the
+        // default-open admin port.
+        if content_length > Self::MAX_ADMIN_BODY_BYTES {
+            Self::send_response(
+                &mut writer,
+                413,
+                "Payload Too Large",
+                "request body exceeds admin size limit",
+            )
+            .await?;
             return Ok(());
         }
 
@@ -299,13 +348,17 @@ impl AdminServer {
             }
         }
 
-        // Read request body for POST/PUT requests
+        // Read request body for POST/PUT requests (size already bounded above).
         let body = if content_length > 0 && (method == "POST" || method == "PUT") {
             let mut body_buf = vec![0u8; content_length];
-            reader
-                .read_exact(&mut body_buf)
+            match tokio::time::timeout(Self::ADMIN_READ_TIMEOUT, reader.read_exact(&mut body_buf))
                 .await
-                .map_err(|e| ProxyError::Network(format!("Body read error: {}", e)))?;
+            {
+                Ok(r) => {
+                    r.map_err(|e| ProxyError::Network(format!("Body read error: {}", e)))?;
+                }
+                Err(_) => return Ok(()), // body read timeout — drop the connection
+            }
             Some(String::from_utf8_lossy(&body_buf).to_string())
         } else {
             None

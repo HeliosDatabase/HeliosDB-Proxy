@@ -1067,6 +1067,16 @@ impl ProxyConfig {
             ));
         }
 
+        // A zero health-check interval panics `tokio::time::interval` at
+        // construction, silently killing the health task (which then never
+        // probes, so the proxy keeps routing to dead backends). Reject it here;
+        // the checker also clamps to a 1s floor as belt-and-suspenders.
+        if self.health.check_interval_secs == 0 {
+            return Err(ProxyError::Config(
+                "health.check_interval_secs must be >= 1".to_string(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -1334,6 +1344,18 @@ mod tests {
     fn test_validate_success() {
         let mut config = ProxyConfig::default();
         config.add_node("localhost:5432", "primary").unwrap();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_health_interval() {
+        // A zero health-check interval panics tokio::time::interval; validation
+        // must reject it up front rather than let the health task die silently.
+        let mut config = ProxyConfig::default();
+        config.add_node("localhost:5432", "primary").unwrap();
+        config.health.check_interval_secs = 0;
+        assert!(config.validate().is_err());
+        config.health.check_interval_secs = 1;
         assert!(config.validate().is_ok());
     }
 

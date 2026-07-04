@@ -1517,7 +1517,27 @@ impl ProxyServer {
         // ClientStream that is plaintext or TLS-wrapped; the rest of the
         // session is written against that single stream type. `pre` carries
         // a first startup/cancel message already read while peeking.
-        let result = match Self::negotiate_client_tls(stream, &state).await {
+        //
+        // Bound the pre-auth negotiation (first-message read + TLS handshake) in
+        // time: a client that connects and then stalls must not pin this task
+        // and its session-map slot indefinitely (slow-loris). The query loop
+        // that follows is intentionally NOT under this deadline — only the
+        // handshake is.
+        let negotiated = match tokio::time::timeout(
+            Self::STARTUP_TIMEOUT,
+            Self::negotiate_client_tls(stream, &state),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::debug!(client = %addr, "pre-auth negotiation timed out; closing");
+                Err(ProxyError::Connection(
+                    "startup negotiation timeout".to_string(),
+                ))
+            }
+        };
+        let result = match negotiated {
             Ok((mut client_stream, pre)) => {
                 Self::client_loop(&mut client_stream, pre, &session, &state, &config).await
             }
@@ -1580,27 +1600,37 @@ impl ProxyServer {
         // connections below the client count) additionally needs
         // proxy-terminated backend auth and is the documented next increment.
         let mut conns: HashMap<String, BackendConn> = HashMap::new();
-        let mut current_node: Option<String> =
-            match Self::handle_startup(stream, &mut buffer, &codec, pre, session, state, config)
-                .await
-            {
-                Ok((Some(stream_conn), node_addr)) => {
-                    conns.insert(node_addr.clone(), BackendConn::new(stream_conn));
-                    Some(node_addr)
-                }
-                Ok((None, _)) => {
-                    // SSL rejected or cancel request, connection should close
-                    return Ok(());
-                }
-                Err(e) => {
-                    tracing::error!("Startup failed: {}", e);
-                    // Send error to client
-                    let err_msg =
-                        Self::create_error_response("08006", &format!("Startup failed: {}", e));
-                    let _ = stream.write_all(&err_msg).await;
-                    return Err(e);
-                }
-            };
+        // Bound the startup/authentication exchange in time (the TLS path reads
+        // the real startup packet here, after negotiation). A client that opens
+        // the connection but never completes startup must not hold the task and
+        // its session slot open indefinitely.
+        let startup_result = match tokio::time::timeout(
+            Self::STARTUP_TIMEOUT,
+            Self::handle_startup(stream, &mut buffer, &codec, pre, session, state, config),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(ProxyError::Connection("startup timeout".to_string())),
+        };
+        let mut current_node: Option<String> = match startup_result {
+            Ok((Some(stream_conn), node_addr)) => {
+                conns.insert(node_addr.clone(), BackendConn::new(stream_conn));
+                Some(node_addr)
+            }
+            Ok((None, _)) => {
+                // SSL rejected or cancel request, connection should close
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::error!("Startup failed: {}", e);
+                // Send error to client
+                let err_msg =
+                    Self::create_error_response("08006", &format!("Startup failed: {}", e));
+                let _ = stream.write_all(&err_msg).await;
+                return Err(e);
+            }
+        };
 
         // Main query loop.
         //
@@ -2507,6 +2537,11 @@ impl ProxyServer {
     /// forwarded).
     const MAX_CANCEL_KEYS: usize = 100_000;
 
+    /// Deadline for the pre-auth startup exchange (client TLS negotiation +
+    /// PostgreSQL startup/authentication). A client that connects and then
+    /// stalls must not hold a task and its session-map slot open forever
+    /// (slow-loris). Only the handshake is bounded; the query loop is not.
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
     /// Timeout for a single backend write on the forward path — a blackholed or
     /// hung backend must never pin a client task indefinitely. Backend reads
     /// are already bounded (30s); this bounds writes symmetrically.
@@ -5010,9 +5045,13 @@ impl ProxyServer {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                state.live_config.load().health.check_interval_secs,
-            ));
+            // Clamp to a 1s floor: `tokio::time::interval` panics on a zero
+            // period, which would silently kill this task (it would then never
+            // probe, so the proxy keeps routing to dead backends). `validate()`
+            // already rejects 0 in a file config; this defends a
+            // programmatically-built or reloaded config too.
+            let interval_secs = state.live_config.load().health.check_interval_secs.max(1);
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
 
             loop {
                 tokio::select! {
