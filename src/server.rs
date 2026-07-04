@@ -411,6 +411,16 @@ struct BackendConn {
     /// (the backend's unnamed statement already holds that SQL) and synthesize
     /// the `ParseComplete` locally — the unnamed-Parse promotion (Batch H).
     unnamed_sig: Option<bytes::Bytes>,
+    /// Whether a simple-query statement forwarded on this socket may have left
+    /// session-level state behind (a `SET`, temp table, `LISTEN`, advisory
+    /// lock, …). Used only by the conditional-reset optimisation
+    /// (`pool_mode.skip_clean_reset`): a connection is eligible to be parked
+    /// WITHOUT running the reset query only when it is provably clean —
+    /// `!dirty && prepared.is_empty() && unnamed_sig.is_none()`. Set
+    /// conservatively (any statement not provably session-neutral sets it), so
+    /// the worst outcome of a misclassification is an unnecessary reset, never
+    /// leaked state. Always `false` on a fresh/reused connection.
+    dirty: bool,
 }
 
 impl BackendConn {
@@ -419,6 +429,7 @@ impl BackendConn {
             stream,
             prepared: HashSet::new(),
             unnamed_sig: None,
+            dirty: false,
         }
     }
 }
@@ -3050,6 +3061,24 @@ impl ProxyServer {
         let Some(mut bc) = conns.remove(node) else {
             return;
         };
+
+        // Conditional reset: a connection that provably touched no session
+        // state — no dirtying simple statement, no named prepared statement, no
+        // unnamed prepared statement — can be parked WITHOUT the `DISCARD ALL`
+        // round-trip, removing a backend RTT from the critical path for clean
+        // autocommit workloads. Any of these three signals forces the full
+        // reset. Extended-protocol traffic always has `prepared`/`unnamed_sig`
+        // set, so it is never clean-skipped (conservative by construction).
+        let clean = !bc.dirty && bc.prepared.is_empty() && bc.unnamed_sig.is_none();
+        if config.pool_mode.skip_clean_reset && clean {
+            let key = Self::pool_key_for(node, session).await;
+            if pool.checkin(&key, bc.stream) {
+                pool.note_reset_skipped();
+                tracing::debug!(target: "helios::pool", node = %node, "parked clean backend connection (reset skipped)");
+            }
+            return;
+        }
+
         if Self::reset_backend(&mut bc.stream, &config.pool_mode.reset_query)
             .await
             .is_ok()
@@ -3261,6 +3290,20 @@ impl ProxyServer {
             return Err(e);
         }
         let backend = conns.get_mut(&target).expect("just ensured");
+
+        // Conditional-reset bookkeeping: if this statement is not provably
+        // session-neutral, mark the connection dirty so it is fully reset (not
+        // clean-skipped) when parked. Only evaluated when the optimisation is
+        // enabled and the connection is not already dirty (one O(len) scan at
+        // most, until the first dirtying statement).
+        #[cfg(feature = "pool-modes")]
+        if config.pool_mode.skip_clean_reset && !backend.dirty {
+            if let Some(sql) = crate::protocol::query_text(&forward_msg.payload) {
+                if Self::stmt_leaves_session_state(sql) {
+                    backend.dirty = true;
+                }
+            }
+        }
 
         let backend_err = match tokio::time::timeout(
             Self::BACKEND_WRITE_TIMEOUT,
@@ -3971,6 +4014,109 @@ impl ProxyServer {
             return true;
         }
 
+        false
+    }
+
+    /// Conservative classifier for the conditional-reset optimisation: could
+    /// this forwarded simple-query SQL leave *session-level* state on the
+    /// backend connection that `DISCARD ALL` would need to clear before another
+    /// client reuses it (a `SET`/GUC, temp table, prepared statement, cursor
+    /// WITH HOLD, `LISTEN`, advisory lock, session authorization, …)?
+    ///
+    /// Biased hard toward `true`. A false negative (calling a dirtying
+    /// statement clean) would leak state to the next borrower — a correctness
+    /// and security bug — so only statements *provably* session-neutral return
+    /// `false`; everything ambiguous returns `true` (forcing the full reset,
+    /// which is merely slower, never unsafe).
+    ///
+    /// Known, documented limitation: a `SELECT` that calls a user-defined
+    /// function which internally runs `set_config(..., is_local => false)` or
+    /// takes an advisory lock via an aliased path is NOT detectable from the
+    /// SQL text. The direct forms (`set_config`, `pg_advisory*`, `nextval`,
+    /// `setval`) ARE caught. This is why `skip_clean_reset` is opt-in and
+    /// intended for autocommit/simple-protocol workloads.
+    #[cfg(feature = "pool-modes")]
+    fn stmt_leaves_session_state(sql: &str) -> bool {
+        use crate::protocol::{contains_ci, starts_with_ci};
+        let t = sql.trim();
+        if t.is_empty() {
+            return false;
+        }
+        // Multiple statements in one simple-query string: a leading-keyword
+        // check cannot vouch for what follows a `;`, so treat any non-trailing
+        // `;` as dirtying. A `;` inside a string literal also trips this —
+        // safe, merely an unnecessary reset.
+        let core = t.strip_suffix(';').unwrap_or(t).trim_end();
+        if core.contains(';') {
+            return true;
+        }
+        // The statement's leading keyword must be one that provably leaves no
+        // session state. CREATE / SET / PREPARE / DECLARE / LISTEN / DISCARD /
+        // RESET / GRANT / ALTER / LOCK / COPY / … are all absent here, so they
+        // fall through to `true` (dirtying).
+        let neutral_lead = starts_with_ci(core, "SELECT")
+            || starts_with_ci(core, "INSERT")
+            || starts_with_ci(core, "UPDATE")
+            || starts_with_ci(core, "DELETE")
+            || starts_with_ci(core, "WITH")
+            || starts_with_ci(core, "VALUES")
+            || starts_with_ci(core, "TABLE")
+            || starts_with_ci(core, "SHOW")
+            || starts_with_ci(core, "EXPLAIN")
+            || starts_with_ci(core, "FETCH")
+            || starts_with_ci(core, "BEGIN")
+            || starts_with_ci(core, "START")
+            || starts_with_ci(core, "COMMIT")
+            || starts_with_ci(core, "END")
+            || starts_with_ci(core, "ROLLBACK")
+            || starts_with_ci(core, "ABORT")
+            || starts_with_ci(core, "SAVEPOINT")
+            || starts_with_ci(core, "RELEASE");
+        if !neutral_lead {
+            return true;
+        }
+        // A neutral-lead statement can still create session state:
+        //  * `SELECT ... INTO [TEMP] t` (and the `WITH … SELECT … INTO` form)
+        //    creates a table. The `INTO` keyword is matched as a whole word (so
+        //    a column name like `into_total` does not trip it) and ONLY for
+        //    SELECT/WITH leads — `INSERT INTO`, `UPDATE`, `DELETE` use `INTO`
+        //    (or not) as ordinary syntax and leave no session state.
+        //  * `set_config()` sets a GUC; `pg_advisory*` takes a session lock;
+        //    `nextval`/`setval` touch the per-session sequence cache.
+        if (starts_with_ci(core, "SELECT") || starts_with_ci(core, "WITH"))
+            && Self::contains_word_ci(core, "into")
+        {
+            return true;
+        }
+        const DIRTY_TOKENS: [&str; 4] = ["set_config", "advisory", "nextval", "setval"];
+        DIRTY_TOKENS.iter().any(|tok| contains_ci(core, tok))
+    }
+
+    /// Case-insensitive whole-word (ASCII identifier-boundary) search — a match
+    /// requires the token to be bounded by a non-`[A-Za-z0-9_]` char (or the
+    /// string edge) on both sides, so a real SQL keyword like `INTO` is caught
+    /// regardless of surrounding whitespace while an identifier substring
+    /// (`into_total`) is not.
+    #[cfg(feature = "pool-modes")]
+    fn contains_word_ci(haystack: &str, word: &str) -> bool {
+        let hb = haystack.as_bytes();
+        let wb = word.as_bytes();
+        if wb.is_empty() || hb.len() < wb.len() {
+            return false;
+        }
+        let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut i = 0;
+        while i + wb.len() <= hb.len() {
+            if hb[i..i + wb.len()].eq_ignore_ascii_case(wb) {
+                let before_ok = i == 0 || !is_ident(hb[i - 1]);
+                let after = i + wb.len();
+                let after_ok = after == hb.len() || !is_ident(hb[after]);
+                if before_ok && after_ok {
+                    return true;
+                }
+            }
+            i += 1;
+        }
         false
     }
 
@@ -6373,6 +6519,69 @@ mod tests {
                 .analyze("select * from orders where id = 1")
                 .is_analytics());
         }
+    }
+
+    /// The conditional-reset classifier must call every session-state-creating
+    /// statement DIRTY (so it is reset before reuse) and only provably neutral
+    /// statements CLEAN. A false "clean" would leak state across clients, so the
+    /// dirty cases here are the security-critical half of the test.
+    #[cfg(feature = "pool-modes")]
+    #[test]
+    fn stmt_classifier_is_conservative() {
+        let clean = ProxyServer::stmt_leaves_session_state;
+        // ---- Provably clean (reset may be skipped) ----
+        assert!(!clean(
+            "SELECT abalance FROM pgbench_accounts WHERE aid = 12345"
+        ));
+        assert!(!clean("SELECT 1"));
+        assert!(!clean("SELECT 1;")); // single trailing ';'
+        assert!(!clean("  select now()  ")); // read of a volatile fn: no session state
+        assert!(!clean("INSERT INTO t VALUES (1)")); // INTO is INSERT syntax, not SELECT INTO
+        assert!(!clean("UPDATE t SET c = 1 WHERE id = 2")); // "SET" is UPDATE syntax, not a GUC
+        assert!(!clean("DELETE FROM t WHERE id = 3"));
+        assert!(!clean("WITH x AS (SELECT 1) SELECT * FROM x"));
+        assert!(!clean("SELECT into_total FROM ledger")); // column named into_total, not INTO kw
+        assert!(!clean("BEGIN"));
+        assert!(!clean("COMMIT"));
+        assert!(!clean("SELECT current_setting('work_mem')")); // reading a GUC is fine
+
+        // ---- Must be DIRTY (reset required) ----
+        assert!(clean("SET work_mem = '1GB'"), "SET GUC");
+        assert!(clean("set search_path to public"), "lowercase SET");
+        assert!(clean("CREATE TEMP TABLE t(x int)"), "temp table");
+        assert!(clean("CREATE TEMPORARY TABLE t(x int)"), "temp table");
+        assert!(clean("SELECT * INTO TEMP t FROM src"), "SELECT INTO temp");
+        assert!(clean("select a into t from s"), "SELECT INTO lowercase");
+        assert!(clean("PREPARE p AS SELECT 1"), "prepared statement");
+        assert!(clean("DEALLOCATE p"), "deallocate");
+        assert!(
+            clean("DECLARE c CURSOR WITH HOLD FOR SELECT 1"),
+            "held cursor"
+        );
+        assert!(clean("LISTEN my_channel"), "listen");
+        assert!(clean("SELECT pg_advisory_lock(42)"), "advisory lock");
+        assert!(clean("SELECT pg_try_advisory_lock(1)"), "try advisory lock");
+        assert!(
+            clean("SELECT set_config('work_mem','1GB',false)"),
+            "set_config fn"
+        );
+        assert!(clean("SELECT nextval('s')"), "sequence cache");
+        assert!(clean("SET ROLE admin"), "set role");
+        assert!(clean("SET SESSION AUTHORIZATION bob"), "session auth");
+        assert!(clean("DISCARD ALL"), "explicit discard");
+        assert!(clean("RESET ALL"), "reset");
+        // Multi-statement: a neutral lead cannot vouch for what follows a ';'.
+        assert!(clean("SELECT 1; SET work_mem='1GB'"), "hidden SET after ;");
+        assert!(
+            clean("SELECT 1; CREATE TEMP TABLE t(x int)"),
+            "hidden temp after ;"
+        );
+        // ';' inside a literal → conservatively dirty (safe over-reset).
+        assert!(clean("SELECT 'a;b'"), "semicolon in literal");
+        // Non-neutral leads.
+        assert!(clean("COPY t FROM STDIN"), "copy");
+        assert!(clean("GRANT SELECT ON t TO bob"), "grant");
+        assert!(clean("ALTER TABLE t ADD COLUMN c int"), "ddl");
     }
 
     /// `reset_backend` must only report success when the reset query cleanly

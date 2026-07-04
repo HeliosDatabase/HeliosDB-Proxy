@@ -67,6 +67,9 @@ pub struct BackendIdlePool {
     stale_evicted: AtomicU64,
     /// Parked connections dropped by the idle reaper for exceeding the TTL.
     reaped: AtomicU64,
+    /// Connections parked WITHOUT running the reset query because they were
+    /// provably clean (the `skip_clean_reset` conditional-reset optimisation).
+    resets_skipped: AtomicU64,
 }
 
 impl BackendIdlePool {
@@ -85,7 +88,18 @@ impl BackendIdlePool {
             over_capacity: AtomicU64::new(0),
             stale_evicted: AtomicU64::new(0),
             reaped: AtomicU64::new(0),
+            resets_skipped: AtomicU64::new(0),
         }
+    }
+
+    /// Record that a provably-clean connection was parked without a reset.
+    pub fn note_reset_skipped(&self) {
+        self.resets_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Connections parked without a reset because they were provably clean.
+    pub fn resets_skipped(&self) -> u64 {
+        self.resets_skipped.load(Ordering::Relaxed)
     }
 
     /// Take a live idle connection for `key`, or `None` if the pool has no
