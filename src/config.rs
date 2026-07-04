@@ -66,6 +66,18 @@ pub struct PoolModeConfig {
     /// Prepared statement mode
     #[serde(default)]
     pub prepared_statement_mode: PreparedStatementMode,
+    /// Conditional reset (Transaction/Statement pooling): when true, a
+    /// connection that provably touched no session state (no `SET`/GUC, temp
+    /// table, prepared statement, `LISTEN`, advisory lock, …) is parked WITHOUT
+    /// running `reset_query`, saving a backend round-trip per clean transaction.
+    /// Classification is conservative — anything not provably session-neutral
+    /// still runs the full reset — so a misclassification only ever costs an
+    /// unnecessary reset, never leaks state. Off by default; intended for
+    /// autocommit / simple-protocol workloads. See the `stmt_leaves_session_state`
+    /// classifier for the exact (documented) limitation around session-setting
+    /// user functions.
+    #[serde(default)]
+    pub skip_clean_reset: bool,
 }
 
 fn default_pool_mode_max_size() -> u32 {
@@ -103,6 +115,7 @@ impl Default for PoolModeConfig {
             acquire_timeout_secs: default_pool_mode_acquire_timeout(),
             reset_query: default_reset_query(),
             prepared_statement_mode: PreparedStatementMode::default(),
+            skip_clean_reset: false,
         }
     }
 }
