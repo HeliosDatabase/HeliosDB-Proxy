@@ -3,6 +3,18 @@
 **Goal:** remove the three places the relay substitutes a timer poll for
 actual readiness, each of which is a measurable latency cliff or a hang.
 
+## Delivery split
+
+- **M3 (this milestone) — auth relay:** 3.A (poll deadlock) + 3.A.2
+  (`ErrorResponse`-blind auth loops). Both `proxy_authentication` (passthrough)
+  and `complete_backend_auth` (redial) rewritten. Self-contained to the
+  startup/auth path; proven by a new `slow-auth-test.sh` that fails on the
+  pre-fix binary.
+- **M3b (follow-up) — data-path relays:** 3.B (Flush 200 ms stall) + 3.C (idle
+  LISTEN/NOTIFY + idle backend-death detection). Deferred because both need a
+  client-readability probe on the `ClientStream` (Plain/Tls) enum, which is a
+  larger, riskier change on the query hot path.
+
 ## Findings
 
 ### 3.A Auth relay: 100 ms client poll + unbounded backend read (BUG)

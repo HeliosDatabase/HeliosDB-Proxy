@@ -2631,86 +2631,103 @@ impl ProxyServer {
         state: &Arc<ServerState>,
         node_addr: &str,
     ) -> Result<()> {
-        let codec = ProtocolCodec::new();
+        // Bidirectional relay driven by readiness, not a fixed poll. The old
+        // loop read the backend (untimed), forwarded, then polled the client
+        // with a fixed 100ms window; a client that answered an auth challenge
+        // more than 100ms after receiving it (WAN RTT, slow SCRAM client) missed
+        // its window, and the loop then re-blocked on the untimed backend read
+        // while the backend waited for the very response the proxy never read —
+        // a deadlock until PostgreSQL's authentication_timeout killed it. Here
+        // both directions are relayed as either side becomes readable, under one
+        // overall deadline, so multi-round SCRAM completes regardless of client
+        // latency.
+        //
+        // Backend-side frames are inspected by RAW tag (the wire decoder is
+        // direction-agnostic — 'E' would decode to the client-side `Execute`,
+        // not `ErrorResponse`), so a backend auth error is recognised here
+        // rather than falling through to a misleading timeout.
         let mut backend_buffer = BytesMut::with_capacity(4096);
-        let mut client_buffer = BytesMut::with_capacity(4096);
-        let mut read_buf = vec![0u8; 4096];
+        let mut cbuf = vec![0u8; 4096];
+        let mut bbuf = vec![0u8; 4096];
+        let deadline = tokio::time::Instant::now() + Self::STARTUP_TIMEOUT;
 
         loop {
-            // Read from backend
-            let n = backend_stream
-                .read(&mut read_buf)
-                .await
-                .map_err(|e| ProxyError::Network(format!("Backend auth read error: {}", e)))?;
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(ProxyError::Auth(
+                        "authentication timed out".to_string(),
+                    ));
+                }
+                // Backend -> client: relay every byte, then scan complete frames
+                // for the auth terminal states.
+                r = backend_stream.read(&mut bbuf) => {
+                    let n = r.map_err(|e| {
+                        ProxyError::Network(format!("Backend auth read error: {}", e))
+                    })?;
+                    if n == 0 {
+                        return Err(ProxyError::Connection(
+                            "Backend closed during auth".to_string(),
+                        ));
+                    }
+                    client_stream
+                        .write_all(&bbuf[..n])
+                        .await
+                        .map_err(|e| ProxyError::Network(format!("Client auth write error: {}", e)))?;
+                    backend_buffer.extend_from_slice(&bbuf[..n]);
 
-            if n == 0 {
-                return Err(ProxyError::Connection(
-                    "Backend closed during auth".to_string(),
-                ));
-            }
-
-            backend_buffer.extend_from_slice(&read_buf[..n]);
-
-            // Forward all data to client
-            client_stream
-                .write_all(&read_buf[..n])
-                .await
-                .map_err(|e| ProxyError::Network(format!("Client auth write error: {}", e)))?;
-
-            // Check for authentication complete or error. Bytes were
-            // already forwarded above, so frames are consumed (decoded
-            // once) straight out of the buffer — no clone needed.
-            while let Some(msg) = codec.decode_message(&mut backend_buffer)? {
-                match msg.msg_type {
-                    MessageType::BackendKeyData
-                        // The backend told the client how to cancel its
-                        // queries; remember which backend owns that key so
-                        // an out-of-band CancelRequest can be forwarded.
-                        if msg.payload.len() >= 8 => {
-                            let pid = u32::from_be_bytes([
-                                msg.payload[0], msg.payload[1], msg.payload[2], msg.payload[3],
-                            ]);
-                            let key = u32::from_be_bytes([
-                                msg.payload[4], msg.payload[5], msg.payload[6], msg.payload[7],
-                            ]);
-                            Self::register_cancel_key(state, pid, key, node_addr);
+                    // Walk complete frames by raw tag.
+                    loop {
+                        if backend_buffer.len() < 5 {
+                            break;
                         }
-                    MessageType::AuthRequest
-                        // Check if auth OK
-                        if msg.payload.len() >= 4 => {
-                            let auth_type =
-                                i32::from_be_bytes([msg.payload[0], msg.payload[1], msg.payload[2], msg.payload[3]]);
-                            if auth_type == 0 {
-                                // AuthenticationOk - continue to read ReadyForQuery
+                        let len = u32::from_be_bytes([
+                            backend_buffer[1],
+                            backend_buffer[2],
+                            backend_buffer[3],
+                            backend_buffer[4],
+                        ]) as usize;
+                        if len < 4 || backend_buffer.len() < len + 1 {
+                            break;
+                        }
+                        let tag = backend_buffer[0];
+                        let frame = backend_buffer.split_to(len + 1);
+                        match tag {
+                            // BackendKeyData: 5-byte header + pid(4) + key(4).
+                            // Remember which backend owns this cancel key.
+                            b'K' if frame.len() >= 13 => {
+                                let pid = u32::from_be_bytes([
+                                    frame[5], frame[6], frame[7], frame[8],
+                                ]);
+                                let key = u32::from_be_bytes([
+                                    frame[9], frame[10], frame[11], frame[12],
+                                ]);
+                                Self::register_cancel_key(state, pid, key, node_addr);
                             }
+                            // ReadyForQuery: authentication + startup complete.
+                            b'Z' => return Ok(()),
+                            // ErrorResponse: auth failed (already relayed to the
+                            // client above); surface the failure to the caller.
+                            b'E' => {
+                                return Err(ProxyError::Auth("Authentication failed".to_string()));
+                            }
+                            _ => {}
                         }
-                    MessageType::ReadyForQuery => {
-                        // Authentication complete
-                        return Ok(());
-                    }
-                    MessageType::ErrorResponse => {
-                        // Authentication failed - error already sent to client
-                        return Err(ProxyError::Auth("Authentication failed".to_string()));
-                    }
-                    _ => {
-                        // Continue forwarding
                     }
                 }
-            }
-
-            // If backend requires password, forward client's response
-            // Read password from client if needed
-            let n = tokio::time::timeout(
-                Duration::from_millis(100),
-                client_stream.read(&mut read_buf),
-            )
-            .await;
-
-            if let Ok(Ok(n)) = n {
-                if n > 0 {
-                    client_buffer.extend_from_slice(&read_buf[..n]);
+                // Client -> backend: relay the client's auth response(s)
+                // whenever they arrive, with no artificial deadline of their own.
+                r = client_stream.read(&mut cbuf) => {
+                    let n = r.map_err(|e| {
+                        ProxyError::Network(format!("Client auth read error: {}", e))
+                    })?;
+                    if n == 0 {
+                        return Err(ProxyError::Connection(
+                            "Client closed during auth".to_string(),
+                        ));
+                    }
                     backend_stream
-                        .write_all(&read_buf[..n])
+                        .write_all(&cbuf[..n])
                         .await
                         .map_err(|e| {
                             ProxyError::Network(format!("Backend password write error: {}", e))
@@ -4383,9 +4400,7 @@ impl ProxyServer {
     /// Complete backend authentication by reading until ReadyForQuery
     /// This is used when switching backends - we don't forward auth to client
     async fn complete_backend_auth(backend: &mut TcpStream) -> Result<()> {
-        let codec = ProtocolCodec::new();
         let mut buffer = BytesMut::with_capacity(4096);
-        let mut read_buf = vec![0u8; 4096];
         let timeout = Duration::from_secs(10);
         let start = std::time::Instant::now();
 
@@ -4396,7 +4411,8 @@ impl ProxyServer {
                 ));
             }
 
-            let n = tokio::time::timeout(Duration::from_secs(5), backend.read(&mut read_buf))
+            buffer.reserve(4096);
+            let n = tokio::time::timeout(Duration::from_secs(5), backend.read_buf(&mut buffer))
                 .await
                 .map_err(|_| ProxyError::Auth("Read timeout during backend auth".to_string()))?
                 .map_err(|e| ProxyError::Network(format!("Backend auth read error: {}", e)))?;
@@ -4407,25 +4423,34 @@ impl ProxyServer {
                 ));
             }
 
-            buffer.extend_from_slice(&read_buf[..n]);
-
-            // Decode (and consume) complete frames directly; returns
-            // None when more data is needed.
-            while let Some(msg) = codec.decode_message(&mut buffer)? {
-                match msg.msg_type {
-                    MessageType::ReadyForQuery => {
-                        // Authentication complete
-                        return Ok(());
-                    }
-                    MessageType::ErrorResponse => {
-                        let err = ErrorResponse::parse(msg.payload)
+            // Walk complete frames by raw tag. The wire decoder is
+            // direction-agnostic ('E' decodes to the client-side `Execute`), so
+            // a backend ErrorResponse must be detected by its raw tag rather
+            // than by `msg_type` — the previous version matched
+            // `MessageType::ErrorResponse`, which never fired, so a failed
+            // backend auth surfaced as a misleading timeout.
+            loop {
+                if buffer.len() < 5 {
+                    break;
+                }
+                let len = u32::from_be_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]) as usize;
+                if len < 4 || buffer.len() < len + 1 {
+                    break;
+                }
+                let tag = buffer[0];
+                let frame = buffer.split_to(len + 1);
+                match tag {
+                    // ReadyForQuery: authentication complete.
+                    b'Z' => return Ok(()),
+                    // ErrorResponse: parse its message for a clear error.
+                    b'E' => {
+                        let payload = BytesMut::from(&frame[5..]);
+                        let err = ErrorResponse::parse(payload)
                             .map(|e| e.message().unwrap_or("Unknown error").to_string())
-                            .unwrap_or_else(|_| "Parse error".to_string());
+                            .unwrap_or_else(|_| "authentication failed".to_string());
                         return Err(ProxyError::Auth(err));
                     }
-                    _ => {
-                        // Continue reading (AuthRequest, ParameterStatus, BackendKeyData, etc.)
-                    }
+                    _ => {}
                 }
             }
         }
