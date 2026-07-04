@@ -1550,6 +1550,17 @@ impl ProxyServer {
             sessions.remove(&session.id);
         }
 
+        // Drop this session's per-connection L1 query cache. The cache keys L1
+        // caches by connection id (the session's first u64), and without this
+        // every session that ran one cacheable SELECT would leak its L1 cache
+        // (up to hundreds of entries) forever — an unbounded leak under
+        // connection churn. TTL only evicts on access, and an abandoned cache
+        // is never accessed again, so teardown is the only reclaim point.
+        #[cfg(feature = "query-cache")]
+        if let Some(ref qc) = state.query_cache {
+            qc.remove_l1_cache(session.id.as_u64_pair().0);
+        }
+
         // Release any active pool lease if pool-modes is enabled
         #[cfg(feature = "pool-modes")]
         if let Some(ref pool_manager) = state.pool_manager {
