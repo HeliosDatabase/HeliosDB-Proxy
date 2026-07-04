@@ -244,6 +244,13 @@ pub struct TransactionJournal {
     max_entries: usize,
     /// Maximum journal size (bytes)
     max_size: usize,
+    /// Global cap on the number of retained transaction journals. The data-path
+    /// write journaling records each write as its own auto-commit transaction
+    /// (a fresh tx_id, begin + log, never committed), so without a global bound
+    /// the map grows by one entry per write forever — an unbounded leak of the
+    /// full SQL of every write. When the cap is reached the oldest journals
+    /// (by start time) are evicted; replay only consults recent history.
+    max_journals: usize,
     /// Whether journaling is enabled
     enabled: bool,
 }
@@ -255,6 +262,7 @@ impl TransactionJournal {
             journals: Arc::new(RwLock::new(HashMap::new())),
             max_entries: 10000,
             max_size: 64 * 1024 * 1024, // 64MB
+            max_journals: 50_000,
             enabled: true,
         }
     }
@@ -263,6 +271,33 @@ impl TransactionJournal {
     pub fn with_max_entries(mut self, max: usize) -> Self {
         self.max_entries = max;
         self
+    }
+
+    /// Configure the global cap on retained journals.
+    pub fn with_max_journals(mut self, max: usize) -> Self {
+        self.max_journals = max.max(1);
+        self
+    }
+
+    /// Evict the oldest journals (by `started_at`) until at most `target_len`
+    /// remain. Called under the write lock when the global cap is hit; evicting
+    /// a batch down to a target amortizes the O(n) scan across many inserts.
+    fn evict_oldest_locked(
+        journals: &mut HashMap<Uuid, TransactionJournalEntry>,
+        target_len: usize,
+    ) {
+        if journals.len() <= target_len {
+            return;
+        }
+        let remove_count = journals.len() - target_len;
+        let mut by_time: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> =
+            journals.iter().map(|(k, v)| (*k, v.started_at)).collect();
+        // Partial order is enough, but a full sort is simple and only runs when
+        // the cap is hit (once per `max_journals/10` writes).
+        by_time.sort_by_key(|(_, t)| *t);
+        for (k, _) in by_time.into_iter().take(remove_count) {
+            journals.remove(&k);
+        }
     }
 
     /// Configure maximum size
@@ -316,7 +351,16 @@ impl TransactionJournal {
         }
 
         let journal = TransactionJournalEntry::new(tx_id, session_id, node_id, start_lsn);
-        self.journals.write().await.insert(tx_id, journal);
+        let mut journals = self.journals.write().await;
+        // Bound total retained journals: the data path never commits (each write
+        // is its own tx_id), so without this the map grows forever. Evict down
+        // to 90% of the cap in one pass to amortize the sort.
+        if journals.len() >= self.max_journals {
+            let target = (self.max_journals * 9 / 10).max(1);
+            Self::evict_oldest_locked(&mut journals, target);
+        }
+        journals.insert(tx_id, journal);
+        drop(journals);
 
         tracing::debug!("Started journaling transaction {:?}", tx_id);
         Ok(())
@@ -660,5 +704,41 @@ mod tests {
         assert_eq!(stats.active_transactions, 1);
         assert_eq!(stats.total_entries, 1);
         assert!(stats.enabled);
+    }
+
+    /// The global journal cap must bound the map even when transactions are
+    /// never committed (the data-path auto-commit journaling pattern), evicting
+    /// the oldest journals rather than growing without limit.
+    #[tokio::test]
+    async fn global_cap_evicts_oldest_journals() {
+        let journal = TransactionJournal::new().with_max_journals(10);
+        let node_id = NodeId::new();
+        // Begin far more single-statement transactions than the cap, never
+        // committing any — mirrors journal_write on the query path.
+        for _ in 0..100 {
+            let tx = Uuid::new_v4();
+            journal
+                .begin_transaction(tx, Uuid::new_v4(), node_id, 0)
+                .await
+                .unwrap();
+            journal
+                .log_statement(
+                    tx,
+                    "INSERT INTO t VALUES (1)".to_string(),
+                    vec![],
+                    None,
+                    None,
+                    1,
+                )
+                .await
+                .unwrap();
+        }
+        // Bounded at the cap (not 100).
+        let stats = journal.stats().await;
+        assert!(
+            stats.active_transactions <= 10,
+            "journal map must stay within the cap, got {}",
+            stats.active_transactions
+        );
     }
 }
