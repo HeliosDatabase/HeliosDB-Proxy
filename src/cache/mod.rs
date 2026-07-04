@@ -199,6 +199,13 @@ impl QueryCache {
         self.l1_caches.remove(&connection_id);
     }
 
+    /// Number of per-connection L1 caches currently retained. Grows by one per
+    /// connection that runs a cacheable read; must return to ~0 as connections
+    /// close (see `remove_l1_cache`). Exposed for leak observability/testing.
+    pub fn l1_cache_count(&self) -> usize {
+        self.l1_caches.len()
+    }
+
     /// Look up a query in the cache hierarchy
     pub async fn get(&self, query: &str, context: &CacheContext) -> CacheLookup {
         // Parse cache hints
@@ -442,6 +449,20 @@ mod tests {
         assert_eq!(format!("{}", CacheLevel::L1Hot), "L1");
         assert_eq!(format!("{}", CacheLevel::L2Warm), "L2");
         assert_eq!(format!("{}", CacheLevel::L3Semantic), "L3");
+    }
+
+    /// Per-connection L1 caches must be reclaimable so they don't leak per
+    /// session. `get_l1_cache` creates one; `remove_l1_cache` reclaims it.
+    #[test]
+    fn l1_cache_is_reclaimed_on_remove() {
+        let cache = QueryCache::new(CacheConfig::default());
+        assert_eq!(cache.l1_cache_count(), 0);
+        let _ = cache.get_l1_cache(42);
+        let _ = cache.get_l1_cache(43);
+        assert_eq!(cache.l1_cache_count(), 2);
+        cache.remove_l1_cache(42);
+        cache.remove_l1_cache(43);
+        assert_eq!(cache.l1_cache_count(), 0, "L1 caches must be reclaimed");
     }
 
     #[tokio::test]

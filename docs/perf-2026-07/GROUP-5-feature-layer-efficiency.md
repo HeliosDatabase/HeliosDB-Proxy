@@ -6,6 +6,17 @@ so it ships **after** G1-G4. Two classes: (a) work done per query even when
 the layer's config is off, (b) unbounded growth / global-lock chokepoints
 when it is on.
 
+## Delivery split
+
+- **M5 (this milestone) — the two unbounded leaks:** 5.1 ha-tr journal
+  (per-write growth, on by default for ha-tr builds) + 5.2 query-cache L1
+  (per-session growth). Both are "one write/session → permanent memory" leaks
+  with small, high-confidence fixes and unit-tested bounds.
+- **M5b (follow-up) — per-query waste + remaining unbounded maps:** 5.3 anomaly
+  off-switch + O(1) window, 5.4 global per-query locks, the redundant-alloc
+  cleanups (N/W/T/C), and the other never-evicted maps (rate-limit R3/R4,
+  cache-invalidation C6). Larger surface, perf-quality rather than correctness.
+
 ## Highest impact
 
 ### 5.1 ha-tr journal: unbounded leak of every write + global lock, ON BY DEFAULT (HIGH)
