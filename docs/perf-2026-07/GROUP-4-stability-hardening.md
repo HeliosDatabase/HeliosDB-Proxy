@@ -4,6 +4,17 @@ Fixes from the control-plane stability sweep. These are small, high-confidence,
 and largely on **unauthenticated or default-exposed** paths — highest safety
 value per line changed.
 
+## Delivery split
+
+- **M4 (this milestone):** 4.3 admin body/header caps + read timeout, 4.5
+  health-interval validation + clamp, 4.6 pre-auth startup timeout. All on the
+  unauthenticated / default-open surface, all independent and low-risk.
+- **M4b (follow-up):** 4.2 session RAII guard (needs the `sessions` map moved
+  off a tokio `RwLock` so `Drop` can deregister synchronously), 4.6 global
+  connection semaphore, 4.7 task supervision, 4.8 typed `is_backend_fault`.
+  Deferred because M1 already removed the main panic triggers (4.1) and these
+  touch broader surfaces.
+
 ## Findings & fixes
 
 ### 4.1 Protocol length underflow → panic (HIGH, unauth remote crash)
