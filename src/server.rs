@@ -1692,14 +1692,82 @@ impl ProxyServer {
         let promote_unnamed = config.optimize_unnamed_parse;
         let mut held_unnamed: Option<(bytes::Bytes, bytes::Bytes)> = None;
         loop {
-            // Read from client directly into the accumulation buffer — no
-            // intermediate zeroed scratch, no extra copy per read. `read_buf`
+            // Read the client's next message directly into the accumulation
+            // buffer (no intermediate zeroed scratch, no extra copy). `read_buf`
             // appends into `buffer`'s spare capacity and advances its length.
+            //
+            // While waiting, ALSO watch the session's current backend connection
+            // so unsolicited backend traffic — LISTEN/NOTIFY notifications,
+            // NoticeResponse, ParameterStatus, and the delayed tail of a `Flush`
+            // response — is relayed to the client promptly instead of sitting
+            // unread until the next query, and a backend that dies while the
+            // session is idle is noticed at once. At the top of the loop the
+            // backend is always quiescent (every query response is fully drained
+            // before we return here), so any bytes it produces are out-of-band
+            // and are relayed verbatim. A mid-COPY backend is excluded — it is
+            // legitimately awaiting CopyData, which the client drives.
             buffer.reserve(16384);
-            let n = stream
-                .read_buf(&mut buffer)
-                .await
-                .map_err(|e| ProxyError::Network(format!("Read error: {}", e)))?;
+            let watch_node: Option<String> = if session
+                .copy_in_progress
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                None
+            } else {
+                current_node.clone().filter(|node| conns.contains_key(node))
+            };
+            let n: usize = 'client_read: {
+                let Some(node) = watch_node.as_deref() else {
+                    break 'client_read stream
+                        .read_buf(&mut buffer)
+                        .await
+                        .map_err(|e| ProxyError::Network(format!("Read error: {}", e)))?;
+                };
+                loop {
+                    let mut backend_gone = false;
+                    let mut client_bytes: Option<usize> = None;
+                    {
+                        let bc = conns.get_mut(node).expect("watch_node is in conns");
+                        let mut abuf = [0u8; 16384];
+                        tokio::select! {
+                            r = stream.read_buf(&mut buffer) => {
+                                client_bytes = Some(r.map_err(|e| {
+                                    ProxyError::Network(format!("Read error: {}", e))
+                                })?);
+                            }
+                            r = bc.stream.read(&mut abuf) => match r {
+                                Ok(0) => backend_gone = true,
+                                Ok(bn) => {
+                                    stream.write_all(&abuf[..bn]).await.map_err(|e| {
+                                        ProxyError::Network(format!("Client write error: {}", e))
+                                    })?;
+                                    state.metrics.bytes_sent.fetch_add(bn as u64, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    tracing::debug!(node = %node, error = %e, "backend read error while idle; dropping cached connection");
+                                    backend_gone = true;
+                                }
+                            },
+                        }
+                    }
+                    if backend_gone {
+                        // Drop the dead cached connection but keep the client
+                        // session alive — the next query redials. (Mid-transaction
+                        // the next forward fails and surfaces the error.)
+                        conns.remove(node);
+                        if current_node.as_deref() == Some(node) {
+                            current_node = None;
+                        }
+                        break 'client_read stream
+                            .read_buf(&mut buffer)
+                            .await
+                            .map_err(|e| ProxyError::Network(format!("Read error: {}", e)))?;
+                    }
+                    if let Some(cn) = client_bytes {
+                        break 'client_read cn;
+                    }
+                    // Otherwise we relayed async backend bytes; keep watching.
+                }
+            };
 
             if n == 0 {
                 // Client disconnected
@@ -3912,11 +3980,19 @@ impl ProxyServer {
         }
     }
 
-    /// Stream whatever the backend has produced in response to a `Flush`
-    /// (which, unlike `Sync`, produces no ReadyForQuery). Relays available
-    /// bytes and returns once the backend goes briefly idle, so the loop can
-    /// read the client's next frames — deadlock-free. The eventual `Sync`
-    /// drains the final ReadyForQuery via `stream_until_ready`.
+    /// Relay whatever the backend has *already* produced in response to a
+    /// `Flush` (which, unlike `Sync`, yields no ReadyForQuery), then return
+    /// immediately — without waiting.
+    ///
+    /// Any Flush output that has not landed in the socket yet is delivered by
+    /// the main loop's backend watch (which relays the current backend's
+    /// out-of-band bytes while waiting for the client), so there is no fixed
+    /// post-Flush stall: the previous version blocked the session loop for up to
+    /// 200 ms after the last backend byte before it would read the client's next
+    /// message, adding that latency to every `Parse`/`Flush`-then-`Bind` prepare
+    /// cycle. Here we drain what is instantly available and hand control back;
+    /// the client's next frames are read at once. The eventual `Sync` drains the
+    /// final ReadyForQuery via `stream_until_ready`.
     async fn stream_flush(
         client: &mut ClientStream,
         backend: &mut TcpStream,
@@ -3927,25 +4003,23 @@ impl ProxyServer {
         let mut read_buf = vec![0u8; 16384];
         let mut sent: u64 = 0;
         loop {
-            match tokio::time::timeout(Duration::from_millis(200), backend.read(&mut read_buf))
-                .await
-            {
-                Ok(Ok(0)) => {
+            match backend.try_read(&mut read_buf) {
+                Ok(0) => {
                     return Err(ProxyError::Connection(
                         "Backend closed mid-flush".to_string(),
                     ))
                 }
-                Ok(Ok(n)) => {
+                Ok(n) => {
                     client
                         .write_all(&read_buf[..n])
                         .await
                         .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
                     sent += n as u64;
                 }
-                Ok(Err(e)) => {
-                    return Err(ProxyError::Network(format!("Backend read error: {}", e)))
-                }
-                Err(_) => return Ok(sent), // idle: backend has emitted all flush output
+                // Nothing more instantly available — the backend watch delivers
+                // any remaining Flush output as it arrives.
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(sent),
+                Err(e) => return Err(ProxyError::Network(format!("Backend read error: {}", e))),
             }
         }
     }
