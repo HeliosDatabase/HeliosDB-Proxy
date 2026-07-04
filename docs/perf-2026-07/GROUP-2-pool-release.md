@@ -5,6 +5,15 @@ parks, identity leakage), then make Transaction/Statement pooling cost
 ~nothing on the client's critical path, so transaction mode stops being
 *slower* than session mode.
 
+## Delivery split
+
+G2 ships in two gated milestones to keep the connection-lifecycle risk isolated:
+- **M2 (this milestone) — correctness only:** 2.0.a COPY-hang, 2.0.b
+  poisoned-park, 2.0.c pool-key startup params. Reset stays **synchronous**
+  (unchanged critical-path cost). Self-contained, high-confidence.
+- **M2b (follow-up) — async release perf:** 2.1/2.2 spawn the reset off the
+  client path with a bounded semaphore. Gated separately.
+
 ## Correctness findings (agent-verified, fix FIRST)
 
 ### 2.0.a COPY FROM STDIN hangs under transaction/statement mode (HIGH)
@@ -98,6 +107,11 @@ query to dial/checkout another conn, churning extras.
   park-on-disconnect) must stay 4/4; new unit test for permit-exhaustion →
   drop; axis A transaction sweep expected ≈ session; axis B peak conns
   must be ≤ baseline's 35.
+- **New `copy-poolmode-test.sh` (required):** the existing `copy-test.sh` runs
+  in session mode (`proxy-pg.toml` has no `[pool_mode]`), so it cannot catch
+  2.0.a. The new test runs `COPY _t FROM STDIN` **through a
+  `pool_mode.mode = "transaction"` proxy** and asserts the row count lands
+  and a follow-up query on the same session succeeds (today: client hang).
 - Gate: full milestone protocol.
 
 ## Expected outcome

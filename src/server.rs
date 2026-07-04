@@ -327,6 +327,14 @@ pub struct ClientSession {
     /// consumers but is no longer touched per query, so the relay pays no
     /// `RwLock` acquisition just to test in-transaction.
     pub in_transaction: std::sync::atomic::AtomicBool,
+    /// Set while the session is mid-COPY (the backend sent CopyInResponse /
+    /// CopyBothResponse and is awaiting CopyData from the client). A COPY is
+    /// NOT a clean transaction boundary even though no ReadyForQuery has been
+    /// seen yet, so Transaction/Statement pool release must be suppressed while
+    /// it is set — otherwise the connection would be reset (`DISCARD ALL`) and
+    /// parked in the middle of a copy, aborting it and hanging the client.
+    /// Cleared once the COPY drains to ReadyForQuery.
+    pub copy_in_progress: std::sync::atomic::AtomicBool,
     /// Rich transaction state (tx id, statement log, savepoints) for
     /// Transaction-Replay/library consumers. Not read or written on the
     /// per-query forward path — see `in_transaction` above.
@@ -1486,6 +1494,7 @@ impl ProxyServer {
             client_addr: addr,
             current_node: RwLock::new(None),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
+            copy_in_progress: std::sync::atomic::AtomicBool::new(false),
             tx_state: RwLock::new(TransactionState::default()),
             variables: RwLock::new(HashMap::new()),
             created_at: chrono::Utc::now(),
@@ -1964,15 +1973,16 @@ impl ProxyServer {
 
                     // ---- COPY sub-protocol (client -> backend) ----
                     MessageType::CopyData | MessageType::CopyDone | MessageType::CopyFail => {
-                        if let Some(node) = current_node.clone() {
-                            if let Some(b) = conns.get_mut(&node) {
+                        let is_copy_end =
+                            matches!(msg.msg_type, MessageType::CopyDone | MessageType::CopyFail);
+                        let conn = current_node.as_ref().and_then(|n| conns.get_mut(n));
+                        match conn {
+                            Some(b) => {
                                 b.stream.write_all(&msg.encode()).await.map_err(|e| {
                                     ProxyError::Network(format!("Backend copy write error: {}", e))
                                 })?;
-                                if matches!(
-                                    msg.msg_type,
-                                    MessageType::CopyDone | MessageType::CopyFail
-                                ) {
+                                if is_copy_end {
+                                    let node = current_node.clone().unwrap();
                                     let r = Self::stream_until_ready(
                                         stream,
                                         &mut b.stream,
@@ -1980,6 +1990,12 @@ impl ProxyServer {
                                         state,
                                     )
                                     .await;
+                                    // Copy has drained back to ReadyForQuery — the
+                                    // session is no longer mid-COPY, so pool release
+                                    // is allowed again.
+                                    session
+                                        .copy_in_progress
+                                        .store(false, std::sync::atomic::Ordering::Relaxed);
                                     match r {
                                         Ok(sent) => {
                                             state
@@ -1992,6 +2008,25 @@ impl ProxyServer {
                                             return Err(e);
                                         }
                                     }
+                                }
+                            }
+                            None => {
+                                // The client is streaming COPY frames but the
+                                // backend connection is gone (dropped/redialed).
+                                // Silently discarding them hangs the client
+                                // forever; instead tell it the copy failed and
+                                // return it to a clean idle state.
+                                session
+                                    .copy_in_progress
+                                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                                if is_copy_end {
+                                    let emsg = Self::create_error_response(
+                                        "57000",
+                                        "COPY aborted: backend connection lost",
+                                    );
+                                    let _ = stream.write_all(&emsg).await;
+                                    let _ =
+                                        stream.write_all(&Self::create_ready_for_query(b'I')).await;
                                 }
                             }
                         }
@@ -2787,46 +2822,126 @@ impl ProxyServer {
         Ok(())
     }
 
-    /// Build the `(node, user, database)` pool key for the current session's
-    /// connection identity. Connections are reused only within an identity, so
-    /// a borrower always matches the principal the parked connection was
-    /// authenticated as.
+    /// Startup parameters that change how the backend interprets or renders
+    /// values and are reset by `DISCARD ALL`/`RESET ALL` to the connection's
+    /// *startup* values. Two clients of the same `(node,user,db)` but different
+    /// values for any of these must NOT share a pooled connection, or the
+    /// borrower silently inherits the lender's encoding/date/number formatting.
+    /// This mirrors PgBouncer's `track_extra_parameters` intent.
+    #[cfg(feature = "pool-modes")]
+    const POOL_IDENTITY_PARAMS: &'static [&'static str] = &[
+        "client_encoding",
+        "DateStyle",
+        "TimeZone",
+        "IntervalStyle",
+        "standard_conforming_strings",
+        "options",
+    ];
+
+    /// Build the pool key for the current session's connection identity.
+    /// Base identity is `(node, user, database)` — connections are reused only
+    /// within an identity, so a borrower always matches the principal the parked
+    /// connection was authenticated as. When any routing-relevant startup GUC
+    /// (see `POOL_IDENTITY_PARAMS`) is set, a hash of those is folded in so the
+    /// borrower also matches the lender's value-formatting settings. The common
+    /// case (no custom GUCs) keeps the bare `(node,user,db)` key unchanged.
     #[cfg(feature = "pool-modes")]
     async fn pool_key_for(target: &str, session: &Arc<ClientSession>) -> String {
         let vars = session.variables.read().await;
         let user = vars.get("user").map(|s| s.as_str()).unwrap_or("");
         // PostgreSQL defaults the database to the role name when unset.
         let database = vars.get("database").map(|s| s.as_str()).unwrap_or(user);
-        crate::pool::pool_key(target, user, database)
+        let base = crate::pool::pool_key(target, user, database);
+
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut any = false;
+        for k in Self::POOL_IDENTITY_PARAMS {
+            if let Some(v) = vars.get(*k) {
+                any = true;
+                k.hash(&mut h);
+                v.hash(&mut h);
+            }
+        }
+        if any {
+            format!("{}\0{:016x}", base, h.finish())
+        } else {
+            base
+        }
     }
 
     /// Reset a backend connection to a clean session state before parking it
     /// for reuse: runs the configured reset query (default `DISCARD ALL`,
     /// which deallocates prepared statements, drops temp tables, resets GUCs
     /// and advisory locks) and drains its response to `ReadyForQuery`. Returns
-    /// `Err` if the connection is unhealthy — the caller then drops (closes)
-    /// it instead of parking a poisoned connection.
+    /// `Err` if the connection is unhealthy OR the reset itself did not cleanly
+    /// succeed — the caller then drops (closes) it instead of parking a
+    /// poisoned connection.
+    ///
+    /// "Cleanly succeeded" means: no `ErrorResponse` frame in the reply AND the
+    /// terminating `ReadyForQuery` reported idle (`'I'`, not in/failed
+    /// transaction). The previous version returned `Ok` on the first
+    /// `ReadyForQuery` regardless, so a failed `DISCARD ALL` (e.g. a copy-abort,
+    /// or a custom `reset_query` that errors) would park a connection with its
+    /// GUCs / temp tables / prepared statements intact — exactly what pooling
+    /// must never do. Frames are walked by raw tag because the wire decoder is
+    /// direction-agnostic (`'E'` decodes to the client-side `Execute`), so a
+    /// backend `ErrorResponse` cannot be recognised via `msg_type`.
     #[cfg(feature = "pool-modes")]
-    async fn reset_backend(stream: &mut TcpStream, reset_sql: &str) -> Result<()> {
+    async fn reset_backend<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+        stream: &mut S,
+        reset_sql: &str,
+    ) -> Result<()> {
         let msg = crate::protocol::QueryMessage {
             query: reset_sql.to_string(),
         }
         .encode();
-        stream
-            .write_all(&msg.encode())
+        tokio::time::timeout(Self::BACKEND_WRITE_TIMEOUT, stream.write_all(&msg.encode()))
             .await
+            .map_err(|_| ProxyError::Network("reset write timeout".to_string()))?
             .map_err(|e| ProxyError::Network(format!("reset write error: {}", e)))?;
 
-        let codec = ProtocolCodec::new();
-        let mut buffer = BytesMut::with_capacity(1024);
-        let mut read_buf = vec![0u8; 1024];
+        let mut buf = BytesMut::with_capacity(1024);
+        let mut had_error = false;
         loop {
-            while let Some(m) = codec.decode_message(&mut buffer)? {
-                if m.msg_type == MessageType::ReadyForQuery {
-                    return Ok(());
+            // Walk complete frames by raw tag, tracking any ErrorResponse and
+            // stopping at ReadyForQuery.
+            let mut consumed = 0usize;
+            let mut ready_status: Option<u8> = None;
+            loop {
+                let rem = &buf[consumed..];
+                if rem.len() < 5 {
+                    break;
+                }
+                let len = u32::from_be_bytes([rem[1], rem[2], rem[3], rem[4]]) as usize;
+                if len < 4 || rem.len() < len + 1 {
+                    break;
+                }
+                let mtype = rem[0];
+                let frame_total = len + 1;
+                if mtype == b'E' {
+                    had_error = true;
+                }
+                consumed += frame_total;
+                if mtype == b'Z' {
+                    ready_status = Some(if frame_total >= 6 { rem[5] } else { b'I' });
+                    break;
                 }
             }
-            let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut read_buf))
+            let _ = buf.split_to(consumed);
+
+            if let Some(status) = ready_status {
+                if had_error || status != b'I' {
+                    return Err(ProxyError::Connection(format!(
+                        "reset query did not cleanly succeed (error={}, status={})",
+                        had_error, status as char
+                    )));
+                }
+                return Ok(());
+            }
+
+            buf.reserve(1024);
+            let n = tokio::time::timeout(Duration::from_secs(5), stream.read_buf(&mut buf))
                 .await
                 .map_err(|_| ProxyError::Network("reset drain timeout".to_string()))?
                 .map_err(|e| ProxyError::Network(format!("reset drain read error: {}", e)))?;
@@ -2835,7 +2950,6 @@ impl ProxyServer {
                     "backend closed during reset".to_string(),
                 ));
             }
-            buffer.extend_from_slice(&read_buf[..n]);
         }
     }
 
@@ -2858,10 +2972,15 @@ impl ProxyServer {
         let Some(node) = node else {
             return;
         };
-        // Only release at a clean transaction boundary.
+        // Only release at a clean transaction boundary — never mid-transaction
+        // and never mid-COPY (the backend is awaiting CopyData; resetting +
+        // parking the socket now aborts the copy and hangs the client).
         if session
             .in_transaction
             .load(std::sync::atomic::Ordering::Relaxed)
+            || session
+                .copy_in_progress
+                .load(std::sync::atomic::Ordering::Relaxed)
         {
             return;
         }
@@ -3559,6 +3678,13 @@ impl ProxyServer {
                 return Ok(sent);
             }
             if yield_for_copy {
+                // The backend now awaits CopyData from the client; the session
+                // is mid-COPY, not at a clean boundary. Mark it so pool release
+                // is suppressed until the COPY drains (cleared in the CopyDone
+                // path). Harmless in session mode (release is a no-op there).
+                session
+                    .copy_in_progress
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 return Ok(sent);
             }
 
@@ -3660,6 +3786,9 @@ impl ProxyServer {
                 return Ok((sent, captured, cacheable, row_count));
             }
             if yield_for_copy {
+                session
+                    .copy_in_progress
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 return Ok((sent, captured, false, row_count));
             }
 
@@ -5350,6 +5479,7 @@ mod tests {
             client_addr: "127.0.0.1:0".parse().unwrap(),
             current_node: RwLock::new(None),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
+            copy_in_progress: std::sync::atomic::AtomicBool::new(false),
             tx_state: RwLock::new(TransactionState::default()),
             variables: RwLock::new(HashMap::new()),
             created_at: chrono::Utc::now(),
@@ -6168,5 +6298,93 @@ mod tests {
                 .analyze("select * from orders where id = 1")
                 .is_analytics());
         }
+    }
+
+    /// `reset_backend` must only report success when the reset query cleanly
+    /// completed — no ErrorResponse and an idle ReadyForQuery. A poisoned reset
+    /// (error, or a non-idle transaction status) must return `Err` so the caller
+    /// drops the connection instead of parking it dirty (Group 2, 2.0.b).
+    #[cfg(feature = "pool-modes")]
+    #[tokio::test]
+    async fn reset_backend_rejects_error_and_nonidle() {
+        use tokio::io::AsyncWriteExt as _;
+        fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut v = vec![tag];
+            v.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+            v.extend_from_slice(body);
+            v
+        }
+        let rfq = |st: u8| frame(b'Z', &[st]);
+        let cc = frame(b'C', b"DISCARD ALL\0");
+        let err = frame(b'E', b"SERROR\0C25P02\0Mreset failed\0\0");
+
+        // Clean: CommandComplete + ReadyForQuery('I') -> Ok.
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let mut resp = cc.clone();
+        resp.extend_from_slice(&rfq(b'I'));
+        server.write_all(&resp).await.unwrap();
+        assert!(
+            ProxyServer::reset_backend(&mut client, "DISCARD ALL")
+                .await
+                .is_ok(),
+            "clean reset must succeed"
+        );
+
+        // ErrorResponse before RFQ -> Err (connection is poisoned).
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let mut resp = err.clone();
+        resp.extend_from_slice(&rfq(b'I'));
+        server.write_all(&resp).await.unwrap();
+        assert!(
+            ProxyServer::reset_backend(&mut client, "DISCARD ALL")
+                .await
+                .is_err(),
+            "reset that errored must be rejected"
+        );
+
+        // Non-idle status ('T') -> Err (still in a transaction).
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let mut resp = cc.clone();
+        resp.extend_from_slice(&rfq(b'T'));
+        server.write_all(&resp).await.unwrap();
+        assert!(
+            ProxyServer::reset_backend(&mut client, "DISCARD ALL")
+                .await
+                .is_err(),
+            "reset leaving a non-idle txn must be rejected"
+        );
+    }
+
+    /// The pool identity key stays the bare `(node,user,db)` triple when no
+    /// routing-relevant startup GUC is set (backward-compatible with existing
+    /// pooling), but diverges when a client sets a different `client_encoding` /
+    /// `DateStyle` / etc., so such clients never share a connection (Group 2,
+    /// 2.0.c).
+    #[cfg(feature = "pool-modes")]
+    #[tokio::test]
+    async fn pool_key_folds_startup_params() {
+        let base = make_test_session();
+        {
+            let mut v = base.variables.write().await;
+            v.insert("user".into(), "u".into());
+            v.insert("database".into(), "d".into());
+        }
+        let k_plain = ProxyServer::pool_key_for("n:5432", &base).await;
+        assert_eq!(k_plain, crate::pool::pool_key("n:5432", "u", "d"));
+
+        // Same identity but a distinct client_encoding must produce a
+        // different key (no cross-encoding sharing).
+        let utf8 = make_test_session();
+        let latin1 = make_test_session();
+        for (s, enc) in [(&utf8, "UTF8"), (&latin1, "LATIN1")] {
+            let mut v = s.variables.write().await;
+            v.insert("user".into(), "u".into());
+            v.insert("database".into(), "d".into());
+            v.insert("client_encoding".into(), enc.into());
+        }
+        let k_utf8 = ProxyServer::pool_key_for("n:5432", &utf8).await;
+        let k_latin1 = ProxyServer::pool_key_for("n:5432", &latin1).await;
+        assert_ne!(k_utf8, k_latin1, "different client_encoding must not share");
+        assert_ne!(k_utf8, k_plain, "GUC-bearing key must differ from bare key");
     }
 }
