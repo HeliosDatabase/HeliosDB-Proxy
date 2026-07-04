@@ -181,9 +181,15 @@ impl Message {
         }
     }
 
-    /// Encode message to bytes
+    /// Encode message to bytes.
+    ///
+    /// Pre-sizes the buffer to the exact final length (1 tag + 4 length +
+    /// payload) so a forwarded message never pays reallocation growth on the
+    /// hot path — `BytesMut::new()` starts at capacity 0 and would realloc as
+    /// the tag/length/payload are appended.
     pub fn encode(&self) -> BytesMut {
-        let mut buf = BytesMut::new();
+        let has_tag = self.msg_type.to_tag().is_some();
+        let mut buf = BytesMut::with_capacity(self.payload.len() + if has_tag { 5 } else { 4 });
 
         if let Some(tag) = self.msg_type.to_tag() {
             buf.put_u8(tag);
@@ -234,6 +240,18 @@ impl ProtocolCodec {
         if len > self.max_message_size {
             return Err(ProxyError::Protocol(format!(
                 "Message too large: {} bytes",
+                len
+            )));
+        }
+
+        // A startup frame is at minimum length(4) + version(4) = 8 bytes.
+        // Anything shorter is malformed: reject it instead of underflowing
+        // `len - 8` (below) or panicking in `get_u32`. This is the very first
+        // bytes of an *unauthenticated* connection, so a 4-byte `00 00 00 04`
+        // must not be able to crash the pre-auth handler task.
+        if len < 8 {
+            return Err(ProxyError::Protocol(format!(
+                "startup message length {} below minimum of 8",
                 len
             )));
         }
@@ -289,6 +307,18 @@ impl ProtocolCodec {
         if len > self.max_message_size {
             return Err(ProxyError::Protocol(format!(
                 "Message too large: {} bytes",
+                len
+            )));
+        }
+
+        // The length field counts itself (4 bytes), so a well-formed message
+        // has `len >= 4`. A declared `len < 4` (e.g. the 5 bytes
+        // `Q 00 00 00 00`) would underflow `len - 4` to a huge usize and panic
+        // in `split_to`. Reject it as a protocol error — this decoder runs on
+        // every client frame and every backend response.
+        if len < 4 {
+            return Err(ProxyError::Protocol(format!(
+                "message length {} below minimum of 4",
                 len
             )));
         }
@@ -853,6 +883,40 @@ mod tests {
         assert_eq!(a, "first");
         assert_eq!(b, "second");
         assert_eq!(&buf[..], b"tail");
+    }
+
+    /// A regular frame whose declared length is below the 4-byte minimum must
+    /// surface a protocol error, not underflow `len - 4` and panic in
+    /// `split_to`. Guards the unauthenticated hot path.
+    #[test]
+    fn test_decode_message_rejects_short_length() {
+        let codec = ProtocolCodec::new();
+        // 'Q' + length field 0 — a legal 5-byte frame with an illegal length.
+        let mut buf = BytesMut::from(&b"Q\x00\x00\x00\x00"[..]);
+        let err = codec
+            .decode_message(&mut buf)
+            .expect_err("len < 4 must be rejected");
+        assert!(matches!(err, ProxyError::Protocol(_)), "got {err:?}");
+        // Length 3 (still < 4) with a byte of body present.
+        let mut buf = BytesMut::from(&b"Q\x00\x00\x00\x03x"[..]);
+        assert!(codec.decode_message(&mut buf).is_err());
+    }
+
+    /// A startup frame shorter than the 8-byte minimum (length+version) must be
+    /// rejected rather than panicking in `get_u32` / underflowing `len - 8`.
+    /// This is the first packet of every connection, pre-auth.
+    #[test]
+    fn test_decode_startup_rejects_short_length() {
+        let codec = ProtocolCodec::new();
+        // Declared length 4, no version — the classic 4-byte crash probe.
+        let mut buf = BytesMut::from(&b"\x00\x00\x00\x04"[..]);
+        let err = codec
+            .decode_startup(&mut buf)
+            .expect_err("len < 8 must be rejected");
+        assert!(matches!(err, ProxyError::Protocol(_)), "got {err:?}");
+        // Declared length 7 (still < 8) with the bytes present.
+        let mut buf = BytesMut::from(&b"\x00\x00\x00\x07\x00\x03\x00"[..]);
+        assert!(codec.decode_startup(&mut buf).is_err());
     }
 
     /// BindMessage parameter values are now `Bytes` (zero-copy), not

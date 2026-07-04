@@ -319,7 +319,17 @@ pub struct ClientSession {
     pub client_addr: SocketAddr,
     /// Current backend node
     pub current_node: RwLock<Option<String>>,
-    /// Transaction state
+    /// Fast, lock-free "in a transaction" flag — the single per-query hot-path
+    /// read/write of transaction state. Written from the ReadyForQuery status
+    /// byte at each response boundary; read by pool-release, read-node
+    /// selection, and cache-eligibility checks. This is authoritative on the
+    /// data path; `tx_state` (below) retains the richer structure for TR/replay
+    /// consumers but is no longer touched per query, so the relay pays no
+    /// `RwLock` acquisition just to test in-transaction.
+    pub in_transaction: std::sync::atomic::AtomicBool,
+    /// Rich transaction state (tx id, statement log, savepoints) for
+    /// Transaction-Replay/library consumers. Not read or written on the
+    /// per-query forward path — see `in_transaction` above.
     pub tx_state: RwLock<TransactionState>,
     /// Session variables
     pub variables: RwLock<HashMap<String, String>>,
@@ -1475,6 +1485,7 @@ impl ProxyServer {
             id: Uuid::new_v4(),
             client_addr: addr,
             current_node: RwLock::new(None),
+            in_transaction: std::sync::atomic::AtomicBool::new(false),
             tx_state: RwLock::new(TransactionState::default()),
             variables: RwLock::new(HashMap::new()),
             created_at: chrono::Utc::now(),
@@ -1596,7 +1607,6 @@ impl ProxyServer {
         // first `Parse`; a batch with no `Parse` (a re-`Bind`/`Execute` of a
         // named prepared statement) stays on the connection the statement was
         // prepared on.
-        let mut read_buf = vec![0u8; 16384];
         let mut pending = BytesMut::new();
         let mut pending_route_sql: Option<String> = None;
         // Prepared-statement tracking (Batch F.4). `stmt_registry` is the
@@ -1621,9 +1631,12 @@ impl ProxyServer {
         let promote_unnamed = config.optimize_unnamed_parse;
         let mut held_unnamed: Option<(bytes::Bytes, bytes::Bytes)> = None;
         loop {
-            // Read from client
+            // Read from client directly into the accumulation buffer — no
+            // intermediate zeroed scratch, no extra copy per read. `read_buf`
+            // appends into `buffer`'s spare capacity and advances its length.
+            buffer.reserve(16384);
             let n = stream
-                .read(&mut read_buf)
+                .read_buf(&mut buffer)
                 .await
                 .map_err(|e| ProxyError::Network(format!("Read error: {}", e)))?;
 
@@ -1632,7 +1645,6 @@ impl ProxyServer {
                 break;
             }
 
-            buffer.extend_from_slice(&read_buf[..n]);
             state
                 .metrics
                 .bytes_received
@@ -2847,7 +2859,10 @@ impl ProxyServer {
             return;
         };
         // Only release at a clean transaction boundary.
-        if session.tx_state.read().await.in_transaction {
+        if session
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return;
         }
         let Some(mut bc) = conns.remove(node) else {
@@ -3491,7 +3506,6 @@ impl ProxyServer {
     ) -> Result<u64> {
         let _ = state;
         let mut buf = BytesMut::with_capacity(16384);
-        let mut read_buf = vec![0u8; 16384];
         let mut sent: u64 = 0;
 
         loop {
@@ -3538,15 +3552,20 @@ impl ProxyServer {
 
             if let Some(status) = ready_status {
                 let st = TransactionStatus::from_byte(status);
-                let mut tx = session.tx_state.write().await;
-                tx.in_transaction = st != TransactionStatus::Idle;
+                session.in_transaction.store(
+                    st != TransactionStatus::Idle,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 return Ok(sent);
             }
             if yield_for_copy {
                 return Ok(sent);
             }
 
-            let n = tokio::time::timeout(Duration::from_secs(30), backend.read(&mut read_buf))
+            // Read straight into the frame accumulator — no zeroed scratch, no
+            // copy. `read_buf` appends to `buf`'s spare capacity.
+            buf.reserve(16384);
+            let n = tokio::time::timeout(Duration::from_secs(30), backend.read_buf(&mut buf))
                 .await
                 .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
                 .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
@@ -3555,7 +3574,6 @@ impl ProxyServer {
                     "Backend closed mid-response".to_string(),
                 ));
             }
-            buf.extend_from_slice(&read_buf[..n]);
         }
     }
 
@@ -3571,7 +3589,6 @@ impl ProxyServer {
         session: &Arc<ClientSession>,
     ) -> Result<(u64, Vec<u8>, bool, usize)> {
         let mut buf = BytesMut::with_capacity(16384);
-        let mut read_buf = vec![0u8; 16384];
         let mut sent: u64 = 0;
         let mut captured: Vec<u8> = Vec::with_capacity(4096);
         let mut had_error = false;
@@ -3635,8 +3652,10 @@ impl ProxyServer {
 
             if let Some(status) = ready_status {
                 let st = TransactionStatus::from_byte(status);
-                let mut tx = session.tx_state.write().await;
-                tx.in_transaction = st != TransactionStatus::Idle;
+                session.in_transaction.store(
+                    st != TransactionStatus::Idle,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 let cacheable = !had_error && status == b'I';
                 return Ok((sent, captured, cacheable, row_count));
             }
@@ -3644,7 +3663,9 @@ impl ProxyServer {
                 return Ok((sent, captured, false, row_count));
             }
 
-            let n = tokio::time::timeout(Duration::from_secs(30), backend.read(&mut read_buf))
+            // Read straight into the frame accumulator — no zeroed scratch.
+            buf.reserve(16384);
+            let n = tokio::time::timeout(Duration::from_secs(30), backend.read_buf(&mut buf))
                 .await
                 .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
                 .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
@@ -3653,7 +3674,6 @@ impl ProxyServer {
                     "Backend closed mid-response".to_string(),
                 ));
             }
-            buf.extend_from_slice(&read_buf[..n]);
         }
     }
 
@@ -4000,7 +4020,10 @@ impl ProxyServer {
             return None;
         }
         // Never cache mid-transaction (visibility would be wrong).
-        if session.tx_state.read().await.in_transaction {
+        if session
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return None;
         }
         let (user, database) = {
@@ -4144,12 +4167,12 @@ impl ProxyServer {
         config: &ProxyConfig,
     ) -> Result<String> {
         // If in transaction, stick to current node
+        if session
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
         {
-            let tx_state = session.tx_state.read().await;
-            if tx_state.in_transaction {
-                if let Some(node) = session.current_node.read().await.clone() {
-                    return Ok(node);
-                }
+            if let Some(node) = session.current_node.read().await.clone() {
+                return Ok(node);
             }
         }
 
@@ -4809,12 +4832,12 @@ impl ProxyServer {
         config: &ProxyConfig,
     ) -> Result<String> {
         // If in a transaction, stick to the current node
+        if session
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed)
         {
-            let tx_state = session.tx_state.read().await;
-            if tx_state.in_transaction {
-                if let Some(node) = session.current_node.read().await.clone() {
-                    return Ok(node);
-                }
+            if let Some(node) = session.current_node.read().await.clone() {
+                return Ok(node);
             }
         }
 
@@ -5326,6 +5349,7 @@ mod tests {
             id: Uuid::new_v4(),
             client_addr: "127.0.0.1:0".parse().unwrap(),
             current_node: RwLock::new(None),
+            in_transaction: std::sync::atomic::AtomicBool::new(false),
             tx_state: RwLock::new(TransactionState::default()),
             variables: RwLock::new(HashMap::new()),
             created_at: chrono::Utc::now(),
