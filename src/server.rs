@@ -152,8 +152,12 @@ fn anomaly_fingerprint(sql: &str) -> String {
 
 /// Server runtime state
 struct ServerState {
-    /// Active client sessions
-    sessions: RwLock<HashMap<Uuid, Arc<ClientSession>>>,
+    /// Active client sessions. A `DashMap` (not a `tokio::RwLock<HashMap>`) so
+    /// register/deregister are synchronous and lock-free-sharded — which lets a
+    /// `SessionGuard`'s `Drop` remove the entry on ANY exit, including a panic
+    /// unwind, and removes a per-connection async write-lock from the accept and
+    /// teardown paths.
+    sessions: DashMap<Uuid, Arc<ClientSession>>,
     /// Node health status
     // Read-mostly: only the periodic health checker writes (a full-map
     // swap), every query reads. ArcSwap makes the per-query read a single
@@ -516,6 +520,33 @@ enum RouteOverride {
     /// supplied. Takes precedence over every other field — the proxy
     /// short-circuits before any backend selection.
     Block(String),
+}
+
+/// RAII teardown for one client connection. Its `Drop` deregisters the session
+/// from `state.sessions`, bumps the connections-closed metric, and reclaims the
+/// session's L1 query cache — running on a normal return AND on a panic unwind,
+/// so a panic in negotiation/startup/the query loop can never leak the session
+/// entry (which would inflate the active-session gauge and stall graceful
+/// drains). All operations are synchronous, so they are valid inside `Drop`.
+struct SessionGuard {
+    state: Arc<ServerState>,
+    session_id: Uuid,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.state.sessions.remove(&self.session_id);
+        self.state
+            .metrics
+            .connections_closed
+            .fetch_add(1, Ordering::Relaxed);
+        // Reclaim the per-connection L1 query cache (keyed by the session's
+        // first u64); without this an abandoned cache leaks under churn.
+        #[cfg(feature = "query-cache")]
+        if let Some(ref qc) = self.state.query_cache {
+            qc.remove_l1_cache(self.session_id.as_u64_pair().0);
+        }
+    }
 }
 
 impl ProxyServer {
@@ -915,7 +946,7 @@ impl ProxyServer {
             };
 
         let state = Arc::new(ServerState {
-            sessions: RwLock::new(HashMap::new()),
+            sessions: DashMap::new(),
             health: ArcSwap::from_pointee(health),
             health_write: parking_lot::Mutex::new(()),
             live_config: ArcSwap::from_pointee(config.clone()),
@@ -1024,7 +1055,7 @@ impl ProxyServer {
     async fn drain_connections(state: &Arc<ServerState>, timeout: Duration) {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let active = state.sessions.read().await.len();
+            let active = state.sessions.len();
             if active == 0 {
                 tracing::info!("drain complete — all in-flight connections finished");
                 return;
@@ -1466,9 +1497,8 @@ impl ProxyServer {
 
                     // Sync session count
                     {
-                        let sessions = server_state.sessions.read().await;
                         let mut admin_sessions = admin_state_sync.active_sessions.write().await;
-                        *admin_sessions = sessions.len() as u64;
+                        *admin_sessions = server_state.sessions.len() as u64;
                     }
                 }
             });
@@ -1518,11 +1548,18 @@ impl ProxyServer {
             plugin_identity: RwLock::new(None),
         });
 
-        // Register session
-        {
-            let mut sessions = state.sessions.write().await;
-            sessions.insert(session.id, session.clone());
-        }
+        // Register the session, then attach an RAII guard that deregisters it on
+        // ANY exit from here on — a normal return OR a panic unwind. Before this,
+        // a panic anywhere in negotiation/startup/the query loop leaked the
+        // ClientSession entry forever, inflating the active-session gauge and
+        // stalling every graceful drain to its full timeout. The guard also
+        // owns the rest of the per-connection teardown (metric + L1 cache) so it
+        // too runs unconditionally.
+        state.sessions.insert(session.id, session.clone());
+        let _session_guard = SessionGuard {
+            state: state.clone(),
+            session_id: session.id,
+        };
 
         // Negotiate client TLS (if the client sent SSLRequest). Produces a
         // ClientStream that is plaintext or TLS-wrapped; the rest of the
@@ -1555,42 +1592,9 @@ impl ProxyServer {
             Err(e) => Err(e),
         };
 
-        // Cleanup session
-        {
-            let mut sessions = state.sessions.write().await;
-            sessions.remove(&session.id);
-        }
-
-        // Drop this session's per-connection L1 query cache. The cache keys L1
-        // caches by connection id (the session's first u64), and without this
-        // every session that ran one cacheable SELECT would leak its L1 cache
-        // (up to hundreds of entries) forever — an unbounded leak under
-        // connection churn. TTL only evicts on access, and an abandoned cache
-        // is never accessed again, so teardown is the only reclaim point.
-        #[cfg(feature = "query-cache")]
-        if let Some(ref qc) = state.query_cache {
-            qc.remove_l1_cache(session.id.as_u64_pair().0);
-        }
-
-        // Release any active pool lease if pool-modes is enabled
-        #[cfg(feature = "pool-modes")]
-        if let Some(ref pool_manager) = state.pool_manager {
-            // Check if there's an active lease for this client and release it
-            if pool_manager.has_active_lease(&session.pool_client_id) {
-                tracing::debug!(
-                    "Releasing pool lease for disconnecting client {:?}",
-                    session.pool_client_id
-                );
-                // Note: The lease is released implicitly when the connection closes
-                // The pool manager will clean up any orphaned leases
-            }
-        }
-
-        state
-            .metrics
-            .connections_closed
-            .fetch_add(1, Ordering::Relaxed);
-
+        // Session deregistration, the connections-closed metric, and the L1
+        // cache reclaim are all handled by `_session_guard`'s Drop (which runs
+        // here on the normal path and on an unwind), so nothing is required here.
         result
     }
 
@@ -5315,7 +5319,18 @@ impl ProxyServer {
                         // Read the live config each tick so a SIGHUP that
                         // adds/removes nodes is checked on the next sweep.
                         let config = state.live_config.load_full();
-                        Self::check_all_nodes(&state, &config).await;
+                        // Run the sweep in a child task so an unexpected panic in
+                        // check_all_nodes surfaces as a JoinError and is logged —
+                        // the health loop keeps running instead of dying silently
+                        // and freezing health at its last snapshot forever.
+                        let st = state.clone();
+                        if let Err(e) = tokio::spawn(async move {
+                            Self::check_all_nodes(&st, &config).await;
+                        })
+                        .await
+                        {
+                            tracing::error!(error = %e, "health-check sweep panicked; health loop continuing");
+                        }
                     }
                     _ = shutdown_rx.recv() => {
                         break;
@@ -5749,8 +5764,7 @@ mod tests {
         let config = test_config();
         let server = ProxyServer::new(config).unwrap();
 
-        let sessions = server.state.sessions.read().await;
-        assert!(sessions.is_empty());
+        assert!(server.state.sessions.is_empty());
     }
 
     #[tokio::test]
@@ -5990,7 +6004,7 @@ mod tests {
         // registered plugins — every hook must defer.
         let pm = Arc::new(PluginManager::new(PluginRuntimeConfig::default()).unwrap());
         let augmented_state = Arc::new(ServerState {
-            sessions: RwLock::new(HashMap::new()),
+            sessions: DashMap::new(),
             health: ArcSwap::from_pointee(HashMap::new()),
             health_write: parking_lot::Mutex::new(()),
             live_config: ArcSwap::from_pointee(ProxyConfig::default()),
@@ -6593,6 +6607,53 @@ mod tests {
                 .analyze("select * from orders where id = 1")
                 .is_analytics());
         }
+    }
+
+    /// The session RAII guard must deregister the session and bump the
+    /// connections-closed metric when dropped normally.
+    #[tokio::test]
+    async fn session_guard_deregisters_on_drop() {
+        let server = ProxyServer::new(test_config()).unwrap();
+        let state = server.state.clone();
+        let session = make_test_session();
+        state.sessions.insert(session.id, session.clone());
+        assert_eq!(state.sessions.len(), 1);
+        let before = state.metrics.connections_closed.load(Ordering::Relaxed);
+        {
+            let _g = SessionGuard {
+                state: state.clone(),
+                session_id: session.id,
+            };
+        }
+        assert!(state.sessions.is_empty(), "guard must deregister on drop");
+        assert_eq!(
+            state.metrics.connections_closed.load(Ordering::Relaxed),
+            before + 1
+        );
+    }
+
+    /// The critical property: the guard must deregister even when the connection
+    /// task unwinds via a panic (the leak this replaces).
+    #[tokio::test]
+    async fn session_guard_deregisters_on_panic() {
+        let server = ProxyServer::new(test_config()).unwrap();
+        let state = server.state.clone();
+        let session = make_test_session();
+        state.sessions.insert(session.id, session.clone());
+        let sid = session.id;
+        let st = state.clone();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = SessionGuard {
+                state: st,
+                session_id: sid,
+            };
+            panic!("simulated connection-task panic");
+        }));
+        assert!(r.is_err(), "closure must have panicked");
+        assert!(
+            state.sessions.is_empty(),
+            "guard must deregister on a panic unwind"
+        );
     }
 
     /// The conditional-reset classifier must call every session-state-creating
