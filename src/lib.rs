@@ -70,6 +70,7 @@ pub mod connection_pool;
 pub mod failover_controller;
 pub mod health_checker;
 pub mod http_gateway;
+pub(crate) mod http_util;
 pub mod load_balancer;
 pub mod mcp;
 pub mod mirror;

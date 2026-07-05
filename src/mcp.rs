@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use crate::agent_contract::{self, AgentContract};
@@ -73,39 +73,53 @@ impl McpServer {
         cfg: Arc<McpConfig>,
         contract: Arc<Option<AgentContract>>,
     ) -> Result<()> {
+        use crate::http_util;
         let (reader, mut writer) = stream.split();
         let mut reader = BufReader::new(reader);
-        let mut line = String::new();
-        let mut content_length = 0usize;
-        // Read request line + headers.
-        use tokio::io::AsyncBufReadExt;
-        let mut first = true;
-        loop {
-            line.clear();
-            let n = reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| ProxyError::Network(format!("MCP read: {}", e)))?;
-            if n == 0 || line == "\r\n" {
-                break;
-            }
-            if first {
-                first = false; // request line; we accept any method/path
-            } else if line.to_ascii_lowercase().starts_with("content-length:") {
-                if let Some(v) = line.split(':').nth(1) {
-                    content_length = v.trim().parse().unwrap_or(0);
-                }
+
+        // Bounded request read: overall deadline + header count/byte caps.
+        let deadline = tokio::time::Instant::now() + http_util::HTTP_READ_TIMEOUT;
+        let head = match http_util::read_head(&mut reader, deadline).await {
+            Ok(h) => h,
+            Err(_) => return Ok(()), // timeout / oversized headers / early close
+        };
+
+        // Bearer auth, when configured. Unlike the wire port there is no
+        // pass-through identity here — the gateway runs SQL under its own
+        // backend credentials — so an unauthenticated request must be refused.
+        // Constant-time comparison (no `==` oracle).
+        if let Some(tok) = cfg.auth_token.as_ref() {
+            let ok = head
+                .header("authorization")
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(|got| http_util::constant_time_eq_str(got, tok))
+                .unwrap_or(false);
+            if !ok {
+                Self::write_http(
+                    &mut writer,
+                    401,
+                    "application/json",
+                    br#"{"error":"unauthorized"}"#,
+                )
+                .await?;
+                return Ok(());
             }
         }
-        let body = if content_length > 0 {
-            let mut buf = vec![0u8; content_length];
-            reader
-                .read_exact(&mut buf)
-                .await
-                .map_err(|e| ProxyError::Network(format!("MCP body read: {}", e)))?;
-            String::from_utf8_lossy(&buf).to_string()
-        } else {
-            String::new()
+
+        // Reject an oversized declared body BEFORE allocating for it.
+        if head.content_length > http_util::MAX_HTTP_BODY_BYTES {
+            Self::write_http(
+                &mut writer,
+                413,
+                "application/json",
+                br#"{"error":"request body too large"}"#,
+            )
+            .await?;
+            return Ok(());
+        }
+        let body = match http_util::read_body(&mut reader, head.content_length, deadline).await {
+            Ok(b) => String::from_utf8_lossy(&b).to_string(),
+            Err(_) => return Ok(()),
         };
 
         let response = Self::dispatch(&body, &cfg, (*contract).as_ref()).await;

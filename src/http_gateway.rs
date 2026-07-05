@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use crate::backend::client::QueryResult;
@@ -65,71 +65,54 @@ impl HttpGateway {
     }
 
     async fn handle(mut stream: tokio::net::TcpStream, cfg: Arc<HttpGatewayConfig>) -> Result<()> {
-        use tokio::io::AsyncBufReadExt;
+        use crate::http_util;
         let (reader, mut writer) = stream.split();
         let mut reader = BufReader::new(reader);
-        let mut line = String::new();
-        let mut content_length = 0usize;
-        let mut method = String::new();
-        let mut path = String::new();
-        let mut authorized = cfg.auth_token.is_none();
-        let mut array_mode = false;
-        let mut first = true;
-        loop {
-            line.clear();
-            let n = reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| ProxyError::Network(format!("HTTP gw read: {}", e)))?;
-            if n == 0 || line == "\r\n" {
-                break;
-            }
-            if first {
-                let mut parts = line.split_whitespace();
-                method = parts.next().unwrap_or("").to_string();
-                path = parts.next().unwrap_or("").to_string();
-                first = false;
-                continue;
-            }
-            let lower = line.to_ascii_lowercase();
-            if lower.starts_with("content-length:") {
-                content_length = line
-                    .split(':')
-                    .nth(1)
-                    .and_then(|v| v.trim().parse().ok())
-                    .unwrap_or(0);
-            } else if lower.starts_with("neon-array-mode:") {
-                array_mode = line
-                    .split(':')
-                    .nth(1)
-                    .map(|v| v.trim().eq_ignore_ascii_case("true"))
-                    .unwrap_or(false);
-            } else if lower.starts_with("authorization:") {
-                if let Some(tok) = cfg.auth_token.as_ref() {
-                    let v = line.split_once(':').map(|x| x.1).unwrap_or("").trim();
-                    authorized = v == format!("Bearer {}", tok);
-                }
-            }
-        }
+
+        // Bounded request read: overall deadline + header count/byte caps.
+        let deadline = tokio::time::Instant::now() + http_util::HTTP_READ_TIMEOUT;
+        let head = match http_util::read_head(&mut reader, deadline).await {
+            Ok(h) => h,
+            Err(_) => return Ok(()), // timeout / oversized headers / early close
+        };
+        let method = head.method.as_str();
+        let path = head.path.as_str();
 
         // Liveness probe.
         if method == "GET" && (path == "/health" || path == "/") {
             return Self::respond(&mut writer, 200, &json!({"status":"ok"})).await;
         }
+        // Constant-time Bearer check (no `==` short-circuit oracle; no per-request
+        // format! of the expected token).
+        let authorized = match cfg.auth_token.as_ref() {
+            None => true,
+            Some(tok) => head
+                .header("authorization")
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(|got| http_util::constant_time_eq_str(got, tok))
+                .unwrap_or(false),
+        };
         if !authorized {
             return Self::respond(&mut writer, 401, &json!({"error":"unauthorized"})).await;
         }
         if method != "POST" {
             return Self::respond(&mut writer, 405, &json!({"error":"use POST /sql"})).await;
         }
-
-        let mut body_buf = vec![0u8; content_length];
-        if content_length > 0 {
-            reader
-                .read_exact(&mut body_buf)
-                .await
-                .map_err(|e| ProxyError::Network(format!("HTTP gw body: {}", e)))?;
+        // Reject an oversized declared body BEFORE allocating for it.
+        if head.content_length > http_util::MAX_HTTP_BODY_BYTES {
+            return Self::respond(&mut writer, 413, &json!({"error":"request body too large"}))
+                .await;
         }
+        let array_mode = head
+            .header("neon-array-mode")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        let body_buf = match http_util::read_body(&mut reader, head.content_length, deadline).await
+        {
+            Ok(b) => b,
+            Err(_) => return Ok(()),
+        };
         let req: Value = match serde_json::from_slice(&body_buf) {
             Ok(v) => v,
             Err(e) => {
