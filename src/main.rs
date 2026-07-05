@@ -32,8 +32,10 @@ struct Cli {
     #[arg(short, long, default_value = "0.0.0.0:5432")]
     listen: String,
 
-    /// Admin API address
-    #[arg(long, default_value = "0.0.0.0:9090")]
+    /// Admin API address. Defaults to loopback: the admin API is privileged, so
+    /// the proxy refuses a non-loopback bind without an admin token (set one in
+    /// a config file, or set admin_allow_insecure).
+    #[arg(long, default_value = "127.0.0.1:9090")]
     admin: String,
 
     /// Primary node (host:port)

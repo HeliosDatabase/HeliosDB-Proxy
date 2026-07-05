@@ -177,10 +177,18 @@ pub struct ProxyConfig {
     pub admin_address: String,
     /// Bearer token required on admin API requests. When set, every admin
     /// endpoint except liveness probes (`/health*`, `/livez`, `/readyz`)
-    /// requires `Authorization: Bearer <token>`. Absent (default) = open
-    /// (current behaviour) — set this for any non-loopback deployment.
+    /// requires `Authorization: Bearer <token>`. Absent (default) = open on
+    /// loopback only — the proxy refuses to start with a non-loopback
+    /// `admin_address` and no token (see `validate`), because the admin API runs
+    /// privileged operations (arbitrary SQL, forced failover, cutover, branch
+    /// DROP DATABASE, replay against arbitrary targets).
     #[serde(default)]
     pub admin_token: Option<String>,
+    /// Explicit opt-in to expose the admin API on a non-loopback address WITHOUT
+    /// a token. Default `false` — leave it so unless you front the admin port
+    /// with your own authenticating proxy/network policy.
+    #[serde(default)]
+    pub admin_allow_insecure: bool,
     /// Enable TR (Transaction Replay)
     pub tr_enabled: bool,
     /// TR mode
@@ -882,8 +890,12 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             listen_address: "0.0.0.0:5432".to_string(),
-            admin_address: "0.0.0.0:9090".to_string(),
+            // Loopback by default: the admin API is privileged and must not be
+            // exposed to the network unless the operator opts in (with a token,
+            // or admin_allow_insecure). A fresh install is safe.
+            admin_address: "127.0.0.1:9090".to_string(),
             admin_token: None,
+            admin_allow_insecure: false,
             tr_enabled: true,
             tr_mode: TrMode::Session,
             pool: PoolConfig::default(),
@@ -1095,6 +1107,27 @@ impl ProxyConfig {
             return Err(ProxyError::Config(
                 "health.check_interval_secs must be >= 1".to_string(),
             ));
+        }
+
+        // Refuse to expose the admin API beyond loopback without a token. The
+        // admin surface runs privileged operations (arbitrary SQL via
+        // /api/sql, forced failover via /api/chaos, migration cutover, branch
+        // CREATE/DROP DATABASE, replay/shadow against operator-chosen targets),
+        // so an anonymous non-loopback bind is a critical hole. Only enforced
+        // when the address parses to a concrete IP; a hostname is left to the
+        // operator's DNS/network policy.
+        if self.admin_token.is_none() && !self.admin_allow_insecure {
+            if let Ok(sa) = self.admin_address.parse::<std::net::SocketAddr>() {
+                if !sa.ip().is_loopback() {
+                    return Err(ProxyError::Config(format!(
+                        "admin_address '{}' is not loopback but admin_token is unset — the admin \
+                         API runs privileged operations and must not be exposed anonymously. Set \
+                         admin_token, bind admin_address to 127.0.0.1, or set \
+                         admin_allow_insecure = true to override.",
+                        self.admin_address
+                    )));
+                }
+            }
         }
 
         Ok(())
@@ -1365,6 +1398,36 @@ mod tests {
         let mut config = ProxyConfig::default();
         config.add_node("localhost:5432", "primary").unwrap();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_refuses_anonymous_nonloopback_admin() {
+        let base = || {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            c
+        };
+        // Loopback + no token: allowed (the default).
+        let mut c = base();
+        c.admin_address = "127.0.0.1:9090".to_string();
+        assert!(c.validate().is_ok());
+        // Non-loopback + no token: REFUSED.
+        let mut c = base();
+        c.admin_address = "0.0.0.0:9090".to_string();
+        assert!(
+            c.validate().is_err(),
+            "anonymous 0.0.0.0 admin must be refused"
+        );
+        // Non-loopback + token: allowed.
+        let mut c = base();
+        c.admin_address = "0.0.0.0:9090".to_string();
+        c.admin_token = Some("secret".to_string());
+        assert!(c.validate().is_ok());
+        // Non-loopback + explicit opt-in: allowed.
+        let mut c = base();
+        c.admin_address = "0.0.0.0:9090".to_string();
+        c.admin_allow_insecure = true;
+        assert!(c.validate().is_ok());
     }
 
     #[test]
