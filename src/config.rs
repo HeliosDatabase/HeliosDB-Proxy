@@ -479,6 +479,12 @@ pub struct McpConfig {
     /// (scoped grants + repair hints). None = only the `read_only` guardrail.
     #[serde(default)]
     pub contract: Option<String>,
+    /// Bearer token required on every MCP request. When set, a request without
+    /// `Authorization: Bearer <token>` is rejected. Absent (default) = open, so
+    /// set this for any non-loopback deployment — like the HTTP/GraphQL
+    /// gateways, MCP exposes SQL and must not be anonymous off localhost.
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 impl Default for McpConfig {
@@ -493,6 +499,7 @@ impl Default for McpConfig {
             backend_database: None,
             read_only: true,
             contract: None,
+            auth_token: None,
         }
     }
 }
