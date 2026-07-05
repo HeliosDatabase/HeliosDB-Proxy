@@ -196,14 +196,27 @@ impl AdminServer {
         );
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+        // Bound concurrent admin connections so a flood can't spawn unbounded
+        // tasks (each may buffer up to the body cap). Excess connections are
+        // dropped rather than queued.
+        let conn_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(Self::MAX_ADMIN_CONNS));
 
         loop {
             tokio::select! {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, addr)) => {
+                            let permit = match conn_limit.clone().try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    tracing::warn!(%addr, "admin connection limit reached; dropping");
+                                    drop(stream);
+                                    continue;
+                                }
+                            };
                             let state = self.state.clone();
                             tokio::spawn(async move {
+                                let _permit = permit; // released when the connection ends
                                 if let Err(e) = Self::handle_connection(stream, addr, state).await {
                                     tracing::error!("Admin connection error: {}", e);
                                 }
@@ -226,6 +239,8 @@ impl AdminServer {
 
     /// Overall deadline for reading one admin request (headers + body). Bounds
     /// slow-loris clients on the default-open admin listener.
+    /// Max concurrent admin connections; excess are dropped, not queued.
+    const MAX_ADMIN_CONNS: usize = 256;
     const ADMIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
     /// Max number of header lines accepted per admin request.
     const MAX_ADMIN_HEADERS: usize = 100;
