@@ -1,0 +1,46 @@
+# Edge e2e — HOME role. Authoritative cache; mints versions, invalidates on
+# writes, pushes invalidations to subscribed edges over SSE. Backend = real PG.
+listen_address = "127.0.0.1:6440"
+admin_address  = "127.0.0.1:9440"
+# The edge presents this as its Bearer token to the home admin SSE endpoint.
+admin_token = "edge-e2e-secret"
+tr_enabled = false
+tr_mode    = "none"
+
+[pool]
+min_connections   = 1
+max_connections   = 10
+idle_timeout_secs = 300
+max_lifetime_secs = 1800
+acquire_timeout_secs = 5
+test_on_acquire = true
+
+[load_balancer]
+read_strategy = "round_robin"
+read_write_split = false
+latency_threshold_ms = 100
+
+[health]
+check_interval_secs = 30
+check_timeout_secs = 3
+failure_threshold = 3
+success_threshold = 2
+check_query = "SELECT 1"
+
+[edge]
+enabled              = true
+role                 = "home"
+region               = "home-1"
+default_ttl_secs     = 60
+liveness_window_secs = 60
+subscribe_gc_secs    = 10
+max_entries          = 10000
+max_edges            = 32
+
+[[nodes]]
+host    = "127.0.0.1"
+port    = 25433
+role    = "primary"
+weight  = 100
+enabled = true
+name    = "pg-primary"
