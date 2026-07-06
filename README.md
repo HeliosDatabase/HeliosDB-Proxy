@@ -113,6 +113,14 @@ The platform tier builds on the connection-routing core with a hardened WASM plu
 | **Anomaly Detection** | `anomaly-detection` | In-process sliding-window detector: rate spikes (z-score vs. rolling EWMA), credential-stuffing bursts, six classes of SQL-injection patterns, and novel query shapes. Events stream over `GET /anomalies` — no external SIEM required |
 | **Edge Mode** | `edge-proxy` | Cache-first geo/edge proxy. Each edge terminates reads against a local LRU+TTL+version cache; the home proxy broadcasts table-scoped invalidations on writes. Last-write-wins, no consensus |
 
+#### Edge mode in action
+
+A two-region edge cache in front of a **HeliosDB-Nano** origin: reads are answered locally at the edge, and a write through the home is pushed to every edge over SSE so the caches stay last-write-wins coherent — no TTL guesswork, no polling. The same proxy fronts any PostgreSQL-compatible database. **[▶ Watch on asciinema](https://asciinema.org/a/mmCddtdB0FSkTIIM)**
+
+<p align="center">
+  <a href="https://asciinema.org/a/mmCddtdB0FSkTIIM"><img src="docs/edge-proxy-demo.gif" alt="HeliosDB edge-proxy — coherent multi-region cache demo" width="820"></a>
+</p>
+
 ### Programmable WASM Data-Plane
 
 | Module | Feature Flag | Description |
