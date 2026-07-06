@@ -100,7 +100,7 @@ anomaly-detection = []
 
 # Edge / geo proxy mode — cache-first request handling, last-write-
 # wins TTL coherence, pull-on-miss + invalidation push.
-edge-proxy = []
+edge-proxy = ["dep:lru"]
 
 # ── Observability ────────────────────────────────────────────────────
 
@@ -161,6 +161,9 @@ dashmap = "5"
 parking_lot = "0.12"
 # Lock-free read-mostly snapshots (node-health map on the per-query path)
 arc-swap = "1"
+# O(1) LRU map backing the edge-proxy result cache. Optional — only
+# compiled with the `edge-proxy` feature.
+lru = { version = "0.12", optional = true }
 # SO_REUSEPORT for zero-downtime binary handoff (a new process binds the same
 # listen address while the old one drains).
 socket2 = "0.5"
