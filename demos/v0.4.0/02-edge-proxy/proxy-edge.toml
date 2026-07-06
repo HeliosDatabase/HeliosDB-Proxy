@@ -17,8 +17,12 @@ weight  = 100
 enabled = true
 
 [edge]
+enabled     = true
 role        = "edge"
 home_url    = "http://proxy-home:9090"
 auth_token  = "demo-token"
-default_ttl = "60s"
+# Demo-only: the compose network is private, so the bearer may ride
+# plain http here. Production must use an https home_url instead.
+allow_insecure_home_url = true
+default_ttl_secs = 60
 max_entries = 10000
