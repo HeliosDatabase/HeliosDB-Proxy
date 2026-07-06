@@ -14,7 +14,8 @@ weight  = 100
 enabled = true
 
 [edge]
+enabled      = true
 role         = "home"
-default_ttl  = "60s"
+default_ttl_secs = 60
 max_entries  = 10000
 max_edges    = 32

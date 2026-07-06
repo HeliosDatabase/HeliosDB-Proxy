@@ -242,6 +242,13 @@ impl AdminServer {
     /// Max concurrent admin connections; excess are dropped, not queued.
     const MAX_ADMIN_CONNS: usize = 256;
     const ADMIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+    /// Bound on every SSE write+flush (preamble, event frame,
+    /// heartbeat), mirroring the data path's CLIENT_WRITE_TIMEOUT
+    /// convention: a subscriber that stops reading must be reaped, not
+    /// pin its admin task + connection permit forever. Comfortably
+    /// above one 15s heartbeat interval.
+    #[cfg(feature = "edge-proxy")]
+    const ADMIN_SSE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     /// Max number of header lines accepted per admin request.
     const MAX_ADMIN_HEADERS: usize = 100;
     /// Max total bytes of the header section.
@@ -361,6 +368,37 @@ impl AdminServer {
                     return Ok(());
                 }
             }
+        }
+
+        // Long-lived SSE subscription for edge invalidations (T3.2, H5).
+        // Intercepted here — before the one-shot `route_request` dispatch —
+        // because `send_json_response` frames with `Content-Length` +
+        // `Connection: close`, which can't hold a stream open. The admin
+        // bearer gate above has already run, so an unauthenticated
+        // subscribe gets the exact same 401 as any other protected route.
+        // ADMIN_READ_TIMEOUT bounded only the request-read phase; the held
+        // SSE response is deliberately unbounded in time, but every WRITE
+        // on it is bounded by ADMIN_SSE_WRITE_TIMEOUT — with the 15s
+        // heartbeat that caps a wedged subscriber's lifetime, so held
+        // MAX_ADMIN_CONNS permits can never exceed live subscribers
+        // (`max_edges`, far below the 256-connection cap) for long.
+        #[cfg(feature = "edge-proxy")]
+        if method == "GET" && path.split('?').next().unwrap_or(path) == "/api/edge/subscribe" {
+            let params = parse_query_params(path);
+            let edge_id = params.get("edge_id").map(String::as_str).unwrap_or("");
+            if edge_id.is_empty() {
+                Self::send_json_response(
+                    &mut writer,
+                    400,
+                    &serde_json::json!({ "error": "edge_id query parameter is required" }),
+                )
+                .await?;
+                return Ok(());
+            }
+            let region = params.get("region").map(String::as_str).unwrap_or("");
+            let base_url = params.get("base_url").map(String::as_str).unwrap_or("");
+            return Self::handle_edge_subscribe(&mut writer, &state, edge_id, region, base_url)
+                .await;
         }
 
         // Read request body for POST/PUT requests (size already bounded above).
@@ -602,7 +640,11 @@ impl AdminServer {
 
             // Edge mode (T3.2). Stats panel for the home; the home's
             // registered edges + cache stats; and a manual
-            // invalidation endpoint for ops drills.
+            // invalidation endpoint for ops drills. (The live SSE
+            // stream, `GET /api/edge/subscribe`, never reaches this
+            // dispatch — `handle_connection` intercepts it first,
+            // since the one-shot JSON writers here can't hold a
+            // stream open.)
             #[cfg(feature = "edge-proxy")]
             ("GET", "/api/edge") => Self::handle_edge_status(state).await,
             #[cfg(feature = "edge-proxy")]
@@ -616,6 +658,16 @@ impl AdminServer {
                 503,
                 serde_json::json!({ "error": "edge-proxy feature not compiled in" }),
             )),
+            // Without the feature the subscribe intercept above is compiled
+            // out, so the SSE path falls through to here: same 503 as its
+            // sibling edge routes (query string included in the match).
+            #[cfg(not(feature = "edge-proxy"))]
+            ("GET", p) if p == "/api/edge/subscribe" || p.starts_with("/api/edge/subscribe?") => {
+                Ok((
+                    503,
+                    serde_json::json!({ "error": "edge-proxy feature not compiled in" }),
+                ))
+            }
 
             // Chaos engineering — controlled fault injection for HA
             // testing. Body is `ChaosRequestBody`; supported actions
@@ -1198,10 +1250,12 @@ impl AdminServer {
         ))
     }
 
-    /// `POST /api/edge/register` — edges call this once at boot to
-    /// announce themselves to the home. Body shape:
-    /// `{"edge_id":"e1","region":"us-east","base_url":"https://e1"}`.
+    /// `POST /api/edge/register` — ack-only compatibility path. Body
+    /// shape: `{"edge_id":"e1","region":"us-east","base_url":"https://e1"}`.
     /// Returns 201 with the assigned slot, 503 when registry full.
+    /// The live invalidation stream is `GET /api/edge/subscribe`, which
+    /// registers AND holds the receiver open for the connection's
+    /// lifetime — edges should use that instead of this endpoint.
     #[cfg(feature = "edge-proxy")]
     async fn handle_edge_register(
         body: Option<&str>,
@@ -1230,11 +1284,12 @@ impl AdminServer {
         let now = chrono::Utc::now().to_rfc3339();
         match registry.register(&req.edge_id, &req.region, &req.base_url, &now) {
             Ok(_rx) => {
-                // Receiver dropped here — in production the SSE
-                // handler keeps it alive for the connection's
-                // lifetime. For the JSON endpoint, we acknowledge
-                // the registration and the edge polls /api/edge for
-                // invalidations until SSE is wired.
+                // Receiver intentionally dropped (H5 resolved): this
+                // JSON endpoint only acknowledges. The live stream is
+                // `GET /api/edge/subscribe`, whose handler holds the
+                // receiver for the connection's lifetime. An edge that
+                // registers here without subscribing is pruned on the
+                // next broadcast.
                 Ok((
                     201,
                     serde_json::json!({
@@ -1247,6 +1302,157 @@ impl AdminServer {
             }
             Err(e) => Ok((503, serde_json::json!({ "error": e.to_string() }))),
         }
+    }
+
+    /// `GET /api/edge/subscribe?edge_id=..&region=..&base_url=..` — the
+    /// live invalidation stream (SSE). Registers the edge, then holds
+    /// the registry receiver open for the connection's lifetime,
+    /// forwarding every `InvalidationEvent` as an SSE `invalidate`
+    /// frame with a `: keepalive` heartbeat every 15s in between.
+    /// Resolves H5: the receiver lives exactly as long as the
+    /// subscriber's connection; returning drops it, and the next
+    /// broadcast prunes the dead sender.
+    ///
+    /// Writes to the raw write half — the SSE response is unframed
+    /// (no Content-Length) and stays open until the edge disconnects
+    /// or the registry evicts the subscription. Auth was already
+    /// enforced by `handle_connection`'s bearer gate.
+    #[cfg(feature = "edge-proxy")]
+    async fn handle_edge_subscribe(
+        writer: &mut tokio::net::tcp::WriteHalf<'_>,
+        state: &Arc<AdminState>,
+        edge_id: &str,
+        region: &str,
+        base_url: &str,
+    ) -> Result<()> {
+        let registry = match state.edge_registry.read().await.clone() {
+            Some(r) => r,
+            None => {
+                Self::send_json_response(
+                    writer,
+                    503,
+                    &serde_json::json!({ "error": "edge registry not attached" }),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut rx = match registry.register(edge_id, region, base_url, &now) {
+            Ok(rx) => rx,
+            // CapacityExceeded — same 503 shape as the JSON register path.
+            Err(e) => {
+                Self::send_json_response(
+                    writer,
+                    503,
+                    &serde_json::json!({ "error": e.to_string() }),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        // SSE preamble, straight onto the socket. Every SSE write is
+        // bounded by ADMIN_SSE_WRITE_TIMEOUT: a subscriber that stops
+        // reading (zero-window peer) must not pin this task — and its
+        // MAX_ADMIN_CONNS permit — forever. The 15s heartbeat
+        // guarantees a write attempt on every connection, so a wedged
+        // subscriber is reaped within one beat + the timeout,
+        // releasing both the permit and the receiver.
+        if !Self::write_sse(
+            writer,
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n",
+        )
+        .await
+        {
+            return Ok(());
+        }
+
+        // Hello frame: an invalidate event carrying the home's
+        // per-boot epoch and current version. The edge (a) detects a
+        // home restart immediately instead of at the first post-restart
+        // write, (b) re-syncs its observed-home clock, and (c) flushes
+        // entries cached while it was disconnected (empty table set =
+        // wildcard), closing the missed-event window on reconnect.
+        if let Some(cache) = state.edge_cache.read().await.clone() {
+            let hello = InvalidationEvent {
+                up_to_version: cache.current_version(),
+                tables: Vec::new(),
+                committed_at: now.clone(),
+                epoch: cache.epoch(),
+            };
+            let json = serde_json::to_string(&hello)
+                .map_err(|e| ProxyError::Internal(format!("JSON error: {}", e)))?;
+            let frame = format!("event: invalidate\ndata: {}\n\n", json);
+            if !Self::write_sse(writer, frame.as_bytes()).await {
+                return Ok(());
+            }
+        }
+
+        tracing::info!(edge_id, region, "edge subscribed to invalidation stream");
+
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
+        // The first interval tick completes immediately — consume it so
+        // heartbeats start 15s after the preamble, not on top of it.
+        heartbeat.tick().await;
+
+        loop {
+            tokio::select! {
+                ev = rx.recv() => {
+                    match ev {
+                        Some(ev) => {
+                            // `to_string` is single-line, per the SSE
+                            // framing contract (exactly one `data:` line).
+                            let json = serde_json::to_string(&ev)
+                                .map_err(|e| ProxyError::Internal(format!("JSON error: {}", e)))?;
+                            let frame = format!("event: invalidate\ndata: {}\n\n", json);
+                            if !Self::write_sse(writer, frame.as_bytes()).await {
+                                // Edge gone (or wedged past the write
+                                // timeout). Returning drops `rx`; the
+                                // next broadcast prunes the sender.
+                                tracing::debug!(edge_id, "edge SSE write failed; closing stream");
+                                return Ok(());
+                            }
+                        }
+                        // Sender side gone: the registry evicted this
+                        // subscription (prune_stale, unregister, or a
+                        // re-register under the same edge_id replaced it).
+                        None => {
+                            tracing::debug!(edge_id, "edge subscription evicted by registry");
+                            return Ok(());
+                        }
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    // Comment-only keepalive — detects a dead client via
+                    // the write error/timeout long before TCP keepalive
+                    // would.
+                    if !Self::write_sse(writer, b": keepalive\n\n").await {
+                        tracing::debug!(edge_id, "edge SSE heartbeat failed; closing stream");
+                        return Ok(());
+                    }
+                    // A delivered heartbeat proves the edge is reading:
+                    // refresh registry liveness so a write-idle home
+                    // never GC-prunes healthy subscribers (prune_stale
+                    // stays as the backstop for wedged/dead peers).
+                    registry.touch(edge_id, &chrono::Utc::now().to_rfc3339());
+                }
+            }
+        }
+    }
+
+    /// One timeout-bounded SSE write+flush. `false` = the connection
+    /// is dead or wedged (treat exactly like a write error and close).
+    #[cfg(feature = "edge-proxy")]
+    async fn write_sse(writer: &mut tokio::net::tcp::WriteHalf<'_>, bytes: &[u8]) -> bool {
+        let write = async {
+            writer.write_all(bytes).await?;
+            writer.flush().await
+        };
+        matches!(
+            tokio::time::timeout(Self::ADMIN_SSE_WRITE_TIMEOUT, write).await,
+            Ok(Ok(()))
+        )
     }
 
     /// `POST /api/edge/invalidate` — manual invalidation for ops
@@ -1289,7 +1495,19 @@ impl AdminServer {
                 ));
             }
         };
-        let version = req.up_to_version.unwrap_or_else(|| cache.next_version());
+        // Null version = "use the cache's current version": strictly
+        // greater than every stamp this process has minted, so the
+        // sweep covers all live entries (a fetch_add mint would also
+        // burn a version for nothing). An explicit version is CLAMPED to the
+        // current clock: a value above it would, once applied on the edges via
+        // observe_home_version, push their observed-home counter past anything
+        // the home will mint for a long time, so every subsequent real
+        // invalidation (a smaller version) would sweep nothing — a permanent
+        // fleet-wide poison from one oversized admin request.
+        let version = req
+            .up_to_version
+            .map(|v| v.min(cache.current_version()))
+            .unwrap_or_else(|| cache.current_version());
         // Local cache invalidation (home-side cache, if any).
         let dropped_local = cache.invalidate(version, &req.tables);
         // Fan out to every registered edge.
@@ -1297,6 +1515,7 @@ impl AdminServer {
             up_to_version: version,
             tables: req.tables.clone(),
             committed_at: chrono::Utc::now().to_rfc3339(),
+            epoch: cache.epoch(),
         };
         let (sent, pruned) = registry.broadcast(ev).await;
         Ok((
@@ -2083,6 +2302,54 @@ fn parse_limit_query(path: &str, default: usize, max: usize) -> usize {
     default
 }
 
+/// Decode `%XX` percent-escapes in a query-string value. Invalid or
+/// truncated escapes pass through literally (lenient — the decoded
+/// value feeds an identifier/URL echo, not a security decision). `+`
+/// is NOT decoded to space: subscribers send RFC 3986 percent-encoded
+/// values, not `application/x-www-form-urlencoded`.
+#[cfg(feature = "edge-proxy")]
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push(((hi as u8) << 4) | lo as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse a URL query string (`?k=v&k2=v2`) into a map, percent-decoding
+/// the values. Keys without a `=` are ignored. Used by the edge SSE
+/// subscribe route — the only admin route taking query params beyond
+/// the single `?limit=` that `parse_limit_query` covers.
+#[cfg(feature = "edge-proxy")]
+fn parse_query_params(path: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let q = match path.find('?') {
+        Some(i) => &path[i + 1..],
+        None => return out,
+    };
+    for kv in q.split('&') {
+        let mut it = kv.splitn(2, '=');
+        if let (Some(k), Some(v)) = (it.next(), it.next()) {
+            if !k.is_empty() {
+                out.insert(k.to_string(), percent_decode(v));
+            }
+        }
+    }
+    out
+}
+
 /// JSON body for `POST /api/shadow`.
 #[cfg(feature = "ha-tr")]
 #[derive(Debug, Deserialize)]
@@ -2776,7 +3043,7 @@ mod tests {
             CacheKey::new("fp1", "p1"),
             CacheEntry {
                 version: 1,
-                response_bytes: b"row".to_vec(),
+                response_bytes: bytes::Bytes::from_static(b"row"),
                 tables: vec!["users".into()],
                 expires_at: Instant::now() + Duration::from_secs(60),
             },
@@ -2801,5 +3068,167 @@ mod tests {
             .await
             .expect("handler ok");
         assert_eq!(status, 503);
+    }
+
+    // ---- edge SSE subscribe: query parsing + gate behaviour ----
+
+    #[cfg(feature = "edge-proxy")]
+    #[test]
+    fn test_parse_query_params_decodes_and_defaults() {
+        let p = parse_query_params(
+            "/api/edge/subscribe?edge_id=e1&region=us-east&base_url=http%3A%2F%2Fe1.svc%3A9090",
+        );
+        assert_eq!(p.get("edge_id").unwrap(), "e1");
+        assert_eq!(p.get("region").unwrap(), "us-east");
+        assert_eq!(p.get("base_url").unwrap(), "http://e1.svc:9090");
+        // No query string at all -> empty map.
+        assert!(parse_query_params("/api/edge/subscribe").is_empty());
+        // Key without '=' is ignored; truncated / invalid escapes pass
+        // through literally.
+        let p2 = parse_query_params("/x?flag&edge_id=a%2&b=%zz");
+        assert!(!p2.contains_key("flag"));
+        assert_eq!(p2.get("edge_id").unwrap(), "a%2");
+        assert_eq!(p2.get("b").unwrap(), "%zz");
+    }
+
+    /// Drive one raw HTTP request through `handle_connection` over a
+    /// real localhost socket (the SSE route is intercepted there,
+    /// before `route_request`, so handler-level tests can't reach it).
+    #[cfg(feature = "edge-proxy")]
+    async fn connect_admin(state: Arc<AdminState>) -> tokio::net::TcpStream {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let _ = AdminServer::handle_connection(stream, peer, state).await;
+        });
+        tokio::net::TcpStream::connect(addr).await.unwrap()
+    }
+
+    /// Read from `stream` until `needle` appears (or a 2s deadline)
+    /// and return everything read so far.
+    #[cfg(feature = "edge-proxy")]
+    async fn read_until(stream: &mut tokio::net::TcpStream, needle: &str) -> String {
+        let mut buf = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let mut chunk = [0u8; 1024];
+            let n = tokio::time::timeout_at(deadline, stream.read(&mut chunk))
+                .await
+                .expect("read timed out")
+                .expect("read failed");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if String::from_utf8_lossy(&buf).contains(needle) {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[cfg(feature = "edge-proxy")]
+    #[tokio::test]
+    async fn test_edge_subscribe_unauthenticated_gets_401() {
+        let s = edge_state().await;
+        *s.auth_token.write().await = Some("s3cret".to_string());
+        let mut c = connect_admin(s).await;
+        c.write_all(b"GET /api/edge/subscribe?edge_id=e1 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let resp = read_until(&mut c, "401").await;
+        assert!(resp.starts_with("HTTP/1.1 401"), "got: {resp}");
+    }
+
+    #[cfg(feature = "edge-proxy")]
+    #[tokio::test]
+    async fn test_edge_subscribe_400_without_edge_id() {
+        let s = edge_state().await;
+        let mut c = connect_admin(s).await;
+        c.write_all(b"GET /api/edge/subscribe?region=us-east HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let resp = read_until(&mut c, "edge_id").await;
+        assert!(resp.starts_with("HTTP/1.1 400"), "got: {resp}");
+        assert!(resp.contains("edge_id query parameter is required"));
+    }
+
+    #[cfg(feature = "edge-proxy")]
+    #[tokio::test]
+    async fn test_edge_subscribe_503_when_registry_full() {
+        use crate::edge::{EdgeCache, EdgeRegistry};
+        let s = Arc::new(AdminState::new());
+        s.with_edge(
+            Arc::new(EdgeCache::new(16)),
+            Arc::new(EdgeRegistry::new(1, std::time::Duration::from_secs(60))),
+        )
+        .await;
+        let registry = s.edge_registry.read().await.clone().unwrap();
+        // Occupy the single slot; the receiver must stay alive so the
+        // subscribe below hits CapacityExceeded, not a pruned slot.
+        let _held = registry.register("occupant", "r", "u", "ts").unwrap();
+        let mut c = connect_admin(s).await;
+        c.write_all(b"GET /api/edge/subscribe?edge_id=e2 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let resp = read_until(&mut c, "full").await;
+        assert!(resp.starts_with("HTTP/1.1 503"), "got: {resp}");
+    }
+
+    #[cfg(feature = "edge-proxy")]
+    #[tokio::test]
+    async fn test_edge_subscribe_streams_preamble_and_invalidations() {
+        let s = edge_state().await;
+        *s.auth_token.write().await = Some("s3cret".to_string());
+        let registry = s.edge_registry.read().await.clone().unwrap();
+        let mut c = connect_admin(s).await;
+        c.write_all(
+            b"GET /api/edge/subscribe?edge_id=e1&region=eu&base_url=http%3A%2F%2Fe1 HTTP/1.1\r\nAuthorization: Bearer s3cret\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let preamble = read_until(&mut c, "\r\n\r\n").await;
+        assert!(preamble.starts_with("HTTP/1.1 200 OK"), "got: {preamble}");
+        assert!(preamble.contains("Content-Type: text/event-stream"));
+
+        // Registration (with percent-decoded params) happened before the
+        // preamble was written, so it's visible once we've read it — and
+        // the receiver is held open by the handler.
+        let nodes = registry.list();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].edge_id, "e1");
+        assert_eq!(nodes[0].region, "eu");
+        assert_eq!(nodes[0].base_url, "http://e1");
+
+        // The subscribe-time hello frame arrives first: an invalidate
+        // event carrying the home's per-boot epoch (never 0) so a
+        // reconnecting edge detects restarts and re-syncs immediately.
+        // (Its bytes may already have ridden along with the preamble
+        // read — accumulate until the frame's closing brace.)
+        let mut hello = preamble;
+        if !hello.contains("}\n\n") {
+            hello.push_str(&read_until(&mut c, "}\n\n").await);
+        }
+        assert!(hello.contains("event: invalidate"), "got: {hello}");
+        assert!(hello.contains("\"epoch\":"), "got: {hello}");
+        assert!(
+            !hello.contains("\"epoch\":0}"),
+            "hello epoch must be non-zero: {hello}"
+        );
+
+        // A broadcast arrives as an SSE invalidate frame.
+        let (sent, _) = registry
+            .broadcast(InvalidationEvent {
+                up_to_version: 7,
+                tables: vec!["users".into()],
+                committed_at: "ts".into(),
+                epoch: 0,
+            })
+            .await;
+        assert_eq!(sent, 1);
+        let frame = read_until(&mut c, "\"up_to_version\":7").await;
+        assert!(frame.contains("event: invalidate"), "got: {frame}");
+        assert!(frame.contains("\"up_to_version\":7"), "got: {frame}");
     }
 }

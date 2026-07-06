@@ -136,7 +136,10 @@ pub mod analytics;
 pub mod anomaly;
 
 // ── Edge / geo proxy mode (T3.2) ───────────────────────────────────
-#[cfg(feature = "edge-proxy")]
+//
+// Always-on so `ProxyConfig` can carry an `[edge]` section on every
+// build (same pattern as mcp/http_gateway/mirror). The cache/registry
+// machinery inside is still gated behind the `edge-proxy` feature.
 pub mod edge;
 
 // ── Multi-tenancy support ───────────────────────────────────────────

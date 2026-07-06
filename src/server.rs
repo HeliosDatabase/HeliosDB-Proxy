@@ -364,6 +364,19 @@ pub struct ClientSession {
     /// deferred to the default auth flow.
     #[cfg(feature = "wasm-plugins")]
     pub plugin_identity: RwLock<Option<Identity>>,
+    /// Sticky edge-cache ineligibility: set once the session executes any
+    /// statement that alters execution context (SET/SET ROLE/search_path,
+    /// temp tables, ...). The shared edge cache keys on (fingerprint,
+    /// params, db/user, startup vars) — it cannot see session-local GUC
+    /// state, so a session that mutates it must never read from or store
+    /// into the shared cache again (cross-session wrong-rows otherwise).
+    #[cfg(feature = "edge-proxy")]
+    pub edge_ineligible: std::sync::atomic::AtomicBool,
+    /// Tables of an in-flight `COPY ... FROM` awaiting its CopyDone drain.
+    /// COPY rows become visible at drain time, so the edge invalidation is
+    /// deferred until then (never held across an await).
+    #[cfg(feature = "edge-proxy")]
+    pub pending_edge_copy_tables: std::sync::Mutex<Option<Vec<String>>>,
 }
 
 /// Transaction state
@@ -1001,11 +1014,11 @@ impl ProxyServer {
                 crate::anomaly::AnomalyConfig::default(),
             )),
             #[cfg(feature = "edge-proxy")]
-            edge_cache: Arc::new(crate::edge::EdgeCache::new(10_000)),
+            edge_cache: Arc::new(crate::edge::EdgeCache::new(config.edge.max_entries.max(1))),
             #[cfg(feature = "edge-proxy")]
             edge_registry: Arc::new(crate::edge::EdgeRegistry::new(
-                32,
-                std::time::Duration::from_secs(120),
+                config.edge.max_edges,
+                std::time::Duration::from_secs(config.edge.liveness_window_secs),
             )),
         });
 
@@ -1099,7 +1112,7 @@ impl ProxyServer {
             return;
         };
         tracing::info!(path, "SIGHUP: reloading configuration");
-        let new_config = match ProxyConfig::from_file(path) {
+        let mut new_config = match ProxyConfig::from_file(path) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(path, error = %e, "SIGHUP reload failed to parse — keeping current config");
@@ -1107,6 +1120,20 @@ impl ProxyServer {
             }
         };
         let old = self.state.live_config.load_full();
+        // [edge] is applied at startup only: the EdgeClient subscription and
+        // the registry GC task are spawned once in run() from the boot
+        // config. Letting the per-connection data path follow a reloaded
+        // [edge] would half-enable the feature (e.g. role=edge serving
+        // cached reads with no invalidation subscription ever spawned), so
+        // carry the running section forward — same warn-and-keep treatment
+        // as listen_address/admin_address.
+        if new_config.edge != old.edge {
+            tracing::warn!(
+                "[edge] configuration changed on SIGHUP but is applied at startup only — \
+                 keeping the running edge settings (restart to apply)"
+            );
+            new_config.edge = old.edge.clone();
+        }
         if new_config.listen_address != old.listen_address {
             tracing::warn!(old = %old.listen_address, new = %new_config.listen_address,
                 "listen_address change needs a restart/handoff; the bound socket is kept");
@@ -1186,6 +1213,14 @@ impl ProxyServer {
         let health_task = self.spawn_health_checker();
         let pool_task = self.spawn_pool_manager();
 
+        // Edge registry GC — prunes edges not seen within the liveness window.
+        #[cfg(feature = "edge-proxy")]
+        let _edge_maintenance_task = if self.config.edge.enabled {
+            Some(self.spawn_edge_maintenance())
+        } else {
+            None
+        };
+
         // Start admin server
         let admin_task = self.spawn_admin_server();
 
@@ -1236,6 +1271,24 @@ impl ProxyServer {
         } else {
             None
         };
+
+        // Edge role: hold an SSE subscription against the home's admin API so
+        // invalidations drop matching local cache entries as they arrive.
+        #[cfg(feature = "edge-proxy")]
+        let _edge_client_task =
+            if self.config.edge.enabled && self.config.edge.role == crate::edge::EdgeRole::Edge {
+                tracing::info!(
+                    home_url = %self.config.edge.home_url,
+                    region = %self.config.edge.region,
+                    "edge role: subscribing to home invalidation stream"
+                );
+                Some(crate::edge::client::EdgeClient::spawn(
+                    self.config.edge.clone(),
+                    self.state.edge_cache.clone(),
+                ))
+            } else {
+                None
+            };
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
@@ -1546,6 +1599,10 @@ impl ProxyServer {
             pool_client_id: ClientId::new(),
             #[cfg(feature = "wasm-plugins")]
             plugin_identity: RwLock::new(None),
+            #[cfg(feature = "edge-proxy")]
+            edge_ineligible: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "edge-proxy")]
+            pending_edge_copy_tables: std::sync::Mutex::new(None),
         });
 
         // Register the session, then attach an RAII guard that deregisters it on
@@ -1688,6 +1745,19 @@ impl ProxyServer {
         let mut batch_defines: Vec<String> = Vec::new();
         let mut batch_refs: Vec<String> = Vec::new();
         let mut batch_closes: Vec<String> = Vec::new();
+        // Edge invalidation metadata for extended-protocol statements,
+        // memoized at Parse time (name -> Some(tables) when the statement is
+        // DML, None when read-only) so steady-state Bind/Execute cycles of a
+        // prepared write cost a map lookup, not a regex pass. The unnamed
+        // statement gets its own slot; `edge_batch_bound_unnamed` records
+        // whether the in-flight batch Bind-referenced it. Resolved into an
+        // invalidation at the Sync boundary.
+        #[cfg(feature = "edge-proxy")]
+        let mut edge_stmt_meta: HashMap<String, Option<Vec<String>>> = HashMap::new();
+        #[cfg(feature = "edge-proxy")]
+        let mut edge_unnamed_meta: Option<Vec<String>> = None;
+        #[cfg(feature = "edge-proxy")]
+        let mut edge_batch_bound_unnamed = false;
         // Unnamed-`Parse` promotion (Batch H). `held_unnamed` parks an unnamed
         // Parse that is the FIRST message of a batch (so the batch stays the
         // clean Parse→Bind→…→Sync shape) — it is NOT appended to `pending`; the
@@ -1982,6 +2052,55 @@ impl ProxyServer {
                                         }
                                     }
                                 }
+                                // Edge invalidation metadata: classify every
+                                // Parse'd statement ONCE (is it DML? which
+                                // tables?) so Sync-time invalidation of
+                                // re-executed prepared writes is a map hit.
+                                // Extended-protocol statements can dirty
+                                // session state too (JDBC-style SET) — the
+                                // sticky edge-ineligibility flag must catch
+                                // them, not just simple-protocol text.
+                                #[cfg(feature = "edge-proxy")]
+                                if config.edge.enabled {
+                                    if let Some(end) = msg.payload.iter().position(|&b| b == 0) {
+                                        if let Some(q) =
+                                            crate::protocol::query_text(&msg.payload[end + 1..])
+                                        {
+                                            if !session
+                                                .edge_ineligible
+                                                .load(std::sync::atomic::Ordering::Relaxed)
+                                                && Self::stmt_leaves_session_state(q)
+                                            {
+                                                session.edge_ineligible.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                            }
+                                            let meta = if Self::is_edge_dml_sql(q) {
+                                                Some(crate::edge::fingerprint::tables_only(q))
+                                            } else if Self::is_edge_procedural_sql(q)
+                                                || Self::is_edge_txn_end_sql(q)
+                                            {
+                                                // Opaque write (EXECUTE/CALL/DO) or a
+                                                // COMMIT/END that makes in-transaction
+                                                // writes visible — memoize as the
+                                                // empty-set wildcard so the batch's
+                                                // Sync hook full-flushes.
+                                                Some(Vec::new())
+                                            } else {
+                                                None
+                                            };
+                                            if unnamed {
+                                                edge_unnamed_meta = meta;
+                                            } else {
+                                                edge_stmt_meta.insert(
+                                                    Self::parse_stmt_name(&msg.payload).to_string(),
+                                                    meta,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                                 // Promotion: park an unnamed Parse that opens a
                                 // fresh batch. Its signature is the payload after
                                 // the empty statement-name NUL (query + param
@@ -2005,7 +2124,15 @@ impl ProxyServer {
                                 }
                             }
                             MessageType::Bind => {
-                                if let Some(name) = Self::bind_stmt_ref(&msg.payload) {
+                                let stmt_ref = Self::bind_stmt_ref(&msg.payload);
+                                // Unnamed statement: not tracked in
+                                // batch_refs, but the edge invalidation must
+                                // still see its execution.
+                                #[cfg(feature = "edge-proxy")]
+                                if stmt_ref.is_none() {
+                                    edge_batch_bound_unnamed = true;
+                                }
+                                if let Some(name) = stmt_ref {
                                     batch_refs.push(name.to_string());
                                 }
                             }
@@ -2073,12 +2200,74 @@ impl ProxyServer {
                             .await;
                         }
                         state.metrics.bytes_sent.fetch_add(sent, Ordering::Relaxed);
+                        // Extended-protocol writes drove zero edge invalidation
+                        // before this hook — prepared-statement drivers
+                        // (JDBC/Npgsql/asyncpg) would leave every edge stale
+                        // until TTL. Union the tables of the batch's referenced
+                        // DML statements (memoized at Parse) and invalidate/
+                        // broadcast exactly like the simple path. Errors inside
+                        // the batch only over-invalidate — safe. A COPY ... FROM
+                        // batch is deferred to its CopyDone drain (rows visible
+                        // then). Runs BEFORE the batch_closes drain below, so an
+                        // execute-then-Close batch still sees its statement's
+                        // metadata; only Sync-terminated batches fire (a pure
+                        // Flush pipeline accumulates refs until its Sync).
+                        #[cfg(feature = "edge-proxy")]
+                        if wait_ready && config.edge.enabled {
+                            if let Some(tables) = Self::edge_extended_batch_tables(
+                                &batch_refs,
+                                edge_batch_bound_unnamed,
+                                &edge_stmt_meta,
+                                &edge_unnamed_meta,
+                            ) {
+                                if session
+                                    .copy_in_progress
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    *session
+                                        .pending_edge_copy_tables
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner()) = Some(tables);
+                                } else {
+                                    Self::edge_invalidate_write(state, config, tables).await;
+                                }
+                            }
+                            edge_batch_bound_unnamed = false;
+                        }
                         // Closed statements are deallocated everywhere — forget
                         // their canonical Parse so they are never re-prepared.
+                        #[cfg(not(feature = "edge-proxy"))]
                         for name in batch_closes.drain(..) {
                             if let Some(removed) = stmt_registry.remove(&name) {
                                 stmt_registry_bytes =
                                     stmt_registry_bytes.saturating_sub(removed.len());
+                            }
+                        }
+                        // Edge builds also prune per-statement invalidation metadata
+                        // — but that metadata is consumed by the Sync-time hook ABOVE
+                        // (which runs first) and must survive a Close seen at an
+                        // earlier Flush of the same batch, and a name Closed then
+                        // re-Parsed in this batch must keep its FRESH meta. So the
+                        // close queue is drained only at the Sync (stmt_registry is
+                        // still pruned every boundary — idempotent), and edge meta is
+                        // removed there only for names not redefined this batch.
+                        // Retaining meta for a genuinely-closed name is safe: a later
+                        // re-Parse overwrites it, and a stale entry only ever
+                        // over-invalidates.
+                        #[cfg(feature = "edge-proxy")]
+                        {
+                            for name in &batch_closes {
+                                if let Some(removed) = stmt_registry.remove(name) {
+                                    stmt_registry_bytes =
+                                        stmt_registry_bytes.saturating_sub(removed.len());
+                                }
+                            }
+                            if wait_ready {
+                                for name in Self::edge_meta_prunable(&batch_closes, &batch_defines)
+                                {
+                                    edge_stmt_meta.remove(name);
+                                }
+                                batch_closes.clear();
                             }
                         }
                         if wait_ready {
@@ -2126,6 +2315,27 @@ impl ProxyServer {
                                                 .metrics
                                                 .bytes_sent
                                                 .fetch_add(sent, Ordering::Relaxed);
+                                            // COPY ... FROM rows became visible at
+                                            // this drain: fire the deferred edge
+                                            // invalidation now. CopyFail loaded
+                                            // nothing — just clear the stash.
+                                            #[cfg(feature = "edge-proxy")]
+                                            if config.edge.enabled {
+                                                let stashed = session
+                                                    .pending_edge_copy_tables
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner())
+                                                    .take();
+                                                if let Some(tables) = stashed {
+                                                    if matches!(msg.msg_type, MessageType::CopyDone)
+                                                    {
+                                                        Self::edge_invalidate_write(
+                                                            state, config, tables,
+                                                        )
+                                                        .await;
+                                                    }
+                                                }
+                                            }
                                         }
                                         Err(e) => {
                                             conns.remove(&node);
@@ -2143,6 +2353,16 @@ impl ProxyServer {
                                 session
                                     .copy_in_progress
                                     .store(false, std::sync::atomic::Ordering::Relaxed);
+                                // The COPY aborted — nothing loaded — so discard any
+                                // deferred invalidation stash, else it would later
+                                // fire against an unrelated COPY's drain.
+                                #[cfg(feature = "edge-proxy")]
+                                {
+                                    *session
+                                        .pending_edge_copy_tables
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner()) = None;
+                                }
                                 if is_copy_end {
                                     let emsg = Self::create_error_response(
                                         "57000",
@@ -3281,6 +3501,111 @@ impl ProxyServer {
         #[cfg(feature = "multi-tenancy")]
         let forward_msg = tenant_msg.as_ref().unwrap_or(forward_msg);
 
+        // Edge cache: independent of the query-cache below — when both are
+        // enabled the edge lookup runs first, so an edge hit returns before
+        // the query-cache is consulted. On a miss the read's stamp/epoch is
+        // taken BEFORE forwarding, so the store gate can reject the store if
+        // an invalidation lands while the read is in flight.
+        //
+        // Session-state stickiness (F2): the shared cache cannot model
+        // session-local execution context (SET search_path / SET ROLE / RLS
+        // GUCs / temp objects). Any statement that leaves such state makes
+        // the session permanently ineligible for edge lookup AND store —
+        // conservative, but the alternative is cross-session wrong rows.
+        #[cfg(feature = "edge-proxy")]
+        if config.edge.enabled
+            && !session
+                .edge_ineligible
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(sql) = crate::protocol::query_text(&forward_msg.payload) {
+                if Self::stmt_leaves_session_state(sql) {
+                    session
+                        .edge_ineligible
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        #[cfg(feature = "edge-proxy")]
+        let edge_ctx: Option<(crate::edge::CacheKey, Vec<String>, u64, u64)> = if is_write
+            || !config.edge.enabled
+            || session
+                .edge_ineligible
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            None
+        } else {
+            let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
+            // Same gate as the query-cache: a plain deterministic SELECT, and
+            // never mid-transaction (visibility would be wrong).
+            if Self::is_cacheable_read_sql(sql)
+                && !session
+                    .in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                // Tenant identity + result-affecting startup params
+                // (TimeZone, options=-c..., extra_float_digits, ...) all
+                // partition the key: identical SQL under a different
+                // session environment must not share a slot.
+                let (database, user, session_vars) = {
+                    let vars = session.variables.read().await;
+                    let database = vars
+                        .get("database")
+                        .cloned()
+                        .unwrap_or_else(|| "default".to_string());
+                    let user = vars.get("user").cloned().unwrap_or_default();
+                    let mut rest: Vec<(String, String)> = vars
+                        .iter()
+                        .filter(|(k, _)| k.as_str() != "database" && k.as_str() != "user")
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    rest.sort();
+                    (database, user, rest)
+                };
+                let fp = crate::edge::fingerprint::analyze(sql, &database, &user, &session_vars);
+                // A read with no extractable tables could never be dropped by
+                // a table-targeted invalidation — never cache it (coherence
+                // rule).
+                if fp.tables.is_empty() {
+                    None
+                } else {
+                    let key = crate::edge::CacheKey {
+                        fingerprint: fp.fingerprint,
+                        params_hash: fp.params_hash,
+                        database,
+                        user,
+                    };
+                    if let Some(entry) = state.edge_cache.get(&key) {
+                        tracing::debug!(target: "helios::edge", "edge cache hit");
+                        client.write_all(&entry.response_bytes).await.map_err(|e| {
+                            ProxyError::Network(format!("Client write error: {}", e))
+                        })?;
+                        return Ok((None, entry.response_bytes.len() as u64));
+                    }
+                    // Miss: stamp the read before it reaches a backend, in
+                    // the INVALIDATION clock's domain. Home role: mint from
+                    // the local counter (the same clock that versions
+                    // writes). Edge role: writes are versioned by the HOME,
+                    // so stamp with the last observed home version — any
+                    // later home write mints a strictly greater version and
+                    // always sweeps this entry; the store race is closed by
+                    // the invalidation-epoch snapshot instead of the hwm.
+                    let (read_version, inval_epoch) =
+                        if config.edge.role == crate::edge::EdgeRole::Edge {
+                            (
+                                state.edge_cache.observed_home_version(),
+                                state.edge_cache.invalidation_epoch(),
+                            )
+                        } else {
+                            (state.edge_cache.next_version(), 0)
+                        };
+                    Some((key, fp.tables, read_version, inval_epoch))
+                }
+            } else {
+                None
+            }
+        };
+
         // Query cache: on a cacheable read, a hit is served from cache with no
         // backend round-trip; on a miss we keep the context to store the result.
         #[cfg(feature = "query-cache")]
@@ -3394,47 +3719,94 @@ impl ProxyServer {
             return Err(e);
         }
 
-        // Cacheable read miss: capture the response frames and store them so a
-        // later identical read is served from cache without a backend hit.
-        #[cfg(feature = "query-cache")]
-        if let (Some(ctx), Some(qc)) = (cache_ctx.as_ref(), state.query_cache.as_ref()) {
-            return match Self::stream_until_ready_capture(client, &mut backend.stream, session)
-                .await
-            {
-                Ok((sent, captured, cacheable, rows)) => {
-                    #[cfg(feature = "circuit-breaker")]
-                    Self::circuit_record(state, &target, true, "");
-                    if cacheable && !captured.is_empty() {
-                        let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
-                        qc.put(
-                            sql,
-                            ctx,
-                            bytes::Bytes::from(captured),
-                            rows,
-                            std::time::Duration::ZERO,
-                        )
-                        .await;
+        // Cacheable read miss (query-cache and/or edge cache): capture the
+        // response frames ONCE and store them so a later identical read is
+        // served from cache without a backend hit. Both caches share the one
+        // captured buffer — never capture twice.
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        {
+            #[cfg(feature = "query-cache")]
+            let qc_wants = cache_ctx.is_some() && state.query_cache.is_some();
+            #[cfg(not(feature = "query-cache"))]
+            let qc_wants = false;
+            #[cfg(feature = "edge-proxy")]
+            let edge_wants = edge_ctx.is_some();
+            #[cfg(not(feature = "edge-proxy"))]
+            let edge_wants = false;
+            if qc_wants || edge_wants {
+                return match Self::stream_until_ready_capture(client, &mut backend.stream, session)
+                    .await
+                {
+                    Ok((sent, captured, cacheable, rows)) => {
+                        #[cfg(not(feature = "query-cache"))]
+                        let _ = rows; // row count only feeds the query-cache
+                        #[cfg(feature = "circuit-breaker")]
+                        Self::circuit_record(state, &target, true, "");
+                        // One zero-copy conversion; both caches then share the
+                        // refcounted buffer (no per-miss memcpy, F20).
+                        let body = bytes::Bytes::from(captured);
+                        // Edge store. The race-checked insert variants re-verify
+                        // the gate UNDER the map lock: a concurrent invalidation
+                        // that completed between the read and this store must
+                        // reject it (read-after-invalidate TOCTOU, F18). Home
+                        // role gates on the version hwm; edge role on the
+                        // invalidation-epoch snapshot taken before forwarding.
+                        #[cfg(feature = "edge-proxy")]
+                        if let Some((key, tables, read_version, inval_epoch)) = edge_ctx {
+                            if cacheable && !body.is_empty() {
+                                let entry = crate::edge::CacheEntry {
+                                    version: read_version,
+                                    response_bytes: body.clone(),
+                                    tables,
+                                    expires_at: std::time::Instant::now()
+                                        + config.edge.default_ttl(),
+                                };
+                                let stored = if config.edge.role == crate::edge::EdgeRole::Edge {
+                                    state.edge_cache.insert_if_epoch(key, entry, inval_epoch)
+                                } else {
+                                    state.edge_cache.insert_if_fresh(key, entry)
+                                };
+                                if !stored {
+                                    tracing::debug!(
+                                        target: "helios::edge",
+                                        "edge store skipped — invalidation raced the read"
+                                    );
+                                }
+                            }
+                        }
+                        #[cfg(feature = "query-cache")]
+                        if let (Some(ctx), Some(qc)) =
+                            (cache_ctx.as_ref(), state.query_cache.as_ref())
+                        {
+                            if cacheable && !body.is_empty() {
+                                let sql =
+                                    crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
+                                qc.put(sql, ctx, body.clone(), rows, std::time::Duration::ZERO)
+                                    .await;
+                            }
+                        }
+                        let _ = body;
+                        #[cfg(feature = "query-analytics")]
+                        if let Some(sql) = analytics_sql.as_deref() {
+                            Self::record_analytics(
+                                state,
+                                session,
+                                sql,
+                                &target,
+                                started.elapsed(),
+                                None,
+                            )
+                            .await;
+                        }
+                        Ok((Some(target), sent))
                     }
-                    #[cfg(feature = "query-analytics")]
-                    if let Some(sql) = analytics_sql.as_deref() {
-                        Self::record_analytics(
-                            state,
-                            session,
-                            sql,
-                            &target,
-                            started.elapsed(),
-                            None,
-                        )
-                        .await;
+                    Err(e) => {
+                        conns.remove(&target);
+                        Self::record_backend_failure(state, &target, &e.to_string());
+                        Err(e)
                     }
-                    Ok((Some(target), sent))
-                }
-                Err(e) => {
-                    conns.remove(&target);
-                    Self::record_backend_failure(state, &target, &e.to_string());
-                    Err(e)
-                }
-            };
+                };
+            }
         }
 
         match Self::stream_until_ready(client, &mut backend.stream, session, state).await {
@@ -3447,6 +3819,39 @@ impl ProxyServer {
                     if let Some(qc) = state.query_cache.as_ref() {
                         let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
                         qc.invalidate_query(sql).await;
+                    }
+                }
+                // Edge cache: drop local entries for the touched tables and
+                // (home role only) fan the invalidation out to every
+                // registered edge over SSE. Also fires for SELECT-leading
+                // multi-statement strings (the trailing write would otherwise
+                // invalidate nothing); bare transaction-control statements
+                // (BEGIN/START/SAVEPOINT/RELEASE/ROLLBACK) change no rows and
+                // are exempted — but COMMIT and SET keep their conservative
+                // full flush. A `COPY ... FROM` is deferred to its CopyDone
+                // drain (rows become visible then).
+                #[cfg(feature = "edge-proxy")]
+                if config.edge.enabled {
+                    let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
+                    if Self::edge_write_needs_invalidation(is_write, sql) {
+                        // `tables_only` skips the fingerprint/params-hash work
+                        // (discarded here) — a bulk INSERT must not pay full-
+                        // buffer regex rewrites on the forward path. An EMPTY
+                        // table set invalidates everything at or below the
+                        // version — an unparseable write must not leave stale
+                        // entries behind (coherence rule).
+                        let tables = crate::edge::fingerprint::tables_only(sql);
+                        if session
+                            .copy_in_progress
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            *session
+                                .pending_edge_copy_tables
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(tables);
+                        } else {
+                            Self::edge_invalidate_write(state, config, tables).await;
+                        }
                     }
                 }
                 // Transaction Replay: journal the write for failover/time-travel.
@@ -3882,11 +4287,18 @@ impl ProxyServer {
     }
 
     /// Like `stream_until_ready` but also captures the full response bytes for
-    /// caching. Returns `(bytes_sent, captured, cacheable, row_count)`.
+    /// caching (query-cache and/or edge cache — one shared capture).
+    /// Returns `(bytes_sent, captured, cacheable, row_count)`.
     /// `cacheable` is false if the response carried an `ErrorResponse`, ended in
-    /// a non-idle transaction status, or yielded for COPY — none of which may
-    /// be cached.
-    #[cfg(feature = "query-cache")]
+    /// a non-idle transaction status, yielded for COPY, or contained an
+    /// asynchronous backend frame — NotificationResponse ('A'), NoticeResponse
+    /// ('N'), or ParameterStatus ('S'). Async frames belong to THIS session's
+    /// moment in time (a LISTENing session's notification, a GUC change);
+    /// replaying them to every later hitter would leak the notification
+    /// payload cross-session and desynchronize hitters' parameter state. The
+    /// frames are still forwarded to the live requester — only the store is
+    /// suppressed.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     async fn stream_until_ready_capture(
         client: &mut ClientStream,
         backend: &mut TcpStream,
@@ -3896,6 +4308,7 @@ impl ProxyServer {
         let mut sent: u64 = 0;
         let mut captured: Vec<u8> = Vec::with_capacity(4096);
         let mut had_error = false;
+        let mut saw_async = false;
         let mut row_count: usize = 0;
 
         loop {
@@ -3915,6 +4328,11 @@ impl ProxyServer {
                 let mtype = rem[0];
                 if mtype == b'E' {
                     had_error = true;
+                }
+                // Async backend frames (backend 'S' is unambiguous here —
+                // PortalSuspended is lowercase 's').
+                if mtype == b'A' || mtype == b'N' || mtype == b'S' {
+                    saw_async = true;
                 }
                 if mtype == b'C' {
                     // CommandComplete tag, e.g. "SELECT 5" — take the row count.
@@ -3960,7 +4378,7 @@ impl ProxyServer {
                     st != TransactionStatus::Idle,
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                let cacheable = !had_error && status == b'I';
+                let cacheable = !had_error && status == b'I' && !saw_async;
                 return Ok((sent, captured, cacheable, row_count));
             }
             if yield_for_copy {
@@ -4095,6 +4513,227 @@ impl ProxyServer {
         false
     }
 
+    /// Should this successfully-executed simple-query string trigger an edge
+    /// invalidation?
+    ///
+    /// - Bare transaction control (BEGIN/START/SAVEPOINT/RELEASE/ROLLBACK)
+    ///   changes no rows: exempt, or every ORM transaction would full-flush
+    ///   the whole fleet twice per request. COMMIT is deliberately NOT
+    ///   exempt (its flush closes the invalidate-at-statement vs
+    ///   commit-visibility window for in-transaction writes), nor is SET
+    ///   (the flush is the interim mitigation for GUC-sensitive results).
+    /// - A multi-statement string (interior `;`) may hide a trailing write
+    ///   behind a read-classified lead — always invalidate (the fingerprint
+    ///   extracts tables from every sub-statement; over-invalidation only).
+    /// - `COPY ... FROM` loads rows but is not classified `is_write` (it
+    ///   must not be re-routed); catch it here for invalidation.
+    #[cfg(feature = "edge-proxy")]
+    fn edge_write_needs_invalidation(is_write: bool, sql: &str) -> bool {
+        use crate::protocol::starts_with_ci;
+        let t = sql.trim();
+        let core = t.strip_suffix(';').unwrap_or(t).trim_end();
+        let multi_stmt = core.contains(';');
+        if !multi_stmt
+            && (starts_with_ci(core, "BEGIN")
+                || starts_with_ci(core, "START")
+                || starts_with_ci(core, "SAVEPOINT")
+                || starts_with_ci(core, "RELEASE")
+                || starts_with_ci(core, "ROLLBACK"))
+        {
+            return false;
+        }
+        is_write
+            || multi_stmt
+            || Self::is_edge_copy_write_sql(core)
+            || Self::is_edge_procedural_sql(core)
+            || Self::is_edge_txn_end_sql(core)
+    }
+
+    /// `COPY ... FROM ...` (STDIN or file) loads rows. Word-boundary FROM so
+    /// `COPY t TO ...` stays a read; a `COPY (SELECT ... FROM t) TO ...`
+    /// false-positive only over-invalidates — safe.
+    #[cfg(feature = "edge-proxy")]
+    fn is_edge_copy_write_sql(sql: &str) -> bool {
+        crate::protocol::starts_with_ci(sql.trim_start(), "COPY")
+            && Self::contains_word_ci(sql, "from")
+    }
+
+    /// Which of a batch's Closed statement names may have their edge
+    /// invalidation metadata pruned at a Sync boundary. A name Closed and then
+    /// re-Parsed in the SAME batch must keep its FRESH metadata (dropping it
+    /// would silently disable invalidation for the live re-prepared statement —
+    /// the Npgsql statement-replacement pattern), so it is excluded. Pruning is
+    /// additionally gated on the Sync by the caller, so a Close seen at an
+    /// earlier Flush keeps its metadata alive for the terminating Sync's
+    /// invalidation hook. Regression guard for the G1 finding.
+    #[cfg(feature = "edge-proxy")]
+    fn edge_meta_prunable<'a>(closes: &'a [String], defines: &[String]) -> Vec<&'a str> {
+        closes
+            .iter()
+            .filter(|n| !defines.contains(n))
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// SQL-level statements whose written table set cannot be attributed
+    /// statically — `EXECUTE` (runs a prepared plan), `CALL` (a procedure),
+    /// `DO` (an anonymous block, often dynamic SQL). Treated as an
+    /// invalidate-everything wildcard write. Rare on the wire (no mainstream
+    /// driver emits them for data changes), so the full flush is cheap in
+    /// practice and over-invalidation is always safe.
+    #[cfg(feature = "edge-proxy")]
+    fn is_edge_procedural_sql(sql: &str) -> bool {
+        use crate::protocol::starts_with_ci;
+        let t = sql.trim_start();
+        starts_with_ci(t, "EXECUTE") || starts_with_ci(t, "CALL") || starts_with_ci(t, "DO")
+    }
+
+    /// Transaction-ending statements: `COMMIT`/`END` and their variants
+    /// (`COMMIT WORK`/`AND CHAIN`/`PREPARED`, `END TRANSACTION`). They make a
+    /// transaction's in-flight writes visible, so — like the simple-path
+    /// COMMIT — they trigger the conservative wildcard flush that closes the
+    /// invalidate-at-statement vs commit-visibility window. `BEGIN`/`START`/
+    /// `SAVEPOINT`/`RELEASE`/`ROLLBACK` are excluded (they make nothing newly
+    /// visible). `END` is a COMMIT synonym here; a rare non-transaction
+    /// statement that happens to start with `END` only over-invalidates.
+    #[cfg(feature = "edge-proxy")]
+    fn is_edge_txn_end_sql(sql: &str) -> bool {
+        use crate::protocol::starts_with_ci;
+        let t = sql.trim_start();
+        starts_with_ci(t, "COMMIT") || starts_with_ci(t, "END")
+    }
+
+    /// Extended-protocol statement classifier for edge invalidation: does
+    /// this Parse'd SQL modify table data when executed? Deliberately NOT
+    /// `is_write_query` — that routing classifier counts BEGIN/COMMIT/SET as
+    /// writes, and their empty table set would full-flush the fleet on every
+    /// transaction commit. WITH-prefixed statements are checked for
+    /// data-modifying CTE verbs by word (false positives over-invalidate
+    /// only).
+    #[cfg(feature = "edge-proxy")]
+    fn is_edge_dml_sql(sql: &str) -> bool {
+        use crate::protocol::starts_with_ci;
+        let t = sql.trim_start();
+        if starts_with_ci(t, "INSERT")
+            || starts_with_ci(t, "UPDATE")
+            || starts_with_ci(t, "DELETE")
+            || starts_with_ci(t, "MERGE")
+            || starts_with_ci(t, "CREATE")
+            || starts_with_ci(t, "DROP")
+            || starts_with_ci(t, "ALTER")
+            || starts_with_ci(t, "TRUNCATE")
+            || starts_with_ci(t, "GRANT")
+            || starts_with_ci(t, "REVOKE")
+        {
+            return true;
+        }
+        if starts_with_ci(t, "COPY") {
+            return Self::contains_word_ci(t, "from");
+        }
+        if starts_with_ci(t, "WITH") {
+            return Self::contains_word_ci(t, "insert")
+                || Self::contains_word_ci(t, "update")
+                || Self::contains_word_ci(t, "delete")
+                || Self::contains_word_ci(t, "merge");
+        }
+        false
+    }
+
+    /// Union the invalidation table set for an extended-protocol batch from
+    /// the per-statement metadata memoized at Parse time. Returns `None`
+    /// when the batch references no DML statement; `Some(vec![])` (the
+    /// invalidate-everything wildcard) when any referenced DML has an
+    /// unattributable table set.
+    #[cfg(feature = "edge-proxy")]
+    fn edge_extended_batch_tables(
+        refs: &[String],
+        bound_unnamed: bool,
+        named_meta: &HashMap<String, Option<Vec<String>>>,
+        unnamed_meta: &Option<Vec<String>>,
+    ) -> Option<Vec<String>> {
+        let mut any_dml = false;
+        let mut wipe_all = false;
+        let mut union: Vec<String> = Vec::new();
+        {
+            let mut consider = |meta: &Option<Vec<String>>| {
+                if let Some(tables) = meta {
+                    any_dml = true;
+                    if tables.is_empty() {
+                        wipe_all = true;
+                    } else {
+                        for t in tables {
+                            if !union.contains(t) {
+                                union.push(t.clone());
+                            }
+                        }
+                    }
+                }
+            };
+            for name in refs {
+                if let Some(meta) = named_meta.get(name) {
+                    consider(meta);
+                }
+            }
+            if bound_unnamed {
+                consider(unnamed_meta);
+            }
+        }
+        if !any_dml {
+            None
+        } else if wipe_all {
+            Some(Vec::new())
+        } else {
+            Some(union)
+        }
+    }
+
+    /// Version-stamp a completed write, drop matching local entries, and
+    /// (home role) fan the invalidation out over SSE. An edge never
+    /// broadcasts — the home versions writes, so the edge sweeps in the
+    /// observed-home domain and lets the home's own event follow.
+    #[cfg(feature = "edge-proxy")]
+    async fn edge_invalidate_write(
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+        tables: Vec<String>,
+    ) {
+        if config.edge.role == crate::edge::EdgeRole::Home {
+            let version = state.edge_cache.next_version();
+            let dropped = state.edge_cache.invalidate(version, &tables);
+            let (notified, pruned) = state
+                .edge_registry
+                .broadcast(crate::edge::InvalidationEvent {
+                    up_to_version: version,
+                    tables,
+                    committed_at: chrono::Utc::now().to_rfc3339(),
+                    epoch: state.edge_cache.epoch(),
+                })
+                .await;
+            tracing::debug!(
+                target: "helios::edge",
+                version,
+                dropped,
+                notified,
+                pruned,
+                "write invalidation broadcast to edges"
+            );
+        } else {
+            // Edge-local sweep in the observed-home domain: every locally
+            // cached entry is stamped at or below the observed version, so
+            // this drops all entries for the touched tables. It also bumps
+            // the invalidation epoch, rejecting in-flight read stores that
+            // raced this write.
+            let version = state.edge_cache.observed_home_version();
+            let dropped = state.edge_cache.invalidate(version, &tables);
+            tracing::debug!(
+                target: "helios::edge",
+                version,
+                dropped,
+                "write invalidated local edge cache (edge role — home broadcasts)"
+            );
+        }
+    }
+
     /// Conservative classifier for the conditional-reset optimisation: could
     /// this forwarded simple-query SQL leave *session-level* state on the
     /// backend connection that `DISCARD ALL` would need to clear before another
@@ -4113,7 +4752,12 @@ impl ProxyServer {
     /// SQL text. The direct forms (`set_config`, `pg_advisory*`, `nextval`,
     /// `setval`) ARE caught. This is why `skip_clean_reset` is opt-in and
     /// intended for autocommit/simple-protocol workloads.
-    #[cfg(feature = "pool-modes")]
+    ///
+    /// Also reused by the edge cache as its sticky session-eligibility
+    /// gate: a session that leaves session state (GUCs, SET ROLE, temp
+    /// objects) no longer matches the shared cache's key model and is
+    /// permanently excluded from edge lookup/store.
+    #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
     fn stmt_leaves_session_state(sql: &str) -> bool {
         use crate::protocol::{contains_ci, starts_with_ci};
         let t = sql.trim();
@@ -4175,7 +4819,11 @@ impl ProxyServer {
     /// string edge) on both sides, so a real SQL keyword like `INTO` is caught
     /// regardless of surrounding whitespace while an identifier substring
     /// (`into_total`) is not.
-    #[cfg(feature = "pool-modes")]
+    #[cfg(any(
+        feature = "pool-modes",
+        feature = "edge-proxy",
+        feature = "query-cache"
+    ))]
     fn contains_word_ci(haystack: &str, word: &str) -> bool {
         let hb = haystack.as_bytes();
         let wb = word.as_bytes();
@@ -4396,20 +5044,42 @@ impl ProxyServer {
         max_lag_bytes > 0 && lag_bytes.map(|l| l > max_lag_bytes).unwrap_or(false)
     }
 
-    /// Pure predicate: is `sql` a plain, deterministic SELECT safe to cache?
-    /// (Not WITH/locking/volatile.) Transaction state is checked separately.
-    #[cfg(feature = "query-cache")]
+    /// Pure predicate: is `sql` a plain, deterministic, SINGLE-statement
+    /// SELECT safe to cache? (Not WITH/locking/volatile/multi-statement/
+    /// SELECT INTO.) Transaction state is checked separately. Shared by the
+    /// query-cache and edge-cache read gates.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     fn is_cacheable_read_sql(sql: &str) -> bool {
         use crate::protocol::{contains_ci, starts_with_ci};
         let t = sql.trim_start();
         if !starts_with_ci(t, "SELECT") {
             return false;
         }
+        // Multi-statement simple-query strings (`SELECT ...; UPDATE ...`)
+        // must never be cached: replaying the capture would fabricate the
+        // trailing statements' results while executing nothing. One
+        // trailing `;` is fine; a `;` inside a string literal only costs
+        // cacheability — safe.
+        let core = t.trim_end();
+        let core = core.strip_suffix(';').map(str::trim_end).unwrap_or(core);
+        if core.contains(';') {
+            return false;
+        }
+        // `SELECT ... INTO t` CREATES a table (CREATE TABLE AS synonym);
+        // replaying it from cache would silently skip the DDL. Word-boundary
+        // match, so newline/tab-delimited INTO is caught while a column
+        // named `into_x` is not (a literal containing the word merely skips
+        // caching).
+        if Self::contains_word_ci(core, "into") {
+            return false;
+        }
         if contains_ci(t, "FOR UPDATE") || contains_ci(t, "FOR SHARE") {
             return false;
         }
-        // Non-deterministic reads must not be reused.
-        const VOLATILE: [&str; 10] = [
+        // Non-deterministic or side-effectful reads must not be reused
+        // (set_config emits ParameterStatus and mutates GUCs — replaying it
+        // would suppress the side effect).
+        const VOLATILE: [&str; 11] = [
             "now(",
             "current_timestamp",
             "current_date",
@@ -4420,6 +5090,7 @@ impl ProxyServer {
             "nextval(",
             "uuid_generate",
             "gen_random_uuid",
+            "set_config(",
         ];
         !VOLATILE.iter().any(|v| contains_ci(t, v))
     }
@@ -5513,6 +6184,42 @@ impl ProxyServer {
         })
     }
 
+    /// Spawn the edge-registry maintenance task: a periodic GC sweep that
+    /// prunes edges not seen within the liveness window. Healthy subscribers
+    /// are continually refreshed by their SSE heartbeat writes (registry
+    /// `touch`), so this is a backstop that reaps wedged or dead peers whose
+    /// heartbeats stopped succeeding — a pruned edge simply re-registers on
+    /// its next reconnect.
+    #[cfg(feature = "edge-proxy")]
+    fn spawn_edge_maintenance(&self) -> tokio::task::JoinHandle<()> {
+        let state = self.state.clone();
+        // validate() rejects 0 when edge is enabled; .max(1) keeps the
+        // interval panic-proof regardless of how the config was built.
+        let gc_secs = self.config.edge.subscribe_gc_secs.max(1);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(gc_secs));
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let pruned = state.edge_registry.prune_stale();
+                        if pruned > 0 {
+                            tracing::debug!(
+                                target: "helios::edge",
+                                pruned,
+                                remaining = state.edge_registry.count(),
+                                "edge registry GC pruned stale edges"
+                            );
+                        }
+                    }
+                    _ = shutdown_rx.recv() => break,
+                }
+            }
+        })
+    }
+
     /// Shutdown the server
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
@@ -5799,6 +6506,10 @@ mod tests {
             pool_client_id: crate::pool::lease::ClientId::default(),
             #[cfg(feature = "wasm-plugins")]
             plugin_identity: RwLock::new(None),
+            #[cfg(feature = "edge-proxy")]
+            edge_ineligible: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "edge-proxy")]
+            pending_edge_copy_tables: std::sync::Mutex::new(None),
         })
     }
 
@@ -6003,6 +6714,8 @@ mod tests {
         // Synthesise a state with a real PluginManager but zero
         // registered plugins — every hook must defer.
         let pm = Arc::new(PluginManager::new(PluginRuntimeConfig::default()).unwrap());
+        #[cfg(feature = "edge-proxy")]
+        let edge_defaults = crate::edge::EdgeConfig::default();
         let augmented_state = Arc::new(ServerState {
             sessions: DashMap::new(),
             health: ArcSwap::from_pointee(HashMap::new()),
@@ -6046,11 +6759,13 @@ mod tests {
                 crate::anomaly::AnomalyConfig::default(),
             )),
             #[cfg(feature = "edge-proxy")]
-            edge_cache: Arc::new(crate::edge::EdgeCache::new(10_000)),
+            edge_cache: Arc::new(crate::edge::EdgeCache::new(
+                edge_defaults.max_entries.max(1),
+            )),
             #[cfg(feature = "edge-proxy")]
             edge_registry: Arc::new(crate::edge::EdgeRegistry::new(
-                32,
-                std::time::Duration::from_secs(120),
+                edge_defaults.max_edges,
+                std::time::Duration::from_secs(edge_defaults.liveness_window_secs),
             )),
         });
 
@@ -6452,6 +7167,375 @@ mod tests {
             assert!(!ProxyServer::is_cacheable_read_sql("select now()"));
             assert!(!ProxyServer::is_cacheable_read_sql("select random()"));
             assert!(!ProxyServer::is_cacheable_read_sql("select nextval('s')"));
+            // set_config mutates GUCs + emits ParameterStatus — replaying
+            // from cache would suppress the side effect.
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "select set_config('timezone', 'UTC', false) from t"
+            ));
+        }
+
+        #[test]
+        fn multi_statement_strings_are_not_cacheable() {
+            // Replaying `SELECT ...; UPDATE ...` would fabricate the
+            // UPDATE's CommandComplete while executing nothing.
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "select v from t; update t set v = 1"
+            ));
+            assert!(!ProxyServer::is_cacheable_read_sql("select 1; select 2"));
+            // A single trailing semicolon stays cacheable.
+            assert!(ProxyServer::is_cacheable_read_sql("select v from t;"));
+            assert!(ProxyServer::is_cacheable_read_sql("SELECT v FROM t ; "));
+        }
+
+        #[test]
+        fn literal_semicolon_or_into_over_rejects_by_design() {
+            // G7 (accepted, safe-direction): the multi-statement and SELECT INTO
+            // guards scan the RAW text, so a ';' or the word "into" inside a
+            // string literal disqualifies an otherwise-cacheable SELECT. This
+            // over-rejection is DELIBERATE and hit-rate-only — the raw scan is
+            // the sole defense against multi-statement replay fabrication (a
+            // literal-stripping pre-pass would misjudge `'x\'; UPDATE ...'` under
+            // standard_conforming_strings and reopen that hole), and a real
+            // SELECT INTO is protocol-indistinguishable from a plain SELECT.
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "select v from t where url = 'a;b=c'"
+            ));
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "select v from t where body like '%go into space%'"
+            ));
+            // A real SELECT INTO (it creates a table) must never be cached.
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "select * into snapshot from t"
+            ));
+        }
+
+        #[test]
+        fn select_into_is_not_cacheable() {
+            // SELECT ... INTO creates a table (CREATE TABLE AS synonym);
+            // a cache replay would silently skip the DDL.
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "select * into report_tmp from src"
+            ));
+            // Word-boundary: newline/tab-delimited INTO is caught too.
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "SELECT *\nINTO report_tmp\nFROM src"
+            ));
+            // ...but an identifier merely containing "into" is not.
+            assert!(ProxyServer::is_cacheable_read_sql(
+                "select into_total from t"
+            ));
+        }
+    }
+
+    // ---- edge-proxy: write-invalidation classifiers ----
+
+    #[cfg(feature = "edge-proxy")]
+    mod edge_proxy {
+        use super::ProxyServer;
+        use std::collections::HashMap;
+
+        #[test]
+        fn bare_txn_control_is_exempt_from_invalidation() {
+            // F10: BEGIN/START/SAVEPOINT/RELEASE/ROLLBACK change no rows —
+            // an ORM's txn-per-request must not full-flush the fleet twice
+            // per request.
+            for sql in [
+                "BEGIN",
+                "begin;",
+                "START TRANSACTION",
+                "SAVEPOINT sp1",
+                "RELEASE SAVEPOINT sp1",
+                "ROLLBACK",
+                "ROLLBACK TO SAVEPOINT sp1;",
+            ] {
+                assert!(
+                    !ProxyServer::edge_write_needs_invalidation(true, sql),
+                    "{sql:?} must be exempt"
+                );
+            }
+            // COMMIT keeps its conservative flush (closes the in-txn
+            // write visibility window), and SET stays (GUC mitigation).
+            assert!(ProxyServer::edge_write_needs_invalidation(true, "COMMIT"));
+            assert!(ProxyServer::edge_write_needs_invalidation(
+                true,
+                "SET search_path TO tenant_b"
+            ));
+        }
+
+        #[test]
+        fn compound_txn_strings_still_invalidate() {
+            // A multi-statement string may hide a write behind a
+            // txn-control or SELECT lead — never exempt it.
+            assert!(ProxyServer::edge_write_needs_invalidation(
+                true,
+                "BEGIN; UPDATE t SET v = 1; COMMIT"
+            ));
+            // SELECT-leading batch with a trailing write classifies
+            // is_write=false, but the interior `;` forces invalidation.
+            assert!(ProxyServer::edge_write_needs_invalidation(
+                false,
+                "SELECT v FROM t; UPDATE t SET v = 1"
+            ));
+            // A plain single SELECT does not invalidate.
+            assert!(!ProxyServer::edge_write_needs_invalidation(
+                false,
+                "SELECT v FROM t"
+            ));
+        }
+
+        #[test]
+        fn copy_from_counts_as_write() {
+            assert!(ProxyServer::edge_write_needs_invalidation(
+                false,
+                "COPY t FROM STDIN"
+            ));
+            assert!(ProxyServer::is_edge_copy_write_sql("copy t from stdin"));
+            // COPY TO exports rows — a read.
+            assert!(!ProxyServer::edge_write_needs_invalidation(
+                false,
+                "COPY t TO STDOUT"
+            ));
+        }
+
+        #[test]
+        fn procedural_and_txn_end_trigger_invalidation() {
+            // G3: SQL-level EXECUTE/CALL/DO are opaque writes — the simple path
+            // must invalidate and the classifier flags them (the extended path
+            // memoizes them as the empty-set wildcard via the same predicate).
+            for sql in [
+                "EXECUTE ins(1)",
+                "execute ins(1)",
+                "CALL do_write()",
+                "DO $$ BEGIN PERFORM 1; END $$",
+            ] {
+                assert!(
+                    ProxyServer::is_edge_procedural_sql(sql),
+                    "{sql:?} is procedural"
+                );
+                assert!(
+                    ProxyServer::edge_write_needs_invalidation(false, sql),
+                    "{sql:?} must invalidate on the simple path"
+                );
+            }
+            for sql in [
+                "INSERT INTO t VALUES (1)",
+                "SELECT 1 FROM t",
+                "UPDATE t SET v=1",
+            ] {
+                assert!(
+                    !ProxyServer::is_edge_procedural_sql(sql),
+                    "{sql:?} is not procedural"
+                );
+            }
+
+            // G2: COMMIT and its END synonym both trigger the wildcard flush
+            // (closing the commit-visibility window); the openers do not.
+            for sql in [
+                "COMMIT",
+                "commit work",
+                "COMMIT PREPARED 'x'",
+                "END",
+                "END TRANSACTION",
+                "end;",
+            ] {
+                assert!(ProxyServer::is_edge_txn_end_sql(sql), "{sql:?} ends a txn");
+                assert!(
+                    ProxyServer::edge_write_needs_invalidation(false, sql),
+                    "{sql:?} must invalidate (commit-visibility window)"
+                );
+            }
+            for sql in ["BEGIN", "START TRANSACTION", "SAVEPOINT s1", "ROLLBACK"] {
+                assert!(
+                    !ProxyServer::is_edge_txn_end_sql(sql),
+                    "{sql:?} is not a txn-end"
+                );
+                assert!(
+                    !ProxyServer::edge_write_needs_invalidation(false, sql),
+                    "{sql:?} must stay exempt on the simple path"
+                );
+            }
+        }
+
+        #[test]
+        fn edge_meta_prunable_protects_reparsed_names() {
+            // G1: at a Sync, a Closed name NOT re-Parsed this batch is prunable;
+            // a name Closed then re-Parsed (Npgsql statement replacement) must be
+            // RETAINED so its fresh DML metadata survives to invalidate.
+            let closes = vec!["S1".to_string(), "S2".to_string()];
+            let none: Vec<String> = vec![];
+            assert_eq!(
+                ProxyServer::edge_meta_prunable(&closes, &none),
+                vec!["S1", "S2"]
+            );
+            // S1 re-Parsed in the same batch → excluded from pruning.
+            assert_eq!(
+                ProxyServer::edge_meta_prunable(&closes, &["S1".to_string()]),
+                vec!["S2"]
+            );
+            // Every closed name re-Parsed → nothing pruned (all meta kept fresh).
+            assert!(ProxyServer::edge_meta_prunable(&closes, &closes).is_empty());
+        }
+
+        #[test]
+        fn edge_dml_classifier_covers_dml_not_txn_control() {
+            for sql in [
+                "INSERT INTO t VALUES (1)",
+                "update t set v = 1",
+                "DELETE FROM t WHERE id = 1",
+                "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v",
+                "TRUNCATE t",
+                "ALTER TABLE t ADD COLUMN c int",
+                "COPY t FROM STDIN",
+                "WITH del AS (DELETE FROM t RETURNING id) SELECT * FROM del",
+            ] {
+                assert!(ProxyServer::is_edge_dml_sql(sql), "{sql:?} is DML");
+            }
+            // Txn control / reads / plain CTE reads: NOT invalidation
+            // triggers (BEGIN/COMMIT here would full-flush per txn).
+            for sql in [
+                "BEGIN",
+                "COMMIT",
+                "ROLLBACK",
+                "SET search_path TO x",
+                "SELECT v FROM t",
+                "WITH x AS (SELECT 1) SELECT * FROM x",
+                "COPY t TO STDOUT",
+            ] {
+                assert!(!ProxyServer::is_edge_dml_sql(sql), "{sql:?} is not DML");
+            }
+        }
+
+        #[test]
+        fn extended_batch_tables_union_and_wildcard() {
+            let mut named: HashMap<String, Option<Vec<String>>> = HashMap::new();
+            named.insert("ins".into(), Some(vec!["orders".into()]));
+            named.insert("upd".into(), Some(vec!["users".into()]));
+            named.insert("sel".into(), None);
+            named.insert("weird".into(), Some(vec![])); // unattributable DML
+            let unnamed: Option<Vec<String>> = Some(vec!["events".into()]);
+
+            // Read-only batch: no invalidation.
+            assert_eq!(
+                ProxyServer::edge_extended_batch_tables(
+                    &["sel".to_string()],
+                    false,
+                    &named,
+                    &unnamed
+                ),
+                None
+            );
+            // DML batch: union of referenced statements' tables.
+            let t = ProxyServer::edge_extended_batch_tables(
+                &["ins".to_string(), "upd".to_string(), "ins".to_string()],
+                false,
+                &named,
+                &unnamed,
+            )
+            .expect("dml");
+            assert_eq!(t, vec!["orders".to_string(), "users".to_string()]);
+            // Unnamed execution folds in.
+            let t = ProxyServer::edge_extended_batch_tables(&[], true, &named, &unnamed)
+                .expect("unnamed dml");
+            assert_eq!(t, vec!["events".to_string()]);
+            // Any unattributable DML → wildcard (invalidate everything).
+            let t = ProxyServer::edge_extended_batch_tables(
+                &["ins".to_string(), "weird".to_string()],
+                false,
+                &named,
+                &unnamed,
+            )
+            .expect("dml");
+            assert!(t.is_empty(), "wildcard invalidation");
+            // Unknown names (never Parse'd — backend errors anyway) are
+            // treated as non-DML.
+            assert_eq!(
+                ProxyServer::edge_extended_batch_tables(
+                    &["ghost".to_string()],
+                    false,
+                    &named,
+                    &None
+                ),
+                None
+            );
+        }
+    }
+
+    /// F12: async backend frames (NotificationResponse 'A', NoticeResponse
+    /// 'N', ParameterStatus 'S') captured inside a response window must
+    /// suppress the store (`cacheable = false`) while still being forwarded
+    /// byte-for-byte — a cached LISTEN/NOTIFY payload would replay to every
+    /// later hitter cross-session.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    #[tokio::test]
+    async fn capture_excludes_async_frames_from_cacheable() {
+        use crate::client_tls::ClientStream;
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::{TcpListener, TcpStream};
+
+        async fn pair() -> (TcpStream, TcpStream) {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            let (accepted, connected) = tokio::join!(l.accept(), TcpStream::connect(addr));
+            (accepted.unwrap().0, connected.unwrap())
+        }
+
+        fn frame(mtype: u8, body: &[u8]) -> Vec<u8> {
+            let mut v = vec![mtype];
+            v.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+            v.extend_from_slice(body);
+            v
+        }
+
+        let clean: Vec<u8> = [
+            frame(b'T', b"rowdesc"),
+            frame(b'D', b"row"),
+            frame(b'C', b"SELECT 1\0"),
+            frame(b'Z', b"I"),
+        ]
+        .concat();
+        let with_notify: Vec<u8> = [
+            frame(b'T', b"rowdesc"),
+            frame(b'A', b"\x00\x00\x30\x39chan\0payload\0"),
+            frame(b'D', b"row"),
+            frame(b'C', b"SELECT 1\0"),
+            frame(b'Z', b"I"),
+        ]
+        .concat();
+        let with_param_status: Vec<u8> = [
+            frame(b'D', b"row"),
+            frame(b'C', b"SELECT 1\0"),
+            frame(b'S', b"TimeZone\0UTC\0"),
+            frame(b'Z', b"I"),
+        ]
+        .concat();
+
+        for (bytes, want_cacheable) in [
+            (clean, true),
+            (with_notify, false),
+            (with_param_status, false),
+        ] {
+            let (mut backend, mut backend_peer) = pair().await;
+            let (client_raw, mut client_peer) = pair().await;
+            let mut client = ClientStream::Plain(client_raw);
+            let session = make_test_session();
+
+            backend_peer.write_all(&bytes).await.unwrap();
+            backend_peer.flush().await.unwrap();
+
+            let (sent, captured, cacheable, _rows) =
+                ProxyServer::stream_until_ready_capture(&mut client, &mut backend, &session)
+                    .await
+                    .expect("capture ok");
+            assert_eq!(cacheable, want_cacheable, "cacheable flag");
+            assert_eq!(sent as usize, bytes.len());
+            assert_eq!(captured, bytes, "capture is byte-exact");
+
+            // Every frame — async ones included — was forwarded to the
+            // live client.
+            let mut got = vec![0u8; bytes.len()];
+            client_peer.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, bytes, "forwarding must not be filtered");
         }
     }
 

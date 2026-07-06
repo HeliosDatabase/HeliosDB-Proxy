@@ -239,6 +239,14 @@ pub struct ProxyConfig {
     /// default — the on-ramp to a PG->Nano migration mirror.
     #[serde(default)]
     pub mirror: MirrorConfig,
+    /// Edge / geo proxy mode (role=home caches reads + broadcasts
+    /// invalidations to subscribed edges; role=edge serves reads from a
+    /// local cache and forwards misses/writes to the home). Disabled by
+    /// default. Parsed on every build so configs round-trip, but
+    /// `enabled = true` requires the `edge-proxy` compile-time feature —
+    /// `validate()` rejects it otherwise.
+    #[serde(default)]
+    pub edge: crate::edge::EdgeConfig,
     /// Instant branch databases. Disabled by default — provisions
     /// CREATE DATABASE ... TEMPLATE clones through the proxy.
     #[serde(default)]
@@ -912,6 +920,7 @@ impl Default for ProxyConfig {
             agent_contracts: Vec::new(),
             http_gateway: HttpGatewayConfig::default(),
             mirror: MirrorConfig::default(),
+            edge: crate::edge::EdgeConfig::default(),
             branch: BranchConfig::default(),
             routing_hints: RoutingHintsConfig::default(),
             rate_limit: RateLimitToml::default(),
@@ -1126,6 +1135,103 @@ impl ProxyConfig {
                          admin_allow_insecure = true to override.",
                         self.admin_address
                     )));
+                }
+            }
+        }
+
+        // Edge / geo proxy mode. The [edge] section is parsed on every build
+        // (so configs round-trip), but enabling it needs the compile-time
+        // feature, and an edge role needs both its control plane (the home's
+        // admin URL for the invalidation subscription) and its data plane
+        // (at least one [[nodes]] entry pointing at the home's PG-wire
+        // listener, through which misses and writes forward).
+        if self.edge.enabled {
+            if !cfg!(feature = "edge-proxy") {
+                return Err(ProxyError::Config(
+                    "edge.enabled = true but this binary was built without the 'edge-proxy' \
+                     feature — rebuild with `--features edge-proxy` or remove/disable the \
+                     [edge] section."
+                        .to_string(),
+                ));
+            }
+            // Same rationale as health.check_interval_secs: a zero interval
+            // panics `tokio::time::interval` at construction, silently killing
+            // the registry GC task. And a zero liveness window would prune
+            // every edge on the first sweep. Reject both up front.
+            if self.edge.subscribe_gc_secs == 0 {
+                return Err(ProxyError::Config(
+                    "edge.subscribe_gc_secs must be >= 1".to_string(),
+                ));
+            }
+            if self.edge.liveness_window_secs == 0 {
+                return Err(ProxyError::Config(
+                    "edge.liveness_window_secs must be >= 1".to_string(),
+                ));
+            }
+            // A zero TTL births every entry expired — the cache would
+            // silently never serve a hit while looking enabled.
+            if self.edge.default_ttl_secs == 0 {
+                return Err(ProxyError::Config(
+                    "edge.default_ttl_secs must be >= 1 when edge is enabled".to_string(),
+                ));
+            }
+            if self.edge.role == crate::edge::EdgeRole::Edge {
+                if self.edge.home_url.trim().is_empty() {
+                    return Err(ProxyError::Config(
+                        "edge.role = 'edge' requires edge.home_url — the home proxy's admin \
+                         base URL (e.g. \"https://home-proxy:9090\") the edge subscribes to \
+                         for cache invalidations."
+                            .to_string(),
+                    ));
+                }
+                // The auth_token is the home's ADMIN bearer (arbitrary SQL,
+                // chaos, replay). Never transmit it in cleartext across the
+                // edge<->home WAN link: require https, or an explicit opt-out
+                // for provably private links (mirrors admin_allow_insecure).
+                // URL schemes are case-insensitive (RFC 3986); compare lowered
+                // so a legitimate `HTTPS://` is not wrongly rejected here (nor
+                // left without downgrade protection in the client).
+                if !self.edge.auth_token.is_empty()
+                    && !self.edge.allow_insecure_home_url
+                    && !self
+                        .edge
+                        .home_url
+                        .trim()
+                        .to_ascii_lowercase()
+                        .starts_with("https://")
+                {
+                    return Err(ProxyError::Config(format!(
+                        "edge.home_url '{}' is not https:// but edge.auth_token is set — the \
+                         token is the home's admin bearer and must not cross the network in \
+                         cleartext. Front the home admin port with a TLS terminator and use \
+                         https://, or set edge.allow_insecure_home_url = true for private \
+                         links (VPN/WireGuard/service mesh).",
+                        self.edge.home_url.trim()
+                    )));
+                }
+                // The query-result cache is not wired to SSE invalidations:
+                // on an edge it would keep serving rows the home already
+                // invalidated, for the full query-cache TTL. Refuse the
+                // combination (the edge cache covers cacheable SELECTs here).
+                if cfg!(feature = "query-cache") && self.cache.enabled {
+                    return Err(ProxyError::Config(
+                        "edge.role = 'edge' cannot be combined with [cache] enabled = true — \
+                         the query-result cache does not receive edge invalidations and would \
+                         serve stale rows past the edge coherence bound. Disable [cache] on \
+                         edge-role proxies; the edge cache serves cacheable SELECTs there."
+                            .to_string(),
+                    ));
+                }
+                // Redundant with the global no-nodes check above today, but
+                // kept for a message that says *what the node is for* in
+                // edge mode should that check ever be relaxed.
+                if self.nodes.is_empty() {
+                    return Err(ProxyError::Config(
+                        "edge.role = 'edge' requires at least one [[nodes]] entry pointing \
+                         at the home proxy's PG-wire listener — cache misses and writes \
+                         forward there."
+                            .to_string(),
+                    ));
                 }
             }
         }
@@ -1440,6 +1546,151 @@ mod tests {
         assert!(config.validate().is_err());
         config.health.check_interval_secs = 1;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_edge_disabled_section_is_inert() {
+        // The default [edge] section (enabled = false) must never affect
+        // validation, whatever features the binary was built with.
+        let mut config = ProxyConfig::default();
+        config.add_node("localhost:5432", "primary").unwrap();
+        assert!(!config.edge.enabled);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_edge_enabled_requires_feature() {
+        let mut config = ProxyConfig::default();
+        config.add_node("localhost:5432", "primary").unwrap();
+        config.edge.enabled = true;
+        // role=home needs nothing beyond the compile-time feature.
+        if cfg!(feature = "edge-proxy") {
+            assert!(config.validate().is_ok());
+        } else {
+            assert!(
+                config.validate().is_err(),
+                "edge.enabled on a build without the edge-proxy feature must be refused"
+            );
+        }
+    }
+
+    #[cfg(feature = "edge-proxy")]
+    #[test]
+    fn test_validate_edge_rejects_zero_intervals() {
+        // Zero GC cadence panics tokio::time::interval; zero liveness
+        // window prunes every edge on the first sweep. Both refused.
+        let base = || {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            c.edge.enabled = true;
+            c
+        };
+        let mut c = base();
+        c.edge.subscribe_gc_secs = 0;
+        assert!(c.validate().is_err());
+        let mut c = base();
+        c.edge.liveness_window_secs = 0;
+        assert!(c.validate().is_err());
+        // Only enforced when the section is enabled: an inert config
+        // with odd values must not fail validation.
+        let mut c = base();
+        c.edge.enabled = false;
+        c.edge.subscribe_gc_secs = 0;
+        assert!(c.validate().is_ok());
+    }
+
+    #[cfg(feature = "edge-proxy")]
+    #[test]
+    fn test_validate_edge_role_requires_home_url() {
+        let base = || {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            c.edge.enabled = true;
+            c.edge.role = crate::edge::EdgeRole::Edge;
+            c
+        };
+        // role=edge without home_url: refused, and the message says why.
+        let c = base();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("home_url"), "unexpected error: {}", err);
+        // role=edge + home_url (+ the node from base): allowed.
+        let mut c = base();
+        c.edge.home_url = "http://home-proxy:9090".to_string();
+        assert!(c.validate().is_ok());
+    }
+
+    #[cfg(feature = "edge-proxy")]
+    #[test]
+    fn test_validate_edge_zero_ttl_refused_when_enabled() {
+        let mut c = ProxyConfig::default();
+        c.add_node("localhost:5432", "primary").unwrap();
+        c.edge.enabled = true;
+        c.edge.default_ttl_secs = 0;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("default_ttl_secs"),
+            "unexpected error: {}",
+            err
+        );
+        // Inert section: odd values tolerated when disabled.
+        c.edge.enabled = false;
+        assert!(c.validate().is_ok());
+    }
+
+    #[cfg(feature = "edge-proxy")]
+    #[test]
+    fn test_validate_edge_token_requires_https_home_url() {
+        let base = || {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            c.edge.enabled = true;
+            c.edge.role = crate::edge::EdgeRole::Edge;
+            c.edge.home_url = "http://home-proxy:9090".to_string();
+            c
+        };
+        // Tokenless plain-http: fine (no credential to leak).
+        assert!(base().validate().is_ok());
+        // Token over plain http: refused, message names both remedies.
+        let mut c = base();
+        c.edge.auth_token = "secret".to_string();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("https"), "unexpected error: {}", err);
+        assert!(err.contains("allow_insecure_home_url"), "{}", err);
+        // Explicit opt-out for private links: allowed.
+        let mut c = base();
+        c.edge.auth_token = "secret".to_string();
+        c.edge.allow_insecure_home_url = true;
+        assert!(c.validate().is_ok());
+        // Token over https: allowed.
+        let mut c = base();
+        c.edge.auth_token = "secret".to_string();
+        c.edge.home_url = "https://home-proxy:9090".to_string();
+        assert!(c.validate().is_ok());
+    }
+
+    #[cfg(all(feature = "edge-proxy", feature = "query-cache"))]
+    #[test]
+    fn test_validate_edge_role_rejects_query_cache_combo() {
+        // The query-result cache never hears SSE invalidations — on an
+        // edge it would serve stale rows past the edge coherence bound.
+        let mut c = ProxyConfig::default();
+        c.add_node("localhost:5432", "primary").unwrap();
+        c.edge.enabled = true;
+        c.edge.role = crate::edge::EdgeRole::Edge;
+        c.edge.home_url = "https://home-proxy:9090".to_string();
+        c.cache.enabled = true;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("[cache]"), "unexpected error: {}", err);
+        // Home role + query-cache stays permitted (local writes
+        // invalidate both caches on the same path).
+        c.edge.role = crate::edge::EdgeRole::Home;
+        c.edge.home_url.clear();
+        assert!(c.validate().is_ok());
+        // Edge role with the cache disabled is fine.
+        c.edge.role = crate::edge::EdgeRole::Edge;
+        c.edge.home_url = "https://home-proxy:9090".to_string();
+        c.cache.enabled = false;
+        assert!(c.validate().is_ok());
     }
 
     #[test]
