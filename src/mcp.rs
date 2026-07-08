@@ -349,11 +349,16 @@ impl McpServer {
     /// `default_transaction_read_only = on` BEFORE the user statement runs.
     /// This is the hard backstop behind the lexical guard: even if the guard
     /// has a gap, the backend refuses any write. It is safe against
-    /// re-enabling — the guard rejects any statement starting with `SET`
-    /// (in `is_write_sql`) and rejects multi-statement, and each call gets a
-    /// fresh connection, so a single user statement cannot turn the GUC back
-    /// off. The user statement runs as its OWN `simple_query` (not
+    /// re-enabling — the guard rejects any statement starting with `SET` or
+    /// `RESET` (in `is_write_sql`) and rejects multi-statement, and each call
+    /// gets a fresh connection, so a single user statement cannot turn the GUC
+    /// back off. The user statement runs as its OWN `simple_query` (not
     /// concatenated) so result parsing / command_tag stay correct.
+    ///
+    /// Known limitation: `default_transaction_read_only` blocks DML/DDL but NOT
+    /// volatile functions with side effects (e.g. `SELECT nextval('s')`,
+    /// `setval`, superuser file/lo functions). Constrain the gateway's backend
+    /// role if that matters for your deployment.
     async fn run_sql(
         cfg: &McpConfig,
         sql: &str,
@@ -447,13 +452,16 @@ fn format_result(r: &QueryResult) -> String {
     out
 }
 
-/// First-keyword write/DDL detection (read-only guardrail).
+/// First-keyword write/DDL detection (read-only guardrail). `SET`/`RESET` are
+/// included so that, in read-only mode, no single statement can flip the
+/// backend's `default_transaction_read_only` GUC back off (see `run_sql`).
 fn is_write_sql(sql: &str) -> bool {
     use crate::protocol::starts_with_ci;
     let s = sql.trim_start();
     for kw in [
         "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE", "GRANT", "REVOKE",
         "COPY", "MERGE", "CALL", "DO", "VACUUM", "REINDEX", "CLUSTER", "LOCK", "COMMENT", "SET",
+        "RESET",
     ] {
         if starts_with_ci(s, kw) {
             return true;
@@ -477,17 +485,39 @@ fn is_word_byte(b: u8) -> bool {
 
 /// `bytes[i]` is `'` — return the index just past the closing quote (or
 /// end-of-input if unterminated). `''` is an in-string escape, not a close.
+///
+/// If the string is an escape-string (`E'…'` / `e'…'` — a standalone `E`
+/// immediately before the quote), a backslash escapes the next byte, so `\'`
+/// does NOT close the string. Regular strings are treated as
+/// standard-conforming (PostgreSQL's default: backslash is literal, only `''`
+/// escapes), which is what the MCP gateway's fresh backend sessions use.
+///
+/// Detecting the `E` prefix EXACTLY matters for safety: a false positive would
+/// skip a real closing quote and could hide a top-level `;` (an under-count →
+/// bypass). So we require the preceding byte to be `E`/`e` AND the byte before
+/// THAT to be an ASCII non-word boundary — a multibyte identifier char before
+/// `E` (`éE'…'`, where `éE` is one identifier) is deliberately NOT treated as
+/// an escape-string, which at worst over-rejects (fail-closed, safe).
 fn skip_single_quoted(bytes: &[u8], i: usize) -> usize {
+    let escape_string = i >= 1
+        && (bytes[i - 1] == b'E' || bytes[i - 1] == b'e')
+        && (i < 2 || (bytes[i - 2] < 0x80 && !is_word_byte(bytes[i - 2])));
     let mut j = i + 1;
     while j < bytes.len() {
-        if bytes[j] == b'\'' {
-            if j + 1 < bytes.len() && bytes[j + 1] == b'\'' {
-                j += 2; // doubled quote → literal, stay in string
+        match bytes[j] {
+            b'\\' if escape_string => {
+                j += 2; // backslash escapes the next byte in an E'…' string
                 continue;
             }
-            return j + 1;
+            b'\'' => {
+                if j + 1 < bytes.len() && bytes[j + 1] == b'\'' {
+                    j += 2; // doubled quote → literal, stay in string
+                    continue;
+                }
+                return j + 1;
+            }
+            _ => j += 1,
         }
-        j += 1;
     }
     bytes.len()
 }
@@ -693,6 +723,10 @@ mod tests {
         assert!(is_write_sql("INSERT INTO t VALUES (1)"));
         assert!(is_write_sql("  drop table t"));
         assert!(is_write_sql("CREATE TABLE t(x int)"));
+        // SET/RESET are flagged so no single statement can flip the read-only GUC.
+        assert!(is_write_sql("SET default_transaction_read_only=off"));
+        assert!(is_write_sql("RESET default_transaction_read_only"));
+        assert!(is_write_sql("reset all"));
         assert!(!is_write_sql("SELECT * FROM t"));
         assert!(!is_write_sql("  with x as (select 1) select * from x"));
     }
@@ -725,6 +759,36 @@ mod tests {
         assert_eq!(
             split_statements("SELECT 'a;''b;c' AS s"),
             vec!["SELECT 'a;''b;c' AS s"]
+        );
+    }
+
+    #[test]
+    fn split_statements_escape_string_backslash_quote() {
+        // In an E'…' escape-string, `\'` is an escaped quote (NOT a close), so a
+        // `;` after it stays inside the string → ONE statement. Regressing this
+        // to over-reject (the pre-fix behavior) fails closed but breaks valid
+        // agents; verify it is admitted as a single statement.
+        assert_eq!(
+            split_statements(r"SELECT E'a\';b' AS s"),
+            vec![r"SELECT E'a\';b' AS s"]
+        );
+        assert_eq!(
+            split_statements(r"select e'x\';drop' AS s"),
+            vec![r"select e'x\';drop' AS s"]
+        );
+        // A REGULAR (non-E) string is standard-conforming: `\` is literal, so
+        // `'a\'` closes at the `'` and the `;` IS top-level → 2 statements.
+        // (The `E` detection must not leak into plain strings, or a real
+        // separator would be hidden — an under-count bypass.)
+        assert_eq!(
+            split_statements(r"SELECT 'a\'; DROP TABLE t"),
+            vec![r"SELECT 'a\'", "DROP TABLE t"]
+        );
+        // `someE'…'` — the `E` is the tail of an identifier, not an escape-string
+        // prefix, so backslash stays literal and the `'` after `\` closes.
+        assert_eq!(
+            split_statements(r"SELECT xE'a\'; DROP TABLE t"),
+            vec![r"SELECT xE'a\'", "DROP TABLE t"]
         );
     }
 
@@ -849,6 +913,9 @@ mod tests {
             "WITH x AS (INSERT INTO t VALUES(1) RETURNING *) SELECT * FROM x",
             "with recursive r as (delete from t returning *) select * from r",
             "SET default_transaction_read_only=off",
+            // A lone RESET must not un-flip the read-only GUC either.
+            "RESET default_transaction_read_only",
+            "RESET ALL",
         ] {
             assert!(
                 McpServer::check_policy(&cfg, None, sql).is_err(),
@@ -871,6 +938,9 @@ mod tests {
             "SELECT $tag$a;b$tag$ AS s",
             // A `$` inside an identifier is fine on its own — read-only SELECT.
             "SELECT 1 AS a$x$",
+            // An E'…' escape-string whose escaped quote precedes a `;` is a
+            // single read-only SELECT, not a batch — must be admitted.
+            r"SELECT E'a\';b' AS s",
         ] {
             assert!(
                 McpServer::check_policy(&cfg, None, sql).is_ok(),
