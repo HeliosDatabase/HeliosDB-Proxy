@@ -421,6 +421,8 @@ ttl_fallback_secs = 60          # Fallback TTL when WAL is unavailable
 # The section is parsed on every build so configs round-trip. Every key below
 # shows its DEFAULT — omit the section entirely to keep the historical
 # hardcoded behaviour unchanged.
+# NOTE: the detector is built once at startup; changing [anomaly] requires a
+# restart (SIGHUP live-reload does not rebuild it).
 # [anomaly]
 # rate_window_secs       = 60        # Rolling window for the per-tenant rate EWMA (>= 1)
 # spike_z_threshold      = 3.0       # Min z-score before a rate spike fires (finite, > 0)
