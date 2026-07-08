@@ -1591,6 +1591,14 @@ impl ProxyConfig {
                     "anomaly.spike_z_threshold must be a finite value > 0".to_string(),
                 ));
             }
+            if a.auth_critical_count == 0 {
+                // A 0 critical threshold fires Critical on the very first failed
+                // auth (count starts at 1 >= 0), turning every login typo into a
+                // critical alert. Require at least 1.
+                return Err(ProxyError::Config(
+                    "anomaly.auth_critical_count must be >= 1".to_string(),
+                ));
+            }
             if a.auth_warning_count > a.auth_critical_count {
                 return Err(ProxyError::Config(format!(
                     "anomaly.auth_warning_count ({}) must be <= anomaly.auth_critical_count ({})",
@@ -2220,6 +2228,16 @@ mod tests {
         c.anomaly.auth_warning_count = 11;
         c.anomaly.auth_critical_count = 10;
         assert!(c.validate().is_err());
+
+        // auth_critical_count = 0 would fire Critical on the first failed auth.
+        let mut c = base();
+        c.anomaly.auth_critical_count = 0;
+        c.anomaly.auth_warning_count = 0; // keep warning <= critical
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("anomaly.auth_critical_count"),
+            "unexpected error: {err}"
+        );
     }
 
     #[cfg(feature = "anomaly-detection")]
