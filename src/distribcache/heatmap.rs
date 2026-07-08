@@ -386,7 +386,10 @@ impl CacheHeatmap {
                     .unwrap_or_default()
                     .as_nanos() as u64;
 
-                let age_secs = (now - last_access) / 1_000_000_000;
+                // saturating_sub: a wall-clock regression (NTP step-back) can
+                // leave last_access > now; an unguarded u64 subtraction would
+                // wrap to a huge age and wrongly flag live data as cold.
+                let age_secs = now.saturating_sub(last_access) / 1_000_000_000;
 
                 if age_secs > 3600 && total < 1000 {
                     recs.push(Recommendation {
