@@ -1848,20 +1848,56 @@ mod tests {
     #[test]
     fn test_all_shipped_configs_parse() {
         // For every `config/*.toml` and `scripts/regress/*.toml`: run env
-        // substitution (with NO env vars set → `:-default` fallbacks) and
-        // assert it deserializes into `ProxyConfig`. `validate()` is skipped
-        // deliberately — the reference examples reference placeholder hosts.
+        // substitution (with NO env vars set → `:-default` fallbacks) and assert
+        // it deserializes into `ProxyConfig`.
+        //
+        // For the `config/*.toml` reference configs we go further and run the
+        // FULL load path — `ProxyConfig::from_file`, which does substitution +
+        // parse + `validate()` exactly as `heliosdb-proxy -c <file>` does. This
+        // is the real guard behind "the shipped configs load": a deserialize-only
+        // check passes even when `validate()` would reject the file (e.g. the
+        // admin-loopback guard), so it would not have caught the non-loopback
+        // `admin_address` default that made every reference config fail to start.
+        //
+        // The `scripts/regress/*.toml` files are intentionally deserialize-only:
+        // they reference placeholder/non-loopback backend hosts, some enable the
+        // `[edge]` section (which `validate()` gates on the compile-time
+        // `edge-proxy` feature and on an `edge.home_url`), so `validate()` is not
+        // universally applicable there. We still guarantee they parse.
         let manifest = env!("CARGO_MANIFEST_DIR");
-        let dirs = [
-            format!("{manifest}/config"),
-            format!("{manifest}/scripts/regress"),
-        ];
-        let mut checked = 0usize;
-        for dir in dirs {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(e) => e,
-                Err(_) => continue, // directory optional (e.g. slim checkout)
-            };
+        let config_dir = format!("{manifest}/config");
+        let regress_dir = format!("{manifest}/scripts/regress");
+
+        // Reference configs: must survive the entire from_file() load path.
+        let mut config_checked = 0usize;
+        let entries = std::fs::read_dir(&config_dir)
+            .unwrap_or_else(|e| panic!("config dir {config_dir} unreadable: {e}"));
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let path_str = path
+                .to_str()
+                .unwrap_or_else(|| panic!("non-UTF-8 config path {}", path.display()));
+            let loaded = ProxyConfig::from_file(path_str);
+            assert!(
+                loaded.is_ok(),
+                "shipped config {} failed to load via from_file() \
+                 (substitute + parse + validate): {}",
+                path.display(),
+                loaded.err().unwrap()
+            );
+            config_checked += 1;
+        }
+        assert!(
+            config_checked >= 3,
+            "expected to load at least the 3 config/*.toml files, checked {config_checked}"
+        );
+
+        // Regression harness configs: must at least deserialize after
+        // substitution (validate() deliberately skipped — see above).
+        if let Ok(entries) = std::fs::read_dir(&regress_dir) {
             for entry in entries {
                 let path = entry.unwrap().path();
                 if path.extension().and_then(|e| e.to_str()) != Some("toml") {
@@ -1874,17 +1910,12 @@ mod tests {
                 let parsed = toml::from_str::<ProxyConfig>(&substituted);
                 assert!(
                     parsed.is_ok(),
-                    "shipped config {} failed to deserialize: {}",
+                    "regress config {} failed to deserialize: {}",
                     path.display(),
                     parsed.err().unwrap()
                 );
-                checked += 1;
             }
         }
-        assert!(
-            checked >= 3,
-            "expected to check at least the 3 config/*.toml files, checked {checked}"
-        );
     }
 
     #[test]

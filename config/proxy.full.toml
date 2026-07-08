@@ -14,7 +14,9 @@
 # =============================================================================
 
 listen_address = "${HELIOS_PROXY_LISTEN:-0.0.0.0:6432}"
-admin_address  = "${HELIOS_PROXY_ADMIN:-0.0.0.0:9090}"
+# Loopback-only by default. The admin API runs privileged operations; binding it
+# to a non-loopback address requires admin_token (or admin_allow_insecure = true).
+admin_address  = "${HELIOS_PROXY_ADMIN:-127.0.0.1:9090}"
 
 # Transaction Replay — re-execute in-flight work after failover.
 # Modes: none, session (re-establish SET vars), select (replay reads),
