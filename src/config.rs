@@ -1041,7 +1041,11 @@ impl Default for PluginToml {
 ///
 /// SECURITY: this is plain string substitution. It performs ONLY an env lookup
 /// plus the `:-` default operator — it never spawns a shell or evaluates
-/// anything.
+/// anything. Trust boundary: substitution is textual and runs BEFORE the TOML
+/// parse, so a substituted value (env var or `:-default`) that contains a quote
+/// or newline can inject arbitrary TOML structure. Env vars and the config file
+/// are operator-controlled, so this is acceptable; do NOT feed an
+/// untrusted-party-controlled env var into a `${...}` reference.
 ///
 /// Comment-awareness is intentionally LINE-LEVEL only: a line whose first
 /// non-whitespace byte is `#` (a full-line TOML comment) is copied verbatim so
