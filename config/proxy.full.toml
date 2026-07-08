@@ -28,6 +28,47 @@ tr_mode    = "session"
 write_timeout_secs = 30
 
 # =============================================================================
+# LIMITS — Operational safety bounds & timeouts (PG-wire data path)
+# =============================================================================
+# Every key below was previously a hardcoded constant in the proxy. The values
+# shown are the built-in defaults, so leaving the whole [limits] block out (or
+# omitting any single key) is byte-for-byte identical to the historical
+# behaviour. Every value MUST be > 0 — a 0 disables a safety bound rather than
+# meaning "unbounded", so the proxy refuses to start with any 0 here. Timeouts
+# are whole seconds; counts/bytes are plain integers.
+#
+# [limits]
+# # Capacity of the query-cancellation key map (BackendKeyData -> backend addr).
+# # At capacity the oldest entries are FIFO-evicted (a dropped entry only means
+# # one best-effort CancelRequest is not forwarded).
+# max_cancel_keys = 100000
+# # Deadline for the pre-auth startup exchange (client TLS + PG startup/auth).
+# # Bounds slow-loris handshakes; the query loop itself is never bounded.
+# startup_timeout_secs = 30
+# # Timeout for a single backend write on the forward path (a hung/blackholed
+# # backend must never pin a client task indefinitely).
+# backend_write_timeout_secs = 30
+# # Timeout for a single client write (a wedged/slow client must not pin a proxy
+# # task and the backend connection it holds).
+# client_write_timeout_secs = 60
+# # Timeout for the out-of-band re-prepare exchange (Parse+Flush -> ParseComplete)
+# # performed when a session moves to a different backend connection.
+# reprepare_timeout_secs = 15
+# # Per-session cap on distinct named prepared statements.
+# max_prepared_statements = 8192
+# # Per-session cap on aggregate bytes retained in the prepared-statement
+# # registry (each entry holds the full encoded Parse). 64 MiB.
+# max_prepared_bytes = 67108864
+# # Per-session cap on the un-flushed extended-protocol buffer: a client must
+# # reach a Sync/Flush boundary before this many bytes pile up. 64 MiB.
+# max_pending_bytes = 67108864
+# # Global ceiling on idle connections parked in the data-path backend pool
+# # across ALL (node,user,db) identities (pool-modes feature only).
+# max_total_idle_backend_conns = 8192
+# # How often the idle-connection reaper runs.
+# pool_reap_interval_secs = 30
+
+# =============================================================================
 # POOL — Backend connection pool (proxy -> database)
 # =============================================================================
 
