@@ -174,16 +174,30 @@ impl SessionHistory {
     }
 
     fn count_in_window(&self, window: Duration) -> usize {
-        let cutoff = Instant::now() - window;
-        self.query_times.iter().filter(|t| **t > cutoff).count()
+        // `Instant - Duration` panics on underflow, and the monotonic clock
+        // can start near zero (e.g. shortly after host boot). When the window
+        // predates the process start, every recorded query falls inside it.
+        match Instant::now().checked_sub(window) {
+            Some(cutoff) => self.query_times.iter().filter(|t| **t > cutoff).count(),
+            None => self.query_times.len(),
+        }
     }
 
     fn count_fingerprint_in_window(&self, hash: u64, window: Duration) -> usize {
-        let cutoff = Instant::now() - window;
-        self.recent_fingerprints
-            .iter()
-            .filter(|(h, t, _, _)| *h == hash && *t > cutoff)
-            .count()
+        // See count_in_window: near host boot the window predates process
+        // start, so every matching fingerprint counts as in-window.
+        match Instant::now().checked_sub(window) {
+            Some(cutoff) => self
+                .recent_fingerprints
+                .iter()
+                .filter(|(h, t, _, _)| *h == hash && *t > cutoff)
+                .count(),
+            None => self
+                .recent_fingerprints
+                .iter()
+                .filter(|(h, _, _, _)| *h == hash)
+                .count(),
+        }
     }
 
     fn get_repeated_fingerprints(
@@ -305,7 +319,10 @@ impl PatternDetector {
                 session_id: session.session_id.clone(),
                 query_count: count,
                 window: self.config.burst_window,
-                start_nanos: now_nanos() - self.config.burst_window.as_nanos() as u64,
+                // saturating_sub avoids u64 underflow if the wall clock is
+                // near epoch / the window is enormous; 0 = "window opened at
+                // epoch 0", which retains all recent entries as intended.
+                start_nanos: now_nanos().saturating_sub(self.config.burst_window.as_nanos() as u64),
                 end_nanos: now_nanos(),
                 top_fingerprints,
             };
@@ -571,5 +588,44 @@ mod tests {
         assert!(desc.contains("N+1"));
         assert!(desc.contains("10 times"));
         assert!(desc.contains("sess-123"));
+    }
+
+    #[test]
+    fn window_larger_than_uptime_does_not_panic() {
+        // Regression: `Instant::now() - window` panicked on Instant underflow
+        // when the monotonic clock was younger than the window (near host
+        // boot), and `now_nanos() - burst_window` underflowed the u64 nanos.
+        // A window larger than any possible uptime forces both fixed paths:
+        // the checked_sub None branch (every entry counts as in-window) and
+        // the saturating_sub start_nanos.
+        let huge = Duration::from_secs(u64::MAX);
+
+        // Direct SessionHistory helpers: None branch retains all entries.
+        let fp = QueryFingerprinter::new();
+        let fingerprint = fp.fingerprint("SELECT * FROM users WHERE id = 1");
+        let mut history = SessionHistory::new("s".to_string());
+        for _ in 0..3 {
+            history.record_query(&fingerprint, 100);
+        }
+        assert_eq!(history.count_in_window(huge), 3);
+        assert_eq!(
+            history.count_fingerprint_in_window(fingerprint.hash, huge),
+            3
+        );
+
+        // Full detector burst path with an enormous window still fires an
+        // alert (computing saturating_sub start_nanos) without panicking.
+        let mut config = PatternConfig::default();
+        config.burst_window = huge;
+        config.burst_threshold = 3;
+        config.n_plus_one_detection = false;
+        let detector = PatternDetector::new(config);
+        let execution =
+            super::super::statistics::QueryExecution::new("SELECT 1", Duration::from_millis(1));
+        for _ in 0..5 {
+            let f = fp.fingerprint("SELECT 1");
+            detector.record_query("s", &execution, &f);
+        }
+        assert!(!detector.get_burst_alerts().is_empty());
     }
 }
