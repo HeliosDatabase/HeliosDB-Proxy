@@ -48,6 +48,9 @@ write_timeout_secs = 30
 # # Timeout for a single backend write on the forward path (a hung/blackholed
 # # backend must never pin a client task indefinitely).
 # backend_write_timeout_secs = 30
+# # Timeout for a single backend read on the relay path (a backend that accepts
+# # the query but then emits no bytes must not pin a client task forever).
+# backend_read_timeout_secs = 30
 # # Timeout for a single client write (a wedged/slow client must not pin a proxy
 # # task and the backend connection it holds).
 # client_write_timeout_secs = 60

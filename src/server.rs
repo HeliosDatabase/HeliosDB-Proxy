@@ -160,6 +160,7 @@ struct ResolvedLimits {
     max_cancel_keys: usize,
     startup_timeout: Duration,
     backend_write_timeout: Duration,
+    backend_read_timeout: Duration,
     client_write_timeout: Duration,
     reprepare_timeout: Duration,
     max_prepared_statements: usize,
@@ -178,6 +179,7 @@ impl ResolvedLimits {
             max_cancel_keys: l.max_cancel_keys,
             startup_timeout: Duration::from_secs(l.startup_timeout_secs),
             backend_write_timeout: Duration::from_secs(l.backend_write_timeout_secs),
+            backend_read_timeout: Duration::from_secs(l.backend_read_timeout_secs),
             client_write_timeout: Duration::from_secs(l.client_write_timeout_secs),
             reprepare_timeout: Duration::from_secs(l.reprepare_timeout_secs),
             max_prepared_statements: l.max_prepared_statements,
@@ -3763,6 +3765,7 @@ impl ProxyServer {
                     &mut backend.stream,
                     session,
                     state.limits.client_write_timeout,
+                    state.limits.backend_read_timeout,
                 )
                 .await
                 {
@@ -4239,6 +4242,7 @@ impl ProxyServer {
         state: &Arc<ServerState>,
     ) -> Result<u64> {
         let client_write_timeout = state.limits.client_write_timeout;
+        let backend_read_timeout = state.limits.backend_read_timeout;
         let mut buf = BytesMut::with_capacity(16384);
         let mut sent: u64 = 0;
 
@@ -4303,7 +4307,7 @@ impl ProxyServer {
             // Read straight into the frame accumulator — no zeroed scratch, no
             // copy. `read_buf` appends to `buf`'s spare capacity.
             buf.reserve(16384);
-            let n = tokio::time::timeout(Duration::from_secs(30), backend.read_buf(&mut buf))
+            let n = tokio::time::timeout(backend_read_timeout, backend.read_buf(&mut buf))
                 .await
                 .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
                 .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
@@ -4333,6 +4337,7 @@ impl ProxyServer {
         backend: &mut TcpStream,
         session: &Arc<ClientSession>,
         client_write_timeout: Duration,
+        backend_read_timeout: Duration,
     ) -> Result<(u64, Vec<u8>, bool, usize)> {
         let mut buf = BytesMut::with_capacity(16384);
         let mut sent: u64 = 0;
@@ -4417,7 +4422,7 @@ impl ProxyServer {
 
             // Read straight into the frame accumulator — no zeroed scratch.
             buf.reserve(16384);
-            let n = tokio::time::timeout(Duration::from_secs(30), backend.read_buf(&mut buf))
+            let n = tokio::time::timeout(backend_read_timeout, backend.read_buf(&mut buf))
                 .await
                 .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
                 .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
@@ -7563,6 +7568,7 @@ mod tests {
                 &mut backend,
                 &session,
                 Duration::from_secs(60),
+                Duration::from_secs(30),
             )
             .await
             .expect("capture ok");
