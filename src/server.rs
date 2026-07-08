@@ -150,8 +150,56 @@ fn anomaly_fingerprint(sql: &str) -> String {
     out.trim_end().to_string()
 }
 
+/// Operational limits/timeouts resolved once at startup from the `[limits]`
+/// TOML section ([`crate::config::LimitsToml`]). The `*_secs` config keys are
+/// converted to [`Duration`] here (at construction, not per-use) so the hot
+/// path reads a ready `Duration`/`usize` with no conversion. Defaults are the
+/// exact prior compiled-in constants, so a default config is unchanged.
+#[derive(Debug, Clone)]
+struct ResolvedLimits {
+    max_cancel_keys: usize,
+    startup_timeout: Duration,
+    backend_write_timeout: Duration,
+    client_write_timeout: Duration,
+    reprepare_timeout: Duration,
+    max_prepared_statements: usize,
+    max_prepared_bytes: usize,
+    max_pending_bytes: usize,
+    /// Only read on the pool-modes data path; gated to avoid a dead-field
+    /// warning on feature-off builds.
+    #[cfg(feature = "pool-modes")]
+    max_total_idle_backend_conns: usize,
+    pool_reap_interval: Duration,
+}
+
+impl ResolvedLimits {
+    fn from_toml(l: &crate::config::LimitsToml) -> Self {
+        Self {
+            max_cancel_keys: l.max_cancel_keys,
+            startup_timeout: Duration::from_secs(l.startup_timeout_secs),
+            backend_write_timeout: Duration::from_secs(l.backend_write_timeout_secs),
+            client_write_timeout: Duration::from_secs(l.client_write_timeout_secs),
+            reprepare_timeout: Duration::from_secs(l.reprepare_timeout_secs),
+            max_prepared_statements: l.max_prepared_statements,
+            max_prepared_bytes: l.max_prepared_bytes,
+            max_pending_bytes: l.max_pending_bytes,
+            #[cfg(feature = "pool-modes")]
+            max_total_idle_backend_conns: l.max_total_idle_backend_conns,
+            pool_reap_interval: Duration::from_secs(l.pool_reap_interval_secs),
+        }
+    }
+}
+
+impl Default for ResolvedLimits {
+    fn default() -> Self {
+        Self::from_toml(&crate::config::LimitsToml::default())
+    }
+}
+
 /// Server runtime state
 struct ServerState {
+    /// Operational limits/timeouts resolved from `[limits]` config at startup.
+    limits: ResolvedLimits,
     /// Active client sessions. A `DashMap` (not a `tokio::RwLock<HashMap>`) so
     /// register/deregister are synchronous and lock-free-sharded — which lets a
     /// `SessionGuard`'s `Drop` remove the entry on ANY exit, including a panic
@@ -633,6 +681,10 @@ impl ProxyServer {
     pub fn new(config: ProxyConfig) -> Result<Self> {
         let (shutdown_tx, _) = broadcast::channel(1);
 
+        // Resolve the [limits] section once (secs -> Duration) so every hot-path
+        // use site reads a ready value; stored on ServerState below.
+        let resolved_limits = ResolvedLimits::from_toml(&config.limits);
+
         // Initialize health status
         let mut health = HashMap::new();
         for node in &config.nodes {
@@ -695,7 +747,7 @@ impl ProxyServer {
                 );
                 Some(Arc::new(crate::pool::BackendIdlePool::new(
                     config.pool_mode.max_pool_size as usize,
-                    Self::MAX_TOTAL_IDLE_BACKEND_CONNS,
+                    resolved_limits.max_total_idle_backend_conns,
                 )))
             }
             crate::config::PoolingMode::Session => None,
@@ -959,6 +1011,7 @@ impl ProxyServer {
             };
 
         let state = Arc::new(ServerState {
+            limits: resolved_limits,
             sessions: DashMap::new(),
             health: ArcSwap::from_pointee(health),
             health_write: parking_lot::Mutex::new(()),
@@ -1629,7 +1682,7 @@ impl ProxyServer {
         // that follows is intentionally NOT under this deadline — only the
         // handshake is.
         let negotiated = match tokio::time::timeout(
-            Self::STARTUP_TIMEOUT,
+            state.limits.startup_timeout,
             Self::negotiate_client_tls(stream, &state),
         )
         .await
@@ -1688,7 +1741,7 @@ impl ProxyServer {
         // the connection but never completes startup must not hold the task and
         // its session slot open indefinitely.
         let startup_result = match tokio::time::timeout(
-            Self::STARTUP_TIMEOUT,
+            state.limits.startup_timeout,
             Self::handle_startup(stream, &mut buffer, &codec, pre, session, state, config),
         )
         .await
@@ -1856,7 +1909,7 @@ impl ProxyServer {
             // Bound a single in-flight message: refuse before the accumulation
             // buffer for one (possibly malicious) oversized frame can exhaust
             // memory. A legitimate client never needs a single >64 MiB message.
-            if buffer.len() > Self::MAX_PENDING_BYTES {
+            if buffer.len() > state.limits.max_pending_bytes {
                 let emsg =
                     Self::create_error_response("53400", "message exceeds per-session size limit");
                 let _ = stream.write_all(&emsg).await;
@@ -1994,7 +2047,8 @@ impl ProxyServer {
                                     // client issuing unbounded named `Parse`s can't grow
                                     // `stmt_registry` without limit.
                                     if !existed
-                                        && stmt_registry.len() >= Self::MAX_PREPARED_STATEMENTS
+                                        && stmt_registry.len()
+                                            >= state.limits.max_prepared_statements
                                     {
                                         let emsg = Self::create_error_response(
                                             "54000",
@@ -2006,7 +2060,7 @@ impl ProxyServer {
                                             .await;
                                         tracing::warn!(
                                             client = %session.client_addr,
-                                            limit = Self::MAX_PREPARED_STATEMENTS,
+                                            limit = state.limits.max_prepared_statements,
                                             "prepared-statement cap exceeded; closing connection"
                                         );
                                         return Ok(());
@@ -2019,7 +2073,7 @@ impl ProxyServer {
                                         stmt_registry.get(&name).map(|b| b.len()).unwrap_or(0);
                                     let projected =
                                         stmt_registry_bytes.saturating_sub(old_len) + encoded.len();
-                                    if projected > Self::MAX_PREPARED_BYTES {
+                                    if projected > state.limits.max_prepared_bytes {
                                         let emsg = Self::create_error_response(
                                             "54000",
                                             "prepared-statement memory limit exceeded for this session",
@@ -2030,7 +2084,7 @@ impl ProxyServer {
                                             .await;
                                         tracing::warn!(
                                             client = %session.client_addr,
-                                            limit = Self::MAX_PREPARED_BYTES,
+                                            limit = state.limits.max_prepared_bytes,
                                             "prepared-statement byte cap exceeded; closing connection"
                                         );
                                         return Ok(());
@@ -2390,7 +2444,7 @@ impl ProxyServer {
             // Bound un-flushed extended-protocol accumulation: a client must
             // reach a Sync/Flush boundary before this many bytes pile up in
             // `pending` (otherwise a never-syncing client grows it unbounded).
-            if pending.len() > Self::MAX_PENDING_BYTES {
+            if pending.len() > state.limits.max_pending_bytes {
                 let emsg = Self::create_error_response(
                     "53400",
                     "un-flushed extended-protocol buffer exceeds per-session limit",
@@ -2846,45 +2900,10 @@ impl ProxyServer {
         msg.to_vec()
     }
 
-    /// Cap on the cancel-key map; the oldest entries are evicted on overflow
-    /// (a dropped stale entry only means one best-effort cancel is not
-    /// forwarded).
-    const MAX_CANCEL_KEYS: usize = 100_000;
-
-    /// Deadline for the pre-auth startup exchange (client TLS negotiation +
-    /// PostgreSQL startup/authentication). A client that connects and then
-    /// stalls must not hold a task and its session-map slot open forever
-    /// (slow-loris). Only the handshake is bounded; the query loop is not.
-    const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-    /// Timeout for a single backend write on the forward path — a blackholed or
-    /// hung backend must never pin a client task indefinitely. Backend reads
-    /// are already bounded (30s); this bounds writes symmetrically.
-    const BACKEND_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-    /// Timeout for a single client write — a wedged or very slow client must
-    /// not pin a proxy task (and the backend connection it holds) forever.
-    const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
-    /// Timeout for the out-of-band re-prepare exchange (write Parse+Flush, read
-    /// ParseComplete) performed on a backend connection switch.
-    const REPREPARE_TIMEOUT: Duration = Duration::from_secs(15);
-    /// Per-session cap on distinct named prepared statements — bounds the
-    /// `stmt_registry` against a client that issues unbounded `Parse`s.
-    const MAX_PREPARED_STATEMENTS: usize = 8192;
-    /// Per-session cap on the aggregate bytes retained in `stmt_registry`. The
-    /// count cap alone does not bound memory: each entry holds the full encoded
-    /// `Parse`, so 8192 large statements could still retain multiple GiB. This
-    /// bounds the total held bytes (statements are tiny in practice; a session
-    /// that approaches this is pathological).
-    const MAX_PREPARED_BYTES: usize = 64 * 1024 * 1024;
-    /// Per-session cap on the un-flushed extended-protocol `pending` buffer: a
-    /// client must reach a Sync/Flush boundary before this many bytes pile up.
-    const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
-    /// Global ceiling on idle connections parked in the data-path backend pool
-    /// across ALL `(node,user,db)` identities — bounds total file descriptors
-    /// regardless of how many distinct identities connect.
-    #[cfg(feature = "pool-modes")]
-    const MAX_TOTAL_IDLE_BACKEND_CONNS: usize = 8192;
-    /// How often the idle-connection reaper runs.
-    const POOL_REAP_INTERVAL: Duration = Duration::from_secs(30);
+    // The operational limits/timeouts that were compiled-in `const`s here are
+    // now tunable via the `[limits]` config section (`crate::config::LimitsToml`),
+    // resolved once at startup into `ServerState::limits` (`ResolvedLimits`).
+    // Defaults are byte-for-byte the prior constants; see that struct.
 
     /// Record the backend that owns a BackendKeyData (pid, secret) pair.
     fn register_cancel_key(state: &Arc<ServerState>, pid: u32, key: u32, node_addr: &str) {
@@ -2893,7 +2912,7 @@ impl ProxyServer {
         // on every insert once full.
         {
             let mut order = state.cancel_order.lock();
-            while state.cancel_map.len() >= Self::MAX_CANCEL_KEYS {
+            while state.cancel_map.len() >= state.limits.max_cancel_keys {
                 match order.pop_front() {
                     Some(old) => {
                         state.cancel_map.remove(&old);
@@ -2963,7 +2982,7 @@ impl ProxyServer {
         let mut backend_buffer = BytesMut::with_capacity(4096);
         let mut cbuf = vec![0u8; 4096];
         let mut bbuf = vec![0u8; 4096];
-        let deadline = tokio::time::Instant::now() + Self::STARTUP_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + state.limits.startup_timeout;
 
         loop {
             tokio::select! {
@@ -3257,12 +3276,13 @@ impl ProxyServer {
     async fn reset_backend<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         stream: &mut S,
         reset_sql: &str,
+        backend_write_timeout: Duration,
     ) -> Result<()> {
         let msg = crate::protocol::QueryMessage {
             query: reset_sql.to_string(),
         }
         .encode();
-        tokio::time::timeout(Self::BACKEND_WRITE_TIMEOUT, stream.write_all(&msg.encode()))
+        tokio::time::timeout(backend_write_timeout, stream.write_all(&msg.encode()))
             .await
             .map_err(|_| ProxyError::Network("reset write timeout".to_string()))?
             .map_err(|e| ProxyError::Network(format!("reset write error: {}", e)))?;
@@ -3371,9 +3391,13 @@ impl ProxyServer {
             return;
         }
 
-        if Self::reset_backend(&mut bc.stream, &config.pool_mode.reset_query)
-            .await
-            .is_ok()
+        if Self::reset_backend(
+            &mut bc.stream,
+            &config.pool_mode.reset_query,
+            state.limits.backend_write_timeout,
+        )
+        .await
+        .is_ok()
         {
             let key = Self::pool_key_for(node, session).await;
             if pool.checkin(&key, bc.stream) {
@@ -3703,7 +3727,7 @@ impl ProxyServer {
         }
 
         let backend_err = match tokio::time::timeout(
-            Self::BACKEND_WRITE_TIMEOUT,
+            state.limits.backend_write_timeout,
             backend.stream.write_all(&forward_msg.encode()),
         )
         .await
@@ -3734,8 +3758,13 @@ impl ProxyServer {
             #[cfg(not(feature = "edge-proxy"))]
             let edge_wants = false;
             if qc_wants || edge_wants {
-                return match Self::stream_until_ready_capture(client, &mut backend.stream, session)
-                    .await
+                return match Self::stream_until_ready_capture(
+                    client,
+                    &mut backend.stream,
+                    session,
+                    state.limits.client_write_timeout,
+                )
+                .await
                 {
                     Ok((sent, captured, cacheable, rows)) => {
                         #[cfg(not(feature = "query-cache"))]
@@ -3993,7 +4022,13 @@ impl ProxyServer {
             let Some(parse_bytes) = registry.get(name) else {
                 continue; // unknown statement — let the batch surface the error
             };
-            match Self::reprepare_statement(&mut backend.stream, parse_bytes).await {
+            match Self::reprepare_statement(
+                &mut backend.stream,
+                parse_bytes,
+                state.limits.reprepare_timeout,
+            )
+            .await
+            {
                 Ok(()) => {
                     backend.prepared.insert(name.clone());
                 }
@@ -4030,7 +4065,7 @@ impl ProxyServer {
         }
 
         let batch_err = match tokio::time::timeout(
-            Self::BACKEND_WRITE_TIMEOUT,
+            state.limits.backend_write_timeout,
             backend.stream.write_all(batch),
         )
         .await
@@ -4113,23 +4148,20 @@ impl ProxyServer {
     async fn reprepare_statement<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         backend: &mut S,
         parse_bytes: &[u8],
+        reprepare_timeout: Duration,
     ) -> Result<()> {
-        tokio::time::timeout(Self::REPREPARE_TIMEOUT, backend.write_all(parse_bytes))
+        tokio::time::timeout(reprepare_timeout, backend.write_all(parse_bytes))
             .await
             .map_err(|_| ProxyError::Network("re-prepare write timeout".to_string()))?
             .map_err(|e| ProxyError::Network(format!("re-prepare write error: {}", e)))?;
         // Flush: 'H' + length 4.
-        tokio::time::timeout(
-            Self::REPREPARE_TIMEOUT,
-            backend.write_all(&[b'H', 0, 0, 0, 4]),
-        )
-        .await
-        .map_err(|_| ProxyError::Network("re-prepare flush timeout".to_string()))?
-        .map_err(|e| ProxyError::Network(format!("re-prepare flush error: {}", e)))?;
-        let mtype =
-            tokio::time::timeout(Self::REPREPARE_TIMEOUT, Self::read_one_frame_type(backend))
-                .await
-                .map_err(|_| ProxyError::Network("re-prepare read timeout".to_string()))??;
+        tokio::time::timeout(reprepare_timeout, backend.write_all(&[b'H', 0, 0, 0, 4]))
+            .await
+            .map_err(|_| ProxyError::Network("re-prepare flush timeout".to_string()))?
+            .map_err(|e| ProxyError::Network(format!("re-prepare flush error: {}", e)))?;
+        let mtype = tokio::time::timeout(reprepare_timeout, Self::read_one_frame_type(backend))
+            .await
+            .map_err(|_| ProxyError::Network("re-prepare read timeout".to_string()))??;
         match mtype {
             b'1' => Ok(()), // ParseComplete
             b'E' => Err(ProxyError::Protocol(
@@ -4206,7 +4238,7 @@ impl ProxyServer {
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
     ) -> Result<u64> {
-        let _ = state;
+        let client_write_timeout = state.limits.client_write_timeout;
         let mut buf = BytesMut::with_capacity(16384);
         let mut sent: u64 = 0;
 
@@ -4241,13 +4273,10 @@ impl ProxyServer {
             }
 
             if consumed > 0 {
-                tokio::time::timeout(
-                    Self::CLIENT_WRITE_TIMEOUT,
-                    client.write_all(&buf[..consumed]),
-                )
-                .await
-                .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
-                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+                tokio::time::timeout(client_write_timeout, client.write_all(&buf[..consumed]))
+                    .await
+                    .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
+                    .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
                 sent += consumed as u64;
                 let _ = buf.split_to(consumed);
             }
@@ -4303,6 +4332,7 @@ impl ProxyServer {
         client: &mut ClientStream,
         backend: &mut TcpStream,
         session: &Arc<ClientSession>,
+        client_write_timeout: Duration,
     ) -> Result<(u64, Vec<u8>, bool, usize)> {
         let mut buf = BytesMut::with_capacity(16384);
         let mut sent: u64 = 0;
@@ -4360,13 +4390,10 @@ impl ProxyServer {
             }
 
             if consumed > 0 {
-                tokio::time::timeout(
-                    Self::CLIENT_WRITE_TIMEOUT,
-                    client.write_all(&buf[..consumed]),
-                )
-                .await
-                .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
-                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+                tokio::time::timeout(client_write_timeout, client.write_all(&buf[..consumed]))
+                    .await
+                    .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
+                    .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
                 captured.extend_from_slice(&buf[..consumed]);
                 sent += consumed as u64;
                 let _ = buf.split_to(consumed);
@@ -6127,10 +6154,13 @@ impl ProxyServer {
         // Only referenced by the pool-modes eviction/cleanup arms below.
         #[cfg(feature = "pool-modes")]
         let state = self.state.clone();
+        // Resolved from [limits] at startup; captured before the move so the
+        // reaper cadence is configurable without a recompile.
+        let reap_interval = self.state.limits.pool_reap_interval;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Self::POOL_REAP_INTERVAL);
+            let mut interval = tokio::time::interval(reap_interval);
 
             loop {
                 tokio::select! {
@@ -6717,6 +6747,7 @@ mod tests {
         #[cfg(feature = "edge-proxy")]
         let edge_defaults = crate::edge::EdgeConfig::default();
         let augmented_state = Arc::new(ServerState {
+            limits: ResolvedLimits::default(),
             sessions: DashMap::new(),
             health: ArcSwap::from_pointee(HashMap::new()),
             health_write: parking_lot::Mutex::new(()),
@@ -6862,16 +6893,20 @@ mod tests {
             p.extend_from_slice(&[0, 0]);
             p
         };
-        assert!(ProxyServer::reprepare_statement(&mut client, &parse)
-            .await
-            .is_ok());
+        assert!(
+            ProxyServer::reprepare_statement(&mut client, &parse, Duration::from_secs(15))
+                .await
+                .is_ok()
+        );
 
         // Backend answers ErrorResponse -> Err.
         let (mut client2, mut backend2) = tokio::io::duplex(64);
         backend2.write_all(&[b'E', 0, 0, 0, 4]).await.unwrap();
-        assert!(ProxyServer::reprepare_statement(&mut client2, &parse)
-            .await
-            .is_err());
+        assert!(
+            ProxyServer::reprepare_statement(&mut client2, &parse, Duration::from_secs(15))
+                .await
+                .is_err()
+        );
     }
 
     // ---- routing-hints: SQL-comment hint → RouteOverride mapping ----
@@ -7523,10 +7558,14 @@ mod tests {
             backend_peer.write_all(&bytes).await.unwrap();
             backend_peer.flush().await.unwrap();
 
-            let (sent, captured, cacheable, _rows) =
-                ProxyServer::stream_until_ready_capture(&mut client, &mut backend, &session)
-                    .await
-                    .expect("capture ok");
+            let (sent, captured, cacheable, _rows) = ProxyServer::stream_until_ready_capture(
+                &mut client,
+                &mut backend,
+                &session,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("capture ok");
             assert_eq!(cacheable, want_cacheable, "cacheable flag");
             assert_eq!(sent as usize, bytes.len());
             assert_eq!(captured, bytes, "capture is byte-exact");
@@ -7827,7 +7866,7 @@ mod tests {
         resp.extend_from_slice(&rfq(b'I'));
         server.write_all(&resp).await.unwrap();
         assert!(
-            ProxyServer::reset_backend(&mut client, "DISCARD ALL")
+            ProxyServer::reset_backend(&mut client, "DISCARD ALL", Duration::from_secs(30))
                 .await
                 .is_ok(),
             "clean reset must succeed"
@@ -7839,7 +7878,7 @@ mod tests {
         resp.extend_from_slice(&rfq(b'I'));
         server.write_all(&resp).await.unwrap();
         assert!(
-            ProxyServer::reset_backend(&mut client, "DISCARD ALL")
+            ProxyServer::reset_backend(&mut client, "DISCARD ALL", Duration::from_secs(30))
                 .await
                 .is_err(),
             "reset that errored must be rejected"
@@ -7851,7 +7890,7 @@ mod tests {
         resp.extend_from_slice(&rfq(b'T'));
         server.write_all(&resp).await.unwrap();
         assert!(
-            ProxyServer::reset_backend(&mut client, "DISCARD ALL")
+            ProxyServer::reset_backend(&mut client, "DISCARD ALL", Duration::from_secs(30))
                 .await
                 .is_err(),
             "reset leaving a non-idle txn must be rejected"

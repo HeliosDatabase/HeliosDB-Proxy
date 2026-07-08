@@ -313,6 +313,13 @@ pub struct ProxyConfig {
     /// `HELIOS_DRAIN_TIMEOUT_SECS` env var.
     #[serde(default = "default_drain_timeout_secs")]
     pub shutdown_drain_timeout_secs: u64,
+    /// Operational safety limits and timeouts for the PG-wire data path
+    /// (cancel-key map size, handshake/read/write deadlines, per-session
+    /// prepared-statement and buffer caps, idle-pool ceiling + reaper cadence).
+    /// Every key defaults to the value it had as a hardcoded constant, so a
+    /// config without a `[limits]` block is byte-for-byte unchanged.
+    #[serde(default)]
+    pub limits: LimitsToml,
 }
 
 fn default_drain_timeout_secs() -> u64 {
@@ -742,6 +749,126 @@ impl Default for CacheToml {
     }
 }
 
+// =============================================================================
+// OPERATIONAL LIMITS & TIMEOUTS (session/protocol safety bounds)
+// =============================================================================
+
+/// Operational safety limits and timeouts for the PG-wire data path. Every
+/// value here was previously a hardcoded `const` in `src/server.rs`; exposing
+/// them as a `[limits]` section makes each one tunable via `proxy.toml` without
+/// a recompile.
+///
+/// Defaults are byte-for-byte the prior compiled-in constants, so a config
+/// without a `[limits]` block (or one that omits any individual key) behaves
+/// exactly as before. Every timeout is expressed in whole seconds and every
+/// count/byte cap as a plain integer; all MUST be > 0. A `0` here would disable
+/// a safety bound rather than mean "unbounded" in any useful way, so
+/// [`ProxyConfig::validate`] rejects it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LimitsToml {
+    /// Capacity of the query-cancellation key map (`BackendKeyData` → backend
+    /// address). At capacity the oldest entries are FIFO-evicted; a dropped
+    /// stale entry only means one best-effort `CancelRequest` is not forwarded.
+    /// Prior constant `MAX_CANCEL_KEYS`.
+    #[serde(default = "default_max_cancel_keys")]
+    pub max_cancel_keys: usize,
+    /// Deadline (seconds) for the pre-auth startup exchange (client TLS
+    /// negotiation + PostgreSQL startup/authentication). Bounds slow-loris
+    /// connections that stall mid-handshake; the query loop itself is not
+    /// bounded. Prior constant `STARTUP_TIMEOUT`.
+    #[serde(default = "default_startup_timeout_secs")]
+    pub startup_timeout_secs: u64,
+    /// Timeout (seconds) for a single backend write on the forward path — a
+    /// blackholed or hung backend must never pin a client task indefinitely.
+    /// Prior constant `BACKEND_WRITE_TIMEOUT`.
+    #[serde(default = "default_backend_write_timeout_secs")]
+    pub backend_write_timeout_secs: u64,
+    /// Timeout (seconds) for a single client write — a wedged or very slow
+    /// client must not pin a proxy task (and the backend connection it holds)
+    /// forever. Prior constant `CLIENT_WRITE_TIMEOUT`.
+    #[serde(default = "default_client_write_timeout_secs")]
+    pub client_write_timeout_secs: u64,
+    /// Timeout (seconds) for the out-of-band re-prepare exchange (write
+    /// Parse+Flush, read ParseComplete) performed on a backend connection
+    /// switch. Prior constant `REPREPARE_TIMEOUT`.
+    #[serde(default = "default_reprepare_timeout_secs")]
+    pub reprepare_timeout_secs: u64,
+    /// Per-session cap on distinct named prepared statements — bounds the
+    /// per-session statement registry against a client issuing unbounded
+    /// `Parse`s. Prior constant `MAX_PREPARED_STATEMENTS`.
+    #[serde(default = "default_max_prepared_statements")]
+    pub max_prepared_statements: usize,
+    /// Per-session cap on the aggregate bytes retained in the statement
+    /// registry (each entry holds the full encoded `Parse`, so the count cap
+    /// alone does not bound memory). Prior constant `MAX_PREPARED_BYTES`.
+    #[serde(default = "default_max_prepared_bytes")]
+    pub max_prepared_bytes: usize,
+    /// Per-session cap on the un-flushed extended-protocol `pending` buffer: a
+    /// client must reach a Sync/Flush boundary before this many bytes pile up.
+    /// Prior constant `MAX_PENDING_BYTES`.
+    #[serde(default = "default_max_pending_bytes")]
+    pub max_pending_bytes: usize,
+    /// Global ceiling on idle connections parked in the data-path backend pool
+    /// across ALL `(node,user,db)` identities — bounds total file descriptors
+    /// regardless of how many distinct identities connect. Only consumed when
+    /// the `pool-modes` feature is compiled in; parsed-and-ignored otherwise.
+    /// Prior constant `MAX_TOTAL_IDLE_BACKEND_CONNS`.
+    #[serde(default = "default_max_total_idle_backend_conns")]
+    pub max_total_idle_backend_conns: usize,
+    /// How often (seconds) the idle-connection reaper runs. Prior constant
+    /// `POOL_REAP_INTERVAL`.
+    #[serde(default = "default_pool_reap_interval_secs")]
+    pub pool_reap_interval_secs: u64,
+}
+
+fn default_max_cancel_keys() -> usize {
+    100_000
+}
+fn default_startup_timeout_secs() -> u64 {
+    30
+}
+fn default_backend_write_timeout_secs() -> u64 {
+    30
+}
+fn default_client_write_timeout_secs() -> u64 {
+    60
+}
+fn default_reprepare_timeout_secs() -> u64 {
+    15
+}
+fn default_max_prepared_statements() -> usize {
+    8192
+}
+fn default_max_prepared_bytes() -> usize {
+    64 * 1024 * 1024
+}
+fn default_max_pending_bytes() -> usize {
+    64 * 1024 * 1024
+}
+fn default_max_total_idle_backend_conns() -> usize {
+    8192
+}
+fn default_pool_reap_interval_secs() -> u64 {
+    30
+}
+
+impl Default for LimitsToml {
+    fn default() -> Self {
+        Self {
+            max_cancel_keys: default_max_cancel_keys(),
+            startup_timeout_secs: default_startup_timeout_secs(),
+            backend_write_timeout_secs: default_backend_write_timeout_secs(),
+            client_write_timeout_secs: default_client_write_timeout_secs(),
+            reprepare_timeout_secs: default_reprepare_timeout_secs(),
+            max_prepared_statements: default_max_prepared_statements(),
+            max_prepared_bytes: default_max_prepared_bytes(),
+            max_pending_bytes: default_max_pending_bytes(),
+            max_total_idle_backend_conns: default_max_total_idle_backend_conns(),
+            pool_reap_interval_secs: default_pool_reap_interval_secs(),
+        }
+    }
+}
+
 /// Replica-lag-aware routing + read-your-writes configuration (always present;
 /// only enforced when the `lag-routing` feature is compiled in AND enabled).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -934,6 +1061,7 @@ impl Default for ProxyConfig {
             graphql_gateway: GraphqlGatewayConfig::default(),
             optimize_unnamed_parse: true,
             shutdown_drain_timeout_secs: default_drain_timeout_secs(),
+            limits: LimitsToml::default(),
         }
     }
 }
@@ -1193,6 +1321,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "graphql_gateway",
     "optimize_unnamed_parse",
     "shutdown_drain_timeout_secs",
+    "limits",
 ];
 
 /// Detect TOP-LEVEL TOML keys that are not fields of [`ProxyConfig`] (silent
@@ -1350,6 +1479,54 @@ impl ProxyConfig {
                         self.admin_address
                     )));
                 }
+            }
+        }
+
+        // Operational limits/timeouts. Each of these was a compiled-in safety
+        // bound; a 0 disables the bound (slow-loris handshake never times out,
+        // an unbounded statement registry, a zero-capacity map, a reaper that
+        // panics `tokio::time::interval`) rather than meaning anything useful,
+        // so reject 0 up front with a message that names the key.
+        {
+            let l = &self.limits;
+            let zero_checks: [(&str, u64); 6] = [
+                ("limits.startup_timeout_secs", l.startup_timeout_secs),
+                (
+                    "limits.backend_write_timeout_secs",
+                    l.backend_write_timeout_secs,
+                ),
+                (
+                    "limits.client_write_timeout_secs",
+                    l.client_write_timeout_secs,
+                ),
+                ("limits.reprepare_timeout_secs", l.reprepare_timeout_secs),
+                ("limits.pool_reap_interval_secs", l.pool_reap_interval_secs),
+                ("limits.max_cancel_keys", l.max_cancel_keys as u64),
+            ];
+            for (name, value) in zero_checks {
+                if value == 0 {
+                    return Err(ProxyError::Config(format!("{name} must be >= 1")));
+                }
+            }
+            if l.max_prepared_statements == 0 {
+                return Err(ProxyError::Config(
+                    "limits.max_prepared_statements must be >= 1".to_string(),
+                ));
+            }
+            if l.max_prepared_bytes == 0 {
+                return Err(ProxyError::Config(
+                    "limits.max_prepared_bytes must be >= 1".to_string(),
+                ));
+            }
+            if l.max_pending_bytes == 0 {
+                return Err(ProxyError::Config(
+                    "limits.max_pending_bytes must be >= 1".to_string(),
+                ));
+            }
+            if l.max_total_idle_backend_conns == 0 {
+                return Err(ProxyError::Config(
+                    "limits.max_total_idle_backend_conns must be >= 1".to_string(),
+                ));
             }
         }
 
@@ -1982,6 +2159,142 @@ mod tests {
         assert!(config.validate().is_err());
         config.health.check_interval_secs = 1;
         assert!(config.validate().is_ok());
+    }
+
+    // -------------------------------------------------------------------------
+    // [limits] section (operational safety bounds, formerly hardcoded consts)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_limits_defaults_equal_prior_constants() {
+        // Every default MUST reproduce the exact value the constant held in
+        // src/server.rs, so an existing deployment with no `[limits]` block is
+        // byte-for-byte unchanged.
+        let l = LimitsToml::default();
+        assert_eq!(l.max_cancel_keys, 100_000);
+        assert_eq!(l.startup_timeout_secs, 30);
+        assert_eq!(l.backend_write_timeout_secs, 30);
+        assert_eq!(l.client_write_timeout_secs, 60);
+        assert_eq!(l.reprepare_timeout_secs, 15);
+        assert_eq!(l.max_prepared_statements, 8192);
+        assert_eq!(l.max_prepared_bytes, 64 * 1024 * 1024);
+        assert_eq!(l.max_pending_bytes, 64 * 1024 * 1024);
+        assert_eq!(l.max_total_idle_backend_conns, 8192);
+        assert_eq!(l.pool_reap_interval_secs, 30);
+        // And the field on a default ProxyConfig matches.
+        assert_eq!(
+            ProxyConfig::default().limits.max_prepared_bytes,
+            64 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn test_limits_toml_partial_overrides_and_fills_defaults() {
+        // Parsing a partial `[limits]` table (as `LimitsToml`) overrides the
+        // listed keys and fills the rest from the per-field serde defaults.
+        let limits: LimitsToml = toml::from_str(
+            "startup_timeout_secs = 5\nmax_prepared_statements = 100\nmax_cancel_keys = 42\n",
+        )
+        .expect("parse partial LimitsToml");
+        // Overridden.
+        assert_eq!(limits.startup_timeout_secs, 5);
+        assert_eq!(limits.max_prepared_statements, 100);
+        assert_eq!(limits.max_cancel_keys, 42);
+        // Untouched keys keep their const defaults.
+        assert_eq!(limits.client_write_timeout_secs, 60);
+        assert_eq!(limits.max_pending_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.pool_reap_interval_secs, 30);
+    }
+
+    #[test]
+    fn test_proxyconfig_partial_limits_section_overrides() {
+        // Full ProxyConfig load path: a `[limits]` section with only some keys
+        // set overrides those and defaults the rest. Built from a serialized
+        // default config so the required non-limits fields are all present.
+        let mut val = toml::Value::try_from(ProxyConfig::default()).unwrap();
+        let mut partial = toml::value::Table::new();
+        partial.insert("startup_timeout_secs".into(), toml::Value::Integer(5));
+        partial.insert("max_cancel_keys".into(), toml::Value::Integer(42));
+        val.as_table_mut()
+            .unwrap()
+            .insert("limits".into(), toml::Value::Table(partial));
+        let text = toml::to_string(&val).unwrap();
+        let cfg: ProxyConfig = toml::from_str(&text).expect("parse config with partial [limits]");
+        assert_eq!(cfg.limits.startup_timeout_secs, 5);
+        assert_eq!(cfg.limits.max_cancel_keys, 42);
+        // Unset key defaults.
+        assert_eq!(cfg.limits.client_write_timeout_secs, 60);
+    }
+
+    #[test]
+    fn test_proxyconfig_absent_limits_section_is_default() {
+        // A config with NO `[limits]` table at all → the whole section defaults
+        // (the `#[serde(default)]` on the field). Built by stripping `limits`
+        // from a serialized default config.
+        let mut val = toml::Value::try_from(ProxyConfig::default()).unwrap();
+        val.as_table_mut().unwrap().remove("limits");
+        assert!(val.as_table().unwrap().get("limits").is_none());
+        let text = toml::to_string(&val).unwrap();
+        let cfg: ProxyConfig = toml::from_str(&text).expect("parse config without [limits]");
+        assert_eq!(cfg.limits.startup_timeout_secs, 30);
+        assert_eq!(cfg.limits.max_total_idle_backend_conns, 8192);
+        assert_eq!(cfg.limits.pool_reap_interval_secs, 30);
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_limits() {
+        let base = || {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            c
+        };
+        // A pristine config validates.
+        assert!(base().validate().is_ok());
+
+        // Each timeout at 0 is rejected.
+        let mut c = base();
+        c.limits.startup_timeout_secs = 0;
+        assert!(
+            c.validate().is_err(),
+            "zero startup_timeout must be rejected"
+        );
+
+        let mut c = base();
+        c.limits.backend_write_timeout_secs = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.client_write_timeout_secs = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.reprepare_timeout_secs = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.pool_reap_interval_secs = 0;
+        assert!(c.validate().is_err());
+
+        // Each cap at 0 is rejected.
+        let mut c = base();
+        c.limits.max_cancel_keys = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.max_prepared_statements = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.max_prepared_bytes = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.max_pending_bytes = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.max_total_idle_backend_conns = 0;
+        assert!(c.validate().is_err());
     }
 
     #[test]
