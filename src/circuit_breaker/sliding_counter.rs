@@ -43,10 +43,14 @@ impl SlidingWindowCounter {
         let now = Instant::now();
         let mut events = self.events.lock().expect("lock poisoned");
 
-        // Remove expired events
-        let cutoff = now - self.window;
-        while events.front().map(|&t| t < cutoff).unwrap_or(false) {
-            events.pop_front();
+        // Remove expired events. `Instant - Duration` panics on underflow,
+        // and the monotonic clock can start near zero (e.g. shortly after
+        // host boot). If the process hasn't been up for one full window
+        // yet, nothing can be expired — prune nothing this pass.
+        if let Some(cutoff) = now.checked_sub(self.window) {
+            while events.front().map(|&t| t < cutoff).unwrap_or(false) {
+                events.pop_front();
+            }
         }
 
         // Add new event
@@ -67,10 +71,14 @@ impl SlidingWindowCounter {
         let now = Instant::now();
         let mut events = self.events.lock().expect("lock poisoned");
 
-        // Remove expired events
-        let cutoff = now - self.window;
-        while events.front().map(|&t| t < cutoff).unwrap_or(false) {
-            events.pop_front();
+        // Remove expired events. `Instant - Duration` panics on underflow,
+        // and the monotonic clock can start near zero (e.g. shortly after
+        // host boot). If the process hasn't been up for one full window
+        // yet, nothing can be expired — prune nothing this pass.
+        if let Some(cutoff) = now.checked_sub(self.window) {
+            while events.front().map(|&t| t < cutoff).unwrap_or(false) {
+                events.pop_front();
+            }
         }
 
         events.len() as u32
@@ -103,10 +111,14 @@ impl SlidingWindowCounter {
         let now = Instant::now();
         let mut events = self.events.lock().expect("lock poisoned");
 
-        // Remove expired events
-        let cutoff = now - self.window;
-        while events.front().map(|&t| t < cutoff).unwrap_or(false) {
-            events.pop_front();
+        // Remove expired events. `Instant - Duration` panics on underflow,
+        // and the monotonic clock can start near zero (e.g. shortly after
+        // host boot). If the process hasn't been up for one full window
+        // yet, nothing can be expired — prune nothing this pass.
+        if let Some(cutoff) = now.checked_sub(self.window) {
+            while events.front().map(|&t| t < cutoff).unwrap_or(false) {
+                events.pop_front();
+            }
         }
 
         events.front().copied()
@@ -135,10 +147,14 @@ impl SlidingWindowCounter {
         let now = Instant::now();
         let mut events = self.events.lock().expect("lock poisoned");
 
-        // Remove expired events
-        let cutoff = now - self.window;
-        while events.front().map(|&t| t < cutoff).unwrap_or(false) {
-            events.pop_front();
+        // Remove expired events. `Instant - Duration` panics on underflow,
+        // and the monotonic clock can start near zero (e.g. shortly after
+        // host boot). If the process hasn't been up for one full window
+        // yet, nothing can be expired — prune nothing this pass.
+        if let Some(cutoff) = now.checked_sub(self.window) {
+            while events.front().map(|&t| t < cutoff).unwrap_or(false) {
+                events.pop_front();
+            }
         }
 
         events.iter().copied().collect()
@@ -354,5 +370,19 @@ mod tests {
         counter.increment();
         assert_eq!(counter.count(), 3);
         assert_eq!(cloned.count(), 2); // Clone is independent
+    }
+
+    #[test]
+    fn window_larger_than_uptime_does_not_panic() {
+        // Regression: `now - self.window` panicked on Instant underflow when
+        // the monotonic clock was younger than the window (near host boot).
+        // A window larger than any possible uptime forces the checked_sub
+        // None path: nothing is old enough to expire, so every event is kept.
+        let counter = SlidingWindowCounter::new(Duration::from_secs(u64::MAX));
+        assert_eq!(counter.increment(), 1);
+        assert_eq!(counter.increment(), 2);
+        assert_eq!(counter.count(), 2);
+        assert!(counter.first_event_time().is_some());
+        assert_eq!(counter.get_events().len(), 2);
     }
 }

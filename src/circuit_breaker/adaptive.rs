@@ -44,10 +44,14 @@ impl RollingStats {
         let now = Instant::now();
         let mut values = self.values.write();
 
-        // Remove expired entries
-        let cutoff = now - self.window;
-        while values.front().map(|(t, _)| *t < cutoff).unwrap_or(false) {
-            values.pop_front();
+        // Remove expired entries. `Instant - Duration` panics on underflow,
+        // and the monotonic clock can start near zero (e.g. shortly after
+        // host boot). If the process hasn't been up for one full window
+        // yet, nothing can be expired — prune nothing this pass.
+        if let Some(cutoff) = now.checked_sub(self.window) {
+            while values.front().map(|(t, _)| *t < cutoff).unwrap_or(false) {
+                values.pop_front();
+            }
         }
 
         // Enforce max points
@@ -63,10 +67,14 @@ impl RollingStats {
         let now = Instant::now();
         let mut values = self.values.write();
 
-        // Remove expired entries
-        let cutoff = now - self.window;
-        while values.front().map(|(t, _)| *t < cutoff).unwrap_or(false) {
-            values.pop_front();
+        // Remove expired entries. `Instant - Duration` panics on underflow,
+        // and the monotonic clock can start near zero (e.g. shortly after
+        // host boot). If the process hasn't been up for one full window
+        // yet, nothing can be expired — prune nothing this pass.
+        if let Some(cutoff) = now.checked_sub(self.window) {
+            while values.front().map(|(t, _)| *t < cutoff).unwrap_or(false) {
+                values.pop_front();
+            }
         }
 
         if values.is_empty() {
@@ -97,10 +105,14 @@ impl RollingStats {
         let now = Instant::now();
         let mut values = self.values.write();
 
-        // Remove expired entries
-        let cutoff = now - self.window;
-        while values.front().map(|(t, _)| *t < cutoff).unwrap_or(false) {
-            values.pop_front();
+        // Remove expired entries. `Instant - Duration` panics on underflow,
+        // and the monotonic clock can start near zero (e.g. shortly after
+        // host boot). If the process hasn't been up for one full window
+        // yet, nothing can be expired — prune nothing this pass.
+        if let Some(cutoff) = now.checked_sub(self.window) {
+            while values.front().map(|(t, _)| *t < cutoff).unwrap_or(false) {
+                values.pop_front();
+            }
         }
 
         values.len()
@@ -436,5 +448,19 @@ mod tests {
         assert_eq!(stats.base_threshold, 10);
         assert_eq!(stats.sample_count, 15);
         assert!(stats.average_failures.is_some());
+    }
+
+    #[test]
+    fn window_larger_than_uptime_does_not_panic() {
+        // Regression: `now - self.window` panicked on Instant underflow when
+        // the monotonic clock was younger than the window (near host boot).
+        // A window larger than any possible uptime forces the checked_sub
+        // None path: nothing expires, so every data point is retained.
+        let stats = RollingStats::new(Duration::from_secs(u64::MAX));
+        stats.add(10.0);
+        stats.add(20.0);
+        stats.add(30.0);
+        assert_eq!(stats.count(), 3);
+        assert!((stats.average().unwrap() - 20.0).abs() < 0.01);
     }
 }
