@@ -592,7 +592,14 @@ fn split_statements(sql: &str) -> Vec<&str> {
             b'"' => i = skip_double_quoted(bytes, i),
             b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => i = skip_line_comment(bytes, i),
             b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => i = skip_block_comment(bytes, i),
-            b'$' => match skip_dollar_quoted(bytes, i) {
+            // A `$` only opens a dollar-quote when it STARTS a token. PostgreSQL's
+            // lexer treats `$` as an identifier-continuation char (ident_cont =
+            // [A-Za-z_0-9$]), so `a$$`, `a$x$` lex as SINGLE identifiers, not as
+            // dollar-quote delimiters. Gating on the preceding-byte token
+            // boundary (mirrors PG's lexer) stops a `$` embedded in an identifier
+            // from spuriously "quoting" — and thereby hiding — a real top-level
+            // `;` (e.g. `SELECT 1 AS a$x$ ; DROP TABLE t`).
+            b'$' if i == 0 || !is_word_byte(bytes[i - 1]) => match skip_dollar_quoted(bytes, i) {
                 Some(end) => i = end,
                 None => i += 1,
             },
@@ -638,7 +645,11 @@ fn has_data_modifying_cte(stmt: &str) -> bool {
             b'"' => i = skip_double_quoted(bytes, i),
             b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => i = skip_line_comment(bytes, i),
             b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => i = skip_block_comment(bytes, i),
-            b'$' => match skip_dollar_quoted(bytes, i) {
+            // Same token-boundary gate as `split_statements`: only treat `$` as a
+            // dollar-quote opener when it starts a token, so a `$` inside an
+            // identifier cannot swallow the rest of the statement and hide an
+            // INSERT/UPDATE/DELETE/MERGE keyword from this scan.
+            b'$' if i == 0 || !is_word_byte(bytes[i - 1]) => match skip_dollar_quoted(bytes, i) {
                 Some(end) => i = end,
                 None => i += 1,
             },
@@ -743,6 +754,33 @@ mod tests {
     }
 
     #[test]
+    fn split_statements_dollar_in_identifier_does_not_hide_semicolon() {
+        // PostgreSQL's lexer treats `$` as an identifier-continuation char, so
+        // `a$x$`, `a$$`, `a$qz$` are SINGLE identifiers — the `$` does NOT open a
+        // dollar quote. A guard that misreads it as a dollar-quote opener would
+        // swallow the real top-level `;` and the trailing write, under-counting
+        // statements and defeating the multi-statement guard.
+        assert_eq!(
+            split_statements("SELECT 1 AS a$x$ ; DROP TABLE t"),
+            vec!["SELECT 1 AS a$x$", "DROP TABLE t"]
+        );
+        assert_eq!(
+            split_statements("SELECT 1 AS a$$ ; DELETE FROM t"),
+            vec!["SELECT 1 AS a$$", "DELETE FROM t"]
+        );
+        assert_eq!(
+            split_statements("SELECT 1 AS a$qz$ ; TRUNCATE users"),
+            vec!["SELECT 1 AS a$qz$", "TRUNCATE users"]
+        );
+        // Guard must not over-fire: a genuine dollar-quote (opening `$` starts a
+        // token) still masks its inner `;`.
+        assert_eq!(
+            split_statements("SELECT $$a;b$$ AS s ; SELECT 2"),
+            vec!["SELECT $$a;b$$ AS s", "SELECT 2"]
+        );
+    }
+
+    #[test]
     fn split_statements_semicolon_inside_comments() {
         assert_eq!(
             split_statements("SELECT 1 -- a;b\n"),
@@ -781,6 +819,20 @@ mod tests {
         assert!(!has_data_modifying_cte(
             "WITH x AS (SELECT 'delete me' AS s) SELECT * FROM x"
         ));
+        // A `$` inside an identifier must NOT be misread as a dollar-quote
+        // opener; if it were, skip_dollar_quoted would consume to EOF and hide
+        // the INSERT keyword, wrongly reporting the CTE as read-only.
+        assert!(has_data_modifying_cte(
+            "WITH t AS (SELECT 1 AS a$x$), w AS (INSERT INTO logs VALUES(1) RETURNING *) SELECT * FROM w"
+        ));
+        assert!(has_data_modifying_cte(
+            "WITH t AS (SELECT 1 AS a$$), w AS (DELETE FROM logs RETURNING *) SELECT * FROM w"
+        ));
+        // Genuine dollar-quote (opening `$` starts a token) still masks the
+        // word inside it — no false positive.
+        assert!(!has_data_modifying_cte(
+            "WITH x AS (SELECT $$insert$$ AS s) SELECT * FROM x"
+        ));
     }
 
     #[test]
@@ -789,6 +841,11 @@ mod tests {
         for sql in [
             "SELECT 1; DROP TABLE t",
             "select 1 ; drop table t",
+            // `$`-in-identifier under-count bypasses: these must still split to
+            // 2 and trip the multi-statement guard.
+            "SELECT 1 AS a$x$ ; DROP TABLE t",
+            "SELECT 1 AS a$$ ; TRUNCATE users",
+            "SELECT 1 AS a$x$ ; COMMIT ; SET default_transaction_read_only=off ; INSERT INTO t VALUES(1)",
             "WITH x AS (INSERT INTO t VALUES(1) RETURNING *) SELECT * FROM x",
             "with recursive r as (delete from t returning *) select * from r",
             "SET default_transaction_read_only=off",
@@ -808,6 +865,12 @@ mod tests {
             "WITH x AS (SELECT 1) SELECT * FROM x",
             "SELECT ';' AS s",
             "SELECT 'delete me' AS s",
+            // A genuine dollar-quote with an inner `;` is ONE statement — the
+            // token-boundary guard must not over-fire and split/reject it.
+            "SELECT $$a;b$$ AS s",
+            "SELECT $tag$a;b$tag$ AS s",
+            // A `$` inside an identifier is fine on its own — read-only SELECT.
+            "SELECT 1 AS a$x$",
         ] {
             assert!(
                 McpServer::check_policy(&cfg, None, sql).is_ok(),
@@ -837,6 +900,19 @@ mod tests {
             "INSERT INTO a VALUES(1); DROP TABLE b"
         )
         .is_err());
+        // `$`-in-identifier under-count: with a permissive contract there is NO
+        // read-only backstop, so the multi-statement guard is the only defense.
+        // A leading SELECT passes `validate`; the guard must still reject.
+        for sql in [
+            "SELECT 1 AS a$x$ ; DROP TABLE b",
+            "SELECT 1 AS a$$ ; TRUNCATE b",
+            "SELECT 1 AS a$qz$ ; INSERT INTO b VALUES(1)",
+        ] {
+            assert!(
+                McpServer::check_policy(&cfg, Some(&contract), sql).is_err(),
+                "expected multi-statement rejection for: {sql}"
+            );
+        }
         // A single allowed INSERT still passes the contract.
         assert!(McpServer::check_policy(&cfg, Some(&contract), "INSERT INTO a VALUES(1)").is_ok());
     }
