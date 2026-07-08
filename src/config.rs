@@ -1022,6 +1022,201 @@ impl Default for PluginToml {
     }
 }
 
+// =============================================================================
+// ENV-VAR SUBSTITUTION + UNKNOWN-KEY DETECTION (config-loader helpers)
+// =============================================================================
+
+/// Expand `${NAME}` and `${NAME:-default}` environment-variable references in a
+/// raw config file, in place, BEFORE it is parsed as TOML.
+///
+/// * `${NAME}`          → the value of env var `NAME`; returns an `Err` naming
+///   `NAME` if it is unset (fail-fast, 12-factor — the literal is never left
+///   in the output).
+/// * `${NAME:-default}` → env var `NAME` if set, otherwise the literal
+///   `default` (which may be empty; the default text runs up to the first `}`).
+///
+/// `NAME` must match `[A-Za-z_][A-Za-z0-9_]*`. Substitution is IN PLACE, so an
+/// unquoted `${POOL_MAX:-50}` becomes the bare token `50` (valid TOML) and a
+/// quoted `"${X:-y}"` becomes `"y"`.
+///
+/// SECURITY: this is plain string substitution. It performs ONLY an env lookup
+/// plus the `:-` default operator — it never spawns a shell or evaluates
+/// anything. Trust boundary: substitution is textual and runs BEFORE the TOML
+/// parse, so a substituted value (env var or `:-default`) that contains a quote
+/// or newline can inject arbitrary TOML structure. Env vars and the config file
+/// are operator-controlled, so this is acceptable; do NOT feed an
+/// untrusted-party-controlled env var into a `${...}` reference.
+///
+/// Comment-awareness is intentionally LINE-LEVEL only: a line whose first
+/// non-whitespace byte is `#` (a full-line TOML comment) is copied verbatim so
+/// the many commented `${VAR}` examples in the shipped reference configs (some
+/// with no `:-default`) do not trigger the unset-variable error. A trailing
+/// `#` comment on a value line is NOT treated as a comment — a full
+/// TOML-comment-aware tokenizer is overkill for the shipped configs and out of
+/// scope here.
+fn substitute_env(text: &str) -> Result<String> {
+    // `split_inclusive` keeps the line terminator attached to each piece, so
+    // reassembling preserves the original text (including a missing trailing
+    // newline) exactly outside of the substituted spans.
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with('#') {
+            // Full-line comment: copy verbatim, never substitute.
+            out.push_str(line);
+        } else {
+            substitute_line(line, &mut out)?;
+        }
+    }
+    Ok(out)
+}
+
+/// Expand every `${...}` reference in a single (non-comment) line into `out`.
+fn substitute_line(line: &str, out: &mut String) -> Result<()> {
+    let mut rest = line;
+    while let Some(idx) = rest.find("${") {
+        out.push_str(&rest[..idx]);
+        let body = &rest[idx + 2..]; // text after the opening "${"
+        match parse_placeholder(body)? {
+            Some((value, consumed)) => {
+                out.push_str(&value);
+                rest = &body[consumed..];
+            }
+            None => {
+                // Not a well-formed `${NAME...}`: emit the literal "${" and
+                // keep scanning after it so a later valid placeholder on the
+                // same line still expands.
+                out.push_str("${");
+                rest = body;
+            }
+        }
+    }
+    out.push_str(rest);
+    Ok(())
+}
+
+/// Parse the body of a placeholder (the text AFTER the opening `${`).
+///
+/// On success returns `(replacement, consumed)` where `consumed` is the number
+/// of bytes of `body` consumed INCLUDING the closing `}`. Returns `Ok(None)`
+/// when `body` is not a well-formed placeholder (the caller leaves it literal).
+/// Returns `Err` only for a well-formed `${NAME}` (no default) whose env var is
+/// unset.
+fn parse_placeholder(body: &str) -> Result<Option<(String, usize)>> {
+    let bytes = body.as_bytes();
+    // NAME = [A-Za-z_][A-Za-z0-9_]*
+    let mut n = 0;
+    while n < bytes.len() {
+        let b = bytes[n];
+        let valid = if n == 0 {
+            b.is_ascii_alphabetic() || b == b'_'
+        } else {
+            b.is_ascii_alphanumeric() || b == b'_'
+        };
+        if valid {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    if n == 0 {
+        return Ok(None); // no valid NAME after `${`
+    }
+    let name = &body[..n];
+    let after = &body[n..];
+
+    if after.starts_with('}') {
+        // `${NAME}` — must be set, no fallback.
+        match std::env::var(name) {
+            Ok(v) => Ok(Some((v, n + 1))),
+            Err(_) => Err(ProxyError::Config(format!(
+                "config env-var substitution: `${{{name}}}` references environment \
+                 variable `{name}`, which is not set (and no `:-default` fallback \
+                 was given)"
+            ))),
+        }
+    } else if let Some(after_op) = after.strip_prefix(":-") {
+        // `${NAME:-default}` — default runs up to the first `}`.
+        match after_op.find('}') {
+            Some(end) => {
+                let default = &after_op[..end];
+                let value = std::env::var(name).unwrap_or_else(|_| default.to_string());
+                // consumed = NAME(n) + ":-"(2) + default(end) + "}"(1)
+                Ok(Some((value, n + 2 + end + 1)))
+            }
+            None => Ok(None), // unterminated placeholder: leave literal
+        }
+    } else {
+        Ok(None) // NAME followed by an unexpected char: leave literal
+    }
+}
+
+/// Top-level keys recognised by [`ProxyConfig`]. Keep in sync with the struct's
+/// fields (there are no field-level `#[serde(rename)]`s, so these are the exact
+/// Rust field names). Used ONLY to warn on unknown top-level sections/keys;
+/// deserialization itself still silently ignores unknowns (there is no
+/// `deny_unknown_fields`), so a stale entry here only mutes or duplicates a
+/// warning — it can never reject a config. The
+/// `test_known_top_level_keys_cover_struct_fields` drift guard fails CI if a
+/// new non-optional field is added without updating this list.
+const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
+    "listen_address",
+    "admin_address",
+    "admin_token",
+    "admin_allow_insecure",
+    "tr_enabled",
+    "tr_mode",
+    "pool",
+    "pool_mode",
+    "load_balancer",
+    "health",
+    "nodes",
+    "tls",
+    "write_timeout_secs",
+    "plugins",
+    "hba",
+    "auth",
+    "mcp",
+    "agent_contracts",
+    "http_gateway",
+    "mirror",
+    "edge",
+    "branch",
+    "routing_hints",
+    "rate_limit",
+    "circuit_breaker",
+    "analytics",
+    "lag_routing",
+    "cache",
+    "query_rewrite",
+    "multi_tenancy",
+    "schema_routing",
+    "graphql_gateway",
+    "optimize_unnamed_parse",
+    "shutdown_drain_timeout_secs",
+];
+
+/// Detect TOP-LEVEL TOML keys that are not fields of [`ProxyConfig`] (silent
+/// doc drift / typos). Pure and testable: parses `text` as a TOML table and
+/// diffs its top-level keys against [`KNOWN_TOP_LEVEL_KEYS`], returning the
+/// unknowns sorted. Nested unknown keys (e.g. `[cache.l1]`) are intentionally
+/// OUT OF SCOPE. If `text` does not parse as a TOML table this returns empty —
+/// the caller's `toml::from_str` already reports genuine parse errors.
+fn unknown_top_level_keys(text: &str) -> Vec<String> {
+    let Ok(value) = toml::from_str::<toml::Value>(text) else {
+        return Vec::new();
+    };
+    let Some(table) = value.as_table() else {
+        return Vec::new();
+    };
+    let mut unknown: Vec<String> = table
+        .keys()
+        .filter(|k| !KNOWN_TOP_LEVEL_KEYS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    unknown.sort();
+    unknown
+}
+
 impl ProxyConfig {
     /// Get write timeout as Duration
     pub fn write_timeout(&self) -> Duration {
@@ -1039,11 +1234,30 @@ impl ProxyConfig {
             )));
         }
 
-        let contents = std::fs::read_to_string(path)
+        let raw = std::fs::read_to_string(path)
             .map_err(|e| ProxyError::Config(format!("Failed to read config: {}", e)))?;
+
+        // Expand `${VAR}` / `${VAR:-default}` references before parsing — the
+        // 12-factor substitution the shipped example configs advertise and use.
+        // Fails fast (naming the variable) if a bare `${VAR}` has no value and
+        // no `:-default` fallback.
+        let contents = substitute_env(&raw)?;
 
         let config: Self = toml::from_str(&contents)
             .map_err(|e| ProxyError::Config(format!("Failed to parse config: {}", e)))?;
+
+        // Surface unknown TOP-LEVEL sections/keys (e.g. documented-but-
+        // unimplemented `[ha]`/`[logging]`/`[metrics]` blocks) as warnings so
+        // silent doc drift becomes visible. We deliberately do NOT reject them:
+        // there is no `deny_unknown_fields`, so deserialization already ignores
+        // unknown fields and pre-existing configs with such sections keep
+        // loading. Nested unknown keys are out of scope.
+        for key in unknown_top_level_keys(&contents) {
+            tracing::warn!(
+                "unknown config section/key '{}' ignored (not part of ProxyConfig)",
+                key
+            );
+        }
 
         config.validate()?;
 
@@ -1484,6 +1698,228 @@ mod tests {
         assert_eq!(config.nodes.len(), 2);
         assert!(config.primary_node().is_some());
         assert_eq!(config.standby_nodes().len(), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // Env-var substitution (`${VAR}` / `${VAR:-default}`)
+    //
+    // Tests use `HELIOS_SUBST_TEST_*` variable names that no shipped config
+    // references, so they cannot perturb `test_all_shipped_configs_parse`
+    // (Cargo runs tests in parallel threads that share one process env).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_substitute_env_set_value_wins() {
+        std::env::set_var("HELIOS_SUBST_TEST_SET", "hello");
+        // `${NAME:-default}`: a set var beats the default.
+        assert_eq!(
+            substitute_env("x = \"${HELIOS_SUBST_TEST_SET:-fallback}\"").unwrap(),
+            "x = \"hello\""
+        );
+        // `${NAME}`: bare form uses the set value.
+        assert_eq!(
+            substitute_env("x = \"${HELIOS_SUBST_TEST_SET}\"").unwrap(),
+            "x = \"hello\""
+        );
+        std::env::remove_var("HELIOS_SUBST_TEST_SET");
+    }
+
+    #[test]
+    fn test_substitute_env_default_fallback() {
+        std::env::remove_var("HELIOS_SUBST_TEST_UNSET_A");
+        assert_eq!(
+            substitute_env("s = \"${HELIOS_SUBST_TEST_UNSET_A:-abc}\"").unwrap(),
+            "s = \"abc\""
+        );
+    }
+
+    #[test]
+    fn test_substitute_env_empty_default() {
+        std::env::remove_var("HELIOS_SUBST_TEST_UNSET_B");
+        assert_eq!(
+            substitute_env("s = \"${HELIOS_SUBST_TEST_UNSET_B:-}\"").unwrap(),
+            "s = \"\""
+        );
+    }
+
+    #[test]
+    fn test_substitute_env_missing_no_default_errors() {
+        std::env::remove_var("HELIOS_SUBST_TEST_UNSET_C");
+        let err = substitute_env("s = \"${HELIOS_SUBST_TEST_UNSET_C}\"").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HELIOS_SUBST_TEST_UNSET_C"),
+            "error must name the missing variable, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_substitute_env_skips_full_line_comments() {
+        std::env::remove_var("HELIOS_SUBST_TEST_UNSET_D");
+        // A commented line carrying a bare `${VAR}` (no default) must neither
+        // error nor be substituted — it is copied verbatim.
+        let input = "  # default_password = \"${HELIOS_SUBST_TEST_UNSET_D}\"\nx = 1\n";
+        assert_eq!(substitute_env(input).unwrap(), input);
+    }
+
+    #[test]
+    fn test_substitute_env_multiple_on_one_line() {
+        std::env::remove_var("HELIOS_SUBST_TEST_UNSET_E");
+        std::env::remove_var("HELIOS_SUBST_TEST_UNSET_F");
+        assert_eq!(
+            substitute_env(
+                "addr = \"${HELIOS_SUBST_TEST_UNSET_E:-host}:${HELIOS_SUBST_TEST_UNSET_F:-5432}\""
+            )
+            .unwrap(),
+            "addr = \"host:5432\""
+        );
+    }
+
+    #[test]
+    fn test_substitute_env_unquoted_numeric_position() {
+        std::env::remove_var("HELIOS_SUBST_TEST_UNSET_G");
+        // Unquoted `${..:-50}` must become the bare token `50` (valid TOML).
+        let out = substitute_env("max_connections = ${HELIOS_SUBST_TEST_UNSET_G:-50}").unwrap();
+        assert_eq!(out, "max_connections = 50");
+        // ...and that must now deserialize as an integer, not a string.
+        #[derive(serde::Deserialize)]
+        struct P {
+            max_connections: u32,
+        }
+        let p: P = toml::from_str(&out).unwrap();
+        assert_eq!(p.max_connections, 50);
+    }
+
+    #[test]
+    fn test_substitute_env_leaves_malformed_literal() {
+        // A `$` not opening a valid `${NAME...}` is left untouched.
+        assert_eq!(substitute_env("cost = $5.00\n").unwrap(), "cost = $5.00\n");
+        std::env::remove_var("HELIOS_SUBST_TEST_UNSET_H");
+        // Unterminated placeholder is left literal (no error).
+        assert_eq!(
+            substitute_env("x = \"${HELIOS_SUBST_TEST_UNSET_H:-oops\"").unwrap(),
+            "x = \"${HELIOS_SUBST_TEST_UNSET_H:-oops\""
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Unknown top-level key detection
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_unknown_top_level_keys_detection() {
+        let text = "listen_address = \"x\"\n\
+                    [pool]\nmin_connections = 1\n\
+                    [ha]\nenabled = true\n\
+                    [logging]\nlevel = \"info\"\n";
+        // `listen_address` and `pool` are known; `ha` and `logging` are not.
+        assert_eq!(
+            unknown_top_level_keys(text),
+            vec!["ha".to_string(), "logging".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_unknown_top_level_keys_nested_are_out_of_scope() {
+        // `[cache.l1]` is a NESTED unknown key under the known `cache` table;
+        // it must NOT be reported (nested detection is out of scope).
+        let text = "[cache]\nenabled = true\n[cache.l1]\nsize = 500\n";
+        assert!(unknown_top_level_keys(text).is_empty());
+    }
+
+    #[test]
+    fn test_known_top_level_keys_cover_struct_fields() {
+        // Drift guard: every key a default `ProxyConfig` serialises to must be
+        // present in `KNOWN_TOP_LEVEL_KEYS`. `Option` fields that default to
+        // `None` (`tls`, `admin_token`) are absent from the serialised form, so
+        // this is a subset check — it still catches a new non-optional field
+        // added without updating the list.
+        let value = toml::Value::try_from(ProxyConfig::default()).unwrap();
+        let table = value.as_table().unwrap();
+        for k in table.keys() {
+            assert!(
+                KNOWN_TOP_LEVEL_KEYS.contains(&k.as_str()),
+                "field '{k}' is present in a serialised default ProxyConfig but \
+                 missing from KNOWN_TOP_LEVEL_KEYS"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // CI guard: every shipped config must load after substitution
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_all_shipped_configs_parse() {
+        // For every `config/*.toml` and `scripts/regress/*.toml`: run env
+        // substitution (with NO env vars set → `:-default` fallbacks) and assert
+        // it deserializes into `ProxyConfig`.
+        //
+        // For the `config/*.toml` reference configs we go further and run the
+        // FULL load path — `ProxyConfig::from_file`, which does substitution +
+        // parse + `validate()` exactly as `heliosdb-proxy -c <file>` does. This
+        // is the real guard behind "the shipped configs load": a deserialize-only
+        // check passes even when `validate()` would reject the file (e.g. the
+        // admin-loopback guard), so it would not have caught the non-loopback
+        // `admin_address` default that made every reference config fail to start.
+        //
+        // The `scripts/regress/*.toml` files are intentionally deserialize-only:
+        // they reference placeholder/non-loopback backend hosts, some enable the
+        // `[edge]` section (which `validate()` gates on the compile-time
+        // `edge-proxy` feature and on an `edge.home_url`), so `validate()` is not
+        // universally applicable there. We still guarantee they parse.
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let config_dir = format!("{manifest}/config");
+        let regress_dir = format!("{manifest}/scripts/regress");
+
+        // Reference configs: must survive the entire from_file() load path.
+        let mut config_checked = 0usize;
+        let entries = std::fs::read_dir(&config_dir)
+            .unwrap_or_else(|e| panic!("config dir {config_dir} unreadable: {e}"));
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let path_str = path
+                .to_str()
+                .unwrap_or_else(|| panic!("non-UTF-8 config path {}", path.display()));
+            let loaded = ProxyConfig::from_file(path_str);
+            assert!(
+                loaded.is_ok(),
+                "shipped config {} failed to load via from_file() \
+                 (substitute + parse + validate): {}",
+                path.display(),
+                loaded.err().unwrap()
+            );
+            config_checked += 1;
+        }
+        assert!(
+            config_checked >= 3,
+            "expected to load at least the 3 config/*.toml files, checked {config_checked}"
+        );
+
+        // Regression harness configs: must at least deserialize after
+        // substitution (validate() deliberately skipped — see above).
+        if let Ok(entries) = std::fs::read_dir(&regress_dir) {
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                    continue;
+                }
+                let raw = std::fs::read_to_string(&path).unwrap();
+                let substituted = substitute_env(&raw).unwrap_or_else(|e| {
+                    panic!("env substitution failed for {}: {e}", path.display())
+                });
+                let parsed = toml::from_str::<ProxyConfig>(&substituted);
+                assert!(
+                    parsed.is_ok(),
+                    "regress config {} failed to deserialize: {}",
+                    path.display(),
+                    parsed.err().unwrap()
+                );
+            }
+        }
     }
 
     #[test]
