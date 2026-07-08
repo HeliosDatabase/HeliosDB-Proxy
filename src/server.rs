@@ -1011,7 +1011,7 @@ impl ProxyServer {
             transaction_journal: Arc::new(crate::transaction_journal::TransactionJournal::new()),
             #[cfg(feature = "anomaly-detection")]
             anomaly_detector: Arc::new(crate::anomaly::AnomalyDetector::new(
-                crate::anomaly::AnomalyConfig::default(),
+                config.anomaly.to_anomaly_config(),
             )),
             #[cfg(feature = "edge-proxy")]
             edge_cache: Arc::new(crate::edge::EdgeCache::new(config.edge.max_entries.max(1))),
@@ -6756,7 +6756,7 @@ mod tests {
             transaction_journal: Arc::new(crate::transaction_journal::TransactionJournal::new()),
             #[cfg(feature = "anomaly-detection")]
             anomaly_detector: Arc::new(crate::anomaly::AnomalyDetector::new(
-                crate::anomaly::AnomalyConfig::default(),
+                ProxyConfig::default().anomaly.to_anomaly_config(),
             )),
             #[cfg(feature = "edge-proxy")]
             edge_cache: Arc::new(crate::edge::EdgeCache::new(
