@@ -783,6 +783,13 @@ pub struct LimitsToml {
     /// Prior constant `BACKEND_WRITE_TIMEOUT`.
     #[serde(default = "default_backend_write_timeout_secs")]
     pub backend_write_timeout_secs: u64,
+    /// Timeout (seconds) for a single backend read on the relay path — a backend
+    /// that accepts the query but then emits no bytes must not pin a client task
+    /// forever. The paired counterpart to `backend_write_timeout_secs`; a
+    /// slow-but-healthy backend read (large sort / lock wait) is not itself
+    /// treated as a fault (see `is_backend_fault`).
+    #[serde(default = "default_backend_read_timeout_secs")]
+    pub backend_read_timeout_secs: u64,
     /// Timeout (seconds) for a single client write — a wedged or very slow
     /// client must not pin a proxy task (and the backend connection it holds)
     /// forever. Prior constant `CLIENT_WRITE_TIMEOUT`.
@@ -830,6 +837,9 @@ fn default_startup_timeout_secs() -> u64 {
 fn default_backend_write_timeout_secs() -> u64 {
     30
 }
+fn default_backend_read_timeout_secs() -> u64 {
+    30
+}
 fn default_client_write_timeout_secs() -> u64 {
     60
 }
@@ -858,6 +868,7 @@ impl Default for LimitsToml {
             max_cancel_keys: default_max_cancel_keys(),
             startup_timeout_secs: default_startup_timeout_secs(),
             backend_write_timeout_secs: default_backend_write_timeout_secs(),
+            backend_read_timeout_secs: default_backend_read_timeout_secs(),
             client_write_timeout_secs: default_client_write_timeout_secs(),
             reprepare_timeout_secs: default_reprepare_timeout_secs(),
             max_prepared_statements: default_max_prepared_statements(),
@@ -1489,11 +1500,15 @@ impl ProxyConfig {
         // so reject 0 up front with a message that names the key.
         {
             let l = &self.limits;
-            let zero_checks: [(&str, u64); 6] = [
+            let zero_checks: [(&str, u64); 7] = [
                 ("limits.startup_timeout_secs", l.startup_timeout_secs),
                 (
                     "limits.backend_write_timeout_secs",
                     l.backend_write_timeout_secs,
+                ),
+                (
+                    "limits.backend_read_timeout_secs",
+                    l.backend_read_timeout_secs,
                 ),
                 (
                     "limits.client_write_timeout_secs",
@@ -2174,6 +2189,7 @@ mod tests {
         assert_eq!(l.max_cancel_keys, 100_000);
         assert_eq!(l.startup_timeout_secs, 30);
         assert_eq!(l.backend_write_timeout_secs, 30);
+        assert_eq!(l.backend_read_timeout_secs, 30);
         assert_eq!(l.client_write_timeout_secs, 60);
         assert_eq!(l.reprepare_timeout_secs, 15);
         assert_eq!(l.max_prepared_statements, 8192);
