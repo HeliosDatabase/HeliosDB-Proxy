@@ -229,7 +229,9 @@ impl McpServer {
                 } else {
                     match Self::check_policy(cfg, contract, sql) {
                         Err(hint) => Err(hint),
-                        Ok(()) => Self::run_sql(cfg, sql).await.map(|r| format_result(&r)),
+                        Ok(()) => Self::run_sql(cfg, sql, effective_read_only(cfg, contract))
+                            .await
+                            .map(|r| format_result(&r)),
                     }
                 }
             }
@@ -237,7 +239,9 @@ impl McpServer {
                 let sql = "SELECT table_schema, table_name FROM information_schema.tables \
                            WHERE table_schema NOT IN ('pg_catalog','information_schema') \
                            ORDER BY table_schema, table_name";
-                Self::run_sql(cfg, sql).await.map(|r| format_result(&r))
+                Self::run_sql(cfg, sql, effective_read_only(cfg, contract))
+                    .await
+                    .map(|r| format_result(&r))
             }
             "explain" => {
                 let sql = args
@@ -250,9 +254,16 @@ impl McpServer {
                 } else {
                     match Self::check_policy(cfg, contract, sql) {
                         Err(hint) => Err(hint),
-                        Ok(()) => Self::run_sql(cfg, &format!("EXPLAIN {}", sql))
-                            .await
-                            .map(|r| format_result(&r)),
+                        // Policy is checked against the RAW sql (so `EXPLAIN a;
+                        // DROP b` is caught as multi-statement); the `EXPLAIN `
+                        // prefix is applied only for execution.
+                        Ok(()) => Self::run_sql(
+                            cfg,
+                            &format!("EXPLAIN {}", sql),
+                            effective_read_only(cfg, contract),
+                        )
+                        .await
+                        .map(|r| format_result(&r)),
                     }
                 }
             }
@@ -282,14 +293,50 @@ impl McpServer {
     /// Gate a SQL statement: when an agent contract is configured, validate
     /// against it and return a structured JSON repair hint on violation;
     /// otherwise apply the plain read-only guardrail.
+    ///
+    /// Both the contract path and the read-only path historically inspected
+    /// only the leading verb of the string, which two shapes bypass:
+    ///
+    /// 1. multi-statement batches (`SELECT 1; DROP TABLE t`) — PostgreSQL's
+    ///    simple-query protocol runs every `;`-separated statement, so the
+    ///    trailing write executes even though the head is a SELECT; this also
+    ///    defeats contract verb/table allow-lists.
+    /// 2. data-modifying CTEs (`WITH x AS (INSERT ... RETURNING *) SELECT ...`)
+    ///    — the head is WITH but the statement writes.
+    ///
+    /// We close both here (a lexical guard) and again in `run_sql` (a backend
+    /// READ ONLY backstop).
     fn check_policy(
         cfg: &McpConfig,
         contract: Option<&AgentContract>,
         sql: &str,
     ) -> std::result::Result<(), String> {
+        // Universal: refuse multi-statement batches regardless of mode, since
+        // a second statement bypasses both the read-only check and contract
+        // allow-lists.
+        let stmts = split_statements(sql);
+        if stmts.len() > 1 {
+            return Err("multiple SQL statements are not permitted over the MCP \
+                        gateway; send one statement per call"
+                .to_string());
+        }
+        // The single statement to gate. If the splitter found none (e.g. a
+        // comment-only body), fall back to the raw trimmed input.
+        let stmt = stmts.first().copied().unwrap_or(sql).trim();
+
         if let Some(c) = contract {
-            agent_contract::validate(sql, c).map_err(|v| v.to_json())
-        } else if cfg.read_only && is_write_sql(sql) {
+            // `validate` only reads the leading verb; pass the single trimmed
+            // statement (not the raw multi-statement string).
+            agent_contract::validate(stmt, c).map_err(|v| v.to_json())?;
+            // `validate` covers the leading-verb write case but not a
+            // data-modifying CTE, so backstop that for a read-only contract.
+            if c.read_only && has_data_modifying_cte(stmt) {
+                return Err("write via data-modifying CTE refused: this agent \
+                            contract is read-only"
+                    .to_string());
+            }
+            Ok(())
+        } else if cfg.read_only && (is_write_sql(stmt) || has_data_modifying_cte(stmt)) {
             Err("write/DDL refused: the MCP gateway is read-only".to_string())
         } else {
             Ok(())
@@ -297,7 +344,26 @@ impl McpServer {
     }
 
     /// Connect to the configured backend, run one statement, return rows.
-    async fn run_sql(cfg: &McpConfig, sql: &str) -> std::result::Result<QueryResult, String> {
+    ///
+    /// When `read_only` is set, the fresh per-call connection is put into
+    /// `default_transaction_read_only = on` BEFORE the user statement runs.
+    /// This is the hard backstop behind the lexical guard: even if the guard
+    /// has a gap, the backend refuses any write. It is safe against
+    /// re-enabling — the guard rejects any statement starting with `SET` or
+    /// `RESET` (in `is_write_sql`) and rejects multi-statement, and each call
+    /// gets a fresh connection, so a single user statement cannot turn the GUC
+    /// back off. The user statement runs as its OWN `simple_query` (not
+    /// concatenated) so result parsing / command_tag stay correct.
+    ///
+    /// Known limitation: `default_transaction_read_only` blocks DML/DDL but NOT
+    /// volatile functions with side effects (e.g. `SELECT nextval('s')`,
+    /// `setval`, superuser file/lo functions). Constrain the gateway's backend
+    /// role if that matters for your deployment.
+    async fn run_sql(
+        cfg: &McpConfig,
+        sql: &str,
+        read_only: bool,
+    ) -> std::result::Result<QueryResult, String> {
         let bcfg = BackendConfig {
             host: cfg.backend_host.clone(),
             port: cfg.backend_port,
@@ -313,6 +379,15 @@ impl McpServer {
         let mut client = BackendClient::connect(&bcfg)
             .await
             .map_err(|e| format!("backend connect: {}", e))?;
+        if read_only {
+            if let Err(e) = client
+                .execute("SET default_transaction_read_only = on")
+                .await
+            {
+                client.close().await;
+                return Err(format!("failed to enforce read-only mode: {}", e));
+            }
+        }
         let res = client.simple_query(sql).await.map_err(|e| format!("{}", e));
         client.close().await;
         res
@@ -377,19 +452,266 @@ fn format_result(r: &QueryResult) -> String {
     out
 }
 
-/// First-keyword write/DDL detection (read-only guardrail).
+/// First-keyword write/DDL detection (read-only guardrail). `SET`/`RESET` are
+/// included so that, in read-only mode, no single statement can flip the
+/// backend's `default_transaction_read_only` GUC back off (see `run_sql`).
 fn is_write_sql(sql: &str) -> bool {
     use crate::protocol::starts_with_ci;
     let s = sql.trim_start();
     for kw in [
         "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE", "GRANT", "REVOKE",
         "COPY", "MERGE", "CALL", "DO", "VACUUM", "REINDEX", "CLUSTER", "LOCK", "COMMENT", "SET",
+        "RESET",
     ] {
         if starts_with_ci(s, kw) {
             return true;
         }
     }
     false
+}
+
+/// Effective read-only decision for the gateway: its own `read_only` OR a
+/// read-only agent contract. Both the lexical guard (`has_data_modifying_cte`
+/// application in `check_policy`) and the backend READ ONLY backstop in
+/// `run_sql` key off this. Pure so it can be unit-tested without a backend.
+fn effective_read_only(cfg: &McpConfig, contract: Option<&AgentContract>) -> bool {
+    cfg.read_only || contract.is_some_and(|c| c.read_only)
+}
+
+#[inline]
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// `bytes[i]` is `'` — return the index just past the closing quote (or
+/// end-of-input if unterminated). `''` is an in-string escape, not a close.
+///
+/// If the string is an escape-string (`E'…'` / `e'…'` — a standalone `E`
+/// immediately before the quote), a backslash escapes the next byte, so `\'`
+/// does NOT close the string. Regular strings are treated as
+/// standard-conforming (PostgreSQL's default: backslash is literal, only `''`
+/// escapes), which is what the MCP gateway's fresh backend sessions use.
+///
+/// Detecting the `E` prefix EXACTLY matters for safety: a false positive would
+/// skip a real closing quote and could hide a top-level `;` (an under-count →
+/// bypass). So we require the preceding byte to be `E`/`e` AND the byte before
+/// THAT to be an ASCII non-word boundary — a multibyte identifier char before
+/// `E` (`éE'…'`, where `éE` is one identifier) is deliberately NOT treated as
+/// an escape-string, which at worst over-rejects (fail-closed, safe).
+fn skip_single_quoted(bytes: &[u8], i: usize) -> usize {
+    let escape_string = i >= 1
+        && (bytes[i - 1] == b'E' || bytes[i - 1] == b'e')
+        && (i < 2 || (bytes[i - 2] < 0x80 && !is_word_byte(bytes[i - 2])));
+    let mut j = i + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\\' if escape_string => {
+                j += 2; // backslash escapes the next byte in an E'…' string
+                continue;
+            }
+            b'\'' => {
+                if j + 1 < bytes.len() && bytes[j + 1] == b'\'' {
+                    j += 2; // doubled quote → literal, stay in string
+                    continue;
+                }
+                return j + 1;
+            }
+            _ => j += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// `bytes[i]` is `"` — return the index just past the closing quote (or
+/// end-of-input if unterminated). `""` is an in-identifier escape.
+fn skip_double_quoted(bytes: &[u8], i: usize) -> usize {
+    let mut j = i + 1;
+    while j < bytes.len() {
+        if bytes[j] == b'"' {
+            if j + 1 < bytes.len() && bytes[j + 1] == b'"' {
+                j += 2;
+                continue;
+            }
+            return j + 1;
+        }
+        j += 1;
+    }
+    bytes.len()
+}
+
+/// `bytes[i..]` starts a `--` line comment — return the index of the
+/// terminating newline (or end-of-input).
+fn skip_line_comment(bytes: &[u8], i: usize) -> usize {
+    let mut j = i + 2;
+    while j < bytes.len() && bytes[j] != b'\n' {
+        j += 1;
+    }
+    j
+}
+
+/// `bytes[i..]` starts a `/*` block comment — return the index just past the
+/// matching `*/`. Postgres block comments NEST, so depth is tracked.
+fn skip_block_comment(bytes: &[u8], i: usize) -> usize {
+    let mut depth = 0usize;
+    let mut j = i;
+    while j + 1 < bytes.len() {
+        if bytes[j] == b'/' && bytes[j + 1] == b'*' {
+            depth += 1;
+            j += 2;
+        } else if bytes[j] == b'*' && bytes[j + 1] == b'/' {
+            depth -= 1;
+            j += 2;
+            if depth == 0 {
+                return j;
+            }
+        } else {
+            j += 1;
+        }
+    }
+    bytes.len()
+}
+
+/// If a dollar-quoted string opens at `i` (`bytes[i]` is `$`), return the
+/// index just past its matching closing delimiter; else `None`. Handles the
+/// empty tag (`$$...$$`) and named tags (`$tag$...$tag$`). A tag follows
+/// identifier rules (starts with a letter/underscore, then alphanumerics/
+/// underscores), so `$1` (a parameter placeholder) is NOT a dollar quote.
+fn skip_dollar_quoted(bytes: &[u8], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    // Parse an optional tag between the two `$`s.
+    if j < bytes.len() && bytes[j] != b'$' {
+        let c = bytes[j];
+        if !(c.is_ascii_alphabetic() || c == b'_') {
+            return None; // first tag char must not be a digit / symbol
+        }
+        j += 1;
+        while j < bytes.len() && bytes[j] != b'$' {
+            if !is_word_byte(bytes[j]) {
+                return None; // invalid tag char → not a dollar quote
+            }
+            j += 1;
+        }
+    }
+    if j >= bytes.len() || bytes[j] != b'$' {
+        return None; // no closing `$` for the opening tag
+    }
+    let tag = &bytes[i..=j]; // includes both delimiting `$`s
+    let mut k = j + 1;
+    while k + tag.len() <= bytes.len() {
+        if &bytes[k..k + tag.len()] == tag {
+            return Some(k + tag.len());
+        }
+        k += 1;
+    }
+    Some(bytes.len()) // unterminated → consume to end
+}
+
+/// Split `sql` on top-level `;`, skipping semicolons that fall inside
+/// single-quoted strings, double-quoted identifiers, dollar-quoted strings,
+/// line comments (`-- … \n`), and (nested) block comments (`/* … */`).
+/// Returns trimmed, non-empty statement slices, so a trailing `;` does not
+/// produce an empty final statement.
+fn split_statements(sql: &str) -> Vec<&str> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => i = skip_single_quoted(bytes, i),
+            b'"' => i = skip_double_quoted(bytes, i),
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => i = skip_line_comment(bytes, i),
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => i = skip_block_comment(bytes, i),
+            // A `$` only opens a dollar-quote when it STARTS a token. PostgreSQL's
+            // lexer treats `$` as an identifier-continuation char (ident_cont =
+            // [A-Za-z_0-9$]), so `a$$`, `a$x$` lex as SINGLE identifiers, not as
+            // dollar-quote delimiters. Gating on the preceding-byte token
+            // boundary (mirrors PG's lexer) stops a `$` embedded in an identifier
+            // from spuriously "quoting" — and thereby hiding — a real top-level
+            // `;` (e.g. `SELECT 1 AS a$x$ ; DROP TABLE t`).
+            b'$' if i == 0 || !is_word_byte(bytes[i - 1]) => match skip_dollar_quoted(bytes, i) {
+                Some(end) => i = end,
+                None => i += 1,
+            },
+            b';' => {
+                let seg = sql[start..i].trim();
+                if !seg.is_empty() {
+                    out.push(seg);
+                }
+                start = i + 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let seg = sql[start..].trim();
+    if !seg.is_empty() {
+        out.push(seg);
+    }
+    out
+}
+
+/// Does a single statement whose head is `WITH` contain a data-modifying
+/// sub-statement (INSERT/UPDATE/DELETE/MERGE) in code — i.e. OUTSIDE string
+/// literals, quoted identifiers, comments, and dollar-quoted strings? A
+/// leading-verb check misses `WITH x AS (INSERT … RETURNING *) SELECT …`,
+/// which writes, so this backstops it.
+///
+/// Only meaningful when the head is `WITH` (also `WITH RECURSIVE`); returns
+/// false otherwise. Matching is whole-word (ASCII boundaries) so `insert_col`
+/// / `deleted_at` do NOT match. Trade-off: a read-only WITH that mentions one
+/// of these words as an UNQUOTED identifier would be conservatively rejected;
+/// that favors safety and such an identifier would normally need quoting.
+fn has_data_modifying_cte(stmt: &str) -> bool {
+    use crate::protocol::starts_with_ci;
+    if !starts_with_ci(stmt.trim_start(), "WITH") {
+        return false;
+    }
+    let bytes = stmt.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => i = skip_single_quoted(bytes, i),
+            b'"' => i = skip_double_quoted(bytes, i),
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => i = skip_line_comment(bytes, i),
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => i = skip_block_comment(bytes, i),
+            // Same token-boundary gate as `split_statements`: only treat `$` as a
+            // dollar-quote opener when it starts a token, so a `$` inside an
+            // identifier cannot swallow the rest of the statement and hide an
+            // INSERT/UPDATE/DELETE/MERGE keyword from this scan.
+            b'$' if i == 0 || !is_word_byte(bytes[i - 1]) => match skip_dollar_quoted(bytes, i) {
+                Some(end) => i = end,
+                None => i += 1,
+            },
+            c if c.is_ascii_alphabetic() => {
+                let at_word_start = i == 0 || !is_word_byte(bytes[i - 1]);
+                if at_word_start {
+                    for kw in ["INSERT", "UPDATE", "DELETE", "MERGE"] {
+                        if matches_keyword(bytes, i, kw.as_bytes()) {
+                            return true;
+                        }
+                    }
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// Whole-word case-insensitive keyword match at `bytes[i..]`. Assumes the
+/// preceding byte is already known to be a word boundary; checks the trailing
+/// boundary here.
+fn matches_keyword(bytes: &[u8], i: usize, kw: &[u8]) -> bool {
+    let end = i + kw.len();
+    if end > bytes.len() {
+        return false;
+    }
+    if !bytes[i..end].eq_ignore_ascii_case(kw) {
+        return false;
+    }
+    end == bytes.len() || !is_word_byte(bytes[end])
 }
 
 #[cfg(test)]
@@ -401,8 +723,288 @@ mod tests {
         assert!(is_write_sql("INSERT INTO t VALUES (1)"));
         assert!(is_write_sql("  drop table t"));
         assert!(is_write_sql("CREATE TABLE t(x int)"));
+        // SET/RESET are flagged so no single statement can flip the read-only GUC.
+        assert!(is_write_sql("SET default_transaction_read_only=off"));
+        assert!(is_write_sql("RESET default_transaction_read_only"));
+        assert!(is_write_sql("reset all"));
         assert!(!is_write_sql("SELECT * FROM t"));
         assert!(!is_write_sql("  with x as (select 1) select * from x"));
+    }
+
+    fn cfg_ro(read_only: bool) -> McpConfig {
+        McpConfig {
+            read_only,
+            ..McpConfig::default()
+        }
+    }
+
+    #[test]
+    fn split_statements_single_and_trailing_semicolon() {
+        assert_eq!(split_statements("SELECT 1"), vec!["SELECT 1"]);
+        // A trailing `;` must NOT yield an empty final statement.
+        assert_eq!(split_statements("SELECT 1;"), vec!["SELECT 1"]);
+        assert_eq!(
+            split_statements("SELECT 1; DROP TABLE t"),
+            vec!["SELECT 1", "DROP TABLE t"]
+        );
+        // Whitespace / empty inputs → no statements.
+        assert!(split_statements("   ").is_empty());
+        assert!(split_statements(";;").is_empty());
+    }
+
+    #[test]
+    fn split_statements_semicolon_inside_single_quotes() {
+        assert_eq!(split_statements("SELECT ';' AS s"), vec!["SELECT ';' AS s"]);
+        // '' escape keeps us inside the string across the semicolon.
+        assert_eq!(
+            split_statements("SELECT 'a;''b;c' AS s"),
+            vec!["SELECT 'a;''b;c' AS s"]
+        );
+    }
+
+    #[test]
+    fn split_statements_escape_string_backslash_quote() {
+        // In an E'…' escape-string, `\'` is an escaped quote (NOT a close), so a
+        // `;` after it stays inside the string → ONE statement. Regressing this
+        // to over-reject (the pre-fix behavior) fails closed but breaks valid
+        // agents; verify it is admitted as a single statement.
+        assert_eq!(
+            split_statements(r"SELECT E'a\';b' AS s"),
+            vec![r"SELECT E'a\';b' AS s"]
+        );
+        assert_eq!(
+            split_statements(r"select e'x\';drop' AS s"),
+            vec![r"select e'x\';drop' AS s"]
+        );
+        // A REGULAR (non-E) string is standard-conforming: `\` is literal, so
+        // `'a\'` closes at the `'` and the `;` IS top-level → 2 statements.
+        // (The `E` detection must not leak into plain strings, or a real
+        // separator would be hidden — an under-count bypass.)
+        assert_eq!(
+            split_statements(r"SELECT 'a\'; DROP TABLE t"),
+            vec![r"SELECT 'a\'", "DROP TABLE t"]
+        );
+        // `someE'…'` — the `E` is the tail of an identifier, not an escape-string
+        // prefix, so backslash stays literal and the `'` after `\` closes.
+        assert_eq!(
+            split_statements(r"SELECT xE'a\'; DROP TABLE t"),
+            vec![r"SELECT xE'a\'", "DROP TABLE t"]
+        );
+    }
+
+    #[test]
+    fn split_statements_semicolon_inside_double_quotes() {
+        assert_eq!(
+            split_statements(r#"SELECT 1 AS "a;b""#),
+            vec![r#"SELECT 1 AS "a;b""#]
+        );
+    }
+
+    #[test]
+    fn split_statements_semicolon_inside_dollar_quotes() {
+        assert_eq!(
+            split_statements("SELECT $$a;b$$ AS s"),
+            vec!["SELECT $$a;b$$ AS s"]
+        );
+        assert_eq!(
+            split_statements("SELECT $tag$a;b$tag$ AS s"),
+            vec!["SELECT $tag$a;b$tag$ AS s"]
+        );
+        // `$1` is a parameter, not a dollar quote — the `;` after it splits.
+        assert_eq!(
+            split_statements("SELECT $1; DROP TABLE t"),
+            vec!["SELECT $1", "DROP TABLE t"]
+        );
+    }
+
+    #[test]
+    fn split_statements_dollar_in_identifier_does_not_hide_semicolon() {
+        // PostgreSQL's lexer treats `$` as an identifier-continuation char, so
+        // `a$x$`, `a$$`, `a$qz$` are SINGLE identifiers — the `$` does NOT open a
+        // dollar quote. A guard that misreads it as a dollar-quote opener would
+        // swallow the real top-level `;` and the trailing write, under-counting
+        // statements and defeating the multi-statement guard.
+        assert_eq!(
+            split_statements("SELECT 1 AS a$x$ ; DROP TABLE t"),
+            vec!["SELECT 1 AS a$x$", "DROP TABLE t"]
+        );
+        assert_eq!(
+            split_statements("SELECT 1 AS a$$ ; DELETE FROM t"),
+            vec!["SELECT 1 AS a$$", "DELETE FROM t"]
+        );
+        assert_eq!(
+            split_statements("SELECT 1 AS a$qz$ ; TRUNCATE users"),
+            vec!["SELECT 1 AS a$qz$", "TRUNCATE users"]
+        );
+        // Guard must not over-fire: a genuine dollar-quote (opening `$` starts a
+        // token) still masks its inner `;`.
+        assert_eq!(
+            split_statements("SELECT $$a;b$$ AS s ; SELECT 2"),
+            vec!["SELECT $$a;b$$ AS s", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn split_statements_semicolon_inside_comments() {
+        assert_eq!(
+            split_statements("SELECT 1 -- a;b\n"),
+            vec!["SELECT 1 -- a;b"]
+        );
+        assert_eq!(
+            split_statements("SELECT 1 /* a;b */ FROM t"),
+            vec!["SELECT 1 /* a;b */ FROM t"]
+        );
+        // Nested block comment: the inner `*/` must not end the outer one.
+        assert_eq!(
+            split_statements("SELECT 1 /* a /* b;c */ d;e */ FROM t"),
+            vec!["SELECT 1 /* a /* b;c */ d;e */ FROM t"]
+        );
+    }
+
+    #[test]
+    fn has_data_modifying_cte_detects_writes() {
+        assert!(has_data_modifying_cte(
+            "WITH x AS (INSERT INTO t VALUES(1) RETURNING *) SELECT * FROM x"
+        ));
+        assert!(has_data_modifying_cte(
+            "with recursive r as (delete from t returning *) select * from r"
+        ));
+        // Read-only CTE: no write keyword in code.
+        assert!(!has_data_modifying_cte(
+            "WITH x AS (SELECT 1) SELECT * FROM x"
+        ));
+        // Not a WITH head → never flagged (leading-verb guard handles it).
+        assert!(!has_data_modifying_cte("INSERT INTO t VALUES(1)"));
+        // Word-boundary: identifiers that merely contain the words don't match.
+        assert!(!has_data_modifying_cte(
+            "WITH x AS (SELECT deleted_at, insert_col FROM t) SELECT * FROM x"
+        ));
+        // The word appearing only inside a string literal doesn't match.
+        assert!(!has_data_modifying_cte(
+            "WITH x AS (SELECT 'delete me' AS s) SELECT * FROM x"
+        ));
+        // A `$` inside an identifier must NOT be misread as a dollar-quote
+        // opener; if it were, skip_dollar_quoted would consume to EOF and hide
+        // the INSERT keyword, wrongly reporting the CTE as read-only.
+        assert!(has_data_modifying_cte(
+            "WITH t AS (SELECT 1 AS a$x$), w AS (INSERT INTO logs VALUES(1) RETURNING *) SELECT * FROM w"
+        ));
+        assert!(has_data_modifying_cte(
+            "WITH t AS (SELECT 1 AS a$$), w AS (DELETE FROM logs RETURNING *) SELECT * FROM w"
+        ));
+        // Genuine dollar-quote (opening `$` starts a token) still masks the
+        // word inside it — no false positive.
+        assert!(!has_data_modifying_cte(
+            "WITH x AS (SELECT $$insert$$ AS s) SELECT * FROM x"
+        ));
+    }
+
+    #[test]
+    fn check_policy_read_only_rejects_bypasses() {
+        let cfg = cfg_ro(true);
+        for sql in [
+            "SELECT 1; DROP TABLE t",
+            "select 1 ; drop table t",
+            // `$`-in-identifier under-count bypasses: these must still split to
+            // 2 and trip the multi-statement guard.
+            "SELECT 1 AS a$x$ ; DROP TABLE t",
+            "SELECT 1 AS a$$ ; TRUNCATE users",
+            "SELECT 1 AS a$x$ ; COMMIT ; SET default_transaction_read_only=off ; INSERT INTO t VALUES(1)",
+            "WITH x AS (INSERT INTO t VALUES(1) RETURNING *) SELECT * FROM x",
+            "with recursive r as (delete from t returning *) select * from r",
+            "SET default_transaction_read_only=off",
+            // A lone RESET must not un-flip the read-only GUC either.
+            "RESET default_transaction_read_only",
+            "RESET ALL",
+        ] {
+            assert!(
+                McpServer::check_policy(&cfg, None, sql).is_err(),
+                "expected rejection for: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_policy_read_only_admits_safe() {
+        let cfg = cfg_ro(true);
+        for sql in [
+            "SELECT * FROM t",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "SELECT ';' AS s",
+            "SELECT 'delete me' AS s",
+            // A genuine dollar-quote with an inner `;` is ONE statement — the
+            // token-boundary guard must not over-fire and split/reject it.
+            "SELECT $$a;b$$ AS s",
+            "SELECT $tag$a;b$tag$ AS s",
+            // A `$` inside an identifier is fine on its own — read-only SELECT.
+            "SELECT 1 AS a$x$",
+            // An E'…' escape-string whose escaped quote precedes a `;` is a
+            // single read-only SELECT, not a batch — must be admitted.
+            r"SELECT E'a\';b' AS s",
+        ] {
+            assert!(
+                McpServer::check_policy(&cfg, None, sql).is_ok(),
+                "expected admit for: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_policy_rejects_multi_statement_even_with_permissive_contract() {
+        // Fully permissive contract (writes allowed) still must not let a
+        // batch through — multi-statement defeats the allow-list model.
+        let contract = AgentContract {
+            id: "writer".into(),
+            read_only: false,
+            allowed_verbs: Some(vec!["INSERT".into(), "SELECT".into()]),
+            allowed_tables: None,
+            denied_tables: vec![],
+            require_predicate_on: vec![],
+            require_limit: false,
+            max_rows: None,
+        };
+        let cfg = cfg_ro(false);
+        assert!(McpServer::check_policy(
+            &cfg,
+            Some(&contract),
+            "INSERT INTO a VALUES(1); DROP TABLE b"
+        )
+        .is_err());
+        // `$`-in-identifier under-count: with a permissive contract there is NO
+        // read-only backstop, so the multi-statement guard is the only defense.
+        // A leading SELECT passes `validate`; the guard must still reject.
+        for sql in [
+            "SELECT 1 AS a$x$ ; DROP TABLE b",
+            "SELECT 1 AS a$$ ; TRUNCATE b",
+            "SELECT 1 AS a$qz$ ; INSERT INTO b VALUES(1)",
+        ] {
+            assert!(
+                McpServer::check_policy(&cfg, Some(&contract), sql).is_err(),
+                "expected multi-statement rejection for: {sql}"
+            );
+        }
+        // A single allowed INSERT still passes the contract.
+        assert!(McpServer::check_policy(&cfg, Some(&contract), "INSERT INTO a VALUES(1)").is_ok());
+    }
+
+    #[test]
+    fn effective_read_only_decision() {
+        let ro = cfg_ro(true);
+        let rw = cfg_ro(false);
+        assert!(effective_read_only(&ro, None));
+        assert!(!effective_read_only(&rw, None));
+        let ro_contract = AgentContract {
+            id: "r".into(),
+            read_only: true,
+            allowed_verbs: None,
+            allowed_tables: None,
+            denied_tables: vec![],
+            require_predicate_on: vec![],
+            require_limit: false,
+            max_rows: None,
+        };
+        // A read-only contract forces read-only even when the gateway is not.
+        assert!(effective_read_only(&rw, Some(&ro_contract)));
     }
 
     #[tokio::test]
