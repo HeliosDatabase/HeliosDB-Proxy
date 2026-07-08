@@ -80,7 +80,7 @@ HeliosProxy features are grouped into a connection-routing tier and a programmab
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
 | **Query Cache** | `query-cache` / `distribcache` | Three-tier result cache (L1 hot / L2 warm / L3 semantic) with TTL-based expiration, pattern-based invalidation, and normalized query fingerprinting. The optional `distribcache` flag adds an AI-powered distributed tier with workload classification, access heatmaps, and intelligent prefetching |
-| **Query Routing** | `routing-hints` | Hint-based routing via SQL comments (`/*+ route=primary */`) and automatic classification of read vs. write queries |
+| **Query Routing** | `routing-hints` | Hint-based routing via SQL comments (`/*helios:route=primary*/`) and automatic classification of read vs. write queries |
 | **Lag-Aware Routing** | `lag-routing` | Routes reads to replicas within an acceptable replication lag threshold, with read-your-writes (RYW) session consistency guarantees |
 | **Query Rewriter** | `query-rewriting` | Rule-based SQL transformation engine — rewrite, redirect, or annotate queries before they reach the backend |
 | **Query Analytics** | `query-analytics` | Real-time query fingerprinting, execution statistics, slow query log, N+1 detection, and intent classification |
@@ -192,9 +192,12 @@ heliosdb-proxy --config proxy.toml
 ```
 
 ```toml
-[proxy]
+# Top-level keys — there is no [proxy] table (ProxyConfig reads these at the
+# document root; a wrapping section would be silently ignored).
 listen_address = "0.0.0.0:6432"
-admin_address = "0.0.0.0:9090"
+# Admin API is loopback-only by default. To expose it off-loopback, set an
+# admin_token (recommended) or admin_allow_insecure = true.
+admin_address = "127.0.0.1:9090"
 
 [pool]
 mode = "transaction"
@@ -320,12 +323,16 @@ curl http://localhost:9090/nodes
 # Connection pool metrics
 curl http://localhost:9090/metrics
 
-# Trigger manual failover
-curl -X POST http://localhost:9090/failover
+# Force a node down to exercise failover (chaos/fault injection)
+curl -X POST http://localhost:9090/api/chaos -d '{"action":"force_down","node":"pg-primary.internal:5432"}'
 
-# Drain node for maintenance
-curl -X POST http://localhost:9090/nodes/{id}/drain
+# Take a node out of rotation for maintenance
+curl -X POST http://localhost:9090/nodes/pg-standby-async.internal:5432/disable
 ```
+
+> Failover is automatic: a backend that fails a query is demoted within ~1
+> query and the next query reroutes. There is no `/failover` endpoint. Graceful
+> whole-proxy drain is triggered by `SIGUSR2`, not an HTTP call.
 
 ### Platform endpoints
 
@@ -406,14 +413,26 @@ containers:
 
 ## Benchmarks
 
-HeliosProxy adds minimal overhead while providing significant throughput improvements through connection pooling, query caching, and pipelining:
+A proxy sits in the data path, so on a raw single-query throughput contest a
+direct connection wins — that is expected. HeliosProxy's value is what a direct
+connection cannot do: multiplex many client connections onto a small, bounded
+backend pool, serve repeated reads from cache, and fail over transparently.
 
-| Metric | Direct Connection | HeliosProxy | Improvement |
-|--------|-------------------|-------------|-------------|
-| Connection setup | 12ms | 0.3ms | 40x faster |
-| Pooled throughput | 8,200 q/s | 42,000 q/s | 5.1x higher |
-| Cached query | — | 0.05ms | Sub-millisecond |
-| Failover time | Manual | 1.2s automatic | Zero downtime |
+Measured on this project's evidence host (PG 18.4, `pgbench -S`, see
+[`docs/perf-2026-07/README.md`](docs/perf-2026-07/README.md) for full tables and
+conditions):
+
+| What the proxy buys you | Result |
+|---|---|
+| Backend-connection fan-in | 32 bursty clients served by ~35 backend connections (session/transaction pooling) |
+| Transaction-pooling throughput after conditional reset (G2c) | +48% at 16 clients, +31% at 64 clients vs always-reset |
+| Idle-relay Flush latency (G3b) | 202 ms → 0.8 ms |
+| Cached read | sub-millisecond, no backend round-trip |
+| Failover | automatic — a failing backend is demoted within ~1 query and the next query reroutes |
+
+Raw scalability (direct vs proxy tps at 1/4/16/64 clients) is tabulated in the
+perf report; the proxy trades some peak tps for connection efficiency and the
+features above. Reproduce with `scripts/regress/bench-scalability.sh`.
 
 ---
 
