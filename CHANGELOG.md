@@ -5,6 +5,102 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-07-08
+
+Minor release — data-path performance, relay robustness, security hardening
+across the admin API and the HTTP/MCP/GraphQL gateways, an edge/geo result-cache
+mode, and config-loader correctness. Covers the 2026-07 performance & stability
+program (PRs #26–#37) plus a security/stability follow-up sweep.
+
+### ⚠️ Breaking / behavior changes — read before upgrading
+
+- **The admin API now binds loopback by default.** The `--admin` CLI default and
+  the `admin_address` default changed from `0.0.0.0:9090` to `127.0.0.1:9090`,
+  and binding the admin API to a **non-loopback** address without an
+  `admin_token` is now **refused at startup**. To keep an off-loopback admin
+  bind, set `admin_token` (recommended) or `admin_allow_insecure = true`.
+- **`[health] check_interval_secs = 0` is now rejected at startup.** Previously
+  it started and silently disabled the health-check task; set a positive value.
+- **Config files now undergo `${VAR}` / `${VAR:-default}` substitution at load.**
+  A `${VAR}` with no default and an unset environment variable now fails fast
+  (naming the variable) instead of being passed through literally.
+
+### Added
+
+- **Edge / geo result-cache mode** (`edge-proxy` feature, `[edge]` config section):
+  a two-region result cache with a home-authoritative clock, SSE invalidation
+  push, and a PG-wire data plane. Admin surface: `GET /api/edge/subscribe` (SSE
+  stream), `POST /api/edge/register`, `POST /api/edge/invalidate`.
+- **`[pool_mode] skip_clean_reset`** — skip `DISCARD ALL` for provably
+  session-neutral pooled connections (opt-in; default off).
+- **`mcp.auth_token`** — bearer authentication for the MCP agent gateway, which
+  was previously open by default.
+- **`admin_allow_insecure`** — opt in to an anonymous non-loopback admin bind
+  (see the breaking-changes note above).
+- **Environment-variable substitution in config files** — `${NAME}` and
+  `${NAME:-default}` are expanded by `ProxyConfig::from_file` (env lookup only,
+  no shell). Unrecognized top-level TOML keys/sections are now logged at startup
+  (`tracing::warn!`) instead of being silently ignored.
+
+### Changed
+
+- **LISTEN/NOTIFY notifications are delivered to idle sessions immediately**
+  (previously deferred to the session's next query); idle-relay `Flush`
+  round-trip latency dropped from ~202 ms to ~0.8 ms.
+- Pooled-connection reset is now conditional for clean connections (see
+  `skip_clean_reset`).
+
+### Fixed
+
+- **MCP `read_only` guardrail bypass.** The gateway inspected only a statement's
+  leading verb, so a multi-statement batch (`SELECT 1; DROP TABLE t`) or a
+  data-modifying CTE (`WITH x AS (INSERT … RETURNING *) SELECT …`) slipped past
+  it — and multi-statement input also defeated agent-contract allow-lists. It is
+  now closed by a comment/quote/dollar-quote-aware lexical guard (reject
+  multi-statement, scan for data-modifying CTEs) **and** a backend
+  `default_transaction_read_only` backstop on the fresh per-call connection.
+  (Also listed under Security.)
+- **Underflow panics on the live query path.** `Instant − Duration` panics when a
+  configured window exceeds process uptime (the monotonic clock starts near zero
+  at boot); ten sites across the circuit breaker (`sliding_counter`, `adaptive`)
+  and analytics (`patterns`), plus a wall-clock age in the distribcache heatmap,
+  now use `checked_sub` / `saturating_sub`.
+- **Auth relay** slow-client deadlock and `ErrorResponse` blindness (the auth
+  relay is now event-driven).
+- **Connection pool** COPY-hang, poisoned-park, and pool-key identity leakage.
+- **Session leaks** — RAII session guard and a DashMap-backed session table;
+  the health-check loop is now supervised.
+- **`ha-tr` transaction journal** is bounded (50 000 journals, oldest-first
+  eviction at capacity) — previously an unbounded leak; note the replay-window
+  implication for `/api/replay`. Per-session L1 caches are reclaimed.
+- **The shipped example configs now load.** `${VAR:-default}` was documented but
+  unimplemented and several files were invalid TOML; the loader now substitutes,
+  and a CI test loads every `config/*.toml` through the real `from_file` path.
+
+### Security
+
+- **Gateway request hardening (HTTP SQL / MCP / GraphQL):** an 8 MiB body cap
+  (rejected with 413 before allocation), a 15 s request deadline, 100-header /
+  64 KiB header caps, constant-time bearer comparison, and the new
+  `mcp.auth_token`.
+- **Admin-API exposure hardening:** loopback-by-default, refusal of anonymous
+  non-loopback binds, a `MAX_ADMIN_CONNS = 256` connection cap, a 15 s admin
+  read timeout, an 8 MiB admin body cap, and header caps.
+- **Pre-auth protocol crash guards:** undersized startup / message frames
+  (`len < 8` / `len < 4`) that previously panicked the pre-auth handler are
+  rejected; a 30 s pre-auth startup timeout bounds the handshake; per-session
+  resource caps bound the prepared-statement registry (count and retained
+  bytes), the un-flushed extended-protocol buffer, and a single inbound message.
+
+### Performance
+
+- **Hot-path per-query allocation elimination** — the relay previously allocated
+  two fresh 16 KiB buffers per query (~1 GB/s of churn at 64 clients); buffers
+  are now reused.
+- **Conditional reset** — transaction-pooling throughput +48 % at 16 clients and
+  +31 % at 64 clients versus always-reset (`pgbench -S`, evidence host).
+- **Idle relay** — `Flush` stall reduced from ~202 ms to ~0.8 ms.
+
 ## [1.3.1] - 2026-06-28
 
 Patch release — feature-gating fix.
