@@ -14,7 +14,9 @@
 # =============================================================================
 
 listen_address = "${HELIOS_PROXY_LISTEN:-0.0.0.0:6432}"
-admin_address  = "${HELIOS_PROXY_ADMIN:-0.0.0.0:9090}"
+# Loopback-only by default. The admin API runs privileged operations; binding it
+# to a non-loopback address requires admin_token (or admin_allow_insecure = true).
+admin_address  = "${HELIOS_PROXY_ADMIN:-127.0.0.1:9090}"
 
 # Transaction Replay — re-execute in-flight work after failover.
 # Modes: none, session (re-establish SET vars), select (replay reads),
@@ -137,7 +139,9 @@ enabled = true
 # =============================================================================
 
 [cache]
-enabled = "${HELIOS_PROXY_CACHE_ENABLED:-true}"
+# Unquoted so `${VAR:-default}` expands to a bare TOML boolean (a quoted
+# "${...}" would deserialize as a string and fail the bool field).
+enabled = ${HELIOS_PROXY_CACHE_ENABLED:-true}
 
 # -- L1: Hot cache (per-connection, sub-microsecond lookups) ------------------
 
