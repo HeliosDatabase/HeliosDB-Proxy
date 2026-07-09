@@ -167,7 +167,7 @@ Client Connection (TCP, PostgreSQL wire protocol)
         |
         v
   +-----------+
-  | Routing   |  Parse SQL hints (/*+ route=primary */)
+  | Routing   |  Parse SQL hints (/*helios:route=primary*/)
   | Hints     |  [routing-hints] Override default routing decision
   +-----------+
         |
