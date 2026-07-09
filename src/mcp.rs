@@ -483,16 +483,21 @@ fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// PostgreSQL identifier-continuation byte: `[A-Za-z0-9_$]`. Distinct from
-/// `is_word_byte` because `$` is a continuation char but NOT a valid first byte
-/// of a dollar-quote tag nor a keyword-boundary word char. Used ONLY by the
-/// dollar-quote-open token-boundary gates: a `$` opens a dollar quote only when
-/// it starts a token, and PG's lexer keeps `$` inside a running identifier
-/// (`a$$b$$` is ONE identifier, not `a` + a `$$b$$` dollar quote), so a `$`
-/// preceded by another `$` must NOT be treated as an opener.
+/// PostgreSQL identifier-continuation byte: `[A-Za-z0-9_$]` AND every high-bit
+/// byte `0x80..=0xFF` (any UTF-8 byte of a non-ASCII identifier char such as
+/// `é`). Distinct from `is_word_byte` because `$` and the multibyte range are
+/// identifier-continuation chars but NOT valid dollar-quote tag bytes nor
+/// keyword-boundary word chars. Used ONLY by the dollar-quote-open
+/// token-boundary gates: a `$` opens a dollar quote only when it STARTS a token,
+/// and PG's lexer keeps `$` inside a running identifier — `a$$b$$` AND `é$$` are
+/// each ONE identifier, not a `$$…` dollar quote — so a `$` preceded by another
+/// `$` OR by a multibyte identifier byte must NOT be treated as an opener.
+/// Omitting the high-bit range reopens the statement-splitter under-count for a
+/// multibyte-led alias (`SELECT 1 AS é$$ ; DROP TABLE t`). Mirrors the `< 0x80`
+/// multibyte guard already used in `skip_single_quoted`.
 #[inline]
 fn is_ident_cont(b: u8) -> bool {
-    is_word_byte(b) || b == b'$'
+    is_word_byte(b) || b == b'$' || b >= 0x80
 }
 
 /// `bytes[i]` is `'` — return the index just past the closing quote (or
@@ -863,6 +868,17 @@ mod tests {
             split_statements("SELECT 1 AS a$$x$$ ; TRUNCATE users"),
             vec!["SELECT 1 AS a$$x$$", "TRUNCATE users"]
         );
+        // Multibyte-led alias: PG's ident_cont includes high-bit bytes, so `é$$`
+        // is ONE identifier. The gate must treat a `$` glued after a multibyte
+        // byte as still-inside-identifier, or it reopens the under-count.
+        assert_eq!(
+            split_statements("SELECT 1 AS é$$ ; DROP TABLE t"),
+            vec!["SELECT 1 AS é$$", "DROP TABLE t"]
+        );
+        assert_eq!(
+            split_statements("SELECT 1 AS naïve$$x$$ ; DELETE FROM t"),
+            vec!["SELECT 1 AS naïve$$x$$", "DELETE FROM t"]
+        );
         // Guard must not over-fire: a genuine dollar-quote (opening `$` starts a
         // token) still masks its inner `;` — both empty-tag and named-tag forms.
         assert_eq!(
@@ -948,6 +964,7 @@ mod tests {
             "SELECT 1 AS a$$ ; TRUNCATE users",
             "SELECT 1 AS a$$b$$ ; DROP TABLE t",
             "SELECT 1 AS a$$x$$ ; DELETE FROM t",
+            "SELECT 1 AS é$$ ; DROP TABLE t",
             "SELECT 1 AS a$x$ ; COMMIT ; SET default_transaction_read_only=off ; INSERT INTO t VALUES(1)",
             "WITH x AS (INSERT INTO t VALUES(1) RETURNING *) SELECT * FROM x",
             "with recursive r as (delete from t returning *) select * from r",
@@ -980,6 +997,9 @@ mod tests {
             // ...including the `$$`-adjacency shape: a lone `a$$b$$` is one
             // identifier, so this is a single read-only statement, not a batch.
             "SELECT 1 AS a$$b$$",
+            // ...and a lone multibyte-led alias `é$$` — one identifier, admitted
+            // (the ident_cont fix must not over-reject genuine single statements).
+            "SELECT 1 AS é$$",
             // An E'…' escape-string whose escaped quote precedes a `;` is a
             // single read-only SELECT, not a batch — must be admitted.
             r"SELECT E'a\';b' AS s",
@@ -1023,6 +1043,10 @@ mod tests {
             "SELECT 1 AS a$qz$ ; INSERT INTO b VALUES(1)",
             "SELECT 1 AS a$$b$$ ; DROP TABLE b",
             "SELECT 1 AS a$$x$$ ; TRUNCATE b",
+            // Multibyte-led alias — the exact write-through the re-audit found:
+            // no read-only backstop on this path, so the split guard is the only
+            // defense and MUST reject.
+            "SELECT 1 AS é$$ ; DROP TABLE b",
         ] {
             assert!(
                 McpServer::check_policy(&cfg, Some(&contract), sql).is_err(),
