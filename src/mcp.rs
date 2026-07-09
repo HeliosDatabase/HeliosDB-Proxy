@@ -483,6 +483,18 @@ fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// PostgreSQL identifier-continuation byte: `[A-Za-z0-9_$]`. Distinct from
+/// `is_word_byte` because `$` is a continuation char but NOT a valid first byte
+/// of a dollar-quote tag nor a keyword-boundary word char. Used ONLY by the
+/// dollar-quote-open token-boundary gates: a `$` opens a dollar quote only when
+/// it starts a token, and PG's lexer keeps `$` inside a running identifier
+/// (`a$$b$$` is ONE identifier, not `a` + a `$$b$$` dollar quote), so a `$`
+/// preceded by another `$` must NOT be treated as an opener.
+#[inline]
+fn is_ident_cont(b: u8) -> bool {
+    is_word_byte(b) || b == b'$'
+}
+
 /// `bytes[i]` is `'` — return the index just past the closing quote (or
 /// end-of-input if unterminated). `''` is an in-string escape, not a close.
 ///
@@ -624,12 +636,14 @@ fn split_statements(sql: &str) -> Vec<&str> {
             b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => i = skip_block_comment(bytes, i),
             // A `$` only opens a dollar-quote when it STARTS a token. PostgreSQL's
             // lexer treats `$` as an identifier-continuation char (ident_cont =
-            // [A-Za-z_0-9$]), so `a$$`, `a$x$` lex as SINGLE identifiers, not as
-            // dollar-quote delimiters. Gating on the preceding-byte token
-            // boundary (mirrors PG's lexer) stops a `$` embedded in an identifier
-            // from spuriously "quoting" — and thereby hiding — a real top-level
-            // `;` (e.g. `SELECT 1 AS a$x$ ; DROP TABLE t`).
-            b'$' if i == 0 || !is_word_byte(bytes[i - 1]) => match skip_dollar_quoted(bytes, i) {
+            // [A-Za-z_0-9$]), so `a$x$` AND `a$$b$$` lex as SINGLE identifiers,
+            // not as dollar-quote delimiters. The gate must therefore reject a `$`
+            // preceded by ANY ident_cont byte — INCLUDING another `$` (that is why
+            // `is_ident_cont`, not `is_word_byte`, is used here): otherwise the
+            // second `$` of `a$$b$$` is misread as a tag opener, `skip_dollar_quoted`
+            // runs off to EOF, and a real top-level `;` is hidden (e.g.
+            // `SELECT 1 AS a$$b$$ ; DROP TABLE t` would under-count to one statement).
+            b'$' if i == 0 || !is_ident_cont(bytes[i - 1]) => match skip_dollar_quoted(bytes, i) {
                 Some(end) => i = end,
                 None => i += 1,
             },
@@ -679,7 +693,7 @@ fn has_data_modifying_cte(stmt: &str) -> bool {
             // dollar-quote opener when it starts a token, so a `$` inside an
             // identifier cannot swallow the rest of the statement and hide an
             // INSERT/UPDATE/DELETE/MERGE keyword from this scan.
-            b'$' if i == 0 || !is_word_byte(bytes[i - 1]) => match skip_dollar_quoted(bytes, i) {
+            b'$' if i == 0 || !is_ident_cont(bytes[i - 1]) => match skip_dollar_quoted(bytes, i) {
                 Some(end) => i = end,
                 None => i += 1,
             },
@@ -836,11 +850,28 @@ mod tests {
             split_statements("SELECT 1 AS a$qz$ ; TRUNCATE users"),
             vec!["SELECT 1 AS a$qz$", "TRUNCATE users"]
         );
+        // The `$$<tag>$$` adjacency: a `$` PRECEDED BY another `$` is still inside
+        // the identifier (ident_cont includes `$`), so `a$$b$$` is ONE identifier.
+        // The gate must use is_ident_cont (not is_word_byte, which omits `$`) or
+        // the second `$` is misread as a tag opener that runs to EOF and hides the
+        // top-level `;` (the real read_only/allow-list bypass this test guards).
+        assert_eq!(
+            split_statements("SELECT 1 AS a$$b$$ ; DROP TABLE t"),
+            vec!["SELECT 1 AS a$$b$$", "DROP TABLE t"]
+        );
+        assert_eq!(
+            split_statements("SELECT 1 AS a$$x$$ ; TRUNCATE users"),
+            vec!["SELECT 1 AS a$$x$$", "TRUNCATE users"]
+        );
         // Guard must not over-fire: a genuine dollar-quote (opening `$` starts a
-        // token) still masks its inner `;`.
+        // token) still masks its inner `;` — both empty-tag and named-tag forms.
         assert_eq!(
             split_statements("SELECT $$a;b$$ AS s ; SELECT 2"),
             vec!["SELECT $$a;b$$ AS s", "SELECT 2"]
+        );
+        assert_eq!(
+            split_statements("SELECT $q$a;b$q$ AS s ; SELECT 2"),
+            vec!["SELECT $q$a;b$q$ AS s", "SELECT 2"]
         );
     }
 
@@ -892,6 +923,12 @@ mod tests {
         assert!(has_data_modifying_cte(
             "WITH t AS (SELECT 1 AS a$$), w AS (DELETE FROM logs RETURNING *) SELECT * FROM w"
         ));
+        // The `$$<tag>$$` adjacency inside a CTE: a `$` after another `$` must not
+        // open a phantom dollar-quote that swallows the INSERT (the same
+        // under-count class as the split_statements bypass).
+        assert!(has_data_modifying_cte(
+            "WITH t AS (SELECT 1 AS a$$b$$), w AS (INSERT INTO logs VALUES(1) RETURNING *) SELECT * FROM w"
+        ));
         // Genuine dollar-quote (opening `$` starts a token) still masks the
         // word inside it — no false positive.
         assert!(!has_data_modifying_cte(
@@ -909,6 +946,8 @@ mod tests {
             // 2 and trip the multi-statement guard.
             "SELECT 1 AS a$x$ ; DROP TABLE t",
             "SELECT 1 AS a$$ ; TRUNCATE users",
+            "SELECT 1 AS a$$b$$ ; DROP TABLE t",
+            "SELECT 1 AS a$$x$$ ; DELETE FROM t",
             "SELECT 1 AS a$x$ ; COMMIT ; SET default_transaction_read_only=off ; INSERT INTO t VALUES(1)",
             "WITH x AS (INSERT INTO t VALUES(1) RETURNING *) SELECT * FROM x",
             "with recursive r as (delete from t returning *) select * from r",
@@ -938,6 +977,9 @@ mod tests {
             "SELECT $tag$a;b$tag$ AS s",
             // A `$` inside an identifier is fine on its own — read-only SELECT.
             "SELECT 1 AS a$x$",
+            // ...including the `$$`-adjacency shape: a lone `a$$b$$` is one
+            // identifier, so this is a single read-only statement, not a batch.
+            "SELECT 1 AS a$$b$$",
             // An E'…' escape-string whose escaped quote precedes a `;` is a
             // single read-only SELECT, not a batch — must be admitted.
             r"SELECT E'a\';b' AS s",
@@ -972,11 +1014,15 @@ mod tests {
         .is_err());
         // `$`-in-identifier under-count: with a permissive contract there is NO
         // read-only backstop, so the multi-statement guard is the only defense.
-        // A leading SELECT passes `validate`; the guard must still reject.
+        // A leading SELECT passes `validate`; the guard must still reject. The
+        // `a$$b$$` / `a$$x$$` shapes are the ones a prior gate (using is_word_byte,
+        // which omits `$`) mis-split into ONE statement, letting DROP/TRUNCATE run.
         for sql in [
             "SELECT 1 AS a$x$ ; DROP TABLE b",
             "SELECT 1 AS a$$ ; TRUNCATE b",
             "SELECT 1 AS a$qz$ ; INSERT INTO b VALUES(1)",
+            "SELECT 1 AS a$$b$$ ; DROP TABLE b",
+            "SELECT 1 AS a$$x$$ ; TRUNCATE b",
         ] {
             assert!(
                 McpServer::check_policy(&cfg, Some(&contract), sql).is_err(),
