@@ -57,7 +57,7 @@ HeliosProxy features are grouped into a connection-routing tier and a programmab
 
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
-| **Connection Pooling** | `pool-modes` | Session, Transaction, and Statement pooling with automatic lease management, prepared statement forwarding, and configurable reset sequences |
+| **Connection Pooling** | `pool-modes` | Session, Transaction, and Statement pooling with automatic lease management, prepared statement forwarding, and configurable reset sequences. `[pool_mode].skip_clean_reset` opts into conditional connection reset (the G2c throughput win in the benchmarks below) |
 | **Load Balancer** | *(core)* | Round-robin, least-connections, and latency-based routing with automatic read/write splitting across primary and standby nodes |
 | **Health Checker** | *(core)* | Continuous node health monitoring with configurable check intervals, failure thresholds, and custom health-check queries |
 | **Pipeline** | *(core)* | PostgreSQL extended query protocol pipelining — batches Parse/Bind/Execute messages for reduced round trips |
@@ -67,7 +67,7 @@ HeliosProxy features are grouped into a connection-routing tier and a programmab
 
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
-| **Failover Controller** | *(core)* | Automatic failover with sync-standby preference, candidate ranking by replication lag, and configurable promotion policies |
+| **Failover Controller** | *(core)* | Automatic failover with candidate ranking by replication lag and configurable promotion policies |
 | **Transaction Replay (TR)** | `ha-tr` | Journals in-flight transactions and transparently replays them on a new primary after failover — zero data loss for committed work, with statement ordering and parameter fidelity preserved |
 | **Session Migration** | `ha-tr` | Captures and restores full session state (SET parameters, prepared statements, advisory locks) when moving connections between nodes |
 | **Cursor Restore** | `ha-tr` | Preserves open cursor positions across failover — clients resume fetching without re-executing the query |
@@ -79,7 +79,7 @@ HeliosProxy features are grouped into a connection-routing tier and a programmab
 
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
-| **Query Cache** | `query-cache` / `distribcache` | Three-tier result cache (L1 hot / L2 warm / L3 semantic) with TTL-based expiration, pattern-based invalidation, and normalized query fingerprinting. The optional `distribcache` flag adds an AI-powered distributed tier with workload classification, access heatmaps, and intelligent prefetching |
+| **Query Cache** | `query-cache` | Three-tier result cache (L1 hot / L2 warm / L3 semantic) with TTL-based expiration, pattern-based invalidation, and normalized query fingerprinting. (`distribcache` is a separate, experimental in-tree library module for distributed cache tiers — it is not wired into this proxy cache path; see the feature-flags table) |
 | **Query Routing** | `routing-hints` | Hint-based routing via SQL comments (`/*helios:route=primary*/`) and automatic classification of read vs. write queries |
 | **Lag-Aware Routing** | `lag-routing` | Routes reads to replicas within an acceptable replication lag threshold, with read-your-writes (RYW) session consistency guarantees |
 | **Query Rewriter** | `query-rewriting` | Rule-based SQL transformation engine — rewrite, redirect, or annotate queries before they reach the backend |
@@ -101,6 +101,7 @@ HeliosProxy features are grouped into a connection-routing tier and a programmab
 | **Multi-Tenancy** | `multi-tenancy` | Tenant-aware connection routing with per-tenant pools, schema isolation, resource quotas, and automatic tenant identification from connection metadata |
 | **WASM Plugins** | `wasm-plugins` | Sandboxed WebAssembly plugin runtime with hot-reload, host function bindings, and per-plugin resource limits |
 | **GraphQL Gateway** | `graphql-gateway` | GraphQL-to-SQL translation layer with automatic schema introspection, DataLoader batching, and query validation |
+| **MCP Agent Gateway** | *(config-gated, `[mcp]`)* | JSON-RPC 2.0 over HTTP for AI agents — `query`, `list_tables`, `explain` tools. Optional bearer-token auth via `[mcp].auth_token` |
 
 ## Platform Tier
 
@@ -194,19 +195,29 @@ heliosdb-proxy --config proxy.toml
 ```toml
 # Top-level keys — there is no [proxy] table (ProxyConfig reads these at the
 # document root; a wrapping section would be silently ignored).
+#
+# Values support environment-variable substitution: `${NAME}` expands to the
+# env var (error if unset) and `${NAME:-default}` falls back to a literal
+# default when unset — e.g. listen_address = "0.0.0.0:${PORT:-6432}".
 listen_address = "0.0.0.0:6432"
 # Admin API is loopback-only by default. To expose it off-loopback, set an
 # admin_token (recommended) or admin_allow_insecure = true.
 admin_address = "127.0.0.1:9090"
 
-[pool]
+# Pooling mode lives in [pool_mode] (mode = session | transaction | statement),
+# NOT [pool]. [pool] holds the size/timeout knobs.
+[pool_mode]
 mode = "transaction"
+
+[pool]
 min_connections = 5
 max_connections = 100
 idle_timeout_secs = 300
 
 [load_balancer]
-strategy = "least_connections"
+# Field is read_strategy: round_robin | weighted_round_robin |
+# least_connections | latency_based | random.
+read_strategy = "least_connections"
 read_write_split = true
 
 [health]
@@ -219,14 +230,15 @@ host = "pg-primary.internal"
 port = 5432
 role = "primary"
 
+# Node fields: host, port, http_port, role, weight, enabled, name. There is no
+# `sync` attribute — a standby is just role = "standby".
 [[nodes]]
-host = "pg-standby-sync.internal"
+host = "pg-standby-1.internal"
 port = 5432
 role = "standby"
-sync = true
 
 [[nodes]]
-host = "pg-standby-async.internal"
+host = "pg-standby-2.internal"
 port = 5432
 role = "standby"
 ```
@@ -261,13 +273,15 @@ export DATABASE_URL="postgres://myapp:password@localhost:6432/mydb"
 | `wasm-plugins` | No | Sandboxed WASM plugin runtime with hot-reload |
 | `graphql-gateway` | No | GraphQL-to-SQL translation with introspection |
 | `schema-routing` | No | Schema-aware routing and workload classification |
-| `distribcache` | No | AI-powered distributed query caching |
+| `distribcache` | No | Experimental in-tree library module (`src/distribcache`) for distributed cache tiers. Compiling it in only makes the module available to library consumers — it is **not** wired into the proxy request path and has no `proxy.toml` section |
 | `anomaly-detection` | No | In-process anomaly detection (rate spikes, credential stuffing, SQLi heuristics, novel queries) |
 | `edge-proxy` | No | Cache-first edge / geo proxy mode with last-write-wins TTL coherence |
 | `postgres-topology` | No | PostgreSQL primary discovery via `pg_is_in_recovery()` |
 | `heliosdb-topology` | No | HeliosDB native topology integration |
-| `observability` | No | Prometheus metrics and OpenTelemetry tracing |
+| `observability` | No | Pulls in the `prometheus` and `opentelemetry` crates as dependencies; it does not itself wire any metrics or tracing. The `/metrics` and `/metrics/prometheus` admin endpoints are always available regardless of this flag |
+| `ldap-auth` | No | LDAP directory authentication (search + bind) inside `auth-proxy`; pulls the `ldap3` client. Enable in addition to `auth-proxy` for directory-backed auth |
 | `all-features` | No | Enables all proxy features (choose a topology provider separately) |
+| `msrv-features` | No | MSRV verification bundle — `all-features` minus `wasm-plugins` and `ldap-auth` so the Rust 1.86 `cargo check` step compiles in reasonable time |
 
 ### Build Examples
 
@@ -323,8 +337,9 @@ curl http://localhost:9090/nodes
 # Connection pool metrics
 curl http://localhost:9090/metrics
 
-# Force a node down to exercise failover (chaos/fault injection)
-curl -X POST http://localhost:9090/api/chaos -d '{"action":"force_down","node":"pg-primary.internal:5432"}'
+# Force a node unhealthy to exercise failover (chaos/fault injection).
+# Actions: force_unhealthy | restore | reset; the node field is target_node.
+curl -X POST http://localhost:9090/api/chaos -d '{"action":"force_unhealthy","target_node":"pg-primary.internal:5432"}'
 
 # Take a node out of rotation for maintenance
 curl -X POST http://localhost:9090/nodes/pg-standby-async.internal:5432/disable
@@ -347,16 +362,25 @@ curl http://localhost:9090/plugins
 curl http://localhost:9090/anomalies?limit=50
 
 # Chaos engineering — fault injection to validate the failover path
-curl -X POST http://localhost:9090/api/chaos -d '{"action":"force_unhealthy","node":"pg-primary"}'
+curl -X POST http://localhost:9090/api/chaos -d '{"action":"force_unhealthy","target_node":"pg-primary.internal:5432"}'
 
-# Shadow execution — run a query against source + shadow backends and diff results
-curl -X POST http://localhost:9090/api/shadow -d '{"query":"SELECT count(*) FROM orders"}'
+# Shadow execution — run a query against source + shadow backends and diff results.
+# Body requires sql plus source_host/source_port and shadow_host/shadow_port.
+curl -X POST http://localhost:9090/api/shadow \
+  -d '{"sql":"SELECT count(*) FROM orders","source_host":"pg-primary.internal","source_port":5432,"shadow_host":"pg-new.internal","shadow_port":5432}'
 
-# Time-travel replay — replay a journal window against a target backend
-curl -X POST http://localhost:9090/api/replay -d '{"from":"...","to":"..."}'
+# Time-travel replay — replay a journal window against a target backend.
+# Requires an RFC-3339 window (from/to) and the target host+port; credentials
+# are optional (falls back to the startup template when omitted).
+curl -X POST http://localhost:9090/api/replay \
+  -d '{"from":"2026-07-09T00:00:00Z","to":"2026-07-09T01:00:00Z","target_host":"staging.internal","target_port":5432}'
 
 # Edge mode — cache stats, edge registration, invalidation broadcast
 curl http://localhost:9090/api/edge
+
+# Edge invalidation stream — edges subscribe here for a live SSE push of
+# table-scoped invalidations from the home proxy
+curl -N "http://localhost:9090/api/edge/subscribe?edge_id=e1&region=us-east"
 ```
 
 The embedded admin Web UI exposes all of the above at `/` and `/ui`.
