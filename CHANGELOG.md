@@ -91,8 +91,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`tr_max_journal_bytes`, `switchover_drain_timeout_secs` never existed), the
   `write_timeout_secs` default (30, not 15), the default `tr_mode` (`session`), the
   text-format (not binary) replay parameter path, and the fact that session-state/cursor
-  migration is not implemented and `FailoverController`/`PrimaryTracker` are library
-  components rather than daemon-wired. The topology doc now separates the daemon's
+  migration exists only as unwired library modules (`src/cursor_restore.rs`,
+  `src/session_migrate.rs`) not reachable from the replay path, while
+  `FailoverController`/`PrimaryTracker` are library components rather than
+  daemon-wired. The topology doc now separates the daemon's
   static-role-plus-health primary tracking (surfaced at `/topology`) from the
   `TopologyProvider` library abstraction, and notes the PostgreSQL provider is constructed
   programmatically (not from `[[nodes]]`). Each doc carries a "last verified against"

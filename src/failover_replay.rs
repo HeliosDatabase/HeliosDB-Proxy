@@ -550,8 +550,10 @@ fn journal_value_to_param(v: &JournalValue) -> ParamValue {
         }
         JournalValue::Array(_) => {
             // Arrays not yet supported in replay — fall back to NULL so
-            // the statement at least compiles. Replay reporting will
-            // show `rows_matched=false` which surfaces the issue.
+            // the statement at least compiles. Replay reporting shows
+            // `rows_matched=false` only for entries that recorded a
+            // `rows_affected` count; for hot-path journals (no recorded
+            // count) the degradation is silent.
             ParamValue::Null
         }
     }
