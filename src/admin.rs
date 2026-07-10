@@ -3492,6 +3492,20 @@ mod tests {
         );
     }
 
+    // Guards the embedded dashboard's stored-XSS fix: every backend/attacker-
+    // derived string interpolated into an innerHTML template is routed through
+    // the `esc()` HTML-escape helper. The anomaly panel in particular renders
+    // attacker-influenced fields (fingerprint, sql_excerpt) via innerHTML, so
+    // if a future regeneration of `admin_ui.html` drops the helper this test
+    // goes red before the sink can be exploited.
+    #[test]
+    fn test_admin_ui_html_contains_esc_helper() {
+        assert!(
+            ADMIN_UI_HTML.contains("function esc("),
+            "admin UI must define the esc() HTML-escape helper to prevent stored XSS in innerHTML sinks"
+        );
+    }
+
     #[cfg(feature = "edge-proxy")]
     async fn edge_state() -> Arc<AdminState> {
         use crate::edge::{EdgeCache, EdgeRegistry};
