@@ -81,9 +81,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Plugin `kv_set` is now bounded (was unbounded in 1.4.0).** The per-plugin KV
-  host import changed from an infallible unbounded store (`kv_set` returned `()`)
-  to a capped one (`kv_set` returns a `bool`: `-1`/`false` when a write is
-  refused). The new `[plugins]` caps default to `kv_max_value_bytes` 65536,
+  store went from an infallible unbounded write to a capped one. The in-WASM
+  `kv_set` import keeps its `i32` ABI — `0` on success, `-1` when the write is
+  refused (a cap breach now joins the internal-error case in returning `-1`);
+  the internal store `set()` method that backs it changed from returning `()` to
+  returning a `bool` (`false` = refused). The new `[plugins]` caps default to
+  `kv_max_value_bytes` 65536,
   `kv_max_keys_per_plugin` 1024, `kv_max_plugins` 256, and `kv_max_total_bytes`
   67108864 (64 MiB). **Upgrade impact:** a plugin deployed under 1.4.0 that
   stored values larger than 64 KiB, or more than 1024 keys in its namespace,
@@ -138,6 +141,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The static shell (`GET /`, `/ui`) is now token-exempt so the page can load
   and prompt — it carries no privileged data, and every API call it makes is
   still individually gated. Without a token, behavior is unchanged (no prompt).
+
+### Security
+
+- **Stored XSS in the embedded admin dashboard (present in 1.4.0 — prioritize
+  this upgrade).** The admin web UI (`src/admin_ui.html`, served at `/` and
+  `/ui`) interpolated backend- and attacker-derived strings into `innerHTML`
+  with only a partial `<`-escape. A crafted SQL query whose text flowed into an
+  anomaly `fingerprint` (or `sql_excerpt`) — surfaced on the `/anomalies` panel
+  — could therefore inject script that runs in an authenticated operator's
+  dashboard, an admin-API-takeover vector. The same gap affected the other
+  anomaly fields (`tenant`, `user`, `client_ip`, each `patterns_matched`
+  entry) and the node (`address`), plugin (`name`/`version`/`hooks`/`state`/
+  error), edge (`edge_id`/`region`/error), and topology (`currentPrimary`)
+  strings rendered into `innerHTML`. Every backend/attacker-derived string
+  interpolated into an `innerHTML` template now passes through a single `esc()`
+  HTML-escape helper; numeric/boolean/hardcoded values and `textContent` sinks
+  were already safe and are unchanged. This path shipped live in the published
+  1.4.0, so 1.4.0 operators should upgrade.
 
 ## [1.4.0] - 2026-07-09
 
