@@ -23,7 +23,7 @@ This guard lives in `ProxyConfig::validate` (`src/config.rs`) and only fires for
 
 ### Bearer-token authentication
 
-When `admin_token` is set, **every route requires** `Authorization: Bearer <token>`, verified with a constant-time compare. Requests without a valid token get `401 Unauthorized` with body `{"error":"missing or invalid admin bearer token"}`.
+When `admin_token` is set, **every route requires** `Authorization: Bearer <token>`, verified with a constant-time compare, **except** the token-exempt liveness paths (below) and the static web-UI shell (`GET /`, `/ui`) — the shell holds no privileged data and injects the token into its own API calls client-side (see [Web UI](#web-ui)). Requests without a valid token get `401 Unauthorized` with body `{"error":"missing or invalid admin bearer token"}`.
 
 ```bash
 curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/nodes
@@ -38,6 +38,8 @@ The auth gate exempts a fixed set of `GET` liveness paths so orchestrators can p
 ```
 /health   /healthz   /livez   /readyz
 ```
+
+The static web-UI shell (`GET /`, `/ui`) is also served without a token (it holds no privileged data); see [Web UI](#web-ui).
 
 All four are routed and token-exempt. The z-suffixed paths are Kubernetes-style aliases of the slash-form health routes and return byte-for-byte the same responses:
 
@@ -116,7 +118,7 @@ Auth column: **token** = requires bearer token when `admin_token` is set; **open
 | `GET` | `/api/branch`, `/branch` | List branch databases (503 if branching off) | — | token |
 | `POST` | `/api/branch`, `/branch` | Create a branch database | — | token |
 | `DELETE` | `/api/branch`, `/branch` | Drop a branch database (`?name=…`) | — | token |
-| `GET` | `/`, `/ui` | Embedded admin web UI (HTML) | — | token |
+| `GET` | `/`, `/ui` | Embedded admin web UI (HTML) — static shell only; its API calls are gated | — | open |
 
 > The `/api/migration/*` and `/api/branch` routes also accept the same paths without the `/api` prefix (e.g. `/migration/cutover`, `/branch`) — both spellings are wired.
 
@@ -489,7 +491,15 @@ Creating without a `name` returns `400 {"error":"provide 'name'"}`; dropping wit
 
 ## Web UI
 
-`GET /` and `GET /ui` serve an embedded admin dashboard (single HTML file compiled into the binary). Like every other non-health route, it requires the bearer token when `admin_token` is set.
+`GET /` and `GET /ui` serve an embedded admin dashboard (single HTML file compiled into the binary). The static shell is **token-exempt** — it is served even when `admin_token` is set, because the HTML itself carries no privileged data; every API call the dashboard makes (`/nodes`, `/metrics`, `/api/sql`, …) still goes through the bearer gate.
+
+When `admin_token` is set, the dashboard handles auth entirely client-side:
+
+- On first load, the first API call returns `401` and the page prompts **once** for the admin token (the same value as `admin_token` in `proxy.toml`).
+- The token is kept in the tab's `sessionStorage` under the key `helios_admin_token` — it dies with the tab, is never written to disk, and never appears in the URL. A wrapped `window.fetch` injects `Authorization: Bearer <token>` into every request (a caller-supplied `Authorization` header still wins).
+- A **token** button in the header bar clears the saved token and reloads, so a wrong token can be re-entered without closing the tab.
+
+When `admin_token` is unset, the dashboard works with no prompt (rely on the loopback bind for protection).
 
 ---
 
