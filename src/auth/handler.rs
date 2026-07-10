@@ -1084,16 +1084,19 @@ mod tests {
     use super::*;
 
     fn test_config() -> AuthConfig {
-        let mut config = AuthConfig::default();
-        config.enabled = true;
-        config.auth_methods = vec![AuthMethod::Trust];
-        config
+        AuthConfig {
+            enabled: true,
+            auth_methods: vec![AuthMethod::Trust],
+            ..Default::default()
+        }
     }
 
     #[tokio::test]
     async fn test_authentication_disabled() {
-        let mut config = AuthConfig::default();
-        config.enabled = false;
+        let config = AuthConfig {
+            enabled: false,
+            ..Default::default()
+        };
         let handler = AuthenticationHandler::new(config);
 
         let request = AuthRequest::new();
@@ -1143,15 +1146,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_key_registration_and_auth() {
-        let mut config = AuthConfig::default();
-        config.enabled = true;
-        config.api_keys = Some(ApiKeyConfig {
-            header_name: "X-API-Key".to_string(),
-            query_param: None,
-            prefix: None,
-            hash_algorithm: "sha256".to_string(),
-        });
-        config.auth_methods = vec![AuthMethod::ApiKey];
+        let config = AuthConfig {
+            enabled: true,
+            api_keys: Some(ApiKeyConfig {
+                header_name: "X-API-Key".to_string(),
+                query_param: None,
+                prefix: None,
+                hash_algorithm: "sha256".to_string(),
+            }),
+            auth_methods: vec![AuthMethod::ApiKey],
+            ..Default::default()
+        };
 
         let handler = AuthenticationHandler::new(config);
 
@@ -1207,9 +1212,11 @@ mod tests {
     async fn basic_auth_denies_without_user_store() {
         // Hardening: HTTP Basic used to accept ANY non-empty password. With no
         // user store wired it must now deny.
-        let mut config = AuthConfig::default();
-        config.enabled = true;
-        config.auth_methods = vec![AuthMethod::Basic];
+        let config = AuthConfig {
+            enabled: true,
+            auth_methods: vec![AuthMethod::Basic],
+            ..Default::default()
+        };
         let handler = AuthenticationHandler::new(config);
 
         use base64::{engine::general_purpose::STANDARD, Engine};
