@@ -33,6 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The detector is built once at startup, so changing `[anomaly]` requires a
   restart (a SIGHUP reload does not rebuild it).
 
+### Fixed
+
+- **`/healthz`, `/livez`, `/readyz` admin routes** — these three
+  Kubernetes-style probe paths were already token-exempt in the admin auth gate
+  but had no handler, so they fell through to the catch-all and returned `404`.
+  They now route to the same handlers as their slash-form twins (`/healthz` →
+  `/health`, `/livez` → `/health/live`, `/readyz` → `/health/ready`), returning
+  byte-for-byte identical responses. Because they are token-exempt, orchestrators
+  can use `/livez` and `/readyz` for unauthenticated liveness/readiness probes
+  even when `admin_token` is set (the slash-form `/health/live` and
+  `/health/ready` remain token-gated, unchanged).
+
 ## [1.4.0] - 2026-07-09
 
 Minor release — data-path performance, relay robustness, security hardening

@@ -31,7 +31,7 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/nodes
 
 When `admin_token` is **unset**, no route requires a token (rely on the loopback bind for protection).
 
-### Token-exempt health paths — and a known quirk
+### Token-exempt health paths
 
 The auth gate exempts a fixed set of `GET` liveness paths so orchestrators can probe without the token:
 
@@ -39,18 +39,18 @@ The auth gate exempts a fixed set of `GET` liveness paths so orchestrators can p
 /health   /healthz   /livez   /readyz
 ```
 
-**Known limitation:** of those four exempt paths, **only `/health` is actually routed.** `/healthz`, `/livez`, and `/readyz` are exempt from the token check but have **no handler** — they fall through to the catch-all and return **`404 Not Found`**. They are effectively dead paths.
+All four are routed and token-exempt. The z-suffixed paths are Kubernetes-style aliases of the slash-form health routes and return byte-for-byte the same responses:
 
-The working liveness/readiness routes are **`/health/live`** and **`/health/ready`** — but those are **not** in the token-exempt list, so when `admin_token` is set they require the bearer token like any other route. In other words:
+| Path | Alias of | Response |
+|------|----------|----------|
+| `/health` | — | 200 `{"status":"ok"}` |
+| `/healthz` | `/health` | 200 `{"status":"ok"}` |
+| `/livez` | `/health/live` | 200 `{"alive":true}` |
+| `/readyz` | `/health/ready` | 200 if ≥1 healthy backend, else 503 |
 
-| Path | Routed? | Token-exempt? | Net behavior with `admin_token` set |
-|------|---------|---------------|-------------------------------------|
-| `/health` | yes | yes | 200, no token needed — use this for liveness probes |
-| `/healthz`, `/livez`, `/readyz` | **no** | yes | **404** (dead paths) |
-| `/health/live` | yes | no | 200, **token required** |
-| `/health/ready` | yes | no | 200/503, **token required** |
+The slash-form `/health/live` and `/health/ready` routes are **not** token-exempt, so when `admin_token` is set they require the bearer token like any other route — use the z-suffixed aliases (`/livez`, `/readyz`) for unauthenticated probes.
 
-**Recommendation for Kubernetes probes:** point the liveness probe at `/health` (open, always 200). If you need a real readiness gate (`/health/ready`) and `admin_token` is set, supply the token in the probe's HTTP headers, or leave `admin_token` unset on a loopback bind.
+**Recommendation for Kubernetes probes:** point the liveness probe at `/healthz` (or `/livez`) and the readiness probe at `/readyz` — all three are open (no token) and always routed.
 
 ### Connection & request caps
 
@@ -80,8 +80,11 @@ Auth column: **token** = requires bearer token when `admin_token` is set; **open
 | Method | Path | Purpose | Feature gate | Auth |
 |--------|------|---------|--------------|------|
 | `GET` | `/health` | Liveness (`{"status":"ok"}`) | — | open |
+| `GET` | `/healthz` | Liveness — alias of `/health` | — | open |
 | `GET` | `/health/live` | Liveness (`{"alive":true}`) | — | token |
+| `GET` | `/livez` | Liveness — alias of `/health/live` | — | open |
 | `GET` | `/health/ready` | Readiness — 200 if ≥1 healthy backend, else 503 | — | token |
+| `GET` | `/readyz` | Readiness — alias of `/health/ready` | — | open |
 | `GET` | `/metrics` | Server metrics (JSON) | — | token |
 | `GET` | `/metrics/prometheus` | Server metrics (Prometheus text, wrapped in JSON `text`) | — | token |
 | `GET` | `/version` | Proxy version | — | token |
@@ -123,37 +126,39 @@ Any path/method not in this table returns `404 {"error":"Not found"}`.
 
 ## Health Endpoints
 
-### GET /health
+### GET /health, GET /healthz
 
-Basic liveness. Always 200 while the process is running. **Token-exempt** — the one health path that is both routed and open, so it is the correct target for an unauthenticated liveness probe.
+Basic liveness. Always 200 while the process is running. **Token-exempt** — both spellings are routed and open, so either is a correct target for an unauthenticated liveness probe (`/healthz` is the Kubernetes-conventional alias).
 
 ```bash
 curl http://localhost:9090/health
+curl http://localhost:9090/healthz
 ```
 
 ```json
 { "status": "ok" }
 ```
 
-### GET /health/live
+### GET /health/live, GET /livez
 
-Simple alive indicator. Always 200. **Requires the bearer token** when `admin_token` is set (it is *not* in the token-exempt list).
+Simple alive indicator. Always 200. `/health/live` **requires the bearer token** when `admin_token` is set (it is *not* in the token-exempt list); its `/livez` alias is **token-exempt** — prefer `/livez` for unauthenticated probes.
 
 ```bash
 curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/health/live
+curl http://localhost:9090/livez
 ```
 
 ```json
 { "alive": true }
 ```
 
-### GET /health/ready
+### GET /health/ready, GET /readyz
 
-Readiness. Returns 200 if at least one backend node is healthy, `503` otherwise. **Requires the bearer token** when `admin_token` is set.
+Readiness. Returns 200 if at least one backend node is healthy, `503` otherwise. `/health/ready` **requires the bearer token** when `admin_token` is set; its `/readyz` alias is **token-exempt** — prefer `/readyz` for unauthenticated probes.
 
 ```bash
 curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/health/ready
-```
+curl http://localhost:9090/readyz
 
 ```json
 { "ready": true, "message": "Proxy is ready" }
@@ -497,7 +502,7 @@ All JSON errors share the shape `{"error":"<description>"}`.
 | `200` | Success. |
 | `400` | Bad request (malformed input, missing required field/param). |
 | `401` | Missing/invalid admin bearer token (only when `admin_token` is set). |
-| `404` | Unknown node address, or an unrouted path (including `/healthz`, `/livez`, `/readyz`). |
+| `404` | Unknown node address, or an unrouted path. |
 | `409` | Migration cutover blocked (mirror not `migration_ready`); retry with `force=true`. |
 | `500` | Internal server error. |
 | `503` | Not ready / no healthy backends, **or** a feature/subsystem is not compiled in / not enabled. |
