@@ -436,8 +436,8 @@ mod tests {
         let decision = router.route(None, Some(Duration::ZERO), None);
 
         // Zero lag requires sync standby
-        if decision.target_node.is_some() {
-            assert_eq!(decision.target_node.as_ref().unwrap(), "sync-1");
+        if let Some(node) = &decision.target_node {
+            assert_eq!(node, "sync-1");
         }
     }
 

@@ -6375,7 +6375,6 @@ pub struct PoolModeStatsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HealthConfig, LoadBalancerConfig, PoolConfig};
     #[cfg(not(feature = "wasm-plugins"))]
     use crate::protocol::QueryMessage;
 

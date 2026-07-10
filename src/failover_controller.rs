@@ -999,15 +999,12 @@ mod tests {
     #[cfg(feature = "ha-tr")]
     #[tokio::test]
     async fn test_coordinate_failover_replay_with_transactions() {
-        use super::super::transaction_journal::{
-            JournalEntry, JournalValue, StatementType, TransactionJournal,
-        };
+        use super::super::transaction_journal::{JournalValue, TransactionJournal};
         use uuid::Uuid;
 
         let controller = FailoverController::new(FailoverConfig::default());
         let journal = TransactionJournal::new();
         let failed_node = NodeId::new();
-        let new_primary_id = NodeId::new();
         let new_primary = NodeEndpoint::new("new-primary", 5432).with_role(NodeRole::Primary);
 
         // Register the new primary as a candidate with zero lag

@@ -1288,7 +1288,7 @@ mod tests {
     ///      offset 100 (3 bytes)
     ///   2. writes the 64-byte hex digest at offset 200
     ///   3. returns the packed (200 << 32) | 64
-    /// so the host can read the digest out of plugin memory.
+    ///      so the host can read the digest out of plugin memory.
     fn build_sha256_test_module(engine: &Engine) -> Module {
         let wat = r#"
             (module

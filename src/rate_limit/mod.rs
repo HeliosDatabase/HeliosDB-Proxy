@@ -67,7 +67,6 @@ pub use token_bucket::TokenBucket;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn test_limiter_key_equality() {

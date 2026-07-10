@@ -1036,7 +1036,7 @@ mod tests {
 
         let id1 = index.insert(vec![1.0, 0.0, 0.0]);
         let id2 = index.insert(vec![0.9, 0.1, 0.0]);
-        let id3 = index.insert(vec![0.0, 1.0, 0.0]);
+        let _id3 = index.insert(vec![0.0, 1.0, 0.0]);
 
         // Search for vector similar to [1.0, 0.0, 0.0]
         let results = index.search(&[1.0, 0.0, 0.0], 2);

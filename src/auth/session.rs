@@ -686,7 +686,7 @@ mod tests {
         let manager = SessionManager::new(SessionConfig::default());
 
         let session = manager.create_session(test_identity(), None, None).unwrap();
-        let original_expires = session.expires_at;
+        let _original_expires = session.expires_at;
 
         std::thread::sleep(Duration::from_millis(10));
 

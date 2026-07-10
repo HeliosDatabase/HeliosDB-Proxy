@@ -629,8 +629,8 @@ mod postgresql_compat_tests {
         let t1 = pipeline
             .submit(conn_id, b"Parse: SELECT $1::int".to_vec())
             .unwrap();
-        let t2 = pipeline.submit(conn_id, b"Bind: [42]".to_vec()).unwrap();
-        let t3 = pipeline.submit(conn_id, b"Execute".to_vec()).unwrap();
+        let _t2 = pipeline.submit(conn_id, b"Bind: [42]".to_vec()).unwrap();
+        let _t3 = pipeline.submit(conn_id, b"Execute".to_vec()).unwrap();
 
         assert_eq!(pipeline.depth(conn_id), 3);
 

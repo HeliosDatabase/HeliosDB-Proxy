@@ -374,7 +374,7 @@ mod tests {
     #[test]
     fn test_slow_query_entry_format() {
         let entry = SlowQueryEntry {
-            timestamp_nanos: 1704067200_000_000_000,
+            timestamp_nanos: 1_704_067_200_000_000_000,
             duration: Duration::from_millis(1500),
             query: "SELECT * FROM users WHERE id = 1".to_string(),
             fingerprint: "select * from users where id = ?".to_string(),

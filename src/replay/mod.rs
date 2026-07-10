@@ -12,8 +12,6 @@
 //! client (added in the T0-TR sequence) — no new infrastructure.
 
 use crate::backend::{BackendClient, BackendConfig, ParamValue};
-#[cfg(test)]
-use crate::transaction_journal::JournalEntry;
 use crate::transaction_journal::{JournalValue, TransactionJournal};
 use crate::{ProxyError, Result};
 use chrono::{DateTime, Utc};
@@ -192,7 +190,6 @@ fn journal_value_to_param(v: &JournalValue) -> ParamValue {
 mod tests {
     use super::*;
     use crate::backend::{tls::default_client_config, TlsMode};
-    use crate::transaction_journal::StatementType;
     use crate::NodeId;
     use std::time::Duration;
     use uuid::Uuid;
@@ -209,19 +206,6 @@ mod tests {
             connect_timeout: Duration::from_millis(200),
             query_timeout: Duration::from_millis(200),
             tls_config: default_client_config(),
-        }
-    }
-
-    fn make_entry(sequence: u64, statement: &str, timestamp: DateTime<Utc>) -> JournalEntry {
-        JournalEntry {
-            sequence,
-            statement: statement.to_string(),
-            parameters: vec![],
-            result_checksum: None,
-            rows_affected: None,
-            timestamp,
-            statement_type: StatementType::Select,
-            duration_ms: 1,
         }
     }
 
