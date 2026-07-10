@@ -1,312 +1,101 @@
 # HeliosProxy Topology Providers
 
-HeliosProxy discovers and tracks the current primary node through a pluggable topology provider abstraction. This document describes the available providers, their configuration, and failover detection behavior.
+HeliosProxy needs to know which backend node is the current primary so it can route
+writes correctly and buffer them across a failover. There are two distinct layers to this,
+and this document keeps them separate because they behave differently:
+
+1. **The standalone daemon** determines the primary from static `[[nodes]]` roles plus
+   live health checks, and reports it at the admin `/topology` endpoint.
+2. **The `TopologyProvider` library abstraction** (`PrimaryTracker` plus pluggable
+   providers) is a programmatic/embedded interface — used by unit tests and by the
+   HeliosDB-workspace build — for automatic, event-driven primary tracking.
+
+Every concrete claim below is grounded in `src/primary_tracker.rs`,
+`src/admin.rs` (`compute_topology`, `TopologyResponse`), and the node/config types in
+`src/config.rs`. Where the library abstraction is *not* wired into the shipped daemon, the
+document says so.
+
+**Last verified against commit `9c5ff9b`.**
 
 ---
 
-## Overview
+## Layer 1 — How the Standalone Daemon Tracks the Primary
 
-The `PrimaryTracker` is the component responsible for knowing which backend node is the current primary at all times. It consumes topology change events and exposes the current primary to the load balancer, failover controller, and switchover buffer.
+In the running `heliosdb-proxy` daemon, the primary is **not** discovered by polling
+`pg_is_in_recovery()`. It is the configured `[[nodes]]` entry whose `role = "primary"`,
+that is `enabled`, and whose health check is currently passing.
 
-Three topology provider implementations are available:
+### Determining the current primary
 
-| Provider | Feature Flag | Discovery Method | Latency |
-|----------|-------------|------------------|---------|
-| PostgreSQL | `postgres-topology` | Polls `pg_is_in_recovery()` on each node | Polling interval (default 2s) |
-| HeliosDB | `heliosdb-topology` | Subscribes to internal topology events | Event-driven (near-instant) |
-| Manual / API | *(none -- always available)* | Explicit `set_primary()` / `clear_primary()` calls | Depends on external orchestration |
+The write path (`select_primary_with_timeout` in `src/server.rs`) looks for
+`n.role == NodeRole::Primary && n.enabled` and a passing health entry. If that node is
+healthy, writes go to it. If it is not, the proxy buffers the write, polling health every
+100 ms for up to `write_timeout_secs` (default 30) for a healthy primary to appear; on
+timeout it increments the `failovers` metric and returns `NoHealthyNodes`. (See
+[transaction-replay.md](transaction-replay.md#what-happens-on-the-live-write-path).)
 
-If no topology provider is configured, the proxy starts in **standalone mode** and expects primary management through the Admin API or direct programmatic calls.
+The admin view (`compute_topology` in `src/admin.rs`) uses the same rule: `currentPrimary`
+is the address of the first node with `role = "primary"` (case-insensitive) whose health
+entry is `healthy = true`. `None` is the correct answer while a failover is in progress and
+no primary-role node is healthy.
 
----
+### The `/topology` response
 
-## PostgreSQL Provider (`postgres-topology`)
+`GET /topology` returns `TopologyResponse` (camelCase to map cleanly into the Kubernetes
+operator CRD status):
 
-The PostgreSQL topology provider discovers the primary by polling the built-in `pg_is_in_recovery()` function on every configured node. The node that returns `false` is the primary; all nodes returning `true` are standbys or replicas.
-
-### How It Works
-
-```
-  +-----------+     pg_is_in_recovery()     +-----------+
-  | HeliosProxy| ────────────────────────> | Node A     |
-  | Topology   |      returns: false        | (Primary)  |
-  | Poller     |                            +-----------+
-  |            |     pg_is_in_recovery()     +-----------+
-  |            | ────────────────────────> | Node B     |
-  |            |      returns: true          | (Standby)  |
-  |            |                            +-----------+
-  |            |     pg_is_in_recovery()     +-----------+
-  |            | ────────────────────────> | Node C     |
-  |            |      returns: true          | (Replica)  |
-  +-----------+                            +-----------+
-```
-
-On each polling interval:
-
-1. The provider connects to every configured node (or reuses an existing connection).
-2. Executes `SELECT pg_is_in_recovery()`.
-3. The node returning `false` is identified as the primary.
-4. If the primary has changed since the last poll, a `TopologyEvent::PrimaryChanged` event is broadcast.
-5. If a node fails to respond, a `TopologyEvent::HealthChanged` event is broadcast.
-
-### Configuration
-
-The PostgreSQL provider is configured through the standard `[[nodes]]` entries in `config.toml`. Each node requires connection credentials for the polling queries.
-
-```toml
-# Enable postgres-topology at build time:
-# cargo build --release --features "postgres-topology"
-
-[[nodes]]
-host = "pg-primary.internal"
-port = 5432
-role = "primary"
-name = "pg-primary"
-
-[[nodes]]
-host = "pg-standby-1.internal"
-port = 5432
-role = "standby"
-name = "pg-standby-1"
-
-[[nodes]]
-host = "pg-standby-2.internal"
-port = 5432
-role = "standby"
-name = "pg-standby-2"
-```
-
-### Polling Interval
-
-The default polling interval is **2 seconds**. This means failover detection latency is at most 2 seconds (one polling cycle) plus the health check `failure_threshold` cycles.
-
-The polling interval can be configured programmatically:
-
-```rust
-use heliosdb_proxy::primary_tracker::PostgresTopologyProvider;
-use std::time::Duration;
-
-let provider = PostgresTopologyProvider::new(nodes)
-    .with_poll_interval(Duration::from_secs(1));  // Poll every second
-```
-
-### Compatible HA Solutions
-
-The PostgreSQL provider works with any HA solution that uses standard PostgreSQL streaming replication, because the detection relies solely on `pg_is_in_recovery()`:
-
-| HA Solution | Compatibility | Notes |
-|-------------|--------------|-------|
-| Native streaming replication | Fully compatible | Standard `pg_basebackup` + streaming replication. |
-| Patroni | Fully compatible | Patroni manages promotion; the proxy detects the new primary via polling. |
-| pg_auto_failover | Fully compatible | Citus-managed automatic failover. |
-| Stolon | Fully compatible | Cloud-native PostgreSQL HA. |
-| repmgr | Fully compatible | Community replication manager. |
-| AWS RDS | Fully compatible | Managed PostgreSQL. The proxy polls read replicas to distinguish them from the primary. |
-| AWS Aurora | Fully compatible | Aurora PostgreSQL-compatible edition. |
-| Google Cloud SQL | Fully compatible | Managed PostgreSQL with read replicas. |
-| Azure Database for PostgreSQL | Fully compatible | Managed PostgreSQL with read replicas. |
-
-### Failover Detection Sequence
-
-When a PostgreSQL primary fails and a standby is promoted:
-
-```
-Time 0s    Primary fails (stops responding to pg_is_in_recovery)
-           |
-Time 0-2s  Next polling cycle detects failure
-           TopologyEvent::HealthChanged { node_id: old_primary, is_healthy: false }
-           |
-Time 2-4s  Standby is promoted by external HA manager (Patroni, etc.)
-           Promoted standby returns pg_is_in_recovery() = false
-           |
-Time 4-6s  Next polling cycle detects new primary
-           TopologyEvent::PrimaryChanged { old_primary, new_primary }
-           |
-Time 6s    PrimaryTracker updates, switchover buffer drains,
-           queries resume on new primary
-```
-
-Total failover detection time: **2-6 seconds** with default settings (2s poll interval).
-
----
-
-## HeliosDB Provider (`heliosdb-topology`)
-
-The HeliosDB topology provider bridges the proxy into the HeliosDB internal replication system. Instead of polling, it subscribes to the `TopologyManager` event stream for instant, zero-latency failover detection.
-
-### How It Works
-
-```
-  +-----------+     TopologyEvent stream     +-----------+
-  | HeliosProxy| <────────────────────────── | HeliosDB   |
-  | Topology   |  PrimaryChanged event       | Topology   |
-  | Subscriber |                             | Manager    |
-  +-----------+                              +-----------+
-```
-
-The HeliosDB provider implements the `TopologyProvider` trait through a bridge interface (`HeliosTopologyBridge`). This avoids a hard compile-time dependency on the HeliosDB replication crate, allowing the standalone proxy to compile without the HeliosDB workspace.
-
-### Architecture
-
-```rust
-// Bridge trait -- implemented by the HeliosDB replication crate
-pub trait HeliosTopologyBridge: Send + Sync + 'static {
-    fn subscribe(&self) -> broadcast::Receiver<TopologyEvent>;
-    fn get_primary(&self) -> Option<TopologyNodeInfo>;
-    fn get_node(&self, id: Uuid) -> Option<TopologyNodeInfo>;
-}
-
-// Wrapper that adapts the bridge to TopologyProvider
-pub struct HeliosTopologyProvider<T: HeliosTopologyBridge> {
-    inner: Arc<T>,
-}
-```
-
-### Configuration
-
-The HeliosDB provider requires no additional configuration beyond the `heliosdb-topology` feature flag. It is initialized programmatically when the proxy is started within the HeliosDB workspace.
-
-```bash
-# Build within the HeliosDB workspace:
-cargo build --release --features "heliosdb-topology"
-```
-
-### Failover Detection
-
-Failover detection is event-driven. When the HeliosDB replication subsystem detects a primary change (through its internal consensus mechanism), it immediately emits a `TopologyEvent::PrimaryChanged` event. The proxy processes this event within milliseconds.
-
-```
-Time 0ms    Primary fails
-            |
-Time ~100ms HeliosDB replication detects failure and promotes standby
-            TopologyEvent::PrimaryChanged emitted
-            |
-Time ~101ms PrimaryTracker updates, queries resume on new primary
-```
-
-Total failover detection time: **sub-second** (limited only by the HeliosDB replication protocol).
-
----
-
-## Manual / Standalone Provider
-
-When no topology feature flag is enabled, the proxy starts in standalone mode. The primary is managed through explicit API calls.
-
-### How It Works
-
-```
-  +-----------+     set_primary()     +-----------+
-  | External  | ──────────────────> | HeliosProxy|
-  | Manager   |     Admin API        | Primary    |
-  | (Patroni, |     or programmatic  | Tracker    |
-  |  scripts) |                      +-----------+
-  +-----------+
-```
-
-### Programmatic API
-
-```rust
-use heliosdb_proxy::primary_tracker::PrimaryTracker;
-
-// Create a standalone tracker
-let tracker = PrimaryTracker::new_standalone();
-
-// Set the primary (e.g., after discovering it externally)
-let node_id = uuid::Uuid::new_v4();
-tracker.set_primary(node_id, "pg-primary.local:5432".to_string());
-
-// Confirm the primary (after verifying it is accepting writes)
-tracker.confirm_primary();
-
-// Handle failover -- clear the old primary
-tracker.clear_primary();
-
-// Set the new primary
-let new_node_id = uuid::Uuid::new_v4();
-tracker.set_primary(new_node_id, "pg-standby.local:5432".to_string());
-tracker.confirm_primary();
-```
-
-### Event Subscription
-
-Regardless of the provider mode, components can subscribe to primary change events:
-
-```rust
-let mut rx = tracker.subscribe();
-
-loop {
-    match rx.recv().await {
-        Ok(PrimaryChangeEvent::Changed { old, new, address }) => {
-            println!("Primary changed: {:?} -> {} at {}", old, new, address);
-        }
-        Ok(PrimaryChangeEvent::Lost { old }) => {
-            println!("Primary lost: {}", old);
-        }
-        Ok(PrimaryChangeEvent::Confirmed { node_id }) => {
-            println!("Primary confirmed: {}", node_id);
-        }
-        Err(_) => break,
-    }
-}
-```
-
-### Use Cases for Standalone Mode
-
-| Use Case | Integration Approach |
-|----------|---------------------|
-| External failover manager (Patroni, pg_auto_failover) | The manager calls the proxy Admin API to update the primary after promotion. |
-| Manual failover scripts | Operator runs `curl -X POST .../nodes/{addr}/enable` after promoting a standby. |
-| Custom orchestration | Application code calls `PrimaryTracker::set_primary()` directly. |
-| Testing and development | Primary is set at startup and remains static. |
-
----
-
-## Primary Lifecycle
-
-All three providers follow the same primary lifecycle:
-
-```
-                              set_primary()
-  ┌──────┐                     ┌─────────┐
-  │ NONE │ ──────────────────> │ PENDING │
-  └──────┘                     └────┬────┘
-      ^                             │
-      │    clear_primary()          │ confirm_primary()
-      │                             v
-      │                        ┌──────────┐
-      └─────────────────────── │CONFIRMED │
-         node lost / unhealthy └──────────┘
-```
-
-| State | Meaning |
+| Field | Meaning |
 |-------|---------|
-| NONE | No primary is known. Write queries are buffered (up to `write_timeout_secs`) or rejected. |
-| PENDING | A primary has been identified but not yet confirmed. The proxy begins routing writes to the pending primary. |
-| CONFIRMED | The primary is verified and accepting writes. Normal operation. |
+| `currentPrimary` | Address of the first healthy `primary`-role node, or `null`. |
+| `healthyNodes` | Count of nodes with a passing health check. |
+| `unhealthyNodes` | Count of nodes with a failing health check. |
+| `totalNodes` | Number of configured `[[nodes]]`. |
+| `lastFailoverAt` | RFC 3339 timestamp of the last observed primary change; `null` when none has been observed since boot (currently always `null` in `compute_topology`). |
 
-### Topology Events
+### Node configuration and manual control
 
-| Event | Trigger |
-|-------|---------|
-| `PrimaryChanged { old, new }` | The primary role moved from one node to another. |
-| `NodeLeft { node_id }` | A node is no longer reachable and has been removed from the topology. |
-| `HealthChanged { node_id, is_healthy }` | A node's health status changed. |
+Nodes are declared with `[[nodes]]` entries (`role = "primary" | "standby" | "replica"`,
+plus `host`/`port`/`name`/`enabled`). See [configuration.md](configuration.md) for the
+full node schema.
 
-### Primary Change Events (Internal)
+Because the daemon derives the primary from role + health, primary changes are driven by:
 
-| Event | Trigger |
-|-------|---------|
-| `Changed { old, new, address }` | A new primary has been set (either via provider event or manual call). |
-| `Lost { old }` | The current primary was cleared (node failure, manual clear). |
-| `Confirmed { node_id }` | The pending primary has been confirmed. |
+- **Health checks** flipping a node's `healthy` flag (a failing primary drops out;
+  `currentPrimary` becomes `null` until a `primary`-role node is healthy again).
+- **`POST /nodes/{addr}/enable` / `/disable`** — operator control over which nodes are
+  in rotation.
+- **`POST /api/chaos`** — force a node unhealthy (or restore it) to exercise the failover
+  path without external tooling.
+
+To promote a standby in this model, an external HA manager (Patroni, pg_auto_failover,
+etc.) performs the promotion, and the proxy's `[[nodes]]` roles are updated (config reload
+via SIGHUP) or the failed primary node recovers under the same address.
 
 ---
 
-## Custom Topology Providers
+## Layer 2 — The `TopologyProvider` Library Abstraction
 
-The `TopologyProvider` trait can be implemented for any custom topology source. This enables integration with proprietary HA solutions, service meshes, or cloud-native orchestration systems.
+`src/primary_tracker.rs` defines a provider abstraction for **automatic** primary
+tracking. These types are compiled into the crate and covered by unit tests, and are the
+intended integration surface for embedding the proxy or building it inside the HeliosDB
+workspace. As of `9c5ff9b` they are **not** instantiated by the standalone daemon's
+forwarding loop — `PrimaryTracker`, `PostgresTopologyProvider`, and the HeliosDB bridge
+appear in the runtime only through the crate's test suite.
 
-### Trait Definition
+### The `PrimaryTracker`
+
+`PrimaryTracker` holds an optional `Arc<dyn TopologyProvider>` and the current
+`PrimaryInfo` (`node_id`, `address`, `became_primary_at`, `is_confirmed`). It can run in
+three modes:
+
+1. **Provider-backed** — `PrimaryTracker::with_provider(provider)`; `run()` subscribes to
+   the provider's event stream and updates on each `TopologyEvent`.
+2. **Standalone** — `PrimaryTracker::new_standalone()`; the primary is set/cleared
+   explicitly via `set_primary` / `confirm_primary` / `clear_primary`.
+3. **PostgreSQL** — pass a `PostgresTopologyProvider` (feature `postgres-topology`) to
+   `with_provider`.
+
+### The `TopologyProvider` trait
 
 ```rust
 pub trait TopologyProvider: Send + Sync + 'static {
@@ -321,44 +110,195 @@ pub trait TopologyProvider: Send + Sync + 'static {
 }
 ```
 
-### Example: Consul-Based Provider
+`TopologyNodeInfo` carries `node_id: Uuid`, `client_addr: String`, and `is_healthy: bool`.
+
+### Provider overview
+
+| Provider | Feature Flag | Discovery Method | Latency |
+|----------|-------------|------------------|---------|
+| PostgreSQL | `postgres-topology` | Polls `pg_is_in_recovery()` on each node | Poll interval (default 2 s) |
+| HeliosDB | `heliosdb-topology` | Subscribes to the internal `TopologyManager` event stream | Event-driven |
+| Manual / standalone | *(none — always available)* | Explicit `set_primary()` / `clear_primary()` | Depends on the caller |
+
+---
+
+## PostgreSQL Provider (`postgres-topology`)
+
+`PostgresTopologyProvider` (feature `postgres-topology`) discovers the primary by polling
+`SELECT pg_is_in_recovery()` on each configured node: the node returning `false` is the
+primary; those returning `true` are standbys/replicas.
+
+### How it works
+
+`poll_nodes` runs each poll interval:
+
+1. `probe_recovery` opens a `BackendClient` to each node and runs
+   `SELECT pg_is_in_recovery()`.
+2. The first node reporting `false` becomes the candidate primary. (Taking the *first*
+   keeps the choice deterministic if a brief split-brain shows two.)
+3. If the primary UUID changed since the previous poll, a
+   `TopologyEvent::PrimaryChanged { old_primary, new_primary }` is broadcast.
+4. If a probe errors, `TopologyEvent::HealthChanged { node_id, is_healthy: false }` is
+   broadcast for that node.
+
+### Construction (programmatic)
+
+The provider is constructed from an explicit `Vec<PostgresNode>`, **not** from `proxy.toml`
+`[[nodes]]` — there is no config wiring that builds a `PostgresTopologyProvider` in the
+daemon. `PostgresNode` carries `node_id`, `host`, `port`, `user`, `password`, `database`.
+
+```rust
+use heliosdb_proxy::primary_tracker::{PostgresNode, PostgresTopologyProvider};
+use std::time::Duration;
+
+let provider = PostgresTopologyProvider::new(nodes)   // Vec<PostgresNode>
+    .with_poll_interval(Duration::from_secs(1))       // default is 2s
+    .with_tls_mode(heliosdb_proxy::backend::TlsMode::Prefer);
+```
+
+Probe connections are built with a rustls client config from the Mozilla root set;
+`with_tls_mode` sets the TLS policy (default `Prefer`), `connect_timeout` is the poll
+interval capped at 5 s, and `application_name` is `helios-topology`.
+
+### Default polling interval
+
+The default poll interval is **2 seconds** (`Duration::from_secs(2)`), tunable with
+`with_poll_interval`. Detection latency is therefore roughly one poll cycle for a lost
+primary, plus another cycle after an external HA manager promotes a standby to `false`.
+
+### Compatible HA solutions
+
+Because detection relies solely on `pg_is_in_recovery()`, the provider works with any HA
+solution built on standard PostgreSQL streaming replication — the external manager performs
+promotion; the provider detects the resulting change. This includes native streaming
+replication, Patroni, pg_auto_failover, Stolon, repmgr, and managed offerings (AWS
+RDS/Aurora, Google Cloud SQL, Azure Database for PostgreSQL) that expose replicas answering
+`pg_is_in_recovery()`.
+
+---
+
+## HeliosDB Provider (`heliosdb-topology`)
+
+`HeliosTopologyProvider<T>` (feature `heliosdb-topology`, in the `heliosdb_provider`
+module) bridges the proxy into HeliosDB's internal replication `TopologyManager` instead of
+polling. It is defined behind a bridge trait so the standalone proxy can compile without a
+hard dependency on the replication crate:
+
+```rust
+// Implemented by the HeliosDB replication crate.
+pub trait HeliosTopologyBridge: Send + Sync + 'static {
+    fn subscribe(&self) -> broadcast::Receiver<TopologyEvent>;
+    fn get_primary(&self) -> Option<TopologyNodeInfo>;
+    fn get_node(&self, id: Uuid) -> Option<TopologyNodeInfo>;
+}
+
+// Adapts the bridge to `TopologyProvider`.
+pub struct HeliosTopologyProvider<T: HeliosTopologyBridge> {
+    inner: Arc<T>,
+}
+```
+
+Detection is event-driven: when the replication subsystem promotes a standby it emits
+`TopologyEvent::PrimaryChanged`, which `PrimaryTracker::run` applies immediately. This
+provider requires only the feature flag; it is initialized programmatically when the proxy
+is built within the HeliosDB workspace.
+
+---
+
+## Manual / Standalone Tracking
+
+With no provider, `PrimaryTracker::new_standalone()` tracks a primary set entirely through
+explicit calls:
+
+```rust
+use heliosdb_proxy::primary_tracker::PrimaryTracker;
+
+let tracker = PrimaryTracker::new_standalone();
+
+tracker.set_primary(node_id, "pg-primary.local:5432".to_string()); // is_confirmed = false
+tracker.confirm_primary();                                          // is_confirmed = true
+
+// On failover:
+tracker.clear_primary();                                           // emits Lost
+tracker.set_primary(new_node_id, "pg-standby.local:5432".to_string());
+tracker.confirm_primary();
+```
+
+This is the mode an external orchestrator would drive: promote out of band, then tell the
+tracker the new primary's address.
+
+---
+
+## Primary Lifecycle
+
+`PrimaryInfo::is_confirmed` encodes a two-phase promotion so writes can begin against a
+pending primary before it is fully verified:
+
+```
+                  set_primary()          confirm_primary()
+   ┌──────┐  ─────────────────────▶ ┌─────────┐ ───────────────▶ ┌───────────┐
+   │ none │                         │ pending │                  │ confirmed │
+   └──────┘  ◀───────────────────── └─────────┘ ◀─────────────── └───────────┘
+                 clear_primary()  (primary lost / node unhealthy)
+```
+
+| State | `PrimaryInfo` | Meaning |
+|-------|---------------|---------|
+| none | `None` | No primary known. |
+| pending | `Some { is_confirmed: false }` | Primary set (e.g. mid-switchover), not yet verified. |
+| confirmed | `Some { is_confirmed: true }` | Primary verified and serving. |
+
+### Events
+
+**`TopologyEvent`** (provider → tracker):
+
+| Event | Trigger |
+|-------|---------|
+| `PrimaryChanged { old_primary, new_primary }` | The primary role moved between nodes. |
+| `NodeLeft { node_id }` | A node left the cluster. |
+| `HealthChanged { node_id, is_healthy }` | A node's health status changed. |
+
+**`PrimaryChangeEvent`** (tracker → subscribers, via `PrimaryTracker::subscribe`):
+
+| Event | Trigger |
+|-------|---------|
+| `Changed { old, new, address }` | A new primary was set (provider event or manual call). |
+| `Lost { old }` | The current primary was cleared. |
+| `Confirmed { node_id }` | The pending primary was confirmed. |
+
+---
+
+## Custom Topology Providers
+
+Any custom HA source can implement `TopologyProvider` and be handed to
+`PrimaryTracker::with_provider`. The trait is exactly the three methods above, so a
+Consul/Patroni/service-mesh integration only needs to translate its own leader-election
+signal into `TopologyEvent`s and answer `get_primary` / `get_node`:
 
 ```rust
 struct ConsulTopologyProvider {
-    consul_url: String,
-    service_name: String,
     event_tx: broadcast::Sender<TopologyEvent>,
     primary: RwLock<Option<TopologyNodeInfo>>,
+    /* consul client, service name, … */
 }
 
 impl TopologyProvider for ConsulTopologyProvider {
     fn subscribe(&self) -> broadcast::Receiver<TopologyEvent> {
         self.event_tx.subscribe()
     }
-
     fn get_primary(&self) -> Option<TopologyNodeInfo> {
         self.primary.read().clone()
     }
-
     fn get_node(&self, id: Uuid) -> Option<TopologyNodeInfo> {
-        self.primary.read()
-            .as_ref()
-            .filter(|n| n.node_id == id)
-            .cloned()
+        self.primary.read().as_ref().filter(|n| n.node_id == id).cloned()
     }
 }
+
+let tracker = PrimaryTracker::with_provider(Arc::new(consul_provider));
 ```
 
-Register the custom provider with the primary tracker:
-
-```rust
-let provider = Arc::new(ConsulTopologyProvider::new(
-    "http://consul:8500",
-    "postgresql",
-));
-
-let tracker = PrimaryTracker::with_provider(provider);
-```
+The crate's own tests cover a mock provider and a `PatroniProvider`-shaped custom
+implementation, demonstrating the same pattern.
 
 ---
 
@@ -367,16 +307,21 @@ let tracker = PrimaryTracker::with_provider(provider);
 | Capability | PostgreSQL | HeliosDB | Manual |
 |-----------|-----------|----------|--------|
 | Automatic detection | Yes (polling) | Yes (event-driven) | No |
-| Detection latency | 2-6 seconds | Sub-second | Depends on external |
-| External dependencies | None | HeliosDB workspace | External manager |
-| Configuration complexity | Low | None (automatic) | Lowest |
-| Feature flag required | `postgres-topology` | `heliosdb-topology` | None |
-| Suitable for production | Yes | Yes | Yes (with external manager) |
+| Detection cadence | Poll interval (default 2 s) | Event-driven | Caller-driven |
+| External dependencies | Reachable PG nodes | HeliosDB workspace | External manager |
+| Feature flag | `postgres-topology` | `heliosdb-topology` | None |
+| Wired into standalone daemon | No (programmatic) | No (workspace build) | No (programmatic) |
+
+> The standalone daemon's own primary tracking (Layer 1) is independent of these
+> providers: it uses static `[[nodes]]` roles + health checks and reports through
+> `/topology`.
 
 ---
 
 ## See Also
 
-- [Architecture](architecture.md) -- System overview and module map
-- [Configuration Reference](configuration.md) -- Node configuration details
-- [Deployment Guides](deployment/) -- Standalone, Docker, and Kubernetes deployment
+- [Configuration Reference](configuration.md) — `[[nodes]]` schema and `write_timeout_secs`.
+- [Transaction Replay](transaction-replay.md) — how the primary is used on the write path.
+- [Admin API Reference](admin-api.md) — `/topology`, `/nodes/{addr}/enable|disable`, `/api/chaos`.
+- [Architecture](architecture.md) — system overview and module map.
+</content>
