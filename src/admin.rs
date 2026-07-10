@@ -493,12 +493,12 @@ impl AdminServer {
             // SQL API - Execute SQL with TWR (Transparent Write Routing)
             ("POST", "/api/sql") => Self::handle_sql_request(body, state).await,
 
-            // Health endpoints
-            ("GET", "/health") => {
+            // Health endpoints (z-suffixed aliases are token-exempt probe paths)
+            ("GET", "/health") | ("GET", "/healthz") => {
                 let health = HealthResponse { status: "ok" };
                 Ok((200, serde_json::to_value(health)?))
             }
-            ("GET", "/health/ready") => {
+            ("GET", "/health/ready") | ("GET", "/readyz") => {
                 let ready = Self::check_readiness(state).await;
                 let response = ReadinessResponse {
                     ready,
@@ -511,7 +511,7 @@ impl AdminServer {
                 let status = if ready { 200 } else { 503 };
                 Ok((status, serde_json::to_value(response)?))
             }
-            ("GET", "/health/live") => {
+            ("GET", "/health/live") | ("GET", "/livez") => {
                 let response = LivenessResponse { alive: true };
                 Ok((200, serde_json::to_value(response)?))
             }
@@ -2551,6 +2551,78 @@ mod tests {
 
         let ready = AdminServer::check_readiness(&state).await;
         assert!(ready);
+    }
+
+    #[tokio::test]
+    async fn test_healthz_alias_matches_health() {
+        let state = Arc::new(AdminState::new());
+        let (status, body) = AdminServer::route_request("GET", "/health", None, &state)
+            .await
+            .unwrap();
+        let (alias_status, alias_body) =
+            AdminServer::route_request("GET", "/healthz", None, &state)
+                .await
+                .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(alias_status, 200);
+        assert_eq!(body, alias_body);
+        assert_eq!(alias_body, serde_json::json!({ "status": "ok" }));
+    }
+
+    #[tokio::test]
+    async fn test_livez_alias_matches_health_live() {
+        let state = Arc::new(AdminState::new());
+        let (status, body) = AdminServer::route_request("GET", "/health/live", None, &state)
+            .await
+            .unwrap();
+        let (alias_status, alias_body) = AdminServer::route_request("GET", "/livez", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(alias_status, 200);
+        assert_eq!(body, alias_body);
+        assert_eq!(alias_body, serde_json::json!({ "alive": true }));
+    }
+
+    #[tokio::test]
+    async fn test_readyz_alias_matches_health_ready() {
+        // No nodes: both the slash-form and the z-suffixed alias report 503.
+        let state = Arc::new(AdminState::new());
+        let (status, body) = AdminServer::route_request("GET", "/health/ready", None, &state)
+            .await
+            .unwrap();
+        let (alias_status, alias_body) = AdminServer::route_request("GET", "/readyz", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(status, 503);
+        assert_eq!(alias_status, status);
+        assert_eq!(body, alias_body);
+
+        // One healthy node: both report 200 with identical bodies.
+        {
+            let mut health = state.node_health.write().await;
+            health.insert(
+                "localhost:5432".to_string(),
+                NodeHealth {
+                    address: "localhost:5432".to_string(),
+                    healthy: true,
+                    last_check: chrono::Utc::now(),
+                    failure_count: 0,
+                    last_error: None,
+                    latency_ms: 1.0,
+                    replication_lag_bytes: None,
+                },
+            );
+        }
+        let (status, body) = AdminServer::route_request("GET", "/health/ready", None, &state)
+            .await
+            .unwrap();
+        let (alias_status, alias_body) = AdminServer::route_request("GET", "/readyz", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(alias_status, status);
+        assert_eq!(body, alias_body);
     }
 
     #[tokio::test]
