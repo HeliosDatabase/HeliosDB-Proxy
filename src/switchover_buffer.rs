@@ -447,9 +447,11 @@ mod tests {
         let buffer = SwitchoverBuffer::new(config);
         buffer.start_buffering();
 
-        // Buffer up to limit
-        let _ = buffer.buffer_query("Q1".to_string(), vec![], 1).unwrap();
-        let _ = buffer.buffer_query("Q2".to_string(), vec![], 2).unwrap();
+        // Buffer up to limit. `buffer_query` enqueues synchronously and hands
+        // back the (never-awaited) oneshot response receiver, which we drop
+        // explicitly — this test only exercises capacity enforcement.
+        drop(buffer.buffer_query("Q1".to_string(), vec![], 1).unwrap());
+        drop(buffer.buffer_query("Q2".to_string(), vec![], 2).unwrap());
 
         // Third should fail
         let result = buffer.buffer_query("Q3".to_string(), vec![], 3);

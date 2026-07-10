@@ -673,8 +673,8 @@ mod tests {
             journal_value_to_param(&JournalValue::Int64(42)),
             ParamValue::Int(42)
         ));
-        match journal_value_to_param(&JournalValue::Float64(3.14)) {
-            ParamValue::Float(f) => assert!((f - 3.14).abs() < 1e-9),
+        match journal_value_to_param(&JournalValue::Float64(std::f64::consts::PI)) {
+            ParamValue::Float(f) => assert!((f - std::f64::consts::PI).abs() < 1e-9),
             other => panic!("expected Float, got {:?}", other),
         }
         match journal_value_to_param(&JournalValue::Text("hi".into())) {

@@ -18,7 +18,7 @@
 
 #![cfg(feature = "wasm-plugins")]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use heliosdb_proxy::plugins::{
@@ -39,13 +39,13 @@ fn find_plugin_wasm(name: &str) -> Option<PathBuf> {
     }
 }
 
-fn manifest_for(name: &str, wasm_path: &PathBuf, hooks: Vec<HookType>) -> PluginManifest {
+fn manifest_for(name: &str, wasm_path: &Path, hooks: Vec<HookType>) -> PluginManifest {
     PluginManifest {
         name: name.to_string(),
         version: "0.1.0".to_string(),
         license: "Apache-2.0".to_string(),
         hooks,
-        path: wasm_path.clone(),
+        path: wasm_path.to_path_buf(),
         ..Default::default()
     }
 }

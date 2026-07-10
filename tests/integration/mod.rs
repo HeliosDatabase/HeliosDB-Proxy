@@ -809,8 +809,9 @@ fn test_module_18_schema_routing_config() {
     use heliosdb_proxy::schema_routing::SchemaRoutingConfig;
 
     let cfg = SchemaRoutingConfig::builder().build();
-    // Verify default routing config is constructible.
-    assert!(!cfg.auto_discover || cfg.auto_discover);
+    // Verify default routing config is constructible with auto-discovery
+    // enabled by default.
+    assert!(cfg.auto_discover);
 }
 
 #[cfg(not(feature = "schema-routing"))]

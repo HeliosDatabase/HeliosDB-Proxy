@@ -308,6 +308,10 @@ mod tests {
     }
 
     #[test]
+    // The `3.14` here is the expected parse result of the string "3.14", not a
+    // use of the mathematical constant; substituting `std::f64::consts::PI`
+    // would break this string→f64 round-trip assertion.
+    #[allow(clippy::approx_constant)]
     fn test_text_value_f64() {
         assert_eq!(
             TextValue::Text("3.14".to_string()).as_f64("x").unwrap(),
@@ -320,10 +324,7 @@ mod tests {
     fn test_text_value_timestamptz_pg_format() {
         let v = TextValue::Text("2026-04-24 12:34:56.789+00".to_string());
         let parsed = v.as_timestamptz("ts").unwrap().expect("some");
-        assert_eq!(
-            parsed.to_rfc3339().starts_with("2026-04-24T12:34:56.789"),
-            true
-        );
+        assert!(parsed.to_rfc3339().starts_with("2026-04-24T12:34:56.789"));
     }
 
     #[test]

@@ -410,10 +410,7 @@ fn random_embedding(dim: usize) -> Vec<f32> {
     let seed = hasher.finish();
 
     (0..dim)
-        .map(|i| {
-            let x = ((seed.wrapping_add(i as u64) as f64) * 0.0001).sin() as f32;
-            x
-        })
+        .map(|i| ((seed.wrapping_add(i as u64) as f64) * 0.0001).sin() as f32)
         .collect()
 }
 

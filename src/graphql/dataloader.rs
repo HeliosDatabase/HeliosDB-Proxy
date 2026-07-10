@@ -585,10 +585,7 @@ mod tests {
 
         let results = loader.load_many(vec!["key1".to_string(), "key2".to_string()]);
 
-        assert_eq!(
-            results.get(&"key1".to_string()),
-            Some(&Some("value1".to_string()))
-        );
-        assert_eq!(results.get(&"key2".to_string()), Some(&None));
+        assert_eq!(results.get("key1"), Some(&Some("value1".to_string())));
+        assert_eq!(results.get("key2"), Some(&None));
     }
 }

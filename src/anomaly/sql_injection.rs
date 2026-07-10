@@ -195,11 +195,8 @@ mod tests {
 
     #[test]
     fn union_legit_query_clean() {
-        assert!(
-            !scan("SELECT id FROM users UNION SELECT id FROM admins")
-                .contains(&"union_select".to_string())
-                == false
-        );
+        assert!(scan("SELECT id FROM users UNION SELECT id FROM admins")
+            .contains(&"union_select".to_string()));
         // Note: above is intentional — UNION across legit tables IS
         // ambiguous from a pattern-matcher's view. We accept the
         // false positive on " union select" since that's what the

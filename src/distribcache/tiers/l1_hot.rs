@@ -264,7 +264,6 @@ impl HotCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn test_hot_cache_insert_get() {

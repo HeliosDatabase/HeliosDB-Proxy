@@ -433,7 +433,7 @@ impl TenantProvisioner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::multi_tenancy::config::{TenantConfig, TenantPermissions};
+    use crate::multi_tenancy::config::TenantConfig;
 
     fn create_test_config(id: &str, isolation: IsolationStrategy) -> TenantConfig {
         TenantConfig::builder()

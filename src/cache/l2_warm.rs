@@ -482,8 +482,6 @@ pub struct L2CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::normalizer::NormalizedQuery;
-    use crate::cache::CacheContext;
     use std::time::Duration;
 
     fn create_result(data: &str) -> CachedResult {
