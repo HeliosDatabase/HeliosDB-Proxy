@@ -331,6 +331,11 @@ Set and update the primary programmatically via the Admin API — suitable for c
 # Cluster health
 curl http://localhost:9090/health
 
+# Kubernetes-style probe aliases (token-exempt, always routed):
+#   /healthz -> liveness, /livez -> liveness, /readyz -> readiness (200/503)
+curl http://localhost:9090/healthz
+curl http://localhost:9090/readyz
+
 # Node status and replication lag
 curl http://localhost:9090/nodes
 
