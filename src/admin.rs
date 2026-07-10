@@ -349,15 +349,22 @@ impl AdminServer {
         let path = parts[1];
 
         // Bearer-token gate. Liveness probes stay open so orchestrators can
-        // health-check without the token; everything else is rejected with
-        // 401 unless `Authorization: Bearer <token>` matches.
+        // health-check without the token; the static dashboard shell (`/`,
+        // `/ui`) also stays open so operators can load the UI without first
+        // knowing the token — the shell then prompts for it and injects a
+        // Bearer header into every one of its own API calls, so no protected
+        // DATA is exposed by serving the HTML. Everything else is rejected
+        // with 401 unless `Authorization: Bearer <token>` matches.
         {
             let required = state.auth_token.read().await.clone();
             if let Some(token) = required {
                 let path_only = path.split('?').next().unwrap_or(path);
-                let is_liveness = method == "GET"
-                    && matches!(path_only, "/health" | "/healthz" | "/livez" | "/readyz");
-                if !is_liveness && !Self::admin_authorized(&headers, &token) {
+                let is_open = method == "GET"
+                    && matches!(
+                        path_only,
+                        "/health" | "/healthz" | "/livez" | "/readyz" | "/" | "/ui" | "/ui/"
+                    );
+                if !is_open && !Self::admin_authorized(&headers, &token) {
                     Self::send_response(
                         &mut writer,
                         401,
@@ -3051,6 +3058,18 @@ mod tests {
         assert_eq!(
             parse_limit_query("/anomalies?other=x&limit=7", 100, 1024),
             7
+        );
+    }
+
+    // Guards the embedded dashboard's admin-token support (P1-11b): the served
+    // UI must carry the sessionStorage key + fetch wrapper so every panel keeps
+    // working when `admin_token` is set. If a future regeneration of
+    // `admin_ui.html` drops the token plumbing this test goes red.
+    #[test]
+    fn test_admin_ui_html_contains_token_handling() {
+        assert!(
+            ADMIN_UI_HTML.contains("helios_admin_token"),
+            "admin UI must inject the admin bearer token via the helios_admin_token key"
         );
     }
 
