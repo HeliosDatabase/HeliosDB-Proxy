@@ -1229,6 +1229,13 @@ pub struct PluginToml {
     /// unsigned .wasm files in the plugin dir).
     #[serde(default)]
     pub trust_root: Option<String>,
+    /// Max bytes for a single plugin-KV value (via `kv_set` or the
+    /// `PUT /admin/kv/<plugin>/<key>` endpoint). `0` = unlimited.
+    #[serde(default = "default_plugin_kv_max_value_bytes")]
+    pub kv_max_value_bytes: usize,
+    /// Max distinct keys per plugin KV namespace. `0` = unlimited.
+    #[serde(default = "default_plugin_kv_max_keys")]
+    pub kv_max_keys_per_plugin: usize,
 }
 
 fn default_plugin_dir() -> String {
@@ -1249,6 +1256,12 @@ fn default_true() -> bool {
 fn default_plugin_fuel() -> u64 {
     1_000_000
 }
+fn default_plugin_kv_max_value_bytes() -> usize {
+    65536
+}
+fn default_plugin_kv_max_keys() -> usize {
+    1024
+}
 
 impl Default for PluginToml {
     fn default() -> Self {
@@ -1262,6 +1275,8 @@ impl Default for PluginToml {
             fuel_metering: true,
             fuel_limit: default_plugin_fuel(),
             trust_root: None,
+            kv_max_value_bytes: default_plugin_kv_max_value_bytes(),
+            kv_max_keys_per_plugin: default_plugin_kv_max_keys(),
         }
     }
 }

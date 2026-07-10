@@ -30,12 +30,16 @@ immediately on the next request that hits the relevant hook.
 
 | Verb | Path | Body / Result |
 |---|---|---|
-| `PUT`    | `/admin/kv/<plugin-name>/<key>` | raw bytes (text or JSON); 200 OK |
-| `GET`    | `/admin/kv/<plugin-name>/<key>` | the value bytes; 200 or 404 |
-| `DELETE` | `/admin/kv/<plugin-name>/<key>` | 200 OK; 404 if absent |
-| `GET`    | `/admin/kv/<plugin-name>/`      | list keys (where supported) |
+| `PUT`    | `/admin/kv/<plugin-name>/<key>` | UTF-8 body (text or JSON); `200 {"ok":true}`, or `413` on a cap breach |
+| `GET`    | `/admin/kv/<plugin-name>/<key>` | `200 {"plugin","key","value"}` (value as a JSON string), or `404 {"error":"key not found"}` |
+| `DELETE` | `/admin/kv/<plugin-name>/<key>` | `200 {"ok":true}` — idempotent (200 even when the key is absent) |
+| `GET`    | `/admin/kv/<plugin-name>/`      | `200 {"plugin","keys":[...]}` — the trailing slash lists the namespace |
 
-Keys are arbitrary UTF-8; the plugin defines the shape it expects.
+Keys are arbitrary UTF-8; the value is returned inside a JSON envelope
+(`{"plugin","key","value"}`), with `value` as a UTF-8 string — pull it
+out with `jq -r .value`. The `<key>` segment may itself contain `/`.
+PUT bodies are decoded with `String::from_utf8_lossy`, so store binary
+blobs base64-encoded.
 
 ## Recipes
 
@@ -70,7 +74,11 @@ mutating one tenant's budget doesn't disturb others.
 ### Recipe 3: Read a value back
 
 ```bash
-curl -s http://localhost:9090/admin/kv/helios-plugin-residency-router/region_map | jq .
+curl -s http://localhost:9090/admin/kv/helios-plugin-residency-router/region_map
+# {"plugin":"helios-plugin-residency-router","key":"region_map","value":"[[\"eu-west\",\"pg-eu-west:5432\"],[\"us-east\",\"pg-us-east:5432\"]]"}
+
+# The stored string lives under .value — unwrap it with jq -r:
+curl -s http://localhost:9090/admin/kv/helios-plugin-residency-router/region_map | jq -r .value | jq .
 # [["eu-west","pg-eu-west:5432"],["us-east","pg-us-east:5432"]]
 ```
 
@@ -82,7 +90,7 @@ generally fall back to a hardcoded default in that case.
 ```bash
 curl -s -X DELETE \
   http://localhost:9090/admin/kv/helios-plugin-cost-governor/budget/tenant-a
-# {"deleted":"budget/tenant-a"}
+# {"ok":true}   (idempotent — 200 even if the key was already gone)
 ```
 
 ### Recipe 5: Bulk-load configuration from a file
@@ -136,12 +144,20 @@ For cost-governor: run a workload at >budget rate and watch
 - **Values don't persist across restart.** The KV is in-process
   memory. Re-PUT after restart, or invoke the proxy via a config
   agent that does this on boot.
-- **No bulk-list endpoint without trailing slash on path.** Some
-  plugins expose `/admin/kv/<plugin>/` (trailing slash) for listing
-  their keys, but that's plugin-implemented, not framework. If GET
-  on the prefix returns 404, that plugin doesn't support it.
-- **`/admin/kv` is unauthenticated by default.** Anyone with admin
-  port access can poke any plugin's config. Firewall it.
+- **List with a trailing slash.** `GET /admin/kv/<plugin>/` (trailing
+  slash, empty key) returns `{"plugin","keys":[...]}` for any loaded
+  plugin — this is framework-provided, not plugin-implemented. A
+  path with no key segment at all (`/admin/kv/<plugin>`, no trailing
+  slash) is malformed and returns `400`.
+- **Size caps.** A value larger than `kv_max_value_bytes` (default
+  65536) or a new key past `kv_max_keys_per_plugin` (default 1024)
+  is rejected with `413`; overwriting an existing key never trips the
+  key-count cap. Both are set in `[plugins]` (`0` = unlimited).
+- **`/admin/kv` follows the admin bearer gate.** When `admin_token`
+  is set, every `/admin/kv` call needs `Authorization: Bearer
+  <token>` (the recipes above omit it for brevity); a proxy with no
+  token configured leaves the admin port open, so firewall it and set
+  a token regardless.
 - **Concurrent PUTs to the same key** are last-writer-wins, no
   CAS. If two operators race, one update vanishes silently.
 

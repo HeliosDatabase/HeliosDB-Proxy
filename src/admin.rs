@@ -888,6 +888,19 @@ impl AdminServer {
                 Ok((200, serde_json::to_value(response)?))
             }
 
+            // Plugin KV — runtime configuration of loaded plugins.
+            // Prefix-guard arm: placed AFTER every exact-path match so it
+            // can never shadow one. `/admin/kv/` is a unique prefix no
+            // exact route uses, so ordering only matters relative to the
+            // 404 catch-all below.
+            #[cfg(feature = "wasm-plugins")]
+            (m, p) if p.starts_with("/admin/kv/") => Self::handle_kv(m, p, body, state).await,
+            #[cfg(not(feature = "wasm-plugins"))]
+            (_m, p) if p.starts_with("/admin/kv/") => Ok((
+                501,
+                serde_json::json!({ "error": "proxy built without the wasm-plugins feature" }),
+            )),
+
             // Not found
             _ => Ok((404, serde_json::json!({ "error": "Not found" }))),
         }
@@ -1870,6 +1883,75 @@ impl AdminServer {
         ))
     }
 
+    /// Handle `/admin/kv/<plugin>/<key>` — read, write, delete, and
+    /// list a loaded plugin's runtime KV state (the same store the
+    /// plugin reads through its `kv_get` import).
+    ///
+    /// Path shapes:
+    /// - `GET    /admin/kv/<plugin>/<key>` → `{"plugin","key","value"}` or 404
+    /// - `GET    /admin/kv/<plugin>/`      → `{"plugin","keys":[...]}` (trailing slash lists)
+    /// - `PUT    /admin/kv/<plugin>/<key>` → 200 `{"ok":true}` or 413 on a cap breach
+    /// - `DELETE /admin/kv/<plugin>/<key>` → 200 `{"ok":true}` (idempotent)
+    ///
+    /// The `<key>` segment may itself contain `/`. PUT bodies arrive as
+    /// `Option<&str>` — the admin request body is decoded with
+    /// `String::from_utf8_lossy`, so values are UTF-8 text; a caller
+    /// storing binary must base64-encode it first. Returns 503 when no
+    /// plugin manager is attached, 400 on a malformed path, and 405 on
+    /// an unsupported method.
+    #[cfg(feature = "wasm-plugins")]
+    async fn handle_kv(
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        state: &Arc<AdminState>,
+    ) -> Result<(u16, serde_json::Value)> {
+        use serde_json::json;
+        // Shape: /admin/kv/<plugin>/<key...>   key may itself contain '/'
+        //        /admin/kv/<plugin>/           trailing slash = list keys
+        let rest = &path["/admin/kv/".len()..];
+        let Some((plugin, key)) = rest.split_once('/') else {
+            return Ok((400, json!({ "error": "expected /admin/kv/<plugin>/<key>" })));
+        };
+        let pm = state.plugin_manager.read().await.clone();
+        let Some(pm) = pm else {
+            return Ok((503, json!({ "error": "plugin runtime not enabled" })));
+        };
+        let kv = pm.kv();
+        match (method, key.is_empty()) {
+            ("GET", true) => Ok((
+                200,
+                json!({ "plugin": plugin, "keys": kv.list_keys(plugin, b"") }),
+            )),
+            ("GET", false) => match kv.get(plugin, key.as_bytes()) {
+                Some(v) => Ok((
+                    200,
+                    json!({ "plugin": plugin, "key": key, "value": String::from_utf8_lossy(&v) }),
+                )),
+                None => Ok((404, json!({ "error": "key not found" }))),
+            },
+            ("PUT", false) => {
+                if kv.set(
+                    plugin,
+                    key.as_bytes().to_vec(),
+                    body.unwrap_or("").as_bytes().to_vec(),
+                ) {
+                    Ok((200, json!({ "ok": true })))
+                } else {
+                    Ok((
+                        413,
+                        json!({ "error": "kv_max_value_bytes or kv_max_keys_per_plugin exceeded" }),
+                    ))
+                }
+            }
+            ("DELETE", false) => {
+                kv.delete(plugin, key.as_bytes());
+                Ok((200, json!({ "ok": true })))
+            }
+            _ => Ok((405, json!({ "error": "method not allowed" }))),
+        }
+    }
+
     /// Compute the joined topology view used by `/topology`.
     ///
     /// `currentPrimary` is the address of the first node whose role
@@ -2825,6 +2907,164 @@ mod tests {
             .await
             .expect("handler returns Ok");
         assert_eq!(status, 503);
+    }
+
+    // ---- /admin/kv/<plugin>/<key> endpoints (T4) ----
+
+    /// Build an admin state with a real (plugin-free) plugin manager
+    /// attached; its `KvBackend` backs every `/admin/kv` call.
+    #[cfg(feature = "wasm-plugins")]
+    async fn kv_state_with_manager() -> Arc<AdminState> {
+        use crate::plugins::{PluginManager, PluginRuntimeConfig};
+        let state = Arc::new(AdminState::new());
+        let pm = Arc::new(PluginManager::new(PluginRuntimeConfig::default()).unwrap());
+        state.with_plugin_manager(pm).await;
+        state
+    }
+
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn test_kv_put_then_get_roundtrip() {
+        let state = kv_state_with_manager().await;
+        let (status, _) =
+            AdminServer::route_request("PUT", "/admin/kv/demo/greeting", Some("hello"), &state)
+                .await
+                .expect("PUT returns Ok");
+        assert_eq!(status, 200);
+
+        let (status, body) =
+            AdminServer::route_request("GET", "/admin/kv/demo/greeting", None, &state)
+                .await
+                .expect("GET returns Ok");
+        assert_eq!(status, 200);
+        assert_eq!(body["plugin"], "demo");
+        assert_eq!(body["key"], "greeting");
+        assert_eq!(body["value"], "hello");
+    }
+
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn test_kv_get_missing_returns_404() {
+        let state = kv_state_with_manager().await;
+        let (status, body) = AdminServer::route_request("GET", "/admin/kv/demo/nope", None, &state)
+            .await
+            .expect("GET returns Ok");
+        assert_eq!(status, 404);
+        assert_eq!(body["error"], "key not found");
+    }
+
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn test_kv_delete_is_idempotent_200() {
+        let state = kv_state_with_manager().await;
+        // DELETE on an absent key is a no-op 200.
+        let (status, _) = AdminServer::route_request("DELETE", "/admin/kv/demo/x", None, &state)
+            .await
+            .expect("DELETE returns Ok");
+        assert_eq!(status, 200);
+
+        // Set, delete, confirm gone.
+        AdminServer::route_request("PUT", "/admin/kv/demo/x", Some("v"), &state)
+            .await
+            .expect("PUT returns Ok");
+        let (status, _) = AdminServer::route_request("DELETE", "/admin/kv/demo/x", None, &state)
+            .await
+            .expect("DELETE returns Ok");
+        assert_eq!(status, 200);
+        let (status, _) = AdminServer::route_request("GET", "/admin/kv/demo/x", None, &state)
+            .await
+            .expect("GET returns Ok");
+        assert_eq!(status, 404);
+    }
+
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn test_kv_list_with_trailing_slash() {
+        let state = kv_state_with_manager().await;
+        AdminServer::route_request("PUT", "/admin/kv/demo/a", Some("1"), &state)
+            .await
+            .unwrap();
+        AdminServer::route_request("PUT", "/admin/kv/demo/b", Some("2"), &state)
+            .await
+            .unwrap();
+        let (status, body) = AdminServer::route_request("GET", "/admin/kv/demo/", None, &state)
+            .await
+            .expect("list returns Ok");
+        assert_eq!(status, 200);
+        assert_eq!(body["plugin"], "demo");
+        let mut names: Vec<String> = body["keys"]
+            .as_array()
+            .expect("keys is an array")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn test_kv_503_when_no_manager() {
+        // No plugin manager attached → 503.
+        let state = Arc::new(AdminState::new());
+        let (status, body) = AdminServer::route_request("GET", "/admin/kv/demo/x", None, &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 503);
+        assert_eq!(body["error"], "plugin runtime not enabled");
+    }
+
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn test_kv_malformed_path_returns_400() {
+        let state = kv_state_with_manager().await;
+        // No key segment (no '/' after the plugin name) → 400. The
+        // malformed-path check runs before the manager lookup.
+        let (status, _) = AdminServer::route_request("GET", "/admin/kv/demo", None, &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 400);
+    }
+
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn test_kv_wrong_method_returns_405() {
+        let state = kv_state_with_manager().await;
+        let (status, _) = AdminServer::route_request("POST", "/admin/kv/demo/x", Some("v"), &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 405);
+    }
+
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn test_kv_put_413_on_value_cap() {
+        use crate::plugins::{PluginManager, PluginRuntimeConfig};
+        let cfg = PluginRuntimeConfig {
+            kv_max_value_bytes: 3,
+            ..PluginRuntimeConfig::default()
+        };
+        let state = Arc::new(AdminState::new());
+        state
+            .with_plugin_manager(Arc::new(PluginManager::new(cfg).unwrap()))
+            .await;
+        // 4-byte value exceeds the 3-byte cap → 413.
+        let (status, _) =
+            AdminServer::route_request("PUT", "/admin/kv/demo/k", Some("toolong"), &state)
+                .await
+                .expect("handler returns Ok");
+        assert_eq!(status, 413);
+    }
+
+    #[cfg(not(feature = "wasm-plugins"))]
+    #[tokio::test]
+    async fn test_kv_501_without_feature() {
+        let state = Arc::new(AdminState::new());
+        let (status, body) = AdminServer::route_request("GET", "/admin/kv/demo/x", None, &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 501);
+        assert!(body["error"].as_str().unwrap().contains("wasm-plugins"));
     }
 
     /// Helper: state with a single healthy node seeded into health.
