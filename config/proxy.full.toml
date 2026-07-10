@@ -648,6 +648,7 @@ ttl_fallback_secs = 60          # Fallback TTL when WAL is unavailable
 # kv_max_value_bytes     = 65536       # Max bytes per plugin-KV key OR value (kv_set / PUT /admin/kv); 0 = unlimited
 # kv_max_keys_per_plugin = 1024        # Max distinct keys per plugin KV namespace; 0 = unlimited
 # kv_max_plugins         = 256         # Max distinct plugin KV namespaces (bounds PUT /admin/kv namespace growth); 0 = unlimited
+# kv_max_total_bytes     = 67108864    # Max TOTAL retained bytes across ALL plugin KV namespaces (key+value+namespace-name); OOM backstop; 0 = unlimited
 # enable_simd   = true
 # enable_threads = false
 # cache_modules = true

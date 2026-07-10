@@ -1896,7 +1896,13 @@ impl AdminServer {
     ///
     /// The `<key>` segment may itself contain `/`. Any query string is
     /// stripped before the plugin/key split, so `?…` never leaks into a
-    /// key or plugin name. PUT bodies arrive as `Option<&str>` — the
+    /// key or plugin name — a corollary is that a key CONTAINING `?`
+    /// (which a plugin can create through `kv_set`) is NOT addressable
+    /// via GET/DELETE here: the strip eats everything from the first
+    /// `?`, and path segments are not percent-decoded, so `%3F` does not
+    /// reach it either. Such a key still shows up in the trailing-slash
+    /// listing but cannot be read or deleted over this surface (keys
+    /// should avoid `?`). PUT bodies arrive as `Option<&str>` — the
     /// admin request body is decoded with `String::from_utf8_lossy`, so
     /// values are UTF-8 text; a caller storing binary must base64-encode
     /// it first. An oversized body is rejected 413 before it is copied.
@@ -1968,7 +1974,7 @@ impl AdminServer {
                     Ok((
                         413,
                         json!({
-                            "error": "kv_max_value_bytes, kv_max_keys_per_plugin, or kv_max_plugins exceeded"
+                            "error": "kv_max_value_bytes, kv_max_keys_per_plugin, kv_max_plugins, or kv_max_total_bytes exceeded"
                         }),
                     ))
                 }
@@ -3116,6 +3122,44 @@ mod tests {
             .await
             .expect("handler returns Ok");
         assert_eq!(status, 200);
+    }
+
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn test_kv_put_413_on_total_bytes_cap() {
+        use crate::plugins::{PluginManager, PluginRuntimeConfig};
+        // A tiny TOTAL byte budget bounds the whole KV footprint even
+        // though the per-key/value/namespace caps stay at their large
+        // defaults — this is the OOM backstop the total cap adds.
+        let cfg = PluginRuntimeConfig {
+            kv_max_total_bytes: 12,
+            ..PluginRuntimeConfig::default()
+        };
+        let state = Arc::new(AdminState::new());
+        state
+            .with_plugin_manager(Arc::new(PluginManager::new(cfg).unwrap()))
+            .await;
+        // namespace "demo" (4) + key "a" (1) + value "1" (1) = 6 ≤ 12.
+        let (status, _) = AdminServer::route_request("PUT", "/admin/kv/demo/a", Some("1"), &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        // + key "b" (1) + value "1" (1) = 8 ≤ 12.
+        let (status, _) = AdminServer::route_request("PUT", "/admin/kv/demo/b", Some("1"), &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        // A 12-byte value (well under the 65536 value cap) would push the
+        // running total to 21 > 12 → 413 naming the total-bytes cap.
+        let (status, body) =
+            AdminServer::route_request("PUT", "/admin/kv/demo/c", Some("way-too-long"), &state)
+                .await
+                .expect("handler returns Ok");
+        assert_eq!(status, 413);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("kv_max_total_bytes"));
     }
 
     #[cfg(feature = "wasm-plugins")]

@@ -45,15 +45,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into a stored key, and an empty `<plugin>` segment (`/admin/kv//<key>`) is
   rejected `400`. All four sit behind the normal admin bearer gate; the build
   returns `501` without `--features wasm-plugins` and `503` when no plugin
-  manager is attached. Three `[plugins]` caps bound writes and are tunable
+  manager is attached. Four `[plugins]` caps bound writes and are tunable
   (`0` = unlimited): `kv_max_value_bytes` (default 65536, now bounds a single
-  key OR value), `kv_max_keys_per_plugin` (default 1024), and `kv_max_plugins`
+  key OR value), `kv_max_keys_per_plugin` (default 1024), `kv_max_plugins`
   (default 256, bounds how many `<plugin>` namespaces can exist so a token-holder
-  cannot exhaust memory by writing to unboundedly-many namespace names). A PUT
+  cannot exhaust memory by writing to unboundedly-many namespace names), and
+  `kv_max_total_bytes` (default 67108864 / 64 MiB) — a total-footprint backstop
+  that sums each entry's key + value bytes plus each live namespace's name bytes
+  and keeps the whole store within a survivable ceiling regardless of the
+  per-axis product (which could otherwise retain tens of GiB). A PUT
   past a cap returns `413` (and the in-WASM `kv_set` returns `-1`); an oversized
   body is rejected before it is copied. Overwriting an existing key never trips
   the key-count cap, writing to an existing namespace never trips the namespace
-  cap, and deleting a namespace's last key frees its slot (memory is reclaimed).
+  cap, and deleting a namespace's last key frees its slot (the reclaimed bytes
+  are subtracted from the total-footprint counter too).
+  Keys must not contain `?`: a query string is stripped before the plugin/key
+  split (so `?prefix=` can filter a listing), which means a plugin-created key
+  containing `?` is listable but not addressable via GET/DELETE over the admin
+  surface.
 
 ### Fixed
 

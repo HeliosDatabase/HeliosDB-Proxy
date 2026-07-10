@@ -151,14 +151,19 @@ For cost-governor: run a workload at >budget rate and watch
   key segment at all (`/admin/kv/<plugin>`, no trailing slash) is
   malformed and returns `400`, as is an empty `<plugin>` segment
   (`/admin/kv//<key>`). Any query string is stripped before the
-  plugin/key split, so `?…` never leaks into a stored key.
+  plugin/key split, so `?…` never leaks into a stored key — as a
+  corollary, a key that itself contains `?` (a plugin can create one
+  via `kv_set`) is listable but NOT addressable via GET/DELETE here
+  (`%3F` is not decoded either); keep `?` out of KV keys.
 - **Size caps.** A key OR value larger than `kv_max_value_bytes`
   (default 65536), a new key past `kv_max_keys_per_plugin` (default
-  1024), or a new namespace past `kv_max_plugins` (default 256) is
-  rejected with `413`; overwriting an existing key never trips the
-  key-count cap, and writing to an already-present namespace never
-  trips the namespace cap. Deleting a namespace's last key frees its
-  slot. All three are set in `[plugins]` (`0` = unlimited).
+  1024), a new namespace past `kv_max_plugins` (default 256), or a
+  write that would push the TOTAL retained footprint past
+  `kv_max_total_bytes` (default 67108864 / 64 MiB) is rejected with
+  `413`; overwriting an existing key never trips the key-count cap, and
+  writing to an already-present namespace never trips the namespace
+  cap. Deleting a namespace's last key frees its slot (and its bytes).
+  All four are set in `[plugins]` (`0` = unlimited).
 - **`/admin/kv` follows the admin bearer gate.** When `admin_token`
   is set, every `/admin/kv` call needs `Authorization: Bearer
   <token>` (the recipes above omit it for brevity); a proxy with no

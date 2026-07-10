@@ -722,6 +722,7 @@ fuel_limit = 1000000
 kv_max_value_bytes = 65536
 kv_max_keys_per_plugin = 1024
 kv_max_plugins = 256
+kv_max_total_bytes = 67108864
 # trust_root = "/etc/heliosproxy/plugin-keys"
 ```
 
@@ -738,6 +739,7 @@ kv_max_plugins = 256
 | `kv_max_value_bytes` | usize | `65536` | Max bytes for a single plugin-KV key OR value (via `kv_set` or `PUT /admin/kv/<plugin>/<key>`); `0` = unlimited. A write past this cap is rejected (`kv_set` returns `-1`; the admin endpoint returns `413`). |
 | `kv_max_keys_per_plugin` | usize | `1024` | Max distinct keys per plugin KV namespace; `0` = unlimited. Overwriting an existing key never trips the cap. |
 | `kv_max_plugins` | usize | `256` | Max distinct plugin KV namespaces that may exist at once; `0` = unlimited. Bounds how many `<plugin>` namespaces `PUT /admin/kv/<plugin>/<key>` can create, so a token-holder cannot exhaust memory by writing to unboundedly-many namespace names. Writing to an already-present namespace never trips the cap; deleting a namespace's last key frees its slot. |
+| `kv_max_total_bytes` | usize | `67108864` (64 MiB) | Max TOTAL retained bytes across ALL plugin KV namespaces (each entry's key + value bytes plus each live namespace's name bytes); `0` = unlimited. The single backstop that bounds the whole KV footprint regardless of the per-axis product `kv_max_plugins × kv_max_keys_per_plugin × kv_max_value_bytes` (which can otherwise reach tens of GiB), so a token-holding `PUT /admin/kv/<plugin>/<key>` caller cannot drive the proxy to an OOM. A write past this cap is rejected (`kv_set` returns `-1`; the admin endpoint returns `413`). |
 | `trust_root` | string | *(none)* | Ed25519 trust-root directory. When set, every `.wasm` requires a sidecar `.sig` verifying against a `*.pub` in this directory; when omitted, signatures are not checked. |
 
 ---

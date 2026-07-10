@@ -65,6 +65,13 @@ pub struct PluginRuntimeConfig {
     /// Max distinct plugin KV namespaces (`0` = unlimited). Bounds how
     /// many `<plugin>` namespaces the `/admin/kv` endpoint can create.
     pub kv_max_plugins: usize,
+
+    /// Max TOTAL retained bytes across ALL plugin KV namespaces (key +
+    /// value + namespace-name bytes; `0` = unlimited). The single cap
+    /// that bounds the whole KV footprint regardless of the per-axis
+    /// product, so a token-holding `/admin/kv` caller cannot drive the
+    /// proxy to an OOM.
+    pub kv_max_total_bytes: usize,
 }
 
 impl Default for PluginRuntimeConfig {
@@ -87,6 +94,7 @@ impl Default for PluginRuntimeConfig {
             kv_max_value_bytes: 65536,
             kv_max_keys_per_plugin: 1024,
             kv_max_plugins: 256,
+            kv_max_total_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -115,6 +123,7 @@ impl From<&crate::config::PluginToml> for PluginRuntimeConfig {
             kv_max_value_bytes: t.kv_max_value_bytes,
             kv_max_keys_per_plugin: t.kv_max_keys_per_plugin,
             kv_max_plugins: t.kv_max_plugins,
+            kv_max_total_bytes: t.kv_max_total_bytes,
         }
     }
 }
