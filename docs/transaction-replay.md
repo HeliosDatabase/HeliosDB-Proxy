@@ -11,7 +11,7 @@ key, default, mode name, behavior — is verifiable in `src/transaction_journal.
 `src/replay/mod.rs`, and the TR fields of `ProxyConfig` in `src/config.rs`. Where the
 narrative describes intent rather than shipped runtime behavior, it says so explicitly.
 
-**Last verified against commit `9c5ff9b`.**
+**Last verified against commit `ab909be`.**
 
 ---
 
@@ -53,17 +53,23 @@ Transaction Replay lives behind the **`ha-tr`** cargo feature
 replay, cursor restore, session migrate"). It is included in `all-features` and in the
 CI feature matrix (`cargo test --features ha-tr`).
 
-What the feature actually gates:
+What the feature actually gates — `ha-tr` compiles out whole modules, not just a hook:
 
-- The **write-path journaling hook** in `src/server.rs` (`if is_write &&
-  config.tr_enabled { journal_write(...) }`) is `#[cfg(feature = "ha-tr")]`.
+- **Entire modules**, behind `#[cfg(feature = "ha-tr")]` in `src/lib.rs`:
+  `transaction_journal`, `failover_replay`, `replay`, `cursor_restore`,
+  `session_migrate`, `upgrade_orchestrator`, and `shadow_execute`. Without the feature
+  these types do not exist at all.
+- The **`ServerState` journal field** (`transaction_journal:
+  Arc<TransactionJournal>`, `src/server.rs`) and the **write-path journaling hook**
+  (`journal_write`, invoked on writes when `tr_enabled`).
 - The **coordinated post-failover replay** on `FailoverController`
-  (`coordinate_failover_replay`, `wait_for_lsn_catchup`, `CoordinatedReplayResult`) is
-  `#[cfg(feature = "ha-tr")]`.
+  (`coordinate_failover_replay`, `wait_for_lsn_catchup`, `CoordinatedReplayResult`).
+- The **`POST /api/replay` admin endpoint**: with the feature off the route returns
+  `503 {"error": "ha-tr feature not compiled in"}` (`src/admin.rs`).
 
-The supporting types — `TransactionJournal`, `FailoverReplay`, `FailoverController`,
-`SwitchoverBuffer` — are compiled unconditionally; only the journaling hook and the
-coordinated-replay orchestration are behind the flag.
+Only `FailoverController` (`src/failover_controller.rs`) and `SwitchoverBuffer`
+(`src/switchover_buffer.rs`) are compiled unconditionally; everything else this document
+describes — journal, replay engine, time-travel replay endpoint — requires `ha-tr`.
 
 ---
 
@@ -87,7 +93,7 @@ write_timeout_secs = 30
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
 | `tr_enabled` | bool | `true` | Enables the write-path journaling hook. Required in a config file (no serde default; the in-code `Default` is `true`). |
-| `tr_mode` | enum | `session` | Selects the replay policy (see below). Stored on each session and surfaced at `/config`. |
+| `tr_mode` | enum | `session` | Selects the replay policy (see below). Stored on each session and surfaced at `/config`. Also required in a config file (no serde default — the `#[default]` on `TrMode` only feeds `ProxyConfig::default()`, so omitting `tr_mode` from `proxy.toml` fails deserialization with "missing field `tr_mode`"). |
 | `write_timeout_secs` | u64 | `30` | `default_write_timeout_secs()` = 30. Exposed as `ProxyConfig::write_timeout()` → `Duration`; consumed by `select_primary_with_timeout` (`src/server.rs`). |
 
 > **No `tr_max_journal_bytes` or `switchover_drain_timeout_secs` key exists.** Earlier
@@ -108,7 +114,7 @@ the authoritative one-line semantics:
 | `select` | Re-execute SELECT queries. |
 | `transaction` | Full transaction replay. |
 
-**Honest caveat on `tr_mode`.** As of `9c5ff9b`, `tr_mode` is parsed, stored on the
+**Honest caveat on `tr_mode`.** As of `ab909be`, `tr_mode` is parsed, stored on the
 `ClientSession` (`session.tr_mode = config.tr_mode`), and reported through `/config`, but
 the live write-path journaling branches only on `tr_enabled` — it does not yet select
 different journaling behavior per mode. Mode-specific replay (session-only vs. re-run
@@ -209,8 +215,10 @@ Replay proceeds through the `ReplayState` machine — `Pending` → `WaitingForW
 3. **Execution** via `crate::backend::BackendClient` — `simple_query` when there are no
    parameters, `query_with_params` otherwise. Parameters are converted by
    `journal_value_to_param` into **text-format** `ParamValue`s (`Bytes` → a `\x…` hex
-   literal; `Array` is not yet supported and degrades to `NULL`, which surfaces as a
-   `rows_matched = false` mismatch).
+   literal; `Array` is not yet supported and degrades to `NULL`). That `NULL` surfaces as
+   a `rows_matched = false` mismatch **only** for entries that captured a `rows_affected`
+   count; hot-path journals record no count (`rows_affected = None`), so there the
+   degradation is silent.
 4. **Verification**: `rows_affected` is compared against the recorded count when one was
    captured. Checksum matching is best-effort — the engine does not recompute a
    server-side hash, so an entry with no recorded checksum counts as matched.
@@ -220,9 +228,12 @@ Replay proceeds through the `ReplayState` machine — `Pending` → `WaitingForW
 and exposes `get_state`, `get_progress`, `cancel_replay`, `history`, and `stats`.
 
 > **Skeleton path.** When no backend template/endpoint is attached to the
-> `FailoverReplay` (the unit-test configuration), the backend-touching calls short-circuit
-> to success without opening a connection. Real replay requires `with_backend_template`
-> plus `register_endpoint`.
+> `FailoverReplay`, the backend-touching calls short-circuit to success without opening a
+> connection (`execute_statement` returns `(true, true, true, None)`). Real replay
+> requires `with_backend_template` plus `register_endpoint`. Nothing in the daemon calls
+> those, so this is not merely the unit-test configuration — it is the only configuration
+> reachable through `coordinate_failover_replay` (see
+> [Failover Coordination](#3-failover-coordination)).
 
 ### 3. Failover Coordination
 
@@ -233,9 +244,10 @@ and exposes `get_state`, `get_progress`, `cancel_replay`, `history`, and `stats`
 
 - **Candidate selection** (`select_best_candidate`): sort standbys by sync status (sync
   preferred when `prefer_sync_standby`), then by replication lag, then by priority.
-- **Sync wait** (`wait_for_sync`): poll `pg_last_wal_replay_lsn()` at 200 ms cadence; two
-  consecutive equal LSNs mean "caught up as far as it can" (the dead primary is producing
-  no new WAL). Bounded by `failover_timeout`.
+- **Sync wait** (`wait_for_sync`): poll `pg_last_wal_replay_lsn()` at 200 ms cadence; the
+  same LSN must be observed across three consecutive polls (`stable_polls >= 2`, i.e. two
+  repeat observations) before the standby is treated as "caught up as far as it can" (the
+  dead primary is producing no new WAL). Bounded by `failover_timeout`.
 - **Promotion** (`promote_standby`): `SELECT pg_promote(true, N)` with `N` clamped to
   10–300 s, then verify on a fresh connection that `pg_is_in_recovery()` is now `false`.
 - **Split-brain guard** (`on_old_primary_recovered`): deliberately read-only. PostgreSQL
@@ -250,6 +262,20 @@ active transactions (`get_transactions_for_node`), compute their maximum `start_
 result is a `CoordinatedReplayResult` with `total_transactions`, `successful_replays`,
 `failed_replays`, per-transaction `ReplayResult`s, and `all_successful()` / `success_rate()`
 helpers.
+
+> **What this actually does today.** `coordinate_failover_replay` builds its
+> `FailoverReplay` via `FailoverReplay::new(ReplayConfig { .. })` and never calls
+> `with_backend_template` or `register_endpoint` on it — there is no API to attach a
+> backend to the instance it constructs. Every statement therefore takes the skeleton
+> path above (`execute_statement` returns `(true, true, true, None)` without opening a
+> connection), so **no statement is executed against the new primary** and each
+> per-transaction result reports success unconditionally. Likewise `wait_for_lsn_catchup`
+> does **not** query `pg_last_wal_replay_lsn()`; it polls the tracked candidate's
+> in-memory `lag_bytes` (code comment: "In a real implementation, we'd query the node's
+> current LSN") and returns immediately when `target_lsn == 0` — always the case for
+> hot-path journals, since `journal_write` records `start_lsn = 0`. Coordinated replay is
+> wired end-to-end, but its executing half is a no-op until a backend is attached to the
+> `FailoverReplay` it creates.
 
 ### 4. Switchover Buffer
 
@@ -274,6 +300,10 @@ via `BackendClient`, returning a `ReplaySummary` (`statements_replayed`, `failur
 against staging" path, distinct from post-failover replay but built on the same journal.
 See [admin-api.md](admin-api.md) for the request/response shape.
 
+Like the journal it reads from, this endpoint is `ha-tr`-gated: a proxy built without the
+feature still routes `POST /api/replay`, but the handler returns
+`503 {"error": "ha-tr feature not compiled in"}` (`src/admin.rs`).
+
 ---
 
 ## Limitations and Trade-offs
@@ -285,13 +315,18 @@ checksums, and row counts are part of the journal model but are not populated by
 forwarding path today, so hot-path replay verification degrades to "did the statement
 run" rather than "did it produce identical results".
 
-### Session state is not migrated
+### Session state is not migrated on the replay path
 The replay engine re-executes journaled SQL statements. It does **not** re-establish
 `SET`/GUC parameters, re-`PREPARE` named statements, restore cursor positions, re-create
-session temp tables, or re-acquire advisory locks on the new primary. (The `ha-tr` feature
-line mentions "cursor restore, session migrate" as intent; those paths are not implemented
-in `failover_replay.rs` as of `9c5ff9b`.) Applications that depend on pre-transaction
-session state surviving a failover need application-level coordination.
+session temp tables, or re-acquire advisory locks on the new primary. The `ha-tr` feature
+line's "cursor restore, session migrate" capabilities *are* implemented — but as
+standalone library modules, not on the replay path: `src/cursor_restore.rs`
+(`CursorRestore::restore_cursor`) and `src/session_migrate.rs`
+(`SessionState::generate_restore_statements`, which regenerates `SET`/`PREPARE`/temp-table
+statements) exist and are unit-tested, yet nothing in `server.rs`, `failover_replay.rs`,
+or `failover_controller.rs` references them, so they are unreachable from a failover
+today. Applications that depend on pre-transaction session state surviving a failover need
+application-level coordination.
 
 ### Non-deterministic functions and sequences
 `random()`, `clock_timestamp()`, `txid_current()`, and `nextval()` produce different
@@ -300,7 +335,9 @@ sequence values are not synchronized. This is inherent to statement-level replay
 
 ### Array parameters
 `JournalValue::Array` is not yet supported by `journal_value_to_param` and degrades to
-`NULL`, which the verification path surfaces as a row-count mismatch.
+`NULL`. The verification path surfaces that as a row-count mismatch only when the journal
+entry captured a `rows_affected` count; for the hot-path journals produced by the live
+write path (which record no counts) the degradation is silent.
 
 ### Coordination is a library capability, not an auto-wired daemon loop
 `FailoverController`, `PrimaryTracker`, and `SwitchoverBuffer` are unit-tested library
@@ -320,7 +357,7 @@ controller/tracker automatically.
 | SELECT re-execution | Yes (`skip_read_only = false`) | Yes (read-only) | Yes | No |
 | WAL-LSN wait before replay | Yes (`pg_last_wal_replay_lsn()`) | N/A | Yes | No |
 | Row-count / checksum verification | Row count; checksum best-effort | Basic | Full | N/A |
-| Cursor / session-state migration | Not implemented | Yes | Yes | No |
+| Cursor / session-state migration | Library modules, unwired | Yes | Yes | No |
 | Planned-switchover buffering | Yes (`SwitchoverBuffer`) | No | Yes | No |
 | Persisted journal | No (in-memory) | N/A | N/A | N/A |
 | Open source | Yes | No | No | Yes |

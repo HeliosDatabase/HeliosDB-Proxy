@@ -395,9 +395,10 @@ impl FailoverController {
     /// Wait for a standby to catch up before promotion.
     ///
     /// Polls `pg_last_wal_replay_lsn()` on the candidate at 200 ms
-    /// cadence. Two consecutive polls that return the same LSN are
-    /// treated as "caught up as far as it can go" (the primary is
-    /// presumed dead, so no new WAL is arriving). Bounded by
+    /// cadence. The same LSN observed across three consecutive polls
+    /// (`stable_polls >= 2`, i.e. two repeat observations) is treated
+    /// as "caught up as far as it can go" (the primary is presumed
+    /// dead, so no new WAL is arriving). Bounded by
     /// `config.failover_timeout`.
     ///
     /// When no backend template is attached, returns `Ok(())` after
@@ -427,7 +428,8 @@ impl FailoverController {
     }
 
     /// Connect to the candidate and poll `pg_last_wal_replay_lsn()`
-    /// until it stabilises across two consecutive 200 ms polls.
+    /// until it stabilises across three consecutive 200 ms polls
+    /// (two repeat observations of the same LSN).
     async fn poll_until_caught_up(cfg: BackendConfig) -> Result<()> {
         let mut client = BackendClient::connect(&cfg)
             .await
