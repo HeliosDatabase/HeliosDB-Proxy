@@ -879,10 +879,12 @@ mod tests {
     #[test]
     fn test_manifest_validation_invalid_memory() {
         let loader = PluginLoader::new();
-        let mut manifest = PluginManifest::default();
-        manifest.name = "test-plugin".to_string();
-        manifest.min_memory = 100 * 1024 * 1024;
-        manifest.max_memory = 50 * 1024 * 1024;
+        let manifest = PluginManifest {
+            name: "test-plugin".to_string(),
+            min_memory: 100 * 1024 * 1024,
+            max_memory: 50 * 1024 * 1024,
+            ..Default::default()
+        };
 
         let result = loader.validate_manifest(&manifest);
         assert!(result.is_err());
@@ -892,8 +894,10 @@ mod tests {
     #[test]
     fn test_manifest_validation_success() {
         let loader = PluginLoader::new();
-        let mut manifest = PluginManifest::default();
-        manifest.name = "test-plugin".to_string();
+        let manifest = PluginManifest {
+            name: "test-plugin".to_string(),
+            ..Default::default()
+        };
 
         let result = loader.validate_manifest(&manifest);
         assert!(result.is_ok());

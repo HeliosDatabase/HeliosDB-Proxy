@@ -70,9 +70,9 @@ jobs:
       - name: cargo clippy
         run: |
           if [ -z "${{ matrix.features }}" ]; then
-            cargo clippy -- -D warnings
+            cargo clippy --tests -- -D warnings
           else
-            cargo clippy --features "${{ matrix.features }}" -- -D warnings
+            cargo clippy --features "${{ matrix.features }}" --tests -- -D warnings
           fi
 
   # ── Feature matrix: tests ───────────────────────────────────────────

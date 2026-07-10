@@ -480,11 +480,13 @@ mod tests {
 
     #[test]
     fn test_function_call_stats() {
-        let mut stats = FunctionCallStats::default();
-        stats.total_calls = 10;
-        stats.successful_calls = 9;
-        stats.failed_calls = 1;
-        stats.total_duration = Duration::from_millis(100);
+        let stats = FunctionCallStats {
+            total_calls: 10,
+            successful_calls: 9,
+            failed_calls: 1,
+            total_duration: Duration::from_millis(100),
+            ..Default::default()
+        };
 
         assert_eq!(stats.avg_duration(), Duration::from_millis(10));
         assert!((stats.success_rate() - 0.9).abs() < 0.001);
