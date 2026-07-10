@@ -5,12 +5,13 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.5.0] - 2026-07-10
 
 ### Added
 
-- **`[limits]` config section** — ten operational safety bounds that were
-  hardcoded `const`s in `src/server.rs` are now tunable via `proxy.toml`. Each
+- **`[limits]` config section** — eleven operational safety bounds (ten
+  formerly-named consts plus the previously-inline 30s backend read timeout)
+  that were hardcoded in `src/server.rs` are now tunable via `proxy.toml`. Each
   default reproduces the prior constant exactly, resolved once at startup, so a
   config without a `[limits]` block is byte-for-byte unchanged. Keys (default):
   `max_cancel_keys` (100000), `startup_timeout_secs` (30),
@@ -20,7 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `max_pending_bytes` (67108864 / 64 MiB),
   `max_total_idle_backend_conns` (8192, pool-modes), and
   `pool_reap_interval_secs` (30). `validate()` rejects a `0` for any of these
-  (a safety bound, not "unbounded") with a key-named error.
+  (a safety bound, not "unbounded") with a key-named error, and caps every
+  `*_secs` timeout at one year (`31536000`) — a value above that would overflow
+  the connect-time `Instant + Duration` deadline and panic the per-connection
+  task, so it is refused up front.
 - **`[anomaly]` config section** — the in-process anomaly detector previously
   ran on a hardcoded `AnomalyConfig::default()` plus a `MAX_SEEN_FINGERPRINTS`
   module const with no way to tune it. Its eight tunables are now exposed via
@@ -76,6 +80,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Plugin `kv_set` is now bounded (was unbounded in 1.4.0).** The per-plugin KV
+  host import changed from an infallible unbounded store (`kv_set` returned `()`)
+  to a capped one (`kv_set` returns a `bool`: `-1`/`false` when a write is
+  refused). The new `[plugins]` caps default to `kv_max_value_bytes` 65536,
+  `kv_max_keys_per_plugin` 1024, `kv_max_plugins` 256, and `kv_max_total_bytes`
+  67108864 (64 MiB). **Upgrade impact:** a plugin deployed under 1.4.0 that
+  stored values larger than 64 KiB, or more than 1024 keys in its namespace,
+  will silently start receiving `-1` from `kv_set` after upgrade — writes past a
+  cap fail instead of succeeding. Setting any `kv_*` cap to `0` disables that
+  cap and restores the unbounded 1.4.0 behavior for that axis (set all four to
+  `0` for byte-for-byte 1.4.0 semantics).
 - **CI now lints test code (`cargo clippy --tests`)** — both clippy invocations
   in `.github/workflows/ci.yml` gained `--tests`, so `#[cfg(test)]` modules and
   the `tests/` integration crate are held to the same `-D warnings` bar as the
