@@ -39,6 +39,11 @@
     header h1 { font-size: 18px; margin: 0; font-weight: 600; }
     header .version { color: var(--muted); font-size: 13px; }
     header .right { margin-left: auto; color: var(--muted); font-size: 12px; }
+    .token-btn {
+      background: var(--chip); color: var(--muted); border: 1px solid var(--line);
+      border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer;
+    }
+    .token-btn:hover { color: var(--fg); }
     main { padding: 24px; display: grid; gap: 24px; grid-template-columns: 1fr; max-width: 1200px; margin: 0 auto; }
     @media (min-width: 900px) {
       main { grid-template-columns: 1fr 1fr; }
@@ -117,6 +122,7 @@
     <h1>HeliosProxy</h1>
     <span class="version" id="version">—</span>
     <span class="right" id="last-refresh">—</span>
+    <button class="token-btn" id="token-btn" title="Clear the saved admin token and re-enter it">token</button>
   </header>
 
   <main>
@@ -322,8 +328,40 @@
   <script>
     const REFRESH_MS = 5000;
 
+    // ---- admin token handling ----------------------------------------------
+    // When `admin_token` is set in proxy.toml every admin route except the
+    // static shell and the liveness probes requires `Authorization: Bearer
+    // <token>`. The shell itself is served without a token; here we wrap
+    // window.fetch ONCE so all existing call sites (j() plus the raw fetch()
+    // calls in the action handlers) transparently carry the bearer header.
+    // The token lives in sessionStorage — it dies with the tab, never touches
+    // disk, and is never written into the URL or logs.
+    const TOK_KEY = "helios_admin_token";
+    const _fetch = window.fetch.bind(window);
+    window.fetch = (url, opts = {}) => {
+      const t = sessionStorage.getItem(TOK_KEY);
+      // Caller-supplied headers win over the injected auth so an explicit
+      // Authorization on a specific call is never clobbered.
+      if (t) opts.headers = Object.assign({ "Authorization": "Bearer " + t }, opts.headers || {});
+      return _fetch(url, opts);
+    };
+
+    // Prompt for the token AT MOST ONCE per page load: the dashboard fires
+    // many fetches in parallel, and without this guard a token-less load would
+    // pop a prompt for every failing panel.
+    let _tokenPrompted = false;
+    function promptToken(msg) {
+      if (_tokenPrompted) return;
+      _tokenPrompted = true;
+      const t = window.prompt(msg || "Admin token required (proxy.toml admin_token):");
+      if (t) { sessionStorage.setItem(TOK_KEY, t.trim()); location.reload(); }
+    }
+
     async function j(url, opts) {
       const r = await fetch(url, opts);
+      // A 401 means the token is missing or wrong — ask for it, then surface
+      // the failure so the current refresh cycle unwinds cleanly.
+      if (r.status === 401) { promptToken(); throw new Error("401 Unauthorized"); }
       if (!r.ok) throw new Error(r.status + " " + r.statusText);
       return r.json();
     }
@@ -702,6 +740,14 @@
     });
     document.querySelector("#chaos-reset").addEventListener("click", () => {
       chaos("reset");
+    });
+
+    // Header "token" control: forget the saved token and reload so the next
+    // failing fetch re-prompts. Lets a wrong token be corrected without
+    // closing the tab.
+    document.querySelector("#token-btn").addEventListener("click", () => {
+      sessionStorage.removeItem(TOK_KEY);
+      location.reload();
     });
 
     refresh();

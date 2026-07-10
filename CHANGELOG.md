@@ -44,6 +44,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can use `/livez` and `/readyz` for unauthenticated liveness/readiness probes
   even when `admin_token` is set (the slash-form `/health/live` and
   `/health/ready` remain token-gated, unchanged).
+- **Embedded admin dashboard usable with `admin_token` set** — v1.4.0 made
+  token-gating the recommended posture, but the embedded web UI
+  (`src/admin_ui.html`, served at `/` and `/ui`) sent no `Authorization`
+  header on any of its `fetch()` calls, so with a token set every panel
+  `401`ed — the secure configuration broke the dashboard. The UI now wraps
+  `window.fetch` once to inject `Authorization: Bearer <token>` (from the tab's
+  `sessionStorage`, key `helios_admin_token`) into every request; on a `401`
+  it prompts once per page load for the token and reloads. A **token** button
+  in the header bar clears the saved token so a wrong one can be re-entered.
+  The static shell (`GET /`, `/ui`) is now token-exempt so the page can load
+  and prompt — it carries no privileged data, and every API call it makes is
+  still individually gated. Without a token, behavior is unchanged (no prompt).
 
 ## [1.4.0] - 2026-07-09
 
