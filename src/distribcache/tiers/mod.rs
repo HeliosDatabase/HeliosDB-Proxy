@@ -358,9 +358,11 @@ mod tests {
 
     #[test]
     fn test_tier_stats_hit_ratio() {
-        let mut stats = TierStats::default();
-        stats.hits = 80;
-        stats.misses = 20;
+        let stats = TierStats {
+            hits: 80,
+            misses: 20,
+            ..Default::default()
+        };
         assert!((stats.hit_ratio() - 0.8).abs() < 0.001);
     }
 

@@ -959,15 +959,19 @@ mod tests {
     /// join so a regression fails fast instead of hanging the test binary.
     #[test]
     fn test_call_hook_enforces_timeout() {
-        let mut config = PluginRuntimeConfig::default();
-        config.fuel_metering = false; // isolate epoch enforcement from fuel
-        config.timeout = Duration::from_millis(100);
+        let config = PluginRuntimeConfig {
+            fuel_metering: false, // isolate epoch enforcement from fuel
+            timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
         let runtime = Arc::new(WasmPluginRuntime::new(&config).unwrap());
 
         let module = build_spin_module(runtime.engine());
-        let mut metadata = PluginMetadata::default();
-        metadata.name = "spin".to_string();
-        metadata.hooks = vec![HookType::PreQuery];
+        let metadata = PluginMetadata {
+            name: "spin".to_string(),
+            hooks: vec![HookType::PreQuery],
+            ..Default::default()
+        };
         let plugin = Arc::new(LoadedPlugin::new(
             metadata,
             PathBuf::from("/test/spin.wasm"),
@@ -1050,16 +1054,20 @@ mod tests {
     /// real, not a stub.
     #[test]
     fn test_call_hook_roundtrips_real_wasm() {
-        let mut config = PluginRuntimeConfig::default();
-        // Disable fuel metering — the test module is trivial and we
-        // don't want to debug fuel exhaustion in unit tests.
-        config.fuel_metering = false;
+        let config = PluginRuntimeConfig {
+            // Disable fuel metering — the test module is trivial and we
+            // don't want to debug fuel exhaustion in unit tests.
+            fuel_metering: false,
+            ..Default::default()
+        };
         let runtime = WasmPluginRuntime::new(&config).unwrap();
 
         let module = build_test_module(runtime.engine());
-        let mut metadata = PluginMetadata::default();
-        metadata.name = "test-roundtrip".to_string();
-        metadata.hooks = vec![HookType::PreQuery, HookType::PostQuery];
+        let metadata = PluginMetadata {
+            name: "test-roundtrip".to_string(),
+            hooks: vec![HookType::PreQuery, HookType::PostQuery],
+            ..Default::default()
+        };
 
         let plugin = LoadedPlugin::new(
             metadata,
@@ -1090,8 +1098,10 @@ mod tests {
     fn test_call_hook_rejects_undeclared_hook() {
         let runtime = WasmPluginRuntime::new(&PluginRuntimeConfig::default()).unwrap();
         let module = build_test_module(runtime.engine());
-        let mut metadata = PluginMetadata::default();
-        metadata.hooks = vec![]; // declares nothing
+        let metadata = PluginMetadata {
+            hooks: vec![], // declares nothing
+            ..Default::default()
+        };
         let plugin = LoadedPlugin::new(
             metadata,
             PathBuf::from("/test/empty.wasm"),
@@ -1110,9 +1120,11 @@ mod tests {
     fn test_call_hook_missing_export_returns_error() {
         let runtime = WasmPluginRuntime::new(&PluginRuntimeConfig::default()).unwrap();
         let module = build_test_module(runtime.engine());
-        let mut metadata = PluginMetadata::default();
-        // Declare a hook the test module doesn't export.
-        metadata.hooks = vec![HookType::Authenticate];
+        let metadata = PluginMetadata {
+            // Declare a hook the test module doesn't export.
+            hooks: vec![HookType::Authenticate],
+            ..Default::default()
+        };
         let plugin = LoadedPlugin::new(
             metadata,
             PathBuf::from("/test/missing.wasm"),
@@ -1162,14 +1174,18 @@ mod tests {
     /// under the plugin's namespace and is readable from Rust.
     #[test]
     fn test_host_kv_import_persists_value() {
-        let mut config = PluginRuntimeConfig::default();
-        config.fuel_metering = false;
+        let config = PluginRuntimeConfig {
+            fuel_metering: false,
+            ..Default::default()
+        };
         let runtime = WasmPluginRuntime::new(&config).unwrap();
 
         let module = build_kv_test_module(runtime.engine());
-        let mut metadata = PluginMetadata::default();
-        metadata.name = "kv-test-plugin".to_string();
-        metadata.hooks = vec![HookType::PreQuery];
+        let metadata = PluginMetadata {
+            name: "kv-test-plugin".to_string(),
+            hooks: vec![HookType::PreQuery],
+            ..Default::default()
+        };
 
         let plugin = LoadedPlugin::new(
             metadata,
@@ -1245,9 +1261,11 @@ mod tests {
             .set("kv-read-plugin", b"seed".to_vec(), b"live-value".to_vec()));
 
         let module = build_kv_read_test_module(runtime.engine());
-        let mut metadata = PluginMetadata::default();
-        metadata.name = "kv-read-plugin".to_string();
-        metadata.hooks = vec![HookType::PreQuery];
+        let metadata = PluginMetadata {
+            name: "kv-read-plugin".to_string(),
+            hooks: vec![HookType::PreQuery],
+            ..Default::default()
+        };
 
         let plugin = LoadedPlugin::new(
             metadata,
@@ -1334,14 +1352,18 @@ mod tests {
         const SHA256_OF_ABC: &[u8; 64] =
             b"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
-        let mut config = PluginRuntimeConfig::default();
-        config.fuel_metering = false;
+        let config = PluginRuntimeConfig {
+            fuel_metering: false,
+            ..Default::default()
+        };
         let runtime = WasmPluginRuntime::new(&config).unwrap();
 
         let module = build_sha256_test_module(runtime.engine());
-        let mut metadata = PluginMetadata::default();
-        metadata.name = "sha256-test-plugin".to_string();
-        metadata.hooks = vec![HookType::PreQuery];
+        let metadata = PluginMetadata {
+            name: "sha256-test-plugin".to_string(),
+            hooks: vec![HookType::PreQuery],
+            ..Default::default()
+        };
 
         let plugin = LoadedPlugin::new(
             metadata,

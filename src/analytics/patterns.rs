@@ -460,9 +460,11 @@ mod tests {
 
     #[test]
     fn test_n_plus_one_detection() {
-        let mut config = PatternConfig::default();
-        config.n_plus_one_threshold = 3;
-        config.burst_detection = false;
+        let config = PatternConfig {
+            n_plus_one_threshold: 3,
+            burst_detection: false,
+            ..Default::default()
+        };
 
         let detector = PatternDetector::new(config);
         let fp = QueryFingerprinter::new();
@@ -485,10 +487,12 @@ mod tests {
 
     #[test]
     fn test_burst_detection() {
-        let mut config = PatternConfig::default();
-        config.burst_threshold = 5;
-        config.burst_window = Duration::from_secs(1);
-        config.n_plus_one_detection = false;
+        let config = PatternConfig {
+            burst_threshold: 5,
+            burst_window: Duration::from_secs(1),
+            n_plus_one_detection: false,
+            ..Default::default()
+        };
 
         let detector = PatternDetector::new(config);
         let fp = QueryFingerprinter::new();
@@ -528,8 +532,10 @@ mod tests {
 
     #[test]
     fn test_session_cleanup() {
-        let mut config = PatternConfig::default();
-        config.session_timeout = Duration::from_millis(100);
+        let config = PatternConfig {
+            session_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
 
         let detector = PatternDetector::new(config);
         let fp = QueryFingerprinter::new();
@@ -615,10 +621,12 @@ mod tests {
 
         // Full detector burst path with an enormous window still fires an
         // alert (computing saturating_sub start_nanos) without panicking.
-        let mut config = PatternConfig::default();
-        config.burst_window = huge;
-        config.burst_threshold = 3;
-        config.n_plus_one_detection = false;
+        let config = PatternConfig {
+            burst_window: huge,
+            burst_threshold: 3,
+            n_plus_one_detection: false,
+            ..Default::default()
+        };
         let detector = PatternDetector::new(config);
         let execution =
             super::super::statistics::QueryExecution::new("SELECT 1", Duration::from_millis(1));

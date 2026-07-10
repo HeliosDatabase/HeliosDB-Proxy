@@ -74,6 +74,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both a per-call delta and a bytes/sec change. Feature-free: it exercises only
   the always-public `protocol` API, so it compiles under every feature set.
 
+### Changed
+
+- **CI now lints test code (`cargo clippy --tests`)** — both clippy invocations
+  in `.github/workflows/ci.yml` gained `--tests`, so `#[cfg(test)]` modules and
+  the `tests/` integration crate are held to the same `-D warnings` bar as the
+  library. Pre-existing `clippy::field_reassign_with_default` warnings in test
+  code (converted `let mut x = T::default(); x.field = …;` sequences into
+  struct-literal `T { field: …, ..Default::default() }` initializers, behavior
+  unchanged) were cleared so the gate starts green.
+
 ### Fixed
 
 - **`/healthz`, `/livez`, `/readyz` admin routes** — these three

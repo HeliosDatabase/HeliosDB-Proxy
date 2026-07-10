@@ -89,9 +89,11 @@ mod tests {
     use std::collections::HashMap;
 
     fn make_ctx(sql: &str, is_read_only: bool) -> QueryContext {
-        let mut hc = HookContext::default();
-        hc.client_id = Some("session-abc".to_string());
-        hc.database = Some("app".to_string());
+        let mut hc = HookContext {
+            client_id: Some("session-abc".to_string()),
+            database: Some("app".to_string()),
+            ..Default::default()
+        };
         hc.attributes
             .insert("tenant_id".to_string(), "acme".to_string());
 
