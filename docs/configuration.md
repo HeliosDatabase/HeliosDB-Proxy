@@ -488,6 +488,45 @@ success_threshold = 3
 
 ---
 
+## Operational Limits (`[limits]`)
+
+Session/protocol safety bounds and relay timeouts. Each key was previously a
+compiled-in constant; the defaults reproduce those constants exactly, so an
+absent `[limits]` block is byte-for-byte unchanged. All values are resolved once
+at startup. `validate()` rejects `0` for any of these (a `0` disables a safety
+bound rather than meaning anything useful).
+
+```toml
+[limits]
+max_cancel_keys = 100000
+startup_timeout_secs = 30
+backend_write_timeout_secs = 30
+backend_read_timeout_secs = 30
+client_write_timeout_secs = 60
+reprepare_timeout_secs = 15
+max_prepared_statements = 8192
+max_prepared_bytes = 67108864
+max_pending_bytes = 67108864
+max_total_idle_backend_conns = 8192
+pool_reap_interval_secs = 30
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_cancel_keys` | usize | `100000` | Capacity of the query-cancellation key map (`BackendKeyData` → backend address); at capacity the oldest entries are FIFO-evicted. |
+| `startup_timeout_secs` | u64 | `30` | Deadline for the pre-auth startup exchange (TLS negotiation + startup/authentication); bounds slow-loris handshakes. |
+| `backend_write_timeout_secs` | u64 | `30` | Timeout for a single backend write on the forward path. |
+| `backend_read_timeout_secs` | u64 | `30` | Timeout for a single backend read on the relay path (paired with `backend_write_timeout_secs`; a slow-but-healthy read is not itself a fault). |
+| `client_write_timeout_secs` | u64 | `60` | Timeout for a single client write, so a wedged client cannot pin a proxy task (and its backend connection) forever. |
+| `reprepare_timeout_secs` | u64 | `15` | Timeout for the out-of-band re-prepare exchange performed on a backend connection switch. |
+| `max_prepared_statements` | usize | `8192` | Per-session cap on distinct named prepared statements. |
+| `max_prepared_bytes` | usize | `67108864` | Per-session cap on aggregate bytes retained in the statement registry (64 MiB). |
+| `max_pending_bytes` | usize | `67108864` | Per-session cap on the un-flushed extended-protocol `pending` buffer (64 MiB). |
+| `max_total_idle_backend_conns` | usize | `8192` | Global ceiling on idle backend-pool connections across all `(node,user,db)` identities. Only consumed with the `pool-modes` feature; parsed-and-ignored otherwise. |
+| `pool_reap_interval_secs` | u64 | `30` | How often the idle-connection reaper runs. |
+
+---
+
 ## Query Analytics (`[analytics]`)
 
 Fingerprinting, per-query stats, slow-query log, pattern detection. Only active with the
@@ -505,6 +544,42 @@ max_fingerprints = 10000
 | `enabled` | bool | `false` | Record per-query statistics and slow-query log. |
 | `slow_query_ms` | u64 | `1000` | Queries slower than this are added to the slow-query log. |
 | `max_fingerprints` | u32 | `10000` | Maximum distinct query fingerprints to track. |
+
+---
+
+## Anomaly Detection (`[anomaly]`)
+
+Tunables for the in-process anomaly detector (SQL-injection patterns, failed-auth
+bursts, per-tenant rate spikes, novel-query shapes). The section is parsed on
+every build for config round-tripping, but the detector is only active with the
+`anomaly-detection` feature. The defaults reproduce the prior hardcoded behavior
+exactly, so an absent `[anomaly]` block changes nothing.
+
+The detector is built **once at startup**, so changing `[anomaly]` requires a
+restart — a SIGHUP config reload does not rebuild it.
+
+```toml
+[anomaly]
+rate_window_secs = 60
+spike_z_threshold = 3.0
+auth_window_secs = 60
+auth_critical_count = 10
+auth_warning_count = 5
+event_buffer_size = 1024
+emit_novel_queries = true
+max_seen_fingerprints = 100000
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `rate_window_secs` | u64 | `60` | Rolling window for the per-tenant rate EWMA, seconds. Must be `>= 1`. |
+| `spike_z_threshold` | f64 | `3.0` | Minimum z-score before a rate spike fires. Must be finite and `> 0`. |
+| `auth_window_secs` | u64 | `60` | Window for failed-auth (credential-stuffing) bursts, seconds. Must be `>= 1`. |
+| `auth_critical_count` | u32 | `10` | Failures inside the auth window that escalate to Critical. Must be `>= 1`. |
+| `auth_warning_count` | u32 | `5` | Failures inside the auth window that escalate to Warning. Must be `<= auth_critical_count`. |
+| `event_buffer_size` | usize | `1024` | Maximum events kept in the in-memory ring buffer. Must be `>= 1`. |
+| `emit_novel_queries` | bool | `true` | Emit first-seen query fingerprints as informational events; set `false` on high-churn workloads. |
+| `max_seen_fingerprints` | usize | `100000` | Upper bound on the novel-query fingerprint set before it is cleared (bounds memory on high-cardinality SQL). Must be `>= 1`. |
 
 ---
 

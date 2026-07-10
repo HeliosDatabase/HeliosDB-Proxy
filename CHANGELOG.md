@@ -5,6 +5,34 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`[limits]` config section** — ten operational safety bounds that were
+  hardcoded `const`s in `src/server.rs` are now tunable via `proxy.toml`. Each
+  default reproduces the prior constant exactly, resolved once at startup, so a
+  config without a `[limits]` block is byte-for-byte unchanged. Keys (default):
+  `max_cancel_keys` (100000), `startup_timeout_secs` (30),
+  `backend_write_timeout_secs` (30), `backend_read_timeout_secs` (30),
+  `client_write_timeout_secs` (60), `reprepare_timeout_secs` (15),
+  `max_prepared_statements` (8192), `max_prepared_bytes` (67108864 / 64 MiB),
+  `max_pending_bytes` (67108864 / 64 MiB),
+  `max_total_idle_backend_conns` (8192, pool-modes), and
+  `pool_reap_interval_secs` (30). `validate()` rejects a `0` for any of these
+  (a safety bound, not "unbounded") with a key-named error.
+- **`[anomaly]` config section** — the in-process anomaly detector previously
+  ran on a hardcoded `AnomalyConfig::default()` plus a `MAX_SEEN_FINGERPRINTS`
+  module const with no way to tune it. Its eight tunables are now exposed via
+  `proxy.toml`, defaults reproducing the prior behavior exactly: `rate_window_secs`
+  (60), `spike_z_threshold` (3.0), `auth_window_secs` (60), `auth_critical_count`
+  (10), `auth_warning_count` (5), `event_buffer_size` (1024), `emit_novel_queries`
+  (true), and `max_seen_fingerprints` (100000). `validate()` rejects degenerate
+  values (windows/buffer/fingerprint-cap `> 0`, `spike_z_threshold` finite and
+  `> 0`, `auth_critical_count >= 1`, `auth_warning_count <= auth_critical_count`).
+  The detector is built once at startup, so changing `[anomaly]` requires a
+  restart (a SIGHUP reload does not rebuild it).
+
 ## [1.4.0] - 2026-07-09
 
 Minor release — data-path performance, relay robustness, security hardening

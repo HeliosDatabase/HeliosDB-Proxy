@@ -28,6 +28,50 @@ tr_mode    = "session"
 write_timeout_secs = 30
 
 # =============================================================================
+# LIMITS — Operational safety bounds & timeouts (PG-wire data path)
+# =============================================================================
+# Every key below was previously a hardcoded constant in the proxy. The values
+# shown are the built-in defaults, so leaving the whole [limits] block out (or
+# omitting any single key) is byte-for-byte identical to the historical
+# behaviour. Every value MUST be > 0 — a 0 disables a safety bound rather than
+# meaning "unbounded", so the proxy refuses to start with any 0 here. Timeouts
+# are whole seconds; counts/bytes are plain integers.
+#
+# [limits]
+# # Capacity of the query-cancellation key map (BackendKeyData -> backend addr).
+# # At capacity the oldest entries are FIFO-evicted (a dropped entry only means
+# # one best-effort CancelRequest is not forwarded).
+# max_cancel_keys = 100000
+# # Deadline for the pre-auth startup exchange (client TLS + PG startup/auth).
+# # Bounds slow-loris handshakes; the query loop itself is never bounded.
+# startup_timeout_secs = 30
+# # Timeout for a single backend write on the forward path (a hung/blackholed
+# # backend must never pin a client task indefinitely).
+# backend_write_timeout_secs = 30
+# # Timeout for a single backend read on the relay path (a backend that accepts
+# # the query but then emits no bytes must not pin a client task forever).
+# backend_read_timeout_secs = 30
+# # Timeout for a single client write (a wedged/slow client must not pin a proxy
+# # task and the backend connection it holds).
+# client_write_timeout_secs = 60
+# # Timeout for the out-of-band re-prepare exchange (Parse+Flush -> ParseComplete)
+# # performed when a session moves to a different backend connection.
+# reprepare_timeout_secs = 15
+# # Per-session cap on distinct named prepared statements.
+# max_prepared_statements = 8192
+# # Per-session cap on aggregate bytes retained in the prepared-statement
+# # registry (each entry holds the full encoded Parse). 64 MiB.
+# max_prepared_bytes = 67108864
+# # Per-session cap on the un-flushed extended-protocol buffer: a client must
+# # reach a Sync/Flush boundary before this many bytes pile up. 64 MiB.
+# max_pending_bytes = 67108864
+# # Global ceiling on idle connections parked in the data-path backend pool
+# # across ALL (node,user,db) identities (pool-modes feature only).
+# max_total_idle_backend_conns = 8192
+# # How often the idle-connection reaper runs.
+# pool_reap_interval_secs = 30
+
+# =============================================================================
 # POOL — Backend connection pool (proxy -> database)
 # =============================================================================
 
@@ -413,6 +457,25 @@ ttl_fallback_secs = 60          # Fallback TTL when WAL is unavailable
 # alert_on_n_plus_one       = true
 # alert_on_burst            = true
 # # webhook_url             = "https://hooks.slack.com/services/..."
+
+# =============================================================================
+# ANOMALY DETECTION — in-process statistical + heuristic detector tunables
+# =============================================================================
+# Only consumed when the binary is built with the `anomaly-detection` feature.
+# The section is parsed on every build so configs round-trip. Every key below
+# shows its DEFAULT — omit the section entirely to keep the historical
+# hardcoded behaviour unchanged.
+# NOTE: the detector is built once at startup; changing [anomaly] requires a
+# restart (SIGHUP live-reload does not rebuild it).
+# [anomaly]
+# rate_window_secs       = 60        # Rolling window for the per-tenant rate EWMA (>= 1)
+# spike_z_threshold      = 3.0       # Min z-score before a rate spike fires (finite, > 0)
+# auth_window_secs       = 60        # Failed-auth burst window, seconds (>= 1)
+# auth_critical_count    = 10        # Failures in the window -> Critical
+# auth_warning_count     = 5         # Failures in the window -> Warning (<= auth_critical_count)
+# event_buffer_size      = 1024      # Max events kept in the in-memory ring buffer (>= 1)
+# emit_novel_queries     = true      # Emit first-seen query fingerprints as info events
+# max_seen_fingerprints  = 100000    # Cap on the novel-query fingerprint set before reset (>= 1)
 
 # =============================================================================
 # MULTI-TENANCY — Tenant isolation and per-tenant resource limits

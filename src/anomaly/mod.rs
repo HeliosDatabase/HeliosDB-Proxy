@@ -118,6 +118,11 @@ pub struct AnomalyConfig {
     /// Treat novel queries as informational events. Set false to
     /// suppress on high-churn workloads (e.g. ad-hoc analytics).
     pub emit_novel_queries: bool,
+    /// Upper bound on the novel-query fingerprint set before it is
+    /// cleared. Bounds memory on high-cardinality SQL (the detector is
+    /// informational, so clearing on overflow is acceptable). Defaults
+    /// to [`MAX_SEEN_FINGERPRINTS`].
+    pub max_seen_fingerprints: usize,
 }
 
 impl Default for AnomalyConfig {
@@ -130,6 +135,7 @@ impl Default for AnomalyConfig {
             auth_warning_count: 5,
             event_buffer_size: 1024,
             emit_novel_queries: true,
+            max_seen_fingerprints: MAX_SEEN_FINGERPRINTS,
         }
     }
 }
@@ -149,9 +155,11 @@ pub struct AnomalyDetector {
     events: Arc<RwLock<VecDeque<AnomalyEvent>>>,
 }
 
-/// Upper bound on the novel-query fingerprint set. Without a cap the set
-/// grows unbounded on high-cardinality SQL (a slow memory leak); the
-/// detector is informational, so clearing on overflow is acceptable.
+/// Default upper bound on the novel-query fingerprint set. Without a cap the
+/// set grows unbounded on high-cardinality SQL (a slow memory leak); the
+/// detector is informational, so clearing on overflow is acceptable. This is
+/// only the DEFAULT — the live cap is [`AnomalyConfig::max_seen_fingerprints`]
+/// (exposed via the `[anomaly]` config section) and read on the hot path.
 const MAX_SEEN_FINGERPRINTS: usize = 100_000;
 
 impl AnomalyDetector {
@@ -204,7 +212,7 @@ impl AnomalyDetector {
         if self.config.emit_novel_queries && !self.seen_fingerprints.contains_key(&ctx.fingerprint)
         {
             // Bound the set so unique-SQL traffic can't leak memory.
-            if self.seen_fingerprints.len() >= MAX_SEEN_FINGERPRINTS {
+            if self.seen_fingerprints.len() >= self.config.max_seen_fingerprints {
                 self.seen_fingerprints.clear();
             }
             // insert returns the prior value; None means we won the race to
@@ -405,6 +413,34 @@ mod tests {
         assert!(!evs
             .iter()
             .any(|e| matches!(e, AnomalyEvent::NovelQuery { .. })));
+    }
+
+    #[test]
+    fn default_max_seen_fingerprints_matches_const() {
+        assert_eq!(
+            AnomalyConfig::default().max_seen_fingerprints,
+            MAX_SEEN_FINGERPRINTS
+        );
+    }
+
+    #[test]
+    fn seen_fingerprint_set_is_bounded_by_configured_cap() {
+        // A tiny cap forces the set to clear on overflow, so a previously-seen
+        // fingerprint re-fires as novel after the reset — proving the cap comes
+        // from config (not the const).
+        let mut cfg = AnomalyConfig::default();
+        cfg.max_seen_fingerprints = 2;
+        let d = AnomalyDetector::new(cfg);
+        let is_novel = |evs: &[AnomalyEvent]| {
+            evs.iter()
+                .any(|e| matches!(e, AnomalyEvent::NovelQuery { .. }))
+        };
+        assert!(is_novel(&d.record_query(&obs("a", "fp0", "SELECT 1"))));
+        assert!(is_novel(&d.record_query(&obs("a", "fp1", "SELECT 2"))));
+        // len == 2 >= cap 2: this insert clears the set first, then records fp2.
+        assert!(is_novel(&d.record_query(&obs("a", "fp2", "SELECT 3"))));
+        // fp0 was evicted by the clear, so it is novel again.
+        assert!(is_novel(&d.record_query(&obs("a", "fp0", "SELECT 1"))));
     }
 
     #[test]
