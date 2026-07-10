@@ -321,7 +321,11 @@ impl WasmPluginRuntime {
             linker,
             epoch_stop,
             host_functions,
-            kv: KvBackend::with_limits(config.kv_max_value_bytes, config.kv_max_keys_per_plugin),
+            kv: KvBackend::with_limits(
+                config.kv_max_value_bytes,
+                config.kv_max_keys_per_plugin,
+                config.kv_max_plugins,
+            ),
             module_cache: RwLock::new(HashMap::new()),
             default_policy,
             created_at: Instant::now(),

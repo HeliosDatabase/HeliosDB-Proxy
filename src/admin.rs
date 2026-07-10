@@ -1888,17 +1888,21 @@ impl AdminServer {
     /// plugin reads through its `kv_get` import).
     ///
     /// Path shapes:
-    /// - `GET    /admin/kv/<plugin>/<key>` → `{"plugin","key","value"}` or 404
-    /// - `GET    /admin/kv/<plugin>/`      → `{"plugin","keys":[...]}` (trailing slash lists)
-    /// - `PUT    /admin/kv/<plugin>/<key>` → 200 `{"ok":true}` or 413 on a cap breach
-    /// - `DELETE /admin/kv/<plugin>/<key>` → 200 `{"ok":true}` (idempotent)
+    /// - `GET    /admin/kv/<plugin>/<key>`  → `{"plugin","key","value"}` or 404
+    /// - `GET    /admin/kv/<plugin>/`       → `{"plugin","keys":[...]}` (trailing slash lists;
+    ///   an optional `?prefix=` filters the listing)
+    /// - `PUT    /admin/kv/<plugin>/<key>`  → 200 `{"ok":true}` or 413 on a cap breach
+    /// - `DELETE /admin/kv/<plugin>/<key>`  → 200 `{"ok":true}` (idempotent)
     ///
-    /// The `<key>` segment may itself contain `/`. PUT bodies arrive as
-    /// `Option<&str>` — the admin request body is decoded with
-    /// `String::from_utf8_lossy`, so values are UTF-8 text; a caller
-    /// storing binary must base64-encode it first. Returns 503 when no
-    /// plugin manager is attached, 400 on a malformed path, and 405 on
-    /// an unsupported method.
+    /// The `<key>` segment may itself contain `/`. Any query string is
+    /// stripped before the plugin/key split, so `?…` never leaks into a
+    /// key or plugin name. PUT bodies arrive as `Option<&str>` — the
+    /// admin request body is decoded with `String::from_utf8_lossy`, so
+    /// values are UTF-8 text; a caller storing binary must base64-encode
+    /// it first. An oversized body is rejected 413 before it is copied.
+    /// Returns 503 when no plugin manager is attached, 400 on a
+    /// malformed path or an empty `<plugin>` segment, and 405 on an
+    /// unsupported method.
     #[cfg(feature = "wasm-plugins")]
     async fn handle_kv(
         method: &str,
@@ -1909,10 +1913,27 @@ impl AdminServer {
         use serde_json::json;
         // Shape: /admin/kv/<plugin>/<key...>   key may itself contain '/'
         //        /admin/kv/<plugin>/           trailing slash = list keys
+        //
+        // Strip any query string BEFORE slicing off the plugin/key, so a
+        // query never leaks into a segment: `PUT /admin/kv/p/k?x=1` must
+        // store key `k` (not `k?x=1`), and `GET /admin/kv/p/?prefix=…`
+        // must LIST (key is empty) rather than GET a key named `?prefix=…`.
+        // The optional `?prefix=` param filters the list response
+        // (percent-decoded, so `prefix=budget%2F` matches `budget/`).
+        let list_prefix = parse_query_params(path)
+            .remove("prefix")
+            .unwrap_or_default();
+        let path = path.split('?').next().unwrap_or(path);
         let rest = &path["/admin/kv/".len()..];
         let Some((plugin, key)) = rest.split_once('/') else {
             return Ok((400, json!({ "error": "expected /admin/kv/<plugin>/<key>" })));
         };
+        // An empty <plugin> segment (`/admin/kv//k`) can never be read
+        // by a real plugin (plugin names are non-empty), so it would be
+        // write-only garbage feeding namespace growth — reject it.
+        if plugin.is_empty() {
+            return Ok((400, json!({ "error": "empty plugin name" })));
+        }
         let pm = state.plugin_manager.read().await.clone();
         let Some(pm) = pm else {
             return Ok((503, json!({ "error": "plugin runtime not enabled" })));
@@ -1921,7 +1942,7 @@ impl AdminServer {
         match (method, key.is_empty()) {
             ("GET", true) => Ok((
                 200,
-                json!({ "plugin": plugin, "keys": kv.list_keys(plugin, b"") }),
+                json!({ "plugin": plugin, "keys": kv.list_keys(plugin, list_prefix.as_bytes()) }),
             )),
             ("GET", false) => match kv.get(plugin, key.as_bytes()) {
                 Some(v) => Ok((
@@ -1931,16 +1952,24 @@ impl AdminServer {
                 None => Ok((404, json!({ "error": "key not found" }))),
             },
             ("PUT", false) => {
-                if kv.set(
-                    plugin,
-                    key.as_bytes().to_vec(),
-                    body.unwrap_or("").as_bytes().to_vec(),
-                ) {
+                // Fast-reject an oversized body BEFORE copying it into an
+                // owned Vec. `set` enforces the same cap, but this avoids
+                // materialising a value we would only discard (the body
+                // has already been read+lossy-decoded upstream; this at
+                // least skips the extra allocation).
+                let body_bytes = body.unwrap_or("").as_bytes();
+                let cap = kv.max_value_bytes();
+                if cap != 0 && body_bytes.len() > cap {
+                    return Ok((413, json!({ "error": "kv_max_value_bytes exceeded" })));
+                }
+                if kv.set(plugin, key.as_bytes().to_vec(), body_bytes.to_vec()) {
                     Ok((200, json!({ "ok": true })))
                 } else {
                     Ok((
                         413,
-                        json!({ "error": "kv_max_value_bytes or kv_max_keys_per_plugin exceeded" }),
+                        json!({
+                            "error": "kv_max_value_bytes, kv_max_keys_per_plugin, or kv_max_plugins exceeded"
+                        }),
                     ))
                 }
             }
@@ -2396,7 +2425,7 @@ fn parse_limit_query(path: &str, default: usize, max: usize) -> usize {
 /// value feeds an identifier/URL echo, not a security decision). `+`
 /// is NOT decoded to space: subscribers send RFC 3986 percent-encoded
 /// values, not `application/x-www-form-urlencoded`.
-#[cfg(feature = "edge-proxy")]
+#[cfg(any(feature = "edge-proxy", feature = "wasm-plugins"))]
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -2419,9 +2448,10 @@ fn percent_decode(s: &str) -> String {
 
 /// Parse a URL query string (`?k=v&k2=v2`) into a map, percent-decoding
 /// the values. Keys without a `=` are ignored. Used by the edge SSE
-/// subscribe route — the only admin route taking query params beyond
-/// the single `?limit=` that `parse_limit_query` covers.
-#[cfg(feature = "edge-proxy")]
+/// subscribe route and the `/admin/kv` list route (`?prefix=`) — the
+/// admin routes taking query params beyond the single `?limit=` that
+/// `parse_limit_query` covers.
+#[cfg(any(feature = "edge-proxy", feature = "wasm-plugins"))]
 fn parse_query_params(path: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let q = match path.find('?') {
@@ -3054,6 +3084,111 @@ mod tests {
                 .await
                 .expect("handler returns Ok");
         assert_eq!(status, 413);
+    }
+
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn test_kv_put_413_on_namespace_cap() {
+        use crate::plugins::{PluginManager, PluginRuntimeConfig};
+        // Only ONE namespace may exist at a time.
+        let cfg = PluginRuntimeConfig {
+            kv_max_plugins: 1,
+            ..PluginRuntimeConfig::default()
+        };
+        let state = Arc::new(AdminState::new());
+        state
+            .with_plugin_manager(Arc::new(PluginManager::new(cfg).unwrap()))
+            .await;
+        // First namespace fits.
+        let (status, _) = AdminServer::route_request("PUT", "/admin/kv/a/k", Some("1"), &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        // A second DISTINCT namespace exceeds the cap → 413 (this is the
+        // unbounded-namespace-growth axis the cap closes).
+        let (status, body) = AdminServer::route_request("PUT", "/admin/kv/b/k", Some("2"), &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 413);
+        assert!(body["error"].as_str().unwrap().contains("kv_max_plugins"));
+        // Writing another key into the EXISTING namespace still works.
+        let (status, _) = AdminServer::route_request("PUT", "/admin/kv/a/k2", Some("3"), &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 200);
+    }
+
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn test_kv_empty_plugin_returns_400() {
+        let state = kv_state_with_manager().await;
+        // `/admin/kv//k` → empty <plugin> segment → 400, no namespace made.
+        let (status, body) = AdminServer::route_request("PUT", "/admin/kv//k", Some("v"), &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 400);
+        assert_eq!(body["error"], "empty plugin name");
+        // The empty namespace was never created / listable.
+        let (status, body) = AdminServer::route_request("GET", "/admin/kv//", None, &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 400);
+        assert_eq!(body["error"], "empty plugin name");
+    }
+
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn test_kv_query_string_is_stripped() {
+        let state = kv_state_with_manager().await;
+        // PUT with a trailing query stores key `k`, NOT `k?x=1`.
+        let (status, _) =
+            AdminServer::route_request("PUT", "/admin/kv/demo/k?x=1", Some("v"), &state)
+                .await
+                .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        // The clean key resolves…
+        let (status, body) = AdminServer::route_request("GET", "/admin/kv/demo/k", None, &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        assert_eq!(body["value"], "v");
+        // …and the polluted key `k?x=1` was never stored.
+        let (status, body) = AdminServer::route_request("GET", "/admin/kv/demo/", None, &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        let keys: Vec<String> = body["keys"]
+            .as_array()
+            .expect("keys array")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(keys, vec!["k".to_string()]);
+    }
+
+    #[cfg(feature = "wasm-plugins")]
+    #[tokio::test]
+    async fn test_kv_list_prefix_filter() {
+        let state = kv_state_with_manager().await;
+        for (k, v) in [("ba", "1"), ("bb", "2"), ("cc", "3")] {
+            AdminServer::route_request("PUT", &format!("/admin/kv/demo/{k}"), Some(v), &state)
+                .await
+                .unwrap();
+        }
+        // `?prefix=b` keeps only the b-prefixed keys; trailing slash lists.
+        let (status, body) =
+            AdminServer::route_request("GET", "/admin/kv/demo/?prefix=b", None, &state)
+                .await
+                .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        let mut keys: Vec<String> = body["keys"]
+            .as_array()
+            .expect("keys array")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        keys.sort();
+        assert_eq!(keys, vec!["ba".to_string(), "bb".to_string()]);
     }
 
     #[cfg(not(feature = "wasm-plugins"))]

@@ -645,8 +645,9 @@ ttl_fallback_secs = 60          # Fallback TTL when WAL is unavailable
 # max_plugins   = 20
 # fuel_metering = true                 # Limit CPU cycles per call
 # fuel_limit    = 1000000
-# kv_max_value_bytes     = 65536       # Max bytes per plugin-KV value (kv_set / PUT /admin/kv); 0 = unlimited
+# kv_max_value_bytes     = 65536       # Max bytes per plugin-KV key OR value (kv_set / PUT /admin/kv); 0 = unlimited
 # kv_max_keys_per_plugin = 1024        # Max distinct keys per plugin KV namespace; 0 = unlimited
+# kv_max_plugins         = 256         # Max distinct plugin KV namespaces (bounds PUT /admin/kv namespace growth); 0 = unlimited
 # enable_simd   = true
 # enable_threads = false
 # cache_modules = true
