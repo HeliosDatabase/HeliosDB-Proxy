@@ -63,6 +63,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   split (so `?prefix=` can filter a listing), which means a plugin-created key
   containing `?` is listable but not addressable via GET/DELETE over the admin
   surface.
+- **`benches/protocol.rs`** — a Criterion benchmark covering the PG-wire
+  per-query hot path that every client frame and backend response flows
+  through, previously uncovered by the pool/routing benches (so a regression
+  there was invisible to quality gate 3). Three groups —
+  `protocol/decode_message`, `protocol/encode_message`, and
+  `protocol/query_text` — each run over three payload sizes (a trivial
+  `SELECT 1`, a ~60-char `WHERE` query, and a deterministically-built ~1 KiB
+  `IN (...)` statement) with `Throughput::Bytes` so a regression surfaces as
+  both a per-call delta and a bytes/sec change. Feature-free: it exercises only
+  the always-public `protocol` API, so it compiles under every feature set.
 
 ### Fixed
 
