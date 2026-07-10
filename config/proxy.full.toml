@@ -459,6 +459,25 @@ ttl_fallback_secs = 60          # Fallback TTL when WAL is unavailable
 # # webhook_url             = "https://hooks.slack.com/services/..."
 
 # =============================================================================
+# ANOMALY DETECTION — in-process statistical + heuristic detector tunables
+# =============================================================================
+# Only consumed when the binary is built with the `anomaly-detection` feature.
+# The section is parsed on every build so configs round-trip. Every key below
+# shows its DEFAULT — omit the section entirely to keep the historical
+# hardcoded behaviour unchanged.
+# NOTE: the detector is built once at startup; changing [anomaly] requires a
+# restart (SIGHUP live-reload does not rebuild it).
+# [anomaly]
+# rate_window_secs       = 60        # Rolling window for the per-tenant rate EWMA (>= 1)
+# spike_z_threshold      = 3.0       # Min z-score before a rate spike fires (finite, > 0)
+# auth_window_secs       = 60        # Failed-auth burst window, seconds (>= 1)
+# auth_critical_count    = 10        # Failures in the window -> Critical
+# auth_warning_count     = 5         # Failures in the window -> Warning (<= auth_critical_count)
+# event_buffer_size      = 1024      # Max events kept in the in-memory ring buffer (>= 1)
+# emit_novel_queries     = true      # Emit first-seen query fingerprints as info events
+# max_seen_fingerprints  = 100000    # Cap on the novel-query fingerprint set before reset (>= 1)
+
+# =============================================================================
 # MULTI-TENANCY — Tenant isolation and per-tenant resource limits
 # =============================================================================
 
