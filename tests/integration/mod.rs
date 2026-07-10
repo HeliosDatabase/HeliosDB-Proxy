@@ -914,6 +914,7 @@ fn test_module_23_wasm_plugin_config() {
         fuel_metering: true,
         fuel_limit: 500_000,
         trust_root: None,
+        ..Default::default()
     };
     assert!(cfg.enabled);
     assert_eq!(cfg.max_plugins, 5);

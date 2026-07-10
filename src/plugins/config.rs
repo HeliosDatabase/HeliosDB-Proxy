@@ -54,6 +54,13 @@ pub struct PluginRuntimeConfig {
     /// aren't checked (preserves the dev-loop ergonomic of dropping
     /// unsigned `.wasm` files in the plugin dir).
     pub trust_root: Option<PathBuf>,
+
+    /// Max bytes for a single plugin-KV value (`0` = unlimited).
+    /// Applied to the shared `KvBackend` at runtime construction.
+    pub kv_max_value_bytes: usize,
+
+    /// Max distinct keys per plugin KV namespace (`0` = unlimited).
+    pub kv_max_keys_per_plugin: usize,
 }
 
 impl Default for PluginRuntimeConfig {
@@ -73,6 +80,8 @@ impl Default for PluginRuntimeConfig {
             cache_dir: None,
             plugins: HashMap::new(),
             trust_root: None,
+            kv_max_value_bytes: 65536,
+            kv_max_keys_per_plugin: 1024,
         }
     }
 }
@@ -98,6 +107,8 @@ impl From<&crate::config::PluginToml> for PluginRuntimeConfig {
             cache_dir: None,
             plugins: HashMap::new(),
             trust_root: t.trust_root.as_ref().map(PathBuf::from),
+            kv_max_value_bytes: t.kv_max_value_bytes,
+            kv_max_keys_per_plugin: t.kv_max_keys_per_plugin,
         }
     }
 }
