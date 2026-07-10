@@ -32,6 +32,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `> 0`, `auth_critical_count >= 1`, `auth_warning_count <= auth_critical_count`).
   The detector is built once at startup, so changing `[anomaly]` requires a
   restart (a SIGHUP reload does not rebuild it).
+- **`/admin/kv/<plugin>/<key>` admin endpoints** — the per-plugin KV store
+  (`KvBackend`, read by plugins through their `kv_get`/`kv_set` host imports)
+  can now be read, written, listed, and deleted from outside the WASM sandbox,
+  so operators can push a plugin's runtime config (budgets, region maps, mask
+  rules, allowlists) without a restart. `GET /admin/kv/<plugin>/<key>` returns
+  `{"plugin","key","value"}` (404 if absent), `GET /admin/kv/<plugin>/`
+  (trailing slash) lists the namespace as `{"plugin","keys":[...]}`,
+  `PUT` sets a value (UTF-8 body via `from_utf8_lossy`), and `DELETE` removes one
+  (idempotent 200). All four sit behind the normal admin bearer gate; the build
+  returns `501` without `--features wasm-plugins` and `503` when no plugin
+  manager is attached. Two new `[plugins]` caps bound writes and are tunable
+  (`0` = unlimited): `kv_max_value_bytes` (default 65536) and
+  `kv_max_keys_per_plugin` (default 1024); a PUT past either returns `413`
+  (and the in-WASM `kv_set` returns `-1`). Overwriting an existing key never
+  trips the key-count cap.
 
 ### Fixed
 

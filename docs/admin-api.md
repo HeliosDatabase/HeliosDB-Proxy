@@ -100,6 +100,10 @@ Auth column: **token** = requires bearer token when `admin_token` is set; **open
 | `GET` | `/pools` | Per-node connection pool stats | — | token |
 | `POST` | `/api/sql` | Execute SQL with transparent write routing | — | token |
 | `GET` | `/plugins` | Loaded WASM plugins (503 if manager not attached) | `wasm-plugins` | token |
+| `GET` | `/admin/kv/{plugin}/{key}` | Read a plugin KV value (`{"plugin","key","value"}`; 404 if absent) | `wasm-plugins` | token |
+| `GET` | `/admin/kv/{plugin}/` | List a plugin's KV keys (trailing slash) | `wasm-plugins` | token |
+| `PUT` | `/admin/kv/{plugin}/{key}` | Set a plugin KV value (UTF-8 body; 413 on cap breach) | `wasm-plugins` | token |
+| `DELETE` | `/admin/kv/{plugin}/{key}` | Delete a plugin KV value (idempotent 200) | `wasm-plugins` | token |
 | `GET` | `/anomalies` | Anomaly-detector recent events (`?limit=N`) | `anomaly-detection` | token |
 | `GET` | `/analytics`, `/api/analytics` | Top queries + slow-query log (`?limit=N`) | `query-analytics` | token |
 | `GET` | `/api/chaos` | Read current chaos overrides | — | token |
@@ -381,6 +385,34 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 ### GET /plugins
 
 Loaded WASM plugins — name, version, description, hooks, state, invocation count. Returns `503 {"error":"plugin manager not attached"}` when the proxy runs without a plugin manager, and `503 {"error":"wasm-plugins feature not compiled in"}` in a build without `--features wasm-plugins`.
+
+### /admin/kv/{plugin}/{key} — plugin runtime KV
+
+Read, write, delete, and list a loaded plugin's key-value state — the same per-plugin namespace the plugin sees through its `kv_get` / `kv_set` host imports. Operators use it to push runtime config (budgets, region maps, mask rules, allowlists) without restarting the proxy. All four verbs sit behind the normal admin bearer gate.
+
+| Method | Path | Behavior |
+|--------|------|----------|
+| `GET` | `/admin/kv/{plugin}/{key}` | `200 {"plugin","key","value"}`, or `404 {"error":"key not found"}` |
+| `GET` | `/admin/kv/{plugin}/` | `200 {"plugin","keys":[...]}` — the trailing slash lists the namespace |
+| `PUT` | `/admin/kv/{plugin}/{key}` | `200 {"ok":true}`, or `413` when a cap is exceeded |
+| `DELETE` | `/admin/kv/{plugin}/{key}` | `200 {"ok":true}` — idempotent (200 even when the key is absent) |
+
+- **`{key}` may contain `/`.** The first path segment after `/admin/kv/` is the plugin name; everything after it is the key (e.g. `budget/tenant-a`).
+- **Values are UTF-8 text.** PUT bodies are decoded with `String::from_utf8_lossy` (the admin body limit still applies), and GET returns the value as a JSON string. Store binary blobs base64-encoded.
+- **Caps** guard against runaway writes; both are tunable in `[plugins]` and `0` means unlimited. `kv_max_value_bytes` (default 65536) bounds a single value's length; `kv_max_keys_per_plugin` (default 1024) bounds the distinct keys per namespace. Overwriting an existing key never trips the key-count cap. A PUT that would exceed either returns `413 {"error":"kv_max_value_bytes or kv_max_keys_per_plugin exceeded"}`.
+- **`400`** on a malformed path (`/admin/kv/{plugin}` with no key segment).
+- **`405`** on an unsupported method.
+- **`503 {"error":"plugin runtime not enabled"}`** when no plugin manager is attached (plugins disabled in config).
+- **`501 {"error":"proxy built without the wasm-plugins feature"}`** in a build without `--features wasm-plugins` — note this is `501`, not the `503` other feature-gated routes use, because the entire KV subsystem is absent from the binary.
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" -X PUT \
+  http://localhost:9090/admin/kv/helios-plugin-cost-governor/budget/tenant-a \
+  --data-raw '{"queries_per_minute":1000}'
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  http://localhost:9090/admin/kv/helios-plugin-cost-governor/budget/tenant-a
+# {"plugin":"helios-plugin-cost-governor","key":"budget/tenant-a","value":"{\"queries_per_minute\":1000}"}
+```
 
 ### GET /anomalies
 
