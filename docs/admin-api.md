@@ -334,7 +334,7 @@ Per-node connection pool statistics (active/idle/pending, lifetime created/close
 ### GET /version
 
 ```json
-{ "version": "1.4.0", "build_time": "1.4.0" }
+{ "version": "1.5.0", "build_time": "1.5.0" }
 ```
 
 > Both fields derive from the crate version (`CARGO_PKG_VERSION`); `build_time` is the version string, not a wall-clock timestamp.
