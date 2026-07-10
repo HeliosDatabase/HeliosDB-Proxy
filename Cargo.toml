@@ -270,6 +270,10 @@ harness = false
 name = "routing"
 harness = false
 
+[[bench]]
+name = "protocol"
+harness = false
+
 [[test]]
 name = "integration"
 path = "tests/integration/mod.rs"
