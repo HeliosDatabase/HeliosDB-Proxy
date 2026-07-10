@@ -444,8 +444,10 @@ mod tests {
 
     #[test]
     fn test_lag_info_meets_freshness() {
-        let mut info = LagInfo::default();
-        info.lag_time = Duration::from_millis(100);
+        let info = LagInfo {
+            lag_time: Duration::from_millis(100),
+            ..Default::default()
+        };
 
         assert!(info.meets_freshness(Duration::from_millis(200)));
         assert!(info.meets_freshness(Duration::from_millis(100)));
@@ -454,8 +456,10 @@ mod tests {
 
     #[test]
     fn test_lag_info_has_reached_lsn() {
-        let mut info = LagInfo::default();
-        info.current_lsn = 1000;
+        let info = LagInfo {
+            current_lsn: 1000,
+            ..Default::default()
+        };
 
         assert!(info.has_reached_lsn(500));
         assert!(info.has_reached_lsn(1000));

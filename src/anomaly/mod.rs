@@ -406,8 +406,10 @@ mod tests {
 
     #[test]
     fn novel_query_can_be_suppressed_via_config() {
-        let mut cfg = AnomalyConfig::default();
-        cfg.emit_novel_queries = false;
+        let cfg = AnomalyConfig {
+            emit_novel_queries: false,
+            ..Default::default()
+        };
         let d = AnomalyDetector::new(cfg);
         let evs = d.record_query(&obs("acme", "fp1", "SELECT 1"));
         assert!(!evs
@@ -428,8 +430,10 @@ mod tests {
         // A tiny cap forces the set to clear on overflow, so a previously-seen
         // fingerprint re-fires as novel after the reset — proving the cap comes
         // from config (not the const).
-        let mut cfg = AnomalyConfig::default();
-        cfg.max_seen_fingerprints = 2;
+        let cfg = AnomalyConfig {
+            max_seen_fingerprints: 2,
+            ..Default::default()
+        };
         let d = AnomalyDetector::new(cfg);
         let is_novel = |evs: &[AnomalyEvent]| {
             evs.iter()
@@ -538,8 +542,10 @@ mod tests {
 
     #[test]
     fn event_buffer_evicts_oldest_when_full() {
-        let mut cfg = AnomalyConfig::default();
-        cfg.event_buffer_size = 5;
+        let cfg = AnomalyConfig {
+            event_buffer_size: 5,
+            ..Default::default()
+        };
         let d = AnomalyDetector::new(cfg);
         for i in 0..20 {
             let _ = d.record_query(&obs("a", &format!("fp{}", i), "SELECT 1"));

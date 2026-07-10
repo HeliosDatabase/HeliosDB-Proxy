@@ -6380,8 +6380,10 @@ mod tests {
     use crate::protocol::QueryMessage;
 
     fn test_config() -> ProxyConfig {
-        let mut config = ProxyConfig::default();
-        config.listen_address = "127.0.0.1:0".to_string();
+        let mut config = ProxyConfig {
+            listen_address: "127.0.0.1:0".to_string(),
+            ..Default::default()
+        };
         config.add_node("127.0.0.1:5432", "primary").unwrap();
         config
     }

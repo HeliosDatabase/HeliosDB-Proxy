@@ -40,13 +40,14 @@ fn find_plugin_wasm(name: &str) -> Option<PathBuf> {
 }
 
 fn manifest_for(name: &str, wasm_path: &PathBuf, hooks: Vec<HookType>) -> PluginManifest {
-    let mut m = PluginManifest::default();
-    m.name = name.to_string();
-    m.version = "0.1.0".to_string();
-    m.license = "Apache-2.0".to_string();
-    m.hooks = hooks;
-    m.path = wasm_path.clone();
-    m
+    PluginManifest {
+        name: name.to_string(),
+        version: "0.1.0".to_string(),
+        license: "Apache-2.0".to_string(),
+        hooks,
+        path: wasm_path.clone(),
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -61,9 +62,11 @@ fn cost_governor_plugin_loads_and_runs_pre_query() {
     };
     let wasm_bytes = std::fs::read(&wasm_path).expect("read wasm bytes");
 
-    let mut config = PluginRuntimeConfig::default();
-    config.fuel_metering = false;
-    config.timeout = Duration::from_secs(5);
+    let config = PluginRuntimeConfig {
+        fuel_metering: false,
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
     let runtime = WasmPluginRuntime::new(&config).expect("runtime init");
 
     let manifest = manifest_for(
@@ -105,8 +108,10 @@ fn cost_governor_blocks_when_budget_exhausted_via_kv() {
     };
     let wasm_bytes = std::fs::read(&wasm_path).expect("read wasm");
 
-    let mut config = PluginRuntimeConfig::default();
-    config.fuel_metering = false;
+    let config = PluginRuntimeConfig {
+        fuel_metering: false,
+        ..Default::default()
+    };
     let runtime = WasmPluginRuntime::new(&config).unwrap();
 
     let manifest = manifest_for(
@@ -163,8 +168,10 @@ fn ai_classifier_writes_request_keys_into_kv() {
     };
     let wasm_bytes = std::fs::read(&wasm_path).unwrap();
 
-    let mut config = PluginRuntimeConfig::default();
-    config.fuel_metering = false;
+    let config = PluginRuntimeConfig {
+        fuel_metering: false,
+        ..Default::default()
+    };
     let runtime = WasmPluginRuntime::new(&config).unwrap();
 
     let manifest = manifest_for(
@@ -268,8 +275,10 @@ fn proxy_loads_packed_tar_gz_artefact() {
 
     // Instantiate through the runtime — proves the loaded wasm is
     // actually the same bytes that compile cleanly.
-    let mut config = PluginRuntimeConfig::default();
-    config.fuel_metering = false;
+    let config = PluginRuntimeConfig {
+        fuel_metering: false,
+        ..Default::default()
+    };
     let runtime = WasmPluginRuntime::new(&config).unwrap();
     runtime.instantiate(&manifest, &bytes).expect("instantiate");
 }
@@ -282,8 +291,10 @@ fn pgvector_router_returns_node_for_top_k_query() {
     };
     let wasm_bytes = std::fs::read(&wasm_path).unwrap();
 
-    let mut config = PluginRuntimeConfig::default();
-    config.fuel_metering = false;
+    let config = PluginRuntimeConfig {
+        fuel_metering: false,
+        ..Default::default()
+    };
     let runtime = WasmPluginRuntime::new(&config).unwrap();
 
     let manifest = manifest_for(

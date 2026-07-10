@@ -438,8 +438,10 @@ mod tests {
 
     #[test]
     fn test_schedule_with_concurrency_limit() {
-        let mut config = DistribCacheConfig::default();
-        config.max_concurrent_oltp = 1;
+        let config = DistribCacheConfig {
+            max_concurrent_oltp: 1,
+            ..Default::default()
+        };
 
         let scheduler = WorkloadScheduler::new(config);
 
