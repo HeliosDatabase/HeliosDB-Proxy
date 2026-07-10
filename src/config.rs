@@ -273,6 +273,13 @@ pub struct ProxyConfig {
     /// `query-analytics` feature is compiled in.
     #[serde(default)]
     pub analytics: AnalyticsToml,
+    /// In-process anomaly detector tunables (rate-spike z-score, credential-
+    /// stuffing burst window, novel-query fingerprint cap, event ring buffer).
+    /// Parsed on every build so configs round-trip; only consumed when the
+    /// `anomaly-detection` feature is compiled in. Defaults reproduce the
+    /// detector's historical hardcoded behaviour exactly.
+    #[serde(default)]
+    pub anomaly: AnomalyToml,
     /// Replica-lag-aware routing + read-your-writes. Disabled by default. Only
     /// enforced when the `lag-routing` feature is compiled in.
     #[serde(default)]
@@ -313,6 +320,13 @@ pub struct ProxyConfig {
     /// `HELIOS_DRAIN_TIMEOUT_SECS` env var.
     #[serde(default = "default_drain_timeout_secs")]
     pub shutdown_drain_timeout_secs: u64,
+    /// Operational safety limits and timeouts for the PG-wire data path
+    /// (cancel-key map size, handshake/read/write deadlines, per-session
+    /// prepared-statement and buffer caps, idle-pool ceiling + reaper cadence).
+    /// Every key defaults to the value it had as a hardcoded constant, so a
+    /// config without a `[limits]` block is byte-for-byte unchanged.
+    #[serde(default)]
+    pub limits: LimitsToml,
 }
 
 fn default_drain_timeout_secs() -> u64 {
@@ -742,6 +756,137 @@ impl Default for CacheToml {
     }
 }
 
+// =============================================================================
+// OPERATIONAL LIMITS & TIMEOUTS (session/protocol safety bounds)
+// =============================================================================
+
+/// Operational safety limits and timeouts for the PG-wire data path. Every
+/// value here was previously a hardcoded `const` in `src/server.rs`; exposing
+/// them as a `[limits]` section makes each one tunable via `proxy.toml` without
+/// a recompile.
+///
+/// Defaults are byte-for-byte the prior compiled-in constants, so a config
+/// without a `[limits]` block (or one that omits any individual key) behaves
+/// exactly as before. Every timeout is expressed in whole seconds and every
+/// count/byte cap as a plain integer; all MUST be > 0. A `0` here would disable
+/// a safety bound rather than mean "unbounded" in any useful way, so
+/// [`ProxyConfig::validate`] rejects it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LimitsToml {
+    /// Capacity of the query-cancellation key map (`BackendKeyData` → backend
+    /// address). At capacity the oldest entries are FIFO-evicted; a dropped
+    /// stale entry only means one best-effort `CancelRequest` is not forwarded.
+    /// Prior constant `MAX_CANCEL_KEYS`.
+    #[serde(default = "default_max_cancel_keys")]
+    pub max_cancel_keys: usize,
+    /// Deadline (seconds) for the pre-auth startup exchange (client TLS
+    /// negotiation + PostgreSQL startup/authentication). Bounds slow-loris
+    /// connections that stall mid-handshake; the query loop itself is not
+    /// bounded. Prior constant `STARTUP_TIMEOUT`.
+    #[serde(default = "default_startup_timeout_secs")]
+    pub startup_timeout_secs: u64,
+    /// Timeout (seconds) for a single backend write on the forward path — a
+    /// blackholed or hung backend must never pin a client task indefinitely.
+    /// Prior constant `BACKEND_WRITE_TIMEOUT`.
+    #[serde(default = "default_backend_write_timeout_secs")]
+    pub backend_write_timeout_secs: u64,
+    /// Timeout (seconds) for a single backend read on the relay path — a backend
+    /// that accepts the query but then emits no bytes must not pin a client task
+    /// forever. The paired counterpart to `backend_write_timeout_secs`; a
+    /// slow-but-healthy backend read (large sort / lock wait) is not itself
+    /// treated as a fault (see `is_backend_fault`).
+    #[serde(default = "default_backend_read_timeout_secs")]
+    pub backend_read_timeout_secs: u64,
+    /// Timeout (seconds) for a single client write — a wedged or very slow
+    /// client must not pin a proxy task (and the backend connection it holds)
+    /// forever. Prior constant `CLIENT_WRITE_TIMEOUT`.
+    #[serde(default = "default_client_write_timeout_secs")]
+    pub client_write_timeout_secs: u64,
+    /// Timeout (seconds) for the out-of-band re-prepare exchange (write
+    /// Parse+Flush, read ParseComplete) performed on a backend connection
+    /// switch. Prior constant `REPREPARE_TIMEOUT`.
+    #[serde(default = "default_reprepare_timeout_secs")]
+    pub reprepare_timeout_secs: u64,
+    /// Per-session cap on distinct named prepared statements — bounds the
+    /// per-session statement registry against a client issuing unbounded
+    /// `Parse`s. Prior constant `MAX_PREPARED_STATEMENTS`.
+    #[serde(default = "default_max_prepared_statements")]
+    pub max_prepared_statements: usize,
+    /// Per-session cap on the aggregate bytes retained in the statement
+    /// registry (each entry holds the full encoded `Parse`, so the count cap
+    /// alone does not bound memory). Prior constant `MAX_PREPARED_BYTES`.
+    #[serde(default = "default_max_prepared_bytes")]
+    pub max_prepared_bytes: usize,
+    /// Per-session cap on the un-flushed extended-protocol `pending` buffer: a
+    /// client must reach a Sync/Flush boundary before this many bytes pile up.
+    /// Prior constant `MAX_PENDING_BYTES`.
+    #[serde(default = "default_max_pending_bytes")]
+    pub max_pending_bytes: usize,
+    /// Global ceiling on idle connections parked in the data-path backend pool
+    /// across ALL `(node,user,db)` identities — bounds total file descriptors
+    /// regardless of how many distinct identities connect. Only consumed when
+    /// the `pool-modes` feature is compiled in; parsed-and-ignored otherwise.
+    /// Prior constant `MAX_TOTAL_IDLE_BACKEND_CONNS`.
+    #[serde(default = "default_max_total_idle_backend_conns")]
+    pub max_total_idle_backend_conns: usize,
+    /// How often (seconds) the idle-connection reaper runs. Prior constant
+    /// `POOL_REAP_INTERVAL`.
+    #[serde(default = "default_pool_reap_interval_secs")]
+    pub pool_reap_interval_secs: u64,
+}
+
+fn default_max_cancel_keys() -> usize {
+    100_000
+}
+fn default_startup_timeout_secs() -> u64 {
+    30
+}
+fn default_backend_write_timeout_secs() -> u64 {
+    30
+}
+fn default_backend_read_timeout_secs() -> u64 {
+    30
+}
+fn default_client_write_timeout_secs() -> u64 {
+    60
+}
+fn default_reprepare_timeout_secs() -> u64 {
+    15
+}
+fn default_max_prepared_statements() -> usize {
+    8192
+}
+fn default_max_prepared_bytes() -> usize {
+    64 * 1024 * 1024
+}
+fn default_max_pending_bytes() -> usize {
+    64 * 1024 * 1024
+}
+fn default_max_total_idle_backend_conns() -> usize {
+    8192
+}
+fn default_pool_reap_interval_secs() -> u64 {
+    30
+}
+
+impl Default for LimitsToml {
+    fn default() -> Self {
+        Self {
+            max_cancel_keys: default_max_cancel_keys(),
+            startup_timeout_secs: default_startup_timeout_secs(),
+            backend_write_timeout_secs: default_backend_write_timeout_secs(),
+            backend_read_timeout_secs: default_backend_read_timeout_secs(),
+            client_write_timeout_secs: default_client_write_timeout_secs(),
+            reprepare_timeout_secs: default_reprepare_timeout_secs(),
+            max_prepared_statements: default_max_prepared_statements(),
+            max_prepared_bytes: default_max_prepared_bytes(),
+            max_pending_bytes: default_max_pending_bytes(),
+            max_total_idle_backend_conns: default_max_total_idle_backend_conns(),
+            pool_reap_interval_secs: default_pool_reap_interval_secs(),
+        }
+    }
+}
+
 /// Replica-lag-aware routing + read-your-writes configuration (always present;
 /// only enforced when the `lag-routing` feature is compiled in AND enabled).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -790,6 +935,103 @@ impl Default for AnalyticsToml {
             enabled: false,
             slow_query_ms: 1000,
             max_fingerprints: 10000,
+        }
+    }
+}
+
+/// Anomaly-detector configuration (TOML-friendly, always present so configs
+/// round-trip on any build). Converted to `crate::anomaly::AnomalyConfig` at
+/// startup and only consumed when the `anomaly-detection` feature is compiled
+/// in. Every default reproduces the detector's historical hardcoded
+/// `AnomalyConfig::default()` (and the old `MAX_SEEN_FINGERPRINTS` const)
+/// EXACTLY, so an absent `[anomaly]` section changes nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnomalyToml {
+    /// Rolling window for the per-tenant rate EWMA, seconds. Must be >= 1.
+    #[serde(default = "default_anomaly_rate_window_secs")]
+    pub rate_window_secs: u64,
+    /// Minimum z-score before a rate spike fires. Must be finite and > 0.
+    #[serde(default = "default_anomaly_spike_z_threshold")]
+    pub spike_z_threshold: f64,
+    /// Window for failed-auth (credential-stuffing) bursts, seconds. Must be
+    /// >= 1.
+    #[serde(default = "default_anomaly_auth_window_secs")]
+    pub auth_window_secs: u64,
+    /// Failures inside the auth window that escalate to Critical.
+    #[serde(default = "default_anomaly_auth_critical_count")]
+    pub auth_critical_count: u32,
+    /// Failures inside the auth window that escalate to Warning. Must be
+    /// <= `auth_critical_count`.
+    #[serde(default = "default_anomaly_auth_warning_count")]
+    pub auth_warning_count: u32,
+    /// Maximum events kept in the in-memory ring buffer. Must be >= 1.
+    #[serde(default = "default_anomaly_event_buffer_size")]
+    pub event_buffer_size: usize,
+    /// Emit novel-query fingerprints as informational events. Set `false` to
+    /// suppress on high-churn workloads (e.g. ad-hoc analytics).
+    #[serde(default = "default_anomaly_emit_novel_queries")]
+    pub emit_novel_queries: bool,
+    /// Upper bound on the novel-query fingerprint set before it is cleared
+    /// (bounds memory on high-cardinality SQL). Must be >= 1.
+    #[serde(default = "default_anomaly_max_seen_fingerprints")]
+    pub max_seen_fingerprints: usize,
+}
+
+fn default_anomaly_rate_window_secs() -> u64 {
+    60
+}
+fn default_anomaly_spike_z_threshold() -> f64 {
+    3.0
+}
+fn default_anomaly_auth_window_secs() -> u64 {
+    60
+}
+fn default_anomaly_auth_critical_count() -> u32 {
+    10
+}
+fn default_anomaly_auth_warning_count() -> u32 {
+    5
+}
+fn default_anomaly_event_buffer_size() -> usize {
+    1024
+}
+fn default_anomaly_emit_novel_queries() -> bool {
+    true
+}
+fn default_anomaly_max_seen_fingerprints() -> usize {
+    100_000
+}
+
+impl Default for AnomalyToml {
+    fn default() -> Self {
+        Self {
+            rate_window_secs: default_anomaly_rate_window_secs(),
+            spike_z_threshold: default_anomaly_spike_z_threshold(),
+            auth_window_secs: default_anomaly_auth_window_secs(),
+            auth_critical_count: default_anomaly_auth_critical_count(),
+            auth_warning_count: default_anomaly_auth_warning_count(),
+            event_buffer_size: default_anomaly_event_buffer_size(),
+            emit_novel_queries: default_anomaly_emit_novel_queries(),
+            max_seen_fingerprints: default_anomaly_max_seen_fingerprints(),
+        }
+    }
+}
+
+#[cfg(feature = "anomaly-detection")]
+impl AnomalyToml {
+    /// Build the runtime detector config from the parsed `[anomaly]` section.
+    /// Field-for-field; the defaults above guarantee this equals
+    /// `crate::anomaly::AnomalyConfig::default()` when the section is absent.
+    pub fn to_anomaly_config(&self) -> crate::anomaly::AnomalyConfig {
+        crate::anomaly::AnomalyConfig {
+            rate_window_secs: self.rate_window_secs,
+            spike_z_threshold: self.spike_z_threshold,
+            auth_window_secs: self.auth_window_secs,
+            auth_critical_count: self.auth_critical_count,
+            auth_warning_count: self.auth_warning_count,
+            event_buffer_size: self.event_buffer_size,
+            emit_novel_queries: self.emit_novel_queries,
+            max_seen_fingerprints: self.max_seen_fingerprints,
         }
     }
 }
@@ -926,6 +1168,7 @@ impl Default for ProxyConfig {
             rate_limit: RateLimitToml::default(),
             circuit_breaker: CircuitBreakerToml::default(),
             analytics: AnalyticsToml::default(),
+            anomaly: AnomalyToml::default(),
             lag_routing: LagRoutingToml::default(),
             cache: CacheToml::default(),
             query_rewrite: QueryRewriteToml::default(),
@@ -934,6 +1177,7 @@ impl Default for ProxyConfig {
             graphql_gateway: GraphqlGatewayConfig::default(),
             optimize_unnamed_parse: true,
             shutdown_drain_timeout_secs: default_drain_timeout_secs(),
+            limits: LimitsToml::default(),
         }
     }
 }
@@ -1185,6 +1429,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "rate_limit",
     "circuit_breaker",
     "analytics",
+    "anomaly",
     "lag_routing",
     "cache",
     "query_rewrite",
@@ -1193,6 +1438,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "graphql_gateway",
     "optimize_unnamed_parse",
     "shutdown_drain_timeout_secs",
+    "limits",
 ];
 
 /// Detect TOP-LEVEL TOML keys that are not fields of [`ProxyConfig`] (silent
@@ -1353,6 +1599,58 @@ impl ProxyConfig {
             }
         }
 
+        // Operational limits/timeouts. Each of these was a compiled-in safety
+        // bound; a 0 disables the bound (slow-loris handshake never times out,
+        // an unbounded statement registry, a zero-capacity map, a reaper that
+        // panics `tokio::time::interval`) rather than meaning anything useful,
+        // so reject 0 up front with a message that names the key.
+        {
+            let l = &self.limits;
+            let zero_checks: [(&str, u64); 7] = [
+                ("limits.startup_timeout_secs", l.startup_timeout_secs),
+                (
+                    "limits.backend_write_timeout_secs",
+                    l.backend_write_timeout_secs,
+                ),
+                (
+                    "limits.backend_read_timeout_secs",
+                    l.backend_read_timeout_secs,
+                ),
+                (
+                    "limits.client_write_timeout_secs",
+                    l.client_write_timeout_secs,
+                ),
+                ("limits.reprepare_timeout_secs", l.reprepare_timeout_secs),
+                ("limits.pool_reap_interval_secs", l.pool_reap_interval_secs),
+                ("limits.max_cancel_keys", l.max_cancel_keys as u64),
+            ];
+            for (name, value) in zero_checks {
+                if value == 0 {
+                    return Err(ProxyError::Config(format!("{name} must be >= 1")));
+                }
+            }
+            if l.max_prepared_statements == 0 {
+                return Err(ProxyError::Config(
+                    "limits.max_prepared_statements must be >= 1".to_string(),
+                ));
+            }
+            if l.max_prepared_bytes == 0 {
+                return Err(ProxyError::Config(
+                    "limits.max_prepared_bytes must be >= 1".to_string(),
+                ));
+            }
+            if l.max_pending_bytes == 0 {
+                return Err(ProxyError::Config(
+                    "limits.max_pending_bytes must be >= 1".to_string(),
+                ));
+            }
+            if l.max_total_idle_backend_conns == 0 {
+                return Err(ProxyError::Config(
+                    "limits.max_total_idle_backend_conns must be >= 1".to_string(),
+                ));
+            }
+        }
+
         // Edge / geo proxy mode. The [edge] section is parsed on every build
         // (so configs round-trip), but enabling it needs the compile-time
         // feature, and an edge role needs both its control plane (the home's
@@ -1447,6 +1745,57 @@ impl ProxyConfig {
                             .to_string(),
                     ));
                 }
+            }
+        }
+
+        // Anomaly detector tunables. Parsed on every build; only consumed when
+        // the `anomaly-detection` feature is compiled in, but the values are
+        // degenerate regardless of feature, so validate them unconditionally.
+        // A zero rate/auth window would divide by an empty sliding window; a
+        // zero event buffer or fingerprint cap would break the ring buffer /
+        // novel-query set; a non-positive or non-finite z-threshold would never
+        // (or always) fire; a warning count above the critical count inverts
+        // the severity ladder.
+        {
+            let a = &self.anomaly;
+            if a.rate_window_secs == 0 {
+                return Err(ProxyError::Config(
+                    "anomaly.rate_window_secs must be >= 1".to_string(),
+                ));
+            }
+            if a.auth_window_secs == 0 {
+                return Err(ProxyError::Config(
+                    "anomaly.auth_window_secs must be >= 1".to_string(),
+                ));
+            }
+            if a.event_buffer_size == 0 {
+                return Err(ProxyError::Config(
+                    "anomaly.event_buffer_size must be >= 1".to_string(),
+                ));
+            }
+            if a.max_seen_fingerprints == 0 {
+                return Err(ProxyError::Config(
+                    "anomaly.max_seen_fingerprints must be >= 1".to_string(),
+                ));
+            }
+            if !(a.spike_z_threshold.is_finite() && a.spike_z_threshold > 0.0) {
+                return Err(ProxyError::Config(
+                    "anomaly.spike_z_threshold must be a finite value > 0".to_string(),
+                ));
+            }
+            if a.auth_critical_count == 0 {
+                // A 0 critical threshold fires Critical on the very first failed
+                // auth (count starts at 1 >= 0), turning every login typo into a
+                // critical alert. Require at least 1.
+                return Err(ProxyError::Config(
+                    "anomaly.auth_critical_count must be >= 1".to_string(),
+                ));
+            }
+            if a.auth_warning_count > a.auth_critical_count {
+                return Err(ProxyError::Config(format!(
+                    "anomaly.auth_warning_count ({}) must be <= anomaly.auth_critical_count ({})",
+                    a.auth_warning_count, a.auth_critical_count
+                )));
             }
         }
 
@@ -1942,6 +2291,187 @@ mod tests {
         assert!(config.validate().is_ok());
     }
 
+    // -------------------------------------------------------------------------
+    // [anomaly] section — tunability of the in-process anomaly detector
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_anomaly_toml_defaults_match_historical_values() {
+        // Every default must reproduce the detector's old hardcoded
+        // `AnomalyConfig::default()` (and the old `MAX_SEEN_FINGERPRINTS`
+        // const) EXACTLY, so an absent [anomaly] section changes nothing.
+        let a = AnomalyToml::default();
+        assert_eq!(a.rate_window_secs, 60);
+        assert_eq!(a.spike_z_threshold, 3.0);
+        assert_eq!(a.auth_window_secs, 60);
+        assert_eq!(a.auth_critical_count, 10);
+        assert_eq!(a.auth_warning_count, 5);
+        assert_eq!(a.event_buffer_size, 1024);
+        assert!(a.emit_novel_queries);
+        assert_eq!(a.max_seen_fingerprints, 100_000);
+    }
+
+    #[test]
+    fn test_anomaly_toml_absent_section_uses_defaults() {
+        // A full, valid ProxyConfig whose serialized TOML has the [anomaly]
+        // table removed must fall back to the historical defaults via the
+        // `#[serde(default)]` on the `anomaly` field.
+        let mut base = ProxyConfig::default();
+        base.add_node("localhost:5432", "primary").unwrap();
+        let mut val = toml::Value::try_from(&base).unwrap();
+        val.as_table_mut().unwrap().remove("anomaly");
+        assert!(
+            val.get("anomaly").is_none(),
+            "anomaly section should be absent for this test"
+        );
+        let s = toml::to_string(&val).unwrap();
+        let cfg: ProxyConfig = toml::from_str(&s).unwrap();
+        let a = AnomalyToml::default();
+        assert_eq!(cfg.anomaly.rate_window_secs, a.rate_window_secs);
+        assert_eq!(cfg.anomaly.max_seen_fingerprints, a.max_seen_fingerprints);
+        assert_eq!(cfg.anomaly.emit_novel_queries, a.emit_novel_queries);
+    }
+
+    #[test]
+    fn test_anomaly_toml_block_parses_and_overrides() {
+        // A present [anomaly] block round-trips through a full ProxyConfig and
+        // overrides every field.
+        let mut base = ProxyConfig::default();
+        base.add_node("localhost:5432", "primary").unwrap();
+        base.anomaly = AnomalyToml {
+            rate_window_secs: 30,
+            spike_z_threshold: 4.5,
+            auth_window_secs: 120,
+            auth_critical_count: 20,
+            auth_warning_count: 8,
+            event_buffer_size: 4096,
+            emit_novel_queries: false,
+            max_seen_fingerprints: 250_000,
+        };
+        let s = toml::to_string(&base).unwrap();
+        assert!(s.contains("[anomaly]"), "serialized config: {s}");
+        let cfg: ProxyConfig = toml::from_str(&s).unwrap();
+        assert_eq!(cfg.anomaly.rate_window_secs, 30);
+        assert_eq!(cfg.anomaly.spike_z_threshold, 4.5);
+        assert_eq!(cfg.anomaly.auth_window_secs, 120);
+        assert_eq!(cfg.anomaly.auth_critical_count, 20);
+        assert_eq!(cfg.anomaly.auth_warning_count, 8);
+        assert_eq!(cfg.anomaly.event_buffer_size, 4096);
+        assert!(!cfg.anomaly.emit_novel_queries);
+        assert_eq!(cfg.anomaly.max_seen_fingerprints, 250_000);
+    }
+
+    #[test]
+    fn test_anomaly_toml_partial_block_fills_rest_from_defaults() {
+        // A partial [anomaly] section overrides only the listed keys; the rest
+        // fall back to the per-field serde defaults. Parsed as the section
+        // struct directly (ProxyConfig's own top-level fields are required).
+        let a: AnomalyToml = toml::from_str("spike_z_threshold = 5.0\n").unwrap();
+        assert_eq!(a.spike_z_threshold, 5.0);
+        assert_eq!(a.rate_window_secs, 60);
+        assert_eq!(a.event_buffer_size, 1024);
+        assert_eq!(a.max_seen_fingerprints, 100_000);
+    }
+
+    #[test]
+    fn test_validate_rejects_degenerate_anomaly_values() {
+        let base = || {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            c
+        };
+        // Sanity: the untouched defaults validate.
+        assert!(base().validate().is_ok());
+
+        // rate_window_secs = 0 -> rejected with a clear message.
+        let mut c = base();
+        c.anomaly.rate_window_secs = 0;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("anomaly.rate_window_secs"),
+            "unexpected error: {err}"
+        );
+
+        // auth_window_secs = 0 -> rejected.
+        let mut c = base();
+        c.anomaly.auth_window_secs = 0;
+        assert!(c.validate().is_err());
+
+        // event_buffer_size = 0 -> rejected.
+        let mut c = base();
+        c.anomaly.event_buffer_size = 0;
+        assert!(c.validate().is_err());
+
+        // max_seen_fingerprints = 0 -> rejected.
+        let mut c = base();
+        c.anomaly.max_seen_fingerprints = 0;
+        assert!(c.validate().is_err());
+
+        // non-finite / non-positive z threshold -> rejected.
+        let mut c = base();
+        c.anomaly.spike_z_threshold = 0.0;
+        assert!(c.validate().is_err());
+        let mut c = base();
+        c.anomaly.spike_z_threshold = f64::NAN;
+        assert!(c.validate().is_err());
+
+        // warning count above critical count inverts the ladder -> rejected.
+        let mut c = base();
+        c.anomaly.auth_warning_count = 11;
+        c.anomaly.auth_critical_count = 10;
+        assert!(c.validate().is_err());
+
+        // auth_critical_count = 0 would fire Critical on the first failed auth.
+        let mut c = base();
+        c.anomaly.auth_critical_count = 0;
+        c.anomaly.auth_warning_count = 0; // keep warning <= critical
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("anomaly.auth_critical_count"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "anomaly-detection")]
+    #[test]
+    fn test_anomaly_toml_to_anomaly_config_roundtrip() {
+        // The conversion is field-for-field; defaults must equal the runtime
+        // detector's own default, and explicit values must carry through.
+        let default_rt = AnomalyToml::default().to_anomaly_config();
+        let expected = crate::anomaly::AnomalyConfig::default();
+        assert_eq!(default_rt.rate_window_secs, expected.rate_window_secs);
+        assert_eq!(default_rt.spike_z_threshold, expected.spike_z_threshold);
+        assert_eq!(default_rt.auth_window_secs, expected.auth_window_secs);
+        assert_eq!(default_rt.auth_critical_count, expected.auth_critical_count);
+        assert_eq!(default_rt.auth_warning_count, expected.auth_warning_count);
+        assert_eq!(default_rt.event_buffer_size, expected.event_buffer_size);
+        assert_eq!(default_rt.emit_novel_queries, expected.emit_novel_queries);
+        assert_eq!(
+            default_rt.max_seen_fingerprints,
+            expected.max_seen_fingerprints
+        );
+
+        let toml = AnomalyToml {
+            rate_window_secs: 15,
+            spike_z_threshold: 2.5,
+            auth_window_secs: 90,
+            auth_critical_count: 12,
+            auth_warning_count: 6,
+            event_buffer_size: 2048,
+            emit_novel_queries: false,
+            max_seen_fingerprints: 500_000,
+        };
+        let rt = toml.to_anomaly_config();
+        assert_eq!(rt.rate_window_secs, 15);
+        assert_eq!(rt.spike_z_threshold, 2.5);
+        assert_eq!(rt.auth_window_secs, 90);
+        assert_eq!(rt.auth_critical_count, 12);
+        assert_eq!(rt.auth_warning_count, 6);
+        assert_eq!(rt.event_buffer_size, 2048);
+        assert!(!rt.emit_novel_queries);
+        assert_eq!(rt.max_seen_fingerprints, 500_000);
+    }
+
     #[test]
     fn test_validate_refuses_anonymous_nonloopback_admin() {
         let base = || {
@@ -1982,6 +2512,143 @@ mod tests {
         assert!(config.validate().is_err());
         config.health.check_interval_secs = 1;
         assert!(config.validate().is_ok());
+    }
+
+    // -------------------------------------------------------------------------
+    // [limits] section (operational safety bounds, formerly hardcoded consts)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_limits_defaults_equal_prior_constants() {
+        // Every default MUST reproduce the exact value the constant held in
+        // src/server.rs, so an existing deployment with no `[limits]` block is
+        // byte-for-byte unchanged.
+        let l = LimitsToml::default();
+        assert_eq!(l.max_cancel_keys, 100_000);
+        assert_eq!(l.startup_timeout_secs, 30);
+        assert_eq!(l.backend_write_timeout_secs, 30);
+        assert_eq!(l.backend_read_timeout_secs, 30);
+        assert_eq!(l.client_write_timeout_secs, 60);
+        assert_eq!(l.reprepare_timeout_secs, 15);
+        assert_eq!(l.max_prepared_statements, 8192);
+        assert_eq!(l.max_prepared_bytes, 64 * 1024 * 1024);
+        assert_eq!(l.max_pending_bytes, 64 * 1024 * 1024);
+        assert_eq!(l.max_total_idle_backend_conns, 8192);
+        assert_eq!(l.pool_reap_interval_secs, 30);
+        // And the field on a default ProxyConfig matches.
+        assert_eq!(
+            ProxyConfig::default().limits.max_prepared_bytes,
+            64 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn test_limits_toml_partial_overrides_and_fills_defaults() {
+        // Parsing a partial `[limits]` table (as `LimitsToml`) overrides the
+        // listed keys and fills the rest from the per-field serde defaults.
+        let limits: LimitsToml = toml::from_str(
+            "startup_timeout_secs = 5\nmax_prepared_statements = 100\nmax_cancel_keys = 42\n",
+        )
+        .expect("parse partial LimitsToml");
+        // Overridden.
+        assert_eq!(limits.startup_timeout_secs, 5);
+        assert_eq!(limits.max_prepared_statements, 100);
+        assert_eq!(limits.max_cancel_keys, 42);
+        // Untouched keys keep their const defaults.
+        assert_eq!(limits.client_write_timeout_secs, 60);
+        assert_eq!(limits.max_pending_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.pool_reap_interval_secs, 30);
+    }
+
+    #[test]
+    fn test_proxyconfig_partial_limits_section_overrides() {
+        // Full ProxyConfig load path: a `[limits]` section with only some keys
+        // set overrides those and defaults the rest. Built from a serialized
+        // default config so the required non-limits fields are all present.
+        let mut val = toml::Value::try_from(ProxyConfig::default()).unwrap();
+        let mut partial = toml::value::Table::new();
+        partial.insert("startup_timeout_secs".into(), toml::Value::Integer(5));
+        partial.insert("max_cancel_keys".into(), toml::Value::Integer(42));
+        val.as_table_mut()
+            .unwrap()
+            .insert("limits".into(), toml::Value::Table(partial));
+        let text = toml::to_string(&val).unwrap();
+        let cfg: ProxyConfig = toml::from_str(&text).expect("parse config with partial [limits]");
+        assert_eq!(cfg.limits.startup_timeout_secs, 5);
+        assert_eq!(cfg.limits.max_cancel_keys, 42);
+        // Unset key defaults.
+        assert_eq!(cfg.limits.client_write_timeout_secs, 60);
+    }
+
+    #[test]
+    fn test_proxyconfig_absent_limits_section_is_default() {
+        // A config with NO `[limits]` table at all → the whole section defaults
+        // (the `#[serde(default)]` on the field). Built by stripping `limits`
+        // from a serialized default config.
+        let mut val = toml::Value::try_from(ProxyConfig::default()).unwrap();
+        val.as_table_mut().unwrap().remove("limits");
+        assert!(val.as_table().unwrap().get("limits").is_none());
+        let text = toml::to_string(&val).unwrap();
+        let cfg: ProxyConfig = toml::from_str(&text).expect("parse config without [limits]");
+        assert_eq!(cfg.limits.startup_timeout_secs, 30);
+        assert_eq!(cfg.limits.max_total_idle_backend_conns, 8192);
+        assert_eq!(cfg.limits.pool_reap_interval_secs, 30);
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_limits() {
+        let base = || {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            c
+        };
+        // A pristine config validates.
+        assert!(base().validate().is_ok());
+
+        // Each timeout at 0 is rejected.
+        let mut c = base();
+        c.limits.startup_timeout_secs = 0;
+        assert!(
+            c.validate().is_err(),
+            "zero startup_timeout must be rejected"
+        );
+
+        let mut c = base();
+        c.limits.backend_write_timeout_secs = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.client_write_timeout_secs = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.reprepare_timeout_secs = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.pool_reap_interval_secs = 0;
+        assert!(c.validate().is_err());
+
+        // Each cap at 0 is rejected.
+        let mut c = base();
+        c.limits.max_cancel_keys = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.max_prepared_statements = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.max_prepared_bytes = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.max_pending_bytes = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.max_total_idle_backend_conns = 0;
+        assert!(c.validate().is_err());
     }
 
     #[test]
