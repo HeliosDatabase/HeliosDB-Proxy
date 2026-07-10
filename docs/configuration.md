@@ -719,6 +719,8 @@ timeout_ms = 100
 max_plugins = 20
 fuel_metering = true
 fuel_limit = 1000000
+kv_max_value_bytes = 65536
+kv_max_keys_per_plugin = 1024
 # trust_root = "/etc/heliosproxy/plugin-keys"
 ```
 
@@ -732,6 +734,8 @@ fuel_limit = 1000000
 | `max_plugins` | usize | `20` | Maximum concurrently-loaded plugins. |
 | `fuel_metering` | bool | `true` | Enable per-call CPU-cycle (fuel) metering. |
 | `fuel_limit` | u64 | `1000000` | Fuel units allowed per hook call when metering is on. |
+| `kv_max_value_bytes` | usize | `65536` | Max bytes for a single plugin-KV value (via `kv_set` or `PUT /admin/kv/<plugin>/<key>`); `0` = unlimited. A write past this cap is rejected (`kv_set` returns `-1`; the admin endpoint returns `413`). |
+| `kv_max_keys_per_plugin` | usize | `1024` | Max distinct keys per plugin KV namespace; `0` = unlimited. Overwriting an existing key never trips the cap. |
 | `trust_root` | string | *(none)* | Ed25519 trust-root directory. When set, every `.wasm` requires a sidecar `.sig` verifying against a `*.pub` in this directory; when omitted, signatures are not checked. |
 
 ---

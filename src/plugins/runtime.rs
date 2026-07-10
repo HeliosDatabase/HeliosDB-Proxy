@@ -321,7 +321,7 @@ impl WasmPluginRuntime {
             linker,
             epoch_stop,
             host_functions,
-            kv: KvBackend::new(),
+            kv: KvBackend::with_limits(config.kv_max_value_bytes, config.kv_max_keys_per_plugin),
             module_cache: RwLock::new(HashMap::new()),
             default_policy,
             created_at: Instant::now(),
@@ -1188,6 +1188,75 @@ mod tests {
         );
         // And nowhere else.
         assert_eq!(runtime.kv().get("other-plugin", b"key"), None);
+    }
+
+    /// Build a WAT module that imports kv_get from `env` and, on
+    /// `pre_query`, reads the key "seed" into offset 300 and returns
+    /// the packed `(300 << 32) | bytes_written` so the host can read
+    /// the value back out of plugin memory.
+    fn build_kv_read_test_module(engine: &Engine) -> Module {
+        let wat = r#"
+            (module
+              (import "env" "kv_get"
+                (func $kv_get (param i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+
+              (data (i32.const 100) "seed")
+
+              (func (export "alloc") (param i32) (result i32) (i32.const 4096))
+              (func (export "dealloc") (param i32 i32))
+
+              ;; pre_query: kv_get("seed") -> offset 300; return (300<<32)|n.
+              (func (export "pre_query")
+                (param $in_ptr i32) (param $in_len i32) (result i64)
+                (local $n i32)
+                (local.set $n (call $kv_get
+                  (i32.const 100) (i32.const 4)
+                  (i32.const 300) (i32.const 64)))
+                (i64.or
+                  (i64.shl (i64.const 300) (i64.const 32))
+                  (i64.extend_i32_u (local.get $n))))
+            )
+        "#;
+        let bytes = wat::parse_str(wat).expect("kv-read-wat parses");
+        Module::from_binary(engine, &bytes).expect("kv-read module compiles")
+    }
+
+    /// A value written straight into the `KvBackend` — exactly what the
+    /// `PUT /admin/kv/<plugin>/<key>` admin path does — must be visible
+    /// to the plugin through its `kv_get` host import.
+    #[test]
+    fn test_kv_backend_set_visible_to_plugin_kv_get() {
+        let config = PluginRuntimeConfig {
+            fuel_metering: false,
+            ..PluginRuntimeConfig::default()
+        };
+        let runtime = WasmPluginRuntime::new(&config).unwrap();
+
+        // Seed as the admin PUT path does: into the shared backend
+        // under the plugin's namespace.
+        assert!(runtime
+            .kv()
+            .set("kv-read-plugin", b"seed".to_vec(), b"live-value".to_vec()));
+
+        let module = build_kv_read_test_module(runtime.engine());
+        let mut metadata = PluginMetadata::default();
+        metadata.name = "kv-read-plugin".to_string();
+        metadata.hooks = vec![HookType::PreQuery];
+
+        let plugin = LoadedPlugin::new(
+            metadata,
+            PathBuf::from("/test/kv-read.wasm"),
+            module,
+            PluginSandbox::default(),
+        );
+
+        // The plugin reads "seed" via kv_get and hands the bytes back;
+        // they must equal the host-written value.
+        let out = runtime
+            .call_hook(&plugin, HookType::PreQuery, &[])
+            .expect("pre_query call");
+        assert_eq!(&out[..], b"live-value");
     }
 
     /// Build a WAT module that imports `env.sha256_hex` and exposes a

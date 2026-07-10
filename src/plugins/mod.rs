@@ -445,6 +445,13 @@ impl PluginManager {
         Ok(())
     }
 
+    /// Borrow the shared per-plugin KV backend. Backs the
+    /// `/admin/kv/<plugin>/<key>` endpoints, which read and mutate the
+    /// same store plugins see through their `kv_get`/`kv_set` imports.
+    pub fn kv(&self) -> &host_imports::KvBackend {
+        self.runtime.kv()
+    }
+
     /// Cheap check whether any loaded plugin registered the given hook.
     /// Lets the server's hook wrappers keep the no-plugin path free of
     /// payload clones, SQL parsing, and context construction.

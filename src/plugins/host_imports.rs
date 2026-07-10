@@ -18,7 +18,10 @@
 //! - `kv_get`: bytes written, or `-1` for missing key, or `-2` if the
 //!   caller's output buffer is too small (caller can retry with a
 //!   larger buffer; the value is left intact).
-//! - `kv_set`: `0` on success, `-1` on internal error.
+//! - `kv_set`: `0` on success, `-1` on internal error. A configured
+//!   cap breach (`kv_max_value_bytes` / `kv_max_keys_per_plugin`) is
+//!   surfaced through this same `-1` — the write is rejected and the
+//!   store is left unchanged.
 //! - `kv_delete`: `0` (idempotent — no error if the key was absent).
 //!
 //! The implementation is in-process and in-memory. A future slice
@@ -38,14 +41,35 @@ type KvStore = HashMap<String, HashMap<Vec<u8>, Vec<u8>>>;
 
 /// In-memory KV backend, namespaced by plugin name. The outer map
 /// is keyed by plugin name; the inner map by user-supplied key.
+///
+/// Two optional caps bound how much a caller (plugin or the
+/// `/admin/kv` endpoint) can store; `0` on either means "unlimited".
+/// `new()` / `Default` leave both at `0` so existing callers and
+/// tests keep the historical unbounded behaviour; production wires
+/// real values via [`KvBackend::with_limits`].
 #[derive(Clone, Default)]
 pub struct KvBackend {
     inner: Arc<RwLock<KvStore>>,
+    /// Max bytes for any single value (`0` = unlimited). Checks the
+    /// VALUE length only; keys are not counted against this cap.
+    max_value_bytes: usize,
+    /// Max distinct keys per plugin namespace (`0` = unlimited).
+    /// Overwriting an existing key never trips this cap.
+    max_keys_per_plugin: usize,
 }
 
 impl KvBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct with explicit caps. `0` on either field = unlimited.
+    pub fn with_limits(max_value_bytes: usize, max_keys_per_plugin: usize) -> Self {
+        Self {
+            max_value_bytes,
+            max_keys_per_plugin,
+            ..Self::default()
+        }
     }
 
     /// Read a value. None if missing.
@@ -54,10 +78,29 @@ impl KvBackend {
         g.get(plugin).and_then(|m| m.get(key).cloned())
     }
 
-    /// Insert / overwrite.
-    pub fn set(&self, plugin: &str, key: Vec<u8>, value: Vec<u8>) {
+    /// Insert / overwrite. Returns `false` (and leaves the store
+    /// untouched) when a configured cap would be exceeded:
+    /// - the value length exceeds `max_value_bytes`, or
+    /// - inserting a NEW key would push the namespace past
+    ///   `max_keys_per_plugin`. Overwriting an existing key never
+    ///   fails the key-count cap.
+    pub fn set(&self, plugin: &str, key: Vec<u8>, value: Vec<u8>) -> bool {
+        // Value-size cap first — cheap, and lets us bail before locking.
+        if self.max_value_bytes != 0 && value.len() > self.max_value_bytes {
+            return false;
+        }
         let mut g = self.inner.write();
-        g.entry(plugin.to_string()).or_default().insert(key, value);
+        let m = g.entry(plugin.to_string()).or_default();
+        // Key-count cap applies only to genuinely new keys; an
+        // overwrite keeps the namespace size constant, so allow it.
+        if self.max_keys_per_plugin != 0
+            && !m.contains_key(&key)
+            && m.len() >= self.max_keys_per_plugin
+        {
+            return false;
+        }
+        m.insert(key, value);
+        true
     }
 
     /// Delete; idempotent.
@@ -69,9 +112,24 @@ impl KvBackend {
     }
 
     /// Returns the number of keys in the plugin's namespace.
-    /// Useful for tests and the future admin endpoint.
+    /// Useful for tests and the admin endpoint.
     pub fn len(&self, plugin: &str) -> usize {
         self.inner.read().get(plugin).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// List keys (lossy UTF-8) in a plugin's namespace, optionally
+    /// filtered by a byte `prefix` (pass `b""` for all keys). Backs
+    /// the `GET /admin/kv/<plugin>/` list endpoint.
+    pub fn list_keys(&self, plugin: &str, prefix: &[u8]) -> Vec<String> {
+        let g = self.inner.read();
+        g.get(plugin)
+            .map(|m| {
+                m.keys()
+                    .filter(|k| k.starts_with(prefix))
+                    .map(|k| String::from_utf8_lossy(k).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -147,8 +205,14 @@ pub fn register_kv_imports(linker: &mut Linker<StoreCtx>) -> Result<(), PluginEr
                 };
                 let plugin_name = caller.data().plugin_name.clone();
                 let kv = caller.data().kv.clone();
-                kv.set(&plugin_name, key, val);
-                0
+                // A cap breach (value too big / key-count exceeded)
+                // returns false → surface as -1 ("internal error"),
+                // which is already part of the documented contract.
+                if kv.set(&plugin_name, key, val) {
+                    0
+                } else {
+                    -1
+                }
             },
         )
         .map_err(|e| PluginError::RuntimeError(format!("link kv_set: {}", e)))?;
@@ -288,5 +352,64 @@ mod tests {
         kv.set("p", b"k".to_vec(), b"v".to_vec());
         kv.delete("p", b"k");
         assert_eq!(kv.get("p", b"k"), None);
+    }
+
+    #[test]
+    fn kv_list_keys_empty_namespace_is_empty() {
+        let kv = KvBackend::new();
+        assert!(kv.list_keys("nobody", b"").is_empty());
+    }
+
+    #[test]
+    fn kv_list_keys_filters_by_prefix() {
+        let kv = KvBackend::new();
+        kv.set("p", b"budget/a".to_vec(), b"1".to_vec());
+        kv.set("p", b"budget/b".to_vec(), b"2".to_vec());
+        kv.set("p", b"region_map".to_vec(), b"3".to_vec());
+
+        // No prefix → every key (order-independent).
+        let mut all = kv.list_keys("p", b"");
+        all.sort();
+        assert_eq!(all, vec!["budget/a", "budget/b", "region_map"]);
+
+        // Prefix filter keeps only the matching keys.
+        let mut budget = kv.list_keys("p", b"budget/");
+        budget.sort();
+        assert_eq!(budget, vec!["budget/a", "budget/b"]);
+    }
+
+    #[test]
+    fn kv_value_cap_rejects_oversized_value() {
+        let kv = KvBackend::with_limits(4, 0);
+        // 4 bytes is exactly the cap — allowed.
+        assert!(kv.set("p", b"k".to_vec(), b"1234".to_vec()));
+        // 5 bytes exceeds it — rejected, store unchanged.
+        assert!(!kv.set("p", b"k".to_vec(), b"12345".to_vec()));
+        assert_eq!(kv.get("p", b"k"), Some(b"1234".to_vec()));
+    }
+
+    #[test]
+    fn kv_key_count_cap_blocks_new_keys_but_allows_overwrite() {
+        let kv = KvBackend::with_limits(0, 2);
+        assert!(kv.set("p", b"a".to_vec(), b"1".to_vec()));
+        assert!(kv.set("p", b"b".to_vec(), b"2".to_vec()));
+        // Third distinct key would exceed the cap of 2 — rejected.
+        assert!(!kv.set("p", b"c".to_vec(), b"3".to_vec()));
+        assert_eq!(kv.len("p"), 2);
+        // Overwriting an existing key under a full cap still succeeds.
+        assert!(kv.set("p", b"a".to_vec(), b"updated".to_vec()));
+        assert_eq!(kv.get("p", b"a"), Some(b"updated".to_vec()));
+        assert_eq!(kv.len("p"), 2);
+    }
+
+    #[test]
+    fn kv_zero_caps_mean_unlimited() {
+        let kv = KvBackend::with_limits(0, 0);
+        // A large value and many keys both succeed under 0 = unlimited.
+        assert!(kv.set("p", b"big".to_vec(), vec![0u8; 1_000_000]));
+        for i in 0..1000u32 {
+            assert!(kv.set("p", i.to_le_bytes().to_vec(), b"v".to_vec()));
+        }
+        assert_eq!(kv.len("p"), 1001);
     }
 }
