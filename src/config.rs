@@ -1243,6 +1243,16 @@ pub struct PluginToml {
     /// names. `0` = unlimited.
     #[serde(default = "default_plugin_kv_max_plugins")]
     pub kv_max_plugins: usize,
+    /// Max TOTAL retained bytes across ALL plugin KV namespaces (each
+    /// entry's key + value bytes plus each live namespace's name
+    /// bytes). `0` = unlimited. This is the survivable-default backstop:
+    /// the per-axis product `kv_max_plugins × kv_max_keys_per_plugin ×
+    /// kv_max_value_bytes` can reach tens of GiB, so this single cap
+    /// bounds actual retained memory to a tunable ceiling and prevents
+    /// a token-holding `PUT /admin/kv` caller from driving the proxy to
+    /// an OOM. Default **67108864** (64 MiB).
+    #[serde(default = "default_plugin_kv_max_total_bytes")]
+    pub kv_max_total_bytes: usize,
 }
 
 fn default_plugin_dir() -> String {
@@ -1272,6 +1282,9 @@ fn default_plugin_kv_max_keys() -> usize {
 fn default_plugin_kv_max_plugins() -> usize {
     256
 }
+fn default_plugin_kv_max_total_bytes() -> usize {
+    64 * 1024 * 1024
+}
 
 impl Default for PluginToml {
     fn default() -> Self {
@@ -1288,6 +1301,7 @@ impl Default for PluginToml {
             kv_max_value_bytes: default_plugin_kv_max_value_bytes(),
             kv_max_keys_per_plugin: default_plugin_kv_max_keys(),
             kv_max_plugins: default_plugin_kv_max_plugins(),
+            kv_max_total_bytes: default_plugin_kv_max_total_bytes(),
         }
     }
 }

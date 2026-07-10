@@ -19,9 +19,9 @@
 //!   caller's output buffer is too small (caller can retry with a
 //!   larger buffer; the value is left intact).
 //! - `kv_set`: `0` on success, `-1` on internal error. A configured
-//!   cap breach (`kv_max_value_bytes` / `kv_max_keys_per_plugin`) is
-//!   surfaced through this same `-1` — the write is rejected and the
-//!   store is left unchanged.
+//!   cap breach (`kv_max_value_bytes` / `kv_max_keys_per_plugin` /
+//!   `kv_max_plugins` / `kv_max_total_bytes`) is surfaced through this
+//!   same `-1` — the write is rejected and the store is left unchanged.
 //! - `kv_delete`: `0` (idempotent — no error if the key was absent).
 //!
 //! The implementation is in-process and in-memory. A future slice
@@ -39,17 +39,30 @@ use super::runtime::PluginError;
 /// KV store type alias: plugin-name -> (key -> value)
 type KvStore = HashMap<String, HashMap<Vec<u8>, Vec<u8>>>;
 
+/// Locked interior of a [`KvBackend`]: the namespaced store plus a
+/// running byte counter kept in lock-step with it. `total_bytes` sums,
+/// across every namespace, each stored `key.len() + value.len()` plus
+/// every live namespace's name `plugin.len()` (counted once per
+/// namespace). Maintaining it incrementally under the same write lock
+/// as the store keeps the `max_total_bytes` check O(1) per `set` /
+/// `delete` instead of walking the whole map on every write.
+#[derive(Default)]
+struct KvState {
+    store: KvStore,
+    total_bytes: usize,
+}
+
 /// In-memory KV backend, namespaced by plugin name. The outer map
 /// is keyed by plugin name; the inner map by user-supplied key.
 ///
-/// Two optional caps bound how much a caller (plugin or the
-/// `/admin/kv` endpoint) can store; `0` on either means "unlimited".
-/// `new()` / `Default` leave both at `0` so existing callers and
-/// tests keep the historical unbounded behaviour; production wires
-/// real values via [`KvBackend::with_limits`].
+/// Four optional caps bound how much a caller (plugin or the
+/// `/admin/kv` endpoint) can store; `0` on any of them means
+/// "unlimited". `new()` / `Default` leave them all at `0` so existing
+/// callers and tests keep the historical unbounded behaviour;
+/// production wires real values via [`KvBackend::with_limits`].
 #[derive(Clone, Default)]
 pub struct KvBackend {
-    inner: Arc<RwLock<KvStore>>,
+    inner: Arc<RwLock<KvState>>,
     /// Max bytes for any single key OR value (`0` = unlimited). BOTH
     /// the user-supplied key and its value are bounded by this cap so
     /// neither axis can grow without limit.
@@ -65,6 +78,16 @@ pub struct KvBackend {
     /// unboundedly-many namespace names. Writing to an already-present
     /// namespace never trips this cap.
     max_plugins: usize,
+    /// Max TOTAL retained bytes across ALL namespaces (`0` =
+    /// unlimited), summed as each entry's `key + value` bytes plus each
+    /// live namespace's name bytes. This is the survivable-default
+    /// backstop for the `/admin/kv` surface: even at the maximum
+    /// per-axis product (`max_plugins × max_keys_per_plugin ×
+    /// max_value_bytes`), which can reach tens of GiB, this single cap
+    /// bounds actual retained memory to a tunable ceiling, so a
+    /// token-holding admin caller cannot drive the proxy to an OOM by
+    /// hammering `PUT /admin/kv`. Tracked incrementally in [`KvState`].
+    max_total_bytes: usize,
 }
 
 impl KvBackend {
@@ -77,11 +100,13 @@ impl KvBackend {
         max_value_bytes: usize,
         max_keys_per_plugin: usize,
         max_plugins: usize,
+        max_total_bytes: usize,
     ) -> Self {
         Self {
             max_value_bytes,
             max_keys_per_plugin,
             max_plugins,
+            max_total_bytes,
             ..Self::default()
         }
     }
@@ -96,7 +121,7 @@ impl KvBackend {
     /// Read a value. None if missing.
     pub fn get(&self, plugin: &str, key: &[u8]) -> Option<Vec<u8>> {
         let g = self.inner.read();
-        g.get(plugin).and_then(|m| m.get(key).cloned())
+        g.store.get(plugin).and_then(|m| m.get(key).cloned())
     }
 
     /// Insert / overwrite. Returns `false` (and leaves the store
@@ -105,9 +130,13 @@ impl KvBackend {
     /// - creating a NEW plugin namespace would push the store past
     ///   `max_plugins`, or
     /// - inserting a NEW key would push the namespace past
-    ///   `max_keys_per_plugin`. Overwriting an existing key (or writing
-    ///   another key into an already-present namespace) never fails the
-    ///   key-count or namespace cap.
+    ///   `max_keys_per_plugin`, or
+    /// - the resulting `total_bytes` would exceed `max_total_bytes`.
+    ///
+    /// Overwriting an existing key (or writing another key into an
+    /// already-present namespace) never fails the key-count or
+    /// namespace cap. Every cap is checked BEFORE any mutation, so a
+    /// rejected write leaves the store and the byte counter unchanged.
     pub fn set(&self, plugin: &str, key: Vec<u8>, value: Vec<u8>) -> bool {
         // Size cap first — cheap, and lets us bail before locking. Both
         // the key and the value are bounded so neither can grow without
@@ -121,23 +150,64 @@ impl KvBackend {
         let mut g = self.inner.write();
         // Namespace cap: refuse to bring a NEW plugin namespace into
         // existence once the outer map is full. Writing to a namespace
-        // that already exists is always allowed (the count stays
-        // constant), so loaded plugins are never starved. Checked
-        // BEFORE `entry().or_default()` so a rejected write never
-        // leaves an empty namespace behind.
-        if self.max_plugins != 0 && !g.contains_key(plugin) && g.len() >= self.max_plugins {
+        // that already EXISTS is always allowed (the count stays
+        // constant), so a plugin whose namespace is already present is
+        // never starved. NOTE: a loaded plugin's FIRST write — into a
+        // namespace that does not yet exist — CAN still be refused here
+        // if the cap is already saturated by other namespaces (e.g.
+        // ones an admin caller created via `/admin/kv`); the default
+        // cap (256) is deliberately far above the typical loaded-plugin
+        // count (`max_plugins`, default 20) so this is a corner case,
+        // and `kv_set` surfaces the refusal as `-1`. Checked BEFORE
+        // `entry().or_default()` so a rejected write never leaves an
+        // empty namespace behind.
+        let ns_exists = g.store.contains_key(plugin);
+        if self.max_plugins != 0 && !ns_exists && g.store.len() >= self.max_plugins {
             return false;
         }
-        let m = g.entry(plugin.to_string()).or_default();
+        // Inspect the existing entry ONCE: whether the key is present
+        // and, if so, its current value length — so an overwrite is
+        // charged only the value-size delta, never the key/namespace
+        // bytes again.
+        let old_val_len = g
+            .store
+            .get(plugin)
+            .and_then(|m| m.get(&key))
+            .map(|v| v.len());
+        let key_exists = old_val_len.is_some();
         // Key-count cap applies only to genuinely new keys; an
         // overwrite keeps the namespace size constant, so allow it.
-        if self.max_keys_per_plugin != 0
-            && !m.contains_key(&key)
-            && m.len() >= self.max_keys_per_plugin
+        if self.max_keys_per_plugin != 0 && !key_exists {
+            let cur = g.store.get(plugin).map(|m| m.len()).unwrap_or(0);
+            if cur >= self.max_keys_per_plugin {
+                return false;
+            }
+        }
+        // Total-bytes cap: compute the SIGNED byte delta this write
+        // would introduce, then reject if it would push the running
+        // total past the ceiling. A new key adds its key bytes; a new
+        // namespace adds its name bytes; the value contributes
+        // `new_len - old_len` (negative when overwriting with a shorter
+        // value).
+        let mut delta = value.len() as isize - old_val_len.unwrap_or(0) as isize;
+        if !key_exists {
+            delta += key.len() as isize;
+        }
+        if !ns_exists {
+            delta += plugin.len() as isize;
+        }
+        if self.max_total_bytes != 0
+            && g.total_bytes as isize + delta > self.max_total_bytes as isize
         {
             return false;
         }
-        m.insert(key, value);
+        // All caps satisfied — commit the write and advance the counter
+        // in lock-step (fold the possibly-negative delta through isize).
+        g.store
+            .entry(plugin.to_string())
+            .or_default()
+            .insert(key, value);
+        g.total_bytes = (g.total_bytes as isize + delta) as usize;
         true
     }
 
@@ -146,27 +216,46 @@ impl KvBackend {
     /// delete-heavy caller actually reclaims memory instead of leaving
     /// zombie namespaces behind — this also keeps the `max_plugins`
     /// namespace count honest (a fully-drained namespace frees a slot).
+    /// The reclaimed key/value/namespace bytes are subtracted from the
+    /// `total_bytes` counter so the `max_total_bytes` cap tracks the
+    /// live footprint exactly.
     pub fn delete(&self, plugin: &str, key: &[u8]) {
         let mut g = self.inner.write();
-        // Compute emptiness inside the `&mut m` scope, then drop that
-        // borrow before touching `g` again so the outer-map removal
-        // never overlaps the inner borrow.
-        let now_empty = match g.get_mut(plugin) {
+        // Remove the key inside the inner-map borrow, capturing the
+        // reclaimed value length and whether the namespace is now
+        // empty, then drop that borrow before touching the outer map
+        // again so the outer-map removal never overlaps the inner
+        // borrow.
+        let removed = match g.store.get_mut(plugin) {
             Some(m) => {
-                m.remove(key);
-                m.is_empty()
+                // Fully finish the mutating `remove` (owned `Option`)
+                // before reborrowing `m` immutably for `is_empty`.
+                let val_len = m.remove(key).map(|v| v.len());
+                val_len.map(|len| (len, m.is_empty()))
             }
-            None => false,
+            None => None,
         };
-        if now_empty {
-            g.remove(plugin);
+        if let Some((val_len, now_empty)) = removed {
+            // key bytes + value bytes are reclaimed (only if a key was
+            // actually removed).
+            g.total_bytes = g.total_bytes.saturating_sub(key.len() + val_len);
+            if now_empty {
+                // Drop the drained namespace and reclaim its name bytes.
+                g.store.remove(plugin);
+                g.total_bytes = g.total_bytes.saturating_sub(plugin.len());
+            }
         }
     }
 
     /// Returns the number of keys in the plugin's namespace.
     /// Useful for tests and the admin endpoint.
     pub fn len(&self, plugin: &str) -> usize {
-        self.inner.read().get(plugin).map(|m| m.len()).unwrap_or(0)
+        self.inner
+            .read()
+            .store
+            .get(plugin)
+            .map(|m| m.len())
+            .unwrap_or(0)
     }
 
     /// List keys (lossy UTF-8) in a plugin's namespace, optionally
@@ -174,7 +263,8 @@ impl KvBackend {
     /// the `GET /admin/kv/<plugin>/` list endpoint.
     pub fn list_keys(&self, plugin: &str, prefix: &[u8]) -> Vec<String> {
         let g = self.inner.read();
-        g.get(plugin)
+        g.store
+            .get(plugin)
             .map(|m| {
                 m.keys()
                     .filter(|k| k.starts_with(prefix))
@@ -432,7 +522,7 @@ mod tests {
 
     #[test]
     fn kv_value_cap_rejects_oversized_value() {
-        let kv = KvBackend::with_limits(4, 0, 0);
+        let kv = KvBackend::with_limits(4, 0, 0, 0);
         // 4 bytes is exactly the cap — allowed.
         assert!(kv.set("p", b"k".to_vec(), b"1234".to_vec()));
         // 5 bytes exceeds it — rejected, store unchanged.
@@ -442,7 +532,7 @@ mod tests {
 
     #[test]
     fn kv_value_cap_also_bounds_key_length() {
-        let kv = KvBackend::with_limits(4, 0, 0);
+        let kv = KvBackend::with_limits(4, 0, 0, 0);
         // A 4-byte key is at the cap — allowed.
         assert!(kv.set("p", b"kkkk".to_vec(), b"v".to_vec()));
         // A 5-byte key exceeds the cap — rejected, store unchanged.
@@ -453,7 +543,7 @@ mod tests {
 
     #[test]
     fn kv_namespace_cap_blocks_new_plugins_but_allows_existing() {
-        let kv = KvBackend::with_limits(0, 0, 2);
+        let kv = KvBackend::with_limits(0, 0, 2, 0);
         // Two distinct namespaces fit under the cap of 2.
         assert!(kv.set("a", b"k".to_vec(), b"1".to_vec()));
         assert!(kv.set("b", b"k".to_vec(), b"2".to_vec()));
@@ -472,7 +562,7 @@ mod tests {
     fn kv_delete_reclaims_empty_namespace_slot() {
         // With a namespace cap of 1, draining the sole namespace must
         // free its slot so a different namespace can then be created.
-        let kv = KvBackend::with_limits(0, 0, 1);
+        let kv = KvBackend::with_limits(0, 0, 1, 0);
         assert!(kv.set("a", b"k".to_vec(), b"1".to_vec()));
         // Cap is full — a second namespace is refused.
         assert!(!kv.set("b", b"k".to_vec(), b"2".to_vec()));
@@ -486,7 +576,7 @@ mod tests {
 
     #[test]
     fn kv_key_count_cap_blocks_new_keys_but_allows_overwrite() {
-        let kv = KvBackend::with_limits(0, 2, 0);
+        let kv = KvBackend::with_limits(0, 2, 0, 0);
         assert!(kv.set("p", b"a".to_vec(), b"1".to_vec()));
         assert!(kv.set("p", b"b".to_vec(), b"2".to_vec()));
         // Third distinct key would exceed the cap of 2 — rejected.
@@ -500,12 +590,59 @@ mod tests {
 
     #[test]
     fn kv_zero_caps_mean_unlimited() {
-        let kv = KvBackend::with_limits(0, 0, 0);
+        let kv = KvBackend::with_limits(0, 0, 0, 0);
         // A large value and many keys both succeed under 0 = unlimited.
         assert!(kv.set("p", b"big".to_vec(), vec![0u8; 1_000_000]));
         for i in 0..1000u32 {
             assert!(kv.set("p", i.to_le_bytes().to_vec(), b"v".to_vec()));
         }
         assert_eq!(kv.len("p"), 1001);
+    }
+
+    #[test]
+    fn kv_total_bytes_cap_counts_key_value_and_namespace() {
+        // Cap of 10 total bytes. The first write charges the namespace
+        // name "p" (1) + key "k" (1) + value "abc" (3) = 5 bytes — fits.
+        let kv = KvBackend::with_limits(0, 0, 0, 10);
+        assert!(kv.set("p", b"k".to_vec(), b"abc".to_vec()));
+        // A second key in the SAME namespace: key "k2" (2) + value
+        // "xy" (2) = +4 → total 9 (the namespace name is not recounted).
+        assert!(kv.set("p", b"k2".to_vec(), b"xy".to_vec()));
+        // A further +2 bytes (key "z" + value "q") would reach 11 > 10 —
+        // rejected, and the store is left unchanged.
+        assert!(!kv.set("p", b"z".to_vec(), b"q".to_vec()));
+        assert_eq!(kv.get("p", b"z"), None);
+        assert_eq!(kv.len("p"), 2);
+    }
+
+    #[test]
+    fn kv_total_bytes_cap_charges_overwrite_value_delta_only() {
+        // Cap 8. Namespace "p" (1) + key "k" (1) + value "aa" (2) = 4.
+        let kv = KvBackend::with_limits(0, 0, 0, 8);
+        assert!(kv.set("p", b"k".to_vec(), b"aa".to_vec()));
+        // Overwrite with a 4-byte value: only the value delta (+2) is
+        // charged (key/namespace already counted) → total 6, fits.
+        assert!(kv.set("p", b"k".to_vec(), b"aaaa".to_vec()));
+        assert_eq!(kv.get("p", b"k"), Some(b"aaaa".to_vec()));
+        // Overwrite with a 7-byte value: delta +3 → total 9 > 8 —
+        // rejected, and the previous value survives intact.
+        assert!(!kv.set("p", b"k".to_vec(), b"aaaaaaa".to_vec()));
+        assert_eq!(kv.get("p", b"k"), Some(b"aaaa".to_vec()));
+    }
+
+    #[test]
+    fn kv_total_bytes_cap_reclaimed_on_delete() {
+        // Cap 6: namespace "p" (1) + key "k" (1) + value "aaaa" (4) = 6,
+        // which fills the cap exactly.
+        let kv = KvBackend::with_limits(0, 0, 0, 6);
+        assert!(kv.set("p", b"k".to_vec(), b"aaaa".to_vec()));
+        // No room for anything more.
+        assert!(!kv.set("p", b"k2".to_vec(), b"z".to_vec()));
+        // Deleting the sole key drains the namespace and reclaims all 6
+        // bytes (key + value + namespace name), so a fresh write of the
+        // same size into a different namespace now fits.
+        kv.delete("p", b"k");
+        assert!(kv.set("q", b"k".to_vec(), b"aaaa".to_vec()));
+        assert_eq!(kv.get("q", b"k"), Some(b"aaaa".to_vec()));
     }
 }

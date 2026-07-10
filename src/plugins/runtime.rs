@@ -325,6 +325,7 @@ impl WasmPluginRuntime {
                 config.kv_max_value_bytes,
                 config.kv_max_keys_per_plugin,
                 config.kv_max_plugins,
+                config.kv_max_total_bytes,
             ),
             module_cache: RwLock::new(HashMap::new()),
             default_policy,
