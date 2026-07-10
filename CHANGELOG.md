@@ -83,6 +83,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   code (converted `let mut x = T::default(); x.field = …;` sequences into
   struct-literal `T { field: …, ..Default::default() }` initializers, behavior
   unchanged) were cleared so the gate starts green.
+- **Rewrote `docs/transaction-replay.md` and `docs/topology-providers.md` against
+  the current code.** Both documents were conceptually dated. The TR deep dive is now
+  grounded in `src/transaction_journal.rs`, `src/failover_replay.rs`,
+  `src/failover_controller.rs`, `src/switchover_buffer.rs`, `src/replay/mod.rs`, and the
+  `tr_enabled` / `tr_mode` / `write_timeout_secs` keys — correcting invented keys
+  (`tr_max_journal_bytes`, `switchover_drain_timeout_secs` never existed), the
+  `write_timeout_secs` default (30, not 15), the default `tr_mode` (`session`), the
+  text-format (not binary) replay parameter path, and the fact that session-state/cursor
+  migration is not implemented and `FailoverController`/`PrimaryTracker` are library
+  components rather than daemon-wired. The topology doc now separates the daemon's
+  static-role-plus-health primary tracking (surfaced at `/topology`) from the
+  `TopologyProvider` library abstraction, and notes the PostgreSQL provider is constructed
+  programmatically (not from `[[nodes]]`). Each doc carries a "last verified against"
+  commit line.
 
 ### Fixed
 
