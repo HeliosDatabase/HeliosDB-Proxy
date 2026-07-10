@@ -1236,6 +1236,13 @@ pub struct PluginToml {
     /// Max distinct keys per plugin KV namespace. `0` = unlimited.
     #[serde(default = "default_plugin_kv_max_keys")]
     pub kv_max_keys_per_plugin: usize,
+    /// Max distinct plugin KV namespaces that may exist at once. Bounds
+    /// how many `<plugin>` namespaces the `PUT /admin/kv/<plugin>/<key>`
+    /// endpoint can bring into existence, so a token-holding caller
+    /// cannot exhaust memory by writing to unboundedly-many namespace
+    /// names. `0` = unlimited.
+    #[serde(default = "default_plugin_kv_max_plugins")]
+    pub kv_max_plugins: usize,
 }
 
 fn default_plugin_dir() -> String {
@@ -1262,6 +1269,9 @@ fn default_plugin_kv_max_value_bytes() -> usize {
 fn default_plugin_kv_max_keys() -> usize {
     1024
 }
+fn default_plugin_kv_max_plugins() -> usize {
+    256
+}
 
 impl Default for PluginToml {
     fn default() -> Self {
@@ -1277,6 +1287,7 @@ impl Default for PluginToml {
             trust_root: None,
             kv_max_value_bytes: default_plugin_kv_max_value_bytes(),
             kv_max_keys_per_plugin: default_plugin_kv_max_keys(),
+            kv_max_plugins: default_plugin_kv_max_plugins(),
         }
     }
 }

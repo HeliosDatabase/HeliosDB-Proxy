@@ -40,13 +40,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `{"plugin","key","value"}` (404 if absent), `GET /admin/kv/<plugin>/`
   (trailing slash) lists the namespace as `{"plugin","keys":[...]}`,
   `PUT` sets a value (UTF-8 body via `from_utf8_lossy`), and `DELETE` removes one
-  (idempotent 200). All four sit behind the normal admin bearer gate; the build
+  (idempotent 200). A trailing-slash list accepts an optional `?prefix=` filter;
+  any query string is stripped before the plugin/key split, so `?…` never leaks
+  into a stored key, and an empty `<plugin>` segment (`/admin/kv//<key>`) is
+  rejected `400`. All four sit behind the normal admin bearer gate; the build
   returns `501` without `--features wasm-plugins` and `503` when no plugin
-  manager is attached. Two new `[plugins]` caps bound writes and are tunable
-  (`0` = unlimited): `kv_max_value_bytes` (default 65536) and
-  `kv_max_keys_per_plugin` (default 1024); a PUT past either returns `413`
-  (and the in-WASM `kv_set` returns `-1`). Overwriting an existing key never
-  trips the key-count cap.
+  manager is attached. Three `[plugins]` caps bound writes and are tunable
+  (`0` = unlimited): `kv_max_value_bytes` (default 65536, now bounds a single
+  key OR value), `kv_max_keys_per_plugin` (default 1024), and `kv_max_plugins`
+  (default 256, bounds how many `<plugin>` namespaces can exist so a token-holder
+  cannot exhaust memory by writing to unboundedly-many namespace names). A PUT
+  past a cap returns `413` (and the in-WASM `kv_set` returns `-1`); an oversized
+  body is rejected before it is copied. Overwriting an existing key never trips
+  the key-count cap, writing to an existing namespace never trips the namespace
+  cap, and deleting a namespace's last key frees its slot (memory is reclaimed).
 
 ### Fixed
 

@@ -146,13 +146,19 @@ For cost-governor: run a workload at >budget rate and watch
   agent that does this on boot.
 - **List with a trailing slash.** `GET /admin/kv/<plugin>/` (trailing
   slash, empty key) returns `{"plugin","keys":[...]}` for any loaded
-  plugin — this is framework-provided, not plugin-implemented. A
-  path with no key segment at all (`/admin/kv/<plugin>`, no trailing
-  slash) is malformed and returns `400`.
-- **Size caps.** A value larger than `kv_max_value_bytes` (default
-  65536) or a new key past `kv_max_keys_per_plugin` (default 1024)
-  is rejected with `413`; overwriting an existing key never trips the
-  key-count cap. Both are set in `[plugins]` (`0` = unlimited).
+  plugin — this is framework-provided, not plugin-implemented. An
+  optional `?prefix=<p>` filters the returned keys. A path with no
+  key segment at all (`/admin/kv/<plugin>`, no trailing slash) is
+  malformed and returns `400`, as is an empty `<plugin>` segment
+  (`/admin/kv//<key>`). Any query string is stripped before the
+  plugin/key split, so `?…` never leaks into a stored key.
+- **Size caps.** A key OR value larger than `kv_max_value_bytes`
+  (default 65536), a new key past `kv_max_keys_per_plugin` (default
+  1024), or a new namespace past `kv_max_plugins` (default 256) is
+  rejected with `413`; overwriting an existing key never trips the
+  key-count cap, and writing to an already-present namespace never
+  trips the namespace cap. Deleting a namespace's last key frees its
+  slot. All three are set in `[plugins]` (`0` = unlimited).
 - **`/admin/kv` follows the admin bearer gate.** When `admin_token`
   is set, every `/admin/kv` call needs `Authorization: Bearer
   <token>` (the recipes above omit it for brevity); a proxy with no

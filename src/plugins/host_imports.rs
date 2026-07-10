@@ -50,12 +50,21 @@ type KvStore = HashMap<String, HashMap<Vec<u8>, Vec<u8>>>;
 #[derive(Clone, Default)]
 pub struct KvBackend {
     inner: Arc<RwLock<KvStore>>,
-    /// Max bytes for any single value (`0` = unlimited). Checks the
-    /// VALUE length only; keys are not counted against this cap.
+    /// Max bytes for any single key OR value (`0` = unlimited). BOTH
+    /// the user-supplied key and its value are bounded by this cap so
+    /// neither axis can grow without limit.
     max_value_bytes: usize,
     /// Max distinct keys per plugin namespace (`0` = unlimited).
     /// Overwriting an existing key never trips this cap.
     max_keys_per_plugin: usize,
+    /// Max distinct plugin namespaces / outer-map entries (`0` =
+    /// unlimited). Bounds how many namespaces a caller can bring into
+    /// existence — notably the `/admin/kv/<plugin>/<key>` endpoint,
+    /// which names an arbitrary `<plugin>` and would otherwise let a
+    /// token-holder grow memory without bound by writing to
+    /// unboundedly-many namespace names. Writing to an already-present
+    /// namespace never trips this cap.
+    max_plugins: usize,
 }
 
 impl KvBackend {
@@ -63,13 +72,25 @@ impl KvBackend {
         Self::default()
     }
 
-    /// Construct with explicit caps. `0` on either field = unlimited.
-    pub fn with_limits(max_value_bytes: usize, max_keys_per_plugin: usize) -> Self {
+    /// Construct with explicit caps. `0` on any field = unlimited.
+    pub fn with_limits(
+        max_value_bytes: usize,
+        max_keys_per_plugin: usize,
+        max_plugins: usize,
+    ) -> Self {
         Self {
             max_value_bytes,
             max_keys_per_plugin,
+            max_plugins,
             ..Self::default()
         }
+    }
+
+    /// The configured single key/value byte cap (`0` = unlimited).
+    /// Lets a caller (e.g. the `/admin/kv` PUT handler) fast-reject an
+    /// oversized body before allocating an owned copy of it.
+    pub fn max_value_bytes(&self) -> usize {
+        self.max_value_bytes
     }
 
     /// Read a value. None if missing.
@@ -80,16 +101,33 @@ impl KvBackend {
 
     /// Insert / overwrite. Returns `false` (and leaves the store
     /// untouched) when a configured cap would be exceeded:
-    /// - the value length exceeds `max_value_bytes`, or
+    /// - the key OR value length exceeds `max_value_bytes`, or
+    /// - creating a NEW plugin namespace would push the store past
+    ///   `max_plugins`, or
     /// - inserting a NEW key would push the namespace past
-    ///   `max_keys_per_plugin`. Overwriting an existing key never
-    ///   fails the key-count cap.
+    ///   `max_keys_per_plugin`. Overwriting an existing key (or writing
+    ///   another key into an already-present namespace) never fails the
+    ///   key-count or namespace cap.
     pub fn set(&self, plugin: &str, key: Vec<u8>, value: Vec<u8>) -> bool {
-        // Value-size cap first — cheap, and lets us bail before locking.
-        if self.max_value_bytes != 0 && value.len() > self.max_value_bytes {
+        // Size cap first — cheap, and lets us bail before locking. Both
+        // the key and the value are bounded so neither can grow without
+        // limit (the admin request line already caps their transport
+        // length, but this makes the retained size tunable).
+        if self.max_value_bytes != 0
+            && (key.len() > self.max_value_bytes || value.len() > self.max_value_bytes)
+        {
             return false;
         }
         let mut g = self.inner.write();
+        // Namespace cap: refuse to bring a NEW plugin namespace into
+        // existence once the outer map is full. Writing to a namespace
+        // that already exists is always allowed (the count stays
+        // constant), so loaded plugins are never starved. Checked
+        // BEFORE `entry().or_default()` so a rejected write never
+        // leaves an empty namespace behind.
+        if self.max_plugins != 0 && !g.contains_key(plugin) && g.len() >= self.max_plugins {
+            return false;
+        }
         let m = g.entry(plugin.to_string()).or_default();
         // Key-count cap applies only to genuinely new keys; an
         // overwrite keeps the namespace size constant, so allow it.
@@ -103,11 +141,25 @@ impl KvBackend {
         true
     }
 
-    /// Delete; idempotent.
+    /// Delete; idempotent. Drops the plugin's inner map and its
+    /// outer-map slot once the namespace becomes empty, so a
+    /// delete-heavy caller actually reclaims memory instead of leaving
+    /// zombie namespaces behind — this also keeps the `max_plugins`
+    /// namespace count honest (a fully-drained namespace frees a slot).
     pub fn delete(&self, plugin: &str, key: &[u8]) {
         let mut g = self.inner.write();
-        if let Some(m) = g.get_mut(plugin) {
-            m.remove(key);
+        // Compute emptiness inside the `&mut m` scope, then drop that
+        // borrow before touching `g` again so the outer-map removal
+        // never overlaps the inner borrow.
+        let now_empty = match g.get_mut(plugin) {
+            Some(m) => {
+                m.remove(key);
+                m.is_empty()
+            }
+            None => false,
+        };
+        if now_empty {
+            g.remove(plugin);
         }
     }
 
@@ -380,7 +432,7 @@ mod tests {
 
     #[test]
     fn kv_value_cap_rejects_oversized_value() {
-        let kv = KvBackend::with_limits(4, 0);
+        let kv = KvBackend::with_limits(4, 0, 0);
         // 4 bytes is exactly the cap — allowed.
         assert!(kv.set("p", b"k".to_vec(), b"1234".to_vec()));
         // 5 bytes exceeds it — rejected, store unchanged.
@@ -389,8 +441,52 @@ mod tests {
     }
 
     #[test]
+    fn kv_value_cap_also_bounds_key_length() {
+        let kv = KvBackend::with_limits(4, 0, 0);
+        // A 4-byte key is at the cap — allowed.
+        assert!(kv.set("p", b"kkkk".to_vec(), b"v".to_vec()));
+        // A 5-byte key exceeds the cap — rejected, store unchanged.
+        assert!(!kv.set("p", b"kkkkk".to_vec(), b"v".to_vec()));
+        assert_eq!(kv.get("p", b"kkkkk"), None);
+        assert_eq!(kv.len("p"), 1);
+    }
+
+    #[test]
+    fn kv_namespace_cap_blocks_new_plugins_but_allows_existing() {
+        let kv = KvBackend::with_limits(0, 0, 2);
+        // Two distinct namespaces fit under the cap of 2.
+        assert!(kv.set("a", b"k".to_vec(), b"1".to_vec()));
+        assert!(kv.set("b", b"k".to_vec(), b"2".to_vec()));
+        // A third distinct namespace would exceed it — rejected, and no
+        // empty namespace is left behind.
+        assert!(!kv.set("c", b"k".to_vec(), b"3".to_vec()));
+        assert_eq!(kv.get("c", b"k"), None);
+        assert!(kv.list_keys("c", b"").is_empty());
+        // Writing MORE keys into an already-present namespace is always
+        // allowed — the namespace count stays constant.
+        assert!(kv.set("a", b"k2".to_vec(), b"9".to_vec()));
+        assert_eq!(kv.len("a"), 2);
+    }
+
+    #[test]
+    fn kv_delete_reclaims_empty_namespace_slot() {
+        // With a namespace cap of 1, draining the sole namespace must
+        // free its slot so a different namespace can then be created.
+        let kv = KvBackend::with_limits(0, 0, 1);
+        assert!(kv.set("a", b"k".to_vec(), b"1".to_vec()));
+        // Cap is full — a second namespace is refused.
+        assert!(!kv.set("b", b"k".to_vec(), b"2".to_vec()));
+        // Drain "a"; its now-empty namespace is dropped, freeing a slot.
+        kv.delete("a", b"k");
+        assert_eq!(kv.len("a"), 0);
+        // The reclaimed slot lets a fresh namespace be created.
+        assert!(kv.set("b", b"k".to_vec(), b"2".to_vec()));
+        assert_eq!(kv.get("b", b"k"), Some(b"2".to_vec()));
+    }
+
+    #[test]
     fn kv_key_count_cap_blocks_new_keys_but_allows_overwrite() {
-        let kv = KvBackend::with_limits(0, 2);
+        let kv = KvBackend::with_limits(0, 2, 0);
         assert!(kv.set("p", b"a".to_vec(), b"1".to_vec()));
         assert!(kv.set("p", b"b".to_vec(), b"2".to_vec()));
         // Third distinct key would exceed the cap of 2 — rejected.
@@ -404,7 +500,7 @@ mod tests {
 
     #[test]
     fn kv_zero_caps_mean_unlimited() {
-        let kv = KvBackend::with_limits(0, 0);
+        let kv = KvBackend::with_limits(0, 0, 0);
         // A large value and many keys both succeed under 0 = unlimited.
         assert!(kv.set("p", b"big".to_vec(), vec![0u8; 1_000_000]));
         for i in 0..1000u32 {

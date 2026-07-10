@@ -393,14 +393,14 @@ Read, write, delete, and list a loaded plugin's key-value state — the same per
 | Method | Path | Behavior |
 |--------|------|----------|
 | `GET` | `/admin/kv/{plugin}/{key}` | `200 {"plugin","key","value"}`, or `404 {"error":"key not found"}` |
-| `GET` | `/admin/kv/{plugin}/` | `200 {"plugin","keys":[...]}` — the trailing slash lists the namespace |
+| `GET` | `/admin/kv/{plugin}/` | `200 {"plugin","keys":[...]}` — the trailing slash lists the namespace; an optional `?prefix=` filters the listing |
 | `PUT` | `/admin/kv/{plugin}/{key}` | `200 {"ok":true}`, or `413` when a cap is exceeded |
-| `DELETE` | `/admin/kv/{plugin}/{key}` | `200 {"ok":true}` — idempotent (200 even when the key is absent) |
+| `DELETE` | `/admin/kv/{plugin}/{key}` | `200 {"ok":true}` — idempotent (200 even when the key is absent); deleting a namespace's last key frees its slot |
 
-- **`{key}` may contain `/`.** The first path segment after `/admin/kv/` is the plugin name; everything after it is the key (e.g. `budget/tenant-a`).
+- **`{key}` may contain `/`.** The first path segment after `/admin/kv/` is the plugin name; everything after it is the key (e.g. `budget/tenant-a`). Any query string is stripped before the split, so `?…` never leaks into a key or plugin name; on a list request `?prefix=<p>` (percent-decoded) filters the returned keys.
 - **Values are UTF-8 text.** PUT bodies are decoded with `String::from_utf8_lossy` (the admin body limit still applies), and GET returns the value as a JSON string. Store binary blobs base64-encoded.
-- **Caps** guard against runaway writes; both are tunable in `[plugins]` and `0` means unlimited. `kv_max_value_bytes` (default 65536) bounds a single value's length; `kv_max_keys_per_plugin` (default 1024) bounds the distinct keys per namespace. Overwriting an existing key never trips the key-count cap. A PUT that would exceed either returns `413 {"error":"kv_max_value_bytes or kv_max_keys_per_plugin exceeded"}`.
-- **`400`** on a malformed path (`/admin/kv/{plugin}` with no key segment).
+- **Caps** guard against runaway writes; all three are tunable in `[plugins]` and `0` means unlimited. `kv_max_value_bytes` (default 65536) bounds a single key's OR value's length; `kv_max_keys_per_plugin` (default 1024) bounds the distinct keys per namespace; `kv_max_plugins` (default 256) bounds how many `<plugin>` namespaces can exist at once (so a token-holder cannot exhaust memory by writing to unboundedly-many namespace names). Overwriting an existing key never trips the key-count cap, and writing to an already-present namespace never trips the namespace cap. A PUT that would exceed a cap returns `413` (`{"error":"kv_max_value_bytes exceeded"}` for an oversized body, or `{"error":"kv_max_value_bytes, kv_max_keys_per_plugin, or kv_max_plugins exceeded"}`).
+- **`400`** on a malformed path (`/admin/kv/{plugin}` with no key segment) or an empty `{plugin}` segment (`/admin/kv//{key}`).
 - **`405`** on an unsupported method.
 - **`503 {"error":"plugin runtime not enabled"}`** when no plugin manager is attached (plugins disabled in config).
 - **`501 {"error":"proxy built without the wasm-plugins feature"}`** in a build without `--features wasm-plugins` — note this is `501`, not the `503` other feature-gated routes use, because the entire KV subsystem is absent from the binary.
