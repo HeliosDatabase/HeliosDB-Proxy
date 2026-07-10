@@ -328,6 +328,14 @@
   <script>
     const REFRESH_MS = 5000;
 
+    // ---- HTML escaping -------------------------------------------------------
+    // Every backend- or attacker-derived STRING interpolated into an innerHTML
+    // template MUST pass through esc(). Some anomaly fields (fingerprint,
+    // sql_excerpt) are derived from client-supplied SQL, so an unescaped sink
+    // is a stored-XSS → authenticated-admin-takeover path. Numeric/boolean
+    // values and textContent assignments are already safe and skip this.
+    function esc(s){ return String(s ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
     // ---- admin token handling ----------------------------------------------
     // When `admin_token` is set in proxy.toml every admin route except the
     // static shell and the liveness probes requires `Authorization: Bearer
@@ -379,11 +387,11 @@
       const rows = nodes.map(n => `
         <tr>
           <td><span class="${dotClass(n.healthy)}"></span></td>
-          <td><code>${n.address}</code></td>
+          <td><code>${esc(n.address)}</code></td>
           <td>${n.healthy ? "yes" : "<strong style='color:var(--err)'>no</strong>"}</td>
           <td>${n.failure_count ?? 0}</td>
           <td>${(n.latency_ms ?? 0).toFixed(1)}</td>
-          <td>${fmtTs(n.last_check)}</td>
+          <td>${esc(fmtTs(n.last_check))}</td>
         </tr>
       `).join("");
       document.querySelector("#nodes tbody").innerHTML = rows || "<tr><td colspan='6'>no nodes</td></tr>";
@@ -411,7 +419,7 @@
     function renderPlugins(plugins) {
       if (!Array.isArray(plugins)) {
         document.querySelector("#plugins tbody").innerHTML =
-          `<tr><td colspan="6" style="color: var(--muted);">${plugins.error ?? "plugins unavailable"}</td></tr>`;
+          `<tr><td colspan="6" style="color: var(--muted);">${esc(plugins.error ?? "plugins unavailable")}</td></tr>`;
         return;
       }
       if (plugins.length === 0) {
@@ -421,10 +429,10 @@
       }
       const rows = plugins.map(p => `
         <tr>
-          <td><code>${p.name}</code></td>
-          <td>${p.version}</td>
-          <td><code>${(p.hooks ?? []).join(", ")}</code></td>
-          <td>${p.state}</td>
+          <td><code>${esc(p.name)}</code></td>
+          <td>${esc(p.version)}</td>
+          <td><code>${(p.hooks ?? []).map(esc).join(", ")}</code></td>
+          <td>${esc(p.state)}</td>
           <td>${(p.invocations ?? 0).toLocaleString()}</td>
           <td>${(p.errors ?? 0) > 0
             ? `<strong style='color:var(--err)'>${p.errors}</strong>`
@@ -438,28 +446,28 @@
       const colour = sev === "critical" ? "var(--err)"
                    : sev === "warning"  ? "var(--warn)"
                    : "var(--muted)";
-      return `<strong style='color:${colour}'>${sev}</strong>`;
+      return `<strong style='color:${colour}'>${esc(sev)}</strong>`;
     }
 
     function anomalyDetails(ev) {
       switch (ev.kind) {
         case "rate_spike":
-          return `tenant <code>${ev.tenant}</code>: ${ev.rate_per_sec.toFixed(1)}/s (baseline ${ev.baseline.toFixed(1)}, z=${ev.z_score.toFixed(1)})`;
+          return `tenant <code>${esc(ev.tenant)}</code>: ${ev.rate_per_sec.toFixed(1)}/s (baseline ${ev.baseline.toFixed(1)}, z=${ev.z_score.toFixed(1)})`;
         case "auth_burst":
-          return `user <code>${ev.user}</code> from <code>${ev.client_ip}</code>: ${ev.failures} failures in ${ev.window_secs}s`;
+          return `user <code>${esc(ev.user)}</code> from <code>${esc(ev.client_ip)}</code>: ${ev.failures} failures in ${ev.window_secs}s`;
         case "sql_injection":
-          return `patterns: ${(ev.patterns_matched ?? []).join(", ")} — <code>${(ev.sql_excerpt ?? "").replace(/</g, "&lt;")}</code>`;
+          return `patterns: ${(ev.patterns_matched ?? []).map(esc).join(", ")} — <code>${esc(ev.sql_excerpt ?? "")}</code>`;
         case "novel_query":
-          return `fingerprint <code>${ev.fingerprint}</code> — ${(ev.sql_excerpt ?? "").replace(/</g, "&lt;")}`;
+          return `fingerprint <code>${esc(ev.fingerprint)}</code> — ${esc(ev.sql_excerpt ?? "")}`;
         default:
-          return JSON.stringify(ev);
+          return esc(JSON.stringify(ev));
       }
     }
 
     function renderEdge(payload) {
       const el = document.querySelector("#edge-stats");
       if (!payload || payload.error) {
-        el.innerHTML = `<span style="color: var(--muted);">${payload?.error ?? "edge-proxy unavailable"}</span>`;
+        el.innerHTML = `<span style="color: var(--muted);">${esc(payload?.error ?? "edge-proxy unavailable")}</span>`;
         return;
       }
       const c = payload.cache ?? {};
@@ -471,13 +479,13 @@
         metricRow("Inserts / evictions", `${c.inserts ?? 0} / ${c.entries_evicted ?? 0}`) +
         metricRow("Invalidations received", c.invalidations_received ?? 0) +
         (edges.length === 0 ? "" :
-          `<div style="margin-top:10px;font-size:12px;color:var(--muted);">Registered: ${edges.map(e => `<code>${e.edge_id}@${e.region}</code>`).join(", ")}</div>`);
+          `<div style="margin-top:10px;font-size:12px;color:var(--muted);">Registered: ${edges.map(e => `<code>${esc(e.edge_id)}@${esc(e.region)}</code>`).join(", ")}</div>`);
     }
 
     function renderAnomalies(payload) {
       const tbody = document.querySelector("#anomalies tbody");
       if (payload.error) {
-        tbody.innerHTML = `<tr><td colspan="4" style="color: var(--muted);">${payload.error}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="4" style="color: var(--muted);">${esc(payload.error)}</td></tr>`;
         return;
       }
       const events = payload.events ?? [];
@@ -487,9 +495,9 @@
       }
       tbody.innerHTML = events.map(ev => `
         <tr>
-          <td>${fmtTs(ev.detected_at)}</td>
+          <td>${esc(fmtTs(ev.detected_at))}</td>
           <td>${severityBadge(ev.severity ?? "info")}</td>
-          <td><code>${ev.kind}</code></td>
+          <td><code>${esc(ev.kind)}</code></td>
           <td>${anomalyDetails(ev)}</td>
         </tr>
       `).join("");
@@ -497,9 +505,9 @@
 
     function renderTopology(t) {
       const primary = t.currentPrimary
-        ? `<code>${t.currentPrimary}</code>`
+        ? `<code>${esc(t.currentPrimary)}</code>`
         : `<strong style='color:var(--warn)'>none — failover in progress</strong>`;
-      const failover = t.lastFailoverAt ? fmtTs(t.lastFailoverAt) : "never";
+      const failover = t.lastFailoverAt ? esc(fmtTs(t.lastFailoverAt)) : "never";
       document.querySelector("#topology").innerHTML =
         metricRow("Current primary", primary) +
         metricRow("Healthy nodes", `${t.healthyNodes ?? 0} / ${t.totalNodes ?? 0}`) +

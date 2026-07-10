@@ -869,6 +869,14 @@ fn default_pool_reap_interval_secs() -> u64 {
     30
 }
 
+/// Upper bound (seconds) for any `[limits]` `*_secs` timeout that feeds a
+/// `Duration`/`Instant`. Each of these is added to a `tokio::time::Instant` at
+/// connect time (`server.rs`); an enormous value such as `u64::MAX` overflows
+/// that `Instant + Duration` and panics the per-connection task. One year is
+/// far above any sane operational timeout while leaving enormous headroom below
+/// the overflow boundary, so [`ProxyConfig::validate`] rejects anything larger.
+const MAX_LIMIT_SECS: u64 = 31_536_000; // 1 year
+
 impl Default for LimitsToml {
     fn default() -> Self {
         Self {
@@ -1667,6 +1675,34 @@ impl ProxyConfig {
             for (name, value) in zero_checks {
                 if value == 0 {
                     return Err(ProxyError::Config(format!("{name} must be >= 1")));
+                }
+            }
+            // Upper-bound every `*_secs` timeout that feeds a `Duration`/`Instant`.
+            // A value beyond MAX_LIMIT_SECS (e.g. `u64::MAX`) overflows the
+            // `Instant + Duration` computed at connect time in `server.rs` and
+            // panics the per-connection task, so reject it up front.
+            let secs_checks: [(&str, u64); 6] = [
+                ("limits.startup_timeout_secs", l.startup_timeout_secs),
+                (
+                    "limits.backend_write_timeout_secs",
+                    l.backend_write_timeout_secs,
+                ),
+                (
+                    "limits.backend_read_timeout_secs",
+                    l.backend_read_timeout_secs,
+                ),
+                (
+                    "limits.client_write_timeout_secs",
+                    l.client_write_timeout_secs,
+                ),
+                ("limits.reprepare_timeout_secs", l.reprepare_timeout_secs),
+                ("limits.pool_reap_interval_secs", l.pool_reap_interval_secs),
+            ];
+            for (name, value) in secs_checks {
+                if value > MAX_LIMIT_SECS {
+                    return Err(ProxyError::Config(format!(
+                        "{name} must be <= {MAX_LIMIT_SECS} seconds (1 year)"
+                    )));
                 }
             }
             if l.max_prepared_statements == 0 {
@@ -2688,6 +2724,52 @@ mod tests {
 
         let mut c = base();
         c.limits.max_total_idle_backend_conns = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_over_bound_limit_secs() {
+        let base = || {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            c
+        };
+        // A value at the ceiling is accepted; one past it is rejected because it
+        // would overflow the connect-time `Instant + Duration` and panic the
+        // per-connection task.
+        let mut c = base();
+        c.limits.startup_timeout_secs = MAX_LIMIT_SECS;
+        assert!(
+            c.validate().is_ok(),
+            "startup_timeout_secs at MAX_LIMIT_SECS must be accepted"
+        );
+
+        // Every `*_secs` key that feeds a Duration/Instant must reject u64::MAX.
+        let mut c = base();
+        c.limits.startup_timeout_secs = u64::MAX;
+        assert!(
+            c.validate().is_err(),
+            "over-bound startup_timeout_secs must be rejected"
+        );
+
+        let mut c = base();
+        c.limits.backend_write_timeout_secs = MAX_LIMIT_SECS + 1;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.backend_read_timeout_secs = u64::MAX;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.client_write_timeout_secs = u64::MAX;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.reprepare_timeout_secs = u64::MAX;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.pool_reap_interval_secs = u64::MAX;
         assert!(c.validate().is_err());
     }
 
