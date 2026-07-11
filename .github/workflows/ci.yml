@@ -128,9 +128,22 @@ jobs:
           key: bench
       - run: cargo bench --features all-features --no-run
 
-  # ── Integration tests (pg18 / nano3.58.1) ───────────────────────────
-  integrate:
-    name: Integration (pg18 / nano3.58.1)
+  # ── Integration tests: PostgreSQL 18 primary + standby (REQUIRED) ────
+  # Uses only the public postgres:18 image from Docker Hub, so it runs on every
+  # push/PR and stays a required (workflow-failing) job. Covers the full
+  # integration suite against PG plus the HA (primary + standby) modules
+  # 06/08/09/10.
+  #
+  # TEST SELECTION — the integration suite (tests/integration/) does NOT branch
+  # on backend engine. Every backend-dependent test reads its connection
+  # coordinates from the HELIOS_TEST_* env vars and runs against whatever
+  # backend they point at (see tests/integration/fixture.rs::read_backend_info;
+  # BackendKind exists but is #[allow(dead_code)] and never inspected by any
+  # test in mod.rs). "PG tests" therefore means "the same suite invoked with the
+  # PG env vars" — HELIOS_TEST_BACKEND=postgres, port 5432 (standby 5434). The
+  # nano runs of the identical suite live in the separate integrate-nano job.
+  integrate-pg:
+    name: Integration — PostgreSQL 18 (primary + standby)
     runs-on: ubuntu-latest
     needs: [fmt, clippy, test]
     permissions:
@@ -150,6 +163,109 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 15
+      # ── HA standby (modules 06/08/09/10) ───────────────────────────
+      pg-standby:
+        image: postgres:18
+        env:
+          POSTGRES_DB: helios_test
+          POSTGRES_USER: helios
+          POSTGRES_PASSWORD: helios_test
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U helios -d helios_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: integrate-pg
+
+      - name: Build proxy binary
+        run: cargo build --features "all-features,postgres-topology"
+
+      - name: Integration tests against PostgreSQL 18
+        continue-on-error: false
+        env:
+          HELIOS_TEST_BACKEND: postgres
+          HELIOS_TEST_PG_HOST: localhost
+          HELIOS_TEST_PG_PORT: "5432"
+          HELIOS_TEST_PG_USER: helios
+          HELIOS_TEST_PG_PASSWORD: helios_test
+          HELIOS_TEST_PG_DB: helios_test
+        run: >-
+          cargo test --test integration
+          --features "all-features,postgres-topology"
+          -- --include-ignored
+
+      # ── HA tests: modules 06 / 08 / 09 / 10 with live standby ─────
+      - name: HA integration tests — PG 18 primary + standby (modules 06/08/09/10)
+        continue-on-error: false
+        env:
+          HELIOS_TEST_BACKEND: postgres
+          HELIOS_TEST_PG_HOST: localhost
+          HELIOS_TEST_PG_PORT: "5432"
+          HELIOS_TEST_PG_USER: helios
+          HELIOS_TEST_PG_PASSWORD: helios_test
+          HELIOS_TEST_PG_DB: helios_test
+          HELIOS_TEST_STANDBY_HOST: localhost
+          HELIOS_TEST_STANDBY_PORT: "5434"
+          HELIOS_TEST_STANDBY_USER: helios
+          HELIOS_TEST_STANDBY_PASSWORD: helios_test
+          HELIOS_TEST_STANDBY_DB: helios_test
+        run: >-
+          cargo test --test integration
+          --features "all-features,postgres-topology"
+          -- --include-ignored
+
+  # ── Integration tests: HeliosDB Nano 3.58 primary + standby ─────────
+  # NON-BLOCKING (continue-on-error) — expected to stay red until a maintainer
+  # acts. See "MAINTAINER ACTION REQUIRED" below.
+  #
+  #   MAINTAINER ACTION REQUIRED — GHCR package-visibility blocker:
+  #   The nano service image ghcr.io/heliosdatabase/heliosdb-nano:v3.58.1 is a
+  #   PRIVATE GHCR package. The default GITHUB_TOKEN used in `credentials` below
+  #   (github.actor / secrets.GITHUB_TOKEN) does NOT have read access to it, so
+  #   the service container fails to pull and this job goes red on every run —
+  #   which is why it was split out of the required integrate job and marked
+  #   `continue-on-error: true`. To make it green and eventually required again,
+  #   a maintainer must do ONE of:
+  #     1. Flip the package's visibility to public (Packages → heliosdb-nano →
+  #        Package settings → Danger Zone → Change visibility), OR
+  #     2. Grant THIS repository read access to the package (Package settings →
+  #        Manage Actions access → add this repo with Read role) so the default
+  #        GITHUB_TOKEN can pull it, OR
+  #     3. Provision a PAT/least-privilege token with `read:packages` as a repo
+  #        secret and reference it in `credentials.password` below instead of
+  #        secrets.GITHUB_TOKEN.
+  #   Once the pull succeeds, remove the `continue-on-error: true` line to make
+  #   this a required job again.
+  #
+  # TEST SELECTION — identical suite to integrate-pg; the ONLY difference is the
+  # HELIOS_TEST_* env vars point at the nano service (HELIOS_TEST_BACKEND=nano,
+  # port 5433 / standby 5435). tests/integration/ does not filter by engine (see
+  # the note on integrate-pg), so "nano tests" == "the same suite run with the
+  # nano env vars".
+  integrate-nano:
+    name: Integration — HeliosDB Nano 3.58 (primary + standby)
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test]
+    # Do not fail the overall workflow while the GHCR package-visibility blocker
+    # documented above is unresolved. Remove once the nano image can be pulled.
+    continue-on-error: true
+    permissions:
+      packages: read
+
+    services:
       nano:
         image: ghcr.io/heliosdatabase/heliosdb-nano:v3.58.1
         credentials:
@@ -165,20 +281,7 @@ jobs:
           --health-timeout 10s
           --health-retries 20
           --health-start-period 10s
-      # ── HA standbys (modules 06/08/09/10) ──────────────────────────
-      pg-standby:
-        image: postgres:18
-        env:
-          POSTGRES_DB: helios_test
-          POSTGRES_USER: helios
-          POSTGRES_PASSWORD: helios_test
-        ports:
-          - 5434:5432
-        options: >-
-          --health-cmd "pg_isready -U helios -d helios_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 15
+      # ── HA standby (modules 06/08/09/10) ───────────────────────────
       nano-standby:
         image: ghcr.io/heliosdatabase/heliosdb-nano:v3.58.1
         credentials:
@@ -205,24 +308,10 @@ jobs:
       - name: Restore build cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: integrate
+          key: integrate-nano
 
       - name: Build proxy binary
         run: cargo build --features "all-features,postgres-topology"
-
-      - name: Integration tests against PostgreSQL 18
-        continue-on-error: false
-        env:
-          HELIOS_TEST_BACKEND: postgres
-          HELIOS_TEST_PG_HOST: localhost
-          HELIOS_TEST_PG_PORT: "5432"
-          HELIOS_TEST_PG_USER: helios
-          HELIOS_TEST_PG_PASSWORD: helios_test
-          HELIOS_TEST_PG_DB: helios_test
-        run: >-
-          cargo test --test integration
-          --features "all-features,postgres-topology"
-          -- --include-ignored
 
       - name: Integration tests against HeliosDB Nano 3.58
         continue-on-error: false
@@ -239,25 +328,6 @@ jobs:
           -- --include-ignored
 
       # ── HA tests: modules 06 / 08 / 09 / 10 with live standby ─────
-      - name: HA integration tests — PG 18 primary + standby (modules 06/08/09/10)
-        continue-on-error: false
-        env:
-          HELIOS_TEST_BACKEND: postgres
-          HELIOS_TEST_PG_HOST: localhost
-          HELIOS_TEST_PG_PORT: "5432"
-          HELIOS_TEST_PG_USER: helios
-          HELIOS_TEST_PG_PASSWORD: helios_test
-          HELIOS_TEST_PG_DB: helios_test
-          HELIOS_TEST_STANDBY_HOST: localhost
-          HELIOS_TEST_STANDBY_PORT: "5434"
-          HELIOS_TEST_STANDBY_USER: helios
-          HELIOS_TEST_STANDBY_PASSWORD: helios_test
-          HELIOS_TEST_STANDBY_DB: helios_test
-        run: >-
-          cargo test --test integration
-          --features "all-features,postgres-topology"
-          -- --include-ignored
-
       - name: HA integration tests — Nano 3.58 primary + standby (modules 06/08/09/10)
         continue-on-error: false
         env:
