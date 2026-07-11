@@ -60,6 +60,25 @@ stay under 3%.
 | routing/route/complex_hints | 3.9361 / 4.0225 / 4.1133 µs |
 | routing/node_select/batch_parse | 344.53 / 348.86 / 353.91 µs |
 
+## benches/protocol.rs
+
+New in 1.5.0 (T5 / P1-12) — first recorded baseline for the PG-wire per-query hot path
+(decode / encode / query-text extraction). Recorded **2026-07-11** at commit **bb21d46**,
+host **gpc001ca**, **`--features all-features`**, fleet-locked + 24G-bounded (same command
+as the header). Feature-free code, so the figures hold across every feature set.
+
+| Benchmark | Time [lower / median / upper] |
+|---|---|
+| protocol/decode_message/short_select | 61.437 / 62.193 / 63.078 ns |
+| protocol/decode_message/medium_where | 65.212 / 66.729 / 68.438 ns |
+| protocol/decode_message/kilobyte_in_list | 127.87 / 129.50 / 131.26 ns |
+| protocol/encode_message/short_select | 25.788 / 26.091 / 26.442 ns |
+| protocol/encode_message/medium_where | 25.835 / 25.991 / 26.190 ns |
+| protocol/encode_message/kilobyte_in_list | 77.951 / 79.102 / 80.421 ns |
+| protocol/query_text/short_select | 11.701 / 11.805 / 11.933 ns |
+| protocol/query_text/medium_where | 43.432 / 43.912 / 44.386 ns |
+| protocol/query_text/kilobyte_in_list | 336.86 / 341.43 / 346.14 ns |
+
 ## Interpreting deltas on this host (important)
 
 This is a shared, production-like host running several concurrent sessions; CPU-frequency
@@ -74,9 +93,11 @@ same quiescent window rather than comparing against a baseline taken at a differ
 
 ## Known gap
 
-This suite covers the pool skeleton and routing-hint paths only — none of the PG-wire
-protocol / relay hot path that the 2026-07 perf program optimized. Backlog item P1-12
-adds `benches/protocol.rs` for that; extend this file in the same session it lands.
+`benches/protocol.rs` (added in 1.5.0, table above) now covers the PG-wire
+decode/encode/query-text hot path. Still uncovered: the end-to-end relay path
+(client↔backend byte pumping, pooling under real acquire contention) and the failover
+/ transaction-replay paths — those need a live backend and live under the scalability
+harness rather than Criterion.
 The proxy-path scalability harness (`scripts/regress/bench-scalability.sh`) has its own
 evidence baselines in `docs/perf-2026-07/README.md` and is always re-measured
 back-to-back with the candidate, never compared across days.
