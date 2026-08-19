@@ -91,13 +91,17 @@ fn bench_switchover_drain(c: &mut Criterion) {
                     for i in 0..n {
                         // Receivers are intentionally dropped; `drain` tolerates
                         // a closed receiver (send returns Err, which it ignores).
-                        let _ = buffer
+                        // Explicit `drop` (not `let _ =`) so clippy's
+                        // let_underscore_future does not fire on the returned
+                        // oneshot receiver (a Future we deliberately discard).
+                        let receiver = buffer
                             .buffer_query(
                                 format!("INSERT INTO t VALUES ({})", i),
                                 Vec::new(),
                                 i as u64,
                             )
                             .unwrap();
+                        drop(receiver);
                     }
                     buffer
                 },
