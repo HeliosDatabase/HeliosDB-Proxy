@@ -274,6 +274,13 @@ harness = false
 name = "protocol"
 harness = false
 
+# Relay / failover / pool-contention in-process paths. No `required-features`:
+# the ha-tr and pool-modes work is `#[cfg]`-gated inside the bench (with no-op
+# fallbacks), so it compiles under every feature set.
+[[bench]]
+name = "relay"
+harness = false
+
 [[test]]
 name = "integration"
 path = "tests/integration/mod.rs"

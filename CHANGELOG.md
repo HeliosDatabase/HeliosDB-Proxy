@@ -5,6 +5,36 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Criterion coverage for the relay / failover / pool-contention paths**
+  (dev tooling only; no shipped runtime change). Closes the "known gap" recorded
+  in `benches/BASELINE.md` for the in-process HA and mode-aware pooling hot paths
+  that never touch a live backend:
+  - `benches/pooling.rs` gains `pool/acquire_release/contention` — the skeleton
+    `ConnectionPool` acquire/return cycle under K concurrent tasks on the
+    multi-thread runtime (real `RwLock<HashMap>` + per-node `Semaphore`
+    contention), extending the existing single-threaded acquire bench.
+  - `benches/protocol.rs` gains the connection-setup and relay framing not
+    covered by the Query-frame bench: `decode_startup` (startup params /
+    SSLRequest / CancelRequest), the extended-query `Parse`/`Bind` parsers, the
+    backend-response `ErrorResponse` / `CommandComplete`+`rows_affected` /
+    `AuthRequest` (SASL, MD5) parsers, and per-frame tag dispatch
+    (`MessageType::from_tag`, `starts_with_ci`, `contains_ci`).
+  - New `benches/relay.rs` (self-gated, compiles under every feature set): the
+    `switchover_buffer` enqueue (`buffer_query`) and no-op replay-drain (`drain`)
+    paths; under `ha-tr`, the `transaction_journal` classifier
+    (`StatementType::from_sql`), size walk (`total_size`), in-memory mutation
+    (`add_entry` / `rollback_to_savepoint`), the async begin+log+commit
+    journaling lifecycle (single-threaded and under write-lock contention), and
+    the time-travel `entries_in_window` scan; under `pool-modes`, the
+    allocation-free classifiers (`TransactionEvent::detect`, `pool_key`,
+    statement-mode safety, PREPARE/DEALLOCATE parsers) and the
+    `ConnectionPoolManager` acquire/release cycle under client concurrency plus
+    the per-statement `on_statement_complete` decision.
+
 ## [1.5.0] - 2026-07-11
 
 ### Added
