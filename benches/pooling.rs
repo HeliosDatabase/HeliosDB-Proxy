@@ -127,6 +127,63 @@ fn bench_pool_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark the acquire/release cycle under real concurrency.
+///
+/// Extends `pool/acquire_release/single` onto the contended path: an
+/// `Arc`-shared skeleton pool is hit by K tasks on the multi-thread tokio
+/// runtime, each looping acquire+return, so the `RwLock<HashMap>` write lock and
+/// the per-node `Semaphore` are exercised under genuine parallelism rather than
+/// sequentially. No backend is involved (skeleton mode, `add_node` only).
+fn bench_acquire_release_contention(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("pool/acquire_release/contention");
+
+    let (pool, node_id) = rt.block_on(async {
+        let pool = std::sync::Arc::new(ConnectionPool::new(PoolConfig {
+            min_connections: 2,
+            max_connections: 256,
+            ..Default::default()
+        }));
+        let node_id = NodeId::new();
+        pool.add_node(node_id).await;
+        (pool, node_id)
+    });
+
+    // Each task performs a small fixed number of acquire+return cycles per
+    // iteration, so the reported throughput reflects total pool operations.
+    const OPS_PER_TASK: usize = 4;
+    for concurrency in [2usize, 8, 32] {
+        group.throughput(Throughput::Elements((concurrency * OPS_PER_TASK) as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(concurrency),
+            &concurrency,
+            |b, &k| {
+                let pool = pool.clone();
+                b.to_async(&rt).iter(|| {
+                    let pool = pool.clone();
+                    async move {
+                        let mut handles = Vec::with_capacity(k);
+                        for _ in 0..k {
+                            let pool = pool.clone();
+                            handles.push(tokio::spawn(async move {
+                                for _ in 0..OPS_PER_TASK {
+                                    let conn = pool.get_connection(&node_id).await.unwrap();
+                                    pool.return_connection(conn).await;
+                                }
+                            }));
+                        }
+                        for h in handles {
+                            let _ = h.await;
+                        }
+                    }
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 /// Benchmark node endpoint construction (used during pool operations).
 fn bench_node_endpoint(c: &mut Criterion) {
     let mut group = c.benchmark_group("pool/node_endpoint");
@@ -190,6 +247,7 @@ criterion_group!(
     bench_pool_config,
     bench_acquire_release,
     bench_pool_throughput,
+    bench_acquire_release_contention,
     bench_node_endpoint,
     bench_pool_metrics,
 );
