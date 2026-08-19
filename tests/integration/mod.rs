@@ -150,8 +150,16 @@ fn test_module_04_request_pipeline_config() {
 }
 
 /// Module 05 — Batch Operations (auto-coalesces INSERTs).
-#[test]
-fn test_module_05_batch_operations_config() {
+///
+/// `#[tokio::test]` (not a plain `#[test]`): `InsertBatcher::add` may seal and
+/// `tokio::spawn` the flush when `should_flush` fires — which, besides the
+/// size threshold, has a time-based trigger, so under load even a single-row
+/// add can flush. A plain `#[test]` has no reactor and that spawn panics
+/// ("there is no reactor running"); running on a Tokio runtime makes the test
+/// deterministic regardless of host timing. The stats asserted below are
+/// updated in `add` before any flush, so they hold either way.
+#[tokio::test]
+async fn test_module_05_batch_operations_config() {
     use heliosdb_proxy::batch::{BatchConfig, InsertBatcher};
 
     let cfg = BatchConfig {

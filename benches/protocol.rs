@@ -10,7 +10,7 @@
 //! so the bench compiles under every feature set.
 
 use bytes::{BufMut, BytesMut};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use heliosdb_proxy::protocol::{
     contains_ci, query_text, starts_with_ci, AuthRequest, BindMessage, CommandComplete,
     ErrorResponse, Message, MessageType, ParseMessage, ProtocolCodec,
