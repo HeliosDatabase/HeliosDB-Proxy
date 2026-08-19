@@ -3,7 +3,12 @@
 //! Measures hint parsing, read/write classification, and node selection
 //! performance for the HeliosProxy routing engine.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+// BenchmarkId + Throughput are used only inside the `routing-hints`-gated
+// module below, so gate the imports too — otherwise they read as unused under
+// default features (surfaced by `cargo clippy --all-targets`).
+#[cfg(feature = "routing-hints")]
+use criterion::{BenchmarkId, Throughput};
 
 #[cfg(feature = "routing-hints")]
 mod routing_benches {
