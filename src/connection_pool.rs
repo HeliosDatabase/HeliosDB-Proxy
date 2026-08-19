@@ -479,7 +479,7 @@ impl ConnectionPool {
     /// Close all connections
     pub async fn close_all(&self) -> Result<()> {
         let mut pools = self.pools.write().await;
-        for (_, pool) in pools.iter_mut() {
+        for pool in pools.values_mut() {
             pool.connections.clear();
         }
         self.total_connections.store(0, Ordering::SeqCst);
@@ -493,7 +493,7 @@ impl ConnectionPool {
         let mut pools = self.pools.write().await;
         let mut evicted = 0;
 
-        for (_, pool) in pools.iter_mut() {
+        for pool in pools.values_mut() {
             let before = pool.connections.len();
             pool.connections.retain(|conn| {
                 let idle_time = chrono::Utc::now()
