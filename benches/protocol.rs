@@ -356,7 +356,7 @@ fn bench_backend_response(c: &mut Criterion) {
 fn bench_tag_dispatch(c: &mut Criterion) {
     let mut group = c.benchmark_group("protocol/tag_dispatch");
 
-    let tags: [u8; 8] = [b'Q', b'P', b'B', b'E', b'C', b'R', b'Z', b'X'];
+    let tags: [u8; 8] = *b"QPBECRZX";
     group.throughput(Throughput::Elements(tags.len() as u64));
     group.bench_function("from_tag", |b| {
         b.iter(|| {
