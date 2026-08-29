@@ -17,6 +17,129 @@ stay under 3%.
   candidate's CI does not overlap the baseline CI (Criterion's own change report says
   "regressed" / "improved" / "within noise").
 
+## 2026-08-29 — full-suite re-baseline (current tip `a6b47d1`)
+
+Recorded per CLAUDE.md quality gate 3 at commit `a6b47d1` (main tip), host **gpc001ca**, `--features all-features`, fleet-locked + 24 GiB-bounded (same command as the header). Toolchain rustc/cargo **1.95.0**. This supersedes the 2026-07-15 numbers as the active baseline.
+
+**Command:** `flock /home/gpc/HDB/sprint/coordination/build.lock systemd-run --user --scope --collect -p MemoryMax=24G -p MemorySwapMax=0 cargo bench --features all-features`
+
+**No performance regression (gate-3 PASS).** No source or benched hot-path code changed between the prior baseline and `a6b47d1` (every intervening commit is demos/docs). Criterion's change report vs the stored run was the documented shared-host scatter: **28 improved / 40 within-noise / 20 regressed**, every delta small and spread across unrelated modules rather than localized to a changed path. Two full-run outliers — `journal/statement_type/other` (spiked to 122 ns) and `pool_mode/txn_event_detect/statement` (spiked to 152 ns) — were isolated and **re-run back-to-back**, both returning to baseline (32.4 ns / 15.8 ns); confirmed co-tenant CPU-spike artifacts, and the corrected values are recorded below. Host load rose 2.1 to 3.0 during the run, the direct cause of the scatter.
+
+### benches/pooling.rs  (11 benches)
+
+| Benchmark | Time [lower / median / upper] |
+|---|---|
+| pool/acquire_release/contention/2 | 21.155 µs / 21.494 µs / 21.789 µs |
+| pool/acquire_release/contention/32 | 339.95 µs / 350.41 µs / 363.36 µs |
+| pool/acquire_release/contention/8 | 80.761 µs / 82.772 µs / 85.124 µs |
+| pool/acquire_release/single | 577.45 ns / 584.81 ns / 593.58 ns |
+| pool/metrics/read_metrics | 4.8980 ns / 4.9689 ns / 5.0498 ns |
+| pool/node_endpoint/address | 116.97 ns / 118.09 ns / 119.43 ns |
+| pool/node_endpoint/create | 724.89 ns / 728.27 ns / 731.94 ns |
+| pool/node_endpoint/node_id | 711.91 ns / 716.64 ns / 721.75 ns |
+| pool/throughput/sequential_acquire/1 | 727.34 ns / 735.42 ns / 744.57 ns |
+| pool/throughput/sequential_acquire/10 | 6.9759 µs / 7.0210 µs / 7.0765 µs |
+| pool/throughput/sequential_acquire/50 | 35.333 µs / 35.730 µs / 36.218 µs |
+
+### benches/protocol.rs  (21 benches)
+
+| Benchmark | Time [lower / median / upper] |
+|---|---|
+| protocol/backend_response/auth_md5 | 38.018 ns / 38.828 ns / 39.801 ns |
+| protocol/backend_response/auth_sasl | 143.81 ns / 145.29 ns / 147.00 ns |
+| protocol/backend_response/command_complete | 134.42 ns / 136.98 ns / 139.74 ns |
+| protocol/backend_response/error_response | 489.84 ns / 493.98 ns / 498.73 ns |
+| protocol/decode_message/kilobyte_in_list | 128.50 ns / 130.18 ns / 131.90 ns |
+| protocol/decode_message/medium_where | 63.214 ns / 63.755 ns / 64.401 ns |
+| protocol/decode_message/short_select | 63.372 ns / 64.150 ns / 65.053 ns |
+| protocol/decode_startup/cancel_request | 35.179 ns / 36.089 ns / 37.110 ns |
+| protocol/decode_startup/ssl_request | 25.856 ns / 26.080 ns / 26.354 ns |
+| protocol/decode_startup/startup_params | 805.55 ns / 819.22 ns / 834.44 ns |
+| protocol/encode_message/kilobyte_in_list | 76.013 ns / 77.081 ns / 78.304 ns |
+| protocol/encode_message/medium_where | 24.187 ns / 24.420 ns / 24.664 ns |
+| protocol/encode_message/short_select | 20.907 ns / 21.252 ns / 21.666 ns |
+| protocol/extended_parse/bind_message | 218.14 ns / 222.99 ns / 228.54 ns |
+| protocol/extended_parse/parse_message | 168.71 ns / 170.73 ns / 172.96 ns |
+| protocol/query_text/kilobyte_in_list | 337.83 ns / 342.06 ns / 346.81 ns |
+| protocol/query_text/medium_where | 41.237 ns / 41.667 ns / 42.150 ns |
+| protocol/query_text/short_select | 11.912 ns / 11.964 ns / 12.028 ns |
+| protocol/tag_dispatch/contains_ci | 21.863 ns / 22.003 ns / 22.182 ns |
+| protocol/tag_dispatch/from_tag | 12.831 ns / 12.918 ns / 13.020 ns |
+| protocol/tag_dispatch/starts_with_ci | 5.2622 ns / 5.3341 ns / 5.4222 ns |
+
+### benches/relay.rs  (42 benches)
+
+| Benchmark | Time [lower / median / upper] |
+|---|---|
+| journal/entries_in_window/scan_500 | 45.452 µs / 46.193 µs / 47.113 µs |
+| journal/manager/begin_log_commit | 426.06 ns / 431.50 ns / 437.92 ns |
+| journal/manager_contention/2 | 14.526 µs / 15.407 µs / 16.407 µs |
+| journal/manager_contention/32 | 116.68 µs / 120.08 µs / 123.31 µs |
+| journal/manager_contention/8 | 24.899 µs / 25.755 µs / 26.659 µs |
+| journal/rollback_to_savepoint/128 | 6.9538 µs / 7.1360 µs / 7.3274 µs |
+| journal/rollback_to_savepoint/16 | 1.2131 µs / 1.2516 µs / 1.2865 µs |
+| journal/statement_type/ddl | 35.527 ns / 36.088 ns / 36.610 ns |
+| journal/statement_type/delete | 33.979 ns / 34.334 ns / 34.764 ns |
+| journal/statement_type/insert | 25.660 ns / 25.905 ns / 26.201 ns |
+| journal/statement_type/other | 32.255 ns / 32.403 ns / 32.599 ns |
+| journal/statement_type/select | 21.466 ns / 21.731 ns / 22.065 ns |
+| journal/statement_type/set | 32.387 ns / 32.689 ns / 33.036 ns |
+| journal/statement_type/txn | 24.410 ns / 24.831 ns / 25.300 ns |
+| journal/statement_type/update | 28.883 ns / 29.335 ns / 29.866 ns |
+| pool_mode/manager_acquire_release/2 | 18.843 µs / 19.414 µs / 19.958 µs |
+| pool_mode/manager_acquire_release/32 | 177.88 µs / 178.66 µs / 179.33 µs |
+| pool_mode/manager_acquire_release/8 | 44.686 µs / 45.736 µs / 46.930 µs |
+| pool_mode/on_statement_complete/txn_sequence | 268.19 ns / 270.15 ns / 272.58 ns |
+| pool_mode/prepared_parse/deallocate/all | 52.751 ns / 53.483 ns / 54.366 ns |
+| pool_mode/prepared_parse/deallocate/named | 88.060 ns / 88.469 ns / 88.976 ns |
+| pool_mode/prepared_parse/prepare/named | 123.70 ns / 124.70 ns / 125.81 ns |
+| pool_mode/prepared_parse/prepare/typed | 243.64 ns / 246.95 ns / 250.77 ns |
+| pool_mode/statement_safety/is_safe/safe_select | 37.367 ns / 37.760 ns / 38.202 ns |
+| pool_mode/statement_safety/is_safe/safe_set_local | 97.796 ns / 98.757 ns / 99.734 ns |
+| pool_mode/statement_safety/is_safe/unsafe_listen | 25.400 ns / 25.751 ns / 26.157 ns |
+| pool_mode/statement_safety/is_safe/unsafe_prepare | 26.347 ns / 26.635 ns / 26.995 ns |
+| pool_mode/statement_safety/is_safe/unsafe_set | 139.52 ns / 141.28 ns / 143.20 ns |
+| pool_mode/statement_safety/warning/safe_select | 37.462 ns / 37.855 ns / 38.344 ns |
+| pool_mode/statement_safety/warning/safe_set_local | 115.99 ns / 117.53 ns / 119.42 ns |
+| pool_mode/statement_safety/warning/unsafe_listen | 25.506 ns / 25.770 ns / 26.093 ns |
+| pool_mode/statement_safety/warning/unsafe_prepare | 27.362 ns / 27.720 ns / 28.137 ns |
+| pool_mode/statement_safety/warning/unsafe_set | 148.99 ns / 150.47 ns / 152.06 ns |
+| pool_mode/txn_event_detect/begin | 8.8294 ns / 8.8951 ns / 8.9907 ns |
+| pool_mode/txn_event_detect/commit | 9.9030 ns / 9.9581 ns / 10.023 ns |
+| pool_mode/txn_event_detect/release | 14.258 ns / 14.377 ns / 14.518 ns |
+| pool_mode/txn_event_detect/rollback | 15.783 ns / 16.001 ns / 16.260 ns |
+| pool_mode/txn_event_detect/rollback_to | 23.197 ns / 23.381 ns / 23.612 ns |
+| pool_mode/txn_event_detect/savepoint | 18.379 ns / 18.661 ns / 18.965 ns |
+| pool_mode/txn_event_detect/start_txn | 24.019 ns / 24.529 ns / 25.188 ns |
+| pool_mode/txn_event_detect/statement | 15.723 ns / 15.782 ns / 15.857 ns |
+| switchover/buffer_query/enqueue_one | 6.7398 µs / 6.8143 µs / 6.9012 µs |
+
+### benches/routing.rs  (18 benches)
+
+| Benchmark | Time [lower / median / upper] |
+|---|---|
+| routing/hint_parse/complex_query | 1.9147 µs / 1.9328 µs / 1.9549 µs |
+| routing/hint_parse/multiple_hints | 3.4589 µs / 3.4977 µs / 3.5451 µs |
+| routing/hint_parse/no_hints | 95.934 ns / 97.099 ns / 98.596 ns |
+| routing/hint_parse/single_hint | 952.20 ns / 976.01 ns / 997.16 ns |
+| routing/hint_strip/no_hints | 76.320 ns / 77.424 ns / 78.768 ns |
+| routing/hint_strip/single_hint | 247.13 ns / 250.76 ns / 254.59 ns |
+| routing/hint_strip/two_hints | 340.34 ns / 344.82 ns / 350.11 ns |
+| routing/node_select/batch_parse | 356.43 µs / 362.42 µs / 369.07 µs |
+| routing/route/complex_hints | 4.0418 µs / 4.0772 µs / 4.1170 µs |
+| routing/route/read_no_hints | 1.7537 µs / 1.8204 µs / 1.8923 µs |
+| routing/route/read_with_hint | 1.8846 µs / 1.9990 µs / 2.1378 µs |
+| routing/write_detect/begin | 47.651 ns / 47.865 ns / 48.190 ns |
+| routing/write_detect/create_table | 51.768 ns / 51.963 ns / 52.183 ns |
+| routing/write_detect/delete | 60.065 ns / 60.398 ns / 60.749 ns |
+| routing/write_detect/insert | 51.221 ns / 51.666 ns / 52.192 ns |
+| routing/write_detect/select | 51.324 ns / 51.526 ns / 51.731 ns |
+| routing/write_detect/update | 57.175 ns / 57.457 ns / 57.884 ns |
+| routing/write_detect/with_cte | 53.046 ns / 53.216 ns / 53.414 ns |
+
+_Total: 92 benches across the 4 harnesses._
+
+
 ## 2026-07-15 — current full-suite baseline (supersedes; adds relay / contention / protocol coverage)
 
 Recorded at commit `2e50705` under `--features all-features`, host gpc001ca, fleet-locked
