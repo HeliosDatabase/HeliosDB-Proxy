@@ -202,6 +202,34 @@ impl Message {
 
         buf
     }
+
+    /// Encode the message directly into `dst`, byte-identical to
+    /// `encode()` but without allocating (and then copying from) an
+    /// intermediate `BytesMut`.
+    ///
+    /// Used on hot paths — e.g. building up a batched extended-protocol
+    /// `pending` buffer — where `encode()` followed by
+    /// `dst.extend_from_slice(&msg.encode())` would allocate a fresh buffer
+    /// per message just to memcpy it into `dst` and drop it.
+    pub fn encode_into(&self, dst: &mut BytesMut) {
+        dst.reserve(
+            self.payload.len()
+                + if self.msg_type.to_tag().is_some() {
+                    5
+                } else {
+                    4
+                },
+        );
+
+        if let Some(tag) = self.msg_type.to_tag() {
+            dst.put_u8(tag);
+        }
+
+        // Length includes itself (4 bytes)
+        let len = self.payload.len() as u32 + 4;
+        dst.put_u32(len);
+        dst.extend_from_slice(&self.payload);
+    }
 }
 
 /// Protocol codec for framing messages
@@ -780,6 +808,47 @@ mod tests {
                 let decoded = MessageType::from_tag(tag);
                 assert_eq!(decoded, msg_type);
             }
+        }
+    }
+
+    #[test]
+    fn test_encode_into_matches_encode() {
+        // encode_into must produce byte-identical output to encode(), for
+        // both tagged and untagged message types, and for empty payloads.
+        let cases = vec![
+            Message::new(MessageType::Parse, BytesMut::from(&b"stmt\0SELECT 1\0"[..])),
+            Message::new(MessageType::Bind, BytesMut::from(&b"portal\0stmt\0"[..])),
+            Message::new(MessageType::Describe, BytesMut::from(&b"S\0stmt"[..])),
+            Message::new(
+                MessageType::Execute,
+                BytesMut::from(&b"portal\0\0\0\0\0"[..]),
+            ),
+            Message::new(MessageType::Close, BytesMut::from(&b"S\0stmt"[..])),
+            Message::empty(MessageType::Sync),
+            Message::empty(MessageType::Flush),
+            // Untagged message type: to_tag() returns None, so encode()
+            // omits the 1-byte tag entirely — encode_into must match.
+            Message::empty(MessageType::Unknown(0)),
+        ];
+
+        for msg in cases {
+            let expected = msg.encode();
+
+            let mut dst = BytesMut::new();
+            msg.encode_into(&mut dst);
+            assert_eq!(
+                dst.to_vec(),
+                expected.to_vec(),
+                "encode_into mismatch for {:?}",
+                msg.msg_type
+            );
+
+            // encode_into must append, not overwrite, existing contents of dst.
+            let mut prefixed = BytesMut::from(&b"PREFIX"[..]);
+            msg.encode_into(&mut prefixed);
+            let mut want = BytesMut::from(&b"PREFIX"[..]);
+            want.extend_from_slice(&expected);
+            assert_eq!(prefixed.to_vec(), want.to_vec());
         }
     }
 
