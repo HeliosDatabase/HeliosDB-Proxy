@@ -3452,7 +3452,7 @@ mod tests {
             let fp = format!("fp{}", i);
             let _ = det.record_query(&QueryObservation {
                 tenant: "test".into(),
-                fingerprint: fp,
+                fingerprint: fp.into(),
                 sql: "SELECT 1".into(),
                 timestamp: std::time::Instant::now(),
             });
