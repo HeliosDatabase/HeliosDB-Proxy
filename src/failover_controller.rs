@@ -7,7 +7,7 @@
 use super::NodeRole;
 use super::{NodeEndpoint, NodeId, ProxyError, Result};
 use crate::backend::{BackendClient, BackendConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,7 +36,19 @@ pub struct FailoverConfig {
     pub retry_failed: bool,
     /// Max retry attempts
     pub max_retries: u32,
+    /// Maximum number of entries retained in the failover history ring
+    /// buffer. Past this cap, the oldest entry is dropped as a new one is
+    /// pushed — prevents unbounded growth under repeated health flapping.
+    /// Mirrors `proxy.toml`'s `[limits] failover_history_max` (default 100).
+    /// Must be > 0; a 0 is clamped up to 1 rather than rejected, since this
+    /// struct has no fallible `validate()` of its own.
+    pub max_history: usize,
 }
+
+/// Default cap on the failover history ring buffer. Matches
+/// `config::default_failover_history_max` in `proxy.toml`'s `[limits]`
+/// section.
+pub const DEFAULT_MAX_HISTORY: usize = 100;
 
 impl Default for FailoverConfig {
     fn default() -> Self {
@@ -48,6 +60,7 @@ impl Default for FailoverConfig {
             max_lag_bytes: 16 * 1024 * 1024, // 16MB
             retry_failed: true,
             max_retries: 3,
+            max_history: DEFAULT_MAX_HISTORY,
         }
     }
 }
@@ -151,8 +164,11 @@ pub struct FailoverController {
     event_rx: Option<mpsc::Receiver<FailoverEvent>>,
     /// Failover count
     failover_count: AtomicU64,
-    /// Failover history
-    history: Arc<RwLock<Vec<FailoverHistoryEntry>>>,
+    /// Failover history (bounded ring buffer; oldest entries are dropped
+    /// past `max_history`)
+    history: Arc<RwLock<VecDeque<FailoverHistoryEntry>>>,
+    /// Effective cap on `history` (`config.max_history`, floored at 1)
+    max_history: usize,
     /// Optional backend-connection template. Host/port are swapped to
     /// a candidate's endpoint when running `pg_promote()` or polling
     /// `pg_last_wal_replay_lsn()`. When `None`, all backend-talking
@@ -165,6 +181,11 @@ impl FailoverController {
     /// Create a new failover controller
     pub fn new(config: FailoverConfig) -> Self {
         let (event_tx, event_rx) = mpsc::channel(100);
+        // Floor at 1 rather than reject: FailoverConfig has no fallible
+        // constructor, so a 0 here (e.g. from a caller that didn't use
+        // `..Default::default()`) degrades to "keep only the latest entry"
+        // instead of silently disabling the cap.
+        let max_history = config.max_history.max(1);
 
         Self {
             config,
@@ -174,7 +195,8 @@ impl FailoverController {
             event_tx,
             event_rx: Some(event_rx),
             failover_count: AtomicU64::new(0),
-            history: Arc::new(RwLock::new(Vec::new())),
+            history: Arc::new(RwLock::new(VecDeque::new())),
+            max_history,
             backend_template: None,
         }
     }
@@ -290,7 +312,18 @@ impl FailoverController {
             success: false,
             error: None,
         };
-        self.history.write().await.push(history_entry);
+        // Captured up front so this specific entry can be closed out by id
+        // below — with overlapping failovers, another entry may be pushed
+        // (or popped off the front, once at capacity) before this one
+        // completes, so `last_mut()` is not safe to use.
+        let history_id = history_entry.id;
+        {
+            let mut history = self.history.write().await;
+            history.push_back(history_entry);
+            while history.len() > self.max_history {
+                history.pop_front();
+            }
+        }
 
         // Check lag
         if candidate.lag_bytes > self.config.max_lag_bytes {
@@ -307,7 +340,7 @@ impl FailoverController {
             // Wait for sync (with timeout)
             let sync_result = self.wait_for_sync(new_primary).await;
             if let Err(e) = sync_result {
-                self.fail_failover(&e.to_string()).await;
+                self.fail_failover(history_id, &e.to_string()).await;
                 return Err(e);
             }
         }
@@ -324,11 +357,8 @@ impl FailoverController {
             .signed_duration_since(start)
             .num_milliseconds() as u64;
 
-        // Update history
-        if let Some(entry) = self.history.write().await.last_mut() {
-            entry.ended_at = Some(chrono::Utc::now());
-            entry.success = true;
-        }
+        // Update history — looked up by id (see comment at push site above).
+        self.close_history_entry(history_id, true, None).await;
 
         let _ = self
             .event_tx
@@ -533,15 +563,13 @@ impl FailoverController {
         Ok(())
     }
 
-    /// Fail the failover
-    async fn fail_failover(&self, reason: &str) {
+    /// Fail the failover. `id` identifies the history entry to close out —
+    /// see the comment at the push site in `initiate_failover`.
+    async fn fail_failover(&self, id: uuid::Uuid, reason: &str) {
         *self.state.write().await = FailoverState::Failed;
 
-        if let Some(entry) = self.history.write().await.last_mut() {
-            entry.ended_at = Some(chrono::Utc::now());
-            entry.success = false;
-            entry.error = Some(reason.to_string());
-        }
+        self.close_history_entry(id, false, Some(reason.to_string()))
+            .await;
 
         let _ = self
             .event_tx
@@ -653,9 +681,22 @@ impl FailoverController {
         self.failover_count.load(Ordering::SeqCst)
     }
 
-    /// Get failover history
+    /// Close out the history entry with the given id — never "the last
+    /// entry", since overlapping failovers can complete out of order and a
+    /// full ring buffer can push the entry we started with off the front
+    /// before we get back here. A miss (already evicted) is a silent no-op.
+    async fn close_history_entry(&self, id: uuid::Uuid, success: bool, error: Option<String>) {
+        let mut history = self.history.write().await;
+        if let Some(entry) = history.iter_mut().find(|e| e.id == id) {
+            entry.ended_at = Some(chrono::Utc::now());
+            entry.success = success;
+            entry.error = error;
+        }
+    }
+
+    /// Get failover history (oldest first; bounded by `max_history`)
     pub async fn history(&self) -> Vec<FailoverHistoryEntry> {
-        self.history.read().await.clone()
+        self.history.read().await.iter().cloned().collect()
     }
 
     /// Take the event receiver
@@ -1076,5 +1117,183 @@ mod tests {
 
         assert!(perfect.all_successful());
         assert_eq!(perfect.success_rate(), 100.0);
+    }
+
+    /// `history_max` must bound the ring buffer: pushing well past capacity
+    /// keeps only the most recent `max_history` entries, oldest dropped
+    /// first (FIFO). Before this fix `history` was an unbounded `Vec`
+    /// pushed on every failover attempt and never trimmed.
+    #[tokio::test]
+    async fn test_history_cap_enforced() {
+        let cap = 3usize;
+        let controller = FailoverController::new(FailoverConfig {
+            max_history: cap,
+            max_lag_bytes: u64::MAX, // never wait for sync in this test
+            ..Default::default()
+        });
+
+        let primary = NodeId::new();
+        controller.set_primary(primary).await;
+
+        let standby = NodeId::new();
+        controller
+            .register_candidate(FailoverCandidate {
+                node_id: standby,
+                endpoint: NodeEndpoint::new("standby", 5432).with_role(NodeRole::Standby),
+                is_sync: true,
+                lag_bytes: 0,
+                priority: 1,
+                last_heartbeat: None,
+            })
+            .await;
+
+        let total_attempts = cap + 5;
+        let mut ids_in_order = Vec::with_capacity(total_attempts);
+        for _ in 0..total_attempts {
+            controller.initiate_failover().await.unwrap();
+            // Snapshot the id of whatever was just appended (the newest
+            // entry, i.e. the one with the latest `started_at`).
+            let history = controller.history().await;
+            ids_in_order.push(history.last().unwrap().id);
+        }
+
+        let history = controller.history().await;
+        assert_eq!(
+            history.len(),
+            cap,
+            "history must be capped at max_history, not grow unbounded"
+        );
+
+        // Only the last `cap` ids pushed should still be present — the
+        // oldest (total_attempts - cap) were evicted FIFO.
+        let expected_surviving = &ids_in_order[total_attempts - cap..];
+        let actual_ids: Vec<_> = history.iter().map(|e| e.id).collect();
+        assert_eq!(actual_ids, expected_surviving);
+    }
+
+    /// With two overlapping failovers in flight, closing one out must not
+    /// stamp the other's record. Before this fix, `.last_mut()` always
+    /// mutated whatever was physically last in the `Vec` regardless of
+    /// which logical failover had actually finished, so the entry started
+    /// first could be silently overwritten (or left open forever) by the
+    /// second failover's completion.
+    #[tokio::test]
+    async fn test_interleaved_failovers_close_correct_entries_by_id() {
+        let controller = FailoverController::new(FailoverConfig::default());
+
+        let node_x = NodeId::new();
+        let node_y = NodeId::new();
+
+        // Simulate two failovers that are simultaneously in flight: both
+        // entries pushed (as `initiate_failover` does at the top of the
+        // function) before either has completed.
+        let entry_first_started = FailoverHistoryEntry {
+            id: uuid::Uuid::new_v4(),
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            old_primary: node_x,
+            new_primary: Some(node_y),
+            success: false,
+            error: None,
+        };
+        let entry_second_started = FailoverHistoryEntry {
+            id: uuid::Uuid::new_v4(),
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            old_primary: node_y,
+            new_primary: Some(node_x),
+            success: false,
+            error: None,
+        };
+        let first_id = entry_first_started.id;
+        let second_id = entry_second_started.id;
+
+        {
+            let mut history = controller.history.write().await;
+            history.push_back(entry_first_started);
+            history.push_back(entry_second_started);
+        }
+
+        // The SECOND-started failover finishes FIRST (success), then the
+        // FIRST-started one finishes LAST (failure) — the ordering a plain
+        // `.last_mut()` would get wrong, since the entry physically last in
+        // the buffer is `second_id` the whole time.
+        controller.close_history_entry(second_id, true, None).await;
+        controller
+            .close_history_entry(first_id, false, Some("standby sync timeout".to_string()))
+            .await;
+
+        let history = controller.history().await;
+        let first = history.iter().find(|e| e.id == first_id).unwrap();
+        let second = history.iter().find(|e| e.id == second_id).unwrap();
+
+        assert!(
+            !first.success,
+            "the first-started (later-closed) entry must record its own failure"
+        );
+        assert_eq!(first.error.as_deref(), Some("standby sync timeout"));
+        assert!(first.ended_at.is_some());
+
+        assert!(
+            second.success,
+            "the second-started (earlier-closed) entry must record its own success, \
+             not be left untouched or overwritten by the other failover's outcome"
+        );
+        assert!(second.error.is_none());
+        assert!(second.ended_at.is_some());
+    }
+
+    /// End-to-end regression: two failovers actually run concurrently
+    /// through the public `initiate_failover()` API. Both must complete
+    /// with their own history entry fully (and correctly) closed out,
+    /// regardless of scheduling order — a real interleaving of the
+    /// push-then-later-close sequence that `.last_mut()` could not handle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_initiate_failover_both_entries_closed() {
+        let controller = Arc::new(FailoverController::new(FailoverConfig {
+            max_lag_bytes: u64::MAX, // skip wait_for_sync so both finish fast
+            ..Default::default()
+        }));
+
+        let primary = NodeId::new();
+        controller.set_primary(primary).await;
+
+        let standby = NodeId::new();
+        controller
+            .register_candidate(FailoverCandidate {
+                node_id: standby,
+                endpoint: NodeEndpoint::new("standby", 5432).with_role(NodeRole::Standby),
+                is_sync: true,
+                lag_bytes: 0,
+                priority: 1,
+                last_heartbeat: None,
+            })
+            .await;
+
+        let c1 = controller.clone();
+        let c2 = controller.clone();
+        let (r1, r2) = tokio::join!(
+            tokio::spawn(async move { c1.initiate_failover().await }),
+            tokio::spawn(async move { c2.initiate_failover().await }),
+        );
+        r1.unwrap().unwrap();
+        r2.unwrap().unwrap();
+
+        let history = controller.history().await;
+        assert_eq!(
+            history.len(),
+            2,
+            "both attempts must record their own entry"
+        );
+        for entry in &history {
+            assert!(
+                entry.ended_at.is_some(),
+                "every completed failover's entry must be closed out, not left open \
+                 because the wrong entry got mutated"
+            );
+            assert!(entry.success, "both concurrent failovers succeeded here");
+        }
+        // And the two entries are genuinely distinct records.
+        assert_ne!(history[0].id, history[1].id);
     }
 }
