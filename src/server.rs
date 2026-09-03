@@ -2205,14 +2205,14 @@ impl ProxyServer {
                             _ => {}
                         }
                         if add_to_pending {
-                            pending.extend_from_slice(&msg.encode());
+                            msg.encode_into(&mut pending);
                         }
                     }
 
                     // ---- Extended batch boundary ----
                     MessageType::Sync | MessageType::Flush => {
                         let wait_ready = msg.msg_type == MessageType::Sync;
-                        pending.extend_from_slice(&msg.encode());
+                        msg.encode_into(&mut pending);
                         let batch = pending.split().freeze();
                         // Re-prepare any named statement this batch references
                         // but does not itself define, in case the target
