@@ -4791,7 +4791,7 @@ impl ProxyServer {
     /// permanently excluded from edge lookup/store.
     #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
     fn stmt_leaves_session_state(sql: &str) -> bool {
-        use crate::protocol::{contains_ci, starts_with_ci};
+        use crate::protocol::starts_with_ci;
         let t = sql.trim();
         if t.is_empty() {
             return false;
@@ -4842,8 +4842,14 @@ impl ProxyServer {
         {
             return true;
         }
+        // Same one-pass-lowercase trick as `is_cacheable_read_sql`: rather
+        // than 4 separate case-insensitive windowed scans over `core`,
+        // lowercase it once and use plain `str::contains`.
         const DIRTY_TOKENS: [&str; 4] = ["set_config", "advisory", "nextval", "setval"];
-        DIRTY_TOKENS.iter().any(|tok| contains_ci(core, tok))
+        let mut lower = String::with_capacity(core.len());
+        lower.push_str(core);
+        lower.make_ascii_lowercase();
+        DIRTY_TOKENS.iter().any(|tok| lower.contains(tok))
     }
 
     /// Case-insensitive whole-word (ASCII identifier-boundary) search — a match
@@ -5082,7 +5088,7 @@ impl ProxyServer {
     /// query-cache and edge-cache read gates.
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     fn is_cacheable_read_sql(sql: &str) -> bool {
-        use crate::protocol::{contains_ci, starts_with_ci};
+        use crate::protocol::starts_with_ci;
         let t = sql.trim_start();
         if !starts_with_ci(t, "SELECT") {
             return false;
@@ -5105,7 +5111,19 @@ impl ProxyServer {
         if Self::contains_word_ci(core, "into") {
             return false;
         }
-        if contains_ci(t, "FOR UPDATE") || contains_ci(t, "FOR SHARE") {
+        // The remaining checks are all "does `t` contain one of these
+        // needles, case-insensitively" — instead of the 13 separate
+        // windowed case-insensitive scans (FOR UPDATE, FOR SHARE, 11
+        // VOLATILE tokens) that used to each walk `t` byte-by-byte,
+        // lowercase `t` ONCE into a scratch buffer and do plain (fast,
+        // SIMD-friendly) `str::contains` checks against it. ASCII-only
+        // lowercasing (`make_ascii_lowercase`) leaves any non-ASCII bytes
+        // untouched, matching `contains_ci`'s byte-for-byte semantics for
+        // non-ASCII input.
+        let mut lower = String::with_capacity(t.len());
+        lower.push_str(t);
+        lower.make_ascii_lowercase();
+        if lower.contains("for update") || lower.contains("for share") {
             return false;
         }
         // Non-deterministic or side-effectful reads must not be reused
@@ -5124,7 +5142,7 @@ impl ProxyServer {
             "gen_random_uuid",
             "set_config(",
         ];
-        !VOLATILE.iter().any(|v| contains_ci(t, v))
+        !VOLATILE.iter().any(|v| lower.contains(v))
     }
 
     /// Decide whether a read query is safe to serve from / store in the cache,
@@ -7266,6 +7284,50 @@ mod tests {
                 "select into_total from t"
             ));
         }
+
+        /// Regression for the single-lowercase-pass rewrite of the FOR
+        /// UPDATE/FOR SHARE + VOLATILE-token checks: every needle must still
+        /// be matched case-insensitively regardless of how the caller casts
+        /// the keyword, exactly as the old per-needle `contains_ci` scan did.
+        #[test]
+        fn locking_and_volatile_checks_stay_case_insensitive() {
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "select * from t FOR UPDATE"
+            ));
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "select * from t For Update"
+            ));
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "select * from t for share"
+            ));
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "select * from t FOR SHARE"
+            ));
+            assert!(!ProxyServer::is_cacheable_read_sql("SELECT NOW()"));
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "select CURRENT_TIMESTAMP"
+            ));
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "select GEN_RANDOM_UUID()"
+            ));
+            assert!(!ProxyServer::is_cacheable_read_sql(
+                "SELECT Set_Config('timezone', 'UTC', false)"
+            ));
+        }
+
+        /// Non-ASCII bytes in the SQL text must not panic the lowercasing
+        /// buffer (`make_ascii_lowercase` only touches ASCII bytes in place,
+        /// so UTF-8 validity is preserved) and must not be case-folded —
+        /// same byte-for-byte semantics as the old `contains_ci`.
+        #[test]
+        fn non_ascii_sql_is_handled_safely() {
+            assert!(ProxyServer::is_cacheable_read_sql(
+                "select name from café where city = 'Zürich'"
+            ));
+            // A non-ASCII volatile-token lookalike must not be flagged —
+            // "NÓW(" is not "now(" under byte-for-byte comparison.
+            assert!(ProxyServer::is_cacheable_read_sql("select NÓW() from t"));
+        }
     }
 
     // ---- edge-proxy: write-invalidation classifiers ----
@@ -7847,6 +7909,28 @@ mod tests {
         assert!(clean("COPY t FROM STDIN"), "copy");
         assert!(clean("GRANT SELECT ON t TO bob"), "grant");
         assert!(clean("ALTER TABLE t ADD COLUMN c int"), "ddl");
+    }
+
+    /// Regression for the single-lowercase-pass rewrite of the
+    /// `DIRTY_TOKENS` scan: `set_config`/`advisory`/`nextval`/`setval` must
+    /// still be matched case-insensitively no matter how the caller casts
+    /// them, exactly as the old per-token `contains_ci` scan did. Also
+    /// checks the lowercasing buffer doesn't panic or fold non-ASCII bytes.
+    #[cfg(feature = "pool-modes")]
+    #[test]
+    fn stmt_classifier_dirty_tokens_stay_case_insensitive() {
+        let clean = ProxyServer::stmt_leaves_session_state;
+        assert!(clean("SELECT PG_ADVISORY_LOCK(1)"), "uppercase advisory");
+        assert!(clean("select Pg_Advisory_Unlock(1)"), "mixed-case advisory");
+        assert!(clean("SELECT NEXTVAL('s')"), "uppercase nextval");
+        assert!(clean("SELECT SETVAL('s', 1)"), "uppercase setval");
+        assert!(
+            clean("SELECT Set_Config('work_mem','1GB',false)"),
+            "mixed-case set_config"
+        );
+        // Non-ASCII bytes must not panic the lowercasing buffer, and must
+        // not be folded into a false match.
+        assert!(!clean("SELECT name FROM café"), "plain non-ASCII select");
     }
 
     /// `reset_backend` must only report success when the reset query cleanly
