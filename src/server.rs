@@ -5187,16 +5187,26 @@ impl ProxyServer {
     /// target. Best-effort: journal errors never fail the client query.
     #[cfg(feature = "ha-tr")]
     async fn journal_write(state: &Arc<ServerState>, session: &Arc<ClientSession>, sql: &str) {
-        let tx_id = uuid::Uuid::new_v4();
-        let j = &state.transaction_journal;
-        if j.begin_transaction(tx_id, session.id, crate::NodeId::new(), 0)
-            .await
-            .is_ok()
-        {
-            let _ = j
-                .log_statement(tx_id, sql.to_string(), Vec::new(), None, None, 0)
-                .await;
-        }
+        // One lock acquisition and one cheap id draw per write: `begin_and_log`
+        // is the fused begin+log, and the auto-commit id comes from the
+        // per-process counter instead of the OS RNG (see
+        // `transaction_journal::next_auto_commit_tx_id`). Explicit
+        // transactions still use begin_transaction + log_statement.
+        let tx_id = crate::transaction_journal::next_auto_commit_tx_id();
+        let _ = state
+            .transaction_journal
+            .begin_and_log(
+                tx_id,
+                session.id,
+                crate::NodeId::new(),
+                0,
+                sql.to_string(),
+                Vec::new(),
+                None,
+                None,
+                0,
+            )
+            .await;
     }
 
     /// Record a forwarded query on the analytics engine (fingerprint, latency,
@@ -7708,6 +7718,42 @@ mod tests {
             let entries = j.entries_in_window(from, to).await;
             assert_eq!(entries.len(), 1, "journaled statement should be in window");
             assert!(entries[0].1.statement.contains("insert"));
+        }
+
+        /// The auto-commit write path (`journal_write`) records one
+        /// single-statement transaction per write via the fused
+        /// `begin_and_log`, with a distinct transaction id per write.
+        #[tokio::test]
+        async fn journal_write_records_one_auto_commit_tx_per_write() {
+            use super::{make_test_session, test_config};
+            use crate::server::ProxyServer;
+
+            let server = ProxyServer::new(test_config()).unwrap();
+            let session = make_test_session();
+            let from = chrono::Utc::now() - chrono::Duration::seconds(60);
+
+            ProxyServer::journal_write(&server.state, &session, "insert into t values (1)").await;
+            ProxyServer::journal_write(&server.state, &session, "update t set a = 2").await;
+
+            let to = chrono::Utc::now() + chrono::Duration::seconds(60);
+            let entries = server
+                .state
+                .transaction_journal
+                .entries_in_window(from, to)
+                .await;
+            assert_eq!(entries.len(), 2, "one journal entry per write");
+            assert_ne!(
+                entries[0].0, entries[1].0,
+                "each write gets its own auto-commit transaction id"
+            );
+            assert_eq!(
+                server.state.transaction_journal.active_count().await,
+                2,
+                "each write is its own uncommitted journal"
+            );
+            for (_, e) in &entries {
+                assert_eq!(e.sequence, 1, "auto-commit journals hold one statement");
+            }
         }
     }
 

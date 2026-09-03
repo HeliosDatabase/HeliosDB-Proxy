@@ -4,8 +4,9 @@
 //! Enables Oracle-grade TAF+TAC merged functionality.
 
 use super::{NodeId, ProxyError, Result};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -236,10 +237,110 @@ fn estimate_params_size(params: &[JournalValue]) -> usize {
         .sum()
 }
 
+/// Fast unique transaction id for the auto-commit data path.
+///
+/// The data path journals every write as its own single-statement
+/// transaction, so `Uuid::new_v4()` used to draw from the OS RNG once per
+/// write. The id is never persisted, serialized, or put on the wire: it is
+/// only a `HashMap` key plus a value formatted into log lines and replay
+/// error strings (`failover_replay.rs`, `replay/mod.rs`, admin
+/// `/api/replay`). The *type* and the rendered format therefore stay a
+/// v4-shaped `Uuid`, but the entropy source does not need to be the OS RNG
+/// on every call: we draw one random v4 UUID per process and stamp a
+/// monotonic counter into its low 64 bits, restoring the RFC 4122 variant
+/// bits (the version nibble lives in the high half and is preserved). A
+/// collision needs either 2^62 ids inside one process or a repeat of the
+/// per-process 60-bit random base.
+pub fn next_auto_commit_tx_id() -> Uuid {
+    static BASE: OnceLock<u128> = OnceLock::new();
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let base = *BASE.get_or_init(|| Uuid::new_v4().as_u128());
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // RFC 4122 variant is the top two bits of the low half.
+    let low = (n & 0x3fff_ffff_ffff_ffff) | 0x8000_0000_0000_0000;
+    Uuid::from_u128((base & (u128::MAX << 64)) | low as u128)
+}
+
+/// Insertion-ordered store of transaction journals.
+///
+/// The auto-commit data path hits the global `max_journals` cap constantly,
+/// so eviction runs on the write hot path. A bare `HashMap` forced an
+/// O(n log n) sort of every retained journal to find the oldest ones; the
+/// `order` index makes eviction O(k log n) in the number actually removed.
+/// Insertion order is the eviction order, which matches `started_at` order
+/// (the journal is built immediately before the lock is taken).
+#[derive(Debug, Default)]
+struct JournalStore {
+    /// tx_id -> (insertion sequence, journal)
+    entries: HashMap<Uuid, (u64, TransactionJournalEntry)>,
+    /// insertion sequence -> tx_id, iterated oldest-first for eviction
+    order: BTreeMap<u64, Uuid>,
+    /// Next insertion sequence to hand out.
+    next_seq: u64,
+}
+
+impl JournalStore {
+    /// Insert (or replace) a journal, returning a mutable handle to it.
+    fn insert(
+        &mut self,
+        tx_id: Uuid,
+        journal: TransactionJournalEntry,
+    ) -> &mut TransactionJournalEntry {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        if let Some((old_seq, _)) = self.entries.insert(tx_id, (seq, journal)) {
+            self.order.remove(&old_seq);
+        }
+        self.order.insert(seq, tx_id);
+        &mut self
+            .entries
+            .get_mut(&tx_id)
+            .expect("journal just inserted")
+            .1
+    }
+
+    fn remove(&mut self, tx_id: &Uuid) {
+        if let Some((seq, _)) = self.entries.remove(tx_id) {
+            self.order.remove(&seq);
+        }
+    }
+
+    fn get(&self, tx_id: &Uuid) -> Option<&TransactionJournalEntry> {
+        self.entries.get(tx_id).map(|(_, j)| j)
+    }
+
+    fn get_mut(&mut self, tx_id: &Uuid) -> Option<&mut TransactionJournalEntry> {
+        self.entries.get_mut(tx_id).map(|(_, j)| j)
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &TransactionJournalEntry> {
+        self.entries.values().map(|(_, j)| j)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&Uuid, &TransactionJournalEntry)> {
+        self.entries.iter().map(|(tx_id, (_, j))| (tx_id, j))
+    }
+
+    /// Evict the oldest journals (insertion order) until at most
+    /// `target_len` remain.
+    fn evict_oldest(&mut self, target_len: usize) {
+        while self.entries.len() > target_len {
+            let Some((_, tx_id)) = self.order.pop_first() else {
+                break;
+            };
+            self.entries.remove(&tx_id);
+        }
+    }
+}
+
 /// Transaction Journal Manager
 pub struct TransactionJournal {
-    /// Active transaction journals
-    journals: Arc<RwLock<HashMap<Uuid, TransactionJournalEntry>>>,
+    /// Active transaction journals, insertion-ordered for O(k) eviction
+    journals: Arc<RwLock<JournalStore>>,
     /// Maximum entries per journal
     max_entries: usize,
     /// Maximum journal size (bytes)
@@ -259,7 +360,7 @@ impl TransactionJournal {
     /// Create a new transaction journal manager
     pub fn new() -> Self {
         Self {
-            journals: Arc::new(RwLock::new(HashMap::new())),
+            journals: Arc::new(RwLock::new(JournalStore::default())),
             max_entries: 10000,
             max_size: 64 * 1024 * 1024, // 64MB
             max_journals: 50_000,
@@ -279,24 +380,14 @@ impl TransactionJournal {
         self
     }
 
-    /// Evict the oldest journals (by `started_at`) until at most `target_len`
-    /// remain. Called under the write lock when the global cap is hit; evicting
-    /// a batch down to a target amortizes the O(n) scan across many inserts.
-    fn evict_oldest_locked(
-        journals: &mut HashMap<Uuid, TransactionJournalEntry>,
-        target_len: usize,
-    ) {
-        if journals.len() <= target_len {
-            return;
-        }
-        let remove_count = journals.len() - target_len;
-        let mut by_time: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> =
-            journals.iter().map(|(k, v)| (*k, v.started_at)).collect();
-        // Partial order is enough, but a full sort is simple and only runs when
-        // the cap is hit (once per `max_journals/10` writes).
-        by_time.sort_by_key(|(_, t)| *t);
-        for (k, _) in by_time.into_iter().take(remove_count) {
-            journals.remove(&k);
+    /// Enforce the global cap under the write lock: when it is reached, evict
+    /// the oldest journals down to 90% of the cap in one pass. Eviction walks
+    /// the insertion-order index, so it costs O(k log n) in the number removed
+    /// rather than an O(n log n) sort of every retained journal.
+    fn enforce_cap_locked(&self, journals: &mut JournalStore) {
+        if journals.len() >= self.max_journals {
+            let target = (self.max_journals * 9 / 10).max(1);
+            journals.evict_oldest(target);
         }
     }
 
@@ -354,12 +445,74 @@ impl TransactionJournal {
         let mut journals = self.journals.write().await;
         // Bound total retained journals: the data path never commits (each write
         // is its own tx_id), so without this the map grows forever. Evict down
-        // to 90% of the cap in one pass to amortize the sort.
-        if journals.len() >= self.max_journals {
-            let target = (self.max_journals * 9 / 10).max(1);
-            Self::evict_oldest_locked(&mut journals, target);
-        }
+        // to 90% of the cap in one pass to amortize the walk.
+        self.enforce_cap_locked(&mut journals);
         journals.insert(tx_id, journal);
+        drop(journals);
+
+        tracing::debug!("Started journaling transaction {:?}", tx_id);
+        Ok(())
+    }
+
+    /// Begin a transaction and log its first statement under a **single**
+    /// write-lock acquisition.
+    ///
+    /// Behaviourally identical to `begin_transaction` followed by
+    /// `log_statement` (same eviction, same limit checks with the same error
+    /// text, same sequence numbering), but takes the global journal lock once
+    /// instead of twice. Used by the auto-commit data path in `server.rs`,
+    /// which records every write as its own single-statement transaction;
+    /// explicit multi-statement transactions keep using `begin_transaction` +
+    /// `log_statement`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn begin_and_log(
+        &self,
+        tx_id: Uuid,
+        session_id: Uuid,
+        node_id: NodeId,
+        start_lsn: u64,
+        statement: String,
+        parameters: Vec<JournalValue>,
+        result_checksum: Option<u64>,
+        rows_affected: Option<u64>,
+        duration_ms: u64,
+    ) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+
+        // Everything that does not need the lock is done outside it.
+        let statement_type = StatementType::from_sql(&statement);
+        let new_journal = TransactionJournalEntry::new(tx_id, session_id, node_id, start_lsn);
+
+        let mut journals = self.journals.write().await;
+        self.enforce_cap_locked(&mut journals);
+        let journal = journals.insert(tx_id, new_journal);
+
+        // Same limit checks `log_statement` applies (a fresh journal is empty,
+        // so these only fire for degenerate max_entries / max_size settings).
+        if journal.entries.len() >= self.max_entries {
+            return Err(ProxyError::Internal(
+                "Transaction journal entries limit exceeded".to_string(),
+            ));
+        }
+        if journal.total_size() >= self.max_size {
+            return Err(ProxyError::Internal(
+                "Transaction journal size limit exceeded".to_string(),
+            ));
+        }
+
+        let sequence = journal.current_sequence + 1;
+        journal.add_entry(JournalEntry {
+            sequence,
+            statement,
+            parameters,
+            result_checksum,
+            rows_affected,
+            timestamp: chrono::Utc::now(),
+            statement_type,
+            duration_ms,
+        });
         drop(journals);
 
         tracing::debug!("Started journaling transaction {:?}", tx_id);
@@ -501,6 +654,13 @@ impl TransactionJournal {
     pub async fn get_max_start_lsn(&self) -> Option<u64> {
         let journals = self.journals.read().await;
         journals.values().map(|j| j.start_lsn).max()
+    }
+
+    /// Test-only: number of entries in the insertion-order index. Used to
+    /// prove the index does not leak slots for committed transactions.
+    #[cfg(test)]
+    async fn order_index_len(&self) -> usize {
+        self.journals.read().await.order.len()
     }
 
     /// Get transactions that started on a specific node
@@ -740,5 +900,215 @@ mod tests {
             "journal map must stay within the cap, got {}",
             stats.active_transactions
         );
+    }
+
+    /// `begin_and_log` must produce exactly the journal that
+    /// `begin_transaction` + `log_statement` produce (one lock acquisition
+    /// instead of two is the only difference).
+    #[tokio::test]
+    async fn begin_and_log_matches_begin_then_log() {
+        let node_id = NodeId::new();
+        let session_id = Uuid::new_v4();
+        let sql = "INSERT INTO t (a) VALUES ($1)".to_string();
+
+        let two_step = TransactionJournal::new();
+        let tx_two = Uuid::new_v4();
+        two_step
+            .begin_transaction(tx_two, session_id, node_id, 7)
+            .await
+            .unwrap();
+        two_step
+            .log_statement(
+                tx_two,
+                sql.clone(),
+                vec![JournalValue::Int64(1)],
+                Some(42),
+                Some(1),
+                3,
+            )
+            .await
+            .unwrap();
+
+        let fused = TransactionJournal::new();
+        let tx_one = Uuid::new_v4();
+        fused
+            .begin_and_log(
+                tx_one,
+                session_id,
+                node_id,
+                7,
+                sql.clone(),
+                vec![JournalValue::Int64(1)],
+                Some(42),
+                Some(1),
+                3,
+            )
+            .await
+            .unwrap();
+
+        let a = two_step.get_journal(&tx_two).await.unwrap();
+        let b = fused.get_journal(&tx_one).await.unwrap();
+
+        assert_eq!(a.session_id, b.session_id);
+        assert_eq!(a.node_id, b.node_id);
+        assert_eq!(a.start_lsn, b.start_lsn);
+        assert_eq!(a.active, b.active);
+        assert_eq!(a.has_mutations, b.has_mutations);
+        assert!(b.has_mutations, "INSERT must mark the journal as mutating");
+        assert_eq!(a.current_sequence, b.current_sequence);
+        assert_eq!(a.entries.len(), b.entries.len());
+        assert_eq!(a.entries[0].sequence, b.entries[0].sequence);
+        assert_eq!(a.entries[0].statement, b.entries[0].statement);
+        assert_eq!(a.entries[0].statement_type, b.entries[0].statement_type);
+        assert_eq!(a.entries[0].result_checksum, b.entries[0].result_checksum);
+        assert_eq!(a.entries[0].rows_affected, b.entries[0].rows_affected);
+        assert_eq!(a.entries[0].duration_ms, b.entries[0].duration_ms);
+        assert_eq!(a.entries[0].parameters.len(), b.entries[0].parameters.len());
+    }
+
+    /// `begin_and_log` is a no-op (Ok) when journaling is disabled, exactly
+    /// like the two-step path.
+    #[tokio::test]
+    async fn begin_and_log_respects_disabled_journal() {
+        let mut journal = TransactionJournal::new();
+        journal.set_enabled(false);
+        let tx = Uuid::new_v4();
+        journal
+            .begin_and_log(
+                tx,
+                Uuid::new_v4(),
+                NodeId::new(),
+                0,
+                "INSERT INTO t VALUES (1)".to_string(),
+                vec![],
+                None,
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(journal.get_journal(&tx).await.is_none());
+        assert_eq!(journal.active_count().await, 0);
+    }
+
+    /// `begin_and_log` must honour the global cap the same way the two-step
+    /// path does (the auto-commit data path never commits).
+    #[tokio::test]
+    async fn begin_and_log_enforces_global_cap() {
+        let journal = TransactionJournal::new().with_max_journals(10);
+        let node_id = NodeId::new();
+        for _ in 0..100 {
+            journal
+                .begin_and_log(
+                    next_auto_commit_tx_id(),
+                    Uuid::new_v4(),
+                    node_id,
+                    0,
+                    "INSERT INTO t VALUES (1)".to_string(),
+                    vec![],
+                    None,
+                    None,
+                    0,
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            journal.active_count().await <= 10,
+            "journal map must stay within the cap"
+        );
+    }
+
+    /// Eviction must drop the *oldest* journals first, deterministically —
+    /// including when many journals are created inside the same clock tick
+    /// (the auto-commit write path). The previous `started_at` sort broke
+    /// timestamp ties in random `HashMap` iteration order and could evict the
+    /// newest journals; the insertion-order index cannot.
+    #[tokio::test]
+    async fn eviction_drops_oldest_first_even_on_timestamp_ties() {
+        let journal = TransactionJournal::new().with_max_journals(10);
+        let node_id = NodeId::new();
+        let mut ids = Vec::new();
+        for _ in 0..12 {
+            let tx = next_auto_commit_tx_id();
+            ids.push(tx);
+            journal
+                .begin_and_log(
+                    tx,
+                    Uuid::new_v4(),
+                    node_id,
+                    0,
+                    "INSERT INTO t VALUES (1)".to_string(),
+                    vec![],
+                    None,
+                    None,
+                    0,
+                )
+                .await
+                .unwrap();
+        }
+        // Cap 10, evicting to 9 on each overflow: the two oldest are gone and
+        // every later journal survives.
+        for (i, tx) in ids.iter().enumerate().take(2) {
+            assert!(
+                journal.get_journal(tx).await.is_none(),
+                "journal {} is among the oldest and must have been evicted",
+                i
+            );
+        }
+        for (i, tx) in ids.iter().enumerate().skip(2) {
+            assert!(
+                journal.get_journal(tx).await.is_some(),
+                "journal {} is recent and must have been retained",
+                i
+            );
+        }
+    }
+
+    /// Committing (or rolling back) must release the insertion-order slot too,
+    /// otherwise the order index would leak one entry per transaction.
+    #[tokio::test]
+    async fn commit_and_rollback_release_order_index_slots() {
+        let journal = TransactionJournal::new();
+        let node_id = NodeId::new();
+        for i in 0..200 {
+            let tx = Uuid::new_v4();
+            journal
+                .begin_transaction(tx, Uuid::new_v4(), node_id, 0)
+                .await
+                .unwrap();
+            journal
+                .log_statement(tx, "SELECT 1".to_string(), vec![], None, None, 0)
+                .await
+                .unwrap();
+            if i % 2 == 0 {
+                journal.commit_transaction(tx).await.unwrap();
+            } else {
+                journal.rollback_transaction(tx).await.unwrap();
+            }
+        }
+        assert_eq!(journal.active_count().await, 0);
+        assert_eq!(
+            journal.order_index_len().await,
+            0,
+            "order index must not retain slots for finished transactions"
+        );
+    }
+
+    /// The auto-commit id source must stay unique and keep the v4 UUID shape
+    /// (the id is rendered into replay logs and error strings).
+    #[test]
+    fn auto_commit_tx_ids_are_unique_and_v4_shaped() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            let id = next_auto_commit_tx_id();
+            assert_eq!(id.get_version_num(), 4, "must render as a v4 UUID");
+            assert_eq!(
+                id.as_bytes()[8] & 0xc0,
+                0x80,
+                "must carry the RFC 4122 variant bits"
+            );
+            assert!(seen.insert(id), "auto-commit tx ids must be unique");
+        }
     }
 }
