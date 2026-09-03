@@ -612,6 +612,64 @@ impl Drop for SessionGuard {
     }
 }
 
+/// The cheap lexical facts about ONE simple-query statement, derived in a
+/// single pass over the SQL text and threaded through the whole forward path.
+///
+/// Every field is a memoized call to the classifier that already owned that
+/// decision (`is_write_query`, `stmt_leaves_session_state`,
+/// `is_cacheable_read_sql`, …) — the semantics are byte-identical, the point
+/// is that the SQL is scanned once per gate instead of once per *call site*
+/// (`forward_simple_query` used to re-derive several of these two or three
+/// times for the same string).
+///
+/// Facts describe the text they were computed from. When a routing-hint
+/// strip, a rewrite rule, or a tenant transform replaces the SQL, the caller
+/// recomputes them on the final text before any gate consults them.
+///
+/// Fields are `cfg`-gated to the features that consume them so the struct
+/// carries no dead state in a minimal build.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StmtFacts {
+    /// `is_write_query`: routing-relevant write / transaction-control / SET.
+    is_write: bool,
+    /// A `;` before the (optional) trailing one — i.e. the simple-query string
+    /// carries more than one statement, so no leading-keyword classification
+    /// can vouch for what follows.
+    #[cfg(feature = "edge-proxy")]
+    has_interior_semicolon: bool,
+    /// `stmt_leaves_session_state`: not provably session-neutral.
+    #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
+    leaves_session_state: bool,
+    /// `is_cacheable_read_sql`: plain, deterministic, single-statement SELECT.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    is_cacheable_read: bool,
+}
+
+impl StmtFacts {
+    /// Classify `sql` once. Each field delegates to the classifier that
+    /// defines it, so this is memoization — never a re-derivation.
+    fn compute(sql: &str) -> Self {
+        Self {
+            is_write: ProxyServer::is_write_query(sql),
+            #[cfg(feature = "edge-proxy")]
+            has_interior_semicolon: ProxyServer::stmt_has_interior_semicolon(sql),
+            #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
+            leaves_session_state: ProxyServer::stmt_leaves_session_state(sql),
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            is_cacheable_read: ProxyServer::is_cacheable_read_sql(sql),
+        }
+    }
+
+    /// Facts for a simple `Query` message. A payload that is not a valid
+    /// query cstring yields the all-false default — the same fallback every
+    /// individual call site used (`unwrap_or(false)` / `unwrap_or("")`).
+    fn of_query(msg: &Message) -> Self {
+        crate::protocol::query_text(&msg.payload)
+            .map(Self::compute)
+            .unwrap_or_default()
+    }
+}
+
 impl ProxyServer {
     /// Build a `PluginManager` from config and preload plugins from disk.
     ///
@@ -3434,7 +3492,13 @@ impl ProxyServer {
             return Ok((None, resp.len() as u64));
         }
 
-        let default_is_write = Self::is_write_message(msg);
+        // Single-pass lexical classification: every cheap fact this forward
+        // path needs about the statement (write? session-dirtying? cacheable
+        // read? multi-statement?) is derived here, once, instead of each gate
+        // re-walking the same SQL string. Recomputed below only if a hint
+        // strip / rewrite / tenant transform replaces the text.
+        let mut facts = StmtFacts::of_query(msg);
+        let default_is_write = facts.is_write;
         let plugin_override = Self::apply_route_hook(msg, state, session);
 
         // Block short-circuits before any backend selection.
@@ -3527,6 +3591,20 @@ impl ProxyServer {
         #[cfg(feature = "multi-tenancy")]
         let forward_msg = tenant_msg.as_ref().unwrap_or(forward_msg);
 
+        // `forward_msg` is now final. The hint strip / rewrite / tenant
+        // transforms above may each have replaced the SQL, and facts only
+        // describe the text they were computed from — so recompute them once
+        // when any of them fired. An untouched query (the common path) keeps
+        // its single original pass.
+        let sql_changed = stripped_msg.is_some();
+        #[cfg(feature = "query-rewriting")]
+        let sql_changed = sql_changed || rewritten_msg.is_some();
+        #[cfg(feature = "multi-tenancy")]
+        let sql_changed = sql_changed || tenant_msg.is_some();
+        if sql_changed {
+            facts = StmtFacts::of_query(forward_msg);
+        }
+
         // Edge cache: independent of the query-cache below — when both are
         // enabled the edge lookup runs first, so an edge hit returns before
         // the query-cache is consulted. On a miss the read's stamp/epoch is
@@ -3540,17 +3618,14 @@ impl ProxyServer {
         // conservative, but the alternative is cross-session wrong rows.
         #[cfg(feature = "edge-proxy")]
         if config.edge.enabled
+            && facts.leaves_session_state
             && !session
                 .edge_ineligible
                 .load(std::sync::atomic::Ordering::Relaxed)
         {
-            if let Some(sql) = crate::protocol::query_text(&forward_msg.payload) {
-                if Self::stmt_leaves_session_state(sql) {
-                    session
-                        .edge_ineligible
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
+            session
+                .edge_ineligible
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         #[cfg(feature = "edge-proxy")]
         let edge_ctx: Option<(crate::edge::CacheKey, Vec<String>, u64, u64)> = if is_write
@@ -3564,7 +3639,7 @@ impl ProxyServer {
             let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
             // Same gate as the query-cache: a plain deterministic SELECT, and
             // never mid-transaction (visibility would be wrong).
-            if Self::is_cacheable_read_sql(sql)
+            if facts.is_cacheable_read
                 && !session
                     .in_transaction
                     .load(std::sync::atomic::Ordering::Relaxed)
@@ -3634,23 +3709,25 @@ impl ProxyServer {
 
         // Query cache: on a cacheable read, a hit is served from cache with no
         // backend round-trip; on a miss we keep the context to store the result.
+        // The lookup's hint parse + normalization are carried over to the
+        // store below (`put_prepared`), so a miss+store normalizes the SQL
+        // once instead of twice.
         #[cfg(feature = "query-cache")]
-        let cache_ctx: Option<crate::cache::CacheContext> = if is_write {
+        let cache_ctx: Option<(crate::cache::CacheContext, crate::cache::QueryPrep)> = if is_write {
             None
         } else if let Some(qc) = state.query_cache.as_ref() {
             let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
-            match Self::cacheable_read_ctx(session, sql).await {
+            match Self::cacheable_read_ctx(session, facts.is_cacheable_read).await {
                 Some(ctx) => {
-                    if let crate::cache::CacheLookup::Hit { result, level } =
-                        qc.get(sql, &ctx).await
-                    {
+                    let (lookup, prep) = qc.get_with_prep(sql, &ctx).await;
+                    if let crate::cache::CacheLookup::Hit { result, level } = lookup {
                         tracing::debug!(target: "helios::cache", level = %level, "cache hit");
                         client.write_all(&result.data).await.map_err(|e| {
                             ProxyError::Network(format!("Client write error: {}", e))
                         })?;
                         return Ok((None, result.data.len() as u64));
                     }
-                    Some(ctx)
+                    Some((ctx, prep))
                 }
                 None => None,
             }
@@ -3716,16 +3793,11 @@ impl ProxyServer {
 
         // Conditional-reset bookkeeping: if this statement is not provably
         // session-neutral, mark the connection dirty so it is fully reset (not
-        // clean-skipped) when parked. Only evaluated when the optimisation is
-        // enabled and the connection is not already dirty (one O(len) scan at
-        // most, until the first dirtying statement).
+        // clean-skipped) when parked. The classification itself is the
+        // single-pass `StmtFacts` value — no extra scan of the SQL here.
         #[cfg(feature = "pool-modes")]
-        if config.pool_mode.skip_clean_reset && !backend.dirty {
-            if let Some(sql) = crate::protocol::query_text(&forward_msg.payload) {
-                if Self::stmt_leaves_session_state(sql) {
-                    backend.dirty = true;
-                }
-            }
+        if config.pool_mode.skip_clean_reset && !backend.dirty && facts.leaves_session_state {
+            backend.dirty = true;
         }
 
         let backend_err = match tokio::time::timeout(
@@ -3807,14 +3879,21 @@ impl ProxyServer {
                             }
                         }
                         #[cfg(feature = "query-cache")]
-                        if let (Some(ctx), Some(qc)) =
+                        if let (Some((ctx, prep)), Some(qc)) =
                             (cache_ctx.as_ref(), state.query_cache.as_ref())
                         {
                             if cacheable && !body.is_empty() {
                                 let sql =
                                     crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
-                                qc.put(sql, ctx, body.clone(), rows, std::time::Duration::ZERO)
-                                    .await;
+                                qc.put_prepared(
+                                    sql,
+                                    ctx,
+                                    prep,
+                                    body.clone(),
+                                    rows,
+                                    std::time::Duration::ZERO,
+                                )
+                                .await;
                             }
                         }
                         let _ = body;
@@ -3865,7 +3944,11 @@ impl ProxyServer {
                 #[cfg(feature = "edge-proxy")]
                 if config.edge.enabled {
                     let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
-                    if Self::edge_write_needs_invalidation(is_write, sql) {
+                    if Self::edge_write_needs_invalidation(
+                        is_write,
+                        sql,
+                        facts.has_interior_semicolon,
+                    ) {
                         // `tables_only` skips the fingerprint/params-hash work
                         // (discarded here) — a bulk INSERT must not pay full-
                         // buffer regex rewrites on the forward path. An EMPTY
@@ -4478,32 +4561,6 @@ impl ProxyServer {
         }
     }
 
-    /// Check if a message is a write operation
-    fn is_write_message(msg: &Message) -> bool {
-        match msg.msg_type {
-            MessageType::Query => {
-                // Borrow the SQL straight out of the payload — the
-                // message is forwarded verbatim, so no copy is needed
-                // just to inspect the leading keyword.
-                crate::protocol::query_text(&msg.payload)
-                    .map(Self::is_write_query)
-                    .unwrap_or(false)
-            }
-            MessageType::Parse => {
-                // Parse payload = statement-name cstring + query
-                // cstring; skip the name and borrow the query.
-                msg.payload
-                    .iter()
-                    .position(|&b| b == 0)
-                    .and_then(|end| crate::protocol::query_text(&msg.payload[end + 1..]))
-                    .map(Self::is_write_query)
-                    .unwrap_or(false)
-            }
-            // Execute, Bind, etc. maintain the current connection
-            _ => false,
-        }
-    }
-
     /// Check if SQL query is a write operation
     fn is_write_query(sql: &str) -> bool {
         use crate::protocol::starts_with_ci;
@@ -4559,12 +4616,15 @@ impl ProxyServer {
     ///   extracts tables from every sub-statement; over-invalidation only).
     /// - `COPY ... FROM` loads rows but is not classified `is_write` (it
     ///   must not be re-routed); catch it here for invalidation.
+    ///
+    /// `multi_stmt` is `StmtFacts::has_interior_semicolon` for the same SQL —
+    /// passed in rather than re-scanned (`stmt_has_interior_semicolon` is the
+    /// single definition of that fact).
     #[cfg(feature = "edge-proxy")]
-    fn edge_write_needs_invalidation(is_write: bool, sql: &str) -> bool {
+    fn edge_write_needs_invalidation(is_write: bool, sql: &str, multi_stmt: bool) -> bool {
         use crate::protocol::starts_with_ci;
         let t = sql.trim();
         let core = t.strip_suffix(';').unwrap_or(t).trim_end();
-        let multi_stmt = core.contains(';');
         if !multi_stmt
             && (starts_with_ci(core, "BEGIN")
                 || starts_with_ci(core, "START")
@@ -4579,6 +4639,17 @@ impl ProxyServer {
             || Self::is_edge_copy_write_sql(core)
             || Self::is_edge_procedural_sql(core)
             || Self::is_edge_txn_end_sql(core)
+    }
+
+    /// Does the simple-query string carry more than one statement? A `;`
+    /// before the optional trailing one means a leading-keyword check cannot
+    /// vouch for what follows. (A `;` inside a string literal also trips this —
+    /// conservative, and only ever costs an extra invalidation/reset.)
+    #[cfg(feature = "edge-proxy")]
+    fn stmt_has_interior_semicolon(sql: &str) -> bool {
+        let t = sql.trim();
+        let core = t.strip_suffix(';').unwrap_or(t).trim_end();
+        core.contains(';')
     }
 
     /// `COPY ... FROM ...` (STDIN or file) loads rows. Word-boundary FROM so
@@ -5130,12 +5201,15 @@ impl ProxyServer {
     /// Decide whether a read query is safe to serve from / store in the cache,
     /// and build its `CacheContext`. Returns `None` for anything not a plain,
     /// deterministic, non-transactional SELECT.
+    ///
+    /// `is_cacheable_read` is `StmtFacts::is_cacheable_read` for the statement
+    /// (i.e. `is_cacheable_read_sql`, already computed once for this message).
     #[cfg(feature = "query-cache")]
     async fn cacheable_read_ctx(
         session: &Arc<ClientSession>,
-        sql: &str,
+        is_cacheable_read: bool,
     ) -> Option<crate::cache::CacheContext> {
-        if !Self::is_cacheable_read_sql(sql) {
+        if !is_cacheable_read {
             return None;
         }
         // Never cache mid-transaction (visibility would be wrong).
@@ -6387,6 +6461,165 @@ mod tests {
         config
     }
 
+    // ---- single-pass statement facts ----
+
+    mod stmt_facts {
+        use super::{ProxyServer, StmtFacts};
+
+        /// Statement table spanning every classifier branch the facts
+        /// memoize: reads, CTEs, all DML verbs, DDL, COPY in both
+        /// directions, session-state verbs, transaction control, PREPARE /
+        /// EXECUTE / LISTEN, multi-statement strings, leading and hint
+        /// comments, volatile and locking reads, `SELECT ... INTO`, and case
+        /// / whitespace variants.
+        const CASES: [&str; 48] = [
+            "SELECT 1",
+            "select v from t",
+            "  \t\n SELECT v FROM t  ",
+            "SELECT v FROM t;",
+            "SELECT v FROM t ; ",
+            "SELECT v FROM t WHERE into_total > 1",
+            "SELECT * INTO tmp FROM t",
+            "select now()",
+            "SELECT random()",
+            "select nextval('s')",
+            "SELECT set_config('x','y',false)",
+            "SELECT pg_advisory_lock(1)",
+            "SELECT v FROM t FOR UPDATE",
+            "SELECT v FROM t FOR SHARE",
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+            "WITH c AS (SELECT 1) SELECT * INTO tmp FROM c",
+            "VALUES (1),(2)",
+            "TABLE t",
+            "SHOW search_path",
+            "EXPLAIN SELECT 1",
+            "FETCH ALL FROM cur",
+            "INSERT INTO t VALUES (1)",
+            "insert into t (a) values (1)",
+            "UPDATE t SET v = 1",
+            "DELETE FROM t WHERE id = 1",
+            "CREATE TABLE t (id int)",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD COLUMN c int",
+            "TRUNCATE t",
+            "GRANT SELECT ON t TO r",
+            "REVOKE SELECT ON t FROM r",
+            "VACUUM ANALYZE t",
+            "REINDEX TABLE t",
+            "CLUSTER t",
+            "COPY t FROM STDIN",
+            "COPY t TO STDOUT",
+            "SET search_path TO tenant_b",
+            "set TimeZone = 'UTC'",
+            "SET TRANSACTION READ ONLY",
+            "RESET ALL",
+            "DISCARD ALL",
+            "PREPARE p AS SELECT 1",
+            "EXECUTE p(1)",
+            "LISTEN chan",
+            "BEGIN",
+            "COMMIT",
+            "ROLLBACK TO SAVEPOINT sp1;",
+            "SELECT v FROM t; UPDATE t SET v = 1",
+        ];
+
+        /// Extra strings that are not plain statements: empty, whitespace,
+        /// leading block/line comments and a routing-hint comment. These
+        /// exercise the "leading comment masks the verb" branches.
+        const ODD_CASES: [&str; 7] = [
+            "",
+            "   ",
+            "/* leading */ SELECT 1",
+            "-- leading\nSELECT 1",
+            "/*helios:route=primary*/ SELECT 1",
+            "/*helios:route=primary*/ UPDATE t SET v = 1",
+            "BEGIN; UPDATE t SET v = 1; COMMIT",
+        ];
+
+        /// `StmtFacts::compute` must agree, field for field, with the legacy
+        /// classifier it memoizes — for every statement shape. This is the
+        /// contract that makes threading the struct through the forward path
+        /// a pure optimisation rather than a behaviour change.
+        #[test]
+        fn compute_agrees_with_legacy_classifiers() {
+            assert!(CASES.len() + ODD_CASES.len() >= 40);
+            for sql in CASES.iter().chain(ODD_CASES.iter()).copied() {
+                let f = StmtFacts::compute(sql);
+                assert_eq!(
+                    f.is_write,
+                    ProxyServer::is_write_query(sql),
+                    "is_write mismatch for {sql:?}"
+                );
+                #[cfg(feature = "edge-proxy")]
+                assert_eq!(
+                    f.has_interior_semicolon,
+                    ProxyServer::stmt_has_interior_semicolon(sql),
+                    "has_interior_semicolon mismatch for {sql:?}"
+                );
+                #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
+                assert_eq!(
+                    f.leaves_session_state,
+                    ProxyServer::stmt_leaves_session_state(sql),
+                    "leaves_session_state mismatch for {sql:?}"
+                );
+                #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+                assert_eq!(
+                    f.is_cacheable_read,
+                    ProxyServer::is_cacheable_read_sql(sql),
+                    "is_cacheable_read mismatch for {sql:?}"
+                );
+            }
+        }
+
+        /// The multi-statement fact is exactly the interior-`;` rule the edge
+        /// invalidation gate used to re-derive inline.
+        #[cfg(feature = "edge-proxy")]
+        #[test]
+        fn interior_semicolon_only_counts_non_trailing() {
+            for (sql, want) in [
+                ("SELECT 1", false),
+                ("SELECT 1;", false),
+                ("SELECT 1 ; ", false),
+                ("SELECT 1; SELECT 2", true),
+                ("BEGIN; UPDATE t SET v = 1; COMMIT", true),
+                ("", false),
+            ] {
+                assert_eq!(
+                    ProxyServer::stmt_has_interior_semicolon(sql),
+                    want,
+                    "{sql:?}"
+                );
+                assert_eq!(
+                    StmtFacts::compute(sql).has_interior_semicolon,
+                    want,
+                    "{sql:?}"
+                );
+            }
+        }
+
+        /// `of_query` classifies the SQL carried by a `Query` message, and a
+        /// payload that is not a valid query cstring falls back to the
+        /// all-false default — the same fallback every individual call site
+        /// used before the facts were hoisted.
+        #[test]
+        fn of_query_reads_the_message_payload() {
+            let msg = crate::protocol::QueryMessage {
+                query: "UPDATE t SET v = 1".to_string(),
+            }
+            .encode();
+            assert_eq!(
+                StmtFacts::of_query(&msg),
+                StmtFacts::compute("UPDATE t SET v = 1")
+            );
+
+            let empty = crate::protocol::Message::new(
+                crate::protocol::MessageType::Query,
+                bytes::BytesMut::new(),
+            );
+            assert_eq!(StmtFacts::of_query(&empty), StmtFacts::default());
+        }
+    }
+
     #[test]
     fn test_server_creation() {
         let config = test_config();
@@ -7275,6 +7508,17 @@ mod tests {
         use super::ProxyServer;
         use std::collections::HashMap;
 
+        /// `edge_write_needs_invalidation` with the multi-statement fact
+        /// derived from `sql` — exactly what the forward path passes from
+        /// `StmtFacts::has_interior_semicolon`.
+        fn ewni(is_write: bool, sql: &str) -> bool {
+            ProxyServer::edge_write_needs_invalidation(
+                is_write,
+                sql,
+                ProxyServer::stmt_has_interior_semicolon(sql),
+            )
+        }
+
         #[test]
         fn bare_txn_control_is_exempt_from_invalidation() {
             // F10: BEGIN/START/SAVEPOINT/RELEASE/ROLLBACK change no rows —
@@ -7289,53 +7533,32 @@ mod tests {
                 "ROLLBACK",
                 "ROLLBACK TO SAVEPOINT sp1;",
             ] {
-                assert!(
-                    !ProxyServer::edge_write_needs_invalidation(true, sql),
-                    "{sql:?} must be exempt"
-                );
+                assert!(!ewni(true, sql), "{sql:?} must be exempt");
             }
             // COMMIT keeps its conservative flush (closes the in-txn
             // write visibility window), and SET stays (GUC mitigation).
-            assert!(ProxyServer::edge_write_needs_invalidation(true, "COMMIT"));
-            assert!(ProxyServer::edge_write_needs_invalidation(
-                true,
-                "SET search_path TO tenant_b"
-            ));
+            assert!(ewni(true, "COMMIT"));
+            assert!(ewni(true, "SET search_path TO tenant_b"));
         }
 
         #[test]
         fn compound_txn_strings_still_invalidate() {
             // A multi-statement string may hide a write behind a
             // txn-control or SELECT lead — never exempt it.
-            assert!(ProxyServer::edge_write_needs_invalidation(
-                true,
-                "BEGIN; UPDATE t SET v = 1; COMMIT"
-            ));
+            assert!(ewni(true, "BEGIN; UPDATE t SET v = 1; COMMIT"));
             // SELECT-leading batch with a trailing write classifies
             // is_write=false, but the interior `;` forces invalidation.
-            assert!(ProxyServer::edge_write_needs_invalidation(
-                false,
-                "SELECT v FROM t; UPDATE t SET v = 1"
-            ));
+            assert!(ewni(false, "SELECT v FROM t; UPDATE t SET v = 1"));
             // A plain single SELECT does not invalidate.
-            assert!(!ProxyServer::edge_write_needs_invalidation(
-                false,
-                "SELECT v FROM t"
-            ));
+            assert!(!ewni(false, "SELECT v FROM t"));
         }
 
         #[test]
         fn copy_from_counts_as_write() {
-            assert!(ProxyServer::edge_write_needs_invalidation(
-                false,
-                "COPY t FROM STDIN"
-            ));
+            assert!(ewni(false, "COPY t FROM STDIN"));
             assert!(ProxyServer::is_edge_copy_write_sql("copy t from stdin"));
             // COPY TO exports rows — a read.
-            assert!(!ProxyServer::edge_write_needs_invalidation(
-                false,
-                "COPY t TO STDOUT"
-            ));
+            assert!(!ewni(false, "COPY t TO STDOUT"));
         }
 
         #[test]
@@ -7354,7 +7577,7 @@ mod tests {
                     "{sql:?} is procedural"
                 );
                 assert!(
-                    ProxyServer::edge_write_needs_invalidation(false, sql),
+                    ewni(false, sql),
                     "{sql:?} must invalidate on the simple path"
                 );
             }
@@ -7381,7 +7604,7 @@ mod tests {
             ] {
                 assert!(ProxyServer::is_edge_txn_end_sql(sql), "{sql:?} ends a txn");
                 assert!(
-                    ProxyServer::edge_write_needs_invalidation(false, sql),
+                    ewni(false, sql),
                     "{sql:?} must invalidate (commit-visibility window)"
                 );
             }
@@ -7391,7 +7614,7 @@ mod tests {
                     "{sql:?} is not a txn-end"
                 );
                 assert!(
-                    !ProxyServer::edge_write_needs_invalidation(false, sql),
+                    !ewni(false, sql),
                     "{sql:?} must stay exempt on the simple path"
                 );
             }
