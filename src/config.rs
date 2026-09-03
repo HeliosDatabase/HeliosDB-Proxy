@@ -1626,6 +1626,20 @@ impl ProxyConfig {
             ));
         }
 
+        // Degraded but legal: a timeout at least as long as the interval means
+        // a probe can still be running when the next tick fires. The health
+        // checker then skips that tick (counted as `health_probe_skipped_inflight`)
+        // rather than stacking a second probe, so detection for a slow node is
+        // coarser than `check_interval` suggests. Warn only — existing
+        // deployments run this way and must keep working after an upgrade.
+        if self.health.check_timeout_secs >= self.health.check_interval_secs {
+            tracing::warn!(
+                check_timeout_secs = self.health.check_timeout_secs,
+                check_interval_secs = self.health.check_interval_secs,
+                "health.check_timeout_secs >= health.check_interval_secs: probes for a slow node will skip ticks (health_probe_skipped_inflight) instead of running every interval"
+            );
+        }
+
         // Refuse to expose the admin API beyond loopback without a token. The
         // admin surface runs privileged operations (arbitrary SQL via
         // /api/sql, forced failover via /api/chaos, migration cutover, branch
@@ -2576,6 +2590,21 @@ mod tests {
         c.admin_address = "0.0.0.0:9090".to_string();
         c.admin_allow_insecure = true;
         assert!(c.validate().is_ok());
+    }
+
+    /// `check_timeout_secs >= check_interval_secs` is degraded but legal: the
+    /// health checker skips ticks (`health_probe_skipped_inflight`) instead of
+    /// stacking probes. validate() must warn, never reject — existing configs
+    /// use this shape and must keep loading unchanged.
+    #[test]
+    fn test_validate_accepts_health_timeout_ge_interval() {
+        let mut config = ProxyConfig::default();
+        config.add_node("localhost:5432", "primary").unwrap();
+        config.health.check_interval_secs = 2;
+        config.health.check_timeout_secs = 5;
+        assert!(config.validate().is_ok());
+        config.health.check_timeout_secs = 2;
+        assert!(config.validate().is_ok());
     }
 
     #[test]
