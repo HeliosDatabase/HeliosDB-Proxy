@@ -833,6 +833,41 @@ pub struct LimitsToml {
     /// `POOL_REAP_INTERVAL`.
     #[serde(default = "default_pool_reap_interval_secs")]
     pub pool_reap_interval_secs: u64,
+    /// Ceiling on concurrently-served client connections on the PG-wire
+    /// listener. `0` (the default) means unlimited — exactly today's behaviour,
+    /// where every accepted socket spawns a task holding its own read buffer
+    /// (and, in session pooling, a backend connection). When > 0 the accept
+    /// loop takes a permit per connection and a connection arriving with no
+    /// permit free is answered with a PostgreSQL `ErrorResponse`
+    /// (SQLSTATE 53300, `too many clients already`) and closed, instead of
+    /// being queued — the same shape as a PostgreSQL server at
+    /// `max_connections`.
+    ///
+    /// Read ONCE at startup: the permit pool is sized when the server is built,
+    /// so a SIGHUP that changes this key is logged and ignored (resizing a live
+    /// semaphore downward cannot revoke permits already held by in-flight
+    /// sessions). Restart to change it.
+    #[serde(default = "default_max_client_connections")]
+    pub max_client_connections: usize,
+    /// Idle-session timeout (seconds) for an authenticated client: how long a
+    /// session may sit between statements before the proxy terminates it with
+    /// SQLSTATE 57P05 (`terminating connection due to idle-session timeout`).
+    /// `0` (the default) disables it — exactly today's behaviour, where an
+    /// authenticated client can hold a session slot (and its pooled backend
+    /// connection) forever and stall a graceful drain to its full timeout.
+    ///
+    /// Matches PostgreSQL's `idle_session_timeout` semantics: the clock starts
+    /// when the session goes idle (i.e. measures time since the client's last
+    /// statement), and unsolicited backend traffic relayed while idle
+    /// (LISTEN/NOTIFY, NoticeResponse, ParameterStatus) is NOT client activity
+    /// and does not reset it. PostgreSQL's separate
+    /// `idle_in_transaction_session_timeout` GUC is not implemented; a session
+    /// idle inside an open transaction is terminated by this timeout too.
+    ///
+    /// Read once at startup (a SIGHUP change applies to nothing already
+    /// connected and is not re-read).
+    #[serde(default = "default_client_idle_timeout_secs")]
+    pub client_idle_timeout_secs: u64,
 }
 
 fn default_max_cancel_keys() -> usize {
@@ -868,6 +903,14 @@ fn default_max_total_idle_backend_conns() -> usize {
 fn default_pool_reap_interval_secs() -> u64 {
     30
 }
+fn default_max_client_connections() -> usize {
+    // 0 = unlimited: preserves the pre-cap behaviour byte-for-byte.
+    0
+}
+fn default_client_idle_timeout_secs() -> u64 {
+    // 0 = disabled: preserves the pre-timeout behaviour byte-for-byte.
+    0
+}
 
 /// Upper bound (seconds) for any `[limits]` `*_secs` timeout that feeds a
 /// `Duration`/`Instant`. Each of these is added to a `tokio::time::Instant` at
@@ -891,6 +934,8 @@ impl Default for LimitsToml {
             max_pending_bytes: default_max_pending_bytes(),
             max_total_idle_backend_conns: default_max_total_idle_backend_conns(),
             pool_reap_interval_secs: default_pool_reap_interval_secs(),
+            max_client_connections: default_max_client_connections(),
+            client_idle_timeout_secs: default_client_idle_timeout_secs(),
         }
     }
 }
@@ -1724,6 +1769,23 @@ impl ProxyConfig {
                 return Err(ProxyError::Config(
                     "limits.max_total_idle_backend_conns must be >= 1".to_string(),
                 ));
+            }
+            // The two opt-in bounds below use 0 as "off" (unlimited / disabled),
+            // so they are deliberately NOT in `zero_checks`. Their upper bounds
+            // still matter: the idle timeout feeds an `Instant + Duration`
+            // deadline in the query loop (same overflow hazard as every other
+            // `*_secs` key), and the connection cap sizes a `tokio::sync::
+            // Semaphore`, which panics above `Semaphore::MAX_PERMITS`.
+            if l.client_idle_timeout_secs > MAX_LIMIT_SECS {
+                return Err(ProxyError::Config(format!(
+                    "limits.client_idle_timeout_secs must be <= {MAX_LIMIT_SECS} seconds (1 year)"
+                )));
+            }
+            if l.max_client_connections > tokio::sync::Semaphore::MAX_PERMITS {
+                return Err(ProxyError::Config(format!(
+                    "limits.max_client_connections must be <= {}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                )));
             }
         }
 
@@ -2611,6 +2673,10 @@ mod tests {
         assert_eq!(l.max_pending_bytes, 64 * 1024 * 1024);
         assert_eq!(l.max_total_idle_backend_conns, 8192);
         assert_eq!(l.pool_reap_interval_secs, 30);
+        // The two opt-in bounds default to "off" so an existing config keeps
+        // today's behaviour exactly: no client-connection cap, no idle timeout.
+        assert_eq!(l.max_client_connections, 0);
+        assert_eq!(l.client_idle_timeout_secs, 0);
         // And the field on a default ProxyConfig matches.
         assert_eq!(
             ProxyConfig::default().limits.max_prepared_bytes,
@@ -2669,6 +2735,69 @@ mod tests {
         assert_eq!(cfg.limits.startup_timeout_secs, 30);
         assert_eq!(cfg.limits.max_total_idle_backend_conns, 8192);
         assert_eq!(cfg.limits.pool_reap_interval_secs, 30);
+        assert_eq!(cfg.limits.max_client_connections, 0);
+        assert_eq!(cfg.limits.client_idle_timeout_secs, 0);
+    }
+
+    #[test]
+    fn test_limits_client_cap_and_idle_timeout_parse_and_validate() {
+        // Both keys are opt-in: parse from a partial [limits] table, and a
+        // non-zero value validates.
+        let limits: LimitsToml =
+            toml::from_str("max_client_connections = 500\nclient_idle_timeout_secs = 120\n")
+                .expect("parse partial LimitsToml");
+        assert_eq!(limits.max_client_connections, 500);
+        assert_eq!(limits.client_idle_timeout_secs, 120);
+        // Untouched keys keep their defaults.
+        assert_eq!(limits.startup_timeout_secs, 30);
+
+        let mut c = ProxyConfig::default();
+        c.add_node("localhost:5432", "primary").unwrap();
+        c.limits = limits;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_accepts_zero_client_cap_and_idle_timeout() {
+        // 0 means "unlimited"/"disabled" for these two (unlike every other
+        // [limits] key, where 0 disables a safety bound and is rejected), so
+        // the default config must validate.
+        let mut c = ProxyConfig::default();
+        c.add_node("localhost:5432", "primary").unwrap();
+        c.limits.max_client_connections = 0;
+        c.limits.client_idle_timeout_secs = 0;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_out_of_range_client_cap_and_idle_timeout() {
+        let base = || {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            c
+        };
+        // An idle timeout beyond the 1-year ceiling would overflow the
+        // `Instant + Duration` deadline computed in the query loop.
+        let mut c = base();
+        c.limits.client_idle_timeout_secs = MAX_LIMIT_SECS + 1;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("limits.client_idle_timeout_secs"),
+            "unexpected error: {err}"
+        );
+        // A cap above Semaphore::MAX_PERMITS would panic Semaphore::new.
+        let mut c = base();
+        c.limits.max_client_connections = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("limits.max_client_connections"),
+            "unexpected error: {err}"
+        );
+        // The boundary values are accepted.
+        let mut c = base();
+        c.limits.client_idle_timeout_secs = MAX_LIMIT_SECS;
+        c.limits.max_client_connections = tokio::sync::Semaphore::MAX_PERMITS;
+        assert!(c.validate().is_ok());
     }
 
     #[test]
