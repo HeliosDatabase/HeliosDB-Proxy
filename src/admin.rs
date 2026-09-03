@@ -1583,6 +1583,14 @@ impl AdminServer {
 
     /// `GET /api/analytics` — top queries by call count plus the slow-query
     /// count. Returns 503 when analytics is not attached/enabled.
+    ///
+    /// Reads the same shared state the query path writes. Since the ingest now
+    /// runs on a background consumer task, the newest few queries may not be
+    /// reflected yet — the view lags by however long it takes to drain the
+    /// `[analytics] queue_capacity` queue (microseconds in practice).
+    /// `analytics_dropped_total` counts executions discarded because that
+    /// queue was full; a persistently non-zero delta means analytics is being
+    /// shed to protect the relay, and the capacity should be raised.
     #[cfg(feature = "query-analytics")]
     async fn handle_analytics(
         path: &str,
@@ -1615,9 +1623,10 @@ impl AdminServer {
         Ok((
             200,
             serde_json::json!({
-                "limit":            limit,
-                "top_queries":      top,
-                "slow_query_count": slow_count,
+                "limit":                     limit,
+                "top_queries":               top,
+                "slow_query_count":          slow_count,
+                "analytics_dropped_total":   a.dropped_total(),
             }),
         ))
     }

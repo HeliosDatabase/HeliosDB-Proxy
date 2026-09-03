@@ -416,12 +416,26 @@ ttl_fallback_secs = 60          # Fallback TTL when WAL is unavailable
 # ANALYTICS — Query analytics, slow query log, and pattern detection
 # =============================================================================
 
+# These are the keys the proxy.toml parser (`AnalyticsToml` in src/config.rs)
+# actually recognises; each line shows its DEFAULT. The `[analytics.*]`
+# sub-tables further down document the library defaults and are IGNORED by
+# proxy.toml.
 # [analytics]
-# enabled            = true
-# normalize_queries  = true          # Replace literals with $N placeholders
-# track_parameters   = false         # Privacy: do not log actual values
-# retention_days     = 7
-# max_fingerprints   = 10000         # Unique query shapes to track
+# enabled                = false     # Record per-query stats / slow log / patterns
+# slow_query_ms          = 1000      # Queries slower than this hit the slow log
+# max_fingerprints       = 10000     # Unique query shapes to track
+# # Bounded queue between the connection tasks and the single background
+# # analytics consumer. Fingerprinting, statistics, the slow-query log, pattern
+# # detection and cost attribution all run on that consumer, so a query only
+# # pays a non-blocking try_send. An execution arriving when the queue is full
+# # is DROPPED — never blocks the relay — and counted as
+# # `analytics_dropped_total` in GET /api/analytics. Must be >= 1. Raise it if
+# # that counter climbs. Because ingest is asynchronous, /api/analytics can lag
+# # the newest query by the queue drain time (microseconds in practice).
+# queue_capacity         = 8192
+# # Bound on the memoized raw-SQL -> fingerprint cache: a repeated statement
+# # skips all six regex normalization passes. Set to 0 to disable memoization.
+# fingerprint_cache_size = 10000
 #
 # # Slow query log
 # [analytics.slow_query]

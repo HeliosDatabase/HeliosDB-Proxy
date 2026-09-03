@@ -262,11 +262,18 @@ impl PatternDetector {
         // Periodic cleanup
         self.maybe_cleanup();
 
-        // Get or create session history
-        let mut session = self
-            .sessions
-            .entry(session_id.to_string())
-            .or_insert_with(|| SessionHistory::new(session_id.to_string()));
+        // Get or create session history. The `entry` API needs an owned key,
+        // so going straight to it allocated a `String` copy of the session id
+        // on EVERY query even though the entry almost always already exists;
+        // probe with the borrowed id first and only pay for the key on the
+        // (once-per-session) miss.
+        let mut session = match self.sessions.get_mut(session_id) {
+            Some(existing) => existing,
+            None => self
+                .sessions
+                .entry(session_id.to_string())
+                .or_insert_with(|| SessionHistory::new(session_id.to_string())),
+        };
 
         // Record the query
         session.record_query(fingerprint, self.config.session_history_size);

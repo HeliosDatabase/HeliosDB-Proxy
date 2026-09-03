@@ -935,6 +935,16 @@ pub struct AnalyticsToml {
     pub slow_query_ms: u64,
     /// Maximum distinct query fingerprints to track.
     pub max_fingerprints: u32,
+    /// Capacity of the bounded queue between the connection tasks and the
+    /// single background analytics consumer. Fingerprinting, metrics, pattern
+    /// detection and cost attribution all run on that consumer, so the query
+    /// relay only pays a `try_send`. An execution arriving when the queue is
+    /// full is DROPPED (counted as `analytics_dropped_total` on
+    /// `GET /api/analytics`) rather than blocking the relay. Must be >= 1.
+    pub queue_capacity: u32,
+    /// Bound on the memoized raw-SQL -> fingerprint cache. Repeat statements
+    /// skip all six regex normalization passes. `0` disables memoization.
+    pub fingerprint_cache_size: u32,
 }
 
 impl Default for AnalyticsToml {
@@ -943,6 +953,8 @@ impl Default for AnalyticsToml {
             enabled: false,
             slow_query_ms: 1000,
             max_fingerprints: 10000,
+            queue_capacity: 8192,
+            fingerprint_cache_size: 10000,
         }
     }
 }
@@ -1824,6 +1836,17 @@ impl ProxyConfig {
             }
         }
 
+        // Query-analytics tunables. A zero ingest-queue capacity would make
+        // `mpsc::channel` panic at construction and would drop 100% of the
+        // samples even if it did not, so reject it here. `fingerprint_cache_size`
+        // is deliberately unconstrained: 0 is the documented way to disable
+        // fingerprint memoization.
+        if self.analytics.queue_capacity == 0 {
+            return Err(ProxyError::Config(
+                "analytics.queue_capacity must be >= 1".to_string(),
+            ));
+        }
+
         // Anomaly detector tunables. Parsed on every build; only consumed when
         // the `anomaly-detection` feature is compiled in, but the values are
         // degenerate regardless of feature, so validate them unconditionally.
@@ -2385,6 +2408,77 @@ mod tests {
         assert_eq!(a.event_buffer_size, 1024);
         assert!(a.emit_novel_queries);
         assert_eq!(a.max_seen_fingerprints, 100_000);
+    }
+
+    /// The two analytics-pipeline knobs must default to the documented
+    /// values, and an existing config that omits them must keep parsing.
+    #[test]
+    fn test_analytics_toml_defaults() {
+        let a = AnalyticsToml::default();
+        assert!(!a.enabled);
+        assert_eq!(a.slow_query_ms, 1000);
+        assert_eq!(a.max_fingerprints, 10000);
+        assert_eq!(a.queue_capacity, 8192);
+        assert_eq!(a.fingerprint_cache_size, 10000);
+    }
+
+    /// An `[analytics]` block written before these keys existed (only the
+    /// three original keys) must still parse and pick up the new defaults.
+    #[test]
+    fn test_analytics_toml_legacy_block_uses_new_defaults() {
+        let mut base = ProxyConfig::default();
+        base.add_node("localhost:5432", "primary").unwrap();
+        let mut val = toml::Value::try_from(&base).unwrap();
+        {
+            let analytics = val
+                .get_mut("analytics")
+                .and_then(|v| v.as_table_mut())
+                .expect("analytics table");
+            analytics.remove("queue_capacity");
+            analytics.remove("fingerprint_cache_size");
+        }
+        let s = toml::to_string(&val).unwrap();
+        let cfg: ProxyConfig = toml::from_str(&s).unwrap();
+        assert_eq!(cfg.analytics.queue_capacity, 8192);
+        assert_eq!(cfg.analytics.fingerprint_cache_size, 10000);
+        cfg.validate().unwrap();
+    }
+
+    /// Both knobs round-trip through a full config and override the defaults.
+    #[test]
+    fn test_analytics_toml_block_parses_and_overrides() {
+        let mut base = ProxyConfig::default();
+        base.add_node("localhost:5432", "primary").unwrap();
+        base.analytics = AnalyticsToml {
+            enabled: true,
+            slow_query_ms: 250,
+            max_fingerprints: 4096,
+            queue_capacity: 128,
+            fingerprint_cache_size: 0,
+        };
+        let s = toml::to_string(&base).unwrap();
+        assert!(s.contains("[analytics]"), "serialized config: {s}");
+        let cfg: ProxyConfig = toml::from_str(&s).unwrap();
+        assert!(cfg.analytics.enabled);
+        assert_eq!(cfg.analytics.slow_query_ms, 250);
+        assert_eq!(cfg.analytics.max_fingerprints, 4096);
+        assert_eq!(cfg.analytics.queue_capacity, 128);
+        // 0 is the documented "disable memoization" value and must validate.
+        assert_eq!(cfg.analytics.fingerprint_cache_size, 0);
+        cfg.validate().unwrap();
+    }
+
+    /// A zero queue capacity would panic `mpsc::channel`; validate() rejects it.
+    #[test]
+    fn test_analytics_queue_capacity_zero_rejected() {
+        let mut c = ProxyConfig::default();
+        c.add_node("localhost:5432", "primary").unwrap();
+        c.analytics.queue_capacity = 0;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("analytics.queue_capacity"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
