@@ -243,6 +243,44 @@ impl ConnectionPool {
         }
     }
 
+    /// Decrement the `total_connections` gauge without wrapping past zero.
+    ///
+    /// `close_all` stores 0 outright, so a connection returned afterwards
+    /// must not underflow the gauge to `u64::MAX`.
+    fn dec_total_connections(&self) {
+        let _ = self
+            .total_connections
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                Some(v.saturating_sub(1))
+            });
+    }
+
+    /// Liveness gate applied to an idle connection at checkout time.
+    ///
+    /// * With a live backend client we always run the free, non-blocking
+    ///   socket peek — a connection the backend closed while it sat idle
+    ///   must never be handed out.
+    /// * Without a socket to peek at (skeleton connections) we fall back to
+    ///   `validate_connection`, gated on the existing
+    ///   `PoolConfig::test_on_acquire` flag.
+    async fn checkout_liveness_ok(&self, conn: &PooledConnection) -> bool {
+        if let Some(client) = conn.client.as_ref() {
+            if client.is_probably_alive() {
+                return true;
+            }
+            self.metrics
+                .validation_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
+        if !self.config.test_on_acquire {
+            return true;
+        }
+        // `validate_connection` counts its own failures.
+        matches!(self.validate_connection(conn).await, Ok(true))
+    }
+
     /// Remove a node from the pool
     pub async fn remove_node(&self, node_id: &NodeId) {
         let mut pools = self.pools.write().await;
@@ -284,7 +322,7 @@ impl ConnectionPool {
                 .to_std()
                 .unwrap_or(Duration::ZERO);
 
-            if age <= self.config.max_lifetime {
+            if age <= self.config.max_lifetime && self.checkout_liveness_ok(&conn).await {
                 conn.state = ConnectionState::InUse;
                 conn.last_used = chrono::Utc::now();
                 conn.use_count += 1;
@@ -292,12 +330,13 @@ impl ConnectionPool {
                 return Ok(conn);
             }
 
-            // Too old — drop it (which releases its permit) and fall through
+            // Too old, or the backend closed / desynced the socket while it
+            // sat idle — drop it (which releases its permit) and fall through
             // to the create-new path.
             self.metrics
                 .connections_recycled
                 .fetch_add(1, Ordering::Relaxed);
-            self.total_connections.fetch_sub(1, Ordering::SeqCst);
+            self.dec_total_connections();
             drop(conn);
         }
 
@@ -353,6 +392,22 @@ impl ConnectionPool {
             conn.state = ConnectionState::Idle;
             conn.last_used = chrono::Utc::now();
             pool.connections.push(conn);
+        } else {
+            // The node was removed (`remove_node`) while this connection was
+            // checked out, so it can only be dropped here. `remove_node` can
+            // only account for the connections that were sitting in the pool
+            // at that moment, so without this decrement the in-use ones leak
+            // into `total_connections` permanently.
+            self.dec_total_connections();
+            self.metrics
+                .connections_closed
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                "Dropped connection {:?}: node {:?} no longer in pool",
+                conn.id,
+                conn.node_id
+            );
+            drop(conn);
         }
     }
 
@@ -712,6 +767,159 @@ mod tests {
 
         let conn = pool.get_connection(&node_id).await.expect("acquire");
         assert!(conn.client.is_none(), "no template → no live client");
+    }
+
+    /// Regression (gauge leak): a connection that is checked out when its
+    /// node is removed can only be dropped on return. `remove_node` accounts
+    /// for the connections sitting in the pool at that moment, not the
+    /// in-use ones, so `return_connection` must decrement the gauge itself —
+    /// otherwise `total_connections` climbs forever.
+    #[tokio::test]
+    async fn test_return_after_remove_node_decrements_total_connections() {
+        let pool = ConnectionPool::new(PoolConfig::default());
+        let node_id = NodeId::new();
+        pool.add_node(node_id).await;
+
+        let conn = pool.get_connection(&node_id).await.expect("acquire");
+        assert_eq!(pool.total_connections().await, 1);
+
+        // Node goes away while the connection is checked out; the in-use
+        // connection is not in `pool.connections`, so nothing is decremented.
+        pool.remove_node(&node_id).await;
+        assert_eq!(pool.total_connections().await, 1);
+
+        pool.return_connection(conn).await;
+        assert_eq!(
+            pool.total_connections().await,
+            0,
+            "returning to a removed node must not leak the gauge"
+        );
+        assert_eq!(pool.active_connections().await, 0);
+        assert_eq!(pool.metrics().await.connections_closed, 1);
+    }
+
+    /// Returning to a removed node must never underflow the gauge, even
+    /// when `close_all` has already zeroed it.
+    #[tokio::test]
+    async fn test_return_after_remove_node_does_not_underflow_total() {
+        let pool = ConnectionPool::new(PoolConfig::default());
+        let node_id = NodeId::new();
+        pool.add_node(node_id).await;
+
+        let conn = pool.get_connection(&node_id).await.expect("acquire");
+        pool.remove_node(&node_id).await;
+        pool.close_all().await.expect("close_all");
+        assert_eq!(pool.total_connections().await, 0);
+
+        pool.return_connection(conn).await;
+        assert_eq!(
+            pool.total_connections().await,
+            0,
+            "gauge must saturate at zero, not wrap to u64::MAX"
+        );
+    }
+
+    /// Regression (stale socket handed out): an idle connection whose
+    /// backend closed the socket must be recycled at checkout instead of
+    /// being handed to the next caller. `test_on_acquire` is set, as it is
+    /// by default.
+    #[tokio::test]
+    async fn test_closed_socket_is_not_handed_out_on_checkout() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let client_sock = TcpStream::connect(addr).await.expect("connect");
+        let (server_sock, _) = listener.accept().await.expect("accept");
+
+        let pool = ConnectionPool::new(PoolConfig {
+            min_connections: 0,
+            max_connections: 4,
+            test_on_acquire: true,
+            acquire_timeout: Duration::from_millis(500),
+            ..Default::default()
+        });
+        let node_id = NodeId::new();
+        pool.add_node(node_id).await;
+
+        // Attach a real socket to the pooled connection, then park it.
+        let mut conn = pool.get_connection(&node_id).await.expect("acquire");
+        let dead_id = conn.id;
+        conn.client = Some(BackendClient::from_tcp_for_test(client_sock));
+        pool.return_connection(conn).await;
+        assert_eq!(pool.total_connections().await, 1);
+
+        // Backend disappears while the connection sits idle.
+        drop(server_sock);
+        for _ in 0..50 {
+            {
+                let pools = pool.pools.read().await;
+                let parked = &pools.get(&node_id).expect("node pool").connections[0];
+                if !parked
+                    .client
+                    .as_ref()
+                    .expect("live client")
+                    .is_probably_alive()
+                {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let fresh = pool.get_connection(&node_id).await.expect("re-acquire");
+        assert_ne!(
+            fresh.id, dead_id,
+            "pool handed out a connection whose socket the backend had closed"
+        );
+
+        let metrics = pool.metrics().await;
+        assert_eq!(
+            metrics.validation_failures, 1,
+            "the dead socket must be counted as a validation failure"
+        );
+        assert_eq!(
+            metrics.connections_recycled, 1,
+            "the dead connection must be recycled, not reused"
+        );
+        assert_eq!(
+            metrics.connections_created, 2,
+            "a replacement connection must be created"
+        );
+        // One recycled (-1) plus one created (+1): the gauge stays at 1.
+        assert_eq!(pool.total_connections().await, 1);
+    }
+
+    /// A live socket must still be reused — the liveness probe must not
+    /// throw away healthy idle connections.
+    #[tokio::test]
+    async fn test_live_socket_connection_is_reused_on_checkout() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let client_sock = TcpStream::connect(addr).await.expect("connect");
+        let (_server_sock, _) = listener.accept().await.expect("accept");
+
+        let pool = ConnectionPool::new(PoolConfig {
+            min_connections: 0,
+            max_connections: 4,
+            test_on_acquire: true,
+            ..Default::default()
+        });
+        let node_id = NodeId::new();
+        pool.add_node(node_id).await;
+
+        let mut conn = pool.get_connection(&node_id).await.expect("acquire");
+        let live_id = conn.id;
+        conn.client = Some(BackendClient::from_tcp_for_test(client_sock));
+        pool.return_connection(conn).await;
+
+        let reused = pool.get_connection(&node_id).await.expect("re-acquire");
+        assert_eq!(reused.id, live_id, "healthy idle connection must be reused");
+        let metrics = pool.metrics().await;
+        assert_eq!(metrics.connections_created, 1);
+        assert_eq!(metrics.validation_failures, 0);
     }
 
     /// Returning a connection to the pool keeps the permit attached, so
