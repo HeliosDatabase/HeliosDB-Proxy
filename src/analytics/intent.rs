@@ -116,62 +116,77 @@ impl QueryClassifier {
         }
     }
 
-    /// Classify query intent
-    #[allow(clippy::if_same_then_else)]
+    /// Classify query intent.
+    ///
+    /// Allocates one lowercase copy of the statement; callers that already
+    /// hold one (the analytics ingest path does — see
+    /// [`QueryClassifier::classify_lower`]) should pass it in instead. This
+    /// previously built BOTH an uppercase and a lowercase copy of every
+    /// statement.
     pub fn classify(&self, query: &str) -> QueryIntent {
-        let upper = query.trim().to_uppercase();
-        let lower = query.to_lowercase();
+        self.classify_lower(&query.to_lowercase())
+    }
+
+    /// Classify from an already-lowercased copy of the statement.
+    ///
+    /// Behaviourally identical to [`QueryClassifier::classify`]: the keyword
+    /// tests only ever inspected the leading token case-insensitively, so
+    /// matching lowercase keywords against the lowercase copy gives the same
+    /// answer while saving a whole-SQL allocation per query.
+    #[allow(clippy::if_same_then_else)]
+    pub fn classify_lower(&self, lower: &str) -> QueryIntent {
+        let head = lower.trim_start();
 
         // Check for transaction control
-        if upper.starts_with("BEGIN")
-            || upper.starts_with("COMMIT")
-            || upper.starts_with("ROLLBACK")
-            || upper.starts_with("START TRANSACTION")
-            || upper.starts_with("SAVEPOINT")
+        if head.starts_with("begin")
+            || head.starts_with("commit")
+            || head.starts_with("rollback")
+            || head.starts_with("start transaction")
+            || head.starts_with("savepoint")
         {
             return QueryIntent::Transaction;
         }
 
         // Check for utility operations
-        if upper.starts_with("SET")
-            || upper.starts_with("SHOW")
-            || upper.starts_with("EXPLAIN")
-            || upper.starts_with("ANALYZE")
-            || upper.starts_with("VACUUM")
+        if head.starts_with("set")
+            || head.starts_with("show")
+            || head.starts_with("explain")
+            || head.starts_with("analyze")
+            || head.starts_with("vacuum")
         {
             return QueryIntent::Utility;
         }
 
         // Check for schema operations
-        if upper.starts_with("CREATE")
-            || upper.starts_with("ALTER")
-            || upper.starts_with("DROP")
-            || upper.starts_with("TRUNCATE")
+        if head.starts_with("create")
+            || head.starts_with("alter")
+            || head.starts_with("drop")
+            || head.starts_with("truncate")
         {
             return QueryIntent::Schema;
         }
 
         // Check for RAG operations (before embedding — RAG tables like
         // "chunks" may contain an "embedding" column, so check RAG first)
-        if self.matches_table_pattern(&lower, &self.rag_tables) {
-            if upper.starts_with("SELECT") {
+        if self.matches_table_pattern(lower, &self.rag_tables) {
+            if head.starts_with("select") {
                 return QueryIntent::RagRetrieval;
-            } else if upper.starts_with("INSERT") || upper.starts_with("UPDATE") {
+            } else if head.starts_with("insert") || head.starts_with("update") {
                 return QueryIntent::RagIndexing;
             }
         }
 
         // Check for embedding operations
-        if self.matches_table_pattern(&lower, &self.embedding_tables) {
-            if upper.starts_with("SELECT") {
+        if self.matches_table_pattern(lower, &self.embedding_tables) {
+            if head.starts_with("select") {
                 return QueryIntent::Embedding;
-            } else if upper.starts_with("INSERT") || upper.starts_with("UPDATE") {
+            } else if head.starts_with("insert") || head.starts_with("update") {
                 return QueryIntent::Embedding;
             }
         }
 
         // Check for agent memory operations
-        if self.matches_table_pattern(&lower, &self.memory_tables) {
+        if self.matches_table_pattern(lower, &self.memory_tables) {
             return QueryIntent::AgentMemory;
         }
 
@@ -187,12 +202,11 @@ impl QueryClassifier {
         }
 
         // Basic classification by operation
-        if upper.starts_with("SELECT") {
+        if head.starts_with("select") {
             return QueryIntent::Retrieval;
         }
 
-        if upper.starts_with("INSERT") || upper.starts_with("UPDATE") || upper.starts_with("DELETE")
-        {
+        if head.starts_with("insert") || head.starts_with("update") || head.starts_with("delete") {
             return QueryIntent::Storage;
         }
 
@@ -651,6 +665,43 @@ fn now_nanos() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `classify_lower` is the allocation-free entry point used by the ingest
+    /// path; it must agree with `classify` on every branch, including the
+    /// leading-whitespace and mixed-case cases.
+    #[test]
+    fn test_classify_lower_matches_classify() {
+        let classifier = QueryClassifier::new();
+        let cases = [
+            "BEGIN",
+            "  begin",
+            "Start Transaction",
+            "SAVEPOINT sp1",
+            "SET search_path = public",
+            "SHOW all",
+            "EXPLAIN SELECT 1",
+            "VACUUM ANALYZE",
+            "CREATE TABLE t (id INT)",
+            "TRUNCATE t",
+            "SELECT * FROM chunks WHERE id = 1",
+            "INSERT INTO documents VALUES (1)",
+            "SELECT * FROM embeddings ORDER BY v <-> '[1,2]'",
+            "UPDATE vectors SET v = '[1]'",
+            "SELECT * FROM agent_memory",
+            "SELECT cosine_similarity(a, b) FROM t",
+            "  SELECT * FROM t",
+            "DELETE FROM t WHERE id = 1",
+            "GRANT SELECT ON t TO bob",
+            "",
+        ];
+        for sql in cases {
+            assert_eq!(
+                classifier.classify(sql),
+                classifier.classify_lower(&sql.to_lowercase()),
+                "classify/classify_lower disagree on {sql:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_query_classifier_basic() {

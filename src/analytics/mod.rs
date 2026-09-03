@@ -7,6 +7,11 @@
 //! - Pattern detection (N+1, bursts)
 //! - AI/Agent workload classification
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use tokio::sync::{mpsc, oneshot};
+
 pub mod config;
 pub mod fingerprinter;
 pub mod histogram;
@@ -19,6 +24,7 @@ pub mod statistics;
 // Re-exports
 pub use config::{
     AnalyticsConfig, AnalyticsConfigBuilder, PatternConfig, SamplingConfig, SlowQueryConfig,
+    DEFAULT_ANALYTICS_QUEUE_CAPACITY,
 };
 pub use fingerprinter::{OperationType, QueryFingerprint, QueryFingerprinter};
 pub use histogram::{HistogramBucket, HistogramSnapshot, LatencyHistogram};
@@ -29,6 +35,18 @@ pub use metrics::{AnalyticsMetrics, AnalyticsSnapshot, QueryMetricEntry};
 pub use patterns::{NplusOnePattern, PatternAlert, PatternDetector, QueryBurst};
 pub use slow_log::{SlowQueryEntry, SlowQueryLog, SlowQueryReader};
 pub use statistics::{QueryExecution, QueryStatistics, QueryStats, StatisticsStore};
+
+/// A unit of work on the analytics ingest queue.
+///
+/// `Record` is boxed so the enum stays pointer-sized: a `QueryExecution`
+/// carries five `String`s and would otherwise inflate every queue slot (and
+/// trip `clippy::large_enum_variant`).
+enum AnalyticsMsg {
+    /// Fingerprint, meter and pattern-match this execution.
+    Record(Box<QueryExecution>),
+    /// Barrier — acked once everything queued ahead of it has been ingested.
+    Flush(oneshot::Sender<()>),
+}
 
 /// Main analytics engine
 pub struct QueryAnalytics {
@@ -58,6 +76,16 @@ pub struct QueryAnalytics {
 
     /// Cost attribution
     costs: CostAttribution,
+
+    /// Queue to the single background consumer, installed by
+    /// [`QueryAnalytics::start_consumer`]. While unset (library and unit-test
+    /// default) `record` does the whole ingest inline on the caller's task,
+    /// exactly as before.
+    queue: OnceLock<mpsc::Sender<AnalyticsMsg>>,
+
+    /// Executions dropped because the queue was full or closed. Surfaced as
+    /// `analytics_dropped_total` on `GET /api/analytics`.
+    dropped: AtomicU64,
 }
 
 impl QueryAnalytics {
@@ -66,9 +94,10 @@ impl QueryAnalytics {
         let slow_log = SlowQueryLog::new(config.slow_query.clone());
         let patterns = PatternDetector::new(config.patterns.clone());
         let statistics = StatisticsStore::new(config.max_fingerprints);
+        let fingerprinter = QueryFingerprinter::with_cache_size(config.fingerprint_cache_size);
 
         Self {
-            fingerprinter: QueryFingerprinter::new(),
+            fingerprinter,
             statistics,
             slow_log,
             patterns,
@@ -76,6 +105,8 @@ impl QueryAnalytics {
             classifier: QueryClassifier::new(),
             workflows: WorkflowTracer::new(),
             costs: CostAttribution::new(),
+            queue: OnceLock::new(),
+            dropped: AtomicU64::new(0),
             config,
         }
     }
@@ -85,7 +116,18 @@ impl QueryAnalytics {
         Self::new(AnalyticsConfig::default())
     }
 
-    /// Record query execution
+    /// Record a query execution.
+    ///
+    /// When the background consumer is running (see
+    /// [`QueryAnalytics::start_consumer`]) this only hands the record to a
+    /// bounded queue and returns: fingerprinting, metrics, pattern detection
+    /// and cost attribution all happen on that task, OFF the connection task
+    /// that served the query. If the queue is full the record is dropped and
+    /// [`QueryAnalytics::dropped_total`] is incremented — the query relay is
+    /// never blocked by analytics.
+    ///
+    /// With no consumer installed the work is done inline on the caller's
+    /// task, byte-for-byte the previous behaviour.
     pub fn record(&self, execution: QueryExecution) {
         if !self.config.enabled {
             return;
@@ -96,34 +138,121 @@ impl QueryAnalytics {
             return;
         }
 
-        // Fingerprint the query
-        let fingerprint = self.fingerprinter.fingerprint(&execution.query);
+        if let Some(tx) = self.queue.get() {
+            if tx
+                .try_send(AnalyticsMsg::Record(Box::new(execution)))
+                .is_err()
+            {
+                // Full or closed: drop the sample rather than stall the relay.
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+
+        self.ingest(&execution);
+    }
+
+    /// Synchronous [`QueryAnalytics::record`]: performs the whole ingest on
+    /// the calling thread even when the background consumer is running. For
+    /// tests and callers that must observe the effect immediately.
+    pub fn record_now(&self, execution: QueryExecution) {
+        if !self.config.enabled {
+            return;
+        }
+
+        if self.config.sampling.enabled && !self.should_sample() {
+            return;
+        }
+
+        self.ingest(&execution);
+    }
+
+    /// The actual analytics work. Runs on the background consumer task when
+    /// one is installed, otherwise on the caller's task.
+    fn ingest(&self, execution: &QueryExecution) {
+        // Fingerprint the query (memoized: repeat SQL skips all regex work).
+        let fingerprint = self.fingerprinter.fingerprint_cached(&execution.query);
 
         // Record statistics
-        self.statistics.record(&fingerprint, &execution);
+        self.statistics.record(&fingerprint, execution);
 
         // Check for slow query
-        self.slow_log.log_if_slow(&execution, &fingerprint);
+        self.slow_log.log_if_slow(execution, &fingerprint);
 
         // Detect patterns
         if let Some(session) = &execution.session_id {
-            self.patterns
-                .record_query(session, &execution, &fingerprint);
+            self.patterns.record_query(session, execution, &fingerprint);
         }
 
-        // Classify intent
+        // Classify intent. One lowercase copy of the statement, shared with
+        // nothing else on this path — the fingerprinter keeps its own inside
+        // the memo, so a cached shape pays no case conversion at all here.
         let intent = self.classifier.classify(&execution.query);
 
         // Record metrics
-        self.metrics.record(&fingerprint, &execution, intent);
+        self.metrics.record(&fingerprint, execution, intent);
 
         // Track workflow if applicable
         if let Some(workflow_id) = &execution.workflow_id {
-            self.workflows.record_step(workflow_id, &execution);
+            self.workflows.record_step(workflow_id, execution);
         }
 
         // Attribute costs
-        self.costs.record(&execution);
+        self.costs.record(execution);
+    }
+
+    /// Spawn the single background consumer and install its queue.
+    ///
+    /// Called once at server startup. A second call is a no-op returning
+    /// `None`. The returned handle is aborted by the server at shutdown; the
+    /// task also exits on its own once the engine is dropped (it holds only a
+    /// `Weak`, so it never keeps the engine alive).
+    ///
+    /// Consumers of the shared state (`/api/analytics`, `/anomalies`) read the
+    /// SAME structures as before — they are simply written from the consumer
+    /// task, so a reading endpoint may lag the newest query by the time it
+    /// takes to drain the queue (microseconds in practice).
+    pub fn start_consumer(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        let capacity = self.config.queue_capacity.max(1);
+        let (tx, mut rx) = mpsc::channel::<AnalyticsMsg>(capacity);
+
+        if self.queue.set(tx).is_err() {
+            tracing::warn!("analytics consumer already running; ignoring duplicate start");
+            return None;
+        }
+
+        let weak = Arc::downgrade(self);
+        Some(tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                let Some(this) = weak.upgrade() else {
+                    break;
+                };
+                match msg {
+                    AnalyticsMsg::Record(execution) => this.ingest(&execution),
+                    AnalyticsMsg::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        }))
+    }
+
+    /// Wait until every execution queued before this call has been ingested.
+    /// No-op when no consumer is running (records are already applied
+    /// synchronously in that case).
+    pub async fn flush(&self) {
+        let Some(tx) = self.queue.get() else {
+            return;
+        };
+        let (ack, done) = oneshot::channel();
+        if tx.send(AnalyticsMsg::Flush(ack)).await.is_ok() {
+            let _ = done.await;
+        }
+    }
+
+    /// Executions dropped because the ingest queue was full (or closed).
+    pub fn dropped_total(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Check if we should sample this query
@@ -277,6 +406,100 @@ mod tests {
         let top = analytics.top_queries(OrderBy::Calls, 10);
         assert_eq!(top.len(), 1);
         assert_eq!(top[0].calls, 1);
+    }
+
+    /// Building an execution record for the tests below.
+    fn exec(query: &str, session: &str) -> QueryExecution {
+        QueryExecution {
+            query: query.to_string(),
+            duration: Duration::from_millis(5),
+            rows: 1,
+            error: None,
+            user: "test_user".to_string(),
+            client_ip: "127.0.0.1".to_string(),
+            database: "test_db".to_string(),
+            node: "primary".to_string(),
+            session_id: Some(session.to_string()),
+            workflow_id: None,
+            parameters: None,
+        }
+    }
+
+    /// With the background consumer running, `record` must return without
+    /// doing the work, and `flush` must make every queued execution visible
+    /// in exactly the same shared state the admin endpoints read.
+    #[tokio::test]
+    async fn test_async_consumer_ingests_queued_executions() {
+        let analytics = Arc::new(QueryAnalytics::with_defaults());
+        let handle = analytics
+            .start_consumer()
+            .expect("first start_consumer must install the queue");
+
+        for _ in 0..8 {
+            analytics.record(exec("SELECT * FROM users WHERE id = 1", "s1"));
+        }
+        analytics.flush().await;
+
+        let top = analytics.top_queries(OrderBy::Calls, 10);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].calls, 8);
+        assert_eq!(analytics.dropped_total(), 0);
+
+        handle.abort();
+    }
+
+    /// A second `start_consumer` must not install a second queue.
+    #[tokio::test]
+    async fn test_start_consumer_is_idempotent() {
+        let analytics = Arc::new(QueryAnalytics::with_defaults());
+        let first = analytics.start_consumer();
+        assert!(first.is_some());
+        assert!(analytics.start_consumer().is_none());
+        first.unwrap().abort();
+    }
+
+    /// A full queue must DROP the record (never block the relay) and count it.
+    /// Runs on the single-threaded test runtime and never awaits, so the
+    /// consumer cannot drain between `record` calls.
+    #[tokio::test]
+    async fn test_record_drops_when_queue_full() {
+        let config = AnalyticsConfig::builder().queue_capacity(1).build();
+        let analytics = Arc::new(QueryAnalytics::new(config));
+        let handle = analytics.start_consumer().unwrap();
+
+        for _ in 0..32 {
+            analytics.record(exec("SELECT 1", "s1"));
+        }
+
+        assert!(
+            analytics.dropped_total() > 0,
+            "a capacity-1 queue with no consumer progress must drop records"
+        );
+        handle.abort();
+    }
+
+    /// `record_now` bypasses the queue: the effect is visible immediately even
+    /// while the consumer is installed.
+    #[tokio::test]
+    async fn test_record_now_is_synchronous() {
+        let analytics = Arc::new(QueryAnalytics::with_defaults());
+        let handle = analytics.start_consumer().unwrap();
+
+        analytics.record_now(exec("SELECT * FROM orders WHERE id = 7", "s1"));
+
+        let top = analytics.top_queries(OrderBy::Calls, 10);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].calls, 1);
+        handle.abort();
+    }
+
+    /// Without a consumer, `flush` must return immediately rather than hang.
+    #[tokio::test]
+    async fn test_flush_without_consumer_is_noop() {
+        let analytics = QueryAnalytics::with_defaults();
+        analytics.record(exec("SELECT 1", "s1"));
+        analytics.flush().await;
+        assert_eq!(analytics.top_queries(OrderBy::Calls, 10).len(), 1);
     }
 
     #[test]
