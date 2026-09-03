@@ -8,8 +8,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use parking_lot::RwLock;
 
 use super::concurrency::ConcurrencyLimiter;
 use super::config::{ExceededAction, PriorityLevel, RateLimitConfig};
@@ -90,6 +90,62 @@ impl std::fmt::Display for LimiterKey {
         }
     }
 }
+
+/// A `LimiterKey` paired with its pre-rendered `Display` string.
+///
+/// The rate-limit gate runs on every query, and both halves of the old hot
+/// path allocated: the key itself was rebuilt from the session variables per
+/// query, and the metrics collector formatted `key.to_string()` per query to
+/// index its per-key stats map. A session's keying dimension (global / client
+/// IP / database / user) is fixed for its whole life, so the pair is resolved
+/// once and reused; the string half is an `Arc<str>` so the metrics map can
+/// take an owned copy on first sight of a key without re-formatting.
+///
+/// Equality and hashing follow the key alone — the rendered string is derived
+/// state, never an independent identity.
+#[derive(Debug, Clone)]
+pub struct CachedLimiterKey {
+    key: LimiterKey,
+    display: Arc<str>,
+}
+
+impl CachedLimiterKey {
+    /// Resolve a key and render its display string once.
+    pub fn new(key: LimiterKey) -> Self {
+        let display: Arc<str> = Arc::from(key.to_string().as_str());
+        Self { key, display }
+    }
+
+    /// The underlying bucket key.
+    pub fn key(&self) -> &LimiterKey {
+        &self.key
+    }
+
+    /// The pre-rendered `Display` form, shareable without re-formatting.
+    pub fn display(&self) -> &Arc<str> {
+        &self.display
+    }
+}
+
+impl From<LimiterKey> for CachedLimiterKey {
+    fn from(key: LimiterKey) -> Self {
+        Self::new(key)
+    }
+}
+
+impl std::fmt::Display for CachedLimiterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.display)
+    }
+}
+
+impl PartialEq for CachedLimiterKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for CachedLimiterKey {}
 
 /// Result of rate limit check
 #[derive(Debug, Clone)]
@@ -187,8 +243,11 @@ impl std::fmt::Display for LimitType {
 
 /// Main rate limiter
 pub struct RateLimiter {
-    /// Configuration
-    config: RwLock<RateLimitConfig>,
+    /// Configuration. Held in an `ArcSwap` rather than a `RwLock` so the
+    /// per-query check path is a lock-free load instead of a global reader
+    /// acquisition shared by every connection; `update_config`/`cleanup`
+    /// publish a whole new snapshot (RCU).
+    config: ArcSwap<RateLimitConfig>,
 
     /// Token bucket limiters (burst + sustained rate)
     token_buckets: DashMap<LimiterKey, TokenBucket>,
@@ -213,7 +272,7 @@ impl RateLimiter {
     /// Create a new rate limiter
     pub fn new(config: RateLimitConfig) -> Self {
         Self {
-            config: RwLock::new(config),
+            config: ArcSwap::from_pointee(config),
             token_buckets: DashMap::new(),
             sliding_windows: DashMap::new(),
             concurrency: DashMap::new(),
@@ -226,7 +285,7 @@ impl RateLimiter {
     /// Create with custom cost estimator
     pub fn with_cost_estimator(config: RateLimitConfig, estimator: QueryCostEstimator) -> Self {
         Self {
-            config: RwLock::new(config),
+            config: ArcSwap::from_pointee(config),
             token_buckets: DashMap::new(),
             sliding_windows: DashMap::new(),
             concurrency: DashMap::new(),
@@ -248,30 +307,70 @@ impl RateLimiter {
         cost: u32,
         priority: PriorityLevel,
     ) -> RateLimitResult {
-        let config = self.config.read();
+        let config = self.config.load();
 
         if !config.enabled {
             return RateLimitResult::Allowed;
         }
 
+        // Callers that hold a `CachedLimiterKey` (the proxy's per-query gate)
+        // reuse its rendered form instead of re-formatting here.
+        let display: Arc<str> = Arc::from(key.to_string().as_str());
+        self.check_resolved(key, &display, cost, priority, &config)
+    }
+
+    /// Check rate limit for a pre-resolved key (no key rebuild, no
+    /// `Display` formatting). This is the per-query path.
+    pub fn check_cached(&self, key: &CachedLimiterKey, cost: u32) -> RateLimitResult {
+        self.check_cached_with_priority(key, cost, PriorityLevel::Normal)
+    }
+
+    /// Check rate limit for a pre-resolved key, with priority.
+    pub fn check_cached_with_priority(
+        &self,
+        key: &CachedLimiterKey,
+        cost: u32,
+        priority: PriorityLevel,
+    ) -> RateLimitResult {
+        let config = self.config.load();
+
+        if !config.enabled {
+            return RateLimitResult::Allowed;
+        }
+
+        self.check_resolved(&key.key, &key.display, cost, priority, &config)
+    }
+
+    /// Shared body of the enabled check path. `display` is the key's rendered
+    /// form, threaded through so the metrics collector never formats it.
+    fn check_resolved(
+        &self,
+        key: &LimiterKey,
+        display: &Arc<str>,
+        cost: u32,
+        priority: PriorityLevel,
+        config: &RateLimitConfig,
+    ) -> RateLimitResult {
         let start = Instant::now();
 
         // Check token bucket (QPS)
-        if let Err(exceeded) = self.check_token_bucket(key, cost, priority, &config) {
-            let result = self.handle_exceeded(key, exceeded, &config);
-            self.metrics.record_decision(key, &result, start.elapsed());
+        if let Err(exceeded) = self.check_token_bucket(key, cost, priority, config) {
+            let result = self.handle_exceeded(key, exceeded, config);
+            self.metrics
+                .record_decision_keyed(display, &result, start.elapsed());
             return result;
         }
 
         // Check sliding window (per-minute)
-        if let Err(exceeded) = self.check_sliding_window(key, cost, &config) {
-            let result = self.handle_exceeded_window(key, exceeded, &config);
-            self.metrics.record_decision(key, &result, start.elapsed());
+        if let Err(exceeded) = self.check_sliding_window(key, cost, config) {
+            let result = self.handle_exceeded_window(key, exceeded, config);
+            self.metrics
+                .record_decision_keyed(display, &result, start.elapsed());
             return result;
         }
 
         self.metrics
-            .record_decision(key, &RateLimitResult::Allowed, start.elapsed());
+            .record_decision_keyed(display, &RateLimitResult::Allowed, start.elapsed());
         RateLimitResult::Allowed
     }
 
@@ -280,7 +379,7 @@ impl RateLimiter {
         &self,
         key: &LimiterKey,
     ) -> Result<Arc<ConcurrencyLimiter>, RateLimitExceeded> {
-        let config = self.config.read();
+        let config = self.config.load();
 
         if !config.enabled {
             // Return a dummy limiter that allows everything
@@ -289,11 +388,16 @@ impl RateLimiter {
 
         let max = config.effective_concurrency(key, PriorityLevel::Normal);
 
-        let limiter = self
-            .concurrency
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(ConcurrencyLimiter::new(max)))
-            .clone();
+        // Hit path first: an existing limiter is looked up by reference, so the
+        // key is only cloned when a new bucket actually has to be inserted.
+        let limiter = match self.concurrency.get(key) {
+            Some(existing) => Arc::clone(existing.value()),
+            None => self
+                .concurrency
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(ConcurrencyLimiter::new(max)))
+                .clone(),
+        };
 
         // Check if would exceed
         if limiter.at_capacity() {
@@ -322,7 +426,7 @@ impl RateLimiter {
         query: &str,
         priority: PriorityLevel,
     ) -> RateLimitResult {
-        let config = self.config.read();
+        let config = self.config.load();
 
         let cost = if config.cost_estimation_enabled {
             self.cost_estimator.estimate_cost_with_hint(query)
@@ -403,12 +507,12 @@ impl RateLimiter {
 
     /// Update configuration
     pub fn update_config(&self, config: RateLimitConfig) {
-        *self.config.write() = config;
+        self.config.store(Arc::new(config));
     }
 
     /// Get current configuration (cloned)
     pub fn config(&self) -> RateLimitConfig {
-        self.config.read().clone()
+        RateLimitConfig::clone(&self.config.load())
     }
 
     // Internal methods
@@ -420,6 +524,13 @@ impl RateLimiter {
         priority: PriorityLevel,
         config: &RateLimitConfig,
     ) -> Result<(), TokenBucketExceeded> {
+        // Hit path: look the bucket up by reference so the steady state never
+        // clones the key (nor resolves the effective limits, which only matter
+        // when a bucket is created).
+        if let Some(bucket) = self.token_buckets.get(key) {
+            return bucket.try_acquire(cost);
+        }
+
         let qps = config.effective_qps(key, priority);
         let burst = config.effective_burst(key, priority);
 
@@ -437,6 +548,11 @@ impl RateLimiter {
         cost: u32,
         _config: &RateLimitConfig,
     ) -> Result<(), SlidingWindowExceeded> {
+        // Hit path: existing windows are looked up by reference (no key clone).
+        if let Some(window) = self.sliding_windows.get(key) {
+            return window.try_record_n(cost);
+        }
+
         // Use a per-minute sliding window
         let window = self
             .sliding_windows
@@ -498,15 +614,17 @@ impl RateLimiter {
 
     /// Clean up expired entries
     pub fn cleanup(&self) {
-        let mut config = self.config.write();
+        // RCU against the `ArcSwap` snapshot: mutate a private copy, publish it.
+        let mut config = RateLimitConfig::clone(&self.config.load());
         config.cleanup_expired();
+        self.config.store(Arc::new(config));
     }
 }
 
 impl std::fmt::Debug for RateLimiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RateLimiter")
-            .field("enabled", &self.config.read().enabled)
+            .field("enabled", &self.config.load().enabled)
             .field("token_buckets", &self.token_buckets.len())
             .field("sliding_windows", &self.sliding_windows.len())
             .field("concurrency_limiters", &self.concurrency.len())
@@ -748,6 +866,137 @@ mod tests {
 
         let conc_limiter = result.unwrap();
         assert_eq!(conc_limiter.max_concurrent(), 10);
+    }
+
+    /// A `CachedLimiterKey` must address exactly the same bucket as the plain
+    /// key it was built from — `check_cached` and `check` share state and
+    /// produce identical verdicts.
+    #[test]
+    fn test_cached_key_shares_bucket_with_plain_key() {
+        let config = RateLimitConfig::builder()
+            .default_qps(1)
+            .default_burst(2)
+            .exceeded_action(ExceededAction::Reject)
+            .build();
+        let limiter = RateLimiter::new(config);
+
+        let key = LimiterKey::User("shared".to_string());
+        let cached = CachedLimiterKey::new(key.clone());
+
+        // Two tokens of burst, consumed one through each entry point.
+        assert!(limiter.check(&key, 1).is_allowed());
+        assert!(limiter.check_cached(&cached, 1).is_allowed());
+
+        // Third check must be denied through either entry point — proving the
+        // cached key did not open a second, independent bucket.
+        assert!(!limiter.check_cached(&cached, 1).is_allowed());
+        assert!(!limiter.check(&key, 1).is_allowed());
+
+        assert_eq!(limiter.token_buckets.len(), 1);
+        assert_eq!(limiter.sliding_windows.len(), 1);
+    }
+
+    /// The cached key's rendered form is exactly `LimiterKey`'s `Display`, so
+    /// the metrics map is keyed identically no matter which path recorded it.
+    #[test]
+    fn test_cached_key_display_matches_limiter_key() {
+        for key in [
+            LimiterKey::Global,
+            LimiterKey::User("alice".to_string()),
+            LimiterKey::Database("mydb".to_string()),
+            LimiterKey::ClientIp("10.0.0.7".parse().unwrap()),
+            LimiterKey::composite(vec![
+                LimiterKey::User("u".to_string()),
+                LimiterKey::Database("d".to_string()),
+            ]),
+        ] {
+            let cached = CachedLimiterKey::new(key.clone());
+            assert_eq!(cached.to_string(), key.to_string());
+            assert_eq!(&**cached.display(), key.to_string().as_str());
+            assert_eq!(cached.key(), &key);
+        }
+    }
+
+    /// Metric bookkeeping must be identical between the cached and plain
+    /// paths: same per-key bucket, same totals.
+    #[test]
+    fn test_cached_and_plain_paths_record_same_metric_key() {
+        let config = RateLimitConfig::builder()
+            .default_qps(100)
+            .default_burst(200)
+            .build();
+        let limiter = RateLimiter::new(config);
+
+        let key = LimiterKey::User("metered".to_string());
+        let cached = CachedLimiterKey::new(key.clone());
+
+        limiter.check(&key, 1);
+        limiter.check_cached(&cached, 1);
+
+        let stats = limiter.metrics().get_stats();
+        assert_eq!(stats.total_requests, 2);
+        assert_eq!(stats.key_stats.len(), 1, "both paths share one metric key");
+        assert_eq!(stats.key_stats.get("user:metered").unwrap().total, 2);
+    }
+
+    /// `check_cached` honors a live `update_config` (the ArcSwap reload path):
+    /// disabling the limiter must short-circuit to Allowed immediately.
+    #[test]
+    fn test_update_config_visible_to_cached_path() {
+        let config = RateLimitConfig::builder()
+            .enabled(true)
+            .default_qps(1)
+            .default_burst(1)
+            .exceeded_action(ExceededAction::Reject)
+            .build();
+        let limiter = RateLimiter::new(config);
+        let cached = CachedLimiterKey::new(LimiterKey::User("reload".to_string()));
+
+        assert!(limiter.check_cached(&cached, 1).is_allowed());
+        assert!(!limiter.check_cached(&cached, 1).is_allowed());
+
+        limiter.update_config(
+            RateLimitConfig::builder()
+                .enabled(false)
+                .default_qps(1)
+                .build(),
+        );
+
+        assert!(!limiter.config().enabled);
+        for _ in 0..10 {
+            assert!(limiter.check_cached(&cached, 1).is_allowed());
+        }
+    }
+
+    /// `cleanup` is an RCU over the config snapshot: expired overrides must be
+    /// gone from the published config afterwards, live ones retained.
+    #[test]
+    fn test_cleanup_publishes_pruned_config() {
+        use super::super::config::LimitOverride;
+
+        let mut config = RateLimitConfig::builder().default_qps(100).build();
+        config.add_override(
+            LimiterKey::User("expiring".to_string()),
+            LimitOverride::new()
+                .with_qps(5)
+                .with_duration(Duration::from_millis(10)),
+        );
+        config.add_override(
+            LimiterKey::User("permanent".to_string()),
+            LimitOverride::new().with_qps(7),
+        );
+
+        let limiter = RateLimiter::new(config);
+        assert_eq!(limiter.config().overrides.len(), 2);
+
+        std::thread::sleep(Duration::from_millis(20));
+        limiter.cleanup();
+
+        let after = limiter.config();
+        assert_eq!(after.overrides.len(), 1);
+        assert!(after
+            .overrides
+            .contains_key(&LimiterKey::User("permanent".to_string())));
     }
 
     #[test]
