@@ -81,6 +81,10 @@ max_connections    = 100
 idle_timeout_secs  = 300
 max_lifetime_secs  = 1800
 acquire_timeout_secs = 5
+# Validate a pooled connection before handing it out. A connection with a
+# live backend socket is always checked for peer-close with a free,
+# non-blocking peek; this flag additionally enables the slower
+# validation path for connections without a socket to peek at.
 test_on_acquire    = true
 
 # =============================================================================
