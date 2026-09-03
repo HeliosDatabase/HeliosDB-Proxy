@@ -833,6 +833,17 @@ pub struct LimitsToml {
     /// `POOL_REAP_INTERVAL`.
     #[serde(default = "default_pool_reap_interval_secs")]
     pub pool_reap_interval_secs: u64,
+    /// Cap on entries retained in `FailoverController`'s in-memory failover
+    /// history ring buffer (`src/failover_controller.rs`). Under repeated
+    /// health flapping the controller can attempt many failovers; without a
+    /// cap the history grew unbounded. Same FIFO-eviction shape as
+    /// `max_cancel_keys`: past capacity, the oldest entry is dropped first.
+    /// There is no `[ha]`/`[failover]` config section wired to
+    /// `FailoverController` yet (it is embedded directly via
+    /// `FailoverConfig`, mirroring this default), so this lives here
+    /// alongside the other operational safety caps.
+    #[serde(default = "default_failover_history_max")]
+    pub failover_history_max: usize,
 }
 
 fn default_max_cancel_keys() -> usize {
@@ -868,6 +879,9 @@ fn default_max_total_idle_backend_conns() -> usize {
 fn default_pool_reap_interval_secs() -> u64 {
     30
 }
+fn default_failover_history_max() -> usize {
+    100
+}
 
 /// Upper bound (seconds) for any `[limits]` `*_secs` timeout that feeds a
 /// `Duration`/`Instant`. Each of these is added to a `tokio::time::Instant` at
@@ -891,6 +905,7 @@ impl Default for LimitsToml {
             max_pending_bytes: default_max_pending_bytes(),
             max_total_idle_backend_conns: default_max_total_idle_backend_conns(),
             pool_reap_interval_secs: default_pool_reap_interval_secs(),
+            failover_history_max: default_failover_history_max(),
         }
     }
 }
@@ -1723,6 +1738,11 @@ impl ProxyConfig {
             if l.max_total_idle_backend_conns == 0 {
                 return Err(ProxyError::Config(
                     "limits.max_total_idle_backend_conns must be >= 1".to_string(),
+                ));
+            }
+            if l.failover_history_max == 0 {
+                return Err(ProxyError::Config(
+                    "limits.failover_history_max must be >= 1".to_string(),
                 ));
             }
         }
@@ -2611,6 +2631,13 @@ mod tests {
         assert_eq!(l.max_pending_bytes, 64 * 1024 * 1024);
         assert_eq!(l.max_total_idle_backend_conns, 8192);
         assert_eq!(l.pool_reap_interval_secs, 30);
+        // New field: not a prior constant (FailoverController's history was
+        // an unbounded Vec before this fix), but its default must reproduce
+        // FailoverConfig::DEFAULT_MAX_HISTORY so the two stay in sync.
+        assert_eq!(
+            l.failover_history_max,
+            crate::failover_controller::DEFAULT_MAX_HISTORY
+        );
         // And the field on a default ProxyConfig matches.
         assert_eq!(
             ProxyConfig::default().limits.max_prepared_bytes,
@@ -2725,6 +2752,13 @@ mod tests {
         let mut c = base();
         c.limits.max_total_idle_backend_conns = 0;
         assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.failover_history_max = 0;
+        assert!(
+            c.validate().is_err(),
+            "zero failover_history_max must be rejected"
+        );
     }
 
     #[test]
