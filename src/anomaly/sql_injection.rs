@@ -16,28 +16,64 @@
 //! Returned values are pattern *labels*, not the payload itself.
 //! Operators correlate against the SQL excerpt in the parent event.
 
+/// Lower-case `sql` into `buf`, replacing whatever `buf` held.
+///
+/// Semantically `*buf = sql.to_lowercase()`, but it reuses `buf`'s
+/// allocation so a hot path scanning one query after another does not
+/// allocate per query. ASCII input (the overwhelming majority of SQL)
+/// takes a byte-wise path with no temporary; non-ASCII input falls
+/// back to `str::to_lowercase` verbatim, so the full Unicode case
+/// mapping — and therefore the scan verdict — is unchanged.
+pub fn lower_into(sql: &str, buf: &mut String) {
+    buf.clear();
+    if sql.is_ascii() {
+        buf.push_str(sql);
+        buf.make_ascii_lowercase();
+    } else {
+        buf.push_str(&sql.to_lowercase());
+    }
+}
+
 /// Scan `sql` and return the labels of every pattern that matched.
 /// Empty vec = clean.
+///
+/// Convenience wrapper: lower-cases into a fresh buffer once and
+/// delegates to [`scan_lowered`]. Hot paths that already keep a
+/// scratch buffer should call [`lower_into`] + [`scan_lowered`]
+/// instead so nothing is allocated per query.
 pub fn scan(sql: &str) -> Vec<String> {
-    let mut hits = Vec::new();
-    let lower = sql.to_lowercase();
+    let mut lower = String::new();
+    lower_into(sql, &mut lower);
+    scan_lowered(&lower)
+}
 
-    if matches_classic_or(&lower) {
+/// Scan an already-lower-cased statement (see [`lower_into`]) and
+/// return the labels of every pattern that matched. Empty vec =
+/// clean.
+///
+/// Every matcher is case-insensitive by construction — its needles
+/// are lower-case ASCII — so one lowered view feeds all of them.
+/// Passing a string that has *not* been lower-cased silently misses
+/// upper-case payloads.
+pub fn scan_lowered(lower: &str) -> Vec<String> {
+    let mut hits = Vec::new();
+
+    if matches_classic_or(lower) {
         hits.push("classic_or_payload".into());
     }
-    if matches_union_select(&lower) {
+    if matches_union_select(lower) {
         hits.push("union_select".into());
     }
-    if matches_comment_escape(&lower) {
+    if matches_comment_escape(lower) {
         hits.push("comment_escape".into());
     }
-    if matches_stacked_queries(sql) {
+    if matches_stacked_queries(lower) {
         hits.push("stacked_queries".into());
     }
-    if matches_time_based(&lower) {
+    if matches_time_based(lower) {
         hits.push("time_based_blind".into());
     }
-    if matches_information_schema_probe(&lower) {
+    if matches_information_schema_probe(lower) {
         hits.push("information_schema_probe".into());
     }
 
@@ -101,10 +137,12 @@ fn matches_comment_escape(lower: &str) -> bool {
 /// escape a string — by the time the payload runs, the original
 /// string context is already broken. False positives on string
 /// literals containing `;<VERB>` are rare in practice.
-fn matches_stacked_queries(sql: &str) -> bool {
+fn matches_stacked_queries(lower: &str) -> bool {
     // Strip trailing whitespace + a single trailing ';' (cosmetic).
-    let trimmed = sql.trim_end().trim_end_matches(';').trim();
-    let lower = trimmed.to_lowercase();
+    // Trimming commutes with lower-casing — no case mapping produces
+    // or consumes whitespace or ';' — so trimming the lowered view
+    // yields the same string as lowering the trimmed view did.
+    let lower = lower.trim_end().trim_end_matches(';').trim();
     let verbs = [
         "select ",
         "insert ",
@@ -282,5 +320,162 @@ mod tests {
     fn benign_query_clean() {
         let r = scan("SELECT id, name FROM users WHERE id = $1 LIMIT 10");
         assert!(r.is_empty(), "got false positives: {:?}", r);
+    }
+
+    /// Verbatim copy of the pre-optimisation `scan`: lower-cases the
+    /// SQL once for most matchers and hands the *raw* SQL to
+    /// `matches_stacked_queries`, which lower-cased a second time.
+    /// The single-lowercase rewrite must be observationally identical
+    /// to this.
+    fn legacy_scan(sql: &str) -> Vec<String> {
+        fn legacy_stacked(sql: &str) -> bool {
+            let trimmed = sql.trim_end().trim_end_matches(';').trim();
+            let lower = trimmed.to_lowercase();
+            let verbs = [
+                "select ",
+                "insert ",
+                "update ",
+                "delete ",
+                "drop ",
+                "create ",
+                "alter ",
+                "truncate ",
+                "grant ",
+                "revoke ",
+                "exec ",
+                "execute ",
+                "begin ",
+                "commit ",
+                "rollback ",
+                "set ",
+                "with ",
+            ];
+            let mut idx = 0;
+            while let Some(off) = lower[idx..].find(';') {
+                let pos = idx + off;
+                let after_trim = lower[pos + 1..].trim_start();
+                if verbs.iter().any(|v| after_trim.starts_with(v)) {
+                    return true;
+                }
+                idx = pos + 1;
+                if idx >= lower.len() {
+                    break;
+                }
+            }
+            false
+        }
+
+        let mut hits = Vec::new();
+        let lower = sql.to_lowercase();
+        if matches_classic_or(&lower) {
+            hits.push("classic_or_payload".to_string());
+        }
+        if matches_union_select(&lower) {
+            hits.push("union_select".to_string());
+        }
+        if matches_comment_escape(&lower) {
+            hits.push("comment_escape".to_string());
+        }
+        if legacy_stacked(sql) {
+            hits.push("stacked_queries".to_string());
+        }
+        if matches_time_based(&lower) {
+            hits.push("time_based_blind".to_string());
+        }
+        if matches_information_schema_probe(&lower) {
+            hits.push("information_schema_probe".to_string());
+        }
+        hits
+    }
+
+    /// Corpus exercised by every equivalence test below: benign SQL,
+    /// each payload class, mixed/upper case, non-ASCII bodies and
+    /// identifiers, and multi-byte characters straddling the
+    /// excerpt/needle boundaries.
+    const CORPUS: &[&str] = &[
+        "",
+        ";",
+        ";;",
+        "   ",
+        "SELECT 1",
+        "SELECT 1;",
+        "select id, name from users where id = $1 limit 10",
+        "SELECT * FROM users WHERE id = 1 OR 1=1",
+        "SeLeCt * FrOm users WHERE id = 1 oR 1 = 1",
+        "SELECT * FROM users WHERE name = 'a' OR '1'='1'",
+        "SELECT * FROM users WHERE id = 1 OR TRUE--",
+        "' UNION SELECT NULL,NULL,NULL --",
+        "foo' UnIoN AlL sElEcT username,password FROM users",
+        "/*!UNION*/ SELECT 1",
+        "foo'--",
+        "foo\" --",
+        "foo'#",
+        "SELECT * FROM users; DROP TABLE logs;",
+        "SELECT * FROM users; drop TABLE logs",
+        "'); DELETE FROM users WHERE 1=1;--",
+        "SELECT 'a;b' FROM dual",
+        "SELECT 1;   WiTh cte AS (SELECT 1) SELECT * FROM cte",
+        "'; SELECT PG_SLEEP(5)--",
+        "SELECT BENCHMARK(1000000, MD5('a'))",
+        "SELECT 1 WAITFOR DELAY '0:0:5'",
+        "' UNION SELECT table_name FROM INFORMATION_SCHEMA.TABLES --",
+        "SELECT * FROM pg_catalog.pg_tables",
+        "SELECT * FROM PG_NAMESPACE",
+        // Non-ASCII: Unicode case mapping must be preserved verbatim.
+        "SELECT * FROM ÜSERS WHERE naïve = 'café'",
+        "SELECT * FROM «таблица» WHERE имя = 'ЗНАЧЕНИЕ'",
+        "SELECT 'ΣΊΣΥΦΟΣ' FROM Σ",
+        "SELECT * FROM ünïcode; DRÖP TABLE x",
+        "SELECT * FROM t WHERE ı = 'İ' OR 1=1",
+        // Dotted capital I and the Kelvin sign lower-case to ASCII
+        // under Unicode rules but not under ASCII-only rules — the
+        // rewrite must keep the Unicode behaviour.
+        "SELECT BENCHMAR\u{212a}('a')",
+        "SELECT 1 WA\u{130}TFOR DELAY",
+        "SELECT 1; \u{130}NSERT INTO t VALUES (1)",
+        "日本語のクエリ; SELECT 1",
+        "SELECT '💥' OR 1=1",
+        "ＳＥＬＥＣＴ 1 OR 1=1",
+    ];
+
+    #[test]
+    fn scan_matches_legacy_scan_on_corpus() {
+        for sql in CORPUS {
+            assert_eq!(
+                scan(sql),
+                legacy_scan(sql),
+                "scan diverged from legacy_scan for {:?}",
+                sql
+            );
+        }
+    }
+
+    #[test]
+    fn scan_lowered_matches_scan_on_corpus() {
+        for sql in CORPUS {
+            let mut buf = String::new();
+            lower_into(sql, &mut buf);
+            assert_eq!(
+                scan_lowered(&buf),
+                scan(sql),
+                "scan_lowered diverged from scan for {:?}",
+                sql
+            );
+        }
+    }
+
+    #[test]
+    fn lower_into_equals_to_lowercase_and_reuses_buffer() {
+        let mut buf = String::new();
+        for sql in CORPUS {
+            lower_into(sql, &mut buf);
+            assert_eq!(buf, sql.to_lowercase(), "lower_into wrong for {:?}", sql);
+        }
+        // Reused buffer must not retain any of the previous content.
+        lower_into("SELECT LONG QUERY FROM SOMEWHERE", &mut buf);
+        lower_into("A", &mut buf);
+        assert_eq!(buf, "a");
+        // …and its capacity is carried over rather than re-grown.
+        assert!(buf.capacity() >= "select long query from somewhere".len());
     }
 }
