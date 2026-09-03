@@ -59,7 +59,7 @@ pub use config::{
     ExceededAction, LimitOverride, PriorityLevel, RateLimitConfig, RateLimitConfigBuilder,
 };
 pub use cost_estimator::{OperationType, QueryCostEstimator};
-pub use limiter::{LimiterKey, RateLimitExceeded, RateLimitResult, RateLimiter};
+pub use limiter::{CachedLimiterKey, LimiterKey, RateLimitExceeded, RateLimitResult, RateLimiter};
 pub use metrics::{KeyStats, RateLimitMetrics, RateLimitStats};
 pub use sliding_window::SlidingWindow;
 pub use token_bucket::TokenBucket;

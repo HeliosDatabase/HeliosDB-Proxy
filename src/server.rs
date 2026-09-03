@@ -427,6 +427,15 @@ pub struct ClientSession {
     /// deferred until then (never held across an await).
     #[cfg(feature = "edge-proxy")]
     pub pending_edge_copy_tables: std::sync::Mutex<Option<Vec<String>>>,
+    /// Rate-limit bucket key for this session, resolved once and reused.
+    /// The keying dimension (`[rate_limit] key_by`) is fixed for the life of a
+    /// connection, and so are the startup parameters it reads (`user`,
+    /// `database`), so the gate no longer rebuilds the key — nor takes the
+    /// `variables` lock, nor re-renders the metrics key string — per query.
+    /// Populated lazily on the first gated query, once the startup parameters
+    /// are present; see `ProxyServer::rate_limit_key`.
+    #[cfg(feature = "rate-limiting")]
+    pub rate_limit_key: std::sync::OnceLock<crate::rate_limit::CachedLimiterKey>,
 }
 
 /// Transaction state
@@ -1658,6 +1667,8 @@ impl ProxyServer {
             edge_ineligible: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "edge-proxy")]
             pending_edge_copy_tables: std::sync::Mutex::new(None),
+            #[cfg(feature = "rate-limiting")]
+            rate_limit_key: std::sync::OnceLock::new(),
         });
 
         // Register the session, then attach an RAII guard that deregisters it on
@@ -4879,25 +4890,66 @@ impl ProxyServer {
     }
 
     /// Derive the rate-limit bucket key for a session per the configured
-    /// keying dimension.
+    /// keying dimension, memoizing it on the session.
+    ///
+    /// Every input is fixed for the life of a connection: `key_by` comes from
+    /// the config snapshot this connection was accepted under, the client
+    /// address never changes, and `user`/`database` are set once from the
+    /// startup packet. So the key (and its rendered metrics string) is built
+    /// once and every later query borrows it — no `LimiterKey` allocation, no
+    /// `variables` read lock, and no `format!` on the per-query gate.
+    ///
+    /// The one case that is *not* memoized is a key derived from a startup
+    /// parameter that is not present yet: that would freeze a placeholder for
+    /// the rest of the session, so it is recomputed (exactly as before) until
+    /// the parameter appears.
     #[cfg(feature = "rate-limiting")]
-    async fn rate_limit_key(
-        session: &Arc<ClientSession>,
+    async fn rate_limit_key<'a>(
+        session: &'a Arc<ClientSession>,
         config: &ProxyConfig,
-    ) -> crate::rate_limit::LimiterKey {
+    ) -> std::borrow::Cow<'a, crate::rate_limit::CachedLimiterKey> {
         use crate::config::RateLimitKeyBy;
-        use crate::rate_limit::LimiterKey;
-        match config.rate_limit.key_by {
-            RateLimitKeyBy::Global => LimiterKey::Global,
-            RateLimitKeyBy::ClientIp => LimiterKey::ClientIp(session.client_addr.ip()),
+        use crate::rate_limit::{CachedLimiterKey, LimiterKey};
+        use std::borrow::Cow;
+
+        if let Some(cached) = session.rate_limit_key.get() {
+            return Cow::Borrowed(cached);
+        }
+
+        // `stable` is false only when the key had to fall back to a default
+        // because the startup parameter it keys on is not populated yet.
+        let (key, stable) = match config.rate_limit.key_by {
+            RateLimitKeyBy::Global => (LimiterKey::Global, true),
+            RateLimitKeyBy::ClientIp => (LimiterKey::ClientIp(session.client_addr.ip()), true),
             RateLimitKeyBy::Database => {
                 let vars = session.variables.read().await;
-                LimiterKey::Database(vars.get("database").cloned().unwrap_or_default())
+                match vars.get("database") {
+                    Some(db) => (LimiterKey::Database(db.clone()), true),
+                    None => (LimiterKey::Database(String::new()), false),
+                }
             }
             RateLimitKeyBy::User => {
                 let vars = session.variables.read().await;
-                LimiterKey::User(vars.get("user").cloned().unwrap_or_default())
+                match vars.get("user") {
+                    Some(user) => (LimiterKey::User(user.clone()), true),
+                    None => (LimiterKey::User(String::new()), false),
+                }
             }
+        };
+
+        let resolved = CachedLimiterKey::new(key);
+        if !stable {
+            return Cow::Owned(resolved);
+        }
+
+        // A concurrent racer may win the `set`; either way the stored value is
+        // the same key, so borrow whatever landed.
+        let _ = session.rate_limit_key.set(resolved);
+        match session.rate_limit_key.get() {
+            Some(cached) => Cow::Borrowed(cached),
+            // Unreachable: `OnceLock` is populated by the `set` above or by the
+            // racer that beat it. Fall back rather than panic on the hot path.
+            None => Cow::Owned(CachedLimiterKey::new(LimiterKey::Global)),
         }
     }
 
@@ -4915,7 +4967,8 @@ impl ProxyServer {
         use crate::rate_limit::RateLimitResult;
         let limiter = state.rate_limiter.as_ref()?;
         let key = Self::rate_limit_key(session, config).await;
-        match limiter.check(&key, 1) {
+        let key = key.as_ref();
+        match limiter.check_cached(key, 1) {
             RateLimitResult::Allowed => None,
             RateLimitResult::Warned(msg) => {
                 tracing::warn!(key = %key, reason = %msg, "rate limit warning");
@@ -6546,6 +6599,8 @@ mod tests {
             edge_ineligible: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "edge-proxy")]
             pending_edge_copy_tables: std::sync::Mutex::new(None),
+            #[cfg(feature = "rate-limiting")]
+            rate_limit_key: std::sync::OnceLock::new(),
         })
     }
 
@@ -7037,6 +7092,99 @@ mod tests {
                 }
             }
             assert!(denied, "over-burst checks must yield a Denied verdict");
+        }
+
+        /// The per-session bucket key is resolved once and then reused: two
+        /// gate invocations must hand back the *same* memoized value, not a
+        /// freshly built one (the whole point of the cache — no key alloc, no
+        /// `variables` read lock, no metrics `format!` per query).
+        #[tokio::test]
+        async fn session_key_is_memoized_after_startup_params() {
+            use crate::config::RateLimitKeyBy;
+
+            let mut cfg = super::test_config();
+            cfg.rate_limit.key_by = RateLimitKeyBy::User;
+
+            let session = super::make_test_session();
+            {
+                let mut vars = session.variables.write().await;
+                vars.insert("user".into(), "alice".into());
+            }
+
+            let first = super::ProxyServer::rate_limit_key(&session, &cfg).await;
+            assert_eq!(first.as_ref().to_string(), "user:alice");
+            drop(first);
+
+            assert!(
+                session.rate_limit_key.get().is_some(),
+                "a resolvable key must be cached on the session"
+            );
+
+            // The second call must borrow the memoized value rather than
+            // rebuild one.
+            let second = super::ProxyServer::rate_limit_key(&session, &cfg).await;
+            assert!(
+                matches!(second, std::borrow::Cow::Borrowed(_)),
+                "key was rebuilt instead of reused"
+            );
+            assert_eq!(second.as_ref().to_string(), "user:alice");
+        }
+
+        /// Before the startup parameters land the key must NOT be memoized —
+        /// otherwise a placeholder (`user:`) would be frozen for the whole
+        /// session. The pre-startup verdict is byte-identical to the old
+        /// recompute-every-time behavior.
+        #[tokio::test]
+        async fn key_is_not_memoized_before_startup_params() {
+            use crate::config::RateLimitKeyBy;
+
+            let mut cfg = super::test_config();
+            cfg.rate_limit.key_by = RateLimitKeyBy::Database;
+
+            let session = super::make_test_session();
+
+            let early = super::ProxyServer::rate_limit_key(&session, &cfg).await;
+            assert_eq!(early.as_ref().to_string(), "db:");
+            assert!(
+                matches!(early, std::borrow::Cow::Owned(_)),
+                "a placeholder key must not be served from the cache"
+            );
+            drop(early);
+            assert!(
+                session.rate_limit_key.get().is_none(),
+                "a placeholder key must never be cached"
+            );
+
+            {
+                let mut vars = session.variables.write().await;
+                vars.insert("database".into(), "shop".into());
+            }
+
+            let later = super::ProxyServer::rate_limit_key(&session, &cfg).await;
+            assert_eq!(later.as_ref().to_string(), "db:shop");
+            drop(later);
+            assert!(session.rate_limit_key.get().is_some());
+        }
+
+        /// Keying dimensions that do not read session variables are cached on
+        /// the very first call, and render exactly as before.
+        #[tokio::test]
+        async fn variable_free_keys_are_cached_immediately() {
+            use crate::config::RateLimitKeyBy;
+
+            for (key_by, expected) in [
+                (RateLimitKeyBy::Global, "global"),
+                (RateLimitKeyBy::ClientIp, "ip:127.0.0.1"),
+            ] {
+                let mut cfg = super::test_config();
+                cfg.rate_limit.key_by = key_by;
+
+                let session = super::make_test_session();
+                let key = super::ProxyServer::rate_limit_key(&session, &cfg).await;
+                assert_eq!(key.as_ref().to_string(), expected);
+                drop(key);
+                assert!(session.rate_limit_key.get().is_some());
+            }
         }
 
         #[test]
