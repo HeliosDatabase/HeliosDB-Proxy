@@ -356,6 +356,12 @@ struct ServerMetrics {
     bytes_sent: AtomicU64,
     /// Failover count
     failovers: AtomicU64,
+    /// Responses whose capture-for-caching was abandoned because the response
+    /// exceeded `[cache] max_cacheable_response_bytes`. Non-zero means reads
+    /// are bypassing the response caches on size grounds (the client still
+    /// receives every byte) — either the workload returns huge result sets or
+    /// the ceiling is set too low.
+    cache_capture_oversize: AtomicU64,
 }
 
 /// Load balancer state
@@ -1069,7 +1075,10 @@ impl ProxyServer {
                 config.anomaly.to_anomaly_config(),
             )),
             #[cfg(feature = "edge-proxy")]
-            edge_cache: Arc::new(crate::edge::EdgeCache::new(config.edge.max_entries.max(1))),
+            edge_cache: Arc::new(crate::edge::EdgeCache::with_limits(
+                config.edge.max_entries.max(1),
+                config.cache.max_cacheable_response_bytes,
+            )),
             #[cfg(feature = "edge-proxy")]
             edge_registry: Arc::new(crate::edge::EdgeRegistry::new(
                 config.edge.max_edges,
@@ -1598,6 +1607,10 @@ impl ProxyServer {
                                 .load(Ordering::Relaxed),
                             bytes_sent: server_state.metrics.bytes_sent.load(Ordering::Relaxed),
                             failovers: server_state.metrics.failovers.load(Ordering::Relaxed),
+                            cache_capture_oversize: server_state
+                                .metrics
+                                .cache_capture_oversize
+                                .load(Ordering::Relaxed),
                         };
                         let mut admin_metrics = admin_state_sync.metrics.write().await;
                         *admin_metrics = metrics;
@@ -3766,6 +3779,8 @@ impl ProxyServer {
                     session,
                     state.limits.client_write_timeout,
                     state.limits.backend_read_timeout,
+                    config.cache.max_cacheable_response_bytes,
+                    &state.metrics,
                 )
                 .await
                 {
@@ -4331,6 +4346,15 @@ impl ProxyServer {
     /// payload cross-session and desynchronize hitters' parameter state. The
     /// frames are still forwarded to the live requester — only the store is
     /// suppressed.
+    ///
+    /// `max_capture_bytes` ([cache] `max_cacheable_response_bytes`) bounds the
+    /// capture buffer: the capture is a *transient* held per concurrent
+    /// session ON TOP of the bytes already streamed out, so an unbounded one
+    /// let a single `SELECT * FROM big_table` pin the whole result set in the
+    /// proxy. The moment appending would cross the bound the buffer is dropped
+    /// (memory freed immediately), nothing further is captured, and the
+    /// response is reported non-cacheable. Forwarding to the client is
+    /// untouched — the client still receives every byte, byte-for-byte.
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     async fn stream_until_ready_capture(
         client: &mut ClientStream,
@@ -4338,6 +4362,8 @@ impl ProxyServer {
         session: &Arc<ClientSession>,
         client_write_timeout: Duration,
         backend_read_timeout: Duration,
+        max_capture_bytes: usize,
+        metrics: &ServerMetrics,
     ) -> Result<(u64, Vec<u8>, bool, usize)> {
         let mut buf = BytesMut::with_capacity(16384);
         let mut sent: u64 = 0;
@@ -4345,6 +4371,9 @@ impl ProxyServer {
         let mut had_error = false;
         let mut saw_async = false;
         let mut row_count: usize = 0;
+        // Set once the response outgrows `max_capture_bytes`; `captured` is
+        // then empty and stays empty for the rest of the response.
+        let mut oversize = false;
 
         loop {
             let mut consumed = 0usize;
@@ -4399,7 +4428,25 @@ impl ProxyServer {
                     .await
                     .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
                     .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
-                captured.extend_from_slice(&buf[..consumed]);
+                if !oversize {
+                    if captured.len().saturating_add(consumed) > max_capture_bytes {
+                        oversize = true;
+                        // Free the transient NOW (`clear` alone keeps the
+                        // allocation alive for the rest of the response).
+                        captured = Vec::new();
+                        metrics
+                            .cache_capture_oversize
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(
+                            target: "helios::cache",
+                            limit = max_capture_bytes,
+                            "response exceeds cache.max_cacheable_response_bytes — \
+                             capture abandoned, response not cached"
+                        );
+                    } else {
+                        captured.extend_from_slice(&buf[..consumed]);
+                    }
+                }
                 sent += consumed as u64;
                 let _ = buf.split_to(consumed);
             }
@@ -4410,7 +4457,7 @@ impl ProxyServer {
                     st != TransactionStatus::Idle,
                     std::sync::atomic::Ordering::Relaxed,
                 );
-                let cacheable = !had_error && status == b'I' && !saw_async;
+                let cacheable = !had_error && status == b'I' && !saw_async && !oversize;
                 return Ok((sent, captured, cacheable, row_count));
             }
             if yield_for_copy {
@@ -6327,6 +6374,11 @@ impl ProxyServer {
             bytes_received: self.state.metrics.bytes_received.load(Ordering::Relaxed),
             bytes_sent: self.state.metrics.bytes_sent.load(Ordering::Relaxed),
             failovers: self.state.metrics.failovers.load(Ordering::Relaxed),
+            cache_capture_oversize: self
+                .state
+                .metrics
+                .cache_capture_oversize
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -6340,6 +6392,9 @@ pub struct ServerMetricsSnapshot {
     pub bytes_received: u64,
     pub bytes_sent: u64,
     pub failovers: u64,
+    /// Cacheable reads whose response outgrew
+    /// `[cache] max_cacheable_response_bytes` and were therefore not cached.
+    pub cache_capture_oversize: u64,
 }
 
 /// Pool mode statistics snapshot (when pool-modes feature is enabled)
@@ -7564,24 +7619,147 @@ mod tests {
             backend_peer.write_all(&bytes).await.unwrap();
             backend_peer.flush().await.unwrap();
 
+            let metrics = ServerMetrics::default();
             let (sent, captured, cacheable, _rows) = ProxyServer::stream_until_ready_capture(
                 &mut client,
                 &mut backend,
                 &session,
                 Duration::from_secs(60),
                 Duration::from_secs(30),
+                usize::MAX,
+                &metrics,
             )
             .await
             .expect("capture ok");
             assert_eq!(cacheable, want_cacheable, "cacheable flag");
             assert_eq!(sent as usize, bytes.len());
             assert_eq!(captured, bytes, "capture is byte-exact");
+            assert_eq!(
+                metrics
+                    .cache_capture_oversize
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "no cap was hit"
+            );
 
             // Every frame — async ones included — was forwarded to the
             // live client.
             let mut got = vec![0u8; bytes.len()];
             client_peer.read_exact(&mut got).await.unwrap();
             assert_eq!(got, bytes, "forwarding must not be filtered");
+        }
+    }
+
+    /// O1: the capture buffer is a per-session transient held ON TOP of the
+    /// bytes already streamed to the client, so it must be bounded. A response
+    /// larger than `[cache] max_cacheable_response_bytes` must (a) reach the
+    /// client byte-for-byte, (b) come back non-cacheable with an EMPTY capture
+    /// (the allocation freed, not merely ignored), and (c) bump
+    /// `cache_capture_oversize`. A response under the cap is unchanged.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    #[tokio::test]
+    async fn capture_stops_and_frees_buffer_past_byte_cap() {
+        use crate::client_tls::ClientStream;
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::{TcpListener, TcpStream};
+
+        async fn pair() -> (TcpStream, TcpStream) {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            let (accepted, connected) = tokio::join!(l.accept(), TcpStream::connect(addr));
+            (accepted.unwrap().0, connected.unwrap())
+        }
+
+        fn frame(mtype: u8, body: &[u8]) -> Vec<u8> {
+            let mut v = vec![mtype];
+            v.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+            v.extend_from_slice(body);
+            v
+        }
+
+        // ~128 KiB of DataRows — far beyond the 1 KiB cap under test, and
+        // beyond a socket buffer, so writer/reader must run concurrently.
+        fn big_response(rows: usize) -> Vec<u8> {
+            let row = vec![b'x'; 1024];
+            let mut v = frame(b'T', b"rowdesc");
+            for _ in 0..rows {
+                v.extend_from_slice(&frame(b'D', &row));
+            }
+            v.extend_from_slice(&frame(b'C', format!("SELECT {}\0", rows).as_bytes()));
+            v.extend_from_slice(&frame(b'Z', b"I"));
+            v
+        }
+
+        const CAP: usize = 1024;
+
+        for (bytes, want_cacheable, want_oversize) in [
+            // Comfortably under the cap → today's behaviour, byte-for-byte.
+            (big_response(0), true, 0u64),
+            // Over the cap → forwarded in full, but never cached.
+            (big_response(128), false, 1u64),
+        ] {
+            assert!(
+                (bytes.len() > CAP) == (want_oversize == 1),
+                "test fixture must straddle the cap"
+            );
+
+            let (mut backend, mut backend_peer) = pair().await;
+            let (client_raw, mut client_peer) = pair().await;
+            let mut client = ClientStream::Plain(client_raw);
+            let session = make_test_session();
+            let metrics = ServerMetrics::default();
+
+            // Both peers must run concurrently with the relay: the response
+            // exceeds the socket buffers in both directions.
+            let to_write = bytes.clone();
+            let writer = tokio::spawn(async move {
+                backend_peer.write_all(&to_write).await.unwrap();
+                backend_peer.flush().await.unwrap();
+                backend_peer
+            });
+            let want_len = bytes.len();
+            let reader = tokio::spawn(async move {
+                let mut got = vec![0u8; want_len];
+                client_peer.read_exact(&mut got).await.unwrap();
+                got
+            });
+
+            let (sent, captured, cacheable, rows) = ProxyServer::stream_until_ready_capture(
+                &mut client,
+                &mut backend,
+                &session,
+                Duration::from_secs(60),
+                Duration::from_secs(30),
+                CAP,
+                &metrics,
+            )
+            .await
+            .expect("capture ok");
+
+            let _ = writer.await.unwrap();
+            let got = reader.await.unwrap();
+
+            // (a) The client stream is untouched by the cap.
+            assert_eq!(got, bytes, "client bytes must be byte-exact");
+            assert_eq!(sent as usize, bytes.len(), "sent count");
+            // Row count is parsed from CommandComplete either way.
+            assert_eq!(rows, if want_oversize == 1 { 128 } else { 0 });
+            // (b) Cacheability + capture buffer.
+            assert_eq!(cacheable, want_cacheable, "cacheable flag");
+            if want_oversize == 1 {
+                assert!(captured.is_empty(), "oversize capture must be dropped");
+                assert_eq!(captured.capacity(), 0, "allocation must be freed, not kept");
+            } else {
+                assert_eq!(captured, bytes, "under-cap capture is byte-exact");
+            }
+            // (c) Operator-visible counter.
+            assert_eq!(
+                metrics.cache_capture_oversize.load(AtomicOrdering::Relaxed),
+                want_oversize,
+                "cache_capture_oversize"
+            );
         }
     }
 
