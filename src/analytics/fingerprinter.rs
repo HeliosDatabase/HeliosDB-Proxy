@@ -43,11 +43,12 @@ impl QueryFingerprinter {
     /// Generate fingerprint from query
     pub fn fingerprint(&self, query: &str) -> QueryFingerprint {
         let normalized = self.normalize(query);
+        // Hash first, then move the owned String into the struct (no clone).
         let hash = self.compute_hash(&normalized);
 
         QueryFingerprint {
             hash,
-            normalized: normalized.clone(),
+            normalized,
             tables: self.extract_tables(query),
             operation: self.detect_operation(query),
             original_length: query.len(),
@@ -290,6 +291,21 @@ mod tests {
     fn test_fingerprinter_new() {
         let fp = QueryFingerprinter::new();
         assert!(fp.string_literal_re.is_match("'hello'"));
+    }
+
+    #[test]
+    fn test_fingerprint_normalized_matches_normalize_and_hash() {
+        let fp = QueryFingerprinter::new();
+        let query = "SELECT * FROM users WHERE name = 'Alice' AND id = 42";
+
+        let fingerprint = fp.fingerprint(query);
+        let normalized = fp.normalize(query);
+
+        // The moved (previously cloned) String must be byte-identical to
+        // `normalize()`, and the hash must be the hash of that same string.
+        assert_eq!(fingerprint.normalized, normalized);
+        assert_eq!(fingerprint.hash, fp.compute_hash(&normalized));
+        assert_eq!(fingerprint.original_length, query.len());
     }
 
     #[test]
