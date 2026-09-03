@@ -2,7 +2,7 @@
 //!
 //! Track aggregated query metrics and provide snapshots.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -184,7 +184,7 @@ pub struct AnalyticsMetrics {
     nodes: DashMap<String, OperationMetrics>,
 
     /// Recent query entries (for debugging)
-    recent: RwLock<Vec<QueryMetricEntry>>,
+    recent: RwLock<VecDeque<QueryMetricEntry>>,
 
     /// Max recent entries
     max_recent: usize,
@@ -207,7 +207,7 @@ impl AnalyticsMetrics {
             users: DashMap::new(),
             databases: DashMap::new(),
             nodes: DashMap::new(),
-            recent: RwLock::new(Vec::new()),
+            recent: RwLock::new(VecDeque::new()),
             max_recent,
         }
     }
@@ -261,10 +261,7 @@ impl AnalyticsMetrics {
         // Recent entries
         {
             let mut recent = self.recent.write();
-            if recent.len() >= self.max_recent {
-                recent.remove(0);
-            }
-            recent.push(QueryMetricEntry {
+            recent.push_back(QueryMetricEntry {
                 fingerprint_hash: fingerprint.hash,
                 normalized: fingerprint.normalized.clone(),
                 duration: execution.duration,
@@ -273,6 +270,11 @@ impl AnalyticsMetrics {
                 database: execution.database.clone(),
                 intent,
             });
+            // Evict oldest entries in O(1) each; `>` (not `>=`) keeps the ring at
+            // exactly `max_recent` and is panic-free when `max_recent == 0`.
+            while recent.len() > self.max_recent {
+                recent.pop_front();
+            }
         }
     }
 
@@ -531,6 +533,51 @@ mod tests {
         // Should only keep last 5
         let recent = metrics.recent_queries(10);
         assert_eq!(recent.len(), 5);
+    }
+
+    #[test]
+    fn test_recent_queries_eviction_keeps_newest_in_order() {
+        let metrics = AnalyticsMetrics::with_max_recent(3);
+        let fp = QueryFingerprinter::new();
+
+        for tag in ["a", "b", "c", "d", "e", "f"] {
+            let query = format!("SELECT * FROM t{}", tag);
+            let fingerprint = fp.fingerprint(&query);
+            let execution = QueryExecution::new(query, Duration::from_millis(1));
+            metrics.record(&fingerprint, &execution, QueryIntent::Retrieval);
+        }
+
+        // The ring must hold exactly the last 3 entries, and `recent_queries`
+        // must yield them newest-first (i.e. the buffer stays oldest -> newest).
+        let recent = metrics.recent_queries(10);
+        assert_eq!(recent.len(), 3);
+        let names: Vec<&str> = recent.iter().map(|e| e.normalized.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["select * from tf", "select * from te", "select * from td"]
+        );
+        let ts: Vec<u64> = recent.iter().map(|e| e.timestamp_nanos).collect();
+        assert!(
+            ts.windows(2).all(|w| w[0] >= w[1]),
+            "recent_queries must return newest-first: {:?}",
+            ts
+        );
+
+        // A smaller limit must still return the newest entries.
+        assert_eq!(metrics.recent_queries(2).len(), 2);
+    }
+
+    #[test]
+    fn test_recent_queries_zero_max_recent_does_not_panic() {
+        let metrics = AnalyticsMetrics::with_max_recent(0);
+        let fp = QueryFingerprinter::new();
+
+        let fingerprint = fp.fingerprint("SELECT 1");
+        let execution = QueryExecution::new("SELECT 1", Duration::from_millis(1));
+        metrics.record(&fingerprint, &execution, QueryIntent::Retrieval);
+
+        assert!(metrics.recent_queries(10).is_empty());
+        assert_eq!(metrics.snapshot().total_queries, 1);
     }
 
     #[test]
