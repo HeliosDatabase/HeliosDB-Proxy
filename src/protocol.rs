@@ -396,17 +396,41 @@ pub fn starts_with_ci(s: &str, prefix: &str) -> bool {
 }
 
 /// Case-insensitive ASCII substring test without allocating.
+///
+/// Instead of a brute-force `windows(needle.len())` scan (checking
+/// `eq_ignore_ascii_case` at every byte offset), this uses `memchr2` to
+/// jump straight to offsets where the needle's first byte matches
+/// case-insensitively (SIMD-accelerated), then verifies the full window
+/// only at those candidates. Same semantics as the naive scan — including
+/// on empty needles, needles longer than the haystack, and non-ASCII bytes
+/// (compared byte-for-byte, never case-folded) — just fewer full-window
+/// comparisons on the common case of a rare first byte.
 pub fn contains_ci(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
-    if haystack.len() < needle.len() {
+    let hb = haystack.as_bytes();
+    let nb = needle.as_bytes();
+    if hb.len() < nb.len() {
         return false;
     }
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    let first_lo = nb[0].to_ascii_lowercase();
+    let first_up = nb[0].to_ascii_uppercase();
+    let last_start = hb.len() - nb.len();
+    let mut pos = 0usize;
+    while pos <= last_start {
+        match memchr::memchr2(first_lo, first_up, &hb[pos..=last_start]) {
+            Some(off) => {
+                let i = pos + off;
+                if hb[i..i + nb.len()].eq_ignore_ascii_case(nb) {
+                    return true;
+                }
+                pos = i + 1;
+            }
+            None => return false,
+        }
+    }
+    false
 }
 
 /// Query message payload
@@ -946,5 +970,101 @@ mod tests {
             None => panic!("first param must be Some"),
         }
         assert!(bind.param_values[1].is_none());
+    }
+
+    /// Reference implementation: the original naive `windows().any()` scan
+    /// `contains_ci` used before the memchr2-accelerated rewrite. Kept only
+    /// in tests so the fast path can be checked against it byte-for-byte.
+    fn contains_ci_naive(haystack: &str, needle: &str) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        if haystack.len() < needle.len() {
+            return false;
+        }
+        haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    }
+
+    /// `contains_ci` must agree with the naive reference implementation on
+    /// every input, including the tricky cases: mixed case, needle at the
+    /// very end, needle longer than the haystack, an empty needle, and
+    /// non-ASCII bytes (which must compare literally, never case-folded).
+    #[test]
+    fn test_contains_ci_matches_naive_reference() {
+        let cases: &[(&str, &str)] = &[
+            ("", ""),
+            ("", "x"),
+            ("x", ""),
+            ("hello world", "WORLD"),
+            ("hello world", "World"),
+            ("hello world", "hello"),
+            ("hello world", "d"), // needle at the very end
+            ("hello world", "h"), // needle at the very start
+            ("hi", "hello"),      // needle longer than haystack
+            ("select * from t", "SELECT"),
+            ("select * from t", "FROM"),
+            ("select * from t", "where"), // absent
+            ("SeLeCt Now() FROM t", "now("),
+            ("aaaaaaaaaaaaaaaaab", "aab"), // many false-start first-byte matches
+            ("AAAA", "aaaa"),
+            ("café latte", "LATTE"), // non-ASCII haystack, ASCII needle
+            ("café LATTE", "café"),  // non-ASCII needle: literal, not folded
+            ("CAFÉ latte", "café"),  // non-ASCII bytes never case-fold
+            ("for update", "FOR UPDATE"),
+            ("... FOR SHARE", "for share"),
+            ("x".repeat(64).as_str(), "XX"),
+            ("mixed CaSe NeEdLe here", "needle"),
+        ];
+        for &(haystack, needle) in cases {
+            assert_eq!(
+                contains_ci(haystack, needle),
+                contains_ci_naive(haystack, needle),
+                "mismatch for haystack={haystack:?} needle={needle:?}"
+            );
+        }
+    }
+
+    /// Exhaustive small-alphabet fuzz: every haystack/needle pair built from a
+    /// tiny mixed-case alphabet is checked against the naive reference, to
+    /// catch off-by-one errors in the memchr2 skip-scan around window
+    /// boundaries that a hand-picked table might miss.
+    #[test]
+    fn test_contains_ci_exhaustive_small_alphabet() {
+        // All strings over `alphabet` up to `max_len`, INCLUDING every
+        // shorter prefix length (not just the longest) — so both "needle
+        // longer than remaining haystack" and "needle at every offset"
+        // shapes are exercised.
+        fn all_strings(alphabet: &[char], max_len: usize) -> Vec<String> {
+            let mut all = vec![String::new()];
+            let mut current = vec![String::new()];
+            for _ in 0..max_len {
+                let mut next = Vec::new();
+                for s in &current {
+                    for &c in alphabet {
+                        let mut t = s.clone();
+                        t.push(c);
+                        next.push(t);
+                    }
+                }
+                all.extend(next.iter().cloned());
+                current = next;
+            }
+            all
+        }
+        let alphabet = ['a', 'A', 'b', 'z'];
+        let haystacks = all_strings(&alphabet, 5);
+        let needles = all_strings(&alphabet, 3);
+        for h in &haystacks {
+            for n in &needles {
+                assert_eq!(
+                    contains_ci(h, n),
+                    contains_ci_naive(h, n),
+                    "mismatch for haystack={h:?} needle={n:?}"
+                );
+            }
+        }
     }
 }
