@@ -691,9 +691,9 @@ impl ProxyServer {
         let mut health = HashMap::new();
         for node in &config.nodes {
             health.insert(
-                node.address(),
+                node.address().to_string(),
                 NodeHealth {
-                    address: node.address(),
+                    address: node.address().to_string(),
                     healthy: true, // Assume healthy until proven otherwise
                     last_check: chrono::Utc::now(),
                     failure_count: 0,
@@ -1222,7 +1222,7 @@ impl ProxyServer {
         let current = state.health.load_full();
         let mut next: HashMap<String, NodeHealth> = HashMap::new();
         for node in &config.nodes {
-            let addr = node.address();
+            let addr = node.address().to_string();
             match current.get(&addr) {
                 Some(existing) => {
                     next.insert(addr, existing.clone());
@@ -1455,7 +1455,7 @@ impl ProxyServer {
                         .nodes
                         .iter()
                         .map(|n| NodeSnapshot {
-                            address: n.address(),
+                            address: n.address().to_string(),
                             role: format!("{:?}", n.role),
                             weight: n.weight,
                             enabled: n.enabled,
@@ -3117,7 +3117,7 @@ impl ProxyServer {
                 let is_primary = config
                     .nodes
                     .iter()
-                    .find(|n| n.address() == *current)
+                    .find(|n| n.address() == current)
                     .map(|n| n.role == NodeRole::Primary)
                     .unwrap_or(false);
                 !is_primary
@@ -3137,7 +3137,7 @@ impl ProxyServer {
                 .nodes
                 .iter()
                 .find(|n| n.name.as_deref() == Some(forced.as_str()) || n.address() == forced)
-                .map(|n| n.address())
+                .map(|n| n.address().to_string())
                 .unwrap_or(forced);
             Ok(resolved)
         } else if need_switch {
@@ -5251,12 +5251,13 @@ impl ProxyServer {
                 .find(|n| n.role == NodeRole::Primary && n.enabled);
 
             if let Some(primary_node) = primary {
-                if let Some(node_health) = health.get(&primary_node.address()) {
+                if let Some(node_health) = health.get(primary_node.address()) {
                     if node_health.healthy {
                         // Update session's current node
+                        let node_addr = primary_node.address().to_string();
                         let mut current = session.current_node.write().await;
-                        *current = Some(primary_node.address());
-                        return Ok(primary_node.address());
+                        *current = Some(node_addr.clone());
+                        return Ok(node_addr);
                     }
                 }
             }
@@ -5303,16 +5304,16 @@ impl ProxyServer {
             .filter(|n| {
                 let base = n.enabled
                     && (n.role == NodeRole::Standby || n.role == NodeRole::ReadReplica)
-                    && health.get(&n.address()).map(|h| h.healthy).unwrap_or(false);
+                    && health.get(n.address()).map(|h| h.healthy).unwrap_or(false);
                 // Drop a standby whose circuit is open so reads avoid it.
                 #[cfg(feature = "circuit-breaker")]
-                let base = base && !Self::circuit_is_open(state, &n.address());
+                let base = base && !Self::circuit_is_open(state, n.address());
                 // Drop a standby lagging beyond the configured byte threshold.
                 #[cfg(feature = "lag-routing")]
                 let base = base
                     && !Self::lag_excludes_standby(
                         health
-                            .get(&n.address())
+                            .get(n.address())
                             .and_then(|h| h.replication_lag_bytes),
                         config.lag_routing.max_lag_bytes,
                     );
@@ -5324,7 +5325,7 @@ impl ProxyServer {
             // Round-robin across healthy standbys
             let ticket = state.lb_state.rr_counter.fetch_add(1, Ordering::Relaxed);
             let index = ticket as usize % healthy_standbys.len();
-            let node_addr = healthy_standbys[index].address();
+            let node_addr = healthy_standbys[index].address().to_string();
 
             let mut current = session.current_node.write().await;
             *current = Some(node_addr.clone());
@@ -5973,7 +5974,7 @@ impl ProxyServer {
         let healthy_nodes: Vec<&NodeConfig> = config
             .nodes
             .iter()
-            .filter(|n| n.enabled && health.get(&n.address()).map(|h| h.healthy).unwrap_or(false))
+            .filter(|n| n.enabled && health.get(n.address()).map(|h| h.healthy).unwrap_or(false))
             .collect();
 
         if healthy_nodes.is_empty() {
@@ -5982,7 +5983,7 @@ impl ProxyServer {
 
         // Try to find healthy primary first
         if let Some(primary) = healthy_nodes.iter().find(|n| n.role == NodeRole::Primary) {
-            let node_addr = primary.address();
+            let node_addr = primary.address().to_string();
             let mut current = session.current_node.write().await;
             *current = Some(node_addr.clone());
             return Ok(node_addr);
@@ -5992,7 +5993,7 @@ impl ProxyServer {
         // (Initial connection will work, writes will use write timeout to wait for primary)
         if let Some(standby) = healthy_nodes.iter().find(|n| n.role == NodeRole::Standby) {
             tracing::warn!("Primary unavailable, connecting to standby for initial session");
-            let node_addr = standby.address();
+            let node_addr = standby.address().to_string();
             let mut current = session.current_node.write().await;
             *current = Some(node_addr.clone());
             return Ok(node_addr);
@@ -6055,7 +6056,7 @@ impl ProxyServer {
         let timeout = Duration::from_secs(config.health.check_timeout_secs);
         let mut set = tokio::task::JoinSet::new();
         for node in &config.nodes {
-            let addr = node.address();
+            let addr = node.address().to_string();
             set.spawn(async move {
                 let r = Self::check_node_addr(&addr, timeout).await;
                 (addr, r)
