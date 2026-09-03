@@ -2031,6 +2031,15 @@ impl AdminServer {
             metrics.connections_accepted
         ));
 
+        output.push_str(
+            "# HELP heliosdb_proxy_connections_rejected_total Total connections refused by cap\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_connections_rejected_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_connections_rejected_total {}\n",
+            metrics.connections_rejected
+        ));
+
         output.push_str("# HELP heliosdb_proxy_connections_closed Total connections closed\n");
         output.push_str("# TYPE heliosdb_proxy_connections_closed counter\n");
         output.push_str(&format!(
@@ -2139,6 +2148,7 @@ impl AdminState {
             node_health: RwLock::new(HashMap::new()),
             metrics: RwLock::new(ServerMetricsSnapshot {
                 connections_accepted: 0,
+                connections_rejected: 0,
                 connections_closed: 0,
                 queries_processed: 0,
                 bytes_received: 0,
@@ -2328,6 +2338,7 @@ struct ErrorResponse {
 #[derive(Serialize)]
 struct MetricsResponse {
     connections_accepted: u64,
+    connections_rejected: u64,
     connections_closed: u64,
     connections_active: u64,
     queries_processed: u64,
@@ -2340,6 +2351,7 @@ impl From<ServerMetricsSnapshot> for MetricsResponse {
     fn from(m: ServerMetricsSnapshot) -> Self {
         Self {
             connections_accepted: m.connections_accepted,
+            connections_rejected: m.connections_rejected,
             connections_closed: m.connections_closed,
             connections_active: m.connections_accepted.saturating_sub(m.connections_closed),
             queries_processed: m.queries_processed,
@@ -2776,6 +2788,7 @@ mod tests {
     fn test_prometheus_metrics_format() {
         let metrics = ServerMetricsSnapshot {
             connections_accepted: 100,
+            connections_rejected: 7,
             connections_closed: 50,
             queries_processed: 1000,
             bytes_received: 50000,
@@ -2787,12 +2800,14 @@ mod tests {
         assert!(output.contains("heliosdb_proxy_connections_total 100"));
         assert!(output.contains("heliosdb_proxy_queries_total 1000"));
         assert!(output.contains("heliosdb_proxy_failovers_total 2"));
+        assert!(output.contains("heliosdb_proxy_connections_rejected_total 7"));
     }
 
     #[test]
     fn test_metrics_response_active_connections() {
         let snapshot = ServerMetricsSnapshot {
             connections_accepted: 100,
+            connections_rejected: 0,
             connections_closed: 30,
             queries_processed: 500,
             bytes_received: 10000,
