@@ -78,6 +78,9 @@ pub struct EdgeCacheStats {
     pub invalidations_received: u64,
     pub entries_evicted: u64,
     pub current_entries: usize,
+    /// Entries refused because their response body exceeded
+    /// `[cache] max_cacheable_response_bytes`.
+    pub oversize_rejected: u64,
 }
 
 /// LRU + version + TTL cache. Cheap to clone via Arc.
@@ -154,6 +157,11 @@ struct EdgeCacheInner {
     /// the map lock by `insert_if_epoch`.
     invalidations: AtomicU64,
     evictions: AtomicU64,
+    oversize_rejected: AtomicU64,
+    /// Per-entry body ceiling (`[cache] max_cacheable_response_bytes`).
+    /// `max_entries` bounds the entry COUNT only, so without this one
+    /// giant entry blows the whole memory budget on its own.
+    max_entry_bytes: usize,
 }
 
 /// Cache key. `database`/`user` are verbatim tenant identity — two
@@ -192,7 +200,15 @@ fn mint_process_epoch() -> u64 {
 }
 
 impl EdgeCache {
+    /// Entry-count bound only; no per-entry byte ceiling. Kept for
+    /// tests/tools — production wiring uses [`EdgeCache::with_limits`].
     pub fn new(max_entries: usize) -> Self {
+        Self::with_limits(max_entries, usize::MAX)
+    }
+
+    /// Entry-count bound plus a per-entry body ceiling
+    /// (`[cache] max_cacheable_response_bytes`).
+    pub fn with_limits(max_entries: usize, max_entry_bytes: usize) -> Self {
         let cap = NonZeroUsize::new(max_entries).expect("max_entries must be > 0");
         Self {
             inner: Arc::new(EdgeCacheInner {
@@ -210,6 +226,8 @@ impl EdgeCache {
                 inserts: AtomicU64::new(0),
                 invalidations: AtomicU64::new(0),
                 evictions: AtomicU64::new(0),
+                oversize_rejected: AtomicU64::new(0),
+                max_entry_bytes,
             }),
         }
     }
@@ -344,6 +362,19 @@ impl EdgeCache {
         self.insert_locked(&mut map, key, entry);
     }
 
+    /// Reject (and count) an entry whose body exceeds the per-entry
+    /// ceiling. Checked on every store path — the capture-side cap in
+    /// the data path is the first line of defence; this is the one that
+    /// holds for any other caller.
+    fn oversize(&self, entry: &CacheEntry) -> bool {
+        if entry.response_bytes.len() > self.inner.max_entry_bytes {
+            self.inner.oversize_rejected.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Home-role store: re-checks the invalidation high-water mark
     /// UNDER the map lock, closing the TOCTOU between an unlocked
     /// `should_cache` and the push (a concurrent `invalidate` bumps
@@ -351,6 +382,9 @@ impl EdgeCache {
     /// here and skip, or our insert lands first and its sweep drops
     /// the entry). Returns whether the entry was stored.
     pub fn insert_if_fresh(&self, key: CacheKey, entry: CacheEntry) -> bool {
+        if self.oversize(&entry) {
+            return false;
+        }
         let mut map = self.lock();
         if entry.version <= self.inner.invalidated_hwm.load(Ordering::Relaxed) {
             return false;
@@ -367,6 +401,9 @@ impl EdgeCache {
     /// `insert_if_fresh` (invalidate bumps the counter before locking).
     /// Returns whether the entry was stored.
     pub fn insert_if_epoch(&self, key: CacheKey, entry: CacheEntry, epoch: u64) -> bool {
+        if self.oversize(&entry) {
+            return false;
+        }
         let mut map = self.lock();
         if self.inner.invalidations.load(Ordering::Relaxed) != epoch {
             return false;
@@ -376,6 +413,9 @@ impl EdgeCache {
     }
 
     fn insert_locked(&self, map: &mut MapState, key: CacheKey, entry: CacheEntry) {
+        if self.oversize(&entry) {
+            return;
+        }
         let tables = entry.tables.clone();
         // `push` returns the displaced pair: the old value when the
         // key was already present (an update, not an eviction), or
@@ -461,6 +501,7 @@ impl EdgeCache {
             invalidations_received: self.inner.invalidations.load(Ordering::Relaxed),
             entries_evicted: self.inner.evictions.load(Ordering::Relaxed),
             current_entries: self.lock().lru.len(),
+            oversize_rejected: self.inner.oversize_rejected.load(Ordering::Relaxed),
         }
     }
 
@@ -891,6 +932,49 @@ mod tests {
         let _ = c.invalidate(1, &[]);
         let _ = c.invalidate(2, &["users".to_string()]);
         assert_eq!(c.stats().invalidations_received, 2);
+    }
+
+    /// O1: `max_entries` bounds the entry COUNT only — one giant entry blows
+    /// the whole budget on its own. Every store path must refuse a body larger
+    /// than `[cache] max_cacheable_response_bytes` and count the refusal.
+    #[test]
+    fn oversize_entries_are_never_inserted() {
+        let c = EdgeCache::with_limits(10, 16);
+        let small = entry(1, b"tiny", &["users"], Duration::from_secs(60));
+        let big = entry(1, &[b'x'; 17], &["users"], Duration::from_secs(60));
+
+        // Plain insert.
+        c.insert(CacheKey::new("big", "p"), big.clone());
+        assert!(c.get(&CacheKey::new("big", "p")).is_none());
+        // Home-role race-checked insert.
+        assert!(!c.insert_if_fresh(CacheKey::new("big2", "p"), big.clone()));
+        assert!(c.get(&CacheKey::new("big2", "p")).is_none());
+        // Edge-role race-checked insert.
+        let epoch = c.invalidation_epoch();
+        assert!(!c.insert_if_epoch(CacheKey::new("big3", "p"), big, epoch));
+        assert!(c.get(&CacheKey::new("big3", "p")).is_none());
+
+        // Exactly-at-the-cap entries still store (the bound is inclusive).
+        let at_cap = entry(1, &[b'y'; 16], &["users"], Duration::from_secs(60));
+        c.insert(CacheKey::new("atcap", "p"), at_cap);
+        assert!(c.get(&CacheKey::new("atcap", "p")).is_some());
+        c.insert(CacheKey::new("small", "p"), small);
+        assert!(c.get(&CacheKey::new("small", "p")).is_some());
+
+        let s = c.stats();
+        assert_eq!(s.oversize_rejected, 3, "one per refused store path");
+        assert_eq!(s.inserts, 2, "only the two in-budget entries landed");
+        assert_eq!(s.current_entries, 2);
+
+        // The count-only constructor keeps the pre-fix (unbounded) behaviour
+        // for tools/tests that do not wire the cap.
+        let unbounded = EdgeCache::new(10);
+        unbounded.insert(
+            CacheKey::new("big", "p"),
+            entry(1, &[b'x'; 4096], &[], Duration::from_secs(60)),
+        );
+        assert!(unbounded.get(&CacheKey::new("big", "p")).is_some());
+        assert_eq!(unbounded.stats().oversize_rejected, 0);
     }
 
     #[test]

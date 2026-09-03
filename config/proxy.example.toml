@@ -172,6 +172,27 @@ enabled = true
 [cache]
 enabled = false
 
+# Hard ceiling, in bytes, on the backend response the proxy will buffer in
+# memory while streaming a cacheable read to the client. The capture is a
+# per-session transient held ON TOP of the bytes already forwarded, so an
+# unbounded one let a single `SELECT * FROM big_table` pin a whole result set
+# per concurrent session. Past this bound the capture buffer is dropped and the
+# response is simply not cached — the client still receives every byte,
+# unchanged.
+#
+# DELIBERATELY SHARED by both response caches: the data path captures a
+# response exactly once and hands the same buffer to the query-result cache
+# and/or the edge cache, so this one key bounds the capture for both. It
+# therefore applies even when `enabled = false` here, as long as `[edge]` is
+# caching reads — and the edge cache also refuses any single entry larger than
+# it (`[edge] max_entries` bounds the entry COUNT only).
+#
+# Default 4 MiB (must be > 0). Kept above the 1 MiB `max_result_bytes` default
+# so it never masks that knob. Watch `heliosdb_proxy_cache_capture_oversize_total`
+# on /metrics/prometheus (and `oversize_rejected` in the edge cache stats) to
+# see how often reads bypass the caches on size grounds.
+max_cacheable_response_bytes = 4194304
+
 # -----------------------------------------------------------------------------
 # High availability
 # -----------------------------------------------------------------------------
