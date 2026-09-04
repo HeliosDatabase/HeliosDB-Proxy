@@ -2296,6 +2296,7 @@ impl ProxyServer {
         buffer: &mut BytesMut,
         conns: &mut HashMap<String, BackendConn>,
         watch_node: Option<&str>,
+        abuf: &mut BytesMut,
         idle_deadline: Option<tokio::time::Instant>,
         state: &Arc<ServerState>,
     ) -> Result<ClientRead> {
@@ -2316,9 +2317,17 @@ impl ProxyServer {
         loop {
             let mut backend_gone = false;
             let mut client_bytes: Option<usize> = None;
+            // Clear — not re-allocate — the caller's session-scoped scratch
+            // buffer before this read attempt (Fix S4). `read_buf` appends
+            // into the buffer's spare capacity, so after `clear()` the count
+            // it returns is exactly the slice length used below. A
+            // `let mut abuf = [0u8; 16384];` local here instead both
+            // zero-filled 16 KiB on every client-message wait and, being live
+            // across the `select!` await, inflated this future — and hence
+            // `client_loop`'s — by that same 16 KiB.
+            abuf.clear();
             {
                 let bc = conns.get_mut(node).expect("watch_node is in conns");
-                let mut abuf = [0u8; 16384];
                 tokio::select! {
                     r = stream.read_buf(buffer) => {
                         client_bytes = Some(r.map_err(|e| {
@@ -2326,7 +2335,7 @@ impl ProxyServer {
                         })?);
                     }
                     _ = &mut idle_wait => return Ok(ClientRead::IdleTimeout),
-                    r = bc.stream.read(&mut abuf) => match r {
+                    r = bc.stream.read_buf(&mut *abuf) => match r {
                         Ok(0) => backend_gone = true,
                         Ok(bn) => {
                             stream.write_all(&abuf[..bn]).await.map_err(|e| {
@@ -2465,6 +2474,14 @@ impl ProxyServer {
         // target connection is known. Holds (full Parse message, signature).
         let promote_unnamed = config.optimize_unnamed_parse;
         let mut held_unnamed: Option<(bytes::Bytes, bytes::Bytes)> = None;
+        // Scratch buffer for the backend-watch below, created once per
+        // session rather than once per client-message wait (a stack array
+        // here would force the whole `handle_client` future to carry 16 KiB
+        // live across every `.await` in this loop). Cleared — not
+        // re-allocated — before each backend read via the same `clear()` +
+        // `read_buf`-into-spare-capacity idiom `stream_flush` uses below, so
+        // steady state costs no allocation and no zero-fill.
+        let mut abuf = BytesMut::with_capacity(16384);
         loop {
             // Read the client's next message directly into the accumulation
             // buffer (no intermediate zeroed scratch, no extra copy). `read_buf`
@@ -2487,19 +2504,25 @@ impl ProxyServer {
             // `None` (the default, `client_idle_timeout_secs = 0`) leaves every
             // read unbounded exactly as before.
             let idle_deadline = Self::client_idle_deadline(state, &buffer, session);
-            let watch_node: Option<String> = if session
+            // Borrowed, not cloned (Fix S4): the watch target is always the
+            // session's current node, so cloning the node key into a fresh
+            // `String` on every client-message wait was pure hot-path overhead.
+            let watch_node: Option<&str> = if session
                 .copy_in_progress
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
                 None
             } else {
-                current_node.clone().filter(|node| conns.contains_key(node))
+                current_node
+                    .as_deref()
+                    .filter(|node| conns.contains_key(*node))
             };
             let n: usize = match Self::read_next_client_message(
                 stream,
                 &mut buffer,
                 &mut conns,
-                watch_node.as_deref(),
+                watch_node,
+                &mut abuf,
                 idle_deadline,
                 state,
             )
@@ -2522,11 +2545,12 @@ impl ProxyServer {
             };
             // `read_next_client_message` drops a watched backend connection that
             // died while the session was idle; the session survives and the next
-            // query redials.
-            if let Some(node) = watch_node.as_deref() {
-                if !conns.contains_key(node) && current_node.as_deref() == Some(node) {
-                    current_node = None;
-                }
+            // query redials. `watch_node` is a reborrow of `current_node` (see
+            // where it is built above), so a now-missing entry is always the
+            // session's current node — no equality re-check is needed.
+            let watched_backend_gone = watch_node.is_some_and(|node| !conns.contains_key(node));
+            if watched_backend_gone {
+                current_node = None;
             }
 
             if n == 0 {
@@ -5168,10 +5192,15 @@ impl ProxyServer {
         state: &Arc<ServerState>,
     ) -> Result<u64> {
         let _ = (session, state);
-        let mut read_buf = vec![0u8; 16384];
+        // Reused across every read of this call via `try_read_buf`, which
+        // writes straight into the buffer's spare capacity from the read
+        // syscall — unlike `vec![0u8; 16384]`, nothing here is
+        // zero-initialized before use.
+        let mut read_buf = BytesMut::with_capacity(16384);
         let mut sent: u64 = 0;
         loop {
-            match backend.try_read(&mut read_buf) {
+            read_buf.clear();
+            match backend.try_read_buf(&mut read_buf) {
                 Ok(0) => {
                     return Err(ProxyError::Connection(
                         "Backend closed mid-flush".to_string(),
@@ -7475,6 +7504,16 @@ mod tests {
         }
     }
 
+    /// A connected loopback `TcpStream` pair, shared by the relay tests
+    /// below that need a real socket (so `try_read_buf`/`WouldBlock`
+    /// behaves as it does in production, unlike an in-memory duplex pipe).
+    async fn pair() -> (TcpStream, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (accepted, connected) = tokio::join!(l.accept(), TcpStream::connect(addr));
+        (accepted.unwrap().0, connected.unwrap())
+    }
+
     #[test]
     fn test_server_creation() {
         let config = test_config();
@@ -8745,14 +8784,6 @@ mod tests {
         use crate::client_tls::ClientStream;
         use tokio::io::AsyncReadExt;
         use tokio::io::AsyncWriteExt as _;
-        use tokio::net::{TcpListener, TcpStream};
-
-        async fn pair() -> (TcpStream, TcpStream) {
-            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = l.local_addr().unwrap();
-            let (accepted, connected) = tokio::join!(l.accept(), TcpStream::connect(addr));
-            (accepted.unwrap().0, connected.unwrap())
-        }
 
         fn frame(mtype: u8, body: &[u8]) -> Vec<u8> {
             let mut v = vec![mtype];
@@ -8841,14 +8872,6 @@ mod tests {
         use std::sync::atomic::Ordering as AtomicOrdering;
         use tokio::io::AsyncReadExt;
         use tokio::io::AsyncWriteExt as _;
-        use tokio::net::{TcpListener, TcpStream};
-
-        async fn pair() -> (TcpStream, TcpStream) {
-            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = l.local_addr().unwrap();
-            let (accepted, connected) = tokio::join!(l.accept(), TcpStream::connect(addr));
-            (accepted.unwrap().0, connected.unwrap())
-        }
 
         fn frame(mtype: u8, body: &[u8]) -> Vec<u8> {
             let mut v = vec![mtype];
@@ -8939,6 +8962,94 @@ mod tests {
                 "cache_capture_oversize"
             );
         }
+    }
+
+    /// `stream_flush` (Fix S4) relays whatever the backend has already
+    /// produced byte-for-byte, then returns as soon as the socket goes
+    /// `WouldBlock` — it must never block waiting for more. The read buffer
+    /// is a reused `BytesMut` (no per-call `vec![0u8; 16384]` zeroing); this
+    /// sends more than one 16 KiB buffer's worth of data so the loop must
+    /// `clear()` and refill the same buffer across multiple `try_read_buf`
+    /// calls without dropping or duplicating bytes.
+    #[tokio::test]
+    async fn stream_flush_relays_available_bytes_then_returns_without_blocking() {
+        use crate::client_tls::ClientStream;
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut backend, mut backend_peer) = pair().await;
+        let (client_raw, mut client_peer) = pair().await;
+        let mut client = ClientStream::Plain(client_raw);
+        let session = make_test_session();
+        let server = ProxyServer::new(test_config()).unwrap();
+        let state = server.state.clone();
+
+        // Larger than one 16 KiB read, so a correct implementation must
+        // loop `try_read_buf` (clearing and refilling the same buffer)
+        // rather than stopping after the first chunk.
+        let bytes: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+
+        // Both sides of the relay run concurrently with the `stream_flush`
+        // calls below, so the test does not depend on 40 KB fitting in the
+        // kernel socket buffers: on a host with small `tcp_wmem`/`tcp_rmem`
+        // an inline `write_all` (or an inline read only after the flush)
+        // would deadlock rather than fail.
+        let feed_bytes = bytes.clone();
+        let feed = tokio::spawn(async move {
+            backend_peer.write_all(&feed_bytes).await.unwrap();
+            backend_peer.flush().await.unwrap();
+        });
+        let bytes_len = bytes.len();
+        let drain = tokio::spawn(async move {
+            let mut got = vec![0u8; bytes_len];
+            client_peer.read_exact(&mut got).await.unwrap();
+            got
+        });
+
+        backend.readable().await.unwrap();
+        // `stream_flush` is non-blocking (`try_read_buf`), so a single call
+        // may see only part of the payload if the kernel hasn't finished
+        // delivering it yet on a loaded host: loop calls (each `clear()`ing
+        // and refilling the same reused buffer, per the doc comment above)
+        // until every byte is relayed, bounded by an overall timeout so a
+        // real regression fails fast instead of hanging.
+        let mut sent: u64 = 0;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while (sent as usize) < bytes.len() {
+                let n = ProxyServer::stream_flush(&mut client, &mut backend, &session, &state)
+                    .await
+                    .expect("flush ok");
+                sent += n;
+                if n == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        })
+        .await
+        .expect("all bytes must be relayed within the timeout");
+        assert_eq!(sent as usize, bytes.len(), "all available bytes relayed");
+
+        let got = tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("client_peer must receive all relayed bytes within the timeout")
+            .unwrap();
+        assert_eq!(got, bytes, "forwarded bytes must be byte-exact");
+        tokio::time::timeout(Duration::from_secs(5), feed)
+            .await
+            .expect("backend writer must finish within the timeout")
+            .unwrap();
+
+        // Nothing left to read: a second call must return immediately with
+        // 0 rather than block — that is the whole point of Flush semantics
+        // (no ReadyForQuery to wait for, unlike `stream_until_ready`).
+        let sent2 = tokio::time::timeout(
+            Duration::from_secs(2),
+            ProxyServer::stream_flush(&mut client, &mut backend, &session, &state),
+        )
+        .await
+        .expect("stream_flush must not block once the backend has nothing more to say")
+        .expect("flush ok");
+        assert_eq!(sent2, 0, "no more data means nothing sent");
     }
 
     // ---- query-rewriting: the rules-engine rewrite contract ----
@@ -9618,6 +9729,7 @@ mod tests {
             &mut buffer,
             &mut conns,
             Some("node-a"),
+            &mut BytesMut::with_capacity(16384),
             Some(deadline),
             &server.state,
         )
