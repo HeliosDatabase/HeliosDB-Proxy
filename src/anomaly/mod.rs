@@ -27,7 +27,6 @@
 //! classifier on later: events become labeled training data.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use dashmap::DashMap;
@@ -241,14 +240,15 @@ impl AnomalyDetector {
         // upstream pre-query already passed; multiple layers is the
         // point.
         //
-        // The statement is lower-cased exactly once, into a
-        // thread-local scratch buffer whose capacity is reused across
-        // queries; every matcher reads that single lowered view.
-        let matches = LOWER_SCRATCH.with(|cell| {
-            let mut buf = cell.borrow_mut();
-            sql_injection::lower_into(&ctx.sql, &mut buf);
-            sql_injection::scan_lowered(&buf)
-        });
+        // The statement is lower-cased exactly once, into a buffer
+        // sized for this call; every matcher reads that single
+        // lowered view. Allocated per call (not cached across calls
+        // in a thread-local) so nothing is retained between queries —
+        // a client sending one very large statement does not leave
+        // its buffer permanently resident on the worker thread.
+        let mut lowered = String::with_capacity(ctx.sql.len());
+        sql_injection::lower_into(&ctx.sql, &mut lowered);
+        let matches = sql_injection::scan_lowered(&lowered);
         if !matches.is_empty() {
             let severity = if matches.len() >= 2 {
                 Severity::Critical
@@ -390,14 +390,6 @@ impl AuthBurstWindow {
         self.failures.push_back(now);
         self.failures.len() as u32
     }
-}
-
-thread_local! {
-    /// Reusable lower-case scratch buffer for the SQL-injection scan.
-    /// Thread-local rather than a field on the detector: the detector
-    /// is shared across every connection task, and this keeps the
-    /// buffer lock-free while still amortising the allocation.
-    static LOWER_SCRATCH: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 /// Bounded, copy-at-most-`max`-bytes excerpt of `s` for display in an
@@ -672,8 +664,12 @@ mod tests {
             sql: Cow::Owned(sql.to_string()),
             timestamp: Instant::now(),
         });
-        // Same event kinds, in the same order, with the same payload
-        // fields (only the wall-clock stamp may differ).
+        // Same event kinds, in the same order. For the two variants
+        // this scan can produce (SqlInjection, NovelQuery) the payload
+        // fields are compared too (only the wall-clock stamp may
+        // differ); a RateSpike or AuthBurst variant, were one ever
+        // added here, would only be checked for discriminant equality
+        // above, not field equality.
         assert_eq!(borrowed.len(), owned.len());
         for (a, b) in borrowed.iter().zip(owned.iter()) {
             assert_eq!(

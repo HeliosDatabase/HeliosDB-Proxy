@@ -157,15 +157,6 @@ fn anomaly_fingerprint_into(sql: &str, out: &mut String) {
     out.truncate(trimmed_len);
 }
 
-#[cfg(feature = "anomaly-detection")]
-thread_local! {
-    /// Reusable fingerprint buffer for [`anomaly_fingerprint_into`].
-    /// Thread-local so connection tasks on the same runtime worker
-    /// share one grown allocation without any locking.
-    static ANOMALY_FINGERPRINT_BUF: std::cell::RefCell<String> =
-        const { std::cell::RefCell::new(String::new()) };
-}
-
 /// Owning wrapper around [`anomaly_fingerprint_into`]. Test-only —
 /// the hot path uses the buffer form.
 #[cfg(all(test, feature = "anomaly-detection"))]
@@ -5660,24 +5651,25 @@ impl ProxyServer {
             Err(_) => session.client_addr.ip().to_string(),
         };
         // Both the fingerprint and the SQL are *lent* to the detector:
-        // the fingerprint from a reusable thread-local buffer, the SQL
-        // straight from the wire frame. The detector copies only on the
-        // rare paths that retain something (first-seen fingerprint,
-        // emitted event excerpt), so a steady-state query allocates
-        // neither.
-        ANOMALY_FINGERPRINT_BUF.with(|cell| {
-            let mut fingerprint = cell.borrow_mut();
-            anomaly_fingerprint_into(query, &mut fingerprint);
-            let obs = crate::anomaly::QueryObservation {
-                tenant,
-                fingerprint: std::borrow::Cow::Borrowed(fingerprint.as_str()),
-                sql: std::borrow::Cow::Borrowed(query),
-                timestamp: std::time::Instant::now(),
-            };
-            for ev in state.anomaly_detector.record_query(&obs) {
-                tracing::warn!(anomaly = ?ev, "anomaly detected");
-            }
-        });
+        // the fingerprint from a buffer sized for this call, the SQL
+        // straight from the wire frame. The detector copies only on
+        // the rare paths that retain something (first-seen
+        // fingerprint, emitted event excerpt). The fingerprint buffer
+        // is allocated per call rather than cached in a thread-local,
+        // so nothing is retained between queries — a client sending
+        // one very large statement does not leave its buffer
+        // permanently resident on the worker thread.
+        let mut fingerprint = String::with_capacity(query.len());
+        anomaly_fingerprint_into(query, &mut fingerprint);
+        let obs = crate::anomaly::QueryObservation {
+            tenant,
+            fingerprint: std::borrow::Cow::Borrowed(fingerprint.as_str()),
+            sql: std::borrow::Cow::Borrowed(query),
+            timestamp: std::time::Instant::now(),
+        };
+        for ev in state.anomaly_detector.record_query(&obs) {
+            tracing::warn!(anomaly = ?ev, "anomaly detected");
+        }
     }
 
     /// Send the client a `Block`-outcome response: an error frame plus

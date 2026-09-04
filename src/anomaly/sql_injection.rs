@@ -18,12 +18,14 @@
 
 /// Lower-case `sql` into `buf`, replacing whatever `buf` held.
 ///
-/// Semantically `*buf = sql.to_lowercase()`, but it reuses `buf`'s
-/// allocation so a hot path scanning one query after another does not
-/// allocate per query. ASCII input (the overwhelming majority of SQL)
+/// Semantically `*buf = sql.to_lowercase()`, but a caller that keeps
+/// `buf` across calls reuses its allocation instead of allocating
+/// fresh each time. ASCII input (the overwhelming majority of SQL)
 /// takes a byte-wise path with no temporary; non-ASCII input falls
-/// back to `str::to_lowercase` verbatim, so the full Unicode case
-/// mapping — and therefore the scan verdict — is unchanged.
+/// back to `str::to_lowercase` verbatim — one temporary `String` plus
+/// a copy into `buf` — so the full Unicode case mapping, and
+/// therefore the scan verdict, is unchanged at the cost of doing
+/// strictly more work than the ASCII path for that one call.
 pub fn lower_into(sql: &str, buf: &mut String) {
     buf.clear();
     if sql.is_ascii() {
@@ -41,6 +43,10 @@ pub fn lower_into(sql: &str, buf: &mut String) {
 /// delegates to [`scan_lowered`]. Hot paths that already keep a
 /// scratch buffer should call [`lower_into`] + [`scan_lowered`]
 /// instead so nothing is allocated per query.
+///
+/// Kept as public API for out-of-tree callers (this crate's own hot
+/// path uses [`lower_into`] + [`scan_lowered`] directly and does not
+/// call this function).
 pub fn scan(sql: &str) -> Vec<String> {
     let mut lower = String::new();
     lower_into(sql, &mut lower);
@@ -138,7 +144,7 @@ fn matches_comment_escape(lower: &str) -> bool {
 /// string context is already broken. False positives on string
 /// literals containing `;<VERB>` are rare in practice.
 fn matches_stacked_queries(lower: &str) -> bool {
-    // Strip trailing whitespace + a single trailing ';' (cosmetic).
+    // Strip trailing whitespace + any trailing ';' characters (cosmetic).
     // Trimming commutes with lower-casing — no case mapping produces
     // or consumes whitespace or ';' — so trimming the lowered view
     // yields the same string as lowering the trimmed view did.
@@ -436,6 +442,12 @@ mod tests {
         "日本語のクエリ; SELECT 1",
         "SELECT '💥' OR 1=1",
         "ＳＥＬＥＣＴ 1 OR 1=1",
+        // Trailing Greek capital sigma (Final_Sigma-sensitive: Σ
+        // lower-cases to final-form ς at a word end, ordinary σ
+        // otherwise) immediately followed by ';' and by whitespace —
+        // pins that trim-then-lower and lower-then-trim agree here.
+        "SELECT * FROM \u{3a3};",
+        "SELECT * FROM \u{3a3} ",
     ];
 
     #[test]
