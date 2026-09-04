@@ -612,61 +612,156 @@ impl Drop for SessionGuard {
     }
 }
 
-/// The cheap lexical facts about ONE simple-query statement, derived in a
-/// single pass over the SQL text and threaded through the whole forward path.
+// Test-only tally of classifier evaluations performed on the CURRENT thread.
+// `libtest` runs each test on its own thread, so the count is per-test and
+// race-free; `StmtFacts` bumps it every time it actually walks the SQL, which
+// is what lets the laziness contract be asserted rather than assumed.
+#[cfg(test)]
+thread_local! {
+    static STMT_FACT_CLASSIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Classifier evaluations performed on this thread so far (test-only).
+#[cfg(test)]
+fn stmt_fact_classifications() -> usize {
+    STMT_FACT_CLASSIFICATIONS.with(std::cell::Cell::get)
+}
+
+/// The cheap lexical facts about ONE simple-query statement, memoized so each
+/// fact is derived AT MOST ONCE per message — and ONLY if a gate that is
+/// actually enabled asks for it.
 ///
-/// Every field is a memoized call to the classifier that already owned that
-/// decision (`is_write_query`, `stmt_leaves_session_state`,
-/// `is_cacheable_read_sql`, …) — the semantics are byte-identical, the point
-/// is that the SQL is scanned once per gate instead of once per *call site*
-/// (`forward_simple_query` used to re-derive several of these two or three
-/// times for the same string).
+/// Every getter delegates to the classifier that already owned that decision
+/// (`is_write_query`, `stmt_leaves_session_state`, `is_cacheable_read_sql`,
+/// …), so the semantics are byte-identical. What changes is the number of
+/// passes over the SQL: `forward_simple_query` used to re-derive several of
+/// these two or three times for the same string (once per *call site*); it now
+/// derives each at most once (once per *fact*).
 ///
-/// Facts describe the text they were computed from. When a routing-hint
-/// strip, a rewrite rule, or a tenant transform replaces the SQL, the caller
-/// recomputes them on the final text before any gate consults them.
+/// The memo is deliberately LAZY. Each of these classifiers sat behind a
+/// runtime gate that is OFF in the stock configuration —
+/// `[pool_mode] skip_clean_reset = false`, `[cache] enabled = false`,
+/// `[edge] enabled = false` — so a default proxy classified the leading
+/// keyword once and nothing else. Computing the whole set up front would make
+/// that default hot path do strictly MORE work than before, worst of all for
+/// the big statements (bulk INSERT, large SELECT text) these classifiers scan
+/// end to end. Every getter is therefore called from inside the very gate that
+/// used to guard the classification, and short-circuits with it.
 ///
-/// Fields are `cfg`-gated to the features that consume them so the struct
+/// Facts describe the text they were computed from: `sql` is borrowed from the
+/// message payload. When a routing-hint strip, a rewrite rule, or a tenant
+/// transform replaces the SQL, the caller rebuilds the whole value on the final
+/// text — which resets every memo cell — before any gate consults it.
+///
+/// Cells are `cfg`-gated to the features that consume them so the struct
 /// carries no dead state in a minimal build.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct StmtFacts {
+#[derive(Debug)]
+struct StmtFacts<'a> {
+    /// The statement text every cell is derived from. `""` when the payload
+    /// carried no valid query cstring — the same fallback the individual call
+    /// sites used (`unwrap_or("")`, or a skipped `if let Some(sql)`: all four
+    /// classifiers answer `false` for the empty string, so the two agree).
+    sql: &'a str,
     /// `is_write_query`: routing-relevant write / transaction-control / SET.
-    is_write: bool,
+    is_write: Option<bool>,
     /// A `;` before the (optional) trailing one — i.e. the simple-query string
     /// carries more than one statement, so no leading-keyword classification
     /// can vouch for what follows.
     #[cfg(feature = "edge-proxy")]
-    has_interior_semicolon: bool,
+    has_interior_semicolon: Option<bool>,
     /// `stmt_leaves_session_state`: not provably session-neutral.
     #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
-    leaves_session_state: bool,
+    leaves_session_state: Option<bool>,
     /// `is_cacheable_read_sql`: plain, deterministic, single-statement SELECT.
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
-    is_cacheable_read: bool,
+    is_cacheable_read: Option<bool>,
 }
 
-impl StmtFacts {
-    /// Classify `sql` once. Each field delegates to the classifier that
-    /// defines it, so this is memoization — never a re-derivation.
-    fn compute(sql: &str) -> Self {
+impl<'a> StmtFacts<'a> {
+    /// Facts for `sql`. Nothing is classified here — every cell is empty
+    /// until a getter asks for it.
+    fn new(sql: &'a str) -> Self {
         Self {
-            is_write: ProxyServer::is_write_query(sql),
+            sql,
+            is_write: None,
             #[cfg(feature = "edge-proxy")]
-            has_interior_semicolon: ProxyServer::stmt_has_interior_semicolon(sql),
+            has_interior_semicolon: None,
             #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
-            leaves_session_state: ProxyServer::stmt_leaves_session_state(sql),
+            leaves_session_state: None,
             #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
-            is_cacheable_read: ProxyServer::is_cacheable_read_sql(sql),
+            is_cacheable_read: None,
         }
     }
 
-    /// Facts for a simple `Query` message. A payload that is not a valid
-    /// query cstring yields the all-false default — the same fallback every
-    /// individual call site used (`unwrap_or(false)` / `unwrap_or("")`).
-    fn of_query(msg: &Message) -> Self {
-        crate::protocol::query_text(&msg.payload)
-            .map(Self::compute)
-            .unwrap_or_default()
+    /// Facts for a simple `Query` message, borrowing the SQL straight out of
+    /// the payload (the message is forwarded verbatim, so no copy is needed).
+    fn of_query(msg: &'a Message) -> Self {
+        Self::new(crate::protocol::query_text(&msg.payload).unwrap_or(""))
+    }
+
+    /// The statement text the facts describe — so a gate that also needs the
+    /// SQL itself does not re-walk the payload for its own copy.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    fn sql(&self) -> &'a str {
+        self.sql
+    }
+
+    /// Compute-on-first-use: run `classify` over the statement the first time
+    /// a cell is read, remember the answer, never run it again.
+    fn memo<F: FnOnce(&str) -> bool>(cell: &mut Option<bool>, sql: &'a str, classify: F) -> bool {
+        match *cell {
+            Some(v) => v,
+            None => {
+                Self::note_classification();
+                let v = classify(sql);
+                *cell = Some(v);
+                v
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn note_classification() {
+        STMT_FACT_CLASSIFICATIONS.with(|c| c.set(c.get() + 1));
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn note_classification() {}
+
+    /// See [`ProxyServer::is_write_query`].
+    fn is_write(&mut self) -> bool {
+        Self::memo(&mut self.is_write, self.sql, ProxyServer::is_write_query)
+    }
+
+    /// See [`ProxyServer::stmt_has_interior_semicolon`].
+    #[cfg(feature = "edge-proxy")]
+    fn has_interior_semicolon(&mut self) -> bool {
+        Self::memo(
+            &mut self.has_interior_semicolon,
+            self.sql,
+            ProxyServer::stmt_has_interior_semicolon,
+        )
+    }
+
+    /// See [`ProxyServer::stmt_leaves_session_state`].
+    #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
+    fn leaves_session_state(&mut self) -> bool {
+        Self::memo(
+            &mut self.leaves_session_state,
+            self.sql,
+            ProxyServer::stmt_leaves_session_state,
+        )
+    }
+
+    /// See [`ProxyServer::is_cacheable_read_sql`].
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    fn is_cacheable_read(&mut self) -> bool {
+        Self::memo(
+            &mut self.is_cacheable_read,
+            self.sql,
+            ProxyServer::is_cacheable_read_sql,
+        )
     }
 }
 
@@ -3492,13 +3587,16 @@ impl ProxyServer {
             return Ok((None, resp.len() as u64));
         }
 
-        // Single-pass lexical classification: every cheap fact this forward
-        // path needs about the statement (write? session-dirtying? cacheable
-        // read? multi-statement?) is derived here, once, instead of each gate
-        // re-walking the same SQL string. Recomputed below only if a hint
-        // strip / rewrite / tenant transform replaces the text.
+        // Lazily-memoized lexical classification: every cheap fact this
+        // forward path may need about the statement (write? session-dirtying?
+        // cacheable read? multi-statement?) is derived AT MOST ONCE here,
+        // instead of each gate re-walking the same SQL string — and only if
+        // the gate that needs it is actually enabled, so the default
+        // configuration keeps paying for exactly one classification (the write
+        // check below, which every route decision needs). Rebuilt further down
+        // only if a hint strip / rewrite / tenant transform replaces the text.
         let mut facts = StmtFacts::of_query(msg);
-        let default_is_write = facts.is_write;
+        let default_is_write = facts.is_write();
         let plugin_override = Self::apply_route_hook(msg, state, session);
 
         // Block short-circuits before any backend selection.
@@ -3593,16 +3691,26 @@ impl ProxyServer {
 
         // `forward_msg` is now final. The hint strip / rewrite / tenant
         // transforms above may each have replaced the SQL, and facts only
-        // describe the text they were computed from — so recompute them once
-        // when any of them fired. An untouched query (the common path) keeps
-        // its single original pass.
-        let sql_changed = stripped_msg.is_some();
-        #[cfg(feature = "query-rewriting")]
-        let sql_changed = sql_changed || rewritten_msg.is_some();
-        #[cfg(feature = "multi-tenancy")]
-        let sql_changed = sql_changed || tenant_msg.is_some();
-        if sql_changed {
-            facts = StmtFacts::of_query(forward_msg);
+        // describe the text they were derived from — so rebuild them (which
+        // clears every memo cell) when any of them fired. An untouched query
+        // (the common path) keeps the value built from the original message,
+        // and rebuilding classifies nothing by itself. The block is gated on
+        // the features that read facts below, so a build with none of them
+        // carries no dead assignment.
+        #[cfg(any(
+            feature = "pool-modes",
+            feature = "query-cache",
+            feature = "edge-proxy"
+        ))]
+        {
+            let sql_changed = stripped_msg.is_some();
+            #[cfg(feature = "query-rewriting")]
+            let sql_changed = sql_changed || rewritten_msg.is_some();
+            #[cfg(feature = "multi-tenancy")]
+            let sql_changed = sql_changed || tenant_msg.is_some();
+            if sql_changed {
+                facts = StmtFacts::of_query(forward_msg);
+            }
         }
 
         // Edge cache: independent of the query-cache below — when both are
@@ -3618,10 +3726,10 @@ impl ProxyServer {
         // conservative, but the alternative is cross-session wrong rows.
         #[cfg(feature = "edge-proxy")]
         if config.edge.enabled
-            && facts.leaves_session_state
             && !session
                 .edge_ineligible
                 .load(std::sync::atomic::Ordering::Relaxed)
+            && facts.leaves_session_state()
         {
             session
                 .edge_ineligible
@@ -3636,10 +3744,10 @@ impl ProxyServer {
         {
             None
         } else {
-            let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
+            let sql = facts.sql();
             // Same gate as the query-cache: a plain deterministic SELECT, and
             // never mid-transaction (visibility would be wrong).
-            if facts.is_cacheable_read
+            if facts.is_cacheable_read()
                 && !session
                     .in_transaction
                     .load(std::sync::atomic::Ordering::Relaxed)
@@ -3716,8 +3824,8 @@ impl ProxyServer {
         let cache_ctx: Option<(crate::cache::CacheContext, crate::cache::QueryPrep)> = if is_write {
             None
         } else if let Some(qc) = state.query_cache.as_ref() {
-            let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
-            match Self::cacheable_read_ctx(session, facts.is_cacheable_read).await {
+            let sql = facts.sql();
+            match Self::cacheable_read_ctx(session, facts.is_cacheable_read()).await {
                 Some(ctx) => {
                     let (lookup, prep) = qc.get_with_prep(sql, &ctx).await;
                     if let crate::cache::CacheLookup::Hit { result, level } = lookup {
@@ -3793,10 +3901,13 @@ impl ProxyServer {
 
         // Conditional-reset bookkeeping: if this statement is not provably
         // session-neutral, mark the connection dirty so it is fully reset (not
-        // clean-skipped) when parked. The classification itself is the
-        // single-pass `StmtFacts` value — no extra scan of the SQL here.
+        // clean-skipped) when parked. Still evaluated only when the
+        // optimisation is enabled and the connection is not already dirty (one
+        // O(len) scan at most, until the first dirtying statement) — the facts
+        // memo just means the edge gate above, when it is also on, shares that
+        // one scan instead of doing its own.
         #[cfg(feature = "pool-modes")]
-        if config.pool_mode.skip_clean_reset && !backend.dirty && facts.leaves_session_state {
+        if config.pool_mode.skip_clean_reset && !backend.dirty && facts.leaves_session_state() {
             backend.dirty = true;
         }
 
@@ -3943,11 +4054,11 @@ impl ProxyServer {
                 // drain (rows become visible then).
                 #[cfg(feature = "edge-proxy")]
                 if config.edge.enabled {
-                    let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
+                    let sql = facts.sql();
                     if Self::edge_write_needs_invalidation(
                         is_write,
                         sql,
-                        facts.has_interior_semicolon,
+                        facts.has_interior_semicolon(),
                     ) {
                         // `tables_only` skips the fingerprint/params-hash work
                         // (discarded here) — a bulk INSERT must not pay full-
@@ -6462,8 +6573,8 @@ mod tests {
     }
 
     // ---- single-pass statement facts ----
-
     mod stmt_facts {
+        use super::super::stmt_fact_classifications;
         use super::{ProxyServer, StmtFacts};
 
         /// Statement table spanning every classifier branch the facts
@@ -6536,39 +6647,153 @@ mod tests {
             "BEGIN; UPDATE t SET v = 1; COMMIT",
         ];
 
-        /// `StmtFacts::compute` must agree, field for field, with the legacy
-        /// classifier it memoizes — for every statement shape. This is the
-        /// contract that makes threading the struct through the forward path
-        /// a pure optimisation rather than a behaviour change.
+        /// Every getter must agree with the legacy classifier it memoizes —
+        /// for every statement shape. This is the contract that makes
+        /// threading the facts through the forward path a pure optimisation
+        /// rather than a behaviour change.
         #[test]
-        fn compute_agrees_with_legacy_classifiers() {
+        fn facts_agree_with_legacy_classifiers() {
             assert!(CASES.len() + ODD_CASES.len() >= 40);
             for sql in CASES.iter().chain(ODD_CASES.iter()).copied() {
-                let f = StmtFacts::compute(sql);
+                let mut f = StmtFacts::new(sql);
                 assert_eq!(
-                    f.is_write,
+                    f.is_write(),
                     ProxyServer::is_write_query(sql),
                     "is_write mismatch for {sql:?}"
                 );
                 #[cfg(feature = "edge-proxy")]
                 assert_eq!(
-                    f.has_interior_semicolon,
+                    f.has_interior_semicolon(),
                     ProxyServer::stmt_has_interior_semicolon(sql),
                     "has_interior_semicolon mismatch for {sql:?}"
                 );
                 #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
                 assert_eq!(
-                    f.leaves_session_state,
+                    f.leaves_session_state(),
                     ProxyServer::stmt_leaves_session_state(sql),
                     "leaves_session_state mismatch for {sql:?}"
                 );
                 #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
                 assert_eq!(
-                    f.is_cacheable_read,
+                    f.is_cacheable_read(),
                     ProxyServer::is_cacheable_read_sql(sql),
                     "is_cacheable_read mismatch for {sql:?}"
                 );
             }
+        }
+
+        /// LAZINESS CONTRACT (the reason the memo is `Option`-celled rather
+        /// than computed up front): building the facts — the one thing the
+        /// forward path does for EVERY simple query — classifies nothing at
+        /// all. In the stock configuration `skip_clean_reset`, the query cache
+        /// and the edge proxy are all off, so no gate ever asks and the
+        /// statement is never scanned by any of these classifiers.
+        #[test]
+        fn building_facts_classifies_nothing() {
+            let before = stmt_fact_classifications();
+
+            let facts = StmtFacts::new("SELECT a, b FROM t WHERE id = 1");
+            let msg = crate::protocol::QueryMessage {
+                query: "INSERT INTO t VALUES (1)".to_string(),
+            }
+            .encode();
+            let from_msg = StmtFacts::of_query(&msg);
+            // Reading the borrowed text is not a classification either.
+            assert_eq!(facts.sql, "SELECT a, b FROM t WHERE id = 1");
+            assert_eq!(from_msg.sql, "INSERT INTO t VALUES (1)");
+
+            assert_eq!(
+                stmt_fact_classifications(),
+                before,
+                "constructing StmtFacts must not run any classifier"
+            );
+        }
+
+        /// …and once a gate does ask, the answer is computed exactly once no
+        /// matter how many gates (or how many calls) consult it.
+        #[test]
+        fn each_fact_is_classified_at_most_once() {
+            let sql = "SELECT v FROM t";
+            let mut f = StmtFacts::new(sql);
+
+            let before = stmt_fact_classifications();
+            let first = f.is_write();
+            let second = f.is_write();
+            let third = f.is_write();
+            assert_eq!(first, second);
+            assert_eq!(first, third);
+            assert_eq!(
+                stmt_fact_classifications() - before,
+                1,
+                "is_write must be classified once, then memoized"
+            );
+
+            #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
+            {
+                let before = stmt_fact_classifications();
+                let _ = f.leaves_session_state();
+                let _ = f.leaves_session_state();
+                assert_eq!(stmt_fact_classifications() - before, 1);
+            }
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            {
+                let before = stmt_fact_classifications();
+                let _ = f.is_cacheable_read();
+                let _ = f.is_cacheable_read();
+                assert_eq!(stmt_fact_classifications() - before, 1);
+            }
+            #[cfg(feature = "edge-proxy")]
+            {
+                let before = stmt_fact_classifications();
+                let _ = f.has_interior_semicolon();
+                let _ = f.has_interior_semicolon();
+                assert_eq!(stmt_fact_classifications() - before, 1);
+            }
+        }
+
+        /// The forward path rebuilds the facts when a routing-hint strip, a
+        /// rewrite rule or the tenant transform replaced the SQL. The rebuild
+        /// must describe the NEW text — i.e. clear the memo — otherwise the
+        /// cache / edge / pool gates would consult facts derived from the
+        /// pre-rewrite string. The hint-strip case is discriminating: a
+        /// leading `helios:` comment masks the SELECT lead, so the fact flips.
+        #[test]
+        fn rebuilding_on_changed_sql_clears_the_memo() {
+            let hinted = "/*helios:route=primary*/ SELECT v FROM t";
+            let stripped = "SELECT v FROM t";
+
+            let mut before = StmtFacts::new(hinted);
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            assert!(
+                !before.is_cacheable_read(),
+                "leading comment masks the SELECT lead"
+            );
+            #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
+            assert!(before.leaves_session_state(), "…and the neutral lead too");
+            let _ = before.is_write();
+
+            // Rebuilt exactly as `forward_simple_query` does it, on the final
+            // message: a fresh value, so nothing memoized from `hinted`
+            // survives.
+            let msg = crate::protocol::QueryMessage {
+                query: stripped.to_string(),
+            }
+            .encode();
+            let mut after = StmtFacts::of_query(&msg);
+            assert_eq!(after.sql, stripped);
+            let count_before = stmt_fact_classifications();
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            assert!(
+                after.is_cacheable_read(),
+                "the stripped SELECT is cacheable"
+            );
+            #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
+            assert!(!after.leaves_session_state());
+            assert!(!after.is_write());
+            assert!(
+                stmt_fact_classifications() > count_before,
+                "the rebuilt facts must re-classify, not reuse the old answers"
+            );
         }
 
         /// The multi-statement fact is exactly the interior-`;` rule the edge
@@ -6590,33 +6815,40 @@ mod tests {
                     "{sql:?}"
                 );
                 assert_eq!(
-                    StmtFacts::compute(sql).has_interior_semicolon,
+                    StmtFacts::new(sql).has_interior_semicolon(),
                     want,
                     "{sql:?}"
                 );
             }
         }
 
-        /// `of_query` classifies the SQL carried by a `Query` message, and a
-        /// payload that is not a valid query cstring falls back to the
-        /// all-false default — the same fallback every individual call site
-        /// used before the facts were hoisted.
+        /// `of_query` borrows the SQL carried by a `Query` message, and a
+        /// payload that is not a valid query cstring falls back to the empty
+        /// statement — for which every classifier answers `false`, the same
+        /// fallback each individual call site used before the facts existed.
         #[test]
         fn of_query_reads_the_message_payload() {
             let msg = crate::protocol::QueryMessage {
                 query: "UPDATE t SET v = 1".to_string(),
             }
             .encode();
-            assert_eq!(
-                StmtFacts::of_query(&msg),
-                StmtFacts::compute("UPDATE t SET v = 1")
-            );
+            let mut f = StmtFacts::of_query(&msg);
+            assert_eq!(f.sql, "UPDATE t SET v = 1");
+            assert!(f.is_write());
 
             let empty = crate::protocol::Message::new(
                 crate::protocol::MessageType::Query,
                 bytes::BytesMut::new(),
             );
-            assert_eq!(StmtFacts::of_query(&empty), StmtFacts::default());
+            let mut f = StmtFacts::of_query(&empty);
+            assert_eq!(f.sql, "");
+            assert!(!f.is_write());
+            #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
+            assert!(!f.leaves_session_state());
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            assert!(!f.is_cacheable_read());
+            #[cfg(feature = "edge-proxy")]
+            assert!(!f.has_interior_semicolon());
         }
     }
 
