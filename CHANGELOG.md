@@ -5,7 +5,27 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.6.0] - 2026-09-04
+
+Performance & stability batch (21 fixes) from the September 2026 audit, plus **Transaction
+Replay made real**: `tr_mode` was previously accepted but never read on the data path — a
+backend failure mid-query dropped the client socket with no error frame. It now drives
+in-session failover (`none` / `session` / `select` / `transaction`, see the entry below), with
+a live kill-the-primary regression (`scripts/regress/tr-failover-test.sh`, 77 checks).
+Highlights: per-connection `Arc<ProxyConfig>` (no deep clone per accept), lazily-memoized
+statement facts (one lexical pass per simple Query), zero-copy `Message::encode_into` on the
+extended-protocol path, O(1) L1 hot-cache LRU, analytics ingest moved off the connection task
+(bounded queue + fingerprint memo), single-lowercase anomaly scan, `[limits]`
+`max_client_connections` / `client_idle_timeout_secs` / `tr_*` caps, `[cache]`
+`max_cacheable_response_bytes`, health-probe in-flight guard, bounded failover history,
+backend auth-frame length cap, pre-auth CancelRequest panic fix, admin `forward_sql_request`
+timeouts + body cap, legacy pool gauge leak + idle-checkout validation, rate-limiter hit-path
+mutual exclusion preserved without key clones, journal `begin_and_log` single-lock path.
+Every change is `proxy.toml`-tunable where it introduces a threshold; defaults reproduce
+prior behavior. Behavior changes to note: backend faults now yield a PostgreSQL
+`ErrorResponse` (57P01 / 08007 / 08006) instead of a bare disconnect; primary selection
+considers any healthy `role = "primary"` node (previously only the first listed);
+`anomaly::QueryObservation` is now borrowed (`Cow`) — library-API change.
 
 ### Fixed
 
