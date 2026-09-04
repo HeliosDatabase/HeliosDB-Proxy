@@ -530,7 +530,15 @@ impl AdminServer {
             }
             ("GET", "/metrics/prometheus") => {
                 let metrics = state.metrics.read().await.clone();
-                let prometheus = Self::format_prometheus_metrics(&metrics);
+                #[allow(unused_mut)]
+                let mut prometheus = Self::format_prometheus_metrics(&metrics);
+                // Shed analytics samples belong next to the other counters, so
+                // an operator can alert on them without polling the JSON
+                // `/api/analytics` endpoint.
+                #[cfg(feature = "query-analytics")]
+                if let Some(a) = state.analytics.read().await.as_ref() {
+                    Self::push_analytics_prometheus(&mut prometheus, a.dropped_total());
+                }
                 Ok((200, serde_json::json!({ "text": prometheus })))
             }
 
@@ -2030,6 +2038,21 @@ impl AdminServer {
     }
 
     /// Format metrics as Prometheus text format
+    /// Append the query-analytics counters to a Prometheus exposition body.
+    ///
+    /// `analytics_dropped_total` is also on `GET /api/analytics`, but the
+    /// counters an operator alerts on live here.
+    #[cfg(feature = "query-analytics")]
+    fn push_analytics_prometheus(output: &mut String, dropped_total: u64) {
+        output.push_str(
+            "# HELP heliosdb_proxy_analytics_dropped_total Query executions dropped before analytics ingest (queue full or closed, or ingest panicked)\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_analytics_dropped_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_analytics_dropped_total {dropped_total}\n"
+        ));
+    }
+
     fn format_prometheus_metrics(metrics: &ServerMetricsSnapshot) -> String {
         let mut output = String::new();
 
@@ -2798,6 +2821,35 @@ mod tests {
         assert!(output.contains("heliosdb_proxy_failovers_total 2"));
     }
 
+    /// Shed analytics samples must be exposed on `/metrics/prometheus`,
+    /// next to the other counters an operator alerts on — before this they
+    /// were only reachable through the JSON `/api/analytics` endpoint.
+    #[cfg(feature = "query-analytics")]
+    #[tokio::test]
+    async fn test_prometheus_exposes_analytics_dropped_total() {
+        let state = Arc::new(AdminState::new());
+
+        // Absent until the engine is attached.
+        let (status, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        assert!(!body["text"]
+            .as_str()
+            .unwrap()
+            .contains("heliosdb_proxy_analytics_dropped_total"));
+
+        let analytics = Arc::new(crate::analytics::QueryAnalytics::with_defaults());
+        state.with_analytics(analytics).await;
+        let (status, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("# TYPE heliosdb_proxy_analytics_dropped_total counter"));
+        assert!(text.contains("heliosdb_proxy_analytics_dropped_total 0\n"));
+    }
+
     #[test]
     fn test_metrics_response_active_connections() {
         let snapshot = ServerMetricsSnapshot {
@@ -3474,6 +3526,36 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(value["limit"].as_u64().unwrap(), 5);
         assert_eq!(value["events"].as_array().unwrap().len(), 5);
+    }
+
+    /// `GET /api/analytics` must return 503 until the engine is attached, and
+    /// then a fixed JSON shape: the operator-facing `analytics_dropped_total`
+    /// (samples shed because the ingest queue was full, or whose ingest
+    /// panicked) is part of that contract.
+    #[cfg(feature = "query-analytics")]
+    #[tokio::test]
+    async fn test_analytics_response_shape() {
+        let state = Arc::new(AdminState::new());
+        let (status, _) = AdminServer::handle_analytics("/api/analytics", &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 503);
+
+        let analytics = Arc::new(crate::analytics::QueryAnalytics::with_defaults());
+        analytics.record_now(crate::analytics::QueryExecution::new(
+            "SELECT * FROM users WHERE id = 1".to_string(),
+            std::time::Duration::from_millis(3),
+        ));
+        state.with_analytics(analytics).await;
+
+        let (status, value) = AdminServer::handle_analytics("/api/analytics?limit=5", &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        assert_eq!(value["limit"].as_u64().unwrap(), 5);
+        assert_eq!(value["top_queries"].as_array().unwrap().len(), 1);
+        assert_eq!(value["slow_query_count"].as_u64().unwrap(), 0);
+        assert_eq!(value["analytics_dropped_total"].as_u64().unwrap(), 0);
     }
 
     #[cfg(any(feature = "anomaly-detection", feature = "query-analytics"))]

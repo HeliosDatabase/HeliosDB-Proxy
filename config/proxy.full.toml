@@ -436,6 +436,13 @@ ttl_fallback_secs = 60          # Fallback TTL when WAL is unavailable
 # # Bound on the memoized raw-SQL -> fingerprint cache: a repeated statement
 # # skips all six regex normalization passes. Set to 0 to disable memoization.
 # fingerprint_cache_size = 10000
+# # Largest statement (bytes) allowed into that memo. The memo key is the raw
+# # SQL, so this is what bounds it in BYTES and not just in entries: with the
+# # defaults it retains at most 10000 * 4096 = ~40 MiB of SQL. A longer
+# # statement (bulk INSERT with inline VALUES, generated DDL) is still
+# # fingerprinted, it is simply never cached. Must be >= 1; use
+# # fingerprint_cache_size = 0 to turn memoization off.
+# fingerprint_cache_max_sql_bytes = 4096
 #
 # # Slow query log
 # [analytics.slow_query]

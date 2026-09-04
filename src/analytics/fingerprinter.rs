@@ -5,6 +5,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -13,6 +14,18 @@ use regex::Regex;
 /// Default bound on the memoized fingerprint cache. Mirrors the
 /// `[analytics] fingerprint_cache_size` default in `proxy.toml`.
 pub const DEFAULT_FINGERPRINT_CACHE_SIZE: usize = 10_000;
+
+/// Default per-statement byte cap for memoization. Mirrors the
+/// `[analytics] fingerprint_cache_max_sql_bytes` default in `proxy.toml`.
+///
+/// A count-only bound is not a memory bound: the memo key is the raw SQL, so
+/// without a per-entry cap a client issuing large distinct statements (a bulk
+/// `INSERT` with inline `VALUES`, say) could pin `fingerprint_cache_size`
+/// whole statements of arbitrary size. Statements longer than this are still
+/// fingerprinted, just never memoized, which caps memo retention at
+/// `fingerprint_cache_size * fingerprint_cache_max_sql_bytes` bytes of SQL
+/// (~40 MiB with both defaults).
+pub const DEFAULT_FINGERPRINT_CACHE_MAX_SQL_BYTES: usize = 4096;
 
 /// Query fingerprinter
 #[derive(Debug)]
@@ -36,8 +49,18 @@ pub struct QueryFingerprinter {
     /// `cache_capacity`: when it fills, the map is cleared wholesale (a cheap
     /// stand-in for LRU that keeps memory flat without per-hit bookkeeping).
     cache: DashMap<Box<str>, Arc<QueryFingerprint>>,
-    /// Bound on `cache`. `0` disables memoization entirely.
+    /// Bound on the NUMBER of `cache` entries. `0` disables memoization.
     cache_capacity: usize,
+    /// Bound on the SIZE of a memoized statement, in bytes. A statement longer
+    /// than this is fingerprinted but not memoized, so the memo's total
+    /// retention is bounded in bytes and not only in entries.
+    cache_max_sql_bytes: usize,
+    /// Occupancy of `cache`, tracked here because `DashMap::len()` read-locks
+    /// every shard — far too expensive to call on each memo miss. Concurrent
+    /// misses can overshoot `cache_capacity` slightly between the check and
+    /// the insert (bounded by the number of racing inserters, corrected by the
+    /// next clear); the bound is a memory guard, not an exact quota.
+    cache_len: AtomicUsize,
 }
 
 impl QueryFingerprinter {
@@ -46,9 +69,18 @@ impl QueryFingerprinter {
         Self::with_cache_size(DEFAULT_FINGERPRINT_CACHE_SIZE)
     }
 
-    /// Create a fingerprinter with an explicit memo-cache bound. `0` disables
-    /// memoization, so every call recomputes (the pre-cache behaviour).
+    /// Create a fingerprinter with an explicit memo-entry bound and the default
+    /// per-statement byte cap. `0` disables memoization, so every call
+    /// recomputes (the pre-cache behaviour).
     pub fn with_cache_size(cache_capacity: usize) -> Self {
+        Self::with_cache_limits(cache_capacity, DEFAULT_FINGERPRINT_CACHE_MAX_SQL_BYTES)
+    }
+
+    /// Create a fingerprinter with both memo bounds: at most `cache_capacity`
+    /// entries, and only for statements of at most `cache_max_sql_bytes`
+    /// bytes. Wired to `[analytics] fingerprint_cache_size` /
+    /// `fingerprint_cache_max_sql_bytes`.
+    pub fn with_cache_limits(cache_capacity: usize, cache_max_sql_bytes: usize) -> Self {
         Self {
             string_literal_re: Regex::new(r"'[^']*'").expect("Invalid regex"),
             numeric_literal_re: Regex::new(r"\b\d+(\.\d+)?\b").expect("Invalid regex"),
@@ -61,31 +93,66 @@ impl QueryFingerprinter {
             hex_re: Regex::new(r"0x[0-9a-fA-F]+").expect("Invalid regex"),
             cache: DashMap::new(),
             cache_capacity,
+            cache_max_sql_bytes,
+            cache_len: AtomicUsize::new(0),
         }
     }
 
     /// Generate fingerprint from query (memoized).
+    ///
+    /// Clones out of the memoized `Arc`; callers on a hot path should prefer
+    /// [`Self::fingerprint_cached`] (or [`Self::fingerprint_cached_lower`],
+    /// which also shares the caller's folded copy) and keep the `Arc`.
     pub fn fingerprint(&self, query: &str) -> QueryFingerprint {
         (*self.fingerprint_cached(query)).clone()
     }
 
     /// Memoizing fingerprint returning the shared entry, so repeat statements
     /// pay neither the regex passes nor a clone of the normalized text.
+    /// Allocates the ASCII-folded copy itself; the analytics ingest path holds
+    /// one already and calls [`Self::fingerprint_cached_lower`] instead.
     pub fn fingerprint_cached(&self, query: &str) -> Arc<QueryFingerprint> {
-        if self.cache_capacity == 0 {
-            return Arc::new(self.compute_fingerprint(query));
+        let lower = ascii_lower(query);
+        self.fingerprint_cached_lower(query, &lower)
+    }
+
+    /// [`Self::fingerprint_cached`] given the caller's ASCII-folded copy of the
+    /// statement (see [`ascii_lower`]), so the whole ingest path pays exactly
+    /// one case conversion per query.
+    ///
+    /// `lower` MUST be `ascii_lower(query)`: it is used for keyword offsets
+    /// that are then applied to `query`, which only holds because ASCII
+    /// folding is length-preserving.
+    pub fn fingerprint_cached_lower(&self, query: &str, lower: &str) -> Arc<QueryFingerprint> {
+        debug_assert_eq!(
+            query.len(),
+            lower.len(),
+            "`lower` must be the ASCII-folded copy of `query`"
+        );
+        // Skip the memo entirely for disabled caches and for oversized
+        // statements: the key is the raw SQL, so memoizing a huge one-off
+        // statement would retain it for the life of the cache generation.
+        if self.cache_capacity == 0 || query.len() > self.cache_max_sql_bytes {
+            return Arc::new(self.compute_fingerprint_lower(query, lower));
         }
         if let Some(hit) = self.cache.get(query) {
             return hit.clone();
         }
-        let fingerprint = Arc::new(self.compute_fingerprint(query));
+        let fingerprint = Arc::new(self.compute_fingerprint_lower(query, lower));
         // Bound the memo. Clearing on overflow is deliberate: it keeps the hot
         // path free of LRU bookkeeping, and a workload with more than
         // `cache_capacity` live shapes gains little from partial eviction.
-        if self.cache.len() >= self.cache_capacity {
+        if self.cache_len.load(Ordering::Relaxed) >= self.cache_capacity {
             self.cache.clear();
+            self.cache_len.store(0, Ordering::Relaxed);
         }
-        self.cache.insert(query.into(), fingerprint.clone());
+        if self
+            .cache
+            .insert(query.into(), fingerprint.clone())
+            .is_none()
+        {
+            self.cache_len.fetch_add(1, Ordering::Relaxed);
+        }
         fingerprint
     }
 
@@ -95,19 +162,24 @@ impl QueryFingerprinter {
     }
 
     /// Compute a fingerprint, bypassing the memo.
-    ///
-    /// Takes ONE lowercase copy of the statement and shares it between table
-    /// extraction and operation detection; both are case-insensitive scans and
-    /// previously allocated an uppercase copy each.
     fn compute_fingerprint(&self, query: &str) -> QueryFingerprint {
-        let lower = query.to_lowercase();
+        let lower = ascii_lower(query);
+        self.compute_fingerprint_lower(query, &lower)
+    }
+
+    /// Compute a fingerprint from the statement and its ASCII-folded copy.
+    ///
+    /// ONE case conversion is shared between table extraction, operation
+    /// detection and (on the ingest path) intent classification; each of those
+    /// previously allocated a whole-statement copy of its own.
+    fn compute_fingerprint_lower(&self, query: &str, lower: &str) -> QueryFingerprint {
         let normalized = self.normalize(query);
         let hash = self.compute_hash(&normalized);
 
         QueryFingerprint {
             hash,
             normalized,
-            tables: self.extract_tables_lower(query, &lower),
+            tables: self.extract_tables_lower(query, lower),
             operation: Self::detect_operation_lower(lower.trim()),
             original_length: query.len(),
         }
@@ -159,19 +231,30 @@ impl QueryFingerprinter {
         hasher.finish()
     }
 
-    /// Extract table names from a query, given an already-lowercased copy of
-    /// it. `lower` is only used for case-insensitive keyword search; every
-    /// extracted identifier still comes from the original `query`.
+    /// Extract table names from a query, given its ASCII-folded copy.
+    ///
+    /// `lower` is only used for case-insensitive keyword search; every
+    /// extracted identifier still comes from the original `query`, so keyword
+    /// offsets found in `lower` are applied to `query`. That mapping is only
+    /// sound because [`ascii_lower`] is length-preserving — a Unicode
+    /// `to_lowercase()` is NOT (U+0130 folds to two chars / three bytes), and
+    /// an offset from such a copy can exceed `query.len()` or land mid-char.
+    /// Every slice below additionally goes through `str::get`, so a future
+    /// caller that passes a mismatched copy gets no table rather than a panic
+    /// on the shared analytics consumer task.
     fn extract_tables_lower(&self, query: &str, lower: &str) -> Vec<String> {
-        let query_lower = lower;
         let mut tables = HashSet::new();
+        let push_after = |offset: usize, tables: &mut HashSet<String>| {
+            if let Some(rest) = query.get(offset..) {
+                if let Some(table) = self.extract_first_identifier(rest) {
+                    tables.insert(table);
+                }
+            }
+        };
 
         // FROM clause
-        if let Some(from_pos) = query_lower.find("from") {
-            let after_from = &query[from_pos + 4..];
-            if let Some(table) = self.extract_first_identifier(after_from) {
-                tables.insert(table);
-            }
+        if let Some(from_pos) = lower.find("from") {
+            push_after(from_pos + 4, &mut tables);
         }
 
         // JOIN clauses
@@ -183,40 +266,26 @@ impl QueryFingerprinter {
             "outer join",
         ] {
             let mut search_pos = 0;
-            while let Some(pos) = query_lower[search_pos..].find(keyword) {
+            while let Some(pos) = lower[search_pos..].find(keyword) {
                 let absolute_pos = search_pos + pos + keyword.len();
-                if absolute_pos < query.len() {
-                    let after_join = &query[absolute_pos..];
-                    if let Some(table) = self.extract_first_identifier(after_join) {
-                        tables.insert(table);
-                    }
-                }
+                push_after(absolute_pos, &mut tables);
                 search_pos = absolute_pos;
             }
         }
 
         // INSERT INTO
-        if let Some(pos) = query_lower.find("insert into") {
-            let after_insert = &query[pos + 11..];
-            if let Some(table) = self.extract_first_identifier(after_insert) {
-                tables.insert(table);
-            }
+        if let Some(pos) = lower.find("insert into") {
+            push_after(pos + 11, &mut tables);
         }
 
         // UPDATE
-        if let Some(pos) = query_lower.find("update") {
-            let after_update = &query[pos + 6..];
-            if let Some(table) = self.extract_first_identifier(after_update) {
-                tables.insert(table);
-            }
+        if let Some(pos) = lower.find("update") {
+            push_after(pos + 6, &mut tables);
         }
 
         // DELETE FROM
-        if let Some(pos) = query_lower.find("delete from") {
-            let after_delete = &query[pos + 11..];
-            if let Some(table) = self.extract_first_identifier(after_delete) {
-                tables.insert(table);
-            }
+        if let Some(pos) = lower.find("delete from") {
+            push_after(pos + 11, &mut tables);
         }
 
         tables.into_iter().collect()
@@ -289,8 +358,23 @@ impl QueryFingerprinter {
     /// only for direct/test callers.
     #[cfg(test)]
     fn detect_operation(&self, query: &str) -> OperationType {
-        Self::detect_operation_lower(query.trim().to_lowercase().as_str())
+        Self::detect_operation_lower(ascii_lower(query.trim()).as_str())
     }
+}
+
+/// ASCII-fold a statement: the ONE case conversion the analytics ingest path
+/// takes, shared by fingerprinting and intent classification.
+///
+/// Deliberately ASCII-only rather than [`str::to_lowercase`]. Folding is used
+/// two ways here — to find SQL keywords, which are ASCII, and to map the
+/// offsets of those keywords back onto the original statement. Unicode folding
+/// breaks the second use: `'\u{130}'.to_lowercase()` yields two chars / three
+/// bytes for a two-byte input, so offsets taken from the folded copy no longer
+/// address the original and slicing it panics. ASCII folding only rewrites
+/// bytes `A-Z` in place, so byte offsets are identical in both strings and any
+/// keyword match is guaranteed to sit on a char boundary of the original.
+pub fn ascii_lower(query: &str) -> String {
+    query.to_ascii_lowercase()
 }
 
 impl Default for QueryFingerprinter {
@@ -480,6 +564,86 @@ mod tests {
             b.sort();
             assert_eq!(a, b);
         }
+    }
+
+    /// Regression: statements whose Unicode lowercase is LONGER than the
+    /// original must not panic. `'\u{130}'.to_lowercase()` is two chars /
+    /// three bytes for a two-byte input, so a keyword offset taken from a
+    /// `to_lowercase()` copy can point past the end of the original statement
+    /// (or into the middle of a char). `SELECT \u{130} from` is 14 bytes but
+    /// 15 lowercased, and `find("from") + 4 == 15` — slicing the original
+    /// there panicked with "byte index 15 is out of range".
+    #[test]
+    fn test_fingerprint_length_changing_unicode_does_not_panic() {
+        let fp = QueryFingerprinter::new();
+
+        for sql in [
+            "SELECT \u{130} from",
+            "SELECT \u{130} FROM users",
+            "select \u{130}\u{130}\u{130} from orders where name = '\u{130}'",
+            "INSERT INTO \u{130}tbl VALUES (1)",
+            "UPDATE \u{130} SET a = 1",
+            "DELETE FROM \u{130} WHERE id = 1",
+            // Other length-changing folds: German sharp s and the ligature fi.
+            "SELECT * FROM \u{1E9E} JOIN \u{FB01} ON 1 = 1",
+        ] {
+            let out = fp.fingerprint(sql);
+            assert_eq!(out.original_length, sql.len());
+        }
+
+        // The ASCII keyword scan still finds the real table names around them.
+        let out = fp.fingerprint("SELECT \u{130} FROM users");
+        assert!(
+            out.tables.contains(&"users".to_string()),
+            "tables: {:?}",
+            out.tables
+        );
+    }
+
+    /// ASCII folding is what makes the offset mapping sound: it must never
+    /// change the byte length, unlike `str::to_lowercase`.
+    #[test]
+    fn test_ascii_lower_preserves_byte_length() {
+        for sql in [
+            "SELECT \u{130} FROM T",
+            "\u{1E9E}\u{130}\u{FB01}",
+            "SELECT * FROM users",
+        ] {
+            assert_eq!(ascii_lower(sql).len(), sql.len());
+        }
+        assert_eq!(ascii_lower("SeLeCt 1"), "select 1");
+        // Non-ASCII is left alone (by design — SQL keywords are ASCII).
+        assert_eq!(ascii_lower("\u{130}"), "\u{130}");
+    }
+
+    /// A statement larger than the per-entry byte cap is still fingerprinted
+    /// but must never enter the memo: the key is the raw SQL, so caching it
+    /// would retain the whole statement for the life of the cache generation.
+    #[test]
+    fn test_fingerprint_memo_skips_oversized_statements() {
+        let fp = QueryFingerprinter::with_cache_limits(1000, 64);
+
+        let small = "SELECT * FROM users WHERE id = 1";
+        fp.fingerprint(small);
+        assert_eq!(fp.cache_len(), 1);
+
+        let big = format!("SELECT * FROM users WHERE id IN ({})", "1,".repeat(200));
+        assert!(big.len() > 64);
+        let a = fp.fingerprint(&big);
+        let b = fp.fingerprint(&big);
+        assert_eq!(
+            fp.cache_len(),
+            1,
+            "oversized statement must not be memoized"
+        );
+        // Bypassing the memo must not change the answer.
+        assert_eq!(a.hash, b.hash);
+        assert_eq!(
+            a.hash,
+            QueryFingerprinter::with_cache_size(0)
+                .fingerprint(&big)
+                .hash
+        );
     }
 
     /// The memo must stay bounded by its configured capacity.
