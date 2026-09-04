@@ -2120,6 +2120,50 @@ impl AdminServer {
             metrics.cache_capture_oversize
         ));
 
+        // In-session Transaction Replay (tr_mode) counters.
+        let tr = &metrics.tr;
+        for (name, help, value) in [
+            (
+                "tr_failovers_total",
+                "Sessions re-homed onto a replacement backend after a backend fault (tr_mode)",
+                tr.failovers,
+            ),
+            (
+                "tr_statements_reexecuted_total",
+                "In-flight statements transparently re-executed after an in-session failover",
+                tr.statements_reexecuted,
+            ),
+            (
+                "tr_transactions_replayed_total",
+                "Explicit transactions replayed on the new backend (tr_mode = transaction)",
+                tr.transactions_replayed,
+            ),
+            (
+                "tr_replay_failures_total",
+                "Transaction replays that failed (client received SQLSTATE 40001)",
+                tr.replay_failures,
+            ),
+            (
+                "tr_unknown_outcome_errors_total",
+                "SQLSTATE 08007 transaction_resolution_unknown errors returned to clients",
+                tr.unknown_outcome_errors,
+            ),
+            (
+                "tr_replay_cap_exceeded_total",
+                "Transactions marked non-replayable by limits.tr_max_replay_statements/bytes",
+                tr.replay_cap_exceeded,
+            ),
+            (
+                "tr_session_set_cap_exceeded_total",
+                "Sessions whose SET tracking stopped at limits.tr_max_session_set_statements",
+                tr.session_set_cap_exceeded,
+            ),
+        ] {
+            output.push_str(&format!("# HELP heliosdb_proxy_{name} {help}\n"));
+            output.push_str(&format!("# TYPE heliosdb_proxy_{name} counter\n"));
+            output.push_str(&format!("heliosdb_proxy_{name} {value}\n"));
+        }
+
         output
     }
 
@@ -2200,6 +2244,7 @@ impl AdminState {
                 bytes_sent: 0,
                 failovers: 0,
                 cache_capture_oversize: 0,
+                tr: Default::default(),
             }),
             active_sessions: RwLock::new(0),
             config_snapshot: RwLock::new(ConfigSnapshot {
@@ -2394,6 +2439,21 @@ struct MetricsResponse {
     /// Cacheable reads whose response outgrew
     /// `[cache] max_cacheable_response_bytes` and were therefore not cached.
     cache_capture_oversize: u64,
+    /// In-session Transaction Replay (`tr_mode`): sessions re-homed onto a
+    /// replacement backend after a backend fault.
+    tr_failovers_total: u64,
+    /// In-flight statements transparently re-executed after a failover.
+    tr_statements_reexecuted_total: u64,
+    /// Explicit transactions replayed on the new backend (`transaction` mode).
+    tr_transactions_replayed_total: u64,
+    /// Transaction replays that failed (client received SQLSTATE 40001).
+    tr_replay_failures_total: u64,
+    /// SQLSTATE 08007 `transaction_resolution_unknown` errors returned.
+    tr_unknown_outcome_errors_total: u64,
+    /// Transactions marked non-replayable by `[limits] tr_max_replay_*`.
+    tr_replay_cap_exceeded_total: u64,
+    /// Sessions whose SET tracking hit `[limits] tr_max_session_set_statements`.
+    tr_session_set_cap_exceeded_total: u64,
 }
 
 impl From<ServerMetricsSnapshot> for MetricsResponse {
@@ -2408,6 +2468,13 @@ impl From<ServerMetricsSnapshot> for MetricsResponse {
             bytes_sent: m.bytes_sent,
             failovers: m.failovers,
             cache_capture_oversize: m.cache_capture_oversize,
+            tr_failovers_total: m.tr.failovers,
+            tr_statements_reexecuted_total: m.tr.statements_reexecuted,
+            tr_transactions_replayed_total: m.tr.transactions_replayed,
+            tr_replay_failures_total: m.tr.replay_failures,
+            tr_unknown_outcome_errors_total: m.tr.unknown_outcome_errors,
+            tr_replay_cap_exceeded_total: m.tr.replay_cap_exceeded,
+            tr_session_set_cap_exceeded_total: m.tr.session_set_cap_exceeded,
         }
     }
 }
@@ -2845,6 +2912,15 @@ mod tests {
             bytes_sent: 100000,
             failovers: 2,
             cache_capture_oversize: 7,
+            tr: crate::server::TrMetricsSnapshot {
+                failovers: 4,
+                statements_reexecuted: 5,
+                transactions_replayed: 6,
+                replay_failures: 1,
+                unknown_outcome_errors: 2,
+                replay_cap_exceeded: 3,
+                session_set_cap_exceeded: 8,
+            },
         };
 
         let output = AdminServer::format_prometheus_metrics(&metrics);
@@ -2854,6 +2930,14 @@ mod tests {
         // O1: the capture byte-cap counter is scrapeable.
         assert!(output.contains("heliosdb_proxy_cache_capture_oversize_total 7"));
         assert!(output.contains("heliosdb_proxy_connections_rejected_total 7"));
+        // F3: in-session Transaction Replay counters are scrapeable.
+        assert!(output.contains("heliosdb_proxy_tr_failovers_total 4"));
+        assert!(output.contains("heliosdb_proxy_tr_statements_reexecuted_total 5"));
+        assert!(output.contains("heliosdb_proxy_tr_transactions_replayed_total 6"));
+        assert!(output.contains("heliosdb_proxy_tr_replay_failures_total 1"));
+        assert!(output.contains("heliosdb_proxy_tr_unknown_outcome_errors_total 2"));
+        assert!(output.contains("heliosdb_proxy_tr_replay_cap_exceeded_total 3"));
+        assert!(output.contains("heliosdb_proxy_tr_session_set_cap_exceeded_total 8"));
     }
 
     /// Shed analytics samples must be exposed on `/metrics/prometheus`,
@@ -2896,11 +2980,17 @@ mod tests {
             bytes_sent: 20000,
             failovers: 1,
             cache_capture_oversize: 3,
+            tr: crate::server::TrMetricsSnapshot {
+                transactions_replayed: 9,
+                ..Default::default()
+            },
         };
 
         let response = MetricsResponse::from(snapshot);
         assert_eq!(response.connections_active, 70);
         assert_eq!(response.cache_capture_oversize, 3);
+        assert_eq!(response.tr_transactions_replayed_total, 9);
+        assert_eq!(response.tr_failovers_total, 0);
     }
 
     /// Helper: build an AdminState with the given (address, role,

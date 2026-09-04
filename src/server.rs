@@ -219,6 +219,12 @@ struct ResolvedLimits {
     /// `client_idle_timeout_secs = 0` (the default), which is the pre-timeout
     /// behaviour: the query loop then waits on the client forever.
     client_idle_timeout: Option<Duration>,
+    /// In-session TR: cap on recorded statements per explicit transaction.
+    tr_max_replay_statements: usize,
+    /// In-session TR: cap on recorded bytes per explicit transaction.
+    tr_max_replay_bytes: usize,
+    /// In-session TR: cap on tracked session `SET`/`RESET` statements.
+    tr_max_session_set_statements: usize,
 }
 
 impl ResolvedLimits {
@@ -241,6 +247,9 @@ impl ResolvedLimits {
                 0 => None,
                 secs => Some(Duration::from_secs(secs)),
             },
+            tr_max_replay_statements: l.tr_max_replay_statements,
+            tr_max_replay_bytes: l.tr_max_replay_bytes,
+            tr_max_session_set_statements: l.tr_max_session_set_statements,
         }
     }
 }
@@ -433,6 +442,43 @@ struct ServerMetrics {
     /// receives every byte) — either the workload returns huge result sets or
     /// the ceiling is set too low.
     cache_capture_oversize: AtomicU64,
+    /// In-session Transaction Replay (`tr_mode`) counters.
+    tr: TrMetrics,
+}
+
+/// In-session Transaction Replay counters (see `TrMode` / `tr_decide`).
+#[derive(Default)]
+struct TrMetrics {
+    /// Sessions re-homed onto a replacement backend after a fault.
+    failovers: AtomicU64,
+    /// In-flight statements transparently re-executed on the new backend.
+    statements_reexecuted: AtomicU64,
+    /// Explicit transactions successfully replayed on the new backend.
+    transactions_replayed: AtomicU64,
+    /// Transaction replays that failed (client received SQLSTATE 40001).
+    replay_failures: AtomicU64,
+    /// SQLSTATE 08007 `transaction_resolution_unknown` errors returned.
+    unknown_outcome_errors: AtomicU64,
+    /// Transactions marked non-replayable because they exceeded
+    /// `[limits] tr_max_replay_statements` / `tr_max_replay_bytes`.
+    replay_cap_exceeded: AtomicU64,
+    /// Sessions whose `SET` tracking stopped at
+    /// `[limits] tr_max_session_set_statements`.
+    session_set_cap_exceeded: AtomicU64,
+}
+
+impl TrMetrics {
+    fn snapshot(&self) -> TrMetricsSnapshot {
+        TrMetricsSnapshot {
+            failovers: self.failovers.load(Ordering::Relaxed),
+            statements_reexecuted: self.statements_reexecuted.load(Ordering::Relaxed),
+            transactions_replayed: self.transactions_replayed.load(Ordering::Relaxed),
+            replay_failures: self.replay_failures.load(Ordering::Relaxed),
+            unknown_outcome_errors: self.unknown_outcome_errors.load(Ordering::Relaxed),
+            replay_cap_exceeded: self.replay_cap_exceeded.load(Ordering::Relaxed),
+            session_set_cap_exceeded: self.session_set_cap_exceeded.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Load balancer state
@@ -472,9 +518,35 @@ pub struct ClientSession {
     /// parked in the middle of a copy, aborting it and hanging the client.
     /// Cleared once the COPY drains to ReadyForQuery.
     pub copy_in_progress: std::sync::atomic::AtomicBool,
+    /// Status byte of the most recent `ReadyForQuery` relayed to the client
+    /// (`b'I'` idle, `b'T'` in transaction, `b'E'` failed transaction).
+    /// Written alongside `in_transaction`; read by the in-session TR
+    /// bookkeeping to detect the Idle→InTx transition and a failed
+    /// transaction (which is never replayable).
+    pub last_rfq_status: std::sync::atomic::AtomicU8,
+    /// Whether the most recent fully-relayed response carried an
+    /// `ErrorResponse` frame. Lets the TR bookkeeping skip recording a
+    /// `SET` that the backend rejected.
+    pub last_response_error: std::sync::atomic::AtomicBool,
+    /// Set by the forward path when the statement it just sent was
+    /// transformed on the way to the backend (query-rewrite rule fired,
+    /// tenant filter injected): the client text the TR bookkeeping records is
+    /// then NOT what executed, so the enclosing transaction must not be
+    /// blindly replayed. Consumed (swapped to false) by the recorder.
+    pub tr_replay_tainted: std::sync::atomic::AtomicBool,
+    /// Secret the proxy may use to authenticate its OWN backend connections
+    /// for this session (SCRAM-SHA-256 / MD5 / cleartext challenges on a
+    /// redial, route switch or in-session failover). Populated only when the
+    /// proxy is the auth boundary (`[auth] mode = "scram"`) and the user's
+    /// `auth_file` entry is plaintext. `None` in pass-through mode: the
+    /// proxy never sees the client's password there, so a fresh connection
+    /// can only be opened to a backend that does not challenge (trust).
+    pub backend_credential: RwLock<Option<String>>,
     /// Rich transaction state (tx id, statement log, savepoints) for
-    /// Transaction-Replay/library consumers. Not read or written on the
-    /// per-query forward path — see `in_transaction` above.
+    /// Transaction-Replay/library consumers. Only touched on the per-query
+    /// path while the session is inside an explicit transaction AND
+    /// `tr_mode` is `select`/`transaction` (the statement log is the replay
+    /// source for in-session failover) — see `in_transaction` above.
     pub tx_state: RwLock<TransactionState>,
     /// Session variables
     pub variables: RwLock<HashMap<String, String>>,
@@ -528,18 +600,35 @@ pub struct TransactionState {
     pub in_transaction: bool,
     /// Transaction ID
     pub tx_id: Option<Uuid>,
-    /// Statements executed in current transaction
+    /// Statements executed in current transaction, in wire order, starting
+    /// with the statement that opened it (the `BEGIN`). This is the source
+    /// for `tr_mode = "transaction"` replay after an in-session failover.
     pub statements: Vec<StatementLog>,
-    /// Read-only transaction
+    /// Read-only transaction — no recorded statement was classified as a
+    /// write (`!has_writes`).
     pub read_only: bool,
     /// Savepoints
     pub savepoints: Vec<String>,
+    /// Bytes retained in `statements` (SQL text + raw extended frames),
+    /// checked against `[limits] tr_max_replay_bytes`.
+    pub replay_bytes: usize,
+    /// Any recorded statement was a write (or an opaque statement that may
+    /// write). Read-only transactions may be replayed in `select` mode.
+    pub has_writes: bool,
+    /// The transaction can no longer be replayed: it exceeded a replay cap,
+    /// entered the failed state, contained a COPY, or a statement was
+    /// transformed on the way to the backend (query-rewrite / tenant filter)
+    /// so its recorded client text is not what executed. `transaction` mode
+    /// degrades to `session` behaviour for it.
+    pub non_replayable: bool,
 }
 
 /// Logged statement for TR replay
 #[derive(Debug, Clone)]
 pub struct StatementLog {
-    /// Statement SQL
+    /// Statement SQL. For an extended-protocol batch this is the routing SQL
+    /// (its first `Parse`, or the referenced named statement's text) and the
+    /// replayable form lives in `extended`.
     pub sql: String,
     /// Parameters
     pub params: Vec<String>,
@@ -547,6 +636,25 @@ pub struct StatementLog {
     pub result_checksum: Option<u64>,
     /// Execution time
     pub executed_at: chrono::DateTime<chrono::Utc>,
+    /// Raw extended-protocol form (`None` for a simple-protocol `Query`).
+    pub extended: Option<ExtendedBatchLog>,
+}
+
+/// Raw extended-protocol frames recorded for one Sync-terminated cycle so it
+/// can be re-sent verbatim to a replacement backend.
+#[derive(Debug, Clone)]
+pub struct ExtendedBatchLog {
+    /// Every frame forwarded for the cycle (all Flush-terminated batches plus
+    /// the terminating Sync batch), in wire order.
+    pub frames: bytes::Bytes,
+    /// The unnamed `Parse` held aside by the unnamed-Parse promotion, if the
+    /// cycle had one — always re-sent first on a fresh connection.
+    pub unnamed_parse: Option<bytes::Bytes>,
+    /// Named statements the cycle's own `Parse`s define.
+    pub defines: Vec<String>,
+    /// Named statements the cycle references (Bind / Describe-S) — re-prepared
+    /// from the session registry if the replacement connection lacks them.
+    pub refs: Vec<String>,
 }
 
 /// A cached per-session backend connection plus the set of *named* prepared
@@ -1951,6 +2059,7 @@ impl ProxyServer {
                                 .metrics
                                 .cache_capture_oversize
                                 .load(Ordering::Relaxed),
+                            tr: server_state.metrics.tr.snapshot(),
                         };
                         let mut admin_metrics = admin_state_sync.metrics.write().await;
                         *admin_metrics = metrics;
@@ -2109,6 +2218,10 @@ impl ProxyServer {
             current_node: RwLock::new(None),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             copy_in_progress: std::sync::atomic::AtomicBool::new(false),
+            last_rfq_status: std::sync::atomic::AtomicU8::new(b'I'),
+            last_response_error: std::sync::atomic::AtomicBool::new(false),
+            tr_replay_tainted: std::sync::atomic::AtomicBool::new(false),
+            backend_credential: RwLock::new(None),
             tx_state: RwLock::new(TransactionState::default()),
             variables: RwLock::new(HashMap::new()),
             created_at: chrono::Utc::now(),
@@ -2498,6 +2611,10 @@ impl ProxyServer {
         // `read_buf`-into-spare-capacity idiom `stream_flush` uses below, so
         // steady state costs no allocation and no zero-fill.
         let mut abuf = BytesMut::with_capacity(16384);
+        // In-session Transaction Replay state (`tr_mode`): tracked session
+        // SETs, the lost-while-idle backend, the aborted-transaction emulation
+        // and the open extended-protocol cycle. See `tr_handle_fault`.
+        let mut tr = TrSession::new(session.tr_mode);
         loop {
             // Read the client's next message directly into the accumulation
             // buffer (no intermediate zeroed scratch, no extra copy). `read_buf`
@@ -2566,6 +2683,27 @@ impl ProxyServer {
             // session's current node — no equality re-check is needed.
             let watched_backend_gone = watch_node.is_some_and(|node| !conns.contains_key(node));
             if watched_backend_gone {
+                // F3: dropping the dead cached connection is enough only with
+                // `tr_mode = none` outside a transaction (the next query simply
+                // redials, as before). Otherwise the loss must be carried into
+                // the next request as a not-delivered backend fault against
+                // this node: a transaction that was open died with the socket
+                // (it must NOT silently continue in autocommit on a fresh
+                // connection), and session state (SETs) has to be restored on
+                // the replacement connection. `tr_handle_fault` picks this up.
+                //
+                // Recorded here rather than inside `read_next_client_message`
+                // (where O2/S4 moved the watch loop) because the helper is
+                // session-agnostic — it takes no `&ClientSession` and owns no
+                // `TrSession` — and `watched_backend_gone` already reconstructs
+                // the same signal losslessly from `conns`.
+                if session.tr_mode != TrMode::None
+                    || session
+                        .in_transaction
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    tr.lost_backend = watch_node.map(|node| node.to_string());
+                }
                 current_node = None;
             }
 
@@ -2654,18 +2792,75 @@ impl ProxyServer {
                             }
                         }
 
+                        // Aborted-transaction emulation after an in-session
+                        // failover: the client's transaction died with the old
+                        // backend, so until it ends the transaction every other
+                        // statement is refused exactly as PostgreSQL would
+                        // (25P02) — never run in autocommit on the new backend.
+                        if tr.tx_aborted {
+                            let sql = crate::protocol::query_text(&msg.payload).unwrap_or("");
+                            let mut resp = if Self::tr_ends_transaction(sql) {
+                                tr.tx_aborted = false;
+                                Self::note_ready_for_query(session, b'I', false);
+                                let mut r = Self::create_command_complete("ROLLBACK");
+                                r.extend_from_slice(&Self::create_ready_for_query(b'I'));
+                                r
+                            } else {
+                                Self::note_ready_for_query(session, b'E', true);
+                                let mut r = Self::create_error_response(
+                                    "25P02",
+                                    "current transaction is aborted, commands ignored until end of transaction block (aborted by proxy failover)",
+                                );
+                                r.extend_from_slice(&Self::create_ready_for_query(b'E'));
+                                r
+                            };
+                            stream.write_all(&resp).await.map_err(|e| {
+                                ProxyError::Network(format!("Client write error: {}", e))
+                            })?;
+                            Self::tr_after_simple(&mut tr, &msg, session, state).await;
+                            state
+                                .metrics
+                                .bytes_sent
+                                .fetch_add(resp.len() as u64, Ordering::Relaxed);
+                            state
+                                .metrics
+                                .queries_processed
+                                .fetch_add(1, Ordering::Relaxed);
+                            resp.clear();
+                            continue;
+                        }
+
                         #[cfg(feature = "wasm-plugins")]
                         let forward_start = std::time::Instant::now();
-                        let fr = Self::forward_simple_query(
-                            stream,
-                            &msg,
-                            &mut conns,
-                            current_node.as_deref(),
-                            session,
-                            state,
-                            config,
-                        )
-                        .await;
+                        let mut fault: Option<BackendFault> = None;
+                        let fr = match tr.lost_backend.take() {
+                            // The session's backend died while idle: the request
+                            // was certainly not delivered anywhere.
+                            Some(lost) => {
+                                fault = Some(BackendFault {
+                                    node: lost,
+                                    phase: FaultPhase::NotDelivered,
+                                    error: "backend connection closed while the session was idle"
+                                        .to_string(),
+                                });
+                                Err(ProxyError::Connection(
+                                    "backend connection lost".to_string(),
+                                ))
+                            }
+                            None => {
+                                Self::forward_simple_query(
+                                    stream,
+                                    &msg,
+                                    &mut conns,
+                                    current_node.as_deref(),
+                                    session,
+                                    state,
+                                    config,
+                                    &mut fault,
+                                )
+                                .await
+                            }
+                        };
                         #[cfg(feature = "wasm-plugins")]
                         Self::fire_post_query_hook(
                             &msg,
@@ -2674,10 +2869,41 @@ impl ProxyServer {
                             &fr,
                             forward_start.elapsed(),
                         );
-                        let (used_node, sent) = fr?;
+                        let (used_node, sent) = match fr {
+                            Ok(v) => v,
+                            Err(e) => match fault.take() {
+                                Some(f) => {
+                                    match Self::tr_handle_fault(
+                                        stream,
+                                        &mut conns,
+                                        &mut current_node,
+                                        f,
+                                        InFlight::Simple(&msg),
+                                        &mut tr,
+                                        &stmt_registry,
+                                        session,
+                                        state,
+                                        config,
+                                    )
+                                    .await?
+                                    {
+                                        Some(v) => v,
+                                        None => return Ok(()),
+                                    }
+                                }
+                                None => {
+                                    if matches!(e, ProxyError::NoHealthyNodes) {
+                                        Self::send_no_healthy_nodes(stream, session, true).await;
+                                        return Ok(());
+                                    }
+                                    return Err(e);
+                                }
+                            },
+                        };
                         if let Some(n) = used_node {
                             current_node = Some(n);
                         }
+                        Self::tr_after_simple(&mut tr, &msg, session, state).await;
                         // Transaction/Statement pooling: park the connection
                         // back to the shared pool once the session is idle.
                         #[cfg(feature = "pool-modes")]
@@ -2893,25 +3119,145 @@ impl ProxyServer {
                             .filter(|r| !batch_defines.contains(r))
                             .cloned()
                             .collect();
-                        let (used_node, sent) = Self::forward_extended_batch(
-                            stream,
-                            &batch,
-                            pending_route_sql.as_deref(),
-                            wait_ready,
-                            &mut conns,
-                            current_node.as_deref(),
-                            &stmt_registry,
-                            &reprepare,
-                            &batch_defines,
-                            held_unnamed.take(),
-                            session,
-                            state,
-                            config,
-                        )
-                        .await?;
+                        // Aborted-transaction emulation (see the simple-query
+                        // path): only a transaction end goes through to the new
+                        // backend; anything else is refused with 25P02. A bare
+                        // Sync just yields the failed-transaction ReadyForQuery.
+                        let mut skip_forward = false;
+                        if tr.tx_aborted {
+                            let ends = pending_route_sql
+                                .as_deref()
+                                .map(Self::tr_ends_transaction)
+                                .unwrap_or(false);
+                            if ends {
+                                tr.tx_aborted = false;
+                            } else {
+                                skip_forward = true;
+                                let bare_sync = batch.len() == 5 && batch[0] == b'S';
+                                let mut resp = Vec::new();
+                                if !bare_sync {
+                                    resp.extend_from_slice(&Self::create_error_response(
+                                        "25P02",
+                                        "current transaction is aborted, commands ignored until end of transaction block (aborted by proxy failover)",
+                                    ));
+                                }
+                                if wait_ready {
+                                    resp.extend_from_slice(&Self::create_ready_for_query(b'E'));
+                                    Self::note_ready_for_query(session, b'E', !bare_sync);
+                                }
+                                if !resp.is_empty() {
+                                    stream.write_all(&resp).await.map_err(|e| {
+                                        ProxyError::Network(format!("Client write error: {}", e))
+                                    })?;
+                                    state
+                                        .metrics
+                                        .bytes_sent
+                                        .fetch_add(resp.len() as u64, Ordering::Relaxed);
+                                }
+                                held_unnamed = None;
+                                // Nothing was closed on the backend: forget the
+                                // batch's Close requests without pruning.
+                                batch_closes.clear();
+                            }
+                        }
+                        let (used_node, sent) = if skip_forward {
+                            (None, 0)
+                        } else {
+                            let mut fault: Option<BackendFault> = None;
+                            let fr = match tr.lost_backend.take() {
+                                Some(lost) => {
+                                    fault = Some(BackendFault {
+                                        node: lost,
+                                        phase: FaultPhase::NotDelivered,
+                                        error:
+                                            "backend connection closed while the session was idle"
+                                                .to_string(),
+                                    });
+                                    Err(ProxyError::Connection(
+                                        "backend connection lost".to_string(),
+                                    ))
+                                }
+                                None => {
+                                    Self::forward_extended_batch(
+                                        stream,
+                                        &batch,
+                                        pending_route_sql.as_deref(),
+                                        wait_ready,
+                                        &mut conns,
+                                        current_node.as_deref(),
+                                        &stmt_registry,
+                                        &reprepare,
+                                        &batch_defines,
+                                        held_unnamed.as_ref(),
+                                        session,
+                                        state,
+                                        config,
+                                        &mut fault,
+                                    )
+                                    .await
+                                }
+                            };
+                            match fr {
+                                Ok(v) => v,
+                                Err(e) => match fault.take() {
+                                    Some(f) => {
+                                        match Self::tr_handle_fault(
+                                            stream,
+                                            &mut conns,
+                                            &mut current_node,
+                                            f,
+                                            InFlight::Extended {
+                                                batch: &batch,
+                                                route_sql: pending_route_sql.as_deref(),
+                                                wait_ready,
+                                                reprepare: &reprepare,
+                                                defines: &batch_defines,
+                                                unnamed: held_unnamed.as_ref(),
+                                            },
+                                            &mut tr,
+                                            &stmt_registry,
+                                            session,
+                                            state,
+                                            config,
+                                        )
+                                        .await?
+                                        {
+                                            Some(v) => v,
+                                            None => return Ok(()),
+                                        }
+                                    }
+                                    None => {
+                                        if matches!(e, ProxyError::NoHealthyNodes) {
+                                            Self::send_no_healthy_nodes(
+                                                stream, session, wait_ready,
+                                            )
+                                            .await;
+                                            return Ok(());
+                                        }
+                                        return Err(e);
+                                    }
+                                },
+                            }
+                        };
                         if let Some(n) = used_node {
                             current_node = Some(n);
                         }
+                        if !skip_forward {
+                            Self::tr_after_extended(
+                                &mut tr,
+                                &batch,
+                                held_unnamed.as_ref(),
+                                pending_route_sql.as_deref(),
+                                wait_ready,
+                                &batch_defines,
+                                &batch_refs,
+                                &stmt_registry,
+                                session,
+                                state,
+                            )
+                            .await;
+                        }
+                        held_unnamed = None;
                         // A `Sync` is the extended-protocol transaction/statement
                         // boundary (it yields ReadyForQuery); a `Flush` is not, so
                         // only a Sync triggers a pool release.
@@ -3018,9 +3364,33 @@ impl ProxyServer {
                         let conn = current_node.as_ref().and_then(|n| conns.get_mut(n));
                         match conn {
                             Some(b) => {
-                                b.stream.write_all(&msg.encode()).await.map_err(|e| {
-                                    ProxyError::Network(format!("Backend copy write error: {}", e))
-                                })?;
+                                if let Err(e) = b.stream.write_all(&msg.encode()).await {
+                                    // The backend died mid-COPY: the data stream
+                                    // cannot be recovered in any tr_mode — one
+                                    // error, then close (never a bare drop).
+                                    let node = current_node.clone().unwrap_or_default();
+                                    let err = format!("Backend copy write error: {}", e);
+                                    conns.remove(&node);
+                                    Self::record_backend_failure(state, &node, &err);
+                                    session
+                                        .copy_in_progress
+                                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    let in_tx = session
+                                        .in_transaction
+                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                    let _ = Self::tr_send_error(
+                                        stream,
+                                        "08006",
+                                        &format!(
+                                            "backend {} failed during COPY ({}); connection closed",
+                                            node, err
+                                        ),
+                                        in_tx,
+                                        true,
+                                    )
+                                    .await;
+                                    return Ok(());
+                                }
                                 if is_copy_end {
                                     let node = current_node.clone().unwrap();
                                     let r = Self::stream_until_ready(
@@ -3038,6 +3408,7 @@ impl ProxyServer {
                                         .store(false, std::sync::atomic::Ordering::Relaxed);
                                     match r {
                                         Ok(sent) => {
+                                            Self::tr_after_copy_drain(&mut tr, session).await;
                                             state
                                                 .metrics
                                                 .bytes_sent
@@ -3066,7 +3437,28 @@ impl ProxyServer {
                                         }
                                         Err(e) => {
                                             conns.remove(&node);
-                                            return Err(e);
+                                            let err = e.to_string();
+                                            if err.contains("Client") {
+                                                return Err(e);
+                                            }
+                                            // Backend fault mid-COPY drain: tell the
+                                            // client (08006) and close — every tr_mode.
+                                            Self::record_backend_failure(state, &node, &err);
+                                            let in_tx = session
+                                                .in_transaction
+                                                .load(std::sync::atomic::Ordering::Relaxed);
+                                            let _ = Self::tr_send_error(
+                                                stream,
+                                                "08006",
+                                                &format!(
+                                                    "backend {} failed during COPY ({}); connection closed",
+                                                    node, err
+                                                ),
+                                                in_tx,
+                                                true,
+                                            )
+                                            .await;
+                                            return Ok(());
                                         }
                                     }
                                 }
@@ -3537,10 +3929,67 @@ impl ProxyServer {
             .await
             .map_err(|e| ProxyError::Network(format!("Backend startup write error: {}", e)))?;
 
-        // Forward authentication messages between client and backend.
-        // Registers the backend's BackendKeyData so a later CancelRequest
-        // can be routed back to this node.
-        Self::proxy_authentication(client_stream, &mut backend, state, &node_addr).await?;
+        if let Some(af) = state.auth_file.as_ref() {
+            // The proxy is the auth boundary: the client is already
+            // authenticated, so the backend's challenges must NOT be relayed to
+            // it. Authenticate the backend ourselves (SCRAM/MD5/cleartext with
+            // the user's plaintext auth_file entry; trust needs nothing), then
+            // hand the client a synthesized AuthenticationOk followed by the
+            // backend's own ParameterStatus/BackendKeyData/ReadyForQuery.
+            let credential = af.password(user).map(str::to_string);
+            let post_auth = match Self::complete_backend_auth(
+                &mut backend,
+                state.limits.max_pending_bytes,
+                user,
+                credential.as_deref(),
+            )
+            .await
+            {
+                Ok(frames) => frames,
+                Err(e) => {
+                    Self::note_backend_failure(state, &node_addr, &e.to_string());
+                    let err = Self::create_error_response(
+                        "08006",
+                        &format!("backend authentication failed: {}", e),
+                    );
+                    let _ = client_stream.write_all(&err).await;
+                    return Err(e);
+                }
+            };
+            *session.backend_credential.write().await = credential;
+            // Register the cancel key from the BackendKeyData frame.
+            let mut off = 0usize;
+            while off + 5 <= post_auth.len() {
+                let len = u32::from_be_bytes([
+                    post_auth[off + 1],
+                    post_auth[off + 2],
+                    post_auth[off + 3],
+                    post_auth[off + 4],
+                ]) as usize;
+                if len < 4 || off + 1 + len > post_auth.len() {
+                    break;
+                }
+                if post_auth[off] == b'K' && len + 1 >= 13 {
+                    let f = &post_auth[off..off + 1 + len];
+                    let pid = u32::from_be_bytes([f[5], f[6], f[7], f[8]]);
+                    let key = u32::from_be_bytes([f[9], f[10], f[11], f[12]]);
+                    Self::register_cancel_key(state, pid, key, &node_addr);
+                }
+                off += 1 + len;
+            }
+            let mut to_client = Vec::with_capacity(9 + post_auth.len());
+            to_client.extend_from_slice(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]); // AuthenticationOk
+            to_client.extend_from_slice(&post_auth);
+            client_stream
+                .write_all(&to_client)
+                .await
+                .map_err(|e| ProxyError::Network(format!("Client auth write error: {}", e)))?;
+        } else {
+            // Pass-through: forward authentication messages between client and
+            // backend. Registers the backend's BackendKeyData so a later
+            // CancelRequest can be routed back to this node.
+            Self::proxy_authentication(client_stream, &mut backend, state, &node_addr).await?;
+        }
 
         // Store session variables
         {
@@ -3878,7 +4327,15 @@ impl ProxyServer {
             .write_all(&startup)
             .await
             .map_err(|e| ProxyError::Network(format!("Backend startup error: {}", e)))?;
-        Self::complete_backend_auth(&mut backend, state.limits.max_pending_bytes).await?;
+        let user = params.get("user").map(String::as_str).unwrap_or("");
+        let credential = session.backend_credential.read().await.clone();
+        Self::complete_backend_auth(
+            &mut backend,
+            state.limits.max_pending_bytes,
+            user,
+            credential.as_deref(),
+        )
+        .await?;
         #[cfg(feature = "pool-modes")]
         if state.backend_pool.is_some() {
             tracing::debug!(target: "helios::pool", node = %target, "dialed fresh backend connection (pool miss)");
@@ -4093,6 +4550,13 @@ impl ProxyServer {
     /// needed, opens) the target node's connection from the per-session
     /// cache. Returns `(Some(node_used), bytes)` — `None` node means the
     /// request was short-circuited (plugin block) without touching a backend.
+    ///
+    /// On a backend fault the broken connection is dropped, the node is
+    /// demoted, `fault` is filled with the failed node and whether the
+    /// statement had already been delivered, and `Err` is returned so the
+    /// caller can run the `tr_mode` recovery. A client-side error leaves
+    /// `fault` untouched.
+    #[allow(clippy::too_many_arguments)]
     async fn forward_simple_query(
         client: &mut ClientStream,
         msg: &Message,
@@ -4101,6 +4565,7 @@ impl ProxyServer {
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,
+        fault: &mut Option<BackendFault>,
     ) -> Result<(Option<String>, u64)> {
         // Rate-limit gate: deny before any backend selection.
         #[cfg(feature = "rate-limiting")]
@@ -4184,6 +4649,14 @@ impl ProxyServer {
             }
         });
         #[cfg(feature = "query-rewriting")]
+        if rewritten_msg.is_some() {
+            // The recorded client text is not what executes — the enclosing
+            // transaction must not be blindly replayed after a failover.
+            session
+                .tr_replay_tainted
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(feature = "query-rewriting")]
         let forward_msg = rewritten_msg.as_ref().unwrap_or(forward_msg);
 
         // Multi-tenancy: resolve the session's tenant and inject a row-level
@@ -4212,6 +4685,12 @@ impl ProxyServer {
         } else {
             None
         };
+        #[cfg(feature = "multi-tenancy")]
+        if tenant_msg.is_some() {
+            session
+                .tr_replay_tainted
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         #[cfg(feature = "multi-tenancy")]
         let forward_msg = tenant_msg.as_ref().unwrap_or(forward_msg);
 
@@ -4421,6 +4900,7 @@ impl ProxyServer {
         // A connect/auth failure trips the breaker (and is propagated as today).
         if let Err(e) = Self::ensure_conn(conns, &target, session, config, state).await {
             Self::record_backend_failure(state, &target, &e.to_string());
+            BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
             return Err(e);
         }
         let backend = conns.get_mut(&target).expect("just ensured");
@@ -4451,6 +4931,7 @@ impl ProxyServer {
             let e = ProxyError::Network(msg);
             conns.remove(&target);
             Self::record_backend_failure(state, &target, &e.to_string());
+            BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
             return Err(e);
         }
 
@@ -4553,6 +5034,7 @@ impl ProxyServer {
                     Err(e) => {
                         conns.remove(&target);
                         Self::record_backend_failure(state, &target, &e.to_string());
+                        BackendFault::set(fault, &target, FaultPhase::OutcomeUnknown, &e);
                         Err(e)
                     }
                 };
@@ -4626,6 +5108,7 @@ impl ProxyServer {
                 // Drop the broken connection so the next use redials.
                 conns.remove(&target);
                 Self::record_backend_failure(state, &target, &e.to_string());
+                BackendFault::set(fault, &target, FaultPhase::OutcomeUnknown, &e);
                 #[cfg(feature = "query-analytics")]
                 if let Some(sql) = analytics_sql.as_deref() {
                     Self::record_analytics(
@@ -4655,6 +5138,8 @@ impl ProxyServer {
     /// sent, so a named statement survives a backend switch/redial (Batch F.4).
     /// `defines` are the named statements this batch's own `Parse`s create —
     /// recorded against the connection once it accepts the batch.
+    ///
+    /// `fault` is filled on a backend fault exactly like `forward_simple_query`.
     #[allow(clippy::too_many_arguments)]
     async fn forward_extended_batch(
         client: &mut ClientStream,
@@ -4666,10 +5151,11 @@ impl ProxyServer {
         registry: &HashMap<String, bytes::Bytes>,
         reprepare: &[String],
         defines: &[String],
-        unnamed: Option<(bytes::Bytes, bytes::Bytes)>,
+        unnamed: Option<&(bytes::Bytes, bytes::Bytes)>,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,
+        fault: &mut Option<BackendFault>,
     ) -> Result<(Option<String>, u64)> {
         // Rate-limit gate. The terminating ReadyForQuery is only appended when
         // the batch carried a Sync (`wait_ready`); a Flush-terminated batch
@@ -4732,6 +5218,7 @@ impl ProxyServer {
 
         if let Err(e) = Self::ensure_conn(conns, &target, session, config, state).await {
             Self::record_backend_failure(state, &target, &e.to_string());
+            BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
             return Err(e);
         }
         let backend = conns.get_mut(&target).expect("just ensured");
@@ -4759,6 +5246,13 @@ impl ProxyServer {
                 }
                 Err(e) => {
                     conns.remove(&target);
+                    // A socket-level failure here is a backend fault (the batch
+                    // was never sent); a backend *rejecting* the re-prepare is
+                    // a protocol-level problem and is propagated as before.
+                    if matches!(e, ProxyError::Network(_)) {
+                        Self::record_backend_failure(state, &target, &e.to_string());
+                        BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
+                    }
                     return Err(e);
                 }
             }
@@ -4772,7 +5266,7 @@ impl ProxyServer {
         // Parse is always (re)forwarded there — correctness is preserved.
         let mut inject_parse_complete = false;
         let mut new_unnamed_sig: Option<bytes::Bytes> = None;
-        if let Some((parse_msg, sig)) = unnamed.as_ref() {
+        if let Some((parse_msg, sig)) = unnamed {
             if backend.unnamed_sig.as_deref() == Some(&sig[..]) {
                 inject_parse_complete = true;
             } else {
@@ -4783,6 +5277,8 @@ impl ProxyServer {
                     .map_err(|e| ProxyError::Network(format!("Backend write error: {}", e)))
                 {
                     conns.remove(&target);
+                    Self::record_backend_failure(state, &target, &e.to_string());
+                    BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
                     return Err(e);
                 }
                 new_unnamed_sig = Some(sig.clone());
@@ -4803,6 +5299,7 @@ impl ProxyServer {
             let e = ProxyError::Network(msg);
             conns.remove(&target);
             Self::record_backend_failure(state, &target, &e.to_string());
+            BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
             return Err(e);
         }
 
@@ -4848,6 +5345,7 @@ impl ProxyServer {
             Err(e) => {
                 conns.remove(&target);
                 Self::record_backend_failure(state, &target, &e.to_string());
+                BackendFault::set(fault, &target, FaultPhase::OutcomeUnknown, &e);
                 #[cfg(feature = "query-analytics")]
                 if let Some(sql) = analytics_sql.as_deref() {
                     Self::record_analytics(
@@ -4967,6 +5465,7 @@ impl ProxyServer {
         let backend_read_timeout = state.limits.backend_read_timeout;
         let mut buf = BytesMut::with_capacity(16384);
         let mut sent: u64 = 0;
+        let mut had_error = false;
 
         loop {
             // Walk complete frames in `buf`, stopping at a boundary frame.
@@ -4985,6 +5484,9 @@ impl ProxyServer {
                 let frame_total = len + 1;
                 let mtype = rem[0];
                 consumed += frame_total;
+                if mtype == b'E' {
+                    had_error = true;
+                }
                 if mtype == b'Z' {
                     // ReadyForQuery: payload is one status byte at rem[5].
                     ready_status = Some(if frame_total >= 6 { rem[5] } else { b'I' });
@@ -5008,11 +5510,7 @@ impl ProxyServer {
             }
 
             if let Some(status) = ready_status {
-                let st = TransactionStatus::from_byte(status);
-                session.in_transaction.store(
-                    st != TransactionStatus::Idle,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                Self::note_ready_for_query(session, status, had_error);
                 return Ok(sent);
             }
             if yield_for_copy {
@@ -5159,11 +5657,7 @@ impl ProxyServer {
             }
 
             if let Some(status) = ready_status {
-                let st = TransactionStatus::from_byte(status);
-                session.in_transaction.store(
-                    st != TransactionStatus::Idle,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                Self::note_ready_for_query(session, status, had_error);
                 let cacheable = !had_error && status == b'I' && !saw_async && !oversize;
                 return Ok((sent, captured, cacheable, row_count));
             }
@@ -5601,12 +6095,8 @@ impl ProxyServer {
     /// requires the token to be bounded by a non-`[A-Za-z0-9_]` char (or the
     /// string edge) on both sides, so a real SQL keyword like `INTO` is caught
     /// regardless of surrounding whitespace while an identifier substring
-    /// (`into_total`) is not.
-    #[cfg(any(
-        feature = "pool-modes",
-        feature = "edge-proxy",
-        feature = "query-cache"
-    ))]
+    /// (`into_total`) is not. Always compiled: the in-session TR statement
+    /// classifier (`tr_classify`) uses it on every build.
     fn contains_word_ci(haystack: &str, word: &str) -> bool {
         let hb = haystack.as_bytes();
         let wb = word.as_bytes();
@@ -6060,23 +6550,24 @@ impl ProxyServer {
         let check_interval = Duration::from_millis(100);
 
         loop {
-            // Try to find healthy primary
+            // Try to find a healthy primary. Every enabled primary is
+            // considered in config order (not just the first): a config that
+            // lists a promoted/secondary primary must be able to fail over to
+            // it once the first is demoted in-band — `select_node_for_startup`
+            // already applies the same rule for new sessions.
             let health = state.health.load_full();
-            let primary = config
-                .nodes
-                .iter()
-                .find(|n| n.role == NodeRole::Primary && n.enabled);
+            let primary = config.nodes.iter().find(|n| {
+                n.role == NodeRole::Primary
+                    && n.enabled
+                    && health.get(n.address()).map(|h| h.healthy).unwrap_or(false)
+            });
 
             if let Some(primary_node) = primary {
-                if let Some(node_health) = health.get(primary_node.address()) {
-                    if node_health.healthy {
-                        // Update session's current node
-                        let node_addr = primary_node.address().to_string();
-                        let mut current = session.current_node.write().await;
-                        *current = Some(node_addr.clone());
-                        return Ok(node_addr);
-                    }
-                }
+                // Update session's current node
+                let node_addr = primary_node.address().to_string();
+                let mut current = session.current_node.write().await;
+                *current = Some(node_addr.clone());
+                return Ok(node_addr);
             }
             drop(health);
 
@@ -6157,8 +6648,26 @@ impl ProxyServer {
     /// This is used when switching backends - we don't forward auth to client.
     /// `max_frame_len` bounds a single declared backend frame length (reuses
     /// `state.limits.max_pending_bytes`; see [`validate_backend_frame_len`]).
-    async fn complete_backend_auth(backend: &mut TcpStream, max_frame_len: usize) -> Result<()> {
+    /// Drive a freshly dialed backend connection (startup already sent) to
+    /// `ReadyForQuery`, answering its authentication challenges with
+    /// `credential` when it has any: SCRAM-SHA-256 (the RFC-5802 client in
+    /// `backend::auth`), MD5 and cleartext password. Without a credential
+    /// only a non-challenging (trust) backend can be completed — a challenge
+    /// then fails fast with `ProxyError::Auth` instead of timing out.
+    ///
+    /// Returns the post-authentication frames the backend sent (ParameterStatus,
+    /// BackendKeyData, ReadyForQuery — every frame except the `R` auth
+    /// requests) so a caller that is the client's auth boundary can forward
+    /// them after its own synthesized `AuthenticationOk`.
+    async fn complete_backend_auth<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+        backend: &mut S,
+        max_frame_len: usize,
+        user: &str,
+        credential: Option<&str>,
+    ) -> Result<Vec<u8>> {
         let mut buffer = BytesMut::with_capacity(4096);
+        let mut forward: Vec<u8> = Vec::with_capacity(512);
+        let mut scram: Option<crate::backend::auth::Scram> = None;
         let timeout = Duration::from_secs(10);
         let start = std::time::Instant::now();
 
@@ -6203,7 +6712,10 @@ impl ProxyServer {
                 let frame = buffer.split_to(len + 1);
                 match tag {
                     // ReadyForQuery: authentication complete.
-                    b'Z' => return Ok(()),
+                    b'Z' => {
+                        forward.extend_from_slice(&frame);
+                        return Ok(forward);
+                    }
                     // ErrorResponse: parse its message for a clear error.
                     b'E' => {
                         let payload = BytesMut::from(&frame[5..]);
@@ -6212,7 +6724,104 @@ impl ProxyServer {
                             .unwrap_or_else(|_| "authentication failed".to_string());
                         return Err(ProxyError::Auth(err));
                     }
-                    _ => {}
+                    // Authentication request: answer the challenge.
+                    b'R' if frame.len() >= 9 => {
+                        let kind = u32::from_be_bytes([frame[5], frame[6], frame[7], frame[8]]);
+                        let body = &frame[9..];
+                        let reply: Option<Vec<u8>> = match kind {
+                            0 => None, // AuthenticationOk
+                            3 | 5 | 10 | 11 | 12 => {
+                                let Some(password) = credential else {
+                                    return Err(ProxyError::Auth(format!(
+                                        "backend requires authentication (type {}) for user '{}' but the proxy holds no credential: pass-through auth cannot open a fresh backend connection — configure [auth] mode = \"scram\" with a plaintext auth_file entry, or a trust backend",
+                                        kind, user
+                                    )));
+                                };
+                                match kind {
+                                    // CleartextPassword
+                                    3 => {
+                                        let mut p = password.as_bytes().to_vec();
+                                        p.push(0);
+                                        Some(p)
+                                    }
+                                    // MD5Password: 4-byte salt.
+                                    5 => {
+                                        if body.len() < 4 {
+                                            return Err(ProxyError::Auth(
+                                                "malformed MD5 challenge".to_string(),
+                                            ));
+                                        }
+                                        let salt = [body[0], body[1], body[2], body[3]];
+                                        Some(crate::backend::auth::md5_password_response(
+                                            user, password, &salt,
+                                        ))
+                                    }
+                                    // SASL: mechanism list (cstrings, empty terminator).
+                                    10 => {
+                                        let offered =
+                                            body.split(|&b| b == 0).any(|m| m == b"SCRAM-SHA-256");
+                                        if !offered {
+                                            return Err(ProxyError::Auth(
+                                                "backend offers no SCRAM-SHA-256 SASL mechanism"
+                                                    .to_string(),
+                                            ));
+                                        }
+                                        let (client, first) =
+                                            crate::backend::auth::Scram::client_first(
+                                                Self::random_nonce(),
+                                            );
+                                        scram = Some(client);
+                                        Some(first.0)
+                                    }
+                                    // SASLContinue: server-first.
+                                    11 => {
+                                        let Some(client) = scram.as_mut() else {
+                                            return Err(ProxyError::Auth(
+                                                "SASLContinue before SASL start".to_string(),
+                                            ));
+                                        };
+                                        Some(
+                                            client
+                                                .client_final(body, password)
+                                                .map_err(|e| {
+                                                    ProxyError::Auth(format!("SCRAM: {}", e))
+                                                })?
+                                                .0,
+                                        )
+                                    }
+                                    // SASLFinal: verify the server signature.
+                                    _ => {
+                                        let Some(client) = scram.as_ref() else {
+                                            return Err(ProxyError::Auth(
+                                                "SASLFinal before SASL start".to_string(),
+                                            ));
+                                        };
+                                        client.verify_server(body).map_err(|e| {
+                                            ProxyError::Auth(format!("SCRAM: {}", e))
+                                        })?;
+                                        None
+                                    }
+                                }
+                            }
+                            other => {
+                                return Err(ProxyError::Auth(format!(
+                                    "unsupported backend authentication method {}",
+                                    other
+                                )));
+                            }
+                        };
+                        if let Some(payload) = reply {
+                            // PasswordMessage: 'p' + int32 len + payload.
+                            let mut msg = Vec::with_capacity(payload.len() + 5);
+                            msg.push(b'p');
+                            msg.extend_from_slice(&((payload.len() + 4) as u32).to_be_bytes());
+                            msg.extend_from_slice(&payload);
+                            backend.write_all(&msg).await.map_err(|e| {
+                                ProxyError::Network(format!("Backend auth write error: {}", e))
+                            })?;
+                        }
+                    }
+                    _ => forward.extend_from_slice(&frame),
                 }
             }
         }
@@ -7184,6 +7793,1457 @@ impl ProxyServer {
                 .metrics
                 .cache_capture_oversize
                 .load(Ordering::Relaxed),
+            tr: self.state.metrics.tr.snapshot(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// In-session Transaction Replay (`tr_mode`)
+//
+// Transparent failover of a LIVE client session when its backend connection
+// fails: the forward path reports the fault (`BackendFault`), a pure decision
+// table (`tr_decide`) picks an action from the configured `TrMode`, and a thin
+// async orchestrator (`tr_handle_fault`) executes it — reconnecting to a
+// healthy primary, restoring session state, replaying the recorded explicit
+// transaction and/or re-executing the interrupted request, or returning ONE
+// well-formed `ErrorResponse` instead of dropping the socket.
+//
+// Hard rules encoded in the table: a write whose outcome is unknown is never
+// re-executed except as part of `transaction` mode's replay of an UNCOMMITTED
+// transaction (the original copy died uncommitted with the old backend), and
+// a COMMIT whose outcome is unknown is never retried.
+// ---------------------------------------------------------------------------
+
+/// Where a backend fault struck relative to the in-flight request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaultPhase {
+    /// The request never reached the backend (connect failure, write error /
+    /// write timeout, or the socket died while the session was idle): it was
+    /// certainly NOT processed.
+    NotDelivered,
+    /// The request was written, then the connection failed before its
+    /// `ReadyForQuery`: the backend may or may not have processed it.
+    OutcomeUnknown,
+}
+
+/// A backend fault reported by the forward path to the session loop.
+#[derive(Debug, Clone)]
+struct BackendFault {
+    /// Address of the backend that failed.
+    node: String,
+    phase: FaultPhase,
+    /// Human-readable cause (used in the client-visible error message).
+    error: String,
+}
+
+impl BackendFault {
+    /// Record a fault into `slot` — unless the error is client-side (the client
+    /// went away; there is nothing to recover for and the caller propagates).
+    fn set(slot: &mut Option<BackendFault>, node: &str, phase: FaultPhase, err: &ProxyError) {
+        let error = err.to_string();
+        if error.contains("Client") {
+            return;
+        }
+        *slot = Some(BackendFault {
+            node: node.to_string(),
+            phase,
+            error,
+        });
+    }
+}
+
+/// Coarse classification of the statement a fault interrupted (and of every
+/// statement recorded inside an explicit transaction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StmtKind {
+    /// Side-effect-free read: `SELECT`/read-only `WITH`/`VALUES`/`TABLE`/`SHOW`/
+    /// `COPY ... TO`/plain `EXPLAIN`.
+    Read,
+    /// Modifies data or schema (or may: data-modifying CTE, `COPY ... FROM`,
+    /// `CALL`/`DO`/`EXECUTE`, `SELECT ... INTO`, a multi-statement string).
+    Write,
+    /// Makes a transaction durable: `COMMIT`/`END`/`PREPARE TRANSACTION`/
+    /// `COMMIT PREPARED` (or a multi-statement string that may contain one).
+    Commit,
+    /// Idempotent session/transaction control with no data effect: `BEGIN`/
+    /// `START`, `SAVEPOINT`, `RELEASE`, `ROLLBACK [TO]`, `ABORT`, `SET`/`RESET`,
+    /// `DISCARD`, the empty query.
+    Control,
+    /// Anything else (`LISTEN`/`NOTIFY`, `LOCK`, cursors, `EXPLAIN ANALYZE`,
+    /// `SELECT nextval(...)`, unknown verbs): conservatively treated like a
+    /// write for re-execution purposes.
+    Other,
+}
+
+/// What the proxy does about a backend fault (see `tr_decide`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrAction {
+    /// Send `ErrorResponse(sqlstate)` + `ReadyForQuery`, then close the client.
+    CloseWithError(&'static str),
+    /// Re-home the session on a healthy primary, send ONE
+    /// `ErrorResponse(sqlstate)` + `ReadyForQuery` for the in-flight request
+    /// (aborting the client-visible transaction if inside one) and keep
+    /// serving the session.
+    ErrorAndContinue(&'static str),
+    /// Re-home the session and transparently re-execute the in-flight request.
+    Reexecute,
+    /// Re-home the session, replay the recorded explicit transaction from its
+    /// `BEGIN` (responses discarded), then re-execute the in-flight request
+    /// inside it.
+    ReplayThenReexecute,
+}
+
+/// The request a fault interrupted, borrowed so it can be re-executed.
+enum InFlight<'a> {
+    Simple(&'a Message),
+    Extended {
+        batch: &'a [u8],
+        route_sql: Option<&'a str>,
+        wait_ready: bool,
+        reprepare: &'a [String],
+        defines: &'a [String],
+        unnamed: Option<&'a (bytes::Bytes, bytes::Bytes)>,
+    },
+}
+
+/// Why a transaction replay failed.
+enum ReplayFailure {
+    /// The replacement backend's socket failed mid-replay.
+    Backend(ProxyError),
+    /// A replayed statement was rejected (or re-prepare rejected).
+    Statement(String),
+}
+
+/// Flush-terminated extended-protocol frames of the cycle in progress,
+/// accumulated until its `Sync` completes and the cycle is recorded as ONE
+/// replay entry (a Flush yields no `ReadyForQuery`, so a replay must send the
+/// whole cycle before draining once).
+struct TrExtCycle {
+    frames: BytesMut,
+    unnamed_parse: Option<bytes::Bytes>,
+    defines: Vec<String>,
+    refs: Vec<String>,
+    route_sql: Option<String>,
+}
+
+/// Per-session, loop-local state for in-session TR (no locks: only the
+/// session's own task touches it).
+struct TrSession {
+    /// Record statements of explicit transactions (`select`/`transaction`).
+    record_tx: bool,
+    /// Track session `SET`/`RESET` for restore (`tr_mode != none`).
+    track_gucs: bool,
+    /// Session-level `SET`/`RESET` statements to replay on a new backend, in
+    /// order, bounded by `[limits] tr_max_session_set_statements`.
+    gucs: Vec<String>,
+    /// Tracking stopped at the cap — the restore is incomplete.
+    guc_cap_hit: bool,
+    /// `SET`s issued inside the current explicit transaction: promoted into
+    /// `gucs` only if the transaction COMMITs (a rolled-back `SET` is undone).
+    pending_tx_gucs: Vec<String>,
+    /// The session's backend socket died while idle: the next request is a
+    /// not-delivered fault against this node.
+    lost_backend: Option<String>,
+    /// The client-visible transaction was aborted by a failover: every
+    /// statement except a transaction end is answered with 25P02 until the
+    /// client issues ROLLBACK/COMMIT (which ends it as a ROLLBACK), so no
+    /// statement of the dead transaction leaks into autocommit on the new
+    /// backend.
+    tx_aborted: bool,
+    /// `ReadyForQuery` status before the statement being recorded.
+    prev_status: u8,
+    ext_cycle: Option<TrExtCycle>,
+}
+
+impl TrSession {
+    fn new(mode: TrMode) -> Self {
+        Self {
+            record_tx: matches!(mode, TrMode::Select | TrMode::Transaction),
+            track_gucs: mode != TrMode::None,
+            gucs: Vec::new(),
+            guc_cap_hit: false,
+            pending_tx_gucs: Vec::new(),
+            lost_backend: None,
+            tx_aborted: false,
+            prev_status: b'I',
+            ext_cycle: None,
+        }
+    }
+}
+
+impl ProxyServer {
+    /// Record the `ReadyForQuery` that closed a response: the hot-path
+    /// `in_transaction` flag plus the raw status byte and whether the response
+    /// carried an `ErrorResponse` (both read by the in-session TR bookkeeping).
+    fn note_ready_for_query(session: &ClientSession, status: u8, had_error: bool) {
+        let st = TransactionStatus::from_byte(status);
+        session.in_transaction.store(
+            st != TransactionStatus::Idle,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        session
+            .last_rfq_status
+            .store(st.to_byte(), std::sync::atomic::Ordering::Relaxed);
+        session
+            .last_response_error
+            .store(had_error, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The pure in-session TR decision table. `in_tx` is the client-visible
+    /// transaction state BEFORE the interrupted statement; `tx_has_writes` /
+    /// `tx_replayable` describe the recorded transaction (irrelevant when
+    /// `!in_tx`); `kind` classifies the interrupted statement.
+    fn tr_decide(
+        mode: TrMode,
+        phase: FaultPhase,
+        in_tx: bool,
+        tx_has_writes: bool,
+        tx_replayable: bool,
+        kind: StmtKind,
+    ) -> TrAction {
+        use TrAction::*;
+        if mode == TrMode::None {
+            return CloseWithError("57P01");
+        }
+        // Safe to run again even if the backend already ran it once.
+        let idempotent = matches!(kind, StmtKind::Read | StmtKind::Control);
+        // Can the recorded transaction be reproduced on the new backend in
+        // this mode? `select` only ever replays READ-ONLY transactions (no
+        // effect can be doubled); `transaction` replays any uncommitted one.
+        let can_replay = tx_replayable
+            && match mode {
+                TrMode::Select => !tx_has_writes,
+                TrMode::Transaction => true,
+                TrMode::None | TrMode::Session => false,
+            };
+        match phase {
+            FaultPhase::NotDelivered => {
+                if !in_tx {
+                    // Never ran, no transaction context lost: just run it.
+                    return Reexecute;
+                }
+                // The transaction died with the old backend; the statement
+                // itself never ran.
+                if can_replay {
+                    ReplayThenReexecute
+                } else {
+                    ErrorAndContinue("57P01")
+                }
+            }
+            FaultPhase::OutcomeUnknown => {
+                if mode == TrMode::Session {
+                    return ErrorAndContinue("08007");
+                }
+                if !in_tx {
+                    // Autocommit: a write may have been applied — never redo it.
+                    return if idempotent {
+                        Reexecute
+                    } else {
+                        ErrorAndContinue("08007")
+                    };
+                }
+                // Inside an explicit transaction the old copy died UNCOMMITTED,
+                // so nothing was applied — unless the in-flight statement was
+                // the COMMIT itself, which may have landed.
+                if kind == StmtKind::Commit {
+                    return ErrorAndContinue("08007");
+                }
+                if can_replay {
+                    ReplayThenReexecute
+                } else {
+                    ErrorAndContinue("08007")
+                }
+            }
+        }
+    }
+
+    /// Case-insensitive keyword prefix with an identifier boundary after it
+    /// (`SET x` matches `SET`, `SETTINGS` does not).
+    fn starts_with_word_ci(s: &str, word: &str) -> bool {
+        crate::protocol::starts_with_ci(s, word)
+            && s.as_bytes()
+                .get(word.len())
+                .map(|&c| !(c.is_ascii_alphanumeric() || c == b'_'))
+                .unwrap_or(true)
+    }
+
+    /// Classify one client statement for in-session TR (see `StmtKind`).
+    /// Conservative by construction: anything not positively recognised as a
+    /// read or as idempotent control is treated as a possible write.
+    fn tr_classify(sql: &str) -> StmtKind {
+        let t = sql.trim();
+        let core = t.strip_suffix(';').unwrap_or(t).trim_end();
+        if core.is_empty() {
+            return StmtKind::Control;
+        }
+        if core.contains(';') {
+            // Multi-statement string: opaque. If it may end a transaction it
+            // must never be retried on an unknown outcome.
+            return if Self::contains_word_ci(core, "commit")
+                || Self::contains_word_ci(core, "end")
+                || Self::contains_word_ci(core, "prepare")
+            {
+                StmtKind::Commit
+            } else {
+                StmtKind::Write
+            };
+        }
+        let kw = |w: &str| Self::starts_with_word_ci(core, w);
+        if kw("COMMIT") || kw("END") || kw("PREPARE TRANSACTION") {
+            return StmtKind::Commit;
+        }
+        if kw("BEGIN")
+            || kw("START")
+            || kw("SAVEPOINT")
+            || kw("RELEASE")
+            || kw("ROLLBACK")
+            || kw("ABORT")
+            || kw("SET")
+            || kw("RESET")
+            || kw("DISCARD")
+        {
+            return StmtKind::Control;
+        }
+        if kw("SELECT") || kw("VALUES") || kw("TABLE") {
+            // `SELECT ... INTO t` creates a table; `nextval`/`setval` consume
+            // sequence values — neither may be silently re-run.
+            return if Self::contains_word_ci(core, "into")
+                || Self::contains_word_ci(core, "nextval")
+                || Self::contains_word_ci(core, "setval")
+            {
+                StmtKind::Other
+            } else {
+                StmtKind::Read
+            };
+        }
+        if kw("SHOW") {
+            return StmtKind::Read;
+        }
+        if kw("WITH") {
+            return if Self::contains_word_ci(core, "insert")
+                || Self::contains_word_ci(core, "update")
+                || Self::contains_word_ci(core, "delete")
+                || Self::contains_word_ci(core, "merge")
+            {
+                StmtKind::Write
+            } else {
+                StmtKind::Read
+            };
+        }
+        if kw("COPY") {
+            return if Self::contains_word_ci(core, "from") {
+                StmtKind::Write
+            } else {
+                StmtKind::Read
+            };
+        }
+        if kw("EXPLAIN") {
+            return if Self::contains_word_ci(core, "analyze")
+                || Self::contains_word_ci(core, "analyse")
+            {
+                StmtKind::Other
+            } else {
+                StmtKind::Read
+            };
+        }
+        if kw("INSERT")
+            || kw("UPDATE")
+            || kw("DELETE")
+            || kw("MERGE")
+            || kw("CREATE")
+            || kw("DROP")
+            || kw("ALTER")
+            || kw("TRUNCATE")
+            || kw("GRANT")
+            || kw("REVOKE")
+            || kw("VACUUM")
+            || kw("REINDEX")
+            || kw("CLUSTER")
+            || kw("CALL")
+            || kw("DO")
+            || kw("EXECUTE")
+            || kw("REFRESH")
+            || kw("IMPORT")
+            || kw("COMMENT")
+            || kw("SECURITY")
+            || kw("ANALYZE")
+        {
+            return StmtKind::Write;
+        }
+        StmtKind::Other
+    }
+
+    /// A single-statement transaction end the aborted-transaction emulation
+    /// accepts: `ROLLBACK`/`ABORT`/`COMMIT`/`END` (optionally `WORK`/
+    /// `TRANSACTION`) — not `ROLLBACK TO`, not `* PREPARED`, not `AND CHAIN`.
+    fn tr_ends_transaction(sql: &str) -> bool {
+        let t = sql.trim();
+        let core = t.strip_suffix(';').unwrap_or(t).trim_end();
+        if core.contains(';') {
+            return false;
+        }
+        let mut words = core.split_ascii_whitespace();
+        let Some(first) = words.next() else {
+            return false;
+        };
+        let first_ok = ["ROLLBACK", "ABORT", "COMMIT", "END"]
+            .iter()
+            .any(|w| first.eq_ignore_ascii_case(w));
+        if !first_ok {
+            return false;
+        }
+        match words.next() {
+            None => true,
+            Some(w) => {
+                (w.eq_ignore_ascii_case("WORK") || w.eq_ignore_ascii_case("TRANSACTION"))
+                    && words.next().is_none()
+            }
+        }
+    }
+
+    /// Is this simple-protocol statement a session-level GUC change worth
+    /// replaying onto a replacement backend? `SET LOCAL` / `SET TRANSACTION` /
+    /// `SET CONSTRAINTS` are transaction-scoped and excluded.
+    fn tr_is_session_set(sql: &str) -> bool {
+        let t = sql.trim();
+        let core = t.strip_suffix(';').unwrap_or(t).trim_end();
+        if core.contains(';') {
+            return false;
+        }
+        if Self::starts_with_word_ci(core, "RESET") {
+            return true;
+        }
+        if !Self::starts_with_word_ci(core, "SET") {
+            return false;
+        }
+        let rest = core[3..].trim_start();
+        !(Self::starts_with_word_ci(rest, "LOCAL")
+            || Self::starts_with_word_ci(rest, "TRANSACTION")
+            || Self::starts_with_word_ci(rest, "CONSTRAINTS"))
+    }
+
+    /// `RESET ALL` / `DISCARD ALL` wipe every tracked session GUC.
+    fn tr_resets_all(sql: &str) -> bool {
+        let t = sql.trim();
+        let core = t.strip_suffix(';').unwrap_or(t).trim_end();
+        (Self::starts_with_word_ci(core, "RESET") || Self::starts_with_word_ci(core, "DISCARD"))
+            && Self::contains_word_ci(core, "all")
+    }
+
+    /// SQL text of an encoded `Parse` message (5-byte header, name cstring,
+    /// query cstring).
+    fn parse_msg_sql(parse_bytes: &[u8]) -> Option<&str> {
+        let body = parse_bytes.get(5..)?;
+        let name_end = body.iter().position(|&b| b == 0)?;
+        crate::protocol::query_text(&body[name_end + 1..])
+    }
+
+    /// Resolve the SQL an extended batch executes: its first `Parse`, else the
+    /// text of the first named statement it references (from the registry).
+    fn tr_extended_sql<'a>(
+        route_sql: Option<&'a str>,
+        refs: &[String],
+        registry: &'a HashMap<String, bytes::Bytes>,
+    ) -> Option<&'a str> {
+        route_sql.or_else(|| {
+            refs.iter()
+                .find_map(|n| registry.get(n).and_then(|b| Self::parse_msg_sql(b)))
+        })
+    }
+
+    /// Append one tracked session `SET`, honouring the cap.
+    fn tr_push_guc(tr: &mut TrSession, sql: &str, state: &Arc<ServerState>) {
+        if tr.guc_cap_hit {
+            return;
+        }
+        if tr.gucs.len() >= state.limits.tr_max_session_set_statements {
+            tr.guc_cap_hit = true;
+            state
+                .metrics
+                .tr
+                .session_set_cap_exceeded
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                limit = state.limits.tr_max_session_set_statements,
+                "in-session TR: session SET tracking cap reached; failover restore will be incomplete"
+            );
+            return;
+        }
+        tr.gucs.push(sql.to_string());
+    }
+
+    /// Per-response in-session TR bookkeeping, run after every fully relayed
+    /// simple-query or extended-protocol response. `sql` is the client's
+    /// statement text (extended: the batch's resolved SQL); `entry` builds
+    /// the replay record and is only invoked while inside an explicit
+    /// transaction in `select`/`transaction` mode. `simple` gates GUC
+    /// tracking (extended-protocol `SET`s are not tracked).
+    ///
+    /// Hot-path cost outside a transaction: a few prefix compares, no
+    /// allocation, no lock.
+    async fn tr_after_response(
+        tr: &mut TrSession,
+        sql: Option<&str>,
+        simple: bool,
+        entry: impl FnOnce() -> StatementLog,
+        entry_bytes: usize,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+    ) {
+        if !tr.record_tx && !tr.track_gucs {
+            return;
+        }
+        // A COPY that yielded for client data has no ReadyForQuery yet; the
+        // cycle is finished (and the status refreshed) by the CopyDone drain.
+        if session
+            .copy_in_progress
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if tr.record_tx {
+                let mut ts = session.tx_state.write().await;
+                if tr.prev_status != b'I' || ts.in_transaction {
+                    // A COPY inside the transaction: its data is not recorded.
+                    ts.non_replayable = true;
+                    ts.statements = Vec::new();
+                    ts.replay_bytes = 0;
+                }
+            }
+            return;
+        }
+        let status = session
+            .last_rfq_status
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let had_error = session
+            .last_response_error
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let prev_status = tr.prev_status;
+        tr.prev_status = status;
+        let now_in_tx = status != b'I';
+        let was_in_tx = prev_status != b'I';
+        let sql = sql.unwrap_or("");
+        // Classify lazily: only needed inside a transaction or for a SET.
+        let mut kind_cache: Option<StmtKind> = None;
+        let kind = |kind_cache: &mut Option<StmtKind>| -> StmtKind {
+            *kind_cache.get_or_insert_with(|| Self::tr_classify(sql))
+        };
+
+        // --- session GUC tracking (simple protocol only) ---
+        if tr.track_gucs && simple {
+            let is_set_like = crate::protocol::starts_with_ci(sql.trim_start(), "SET")
+                || crate::protocol::starts_with_ci(sql.trim_start(), "RESET")
+                || crate::protocol::starts_with_ci(sql.trim_start(), "DISCARD");
+            if is_set_like && !had_error {
+                if Self::tr_resets_all(sql) {
+                    tr.gucs.clear();
+                    tr.pending_tx_gucs.clear();
+                    tr.guc_cap_hit = false;
+                } else if Self::tr_is_session_set(sql) {
+                    if now_in_tx {
+                        tr.pending_tx_gucs.push(sql.to_string());
+                    } else {
+                        Self::tr_push_guc(tr, sql, state);
+                    }
+                }
+            }
+            if was_in_tx && !now_in_tx {
+                // Transaction ended: SETs made inside it persist only if it
+                // committed (a failed transaction's COMMIT is a ROLLBACK).
+                let committed =
+                    prev_status == b'T' && !had_error && kind(&mut kind_cache) == StmtKind::Commit;
+                if committed {
+                    let pending = std::mem::take(&mut tr.pending_tx_gucs);
+                    for s in pending {
+                        Self::tr_push_guc(tr, &s, state);
+                    }
+                } else {
+                    tr.pending_tx_gucs.clear();
+                }
+            }
+        }
+
+        // --- explicit-transaction statement recording ---
+        if !tr.record_tx || (!now_in_tx && !was_in_tx) {
+            return;
+        }
+        let mut ts = session.tx_state.write().await;
+        if !now_in_tx {
+            // Transaction over (COMMIT/ROLLBACK/implicit): release the record.
+            *ts = TransactionState::default();
+            return;
+        }
+        if !was_in_tx {
+            // Idle -> InTx: this statement opened the transaction.
+            *ts = TransactionState::default();
+            ts.in_transaction = true;
+            ts.tx_id = Some(Uuid::new_v4());
+            ts.read_only = true;
+        }
+        let k = kind(&mut kind_cache);
+        if !matches!(k, StmtKind::Read | StmtKind::Control) {
+            ts.has_writes = true;
+            ts.read_only = false;
+        }
+        let tainted = session
+            .tr_replay_tainted
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if status == b'E' || tainted {
+            // A failed transaction can only be rolled back; a transformed
+            // statement's recorded text is not what executed.
+            ts.non_replayable = true;
+        }
+        if ts.non_replayable {
+            if !ts.statements.is_empty() {
+                ts.statements = Vec::new();
+                ts.replay_bytes = 0;
+            }
+            return;
+        }
+        if ts.statements.len() >= state.limits.tr_max_replay_statements
+            || ts.replay_bytes.saturating_add(entry_bytes) > state.limits.tr_max_replay_bytes
+        {
+            ts.non_replayable = true;
+            ts.statements = Vec::new();
+            ts.replay_bytes = 0;
+            state
+                .metrics
+                .tr
+                .replay_cap_exceeded
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                target: "helios::tr",
+                "transaction exceeded [limits] tr_max_replay_statements/bytes; marked non-replayable"
+            );
+            return;
+        }
+        ts.statements.push(entry());
+        ts.replay_bytes += entry_bytes;
+    }
+
+    /// Bookkeeping after a simple-query response.
+    async fn tr_after_simple(
+        tr: &mut TrSession,
+        msg: &Message,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+    ) {
+        let sql = crate::protocol::query_text(&msg.payload);
+        let bytes = sql.map(|s| s.len()).unwrap_or(0);
+        Self::tr_after_response(
+            tr,
+            sql,
+            true,
+            || StatementLog {
+                sql: sql.unwrap_or("").to_string(),
+                params: Vec::new(),
+                result_checksum: None,
+                executed_at: chrono::Utc::now(),
+                extended: None,
+            },
+            bytes,
+            session,
+            state,
+        )
+        .await;
+    }
+
+    /// Bookkeeping after an extended-protocol batch. A Flush-terminated batch
+    /// is accumulated into the open cycle; the Sync-terminated batch closes
+    /// the cycle and records it as one replay entry.
+    #[allow(clippy::too_many_arguments)]
+    async fn tr_after_extended(
+        tr: &mut TrSession,
+        batch: &bytes::Bytes,
+        unnamed: Option<&(bytes::Bytes, bytes::Bytes)>,
+        route_sql: Option<&str>,
+        wait_ready: bool,
+        defines: &[String],
+        refs: &[String],
+        registry: &HashMap<String, bytes::Bytes>,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+    ) {
+        if !tr.record_tx {
+            return;
+        }
+        // Only accumulate while a transaction is (or may be) open — a Flush
+        // batch with no ReadyForQuery cannot itself tell us.
+        let in_tx_context = tr.prev_status != b'I'
+            || session
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed);
+        if !wait_ready {
+            if !in_tx_context {
+                return;
+            }
+            let cycle = tr.ext_cycle.get_or_insert_with(|| TrExtCycle {
+                frames: BytesMut::new(),
+                unnamed_parse: None,
+                defines: Vec::new(),
+                refs: Vec::new(),
+                route_sql: None,
+            });
+            if let Some((p, _)) = unnamed {
+                cycle.unnamed_parse.get_or_insert_with(|| p.clone());
+            }
+            cycle.frames.extend_from_slice(batch);
+            cycle.defines.extend(defines.iter().cloned());
+            cycle.refs.extend(refs.iter().cloned());
+            if cycle.route_sql.is_none() {
+                cycle.route_sql = route_sql.map(|s| s.to_string());
+            }
+            return;
+        }
+        let cycle = tr.ext_cycle.take();
+        let cycle_route: Option<String> = cycle.as_ref().and_then(|c| c.route_sql.clone());
+        let resolved = Self::tr_extended_sql(route_sql.or(cycle_route.as_deref()), refs, registry);
+        // The cycle's unnamed Parse is the one from its first batch (a later
+        // one only replaces it if none was held earlier) — mirror the entry
+        // builder below.
+        let unnamed_len = cycle
+            .as_ref()
+            .and_then(|c| c.unnamed_parse.as_ref().map(|p| p.len()))
+            .or_else(|| unnamed.map(|(p, _)| p.len()))
+            .unwrap_or(0);
+        let entry_bytes =
+            batch.len() + cycle.as_ref().map(|c| c.frames.len()).unwrap_or(0) + unnamed_len;
+        Self::tr_after_response(
+            tr,
+            resolved,
+            false,
+            || {
+                let (frames, unnamed_parse, mut all_defines, mut all_refs) = match cycle {
+                    Some(mut c) => {
+                        c.frames.extend_from_slice(batch);
+                        let up = c.unnamed_parse.or_else(|| unnamed.map(|(p, _)| p.clone()));
+                        (c.frames.freeze(), up, c.defines, c.refs)
+                    }
+                    None => (
+                        batch.clone(),
+                        unnamed.map(|(p, _)| p.clone()),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                };
+                all_defines.extend(defines.iter().cloned());
+                all_refs.extend(refs.iter().cloned());
+                StatementLog {
+                    sql: resolved.unwrap_or("").to_string(),
+                    params: Vec::new(),
+                    result_checksum: None,
+                    executed_at: chrono::Utc::now(),
+                    extended: Some(ExtendedBatchLog {
+                        frames,
+                        unnamed_parse,
+                        defines: all_defines,
+                        refs: all_refs,
+                    }),
+                }
+            },
+            entry_bytes,
+            session,
+            state,
+        )
+        .await;
+    }
+
+    /// Finish the bookkeeping for a COPY cycle once its CopyDone/CopyFail
+    /// drained to `ReadyForQuery`: refresh the status baseline and, if the
+    /// COPY ran inside an explicit transaction, mark it non-replayable (its
+    /// data stream is not recorded).
+    async fn tr_after_copy_drain(tr: &mut TrSession, session: &Arc<ClientSession>) {
+        let status = session
+            .last_rfq_status
+            .load(std::sync::atomic::Ordering::Relaxed);
+        tr.prev_status = status;
+        if !tr.record_tx {
+            return;
+        }
+        let mut ts = session.tx_state.write().await;
+        if status == b'I' {
+            *ts = TransactionState::default();
+        } else {
+            ts.in_transaction = true;
+            ts.non_replayable = true;
+            ts.has_writes = true;
+            ts.read_only = false;
+            ts.statements = Vec::new();
+            ts.replay_bytes = 0;
+        }
+    }
+
+    /// Build `CommandComplete(tag)`.
+    fn create_command_complete(tag: &str) -> Vec<u8> {
+        crate::protocol::CommandComplete {
+            tag: tag.to_string(),
+        }
+        .encode()
+        .encode()
+        .to_vec()
+    }
+
+    /// Write `ErrorResponse(code, message)` (+ `ReadyForQuery` when
+    /// `with_ready`, status `E` inside a transaction else `I`) to the client.
+    /// Returns bytes written.
+    async fn tr_send_error(
+        client: &mut ClientStream,
+        code: &str,
+        message: &str,
+        in_tx: bool,
+        with_ready: bool,
+    ) -> Result<u64> {
+        let mut resp = Self::create_error_response(code, message);
+        if with_ready {
+            resp.extend_from_slice(&Self::create_ready_for_query(if in_tx {
+                b'E'
+            } else {
+                b'I'
+            }));
+        }
+        client
+            .write_all(&resp)
+            .await
+            .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+        Ok(resp.len() as u64)
+    }
+
+    /// Read and discard backend frames up to and including one `ReadyForQuery`.
+    /// Returns `(status byte, saw ErrorResponse)`. Every read is bounded by
+    /// `read_timeout`. A COPY-in request from the backend cannot be satisfied
+    /// here and is an error.
+    async fn drain_until_ready<S: AsyncReadExt + Unpin>(
+        backend: &mut S,
+        read_timeout: Duration,
+    ) -> Result<(u8, bool)> {
+        let mut buf = BytesMut::with_capacity(4096);
+        let mut had_error = false;
+        loop {
+            let mut consumed = 0usize;
+            let mut ready: Option<u8> = None;
+            loop {
+                let rem = &buf[consumed..];
+                if rem.len() < 5 {
+                    break;
+                }
+                let len = u32::from_be_bytes([rem[1], rem[2], rem[3], rem[4]]) as usize;
+                if len < 4 {
+                    return Err(ProxyError::Protocol(
+                        "malformed backend frame during replay".to_string(),
+                    ));
+                }
+                if rem.len() < len + 1 {
+                    break;
+                }
+                let mtype = rem[0];
+                let frame_total = len + 1;
+                consumed += frame_total;
+                match mtype {
+                    b'E' => had_error = true,
+                    b'G' | b'W' => {
+                        return Err(ProxyError::Protocol(
+                            "backend requested COPY data during replay".to_string(),
+                        ))
+                    }
+                    b'Z' => {
+                        ready = Some(if frame_total >= 6 { rem[5] } else { b'I' });
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let _ = buf.split_to(consumed);
+            if let Some(status) = ready {
+                return Ok((status, had_error));
+            }
+            buf.reserve(4096);
+            let n = tokio::time::timeout(read_timeout, backend.read_buf(&mut buf))
+                .await
+                .map_err(|_| ProxyError::Network("replay drain read timeout".to_string()))?
+                .map_err(|e| ProxyError::Network(format!("replay drain read error: {}", e)))?;
+            if n == 0 {
+                return Err(ProxyError::Connection(
+                    "backend closed during replay".to_string(),
+                ));
+            }
+        }
+    }
+
+    /// Run one simple-query statement on a backend socket and discard its
+    /// response. `Err(Protocol)` if the backend rejected it; `Err(Network|
+    /// Connection)` on a socket failure.
+    async fn tr_run_discard<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+        backend: &mut S,
+        sql: &str,
+        write_timeout: Duration,
+        read_timeout: Duration,
+    ) -> Result<u8> {
+        let msg = crate::protocol::QueryMessage {
+            query: sql.to_string(),
+        }
+        .encode()
+        .encode();
+        tokio::time::timeout(write_timeout, backend.write_all(&msg))
+            .await
+            .map_err(|_| ProxyError::Network("replay write timeout".to_string()))?
+            .map_err(|e| ProxyError::Network(format!("replay write error: {}", e)))?;
+        let (status, had_error) = Self::drain_until_ready(backend, read_timeout).await?;
+        if had_error {
+            return Err(ProxyError::Protocol(format!(
+                "backend rejected replayed statement: {}",
+                Self::tr_short_sql(sql)
+            )));
+        }
+        Ok(status)
+    }
+
+    /// Statement text abbreviated for log/error messages.
+    fn tr_short_sql(sql: &str) -> String {
+        let t = sql.trim();
+        if t.len() <= 80 {
+            t.to_string()
+        } else {
+            let mut end = 80;
+            while !t.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}...", &t[..end])
+        }
+    }
+
+    /// Restore session-level state on a freshly dialed replacement
+    /// connection: replay the tracked `SET`/`RESET` statements in order.
+    /// Returns how many were replayed. `Err(Protocol)` if the backend rejected
+    /// one (the session cannot be faithfully restored); `Err(Network|Connection)`
+    /// on a socket failure.
+    async fn tr_restore_session_state<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+        backend: &mut S,
+        gucs: &[String],
+        write_timeout: Duration,
+        read_timeout: Duration,
+    ) -> Result<usize> {
+        for sql in gucs {
+            Self::tr_run_discard(backend, sql, write_timeout, read_timeout).await?;
+        }
+        Ok(gucs.len())
+    }
+
+    /// Re-home the session: wait for a healthy primary (bounded by
+    /// `write_timeout_secs`), dial it (startup params re-sent by
+    /// `ensure_conn`), restore the tracked session GUCs, and make it the
+    /// session's current node. A node that fails to connect or whose socket
+    /// dies during restore is demoted and the wait continues until the
+    /// deadline; a backend that *rejects* a restore statement aborts at once.
+    async fn tr_acquire_replacement(
+        conns: &mut HashMap<String, BackendConn>,
+        tr: &TrSession,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+    ) -> Result<String> {
+        let deadline = std::time::Instant::now() + config.write_timeout();
+        loop {
+            let node = Self::select_primary_with_timeout(session, state, config).await?;
+            let err = match Self::ensure_conn(conns, &node, session, config, state).await {
+                Ok(()) => {
+                    let bc = conns.get_mut(&node).expect("just ensured");
+                    match Self::tr_restore_session_state(
+                        &mut bc.stream,
+                        &tr.gucs,
+                        state.limits.backend_write_timeout,
+                        state.limits.backend_read_timeout,
+                    )
+                    .await
+                    {
+                        Ok(n) => {
+                            #[cfg(feature = "pool-modes")]
+                            if n > 0 {
+                                bc.dirty = true;
+                            }
+                            *session.current_node.write().await = Some(node.clone());
+                            state.metrics.tr.failovers.fetch_add(1, Ordering::Relaxed);
+                            tracing::info!(
+                                target: "helios::tr",
+                                node = %node,
+                                restored_sets = n,
+                                incomplete = tr.guc_cap_hit,
+                                "in-session failover: session re-homed"
+                            );
+                            return Ok(node);
+                        }
+                        Err(e @ ProxyError::Protocol(_)) => {
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            conns.remove(&node);
+                            e
+                        }
+                    }
+                }
+                // A backend that challenges for a credential the proxy does
+                // not hold (pass-through mode) or rejects it is healthy — do
+                // not demote it, and do not wait: fail the recovery now.
+                Err(e @ ProxyError::Auth(_)) => return Err(e),
+                Err(e) => e,
+            };
+            Self::record_backend_failure(state, &node, &err.to_string());
+            if std::time::Instant::now() >= deadline {
+                return Err(err);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Replay a recorded explicit transaction on `node`'s connection,
+    /// discarding every response. Named statements a cycle references are
+    /// re-prepared from the registry unless an earlier replayed cycle (or the
+    /// connection) already holds them. Leaves the connection inside the
+    /// replayed (uncommitted) transaction on success.
+    async fn tr_replay_transaction(
+        conns: &mut HashMap<String, BackendConn>,
+        node: &str,
+        entries: &[StatementLog],
+        registry: &HashMap<String, bytes::Bytes>,
+        state: &Arc<ServerState>,
+    ) -> std::result::Result<(), ReplayFailure> {
+        let bc = conns.get_mut(node).ok_or_else(|| {
+            ReplayFailure::Backend(ProxyError::Connection("no connection".into()))
+        })?;
+        let wt = state.limits.backend_write_timeout;
+        let rt = state.limits.backend_read_timeout;
+        let total = entries.len();
+        for (i, st) in entries.iter().enumerate() {
+            let status = match &st.extended {
+                None => Self::tr_run_discard(&mut bc.stream, &st.sql, wt, rt)
+                    .await
+                    .map_err(|e| match e {
+                        ProxyError::Protocol(_) => ReplayFailure::Statement(format!(
+                            "statement {}/{} rejected: {}",
+                            i + 1,
+                            total,
+                            Self::tr_short_sql(&st.sql)
+                        )),
+                        other => ReplayFailure::Backend(other),
+                    })?,
+                Some(ext) => {
+                    for name in &ext.refs {
+                        if bc.prepared.contains(name) || ext.defines.contains(name) {
+                            continue;
+                        }
+                        let Some(parse_bytes) = registry.get(name) else {
+                            continue;
+                        };
+                        Self::reprepare_statement(
+                            &mut bc.stream,
+                            parse_bytes,
+                            state.limits.reprepare_timeout,
+                        )
+                        .await
+                        .map_err(|e| match e {
+                            ProxyError::Protocol(_) => ReplayFailure::Statement(format!(
+                                "re-prepare of statement '{}' rejected",
+                                name
+                            )),
+                            other => ReplayFailure::Backend(other),
+                        })?;
+                        bc.prepared.insert(name.clone());
+                    }
+                    let mut wire = Vec::with_capacity(
+                        ext.frames.len() + ext.unnamed_parse.as_ref().map(|p| p.len()).unwrap_or(0),
+                    );
+                    if let Some(p) = &ext.unnamed_parse {
+                        wire.extend_from_slice(p);
+                    }
+                    wire.extend_from_slice(&ext.frames);
+                    tokio::time::timeout(wt, bc.stream.write_all(&wire))
+                        .await
+                        .map_err(|_| {
+                            ReplayFailure::Backend(ProxyError::Network(
+                                "replay write timeout".to_string(),
+                            ))
+                        })?
+                        .map_err(|e| {
+                            ReplayFailure::Backend(ProxyError::Network(format!(
+                                "replay write error: {}",
+                                e
+                            )))
+                        })?;
+                    let (status, had_error) = Self::drain_until_ready(&mut bc.stream, rt)
+                        .await
+                        .map_err(ReplayFailure::Backend)?;
+                    if had_error {
+                        return Err(ReplayFailure::Statement(format!(
+                            "extended batch {}/{} rejected: {}",
+                            i + 1,
+                            total,
+                            Self::tr_short_sql(&st.sql)
+                        )));
+                    }
+                    for d in &ext.defines {
+                        bc.prepared.insert(d.clone());
+                    }
+                    // The cycle may have (re)defined the unnamed statement.
+                    bc.unnamed_sig = None;
+                    status
+                }
+            };
+            if status == b'E' {
+                return Err(ReplayFailure::Statement(format!(
+                    "statement {}/{} left the transaction in the failed state",
+                    i + 1,
+                    total
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop the session's recorded transaction (it died with the backend).
+    async fn tr_clear_tx(session: &Arc<ClientSession>) {
+        *session.tx_state.write().await = TransactionState::default();
+    }
+
+    /// Routing found no healthy node within `write_timeout_secs`: tell the
+    /// client (08006) instead of dropping the socket. The caller closes.
+    async fn send_no_healthy_nodes(
+        client: &mut ClientStream,
+        session: &Arc<ClientSession>,
+        with_ready: bool,
+    ) {
+        let in_tx = session
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let _ = Self::tr_send_error(
+            client,
+            "08006",
+            "no healthy backend node available within write_timeout; connection closed",
+            in_tx,
+            with_ready,
+        )
+        .await;
+    }
+
+    /// Execute the in-session TR recovery for a backend fault. Returns
+    /// `Ok(Some(forward_result))` when the session continues (the request was
+    /// re-executed or answered with an error), `Ok(None)` when the client
+    /// connection must be closed, `Err` only when the CLIENT socket failed.
+    #[allow(clippy::too_many_arguments)]
+    async fn tr_handle_fault(
+        client: &mut ClientStream,
+        conns: &mut HashMap<String, BackendConn>,
+        current_node: &mut Option<String>,
+        fault: BackendFault,
+        inflight: InFlight<'_>,
+        tr: &mut TrSession,
+        registry: &HashMap<String, bytes::Bytes>,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+    ) -> Result<Option<(Option<String>, u64)>> {
+        let mode = session.tr_mode;
+        let in_tx = session
+            .in_transaction
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let copying = session
+            .copy_in_progress
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let (sql, wait_ready, is_extended) = match &inflight {
+            InFlight::Simple(msg) => (crate::protocol::query_text(&msg.payload), true, false),
+            InFlight::Extended {
+                route_sql,
+                wait_ready,
+                reprepare,
+                ..
+            } => (
+                Self::tr_extended_sql(*route_sql, reprepare, registry),
+                *wait_ready,
+                true,
+            ),
+        };
+        let kind = sql.map(Self::tr_classify).unwrap_or(StmtKind::Other);
+        let (tx_has_writes, tx_replayable) = {
+            let ts = session.tx_state.read().await;
+            (
+                ts.has_writes,
+                !ts.non_replayable && !ts.statements.is_empty(),
+            )
+        };
+        let mut action = if copying {
+            // The COPY data stream is unrecoverable in every mode.
+            TrAction::CloseWithError("08006")
+        } else {
+            Self::tr_decide(mode, fault.phase, in_tx, tx_has_writes, tx_replayable, kind)
+        };
+        // A proxy-side backend READ timeout is a slow statement, not a dead
+        // backend — never run it a second time. A Sync whose cycle had earlier
+        // Flush batches cannot be re-executed on its own (their responses were
+        // already relayed).
+        let partial_cycle = is_extended && tr.ext_cycle.is_some();
+        if (!Self::is_backend_fault(&fault.error) || partial_cycle)
+            && matches!(action, TrAction::Reexecute | TrAction::ReplayThenReexecute)
+        {
+            action = TrAction::ErrorAndContinue(match fault.phase {
+                FaultPhase::NotDelivered => "57P01",
+                FaultPhase::OutcomeUnknown => "08007",
+            });
+        }
+        tr.ext_cycle = None;
+        tracing::warn!(
+            target: "helios::tr",
+            node = %fault.node,
+            error = %fault.error,
+            phase = ?fault.phase,
+            mode = ?mode,
+            in_tx,
+            kind = ?kind,
+            action = ?action,
+            "backend fault on a live session"
+        );
+        let phase_desc = match fault.phase {
+            FaultPhase::NotDelivered => "before the statement was delivered",
+            FaultPhase::OutcomeUnknown => "while the statement was in flight (outcome unknown)",
+        };
+
+        match action {
+            TrAction::CloseWithError(code) => {
+                let message = if copying {
+                    format!(
+                        "backend {} failed during COPY ({}); connection closed",
+                        fault.node, fault.error
+                    )
+                } else {
+                    format!(
+                        "backend {} failed {} ({}); closing connection (tr_mode = {:?})",
+                        fault.node, phase_desc, fault.error, mode
+                    )
+                };
+                let _ = Self::tr_send_error(client, code, &message, in_tx, wait_ready).await;
+                Self::tr_clear_tx(session).await;
+                Ok(None)
+            }
+            TrAction::ErrorAndContinue(code) => {
+                let node =
+                    match Self::tr_acquire_replacement(conns, tr, session, state, config).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            return Self::tr_fail_no_replacement(
+                                client, &fault, &e, in_tx, wait_ready, session,
+                            )
+                            .await;
+                        }
+                    };
+                let message = format!(
+                    "backend {} failed {} ({}){}",
+                    fault.node,
+                    phase_desc,
+                    fault.error,
+                    if in_tx {
+                        "; the transaction was aborted — ROLLBACK and retry"
+                    } else {
+                        ""
+                    }
+                );
+                if code == "08007" {
+                    state
+                        .metrics
+                        .tr
+                        .unknown_outcome_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                let sent = Self::tr_send_error(client, code, &message, in_tx, wait_ready).await?;
+                Self::tr_enter_aborted(tr, in_tx, session).await;
+                *current_node = Some(node.clone());
+                Ok(Some((Some(node), sent)))
+            }
+            TrAction::Reexecute | TrAction::ReplayThenReexecute => {
+                let node =
+                    match Self::tr_acquire_replacement(conns, tr, session, state, config).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            return Self::tr_fail_no_replacement(
+                                client, &fault, &e, in_tx, wait_ready, session,
+                            )
+                            .await;
+                        }
+                    };
+                if action == TrAction::ReplayThenReexecute {
+                    let entries = session.tx_state.read().await.statements.clone();
+                    match Self::tr_replay_transaction(conns, &node, &entries, registry, state).await
+                    {
+                        Ok(()) => {
+                            state
+                                .metrics
+                                .tr
+                                .transactions_replayed
+                                .fetch_add(1, Ordering::Relaxed);
+                            tracing::info!(
+                                target: "helios::tr",
+                                node = %node,
+                                statements = entries.len(),
+                                "transaction replayed on new backend"
+                            );
+                        }
+                        Err(failure) => {
+                            state
+                                .metrics
+                                .tr
+                                .replay_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                            let detail = match failure {
+                                ReplayFailure::Statement(d) => {
+                                    // Leave the new backend clean.
+                                    if let Some(bc) = conns.get_mut(&node) {
+                                        let _ = Self::tr_run_discard(
+                                            &mut bc.stream,
+                                            "ROLLBACK",
+                                            state.limits.backend_write_timeout,
+                                            state.limits.backend_read_timeout,
+                                        )
+                                        .await;
+                                    }
+                                    d
+                                }
+                                ReplayFailure::Backend(e) => {
+                                    conns.remove(&node);
+                                    Self::record_backend_failure(state, &node, &e.to_string());
+                                    format!("replacement backend {} failed: {}", node, e)
+                                }
+                            };
+                            let message =
+                                format!("transaction replay failed after failover: {}", detail);
+                            let sent =
+                                Self::tr_send_error(client, "40001", &message, in_tx, wait_ready)
+                                    .await?;
+                            Self::tr_enter_aborted(tr, in_tx, session).await;
+                            let cur = conns.contains_key(&node).then(|| node.clone());
+                            *current_node = cur.clone();
+                            return Ok(Some((cur, sent)));
+                        }
+                    }
+                }
+                state
+                    .metrics
+                    .tr
+                    .statements_reexecuted
+                    .fetch_add(1, Ordering::Relaxed);
+                *current_node = Some(node.clone());
+                let mut second: Option<BackendFault> = None;
+                let r = match inflight {
+                    InFlight::Simple(msg) => {
+                        Self::forward_simple_query(
+                            client,
+                            msg,
+                            conns,
+                            Some(node.as_str()),
+                            session,
+                            state,
+                            config,
+                            &mut second,
+                        )
+                        .await
+                    }
+                    InFlight::Extended {
+                        batch,
+                        route_sql,
+                        wait_ready,
+                        reprepare,
+                        defines,
+                        unnamed,
+                    } => {
+                        Self::forward_extended_batch(
+                            client,
+                            batch,
+                            route_sql,
+                            wait_ready,
+                            conns,
+                            Some(node.as_str()),
+                            registry,
+                            reprepare,
+                            defines,
+                            unnamed,
+                            session,
+                            state,
+                            config,
+                            &mut second,
+                        )
+                        .await
+                    }
+                };
+                match r {
+                    Ok(v) => Ok(Some(v)),
+                    Err(e) => {
+                        let Some(f2) = second else {
+                            // Client-side failure: nothing left to do.
+                            return Err(e);
+                        };
+                        // The replacement failed too: give this request up
+                        // with one error rather than cascading recoveries.
+                        tracing::warn!(
+                            target: "helios::tr",
+                            node = %f2.node,
+                            error = %f2.error,
+                            "replacement backend failed during re-execution"
+                        );
+                        let message = format!(
+                            "backend {} failed during failover re-execution ({}){}",
+                            f2.node,
+                            f2.error,
+                            if in_tx {
+                                "; the transaction was aborted — ROLLBACK and retry"
+                            } else {
+                                ""
+                            }
+                        );
+                        let sent =
+                            Self::tr_send_error(client, "08006", &message, in_tx, wait_ready)
+                                .await?;
+                        Self::tr_enter_aborted(tr, in_tx, session).await;
+                        *current_node = None;
+                        Ok(Some((None, sent)))
+                    }
+                }
+            }
+        }
+    }
+
+    /// No healthy primary within `write_timeout_secs` (or the session state
+    /// could not be restored): tell the client and close.
+    async fn tr_fail_no_replacement(
+        client: &mut ClientStream,
+        fault: &BackendFault,
+        err: &ProxyError,
+        in_tx: bool,
+        wait_ready: bool,
+        session: &Arc<ClientSession>,
+    ) -> Result<Option<(Option<String>, u64)>> {
+        let message = match err {
+            ProxyError::Protocol(_) => format!(
+                "backend {} failed ({}); session state could not be restored on the new primary: {}",
+                fault.node, fault.error, err
+            ),
+            ProxyError::Auth(_) => format!(
+                "backend {} failed ({}); the proxy could not authenticate to the replacement primary: {}",
+                fault.node, fault.error, err
+            ),
+            _ => format!(
+                "backend {} failed ({}); no healthy primary became available within write_timeout: {}",
+                fault.node, fault.error, err
+            ),
+        };
+        let _ = Self::tr_send_error(client, "08006", &message, in_tx, wait_ready).await;
+        Self::tr_clear_tx(session).await;
+        Ok(None)
+    }
+
+    /// After an error was returned for the in-flight request: the recorded
+    /// transaction is gone; if the client believes it is inside one, enter
+    /// the aborted-transaction emulation until it ends it.
+    async fn tr_enter_aborted(tr: &mut TrSession, in_tx: bool, session: &Arc<ClientSession>) {
+        Self::tr_clear_tx(session).await;
+        tr.pending_tx_gucs.clear();
+        // The response the client just saw ended with ErrorResponse + RFQ.
+        Self::note_ready_for_query(session, if in_tx { b'E' } else { b'I' }, true);
+        if in_tx {
+            tr.tx_aborted = true;
         }
     }
 }
@@ -7203,6 +9263,27 @@ pub struct ServerMetricsSnapshot {
     /// Cacheable reads whose response outgrew
     /// `[cache] max_cacheable_response_bytes` and were therefore not cached.
     pub cache_capture_oversize: u64,
+    /// In-session Transaction Replay (`tr_mode`) counters.
+    pub tr: TrMetricsSnapshot,
+}
+
+/// In-session Transaction Replay counters (see `TrMode`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrMetricsSnapshot {
+    /// Sessions re-homed onto a replacement backend after a backend fault.
+    pub failovers: u64,
+    /// In-flight statements transparently re-executed on the new backend.
+    pub statements_reexecuted: u64,
+    /// Explicit transactions successfully replayed on the new backend.
+    pub transactions_replayed: u64,
+    /// Transaction replays that failed (client received SQLSTATE 40001).
+    pub replay_failures: u64,
+    /// SQLSTATE 08007 `transaction_resolution_unknown` errors returned.
+    pub unknown_outcome_errors: u64,
+    /// Transactions marked non-replayable by `[limits] tr_max_replay_*`.
+    pub replay_cap_exceeded: u64,
+    /// Sessions whose `SET` tracking hit `[limits] tr_max_session_set_statements`.
+    pub session_set_cap_exceeded: u64,
 }
 
 /// Pool mode statistics snapshot (when pool-modes feature is enabled)
@@ -7689,6 +9770,10 @@ mod tests {
             current_node: RwLock::new(None),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             copy_in_progress: std::sync::atomic::AtomicBool::new(false),
+            last_rfq_status: std::sync::atomic::AtomicU8::new(b'I'),
+            last_response_error: std::sync::atomic::AtomicBool::new(false),
+            tr_replay_tainted: std::sync::atomic::AtomicBool::new(false),
+            backend_credential: RwLock::new(None),
             tx_state: RwLock::new(TransactionState::default()),
             variables: RwLock::new(HashMap::new()),
             created_at: chrono::Utc::now(),
@@ -10100,5 +12185,1050 @@ mod tests {
         anomaly_fingerprint_into("select * from USERS where id = 99", &mut buf);
         assert_eq!(a, buf);
         assert_eq!(a, "select * from users where id = ?");
+    }
+
+    // ---- In-session Transaction Replay (tr_mode) ----
+
+    mod tr_in_session {
+        use super::*;
+        use crate::config::TrMode;
+        use crate::protocol::QueryMessage;
+
+        const MODES: [TrMode; 4] = [
+            TrMode::None,
+            TrMode::Session,
+            TrMode::Select,
+            TrMode::Transaction,
+        ];
+        const PHASES: [FaultPhase; 2] = [FaultPhase::NotDelivered, FaultPhase::OutcomeUnknown];
+        const KINDS: [StmtKind; 5] = [
+            StmtKind::Read,
+            StmtKind::Write,
+            StmtKind::Commit,
+            StmtKind::Control,
+            StmtKind::Other,
+        ];
+
+        /// Every cell of the decision table must satisfy the hard rules.
+        #[test]
+        fn tr_decide_exhaustive_invariants() {
+            use TrAction::*;
+            let mut cells = 0;
+            for mode in MODES {
+                for phase in PHASES {
+                    for in_tx in [false, true] {
+                        for has_writes in [false, true] {
+                            for replayable in [false, true] {
+                                for kind in KINDS {
+                                    cells += 1;
+                                    let a = ProxyServer::tr_decide(
+                                        mode, phase, in_tx, has_writes, replayable, kind,
+                                    );
+                                    let ctx = format!(
+                                        "{mode:?}/{phase:?}/in_tx={in_tx}/writes={has_writes}/replayable={replayable}/{kind:?} -> {a:?}"
+                                    );
+                                    // none: always one error, then close.
+                                    if mode == TrMode::None {
+                                        assert_eq!(a, CloseWithError("57P01"), "{ctx}");
+                                        continue;
+                                    }
+                                    assert!(!matches!(a, CloseWithError(_)), "{ctx}");
+                                    // A statement that never ran, outside a
+                                    // transaction, is always just re-run.
+                                    if phase == FaultPhase::NotDelivered && !in_tx {
+                                        assert_eq!(a, Reexecute, "{ctx}");
+                                    }
+                                    // Never double-apply: an autocommit write/
+                                    // opaque statement with unknown outcome is
+                                    // never re-executed.
+                                    if phase == FaultPhase::OutcomeUnknown
+                                        && !in_tx
+                                        && matches!(kind, StmtKind::Write | StmtKind::Other)
+                                    {
+                                        assert_eq!(a, ErrorAndContinue("08007"), "{ctx}");
+                                    }
+                                    // A COMMIT with unknown outcome is never retried.
+                                    if phase == FaultPhase::OutcomeUnknown
+                                        && in_tx
+                                        && kind == StmtKind::Commit
+                                    {
+                                        assert_eq!(a, ErrorAndContinue("08007"), "{ctx}");
+                                    }
+                                    // Replay only ever happens inside a
+                                    // transaction that is recorded & replayable.
+                                    if a == ReplayThenReexecute {
+                                        assert!(in_tx && replayable, "{ctx}");
+                                        assert_ne!(mode, TrMode::Session, "{ctx}");
+                                        if mode == TrMode::Select {
+                                            assert!(!has_writes, "{ctx}");
+                                        }
+                                    }
+                                    // Inside a transaction the ONLY transparent
+                                    // outcome is a replay (the tx died with the
+                                    // old backend; a bare re-execution would run
+                                    // in autocommit).
+                                    if in_tx {
+                                        assert_ne!(a, Reexecute, "{ctx}");
+                                    }
+                                    // session mode never replays anything.
+                                    if mode == TrMode::Session {
+                                        assert!(
+                                            matches!(a, ErrorAndContinue(_))
+                                                || (phase == FaultPhase::NotDelivered && !in_tx),
+                                            "{ctx}"
+                                        );
+                                    }
+                                    // SQLSTATE follows the phase.
+                                    if let ErrorAndContinue(code) = a {
+                                        match phase {
+                                            FaultPhase::NotDelivered => {
+                                                assert_eq!(code, "57P01", "{ctx}")
+                                            }
+                                            FaultPhase::OutcomeUnknown => {
+                                                assert_eq!(code, "08007", "{ctx}")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(cells, 4 * 2 * 2 * 2 * 2 * 5);
+        }
+
+        /// Spot rows straight from the specification table.
+        #[test]
+        fn tr_decide_spec_rows() {
+            use FaultPhase::*;
+            use StmtKind::*;
+            use TrAction::*;
+            let d = ProxyServer::tr_decide;
+            // none
+            assert_eq!(
+                d(TrMode::None, OutcomeUnknown, true, true, true, Read),
+                CloseWithError("57P01")
+            );
+            // session: not-delivered outside tx -> re-execute (any kind)
+            assert_eq!(
+                d(TrMode::Session, NotDelivered, false, false, false, Write),
+                Reexecute
+            );
+            assert_eq!(
+                d(TrMode::Session, NotDelivered, false, false, false, Commit),
+                Reexecute
+            );
+            // session: not-delivered inside tx -> 57P01; unknown -> 08007
+            assert_eq!(
+                d(TrMode::Session, NotDelivered, true, true, true, Write),
+                ErrorAndContinue("57P01")
+            );
+            assert_eq!(
+                d(TrMode::Session, OutcomeUnknown, false, false, false, Read),
+                ErrorAndContinue("08007")
+            );
+            assert_eq!(
+                d(TrMode::Session, OutcomeUnknown, true, false, true, Read),
+                ErrorAndContinue("08007")
+            );
+            // select: unknown-outcome read outside tx -> re-execute; write -> 08007
+            assert_eq!(
+                d(TrMode::Select, OutcomeUnknown, false, false, false, Read),
+                Reexecute
+            );
+            assert_eq!(
+                d(TrMode::Select, OutcomeUnknown, false, false, false, Control),
+                Reexecute
+            );
+            assert_eq!(
+                d(TrMode::Select, OutcomeUnknown, false, false, false, Write),
+                ErrorAndContinue("08007")
+            );
+            // select: read-only replayable tx -> replay; tx with writes -> error
+            assert_eq!(
+                d(TrMode::Select, OutcomeUnknown, true, false, true, Read),
+                ReplayThenReexecute
+            );
+            assert_eq!(
+                d(TrMode::Select, NotDelivered, true, false, true, Write),
+                ReplayThenReexecute
+            );
+            assert_eq!(
+                d(TrMode::Select, OutcomeUnknown, true, true, true, Read),
+                ErrorAndContinue("08007")
+            );
+            assert_eq!(
+                d(TrMode::Select, NotDelivered, true, true, true, Read),
+                ErrorAndContinue("57P01")
+            );
+            assert_eq!(
+                d(TrMode::Select, OutcomeUnknown, true, false, false, Read),
+                ErrorAndContinue("08007")
+            );
+            // transaction: replay uncommitted tx then re-execute (writes included)
+            assert_eq!(
+                d(TrMode::Transaction, NotDelivered, true, true, true, Write),
+                ReplayThenReexecute
+            );
+            assert_eq!(
+                d(TrMode::Transaction, OutcomeUnknown, true, true, true, Write),
+                ReplayThenReexecute
+            );
+            assert_eq!(
+                d(TrMode::Transaction, NotDelivered, true, true, true, Commit),
+                ReplayThenReexecute
+            );
+            // transaction: COMMIT with unknown outcome -> 08007, never retried
+            assert_eq!(
+                d(
+                    TrMode::Transaction,
+                    OutcomeUnknown,
+                    true,
+                    true,
+                    true,
+                    Commit
+                ),
+                ErrorAndContinue("08007")
+            );
+            // transaction: autocommit write unknown -> 08007
+            assert_eq!(
+                d(
+                    TrMode::Transaction,
+                    OutcomeUnknown,
+                    false,
+                    false,
+                    false,
+                    Write
+                ),
+                ErrorAndContinue("08007")
+            );
+            // transaction: non-replayable (over cap) degrades to session behaviour
+            assert_eq!(
+                d(TrMode::Transaction, NotDelivered, true, true, false, Write),
+                ErrorAndContinue("57P01")
+            );
+            assert_eq!(
+                d(TrMode::Transaction, OutcomeUnknown, true, true, false, Read),
+                ErrorAndContinue("08007")
+            );
+        }
+
+        #[test]
+        fn tr_classify_table() {
+            use StmtKind::*;
+            let c = ProxyServer::tr_classify;
+            assert_eq!(c("SELECT 1"), Read);
+            assert_eq!(c("  select * from t where x = 'a;b' "), Write); // interior ';' -> opaque
+            assert_eq!(c("SELECT count(*) FROM t;"), Read);
+            assert_eq!(c("SELECT CASE WHEN x THEN 1 END FROM t"), Read);
+            assert_eq!(c("SELECT * INTO t2 FROM t"), Other);
+            assert_eq!(c("SELECT nextval('s')"), Other);
+            assert_eq!(c("SELECT pg_sleep(0.5), 42"), Read);
+            assert_eq!(c("SHOW application_name"), Read);
+            assert_eq!(c("VALUES (1)"), Read);
+            assert_eq!(c("TABLE t"), Read);
+            assert_eq!(c("WITH x AS (SELECT 1) SELECT * FROM x"), Read);
+            assert_eq!(
+                c("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"),
+                Write
+            );
+            assert_eq!(c("with u as (update t set v=1) select 1"), Write);
+            assert_eq!(c("EXPLAIN SELECT 1"), Read);
+            assert_eq!(c("EXPLAIN ANALYZE DELETE FROM t"), Other);
+            assert_eq!(c("COPY t TO STDOUT"), Read);
+            assert_eq!(c("COPY t FROM STDIN"), Write);
+            assert_eq!(c("INSERT INTO t VALUES (1)"), Write);
+            assert_eq!(c("update t set v = 2"), Write);
+            assert_eq!(c("DELETE FROM t"), Write);
+            assert_eq!(
+                c("MERGE INTO t USING s ON true WHEN MATCHED THEN DELETE"),
+                Write
+            );
+            assert_eq!(c("CREATE TABLE x(i int)"), Write);
+            assert_eq!(c("CALL p()"), Write);
+            assert_eq!(c("DO $$ BEGIN END $$"), Write);
+            assert_eq!(c("EXECUTE p(1)"), Write);
+            assert_eq!(c("COMMIT"), Commit);
+            assert_eq!(c("commit;"), Commit);
+            assert_eq!(c("END"), Commit);
+            assert_eq!(c("END TRANSACTION"), Commit);
+            assert_eq!(c("COMMIT PREPARED 'x'"), Commit);
+            assert_eq!(c("PREPARE TRANSACTION 'x'"), Commit);
+            assert_eq!(c("PREPARE p AS SELECT 1"), Other); // server-side prepare, not a commit
+            assert_eq!(c("INSERT INTO t VALUES (1); COMMIT"), Commit); // multi-stmt that may commit
+            assert_eq!(
+                c("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)"),
+                Write
+            );
+            assert_eq!(c("BEGIN"), Control);
+            assert_eq!(c("BEGIN; INSERT INTO t VALUES (1)"), Write);
+            assert_eq!(c("START TRANSACTION"), Control);
+            assert_eq!(c("SAVEPOINT s1"), Control);
+            assert_eq!(c("RELEASE SAVEPOINT s1"), Control);
+            assert_eq!(c("ROLLBACK"), Control);
+            assert_eq!(c("ROLLBACK TO SAVEPOINT s1"), Control);
+            assert_eq!(c("ABORT"), Control);
+            assert_eq!(c("SET application_name = 'x'"), Control);
+            assert_eq!(c("RESET ALL"), Control);
+            assert_eq!(c("DISCARD ALL"), Control);
+            assert_eq!(c(""), Control);
+            assert_eq!(c("   ;  "), Control);
+            assert_eq!(c("SETTINGS"), Other);
+            assert_eq!(c("LISTEN ch"), Other);
+            assert_eq!(c("NOTIFY ch"), Other);
+            assert_eq!(c("LOCK TABLE t"), Other);
+            assert_eq!(c("FETCH 10 FROM c"), Other);
+        }
+
+        #[test]
+        fn tr_ends_transaction_recognises_single_statement_ends_only() {
+            let f = ProxyServer::tr_ends_transaction;
+            for s in [
+                "ROLLBACK",
+                "rollback;",
+                "ABORT",
+                "COMMIT",
+                "END",
+                "COMMIT WORK",
+                "END TRANSACTION",
+                " Rollback Work ; ",
+            ] {
+                assert!(f(s), "{s}");
+            }
+            for s in [
+                "ROLLBACK TO SAVEPOINT a",
+                "ROLLBACK PREPARED 'x'",
+                "COMMIT PREPARED 'x'",
+                "COMMIT AND CHAIN",
+                "ROLLBACK; SELECT 1",
+                "SELECT 1",
+                "",
+                "ENDING",
+            ] {
+                assert!(!f(s), "{s}");
+            }
+        }
+
+        #[test]
+        fn tr_session_set_tracking_filters() {
+            let set = ProxyServer::tr_is_session_set;
+            assert!(set("SET application_name = 'tr-f3'"));
+            assert!(set("set search_path to a, b;"));
+            assert!(set("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"));
+            assert!(set("SET ROLE readonly"));
+            assert!(set("RESET application_name"));
+            assert!(!set("SET LOCAL statement_timeout = 1"));
+            assert!(!set("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"));
+            assert!(!set("SET CONSTRAINTS ALL DEFERRED"));
+            assert!(!set("SET a = 1; SET b = 2"));
+            assert!(!set("SELECT set_config('a','b',false)"));
+            assert!(!set("SETTINGS"));
+            let all = ProxyServer::tr_resets_all;
+            assert!(all("RESET ALL"));
+            assert!(all("discard all;"));
+            assert!(!all("RESET application_name"));
+            assert!(!all("DISCARD PLANS"));
+        }
+
+        #[test]
+        fn starts_with_word_ci_requires_boundary() {
+            assert!(ProxyServer::starts_with_word_ci("SET x", "SET"));
+            assert!(ProxyServer::starts_with_word_ci("set", "SET"));
+            assert!(ProxyServer::starts_with_word_ci("END;", "END"));
+            assert!(!ProxyServer::starts_with_word_ci("SETTINGS", "SET"));
+            assert!(!ProxyServer::starts_with_word_ci("SE", "SET"));
+        }
+
+        #[test]
+        fn parse_msg_sql_extracts_query_from_encoded_parse() {
+            let mut p = vec![b'P', 0, 0, 0, 0];
+            p.extend_from_slice(&cstr("ps1"));
+            p.extend_from_slice(&cstr("SELECT 42"));
+            p.extend_from_slice(&[0, 0]);
+            assert_eq!(ProxyServer::parse_msg_sql(&p), Some("SELECT 42"));
+            assert_eq!(ProxyServer::parse_msg_sql(&p[..3]), None);
+            let mut reg: HashMap<String, bytes::Bytes> = HashMap::new();
+            reg.insert("ps1".to_string(), bytes::Bytes::from(p));
+            let refs = vec!["ps1".to_string()];
+            assert_eq!(
+                ProxyServer::tr_extended_sql(None, &refs, &reg),
+                Some("SELECT 42")
+            );
+            assert_eq!(
+                ProxyServer::tr_extended_sql(Some("SELECT 1"), &refs, &reg),
+                Some("SELECT 1")
+            );
+            assert_eq!(
+                ProxyServer::tr_extended_sql(None, &["nope".to_string()], &reg),
+                None
+            );
+        }
+
+        fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut f = vec![tag];
+            f.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+            f.extend_from_slice(body);
+            f
+        }
+
+        /// One response per call (the replay/restore paths only ever have ONE
+        /// response outstanding — statement, drain, statement, drain), with
+        /// the status byte and error flag reported.
+        #[tokio::test]
+        async fn drain_until_ready_reports_status_and_errors() {
+            let (mut a, mut b) = tokio::io::duplex(4096);
+            let mut wire = frame(b'C', &cstr("INSERT 0 1"));
+            wire.extend_from_slice(&frame(b'Z', b"T"));
+            b.write_all(&wire).await.unwrap();
+            let (status, err) = ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert_eq!((status, err), (b'T', false));
+            // Error frames are reported, not fatal.
+            let mut wire = frame(b'E', &[b'S', 0, b'C', 0, 0]);
+            wire.extend_from_slice(&frame(b'Z', b"E"));
+            b.write_all(&wire).await.unwrap();
+            let (status, err) = ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert_eq!((status, err), (b'E', true));
+            // A COPY-in request cannot be satisfied during a replay.
+            b.write_all(&frame(b'G', &[0, 0, 0])).await.unwrap();
+            assert!(
+                ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5))
+                    .await
+                    .is_err()
+            );
+            // EOF is an error.
+            drop(b);
+            assert!(
+                ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5))
+                    .await
+                    .is_err()
+            );
+        }
+
+        #[tokio::test]
+        async fn drain_until_ready_times_out_on_silent_backend() {
+            let (mut a, _b) = tokio::io::duplex(64);
+            let r = ProxyServer::drain_until_ready(&mut a, Duration::from_millis(50)).await;
+            assert!(matches!(r, Err(ProxyError::Network(_))));
+        }
+
+        #[tokio::test]
+        async fn tr_run_discard_and_restore_session_state() {
+            let (mut a, mut b) = tokio::io::duplex(4096);
+            // Backend: answers the first statement OK, rejects the second —
+            // one response per received Query, like a real server.
+            let backend = tokio::spawn(async move {
+                let mut seen = Vec::new();
+                for i in 0..2 {
+                    let mut hdr = [0u8; 5];
+                    b.read_exact(&mut hdr).await.unwrap();
+                    let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+                    let mut body = vec![0u8; len - 4];
+                    b.read_exact(&mut body).await.unwrap();
+                    seen.push((
+                        hdr[0],
+                        crate::protocol::query_text(&body).unwrap().to_string(),
+                    ));
+                    let mut out = if i == 0 {
+                        frame(b'C', &cstr("SET"))
+                    } else {
+                        frame(b'E', &[b'C', 0, 0])
+                    };
+                    out.extend_from_slice(&frame(b'Z', b"I"));
+                    b.write_all(&out).await.unwrap();
+                }
+                seen
+            });
+            let gucs = vec!["SET a = 1".to_string(), "SET b = 2".to_string()];
+            let r = ProxyServer::tr_restore_session_state(
+                &mut a,
+                &gucs,
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            )
+            .await;
+            assert!(matches!(r, Err(ProxyError::Protocol(_))), "{r:?}");
+            // Both Query frames reached the backend, in order.
+            let seen = backend.await.unwrap();
+            assert_eq!(
+                seen,
+                vec![
+                    (b'Q', "SET a = 1".to_string()),
+                    (b'Q', "SET b = 2".to_string())
+                ]
+            );
+            // Empty list restores nothing and succeeds.
+            let (mut a2, _b2) = tokio::io::duplex(64);
+            assert_eq!(
+                ProxyServer::tr_restore_session_state(
+                    &mut a2,
+                    &[],
+                    Duration::from_secs(1),
+                    Duration::from_secs(1)
+                )
+                .await
+                .unwrap(),
+                0
+            );
+        }
+
+        /// Fake PG backend: answers every simple Query with `CommandComplete` +
+        /// `ReadyForQuery('T')`; a query containing "boom" gets ErrorResponse +
+        /// RFQ('E'). Received query texts are pushed to `seen`.
+        async fn fake_backend(
+            listener: tokio::net::TcpListener,
+            seen: Arc<std::sync::Mutex<Vec<String>>>,
+        ) {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = BytesMut::with_capacity(4096);
+            loop {
+                buf.reserve(4096);
+                match sock.read_buf(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                while buf.len() >= 5 {
+                    let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+                    if buf.len() < len + 1 {
+                        break;
+                    }
+                    let f = buf.split_to(len + 1);
+                    if f[0] == b'Q' {
+                        let q = crate::protocol::query_text(&f[5..])
+                            .unwrap_or("")
+                            .to_string();
+                        let fail = q.contains("boom");
+                        seen.lock().unwrap().push(q);
+                        let mut out = if fail {
+                            frame(b'E', &[b'C', b'4', b'2', b'0', b'0', b'0', 0, 0])
+                        } else {
+                            frame(b'C', &cstr("OK"))
+                        };
+                        out.extend_from_slice(&frame(b'Z', if fail { b"E" } else { b"T" }));
+                        sock.write_all(&out).await.unwrap();
+                    }
+                }
+            }
+        }
+
+        fn simple_log(sql: &str) -> StatementLog {
+            StatementLog {
+                sql: sql.to_string(),
+                params: Vec::new(),
+                result_checksum: None,
+                executed_at: chrono::Utc::now(),
+                extended: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn tr_replay_transaction_replays_in_order_and_reports_rejections() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            tokio::spawn(fake_backend(listener, seen.clone()));
+            let server = ProxyServer::new(test_config()).unwrap();
+            let state = server.state.clone();
+            let mut conns: HashMap<String, BackendConn> = HashMap::new();
+            conns.insert(
+                addr.clone(),
+                BackendConn::new(TcpStream::connect(&addr).await.unwrap()),
+            );
+            let registry: HashMap<String, bytes::Bytes> = HashMap::new();
+            let entries = vec![
+                simple_log("BEGIN"),
+                simple_log("INSERT INTO t VALUES (1)"),
+                simple_log("SAVEPOINT a"),
+            ];
+            let r =
+                ProxyServer::tr_replay_transaction(&mut conns, &addr, &entries, &registry, &state)
+                    .await;
+            assert!(r.is_ok());
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec!["BEGIN", "INSERT INTO t VALUES (1)", "SAVEPOINT a"]
+            );
+            // A rejected statement stops the replay with a Statement failure.
+            let entries = vec![
+                simple_log("BEGIN"),
+                simple_log("INSERT boom"),
+                simple_log("SELECT 1"),
+            ];
+            let r =
+                ProxyServer::tr_replay_transaction(&mut conns, &addr, &entries, &registry, &state)
+                    .await;
+            match r {
+                Err(ReplayFailure::Statement(d)) => assert!(d.contains("2/3"), "{d}"),
+                _ => panic!("expected statement failure"),
+            }
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                5,
+                "replay stopped at the failure"
+            );
+            // A missing connection is a Backend failure.
+            let r = ProxyServer::tr_replay_transaction(
+                &mut conns,
+                "127.0.0.1:1",
+                &entries,
+                &registry,
+                &state,
+            )
+            .await;
+            assert!(matches!(r, Err(ReplayFailure::Backend(_))));
+        }
+
+        fn qmsg(sql: &str) -> Message {
+            QueryMessage {
+                query: sql.to_string(),
+            }
+            .encode()
+        }
+
+        /// Drive the recorder through a transaction: BEGIN/INSERT/SET are
+        /// recorded (with write tracking), the statement cap marks the
+        /// transaction non-replayable (+ metric), COMMIT releases the record
+        /// and promotes transaction-scoped SETs, and the SET cap stops tracking.
+        #[tokio::test]
+        async fn tr_recorder_tracks_transaction_gucs_and_caps() {
+            let mut config = test_config();
+            config.limits.tr_max_replay_statements = 3;
+            config.limits.tr_max_session_set_statements = 2;
+            let server = ProxyServer::new(config).unwrap();
+            let state = server.state.clone();
+            let session = make_test_session();
+            let mut tr = TrSession::new(TrMode::Transaction);
+
+            // Autocommit SET -> tracked immediately. SET LOCAL -> ignored.
+            ProxyServer::note_ready_for_query(&session, b'I', false);
+            ProxyServer::tr_after_simple(
+                &mut tr,
+                &qmsg("SET application_name = 'x'"),
+                &session,
+                &state,
+            )
+            .await;
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("SET LOCAL a = 1"), &session, &state).await;
+            assert_eq!(tr.gucs, vec!["SET application_name = 'x'"]);
+            // A rejected SET is not tracked.
+            ProxyServer::note_ready_for_query(&session, b'I', true);
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("SET bogus = 1"), &session, &state).await;
+            assert_eq!(tr.gucs.len(), 1);
+            assert!(session.tx_state.read().await.statements.is_empty());
+
+            // BEGIN opens the record; INSERT marks writes.
+            ProxyServer::note_ready_for_query(&session, b'T', false);
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("BEGIN"), &session, &state).await;
+            {
+                let ts = session.tx_state.read().await;
+                assert!(ts.in_transaction && ts.tx_id.is_some());
+                assert_eq!(ts.statements.len(), 1);
+                assert!(!ts.has_writes && ts.read_only && !ts.non_replayable);
+            }
+            ProxyServer::tr_after_simple(
+                &mut tr,
+                &qmsg("INSERT INTO t VALUES (1)"),
+                &session,
+                &state,
+            )
+            .await;
+            // SET inside the transaction is pending until COMMIT.
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("SET b = 2"), &session, &state).await;
+            assert_eq!(tr.pending_tx_gucs, vec!["SET b = 2"]);
+            {
+                let ts = session.tx_state.read().await;
+                assert_eq!(ts.statements.len(), 3);
+                assert!(ts.has_writes && !ts.read_only);
+                assert_eq!(
+                    ts.replay_bytes,
+                    "BEGIN".len() + "INSERT INTO t VALUES (1)".len() + "SET b = 2".len()
+                );
+            }
+            // Fourth statement exceeds tr_max_replay_statements = 3.
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("SELECT 1"), &session, &state).await;
+            {
+                let ts = session.tx_state.read().await;
+                assert!(ts.non_replayable);
+                assert!(ts.statements.is_empty(), "record released at the cap");
+                assert!(ts.in_transaction, "still inside the transaction");
+            }
+            assert_eq!(
+                state.metrics.tr.replay_cap_exceeded.load(Ordering::Relaxed),
+                1
+            );
+            // COMMIT -> record released, pending SET promoted (cap 2 reached).
+            ProxyServer::note_ready_for_query(&session, b'I', false);
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("COMMIT"), &session, &state).await;
+            assert!(!session.tx_state.read().await.in_transaction);
+            assert_eq!(tr.gucs, vec!["SET application_name = 'x'", "SET b = 2"]);
+            assert!(tr.pending_tx_gucs.is_empty());
+            // Third SET hits tr_max_session_set_statements = 2 -> cap metric.
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("SET c = 3"), &session, &state).await;
+            assert!(tr.guc_cap_hit);
+            assert_eq!(tr.gucs.len(), 2);
+            assert_eq!(
+                state
+                    .metrics
+                    .tr
+                    .session_set_cap_exceeded
+                    .load(Ordering::Relaxed),
+                1
+            );
+            // RESET ALL wipes tracking and lifts the cap.
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("RESET ALL"), &session, &state).await;
+            assert!(tr.gucs.is_empty() && !tr.guc_cap_hit);
+
+            // A rolled-back transaction drops its pending SETs, and a failed
+            // transaction ('E') is never replayable.
+            ProxyServer::note_ready_for_query(&session, b'T', false);
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("BEGIN"), &session, &state).await;
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("SET d = 4"), &session, &state).await;
+            ProxyServer::note_ready_for_query(&session, b'E', true);
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("INSERT boom"), &session, &state).await;
+            assert!(session.tx_state.read().await.non_replayable);
+            ProxyServer::note_ready_for_query(&session, b'I', false);
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("ROLLBACK"), &session, &state).await;
+            assert!(tr.gucs.is_empty() && tr.pending_tx_gucs.is_empty());
+        }
+
+        /// `session` mode records no transaction statements (no lock, no
+        /// allocation on the in-transaction path) but still tracks SETs;
+        /// `none` tracks nothing.
+        #[tokio::test]
+        async fn tr_recorder_mode_gating() {
+            let server = ProxyServer::new(test_config()).unwrap();
+            let state = server.state.clone();
+            let session = make_test_session();
+            let mut tr = TrSession::new(TrMode::Session);
+            ProxyServer::note_ready_for_query(&session, b'T', false);
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("BEGIN"), &session, &state).await;
+            ProxyServer::tr_after_simple(
+                &mut tr,
+                &qmsg("INSERT INTO t VALUES (1)"),
+                &session,
+                &state,
+            )
+            .await;
+            assert!(session.tx_state.read().await.statements.is_empty());
+            ProxyServer::note_ready_for_query(&session, b'I', false);
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("SET a = 1"), &session, &state).await;
+            assert_eq!(tr.gucs, vec!["SET a = 1"]);
+
+            let mut none = TrSession::new(TrMode::None);
+            ProxyServer::tr_after_simple(&mut none, &qmsg("SET a = 1"), &session, &state).await;
+            assert!(none.gucs.is_empty());
+        }
+
+        /// A tenant/rewrite transform taints the transaction: recorded text is
+        /// not what executed, so it must not be replayed.
+        #[tokio::test]
+        async fn tr_recorder_taint_marks_non_replayable() {
+            let server = ProxyServer::new(test_config()).unwrap();
+            let state = server.state.clone();
+            let session = make_test_session();
+            let mut tr = TrSession::new(TrMode::Transaction);
+            ProxyServer::note_ready_for_query(&session, b'T', false);
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("BEGIN"), &session, &state).await;
+            session
+                .tr_replay_tainted
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("SELECT 1"), &session, &state).await;
+            let ts = session.tx_state.read().await;
+            assert!(ts.non_replayable && ts.statements.is_empty());
+            assert!(!session
+                .tr_replay_tainted
+                .load(std::sync::atomic::Ordering::Relaxed));
+        }
+
+        /// Extended-protocol cycles: Flush-terminated batches accumulate and the
+        /// Sync closes them into one replay entry carrying the raw frames.
+        #[tokio::test]
+        async fn tr_recorder_extended_cycle_accumulates_until_sync() {
+            let server = ProxyServer::new(test_config()).unwrap();
+            let state = server.state.clone();
+            let session = make_test_session();
+            let mut tr = TrSession::new(TrMode::Transaction);
+            let registry: HashMap<String, bytes::Bytes> = HashMap::new();
+            // Already inside a transaction (BEGIN recorded via simple protocol).
+            ProxyServer::note_ready_for_query(&session, b'T', false);
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("BEGIN"), &session, &state).await;
+            let flush_batch = bytes::Bytes::from_static(b"FLUSHBATCH");
+            let sync_batch = bytes::Bytes::from_static(b"SYNCBATCH");
+            let unnamed = (
+                bytes::Bytes::from_static(b"PARSE"),
+                bytes::Bytes::from_static(b"sig"),
+            );
+            ProxyServer::tr_after_extended(
+                &mut tr,
+                &flush_batch,
+                Some(&unnamed),
+                Some("INSERT INTO t VALUES ($1)"),
+                false,
+                &[],
+                &[],
+                &registry,
+                &session,
+                &state,
+            )
+            .await;
+            assert!(tr.ext_cycle.is_some());
+            assert_eq!(session.tx_state.read().await.statements.len(), 1);
+            ProxyServer::tr_after_extended(
+                &mut tr,
+                &sync_batch,
+                None,
+                None,
+                true,
+                &["s1".to_string()],
+                &["s1".to_string()],
+                &registry,
+                &session,
+                &state,
+            )
+            .await;
+            assert!(tr.ext_cycle.is_none());
+            let ts = session.tx_state.read().await;
+            assert_eq!(ts.statements.len(), 2);
+            assert!(ts.has_writes);
+            let ext = ts.statements[1].extended.as_ref().expect("extended entry");
+            assert_eq!(&ext.frames[..], b"FLUSHBATCHSYNCBATCH");
+            assert_eq!(ext.unnamed_parse.as_deref(), Some(&b"PARSE"[..]));
+            assert_eq!(ext.defines, vec!["s1"]);
+            assert_eq!(ts.statements[1].sql, "INSERT INTO t VALUES ($1)");
+            assert_eq!(ts.replay_bytes, "BEGIN".len() + 10 + 9 + 5);
+        }
+
+        #[test]
+        fn backend_fault_set_ignores_client_errors() {
+            let mut slot = None;
+            BackendFault::set(
+                &mut slot,
+                "n",
+                FaultPhase::OutcomeUnknown,
+                &ProxyError::Network("Client write error: x".into()),
+            );
+            assert!(slot.is_none());
+            BackendFault::set(
+                &mut slot,
+                "n",
+                FaultPhase::OutcomeUnknown,
+                &ProxyError::Network("Backend read error: reset".into()),
+            );
+            let f = slot.unwrap();
+            assert_eq!(
+                (f.node.as_str(), f.phase),
+                ("n", FaultPhase::OutcomeUnknown)
+            );
+        }
+
+        #[test]
+        fn tr_metrics_snapshot_roundtrip() {
+            let m = TrMetrics::default();
+            m.failovers.fetch_add(2, Ordering::Relaxed);
+            m.unknown_outcome_errors.fetch_add(3, Ordering::Relaxed);
+            let s = m.snapshot();
+            assert_eq!(s.failovers, 2);
+            assert_eq!(s.unknown_outcome_errors, 3);
+            assert_eq!(s.transactions_replayed, 0);
+        }
+
+        // ---- backend authentication on a fresh (redial/failover) connection ----
+
+        /// Read one complete frame (tag + body) from a stream.
+        async fn read_frame<S: AsyncReadExt + Unpin>(s: &mut S) -> (u8, Vec<u8>) {
+            let mut hdr = [0u8; 5];
+            s.read_exact(&mut hdr).await.unwrap();
+            let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+            let mut body = vec![0u8; len - 4];
+            s.read_exact(&mut body).await.unwrap();
+            (hdr[0], body)
+        }
+
+        fn auth_frame(kind: u32, body: &[u8]) -> Vec<u8> {
+            let mut b = kind.to_be_bytes().to_vec();
+            b.extend_from_slice(body);
+            frame(b'R', &b)
+        }
+
+        /// A SCRAM-SHA-256 backend (driven by the tested `ScramServer`)
+        /// accepts the proxy's client exchange; the post-auth frames are
+        /// returned for the caller to forward.
+        #[tokio::test]
+        async fn complete_backend_auth_completes_scram_with_credential() {
+            use crate::auth_scram::{ScramServer, ScramVerifier};
+            let (mut proxy_side, mut backend_side) = tokio::io::duplex(8192);
+            let password = "benchpass";
+            let verifier =
+                ScramVerifier::from_password(password, b"saltsaltsaltsalt".to_vec(), 4096);
+            let backend = tokio::spawn(async move {
+                // AuthenticationSASL: mechanism list.
+                backend_side
+                    .write_all(&auth_frame(10, b"SCRAM-SHA-256\0\0"))
+                    .await
+                    .unwrap();
+                let (tag, body) = read_frame(&mut backend_side).await;
+                assert_eq!(tag, b'p');
+                let mech_end = body.iter().position(|&b| b == 0).unwrap() + 1;
+                let client_first = std::str::from_utf8(&body[mech_end + 4..]).unwrap();
+                let (server, server_first) =
+                    ScramServer::start(verifier, client_first, "serverNONCE").unwrap();
+                backend_side
+                    .write_all(&auth_frame(11, server_first.as_bytes()))
+                    .await
+                    .unwrap();
+                let (tag, body) = read_frame(&mut backend_side).await;
+                assert_eq!(tag, b'p');
+                let server_final = server.finish(std::str::from_utf8(&body).unwrap()).unwrap();
+                let mut out = auth_frame(12, server_final.as_bytes());
+                out.extend_from_slice(&auth_frame(0, b""));
+                out.extend_from_slice(&frame(b'S', b"server_version\0"));
+                out.extend_from_slice(&frame(b'K', &[0, 0, 0, 7, 0, 0, 0, 9]));
+                out.extend_from_slice(&frame(b'Z', b"I"));
+                backend_side.write_all(&out).await.unwrap();
+                backend_side
+            });
+            let forwarded = ProxyServer::complete_backend_auth(
+                &mut proxy_side,
+                1 << 20,
+                "bench",
+                Some(password),
+            )
+            .await
+            .unwrap();
+            let _ = backend.await.unwrap();
+            // Only non-auth frames are handed back: ParameterStatus,
+            // BackendKeyData, ReadyForQuery.
+            assert_eq!(forwarded[0], b'S');
+            assert!(forwarded.ends_with(&frame(b'Z', b"I")));
+            assert!(!forwarded.contains(&b'R') || forwarded[0] != b'R');
+            let tags: Vec<u8> = {
+                let mut v = Vec::new();
+                let mut off = 0;
+                while off < forwarded.len() {
+                    v.push(forwarded[off]);
+                    let len = u32::from_be_bytes([
+                        forwarded[off + 1],
+                        forwarded[off + 2],
+                        forwarded[off + 3],
+                        forwarded[off + 4],
+                    ]) as usize;
+                    off += 1 + len;
+                }
+                v
+            };
+            assert_eq!(tags, vec![b'S', b'K', b'Z']);
+        }
+
+        /// A wrong password is rejected by the SCRAM server -> ErrorResponse
+        /// -> `ProxyError::Auth`.
+        #[tokio::test]
+        async fn complete_backend_auth_reports_scram_rejection() {
+            use crate::auth_scram::{ScramServer, ScramVerifier};
+            let (mut proxy_side, mut backend_side) = tokio::io::duplex(8192);
+            let verifier =
+                ScramVerifier::from_password("right", b"saltsaltsaltsalt".to_vec(), 4096);
+            tokio::spawn(async move {
+                backend_side
+                    .write_all(&auth_frame(10, b"SCRAM-SHA-256\0\0"))
+                    .await
+                    .unwrap();
+                let (_, body) = read_frame(&mut backend_side).await;
+                let mech_end = body.iter().position(|&b| b == 0).unwrap() + 1;
+                let client_first = std::str::from_utf8(&body[mech_end + 4..]).unwrap();
+                let (server, server_first) =
+                    ScramServer::start(verifier, client_first, "serverNONCE").unwrap();
+                backend_side
+                    .write_all(&auth_frame(11, server_first.as_bytes()))
+                    .await
+                    .unwrap();
+                let (_, body) = read_frame(&mut backend_side).await;
+                assert!(server.finish(std::str::from_utf8(&body).unwrap()).is_err());
+                let mut err = vec![b'S'];
+                err.extend_from_slice(b"FATAL\0C28P01\0Mpassword authentication failed\0\0");
+                backend_side.write_all(&frame(b'E', &err)).await.unwrap();
+            });
+            let r = ProxyServer::complete_backend_auth(
+                &mut proxy_side,
+                1 << 20,
+                "bench",
+                Some("wrong"),
+            )
+            .await;
+            match r {
+                Err(ProxyError::Auth(m)) => {
+                    assert!(m.contains("password authentication failed"), "{m}")
+                }
+                other => panic!("expected Auth error, got {other:?}"),
+            }
+        }
+
+        /// Without a credential (pass-through mode) a challenge fails fast with
+        /// a clear error instead of a timeout; a trust backend still completes.
+        #[tokio::test]
+        async fn complete_backend_auth_without_credential() {
+            let (mut proxy_side, mut backend_side) = tokio::io::duplex(4096);
+            backend_side
+                .write_all(&auth_frame(10, b"SCRAM-SHA-256\0\0"))
+                .await
+                .unwrap();
+            let r =
+                ProxyServer::complete_backend_auth(&mut proxy_side, 1 << 20, "bench", None).await;
+            match r {
+                Err(ProxyError::Auth(m)) => assert!(m.contains("holds no credential"), "{m}"),
+                other => panic!("expected Auth error, got {other:?}"),
+            }
+            // Trust backend: AuthenticationOk straight away.
+            let (mut p2, mut b2) = tokio::io::duplex(4096);
+            let mut out = auth_frame(0, b"");
+            out.extend_from_slice(&frame(b'K', &[0, 0, 0, 1, 0, 0, 0, 2]));
+            out.extend_from_slice(&frame(b'Z', b"I"));
+            b2.write_all(&out).await.unwrap();
+            let fwd = ProxyServer::complete_backend_auth(&mut p2, 1 << 20, "bench", None)
+                .await
+                .unwrap();
+            assert_eq!(fwd[0], b'K');
+            assert!(fwd.ends_with(&frame(b'Z', b"I")));
+        }
+
+        /// Cleartext and MD5 challenges are answered from the credential.
+        #[tokio::test]
+        async fn complete_backend_auth_answers_cleartext_and_md5() {
+            // Cleartext.
+            let (mut p, mut b) = tokio::io::duplex(4096);
+            let backend = tokio::spawn(async move {
+                b.write_all(&auth_frame(3, b"")).await.unwrap();
+                let (tag, body) = read_frame(&mut b).await;
+                assert_eq!((tag, body.as_slice()), (b'p', &b"pw\0"[..]));
+                let mut out = auth_frame(0, b"");
+                out.extend_from_slice(&frame(b'Z', b"I"));
+                b.write_all(&out).await.unwrap();
+            });
+            ProxyServer::complete_backend_auth(&mut p, 1 << 20, "u", Some("pw"))
+                .await
+                .unwrap();
+            backend.await.unwrap();
+            // MD5.
+            let (mut p, mut b) = tokio::io::duplex(4096);
+            let backend = tokio::spawn(async move {
+                b.write_all(&auth_frame(5, &[1, 2, 3, 4])).await.unwrap();
+                let (tag, body) = read_frame(&mut b).await;
+                assert_eq!(tag, b'p');
+                assert_eq!(
+                    body,
+                    crate::backend::auth::md5_password_response("u", "pw", &[1, 2, 3, 4])
+                );
+                let mut out = auth_frame(0, b"");
+                out.extend_from_slice(&frame(b'Z', b"I"));
+                b.write_all(&out).await.unwrap();
+            });
+            ProxyServer::complete_backend_auth(&mut p, 1 << 20, "u", Some("pw"))
+                .await
+                .unwrap();
+            backend.await.unwrap();
+        }
     }
 }

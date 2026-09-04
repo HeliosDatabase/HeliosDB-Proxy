@@ -18,9 +18,47 @@ listen_address = "${HELIOS_PROXY_LISTEN:-0.0.0.0:6432}"
 # to a non-loopback address requires admin_token (or admin_allow_insecure = true).
 admin_address  = "${HELIOS_PROXY_ADMIN:-127.0.0.1:9090}"
 
-# Transaction Replay — re-execute in-flight work after failover.
-# Modes: none, session (re-establish SET vars), select (replay reads),
-#        transaction (full replay including writes — requires idempotent workloads).
+# Transaction Replay.
+#   tr_enabled — journal auto-commit writes for the operator-driven replay engine
+#                (POST /api/replay, time-travel; needs the `ha-tr` feature).
+#   tr_mode    — in-session failover: what a LIVE client session experiences when
+#                its backend connection fails mid-request (write error/timeout,
+#                read error, EOF, reset) or dies while idle. Always available.
+#
+#   mode        | on a backend fault
+#   ------------+-------------------------------------------------------------------
+#   none        | ONE ErrorResponse (SQLSTATE 57P01 naming the failed node) +
+#               | ReadyForQuery, then the client connection is closed.
+#   session     | Connection kept open. Waits for a healthy primary (write_timeout_secs),
+#   (default)   | reconnects, replays the session's SET/RESET statements (named prepared
+#               | statements are re-prepared lazily). A statement that never reached the
+#               | old backend and was issued outside an explicit transaction is re-run
+#               | transparently. Anything else -> ONE error (57P01 not delivered inside
+#               | a transaction / 08007 outcome unknown) and the transaction is aborted
+#               | (ROLLBACK and retry); the session then continues on the new primary.
+#   select      | session + an unknown-outcome READ (SELECT/SHOW/...; never a write) is
+#               | re-executed transparently outside a transaction; a READ-ONLY explicit
+#               | transaction is replayed from its BEGIN first.
+#   transaction | select + an UNCOMMITTED explicit transaction is replayed from its
+#               | BEGIN on the new primary (statement responses discarded — the client
+#               | already saw them) and the in-flight statement is re-executed inside
+#               | it. A COMMIT whose outcome is unknown is NEVER retried (08007).
+#               | Opt-in: blind replay is only correct for deterministic statements —
+#               | now(), random(), RETURNING serials may differ on the second run.
+#   Replay caps: [limits] tr_max_replay_statements / tr_max_replay_bytes (a
+#   transaction over a cap degrades to `session` behaviour). A transaction that
+#   contained a COPY, entered the failed state, or had a statement transformed by
+#   query-rewrite/multi-tenancy is never replayed. Extended-protocol SETs (JDBC)
+#   and SQL-level PREPARE are not tracked for restore. COPY in progress at the
+#   fault -> 08006 and close, every mode.
+#   Credentials: re-homing opens a FRESH backend connection. In pass-through
+#   auth mode the proxy never holds the client's password, so only a trust
+#   backend can be reached (a challenging one fails the recovery with 08006).
+#   For SCRAM/MD5 backends set [auth] mode = "scram" with a plaintext auth_file
+#   entry — the proxy then authenticates its own backend connections.
+#   Metrics: tr_failovers_total, tr_statements_reexecuted_total,
+#   tr_transactions_replayed_total, tr_replay_failures_total,
+#   tr_unknown_outcome_errors_total (+ *_cap_exceeded_total) on /metrics.
 tr_enabled = true
 tr_mode    = "session"
 
@@ -98,6 +136,16 @@ write_timeout_secs = 30
 # # left idle inside an open transaction is terminated by this timeout too. Read
 # # once at startup.
 # client_idle_timeout_secs = 0
+# # In-session Transaction Replay (tr_mode = select | transaction): caps on the
+# # statements / bytes recorded per explicit transaction for replay after a
+# # failover. Over a cap the transaction is marked non-replayable (transaction
+# # mode degrades to session behaviour for it; tr_replay_cap_exceeded_total).
+# tr_max_replay_statements = 1000
+# tr_max_replay_bytes = 4194304
+# # In-session Transaction Replay (tr_mode != none): cap on tracked session
+# # SET/RESET statements replayed onto the replacement backend. Over the cap,
+# # tracking stops (tr_session_set_cap_exceeded_total) and the restore is partial.
+# tr_max_session_set_statements = 256
 
 # =============================================================================
 # POOL — Backend connection pool (proxy -> database)
