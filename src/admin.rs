@@ -1074,6 +1074,23 @@ impl AdminServer {
         Ok(healthy_nodes[index])
     }
 
+    /// Cap a backend-declared response `Content-Length` before it is used to
+    /// size an allocation. A hostile or buggy backend answering
+    /// `Content-Length: 99999999999` would otherwise make the admin task
+    /// zero-fill a peer-chosen buffer and OOM the process. Mirrors the 413 the
+    /// inbound admin path returns for an oversized request body, reusing the
+    /// same `MAX_ADMIN_BODY_BYTES` cap. Pure, so it is unit-testable.
+    fn check_forward_body_len(content_length: usize) -> Result<usize> {
+        if content_length > Self::MAX_ADMIN_BODY_BYTES {
+            return Err(ProxyError::Network(format!(
+                "413 Payload Too Large: backend response Content-Length {} exceeds admin limit {}",
+                content_length,
+                Self::MAX_ADMIN_BODY_BYTES
+            )));
+        }
+        Ok(content_length)
+    }
+
     /// Forward SQL request to backend node's HTTP API
     async fn forward_sql_request(url: &str, sql: &str) -> Result<serde_json::Value> {
         // Build HTTP request
@@ -1094,10 +1111,19 @@ impl AdminServer {
             "/".to_string()
         };
 
+        // One deadline covers connect + request write + response head + response
+        // body. Every one of these steps used to be unbounded in time, so a
+        // backend that accepted the connection and then stalled pinned this
+        // admin task (and its connection permit) forever.
+        let deadline = tokio::time::Instant::now() + Self::ADMIN_READ_TIMEOUT;
+
         // Connect to backend
-        let stream = TcpStream::connect(host_port).await.map_err(|e| {
-            ProxyError::Network(format!("Failed to connect to {}: {}", host_port, e))
-        })?;
+        let stream = tokio::time::timeout_at(deadline, TcpStream::connect(host_port))
+            .await
+            .map_err(|_| ProxyError::Network(format!("Timed out connecting to {}", host_port)))?
+            .map_err(|e| {
+                ProxyError::Network(format!("Failed to connect to {}: {}", host_port, e))
+            })?;
 
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
@@ -1110,48 +1136,26 @@ impl AdminServer {
             body_bytes.len()
         );
 
-        writer
-            .write_all(request.as_bytes())
+        tokio::time::timeout_at(deadline, writer.write_all(request.as_bytes()))
             .await
+            .map_err(|_| ProxyError::Network("Request write timeout".to_string()))?
             .map_err(|e| ProxyError::Network(format!("Write error: {}", e)))?;
-        writer
-            .write_all(&body_bytes)
+        tokio::time::timeout_at(deadline, writer.write_all(&body_bytes))
             .await
+            .map_err(|_| ProxyError::Network("Request body write timeout".to_string()))?
             .map_err(|e| ProxyError::Network(format!("Write body error: {}", e)))?;
 
-        // Read response headers
-        let mut response_headers = Vec::new();
-        let mut line = String::new();
-        let mut content_length: usize = 0;
+        // Read the response head (status line + headers) under the same bounds
+        // the inbound admin path enforces: header count and header bytes are
+        // capped and the read is deadline-bounded. `read_head` discards the
+        // start line, which is what this call site already did with the status
+        // line.
+        let head = crate::http_util::read_head(&mut reader, deadline).await?;
 
-        loop {
-            line.clear();
-            let bytes_read = reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| ProxyError::Network(format!("Response read error: {}", e)))?;
-
-            if bytes_read == 0 || line == "\r\n" {
-                break;
-            }
-
-            let trimmed = line.trim();
-            if trimmed.to_lowercase().starts_with("content-length:") {
-                if let Some(len_str) = trimmed.split(':').nth(1) {
-                    content_length = len_str.trim().parse().unwrap_or(0);
-                }
-            }
-            response_headers.push(trimmed.to_string());
-        }
-
-        // Read response body
-        let mut body_buf = vec![0u8; content_length];
-        if content_length > 0 {
-            reader
-                .read_exact(&mut body_buf)
-                .await
-                .map_err(|e| ProxyError::Network(format!("Response body read error: {}", e)))?;
-        }
+        // Reject an oversized declared Content-Length BEFORE it sizes an
+        // allocation, then read the body under the same deadline.
+        let content_length = Self::check_forward_body_len(head.content_length)?;
+        let body_buf = crate::http_util::read_body(&mut reader, content_length, deadline).await?;
 
         let response_body = String::from_utf8_lossy(&body_buf);
 
@@ -3879,5 +3883,71 @@ mod tests {
         let frame = read_until(&mut c, "\"up_to_version\":7").await;
         assert!(frame.contains("event: invalidate"), "got: {frame}");
         assert!(frame.contains("\"up_to_version\":7"), "got: {frame}");
+    }
+
+    #[test]
+    fn forward_sql_body_len_capped_at_admin_limit() {
+        // Exactly at the cap is accepted, one byte over is rejected.
+        assert_eq!(AdminServer::check_forward_body_len(0).unwrap(), 0);
+        let cap = AdminServer::MAX_ADMIN_BODY_BYTES;
+        assert_eq!(AdminServer::check_forward_body_len(cap).unwrap(), cap);
+        let err = AdminServer::check_forward_body_len(cap + 1).unwrap_err();
+        assert!(err.to_string().contains("413"), "unexpected error: {err}");
+        // The hostile declaration this guard exists for: a peer-chosen
+        // Content-Length that would size a multi-gigabyte zero-filled Vec.
+        let err = AdminServer::check_forward_body_len(usize::MAX).unwrap_err();
+        assert!(err.to_string().contains("413"), "unexpected error: {err}");
+    }
+
+    /// Spawn a one-shot HTTP responder that replies with `headers`
+    /// (already CRLF-terminated, without the blank line) plus `body`.
+    async fn spawn_sql_backend(headers: String, body: &'static [u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Read whatever the proxy sends so its writes complete.
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(headers.as_bytes()).await;
+            let _ = sock.write_all(b"\r\n").await;
+            let _ = sock.write_all(body).await;
+        });
+        format!("http://{addr}/api/sql")
+    }
+
+    #[tokio::test]
+    async fn forward_sql_request_parses_bounded_response() {
+        let body = br#"{"rows":[]}"#;
+        let url = spawn_sql_backend(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+                body.len()
+            ),
+            body,
+        )
+        .await;
+        let value = AdminServer::forward_sql_request(&url, "SELECT 1")
+            .await
+            .expect("well-formed backend response must still parse");
+        assert!(value["rows"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn forward_sql_request_rejects_oversized_content_length() {
+        // Backend declares more body than the admin cap allows and then sends
+        // nothing: the old code allocated `vec![0u8; content_length]` first.
+        let url = spawn_sql_backend(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n",
+                AdminServer::MAX_ADMIN_BODY_BYTES + 1
+            ),
+            b"",
+        )
+        .await;
+        let err = AdminServer::forward_sql_request(&url, "SELECT 1")
+            .await
+            .expect_err("oversized Content-Length must be rejected before allocating");
+        assert!(err.to_string().contains("413"), "unexpected error: {err}");
     }
 }
