@@ -121,6 +121,9 @@ impl RateLimitMetrics {
         owned: impl FnOnce() -> Arc<str>,
         result: &RateLimitResult,
     ) {
+        // A shard *read* guard is enough here, unlike the limiter's bucket
+        // maps: `KeyStats::record` only does atomic fetch_add/store, so two
+        // threads recording the same key concurrently cannot lose an update.
         if let Some(stats) = self.key_stats.get(key) {
             stats.record(result);
             return;
