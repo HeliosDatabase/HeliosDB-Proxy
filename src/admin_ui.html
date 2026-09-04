@@ -406,6 +406,7 @@
         metricRow("Queries processed", (m.queries_processed ?? 0).toLocaleString()) +
         metricRow("Connections accepted", (m.connections_accepted ?? 0).toLocaleString()) +
         metricRow("Connections closed", (m.connections_closed ?? 0).toLocaleString()) +
+        metricRow("Connections rejected (cap)", (m.connections_rejected ?? 0).toLocaleString()) +
         metricRow("Bytes received", (m.bytes_received ?? 0).toLocaleString()) +
         metricRow("Bytes sent", (m.bytes_sent ?? 0).toLocaleString());
     }

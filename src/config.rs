@@ -836,11 +836,13 @@ pub struct LimitsToml {
     /// Ceiling on concurrently-served client connections on the PG-wire
     /// listener. `0` (the default) means unlimited — exactly today's behaviour,
     /// where every accepted socket spawns a task holding its own read buffer
-    /// (and, in session pooling, a backend connection). When > 0 the accept
-    /// loop takes a permit per connection and a connection arriving with no
-    /// permit free is answered with a PostgreSQL `ErrorResponse`
-    /// (SQLSTATE 53300, `too many clients already`) and closed, instead of
-    /// being queued — the same shape as a PostgreSQL server at
+    /// (and, in session pooling, a backend connection). When > 0 a permit is
+    /// taken per connection — once its first startup message is known to be a
+    /// real `Startup`, so a `CancelRequest` (query cancellation) is always
+    /// served and never consumes one — and a connection arriving with no
+    /// permit free is answered with a PostgreSQL `ErrorResponse` (`FATAL`,
+    /// SQLSTATE 53300, `sorry, too many clients already`) and closed, instead
+    /// of being queued — the same shape as a PostgreSQL server at
     /// `max_connections`.
     ///
     /// Read ONCE at startup: the permit pool is sized when the server is built,
@@ -856,13 +858,17 @@ pub struct LimitsToml {
     /// authenticated client can hold a session slot (and its pooled backend
     /// connection) forever and stall a graceful drain to its full timeout.
     ///
-    /// Matches PostgreSQL's `idle_session_timeout` semantics: the clock starts
-    /// when the session goes idle (i.e. measures time since the client's last
+    /// Matches PostgreSQL's `idle_session_timeout` semantics: it applies only
+    /// to a session actually waiting for a NEW command. The clock starts when
+    /// the session goes idle (i.e. measures time since the client's last
     /// statement), and unsolicited backend traffic relayed while idle
     /// (LISTEN/NOTIFY, NoticeResponse, ParameterStatus) is NOT client activity
-    /// and does not reset it. PostgreSQL's separate
-    /// `idle_in_transaction_session_timeout` GUC is not implemented; a session
-    /// idle inside an open transaction is terminated by this timeout too.
+    /// and does not reset it. It is NOT armed while a message is only
+    /// partially received (a client trickling a large statement is slow, not
+    /// idle) nor during a `COPY FROM STDIN` (a paused bulk load is not an idle
+    /// session). PostgreSQL's separate `idle_in_transaction_session_timeout`
+    /// GUC is not implemented; a session idle inside an open transaction is
+    /// terminated by this timeout too.
     ///
     /// Read once at startup (a SIGHUP change applies to nothing already
     /// connected and is not re-read).
