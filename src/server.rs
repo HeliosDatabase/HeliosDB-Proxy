@@ -1378,8 +1378,10 @@ impl ProxyServer {
                             let state = self.state.clone();
                             // Snapshot the *live* config so a SIGHUP reload
                             // applies to new connections; in-flight sessions
-                            // keep the snapshot they began with (Batch H).
-                            let config = (*self.state.live_config.load_full()).clone();
+                            // keep the snapshot they began with (Batch H). This
+                            // is an Arc clone (cheap, atomic refcount bump), not
+                            // a deep clone of ProxyConfig — see handle_client.
+                            let config = self.state.live_config.load_full();
                             let shutdown_tx = self.shutdown_tx.clone();
 
                             tokio::spawn(async move {
@@ -1632,7 +1634,7 @@ impl ProxyServer {
         stream: TcpStream,
         addr: SocketAddr,
         state: Arc<ServerState>,
-        config: ProxyConfig,
+        config: Arc<ProxyConfig>,
         _shutdown_tx: broadcast::Sender<()>,
     ) -> Result<()> {
         tracing::debug!("New client connection from {}", addr);
