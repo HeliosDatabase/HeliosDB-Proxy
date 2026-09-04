@@ -928,8 +928,9 @@ mod tests {
             let (holder_ready_tx, holder_ready_rx) = mpsc::channel::<()>();
             let (release_tx, release_rx) = mpsc::channel::<()>();
 
-            let holder = scope.spawn(|| {
-                let guard = limiter.token_buckets.get_mut(&key).unwrap();
+            let (l, k) = (&limiter, &key);
+            let holder = scope.spawn(move || {
+                let guard = l.token_buckets.get_mut(k).unwrap();
                 holder_ready_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 drop(guard);
@@ -938,9 +939,9 @@ mod tests {
 
             let (second_started_tx, second_started_rx) = mpsc::channel::<()>();
             let (second_done_tx, second_done_rx) = mpsc::channel::<()>();
-            let second = scope.spawn(|| {
+            let second = scope.spawn(move || {
                 second_started_tx.send(()).unwrap();
-                let _guard = limiter.token_buckets.get_mut(&key).unwrap();
+                let _guard = l.token_buckets.get_mut(k).unwrap();
                 second_done_tx.send(()).unwrap();
             });
             second_started_rx.recv().unwrap();
