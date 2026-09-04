@@ -63,6 +63,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `ConnectionPoolManager` acquire/release cycle under client concurrency plus
     the per-statement `on_statement_complete` decision.
 
+### Changed
+
+- **L1 hot cache now uses `lru::LruCache` for O(1) get/put/eviction**,
+  replacing the previous `HashMap` + `Vec<(String, Instant)>` pair whose LRU
+  bookkeeping did an O(n) scan-and-allocate on every hit and put. This trades
+  away the read-lock-only hit path added in 0.3.1 (`L1 hot cache: hits take
+  only a read lock`, above): `get()` now takes a brief write lock to promote
+  the entry to most-recently-used, so concurrent hits on the *same* cached
+  query serialize briefly on that lock instead of running fully in parallel
+  under a shared read lock. Puts on a full cache no longer prefer evicting an
+  already-expired entry over a live LRU one; expired entries are still
+  purged, just lazily — on the `get()` that finds them, or by the periodic
+  `evict_expired()` sweep — rather than being scanned for preferentially on
+  every insert. Public API and hit/access-count metrics are unchanged.
+  `test_concurrent_hits_read_lock_only` is renamed
+  `test_concurrent_hits_no_lost_updates` to describe what it actually
+  verifies now.
+
 ## [1.5.0] - 2026-07-11
 
 ### Added
