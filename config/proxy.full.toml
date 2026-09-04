@@ -70,10 +70,6 @@ write_timeout_secs = 30
 # max_total_idle_backend_conns = 8192
 # # How often the idle-connection reaper runs.
 # pool_reap_interval_secs = 30
-# # Cap on entries kept in the failover controller's in-memory history ring
-# # buffer (FailoverController, embedded via FailoverConfig — not yet its own
-# # [ha]/[failover] section). Past capacity, the oldest entry is FIFO-evicted.
-# failover_history_max = 100
 
 # =============================================================================
 # POOL — Backend connection pool (proxy -> database)
