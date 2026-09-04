@@ -81,6 +81,13 @@ max_connections    = 100
 idle_timeout_secs  = 300
 max_lifetime_secs  = 1800
 acquire_timeout_secs = 5
+# Validate a pooled connection before handing it out; false skips
+# acquire-time validation entirely. Today that validation is a lightweight
+# state check (not a live socket probe) for every shipped deployment, since
+# the pool never attaches a real backend socket to its connections outside
+# of unit tests. The data-path liveness check operators actually rely on is
+# the idle backend pool's periodic stale-connection probe
+# (pool_reap_interval_secs, above).
 test_on_acquire    = true
 
 # =============================================================================
