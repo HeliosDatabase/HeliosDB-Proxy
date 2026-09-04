@@ -26,9 +26,21 @@ listen_address = "${HELIOS_PROXY_LISTEN:-0.0.0.0:6432}"
 # env var AND set a token, e.g. HELIOS_PROXY_ADMIN=0.0.0.0:9090 + admin_token.
 admin_address = "${HELIOS_PROXY_ADMIN:-127.0.0.1:9090}"
 
-# Transaction Replay (TR) — automatically replays in-flight transactions
-# after a failover so clients see no errors.
-# Disable if you handle retries at the application level.
+# Transaction Replay (TR).
+# tr_enabled journals auto-commit writes for the operator-driven replay engine
+# (POST /api/replay; `ha-tr` feature). tr_mode is in-session failover — what a
+# live client session experiences when its backend connection fails:
+#   none        -> one ErrorResponse (57P01), connection closed
+#   session     -> connection kept; reconnect to a healthy primary, restore SET
+#                  state; a never-delivered autocommit statement is re-run, else
+#                  ONE error (57P01 / 08007) and the transaction is aborted
+#   select      -> session + unknown-outcome reads re-executed transparently
+#                  (read-only transactions replayed)
+#   transaction -> select + uncommitted transactions replayed from BEGIN and the
+#                  in-flight statement re-executed; a COMMIT with unknown outcome
+#                  is never retried. Opt-in: needs deterministic statements.
+# Caps: [limits] tr_max_replay_statements / tr_max_replay_bytes /
+# tr_max_session_set_statements. See config/proxy.full.toml for the full table.
 tr_enabled = false
 tr_mode = "session"   # none | session | select | transaction
 
