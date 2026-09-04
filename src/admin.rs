@@ -2849,6 +2849,7 @@ mod tests {
         assert!(output.contains("heliosdb_proxy_failovers_total 2"));
         // O1: the capture byte-cap counter is scrapeable.
         assert!(output.contains("heliosdb_proxy_cache_capture_oversize_total 7"));
+        assert!(output.contains("heliosdb_proxy_connections_rejected_total 7"));
     }
 
     /// Shed analytics samples must be exposed on `/metrics/prometheus`,
