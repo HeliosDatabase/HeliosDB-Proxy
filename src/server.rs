@@ -4846,9 +4846,7 @@ impl ProxyServer {
         // than 4 separate case-insensitive windowed scans over `core`,
         // lowercase it once and use plain `str::contains`.
         const DIRTY_TOKENS: [&str; 4] = ["set_config", "advisory", "nextval", "setval"];
-        let mut lower = String::with_capacity(core.len());
-        lower.push_str(core);
-        lower.make_ascii_lowercase();
+        let lower = core.to_ascii_lowercase();
         DIRTY_TOKENS.iter().any(|tok| lower.contains(tok))
     }
 
@@ -5115,14 +5113,13 @@ impl ProxyServer {
         // needles, case-insensitively" — instead of the 13 separate
         // windowed case-insensitive scans (FOR UPDATE, FOR SHARE, 11
         // VOLATILE tokens) that used to each walk `t` byte-by-byte,
-        // lowercase `t` ONCE into a scratch buffer and do plain (fast,
-        // SIMD-friendly) `str::contains` checks against it. ASCII-only
-        // lowercasing (`make_ascii_lowercase`) leaves any non-ASCII bytes
-        // untouched, matching `contains_ci`'s byte-for-byte semantics for
-        // non-ASCII input.
-        let mut lower = String::with_capacity(t.len());
-        lower.push_str(t);
-        lower.make_ascii_lowercase();
+        // lowercase `t` ONCE into a scratch buffer and do plain `str::contains`
+        // checks against it (Two-Way substring search — no SIMD, but a single
+        // linear scan replacing 13 windowed case-insensitive ones is still a
+        // clear win). ASCII-only lowercasing (`to_ascii_lowercase`) leaves any
+        // non-ASCII bytes untouched, matching `contains_ci`'s byte-for-byte
+        // semantics for non-ASCII input.
+        let lower = t.to_ascii_lowercase();
         if lower.contains("for update") || lower.contains("for share") {
             return false;
         }
@@ -7316,9 +7313,9 @@ mod tests {
         }
 
         /// Non-ASCII bytes in the SQL text must not panic the lowercasing
-        /// buffer (`make_ascii_lowercase` only touches ASCII bytes in place,
-        /// so UTF-8 validity is preserved) and must not be case-folded —
-        /// same byte-for-byte semantics as the old `contains_ci`.
+        /// buffer (`to_ascii_lowercase` only touches ASCII bytes, so UTF-8
+        /// validity is preserved) and must not be case-folded — same
+        /// byte-for-byte semantics as the old `contains_ci`.
         #[test]
         fn non_ascii_sql_is_handled_safely() {
             assert!(ProxyServer::is_cacheable_read_sql(
@@ -7919,18 +7916,20 @@ mod tests {
     #[cfg(feature = "pool-modes")]
     #[test]
     fn stmt_classifier_dirty_tokens_stay_case_insensitive() {
-        let clean = ProxyServer::stmt_leaves_session_state;
-        assert!(clean("SELECT PG_ADVISORY_LOCK(1)"), "uppercase advisory");
-        assert!(clean("select Pg_Advisory_Unlock(1)"), "mixed-case advisory");
-        assert!(clean("SELECT NEXTVAL('s')"), "uppercase nextval");
-        assert!(clean("SELECT SETVAL('s', 1)"), "uppercase setval");
+        // `dirty(sql) == true` means `stmt_leaves_session_state` reports the
+        // statement as session-state-creating (reset required before reuse).
+        let dirty = ProxyServer::stmt_leaves_session_state;
+        assert!(dirty("SELECT PG_ADVISORY_LOCK(1)"), "uppercase advisory");
+        assert!(dirty("select Pg_Advisory_Unlock(1)"), "mixed-case advisory");
+        assert!(dirty("SELECT NEXTVAL('s')"), "uppercase nextval");
+        assert!(dirty("SELECT SETVAL('s', 1)"), "uppercase setval");
         assert!(
-            clean("SELECT Set_Config('work_mem','1GB',false)"),
+            dirty("SELECT Set_Config('work_mem','1GB',false)"),
             "mixed-case set_config"
         );
         // Non-ASCII bytes must not panic the lowercasing buffer, and must
         // not be folded into a false match.
-        assert!(!clean("SELECT name FROM café"), "plain non-ASCII select");
+        assert!(!dirty("SELECT name FROM café"), "plain non-ASCII select");
     }
 
     /// `reset_backend` must only report success when the reset query cleanly

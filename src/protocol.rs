@@ -994,6 +994,7 @@ mod tests {
     /// non-ASCII bytes (which must compare literally, never case-folded).
     #[test]
     fn test_contains_ci_matches_naive_reference() {
+        let long_x = "x".repeat(64);
         let cases: &[(&str, &str)] = &[
             ("", ""),
             ("", "x"),
@@ -1015,7 +1016,7 @@ mod tests {
             ("CAFÉ latte", "café"),  // non-ASCII bytes never case-fold
             ("for update", "FOR UPDATE"),
             ("... FOR SHARE", "for share"),
-            ("x".repeat(64).as_str(), "XX"),
+            (long_x.as_str(), "XX"),
             ("mixed CaSe NeEdLe here", "needle"),
         ];
         for &(haystack, needle) in cases {
@@ -1054,7 +1055,10 @@ mod tests {
             }
             all
         }
-        let alphabet = ['a', 'A', 'b', 'z'];
+        // 'é' is a deliberate non-ASCII (2-byte UTF-8) member: it must never
+        // case-fold against 'E'/'e', and it exercises memchr2's first-byte
+        // candidate selection on a non-ASCII lead byte.
+        let alphabet = ['a', 'A', 'b', 'z', 'é'];
         let haystacks = all_strings(&alphabet, 5);
         let needles = all_strings(&alphabet, 3);
         for h in &haystacks {
