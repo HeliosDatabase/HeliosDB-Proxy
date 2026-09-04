@@ -1020,7 +1020,7 @@ impl AdminServer {
             .find(|n| {
                 n.role == NodeRole::Primary
                     && n.enabled
-                    && health.get(&n.address()).map(|h| h.healthy).unwrap_or(false)
+                    && health.get(n.address()).map(|h| h.healthy).unwrap_or(false)
             })
             .ok_or_else(|| ProxyError::Internal("No healthy primary node available".to_string()))
     }
@@ -1035,7 +1035,7 @@ impl AdminServer {
         let healthy_nodes: Vec<&NodeConfig> = config
             .nodes
             .iter()
-            .filter(|n| n.enabled && health.get(&n.address()).map(|h| h.healthy).unwrap_or(false))
+            .filter(|n| n.enabled && health.get(n.address()).map(|h| h.healthy).unwrap_or(false))
             .collect();
 
         if healthy_nodes.is_empty() {
