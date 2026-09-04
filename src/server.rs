@@ -401,6 +401,12 @@ pub struct ClientSession {
     pub id: Uuid,
     /// Client address
     pub client_addr: SocketAddr,
+    /// `client_addr.ip()` rendered once at session creation. Formatting an
+    /// `IpAddr` allocates; the analytics path needed it on EVERY query.
+    pub client_ip_str: String,
+    /// `id` rendered once at session creation. Formatting a `Uuid` allocates
+    /// and hex-encodes 16 bytes; same reason as `client_ip_str`.
+    pub session_id_str: String,
     /// Current backend node
     pub current_node: RwLock<Option<String>>,
     /// Fast, lock-free "in a transaction" flag — the single per-query hot-path
@@ -1053,11 +1059,17 @@ impl ProxyServer {
             tracing::info!(
                 slow_query_ms = a.slow_query_ms,
                 max_fingerprints = a.max_fingerprints,
+                queue_capacity = a.queue_capacity,
+                fingerprint_cache_size = a.fingerprint_cache_size,
+                fingerprint_cache_max_sql_bytes = a.fingerprint_cache_max_sql_bytes,
                 "query analytics enabled"
             );
             let ac = crate::analytics::AnalyticsConfig {
                 enabled: true,
                 max_fingerprints: a.max_fingerprints as usize,
+                queue_capacity: a.queue_capacity as usize,
+                fingerprint_cache_size: a.fingerprint_cache_size as usize,
+                fingerprint_cache_max_sql_bytes: a.fingerprint_cache_max_sql_bytes as usize,
                 slow_query: crate::analytics::SlowQueryConfig {
                     threshold: Duration::from_millis(a.slow_query_ms),
                     ..Default::default()
@@ -1463,6 +1475,19 @@ impl ProxyServer {
         let health_task = self.spawn_health_checker();
         let pool_task = self.spawn_pool_manager();
 
+        // Single background analytics consumer. Everything expensive about
+        // recording a query (fingerprint normalization, statistics, slow-query
+        // log, pattern detection, cost attribution) runs here instead of on the
+        // connection task that served the query; the relay only pays a
+        // `try_send` onto a bounded queue. Started exactly once, here, and
+        // aborted with the other background tasks at shutdown.
+        #[cfg(feature = "query-analytics")]
+        let analytics_task = self
+            .state
+            .analytics
+            .as_ref()
+            .and_then(|a| a.start_consumer());
+
         // Edge registry GC — prunes edges not seen within the liveness window.
         #[cfg(feature = "edge-proxy")]
         let _edge_maintenance_task = if self.config.edge.enabled {
@@ -1618,6 +1643,22 @@ impl ProxyServer {
         health_task.abort();
         pool_task.abort();
         admin_task.abort();
+        // Drain what the connection tasks already queued before killing the
+        // consumer, so a graceful handoff does not silently lose the last few
+        // hundred samples. Bounded by the same `shutdown_drain_timeout_secs`
+        // budget as the connection drain — the queue is small and this is
+        // normally instant, but a wedged consumer must not hold up exit.
+        #[cfg(feature = "query-analytics")]
+        if let Some(t) = analytics_task {
+            if let Some(a) = self.state.analytics.as_ref() {
+                let budget =
+                    Self::drain_timeout(self.state.live_config.load().shutdown_drain_timeout_secs);
+                if tokio::time::timeout(budget, a.flush()).await.is_err() {
+                    tracing::warn!("analytics ingest queue did not drain before shutdown");
+                }
+            }
+            t.abort();
+        }
         if let Some(t) = mcp_task {
             t.abort();
         }
@@ -1839,9 +1880,12 @@ impl ProxyServer {
         tracing::debug!("New client connection from {}", addr);
 
         // Create session
+        let session_id = Uuid::new_v4();
         let session = Arc::new(ClientSession {
-            id: Uuid::new_v4(),
+            id: session_id,
             client_addr: addr,
+            client_ip_str: addr.ip().to_string(),
+            session_id_str: session_id.to_string(),
             current_node: RwLock::new(None),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             copy_in_progress: std::sync::atomic::AtomicBool::new(false),
@@ -5533,8 +5577,13 @@ impl ProxyServer {
             .await;
     }
 
-    /// Record a forwarded query on the analytics engine (fingerprint, latency,
-    /// slow-query log, pattern detection). No-op when analytics is disabled.
+    /// Hand a forwarded query to the analytics engine. This only builds the
+    /// `QueryExecution` and pushes it onto the engine's bounded queue — the
+    /// fingerprinting, metrics, slow-query log and pattern detection all run
+    /// on the single background consumer task (see
+    /// `QueryAnalytics::start_consumer`), so the connection task never pays
+    /// for them. A full queue drops the sample rather than stalling the relay.
+    /// No-op when analytics is disabled.
     #[cfg(feature = "query-analytics")]
     async fn record_analytics(
         state: &Arc<ServerState>,
@@ -5557,9 +5606,10 @@ impl ProxyServer {
         let mut exec = crate::analytics::QueryExecution::new(sql, duration);
         exec.user = user;
         exec.database = database;
-        exec.client_ip = session.client_addr.ip().to_string();
+        // Both pre-rendered at session creation — see `ClientSession`.
+        exec.client_ip = session.client_ip_str.clone();
         exec.node = node.to_string();
-        exec.session_id = Some(session.id.to_string());
+        exec.session_id = Some(session.session_id_str.clone());
         exec.error = error;
         analytics.record(exec);
     }
@@ -7155,9 +7205,13 @@ mod tests {
 
     /// Build a minimal `ClientSession` for plugin-hook unit tests.
     fn make_test_session() -> Arc<ClientSession> {
+        let id = Uuid::new_v4();
+        let client_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         Arc::new(ClientSession {
-            id: Uuid::new_v4(),
-            client_addr: "127.0.0.1:0".parse().unwrap(),
+            id,
+            client_addr,
+            client_ip_str: client_addr.ip().to_string(),
+            session_id_str: id.to_string(),
             current_node: RwLock::new(None),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             copy_in_progress: std::sync::atomic::AtomicBool::new(false),
@@ -7178,6 +7232,17 @@ mod tests {
             #[cfg(feature = "rate-limiting")]
             rate_limit_key: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The per-query analytics path reads pre-rendered client-IP and session-id
+    /// strings off the session instead of formatting an `IpAddr`/`Uuid` on every
+    /// query. They must match what the old per-query formatting produced.
+    #[test]
+    fn test_session_caches_client_ip_and_id_strings() {
+        let session = make_test_session();
+        assert_eq!(session.client_ip_str, session.client_addr.ip().to_string());
+        assert_eq!(session.session_id_str, session.id.to_string());
+        assert!(!session.session_id_str.is_empty());
     }
 
     /// With no plugin manager attached, `apply_route_hook` must be a
