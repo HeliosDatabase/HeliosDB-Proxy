@@ -211,6 +211,7 @@ async fn test_module_06_failover_controller_config() {
         max_lag_bytes: 16 * 1024 * 1024,
         retry_failed: false,
         max_retries: 0,
+        ..Default::default()
     };
     let controller = FailoverController::new(cfg);
 
