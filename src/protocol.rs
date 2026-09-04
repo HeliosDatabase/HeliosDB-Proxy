@@ -296,8 +296,19 @@ impl ProtocolCodec {
             return Ok(Some(StartupMessage::SSLRequest));
         }
 
-        // Check for cancel request
+        // Check for cancel request. A well-formed CancelRequest carries pid+key
+        // after the length+version already consumed above, i.e. `len >= 16`
+        // (equivalently `src.remaining() >= 8` at this point). A client that
+        // sends only the 8-byte length+version prefix (declared `len == 8`,
+        // e.g. `00 00 00 08 04 D2 16 2E`) must not crash the unauthenticated
+        // pre-auth handler task by panicking in `get_u32`.
         if protocol_version == 80877102 {
+            if src.remaining() < 8 {
+                return Err(ProxyError::Protocol(format!(
+                    "CancelRequest length {} too short for pid+key (need at least 16)",
+                    len
+                )));
+            }
             let pid = src.get_u32();
             let key = src.get_u32();
             return Ok(Some(StartupMessage::CancelRequest { pid, key }));
@@ -1010,6 +1021,45 @@ mod tests {
         // Declared length 7 (still < 8) with the bytes present.
         let mut buf = BytesMut::from(&b"\x00\x00\x00\x07\x00\x03\x00"[..]);
         assert!(codec.decode_startup(&mut buf).is_err());
+    }
+
+    /// A minimal 8-byte CancelRequest (length + protocol version only, no
+    /// pid/key) must be rejected with a protocol error rather than panicking
+    /// in `get_u32` ("advance out of bounds") inside the unauthenticated
+    /// pre-auth handler task. Reproduces the exact wire bytes of the crash
+    /// probe: length `00 00 00 08`, cancel-request magic `04 D2 16 2E`
+    /// (80877102), and nothing else.
+    #[test]
+    fn test_decode_startup_rejects_short_cancel_request() {
+        let codec = ProtocolCodec::new();
+        let mut buf = BytesMut::from(&b"\x00\x00\x00\x08\x04\xD2\x16\x2E"[..]);
+        let err = codec
+            .decode_startup(&mut buf)
+            .expect_err("truncated CancelRequest must be rejected, not panic");
+        assert!(matches!(err, ProxyError::Protocol(_)), "got {err:?}");
+    }
+
+    /// A full, well-formed 16-byte CancelRequest (length + version + pid +
+    /// key) must still decode successfully with the correct pid/key values.
+    #[test]
+    fn test_decode_startup_accepts_full_cancel_request() {
+        let codec = ProtocolCodec::new();
+        let mut buf = BytesMut::new();
+        buf.put_u32(16); // length
+        buf.put_u32(80877102); // cancel request magic
+        buf.put_u32(1234); // pid
+        buf.put_u32(5678); // key
+        let msg = codec
+            .decode_startup(&mut buf)
+            .expect("well-formed CancelRequest must decode")
+            .expect("must produce a message");
+        match msg {
+            StartupMessage::CancelRequest { pid, key } => {
+                assert_eq!(pid, 1234);
+                assert_eq!(key, 5678);
+            }
+            other => panic!("expected CancelRequest, got {other:?}"),
+        }
     }
 
     /// BindMessage parameter values are now `Bytes` (zero-copy), not
