@@ -8,8 +8,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use parking_lot::RwLock;
 
 use super::concurrency::ConcurrencyLimiter;
 use super::config::{ExceededAction, PriorityLevel, RateLimitConfig};
@@ -90,6 +90,62 @@ impl std::fmt::Display for LimiterKey {
         }
     }
 }
+
+/// A `LimiterKey` paired with its pre-rendered `Display` string.
+///
+/// The rate-limit gate runs on every query, and both halves of the old hot
+/// path allocated: the key itself was rebuilt from the session variables per
+/// query, and the metrics collector formatted `key.to_string()` per query to
+/// index its per-key stats map. A session's keying dimension (global / client
+/// IP / database / user) is fixed for its whole life, so the pair is resolved
+/// once and reused; the string half is an `Arc<str>` so the metrics map can
+/// take an owned copy on first sight of a key without re-formatting.
+///
+/// Equality follows the key alone — the rendered string is derived state,
+/// never an independent identity.
+#[derive(Debug, Clone)]
+pub struct CachedLimiterKey {
+    key: LimiterKey,
+    display: Arc<str>,
+}
+
+impl CachedLimiterKey {
+    /// Resolve a key and render its display string once.
+    pub fn new(key: LimiterKey) -> Self {
+        let display: Arc<str> = Arc::<str>::from(key.to_string());
+        Self { key, display }
+    }
+
+    /// The underlying bucket key.
+    pub fn key(&self) -> &LimiterKey {
+        &self.key
+    }
+
+    /// The pre-rendered `Display` form, shareable without re-formatting.
+    pub fn display(&self) -> &Arc<str> {
+        &self.display
+    }
+}
+
+impl From<LimiterKey> for CachedLimiterKey {
+    fn from(key: LimiterKey) -> Self {
+        Self::new(key)
+    }
+}
+
+impl std::fmt::Display for CachedLimiterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.display)
+    }
+}
+
+impl PartialEq for CachedLimiterKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for CachedLimiterKey {}
 
 /// Result of rate limit check
 #[derive(Debug, Clone)]
@@ -187,8 +243,11 @@ impl std::fmt::Display for LimitType {
 
 /// Main rate limiter
 pub struct RateLimiter {
-    /// Configuration
-    config: RwLock<RateLimitConfig>,
+    /// Configuration. Held in an `ArcSwap` rather than a `RwLock` so the
+    /// per-query check path is a lock-free load instead of a global reader
+    /// acquisition shared by every connection; `update_config`/`cleanup`
+    /// publish a whole new snapshot (RCU).
+    config: ArcSwap<RateLimitConfig>,
 
     /// Token bucket limiters (burst + sustained rate)
     token_buckets: DashMap<LimiterKey, TokenBucket>,
@@ -213,7 +272,7 @@ impl RateLimiter {
     /// Create a new rate limiter
     pub fn new(config: RateLimitConfig) -> Self {
         Self {
-            config: RwLock::new(config),
+            config: ArcSwap::from_pointee(config),
             token_buckets: DashMap::new(),
             sliding_windows: DashMap::new(),
             concurrency: DashMap::new(),
@@ -226,7 +285,7 @@ impl RateLimiter {
     /// Create with custom cost estimator
     pub fn with_cost_estimator(config: RateLimitConfig, estimator: QueryCostEstimator) -> Self {
         Self {
-            config: RwLock::new(config),
+            config: ArcSwap::from_pointee(config),
             token_buckets: DashMap::new(),
             sliding_windows: DashMap::new(),
             concurrency: DashMap::new(),
@@ -248,30 +307,70 @@ impl RateLimiter {
         cost: u32,
         priority: PriorityLevel,
     ) -> RateLimitResult {
-        let config = self.config.read();
+        let config = self.config.load();
 
         if !config.enabled {
             return RateLimitResult::Allowed;
         }
 
+        // Callers that hold a `CachedLimiterKey` (the proxy's per-query gate)
+        // reuse its rendered form instead of re-formatting here.
+        let display: Arc<str> = Arc::<str>::from(key.to_string());
+        self.check_resolved(key, &display, cost, priority, &config)
+    }
+
+    /// Check rate limit for a pre-resolved key (no key rebuild, no
+    /// `Display` formatting). This is the per-query path.
+    pub fn check_cached(&self, key: &CachedLimiterKey, cost: u32) -> RateLimitResult {
+        self.check_cached_with_priority(key, cost, PriorityLevel::Normal)
+    }
+
+    /// Check rate limit for a pre-resolved key, with priority.
+    pub fn check_cached_with_priority(
+        &self,
+        key: &CachedLimiterKey,
+        cost: u32,
+        priority: PriorityLevel,
+    ) -> RateLimitResult {
+        let config = self.config.load();
+
+        if !config.enabled {
+            return RateLimitResult::Allowed;
+        }
+
+        self.check_resolved(&key.key, &key.display, cost, priority, &config)
+    }
+
+    /// Shared body of the enabled check path. `display` is the key's rendered
+    /// form, threaded through so the metrics collector never formats it.
+    fn check_resolved(
+        &self,
+        key: &LimiterKey,
+        display: &Arc<str>,
+        cost: u32,
+        priority: PriorityLevel,
+        config: &RateLimitConfig,
+    ) -> RateLimitResult {
         let start = Instant::now();
 
         // Check token bucket (QPS)
-        if let Err(exceeded) = self.check_token_bucket(key, cost, priority, &config) {
-            let result = self.handle_exceeded(key, exceeded, &config);
-            self.metrics.record_decision(key, &result, start.elapsed());
+        if let Err(exceeded) = self.check_token_bucket(key, cost, priority, config) {
+            let result = self.handle_exceeded(key, exceeded, config);
+            self.metrics
+                .record_decision_keyed(display, &result, start.elapsed());
             return result;
         }
 
         // Check sliding window (per-minute)
-        if let Err(exceeded) = self.check_sliding_window(key, cost, &config) {
-            let result = self.handle_exceeded_window(key, exceeded, &config);
-            self.metrics.record_decision(key, &result, start.elapsed());
+        if let Err(exceeded) = self.check_sliding_window(key, cost, config) {
+            let result = self.handle_exceeded_window(key, exceeded, config);
+            self.metrics
+                .record_decision_keyed(display, &result, start.elapsed());
             return result;
         }
 
         self.metrics
-            .record_decision(key, &RateLimitResult::Allowed, start.elapsed());
+            .record_decision_keyed(display, &RateLimitResult::Allowed, start.elapsed());
         RateLimitResult::Allowed
     }
 
@@ -280,7 +379,7 @@ impl RateLimiter {
         &self,
         key: &LimiterKey,
     ) -> Result<Arc<ConcurrencyLimiter>, RateLimitExceeded> {
-        let config = self.config.read();
+        let config = self.config.load();
 
         if !config.enabled {
             // Return a dummy limiter that allows everything
@@ -289,11 +388,21 @@ impl RateLimiter {
 
         let max = config.effective_concurrency(key, PriorityLevel::Normal);
 
-        let limiter = self
-            .concurrency
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(ConcurrencyLimiter::new(max)))
-            .clone();
+        // Hit path first: an existing limiter is looked up with `get_mut`
+        // (still the DashMap shard *write* guard, so the key is only cloned
+        // when a new bucket actually has to be inserted) rather than `get`
+        // (a read guard). See `check_token_bucket` for why the write guard
+        // matters: DashMap's `entry()` and `get_mut()` take the same shard
+        // write lock, so this preserves the mutual exclusion `entry()` gave
+        // us between two threads racing to insert the same fresh key.
+        let limiter = match self.concurrency.get_mut(key) {
+            Some(existing) => Arc::clone(existing.value()),
+            None => self
+                .concurrency
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(ConcurrencyLimiter::new(max)))
+                .clone(),
+        };
 
         // Check if would exceed
         if limiter.at_capacity() {
@@ -322,7 +431,7 @@ impl RateLimiter {
         query: &str,
         priority: PriorityLevel,
     ) -> RateLimitResult {
-        let config = self.config.read();
+        let config = self.config.load();
 
         let cost = if config.cost_estimation_enabled {
             self.cost_estimator.estimate_cost_with_hint(query)
@@ -403,12 +512,12 @@ impl RateLimiter {
 
     /// Update configuration
     pub fn update_config(&self, config: RateLimitConfig) {
-        *self.config.write() = config;
+        self.config.store(Arc::new(config));
     }
 
     /// Get current configuration (cloned)
     pub fn config(&self) -> RateLimitConfig {
-        self.config.read().clone()
+        RateLimitConfig::clone(&self.config.load())
     }
 
     // Internal methods
@@ -420,6 +529,20 @@ impl RateLimiter {
         priority: PriorityLevel,
         config: &RateLimitConfig,
     ) -> Result<(), TokenBucketExceeded> {
+        // Hit path: look the bucket up with `get_mut`, which still takes the
+        // DashMap shard *write* guard (unlike `get`, a read guard) — so the
+        // key is only cloned when a new bucket has to be inserted, while two
+        // threads racing on the same existing key still can't both be inside
+        // `try_acquire` at once, exactly as `entry()` guaranteed before this
+        // optimization. Keeping that guarantee keeps decisions identical to
+        // the pre-optimization path; `TokenBucket::refill` is independently
+        // hardened (its token add is a compare-exchange loop, not a
+        // load/store) so the bucket is also sound for callers that reach it
+        // without this map's guard.
+        if let Some(bucket) = self.token_buckets.get_mut(key) {
+            return bucket.try_acquire(cost);
+        }
+
         let qps = config.effective_qps(key, priority);
         let burst = config.effective_burst(key, priority);
 
@@ -437,6 +560,18 @@ impl RateLimiter {
         cost: u32,
         _config: &RateLimitConfig,
     ) -> Result<(), SlidingWindowExceeded> {
+        // Hit path: existing windows are looked up with `get_mut` (the same
+        // shard write guard `entry()` used, still avoiding a key clone on
+        // hit) rather than `get`'s read guard — see `check_token_bucket` for
+        // why the write guard matters. `SlidingWindow::try_record_n` is
+        // fully mutex-guarded internally, so this map didn't strictly need
+        // the write guard for correctness, but it's kept consistent with the
+        // other maps this branch touches rather than relying on that
+        // internal-locking detail staying true.
+        if let Some(window) = self.sliding_windows.get_mut(key) {
+            return window.try_record_n(cost);
+        }
+
         // Use a per-minute sliding window
         let window = self
             .sliding_windows
@@ -498,15 +633,23 @@ impl RateLimiter {
 
     /// Clean up expired entries
     pub fn cleanup(&self) {
-        let mut config = self.config.write();
-        config.cleanup_expired();
+        // `rcu` re-runs the closure against the latest snapshot if another
+        // `store` (e.g. a concurrent `update_config`) lands in between, so a
+        // racing writer's change is merged into rather than clobbered by
+        // this read-modify-write — unlike a plain load-then-store, which
+        // would silently drop whatever the racer just published.
+        self.config.rcu(|current| {
+            let mut config = RateLimitConfig::clone(current);
+            config.cleanup_expired();
+            config
+        });
     }
 }
 
 impl std::fmt::Debug for RateLimiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RateLimiter")
-            .field("enabled", &self.config.read().enabled)
+            .field("enabled", &self.config.load().enabled)
             .field("token_buckets", &self.token_buckets.len())
             .field("sliding_windows", &self.sliding_windows.len())
             .field("concurrency_limiters", &self.concurrency.len())
@@ -748,6 +891,287 @@ mod tests {
 
         let conc_limiter = result.unwrap();
         assert_eq!(conc_limiter.max_concurrent(), 10);
+    }
+
+    /// Regression test for the O4 rate-limiter-key fix: the token-bucket hit
+    /// path (`check_token_bucket`'s `if let Some(bucket) = ...`) must take
+    /// the DashMap shard *write* guard, exactly like `entry()` did on main,
+    /// not a read guard. Two threads racing `get_mut` on the same key can
+    /// never both be inside the guard at once; a `get()` read guard would let
+    /// them, which is what unmasked the lost-update race in
+    /// `TokenBucket::refill` (see the accounting test in `token_bucket.rs`,
+    /// which covers the same race from the other side).
+    ///
+    /// This drives the DashMap guard directly with a channel-synchronized
+    /// hold, rather than a timing race, so it is deterministic and cannot be
+    /// flaky under CI scheduling jitter.
+    #[test]
+    fn test_token_bucket_hit_path_guard_is_mutually_exclusive() {
+        use std::sync::mpsc;
+
+        let config = RateLimitConfig::builder()
+            .default_qps(10)
+            .default_burst(10)
+            .build();
+        let limiter = RateLimiter::new(config);
+        let key = LimiterKey::Global;
+
+        // Create the bucket via the one-time miss (`entry()`) path so both
+        // threads below exercise the hit path this fix changed.
+        let cfg = limiter.config();
+        limiter
+            .check_token_bucket(&key, 0, PriorityLevel::Normal, &cfg)
+            .unwrap();
+        assert_eq!(limiter.token_buckets.len(), 1);
+
+        std::thread::scope(|scope| {
+            let (holder_ready_tx, holder_ready_rx) = mpsc::channel::<()>();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+
+            let holder = scope.spawn(|| {
+                let guard = limiter.token_buckets.get_mut(&key).unwrap();
+                holder_ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                drop(guard);
+            });
+            holder_ready_rx.recv().unwrap();
+
+            let (second_started_tx, second_started_rx) = mpsc::channel::<()>();
+            let (second_done_tx, second_done_rx) = mpsc::channel::<()>();
+            let second = scope.spawn(|| {
+                second_started_tx.send(()).unwrap();
+                let _guard = limiter.token_buckets.get_mut(&key).unwrap();
+                second_done_tx.send(()).unwrap();
+            });
+            second_started_rx.recv().unwrap();
+
+            // The second `get_mut` must still be blocked a moment after it
+            // started, because the holder has not released its guard yet.
+            assert!(
+                second_done_rx
+                    .recv_timeout(Duration::from_millis(200))
+                    .is_err(),
+                "a second get_mut() on the same bucket key completed while \
+                 another thread still held its guard — the hit path lost \
+                 its mutual-exclusion guarantee (regressed to a `get()` \
+                 read guard, or equivalent)"
+            );
+
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+
+            // Now that the holder released, the second call can complete.
+            second_done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second get_mut() should complete once the guard is released");
+            second.join().unwrap();
+        });
+    }
+
+    /// End-to-end companion to the mutual-exclusion test above: many threads
+    /// hammer the token-bucket check for one key concurrently, and the number
+    /// of grants must never exceed what the burst capacity plus legitimate
+    /// elapsed-time refill could possibly allow.
+    ///
+    /// This exercises the whole hit path (`get_mut` guard + `TokenBucket`),
+    /// and uses the same leak-maximizing shape as
+    /// `token_bucket::tests::test_concurrent_acquire_never_exceeds_capacity_plus_refill`
+    /// — a large burst drained by many threads against a slow refill — so it
+    /// fails on either half of the pre-fix code: the `get()` read guard, or
+    /// the load/store refill it unmasked.
+    #[test]
+    fn test_token_bucket_concurrent_hammering_never_exceeds_burst_plus_refill() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Barrier;
+
+        const N_THREADS: usize = 8;
+        let qps: u32 = 10;
+        let burst: u32 = 100_000;
+        let test_duration = Duration::from_millis(200);
+
+        // Taken before the bucket exists, so `elapsed` can never under-count
+        // the bucket's own epoch-relative refill window.
+        let start = Instant::now();
+        let config = RateLimitConfig::builder()
+            .default_qps(qps)
+            .default_burst(burst)
+            .build();
+        let limiter = RateLimiter::new(config);
+        let key = LimiterKey::Global;
+
+        // Create the bucket through the one-time miss path so every threaded
+        // call below takes the hit path this fix changed.
+        let cfg = limiter.config();
+        limiter
+            .check_token_bucket(&key, 0, PriorityLevel::Normal, &cfg)
+            .unwrap();
+
+        let granted = AtomicU64::new(0);
+        let barrier = Barrier::new(N_THREADS);
+
+        std::thread::scope(|scope| {
+            for _ in 0..N_THREADS {
+                let limiter = &limiter;
+                let key = &key;
+                let cfg = &cfg;
+                let granted = &granted;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    while start.elapsed() < test_duration {
+                        if limiter
+                            .check_token_bucket(key, 1, PriorityLevel::Normal, cfg)
+                            .is_ok()
+                        {
+                            granted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+
+        let elapsed = start.elapsed();
+        let max_legitimate_refill = (elapsed.as_secs_f64() * qps as f64).ceil() as u64;
+        let bound = burst as u64 + max_legitimate_refill;
+
+        let total_granted = granted.load(Ordering::Relaxed);
+        assert!(
+            total_granted <= bound,
+            "granted {total_granted} tokens for burst={burst} + elapsed refill<={max_legitimate_refill} \
+             (hard bound {bound}) over {elapsed:?} — the token-bucket hit path is admitting more \
+             than the configured rate allows"
+        );
+    }
+
+    /// A `CachedLimiterKey` must address exactly the same bucket as the plain
+    /// key it was built from — `check_cached` and `check` share state and
+    /// produce identical verdicts.
+    #[test]
+    fn test_cached_key_shares_bucket_with_plain_key() {
+        let config = RateLimitConfig::builder()
+            .default_qps(1)
+            .default_burst(2)
+            .exceeded_action(ExceededAction::Reject)
+            .build();
+        let limiter = RateLimiter::new(config);
+
+        let key = LimiterKey::User("shared".to_string());
+        let cached = CachedLimiterKey::new(key.clone());
+
+        // Two tokens of burst, consumed one through each entry point.
+        assert!(limiter.check(&key, 1).is_allowed());
+        assert!(limiter.check_cached(&cached, 1).is_allowed());
+
+        // Third check must be denied through either entry point — proving the
+        // cached key did not open a second, independent bucket.
+        assert!(!limiter.check_cached(&cached, 1).is_allowed());
+        assert!(!limiter.check(&key, 1).is_allowed());
+
+        assert_eq!(limiter.token_buckets.len(), 1);
+        assert_eq!(limiter.sliding_windows.len(), 1);
+    }
+
+    /// The cached key's rendered form is exactly `LimiterKey`'s `Display`, so
+    /// the metrics map is keyed identically no matter which path recorded it.
+    #[test]
+    fn test_cached_key_display_matches_limiter_key() {
+        for key in [
+            LimiterKey::Global,
+            LimiterKey::User("alice".to_string()),
+            LimiterKey::Database("mydb".to_string()),
+            LimiterKey::ClientIp("10.0.0.7".parse().unwrap()),
+            LimiterKey::composite(vec![
+                LimiterKey::User("u".to_string()),
+                LimiterKey::Database("d".to_string()),
+            ]),
+        ] {
+            let cached = CachedLimiterKey::new(key.clone());
+            assert_eq!(cached.to_string(), key.to_string());
+            assert_eq!(&**cached.display(), key.to_string().as_str());
+            assert_eq!(cached.key(), &key);
+        }
+    }
+
+    /// Metric bookkeeping must be identical between the cached and plain
+    /// paths: same per-key bucket, same totals.
+    #[test]
+    fn test_cached_and_plain_paths_record_same_metric_key() {
+        let config = RateLimitConfig::builder()
+            .default_qps(100)
+            .default_burst(200)
+            .build();
+        let limiter = RateLimiter::new(config);
+
+        let key = LimiterKey::User("metered".to_string());
+        let cached = CachedLimiterKey::new(key.clone());
+
+        limiter.check(&key, 1);
+        limiter.check_cached(&cached, 1);
+
+        let stats = limiter.metrics().get_stats();
+        assert_eq!(stats.total_requests, 2);
+        assert_eq!(stats.key_stats.len(), 1, "both paths share one metric key");
+        assert_eq!(stats.key_stats.get("user:metered").unwrap().total, 2);
+    }
+
+    /// `check_cached` honors a live `update_config` (the ArcSwap reload path):
+    /// disabling the limiter must short-circuit to Allowed immediately.
+    #[test]
+    fn test_update_config_visible_to_cached_path() {
+        let config = RateLimitConfig::builder()
+            .enabled(true)
+            .default_qps(1)
+            .default_burst(1)
+            .exceeded_action(ExceededAction::Reject)
+            .build();
+        let limiter = RateLimiter::new(config);
+        let cached = CachedLimiterKey::new(LimiterKey::User("reload".to_string()));
+
+        assert!(limiter.check_cached(&cached, 1).is_allowed());
+        assert!(!limiter.check_cached(&cached, 1).is_allowed());
+
+        limiter.update_config(
+            RateLimitConfig::builder()
+                .enabled(false)
+                .default_qps(1)
+                .build(),
+        );
+
+        assert!(!limiter.config().enabled);
+        for _ in 0..10 {
+            assert!(limiter.check_cached(&cached, 1).is_allowed());
+        }
+    }
+
+    /// `cleanup` is an RCU over the config snapshot: expired overrides must be
+    /// gone from the published config afterwards, live ones retained.
+    #[test]
+    fn test_cleanup_publishes_pruned_config() {
+        use super::super::config::LimitOverride;
+
+        let mut config = RateLimitConfig::builder().default_qps(100).build();
+        config.add_override(
+            LimiterKey::User("expiring".to_string()),
+            LimitOverride::new()
+                .with_qps(5)
+                .with_duration(Duration::from_millis(10)),
+        );
+        config.add_override(
+            LimiterKey::User("permanent".to_string()),
+            LimitOverride::new().with_qps(7),
+        );
+
+        let limiter = RateLimiter::new(config);
+        assert_eq!(limiter.config().overrides.len(), 2);
+
+        std::thread::sleep(Duration::from_millis(20));
+        limiter.cleanup();
+
+        let after = limiter.config();
+        assert_eq!(after.overrides.len(), 1);
+        assert!(after
+            .overrides
+            .contains_key(&LimiterKey::User("permanent".to_string())));
     }
 
     #[test]
