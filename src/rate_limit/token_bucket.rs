@@ -145,11 +145,29 @@ impl TokenBucket {
         let new_tokens = (elapsed_secs * self.refill_rate * 1000.0) as u64;
 
         if new_tokens > 0 {
-            let current = self.tokens.load(Ordering::Acquire);
             let max = (self.capacity as u64) * 1000;
-            let updated = (current + new_tokens).min(max);
 
-            self.tokens.store(updated, Ordering::Release);
+            // Add the refill with a compare-exchange loop, never a plain
+            // store: `refill_lock` serializes refills against each other, but
+            // it does NOT exclude a concurrent `try_acquire` decrement. A
+            // load/store read-modify-write here would silently overwrite any
+            // decrement that landed in between, handing back tokens that were
+            // already spent and letting the bucket admit more than its
+            // configured rate.
+            let mut current = self.tokens.load(Ordering::Acquire);
+            loop {
+                let updated = (current + new_tokens).min(max);
+                match self.tokens.compare_exchange_weak(
+                    current,
+                    updated,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
+
             self.last_refill.store(now_nanos, Ordering::Release);
         }
     }
@@ -429,6 +447,66 @@ mod tests {
 
         // Tokens should be reduced (exact value depends on timing)
         assert!(bucket.current_tokens() < 1000);
+    }
+
+    /// Regression test for the O4 review finding: `refill` must fold new
+    /// tokens in with a compare-exchange loop, not a load/store.
+    ///
+    /// `refill_lock` only serializes refills against each other; it does NOT
+    /// exclude a concurrent `try_acquire` decrement. With a plain store, a
+    /// decrement that lands between the refill's load and its store is
+    /// silently overwritten — the spent tokens are handed back and the bucket
+    /// admits more than `capacity + refill_rate * elapsed` ever allows.
+    ///
+    /// The shape below maximizes the number of decrements per refill store (a
+    /// large burst drained by many threads, refilling slowly), so the leak is
+    /// visible against a hard accounting bound: on the pre-fix load/store this
+    /// reliably grants ~5-30 tokens past the bound, while the fixed code can
+    /// never reach it (each refill adds at most `elapsed_since_last * rate`,
+    /// truncated, and is clamped to capacity).
+    #[test]
+    fn test_concurrent_acquire_never_exceeds_capacity_plus_refill() {
+        use std::sync::Arc;
+        use std::thread;
+
+        const THREADS: usize = 8;
+        const CAPACITY: u32 = 100_000;
+        const REFILL_PER_SEC: f64 = 10.0;
+        let test_duration = Duration::from_millis(200);
+
+        // Started before the bucket exists, so `elapsed` below can never
+        // under-count the bucket's own epoch-relative refill window.
+        let start = Instant::now();
+        let bucket = Arc::new(TokenBucket::new(CAPACITY, REFILL_PER_SEC));
+        let granted = Arc::new(AtomicU64::new(0));
+
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let bucket = Arc::clone(&bucket);
+            let granted = Arc::clone(&granted);
+            handles.push(thread::spawn(move || {
+                while start.elapsed() < test_duration {
+                    if bucket.try_acquire(1).is_ok() {
+                        granted.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let elapsed = start.elapsed();
+        let max_refill = (elapsed.as_secs_f64() * REFILL_PER_SEC).ceil() as u64;
+        let bound = CAPACITY as u64 + max_refill;
+        let total = granted.load(Ordering::Relaxed);
+
+        assert!(
+            total <= bound,
+            "granted {total} tokens from a bucket with capacity {CAPACITY} refilling at \
+             {REFILL_PER_SEC}/s over {elapsed:?} (hard bound {bound}) — refill is losing \
+             concurrent decrements and manufacturing tokens"
+        );
     }
 
     #[test]

@@ -5,6 +5,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Default capacity of the analytics ingest queue. Mirrors the
+/// `[analytics] queue_capacity` default in `proxy.toml`.
+pub const DEFAULT_ANALYTICS_QUEUE_CAPACITY: usize = 8192;
+
 /// Analytics configuration
 #[derive(Debug, Clone)]
 pub struct AnalyticsConfig {
@@ -22,6 +26,24 @@ pub struct AnalyticsConfig {
 
     /// Maximum fingerprints to track
     pub max_fingerprints: usize,
+
+    /// Bound on the memoized raw-SQL -> fingerprint cache. Repeat statements
+    /// skip all regex normalization. `0` disables memoization.
+    /// Wired to `[analytics] fingerprint_cache_size` in `proxy.toml`.
+    pub fingerprint_cache_size: usize,
+
+    /// Largest statement (in bytes) that may be memoized. The memo key is the
+    /// raw SQL, so this is what bounds the memo in BYTES rather than only in
+    /// entries: a longer statement is still fingerprinted, just not cached.
+    /// Wired to `[analytics] fingerprint_cache_max_sql_bytes` in `proxy.toml`.
+    pub fingerprint_cache_max_sql_bytes: usize,
+
+    /// Capacity of the bounded queue between the connection tasks and the
+    /// single background analytics consumer. An execution arriving when the
+    /// queue is full is DROPPED (and counted in
+    /// `QueryAnalytics::dropped_total`) rather than blocking the query relay.
+    /// Wired to `[analytics] queue_capacity` in `proxy.toml`.
+    pub queue_capacity: usize,
 
     /// Slow query configuration
     pub slow_query: SlowQueryConfig,
@@ -44,6 +66,10 @@ impl Default for AnalyticsConfig {
             track_parameters: false,
             retention: Duration::from_secs(7 * 24 * 3600), // 7 days
             max_fingerprints: 10000,
+            fingerprint_cache_size: super::fingerprinter::DEFAULT_FINGERPRINT_CACHE_SIZE,
+            fingerprint_cache_max_sql_bytes:
+                super::fingerprinter::DEFAULT_FINGERPRINT_CACHE_MAX_SQL_BYTES,
+            queue_capacity: DEFAULT_ANALYTICS_QUEUE_CAPACITY,
             slow_query: SlowQueryConfig::default(),
             patterns: PatternConfig::default(),
             sampling: SamplingConfig::default(),
@@ -85,6 +111,21 @@ impl AnalyticsConfigBuilder {
 
     pub fn max_fingerprints(mut self, max: usize) -> Self {
         self.config.max_fingerprints = max;
+        self
+    }
+
+    pub fn fingerprint_cache_size(mut self, size: usize) -> Self {
+        self.config.fingerprint_cache_size = size;
+        self
+    }
+
+    pub fn fingerprint_cache_max_sql_bytes(mut self, bytes: usize) -> Self {
+        self.config.fingerprint_cache_max_sql_bytes = bytes;
+        self
+    }
+
+    pub fn queue_capacity(mut self, capacity: usize) -> Self {
+        self.config.queue_capacity = capacity;
         self
     }
 
@@ -331,6 +372,24 @@ mod tests {
         assert!(config.normalize_queries);
         assert!(!config.track_parameters);
         assert_eq!(config.max_fingerprints, 10000);
+        assert_eq!(config.fingerprint_cache_size, 10000);
+        assert_eq!(config.fingerprint_cache_max_sql_bytes, 4096);
+        assert_eq!(config.queue_capacity, 8192);
+    }
+
+    /// The two async/memoization knobs must be settable through the builder,
+    /// so `proxy.toml` can tune them without touching the defaults.
+    #[test]
+    fn test_builder_queue_and_cache_knobs() {
+        let config = AnalyticsConfig::builder()
+            .fingerprint_cache_size(64)
+            .fingerprint_cache_max_sql_bytes(128)
+            .queue_capacity(16)
+            .build();
+
+        assert_eq!(config.fingerprint_cache_size, 64);
+        assert_eq!(config.fingerprint_cache_max_sql_bytes, 128);
+        assert_eq!(config.queue_capacity, 16);
     }
 
     #[test]

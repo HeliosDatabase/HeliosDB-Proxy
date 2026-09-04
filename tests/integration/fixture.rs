@@ -155,19 +155,21 @@ pub async fn start_proxy() -> Option<ProxyFixture> {
     let proxy_port = pick_free_port();
     let admin_port = pick_free_port();
 
+    // NodeConfig carries a private address cache, so it can only be built
+    // cross-crate via `NodeConfig::new()` + field assignment, not a full
+    // struct literal.
+    let mut primary_node = NodeConfig::new(backend.host.clone(), backend.port);
+    primary_node.http_port = 8080;
+    primary_node.role = NodeRole::Primary;
+    primary_node.weight = 100;
+    primary_node.enabled = true;
+    primary_node.name = Some("test-primary".to_string());
+
     let config = ProxyConfig {
         listen_address: format!("127.0.0.1:{}", proxy_port),
         admin_address: format!("127.0.0.1:{}", admin_port),
         tr_enabled: false,
-        nodes: vec![NodeConfig {
-            host: backend.host.clone(),
-            port: backend.port,
-            http_port: 8080,
-            role: NodeRole::Primary,
-            weight: 100,
-            enabled: true,
-            name: Some("test-primary".to_string()),
-        }],
+        nodes: vec![primary_node],
         pool: PoolConfig {
             min_connections: 1,
             max_connections: 5,
@@ -223,30 +225,28 @@ pub async fn start_proxy_ha() -> Option<HaFixture> {
     let proxy_port = pick_free_port();
     let admin_port = pick_free_port();
 
+    // NodeConfig carries a private address cache, so it can only be built
+    // cross-crate via `NodeConfig::new()` + field assignment, not a full
+    // struct literal.
+    let mut primary_node = NodeConfig::new(primary.host.clone(), primary.port);
+    primary_node.http_port = 8080;
+    primary_node.role = NodeRole::Primary;
+    primary_node.weight = 100;
+    primary_node.enabled = true;
+    primary_node.name = Some("test-primary".to_string());
+
+    let mut standby_node = NodeConfig::new(standby.host.clone(), standby.port);
+    standby_node.http_port = 8081;
+    standby_node.role = NodeRole::Standby;
+    standby_node.weight = 100;
+    standby_node.enabled = true;
+    standby_node.name = Some("test-standby".to_string());
+
     let config = ProxyConfig {
         listen_address: format!("127.0.0.1:{}", proxy_port),
         admin_address: format!("127.0.0.1:{}", admin_port),
         tr_enabled: false,
-        nodes: vec![
-            NodeConfig {
-                host: primary.host.clone(),
-                port: primary.port,
-                http_port: 8080,
-                role: NodeRole::Primary,
-                weight: 100,
-                enabled: true,
-                name: Some("test-primary".to_string()),
-            },
-            NodeConfig {
-                host: standby.host.clone(),
-                port: standby.port,
-                http_port: 8081,
-                role: NodeRole::Standby,
-                weight: 100,
-                enabled: true,
-                name: Some("test-standby".to_string()),
-            },
-        ],
+        nodes: vec![primary_node, standby_node],
         pool: PoolConfig {
             min_connections: 1,
             max_connections: 5,

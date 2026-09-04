@@ -3,14 +3,31 @@
 //! Per-connection, exact-match cache with LRU eviction.
 //! Provides sub-microsecond latency for repeated queries.
 //!
-//! Hits take only a read lock on the entries map; `L1Entry::access_count`
-//! is an `AtomicU64`, so its increment doesn't require `&mut` access to
-//! the entry. `parking_lot::RwLock` is used throughout — no poisoning,
-//! no `.unwrap()` on every lock acquire.
+//! Backed by `lru::LruCache`, an intrusive linked hash map: `get`/`put`
+//! are O(1), including eviction — when `put` inserts a new key past
+//! capacity, `lru::LruCache` itself evicts the true least-recently-used
+//! entry in O(1), with no scan over the map. That replaces a previous
+//! `HashMap` + `Vec<(String, Instant)>` pair whose LRU bookkeeping did
+//! an O(n) `retain` scan plus a `String` allocation on every single hit
+//! and put, with eviction doing an O(n) scan per candidate (O(n^2)
+//! overall). A single `parking_lot::RwLock` (write-locked for both
+//! reads and writes, since promotion needs `&mut`) guards the map —
+//! no poisoning, no `.unwrap()` on every lock acquire.
+//!
+//! Expired entries are not preferentially evicted on insert — that
+//! would require an O(n) scan of the map on every full-cache put,
+//! which is exactly the cost this rewrite removes. Instead, TTL
+//! reclamation happens in two places: `get()` checks `is_expired()`
+//! on the entry it just looked up and evicts it in place before
+//! returning `None`, and the periodic `evict_expired()` sweep removes
+//! any expired entries regardless of LRU order. Between those, an
+//! expired-but-not-yet-swept entry can still be evicted by plain LRU
+//! order ahead of a live entry that hasn't been touched recently —
+//! that's an accepted trade of strict expiry-preference for O(1) puts.
 
-use std::collections::HashMap;
-use std::time::Instant;
+use std::num::NonZeroUsize;
 
+use lru::LruCache;
 use parking_lot::RwLock;
 
 use super::config::L1Config;
@@ -25,61 +42,41 @@ pub struct L1HotCache {
     /// Cache configuration
     config: L1Config,
 
-    /// Cache entries indexed by exact query string
-    entries: RwLock<HashMap<String, L1Entry>>,
-
-    /// LRU order tracking (query string -> last access time)
-    lru_order: RwLock<Vec<(String, Instant)>>,
+    /// Cache entries indexed by exact query string, in LRU order.
+    entries: RwLock<LruCache<String, L1Entry>>,
 }
 
 impl L1HotCache {
     /// Create a new L1 hot cache with the given configuration
     pub fn new(config: L1Config) -> Self {
-        let size = config.size;
+        // `size == 0` would be an invalid `NonZeroUsize`; the previous
+        // Vec/HashMap implementation degraded to an effective capacity
+        // of 1 in that case (evicting-then-inserting on every put), so
+        // floor at 1 here to match rather than panicking.
+        let cap = NonZeroUsize::new(config.size).unwrap_or(NonZeroUsize::MIN);
         Self {
+            entries: RwLock::new(LruCache::new(cap)),
             config,
-            entries: RwLock::new(HashMap::with_capacity(size)),
-            lru_order: RwLock::new(Vec::with_capacity(size)),
         }
     }
 
     /// Look up a query in the cache.
     ///
-    /// Hits take only a read lock on the entries map; the `touch()` call
-    /// uses atomic `fetch_add` on `access_count` rather than exclusive
-    /// access. Expired entries still need a write-lock to evict, but that
-    /// is only the slow path.
+    /// O(1): one write-locked map lookup, which also promotes the
+    /// entry to most-recently-used.
     pub fn get(&self, query: &str) -> Option<CachedResult> {
         if !self.config.enabled {
             return None;
         }
 
-        // Fast path: read lock.
-        let (result, expired) = {
-            let entries = self.entries.read();
-            match entries.get(query) {
-                None => return None,
-                Some(entry) if entry.is_expired() => (None, true),
-                Some(entry) => {
-                    entry.touch();
-                    (Some(entry.result.clone()), false)
-                }
-            }
-        };
-
-        if expired {
-            // Slow path: escalate to a write lock to evict the dead entry.
-            let mut entries = self.entries.write();
-            entries.remove(query);
-            drop(entries);
-            self.remove_from_lru(query);
+        let mut entries = self.entries.write();
+        let entry = entries.get(query)?;
+        if entry.is_expired() {
+            entries.pop(query);
             return None;
         }
-
-        // Hit: update LRU ordering after releasing the entries read lock,
-        // so it contends only with other LRU updates, not with reads.
-        self.update_lru(query);
-        result
+        entry.touch();
+        Some(entry.result.clone())
     }
 
     /// Store a query result in the cache
@@ -90,10 +87,12 @@ impl L1HotCache {
 
         let mut entries = self.entries.write();
 
-        // Check if we need to evict
-        if entries.len() >= self.config.size && !entries.contains_key(&query) {
-            self.evict_lru(&mut entries);
-        }
+        // No eviction bookkeeping here: `entries.put` below is O(1) and
+        // evicts the true least-recently-used entry itself when the
+        // cache is full and this is a new key (built into the `lru`
+        // crate). Expired entries are reclaimed lazily — on `get()`,
+        // when a lookup lands on one, or in bulk by `evict_expired()` —
+        // not preferentially on insert, which would need an O(n) scan.
 
         // Create TTL-adjusted result
         let mut adjusted_result = result;
@@ -101,23 +100,19 @@ impl L1HotCache {
             adjusted_result.ttl = self.config.ttl;
         }
 
-        // Insert or update entry
+        // Insert or update entry (promotes to most-recently-used).
         let entry = L1Entry::new(query.clone(), adjusted_result);
-        entries.insert(query.clone(), entry);
-        drop(entries);
-        self.update_lru(&query);
+        entries.put(query, entry);
     }
 
     /// Remove an entry from the cache
     pub fn remove(&self, query: &str) {
-        self.entries.write().remove(query);
-        self.remove_from_lru(query);
+        self.entries.write().pop(query);
     }
 
     /// Clear all entries
     pub fn clear(&self) {
         self.entries.write().clear();
-        self.lru_order.write().clear();
     }
 
     /// Get current entry count
@@ -138,8 +133,8 @@ impl L1HotCache {
     /// Get hit statistics
     pub fn stats(&self) -> L1CacheStats {
         let entries = self.entries.read();
-        let total_size: usize = entries.values().map(|e| e.result.size()).sum();
-        let total_access: u64 = entries.values().map(|e| e.access_count()).sum();
+        let total_size: usize = entries.iter().map(|(_, e)| e.result.size()).sum();
+        let total_access: u64 = entries.iter().map(|(_, e)| e.access_count()).sum();
 
         L1CacheStats {
             entry_count: entries.len(),
@@ -159,49 +154,7 @@ impl L1HotCache {
             .collect();
 
         for key in &expired {
-            entries.remove(key);
-        }
-        drop(entries);
-
-        for key in &expired {
-            self.remove_from_lru(key);
-        }
-    }
-
-    /// Update LRU tracking for a query
-    fn update_lru(&self, query: &str) {
-        let mut lru = self.lru_order.write();
-        lru.retain(|(q, _)| q != query);
-        lru.push((query.to_string(), Instant::now()));
-    }
-
-    /// Remove from LRU tracking
-    fn remove_from_lru(&self, query: &str) {
-        self.lru_order.write().retain(|(q, _)| q != query);
-    }
-
-    /// Evict least recently used entry
-    fn evict_lru(&self, entries: &mut HashMap<String, L1Entry>) {
-        let mut lru = self.lru_order.write();
-
-        // First, try to evict expired entries
-        let expired: Vec<String> = lru
-            .iter()
-            .filter(|(q, _)| entries.get(q).map(|e| e.is_expired()).unwrap_or(true))
-            .map(|(q, _)| q.clone())
-            .collect();
-
-        for key in expired {
-            entries.remove(&key);
-            lru.retain(|(q, _)| q != &key);
-        }
-
-        // If still full, evict LRU entry
-        if entries.len() >= self.config.size {
-            if let Some((key, _)) = lru.first().cloned() {
-                entries.remove(&key);
-                lru.remove(0);
-            }
+            entries.pop(key);
         }
     }
 }
@@ -438,13 +391,18 @@ mod tests {
         assert_eq!(cached.data, Bytes::from("new"));
     }
 
-    /// Concurrent hits on the same key must not block each other and must
-    /// all observe the cached result. Before the read-path refactor this
-    /// test could not be written sensibly — every `get()` took a write
-    /// lock, so reads serialised. With atomic access_count + read-locked
-    /// hits, many threads can hit the same entry in parallel.
+    /// Concurrent hits on the same key must all observe the cached
+    /// result and be reflected exactly once each in the access count:
+    /// no lost updates, no torn reads. `get()` write-locks the map
+    /// (promoting to most-recently-used needs `&mut`), so hits on the
+    /// same entry serialize briefly on that lock rather than running
+    /// under a shared read lock the way the earlier HashMap+Vec
+    /// implementation did — see the module doc comment and
+    /// `docs/internal/website-brief-connection-routing.md`. What this
+    /// test actually guards is unchanged: every thread gets the right
+    /// data, and the access counter ends up exactly right.
     #[test]
-    fn test_concurrent_hits_read_lock_only() {
+    fn test_concurrent_hits_no_lost_updates() {
         use std::sync::Arc;
         use std::thread;
 
@@ -478,6 +436,98 @@ mod tests {
         assert_eq!(
             stats.total_accesses,
             1 + (THREADS * ITERS_PER_THREAD) as u64
+        );
+    }
+
+    /// The cache must never hold more than `size` entries, however many
+    /// distinct keys are pushed through it — this is the capacity
+    /// invariant the O(1) `lru`-crate rewrite has to preserve exactly
+    /// as the old `HashMap` + `Vec<(String, Instant)>` implementation
+    /// did.
+    #[test]
+    fn test_capacity_invariant_under_heavy_churn() {
+        let config = L1Config {
+            enabled: true,
+            size: 128,
+            ttl: Duration::from_secs(60),
+        };
+        let cache = L1HotCache::new(config);
+
+        for i in 0..5_000 {
+            cache.put(format!("query-{i}"), create_result("v"));
+            assert!(cache.len() <= 128, "cache exceeded capacity at i={i}");
+        }
+        assert_eq!(cache.len(), 128);
+
+        // Most recently inserted keys must have survived eviction.
+        for i in 5_000 - 128..5_000 {
+            assert!(
+                cache.get(&format!("query-{i}")).is_some(),
+                "recently inserted key {i} was evicted"
+            );
+        }
+        // The oldest keys must be gone.
+        assert!(cache.get("query-0").is_none());
+    }
+
+    /// Discriminates true LRU-order eviction from insertion-order
+    /// eviction: with capacity 3, touching `a` via `get` must move it
+    /// ahead of `b` in recency, so the next insert past capacity evicts
+    /// `b` (the actual least-recently-used key), not `a` (the oldest
+    /// insert). A cache that evicted by insertion order rather than
+    /// access order would fail this.
+    #[test]
+    fn test_put_on_full_cache_evicts_least_recently_used() {
+        let config = L1Config {
+            enabled: true,
+            size: 3,
+            ttl: Duration::from_secs(60),
+        };
+        let cache = L1HotCache::new(config);
+
+        cache.put("a".to_string(), create_result("a"));
+        cache.put("b".to_string(), create_result("b"));
+        cache.put("c".to_string(), create_result("c"));
+
+        // Touch `a` so `b` becomes the least-recently-used key.
+        assert!(cache.get("a").is_some());
+
+        cache.put("d".to_string(), create_result("d"));
+
+        assert!(
+            cache.get("b").is_none(),
+            "least-recently-used key b was not evicted"
+        );
+        assert!(
+            cache.get("a").is_some(),
+            "recently-touched key a was evicted"
+        );
+        assert!(cache.get("c").is_some(), "key c was evicted");
+        assert!(cache.get("d").is_some(), "newly inserted key d was evicted");
+    }
+
+    /// An expired entry is never returned by `get`, and `get` removes
+    /// it from the map on that read rather than leaving it to a later
+    /// `evict_expired()` sweep.
+    #[test]
+    fn test_get_purges_expired_entry_on_read() {
+        let config = L1Config {
+            enabled: true,
+            size: 100,
+            ttl: Duration::from_millis(10),
+        };
+        let cache = L1HotCache::new(config);
+
+        cache.put("query".to_string(), create_result("data"));
+        assert_eq!(cache.len(), 1);
+
+        std::thread::sleep(Duration::from_millis(15));
+
+        assert!(cache.get("query").is_none(), "expired entry was returned");
+        assert_eq!(
+            cache.len(),
+            0,
+            "expired entry was not removed by the read that found it expired"
         );
     }
 }

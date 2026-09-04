@@ -82,6 +82,13 @@ impl ScramVerifier {
 #[derive(Debug, Clone, Default)]
 pub struct AuthFile {
     users: HashMap<String, ScramVerifier>,
+    /// Plaintext secrets, kept only for entries that were given in
+    /// plaintext (not as a `SCRAM-SHA-256$` verifier). With the proxy as
+    /// the auth boundary these let it authenticate its OWN backend
+    /// connections (SCRAM/MD5/cleartext) — the pass-through exchange is
+    /// unavailable on a redial or an in-session failover, and a verifier
+    /// alone cannot produce a client proof.
+    plain: HashMap<String, String>,
 }
 
 impl AuthFile {
@@ -93,6 +100,7 @@ impl AuthFile {
 
     pub fn parse_str(data: &str, path: &str) -> Result<Self, String> {
         let mut users = HashMap::new();
+        let mut plain = HashMap::new();
         for (lineno, raw) in data.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -111,15 +119,24 @@ impl AuthFile {
                 // from the username (stable across restarts so the same
                 // client password always validates) and 4096 iterations.
                 let salt = sha256(user.as_bytes())[..16].to_vec();
+                plain.insert(user.clone(), secret.clone());
                 ScramVerifier::from_password(&secret, salt, 4096)
             };
             users.insert(user, verifier);
         }
-        Ok(Self { users })
+        Ok(Self { users, plain })
     }
 
     pub fn get(&self, user: &str) -> Option<&ScramVerifier> {
         self.users.get(user)
+    }
+
+    /// The plaintext secret for `user`, if its `auth_file` entry was given in
+    /// plaintext. `None` for verifier-only entries — the proxy can then
+    /// authenticate the client but cannot open its own password-protected
+    /// backend connections for that user.
+    pub fn password(&self, user: &str) -> Option<&str> {
+        self.plain.get(user).map(String::as_str)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -269,6 +286,25 @@ mod tests {
         assert_eq!(p.salt, v.salt);
         assert_eq!(p.stored_key, v.stored_key);
         assert_eq!(p.server_key, v.server_key);
+    }
+
+    #[test]
+    fn auth_file_keeps_plaintext_only_for_plaintext_entries() {
+        let v = ScramVerifier::from_password("pw", b"0123456789abcdef".to_vec(), 4096);
+        let verifier_str = format!(
+            "SCRAM-SHA-256${}:{}${}:{}",
+            v.iterations,
+            BASE64.encode(&v.salt),
+            BASE64.encode(v.stored_key),
+            BASE64.encode(v.server_key)
+        );
+        let data = format!("alice:\"s3cret\"\nbob:{}\n", verifier_str);
+        let af = AuthFile::parse_str(&data, "test").unwrap();
+        assert_eq!(af.password("alice"), Some("s3cret"));
+        assert!(af.get("alice").is_some());
+        assert_eq!(af.password("bob"), None);
+        assert!(af.get("bob").is_some());
+        assert_eq!(af.password("nobody"), None);
     }
 
     #[test]

@@ -50,7 +50,7 @@ heliosdb-topology = []
 # ── Proxy feature modules ───────────────────────────────────────────
 
 # Query caching (L1 hot / L2 warm / L3 semantic)
-query-cache = []
+query-cache = ["dep:lru"]
 
 # Query routing hints (/*+ route=primary */)
 routing-hints = []
@@ -161,8 +161,9 @@ dashmap = "5"
 parking_lot = "0.12"
 # Lock-free read-mostly snapshots (node-health map on the per-query path)
 arc-swap = "1"
-# O(1) LRU map backing the edge-proxy result cache. Optional — only
-# compiled with the `edge-proxy` feature.
+# O(1) LRU map backing the edge-proxy result cache and the L1 hot query
+# cache. Optional — only compiled with the `edge-proxy` or `query-cache`
+# feature.
 lru = { version = "0.12", optional = true }
 # SO_REUSEPORT for zero-downtime binary handoff (a new process binds the same
 # listen address while the old one drains).
@@ -176,6 +177,10 @@ toml = "0.8"
 # Regex (used by analytics, routing, rewriter)
 regex = "1"
 once_cell = "1"
+# SIMD-accelerated single-byte search — already in the tree transitively
+# via regex, pinned direct here for src/protocol.rs's contains_ci hot path
+# (called from the per-query cacheability/session-state classifiers).
+memchr = "2"
 
 # Encoding (used by auth, distribcache)
 base64 = "0.21"

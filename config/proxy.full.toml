@@ -18,9 +18,47 @@ listen_address = "${HELIOS_PROXY_LISTEN:-0.0.0.0:6432}"
 # to a non-loopback address requires admin_token (or admin_allow_insecure = true).
 admin_address  = "${HELIOS_PROXY_ADMIN:-127.0.0.1:9090}"
 
-# Transaction Replay — re-execute in-flight work after failover.
-# Modes: none, session (re-establish SET vars), select (replay reads),
-#        transaction (full replay including writes — requires idempotent workloads).
+# Transaction Replay.
+#   tr_enabled — journal auto-commit writes for the operator-driven replay engine
+#                (POST /api/replay, time-travel; needs the `ha-tr` feature).
+#   tr_mode    — in-session failover: what a LIVE client session experiences when
+#                its backend connection fails mid-request (write error/timeout,
+#                read error, EOF, reset) or dies while idle. Always available.
+#
+#   mode        | on a backend fault
+#   ------------+-------------------------------------------------------------------
+#   none        | ONE ErrorResponse (SQLSTATE 57P01 naming the failed node) +
+#               | ReadyForQuery, then the client connection is closed.
+#   session     | Connection kept open. Waits for a healthy primary (write_timeout_secs),
+#   (default)   | reconnects, replays the session's SET/RESET statements (named prepared
+#               | statements are re-prepared lazily). A statement that never reached the
+#               | old backend and was issued outside an explicit transaction is re-run
+#               | transparently. Anything else -> ONE error (57P01 not delivered inside
+#               | a transaction / 08007 outcome unknown) and the transaction is aborted
+#               | (ROLLBACK and retry); the session then continues on the new primary.
+#   select      | session + an unknown-outcome READ (SELECT/SHOW/...; never a write) is
+#               | re-executed transparently outside a transaction; a READ-ONLY explicit
+#               | transaction is replayed from its BEGIN first.
+#   transaction | select + an UNCOMMITTED explicit transaction is replayed from its
+#               | BEGIN on the new primary (statement responses discarded — the client
+#               | already saw them) and the in-flight statement is re-executed inside
+#               | it. A COMMIT whose outcome is unknown is NEVER retried (08007).
+#               | Opt-in: blind replay is only correct for deterministic statements —
+#               | now(), random(), RETURNING serials may differ on the second run.
+#   Replay caps: [limits] tr_max_replay_statements / tr_max_replay_bytes (a
+#   transaction over a cap degrades to `session` behaviour). A transaction that
+#   contained a COPY, entered the failed state, or had a statement transformed by
+#   query-rewrite/multi-tenancy is never replayed. Extended-protocol SETs (JDBC)
+#   and SQL-level PREPARE are not tracked for restore. COPY in progress at the
+#   fault -> 08006 and close, every mode.
+#   Credentials: re-homing opens a FRESH backend connection. In pass-through
+#   auth mode the proxy never holds the client's password, so only a trust
+#   backend can be reached (a challenging one fails the recovery with 08006).
+#   For SCRAM/MD5 backends set [auth] mode = "scram" with a plaintext auth_file
+#   entry — the proxy then authenticates its own backend connections.
+#   Metrics: tr_failovers_total, tr_statements_reexecuted_total,
+#   tr_transactions_replayed_total, tr_replay_failures_total,
+#   tr_unknown_outcome_errors_total (+ *_cap_exceeded_total) on /metrics.
 tr_enabled = true
 tr_mode    = "session"
 
@@ -35,7 +73,9 @@ write_timeout_secs = 30
 # omitting any single key) is byte-for-byte identical to the historical
 # behaviour. Every value MUST be > 0 — a 0 disables a safety bound rather than
 # meaning "unbounded", so the proxy refuses to start with any 0 here. Timeouts
-# are whole seconds; counts/bytes are plain integers.
+# are whole seconds; counts/bytes are plain integers. The two OPT-IN keys at the
+# end of the block (max_client_connections, client_idle_timeout_secs) are the
+# exception: there 0 is the default and means "off".
 #
 # [limits]
 # # Capacity of the query-cancellation key map (BackendKeyData -> backend addr).
@@ -70,6 +110,42 @@ write_timeout_secs = 30
 # max_total_idle_backend_conns = 8192
 # # How often the idle-connection reaper runs.
 # pool_reap_interval_secs = 30
+# # Ceiling on concurrently-served client connections on the PG-wire listener.
+# # 0 (default) = unlimited, exactly as before this key existed. When > 0, a
+# # connection that arrives with no free slot is answered with a PostgreSQL
+# # ErrorResponse (FATAL, SQLSTATE 53300, "sorry, too many clients already")
+# # and closed instead of being queued — the shape a PostgreSQL server at
+# # max_connections gives. The slot is taken only once the connection's first
+# # startup message is known to be a real Startup, so a CancelRequest (query
+# # cancellation) is always served, even at the cap, and never consumes a slot.
+# # Rejections are counted by the `connections_rejected` metric
+# # (/metrics, /metrics/prometheus). READ ONCE AT STARTUP: a SIGHUP that
+# # changes this key is logged and ignored — restart to change the cap.
+# max_client_connections = 0
+# # Idle-session timeout for an authenticated client: how long a session may sit
+# # between statements before the proxy terminates it with SQLSTATE 57P05
+# # ("terminating connection due to idle-session timeout"). 0 (default) =
+# # disabled, exactly as before this key existed. Follows PostgreSQL's
+# # idle_session_timeout semantics — it applies only to a session waiting for a
+# # NEW command. The clock measures time since the client's last statement, and
+# # unsolicited backend traffic relayed to an idle client (LISTEN/NOTIFY,
+# # NoticeResponse, ParameterStatus) is not client activity and does not reset
+# # it. It is NOT armed while a message is only partially received, nor during a
+# # COPY FROM STDIN (a paused bulk load is never killed by it). PostgreSQL's
+# # separate idle_in_transaction_session_timeout is NOT implemented: a session
+# # left idle inside an open transaction is terminated by this timeout too. Read
+# # once at startup.
+# client_idle_timeout_secs = 0
+# # In-session Transaction Replay (tr_mode = select | transaction): caps on the
+# # statements / bytes recorded per explicit transaction for replay after a
+# # failover. Over a cap the transaction is marked non-replayable (transaction
+# # mode degrades to session behaviour for it; tr_replay_cap_exceeded_total).
+# tr_max_replay_statements = 1000
+# tr_max_replay_bytes = 4194304
+# # In-session Transaction Replay (tr_mode != none): cap on tracked session
+# # SET/RESET statements replayed onto the replacement backend. Over the cap,
+# # tracking stops (tr_session_set_cap_exceeded_total) and the restore is partial.
+# tr_max_session_set_statements = 256
 
 # =============================================================================
 # POOL — Backend connection pool (proxy -> database)
@@ -81,6 +157,13 @@ max_connections    = 100
 idle_timeout_secs  = 300
 max_lifetime_secs  = 1800
 acquire_timeout_secs = 5
+# Validate a pooled connection before handing it out; false skips
+# acquire-time validation entirely. Today that validation is a lightweight
+# state check (not a live socket probe) for every shipped deployment, since
+# the pool never attaches a real backend socket to its connections outside
+# of unit tests. The data-path liveness check operators actually rely on is
+# the idle backend pool's periodic stale-connection probe
+# (pool_reap_interval_secs, above).
 test_on_acquire    = true
 
 # =============================================================================
@@ -132,6 +215,11 @@ latency_threshold_ms = 100
 # =============================================================================
 
 [health]
+# Keep check_timeout_secs < check_interval_secs. If a probe can still be running
+# when the next tick fires, that tick is skipped for the node (counted as
+# health_probe_skipped_inflight) instead of stacking a second probe, so
+# detection is coarser than check_interval_secs suggests. A config where
+# check_timeout_secs >= check_interval_secs still loads, but logs a warning.
 check_interval_secs = 5
 check_timeout_secs  = 3
 failure_threshold   = 3     # Failures before marking unhealthy
@@ -186,6 +274,27 @@ enabled = true
 # Unquoted so `${VAR:-default}` expands to a bare TOML boolean (a quoted
 # "${...}" would deserialize as a string and fail the bool field).
 enabled = ${HELIOS_PROXY_CACHE_ENABLED:-true}
+
+# Hard ceiling, in bytes, on the backend response the proxy will buffer in
+# memory while streaming a cacheable read to the client. The capture is a
+# per-session transient held ON TOP of the bytes already forwarded, so an
+# unbounded one let a single `SELECT * FROM big_table` pin a whole result set
+# per concurrent session. Past this bound the capture buffer is dropped and the
+# response is simply not cached — the client still receives every byte,
+# unchanged.
+#
+# DELIBERATELY SHARED by both response caches: the data path captures a
+# response exactly once and hands the same buffer to the query-result cache
+# and/or the edge cache, so this one key bounds the capture for both. It
+# therefore applies even when `enabled = false` here, as long as `[edge]` is
+# caching reads — and the edge cache also refuses any single entry larger than
+# it (`[edge] max_entries` bounds the entry COUNT only).
+#
+# Default 4 MiB (must be > 0). Kept above the 1 MiB `max_result_bytes` default
+# so it never masks that knob. Watch `heliosdb_proxy_cache_capture_oversize_total`
+# on /metrics/prometheus (and `oversize_rejected` in the edge cache stats) to
+# see how often reads bypass the caches on size grounds.
+max_cacheable_response_bytes = 4194304
 
 # -- L1: Hot cache (per-connection, sub-microsecond lookups) ------------------
 
@@ -416,12 +525,33 @@ ttl_fallback_secs = 60          # Fallback TTL when WAL is unavailable
 # ANALYTICS — Query analytics, slow query log, and pattern detection
 # =============================================================================
 
+# These are the keys the proxy.toml parser (`AnalyticsToml` in src/config.rs)
+# actually recognises; each line shows its DEFAULT. The `[analytics.*]`
+# sub-tables further down document the library defaults and are IGNORED by
+# proxy.toml.
 # [analytics]
-# enabled            = true
-# normalize_queries  = true          # Replace literals with $N placeholders
-# track_parameters   = false         # Privacy: do not log actual values
-# retention_days     = 7
-# max_fingerprints   = 10000         # Unique query shapes to track
+# enabled                = false     # Record per-query stats / slow log / patterns
+# slow_query_ms          = 1000      # Queries slower than this hit the slow log
+# max_fingerprints       = 10000     # Unique query shapes to track
+# # Bounded queue between the connection tasks and the single background
+# # analytics consumer. Fingerprinting, statistics, the slow-query log, pattern
+# # detection and cost attribution all run on that consumer, so a query only
+# # pays a non-blocking try_send. An execution arriving when the queue is full
+# # is DROPPED — never blocks the relay — and counted as
+# # `analytics_dropped_total` in GET /api/analytics. Must be >= 1. Raise it if
+# # that counter climbs. Because ingest is asynchronous, /api/analytics can lag
+# # the newest query by the queue drain time (microseconds in practice).
+# queue_capacity         = 8192
+# # Bound on the memoized raw-SQL -> fingerprint cache: a repeated statement
+# # skips all six regex normalization passes. Set to 0 to disable memoization.
+# fingerprint_cache_size = 10000
+# # Largest statement (bytes) allowed into that memo. The memo key is the raw
+# # SQL, so this is what bounds it in BYTES and not just in entries: with the
+# # defaults it retains at most 10000 * 4096 = ~40 MiB of SQL. A longer
+# # statement (bulk INSERT with inline VALUES, generated DDL) is still
+# # fingerprinted, it is simply never cached. Must be >= 1; use
+# # fingerprint_cache_size = 0 to turn memoization off.
+# fingerprint_cache_max_sql_bytes = 4096
 #
 # # Slow query log
 # [analytics.slow_query]

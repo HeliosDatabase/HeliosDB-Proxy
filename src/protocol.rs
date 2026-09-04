@@ -202,6 +202,34 @@ impl Message {
 
         buf
     }
+
+    /// Encode the message directly into `dst`, byte-identical to
+    /// `encode()` but without allocating (and then copying from) an
+    /// intermediate `BytesMut`.
+    ///
+    /// Used on hot paths — e.g. building up a batched extended-protocol
+    /// `pending` buffer — where `encode()` followed by
+    /// `dst.extend_from_slice(&msg.encode())` would allocate a fresh buffer
+    /// per message just to memcpy it into `dst` and drop it.
+    pub fn encode_into(&self, dst: &mut BytesMut) {
+        dst.reserve(
+            self.payload.len()
+                + if self.msg_type.to_tag().is_some() {
+                    5
+                } else {
+                    4
+                },
+        );
+
+        if let Some(tag) = self.msg_type.to_tag() {
+            dst.put_u8(tag);
+        }
+
+        // Length includes itself (4 bytes)
+        let len = self.payload.len() as u32 + 4;
+        dst.put_u32(len);
+        dst.extend_from_slice(&self.payload);
+    }
 }
 
 /// Protocol codec for framing messages
@@ -268,8 +296,19 @@ impl ProtocolCodec {
             return Ok(Some(StartupMessage::SSLRequest));
         }
 
-        // Check for cancel request
+        // Check for cancel request. A well-formed CancelRequest carries pid+key
+        // after the length+version already consumed above, i.e. `len >= 16`
+        // (equivalently `src.remaining() >= 8` at this point). A client that
+        // sends only the 8-byte length+version prefix (declared `len == 8`,
+        // e.g. `00 00 00 08 04 D2 16 2E`) must not crash the unauthenticated
+        // pre-auth handler task by panicking in `get_u32`.
         if protocol_version == 80877102 {
+            if src.remaining() < 8 {
+                return Err(ProxyError::Protocol(format!(
+                    "CancelRequest length {} too short for pid+key (need at least 16)",
+                    len
+                )));
+            }
             let pid = src.get_u32();
             let key = src.get_u32();
             return Ok(Some(StartupMessage::CancelRequest { pid, key }));
@@ -396,17 +435,41 @@ pub fn starts_with_ci(s: &str, prefix: &str) -> bool {
 }
 
 /// Case-insensitive ASCII substring test without allocating.
+///
+/// Instead of a brute-force `windows(needle.len())` scan (checking
+/// `eq_ignore_ascii_case` at every byte offset), this uses `memchr2` to
+/// jump straight to offsets where the needle's first byte matches
+/// case-insensitively (SIMD-accelerated), then verifies the full window
+/// only at those candidates. Same semantics as the naive scan — including
+/// on empty needles, needles longer than the haystack, and non-ASCII bytes
+/// (compared byte-for-byte, never case-folded) — just fewer full-window
+/// comparisons on the common case of a rare first byte.
 pub fn contains_ci(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
-    if haystack.len() < needle.len() {
+    let hb = haystack.as_bytes();
+    let nb = needle.as_bytes();
+    if hb.len() < nb.len() {
         return false;
     }
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    let first_lo = nb[0].to_ascii_lowercase();
+    let first_up = nb[0].to_ascii_uppercase();
+    let last_start = hb.len() - nb.len();
+    let mut pos = 0usize;
+    while pos <= last_start {
+        match memchr::memchr2(first_lo, first_up, &hb[pos..=last_start]) {
+            Some(off) => {
+                let i = pos + off;
+                if hb[i..i + nb.len()].eq_ignore_ascii_case(nb) {
+                    return true;
+                }
+                pos = i + 1;
+            }
+            None => return false,
+        }
+    }
+    false
 }
 
 /// Query message payload
@@ -784,6 +847,47 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_into_matches_encode() {
+        // encode_into must produce byte-identical output to encode(), for
+        // both tagged and untagged message types, and for empty payloads.
+        let cases = vec![
+            Message::new(MessageType::Parse, BytesMut::from(&b"stmt\0SELECT 1\0"[..])),
+            Message::new(MessageType::Bind, BytesMut::from(&b"portal\0stmt\0"[..])),
+            Message::new(MessageType::Describe, BytesMut::from(&b"S\0stmt"[..])),
+            Message::new(
+                MessageType::Execute,
+                BytesMut::from(&b"portal\0\0\0\0\0"[..]),
+            ),
+            Message::new(MessageType::Close, BytesMut::from(&b"S\0stmt"[..])),
+            Message::empty(MessageType::Sync),
+            Message::empty(MessageType::Flush),
+            // Untagged message type: to_tag() returns None, so encode()
+            // omits the 1-byte tag entirely — encode_into must match.
+            Message::empty(MessageType::Unknown(0)),
+        ];
+
+        for msg in cases {
+            let expected = msg.encode();
+
+            let mut dst = BytesMut::new();
+            msg.encode_into(&mut dst);
+            assert_eq!(
+                dst.to_vec(),
+                expected.to_vec(),
+                "encode_into mismatch for {:?}",
+                msg.msg_type
+            );
+
+            // encode_into must append, not overwrite, existing contents of dst.
+            let mut prefixed = BytesMut::from(&b"PREFIX"[..]);
+            msg.encode_into(&mut prefixed);
+            let mut want = BytesMut::from(&b"PREFIX"[..]);
+            want.extend_from_slice(&expected);
+            assert_eq!(prefixed.to_vec(), want.to_vec());
+        }
+    }
+
+    #[test]
     fn test_auth_request_tag_mapping() {
         // Regression: 'R' (AuthenticationRequest) must decode to AuthRequest,
         // not Unknown(82) — the backend client matches on this to authenticate.
@@ -919,6 +1023,45 @@ mod tests {
         assert!(codec.decode_startup(&mut buf).is_err());
     }
 
+    /// A minimal 8-byte CancelRequest (length + protocol version only, no
+    /// pid/key) must be rejected with a protocol error rather than panicking
+    /// in `get_u32` ("advance out of bounds") inside the unauthenticated
+    /// pre-auth handler task. Reproduces the exact wire bytes of the crash
+    /// probe: length `00 00 00 08`, cancel-request magic `04 D2 16 2E`
+    /// (80877102), and nothing else.
+    #[test]
+    fn test_decode_startup_rejects_short_cancel_request() {
+        let codec = ProtocolCodec::new();
+        let mut buf = BytesMut::from(&b"\x00\x00\x00\x08\x04\xD2\x16\x2E"[..]);
+        let err = codec
+            .decode_startup(&mut buf)
+            .expect_err("truncated CancelRequest must be rejected, not panic");
+        assert!(matches!(err, ProxyError::Protocol(_)), "got {err:?}");
+    }
+
+    /// A full, well-formed 16-byte CancelRequest (length + version + pid +
+    /// key) must still decode successfully with the correct pid/key values.
+    #[test]
+    fn test_decode_startup_accepts_full_cancel_request() {
+        let codec = ProtocolCodec::new();
+        let mut buf = BytesMut::new();
+        buf.put_u32(16); // length
+        buf.put_u32(80877102); // cancel request magic
+        buf.put_u32(1234); // pid
+        buf.put_u32(5678); // key
+        let msg = codec
+            .decode_startup(&mut buf)
+            .expect("well-formed CancelRequest must decode")
+            .expect("must produce a message");
+        match msg {
+            StartupMessage::CancelRequest { pid, key } => {
+                assert_eq!(pid, 1234);
+                assert_eq!(key, 5678);
+            }
+            other => panic!("expected CancelRequest, got {other:?}"),
+        }
+    }
+
     /// BindMessage parameter values are now `Bytes` (zero-copy), not
     /// `Vec<u8>`. Round-trip a synthetic payload and confirm the
     /// parsed values match.
@@ -946,5 +1089,105 @@ mod tests {
             None => panic!("first param must be Some"),
         }
         assert!(bind.param_values[1].is_none());
+    }
+
+    /// Reference implementation: the original naive `windows().any()` scan
+    /// `contains_ci` used before the memchr2-accelerated rewrite. Kept only
+    /// in tests so the fast path can be checked against it byte-for-byte.
+    fn contains_ci_naive(haystack: &str, needle: &str) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        if haystack.len() < needle.len() {
+            return false;
+        }
+        haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    }
+
+    /// `contains_ci` must agree with the naive reference implementation on
+    /// every input, including the tricky cases: mixed case, needle at the
+    /// very end, needle longer than the haystack, an empty needle, and
+    /// non-ASCII bytes (which must compare literally, never case-folded).
+    #[test]
+    fn test_contains_ci_matches_naive_reference() {
+        let long_x = "x".repeat(64);
+        let cases: &[(&str, &str)] = &[
+            ("", ""),
+            ("", "x"),
+            ("x", ""),
+            ("hello world", "WORLD"),
+            ("hello world", "World"),
+            ("hello world", "hello"),
+            ("hello world", "d"), // needle at the very end
+            ("hello world", "h"), // needle at the very start
+            ("hi", "hello"),      // needle longer than haystack
+            ("select * from t", "SELECT"),
+            ("select * from t", "FROM"),
+            ("select * from t", "where"), // absent
+            ("SeLeCt Now() FROM t", "now("),
+            ("aaaaaaaaaaaaaaaaab", "aab"), // many false-start first-byte matches
+            ("AAAA", "aaaa"),
+            ("café latte", "LATTE"), // non-ASCII haystack, ASCII needle
+            ("café LATTE", "café"),  // non-ASCII needle: literal, not folded
+            ("CAFÉ latte", "café"),  // non-ASCII bytes never case-fold
+            ("for update", "FOR UPDATE"),
+            ("... FOR SHARE", "for share"),
+            (long_x.as_str(), "XX"),
+            ("mixed CaSe NeEdLe here", "needle"),
+        ];
+        for &(haystack, needle) in cases {
+            assert_eq!(
+                contains_ci(haystack, needle),
+                contains_ci_naive(haystack, needle),
+                "mismatch for haystack={haystack:?} needle={needle:?}"
+            );
+        }
+    }
+
+    /// Exhaustive small-alphabet fuzz: every haystack/needle pair built from a
+    /// tiny mixed-case alphabet is checked against the naive reference, to
+    /// catch off-by-one errors in the memchr2 skip-scan around window
+    /// boundaries that a hand-picked table might miss.
+    #[test]
+    fn test_contains_ci_exhaustive_small_alphabet() {
+        // All strings over `alphabet` up to `max_len`, INCLUDING every
+        // shorter prefix length (not just the longest) — so both "needle
+        // longer than remaining haystack" and "needle at every offset"
+        // shapes are exercised.
+        fn all_strings(alphabet: &[char], max_len: usize) -> Vec<String> {
+            let mut all = vec![String::new()];
+            let mut current = vec![String::new()];
+            for _ in 0..max_len {
+                let mut next = Vec::new();
+                for s in &current {
+                    for &c in alphabet {
+                        let mut t = s.clone();
+                        t.push(c);
+                        next.push(t);
+                    }
+                }
+                all.extend(next.iter().cloned());
+                current = next;
+            }
+            all
+        }
+        // 'é' is a deliberate non-ASCII (2-byte UTF-8) member: it must never
+        // case-fold against 'E'/'e', and it exercises memchr2's first-byte
+        // candidate selection on a non-ASCII lead byte.
+        let alphabet = ['a', 'A', 'b', 'z', 'é'];
+        let haystacks = all_strings(&alphabet, 5);
+        let needles = all_strings(&alphabet, 3);
+        for h in &haystacks {
+            for n in &needles {
+                assert_eq!(
+                    contains_ci(h, n),
+                    contains_ci_naive(h, n),
+                    "mismatch for haystack={h:?} needle={n:?}"
+                );
+            }
+        }
     }
 }
