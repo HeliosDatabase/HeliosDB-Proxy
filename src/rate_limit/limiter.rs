@@ -101,8 +101,8 @@ impl std::fmt::Display for LimiterKey {
 /// once and reused; the string half is an `Arc<str>` so the metrics map can
 /// take an owned copy on first sight of a key without re-formatting.
 ///
-/// Equality and hashing follow the key alone — the rendered string is derived
-/// state, never an independent identity.
+/// Equality follows the key alone — the rendered string is derived state,
+/// never an independent identity.
 #[derive(Debug, Clone)]
 pub struct CachedLimiterKey {
     key: LimiterKey,
@@ -112,7 +112,7 @@ pub struct CachedLimiterKey {
 impl CachedLimiterKey {
     /// Resolve a key and render its display string once.
     pub fn new(key: LimiterKey) -> Self {
-        let display: Arc<str> = Arc::from(key.to_string().as_str());
+        let display: Arc<str> = Arc::<str>::from(key.to_string());
         Self { key, display }
     }
 
@@ -531,15 +531,14 @@ impl RateLimiter {
     ) -> Result<(), TokenBucketExceeded> {
         // Hit path: look the bucket up with `get_mut`, which still takes the
         // DashMap shard *write* guard (unlike `get`, a read guard) — so the
-        // key is only cloned when a new bucket has to be inserted, but two
+        // key is only cloned when a new bucket has to be inserted, while two
         // threads racing on the same existing key still can't both be inside
-        // `try_acquire` at once. That mutual exclusion is load-bearing:
-        // `TokenBucket::refill` does a non-atomic load/store read-modify-write
-        // of the token count guarded only by a refill-vs-refill mutex, so two
-        // concurrent `try_acquire` calls on the same bucket (as `get`'s read
-        // guard would allow) can race a refill against a decrement and hand
-        // back tokens that were already spent — a lost-update that lets the
-        // limiter admit more than the configured QPS.
+        // `try_acquire` at once, exactly as `entry()` guaranteed before this
+        // optimization. Keeping that guarantee keeps decisions identical to
+        // the pre-optimization path; `TokenBucket::refill` is independently
+        // hardened (its token add is a compare-exchange loop, not a
+        // load/store) so the bucket is also sound for callers that reach it
+        // without this map's guard.
         if let Some(bucket) = self.token_buckets.get_mut(key) {
             return bucket.try_acquire(cost);
         }
@@ -898,10 +897,10 @@ mod tests {
     /// path (`check_token_bucket`'s `if let Some(bucket) = ...`) must take
     /// the DashMap shard *write* guard, exactly like `entry()` did on main,
     /// not a read guard. Two threads racing `get_mut` on the same key can
-    /// never both be inside the guard at once; a `get()` read guard would
-    /// let them, unmasking the lost-update race in `TokenBucket::refill`
-    /// (a non-atomic load/store of the token count, guarded only against
-    /// concurrent *refills* — not against a concurrent decrement).
+    /// never both be inside the guard at once; a `get()` read guard would let
+    /// them, which is what unmasked the lost-update race in
+    /// `TokenBucket::refill` (see the accounting test in `token_bucket.rs`,
+    /// which covers the same race from the other side).
     ///
     /// This drives the DashMap guard directly with a channel-synchronized
     /// hold, rather than a timing race, so it is deterministic and cannot be
@@ -970,20 +969,29 @@ mod tests {
     }
 
     /// End-to-end companion to the mutual-exclusion test above: many threads
-    /// hammer `try_acquire` on one already-created bucket concurrently, and
-    /// the total number of grants must never exceed what the burst capacity
-    /// plus legitimate elapsed-time refill could possibly allow. Under the
-    /// pre-fix `get()` read guard this bound is blown by a wide margin (the
-    /// lost-update race repeatedly hands back tokens that were already
-    /// spent); the slack below is generous enough to tolerate scheduling
-    /// jitter on a loaded host without masking that.
+    /// hammer the token-bucket check for one key concurrently, and the number
+    /// of grants must never exceed what the burst capacity plus legitimate
+    /// elapsed-time refill could possibly allow.
+    ///
+    /// This exercises the whole hit path (`get_mut` guard + `TokenBucket`),
+    /// and uses the same leak-maximizing shape as
+    /// `token_bucket::tests::test_concurrent_acquire_never_exceeds_capacity_plus_refill`
+    /// — a large burst drained by many threads against a slow refill — so it
+    /// fails on either half of the pre-fix code: the `get()` read guard, or
+    /// the load/store refill it unmasked.
     #[test]
     fn test_token_bucket_concurrent_hammering_never_exceeds_burst_plus_refill() {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::Barrier;
 
-        let qps: u32 = 2_000;
-        let burst: u32 = 1_000;
+        const N_THREADS: usize = 8;
+        let qps: u32 = 10;
+        let burst: u32 = 100_000;
+        let test_duration = Duration::from_millis(200);
+
+        // Taken before the bucket exists, so `elapsed` can never under-count
+        // the bucket's own epoch-relative refill window.
+        let start = Instant::now();
         let config = RateLimitConfig::builder()
             .default_qps(qps)
             .default_burst(burst)
@@ -991,16 +999,15 @@ mod tests {
         let limiter = RateLimiter::new(config);
         let key = LimiterKey::Global;
 
+        // Create the bucket through the one-time miss path so every threaded
+        // call below takes the hit path this fix changed.
         let cfg = limiter.config();
         limiter
             .check_token_bucket(&key, 0, PriorityLevel::Normal, &cfg)
             .unwrap();
 
-        const N_THREADS: usize = 16;
-        let test_duration = Duration::from_millis(150);
         let granted = AtomicU64::new(0);
         let barrier = Barrier::new(N_THREADS);
-        let start = Instant::now();
 
         std::thread::scope(|scope| {
             for _ in 0..N_THREADS {
@@ -1025,18 +1032,14 @@ mod tests {
 
         let elapsed = start.elapsed();
         let max_legitimate_refill = (elapsed.as_secs_f64() * qps as f64).ceil() as u64;
-        // Slack for scheduling jitter around the deadline check, not for the
-        // race itself: the race this guards against manufactures grants far
-        // in excess of this on a hammering workload.
-        let bound = burst as u64 + max_legitimate_refill + (burst as u64 / 4) + 50;
+        let bound = burst as u64 + max_legitimate_refill;
 
         let total_granted = granted.load(Ordering::Relaxed);
         assert!(
             total_granted <= bound,
             "granted {total_granted} tokens for burst={burst} + elapsed refill<={max_legitimate_refill} \
-             (bound {bound}) over {elapsed:?} — the token-bucket hit path is admitting more than \
-             the configured rate allows, consistent with the lost-update race a `get()` read guard \
-             would unmask"
+             (hard bound {bound}) over {elapsed:?} — the token-bucket hit path is admitting more \
+             than the configured rate allows"
         );
     }
 
