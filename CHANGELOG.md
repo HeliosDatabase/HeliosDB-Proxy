@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`FailoverController` history is now a bounded ring buffer, and entries are
+  closed out by id.** `history` was an unbounded `Vec` pushed on every failover
+  attempt and never trimmed, so repeated health flapping grew it without bound;
+  closing out a completed/failed attempt used `.last_mut()`, which could stamp
+  the wrong record when two failovers overlapped. History is now a `VecDeque`
+  capped at `FailoverConfig::max_history` (default 100, FIFO-evicted past
+  capacity), and completion looks the entry up by its `id: Uuid` instead of
+  assuming it's last. `FailoverConfig` is library-only (`FailoverController`
+  has no construction site in the daemon yet — `src/server.rs` runs its own
+  independent failover path); `max_history` is a library-API knob, not a
+  `proxy.toml` parameter. Library consumers note: `max_history` is a new public
+  field on `FailoverConfig`, so an exhaustive `FailoverConfig { .. }` literal
+  must either add it or fall back on `..Default::default()`.
+
 ### Added
 
 - **Criterion coverage for the relay / failover / pool-contention paths**
