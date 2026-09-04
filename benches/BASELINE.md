@@ -17,6 +17,151 @@ stay under 3%.
   candidate's CI does not overlap the baseline CI (Criterion's own change report says
   "regressed" / "improved" / "within noise").
 
+## 2026-09-04 — 1.6.0 post-release measurement (main `ce73809`, code = tag `v1.6.0`)
+
+Full-suite run of the released 1.6.0 (21 perf/stability fixes + F3 tr_mode failover) on this host —
+107 benches (15 added since the 2026-08-29 baseline, recorded here for the first time),
+`cargo bench --features all-features`, bounded (`systemd-run MemoryMax=24G`) under the fleet build
+lock, own target dir. **Gate 3 vs the 2026-08-29 baseline: 92/92 matched, mean median delta +1.59%
+(cumulative budget 3%) — PASS.** Host was noticeably busier than on 2026-08-29 (co-tenant Nano
+release gate ran back-to-back): the largest single swings are on code the batch did not touch
+(`routing/route/read_no_hints` +37%, `routing/route/read_with_hint` +37%, `pool/metrics/read_metrics`
++14% on a 5 ns bench) and the same runs show −22% / −30% on untouched siblings — variance, per the
+interpretation notes below. Localized, reproducible (main-vs-candidate back-to-back) deltas that ARE
+attributable: `journal/manager/begin_log_commit` +11–13% (O5 insertion-order index on the legacy
+3-call API; the daemon uses the new single-lock `begin_and_log`), legacy `pool/acquire_release/*`
++7–18% (S10 idle-checkout validation, `test_on_acquire`-gated, not the data-path pool),
+`pool_mode/txn_event_detect/start_txn` +78% (24→44 ns) on untouched `src/pool` code with
+`statement`/`savepoint` siblings −16%/−22% — codegen-layout shift under thin-LTO.
+This section is the reference for the next gate-3 comparison.
+
+### benches/pooling.rs  (17 benches)
+
+| Benchmark | Time [lower / median / upper] |
+|---|---|
+| pool/create/10 | 70.712 ns / 71.726 ns / 72.787 ns |
+| pool/create/50 | 71.214 ns / 72.403 ns / 73.689 ns |
+| pool/create/100 | 72.232 ns / 73.052 ns / 73.939 ns |
+| pool/create/500 | 71.302 ns / 71.838 ns / 72.460 ns |
+| pool/config/default | 3.9565 ns / 3.9879 ns / 4.0274 ns |
+| pool/config/custom | 3.8723 ns / 3.8861 ns / 3.8981 ns |
+| pool/acquire_release/single | 688.38 ns / 701.49 ns / 717.18 ns |
+| pool/throughput/sequential_acquire/1 | 803.82 ns / 831.52 ns / 861.87 ns |
+| pool/throughput/sequential_acquire/10 | 8.4934 µs / 8.7279 µs / 8.9847 µs |
+| pool/throughput/sequential_acquire/50 | 38.908 µs / 39.243 µs / 39.605 µs |
+| pool/acquire_release/contention/2 | 19.072 µs / 19.529 µs / 20.093 µs |
+| pool/acquire_release/contention/8 | 94.372 µs / 95.939 µs / 97.412 µs |
+| pool/acquire_release/contention/32 | 363.00 µs / 370.39 µs / 377.17 µs |
+| pool/node_endpoint/create | 729.12 ns / 733.62 ns / 738.18 ns |
+| pool/node_endpoint/address | 120.81 ns / 121.79 ns / 122.86 ns |
+| pool/node_endpoint/node_id | 737.19 ns / 743.21 ns / 749.42 ns |
+| pool/metrics/read_metrics | 5.6832 ns / 5.9179 ns / 6.1470 ns |
+
+### benches/protocol.rs  (21 benches)
+
+| Benchmark | Time [lower / median / upper] |
+|---|---|
+| protocol/decode_message/short_select | 62.758 ns / 63.410 ns / 64.230 ns |
+| protocol/decode_message/medium_where | 68.615 ns / 70.059 ns / 71.433 ns |
+| protocol/decode_message/kilobyte_in_list | 124.66 ns / 125.77 ns / 127.17 ns |
+| protocol/encode_message/short_select | 22.014 ns / 22.214 ns / 22.435 ns |
+| protocol/encode_message/medium_where | 23.518 ns / 23.752 ns / 24.042 ns |
+| protocol/encode_message/kilobyte_in_list | 87.044 ns / 88.547 ns / 90.114 ns |
+| protocol/query_text/short_select | 11.575 ns / 11.635 ns / 11.707 ns |
+| protocol/query_text/medium_where | 43.419 ns / 43.921 ns / 44.425 ns |
+| protocol/query_text/kilobyte_in_list | 350.90 ns / 355.19 ns / 360.29 ns |
+| protocol/decode_startup/startup_params | 836.72 ns / 844.19 ns / 852.53 ns |
+| protocol/decode_startup/ssl_request | 26.461 ns / 26.994 ns / 27.610 ns |
+| protocol/decode_startup/cancel_request | 44.262 ns / 44.781 ns / 45.368 ns |
+| protocol/extended_parse/parse_message | 164.56 ns / 166.13 ns / 167.90 ns |
+| protocol/extended_parse/bind_message | 215.65 ns / 217.85 ns / 220.37 ns |
+| protocol/backend_response/error_response | 499.21 ns / 506.01 ns / 513.90 ns |
+| protocol/backend_response/command_complete | 134.55 ns / 135.57 ns / 136.75 ns |
+| protocol/backend_response/auth_sasl | 147.82 ns / 150.20 ns / 152.97 ns |
+| protocol/backend_response/auth_md5 | 41.888 ns / 42.262 ns / 42.643 ns |
+| protocol/tag_dispatch/from_tag | 13.076 ns / 13.273 ns / 13.505 ns |
+| protocol/tag_dispatch/starts_with_ci | 5.1950 ns / 5.2459 ns / 5.2999 ns |
+| protocol/tag_dispatch/contains_ci | 20.859 ns / 21.266 ns / 21.695 ns |
+
+### benches/relay.rs  (50 benches)
+
+| Benchmark | Time [lower / median / upper] |
+|---|---|
+| switchover/buffer_query/enqueue_one | 251.53 ns / 259.69 ns / 268.23 ns |
+| switchover/drain/1 | 407.73 ns / 419.45 ns / 429.59 ns |
+| switchover/drain/16 | 1.9262 µs / 1.9399 µs / 1.9548 µs |
+| switchover/drain/64 | 6.5023 µs / 6.5694 µs / 6.6434 µs |
+| journal/statement_type/select | 23.631 ns / 24.134 ns / 24.655 ns |
+| journal/statement_type/insert | 25.698 ns / 25.972 ns / 26.292 ns |
+| journal/statement_type/update | 29.866 ns / 30.322 ns / 30.817 ns |
+| journal/statement_type/delete | 32.845 ns / 33.045 ns / 33.275 ns |
+| journal/statement_type/ddl | 34.599 ns / 34.959 ns / 35.359 ns |
+| journal/statement_type/txn | 23.698 ns / 23.865 ns / 24.059 ns |
+| journal/statement_type/set | 32.397 ns / 32.764 ns / 33.278 ns |
+| journal/statement_type/other | 32.445 ns / 32.717 ns / 33.045 ns |
+| journal/total_size/1 | 6.1654 ns / 6.1890 ns / 6.2172 ns |
+| journal/total_size/16 | 102.13 ns / 102.79 ns / 103.59 ns |
+| journal/total_size/128 | 763.17 ns / 769.66 ns / 777.46 ns |
+| journal/add_entry/push | 120.47 ns / 122.24 ns / 124.31 ns |
+| journal/rollback_to_savepoint/16 | 1.3574 µs / 1.4048 µs / 1.4470 µs |
+| journal/rollback_to_savepoint/128 | 7.9521 µs / 8.1095 µs / 8.2560 µs |
+| journal/manager/begin_log_commit | 481.11 ns / 485.60 ns / 490.83 ns |
+| journal/manager_contention/2 | 12.971 µs / 13.465 µs / 13.975 µs |
+| journal/manager_contention/8 | 26.169 µs / 26.753 µs / 27.283 µs |
+| journal/manager_contention/32 | 112.09 µs / 115.97 µs / 120.41 µs |
+| journal/entries_in_window/scan_500 | 47.185 µs / 47.814 µs / 48.610 µs |
+| pool_mode/txn_event_detect/begin | 8.6681 ns / 8.7492 ns / 8.8553 ns |
+| pool_mode/txn_event_detect/start_txn | 43.709 ns / 44.284 ns / 44.954 ns |
+| pool_mode/txn_event_detect/commit | 11.349 ns / 11.386 ns / 11.430 ns |
+| pool_mode/txn_event_detect/rollback | 18.305 ns / 18.632 ns / 19.013 ns |
+| pool_mode/txn_event_detect/rollback_to | 23.451 ns / 23.630 ns / 23.870 ns |
+| pool_mode/txn_event_detect/savepoint | 14.562 ns / 14.712 ns / 14.902 ns |
+| pool_mode/txn_event_detect/release | 15.148 ns / 15.332 ns / 15.541 ns |
+| pool_mode/txn_event_detect/statement | 14.554 ns / 14.919 ns / 15.241 ns |
+| pool_mode/pool_key | 157.52 ns / 159.07 ns / 161.01 ns |
+| pool_mode/statement_safety/is_safe/safe_select | 40.150 ns / 40.829 ns / 41.509 ns |
+| pool_mode/statement_safety/warning/safe_select | 36.634 ns / 36.969 ns / 37.408 ns |
+| pool_mode/statement_safety/is_safe/unsafe_listen | 27.053 ns / 27.877 ns / 28.761 ns |
+| pool_mode/statement_safety/warning/unsafe_listen | 25.487 ns / 25.630 ns / 25.825 ns |
+| pool_mode/statement_safety/is_safe/unsafe_prepare | 26.615 ns / 26.895 ns / 27.187 ns |
+| pool_mode/statement_safety/warning/unsafe_prepare | 27.387 ns / 27.749 ns / 28.207 ns |
+| pool_mode/statement_safety/is_safe/unsafe_set | 155.16 ns / 158.28 ns / 161.13 ns |
+| pool_mode/statement_safety/warning/unsafe_set | 143.43 ns / 144.31 ns / 145.40 ns |
+| pool_mode/statement_safety/is_safe/safe_set_local | 106.95 ns / 108.14 ns / 109.55 ns |
+| pool_mode/statement_safety/warning/safe_set_local | 102.12 ns / 103.44 ns / 105.09 ns |
+| pool_mode/prepared_parse/prepare/named | 119.38 ns / 120.24 ns / 121.11 ns |
+| pool_mode/prepared_parse/prepare/typed | 222.62 ns / 225.32 ns / 228.55 ns |
+| pool_mode/prepared_parse/deallocate/named | 61.475 ns / 62.005 ns / 62.653 ns |
+| pool_mode/prepared_parse/deallocate/all | 54.207 ns / 55.351 ns / 56.651 ns |
+| pool_mode/manager_acquire_release/2 | 19.233 µs / 19.675 µs / 20.081 µs |
+| pool_mode/manager_acquire_release/8 | 49.402 µs / 49.879 µs / 50.420 µs |
+| pool_mode/manager_acquire_release/32 | 182.92 µs / 185.68 µs / 189.04 µs |
+| pool_mode/on_statement_complete/txn_sequence | 284.16 ns / 287.04 ns / 290.59 ns |
+
+### benches/routing.rs  (19 benches)
+
+| Benchmark | Time [lower / median / upper] |
+|---|---|
+| routing/hint_parse/no_hints | 95.451 ns / 96.709 ns / 98.094 ns |
+| routing/hint_parse/single_hint | 865.45 ns / 882.61 ns / 902.92 ns |
+| routing/hint_parse/multiple_hints | 3.4120 µs / 3.4365 µs / 3.4630 µs |
+| routing/hint_parse/complex_query | 1.9430 µs / 1.9745 µs / 2.0098 µs |
+| routing/hint_strip/no_hints | 76.252 ns / 77.242 ns / 78.479 ns |
+| routing/hint_strip/single_hint | 252.56 ns / 257.06 ns / 262.21 ns |
+| routing/hint_strip/two_hints | 351.99 ns / 359.59 ns / 368.58 ns |
+| routing/write_detect/select | 51.517 ns / 51.928 ns / 52.390 ns |
+| routing/write_detect/insert | 50.490 ns / 50.760 ns / 51.145 ns |
+| routing/write_detect/update | 58.031 ns / 58.353 ns / 58.682 ns |
+| routing/write_detect/delete | 58.417 ns / 58.677 ns / 59.023 ns |
+| routing/write_detect/begin | 48.284 ns / 48.492 ns / 48.693 ns |
+| routing/write_detect/create_table | 51.363 ns / 51.566 ns / 51.811 ns |
+| routing/write_detect/with_cte | 53.119 ns / 53.376 ns / 53.637 ns |
+| routing/route/read_no_hints | 2.4895 µs / 2.6418 µs / 2.7761 µs |
+| routing/route/read_with_hint | 2.7294 µs / 2.7992 µs / 2.8725 µs |
+| routing/route/write | 2.2714 µs / 2.3551 µs / 2.4344 µs |
+| routing/route/complex_hints | 4.3332 µs / 4.4416 µs / 4.5497 µs |
+| routing/node_select/batch_parse | 340.13 µs / 344.67 µs / 349.82 µs |
+
 ## 2026-08-29 — full-suite re-baseline (current tip `a6b47d1`)
 
 Recorded per CLAUDE.md quality gate 3 at commit `a6b47d1` (main tip), host **gpc001ca**, `--features all-features`, fleet-locked + 24 GiB-bounded (same command as the header). Toolchain rustc/cargo **1.95.0**. This supersedes the 2026-07-15 numbers as the active baseline.
