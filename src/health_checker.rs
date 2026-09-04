@@ -5,10 +5,13 @@
 
 use super::{NodeEndpoint, NodeId, Result};
 use crate::backend::{BackendClient, BackendConfig};
-use std::collections::HashMap;
+use parking_lot::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
+use tokio::task::{JoinHandle, JoinSet};
 
 /// Health checker configuration
 #[derive(Debug, Clone)]
@@ -63,6 +66,10 @@ pub struct NodeHealth {
     pub total_checks: u64,
     /// Total failures
     pub total_failures: u64,
+    /// Ticks skipped for this node because the previous probe was still
+    /// running (the per-node share of the `health_probe_skipped_inflight`
+    /// counter).
+    pub probes_skipped_inflight: u64,
 }
 
 impl NodeHealth {
@@ -78,7 +85,39 @@ impl NodeHealth {
             avg_response_ms: 0.0,
             total_checks: 0,
             total_failures: 0,
+            probes_skipped_inflight: 0,
         }
+    }
+}
+
+/// RAII marker for "a probe for this node is currently running".
+///
+/// Acquired synchronously on the checker loop *before* the probe task is
+/// spawned and moved into that task, so the slot is released when the probe
+/// finishes, panics, or is aborted by [`HealthChecker::stop`] (abort drops the
+/// task's locals, which runs this `Drop`).
+struct InFlightGuard {
+    node_id: NodeId,
+    set: Arc<Mutex<HashSet<NodeId>>>,
+}
+
+impl InFlightGuard {
+    /// Returns `None` when a probe for `node_id` is already in flight.
+    fn try_acquire(set: &Arc<Mutex<HashSet<NodeId>>>, node_id: NodeId) -> Option<Self> {
+        if set.lock().insert(node_id) {
+            Some(Self {
+                node_id,
+                set: set.clone(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.set.lock().remove(&self.node_id);
     }
 }
 
@@ -115,6 +154,23 @@ pub struct HealthChecker {
     /// — useful for unit tests and for construction-time scenarios
     /// where the caller does not yet have backend credentials.
     backend_template: Option<BackendConfig>,
+    /// Nodes with a probe still running. A tick that finds a node here skips
+    /// it instead of stacking a second probe: with
+    /// `check_timeout >= check_interval` (both configurable) a hung backend
+    /// would otherwise collect one extra detached task — and one extra fresh
+    /// connection — per tick, i.e. a reconnection storm against a backend that
+    /// is already struggling.
+    in_flight: Arc<Mutex<HashSet<NodeId>>>,
+    /// `health_probe_skipped_inflight`: total ticks skipped by the guard
+    /// above. Exposed via [`HealthChecker::health_probe_skipped_inflight`] and,
+    /// per node, via [`NodeHealth::probes_skipped_inflight`].
+    skipped_inflight: Arc<AtomicU64>,
+    /// Shutdown signal for the probe loop. Dropping the sender (i.e. dropping
+    /// the checker) also stops the loop.
+    shutdown_tx: Mutex<Option<watch::Sender<bool>>>,
+    /// Handle to the probe loop task. The loop owns the `JoinSet` of in-flight
+    /// probes, so aborting this handle aborts every probe with it.
+    probe_loop: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl HealthChecker {
@@ -130,6 +186,10 @@ impl HealthChecker {
             event_rx: Some(event_rx),
             running: Arc::new(RwLock::new(false)),
             backend_template: None,
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
+            skipped_inflight: Arc::new(AtomicU64::new(0)),
+            shutdown_tx: Mutex::new(None),
+            probe_loop: Mutex::new(None),
         }
     }
 
@@ -187,16 +247,50 @@ impl HealthChecker {
         let event_tx = self.event_tx.clone();
         let running = self.running.clone();
         let backend_template = self.backend_template.clone();
+        let in_flight = self.in_flight.clone();
+        let skipped_inflight = self.skipped_inflight.clone();
 
-        tokio::spawn(async move {
+        // A timeout at least as long as the interval means a hung node cannot
+        // be re-probed every tick; those ticks are skipped (and counted as
+        // `health_probe_skipped_inflight`) instead. Warn rather than reject --
+        // existing deployments may legitimately run this way.
+        if config.check_timeout >= config.check_interval {
+            tracing::warn!(
+                check_timeout_ms = config.check_timeout.as_millis() as u64,
+                check_interval_ms = config.check_interval.as_millis() as u64,
+                "health check_timeout >= check_interval: probes for a slow node will skip ticks (health_probe_skipped_inflight) instead of stacking"
+            );
+        }
+
+        // Fresh shutdown channel per start() so a previously stopped checker
+        // can be restarted without inheriting a stale signal.
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        *self.shutdown_tx.lock() = Some(shutdown_tx);
+
+        let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(config.check_interval);
+            // Owning the probe tasks (instead of detaching them) is what makes
+            // stop() able to abort probes that are still in flight: dropping
+            // this JoinSet -- which happens when this task is aborted -- aborts
+            // every probe it holds.
+            let mut probes: JoinSet<()> = JoinSet::new();
 
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    // stop() fired, or the checker (and with it the sender) was
+                    // dropped. Either way, leave now rather than at the next
+                    // tick -- with a long check_interval that could be minutes.
+                    _ = shutdown_rx.changed() => break,
+                }
 
                 if !*running.read().await {
                     break;
                 }
+
+                // Reap finished probes so the JoinSet does not grow over a long
+                // uptime (their in-flight slots are already released by Drop).
+                while probes.try_join_next().is_some() {}
 
                 // Snapshot (node_id, endpoint) pairs under a short read
                 // lock so the spawned tasks don't race on the map.
@@ -208,12 +302,36 @@ impl HealthChecker {
                     .collect();
 
                 for (node_id, endpoint) in snapshot {
+                    // Acquire the per-node slot synchronously, before spawning,
+                    // so the decision is exact for this tick.
+                    let guard = match InFlightGuard::try_acquire(&in_flight, node_id) {
+                        Some(guard) => guard,
+                        None => {
+                            // Previous probe still running: skip this tick for
+                            // this node. Opening another connection to a node
+                            // that is already not answering only adds to the
+                            // pile-up.
+                            skipped_inflight.fetch_add(1, Ordering::Relaxed);
+                            if let Some(node_health) = health.write().await.get_mut(&node_id) {
+                                node_health.probes_skipped_inflight += 1;
+                            }
+                            tracing::debug!(
+                                node_id = ?node_id,
+                                "health_probe_skipped_inflight: probe still in flight, skipping tick"
+                            );
+                            continue;
+                        }
+                    };
+
                     let config = config.clone();
                     let health = health.clone();
                     let event_tx = event_tx.clone();
                     let template = backend_template.clone();
 
-                    tokio::spawn(async move {
+                    probes.spawn(async move {
+                        // Released when this probe ends -- including on abort,
+                        // which drops the task's locals.
+                        let _in_flight = guard;
                         Self::check_node_health(
                             node_id,
                             Some(endpoint),
@@ -227,17 +345,51 @@ impl HealthChecker {
                 }
             }
 
+            // Cooperative exit: abort and reap whatever is still probing.
+            probes.shutdown().await;
             tracing::info!("Health checker stopped");
         });
+
+        *self.probe_loop.lock() = Some(handle);
 
         tracing::info!("Health checker started");
         Ok(())
     }
 
-    /// Stop health checking
+    /// Stop health checking.
+    ///
+    /// Takes effect immediately. The loop is woken through its shutdown
+    /// channel, and its task handle is aborted so that in-flight probes (owned
+    /// by the loop's `JoinSet`) are aborted with it. Previously this only
+    /// cleared a flag that the loop noticed on its *next* `interval.tick()`,
+    /// leaving the loop and any hung probe alive for up to a full interval.
     pub async fn stop(&self) -> Result<()> {
         *self.running.write().await = false;
+        if let Some(tx) = self.shutdown_tx.lock().take() {
+            let _ = tx.send(true);
+        }
+        // The handle is left in place (not taken) so a repeated stop() is a
+        // harmless no-op and callers can still observe completion.
+        if let Some(handle) = self.probe_loop.lock().as_ref() {
+            handle.abort();
+        }
+        tracing::info!("Health checker stopped");
         Ok(())
+    }
+
+    /// `health_probe_skipped_inflight` -- total health-check ticks skipped
+    /// because a probe for that node was still running. A steadily rising
+    /// value means at least one backend is answering slower than
+    /// `check_interval`. Per-node counts live in
+    /// [`NodeHealth::probes_skipped_inflight`], which is part of the
+    /// `get_health` / `all_health` output.
+    pub fn health_probe_skipped_inflight(&self) -> u64 {
+        self.skipped_inflight.load(Ordering::Relaxed)
+    }
+
+    /// Number of nodes with a health probe currently in flight.
+    pub fn in_flight_probes(&self) -> usize {
+        self.in_flight.lock().len()
     }
 
     /// Check a single node's health
@@ -391,7 +543,12 @@ impl HealthChecker {
             .count()
     }
 
-    /// Force a health check for a specific node
+    /// Force a health check for a specific node.
+    ///
+    /// Deliberately bypasses the periodic loop's in-flight guard: this is an
+    /// explicit operator/caller-driven probe and it runs inline (awaited by the
+    /// caller) rather than being spawned, so it cannot pile up the way detached
+    /// per-tick probes could.
     pub async fn force_check(&self, node_id: &NodeId) -> Result<()> {
         let config = self.config.clone();
         let health = self.health.clone();
@@ -556,6 +713,211 @@ mod tests {
             msg.contains("connect") || msg.contains("exceeded"),
             "unexpected error message: {}",
             msg
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // In-flight probe guard + prompt shutdown
+    // ---------------------------------------------------------------------
+
+    fn hanging_template(timeout: Duration) -> BackendConfig {
+        use crate::backend::{tls::default_client_config, TlsMode};
+        BackendConfig {
+            host: "placeholder".into(),
+            port: 0,
+            user: "postgres".into(),
+            password: None,
+            database: None,
+            application_name: Some("helios-health-check".into()),
+            tls_mode: TlsMode::Disable,
+            connect_timeout: timeout,
+            query_timeout: timeout,
+            tls_config: default_client_config(),
+        }
+    }
+
+    /// Fake backend that accepts connections and never answers the startup
+    /// message, so every probe against it blocks for the whole
+    /// `check_timeout`. Returns the bound address plus a count of accepted
+    /// connections — i.e. of probes actually spawned.
+    async fn spawn_hanging_backend() -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>)
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            // Hold each socket open: closing it would fail the probe fast and
+            // release its in-flight slot, defeating the point of the fixture.
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(sock);
+            }
+        });
+        (addr, accepted)
+    }
+
+    /// A probe that is still running must not be spawned again on the next
+    /// tick. Before the in-flight guard, `check_timeout >= check_interval`
+    /// meant one extra detached task — and one extra backend connection — per
+    /// tick against a hung node (a reconnection storm); this test counts the
+    /// connections the node actually receives.
+    #[tokio::test]
+    async fn test_inflight_guard_skips_ticks_instead_of_stacking_probes() {
+        let (addr, accepted) = spawn_hanging_backend().await;
+
+        let config = HealthConfig {
+            check_interval: Duration::from_millis(50),
+            // Deliberately >= interval — the pathological-but-legal config.
+            check_timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let mut checker = HealthChecker::new(config)
+            .with_backend_template(hanging_template(Duration::from_secs(30)));
+        let endpoint = NodeEndpoint::new(addr.ip().to_string(), addr.port());
+        let node_id = endpoint.id;
+        checker.add_node(endpoint);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        checker.start().await.unwrap();
+        // ~10 ticks at 50ms.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "hung node must be probed exactly once while that probe is in flight"
+        );
+        assert_eq!(checker.in_flight_probes(), 1);
+        assert!(
+            checker.health_probe_skipped_inflight() >= 2,
+            "expected skipped ticks to be counted, got {}",
+            checker.health_probe_skipped_inflight()
+        );
+
+        let health = checker.get_health(&node_id).await.unwrap();
+        assert!(
+            health.probes_skipped_inflight >= 2,
+            "per-node skip counter not surfaced in health output: {}",
+            health.probes_skipped_inflight
+        );
+        assert_eq!(
+            health.total_checks, 0,
+            "a skipped tick must not be recorded as a completed check"
+        );
+
+        checker.stop().await.unwrap();
+    }
+
+    /// `stop()` must take effect immediately — both for the loop task and for
+    /// probes still in flight. Previously it only cleared a flag that the loop
+    /// read on its next tick, so with a 30s interval the loop (and the hung
+    /// probe's backend connection) lived on for up to 30s after shutdown.
+    #[tokio::test]
+    async fn test_stop_aborts_inflight_probe_and_loop_immediately() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (eof_tx, eof_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            // Never answer. The only way this loop sees EOF is the probe task
+            // being dropped, i.e. aborted.
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            let _ = eof_tx.send(());
+        });
+
+        let config = HealthConfig {
+            check_interval: Duration::from_secs(30),
+            check_timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let mut checker = HealthChecker::new(config)
+            .with_backend_template(hanging_template(Duration::from_secs(30)));
+        checker.add_node(NodeEndpoint::new(addr.ip().to_string(), addr.port()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        checker.start().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            checker.in_flight_probes(),
+            1,
+            "probe should still be hanging on the fake backend"
+        );
+
+        checker.stop().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), eof_rx)
+            .await
+            .expect("stop() did not abort the in-flight probe within 2s")
+            .expect("fake backend task died");
+
+        let loop_finished = {
+            let guard = checker.probe_loop.lock();
+            guard.as_ref().unwrap().is_finished()
+        };
+        assert!(
+            loop_finished,
+            "probe loop still alive after stop() (it used to wait for the next tick)"
+        );
+        assert_eq!(
+            checker.in_flight_probes(),
+            0,
+            "in-flight slot must be released when the probe is aborted"
+        );
+    }
+
+    /// The guard is per node: a node whose probe is hung must not block probes
+    /// for the other nodes.
+    #[tokio::test]
+    async fn test_inflight_guard_is_per_node() {
+        let (slow_addr, slow_accepted) = spawn_hanging_backend().await;
+
+        let config = HealthConfig {
+            check_interval: Duration::from_millis(50),
+            check_timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let mut checker = HealthChecker::new(config)
+            .with_backend_template(hanging_template(Duration::from_secs(30)));
+
+        checker.add_node(NodeEndpoint::new(
+            slow_addr.ip().to_string(),
+            slow_addr.port(),
+        ));
+        // 127.0.0.1:1 — refused immediately, so this node's probe always
+        // finishes inside a tick and is free to run again next tick.
+        let fast = NodeEndpoint::new("127.0.0.1", 1);
+        let fast_id = fast.id;
+        checker.add_node(fast);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        checker.start().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        checker.stop().await.unwrap();
+
+        assert_eq!(
+            slow_accepted.load(Ordering::SeqCst),
+            1,
+            "hung node must not be re-probed"
+        );
+        let fast_health = checker.get_health(&fast_id).await.unwrap();
+        assert!(
+            fast_health.total_checks >= 2,
+            "fast node was starved by the hung node: {} checks",
+            fast_health.total_checks
+        );
+        assert_eq!(
+            fast_health.probes_skipped_inflight, 0,
+            "fast node should never be skipped"
         );
     }
 
