@@ -9608,7 +9608,7 @@ mod tests {
             sock,
             peer,
             state.clone(),
-            config.clone(),
+            Arc::new(config.clone()),
             shutdown_tx.clone(),
         ));
         client.write_all(&startup_bytes("alice")).await.unwrap();
@@ -9633,7 +9633,7 @@ mod tests {
             sock,
             peer,
             state.clone(),
-            config.clone(),
+            Arc::new(config.clone()),
             shutdown_tx.clone(),
         ));
         client.write_all(&cancel_bytes(42, 43)).await.unwrap();

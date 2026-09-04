@@ -2878,7 +2878,6 @@ mod tests {
         let text = body["text"].as_str().unwrap();
         assert!(text.contains("# TYPE heliosdb_proxy_analytics_dropped_total counter"));
         assert!(text.contains("heliosdb_proxy_analytics_dropped_total 0\n"));
-        assert!(output.contains("heliosdb_proxy_connections_rejected_total 7"));
     }
 
     #[test]

@@ -161,12 +161,6 @@ impl QueryFingerprinter {
         self.cache.len()
     }
 
-    /// Compute a fingerprint, bypassing the memo.
-    fn compute_fingerprint(&self, query: &str) -> QueryFingerprint {
-        let lower = ascii_lower(query);
-        self.compute_fingerprint_lower(query, &lower)
-    }
-
     /// Compute a fingerprint from the statement and its ASCII-folded copy.
     ///
     /// ONE case conversion is shared between table extraction, operation
