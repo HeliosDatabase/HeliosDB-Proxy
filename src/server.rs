@@ -150,6 +150,30 @@ fn anomaly_fingerprint(sql: &str) -> String {
     out.trim_end().to_string()
 }
 
+/// Validate a backend-declared frame length against the configured cap
+/// before it is used to size a read/accumulation buffer.
+///
+/// The backend auth-phase scanners (`proxy_authentication`,
+/// `complete_backend_auth`) hand-parse the raw wire header — `len` is the
+/// 4-byte big-endian length field straight off a byte a hostile or
+/// compromised backend controls. Without this check a declared
+/// `len = 0xFFFFFFFF` makes the scanner wait for ~4 GiB to accumulate in
+/// `backend_buffer`/`buffer` before ever reaching `ProtocolCodec`, which
+/// enforces its own `max_message_size` only on the already-decoded path.
+/// `max` is `state.limits.max_pending_bytes` — the same configured cap the
+/// client-facing buffers in this file already use to bound frame/pending
+/// accumulation (see the `max_pending_bytes` checks above in the data
+/// path), reused here rather than inventing a second size limit.
+fn validate_backend_frame_len(len: usize, max: usize) -> Result<()> {
+    if len > max {
+        return Err(ProxyError::Protocol(format!(
+            "backend frame length {} exceeds max {}",
+            len, max
+        )));
+    }
+    Ok(())
+}
+
 /// Operational limits/timeouts resolved once at startup from the `[limits]`
 /// TOML section ([`crate::config::LimitsToml`]). The `*_secs` config keys are
 /// converted to [`Duration`] here (at construction, not per-use) so the hot
@@ -3024,7 +3048,11 @@ impl ProxyServer {
                             backend_buffer[3],
                             backend_buffer[4],
                         ]) as usize;
-                        if len < 4 || backend_buffer.len() < len + 1 {
+                        if len < 4 {
+                            break;
+                        }
+                        validate_backend_frame_len(len, state.limits.max_pending_bytes)?;
+                        if backend_buffer.len() < len + 1 {
                             break;
                         }
                         let tag = backend_buffer[0];
@@ -3162,7 +3190,7 @@ impl ProxyServer {
         target: &str,
         session: &Arc<ClientSession>,
         config: &ProxyConfig,
-        _state: &Arc<ServerState>,
+        state: &Arc<ServerState>,
     ) -> Result<()> {
         if conns.contains_key(target) {
             return Ok(());
@@ -3173,7 +3201,7 @@ impl ProxyServer {
         // The parked connection was `DISCARD ALL`-reset on release, so it is
         // clean for this (same-identity) client.
         #[cfg(feature = "pool-modes")]
-        if let Some(pool) = _state.backend_pool.as_ref() {
+        if let Some(pool) = state.backend_pool.as_ref() {
             let key = Self::pool_key_for(target, session).await;
             if let Some(stream) = pool.checkout(&key) {
                 tracing::info!(
@@ -3201,9 +3229,9 @@ impl ProxyServer {
             .write_all(&startup)
             .await
             .map_err(|e| ProxyError::Network(format!("Backend startup error: {}", e)))?;
-        Self::complete_backend_auth(&mut backend).await?;
+        Self::complete_backend_auth(&mut backend, state.limits.max_pending_bytes).await?;
         #[cfg(feature = "pool-modes")]
-        if _state.backend_pool.is_some() {
+        if state.backend_pool.is_some() {
             tracing::debug!(target: "helios::pool", node = %target, "dialed fresh backend connection (pool miss)");
         }
         tracing::debug!(node = %target, "opened backend connection");
@@ -5338,8 +5366,10 @@ impl ProxyServer {
     }
 
     /// Complete backend authentication by reading until ReadyForQuery
-    /// This is used when switching backends - we don't forward auth to client
-    async fn complete_backend_auth(backend: &mut TcpStream) -> Result<()> {
+    /// This is used when switching backends - we don't forward auth to client.
+    /// `max_frame_len` bounds a single declared backend frame length (reuses
+    /// `state.limits.max_pending_bytes`; see [`validate_backend_frame_len`]).
+    async fn complete_backend_auth(backend: &mut TcpStream, max_frame_len: usize) -> Result<()> {
         let mut buffer = BytesMut::with_capacity(4096);
         let timeout = Duration::from_secs(10);
         let start = std::time::Instant::now();
@@ -5374,7 +5404,11 @@ impl ProxyServer {
                     break;
                 }
                 let len = u32::from_be_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]) as usize;
-                if len < 4 || buffer.len() < len + 1 {
+                if len < 4 {
+                    break;
+                }
+                validate_backend_frame_len(len, max_frame_len)?;
+                if buffer.len() < len + 1 {
                     break;
                 }
                 let tag = buffer[0];
@@ -7937,5 +7971,46 @@ mod tests {
         let k_latin1 = ProxyServer::pool_key_for("n:5432", &latin1).await;
         assert_ne!(k_utf8, k_latin1, "different client_encoding must not share");
         assert_ne!(k_utf8, k_plain, "GUC-bearing key must differ from bare key");
+    }
+
+    /// A declared backend frame length within the cap is accepted — this
+    /// must keep passing for every legitimate frame the auth-phase scanners
+    /// see today (S5-backend-auth-frame-cap).
+    #[test]
+    fn test_validate_backend_frame_len_within_cap_ok() {
+        assert!(validate_backend_frame_len(4, 1024).is_ok());
+        assert!(validate_backend_frame_len(1024, 1024).is_ok());
+    }
+
+    /// A hostile/compromised backend declaring a length far past the
+    /// configured cap (e.g. len=0xFFFFFFFF, which would otherwise grow the
+    /// scanner's accumulation buffer toward 4 GiB) must be rejected instead
+    /// of silently accepted. This is the regression case for
+    /// S5-backend-auth-frame-cap: on the old code (no comparison against any
+    /// cap at all) this assertion fails because there was no length check to
+    /// call.
+    #[test]
+    fn test_validate_backend_frame_len_exceeds_cap_rejected() {
+        let err = validate_backend_frame_len(0xFFFF_FFFF, 1024)
+            .expect_err("oversized backend frame length must be rejected");
+        assert!(matches!(err, ProxyError::Protocol(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("4294967295"),
+            "message should name the offending length: {msg}"
+        );
+        assert!(
+            msg.contains("1024"),
+            "message should name the configured max: {msg}"
+        );
+    }
+
+    /// Boundary: exactly at the cap is still allowed (only strictly-greater
+    /// is rejected), matching the `len > max_message_size` boundary
+    /// `ProtocolCodec` already uses on the decoded path.
+    #[test]
+    fn test_validate_backend_frame_len_boundary() {
+        assert!(validate_backend_frame_len(1024, 1024).is_ok());
+        assert!(validate_backend_frame_len(1025, 1024).is_err());
     }
 }
