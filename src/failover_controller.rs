@@ -20,7 +20,17 @@ use super::failover_replay::{FailoverReplay, ReplayConfig, ReplayResult};
 use super::transaction_journal::TransactionJournal;
 
 /// Failover configuration
+///
+/// Library-only: `FailoverController` has no construction site in the
+/// `heliosdb-proxy` daemon today (`src/server.rs` runs its own independent
+/// primary-selection/health-tracking failover path and never builds one of
+/// these) — this type and its fields are reachable only through the library
+/// API, not through `proxy.toml`. Marked `#[non_exhaustive]` so adding a
+/// field like `max_history` here cannot again be a breaking change for an
+/// exhaustive struct literal in a downstream crate (or in this repo's own
+/// tests — see CHANGELOG).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FailoverConfig {
     /// Time to wait before initiating failover
     pub detection_time: Duration,
@@ -39,15 +49,13 @@ pub struct FailoverConfig {
     /// Maximum number of entries retained in the failover history ring
     /// buffer. Past this cap, the oldest entry is dropped as a new one is
     /// pushed — prevents unbounded growth under repeated health flapping.
-    /// Mirrors `proxy.toml`'s `[limits] failover_history_max` (default 100).
-    /// Must be > 0; a 0 is clamped up to 1 rather than rejected, since this
-    /// struct has no fallible `validate()` of its own.
+    /// Library-only knob (see struct docs above) — there is no `proxy.toml`
+    /// equivalent. Must be > 0; a 0 is clamped up to 1 rather than rejected,
+    /// since this struct has no fallible `validate()` of its own.
     pub max_history: usize,
 }
 
-/// Default cap on the failover history ring buffer. Matches
-/// `config::default_failover_history_max` in `proxy.toml`'s `[limits]`
-/// section.
+/// Default cap on the failover history ring buffer.
 pub const DEFAULT_MAX_HISTORY: usize = 100;
 
 impl Default for FailoverConfig {
@@ -165,10 +173,8 @@ pub struct FailoverController {
     /// Failover count
     failover_count: AtomicU64,
     /// Failover history (bounded ring buffer; oldest entries are dropped
-    /// past `max_history`)
+    /// past `config.max_history`, which `new()` normalises to be >= 1)
     history: Arc<RwLock<VecDeque<FailoverHistoryEntry>>>,
-    /// Effective cap on `history` (`config.max_history`, floored at 1)
-    max_history: usize,
     /// Optional backend-connection template. Host/port are swapped to
     /// a candidate's endpoint when running `pg_promote()` or polling
     /// `pg_last_wal_replay_lsn()`. When `None`, all backend-talking
@@ -179,13 +185,15 @@ pub struct FailoverController {
 
 impl FailoverController {
     /// Create a new failover controller
-    pub fn new(config: FailoverConfig) -> Self {
+    pub fn new(mut config: FailoverConfig) -> Self {
         let (event_tx, event_rx) = mpsc::channel(100);
         // Floor at 1 rather than reject: FailoverConfig has no fallible
         // constructor, so a 0 here (e.g. from a caller that didn't use
         // `..Default::default()`) degrades to "keep only the latest entry"
-        // instead of silently disabling the cap.
-        let max_history = config.max_history.max(1);
+        // instead of silently disabling the cap. Normalised into `config`
+        // itself (rather than kept as a second copy alongside it) so every
+        // reader of `self.config.max_history` sees the same floored value.
+        config.max_history = config.max_history.max(1);
 
         Self {
             config,
@@ -196,7 +204,6 @@ impl FailoverController {
             event_rx: Some(event_rx),
             failover_count: AtomicU64::new(0),
             history: Arc::new(RwLock::new(VecDeque::new())),
-            max_history,
             backend_template: None,
         }
     }
@@ -320,7 +327,7 @@ impl FailoverController {
         {
             let mut history = self.history.write().await;
             history.push_back(history_entry);
-            while history.len() > self.max_history {
+            while history.len() > self.config.max_history {
                 history.pop_front();
             }
         }
@@ -685,6 +692,10 @@ impl FailoverController {
     /// entry", since overlapping failovers can complete out of order and a
     /// full ring buffer can push the entry we started with off the front
     /// before we get back here. A miss (already evicted) is a silent no-op.
+    /// O(n) linear scan under the write lock, n = `config.max_history`
+    /// (default 100) — fine at that size; couples completion cost to
+    /// whatever the cap is, so worth revisiting with an id->index map if a
+    /// much larger cap is ever needed.
     async fn close_history_entry(&self, id: uuid::Uuid, success: bool, error: Option<String>) {
         let mut history = self.history.write().await;
         if let Some(entry) = history.iter_mut().find(|e| e.id == id) {
@@ -1126,11 +1137,18 @@ mod tests {
     #[tokio::test]
     async fn test_history_cap_enforced() {
         let cap = 3usize;
-        let controller = FailoverController::new(FailoverConfig {
+        let mut controller = FailoverController::new(FailoverConfig {
             max_history: cap,
             max_lag_bytes: u64::MAX, // never wait for sync in this test
             ..Default::default()
         });
+        // `initiate_failover()` sends 3 events per attempt into a
+        // capacity-100 mpsc channel; drain it in the background so this
+        // test stays robust if `cap` (and so the attempt count below) is
+        // ever raised well past ~33 — an undrained receiver would otherwise
+        // make `event_tx.send(..).await` block forever once full.
+        let mut event_rx = controller.take_event_receiver().unwrap();
+        tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
 
         let primary = NodeId::new();
         controller.set_primary(primary).await;
