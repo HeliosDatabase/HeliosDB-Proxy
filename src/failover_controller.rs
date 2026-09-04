@@ -25,12 +25,8 @@ use super::transaction_journal::TransactionJournal;
 /// `heliosdb-proxy` daemon today (`src/server.rs` runs its own independent
 /// primary-selection/health-tracking failover path and never builds one of
 /// these) — this type and its fields are reachable only through the library
-/// API, not through `proxy.toml`. Marked `#[non_exhaustive]` so adding a
-/// field like `max_history` here cannot again be a breaking change for an
-/// exhaustive struct literal in a downstream crate (or in this repo's own
-/// tests — see CHANGELOG).
+/// API, not through `proxy.toml`.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub struct FailoverConfig {
     /// Time to wait before initiating failover
     pub detection_time: Duration,

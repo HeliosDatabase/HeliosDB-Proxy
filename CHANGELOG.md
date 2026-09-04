@@ -19,16 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assuming it's last. `FailoverConfig` is library-only (`FailoverController`
   has no construction site in the daemon yet — `src/server.rs` runs its own
   independent failover path); `max_history` is a library-API knob, not a
-  `proxy.toml` parameter.
-
-### Changed
-
-- **`FailoverConfig` is now `#[non_exhaustive]`.** It is a `pub` struct with
-  public fields, published on crates.io; the `max_history` field above is the
-  first field added to it since publication, and an exhaustive struct literal
-  outside this crate would have silently stopped compiling. Downstream
-  constructors must use `FailoverConfig { field: val, ..Default::default() }`
-  (or `FailoverConfig::default()`) going forward.
+  `proxy.toml` parameter. Library consumers note: `max_history` is a new public
+  field on `FailoverConfig`, so an exhaustive `FailoverConfig { .. }` literal
+  must either add it or fall back on `..Default::default()`.
 
 ### Added
 
