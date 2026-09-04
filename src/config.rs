@@ -894,6 +894,27 @@ pub struct LimitsToml {
     /// connected and is not re-read).
     #[serde(default = "default_client_idle_timeout_secs")]
     pub client_idle_timeout_secs: u64,
+    /// In-session Transaction Replay (`tr_mode = "select" | "transaction"`):
+    /// maximum number of statements recorded for the current explicit
+    /// transaction. A transaction that exceeds this cap is marked
+    /// non-replayable — `transaction` mode then degrades to `session`
+    /// behaviour for it (the client gets one error and must retry) and the
+    /// recorded statements are released. Default 1000.
+    #[serde(default = "default_tr_max_replay_statements")]
+    pub tr_max_replay_statements: usize,
+    /// In-session Transaction Replay: maximum bytes of statement text / raw
+    /// extended-protocol frames retained for the current explicit transaction.
+    /// Over the cap the transaction is marked non-replayable (see
+    /// `tr_max_replay_statements`). Default 4 MiB.
+    #[serde(default = "default_tr_max_replay_bytes")]
+    pub tr_max_replay_bytes: usize,
+    /// In-session Transaction Replay (`tr_mode != "none"`): maximum number of
+    /// session-level `SET`/`RESET` statements tracked per session for replay
+    /// onto the replacement backend after a failover. Once exceeded, tracking
+    /// stops (the session's GUC restore becomes incomplete) and a metric is
+    /// incremented. Default 256.
+    #[serde(default = "default_tr_max_session_set_statements")]
+    pub tr_max_session_set_statements: usize,
 }
 
 fn default_max_cancel_keys() -> usize {
@@ -937,6 +958,15 @@ fn default_client_idle_timeout_secs() -> u64 {
     // 0 = disabled: preserves the pre-timeout behaviour byte-for-byte.
     0
 }
+fn default_tr_max_replay_statements() -> usize {
+    1000
+}
+fn default_tr_max_replay_bytes() -> usize {
+    4 * 1024 * 1024
+}
+fn default_tr_max_session_set_statements() -> usize {
+    256
+}
 
 /// Upper bound (seconds) for any `[limits]` `*_secs` timeout that feeds a
 /// `Duration`/`Instant`. Each of these is added to a `tokio::time::Instant` at
@@ -962,6 +992,9 @@ impl Default for LimitsToml {
             pool_reap_interval_secs: default_pool_reap_interval_secs(),
             max_client_connections: default_max_client_connections(),
             client_idle_timeout_secs: default_client_idle_timeout_secs(),
+            tr_max_replay_statements: default_tr_max_replay_statements(),
+            tr_max_replay_bytes: default_tr_max_replay_bytes(),
+            tr_max_session_set_statements: default_tr_max_session_set_statements(),
         }
     }
 }
@@ -1863,6 +1896,21 @@ impl ProxyConfig {
                     tokio::sync::Semaphore::MAX_PERMITS
                 )));
             }
+            if l.tr_max_replay_statements == 0 {
+                return Err(ProxyError::Config(
+                    "limits.tr_max_replay_statements must be >= 1".to_string(),
+                ));
+            }
+            if l.tr_max_replay_bytes == 0 {
+                return Err(ProxyError::Config(
+                    "limits.tr_max_replay_bytes must be >= 1".to_string(),
+                ));
+            }
+            if l.tr_max_session_set_statements == 0 {
+                return Err(ProxyError::Config(
+                    "limits.tr_max_session_set_statements must be >= 1".to_string(),
+                ));
+            }
         }
 
         // Edge / geo proxy mode. The [edge] section is parsed on every build
@@ -2057,19 +2105,39 @@ impl ProxyConfig {
     }
 }
 
-/// TR (Transaction Replay) mode
+/// TR (Transaction Replay) mode — what the proxy does for a client session
+/// whose backend connection fails (write error/timeout, read error, EOF,
+/// reset) while a request is in flight or before the next request can be
+/// delivered. See `ProxyServer::tr_decide` for the exact decision table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum TrMode {
-    /// No transaction replay
+    /// No in-session failover: the client receives one `ErrorResponse`
+    /// (SQLSTATE 57P01 naming the failed node) plus `ReadyForQuery`, then the
+    /// connection is closed.
     None,
-    /// Re-establish session only
+    /// Keep the client connection alive across the fault: wait for a healthy
+    /// primary (`write_timeout_secs`), reconnect, replay the session's
+    /// tracked `SET`/`RESET` statements (named prepared statements are
+    /// re-prepared lazily). A statement that provably never reached the old
+    /// backend and was issued outside an explicit transaction is re-executed
+    /// transparently; anything else surfaces as ONE error (57P01 when not
+    /// delivered inside a transaction, 08007 `transaction_resolution_unknown`
+    /// when the outcome is unknown) and the transaction is aborted.
     #[default]
     Session,
-    /// Re-execute SELECT queries
+    /// `Session`, plus: a read (SELECT/SHOW/... — never a write) whose outcome
+    /// is unknown is re-executed transparently when the session is not inside
+    /// a transaction that has executed writes (a read-only transaction is
+    /// replayed from its BEGIN first).
     Select,
-    /// Full transaction replay
+    /// `Select`, plus: an UNCOMMITTED explicit transaction is replayed from its
+    /// BEGIN on the new primary (responses discarded — the client already saw
+    /// them) and the in-flight statement is then re-executed. A COMMIT whose
+    /// outcome is unknown is never retried (08007). Opt-in: blind replay is
+    /// only correct for deterministic statements (`now()`, `random()`,
+    /// `RETURNING` serials may differ on the second run).
     Transaction,
 }
 
@@ -2971,6 +3039,10 @@ mod tests {
         // today's behaviour exactly: no client-connection cap, no idle timeout.
         assert_eq!(l.max_client_connections, 0);
         assert_eq!(l.client_idle_timeout_secs, 0);
+        // In-session TR caps (documented defaults in config/proxy.full.toml).
+        assert_eq!(l.tr_max_replay_statements, 1000);
+        assert_eq!(l.tr_max_replay_bytes, 4 * 1024 * 1024);
+        assert_eq!(l.tr_max_session_set_statements, 256);
         // And the field on a default ProxyConfig matches.
         assert_eq!(
             ProxyConfig::default().limits.max_prepared_bytes,
@@ -3148,6 +3220,29 @@ mod tests {
         let mut c = base();
         c.limits.max_total_idle_backend_conns = 0;
         assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.tr_max_replay_statements = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.tr_max_replay_bytes = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.tr_max_session_set_statements = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_limits_tr_caps_parse_from_toml() {
+        let limits: LimitsToml =
+            toml::from_str("tr_max_replay_statements = 5\ntr_max_replay_bytes = 1024\n")
+                .expect("parse partial LimitsToml");
+        assert_eq!(limits.tr_max_replay_statements, 5);
+        assert_eq!(limits.tr_max_replay_bytes, 1024);
+        // Untouched key keeps its default.
+        assert_eq!(limits.tr_max_session_set_statements, 256);
     }
 
     #[test]
