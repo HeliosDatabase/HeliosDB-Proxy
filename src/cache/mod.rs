@@ -103,11 +103,11 @@ impl Default for CacheContext {
 /// the cache levels: the parsed cache hints and — when the lookup got as far
 /// as L2/L3 — the normalized query (fingerprint + extracted tables).
 ///
-/// [`QueryCache::get_with_prep`] hands it back so a miss followed by
-/// [`QueryCache::put_prepared`] reuses that work instead of re-parsing the
-/// hints and re-running the normalizer's regex pass over the same SQL a
-/// second time (one normalization per miss+store, not two).
-#[derive(Debug, Clone, Default)]
+/// [`QueryCache::get_with_prep`] hands it back so a miss followed by the
+/// crate-internal `QueryCache::put_prepared` reuses that work instead of
+/// re-parsing the hints and re-running the normalizer's regex pass over the
+/// same SQL a second time (one normalization per miss+store, not two).
+#[derive(Debug, Clone)]
 pub struct QueryPrep {
     /// Hints parsed from the query's `helios:` comments.
     hints: CacheHint,
@@ -230,8 +230,9 @@ impl QueryCache {
     }
 
     /// Look up a query in the cache hierarchy, also returning the [`QueryPrep`]
-    /// the lookup computed. On a miss, pass it to [`Self::put_prepared`] so the
-    /// hint parse and query normalization are not repeated for the store.
+    /// the lookup computed. On a miss, pass it to the crate-internal
+    /// `put_prepared` so the hint parse and query normalization are not
+    /// repeated for the store.
     /// Behaviour is identical to [`Self::get`] in every other respect.
     pub async fn get_with_prep(
         &self,
@@ -357,7 +358,13 @@ impl QueryCache {
     /// performed for the same SQL. When `prep` carries no normalization the
     /// query is normalized here — so this is behaviourally identical to
     /// [`Self::put`], only cheaper on the miss+store path.
-    pub async fn put_prepared(
+    ///
+    /// The `prep` MUST be the one [`Self::get_with_prep`] returned for this
+    /// exact `query` — it carries that query's hints and normalization, so a
+    /// foreign prep would key, TTL, or skip the entry differently from
+    /// [`Self::put`]. Hence `pub(crate)`, and hence `QueryPrep` has no
+    /// `Default`: the only way to obtain one is from a lookup.
+    pub(crate) async fn put_prepared(
         &self,
         query: &str,
         context: &CacheContext,
