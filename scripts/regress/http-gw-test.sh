@@ -12,7 +12,7 @@ bad(){ FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$*"; }
 
 case "$BK" in
   pg)   BHOST=127.0.0.1; BPORT=25433; BUSER=bench;    BPASS=benchpass; BDB=benchdb ;;
-  nano) BHOST=127.0.0.1; BPORT=55337; BUSER=postgres; BPASS=trust;     BDB=postgres ;;
+  nano) BHOST="${NANO_HOST:-100.64.0.2}"; BPORT="${NANO_PORT:-54320}"; BUSER="${NANO_USER:-postgres}"; BPASS="${NANO_PASS:-OTPZ7Mxh9FJEeeKF3qqSKmW64lmT2u3}"; BDB="${NANO_DB:-postgres}" ;;
   *) echo "unknown BK=$BK"; exit 2 ;;
 esac
 TOKEN="gw-token-xyz"
