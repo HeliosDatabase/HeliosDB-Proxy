@@ -5,6 +5,7 @@
 use crate::{ProxyError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 // =============================================================================
@@ -1589,6 +1590,7 @@ impl ProxyConfig {
             weight: 100,
             enabled: true,
             name: None,
+            addr_cache: OnceLock::new(),
         });
 
         Ok(())
@@ -2071,16 +2073,51 @@ pub struct NodeConfig {
     pub enabled: bool,
     /// Optional node name for logging
     pub name: Option<String>,
+    /// Lazily-computed `"host:port"` string, cached so the hot query path
+    /// (looked up several times per read query — health, circuit-breaker,
+    /// lag, and the winning node) doesn't `format!()` a fresh `String` on
+    /// every call. Not part of the wire/config format.
+    #[serde(skip)]
+    addr_cache: OnceLock<String>,
 }
 
 fn default_http_port() -> u16 {
     8080
 }
 
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: 0,
+            http_port: default_http_port(),
+            role: NodeRole::Standby,
+            weight: 0,
+            enabled: false,
+            name: None,
+            addr_cache: OnceLock::new(),
+        }
+    }
+}
+
 impl NodeConfig {
-    /// Get address string
-    pub fn address(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+    /// Construct with `host`/`port` and the rest defaulted. `addr_cache` is
+    /// private (it backs `address()`'s allocation-free hot path), so this
+    /// is the supported way to build a `NodeConfig` from outside this
+    /// crate — set the remaining public fields (`role`, `weight`,
+    /// `enabled`, `name`, `http_port`) afterwards.
+    pub fn new(host: impl Into<String>, port: u16) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            ..Default::default()
+        }
+    }
+
+    /// Get address string (`"host:port"`), computed once and cached.
+    pub fn address(&self) -> &str {
+        self.addr_cache
+            .get_or_init(|| format!("{}:{}", self.host, self.port))
     }
 
     /// Get display name
@@ -2137,6 +2174,64 @@ mod tests {
         assert_eq!(config.nodes.len(), 2);
         assert!(config.primary_node().is_some());
         assert_eq!(config.standby_nodes().len(), 1);
+    }
+
+    #[test]
+    fn test_node_config_address_format() {
+        let node = NodeConfig {
+            host: "db.example.com".to_string(),
+            port: 5433,
+            role: NodeRole::Primary,
+            weight: 100,
+            enabled: true,
+            name: None,
+            ..Default::default()
+        };
+        assert_eq!(node.address(), "db.example.com:5433");
+    }
+
+    /// `address()` is called several times per read query on the hot path
+    /// (health lookup, circuit-breaker check, lag lookup, the winning
+    /// node); it must serve the cached allocation on repeated calls rather
+    /// than `format!()`-ing a fresh `String` every time.
+    #[test]
+    fn test_node_config_address_is_cached_not_reallocated() {
+        let node = NodeConfig {
+            host: "cache.example.com".to_string(),
+            port: 9999,
+            role: NodeRole::Standby,
+            weight: 1,
+            enabled: true,
+            name: None,
+            ..Default::default()
+        };
+        let first = node.address();
+        let first_ptr = first.as_ptr();
+        let second = node.address();
+        assert_eq!(first, second);
+        assert_eq!(
+            first_ptr,
+            second.as_ptr(),
+            "address() should return the same cached allocation on repeated calls"
+        );
+    }
+
+    #[test]
+    fn test_node_config_clone_has_independent_address_cache() {
+        let node = NodeConfig {
+            host: "clone.example.com".to_string(),
+            port: 1111,
+            role: NodeRole::ReadReplica,
+            weight: 1,
+            enabled: true,
+            name: None,
+            ..Default::default()
+        };
+        // Populate the cache on the original before cloning.
+        let _ = node.address();
+        let cloned = node.clone();
+        assert_eq!(cloned.address(), "clone.example.com:1111");
+        assert_eq!(node.address(), cloned.address());
     }
 
     // -------------------------------------------------------------------------
