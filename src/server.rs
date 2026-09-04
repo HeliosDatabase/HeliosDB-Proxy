@@ -9021,9 +9021,13 @@ mod tests {
         // an inline `write_all` (or an inline read only after the flush)
         // would deadlock rather than fail.
         let feed_bytes = bytes.clone();
+        // Return the peer so it stays OPEN until the relay has drained
+        // everything: dropping it here would deliver EOF right after the
+        // payload, which `stream_flush` correctly reports as a closed backend.
         let feed = tokio::spawn(async move {
             backend_peer.write_all(&feed_bytes).await.unwrap();
             backend_peer.flush().await.unwrap();
+            backend_peer
         });
         let bytes_len = bytes.len();
         let drain = tokio::spawn(async move {
