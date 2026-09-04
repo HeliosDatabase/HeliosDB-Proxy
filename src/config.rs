@@ -5,6 +5,7 @@
 use crate::{ProxyError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 // =============================================================================
@@ -744,6 +745,24 @@ pub struct CacheToml {
     pub ttl_secs: u64,
     /// Maximum single result size to cache, bytes (larger results bypass).
     pub max_result_bytes: usize,
+    /// Hard ceiling, in bytes, on the response the proxy is willing to buffer
+    /// in memory while streaming a cacheable read to the client.
+    ///
+    /// Deliberately SHARED by both response caches (query-cache and the
+    /// edge-proxy result cache): the data path captures the backend response
+    /// exactly once and hands the same buffer to whichever cache is armed, so
+    /// one ceiling bounds the capture regardless of which section enabled it.
+    /// It therefore applies even when `[cache] enabled = false`, as long as
+    /// `[edge]` is caching reads.
+    ///
+    /// Once a response crosses this bound the capture buffer is dropped and the
+    /// response is marked non-cacheable; the bytes already streamed to the
+    /// client are unaffected (the client always receives the full, unmodified
+    /// response). Default 4 MiB — comfortably above the 1 MiB default
+    /// `max_result_bytes` so it never masks that knob, while bounding the
+    /// per-session transient to a few MiB instead of a whole result set.
+    /// MUST be > 0.
+    pub max_cacheable_response_bytes: usize,
 }
 
 impl Default for CacheToml {
@@ -752,6 +771,7 @@ impl Default for CacheToml {
             enabled: false,
             ttl_secs: 300,
             max_result_bytes: 1024 * 1024,
+            max_cacheable_response_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -833,6 +853,68 @@ pub struct LimitsToml {
     /// `POOL_REAP_INTERVAL`.
     #[serde(default = "default_pool_reap_interval_secs")]
     pub pool_reap_interval_secs: u64,
+    /// Ceiling on concurrently-served client connections on the PG-wire
+    /// listener. `0` (the default) means unlimited — exactly today's behaviour,
+    /// where every accepted socket spawns a task holding its own read buffer
+    /// (and, in session pooling, a backend connection). When > 0 a permit is
+    /// taken per connection — once its first startup message is known to be a
+    /// real `Startup`, so a `CancelRequest` (query cancellation) is always
+    /// served and never consumes one — and a connection arriving with no
+    /// permit free is answered with a PostgreSQL `ErrorResponse` (`FATAL`,
+    /// SQLSTATE 53300, `sorry, too many clients already`) and closed, instead
+    /// of being queued — the same shape as a PostgreSQL server at
+    /// `max_connections`.
+    ///
+    /// Read ONCE at startup: the permit pool is sized when the server is built,
+    /// so a SIGHUP that changes this key is logged and ignored (resizing a live
+    /// semaphore downward cannot revoke permits already held by in-flight
+    /// sessions). Restart to change it.
+    #[serde(default = "default_max_client_connections")]
+    pub max_client_connections: usize,
+    /// Idle-session timeout (seconds) for an authenticated client: how long a
+    /// session may sit between statements before the proxy terminates it with
+    /// SQLSTATE 57P05 (`terminating connection due to idle-session timeout`).
+    /// `0` (the default) disables it — exactly today's behaviour, where an
+    /// authenticated client can hold a session slot (and its pooled backend
+    /// connection) forever and stall a graceful drain to its full timeout.
+    ///
+    /// Matches PostgreSQL's `idle_session_timeout` semantics: it applies only
+    /// to a session actually waiting for a NEW command. The clock starts when
+    /// the session goes idle (i.e. measures time since the client's last
+    /// statement), and unsolicited backend traffic relayed while idle
+    /// (LISTEN/NOTIFY, NoticeResponse, ParameterStatus) is NOT client activity
+    /// and does not reset it. It is NOT armed while a message is only
+    /// partially received (a client trickling a large statement is slow, not
+    /// idle) nor during a `COPY FROM STDIN` (a paused bulk load is not an idle
+    /// session). PostgreSQL's separate `idle_in_transaction_session_timeout`
+    /// GUC is not implemented; a session idle inside an open transaction is
+    /// terminated by this timeout too.
+    ///
+    /// Read once at startup (a SIGHUP change applies to nothing already
+    /// connected and is not re-read).
+    #[serde(default = "default_client_idle_timeout_secs")]
+    pub client_idle_timeout_secs: u64,
+    /// In-session Transaction Replay (`tr_mode = "select" | "transaction"`):
+    /// maximum number of statements recorded for the current explicit
+    /// transaction. A transaction that exceeds this cap is marked
+    /// non-replayable — `transaction` mode then degrades to `session`
+    /// behaviour for it (the client gets one error and must retry) and the
+    /// recorded statements are released. Default 1000.
+    #[serde(default = "default_tr_max_replay_statements")]
+    pub tr_max_replay_statements: usize,
+    /// In-session Transaction Replay: maximum bytes of statement text / raw
+    /// extended-protocol frames retained for the current explicit transaction.
+    /// Over the cap the transaction is marked non-replayable (see
+    /// `tr_max_replay_statements`). Default 4 MiB.
+    #[serde(default = "default_tr_max_replay_bytes")]
+    pub tr_max_replay_bytes: usize,
+    /// In-session Transaction Replay (`tr_mode != "none"`): maximum number of
+    /// session-level `SET`/`RESET` statements tracked per session for replay
+    /// onto the replacement backend after a failover. Once exceeded, tracking
+    /// stops (the session's GUC restore becomes incomplete) and a metric is
+    /// incremented. Default 256.
+    #[serde(default = "default_tr_max_session_set_statements")]
+    pub tr_max_session_set_statements: usize,
 }
 
 fn default_max_cancel_keys() -> usize {
@@ -868,6 +950,23 @@ fn default_max_total_idle_backend_conns() -> usize {
 fn default_pool_reap_interval_secs() -> u64 {
     30
 }
+fn default_max_client_connections() -> usize {
+    // 0 = unlimited: preserves the pre-cap behaviour byte-for-byte.
+    0
+}
+fn default_client_idle_timeout_secs() -> u64 {
+    // 0 = disabled: preserves the pre-timeout behaviour byte-for-byte.
+    0
+}
+fn default_tr_max_replay_statements() -> usize {
+    1000
+}
+fn default_tr_max_replay_bytes() -> usize {
+    4 * 1024 * 1024
+}
+fn default_tr_max_session_set_statements() -> usize {
+    256
+}
 
 /// Upper bound (seconds) for any `[limits]` `*_secs` timeout that feeds a
 /// `Duration`/`Instant`. Each of these is added to a `tokio::time::Instant` at
@@ -891,6 +990,11 @@ impl Default for LimitsToml {
             max_pending_bytes: default_max_pending_bytes(),
             max_total_idle_backend_conns: default_max_total_idle_backend_conns(),
             pool_reap_interval_secs: default_pool_reap_interval_secs(),
+            max_client_connections: default_max_client_connections(),
+            client_idle_timeout_secs: default_client_idle_timeout_secs(),
+            tr_max_replay_statements: default_tr_max_replay_statements(),
+            tr_max_replay_bytes: default_tr_max_replay_bytes(),
+            tr_max_session_set_statements: default_tr_max_session_set_statements(),
         }
     }
 }
@@ -935,6 +1039,22 @@ pub struct AnalyticsToml {
     pub slow_query_ms: u64,
     /// Maximum distinct query fingerprints to track.
     pub max_fingerprints: u32,
+    /// Capacity of the bounded queue between the connection tasks and the
+    /// single background analytics consumer. Fingerprinting, metrics, pattern
+    /// detection and cost attribution all run on that consumer, so the query
+    /// relay only pays a `try_send`. An execution arriving when the queue is
+    /// full is DROPPED (counted as `analytics_dropped_total` on
+    /// `GET /api/analytics`) rather than blocking the relay. Must be >= 1.
+    pub queue_capacity: u32,
+    /// Bound on the memoized raw-SQL -> fingerprint cache. Repeat statements
+    /// skip all six regex normalization passes. `0` disables memoization.
+    pub fingerprint_cache_size: u32,
+    /// Largest statement, in bytes, that may enter the fingerprint memo. The
+    /// memo key is the raw SQL, so without this the cache is bounded only by
+    /// entry COUNT and a client issuing large distinct statements could pin
+    /// `fingerprint_cache_size` of them. Longer statements are still
+    /// fingerprinted, just never memoized. Must be >= 1.
+    pub fingerprint_cache_max_sql_bytes: u32,
 }
 
 impl Default for AnalyticsToml {
@@ -943,6 +1063,16 @@ impl Default for AnalyticsToml {
             enabled: false,
             slow_query_ms: 1000,
             max_fingerprints: 10000,
+            // Kept in sync with the library-side constants by
+            // `analytics::config::tests` + `config::tests` (this crate's
+            // `src/analytics` is cfg-gated behind `query-analytics` while
+            // `config.rs` is not, so the literals cannot reference
+            // `DEFAULT_ANALYTICS_QUEUE_CAPACITY` /
+            // `DEFAULT_FINGERPRINT_CACHE_SIZE` /
+            // `DEFAULT_FINGERPRINT_CACHE_MAX_SQL_BYTES` directly).
+            queue_capacity: 8192,
+            fingerprint_cache_size: 10000,
+            fingerprint_cache_max_sql_bytes: 4096,
         }
     }
 }
@@ -1589,6 +1719,7 @@ impl ProxyConfig {
             weight: 100,
             enabled: true,
             name: None,
+            addr_cache: OnceLock::new(),
         });
 
         Ok(())
@@ -1623,6 +1754,29 @@ impl ProxyConfig {
         if self.health.check_interval_secs == 0 {
             return Err(ProxyError::Config(
                 "health.check_interval_secs must be >= 1".to_string(),
+            ));
+        }
+
+        // Degraded but legal: a timeout at least as long as the interval means
+        // a probe can still be running when the next tick fires. The health
+        // checker then skips that tick (counted as `health_probe_skipped_inflight`)
+        // rather than stacking a second probe, so detection for a slow node is
+        // coarser than `check_interval` suggests. Warn only — existing
+        // deployments run this way and must keep working after an upgrade.
+        if self.health.check_timeout_secs >= self.health.check_interval_secs {
+            tracing::warn!(
+                check_timeout_secs = self.health.check_timeout_secs,
+                check_interval_secs = self.health.check_interval_secs,
+                "health.check_timeout_secs >= health.check_interval_secs: probes for a slow node will skip ticks (health_probe_skipped_inflight) instead of running every interval"
+            );
+        }
+        // Zero would mean "capture nothing is ever cacheable" while still
+        // looking like a working cache, and is more likely a typo than intent.
+        // Checked unconditionally: the bound governs the shared response
+        // capture used by the query-cache AND the edge cache.
+        if self.cache.max_cacheable_response_bytes == 0 {
+            return Err(ProxyError::Config(
+                "cache.max_cacheable_response_bytes must be >= 1".to_string(),
             ));
         }
 
@@ -1725,6 +1879,38 @@ impl ProxyConfig {
                     "limits.max_total_idle_backend_conns must be >= 1".to_string(),
                 ));
             }
+            // The two opt-in bounds below use 0 as "off" (unlimited / disabled),
+            // so they are deliberately NOT in `zero_checks`. Their upper bounds
+            // still matter: the idle timeout feeds an `Instant + Duration`
+            // deadline in the query loop (same overflow hazard as every other
+            // `*_secs` key), and the connection cap sizes a `tokio::sync::
+            // Semaphore`, which panics above `Semaphore::MAX_PERMITS`.
+            if l.client_idle_timeout_secs > MAX_LIMIT_SECS {
+                return Err(ProxyError::Config(format!(
+                    "limits.client_idle_timeout_secs must be <= {MAX_LIMIT_SECS} seconds (1 year)"
+                )));
+            }
+            if l.max_client_connections > tokio::sync::Semaphore::MAX_PERMITS {
+                return Err(ProxyError::Config(format!(
+                    "limits.max_client_connections must be <= {}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                )));
+            }
+            if l.tr_max_replay_statements == 0 {
+                return Err(ProxyError::Config(
+                    "limits.tr_max_replay_statements must be >= 1".to_string(),
+                ));
+            }
+            if l.tr_max_replay_bytes == 0 {
+                return Err(ProxyError::Config(
+                    "limits.tr_max_replay_bytes must be >= 1".to_string(),
+                ));
+            }
+            if l.tr_max_session_set_statements == 0 {
+                return Err(ProxyError::Config(
+                    "limits.tr_max_session_set_statements must be >= 1".to_string(),
+                ));
+            }
         }
 
         // Edge / geo proxy mode. The [edge] section is parsed on every build
@@ -1824,6 +2010,26 @@ impl ProxyConfig {
             }
         }
 
+        // Query-analytics tunables. A zero ingest-queue capacity would make
+        // `mpsc::channel` panic at construction and would drop 100% of the
+        // samples even if it did not, so reject it here. `fingerprint_cache_size`
+        // is deliberately unconstrained: 0 is the documented way to disable
+        // fingerprint memoization.
+        if self.analytics.queue_capacity == 0 {
+            return Err(ProxyError::Config(
+                "analytics.queue_capacity must be >= 1".to_string(),
+            ));
+        }
+        // A zero byte cap would mean "memoize nothing", which is already what
+        // `fingerprint_cache_size = 0` says; rejecting it keeps the two knobs
+        // from disagreeing about how memoization is turned off.
+        if self.analytics.fingerprint_cache_max_sql_bytes == 0 {
+            return Err(ProxyError::Config(
+                "analytics.fingerprint_cache_max_sql_bytes must be >= 1 (set analytics.fingerprint_cache_size = 0 to disable memoization)"
+                    .to_string(),
+            ));
+        }
+
         // Anomaly detector tunables. Parsed on every build; only consumed when
         // the `anomaly-detection` feature is compiled in, but the values are
         // degenerate regardless of feature, so validate them unconditionally.
@@ -1899,19 +2105,39 @@ impl ProxyConfig {
     }
 }
 
-/// TR (Transaction Replay) mode
+/// TR (Transaction Replay) mode — what the proxy does for a client session
+/// whose backend connection fails (write error/timeout, read error, EOF,
+/// reset) while a request is in flight or before the next request can be
+/// delivered. See `ProxyServer::tr_decide` for the exact decision table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum TrMode {
-    /// No transaction replay
+    /// No in-session failover: the client receives one `ErrorResponse`
+    /// (SQLSTATE 57P01 naming the failed node) plus `ReadyForQuery`, then the
+    /// connection is closed.
     None,
-    /// Re-establish session only
+    /// Keep the client connection alive across the fault: wait for a healthy
+    /// primary (`write_timeout_secs`), reconnect, replay the session's
+    /// tracked `SET`/`RESET` statements (named prepared statements are
+    /// re-prepared lazily). A statement that provably never reached the old
+    /// backend and was issued outside an explicit transaction is re-executed
+    /// transparently; anything else surfaces as ONE error (57P01 when not
+    /// delivered inside a transaction, 08007 `transaction_resolution_unknown`
+    /// when the outcome is unknown) and the transaction is aborted.
     #[default]
     Session,
-    /// Re-execute SELECT queries
+    /// `Session`, plus: a read (SELECT/SHOW/... — never a write) whose outcome
+    /// is unknown is re-executed transparently when the session is not inside
+    /// a transaction that has executed writes (a read-only transaction is
+    /// replayed from its BEGIN first).
     Select,
-    /// Full transaction replay
+    /// `Select`, plus: an UNCOMMITTED explicit transaction is replayed from its
+    /// BEGIN on the new primary (responses discarded — the client already saw
+    /// them) and the in-flight statement is then re-executed. A COMMIT whose
+    /// outcome is unknown is never retried (08007). Opt-in: blind replay is
+    /// only correct for deterministic statements (`now()`, `random()`,
+    /// `RETURNING` serials may differ on the second run).
     Transaction,
 }
 
@@ -2057,16 +2283,51 @@ pub struct NodeConfig {
     pub enabled: bool,
     /// Optional node name for logging
     pub name: Option<String>,
+    /// Lazily-computed `"host:port"` string, cached so the hot query path
+    /// (looked up several times per read query — health, circuit-breaker,
+    /// lag, and the winning node) doesn't `format!()` a fresh `String` on
+    /// every call. Not part of the wire/config format.
+    #[serde(skip)]
+    addr_cache: OnceLock<String>,
 }
 
 fn default_http_port() -> u16 {
     8080
 }
 
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: 0,
+            http_port: default_http_port(),
+            role: NodeRole::Standby,
+            weight: 0,
+            enabled: false,
+            name: None,
+            addr_cache: OnceLock::new(),
+        }
+    }
+}
+
 impl NodeConfig {
-    /// Get address string
-    pub fn address(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+    /// Construct with `host`/`port` and the rest defaulted. `addr_cache` is
+    /// private (it backs `address()`'s allocation-free hot path), so this
+    /// is the supported way to build a `NodeConfig` from outside this
+    /// crate — set the remaining public fields (`role`, `weight`,
+    /// `enabled`, `name`, `http_port`) afterwards.
+    pub fn new(host: impl Into<String>, port: u16) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            ..Default::default()
+        }
+    }
+
+    /// Get address string (`"host:port"`), computed once and cached.
+    pub fn address(&self) -> &str {
+        self.addr_cache
+            .get_or_init(|| format!("{}:{}", self.host, self.port))
     }
 
     /// Get display name
@@ -2123,6 +2384,64 @@ mod tests {
         assert_eq!(config.nodes.len(), 2);
         assert!(config.primary_node().is_some());
         assert_eq!(config.standby_nodes().len(), 1);
+    }
+
+    #[test]
+    fn test_node_config_address_format() {
+        let node = NodeConfig {
+            host: "db.example.com".to_string(),
+            port: 5433,
+            role: NodeRole::Primary,
+            weight: 100,
+            enabled: true,
+            name: None,
+            ..Default::default()
+        };
+        assert_eq!(node.address(), "db.example.com:5433");
+    }
+
+    /// `address()` is called several times per read query on the hot path
+    /// (health lookup, circuit-breaker check, lag lookup, the winning
+    /// node); it must serve the cached allocation on repeated calls rather
+    /// than `format!()`-ing a fresh `String` every time.
+    #[test]
+    fn test_node_config_address_is_cached_not_reallocated() {
+        let node = NodeConfig {
+            host: "cache.example.com".to_string(),
+            port: 9999,
+            role: NodeRole::Standby,
+            weight: 1,
+            enabled: true,
+            name: None,
+            ..Default::default()
+        };
+        let first = node.address();
+        let first_ptr = first.as_ptr();
+        let second = node.address();
+        assert_eq!(first, second);
+        assert_eq!(
+            first_ptr,
+            second.as_ptr(),
+            "address() should return the same cached allocation on repeated calls"
+        );
+    }
+
+    #[test]
+    fn test_node_config_clone_has_independent_address_cache() {
+        let node = NodeConfig {
+            host: "clone.example.com".to_string(),
+            port: 1111,
+            role: NodeRole::ReadReplica,
+            weight: 1,
+            enabled: true,
+            name: None,
+            ..Default::default()
+        };
+        // Populate the cache on the original before cloning.
+        let _ = node.address();
+        let cloned = node.clone();
+        assert_eq!(cloned.address(), "clone.example.com:1111");
+        assert_eq!(node.address(), cloned.address());
     }
 
     // -------------------------------------------------------------------------
@@ -2387,6 +2706,96 @@ mod tests {
         assert_eq!(a.max_seen_fingerprints, 100_000);
     }
 
+    /// The two analytics-pipeline knobs must default to the documented
+    /// values, and an existing config that omits them must keep parsing.
+    #[test]
+    fn test_analytics_toml_defaults() {
+        let a = AnalyticsToml::default();
+        assert!(!a.enabled);
+        assert_eq!(a.slow_query_ms, 1000);
+        assert_eq!(a.max_fingerprints, 10000);
+        assert_eq!(a.queue_capacity, 8192);
+        assert_eq!(a.fingerprint_cache_size, 10000);
+        assert_eq!(a.fingerprint_cache_max_sql_bytes, 4096);
+    }
+
+    /// An `[analytics]` block written before these keys existed (only the
+    /// three original keys) must still parse and pick up the new defaults.
+    #[test]
+    fn test_analytics_toml_legacy_block_uses_new_defaults() {
+        let mut base = ProxyConfig::default();
+        base.add_node("localhost:5432", "primary").unwrap();
+        let mut val = toml::Value::try_from(&base).unwrap();
+        {
+            let analytics = val
+                .get_mut("analytics")
+                .and_then(|v| v.as_table_mut())
+                .expect("analytics table");
+            analytics.remove("queue_capacity");
+            analytics.remove("fingerprint_cache_size");
+            analytics.remove("fingerprint_cache_max_sql_bytes");
+        }
+        let s = toml::to_string(&val).unwrap();
+        let cfg: ProxyConfig = toml::from_str(&s).unwrap();
+        assert_eq!(cfg.analytics.queue_capacity, 8192);
+        assert_eq!(cfg.analytics.fingerprint_cache_size, 10000);
+        assert_eq!(cfg.analytics.fingerprint_cache_max_sql_bytes, 4096);
+        cfg.validate().unwrap();
+    }
+
+    /// Both knobs round-trip through a full config and override the defaults.
+    #[test]
+    fn test_analytics_toml_block_parses_and_overrides() {
+        let mut base = ProxyConfig::default();
+        base.add_node("localhost:5432", "primary").unwrap();
+        base.analytics = AnalyticsToml {
+            enabled: true,
+            slow_query_ms: 250,
+            max_fingerprints: 4096,
+            queue_capacity: 128,
+            fingerprint_cache_size: 0,
+            fingerprint_cache_max_sql_bytes: 512,
+        };
+        let s = toml::to_string(&base).unwrap();
+        assert!(s.contains("[analytics]"), "serialized config: {s}");
+        let cfg: ProxyConfig = toml::from_str(&s).unwrap();
+        assert!(cfg.analytics.enabled);
+        assert_eq!(cfg.analytics.slow_query_ms, 250);
+        assert_eq!(cfg.analytics.max_fingerprints, 4096);
+        assert_eq!(cfg.analytics.queue_capacity, 128);
+        // 0 is the documented "disable memoization" value and must validate.
+        assert_eq!(cfg.analytics.fingerprint_cache_size, 0);
+        assert_eq!(cfg.analytics.fingerprint_cache_max_sql_bytes, 512);
+        cfg.validate().unwrap();
+    }
+
+    /// A zero per-statement memo byte cap is rejected: `fingerprint_cache_size
+    /// = 0` is the one documented way to disable memoization.
+    #[test]
+    fn test_analytics_fingerprint_cache_max_sql_bytes_zero_rejected() {
+        let mut c = ProxyConfig::default();
+        c.add_node("localhost:5432", "primary").unwrap();
+        c.analytics.fingerprint_cache_max_sql_bytes = 0;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("analytics.fingerprint_cache_max_sql_bytes"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A zero queue capacity would panic `mpsc::channel`; validate() rejects it.
+    #[test]
+    fn test_analytics_queue_capacity_zero_rejected() {
+        let mut c = ProxyConfig::default();
+        c.add_node("localhost:5432", "primary").unwrap();
+        c.analytics.queue_capacity = 0;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("analytics.queue_capacity"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn test_anomaly_toml_absent_section_uses_defaults() {
         // A full, valid ProxyConfig whose serialized TOML has the [anomaly]
@@ -2578,6 +2987,21 @@ mod tests {
         assert!(c.validate().is_ok());
     }
 
+    /// `check_timeout_secs >= check_interval_secs` is degraded but legal: the
+    /// health checker skips ticks (`health_probe_skipped_inflight`) instead of
+    /// stacking probes. validate() must warn, never reject — existing configs
+    /// use this shape and must keep loading unchanged.
+    #[test]
+    fn test_validate_accepts_health_timeout_ge_interval() {
+        let mut config = ProxyConfig::default();
+        config.add_node("localhost:5432", "primary").unwrap();
+        config.health.check_interval_secs = 2;
+        config.health.check_timeout_secs = 5;
+        assert!(config.validate().is_ok());
+        config.health.check_timeout_secs = 2;
+        assert!(config.validate().is_ok());
+    }
+
     #[test]
     fn test_validate_rejects_zero_health_interval() {
         // A zero health-check interval panics tokio::time::interval; validation
@@ -2611,6 +3035,14 @@ mod tests {
         assert_eq!(l.max_pending_bytes, 64 * 1024 * 1024);
         assert_eq!(l.max_total_idle_backend_conns, 8192);
         assert_eq!(l.pool_reap_interval_secs, 30);
+        // The two opt-in bounds default to "off" so an existing config keeps
+        // today's behaviour exactly: no client-connection cap, no idle timeout.
+        assert_eq!(l.max_client_connections, 0);
+        assert_eq!(l.client_idle_timeout_secs, 0);
+        // In-session TR caps (documented defaults in config/proxy.full.toml).
+        assert_eq!(l.tr_max_replay_statements, 1000);
+        assert_eq!(l.tr_max_replay_bytes, 4 * 1024 * 1024);
+        assert_eq!(l.tr_max_session_set_statements, 256);
         // And the field on a default ProxyConfig matches.
         assert_eq!(
             ProxyConfig::default().limits.max_prepared_bytes,
@@ -2669,6 +3101,69 @@ mod tests {
         assert_eq!(cfg.limits.startup_timeout_secs, 30);
         assert_eq!(cfg.limits.max_total_idle_backend_conns, 8192);
         assert_eq!(cfg.limits.pool_reap_interval_secs, 30);
+        assert_eq!(cfg.limits.max_client_connections, 0);
+        assert_eq!(cfg.limits.client_idle_timeout_secs, 0);
+    }
+
+    #[test]
+    fn test_limits_client_cap_and_idle_timeout_parse_and_validate() {
+        // Both keys are opt-in: parse from a partial [limits] table, and a
+        // non-zero value validates.
+        let limits: LimitsToml =
+            toml::from_str("max_client_connections = 500\nclient_idle_timeout_secs = 120\n")
+                .expect("parse partial LimitsToml");
+        assert_eq!(limits.max_client_connections, 500);
+        assert_eq!(limits.client_idle_timeout_secs, 120);
+        // Untouched keys keep their defaults.
+        assert_eq!(limits.startup_timeout_secs, 30);
+
+        let mut c = ProxyConfig::default();
+        c.add_node("localhost:5432", "primary").unwrap();
+        c.limits = limits;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_accepts_zero_client_cap_and_idle_timeout() {
+        // 0 means "unlimited"/"disabled" for these two (unlike every other
+        // [limits] key, where 0 disables a safety bound and is rejected), so
+        // the default config must validate.
+        let mut c = ProxyConfig::default();
+        c.add_node("localhost:5432", "primary").unwrap();
+        c.limits.max_client_connections = 0;
+        c.limits.client_idle_timeout_secs = 0;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_out_of_range_client_cap_and_idle_timeout() {
+        let base = || {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            c
+        };
+        // An idle timeout beyond the 1-year ceiling would overflow the
+        // `Instant + Duration` deadline computed in the query loop.
+        let mut c = base();
+        c.limits.client_idle_timeout_secs = MAX_LIMIT_SECS + 1;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("limits.client_idle_timeout_secs"),
+            "unexpected error: {err}"
+        );
+        // A cap above Semaphore::MAX_PERMITS would panic Semaphore::new.
+        let mut c = base();
+        c.limits.max_client_connections = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("limits.max_client_connections"),
+            "unexpected error: {err}"
+        );
+        // The boundary values are accepted.
+        let mut c = base();
+        c.limits.client_idle_timeout_secs = MAX_LIMIT_SECS;
+        c.limits.max_client_connections = tokio::sync::Semaphore::MAX_PERMITS;
+        assert!(c.validate().is_ok());
     }
 
     #[test]
@@ -2725,6 +3220,29 @@ mod tests {
         let mut c = base();
         c.limits.max_total_idle_backend_conns = 0;
         assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.tr_max_replay_statements = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.tr_max_replay_bytes = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.tr_max_session_set_statements = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_limits_tr_caps_parse_from_toml() {
+        let limits: LimitsToml =
+            toml::from_str("tr_max_replay_statements = 5\ntr_max_replay_bytes = 1024\n")
+                .expect("parse partial LimitsToml");
+        assert_eq!(limits.tr_max_replay_statements, 5);
+        assert_eq!(limits.tr_max_replay_bytes, 1024);
+        // Untouched key keeps its default.
+        assert_eq!(limits.tr_max_session_set_statements, 256);
     }
 
     #[test]
@@ -2891,6 +3409,31 @@ mod tests {
         c.edge.auth_token = "secret".to_string();
         c.edge.home_url = "https://home-proxy:9090".to_string();
         assert!(c.validate().is_ok());
+    }
+
+    /// O1: the shared response-capture ceiling defaults to 4 MiB, round-trips
+    /// through TOML, and a zero (which would silently make every response
+    /// uncacheable) is rejected.
+    #[test]
+    fn test_validate_max_cacheable_response_bytes() {
+        let mut c = ProxyConfig::default();
+        c.add_node("localhost:5432", "primary").unwrap();
+        assert_eq!(c.cache.max_cacheable_response_bytes, 4 * 1024 * 1024);
+        assert!(c.validate().is_ok());
+
+        c.cache.max_cacheable_response_bytes = 0;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("cache.max_cacheable_response_bytes"),
+            "unexpected error: {}",
+            err
+        );
+
+        // An existing config without the key keeps the documented default.
+        let parsed: CacheToml = toml::from_str("enabled = true\nttl_secs = 30\n").unwrap();
+        assert_eq!(parsed.max_cacheable_response_bytes, 4 * 1024 * 1024);
+        let parsed: CacheToml = toml::from_str("max_cacheable_response_bytes = 8192\n").unwrap();
+        assert_eq!(parsed.max_cacheable_response_bytes, 8192);
     }
 
     #[cfg(all(feature = "edge-proxy", feature = "query-cache"))]

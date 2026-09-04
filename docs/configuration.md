@@ -163,12 +163,51 @@ listed below is optional and defaults to disabled/off.
 
 ### Transaction Replay Modes (`tr_mode`)
 
-| Mode | Description |
+`tr_mode` governs **in-session failover**: what a live client session experiences
+when its backend connection fails while a request is in flight (write error /
+timeout, read error, EOF, reset) or dies while idle. It is independent of
+`tr_enabled` (the write journal for the operator-driven `POST /api/replay`
+engine) and needs no cargo feature. Two fault phases are distinguished:
+**not-delivered** (the request never reached the backend — it certainly did not
+run) and **outcome-unknown** (written, then the connection failed before
+`ReadyForQuery`).
+
+| Mode | Behaviour on a backend fault |
 |------|-------------|
-| `none` | Transaction Replay disabled. In-flight transactions are aborted on failover. |
-| `session` | Re-establish session state (SET parameters, prepared statements) on the new primary. Transactions are not replayed. |
-| `select` | Restore session state and re-execute SELECT queries. Write transactions are not replayed. |
-| `transaction` | Full transaction replay — all journaled statements re-executed on the new primary. Strongest failover guarantee. |
+| `none` | One `ErrorResponse` (SQLSTATE `57P01`, naming the failed node) + `ReadyForQuery`, then the client connection is closed. |
+| `session` (default) | The client connection stays open. The proxy waits for a healthy primary (`write_timeout_secs`), reconnects (startup parameters re-sent), replays the session's tracked `SET`/`RESET` statements, and re-prepares named prepared statements lazily. A not-delivered statement issued **outside** an explicit transaction is re-executed transparently. Anything else gets ONE error — `57P01` (not delivered inside a transaction) or `08007 transaction_resolution_unknown` — the client-visible transaction is aborted (`ROLLBACK` and retry; other statements get `25P02` until then) and the session continues on the new primary. |
+| `select` | `session`, plus: an outcome-unknown **read** (`SELECT`/`SHOW`/`VALUES`/read-only `WITH`/`COPY … TO`; never a write, never `nextval()`) is re-executed transparently outside a transaction; a **read-only** explicit transaction is replayed from its `BEGIN` first and the interrupted statement re-run inside it. |
+| `transaction` | `select`, plus: an **uncommitted** explicit transaction is replayed from its `BEGIN` on the new primary (recorded simple-protocol text / raw extended-protocol batches; responses discarded — the client already saw them) and the in-flight statement is re-executed inside it. If a replayed statement fails the replay is rolled back and the client gets `40001` (`transaction replay failed after failover: …`). A `COMMIT`/`END`/`PREPARE TRANSACTION`/`COMMIT PREPARED` whose outcome is unknown is **never** retried (`08007`). Opt-in: blind replay is only correct for deterministic statements (`now()`, `random()`, `RETURNING` serials may differ on the second run). |
+
+Hard rules in every mode: a write whose outcome is unknown is never re-executed
+except as part of `transaction` mode's replay of an uncommitted transaction (the
+original died uncommitted with the old backend); a `COMMIT` with unknown outcome
+is never retried; `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` are ordinary replayed
+statements; a `COPY` in progress at the fault → `08006` and the connection is
+closed. A transaction is marked non-replayable (so `transaction` degrades to
+`session` for it) when it exceeds `[limits] tr_max_replay_statements` /
+`tr_max_replay_bytes`, enters the failed state, contains a `COPY`, or one of
+its statements was transformed by query-rewrite / multi-tenancy. Session `SET`
+tracking covers simple-protocol statements only (extended-protocol `SET`s as
+sent by JDBC, and SQL-level `PREPARE`, are not restored) and is capped by
+`tr_max_session_set_statements`.
+
+**Backend credentials.** Re-homing a session means opening a *fresh* backend
+connection. In pass-through auth mode the proxy never sees the client's
+password (SCRAM is designed for that), so a fresh connection can only be
+completed against a backend that does not challenge (trust); a challenging
+backend fails the recovery immediately with `08006` ("the proxy could not
+authenticate to the replacement primary"). To fail over onto password-protected
+(SCRAM-SHA-256 / MD5 / cleartext) backends, make the proxy the auth boundary:
+`[auth] mode = "scram"` with a **plaintext** `auth_file` entry for the user —
+the proxy then authenticates the client itself and uses the same secret as a
+SCRAM client towards every backend connection it opens (this also removes the
+former "scram mode needs a trust backend" restriction on the first connection).
+
+Counters on `/metrics` and `/metrics/prometheus`: `tr_failovers_total`,
+`tr_statements_reexecuted_total`, `tr_transactions_replayed_total`,
+`tr_replay_failures_total`, `tr_unknown_outcome_errors_total`,
+`tr_replay_cap_exceeded_total`, `tr_session_set_cap_exceeded_total`.
 
 ---
 
@@ -509,6 +548,9 @@ max_prepared_bytes = 67108864
 max_pending_bytes = 67108864
 max_total_idle_backend_conns = 8192
 pool_reap_interval_secs = 30
+tr_max_replay_statements = 1000
+tr_max_replay_bytes = 4194304
+tr_max_session_set_statements = 256
 ```
 
 | Key | Type | Default | Description |
@@ -524,6 +566,9 @@ pool_reap_interval_secs = 30
 | `max_pending_bytes` | usize | `67108864` | Per-session cap on the un-flushed extended-protocol `pending` buffer (64 MiB). |
 | `max_total_idle_backend_conns` | usize | `8192` | Global ceiling on idle backend-pool connections across all `(node,user,db)` identities. Only consumed with the `pool-modes` feature; parsed-and-ignored otherwise. |
 | `pool_reap_interval_secs` | u64 | `30` | How often the idle-connection reaper runs. |
+| `tr_max_replay_statements` | usize | `1000` | In-session TR (`tr_mode = select\|transaction`): cap on statements recorded per explicit transaction for failover replay. Over the cap the transaction is marked non-replayable (`transaction` degrades to `session` for it; `tr_replay_cap_exceeded_total`). |
+| `tr_max_replay_bytes` | usize | `4194304` | In-session TR: cap on bytes (statement text / raw extended-protocol frames) recorded per explicit transaction (4 MiB). Same degradation as above. |
+| `tr_max_session_set_statements` | usize | `256` | In-session TR (`tr_mode != none`): cap on tracked session `SET`/`RESET` statements replayed onto the replacement backend. Over the cap tracking stops (`tr_session_set_cap_exceeded_total`) and the restore is partial. |
 
 ---
 

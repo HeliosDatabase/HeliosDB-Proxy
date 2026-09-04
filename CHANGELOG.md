@@ -7,7 +7,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`FailoverController` history is now a bounded ring buffer, and entries are
+  closed out by id.** `history` was an unbounded `Vec` pushed on every failover
+  attempt and never trimmed, so repeated health flapping grew it without bound;
+  closing out a completed/failed attempt used `.last_mut()`, which could stamp
+  the wrong record when two failovers overlapped. History is now a `VecDeque`
+  capped at `FailoverConfig::max_history` (default 100, FIFO-evicted past
+  capacity), and completion looks the entry up by its `id: Uuid` instead of
+  assuming it's last. `FailoverConfig` is library-only (`FailoverController`
+  has no construction site in the daemon yet — `src/server.rs` runs its own
+  independent failover path); `max_history` is a library-API knob, not a
+  `proxy.toml` parameter. Library consumers note: `max_history` is a new public
+  field on `FailoverConfig`, so an exhaustive `FailoverConfig { .. }` literal
+  must either add it or fall back on `..Default::default()`.
+
+### Changed
+
+- **BREAKING (semver-major for library consumers)**: `anomaly::QueryObservation`
+  is now `QueryObservation<'a>`, with `fingerprint` and `sql` changed from
+  `String` to `Cow<'a, str>`, and `AnomalyDetector::record_query` now takes
+  `&QueryObservation<'_>`. This lets the per-query hot path lend the detector
+  a view into a buffer it already owns (the wire frame, a fingerprint scratch
+  buffer) instead of copying every statement, at zero cost to callers that
+  already own a `String`/`&str` (`.into()` still builds the `Cow` for them).
+  Any out-of-tree code constructing `QueryObservation` with owned `String`
+  fields needs a version bump / `.into()` to keep compiling.
+
 ### Added
+
+- **`tr_mode` now delivers in-session transparent failover (F3).** The
+  `tr_mode` setting (`none | session | select | transaction`) was parsed and
+  shown on `/config` but never read on the data path: a backend that failed
+  mid-query dropped the client socket with no `ErrorResponse`, and a backend
+  that died while a session sat idle inside a transaction let the next
+  statement run in autocommit on a fresh connection. Every mode is now real,
+  for both the simple and the extended query protocol, with a pure decision
+  table (`tr_decide`, exhaustively unit-tested over mode × fault phase ×
+  transaction state × statement kind):
+  - `none`: one `ErrorResponse` (SQLSTATE `57P01`, naming the failed node) +
+    `ReadyForQuery`, then close.
+  - `session` (default): the connection stays open; the proxy waits for a
+    healthy primary (`write_timeout_secs`), reconnects, replays the session's
+    tracked `SET`/`RESET` statements (named prepared statements are
+    re-prepared lazily), transparently re-runs a not-delivered autocommit
+    statement, and otherwise returns ONE error (`57P01` not delivered inside a
+    transaction / `08007 transaction_resolution_unknown`) while aborting the
+    client-visible transaction (`25P02` until the client issues `ROLLBACK`).
+  - `select`: `session` + unknown-outcome reads are re-executed transparently;
+    read-only explicit transactions are replayed from `BEGIN`.
+  - `transaction`: `select` + uncommitted explicit transactions are replayed
+    from `BEGIN` (recorded statement text / raw extended-protocol batches,
+    responses discarded) and the in-flight statement re-executed inside them;
+    a replay failure yields `40001`; a `COMMIT` with unknown outcome is never
+    retried. Documented as opt-in because blind replay assumes deterministic
+    statements.
+  A `COPY` in progress at the fault returns `08006` and closes in every mode;
+  a routing timeout (`NoHealthyNodes`) now also returns `08006` instead of a
+  bare disconnect.
+- `[limits] tr_max_replay_statements` (default 1000), `tr_max_replay_bytes`
+  (default 4 MiB) and `tr_max_session_set_statements` (default 256) bound the
+  per-transaction replay record and the per-session `SET` tracking; over a cap
+  the transaction is marked non-replayable (`transaction` degrades to `session`
+  behaviour for it) / tracking stops, with a counter each.
+- Metrics (`/metrics`, `/metrics/prometheus`): `tr_failovers_total`,
+  `tr_statements_reexecuted_total`, `tr_transactions_replayed_total`,
+  `tr_replay_failures_total`, `tr_unknown_outcome_errors_total`,
+  `tr_replay_cap_exceeded_total`, `tr_session_set_cap_exceeded_total`.
+- **Backend SCRAM-SHA-256 / MD5 / cleartext client authentication for fresh
+  backend connections.** `complete_backend_auth` (used by every redial: route
+  switch, pooled-connection miss, in-session failover, and the first backend
+  connection in `[auth] mode = "scram"`) previously only completed against
+  trust backends — a challenging backend timed out after 5 s. It now answers
+  SASL/MD5/cleartext challenges with the user's plaintext `auth_file` entry
+  when the proxy is the auth boundary (`[auth] mode = "scram"`), and fails fast
+  with a clear `ProxyError::Auth` when it holds no credential (pass-through
+  mode). In scram mode the backend's auth frames are no longer relayed to the
+  already-authenticated client (a synthesized `AuthenticationOk` precedes the
+  backend's ParameterStatus/BackendKeyData/ReadyForQuery), so scram mode no
+  longer requires a trust backend.
+- `scripts/regress/tr-failover-test.sh` + `scripts/regress/tcp-relay.py`: live
+  battery that kills a TCP relay in front of the backend mid-transaction and
+  checks every `tr_mode` (no second PostgreSQL required).
+
+### Fixed
+
+- `select_primary_with_timeout` only ever inspected the *first* enabled
+  `role = "primary"` node, so a configuration listing a second primary could
+  never fail over to it once the first was demoted in-band; it now picks any
+  healthy enabled primary in config order (matching `select_node_for_startup`).
 
 - **Criterion coverage for the relay / failover / pool-contention paths**
   (dev tooling only; no shipped runtime change). Closes the "known gap" recorded
@@ -34,6 +123,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     statement-mode safety, PREPARE/DEALLOCATE parsers) and the
     `ConnectionPoolManager` acquire/release cycle under client concurrency plus
     the per-statement `on_statement_complete` decision.
+
+### Changed
+
+- **L1 hot cache now uses `lru::LruCache` for O(1) get/put/eviction**,
+  replacing the previous `HashMap` + `Vec<(String, Instant)>` pair whose LRU
+  bookkeeping did an O(n) scan-and-allocate on every hit and put. This trades
+  away the read-lock-only hit path added in 0.3.1 (`L1 hot cache: hits take
+  only a read lock`, above): `get()` now takes a brief write lock to promote
+  the entry to most-recently-used, so concurrent hits on the *same* cached
+  query serialize briefly on that lock instead of running fully in parallel
+  under a shared read lock. Puts on a full cache no longer prefer evicting an
+  already-expired entry over a live LRU one; expired entries are still
+  purged, just lazily — on the `get()` that finds them, or by the periodic
+  `evict_expired()` sweep — rather than being scanned for preferentially on
+  every insert. Public API and hit/access-count metrics are unchanged.
+  `test_concurrent_hits_read_lock_only` is renamed
+  `test_concurrent_hits_no_lost_updates` to describe what it actually
+  verifies now.
 
 ## [1.5.0] - 2026-07-11
 

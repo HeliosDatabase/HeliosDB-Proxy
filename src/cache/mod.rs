@@ -99,6 +99,24 @@ impl Default for CacheContext {
     }
 }
 
+/// The per-query lexical work a cache lookup performs before it can consult
+/// the cache levels: the parsed cache hints and — when the lookup got as far
+/// as L2/L3 — the normalized query (fingerprint + extracted tables).
+///
+/// [`QueryCache::get_with_prep`] hands it back so a miss followed by the
+/// crate-internal `QueryCache::put_prepared` reuses that work instead of
+/// re-parsing the hints and re-running the normalizer's regex pass over the
+/// same SQL a second time (one normalization per miss+store, not two).
+#[derive(Debug, Clone)]
+pub struct QueryPrep {
+    /// Hints parsed from the query's `helios:` comments.
+    hints: CacheHint,
+    /// Normalized form — present only when the lookup reached the levels that
+    /// need it. Absent on a hint-skip or an L1 exact hit (neither normalizes);
+    /// `put_prepared` then normalizes lazily, exactly as `put` always did.
+    normalized: Option<NormalizedQuery>,
+}
+
 /// Cache lookup result
 #[derive(Debug)]
 pub enum CacheLookup {
@@ -208,13 +226,32 @@ impl QueryCache {
 
     /// Look up a query in the cache hierarchy
     pub async fn get(&self, query: &str, context: &CacheContext) -> CacheLookup {
+        self.get_with_prep(query, context).await.0
+    }
+
+    /// Look up a query in the cache hierarchy, also returning the [`QueryPrep`]
+    /// the lookup computed. On a miss, pass it to the crate-internal
+    /// `put_prepared` so the hint parse and query normalization are not
+    /// repeated for the store.
+    /// Behaviour is identical to [`Self::get`] in every other respect.
+    pub async fn get_with_prep(
+        &self,
+        query: &str,
+        context: &CacheContext,
+    ) -> (CacheLookup, QueryPrep) {
         // Parse cache hints
         let hints = parse_cache_hints(query);
 
         // Skip cache if hint says so
         if hints.skip {
             self.metrics.record_skip();
-            return CacheLookup::Miss;
+            return (
+                CacheLookup::Miss,
+                QueryPrep {
+                    hints,
+                    normalized: None,
+                },
+            );
         }
 
         let start = Instant::now();
@@ -225,10 +262,16 @@ impl QueryCache {
                 let l1 = self.get_l1_cache(conn_id);
                 if let Some(result) = l1.get(query) {
                     self.metrics.record_hit(CacheLevel::L1Hot, start.elapsed());
-                    return CacheLookup::Hit {
-                        result,
-                        level: CacheLevel::L1Hot,
-                    };
+                    return (
+                        CacheLookup::Hit {
+                            result,
+                            level: CacheLevel::L1Hot,
+                        },
+                        QueryPrep {
+                            hints,
+                            normalized: None,
+                        },
+                    );
                 }
             }
         }
@@ -250,10 +293,16 @@ impl QueryCache {
                     }
                 }
 
-                return CacheLookup::Hit {
-                    result,
-                    level: CacheLevel::L2Warm,
-                };
+                return (
+                    CacheLookup::Hit {
+                        result,
+                        level: CacheLevel::L2Warm,
+                    },
+                    QueryPrep {
+                        hints,
+                        normalized: Some(normalized),
+                    },
+                );
             }
         }
 
@@ -263,16 +312,28 @@ impl QueryCache {
                 if let Some(result) = l3.get(query, context).await {
                     self.metrics
                         .record_hit(CacheLevel::L3Semantic, start.elapsed());
-                    return CacheLookup::Hit {
-                        result,
-                        level: CacheLevel::L3Semantic,
-                    };
+                    return (
+                        CacheLookup::Hit {
+                            result,
+                            level: CacheLevel::L3Semantic,
+                        },
+                        QueryPrep {
+                            hints,
+                            normalized: Some(normalized),
+                        },
+                    );
                 }
             }
         }
 
         self.metrics.record_miss(start.elapsed());
-        CacheLookup::Miss
+        (
+            CacheLookup::Miss,
+            QueryPrep {
+                hints,
+                normalized: Some(normalized),
+            },
+        )
     }
 
     /// Store a query result in the cache
@@ -284,16 +345,50 @@ impl QueryCache {
         row_count: usize,
         execution_time: Duration,
     ) {
-        // Parse cache hints
-        let hints = parse_cache_hints(query);
+        let prep = QueryPrep {
+            hints: parse_cache_hints(query),
+            normalized: None,
+        };
+        self.put_prepared(query, context, &prep, data, row_count, execution_time)
+            .await
+    }
+
+    /// Store a query result in the cache, reusing the hint parse (and, when
+    /// present, the normalization) a preceding [`Self::get_with_prep`] already
+    /// performed for the same SQL. When `prep` carries no normalization the
+    /// query is normalized here — so this is behaviourally identical to
+    /// [`Self::put`], only cheaper on the miss+store path.
+    ///
+    /// The `prep` MUST be the one [`Self::get_with_prep`] returned for this
+    /// exact `query` — it carries that query's hints and normalization, so a
+    /// foreign prep would key, TTL, or skip the entry differently from
+    /// [`Self::put`]. Hence `pub(crate)`, and hence `QueryPrep` has no
+    /// `Default`: the only way to obtain one is from a lookup.
+    pub(crate) async fn put_prepared(
+        &self,
+        query: &str,
+        context: &CacheContext,
+        prep: &QueryPrep,
+        data: Bytes,
+        row_count: usize,
+        execution_time: Duration,
+    ) {
+        let hints = &prep.hints;
 
         // Skip if hint says so
         if hints.skip {
             return;
         }
 
-        // Normalize query
-        let normalized = self.normalizer.normalize(query);
+        // Normalize query (reusing the lookup's normalization when it has one)
+        let owned_normalized;
+        let normalized = match prep.normalized.as_ref() {
+            Some(n) => n,
+            None => {
+                owned_normalized = self.normalizer.normalize(query);
+                &owned_normalized
+            }
+        };
 
         // Determine TTL
         let ttl = hints
@@ -326,7 +421,7 @@ impl QueryCache {
 
         // Store in L2 (normalized)
         if let Some(ref l2) = self.l2_cache {
-            let cache_key = CacheKey::new(&normalized, context);
+            let cache_key = CacheKey::new(normalized, context);
             l2.put(cache_key.clone(), result.clone()).await;
 
             // Register for invalidation
@@ -497,5 +592,90 @@ mod tests {
 
         let result = cache.get("SELECT * FROM users", &context).await;
         assert!(matches!(result, CacheLookup::Miss));
+    }
+
+    /// A miss returns the hint parse + normalization it performed, so the
+    /// store can reuse them. The prep must describe the query it was taken
+    /// from — otherwise `put_prepared` would key or TTL the entry differently
+    /// from `put`.
+    #[tokio::test]
+    async fn get_with_prep_returns_the_lookups_normalization() {
+        let cache = QueryCache::new(CacheConfig::default());
+        let ctx = CacheContext::default();
+        let sql = "SELECT id FROM users WHERE id = 7";
+
+        let (lookup, prep) = cache.get_with_prep(sql, &ctx).await;
+        assert!(matches!(lookup, CacheLookup::Miss));
+        assert!(!prep.hints.skip);
+        let normalized = prep.normalized.as_ref().expect("miss normalizes once");
+        let fresh = cache.normalizer.normalize(sql);
+        assert_eq!(normalized.fingerprint, fresh.fingerprint);
+        assert_eq!(normalized.hash, fresh.hash);
+        assert_eq!(normalized.tables, fresh.tables);
+    }
+
+    /// `put_prepared` with a reused prep must store exactly what `put` would
+    /// have stored (same L1 entry, same TTL, same table dependencies) — the
+    /// single-normalization path is an optimisation, not a behaviour change.
+    #[tokio::test]
+    async fn put_prepared_matches_put() {
+        let sql = "SELECT id FROM users WHERE id = 7";
+        let ctx = CacheContext {
+            connection_id: Some(1),
+            ..Default::default()
+        };
+        let body = Bytes::from_static(b"rows");
+
+        let via_put = QueryCache::new(CacheConfig::default());
+        via_put
+            .put(sql, &ctx, body.clone(), 3, Duration::from_millis(5))
+            .await;
+
+        let via_prep = QueryCache::new(CacheConfig::default());
+        let (lookup, prep) = via_prep.get_with_prep(sql, &ctx).await;
+        assert!(matches!(lookup, CacheLookup::Miss));
+        via_prep
+            .put_prepared(sql, &ctx, &prep, body.clone(), 3, Duration::from_millis(5))
+            .await;
+
+        let a = via_put.get_l1_cache(1).get(sql).expect("put stored to L1");
+        let b = via_prep
+            .get_l1_cache(1)
+            .get(sql)
+            .expect("put_prepared stored to L1");
+        assert_eq!(a.data, b.data);
+        assert_eq!(a.row_count, b.row_count);
+        assert_eq!(a.ttl, b.ttl);
+        assert_eq!(a.tables, b.tables);
+    }
+
+    /// A `cache=skip` hint short-circuits the lookup before normalizing; the
+    /// prep it hands back must still make `put_prepared` skip the store, just
+    /// as `put` does.
+    #[tokio::test]
+    async fn skip_hint_prep_still_skips_the_store() {
+        let cache = QueryCache::new(CacheConfig::default());
+        let ctx = CacheContext {
+            connection_id: Some(1),
+            ..Default::default()
+        };
+        let sql = "/* helios:cache=skip */ SELECT 1";
+
+        let (lookup, prep) = cache.get_with_prep(sql, &ctx).await;
+        assert!(matches!(lookup, CacheLookup::Miss));
+        assert!(prep.hints.skip);
+        assert!(prep.normalized.is_none(), "skip must not normalize");
+
+        cache
+            .put_prepared(
+                sql,
+                &ctx,
+                &prep,
+                Bytes::from_static(b"rows"),
+                1,
+                Duration::ZERO,
+            )
+            .await;
+        assert!(cache.get_l1_cache(1).get(sql).is_none());
     }
 }

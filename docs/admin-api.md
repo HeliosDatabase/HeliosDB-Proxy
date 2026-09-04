@@ -300,6 +300,7 @@ Server metrics in JSON.
 ```json
 {
   "connections_accepted": 15234,
+  "connections_rejected": 0,
   "connections_closed": 15100,
   "connections_active": 134,
   "queries_processed": 892451,
@@ -309,7 +310,10 @@ Server metrics in JSON.
 }
 ```
 
-`connections_active` is computed as `accepted − closed`.
+`connections_active` is computed as `accepted − closed`. `connections_rejected`
+counts connections refused because the `[limits] max_client_connections` cap was
+saturated (they are also counted in `accepted`/`closed`); cancel requests are
+never refused.
 
 ### GET /metrics/prometheus
 

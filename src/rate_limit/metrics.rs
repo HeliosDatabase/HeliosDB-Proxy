@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -31,8 +32,11 @@ pub struct RateLimitMetrics {
     /// Requests denied
     denied: AtomicU64,
 
-    /// Per-key statistics
-    key_stats: DashMap<String, KeyStats>,
+    /// Per-key statistics, indexed by the key's rendered `Display` form.
+    /// Keyed by `Arc<str>` (not `String`) so the per-query path can hand over
+    /// the caller's already-rendered key: a hit borrows it as `&str` and a
+    /// miss clones the `Arc`, so no key is ever formatted per request.
+    key_stats: DashMap<Arc<str>, KeyStats>,
 
     /// Decision timing (microseconds)
     decision_times_us: RwLock<Vec<u64>>,
@@ -61,8 +65,33 @@ impl RateLimitMetrics {
         }
     }
 
-    /// Record a rate limit decision
+    /// Record a rate limit decision, rendering the key's `Display` form.
+    ///
+    /// Prefer [`record_decision_keyed`](Self::record_decision_keyed) on hot
+    /// paths, which reuses an already-rendered key.
     pub fn record_decision(&self, key: &LimiterKey, result: &RateLimitResult, elapsed: Duration) {
+        let key_str = key.to_string();
+        self.record_totals(result);
+        self.touch_key_stats(&key_str, || Arc::from(key_str.as_str()), result);
+        self.record_timing(elapsed);
+    }
+
+    /// Record a rate limit decision for a key whose `Display` form was
+    /// rendered once (see `CachedLimiterKey`). Identical bookkeeping to
+    /// [`record_decision`](Self::record_decision) with no per-call formatting.
+    pub fn record_decision_keyed(
+        &self,
+        key: &Arc<str>,
+        result: &RateLimitResult,
+        elapsed: Duration,
+    ) {
+        self.record_totals(result);
+        self.touch_key_stats(key, || Arc::clone(key), result);
+        self.record_timing(elapsed);
+    }
+
+    /// Bump the aggregate counters for a decision.
+    fn record_totals(&self, result: &RateLimitResult) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
 
         match result {
@@ -82,20 +111,32 @@ impl RateLimitMetrics {
                 self.denied.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
 
-        // Update per-key stats
-        let key_str = key.to_string();
+    /// Record a decision against the per-key stats. The owned key is only
+    /// materialized when the entry has to be created.
+    fn touch_key_stats(
+        &self,
+        key: &str,
+        owned: impl FnOnce() -> Arc<str>,
+        result: &RateLimitResult,
+    ) {
+        // A shard *read* guard is enough here, unlike the limiter's bucket
+        // maps: `KeyStats::record` only does atomic fetch_add/store, so two
+        // threads recording the same key concurrently cannot lose an update.
+        if let Some(stats) = self.key_stats.get(key) {
+            stats.record(result);
+            return;
+        }
+
         self.key_stats
-            .entry(key_str)
+            .entry(owned())
             .and_modify(|stats| stats.record(result))
             .or_insert_with(|| {
                 let stats = KeyStats::new();
                 stats.record(result);
                 stats
             });
-
-        // Record timing
-        self.record_timing(elapsed);
     }
 
     /// Record timing sample
@@ -112,7 +153,7 @@ impl RateLimitMetrics {
     /// Reset stats for a key
     pub fn reset_key(&self, key: &LimiterKey) {
         let key_str = key.to_string();
-        self.key_stats.remove(&key_str);
+        self.key_stats.remove(key_str.as_str());
     }
 
     /// Get current statistics snapshot
@@ -147,7 +188,7 @@ impl RateLimitMetrics {
         let key_stats: HashMap<_, _> = self
             .key_stats
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().snapshot()))
+            .map(|entry| (entry.key().to_string(), entry.value().snapshot()))
             .collect();
 
         RateLimitStats {
@@ -594,6 +635,62 @@ mod tests {
         assert_eq!(stats.key_stats.len(), 1);
         assert!(!stats.key_stats.contains_key("user:user1"));
         assert!(stats.key_stats.contains_key("user:user2"));
+    }
+
+    /// `record_decision_keyed` (the per-query path, which passes an
+    /// already-rendered `Arc<str>`) must land in the same per-key bucket as
+    /// `record_decision` (which formats the key) and produce identical totals.
+    #[test]
+    fn test_record_decision_keyed_matches_formatted_path() {
+        let metrics = RateLimitMetrics::new();
+        let key = LimiterKey::User("cached".to_string());
+        let rendered: Arc<str> = Arc::from(key.to_string().as_str());
+
+        metrics.record_decision(&key, &RateLimitResult::Allowed, Duration::from_micros(10));
+        metrics.record_decision_keyed(
+            &rendered,
+            &RateLimitResult::Allowed,
+            Duration::from_micros(10),
+        );
+        metrics.record_decision_keyed(
+            &rendered,
+            &RateLimitResult::Warned("w".to_string()),
+            Duration::from_micros(10),
+        );
+
+        let stats = metrics.get_stats();
+        assert_eq!(stats.total_requests, 3);
+        assert_eq!(stats.allowed, 2);
+        assert_eq!(stats.warned, 1);
+        assert_eq!(
+            stats.key_stats.len(),
+            1,
+            "the rendered key must not create a second bucket"
+        );
+
+        let per_key = stats.key_stats.get("user:cached").unwrap();
+        assert_eq!(per_key.total, 3);
+        assert_eq!(per_key.allowed, 3);
+        assert_eq!(per_key.denied, 0);
+    }
+
+    /// `reset_key` still finds an entry that was written through the keyed
+    /// (`Arc<str>`) path — the map is looked up by borrowed `&str`.
+    #[test]
+    fn test_reset_key_clears_keyed_entry() {
+        let metrics = RateLimitMetrics::new();
+        let key = LimiterKey::Database("shop".to_string());
+        let rendered: Arc<str> = Arc::from(key.to_string().as_str());
+
+        metrics.record_decision_keyed(
+            &rendered,
+            &RateLimitResult::Allowed,
+            Duration::from_micros(10),
+        );
+        assert!(metrics.get_stats().key_stats.contains_key("db:shop"));
+
+        metrics.reset_key(&key);
+        assert!(!metrics.get_stats().key_stats.contains_key("db:shop"));
     }
 
     #[test]

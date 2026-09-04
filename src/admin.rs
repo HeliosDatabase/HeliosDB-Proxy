@@ -530,7 +530,15 @@ impl AdminServer {
             }
             ("GET", "/metrics/prometheus") => {
                 let metrics = state.metrics.read().await.clone();
-                let prometheus = Self::format_prometheus_metrics(&metrics);
+                #[allow(unused_mut)]
+                let mut prometheus = Self::format_prometheus_metrics(&metrics);
+                // Shed analytics samples belong next to the other counters, so
+                // an operator can alert on them without polling the JSON
+                // `/api/analytics` endpoint.
+                #[cfg(feature = "query-analytics")]
+                if let Some(a) = state.analytics.read().await.as_ref() {
+                    Self::push_analytics_prometheus(&mut prometheus, a.dropped_total());
+                }
                 Ok((200, serde_json::json!({ "text": prometheus })))
             }
 
@@ -1020,7 +1028,7 @@ impl AdminServer {
             .find(|n| {
                 n.role == NodeRole::Primary
                     && n.enabled
-                    && health.get(&n.address()).map(|h| h.healthy).unwrap_or(false)
+                    && health.get(n.address()).map(|h| h.healthy).unwrap_or(false)
             })
             .ok_or_else(|| ProxyError::Internal("No healthy primary node available".to_string()))
     }
@@ -1035,7 +1043,7 @@ impl AdminServer {
         let healthy_nodes: Vec<&NodeConfig> = config
             .nodes
             .iter()
-            .filter(|n| n.enabled && health.get(&n.address()).map(|h| h.healthy).unwrap_or(false))
+            .filter(|n| n.enabled && health.get(n.address()).map(|h| h.healthy).unwrap_or(false))
             .collect();
 
         if healthy_nodes.is_empty() {
@@ -1066,6 +1074,23 @@ impl AdminServer {
         Ok(healthy_nodes[index])
     }
 
+    /// Cap a backend-declared response `Content-Length` before it is used to
+    /// size an allocation. A hostile or buggy backend answering
+    /// `Content-Length: 99999999999` would otherwise make the admin task
+    /// zero-fill a peer-chosen buffer and OOM the process. Mirrors the 413 the
+    /// inbound admin path returns for an oversized request body, reusing the
+    /// same `MAX_ADMIN_BODY_BYTES` cap. Pure, so it is unit-testable.
+    fn check_forward_body_len(content_length: usize) -> Result<usize> {
+        if content_length > Self::MAX_ADMIN_BODY_BYTES {
+            return Err(ProxyError::Network(format!(
+                "413 Payload Too Large: backend response Content-Length {} exceeds admin limit {}",
+                content_length,
+                Self::MAX_ADMIN_BODY_BYTES
+            )));
+        }
+        Ok(content_length)
+    }
+
     /// Forward SQL request to backend node's HTTP API
     async fn forward_sql_request(url: &str, sql: &str) -> Result<serde_json::Value> {
         // Build HTTP request
@@ -1086,10 +1111,19 @@ impl AdminServer {
             "/".to_string()
         };
 
+        // One deadline covers connect + request write + response head + response
+        // body. Every one of these steps used to be unbounded in time, so a
+        // backend that accepted the connection and then stalled pinned this
+        // admin task (and its connection permit) forever.
+        let deadline = tokio::time::Instant::now() + Self::ADMIN_READ_TIMEOUT;
+
         // Connect to backend
-        let stream = TcpStream::connect(host_port).await.map_err(|e| {
-            ProxyError::Network(format!("Failed to connect to {}: {}", host_port, e))
-        })?;
+        let stream = tokio::time::timeout_at(deadline, TcpStream::connect(host_port))
+            .await
+            .map_err(|_| ProxyError::Network(format!("Timed out connecting to {}", host_port)))?
+            .map_err(|e| {
+                ProxyError::Network(format!("Failed to connect to {}: {}", host_port, e))
+            })?;
 
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
@@ -1102,48 +1136,26 @@ impl AdminServer {
             body_bytes.len()
         );
 
-        writer
-            .write_all(request.as_bytes())
+        tokio::time::timeout_at(deadline, writer.write_all(request.as_bytes()))
             .await
+            .map_err(|_| ProxyError::Network("Request write timeout".to_string()))?
             .map_err(|e| ProxyError::Network(format!("Write error: {}", e)))?;
-        writer
-            .write_all(&body_bytes)
+        tokio::time::timeout_at(deadline, writer.write_all(&body_bytes))
             .await
+            .map_err(|_| ProxyError::Network("Request body write timeout".to_string()))?
             .map_err(|e| ProxyError::Network(format!("Write body error: {}", e)))?;
 
-        // Read response headers
-        let mut response_headers = Vec::new();
-        let mut line = String::new();
-        let mut content_length: usize = 0;
+        // Read the response head (status line + headers) under the same bounds
+        // the inbound admin path enforces: header count and header bytes are
+        // capped and the read is deadline-bounded. `read_head` discards the
+        // start line, which is what this call site already did with the status
+        // line.
+        let head = crate::http_util::read_head(&mut reader, deadline).await?;
 
-        loop {
-            line.clear();
-            let bytes_read = reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| ProxyError::Network(format!("Response read error: {}", e)))?;
-
-            if bytes_read == 0 || line == "\r\n" {
-                break;
-            }
-
-            let trimmed = line.trim();
-            if trimmed.to_lowercase().starts_with("content-length:") {
-                if let Some(len_str) = trimmed.split(':').nth(1) {
-                    content_length = len_str.trim().parse().unwrap_or(0);
-                }
-            }
-            response_headers.push(trimmed.to_string());
-        }
-
-        // Read response body
-        let mut body_buf = vec![0u8; content_length];
-        if content_length > 0 {
-            reader
-                .read_exact(&mut body_buf)
-                .await
-                .map_err(|e| ProxyError::Network(format!("Response body read error: {}", e)))?;
-        }
+        // Reject an oversized declared Content-Length BEFORE it sizes an
+        // allocation, then read the body under the same deadline.
+        let content_length = Self::check_forward_body_len(head.content_length)?;
+        let body_buf = crate::http_util::read_body(&mut reader, content_length, deadline).await?;
 
         let response_body = String::from_utf8_lossy(&body_buf);
 
@@ -1583,6 +1595,14 @@ impl AdminServer {
 
     /// `GET /api/analytics` — top queries by call count plus the slow-query
     /// count. Returns 503 when analytics is not attached/enabled.
+    ///
+    /// Reads the same shared state the query path writes. Since the ingest now
+    /// runs on a background consumer task, the newest few queries may not be
+    /// reflected yet — the view lags by however long it takes to drain the
+    /// `[analytics] queue_capacity` queue (microseconds in practice).
+    /// `analytics_dropped_total` counts executions discarded because that
+    /// queue was full; a persistently non-zero delta means analytics is being
+    /// shed to protect the relay, and the capacity should be raised.
     #[cfg(feature = "query-analytics")]
     async fn handle_analytics(
         path: &str,
@@ -1615,9 +1635,10 @@ impl AdminServer {
         Ok((
             200,
             serde_json::json!({
-                "limit":            limit,
-                "top_queries":      top,
-                "slow_query_count": slow_count,
+                "limit":                     limit,
+                "top_queries":               top,
+                "slow_query_count":          slow_count,
+                "analytics_dropped_total":   a.dropped_total(),
             }),
         ))
     }
@@ -2021,6 +2042,21 @@ impl AdminServer {
     }
 
     /// Format metrics as Prometheus text format
+    /// Append the query-analytics counters to a Prometheus exposition body.
+    ///
+    /// `analytics_dropped_total` is also on `GET /api/analytics`, but the
+    /// counters an operator alerts on live here.
+    #[cfg(feature = "query-analytics")]
+    fn push_analytics_prometheus(output: &mut String, dropped_total: u64) {
+        output.push_str(
+            "# HELP heliosdb_proxy_analytics_dropped_total Query executions dropped before analytics ingest (queue full or closed, or ingest panicked)\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_analytics_dropped_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_analytics_dropped_total {dropped_total}\n"
+        ));
+    }
+
     fn format_prometheus_metrics(metrics: &ServerMetricsSnapshot) -> String {
         let mut output = String::new();
 
@@ -2029,6 +2065,15 @@ impl AdminServer {
         output.push_str(&format!(
             "heliosdb_proxy_connections_total {}\n",
             metrics.connections_accepted
+        ));
+
+        output.push_str(
+            "# HELP heliosdb_proxy_connections_rejected_total Total connections refused by cap\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_connections_rejected_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_connections_rejected_total {}\n",
+            metrics.connections_rejected
         ));
 
         output.push_str("# HELP heliosdb_proxy_connections_closed Total connections closed\n");
@@ -2065,6 +2110,59 @@ impl AdminServer {
             "heliosdb_proxy_failovers_total {}\n",
             metrics.failovers
         ));
+
+        output.push_str(
+            "# HELP heliosdb_proxy_cache_capture_oversize_total Cacheable reads not cached              because the response exceeded cache.max_cacheable_response_bytes\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_cache_capture_oversize_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_cache_capture_oversize_total {}\n",
+            metrics.cache_capture_oversize
+        ));
+
+        // In-session Transaction Replay (tr_mode) counters.
+        let tr = &metrics.tr;
+        for (name, help, value) in [
+            (
+                "tr_failovers_total",
+                "Sessions re-homed onto a replacement backend after a backend fault (tr_mode)",
+                tr.failovers,
+            ),
+            (
+                "tr_statements_reexecuted_total",
+                "In-flight statements transparently re-executed after an in-session failover",
+                tr.statements_reexecuted,
+            ),
+            (
+                "tr_transactions_replayed_total",
+                "Explicit transactions replayed on the new backend (tr_mode = transaction)",
+                tr.transactions_replayed,
+            ),
+            (
+                "tr_replay_failures_total",
+                "Transaction replays that failed (client received SQLSTATE 40001)",
+                tr.replay_failures,
+            ),
+            (
+                "tr_unknown_outcome_errors_total",
+                "SQLSTATE 08007 transaction_resolution_unknown errors returned to clients",
+                tr.unknown_outcome_errors,
+            ),
+            (
+                "tr_replay_cap_exceeded_total",
+                "Transactions marked non-replayable by limits.tr_max_replay_statements/bytes",
+                tr.replay_cap_exceeded,
+            ),
+            (
+                "tr_session_set_cap_exceeded_total",
+                "Sessions whose SET tracking stopped at limits.tr_max_session_set_statements",
+                tr.session_set_cap_exceeded,
+            ),
+        ] {
+            output.push_str(&format!("# HELP heliosdb_proxy_{name} {help}\n"));
+            output.push_str(&format!("# TYPE heliosdb_proxy_{name} counter\n"));
+            output.push_str(&format!("heliosdb_proxy_{name} {value}\n"));
+        }
 
         output
     }
@@ -2139,11 +2237,14 @@ impl AdminState {
             node_health: RwLock::new(HashMap::new()),
             metrics: RwLock::new(ServerMetricsSnapshot {
                 connections_accepted: 0,
+                connections_rejected: 0,
                 connections_closed: 0,
                 queries_processed: 0,
                 bytes_received: 0,
                 bytes_sent: 0,
                 failovers: 0,
+                cache_capture_oversize: 0,
+                tr: Default::default(),
             }),
             active_sessions: RwLock::new(0),
             config_snapshot: RwLock::new(ConfigSnapshot {
@@ -2328,24 +2429,52 @@ struct ErrorResponse {
 #[derive(Serialize)]
 struct MetricsResponse {
     connections_accepted: u64,
+    connections_rejected: u64,
     connections_closed: u64,
     connections_active: u64,
     queries_processed: u64,
     bytes_received: u64,
     bytes_sent: u64,
     failovers: u64,
+    /// Cacheable reads whose response outgrew
+    /// `[cache] max_cacheable_response_bytes` and were therefore not cached.
+    cache_capture_oversize: u64,
+    /// In-session Transaction Replay (`tr_mode`): sessions re-homed onto a
+    /// replacement backend after a backend fault.
+    tr_failovers_total: u64,
+    /// In-flight statements transparently re-executed after a failover.
+    tr_statements_reexecuted_total: u64,
+    /// Explicit transactions replayed on the new backend (`transaction` mode).
+    tr_transactions_replayed_total: u64,
+    /// Transaction replays that failed (client received SQLSTATE 40001).
+    tr_replay_failures_total: u64,
+    /// SQLSTATE 08007 `transaction_resolution_unknown` errors returned.
+    tr_unknown_outcome_errors_total: u64,
+    /// Transactions marked non-replayable by `[limits] tr_max_replay_*`.
+    tr_replay_cap_exceeded_total: u64,
+    /// Sessions whose SET tracking hit `[limits] tr_max_session_set_statements`.
+    tr_session_set_cap_exceeded_total: u64,
 }
 
 impl From<ServerMetricsSnapshot> for MetricsResponse {
     fn from(m: ServerMetricsSnapshot) -> Self {
         Self {
             connections_accepted: m.connections_accepted,
+            connections_rejected: m.connections_rejected,
             connections_closed: m.connections_closed,
             connections_active: m.connections_accepted.saturating_sub(m.connections_closed),
             queries_processed: m.queries_processed,
             bytes_received: m.bytes_received,
             bytes_sent: m.bytes_sent,
             failovers: m.failovers,
+            cache_capture_oversize: m.cache_capture_oversize,
+            tr_failovers_total: m.tr.failovers,
+            tr_statements_reexecuted_total: m.tr.statements_reexecuted,
+            tr_transactions_replayed_total: m.tr.transactions_replayed,
+            tr_replay_failures_total: m.tr.replay_failures,
+            tr_unknown_outcome_errors_total: m.tr.unknown_outcome_errors,
+            tr_replay_cap_exceeded_total: m.tr.replay_cap_exceeded,
+            tr_session_set_cap_exceeded_total: m.tr.session_set_cap_exceeded,
         }
     }
 }
@@ -2776,32 +2905,92 @@ mod tests {
     fn test_prometheus_metrics_format() {
         let metrics = ServerMetricsSnapshot {
             connections_accepted: 100,
+            connections_rejected: 7,
             connections_closed: 50,
             queries_processed: 1000,
             bytes_received: 50000,
             bytes_sent: 100000,
             failovers: 2,
+            cache_capture_oversize: 7,
+            tr: crate::server::TrMetricsSnapshot {
+                failovers: 4,
+                statements_reexecuted: 5,
+                transactions_replayed: 6,
+                replay_failures: 1,
+                unknown_outcome_errors: 2,
+                replay_cap_exceeded: 3,
+                session_set_cap_exceeded: 8,
+            },
         };
 
         let output = AdminServer::format_prometheus_metrics(&metrics);
         assert!(output.contains("heliosdb_proxy_connections_total 100"));
         assert!(output.contains("heliosdb_proxy_queries_total 1000"));
         assert!(output.contains("heliosdb_proxy_failovers_total 2"));
+        // O1: the capture byte-cap counter is scrapeable.
+        assert!(output.contains("heliosdb_proxy_cache_capture_oversize_total 7"));
+        assert!(output.contains("heliosdb_proxy_connections_rejected_total 7"));
+        // F3: in-session Transaction Replay counters are scrapeable.
+        assert!(output.contains("heliosdb_proxy_tr_failovers_total 4"));
+        assert!(output.contains("heliosdb_proxy_tr_statements_reexecuted_total 5"));
+        assert!(output.contains("heliosdb_proxy_tr_transactions_replayed_total 6"));
+        assert!(output.contains("heliosdb_proxy_tr_replay_failures_total 1"));
+        assert!(output.contains("heliosdb_proxy_tr_unknown_outcome_errors_total 2"));
+        assert!(output.contains("heliosdb_proxy_tr_replay_cap_exceeded_total 3"));
+        assert!(output.contains("heliosdb_proxy_tr_session_set_cap_exceeded_total 8"));
+    }
+
+    /// Shed analytics samples must be exposed on `/metrics/prometheus`,
+    /// next to the other counters an operator alerts on — before this they
+    /// were only reachable through the JSON `/api/analytics` endpoint.
+    #[cfg(feature = "query-analytics")]
+    #[tokio::test]
+    async fn test_prometheus_exposes_analytics_dropped_total() {
+        let state = Arc::new(AdminState::new());
+
+        // Absent until the engine is attached.
+        let (status, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        assert!(!body["text"]
+            .as_str()
+            .unwrap()
+            .contains("heliosdb_proxy_analytics_dropped_total"));
+
+        let analytics = Arc::new(crate::analytics::QueryAnalytics::with_defaults());
+        state.with_analytics(analytics).await;
+        let (status, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("# TYPE heliosdb_proxy_analytics_dropped_total counter"));
+        assert!(text.contains("heliosdb_proxy_analytics_dropped_total 0\n"));
     }
 
     #[test]
     fn test_metrics_response_active_connections() {
         let snapshot = ServerMetricsSnapshot {
             connections_accepted: 100,
+            connections_rejected: 0,
             connections_closed: 30,
             queries_processed: 500,
             bytes_received: 10000,
             bytes_sent: 20000,
             failovers: 1,
+            cache_capture_oversize: 3,
+            tr: crate::server::TrMetricsSnapshot {
+                transactions_replayed: 9,
+                ..Default::default()
+            },
         };
 
         let response = MetricsResponse::from(snapshot);
         assert_eq!(response.connections_active, 70);
+        assert_eq!(response.cache_capture_oversize, 3);
+        assert_eq!(response.tr_transactions_replayed_total, 9);
+        assert_eq!(response.tr_failovers_total, 0);
     }
 
     /// Helper: build an AdminState with the given (address, role,
@@ -3452,7 +3641,7 @@ mod tests {
             let fp = format!("fp{}", i);
             let _ = det.record_query(&QueryObservation {
                 tenant: "test".into(),
-                fingerprint: fp,
+                fingerprint: fp.into(),
                 sql: "SELECT 1".into(),
                 timestamp: std::time::Instant::now(),
             });
@@ -3465,6 +3654,36 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(value["limit"].as_u64().unwrap(), 5);
         assert_eq!(value["events"].as_array().unwrap().len(), 5);
+    }
+
+    /// `GET /api/analytics` must return 503 until the engine is attached, and
+    /// then a fixed JSON shape: the operator-facing `analytics_dropped_total`
+    /// (samples shed because the ingest queue was full, or whose ingest
+    /// panicked) is part of that contract.
+    #[cfg(feature = "query-analytics")]
+    #[tokio::test]
+    async fn test_analytics_response_shape() {
+        let state = Arc::new(AdminState::new());
+        let (status, _) = AdminServer::handle_analytics("/api/analytics", &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 503);
+
+        let analytics = Arc::new(crate::analytics::QueryAnalytics::with_defaults());
+        analytics.record_now(crate::analytics::QueryExecution::new(
+            "SELECT * FROM users WHERE id = 1".to_string(),
+            std::time::Duration::from_millis(3),
+        ));
+        state.with_analytics(analytics).await;
+
+        let (status, value) = AdminServer::handle_analytics("/api/analytics?limit=5", &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        assert_eq!(value["limit"].as_u64().unwrap(), 5);
+        assert_eq!(value["top_queries"].as_array().unwrap().len(), 1);
+        assert_eq!(value["slow_query_count"].as_u64().unwrap(), 0);
+        assert_eq!(value["analytics_dropped_total"].as_u64().unwrap(), 0);
     }
 
     #[cfg(any(feature = "anomaly-detection", feature = "query-analytics"))]
@@ -3754,5 +3973,71 @@ mod tests {
         let frame = read_until(&mut c, "\"up_to_version\":7").await;
         assert!(frame.contains("event: invalidate"), "got: {frame}");
         assert!(frame.contains("\"up_to_version\":7"), "got: {frame}");
+    }
+
+    #[test]
+    fn forward_sql_body_len_capped_at_admin_limit() {
+        // Exactly at the cap is accepted, one byte over is rejected.
+        assert_eq!(AdminServer::check_forward_body_len(0).unwrap(), 0);
+        let cap = AdminServer::MAX_ADMIN_BODY_BYTES;
+        assert_eq!(AdminServer::check_forward_body_len(cap).unwrap(), cap);
+        let err = AdminServer::check_forward_body_len(cap + 1).unwrap_err();
+        assert!(err.to_string().contains("413"), "unexpected error: {err}");
+        // The hostile declaration this guard exists for: a peer-chosen
+        // Content-Length that would size a multi-gigabyte zero-filled Vec.
+        let err = AdminServer::check_forward_body_len(usize::MAX).unwrap_err();
+        assert!(err.to_string().contains("413"), "unexpected error: {err}");
+    }
+
+    /// Spawn a one-shot HTTP responder that replies with `headers`
+    /// (already CRLF-terminated, without the blank line) plus `body`.
+    async fn spawn_sql_backend(headers: String, body: &'static [u8]) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Read whatever the proxy sends so its writes complete.
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(headers.as_bytes()).await;
+            let _ = sock.write_all(b"\r\n").await;
+            let _ = sock.write_all(body).await;
+        });
+        format!("http://{addr}/api/sql")
+    }
+
+    #[tokio::test]
+    async fn forward_sql_request_parses_bounded_response() {
+        let body = br#"{"rows":[]}"#;
+        let url = spawn_sql_backend(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+                body.len()
+            ),
+            body,
+        )
+        .await;
+        let value = AdminServer::forward_sql_request(&url, "SELECT 1")
+            .await
+            .expect("well-formed backend response must still parse");
+        assert!(value["rows"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn forward_sql_request_rejects_oversized_content_length() {
+        // Backend declares more body than the admin cap allows and then sends
+        // nothing: the old code allocated `vec![0u8; content_length]` first.
+        let url = spawn_sql_backend(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n",
+                AdminServer::MAX_ADMIN_BODY_BYTES + 1
+            ),
+            b"",
+        )
+        .await;
+        let err = AdminServer::forward_sql_request(&url, "SELECT 1")
+            .await
+            .expect_err("oversized Content-Length must be rejected before allocating");
+        assert!(err.to_string().contains("413"), "unexpected error: {err}");
     }
 }

@@ -40,8 +40,9 @@ These improve things we already market. Keep the framing neutral and specific �
 - Goes on: protocol / PostgreSQL compatibility section.
 
 #### L1 hot cache
-- **Claim:** *"L1 cache hits take only a read lock; the per-entry access counter is atomic, so many threads can hit the same cached query in parallel without serialising."*
-- **Evidence (not a number):** *"Exercised by a 16-thread × 500-iteration regression test against the same key."*
+- **Claim:** *"L1 cache hits are O(1) with no per-hit allocation — the cache is backed by an intrusive LRU map, so a hit is one map lookup plus an in-place recency update, never a scan or a clone of the key."*
+- **Caveat — do not overclaim parallelism:** a hit takes a brief write lock on the entry map (promoting the entry to most-recently-used requires exclusive access), so concurrent hits on the *same* cached query serialize briefly on that lock rather than running fully in parallel under a shared read lock. Do not use "read lock" or "without serialising" language for this any more.
+- **Evidence (not a number):** *"Exercised by a 16-thread × 500-iteration regression test against the same key, which asserts every thread observes the correct cached data and the access counter ends up exactly right with no lost updates."*
 - Goes on: query-cache section, wherever L1/L2/L3 tiers are described.
 
 ### CHANGELOG-only — do NOT broadcast
@@ -126,7 +127,7 @@ HeliosProxy copy is **formal, commercial, protocol-level**:
   - `src/connection_pool.rs::tests::test_return_then_reacquire_reuses_permit`
   - `src/protocol.rs::tests::test_read_cstring_unterminated`
   - `src/protocol.rs::tests::test_bind_message_param_values_are_bytes`
-  - `src/cache/l1_hot.rs::tests::test_concurrent_hits_read_lock_only`
+  - `src/cache/l1_hot.rs::tests::test_concurrent_hits_no_lost_updates`
 
 ---
 
