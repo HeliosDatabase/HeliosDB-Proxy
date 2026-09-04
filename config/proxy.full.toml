@@ -75,9 +75,12 @@ write_timeout_secs = 30
 # # Ceiling on concurrently-served client connections on the PG-wire listener.
 # # 0 (default) = unlimited, exactly as before this key existed. When > 0, a
 # # connection that arrives with no free slot is answered with a PostgreSQL
-# # ErrorResponse (SQLSTATE 53300, "too many clients already") and closed
-# # instead of being queued — the shape a PostgreSQL server at max_connections
-# # gives. Rejections are counted by the `connections_rejected` metric
+# # ErrorResponse (FATAL, SQLSTATE 53300, "sorry, too many clients already")
+# # and closed instead of being queued — the shape a PostgreSQL server at
+# # max_connections gives. The slot is taken only once the connection's first
+# # startup message is known to be a real Startup, so a CancelRequest (query
+# # cancellation) is always served, even at the cap, and never consumes a slot.
+# # Rejections are counted by the `connections_rejected` metric
 # # (/metrics, /metrics/prometheus). READ ONCE AT STARTUP: a SIGHUP that
 # # changes this key is logged and ignored — restart to change the cap.
 # max_client_connections = 0
@@ -85,12 +88,15 @@ write_timeout_secs = 30
 # # between statements before the proxy terminates it with SQLSTATE 57P05
 # # ("terminating connection due to idle-session timeout"). 0 (default) =
 # # disabled, exactly as before this key existed. Follows PostgreSQL's
-# # idle_session_timeout semantics — the clock measures time since the client's
-# # last statement, and unsolicited backend traffic relayed to an idle client
-# # (LISTEN/NOTIFY, NoticeResponse, ParameterStatus) is not client activity and
-# # does not reset it. PostgreSQL's separate idle_in_transaction_session_timeout
-# # is NOT implemented: a session left idle inside an open transaction is
-# # terminated by this timeout too. Read once at startup.
+# # idle_session_timeout semantics — it applies only to a session waiting for a
+# # NEW command. The clock measures time since the client's last statement, and
+# # unsolicited backend traffic relayed to an idle client (LISTEN/NOTIFY,
+# # NoticeResponse, ParameterStatus) is not client activity and does not reset
+# # it. It is NOT armed while a message is only partially received, nor during a
+# # COPY FROM STDIN (a paused bulk load is never killed by it). PostgreSQL's
+# # separate idle_in_transaction_session_timeout is NOT implemented: a session
+# # left idle inside an open transaction is terminated by this timeout too. Read
+# # once at startup.
 # client_idle_timeout_secs = 0
 
 # =============================================================================

@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
@@ -217,9 +217,10 @@ struct ServerState {
     limits: ResolvedLimits,
     /// Permit pool bounding concurrently-served client connections, sized from
     /// `[limits] max_client_connections` when that is > 0 (`None` = unlimited,
-    /// the default and the historical behaviour). The accept loop takes one
-    /// owned permit per connection *before* spawning its task and hands it to
-    /// the connection's `SessionGuard`, so the permit is returned on every exit
+    /// the default and the historical behaviour). One owned permit is taken per
+    /// connection by `admit_client_slot` — after its first startup message is
+    /// classified, so a `CancelRequest` is never refused — and handed to the
+    /// connection's `SessionGuard`, so the permit is returned on every exit
     /// path including a panic unwind. Sized ONCE at startup: a SIGHUP reload
     /// cannot shrink it (permits already held by in-flight sessions could not
     /// be revoked), so the reload path logs and ignores a change to the key.
@@ -368,11 +369,13 @@ pub struct NodeHealth {
 struct ServerMetrics {
     /// Total connections accepted
     connections_accepted: AtomicU64,
-    /// Total connections refused at accept time because the
-    /// `[limits] max_client_connections` cap was already saturated. These never
-    /// become sessions, so they are deliberately NOT counted in
-    /// `connections_accepted`/`connections_closed` (whose difference is the
-    /// active-session gauge).
+    /// Total connections refused because the `[limits] max_client_connections`
+    /// cap was already saturated. The refusal happens after the socket is
+    /// accepted and its first startup message classified (so a `CancelRequest`
+    /// is never refused), hence a rejected connection IS also counted in
+    /// `connections_accepted` — and in `connections_closed` when it ends, so
+    /// their difference stays a correct active-session gauge. This counter is
+    /// the separate "how often did the cap bite" signal.
     connections_rejected: AtomicU64,
     /// Total connections closed
     connections_closed: AtomicU64,
@@ -613,6 +616,16 @@ enum RouteOverride {
     Block(String),
 }
 
+/// Outcome of waiting for the client's next protocol message.
+#[derive(Debug, PartialEq, Eq)]
+enum ClientRead {
+    /// Bytes were appended to the session buffer (`0` = the client closed).
+    Bytes(usize),
+    /// The `[limits] client_idle_timeout_secs` deadline expired while the
+    /// session sat idle between statements.
+    IdleTimeout,
+}
+
 /// RAII teardown for one client connection. Its `Drop` deregisters the session
 /// from `state.sessions`, bumps the connections-closed metric, and reclaims the
 /// session's L1 query cache — running on a normal return AND on a panic unwind,
@@ -622,10 +635,12 @@ enum RouteOverride {
 struct SessionGuard {
     state: Arc<ServerState>,
     session_id: Uuid,
-    /// Owned client-connection permit taken by the accept loop (`None` when
-    /// `[limits] max_client_connections = 0`, i.e. no cap). Held here purely so
-    /// that dropping the guard returns the slot — on a normal return AND on a
-    /// panic unwind, which a release at the end of `handle_client` would miss.
+    /// Owned client-connection permit taken by admission control once the
+    /// connection's first startup message is classified (`None` when
+    /// `[limits] max_client_connections = 0`, i.e. no cap, or for a
+    /// `CancelRequest`, which never consumes one). Held here purely so that
+    /// dropping the guard returns the slot — on a normal return AND on a panic
+    /// unwind, which a release at the end of `handle_client` would miss.
     _client_slot: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
@@ -1250,6 +1265,11 @@ impl ProxyServer {
                 new_client_idle_timeout_secs = new_config.limits.client_idle_timeout_secs,
                 "[limits] max_client_connections / client_idle_timeout_secs changed on SIGHUP but are applied at startup only — keeping the running values (restart to apply)"
             );
+            // Keep the published config truthful: `/config` must not advertise
+            // a cap/idle timeout that is not the one in effect (same treatment
+            // as `[edge]` above).
+            new_config.limits.max_client_connections = old.limits.max_client_connections;
+            new_config.limits.client_idle_timeout_secs = old.limits.client_idle_timeout_secs;
         }
         if new_config.listen_address != old.listen_address {
             tracing::warn!(old = %old.listen_address, new = %new_config.listen_address,
@@ -1436,38 +1456,15 @@ impl ProxyServer {
                             // frames; Nagle + delayed-ACK costs tens of
                             // ms per round-trip if left on.
                             let _ = stream.set_nodelay(true);
-                            // Bound concurrently-served clients. Take the permit
-                            // BEFORE spawning (and before counting the connection
-                            // as accepted) so a saturated proxy refuses the socket
-                            // outright instead of spawning an unbounded number of
-                            // tasks, each holding a read buffer and, in session
-                            // pooling, a backend connection. `None` = no cap
-                            // configured, which is the default and unchanged.
-                            let client_slot = match self.state.client_slots.as_ref() {
-                                None => None,
-                                Some(sem) => match Arc::clone(sem).try_acquire_owned() {
-                                    Ok(permit) => Some(permit),
-                                    Err(_) => {
-                                        // Never block the accept loop on the
-                                        // refusal write: hand the socket to a
-                                        // tiny bounded task and go back to
-                                        // accepting immediately.
-                                        self.state
-                                            .metrics
-                                            .connections_rejected
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        tracing::warn!(
-                                            client = %addr,
-                                            "client connection cap reached; refusing connection"
-                                        );
-                                        let write_timeout = self.state.limits.client_write_timeout;
-                                        tokio::spawn(async move {
-                                            Self::refuse_over_capacity(stream, write_timeout).await;
-                                        });
-                                        continue;
-                                    }
-                                },
-                            };
+                            // NOTE: the `[limits] max_client_connections` cap is
+                            // NOT applied here. A slot is taken inside
+                            // `handle_client`, once the first startup message has
+                            // been classified — a `CancelRequest` arrives as its
+                            // own fresh connection and must still be served when
+                            // the proxy is saturated (that is exactly when an
+                            // operator needs to cancel a query), just as
+                            // PostgreSQL handles cancels in the postmaster
+                            // without consuming a `max_connections` slot.
                             self.state.metrics.connections_accepted.fetch_add(1, Ordering::Relaxed);
                             let state = self.state.clone();
                             // Snapshot the *live* config so a SIGHUP reload
@@ -1477,7 +1474,7 @@ impl ProxyServer {
                             let shutdown_tx = self.shutdown_tx.clone();
 
                             tokio::spawn(async move {
-                                if let Err(e) = Self::handle_client(stream, addr, state, config, shutdown_tx, client_slot).await {
+                                if let Err(e) = Self::handle_client(stream, addr, state, config, shutdown_tx).await {
                                     tracing::error!("Client handler error: {}", e);
                                 }
                             });
@@ -1728,38 +1725,110 @@ impl ProxyServer {
     /// PostgreSQL `ErrorResponse` bytes for a connection refused because the
     /// `[limits] max_client_connections` cap is saturated.
     ///
-    /// SQLSTATE `53300` (`too_many_connections`) with PostgreSQL's own wording,
-    /// so an off-the-shelf driver reports the same condition it would report
-    /// against a PostgreSQL server at `max_connections` instead of seeing a
-    /// bare TCP reset. Factored out so it can be asserted on without a socket.
+    /// SQLSTATE `53300` (`too_many_connections`) with PostgreSQL's own severity
+    /// and wording (`FATAL`, `sorry, too many clients already`), so an
+    /// off-the-shelf driver marks the connection dead and reports the same
+    /// condition it would report against a PostgreSQL server at
+    /// `max_connections` instead of seeing a bare TCP reset. Factored out so it
+    /// can be asserted on without a socket.
     fn over_capacity_error_bytes() -> Vec<u8> {
-        Self::create_error_response("53300", "too many clients already")
+        Self::create_fatal_response("53300", "sorry, too many clients already")
     }
 
-    /// Tell a client the proxy is at its connection cap, then close the socket.
+    /// Admission control for a client connection whose first startup-phase
+    /// message has just been classified.
     ///
-    /// Runs in its own task (never on the accept loop) and is bounded by the
-    /// configured client write timeout, so a client that never reads cannot pin
-    /// this task: worst case the frame is dropped and the socket closed anyway.
-    async fn refuse_over_capacity(mut stream: TcpStream, write_timeout: Duration) {
+    /// `Ok(slot)` admits the connection (`None` = no cap configured, the
+    /// default); `Err(())` means the cap is saturated and the caller must
+    /// answer with [`Self::over_capacity_error_bytes`] and close.
+    ///
+    /// A `CancelRequest` NEVER consumes a slot: it always arrives as its own
+    /// throwaway connection, it is answered without ever becoming a session,
+    /// and refusing it would make query cancellation impossible exactly when
+    /// the proxy is saturated — PostgreSQL likewise handles cancels in the
+    /// postmaster without taking a `max_connections` slot.
+    fn admit_client_slot(
+        state: &Arc<ServerState>,
+        first: &StartupMessage,
+    ) -> std::result::Result<Option<tokio::sync::OwnedSemaphorePermit>, ()> {
+        if matches!(first, StartupMessage::CancelRequest { .. }) {
+            return Ok(None);
+        }
+        let Some(sem) = state.client_slots.as_ref() else {
+            return Ok(None);
+        };
+        match Arc::clone(sem).try_acquire_owned() {
+            Ok(permit) => Ok(Some(permit)),
+            Err(_) => {
+                state
+                    .metrics
+                    .connections_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(())
+            }
+        }
+    }
+
+    /// Tell a client the proxy is at its connection cap, then close the stream.
+    ///
+    /// Bounded by the configured client write timeout, so a client that never
+    /// reads cannot pin this task and the session slot it is being refused:
+    /// worst case the frame is dropped and the connection closed anyway.
+    async fn refuse_over_capacity(stream: &mut ClientStream, write_timeout: Duration) {
         let msg = Self::over_capacity_error_bytes();
         let _ = tokio::time::timeout(write_timeout, async {
             let _ = stream.write_all(&msg).await;
             let _ = stream.flush().await;
+            let _ = stream.shutdown().await;
         })
         .await;
-        let _ = stream.shutdown().await;
     }
 
     /// PostgreSQL `ErrorResponse` bytes for a session terminated by the
     /// `[limits] client_idle_timeout_secs` idle-session timeout.
     ///
-    /// SQLSTATE `57P05` (`idle_session_timeout`) with PostgreSQL's own wording.
+    /// SQLSTATE `57P05` (`idle_session_timeout`) with PostgreSQL's own severity
+    /// and wording (`FATAL`), so a driver marks the connection dead instead of
+    /// trying to continue on it and then hitting a bare EOF.
     fn idle_session_timeout_error_bytes() -> Vec<u8> {
-        Self::create_error_response(
+        Self::create_fatal_response(
             "57P05",
             "terminating connection due to idle-session timeout",
         )
+    }
+
+    /// Tell a client its session is being reclaimed by the idle-session
+    /// timeout. The caller then leaves the query loop, which closes the
+    /// connection through the normal teardown path.
+    ///
+    /// The write is bounded by the configured client write timeout: a client
+    /// that has stopped reading (a zero receive window, a vanished host —
+    /// precisely the stall this timeout exists to reclaim) must not be able to
+    /// pin the connection task, its session-map entry and its connection slot
+    /// forever on the goodbye frame.
+    async fn terminate_idle_session(
+        stream: &mut ClientStream,
+        state: &Arc<ServerState>,
+        session: &Arc<ClientSession>,
+    ) {
+        tracing::debug!(
+            client = %session.client_addr,
+            in_transaction = session
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed),
+            timeout_secs = state
+                .limits
+                .client_idle_timeout
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            "terminating idle client session (idle-session timeout)"
+        );
+        let emsg = Self::idle_session_timeout_error_bytes();
+        let _ = tokio::time::timeout(state.limits.client_write_timeout, async {
+            let _ = stream.write_all(&emsg).await;
+            let _ = stream.flush().await;
+        })
+        .await;
     }
 
     /// Handle a client connection
@@ -1769,7 +1838,6 @@ impl ProxyServer {
         state: Arc<ServerState>,
         config: ProxyConfig,
         _shutdown_tx: broadcast::Sender<()>,
-        client_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<()> {
         tracing::debug!("New client connection from {}", addr);
 
@@ -1804,10 +1872,12 @@ impl ProxyServer {
         // owns the rest of the per-connection teardown (metric + L1 cache) so it
         // too runs unconditionally.
         state.sessions.insert(session.id, session.clone());
-        let _session_guard = SessionGuard {
+        let mut _session_guard = SessionGuard {
             state: state.clone(),
             session_id: session.id,
-            _client_slot: client_slot,
+            // Filled in below, once admission control has run: the guard owns
+            // the slot so it is returned on every exit path, panics included.
+            _client_slot: None,
         };
 
         // Negotiate client TLS (if the client sent SSLRequest). Produces a
@@ -1817,11 +1887,13 @@ impl ProxyServer {
         //
         // Bound the pre-auth negotiation (first-message read + TLS handshake) in
         // time: a client that connects and then stalls must not pin this task
-        // and its session-map slot indefinitely (slow-loris). The query loop
-        // that follows is intentionally NOT under this deadline — only the
-        // handshake is.
-        let negotiated = match tokio::time::timeout(
-            state.limits.startup_timeout,
+        // and its session-map slot indefinitely (slow-loris). ONE deadline
+        // covers the handshake *and* the first startup message read below, so
+        // the TLS path is bounded by the same budget as the plaintext one. The
+        // query loop that follows is intentionally NOT under this deadline.
+        let handshake_deadline = tokio::time::Instant::now() + state.limits.startup_timeout;
+        let negotiated = match tokio::time::timeout_at(
+            handshake_deadline,
             Self::negotiate_client_tls(stream, &state),
         )
         .await
@@ -1836,7 +1908,62 @@ impl ProxyServer {
         };
         let result = match negotiated {
             Ok((mut client_stream, pre)) => {
-                Self::client_loop(&mut client_stream, pre, &session, &state, &config).await
+                // Resolve the first startup-phase message before anything else:
+                // admission control ([limits] max_client_connections) must be
+                // able to tell a real `Startup` from a `CancelRequest`, and on
+                // the TLS path that message only arrives after the handshake, so
+                // it is read here (inside the same pre-auth deadline) rather
+                // than inside `handle_startup`. `buffer` carries any bytes read
+                // past it into the query loop.
+                let mut buffer = BytesMut::with_capacity(8192);
+                let first = match pre {
+                    Some(msg) => Ok(Some(msg)),
+                    None => match tokio::time::timeout_at(
+                        handshake_deadline,
+                        Self::read_startup_message(&mut client_stream, &mut buffer),
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => {
+                            tracing::debug!(client = %addr, "startup message timed out; closing");
+                            Err(ProxyError::Connection(
+                                "startup negotiation timeout".to_string(),
+                            ))
+                        }
+                    },
+                };
+                match first {
+                    // Client closed before sending a complete startup message.
+                    Ok(None) => Ok(()),
+                    Ok(Some(msg)) => match Self::admit_client_slot(&state, &msg) {
+                        Ok(slot) => {
+                            _session_guard._client_slot = slot;
+                            Self::client_loop(
+                                &mut client_stream,
+                                Some(msg),
+                                buffer,
+                                &session,
+                                &state,
+                                &config,
+                            )
+                            .await
+                        }
+                        Err(()) => {
+                            tracing::warn!(
+                                client = %addr,
+                                "client connection cap reached; refusing connection"
+                            );
+                            Self::refuse_over_capacity(
+                                &mut client_stream,
+                                state.limits.client_write_timeout,
+                            )
+                            .await;
+                            Ok(())
+                        }
+                    },
+                    Err(e) => Err(e),
+                }
             }
             Err(e) => Err(e),
         };
@@ -1847,16 +1974,150 @@ impl ProxyServer {
         result
     }
 
+    /// Deadline for the client's next message, or `None` when this session must
+    /// not be reclaimed by the idle-session timeout right now.
+    ///
+    /// PostgreSQL's `idle_session_timeout` only applies to a session that is
+    /// genuinely waiting for a NEW command, so the deadline is armed only at a
+    /// true message boundary:
+    ///
+    /// * not while `buffer` still holds a partially received message — a client
+    ///   trickling a large message is slow, not idle, and killing it would
+    ///   truncate a legitimate statement;
+    /// * not while the session is inside a `COPY FROM STDIN` — a COPY producer
+    ///   that pauses longer than the timeout would otherwise be killed
+    ///   mid-stream and the bulk load aborted.
+    ///
+    /// `None` is also returned when the timeout is disabled (the default), in
+    /// which case the read below is unbounded exactly as it was before the key
+    /// existed.
+    fn client_idle_deadline(
+        state: &ServerState,
+        buffer: &BytesMut,
+        session: &ClientSession,
+    ) -> Option<tokio::time::Instant> {
+        let idle = state.limits.client_idle_timeout?;
+        if !buffer.is_empty() {
+            return None;
+        }
+        if session
+            .copy_in_progress
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
+        Some(tokio::time::Instant::now() + idle)
+    }
+
+    /// Read the client's next message into `buffer`, optionally under an
+    /// idle-session deadline.
+    async fn read_client_bytes(
+        stream: &mut ClientStream,
+        buffer: &mut BytesMut,
+        idle_deadline: Option<tokio::time::Instant>,
+    ) -> Result<ClientRead> {
+        let read = match idle_deadline {
+            Some(deadline) => {
+                match tokio::time::timeout_at(deadline, stream.read_buf(buffer)).await {
+                    Ok(r) => r,
+                    Err(_) => return Ok(ClientRead::IdleTimeout),
+                }
+            }
+            None => stream.read_buf(buffer).await,
+        };
+        Ok(ClientRead::Bytes(read.map_err(|e| {
+            ProxyError::Network(format!("Read error: {}", e))
+        })?))
+    }
+
+    /// Wait for the client's next message.
+    ///
+    /// When `watch_node` names a cached backend connection, that socket is
+    /// watched at the same time so unsolicited backend traffic (LISTEN/NOTIFY
+    /// notifications, NoticeResponse, ParameterStatus, the delayed tail of a
+    /// `Flush` response) is relayed to the client promptly instead of sitting
+    /// unread until the next query, and a backend that dies while the session is
+    /// idle is noticed at once — in which case its entry is removed from `conns`
+    /// (the session survives; the next query redials) and the wait continues on
+    /// the client alone.
+    ///
+    /// `idle_deadline` is the session's idle-session deadline; relaying async
+    /// backend traffic to an idle client is not client activity, so the deadline
+    /// is NOT re-armed while doing so.
+    async fn read_next_client_message(
+        stream: &mut ClientStream,
+        buffer: &mut BytesMut,
+        conns: &mut HashMap<String, BackendConn>,
+        watch_node: Option<&str>,
+        idle_deadline: Option<tokio::time::Instant>,
+        state: &Arc<ServerState>,
+    ) -> Result<ClientRead> {
+        let Some(node) = watch_node else {
+            return Self::read_client_bytes(stream, buffer, idle_deadline).await;
+        };
+        // Built once, outside the watch loop: a `select!` evaluates even a
+        // disabled branch's expression, so an inline `sleep_until` would
+        // construct a timer on every relay iteration — and with no idle timeout
+        // configured (the default) this future never registers one at all.
+        let idle_wait = async move {
+            match idle_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(idle_wait);
+        loop {
+            let mut backend_gone = false;
+            let mut client_bytes: Option<usize> = None;
+            {
+                let bc = conns.get_mut(node).expect("watch_node is in conns");
+                let mut abuf = [0u8; 16384];
+                tokio::select! {
+                    r = stream.read_buf(buffer) => {
+                        client_bytes = Some(r.map_err(|e| {
+                            ProxyError::Network(format!("Read error: {}", e))
+                        })?);
+                    }
+                    _ = &mut idle_wait => return Ok(ClientRead::IdleTimeout),
+                    r = bc.stream.read(&mut abuf) => match r {
+                        Ok(0) => backend_gone = true,
+                        Ok(bn) => {
+                            stream.write_all(&abuf[..bn]).await.map_err(|e| {
+                                ProxyError::Network(format!("Client write error: {}", e))
+                            })?;
+                            state.metrics.bytes_sent.fetch_add(bn as u64, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            tracing::debug!(node = %node, error = %e, "backend read error while idle; dropping cached connection");
+                            backend_gone = true;
+                        }
+                    },
+                }
+            }
+            if backend_gone {
+                // Drop the dead cached connection but keep the client session
+                // alive — the next query redials. (Mid-transaction the next
+                // forward fails and surfaces the error.)
+                conns.remove(node);
+                return Self::read_client_bytes(stream, buffer, idle_deadline).await;
+            }
+            if let Some(cn) = client_bytes {
+                return Ok(ClientRead::Bytes(cn));
+            }
+            // Otherwise we relayed async backend bytes; keep watching.
+        }
+    }
+
     /// Main client processing loop with full PostgreSQL protocol handling
     async fn client_loop(
         stream: &mut ClientStream,
         pre: Option<StartupMessage>,
+        mut buffer: BytesMut,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,
     ) -> Result<()> {
         let codec = ProtocolCodec::new();
-        let mut buffer = BytesMut::with_capacity(8192);
 
         // Handle startup phase. The session keeps a per-node cache of
         // authenticated backend connections (`conns`) instead of a single
@@ -1881,7 +2142,7 @@ impl ProxyServer {
         // its session slot open indefinitely.
         let startup_result = match tokio::time::timeout(
             state.limits.startup_timeout,
-            Self::handle_startup(stream, &mut buffer, &codec, pre, session, state, config),
+            Self::handle_startup(stream, &mut buffer, pre, session, state, config),
         )
         .await
         {
@@ -1973,20 +2234,12 @@ impl ProxyServer {
             // and are relayed verbatim. A mid-COPY backend is excluded — it is
             // legitimately awaiting CopyData, which the client drives.
             buffer.reserve(16384);
-            // Idle-session deadline (PostgreSQL `idle_session_timeout`
-            // semantics): the clock measures time since the client's LAST
-            // statement, so it is armed here — once per outer iteration, i.e.
-            // at the moment the session goes idle — and deliberately NOT
-            // re-armed by the inner backend-watch loop. Relaying unsolicited
-            // backend traffic to an idle client (LISTEN/NOTIFY, NoticeResponse,
-            // ParameterStatus) is not client activity and must not extend the
-            // deadline. `None` (the default, `client_idle_timeout_secs = 0`)
-            // leaves every read unbounded exactly as before.
-            let idle_deadline = state
-                .limits
-                .client_idle_timeout
-                .map(|d| tokio::time::Instant::now() + d);
-            let mut idle_timed_out = false;
+            // Idle-session deadline — armed only when this session is genuinely
+            // waiting for a NEW command (see `client_idle_deadline`), i.e. never
+            // mid-COPY and never with a partially received message pending.
+            // `None` (the default, `client_idle_timeout_secs = 0`) leaves every
+            // read unbounded exactly as before.
+            let idle_deadline = Self::client_idle_deadline(state, &buffer, session);
             let watch_node: Option<String> = if session
                 .copy_in_progress
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -1995,121 +2248,38 @@ impl ProxyServer {
             } else {
                 current_node.clone().filter(|node| conns.contains_key(node))
             };
-            let n: usize = 'client_read: {
-                let Some(node) = watch_node.as_deref() else {
-                    let read = match idle_deadline {
-                        Some(deadline) => {
-                            match tokio::time::timeout_at(deadline, stream.read_buf(&mut buffer))
-                                .await
-                            {
-                                Ok(r) => r,
-                                Err(_) => {
-                                    idle_timed_out = true;
-                                    break 'client_read 0;
-                                }
-                            }
-                        }
-                        None => stream.read_buf(&mut buffer).await,
-                    };
-                    break 'client_read read
-                        .map_err(|e| ProxyError::Network(format!("Read error: {}", e)))?;
-                };
-                loop {
-                    let mut backend_gone = false;
-                    let mut client_bytes: Option<usize> = None;
-                    {
-                        let bc = conns.get_mut(node).expect("watch_node is in conns");
-                        let mut abuf = [0u8; 16384];
-                        tokio::select! {
-                            r = stream.read_buf(&mut buffer) => {
-                                client_bytes = Some(r.map_err(|e| {
-                                    ProxyError::Network(format!("Read error: {}", e))
-                                })?);
-                            }
-                            // Same deadline as the branch above: an idle
-                            // session's clock keeps running while we relay
-                            // async backend traffic to it.
-                            _ = tokio::time::sleep_until(idle_deadline.unwrap_or_else(tokio::time::Instant::now)),
-                                if idle_deadline.is_some() =>
-                            {
-                                idle_timed_out = true;
-                            }
-                            r = bc.stream.read(&mut abuf) => match r {
-                                Ok(0) => backend_gone = true,
-                                Ok(bn) => {
-                                    stream.write_all(&abuf[..bn]).await.map_err(|e| {
-                                        ProxyError::Network(format!("Client write error: {}", e))
-                                    })?;
-                                    state.metrics.bytes_sent.fetch_add(bn as u64, Ordering::Relaxed);
-                                }
-                                Err(e) => {
-                                    tracing::debug!(node = %node, error = %e, "backend read error while idle; dropping cached connection");
-                                    backend_gone = true;
-                                }
-                            },
-                        }
-                    }
-                    if idle_timed_out {
-                        break 'client_read 0;
-                    }
-                    if backend_gone {
-                        // Drop the dead cached connection but keep the client
-                        // session alive — the next query redials. (Mid-transaction
-                        // the next forward fails and surfaces the error.)
-                        conns.remove(node);
-                        if current_node.as_deref() == Some(node) {
-                            current_node = None;
-                        }
-                        let read = match idle_deadline {
-                            Some(deadline) => {
-                                match tokio::time::timeout_at(
-                                    deadline,
-                                    stream.read_buf(&mut buffer),
-                                )
-                                .await
-                                {
-                                    Ok(r) => r,
-                                    Err(_) => {
-                                        idle_timed_out = true;
-                                        break 'client_read 0;
-                                    }
-                                }
-                            }
-                            None => stream.read_buf(&mut buffer).await,
-                        };
-                        break 'client_read read
-                            .map_err(|e| ProxyError::Network(format!("Read error: {}", e)))?;
-                    }
-                    if let Some(cn) = client_bytes {
-                        break 'client_read cn;
-                    }
-                    // Otherwise we relayed async backend bytes; keep watching.
+            let n: usize = match Self::read_next_client_message(
+                stream,
+                &mut buffer,
+                &mut conns,
+                watch_node.as_deref(),
+                idle_deadline,
+                state,
+            )
+            .await?
+            {
+                ClientRead::Bytes(n) => n,
+                ClientRead::IdleTimeout => {
+                    // PostgreSQL's `idle_session_timeout` behaviour: tell the
+                    // client why, then close. A session idle INSIDE an open
+                    // transaction is terminated too — PostgreSQL splits that
+                    // case out into the separate
+                    // `idle_in_transaction_session_timeout` GUC, which this
+                    // proxy does not implement. Leaving the loop (rather than
+                    // returning here) keeps the normal teardown path, so under
+                    // transaction/statement pooling the session's still-idle
+                    // backend connections are parked for reuse as usual.
+                    Self::terminate_idle_session(stream, state, session).await;
+                    break;
                 }
             };
-
-            if idle_timed_out {
-                // PostgreSQL's `idle_session_timeout` behaviour: tell the client
-                // why, then close. A session idle INSIDE an open transaction is
-                // terminated too — PostgreSQL splits that case out into the
-                // separate `idle_in_transaction_session_timeout` GUC, which this
-                // proxy does not implement; the backend connection is released
-                // by the normal teardown path either way.
-                tracing::debug!(
-                    client = %session.client_addr,
-                    in_transaction = session
-                        .in_transaction
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    timeout_secs = state
-                        .limits
-                        .client_idle_timeout
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0),
-                    "terminating idle client session (idle-session timeout)"
-                );
-                let emsg = Self::idle_session_timeout_error_bytes();
-                let _ = stream.write_all(&emsg).await;
-                let _ = stream.flush().await;
-                return Ok(());
+            // `read_next_client_message` drops a watched backend connection that
+            // died while the session was idle; the session survives and the next
+            // query redials.
+            if let Some(node) = watch_node.as_deref() {
+                if !conns.contains_key(node) && current_node.as_deref() == Some(node) {
+                    current_node = None;
+                }
             }
 
             if n == 0 {
@@ -2697,6 +2867,32 @@ impl ProxyServer {
         Ok(())
     }
 
+    /// Read one startup-phase message (`Startup`, `SSLRequest` or
+    /// `CancelRequest`) from a client stream, appending whatever it reads into
+    /// `buffer` so any bytes that follow the message are preserved for the
+    /// caller. `Ok(None)` = the client closed before a complete message
+    /// arrived. Callers bound this in time (pre-auth `startup_timeout`).
+    async fn read_startup_message<S: AsyncRead + Unpin>(
+        stream: &mut S,
+        buffer: &mut BytesMut,
+    ) -> Result<Option<StartupMessage>> {
+        let codec = ProtocolCodec::new();
+        let mut read_buf = vec![0u8; 1024];
+        loop {
+            if let Some(msg) = codec.decode_startup(buffer)? {
+                return Ok(Some(msg));
+            }
+            let n = stream
+                .read(&mut read_buf)
+                .await
+                .map_err(|e| ProxyError::Network(format!("Startup read error: {}", e)))?;
+            if n == 0 {
+                return Ok(None);
+            }
+            buffer.extend_from_slice(&read_buf[..n]);
+        }
+    }
+
     /// Peek the first startup-phase message and negotiate client TLS.
     ///
     /// On `SSLRequest` the proxy answers `S` and runs a rustls server
@@ -2707,24 +2903,14 @@ impl ProxyServer {
         mut tcp: TcpStream,
         state: &Arc<ServerState>,
     ) -> Result<(ClientStream, Option<StartupMessage>)> {
-        let codec = ProtocolCodec::new();
         let mut buffer = BytesMut::with_capacity(1024);
-        let mut read_buf = vec![0u8; 1024];
-
-        let first = loop {
-            if let Some(msg) = codec.decode_startup(&mut buffer)? {
-                break msg;
-            }
-            let n = tcp
-                .read(&mut read_buf)
-                .await
-                .map_err(|e| ProxyError::Network(format!("Startup read error: {}", e)))?;
-            if n == 0 {
+        let first = match Self::read_startup_message(&mut tcp, &mut buffer).await? {
+            Some(msg) => msg,
+            None => {
                 return Err(ProxyError::Connection(
                     "client closed before startup".to_string(),
-                ));
+                ))
             }
-            buffer.extend_from_slice(&read_buf[..n]);
         };
 
         match first {
@@ -2759,7 +2945,6 @@ impl ProxyServer {
     async fn handle_startup(
         client_stream: &mut ClientStream,
         buffer: &mut BytesMut,
-        codec: &ProtocolCodec,
         pre: Option<StartupMessage>,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
@@ -2769,22 +2954,11 @@ impl ProxyServer {
         // now (the TLS case, where the real startup follows the handshake).
         let startup_msg = match pre {
             Some(msg) => Some(msg),
-            None => {
-                let mut read_buf = vec![0u8; 1024];
-                loop {
-                    if let Some(msg) = codec.decode_startup(buffer)? {
-                        break Some(msg);
-                    }
-                    let n = client_stream
-                        .read(&mut read_buf)
-                        .await
-                        .map_err(|e| ProxyError::Network(format!("Startup read error: {}", e)))?;
-                    if n == 0 {
-                        return Ok((None, String::new()));
-                    }
-                    buffer.extend_from_slice(&read_buf[..n]);
-                }
-            }
+            None => match Self::read_startup_message(client_stream, buffer).await? {
+                Some(msg) => Some(msg),
+                // Client closed before sending a complete startup message.
+                None => return Ok((None, String::new())),
+            },
         };
 
         match startup_msg {
@@ -5610,9 +5784,22 @@ impl ProxyServer {
 
     /// Create PostgreSQL error response message
     fn create_error_response(code: &str, message: &str) -> Vec<u8> {
+        Self::create_severity_response("ERROR", code, message)
+    }
+
+    /// Create a PostgreSQL `ErrorResponse` with `FATAL` severity — the severity
+    /// PostgreSQL itself uses for a connection it is about to close (e.g.
+    /// `53300 too_many_connections`, `57P05 idle_session_timeout`). Drivers
+    /// (pgx, npgsql, JDBC) key on `FATAL` to mark the connection dead; with
+    /// `ERROR` they try to keep using it and then hit a bare EOF.
+    fn create_fatal_response(code: &str, message: &str) -> Vec<u8> {
+        Self::create_severity_response("FATAL", code, message)
+    }
+
+    fn create_severity_response(severity: &str, code: &str, message: &str) -> Vec<u8> {
         let mut fields = HashMap::new();
-        fields.insert('S', "ERROR".to_string());
-        fields.insert('V', "ERROR".to_string());
+        fields.insert('S', severity.to_string());
+        fields.insert('V', severity.to_string());
         fields.insert('C', code.to_string());
         fields.insert('M', message.to_string());
 
@@ -8100,8 +8287,9 @@ mod tests {
     }
 
     /// The refusal frame a capped-out proxy sends must be a real PostgreSQL
-    /// ErrorResponse carrying SQLSTATE 53300 (too_many_connections), so a
-    /// driver reports the condition instead of a bare connection reset.
+    /// ErrorResponse carrying SQLSTATE 53300 (too_many_connections) at FATAL
+    /// severity (which is what marks the connection dead for pgx/npgsql/JDBC),
+    /// so a driver reports the condition instead of a bare connection reset.
     #[test]
     fn over_capacity_error_encodes_sqlstate_53300() {
         let bytes = ProxyServer::over_capacity_error_bytes();
@@ -8110,7 +8298,11 @@ mod tests {
             bytes.windows(7).any(|w| w == b"C53300\0"),
             "SQLSTATE field must be 53300"
         );
-        assert!(String::from_utf8_lossy(&bytes).contains("too many clients already"));
+        assert!(
+            bytes.windows(7).any(|w| w == b"SFATAL\0"),
+            "severity must be FATAL, as PostgreSQL sends for 53300"
+        );
+        assert!(String::from_utf8_lossy(&bytes).contains("sorry, too many clients already"));
     }
 
     /// End-to-end over a real socket: the refusal is written and the connection
@@ -8121,7 +8313,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let srv = tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
-            ProxyServer::refuse_over_capacity(sock, Duration::from_secs(5)).await;
+            ProxyServer::refuse_over_capacity(
+                &mut ClientStream::Plain(sock),
+                Duration::from_secs(5),
+            )
+            .await;
         });
         let mut client = TcpStream::connect(addr).await.unwrap();
         let mut buf = Vec::new();
@@ -8130,7 +8326,7 @@ mod tests {
         srv.await.unwrap();
         assert_eq!(buf[0], b'E');
         assert!(buf.windows(7).any(|w| w == b"C53300\0"));
-        assert!(String::from_utf8_lossy(&buf).contains("too many clients already"));
+        assert!(String::from_utf8_lossy(&buf).contains("sorry, too many clients already"));
     }
 
     /// `client_idle_timeout_secs = 0` (the default) must leave the query loop's
@@ -8171,8 +8367,285 @@ mod tests {
             bytes.windows(7).any(|w| w == b"C57P05\0"),
             "SQLSTATE field must be 57P05"
         );
+        assert!(
+            bytes.windows(7).any(|w| w == b"SFATAL\0"),
+            "severity must be FATAL, as PostgreSQL sends for 57P05"
+        );
         assert!(String::from_utf8_lossy(&bytes)
             .contains("terminating connection due to idle-session timeout"));
+    }
+
+    // ---- wiring: admission control, the idle deadline, and the read path ----
+
+    /// Startup-message bytes for a plain (non-TLS) client: len + protocol
+    /// version 3.0 + a `user` parameter.
+    fn startup_bytes(user: &str) -> Vec<u8> {
+        let mut params = Vec::new();
+        params.extend_from_slice(b"user\0");
+        params.extend_from_slice(user.as_bytes());
+        params.extend_from_slice(b"\0\0");
+        let mut out = Vec::new();
+        out.extend_from_slice(&((8 + params.len()) as u32).to_be_bytes());
+        out.extend_from_slice(&196608u32.to_be_bytes()); // 3.0
+        out.extend_from_slice(&params);
+        out
+    }
+
+    /// CancelRequest bytes: len(16) + code 80877102 + pid + key.
+    fn cancel_bytes(pid: u32, key: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&16u32.to_be_bytes());
+        out.extend_from_slice(&80877102u32.to_be_bytes());
+        out.extend_from_slice(&pid.to_be_bytes());
+        out.extend_from_slice(&key.to_be_bytes());
+        out
+    }
+
+    fn startup_msg() -> StartupMessage {
+        StartupMessage::Startup {
+            protocol_version: 196608,
+            params: HashMap::new(),
+        }
+    }
+
+    /// Admission control: a real Startup takes a slot; when none is free it is
+    /// refused and `connections_rejected` counts it.
+    #[test]
+    fn admission_takes_a_slot_and_counts_a_refusal() {
+        let mut config = test_config();
+        config.limits.max_client_connections = 1;
+        let server = ProxyServer::new(config).unwrap();
+        let state = server.state.clone();
+
+        let slot = ProxyServer::admit_client_slot(&state, &startup_msg())
+            .expect("the first connection is admitted");
+        assert!(slot.is_some(), "a configured cap must hand out a slot");
+        assert_eq!(
+            state.metrics.connections_rejected.load(Ordering::Relaxed),
+            0
+        );
+
+        // Cap saturated: the next Startup is refused and counted.
+        assert!(ProxyServer::admit_client_slot(&state, &startup_msg()).is_err());
+        assert_eq!(
+            state.metrics.connections_rejected.load(Ordering::Relaxed),
+            1,
+            "a refusal must increment connections_rejected"
+        );
+
+        // Releasing the slot re-admits.
+        drop(slot);
+        assert!(ProxyServer::admit_client_slot(&state, &startup_msg()).is_ok());
+    }
+
+    /// A CancelRequest must be admitted even with the cap saturated — it is a
+    /// throwaway connection that never becomes a session, and refusing it would
+    /// make query cancellation impossible exactly when it is needed. It must
+    /// also never consume a slot, nor count as a rejection.
+    #[test]
+    fn cancel_request_is_admitted_while_the_cap_is_saturated() {
+        let mut config = test_config();
+        config.limits.max_client_connections = 1;
+        let server = ProxyServer::new(config).unwrap();
+        let state = server.state.clone();
+        let sem = state.client_slots.clone().expect("cap configured");
+        let _held = Arc::clone(&sem).try_acquire_owned().unwrap();
+        assert_eq!(sem.available_permits(), 0, "cap is saturated");
+
+        let slot = ProxyServer::admit_client_slot(
+            &state,
+            &StartupMessage::CancelRequest { pid: 1, key: 2 },
+        )
+        .expect("a cancel request must never be refused");
+        assert!(slot.is_none(), "a cancel request must not consume a slot");
+        assert_eq!(
+            state.metrics.connections_rejected.load(Ordering::Relaxed),
+            0,
+            "a cancel request is not a rejection"
+        );
+    }
+
+    /// Over the wire through `handle_client`: with the cap saturated a client
+    /// that sends a real Startup gets the 53300 FATAL frame then EOF, and the
+    /// rejection is counted — while a client that sends a CancelRequest is
+    /// served (no error frame) and never touches the cap.
+    #[tokio::test]
+    async fn handle_client_refuses_startup_but_serves_cancel_when_saturated() {
+        let mut config = test_config();
+        config.limits.max_client_connections = 1;
+        let server = ProxyServer::new(config.clone()).unwrap();
+        let state = server.state.clone();
+        let sem = state.client_slots.clone().expect("cap configured");
+        let _held = Arc::clone(&sem).try_acquire_owned().unwrap();
+        let (shutdown_tx, _rx) = broadcast::channel(1);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // --- a real Startup while saturated: refused with 53300 ---
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (sock, peer) = listener.accept().await.unwrap();
+        let h = tokio::spawn(ProxyServer::handle_client(
+            sock,
+            peer,
+            state.clone(),
+            config.clone(),
+            shutdown_tx.clone(),
+        ));
+        client.write_all(&startup_bytes("alice")).await.unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        h.await.unwrap().unwrap();
+        assert_eq!(buf[0], b'E', "refused client must get an ErrorResponse");
+        assert!(
+            buf.windows(7).any(|w| w == b"C53300\0"),
+            "refusal must carry SQLSTATE 53300"
+        );
+        assert_eq!(
+            state.metrics.connections_rejected.load(Ordering::Relaxed),
+            1
+        );
+        assert!(state.sessions.is_empty(), "no session may be left behind");
+
+        // --- a CancelRequest while still saturated: served, not refused ---
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (sock, peer) = listener.accept().await.unwrap();
+        let h = tokio::spawn(ProxyServer::handle_client(
+            sock,
+            peer,
+            state.clone(),
+            config.clone(),
+            shutdown_tx.clone(),
+        ));
+        client.write_all(&cancel_bytes(42, 43)).await.unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        h.await.unwrap().unwrap();
+        assert!(
+            buf.is_empty(),
+            "a cancel request must not be answered with an error frame, got {:?}",
+            String::from_utf8_lossy(&buf)
+        );
+        assert_eq!(
+            state.metrics.connections_rejected.load(Ordering::Relaxed),
+            1,
+            "a cancel request must not count as a rejection"
+        );
+        assert_eq!(sem.available_permits(), 0, "the cap is still saturated");
+    }
+
+    /// The idle deadline is armed ONLY when the session is genuinely waiting
+    /// for a new command: never mid-COPY (a paused COPY FROM STDIN producer
+    /// must not be killed and the bulk load aborted) and never with a partially
+    /// received message in the buffer (a client trickling a large statement is
+    /// slow, not idle).
+    #[test]
+    fn idle_deadline_armed_only_at_a_message_boundary() {
+        let mut config = test_config();
+        config.limits.client_idle_timeout_secs = 30;
+        let server = ProxyServer::new(config).unwrap();
+        let state = server.state.clone();
+        let session = make_test_session();
+
+        let empty = BytesMut::new();
+        assert!(
+            ProxyServer::client_idle_deadline(&state, &empty, &session).is_some(),
+            "an idle session at a message boundary is armed"
+        );
+
+        // Half a message received: not idle, still arriving.
+        let mut partial = BytesMut::new();
+        partial.extend_from_slice(b"Q\0\0\0");
+        assert!(
+            ProxyServer::client_idle_deadline(&state, &partial, &session).is_none(),
+            "a partially received message must not arm the idle timeout"
+        );
+
+        // COPY FROM STDIN in progress: the client may legitimately pause.
+        session
+            .copy_in_progress
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            ProxyServer::client_idle_deadline(&state, &empty, &session).is_none(),
+            "a COPY FROM STDIN must not be killed by the idle timeout"
+        );
+        session
+            .copy_in_progress
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // Disabled (the default) arms nothing at all.
+        let server = ProxyServer::new(test_config()).unwrap();
+        assert!(
+            ProxyServer::client_idle_deadline(&server.state, &empty, &session).is_none(),
+            "client_idle_timeout_secs = 0 must never arm a deadline"
+        );
+    }
+
+    /// The idle deadline actually fires on the plain client read, and does not
+    /// fire when the client speaks in time.
+    #[tokio::test]
+    async fn read_client_bytes_times_out_when_idle() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut stream = ClientStream::Plain(sock);
+        let mut buffer = BytesMut::with_capacity(64);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(60);
+        let outcome = ProxyServer::read_client_bytes(&mut stream, &mut buffer, Some(deadline))
+            .await
+            .unwrap();
+        assert_eq!(outcome, ClientRead::IdleTimeout);
+        assert!(buffer.is_empty());
+
+        // A client that speaks before the deadline is not timed out.
+        client.write_all(b"hello").await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let outcome = ProxyServer::read_client_bytes(&mut stream, &mut buffer, Some(deadline))
+            .await
+            .unwrap();
+        assert_eq!(outcome, ClientRead::Bytes(5));
+        assert_eq!(&buffer[..], b"hello");
+    }
+
+    /// …and it fires the same way while the session's cached backend connection
+    /// is being watched for unsolicited traffic (the `select!` arm), which is
+    /// the state an idle pooled session actually sits in.
+    #[tokio::test]
+    async fn read_next_client_message_times_out_while_watching_the_backend() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut stream = ClientStream::Plain(sock);
+
+        // A quiet "backend" socket for the session to watch.
+        let blistener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let baddr = blistener.local_addr().unwrap();
+        let backend = TcpStream::connect(baddr).await.unwrap();
+        let _backend_peer = blistener.accept().await.unwrap();
+        let mut conns: HashMap<String, BackendConn> = HashMap::new();
+        conns.insert("node-a".to_string(), BackendConn::new(backend));
+
+        let server = ProxyServer::new(test_config()).unwrap();
+        let mut buffer = BytesMut::with_capacity(64);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(60);
+        let outcome = ProxyServer::read_next_client_message(
+            &mut stream,
+            &mut buffer,
+            &mut conns,
+            Some("node-a"),
+            Some(deadline),
+            &server.state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ClientRead::IdleTimeout);
+        assert!(
+            conns.contains_key("node-a"),
+            "a live backend must not be dropped by the idle timeout"
+        );
     }
 
     /// The conditional-reset classifier must call every session-state-creating
