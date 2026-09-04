@@ -26,7 +26,7 @@ pub use config::{
     AnalyticsConfig, AnalyticsConfigBuilder, PatternConfig, SamplingConfig, SlowQueryConfig,
     DEFAULT_ANALYTICS_QUEUE_CAPACITY,
 };
-pub use fingerprinter::{OperationType, QueryFingerprint, QueryFingerprinter};
+pub use fingerprinter::{ascii_lower, OperationType, QueryFingerprint, QueryFingerprinter};
 pub use histogram::{HistogramBucket, HistogramSnapshot, LatencyHistogram};
 pub use intent::{
     CostAttribution, QueryClassifier, QueryIntent, RagAnalytics, WorkflowTrace, WorkflowTracer,
@@ -83,9 +83,15 @@ pub struct QueryAnalytics {
     /// exactly as before.
     queue: OnceLock<mpsc::Sender<AnalyticsMsg>>,
 
-    /// Executions dropped because the queue was full or closed. Surfaced as
+    /// Executions dropped because the queue was full or closed, plus any whose
+    /// ingest panicked (see [`QueryAnalytics::ingest_guarded`]). Surfaced as
     /// `analytics_dropped_total` on `GET /api/analytics`.
     dropped: AtomicU64,
+
+    /// Test-only injection point for [`QueryAnalytics::ingest_guarded`]: makes
+    /// the next ingest panic so the consumer's panic guard can be exercised.
+    #[cfg(test)]
+    panic_next_ingest: std::sync::atomic::AtomicBool,
 }
 
 impl QueryAnalytics {
@@ -94,7 +100,10 @@ impl QueryAnalytics {
         let slow_log = SlowQueryLog::new(config.slow_query.clone());
         let patterns = PatternDetector::new(config.patterns.clone());
         let statistics = StatisticsStore::new(config.max_fingerprints);
-        let fingerprinter = QueryFingerprinter::with_cache_size(config.fingerprint_cache_size);
+        let fingerprinter = QueryFingerprinter::with_cache_limits(
+            config.fingerprint_cache_size,
+            config.fingerprint_cache_max_sql_bytes,
+        );
 
         Self {
             fingerprinter,
@@ -107,6 +116,8 @@ impl QueryAnalytics {
             costs: CostAttribution::new(),
             queue: OnceLock::new(),
             dropped: AtomicU64::new(0),
+            #[cfg(test)]
+            panic_next_ingest: std::sync::atomic::AtomicBool::new(false),
             config,
         }
     }
@@ -170,8 +181,25 @@ impl QueryAnalytics {
     /// The actual analytics work. Runs on the background consumer task when
     /// one is installed, otherwise on the caller's task.
     fn ingest(&self, execution: &QueryExecution) {
+        #[cfg(test)]
+        if self
+            .panic_next_ingest
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            panic!("test-injected ingest panic");
+        }
+
+        // ONE case conversion for the whole ingest, shared by fingerprinting
+        // and intent classification (they took two of their own before, on top
+        // of the two the fingerprinter itself used internally). ASCII folding
+        // keeps byte offsets aligned with `execution.query` — see
+        // [`analytics::ascii_lower`].
+        let lower = ascii_lower(&execution.query);
+
         // Fingerprint the query (memoized: repeat SQL skips all regex work).
-        let fingerprint = self.fingerprinter.fingerprint_cached(&execution.query);
+        let fingerprint = self
+            .fingerprinter
+            .fingerprint_cached_lower(&execution.query, &lower);
 
         // Record statistics
         self.statistics.record(&fingerprint, execution);
@@ -184,10 +212,8 @@ impl QueryAnalytics {
             self.patterns.record_query(session, execution, &fingerprint);
         }
 
-        // Classify intent. One lowercase copy of the statement, shared with
-        // nothing else on this path — the fingerprinter keeps its own inside
-        // the memo, so a cached shape pays no case conversion at all here.
-        let intent = self.classifier.classify(&execution.query);
+        // Classify intent from the copy taken above: no second conversion.
+        let intent = self.classifier.classify_lower(&lower);
 
         // Record metrics
         self.metrics.record(&fingerprint, execution, intent);
@@ -201,6 +227,27 @@ impl QueryAnalytics {
         self.costs.record(execution);
     }
 
+    /// [`QueryAnalytics::ingest`] with a panic guard.
+    ///
+    /// The consumer is a SINGLE task shared by every connection: a panic there
+    /// would drop the receiver, so every later `record` would fail its
+    /// `try_send` and analytics would be silently dead for the life of the
+    /// process. Instead a panicking ingest is logged, counted as a dropped
+    /// sample, and the consumer carries on with the next execution. State
+    /// touched by the panicking ingest may be partially updated (the
+    /// `AssertUnwindSafe`), which is strictly better than losing all of it.
+    fn ingest_guarded(&self, execution: &QueryExecution) {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.ingest(execution)));
+        if result.is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                query_len = execution.query.len(),
+                "analytics ingest panicked; sample dropped, consumer continues"
+            );
+        }
+    }
+
     /// Spawn the single background consumer and install its queue.
     ///
     /// Called once at server startup. A second call is a no-op returning
@@ -211,7 +258,14 @@ impl QueryAnalytics {
     /// Consumers of the shared state (`/api/analytics`, `/anomalies`) read the
     /// SAME structures as before — they are simply written from the consumer
     /// task, so a reading endpoint may lag the newest query by the time it
-    /// takes to drain the queue (microseconds in practice).
+    /// takes to drain the queue (microseconds while the consumer keeps up).
+    ///
+    /// One semantic consequence: everything the ingest stamps with the current
+    /// time — the slow-query entry timestamp, and the windows
+    /// `PatternDetector` uses for N+1 and burst detection — is now stamped
+    /// when the execution is INGESTED, not when the query completed. Under a
+    /// queue backlog those windows stretch by the backlog delay (the recorded
+    /// query DURATION is measured on the connection task and is unaffected).
     pub fn start_consumer(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
         let capacity = self.config.queue_capacity.max(1);
         let (tx, mut rx) = mpsc::channel::<AnalyticsMsg>(capacity);
@@ -228,7 +282,7 @@ impl QueryAnalytics {
                     break;
                 };
                 match msg {
-                    AnalyticsMsg::Record(execution) => this.ingest(&execution),
+                    AnalyticsMsg::Record(execution) => this.ingest_guarded(&execution),
                     AnalyticsMsg::Flush(ack) => {
                         let _ = ack.send(());
                     }
@@ -250,7 +304,9 @@ impl QueryAnalytics {
         }
     }
 
-    /// Executions dropped because the ingest queue was full (or closed).
+    /// Executions dropped because the ingest queue was full (or closed), plus
+    /// any whose ingest panicked. Also exposed as
+    /// `heliosdb_proxy_analytics_dropped_total` on `/metrics/prometheus`.
     pub fn dropped_total(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -500,6 +556,92 @@ mod tests {
         analytics.record(exec("SELECT 1", "s1"));
         analytics.flush().await;
         assert_eq!(analytics.top_queries(OrderBy::Calls, 10).len(), 1);
+    }
+
+    /// Regression: a statement whose Unicode lowercase is LONGER than the
+    /// original (U+0130 folds to two chars / three bytes) used to make the
+    /// fingerprinter slice the original statement with an offset taken from
+    /// the folded copy — an out-of-range / mid-char slice panic. On the shared
+    /// consumer that panic killed the task and silently disabled analytics
+    /// process-wide. It must now ingest cleanly, and later records must still
+    /// be ingested.
+    #[tokio::test]
+    async fn test_consumer_survives_length_changing_unicode() {
+        let analytics = Arc::new(QueryAnalytics::with_defaults());
+        let handle = analytics.start_consumer().unwrap();
+
+        // 14 bytes; 15 lowercased, and `find("from") + 4 == 15` — the exact
+        // input that panicked "byte index 15 is out of range".
+        analytics.record(exec("SELECT \u{130} from", "s1"));
+        analytics.flush().await;
+        analytics.record(exec("SELECT * FROM users WHERE id = 1", "s1"));
+        analytics.flush().await;
+
+        assert_eq!(analytics.dropped_total(), 0, "no sample may be lost");
+        assert_eq!(
+            analytics.top_queries(OrderBy::Calls, 10).len(),
+            2,
+            "the consumer must still be alive after the exotic statement"
+        );
+        handle.abort();
+    }
+
+    /// Defence in depth for the above: even if some future ingest panics, the
+    /// single shared consumer must survive it — counting the sample as dropped
+    /// and continuing — instead of dropping the receiver and killing analytics
+    /// for the life of the process.
+    #[tokio::test]
+    async fn test_consumer_survives_panicking_ingest() {
+        let analytics = Arc::new(QueryAnalytics::with_defaults());
+        let handle = analytics.start_consumer().unwrap();
+
+        analytics
+            .panic_next_ingest
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        analytics.record(exec("SELECT 1", "s1"));
+        analytics.flush().await;
+        std::panic::set_hook(hook);
+
+        assert_eq!(analytics.dropped_total(), 1, "panicked sample is dropped");
+        assert!(analytics.top_queries(OrderBy::Calls, 10).is_empty());
+
+        analytics.record(exec("SELECT * FROM users WHERE id = 1", "s1"));
+        analytics.flush().await;
+        assert_eq!(
+            analytics.top_queries(OrderBy::Calls, 10).len(),
+            1,
+            "the consumer must keep ingesting after a panic"
+        );
+        assert_eq!(analytics.dropped_total(), 1);
+        handle.abort();
+    }
+
+    /// The ingest path takes exactly ONE case conversion and shares it: the
+    /// intent it records must equal what `QueryClassifier::classify` would
+    /// have produced from the raw statement.
+    #[test]
+    fn test_ingest_classifies_from_the_shared_lowercase_copy() {
+        let analytics = QueryAnalytics::with_defaults();
+        let classifier = QueryClassifier::new();
+
+        for sql in [
+            "SELECT * FROM embeddings ORDER BY v <-> '[1,2]'",
+            "INSERT INTO chunks (id) VALUES (1)",
+            "BEGIN",
+            "VACUUM ANALYZE",
+            "UPDATE agent_memory SET v = 1",
+        ] {
+            assert_eq!(
+                classifier.classify_lower(&ascii_lower(sql)),
+                classifier.classify(sql),
+                "shared ASCII-folded copy must classify {sql} identically"
+            );
+            analytics.record_now(exec(sql, "s1"));
+        }
+
+        assert_eq!(analytics.top_queries(OrderBy::Calls, 10).len(), 5);
     }
 
     #[test]

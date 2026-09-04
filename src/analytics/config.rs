@@ -32,6 +32,12 @@ pub struct AnalyticsConfig {
     /// Wired to `[analytics] fingerprint_cache_size` in `proxy.toml`.
     pub fingerprint_cache_size: usize,
 
+    /// Largest statement (in bytes) that may be memoized. The memo key is the
+    /// raw SQL, so this is what bounds the memo in BYTES rather than only in
+    /// entries: a longer statement is still fingerprinted, just not cached.
+    /// Wired to `[analytics] fingerprint_cache_max_sql_bytes` in `proxy.toml`.
+    pub fingerprint_cache_max_sql_bytes: usize,
+
     /// Capacity of the bounded queue between the connection tasks and the
     /// single background analytics consumer. An execution arriving when the
     /// queue is full is DROPPED (and counted in
@@ -61,6 +67,8 @@ impl Default for AnalyticsConfig {
             retention: Duration::from_secs(7 * 24 * 3600), // 7 days
             max_fingerprints: 10000,
             fingerprint_cache_size: super::fingerprinter::DEFAULT_FINGERPRINT_CACHE_SIZE,
+            fingerprint_cache_max_sql_bytes:
+                super::fingerprinter::DEFAULT_FINGERPRINT_CACHE_MAX_SQL_BYTES,
             queue_capacity: DEFAULT_ANALYTICS_QUEUE_CAPACITY,
             slow_query: SlowQueryConfig::default(),
             patterns: PatternConfig::default(),
@@ -108,6 +116,11 @@ impl AnalyticsConfigBuilder {
 
     pub fn fingerprint_cache_size(mut self, size: usize) -> Self {
         self.config.fingerprint_cache_size = size;
+        self
+    }
+
+    pub fn fingerprint_cache_max_sql_bytes(mut self, bytes: usize) -> Self {
+        self.config.fingerprint_cache_max_sql_bytes = bytes;
         self
     }
 
@@ -360,6 +373,7 @@ mod tests {
         assert!(!config.track_parameters);
         assert_eq!(config.max_fingerprints, 10000);
         assert_eq!(config.fingerprint_cache_size, 10000);
+        assert_eq!(config.fingerprint_cache_max_sql_bytes, 4096);
         assert_eq!(config.queue_capacity, 8192);
     }
 
@@ -369,10 +383,12 @@ mod tests {
     fn test_builder_queue_and_cache_knobs() {
         let config = AnalyticsConfig::builder()
             .fingerprint_cache_size(64)
+            .fingerprint_cache_max_sql_bytes(128)
             .queue_capacity(16)
             .build();
 
         assert_eq!(config.fingerprint_cache_size, 64);
+        assert_eq!(config.fingerprint_cache_max_sql_bytes, 128);
         assert_eq!(config.queue_capacity, 16);
     }
 

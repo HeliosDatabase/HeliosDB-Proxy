@@ -118,11 +118,11 @@ impl QueryClassifier {
 
     /// Classify query intent.
     ///
-    /// Allocates one lowercase copy of the statement; callers that already
-    /// hold one (the analytics ingest path does — see
-    /// [`QueryClassifier::classify_lower`]) should pass it in instead. This
-    /// previously built BOTH an uppercase and a lowercase copy of every
-    /// statement.
+    /// Allocates one lowercase copy of the statement. The analytics ingest
+    /// path already holds one (shared with the fingerprinter) and calls
+    /// [`QueryClassifier::classify_lower`] directly instead; this entry point
+    /// is for callers that only have the raw statement. It previously built
+    /// BOTH an uppercase and a lowercase copy of every statement.
     pub fn classify(&self, query: &str) -> QueryIntent {
         self.classify_lower(&query.to_lowercase())
     }
@@ -133,6 +133,13 @@ impl QueryClassifier {
     /// tests only ever inspected the leading token case-insensitively, so
     /// matching lowercase keywords against the lowercase copy gives the same
     /// answer while saving a whole-SQL allocation per query.
+    ///
+    /// The ingest path passes the ASCII-folded copy it shares with the
+    /// fingerprinter (`analytics::ascii_lower`, which — unlike
+    /// `str::to_lowercase` — preserves byte offsets). SQL keywords and the
+    /// default table patterns are ASCII, so the two folds agree; a table
+    /// pattern configured with non-ASCII uppercase letters would only match
+    /// case-sensitively on that path.
     #[allow(clippy::if_same_then_else)]
     pub fn classify_lower(&self, lower: &str) -> QueryIntent {
         let head = lower.trim_start();

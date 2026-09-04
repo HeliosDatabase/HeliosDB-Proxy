@@ -869,6 +869,7 @@ impl ProxyServer {
                 max_fingerprints = a.max_fingerprints,
                 queue_capacity = a.queue_capacity,
                 fingerprint_cache_size = a.fingerprint_cache_size,
+                fingerprint_cache_max_sql_bytes = a.fingerprint_cache_max_sql_bytes,
                 "query analytics enabled"
             );
             let ac = crate::analytics::AnalyticsConfig {
@@ -876,6 +877,7 @@ impl ProxyServer {
                 max_fingerprints: a.max_fingerprints as usize,
                 queue_capacity: a.queue_capacity as usize,
                 fingerprint_cache_size: a.fingerprint_cache_size as usize,
+                fingerprint_cache_max_sql_bytes: a.fingerprint_cache_max_sql_bytes as usize,
                 slow_query: crate::analytics::SlowQueryConfig {
                     threshold: Duration::from_millis(a.slow_query_ms),
                     ..Default::default()
@@ -1444,8 +1446,20 @@ impl ProxyServer {
         health_task.abort();
         pool_task.abort();
         admin_task.abort();
+        // Drain what the connection tasks already queued before killing the
+        // consumer, so a graceful handoff does not silently lose the last few
+        // hundred samples. Bounded by the same `shutdown_drain_timeout_secs`
+        // budget as the connection drain — the queue is small and this is
+        // normally instant, but a wedged consumer must not hold up exit.
         #[cfg(feature = "query-analytics")]
         if let Some(t) = analytics_task {
+            if let Some(a) = self.state.analytics.as_ref() {
+                let budget =
+                    Self::drain_timeout(self.state.live_config.load().shutdown_drain_timeout_secs);
+                if tokio::time::timeout(budget, a.flush()).await.is_err() {
+                    tracing::warn!("analytics ingest queue did not drain before shutdown");
+                }
+            }
             t.abort();
         }
         if let Some(t) = mcp_task {
