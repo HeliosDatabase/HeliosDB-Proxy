@@ -68,7 +68,7 @@ HeliosProxy features are grouped into a connection-routing tier and a programmab
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
 | **Failover Controller** | *(core)* | Automatic failover with candidate ranking by replication lag and configurable promotion policies |
-| **Transaction Replay (TR)** | `ha-tr` | Journals in-flight transactions and transparently replays them on a new primary after failover — zero data loss for committed work, with statement ordering and parameter fidelity preserved |
+| **Transaction Replay (TR)** | *(core; journal/replay engine: `ha-tr`)* | `tr_mode` keeps client sessions alive across a backend failure: `session` re-homes the connection to the new primary and restores `SET` state, `select` transparently re-runs interrupted reads, and opt-in `transaction` replays the uncommitted transaction on the new primary and continues. A `COMMIT` with unknown outcome is never retried (client gets SQLSTATE 08007). Failing over onto password-protected backends requires the proxy to be the auth boundary (`[auth] mode = "scram"`). `ha-tr` adds the write journal and the operator-driven `/api/replay` engine |
 | **Session Migration** | `ha-tr` | Captures and restores full session state (SET parameters, prepared statements, advisory locks) when moving connections between nodes |
 | **Cursor Restore** | `ha-tr` | Preserves open cursor positions across failover — clients resume fetching without re-executing the query |
 | **Switchover Buffer** | *(core)* | Buffers incoming queries during planned switchover, drains them to the new primary once promotion completes |
