@@ -315,7 +315,7 @@ impl RateLimiter {
 
         // Callers that hold a `CachedLimiterKey` (the proxy's per-query gate)
         // reuse its rendered form instead of re-formatting here.
-        let display: Arc<str> = Arc::from(key.to_string().as_str());
+        let display: Arc<str> = Arc::<str>::from(key.to_string());
         self.check_resolved(key, &display, cost, priority, &config)
     }
 
@@ -388,9 +388,14 @@ impl RateLimiter {
 
         let max = config.effective_concurrency(key, PriorityLevel::Normal);
 
-        // Hit path first: an existing limiter is looked up by reference, so the
-        // key is only cloned when a new bucket actually has to be inserted.
-        let limiter = match self.concurrency.get(key) {
+        // Hit path first: an existing limiter is looked up with `get_mut`
+        // (still the DashMap shard *write* guard, so the key is only cloned
+        // when a new bucket actually has to be inserted) rather than `get`
+        // (a read guard). See `check_token_bucket` for why the write guard
+        // matters: DashMap's `entry()` and `get_mut()` take the same shard
+        // write lock, so this preserves the mutual exclusion `entry()` gave
+        // us between two threads racing to insert the same fresh key.
+        let limiter = match self.concurrency.get_mut(key) {
             Some(existing) => Arc::clone(existing.value()),
             None => self
                 .concurrency
@@ -524,10 +529,18 @@ impl RateLimiter {
         priority: PriorityLevel,
         config: &RateLimitConfig,
     ) -> Result<(), TokenBucketExceeded> {
-        // Hit path: look the bucket up by reference so the steady state never
-        // clones the key (nor resolves the effective limits, which only matter
-        // when a bucket is created).
-        if let Some(bucket) = self.token_buckets.get(key) {
+        // Hit path: look the bucket up with `get_mut`, which still takes the
+        // DashMap shard *write* guard (unlike `get`, a read guard) — so the
+        // key is only cloned when a new bucket has to be inserted, but two
+        // threads racing on the same existing key still can't both be inside
+        // `try_acquire` at once. That mutual exclusion is load-bearing:
+        // `TokenBucket::refill` does a non-atomic load/store read-modify-write
+        // of the token count guarded only by a refill-vs-refill mutex, so two
+        // concurrent `try_acquire` calls on the same bucket (as `get`'s read
+        // guard would allow) can race a refill against a decrement and hand
+        // back tokens that were already spent — a lost-update that lets the
+        // limiter admit more than the configured QPS.
+        if let Some(bucket) = self.token_buckets.get_mut(key) {
             return bucket.try_acquire(cost);
         }
 
@@ -548,8 +561,15 @@ impl RateLimiter {
         cost: u32,
         _config: &RateLimitConfig,
     ) -> Result<(), SlidingWindowExceeded> {
-        // Hit path: existing windows are looked up by reference (no key clone).
-        if let Some(window) = self.sliding_windows.get(key) {
+        // Hit path: existing windows are looked up with `get_mut` (the same
+        // shard write guard `entry()` used, still avoiding a key clone on
+        // hit) rather than `get`'s read guard — see `check_token_bucket` for
+        // why the write guard matters. `SlidingWindow::try_record_n` is
+        // fully mutex-guarded internally, so this map didn't strictly need
+        // the write guard for correctness, but it's kept consistent with the
+        // other maps this branch touches rather than relying on that
+        // internal-locking detail staying true.
+        if let Some(window) = self.sliding_windows.get_mut(key) {
             return window.try_record_n(cost);
         }
 
@@ -614,10 +634,16 @@ impl RateLimiter {
 
     /// Clean up expired entries
     pub fn cleanup(&self) {
-        // RCU against the `ArcSwap` snapshot: mutate a private copy, publish it.
-        let mut config = RateLimitConfig::clone(&self.config.load());
-        config.cleanup_expired();
-        self.config.store(Arc::new(config));
+        // `rcu` re-runs the closure against the latest snapshot if another
+        // `store` (e.g. a concurrent `update_config`) lands in between, so a
+        // racing writer's change is merged into rather than clobbered by
+        // this read-modify-write — unlike a plain load-then-store, which
+        // would silently drop whatever the racer just published.
+        self.config.rcu(|current| {
+            let mut config = RateLimitConfig::clone(current);
+            config.cleanup_expired();
+            config
+        });
     }
 }
 
@@ -866,6 +892,152 @@ mod tests {
 
         let conc_limiter = result.unwrap();
         assert_eq!(conc_limiter.max_concurrent(), 10);
+    }
+
+    /// Regression test for the O4 rate-limiter-key fix: the token-bucket hit
+    /// path (`check_token_bucket`'s `if let Some(bucket) = ...`) must take
+    /// the DashMap shard *write* guard, exactly like `entry()` did on main,
+    /// not a read guard. Two threads racing `get_mut` on the same key can
+    /// never both be inside the guard at once; a `get()` read guard would
+    /// let them, unmasking the lost-update race in `TokenBucket::refill`
+    /// (a non-atomic load/store of the token count, guarded only against
+    /// concurrent *refills* — not against a concurrent decrement).
+    ///
+    /// This drives the DashMap guard directly with a channel-synchronized
+    /// hold, rather than a timing race, so it is deterministic and cannot be
+    /// flaky under CI scheduling jitter.
+    #[test]
+    fn test_token_bucket_hit_path_guard_is_mutually_exclusive() {
+        use std::sync::mpsc;
+
+        let config = RateLimitConfig::builder()
+            .default_qps(10)
+            .default_burst(10)
+            .build();
+        let limiter = RateLimiter::new(config);
+        let key = LimiterKey::Global;
+
+        // Create the bucket via the one-time miss (`entry()`) path so both
+        // threads below exercise the hit path this fix changed.
+        let cfg = limiter.config();
+        limiter
+            .check_token_bucket(&key, 0, PriorityLevel::Normal, &cfg)
+            .unwrap();
+        assert_eq!(limiter.token_buckets.len(), 1);
+
+        std::thread::scope(|scope| {
+            let (holder_ready_tx, holder_ready_rx) = mpsc::channel::<()>();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+
+            let holder = scope.spawn(|| {
+                let guard = limiter.token_buckets.get_mut(&key).unwrap();
+                holder_ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                drop(guard);
+            });
+            holder_ready_rx.recv().unwrap();
+
+            let (second_started_tx, second_started_rx) = mpsc::channel::<()>();
+            let (second_done_tx, second_done_rx) = mpsc::channel::<()>();
+            let second = scope.spawn(|| {
+                second_started_tx.send(()).unwrap();
+                let _guard = limiter.token_buckets.get_mut(&key).unwrap();
+                second_done_tx.send(()).unwrap();
+            });
+            second_started_rx.recv().unwrap();
+
+            // The second `get_mut` must still be blocked a moment after it
+            // started, because the holder has not released its guard yet.
+            assert!(
+                second_done_rx
+                    .recv_timeout(Duration::from_millis(200))
+                    .is_err(),
+                "a second get_mut() on the same bucket key completed while \
+                 another thread still held its guard — the hit path lost \
+                 its mutual-exclusion guarantee (regressed to a `get()` \
+                 read guard, or equivalent)"
+            );
+
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+
+            // Now that the holder released, the second call can complete.
+            second_done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second get_mut() should complete once the guard is released");
+            second.join().unwrap();
+        });
+    }
+
+    /// End-to-end companion to the mutual-exclusion test above: many threads
+    /// hammer `try_acquire` on one already-created bucket concurrently, and
+    /// the total number of grants must never exceed what the burst capacity
+    /// plus legitimate elapsed-time refill could possibly allow. Under the
+    /// pre-fix `get()` read guard this bound is blown by a wide margin (the
+    /// lost-update race repeatedly hands back tokens that were already
+    /// spent); the slack below is generous enough to tolerate scheduling
+    /// jitter on a loaded host without masking that.
+    #[test]
+    fn test_token_bucket_concurrent_hammering_never_exceeds_burst_plus_refill() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Barrier;
+
+        let qps: u32 = 2_000;
+        let burst: u32 = 1_000;
+        let config = RateLimitConfig::builder()
+            .default_qps(qps)
+            .default_burst(burst)
+            .build();
+        let limiter = RateLimiter::new(config);
+        let key = LimiterKey::Global;
+
+        let cfg = limiter.config();
+        limiter
+            .check_token_bucket(&key, 0, PriorityLevel::Normal, &cfg)
+            .unwrap();
+
+        const N_THREADS: usize = 16;
+        let test_duration = Duration::from_millis(150);
+        let granted = AtomicU64::new(0);
+        let barrier = Barrier::new(N_THREADS);
+        let start = Instant::now();
+
+        std::thread::scope(|scope| {
+            for _ in 0..N_THREADS {
+                let limiter = &limiter;
+                let key = &key;
+                let cfg = &cfg;
+                let granted = &granted;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    while start.elapsed() < test_duration {
+                        if limiter
+                            .check_token_bucket(key, 1, PriorityLevel::Normal, cfg)
+                            .is_ok()
+                        {
+                            granted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+
+        let elapsed = start.elapsed();
+        let max_legitimate_refill = (elapsed.as_secs_f64() * qps as f64).ceil() as u64;
+        // Slack for scheduling jitter around the deadline check, not for the
+        // race itself: the race this guards against manufactures grants far
+        // in excess of this on a hammering workload.
+        let bound = burst as u64 + max_legitimate_refill + (burst as u64 / 4) + 50;
+
+        let total_granted = granted.load(Ordering::Relaxed);
+        assert!(
+            total_granted <= bound,
+            "granted {total_granted} tokens for burst={burst} + elapsed refill<={max_legitimate_refill} \
+             (bound {bound}) over {elapsed:?} — the token-bucket hit path is admitting more than \
+             the configured rate allows, consistent with the lost-update race a `get()` read guard \
+             would unmask"
+        );
     }
 
     /// A `CachedLimiterKey` must address exactly the same bucket as the plain

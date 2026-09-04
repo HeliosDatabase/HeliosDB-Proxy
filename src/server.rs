@@ -4942,15 +4942,9 @@ impl ProxyServer {
             return Cow::Owned(resolved);
         }
 
-        // A concurrent racer may win the `set`; either way the stored value is
+        // A concurrent racer may win the init; either way the stored value is
         // the same key, so borrow whatever landed.
-        let _ = session.rate_limit_key.set(resolved);
-        match session.rate_limit_key.get() {
-            Some(cached) => Cow::Borrowed(cached),
-            // Unreachable: `OnceLock` is populated by the `set` above or by the
-            // racer that beat it. Fall back rather than panic on the hot path.
-            None => Cow::Owned(CachedLimiterKey::new(LimiterKey::Global)),
-        }
+        Cow::Borrowed(session.rate_limit_key.get_or_init(|| resolved))
     }
 
     /// Check rate limits before a query is forwarded. Returns `Some(bytes)` —

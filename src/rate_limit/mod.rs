@@ -35,11 +35,12 @@
 //! let config = RateLimitConfig::default();
 //! let limiter = RateLimiter::new(config);
 //!
-//! // Check rate limit for a user
+//! // Check rate limit for a user (synchronous — no `.await`)
 //! let key = LimiterKey::User("app_user".to_string());
-//! match limiter.check(&key, 1).await {
-//!     Ok(()) => println!("Query allowed"),
-//!     Err(e) => println!("Rate limited: {:?}", e),
+//! if limiter.check(&key, 1).is_allowed() {
+//!     println!("Query allowed");
+//! } else {
+//!     println!("Rate limited");
 //! }
 //! ```
 
