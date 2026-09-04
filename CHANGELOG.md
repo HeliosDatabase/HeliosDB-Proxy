@@ -23,6 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   field on `FailoverConfig`, so an exhaustive `FailoverConfig { .. }` literal
   must either add it or fall back on `..Default::default()`.
 
+### Changed
+
+- **BREAKING (semver-major for library consumers)**: `anomaly::QueryObservation`
+  is now `QueryObservation<'a>`, with `fingerprint` and `sql` changed from
+  `String` to `Cow<'a, str>`, and `AnomalyDetector::record_query` now takes
+  `&QueryObservation<'_>`. This lets the per-query hot path lend the detector
+  a view into a buffer it already owns (the wire frame, a fingerprint scratch
+  buffer) instead of copying every statement, at zero cost to callers that
+  already own a `String`/`&str` (`.into()` still builds the `Cow` for them).
+  Any out-of-tree code constructing `QueryObservation` with owned `String`
+  fields needs a version bump / `.into()` to keep compiling.
+
 ### Added
 
 - **Criterion coverage for the relay / failover / pool-contention paths**

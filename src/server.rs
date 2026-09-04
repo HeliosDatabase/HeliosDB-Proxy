@@ -102,9 +102,14 @@ fn build_replay_backend_template(_config: &ProxyConfig) -> BackendConfig {
 /// Not a parser. The analytics module has the canonical normaliser
 /// when query-analytics is on; this is a lightweight standalone so
 /// the anomaly detector works even when analytics is off.
+///
+/// Writes into `out` (cleared first) rather than returning a fresh
+/// `String` so the per-query hot path can hand it a reusable buffer
+/// and allocate nothing once the buffer has grown.
 #[cfg(feature = "anomaly-detection")]
-fn anomaly_fingerprint(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
+fn anomaly_fingerprint_into(sql: &str, out: &mut String) {
+    out.clear();
+    out.reserve(sql.len());
     let mut in_single = false;
     let mut prev_space = false;
     let mut chars = sql.chars().peekable();
@@ -147,7 +152,18 @@ fn anomaly_fingerprint(sql: &str) -> String {
         out.push(c.to_ascii_lowercase());
         prev_space = false;
     }
-    out.trim_end().to_string()
+    // Same as the old `out.trim_end().to_string()`, in place.
+    let trimmed_len = out.trim_end().len();
+    out.truncate(trimmed_len);
+}
+
+/// Owning wrapper around [`anomaly_fingerprint_into`]. Test-only —
+/// the hot path uses the buffer form.
+#[cfg(all(test, feature = "anomaly-detection"))]
+fn anomaly_fingerprint(sql: &str) -> String {
+    let mut out = String::new();
+    anomaly_fingerprint_into(sql, &mut out);
+    out
 }
 
 /// Validate a backend-declared frame length against the configured cap
@@ -6455,11 +6471,21 @@ impl ProxyServer {
                 .unwrap_or_else(|| session.client_addr.ip().to_string()),
             Err(_) => session.client_addr.ip().to_string(),
         };
-        let fingerprint = anomaly_fingerprint(query);
+        // Both the fingerprint and the SQL are *lent* to the detector:
+        // the fingerprint from a buffer sized for this call, the SQL
+        // straight from the wire frame. The detector copies only on
+        // the rare paths that retain something (first-seen
+        // fingerprint, emitted event excerpt). The fingerprint buffer
+        // is allocated per call rather than cached in a thread-local,
+        // so nothing is retained between queries — a client sending
+        // one very large statement does not leave its buffer
+        // permanently resident on the worker thread.
+        let mut fingerprint = String::with_capacity(query.len());
+        anomaly_fingerprint_into(query, &mut fingerprint);
         let obs = crate::anomaly::QueryObservation {
             tenant,
-            fingerprint,
-            sql: query.to_string(),
+            fingerprint: std::borrow::Cow::Borrowed(fingerprint.as_str()),
+            sql: std::borrow::Cow::Borrowed(query),
             timestamp: std::time::Instant::now(),
         };
         for ev in state.anomaly_detector.record_query(&obs) {
@@ -9956,5 +9982,119 @@ mod tests {
     fn test_validate_backend_frame_len_boundary() {
         assert!(validate_backend_frame_len(1024, 1024).is_ok());
         assert!(validate_backend_frame_len(1025, 1024).is_err());
+    }
+
+    /// Verbatim copy of the pre-optimisation `anomaly_fingerprint`,
+    /// which built a fresh `String` per call. The reusable-buffer
+    /// rewrite must produce byte-identical fingerprints.
+    #[cfg(feature = "anomaly-detection")]
+    fn legacy_anomaly_fingerprint(sql: &str) -> String {
+        let mut out = String::with_capacity(sql.len());
+        let mut in_single = false;
+        let mut prev_space = false;
+        let mut chars = sql.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\'' {
+                in_single = !in_single;
+                if in_single {
+                    out.push('?');
+                    while let Some(&n) = chars.peek() {
+                        chars.next();
+                        if n == '\'' {
+                            in_single = false;
+                            break;
+                        }
+                    }
+                    prev_space = false;
+                    continue;
+                }
+            }
+            if c.is_ascii_digit() {
+                if !out.ends_with('?') {
+                    out.push('?');
+                }
+                while matches!(chars.peek(), Some(c) if c.is_ascii_digit() || *c == '.') {
+                    chars.next();
+                }
+                prev_space = false;
+                continue;
+            }
+            if c.is_ascii_whitespace() {
+                if !prev_space && !out.is_empty() {
+                    out.push(' ');
+                    prev_space = true;
+                }
+                continue;
+            }
+            out.push(c.to_ascii_lowercase());
+            prev_space = false;
+        }
+        out.trim_end().to_string()
+    }
+
+    #[cfg(feature = "anomaly-detection")]
+    const FINGERPRINT_CORPUS: &[&str] = &[
+        "",
+        "   ",
+        "SELECT 1",
+        "SELECT * FROM users WHERE id = 1",
+        "SELECT * FROM users WHERE id = 99",
+        "select   *\n from\tusers  where name = 'bob'   ",
+        "INSERT INTO t VALUES (1, 2.5, 'a''b', NULL)",
+        "SELECT '' FROM t",
+        "SELECT 'unterminated FROM t",
+        "UPDATE t SET x = 3.14159 WHERE y = 'Ünïcode'",
+        "SELECT * FROM «таблица» WHERE имя = 'ЗНАЧЕНИЕ'",
+        "SELECT * FROM t WHERE n = 1 OR 1=1 -- 💥",
+        "SELECT 1;",
+        "\n\n\t",
+    ];
+
+    #[cfg(feature = "anomaly-detection")]
+    #[test]
+    fn anomaly_fingerprint_matches_legacy_implementation() {
+        for sql in FINGERPRINT_CORPUS {
+            assert_eq!(
+                anomaly_fingerprint(sql),
+                legacy_anomaly_fingerprint(sql),
+                "fingerprint diverged for {:?}",
+                sql
+            );
+        }
+    }
+
+    #[cfg(feature = "anomaly-detection")]
+    #[test]
+    fn anomaly_fingerprint_into_reuses_buffer_without_residue() {
+        let mut buf = String::new();
+        // A reused buffer must yield exactly what a fresh one does,
+        // in any order — no leftovers from the previous statement.
+        for sql in FINGERPRINT_CORPUS {
+            anomaly_fingerprint_into(sql, &mut buf);
+            assert_eq!(buf, legacy_anomaly_fingerprint(sql), "for {:?}", sql);
+        }
+        anomaly_fingerprint_into("SELECT a_very_long_identifier FROM some_table", &mut buf);
+        let grown = buf.capacity();
+        anomaly_fingerprint_into("SELECT 1", &mut buf);
+        assert_eq!(buf, "select ?");
+        assert_eq!(
+            buf.capacity(),
+            grown,
+            "capacity should be reused, not reset"
+        );
+    }
+
+    /// The fingerprint normalises literals, so queries differing only
+    /// in their literal values collapse to one shape — the property
+    /// the novel-query detector depends on.
+    #[cfg(feature = "anomaly-detection")]
+    #[test]
+    fn anomaly_fingerprint_collapses_literals() {
+        let mut buf = String::new();
+        anomaly_fingerprint_into("SELECT * FROM users WHERE id = 1", &mut buf);
+        let a = buf.clone();
+        anomaly_fingerprint_into("select * from USERS where id = 99", &mut buf);
+        assert_eq!(a, buf);
+        assert_eq!(a, "select * from users where id = ?");
     }
 }

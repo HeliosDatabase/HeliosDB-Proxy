@@ -26,6 +26,7 @@
 //! [`AnomalyEvent`] trail makes it possible to bolt a learned
 //! classifier on later: events become labeled training data.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 
 use dashmap::DashMap;
@@ -176,7 +177,7 @@ impl AnomalyDetector {
     /// Record a query event. Detectors may emit zero or more events.
     /// Returns the events emitted by THIS call (the caller can also
     /// poll `recent_events` for the full ring buffer).
-    pub fn record_query(&self, ctx: &QueryObservation) -> Vec<AnomalyEvent> {
+    pub fn record_query(&self, ctx: &QueryObservation<'_>) -> Vec<AnomalyEvent> {
         let mut emitted = Vec::new();
 
         // Rate-spike detector. Per-tenant shard lock only.
@@ -209,7 +210,10 @@ impl AnomalyDetector {
 
         // Novel-query detector. The common already-seen path takes only a
         // shard read; a fresh fingerprint upgrades to a shard write.
-        if self.config.emit_novel_queries && !self.seen_fingerprints.contains_key(&ctx.fingerprint)
+        if self.config.emit_novel_queries
+            && !self
+                .seen_fingerprints
+                .contains_key(ctx.fingerprint.as_ref())
         {
             // Bound the set so unique-SQL traffic can't leak memory.
             if self.seen_fingerprints.len() >= self.config.max_seen_fingerprints {
@@ -219,11 +223,11 @@ impl AnomalyDetector {
             // first-see this fingerprint, so emit exactly once.
             if self
                 .seen_fingerprints
-                .insert(ctx.fingerprint.clone(), ())
+                .insert(ctx.fingerprint.as_ref().to_owned(), ())
                 .is_none()
             {
                 let ev = AnomalyEvent::NovelQuery {
-                    fingerprint: ctx.fingerprint.clone(),
+                    fingerprint: ctx.fingerprint.as_ref().to_owned(),
                     sql_excerpt: excerpt(&ctx.sql, 120),
                     detected_at: chrono::Utc::now().to_rfc3339(),
                 };
@@ -235,7 +239,16 @@ impl AnomalyDetector {
         // SQL-injection detector. Pure heuristic — runs even if the
         // upstream pre-query already passed; multiple layers is the
         // point.
-        let matches = sql_injection::scan(&ctx.sql);
+        //
+        // The statement is lower-cased exactly once, into a buffer
+        // sized for this call; every matcher reads that single
+        // lowered view. Allocated per call (not cached across calls
+        // in a thread-local) so nothing is retained between queries —
+        // a client sending one very large statement does not leave
+        // its buffer permanently resident on the worker thread.
+        let mut lowered = String::with_capacity(ctx.sql.len());
+        sql_injection::lower_into(&ctx.sql, &mut lowered);
+        let matches = sql_injection::scan_lowered(&lowered);
         if !matches.is_empty() {
             let severity = if matches.len() >= 2 {
                 Severity::Critical
@@ -327,15 +340,24 @@ impl AnomalyDetector {
 /// Per-query observation passed to the detector. Built by the proxy
 /// at hook time; populated as much as the proxy knows about the
 /// query.
+///
+/// `fingerprint` and `sql` are [`Cow`]s so the hot path can lend the
+/// detector views into buffers it already owns — the proxy's wire
+/// frame for the SQL, a reusable scratch String for the fingerprint —
+/// instead of copying every statement into the observation. The
+/// detector only takes ownership on the rare paths that actually
+/// retain a value (a first-seen fingerprint, an emitted event's
+/// bounded excerpt). `.into()` on a `&str` or `String` still builds
+/// one, so owning callers are unaffected.
 #[derive(Debug, Clone)]
-pub struct QueryObservation {
+pub struct QueryObservation<'a> {
     /// Tenant identifier (or "default" / "" when no multi-tenancy).
     pub tenant: String,
     /// Canonical query fingerprint (literals normalised). Same shape
     /// the analytics module produces.
-    pub fingerprint: String,
+    pub fingerprint: Cow<'a, str>,
     /// Raw SQL — used for SQL-injection scanning + UI excerpt.
-    pub sql: String,
+    pub sql: Cow<'a, str>,
     /// Wall-clock timestamp the query arrived. Detectors compute
     /// rates against this.
     pub timestamp: Instant,
@@ -370,19 +392,26 @@ impl AuthBurstWindow {
     }
 }
 
+/// Bounded, copy-at-most-`max`-bytes excerpt of `s` for display in an
+/// event. Truncation snaps *down* to the nearest UTF-8 character
+/// boundary, so a multi-byte character straddling `max` is dropped
+/// rather than split (slicing mid-character would panic).
 fn excerpt(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
+        return s.to_string();
     }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn obs(tenant: &str, fp: &str, sql: &str) -> QueryObservation {
+    fn obs<'a>(tenant: &str, fp: &'a str, sql: &'a str) -> QueryObservation<'a> {
         QueryObservation {
             tenant: tenant.into(),
             fingerprint: fp.into(),
@@ -554,5 +583,149 @@ mod tests {
         // buffer size, not lifetime count (simpler than tracking
         // separately).
         assert_eq!(d.event_count(), 5);
+    }
+
+    #[test]
+    fn excerpt_truncates_on_char_boundary() {
+        // A multi-byte character straddling `max` must be dropped,
+        // not split — slicing mid-character would panic.
+        let s = "é".repeat(20); // 40 bytes, boundaries at even offsets
+        let e = excerpt(&s, 5);
+        assert_eq!(e, "éé…");
+        // Whole excerpt stays inside the byte budget.
+        assert!(e.len() - "…".len() <= 5);
+        // A max landing exactly on a boundary keeps that many bytes.
+        assert_eq!(excerpt(&s, 4), "éé…");
+        // Short strings are returned verbatim.
+        assert_eq!(excerpt("ünïcode", 64), "ünïcode");
+        // Degenerate max smaller than the first character.
+        assert_eq!(excerpt(&s, 1), "…");
+    }
+
+    #[test]
+    fn sql_injection_excerpt_survives_multibyte_payload() {
+        // Regression: a >200-byte payload whose 200th byte falls
+        // inside a multi-byte character used to panic while building
+        // the event excerpt.
+        let d = AnomalyDetector::new(AnomalyConfig::default());
+        let sql = format!("SELECT * FROM t WHERE n = '{}' OR 1=1", "é".repeat(200));
+        let evs = d.record_query(&obs("acme", "fp-mb", &sql));
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, AnomalyEvent::SqlInjection { .. })),
+            "expected SqlInjection event in {:?}",
+            evs
+        );
+    }
+
+    #[test]
+    fn injection_detection_is_case_and_unicode_stable_across_observations() {
+        // The scan runs off a reused thread-local lower-case buffer;
+        // a long non-ASCII statement followed by a short ASCII one
+        // must not leak residue between observations.
+        let d = AnomalyDetector::new(AnomalyConfig::default());
+        let long_unicode = format!("SELECT * FROM «Ünïcode» WHERE n = '{}'", "Ä".repeat(300));
+        let _ = d.record_query(&obs("acme", "fp-a", &long_unicode));
+        let evs = d.record_query(&obs("acme", "fp-b", "SELECT 1"));
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, AnomalyEvent::SqlInjection { .. })),
+            "clean query flagged after a long one: {:?}",
+            evs
+        );
+        // …and an upper-case payload still fires.
+        let evs = d.record_query(&obs(
+            "acme",
+            "fp-c",
+            "FOO' UNION SELECT PASSWORD FROM USERS",
+        ));
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, AnomalyEvent::SqlInjection { .. })),
+            "upper-case payload missed: {:?}",
+            evs
+        );
+    }
+
+    #[test]
+    fn borrowed_and_owned_observations_detect_identically() {
+        let sql = "SELECT * FROM users WHERE id = 1 OR 1=1 --";
+        let d1 = AnomalyDetector::new(AnomalyConfig::default());
+        let borrowed = d1.record_query(&QueryObservation {
+            tenant: "acme".into(),
+            fingerprint: Cow::Borrowed("fp"),
+            sql: Cow::Borrowed(sql),
+            timestamp: Instant::now(),
+        });
+        let d2 = AnomalyDetector::new(AnomalyConfig::default());
+        let owned = d2.record_query(&QueryObservation {
+            tenant: "acme".into(),
+            fingerprint: Cow::Owned("fp".to_string()),
+            sql: Cow::Owned(sql.to_string()),
+            timestamp: Instant::now(),
+        });
+        // Same event kinds, in the same order. For the two variants
+        // this scan can produce (SqlInjection, NovelQuery) the payload
+        // fields are compared too (only the wall-clock stamp may
+        // differ); a RateSpike or AuthBurst variant, were one ever
+        // added here, would only be checked for discriminant equality
+        // above, not field equality.
+        assert_eq!(borrowed.len(), owned.len());
+        for (a, b) in borrowed.iter().zip(owned.iter()) {
+            assert_eq!(
+                std::mem::discriminant(a),
+                std::mem::discriminant(b),
+                "event kinds diverged: {:?} vs {:?}",
+                a,
+                b
+            );
+            if let (
+                AnomalyEvent::SqlInjection {
+                    sql_excerpt: ea,
+                    patterns_matched: pa,
+                    severity: sa,
+                    ..
+                },
+                AnomalyEvent::SqlInjection {
+                    sql_excerpt: eb,
+                    patterns_matched: pb,
+                    severity: sb,
+                    ..
+                },
+            ) = (a, b)
+            {
+                assert_eq!(ea, eb);
+                assert_eq!(pa, pb);
+                assert_eq!(sa, sb);
+            }
+            if let (
+                AnomalyEvent::NovelQuery {
+                    fingerprint: fa,
+                    sql_excerpt: ea,
+                    ..
+                },
+                AnomalyEvent::NovelQuery {
+                    fingerprint: fb,
+                    sql_excerpt: eb,
+                    ..
+                },
+            ) = (a, b)
+            {
+                assert_eq!(fa, fb);
+                assert_eq!(ea, eb);
+            }
+        }
+        assert!(
+            borrowed
+                .iter()
+                .any(|e| matches!(e, AnomalyEvent::SqlInjection { .. })),
+            "expected the payload to be flagged: {:?}",
+            borrowed
+        );
+        // A borrowed fingerprint is still retained by the seen-set.
+        assert!(d1
+            .record_query(&obs("acme", "fp", sql))
+            .iter()
+            .all(|e| !matches!(e, AnomalyEvent::NovelQuery { .. })));
     }
 }
