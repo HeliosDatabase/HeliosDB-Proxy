@@ -409,6 +409,28 @@ impl BackendClient {
     pub fn is_tls(&self) -> bool {
         self.stream.is_tls()
     }
+
+    /// Best-effort, non-blocking liveness probe of the underlying socket.
+    /// Returns `false` when the backend has closed the connection (FIN),
+    /// when unread bytes are already buffered (async frame / desync), or
+    /// when the socket is in an error state. Never blocks and never
+    /// awaits — safe to call on every pool checkout.
+    pub fn is_probably_alive(&self) -> bool {
+        self.stream.is_probably_alive()
+    }
+
+    /// Test-only: wrap an already-connected TCP socket without running the
+    /// PostgreSQL startup handshake. Lets pool unit tests build a
+    /// `BackendClient` whose peer they can close on demand.
+    #[cfg(test)]
+    pub(crate) fn from_tcp_for_test(tcp: TcpStream) -> Self {
+        Self {
+            stream: Stream::Plain(tcp),
+            server_parameters: std::collections::HashMap::new(),
+            backend_pid: None,
+            backend_secret: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
