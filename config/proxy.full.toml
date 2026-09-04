@@ -132,6 +132,11 @@ latency_threshold_ms = 100
 # =============================================================================
 
 [health]
+# Keep check_timeout_secs < check_interval_secs. If a probe can still be running
+# when the next tick fires, that tick is skipped for the node (counted as
+# health_probe_skipped_inflight) instead of stacking a second probe, so
+# detection is coarser than check_interval_secs suggests. A config where
+# check_timeout_secs >= check_interval_secs still loads, but logs a warning.
 check_interval_secs = 5
 check_timeout_secs  = 3
 failure_threshold   = 3     # Failures before marking unhealthy
