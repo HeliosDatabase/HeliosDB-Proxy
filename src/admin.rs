@@ -2066,6 +2066,15 @@ impl AdminServer {
             metrics.failovers
         ));
 
+        output.push_str(
+            "# HELP heliosdb_proxy_cache_capture_oversize_total Cacheable reads not cached              because the response exceeded cache.max_cacheable_response_bytes\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_cache_capture_oversize_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_cache_capture_oversize_total {}\n",
+            metrics.cache_capture_oversize
+        ));
+
         output
     }
 
@@ -2144,6 +2153,7 @@ impl AdminState {
                 bytes_received: 0,
                 bytes_sent: 0,
                 failovers: 0,
+                cache_capture_oversize: 0,
             }),
             active_sessions: RwLock::new(0),
             config_snapshot: RwLock::new(ConfigSnapshot {
@@ -2334,6 +2344,9 @@ struct MetricsResponse {
     bytes_received: u64,
     bytes_sent: u64,
     failovers: u64,
+    /// Cacheable reads whose response outgrew
+    /// `[cache] max_cacheable_response_bytes` and were therefore not cached.
+    cache_capture_oversize: u64,
 }
 
 impl From<ServerMetricsSnapshot> for MetricsResponse {
@@ -2346,6 +2359,7 @@ impl From<ServerMetricsSnapshot> for MetricsResponse {
             bytes_received: m.bytes_received,
             bytes_sent: m.bytes_sent,
             failovers: m.failovers,
+            cache_capture_oversize: m.cache_capture_oversize,
         }
     }
 }
@@ -2781,12 +2795,15 @@ mod tests {
             bytes_received: 50000,
             bytes_sent: 100000,
             failovers: 2,
+            cache_capture_oversize: 7,
         };
 
         let output = AdminServer::format_prometheus_metrics(&metrics);
         assert!(output.contains("heliosdb_proxy_connections_total 100"));
         assert!(output.contains("heliosdb_proxy_queries_total 1000"));
         assert!(output.contains("heliosdb_proxy_failovers_total 2"));
+        // O1: the capture byte-cap counter is scrapeable.
+        assert!(output.contains("heliosdb_proxy_cache_capture_oversize_total 7"));
     }
 
     #[test]
@@ -2798,10 +2815,12 @@ mod tests {
             bytes_received: 10000,
             bytes_sent: 20000,
             failovers: 1,
+            cache_capture_oversize: 3,
         };
 
         let response = MetricsResponse::from(snapshot);
         assert_eq!(response.connections_active, 70);
+        assert_eq!(response.cache_capture_oversize, 3);
     }
 
     /// Helper: build an AdminState with the given (address, role,

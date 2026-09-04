@@ -745,6 +745,24 @@ pub struct CacheToml {
     pub ttl_secs: u64,
     /// Maximum single result size to cache, bytes (larger results bypass).
     pub max_result_bytes: usize,
+    /// Hard ceiling, in bytes, on the response the proxy is willing to buffer
+    /// in memory while streaming a cacheable read to the client.
+    ///
+    /// Deliberately SHARED by both response caches (query-cache and the
+    /// edge-proxy result cache): the data path captures the backend response
+    /// exactly once and hands the same buffer to whichever cache is armed, so
+    /// one ceiling bounds the capture regardless of which section enabled it.
+    /// It therefore applies even when `[cache] enabled = false`, as long as
+    /// `[edge]` is caching reads.
+    ///
+    /// Once a response crosses this bound the capture buffer is dropped and the
+    /// response is marked non-cacheable; the bytes already streamed to the
+    /// client are unaffected (the client always receives the full, unmodified
+    /// response). Default 4 MiB — comfortably above the 1 MiB default
+    /// `max_result_bytes` so it never masks that knob, while bounding the
+    /// per-session transient to a few MiB instead of a whole result set.
+    /// MUST be > 0.
+    pub max_cacheable_response_bytes: usize,
 }
 
 impl Default for CacheToml {
@@ -753,6 +771,7 @@ impl Default for CacheToml {
             enabled: false,
             ttl_secs: 300,
             max_result_bytes: 1024 * 1024,
+            max_cacheable_response_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -1640,6 +1659,15 @@ impl ProxyConfig {
                 check_interval_secs = self.health.check_interval_secs,
                 "health.check_timeout_secs >= health.check_interval_secs: probes for a slow node will skip ticks (health_probe_skipped_inflight) instead of running every interval"
             );
+        }
+        // Zero would mean "capture nothing is ever cacheable" while still
+        // looking like a working cache, and is more likely a typo than intent.
+        // Checked unconditionally: the bound governs the shared response
+        // capture used by the query-cache AND the edge cache.
+        if self.cache.max_cacheable_response_bytes == 0 {
+            return Err(ProxyError::Config(
+                "cache.max_cacheable_response_bytes must be >= 1".to_string(),
+            ));
         }
 
         // Refuse to expose the admin API beyond loopback without a token. The
@@ -3015,6 +3043,31 @@ mod tests {
         c.edge.auth_token = "secret".to_string();
         c.edge.home_url = "https://home-proxy:9090".to_string();
         assert!(c.validate().is_ok());
+    }
+
+    /// O1: the shared response-capture ceiling defaults to 4 MiB, round-trips
+    /// through TOML, and a zero (which would silently make every response
+    /// uncacheable) is rejected.
+    #[test]
+    fn test_validate_max_cacheable_response_bytes() {
+        let mut c = ProxyConfig::default();
+        c.add_node("localhost:5432", "primary").unwrap();
+        assert_eq!(c.cache.max_cacheable_response_bytes, 4 * 1024 * 1024);
+        assert!(c.validate().is_ok());
+
+        c.cache.max_cacheable_response_bytes = 0;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("cache.max_cacheable_response_bytes"),
+            "unexpected error: {}",
+            err
+        );
+
+        // An existing config without the key keeps the documented default.
+        let parsed: CacheToml = toml::from_str("enabled = true\nttl_secs = 30\n").unwrap();
+        assert_eq!(parsed.max_cacheable_response_bytes, 4 * 1024 * 1024);
+        let parsed: CacheToml = toml::from_str("max_cacheable_response_bytes = 8192\n").unwrap();
+        assert_eq!(parsed.max_cacheable_response_bytes, 8192);
     }
 
     #[cfg(all(feature = "edge-proxy", feature = "query-cache"))]
