@@ -929,11 +929,12 @@ pub struct LimitsToml {
     /// `tr_max_replay_statements`). Default 4 MiB.
     #[serde(default = "default_tr_max_replay_bytes")]
     pub tr_max_replay_bytes: usize,
-    /// In-session Transaction Replay (`tr_mode != "none"`): maximum number of
-    /// session-level `SET`/`RESET` statements tracked per session for replay
-    /// onto the replacement backend after a failover. Once exceeded, tracking
-    /// stops (the session's GUC restore becomes incomplete) and a metric is
-    /// incremented. Default 256.
+    /// Cap on DISTINCT session variables whose latest simple-protocol `SET` is
+    /// replayed onto the replacement backend after an in-session failover. A later
+    /// `SET` of the same variable replaces the earlier one; `RESET name` frees the
+    /// slot; `RESET ALL`/`DISCARD ALL` clear all. Over the cap tracking stops
+    /// (`tr_session_set_cap_exceeded_total`) and a subsequent failover is refused
+    /// with `08006` instead of re-homing with incomplete state (TR-04).
     #[serde(default = "default_tr_max_session_set_statements")]
     pub tr_max_session_set_statements: usize,
 }

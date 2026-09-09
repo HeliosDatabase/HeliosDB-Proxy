@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Session `SET` tracking for failover restore is now transactional, mirroring
+  PostgreSQL: a `SET` inside a transaction is restored only if that transaction
+  commits, `ROLLBACK TO SAVEPOINT` discards the `SET`s made after the savepoint,
+  and `RESET name` / `RESET ALL` / `DISCARD ALL` inside a transaction are deferred
+  until commit instead of taking effect immediately (a rolled-back `RESET ALL` no
+  longer wipes the restore set). Variables are tracked by name, so a repeated `SET`
+  replaces the earlier value rather than consuming another slot of
+  `tr_max_session_set_statements`, and when that cap has been exceeded a failover
+  is refused with `08006` rather than re-homing the session with incomplete state
+  (TR-04).
+
 - In-session Transaction Replay no longer treats every `SELECT` as re-executable.
   An interrupted read is re-run on the replacement backend only when every function
   it calls is a PostgreSQL built-in known to be side-effect-free (or is listed in the
