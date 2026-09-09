@@ -1,0 +1,139 @@
+{
+  "fixture": "disposable PostgreSQL; controlled response publication and loss",
+  "suite": "commit",
+  "postgres_version": "18.4 (Debian 18.4-1.pgdg12+1)",
+  "binary": "/home/gpc/HDB/Proxy/target-integ/debug/heliosdb-proxy",
+  "sha256": "723708c2e9d9264856581ac4de2b9f501272a33a38bd6ca5cffaa498b0afec90",
+  "cases": [
+    {
+      "case": "plain_commit",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "ledger_rows": 1,
+      "invariant": "PASS"
+    },
+    {
+      "case": "commented_commit",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "ledger_rows": 1,
+      "invariant": "PASS"
+    },
+    {
+      "case": "commented_end",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "ledger_rows": 1,
+      "invariant": "PASS"
+    },
+    {
+      "case": "multi_query_commit",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "ledger_rows": 1,
+      "invariant": "PASS"
+    },
+    {
+      "case": "extended_commit",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "ledger_rows": 1,
+      "invariant": "PASS"
+    },
+    {
+      "case": "commit_and_begin",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "ledger_rows": 1,
+      "invariant": "PASS"
+    },
+    {
+      "case": "prepared_transaction",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "prepared_outcomes": [
+        "audit_prepared"
+      ],
+      "ledger_rows": 1,
+      "invariant": "PASS"
+    }
+  ],
+  "failures": 0
+}

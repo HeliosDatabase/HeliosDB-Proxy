@@ -58,7 +58,7 @@ make incorrect responses faster or overload the surviving primary during failove
   WITH-wrapped sequence/UDF calls and data-modifying functions execute at most once
   on unknown autocommit outcomes. Publish the supported replay subset.
 
-- [ ] **TR-04 · P1 — restore session state transactionally and within a byte budget.**
+- [x] **TR-04 · P1 — restore session state transactionally and within a byte budget.** *(2026-09-09: deferred `GucOp`s applied at COMMIT, savepoint-scoped rollback, variables keyed by name, cap = distinct variables, failover refused (08006) when the cap was exceeded; all three `guc_*` probes green. Extended-protocol SETs, `PREPARE`, temp tables and cursors remain unrestored.)*
   Track effective GUC state plus savepoint undo, RESET/DISCARD and extended SET;
   apply only changes that survive transaction end. Maintain effective role,
   search_path, timezone and startup options consistently with cache identity.

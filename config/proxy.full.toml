@@ -158,7 +158,8 @@ write_timeout_secs = 30
 # # In-session Transaction Replay (tr_mode != none): cap on tracked session
 # # SET/RESET statements replayed onto the replacement backend. Over the cap,
 # # tracking stops (tr_session_set_cap_exceeded_total) and the restore is partial.
-# tr_max_session_set_statements = 256
+# tr_max_session_set_statements = 256   # distinct session variables tracked for restore;
+#                                        # over the cap a failover is refused (08006)
 
 # =============================================================================
 # POOL — Backend connection pool (proxy -> database)
