@@ -5,7 +5,17 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.6.1] - 2026-09-09
+
+Patch release: Transaction Replay correctness. An independent audit of 1.6.0 showed the
+released binary re-executing possibly-committed statements (4 of 7 real-PostgreSQL
+commit-outcome probes) and appending re-executed rows to responses the client had
+already partly received (12 of 13 streaming probes). This release closes those paths
+and the further gaps found reviewing the fix; the probes now pass 7/7 and 13/13 and
+ship as `tests/integration/tr_commit_outcome.py` and `scripts/regress/tr-boundary-test.py`.
+No configuration changes. See `docs/internal/audit-2026-09/` for the audit and the
+remaining backlog (replay eligibility policy, transactional session restoration,
+cross-cycle statement identity).
 
 ### Fixed
 
