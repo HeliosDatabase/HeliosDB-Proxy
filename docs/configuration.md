@@ -546,6 +546,7 @@ reprepare_timeout_secs = 15
 max_prepared_statements = 8192
 max_prepared_bytes = 67108864
 max_pending_bytes = 67108864
+max_backend_frame_bytes = 104857600
 max_total_idle_backend_conns = 8192
 pool_reap_interval_secs = 30
 tr_max_replay_statements = 1000
@@ -564,6 +565,7 @@ tr_max_session_set_statements = 256
 | `max_prepared_statements` | usize | `8192` | Per-session cap on distinct named prepared statements. |
 | `max_prepared_bytes` | usize | `67108864` | Per-session cap on aggregate bytes retained in the statement registry (64 MiB). |
 | `max_pending_bytes` | usize | `67108864` | Per-session cap on the un-flushed extended-protocol `pending` buffer (64 MiB). |
+| `max_backend_frame_bytes` | usize | `104857600` | Cap on the declared length of one backend response frame on every streaming relay; a header above it or below the 4-byte minimum closes the backend as malformed (100 MiB, the frontend message cap). Bounds a frame, not a result set. |
 | `max_total_idle_backend_conns` | usize | `8192` | Global ceiling on idle backend-pool connections across all `(node,user,db)` identities. Only consumed with the `pool-modes` feature; parsed-and-ignored otherwise. |
 | `pool_reap_interval_secs` | u64 | `30` | How often the idle-connection reaper runs. |
 | `tr_max_replay_statements` | usize | `1000` | In-session TR (`tr_mode = select\|transaction`): cap on statements recorded per explicit transaction for failover replay. Over the cap the transaction is marked non-replayable (`transaction` degrades to `session` for it; `tr_replay_cap_exceeded_total`). |

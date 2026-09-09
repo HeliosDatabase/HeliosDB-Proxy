@@ -5,6 +5,20 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Every backend streaming relay (query responses, cache capture, replay drain, pool
+  reset, and the idle backend-watch) now validates each response frame header
+  immediately against the new `[limits] max_backend_frame_bytes` (default 100 MiB,
+  the existing frontend message cap). A declared length above it, or below the
+  4-byte protocol minimum, closes the backend connection as malformed. Previously a
+  length below four looped waiting for bytes that could never complete the frame,
+  and an excessive length grew the accumulator toward the advertised size; the
+  out-of-band re-prepare reader also allocated the advertised body size up front,
+  which it now discards in bounded chunks (H-07).
+
 ## [1.6.1] - 2026-09-09
 
 Patch release: Transaction Replay correctness. An independent audit of 1.6.0 showed the
