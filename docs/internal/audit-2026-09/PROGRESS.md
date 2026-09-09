@@ -13,6 +13,7 @@ complete. Global guarantees must remain consistent with actual backend capabilit
 | TR-05 | Conservative partial-write handling passed functional/lint/MSRV gates | Investigate per-benchmark regressions before final acceptance |
 | TR-02 | Streaming guard and recorder follow-ups passed targeted validation; the uncovered backend-watch publication path found in review is now frame-aligned | Optional bounded response buffering and performance/memory acceptance |
 | H-07 | Frame-header validation applied on EVERY backend streaming relay (`stream_until_ready`, capture, replay drain, pool reset, re-prepare reader, idle watch) via `backend_frame_len` and the new `[limits] max_backend_frame_bytes` (default 100 MiB); malformed (< 4) or oversize headers close the backend immediately; the re-prepare reader no longer allocates the advertised body size | Slow-drip: a backend dripping bytes inside one frame resets the per-read `backend_read_timeout` each time — a whole-response deadline is TR-06's "one recovery deadline"; track there |
+| TR-03 | Lexical read-eligibility policy: every function call must be a listed side-effect-free built-in or in `tr_read_functions`; quoted-identifier calls, `INTO`, sequences are opaque. `volatile_select` probe green | Catalog-backed eligibility for PG-wire backends without catalogs; invalidation on UDF change |
 | Other items | Open | Work through the dependency order in IMPROVEMENTS.md |
 
 ## Independent review, 2026-09-09 (Claude)

@@ -48,7 +48,7 @@ make incorrect responses faster or overload the surviving primary during failove
   rows or protocol completion messages. Test with streaming clients and slow readers.
   Measure first-row latency and memory with/without optional buffering.
 
-- [ ] **TR-03 · P0 — establish replay eligibility, not a SELECT keyword heuristic.**
+- [x] **TR-03 · P0 — establish replay eligibility, not a SELECT keyword heuristic.** *(2026-09-09: lexical call scan against a side-effect-free built-in allowlist + `tr_read_functions`; subset published in docs/configuration.md. Catalog-informed eligibility and table/UDF-change invalidation remain future work.)*
   Unknown functions, volatile operations, advisory/session locks, sequence calls,
   notifications, external effects and unsupported SQL constructs need an explicit
   policy. For PG, catalog metadata can inform a cached allowlist; PG-wire backends

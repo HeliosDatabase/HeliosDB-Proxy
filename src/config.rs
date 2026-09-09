@@ -194,6 +194,16 @@ pub struct ProxyConfig {
     pub tr_enabled: bool,
     /// TR mode
     pub tr_mode: TrMode,
+    /// Additional function names (unqualified, case-insensitive) that in-session
+    /// Transaction Replay may treat as side-effect-free when deciding whether an
+    /// interrupted read can be re-executed on the replacement backend (TR-03).
+    /// The built-in policy allows only PostgreSQL's own pure/stable functions; a
+    /// read that calls anything else — a user-defined function, `nextval`,
+    /// `pg_notify`, `set_config`, advisory locks — is never re-executed on an
+    /// unknown outcome because it might have already run. List your own provably
+    /// pure functions here to make reads that call them eligible again.
+    #[serde(default)]
+    pub tr_read_functions: Vec<String>,
     /// Connection pool configuration
     pub pool: PoolConfig,
     /// Pool mode configuration (Session/Transaction/Statement)
@@ -1301,6 +1311,7 @@ impl Default for ProxyConfig {
             admin_allow_insecure: false,
             tr_enabled: true,
             tr_mode: TrMode::Session,
+            tr_read_functions: Vec::new(),
             pool: PoolConfig::default(),
             pool_mode: PoolModeConfig::default(),
             load_balancer: LoadBalancerConfig::default(),
@@ -1602,6 +1613,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "admin_allow_insecure",
     "tr_enabled",
     "tr_mode",
+    "tr_read_functions",
     "pool",
     "pool_mode",
     "load_balancer",
@@ -1891,6 +1903,16 @@ impl ProxyConfig {
             }
             // 5 = the smallest legal backend frame (ReadyForQuery: tag + len(4)
             // + status); anything smaller could not pass a single response.
+            for f in &self.tr_read_functions {
+                let ok = !f.is_empty()
+                    && f.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                    && !f.as_bytes()[0].is_ascii_digit();
+                if !ok {
+                    return Err(ProxyError::Config(format!(
+                        "tr_read_functions entry {f:?} is not a plain function name"
+                    )));
+                }
+            }
             if l.max_backend_frame_bytes < 5 {
                 return Err(ProxyError::Config(
                     "limits.max_backend_frame_bytes must be >= 5".to_string(),

@@ -198,6 +198,149 @@ fn scan(sql: &str, backslash_escapes: bool) -> Result<Scan<'_>, ()> {
     })
 }
 
+/// A word token outside quotes and comments, with whether the next
+/// non-whitespace byte is `(` — i.e. whether it syntactically looks like a
+/// function call. Quoted identifiers are reported with `quoted = true` so a
+/// policy can refuse them rather than guess at case folding.
+pub(crate) struct Word<'a> {
+    pub text: &'a str,
+    pub call: bool,
+    pub quoted: bool,
+}
+
+/// Walk every word of `sql` outside string literals, quoted identifiers,
+/// dollar quotes and comments, in order, under the non-escaping reading (the
+/// caller has already established via [`boundaries`] that both readings agree
+/// on statement structure, so word order is the same). Stops early when `f`
+/// returns `false`. Allocation-free. Errors mirror [`boundaries`]: unterminated
+/// tokens refuse.
+pub(crate) fn words(sql: &str, mut f: impl FnMut(Word<'_>) -> bool) -> Result<(), ()> {
+    let b = sql.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let start = i;
+        match b[i] {
+            c if c.is_ascii_whitespace() => {
+                i += 1;
+                continue;
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && !matches!(b[i], b'\n' | b'\r') {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                let mut depth = 1usize;
+                while depth != 0 {
+                    match b.get(i..i.saturating_add(2)) {
+                        Some(b"/*") => {
+                            depth += 1;
+                            i += 2;
+                        }
+                        Some(b"*/") => {
+                            depth -= 1;
+                            i += 2;
+                        }
+                        Some(_) => i += 1,
+                        None => return Err(()),
+                    }
+                }
+                continue;
+            }
+            0 => return Err(()),
+            _ => {}
+        }
+        if ident_start(b[i]) {
+            i += 1;
+            while i < b.len() && ident_cont(b[i]) {
+                i += 1;
+            }
+            let text = &sql[start..i];
+            let mut j = i;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let call = b.get(j) == Some(&b'(');
+            if !f(Word {
+                text,
+                call,
+                quoted: false,
+            }) {
+                return Ok(());
+            }
+        } else if b[i] == b'"' {
+            // Quoted identifier: report it (opaque to case folding), skip it.
+            i += 1;
+            loop {
+                match b.get(i) {
+                    None | Some(0) => return Err(()),
+                    Some(b'"') => {
+                        i += 1;
+                        if b.get(i) == Some(&b'"') {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    Some(_) => i += 1,
+                }
+            }
+            let mut j = i;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let call = b.get(j) == Some(&b'(');
+            if !f(Word {
+                text: &sql[start..i],
+                call,
+                quoted: true,
+            }) {
+                return Ok(());
+            }
+        } else if b[i] == b'\'' {
+            i += 1;
+            loop {
+                match b.get(i) {
+                    None | Some(0) => return Err(()),
+                    Some(b'\'') => {
+                        i += 1;
+                        if b.get(i) == Some(&b'\'') {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    Some(_) => i += 1,
+                }
+            }
+        } else if b[i] == b'$' {
+            let mut end = i + 1;
+            if b.get(end).is_some_and(|c| ident_start(*c)) {
+                end += 1;
+                while b
+                    .get(end)
+                    .is_some_and(|c| ident_start(*c) || c.is_ascii_digit())
+                {
+                    end += 1;
+                }
+            }
+            if b.get(end) == Some(&b'$') {
+                let tag = &b[i..=end];
+                let tail = &b[end + 1..];
+                let close = memchr::memmem::find(tail, tag).ok_or(())?;
+                i = end + 1 + close + tag.len();
+            } else {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +421,52 @@ mod tests {
         }
         let nested = format!("{}{} COMMIT", "/*".repeat(4096), "*/".repeat(4096));
         assert!(boundaries(&nested).unwrap().may_commit);
+    }
+
+    #[test]
+    fn words_reports_calls_outside_quotes_and_comments() {
+        let mut seen = Vec::new();
+        words(
+            "SELECT count(*), lower (name), 'f(x)' /* g( */ -- h(\n, \"Quoted\"(1), t.col FROM t",
+            |w| {
+                seen.push((w.text.to_string(), w.call, w.quoted));
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                ("SELECT".to_string(), false, false),
+                ("count".to_string(), true, false),
+                ("lower".to_string(), true, false),
+                ("name".to_string(), false, false),
+                ("\"Quoted\"".to_string(), true, true),
+                ("t".to_string(), false, false),
+                ("col".to_string(), false, false),
+                ("FROM".to_string(), false, false),
+                ("t".to_string(), false, false),
+            ]
+        );
+        // Dollar-quoted bodies and escaped quotes hide nothing that looks
+        // like a call.
+        let mut calls = Vec::new();
+        words("SELECT $$nextval('s')$$, 'it''s(', $q$ f( $q$", |w| {
+            if w.call {
+                calls.push(w.text.to_string());
+            }
+            true
+        })
+        .unwrap();
+        assert!(calls.is_empty(), "{calls:?}");
+        // Early stop.
+        let mut n = 0;
+        words("a b c d", |_| {
+            n += 1;
+            n < 2
+        })
+        .unwrap();
+        assert_eq!(n, 2);
+        assert!(words("SELECT 'unterminated", |_| true).is_err());
     }
 }
