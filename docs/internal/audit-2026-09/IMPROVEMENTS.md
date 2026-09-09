@@ -157,7 +157,7 @@ make incorrect responses faster or overload the surviving primary during failove
   resource limit yields equivalent enforcement across interfaces; gateway connection
   churn and throughput improve with measured pooling.
 
-- [ ] **H-07 · P0 — enforce backend frame bounds on streaming paths.** Follow-up
+- [x] **H-07 · P0 — enforce backend frame bounds on streaming paths.** *(2026-09-09: `[limits] max_backend_frame_bytes`, applied on every relay; slow-drip whole-response deadline tracked under TR-06.)* Follow-up
   inspection during TR-01/05 implementation found that `stream_until_ready` and
   `stream_until_ready_capture` wait for `len + 1` bytes without applying
   `validate_backend_frame_len`. A malformed length below four loops waiting for

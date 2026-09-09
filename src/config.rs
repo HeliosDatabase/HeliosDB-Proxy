@@ -842,6 +842,17 @@ pub struct LimitsToml {
     /// Prior constant `MAX_PENDING_BYTES`.
     #[serde(default = "default_max_pending_bytes")]
     pub max_pending_bytes: usize,
+    /// Upper bound (bytes) on the declared length of ONE backend response frame
+    /// on every streaming relay (query responses, cache capture, replay drain,
+    /// pool reset, the idle backend-watch). A header above it, or below the
+    /// 4-byte protocol minimum, is a malformed frame: the backend connection is
+    /// closed immediately instead of accumulating toward the advertised size or
+    /// waiting forever for bytes that cannot make the frame valid (H-07). This
+    /// bounds a single frame; valid large results made of many frames stream
+    /// through unaffected. Default 100 MiB, the same cap the proxy already
+    /// applies to client (frontend) messages.
+    #[serde(default = "default_max_backend_frame_bytes")]
+    pub max_backend_frame_bytes: usize,
     /// Global ceiling on idle connections parked in the data-path backend pool
     /// across ALL `(node,user,db)` identities — bounds total file descriptors
     /// regardless of how many distinct identities connect. Only consumed when
@@ -944,6 +955,9 @@ fn default_max_prepared_bytes() -> usize {
 fn default_max_pending_bytes() -> usize {
     64 * 1024 * 1024
 }
+fn default_max_backend_frame_bytes() -> usize {
+    100 * 1024 * 1024
+}
 fn default_max_total_idle_backend_conns() -> usize {
     8192
 }
@@ -988,6 +1002,7 @@ impl Default for LimitsToml {
             max_prepared_statements: default_max_prepared_statements(),
             max_prepared_bytes: default_max_prepared_bytes(),
             max_pending_bytes: default_max_pending_bytes(),
+            max_backend_frame_bytes: default_max_backend_frame_bytes(),
             max_total_idle_backend_conns: default_max_total_idle_backend_conns(),
             pool_reap_interval_secs: default_pool_reap_interval_secs(),
             max_client_connections: default_max_client_connections(),
@@ -1872,6 +1887,13 @@ impl ProxyConfig {
             if l.max_pending_bytes == 0 {
                 return Err(ProxyError::Config(
                     "limits.max_pending_bytes must be >= 1".to_string(),
+                ));
+            }
+            // 5 = the smallest legal backend frame (ReadyForQuery: tag + len(4)
+            // + status); anything smaller could not pass a single response.
+            if l.max_backend_frame_bytes < 5 {
+                return Err(ProxyError::Config(
+                    "limits.max_backend_frame_bytes must be >= 5".to_string(),
                 ));
             }
             if l.max_total_idle_backend_conns == 0 {
@@ -3033,6 +3055,8 @@ mod tests {
         assert_eq!(l.max_prepared_statements, 8192);
         assert_eq!(l.max_prepared_bytes, 64 * 1024 * 1024);
         assert_eq!(l.max_pending_bytes, 64 * 1024 * 1024);
+        // H-07: matches ProtocolCodec's frontend `max_message_size` (100 MiB).
+        assert_eq!(l.max_backend_frame_bytes, 100 * 1024 * 1024);
         assert_eq!(l.max_total_idle_backend_conns, 8192);
         assert_eq!(l.pool_reap_interval_secs, 30);
         // The two opt-in bounds default to "off" so an existing config keeps
@@ -3227,6 +3251,12 @@ mod tests {
 
         let mut c = base();
         c.limits.tr_max_replay_bytes = 0;
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.tr_max_session_set_statements = 0;
+        assert!(c.validate().is_err());
+        c.limits.max_backend_frame_bytes = 4;
         assert!(c.validate().is_err());
 
         let mut c = base();
