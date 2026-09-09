@@ -1,0 +1,67 @@
+{
+  "binary": "/tmp/proxy-tr01-20260908/proxy-default",
+  "sha256": "a61522336afea846d3b807938b2edd26ac7bcb5d64c79e58016d77c08a4cf83f",
+  "fixture": "synthetic PG-wire; no database",
+  "cases": [
+    {
+      "case": "plain_commit_unknown",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "invariant": "PASS"
+    },
+    {
+      "case": "commented_commit_unknown",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "invariant": "PASS"
+    },
+    {
+      "case": "extended_commit_unknown",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "invariant": "PASS"
+    },
+    {
+      "case": "transaction_replay_control",
+      "mode": "transaction",
+      "response_tags": "TDDCZ",
+      "sqlstates": [],
+      "data_rows": 2,
+      "replacement_queries": [
+        "BEGIN",
+        "INSERT INTO audit VALUES (1)",
+        "SELECT 1"
+      ],
+      "invariant": "PASS"
+    },
+    {
+      "case": "extended_replay_control",
+      "mode": "transaction",
+      "response_tags": "12TDDCZ",
+      "sqlstates": [],
+      "data_rows": 2,
+      "replacement_queries": [
+        "BEGIN",
+        "INSERT INTO audit VALUES (1)",
+        "SELECT 1"
+      ],
+      "invariant": "PASS"
+    }
+  ],
+  "failures": 0
+}

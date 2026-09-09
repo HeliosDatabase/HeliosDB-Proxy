@@ -2420,6 +2420,35 @@ impl ProxyServer {
     /// `idle_deadline` is the session's idle-session deadline; relaying async
     /// backend traffic to an idle client is not client activity, so the deadline
     /// is NOT re-armed while doing so.
+    /// Length of the longest prefix of `buf` made up of WHOLE backend frames.
+    ///
+    /// A backend message is a 1-byte tag followed by a 4-byte big-endian length
+    /// that counts itself, so one frame occupies `1 + len` bytes. Returns an
+    /// error for a length below the 4-byte minimum: that is a malformed frame,
+    /// and treating it as "incomplete" would stall reassembly until the session
+    /// buffer cap instead of surfacing the fault (H-07).
+    fn complete_frame_prefix(buf: &[u8]) -> Result<usize> {
+        let mut off = 0usize;
+        while off + 5 <= buf.len() {
+            let len = u32::from_be_bytes([buf[off + 1], buf[off + 2], buf[off + 3], buf[off + 4]])
+                as usize;
+            if len < 4 {
+                return Err(ProxyError::Protocol(format!(
+                    "backend frame '{}' declares length {} below the 4-byte minimum",
+                    buf[off] as char, len
+                )));
+            }
+            // `len` is at most u32::MAX and `off` is bounded by the buffer, so
+            // this cannot overflow on any supported platform.
+            let end = off + 1 + len;
+            if end > buf.len() {
+                break;
+            }
+            off = end;
+        }
+        Ok(off)
+    }
+
     async fn read_next_client_message(
         stream: &mut ClientStream,
         buffer: &mut BytesMut,
@@ -2446,15 +2475,13 @@ impl ProxyServer {
         loop {
             let mut backend_gone = false;
             let mut client_bytes: Option<usize> = None;
-            // Clear — not re-allocate — the caller's session-scoped scratch
-            // buffer before this read attempt (Fix S4). `read_buf` appends
-            // into the buffer's spare capacity, so after `clear()` the count
-            // it returns is exactly the slice length used below. A
-            // `let mut abuf = [0u8; 16384];` local here instead both
-            // zero-filled 16 KiB on every client-message wait and, being live
-            // across the `select!` await, inflated this future — and hence
-            // `client_loop`'s — by that same 16 KiB.
-            abuf.clear();
+            // `abuf` is the caller's session-scoped reassembly buffer (Fix S4:
+            // reused, never re-allocated, and never zero-filled — `read_buf`
+            // appends into spare capacity). It is deliberately NOT cleared here:
+            // one read can end mid-frame, and only whole frames may be forwarded,
+            // so any trailing partial frame stays buffered until the rest of it
+            // arrives.
+            abuf.reserve(16 * 1024);
             {
                 let bc = conns.get_mut(node).expect("watch_node is in conns");
                 tokio::select! {
@@ -2466,11 +2493,30 @@ impl ProxyServer {
                     _ = &mut idle_wait => return Ok(ClientRead::IdleTimeout),
                     r = bc.stream.read_buf(&mut *abuf) => match r {
                         Ok(0) => backend_gone = true,
-                        Ok(bn) => {
-                            stream.write_all(&abuf[..bn]).await.map_err(|e| {
-                                ProxyError::Network(format!("Client write error: {}", e))
-                            })?;
-                            state.metrics.bytes_sent.fetch_add(bn as u64, Ordering::Relaxed);
+                        Ok(_) => {
+                            // Publish only COMPLETE frames. A truncated frame is
+                            // unrecoverable: the client blocks waiting for the
+                            // rest, and nothing may ever be injected after it —
+                            // not an ErrorResponse, and certainly not the rows of
+                            // a re-executed statement, which would be appended to
+                            // whatever the partial frame turns out to be.
+                            let whole = Self::complete_frame_prefix(abuf)?;
+                            if whole > 0 {
+                                tokio::time::timeout(state.limits.client_write_timeout, stream.write_all(&abuf[..whole]))
+                                    .await
+                                    .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
+                                    .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+                                let _ = abuf.split_to(whole);
+                                state.metrics.bytes_sent.fetch_add(whole as u64, Ordering::Relaxed);
+                            }
+                            // A single asynchronous frame must not grow the
+                            // session's memory without bound while it reassembles.
+                            if abuf.len() > state.limits.max_pending_bytes {
+                                return Err(ProxyError::Protocol(format!(
+                                    "backend asynchronous frame exceeds {} bytes",
+                                    state.limits.max_pending_bytes
+                                )));
+                            }
                         }
                         Err(e) => {
                             tracing::debug!(node = %node, error = %e, "backend read error while idle; dropping cached connection");
@@ -2482,7 +2528,11 @@ impl ProxyServer {
             if backend_gone {
                 // Drop the dead cached connection but keep the client session
                 // alive — the next query redials. (Mid-transaction the next
-                // forward fails and surfaces the error.)
+                // forward fails and surfaces the error.) Any partially received
+                // frame dies with it: it was never published, so the client
+                // stream stays frame-aligned and a synthesized error or a
+                // re-executed statement can still be written safely.
+                abuf.clear();
                 conns.remove(node);
                 return Self::read_client_bytes(stream, buffer, idle_deadline).await;
             }
@@ -2672,7 +2722,9 @@ impl ProxyServer {
                     // returning here) keeps the normal teardown path, so under
                     // transaction/statement pooling the session's still-idle
                     // backend connections are parked for reuse as usual.
-                    Self::terminate_idle_session(stream, state, session).await;
+                    if !tr.ext_dispatched {
+                        Self::terminate_idle_session(stream, state, session).await;
+                    }
                     break;
                 }
             };
@@ -2698,6 +2750,7 @@ impl ProxyServer {
                 // `TrSession` — and `watched_backend_gone` already reconstructs
                 // the same signal losslessly from `conns`.
                 if session.tr_mode != TrMode::None
+                    || tr.ext_dispatched
                     || session
                         .in_transaction
                         .load(std::sync::atomic::Ordering::Relaxed)
@@ -2818,6 +2871,7 @@ impl ProxyServer {
                                 ProxyError::Network(format!("Client write error: {}", e))
                             })?;
                             Self::tr_after_simple(&mut tr, &msg, session, state).await;
+                            tr.ext_dispatched = false;
                             state
                                 .metrics
                                 .bytes_sent
@@ -2840,6 +2894,8 @@ impl ProxyServer {
                                 fault = Some(BackendFault {
                                     node: lost,
                                     phase: FaultPhase::NotDelivered,
+                                    progress: ResponseProgress::default(),
+                                    kind: None,
                                     error: "backend connection closed while the session was idle"
                                         .to_string(),
                                 });
@@ -2893,6 +2949,9 @@ impl ProxyServer {
                                 }
                                 None => {
                                     if matches!(e, ProxyError::NoHealthyNodes) {
+                                        if tr.ext_dispatched {
+                                            return Ok(());
+                                        }
                                         Self::send_no_healthy_nodes(stream, session, true).await;
                                         return Ok(());
                                     }
@@ -2904,6 +2963,7 @@ impl ProxyServer {
                             current_node = Some(n);
                         }
                         Self::tr_after_simple(&mut tr, &msg, session, state).await;
+                        tr.ext_dispatched = false;
                         // Transaction/Statement pooling: park the connection
                         // back to the shared pool once the session is idle.
                         #[cfg(feature = "pool-modes")]
@@ -3169,6 +3229,8 @@ impl ProxyServer {
                                     fault = Some(BackendFault {
                                         node: lost,
                                         phase: FaultPhase::NotDelivered,
+                                        progress: ResponseProgress::default(),
+                                        kind: None,
                                         error:
                                             "backend connection closed while the session was idle"
                                                 .to_string(),
@@ -3228,6 +3290,9 @@ impl ProxyServer {
                                     }
                                     None => {
                                         if matches!(e, ProxyError::NoHealthyNodes) {
+                                            if tr.ext_dispatched {
+                                                return Ok(());
+                                            }
                                             Self::send_no_healthy_nodes(
                                                 stream, session, wait_ready,
                                             )
@@ -3256,6 +3321,7 @@ impl ProxyServer {
                                 state,
                             )
                             .await;
+                            tr.ext_dispatched = !wait_ready;
                         }
                         held_unnamed = None;
                         // A `Sync` is the extended-protocol transaction/statement
@@ -3439,7 +3505,10 @@ impl ProxyServer {
                                             conns.remove(&node);
                                             let err = e.to_string();
                                             if err.contains("Client") {
-                                                return Err(e);
+                                                return Err(e.error);
+                                            }
+                                            if e.progress.terminal || e.progress.raw {
+                                                return Ok(());
                                             }
                                             // Backend fault mid-COPY drain: tell the
                                             // client (08006) and close — every tr_mode.
@@ -5034,8 +5103,8 @@ impl ProxyServer {
                     Err(e) => {
                         conns.remove(&target);
                         Self::record_backend_failure(state, &target, &e.to_string());
-                        BackendFault::set(fault, &target, FaultPhase::OutcomeUnknown, &e);
-                        Err(e)
+                        BackendFault::set_response(fault, &target, &e);
+                        Err(e.error)
                     }
                 };
             }
@@ -5108,7 +5177,7 @@ impl ProxyServer {
                 // Drop the broken connection so the next use redials.
                 conns.remove(&target);
                 Self::record_backend_failure(state, &target, &e.to_string());
-                BackendFault::set(fault, &target, FaultPhase::OutcomeUnknown, &e);
+                BackendFault::set_response(fault, &target, &e);
                 #[cfg(feature = "query-analytics")]
                 if let Some(sql) = analytics_sql.as_deref() {
                     Self::record_analytics(
@@ -5121,7 +5190,7 @@ impl ProxyServer {
                     )
                     .await;
                 }
-                Err(e)
+                Err(e.error)
             }
         }
     }
@@ -5270,12 +5339,15 @@ impl ProxyServer {
             if backend.unnamed_sig.as_deref() == Some(&sig[..]) {
                 inject_parse_complete = true;
             } else {
-                if let Err(e) = backend
-                    .stream
-                    .write_all(parse_msg)
-                    .await
-                    .map_err(|e| ProxyError::Network(format!("Backend write error: {}", e)))
-                {
+                if let Err(e) = tokio::time::timeout(
+                    state.limits.backend_write_timeout,
+                    backend.stream.write_all(parse_msg),
+                )
+                .await
+                .map_err(|_| ProxyError::Network("Backend write timeout".to_string()))
+                .and_then(|r| {
+                    r.map_err(|e| ProxyError::Network(format!("Backend write error: {}", e)))
+                }) {
                     conns.remove(&target);
                     Self::record_backend_failure(state, &target, &e.to_string());
                     BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
@@ -5285,21 +5357,16 @@ impl ProxyServer {
             }
         }
 
-        let batch_err = match tokio::time::timeout(
+        if let Err((e, phase)) = Self::tr_write_batch(
+            &mut backend.stream,
+            batch,
             state.limits.backend_write_timeout,
-            backend.stream.write_all(batch),
         )
         .await
         {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(format!("Backend write error: {}", e)),
-            Err(_) => Some("Backend write timeout".to_string()),
-        };
-        if let Some(msg) = batch_err {
-            let e = ProxyError::Network(msg);
             conns.remove(&target);
             Self::record_backend_failure(state, &target, &e.to_string());
-            BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
+            BackendFault::set(fault, &target, phase, &e);
             return Err(e);
         }
 
@@ -5342,10 +5409,11 @@ impl ProxyServer {
                 }
                 Ok((Some(target), sent + injected))
             }
-            Err(e) => {
+            Err(mut e) => {
                 conns.remove(&target);
                 Self::record_backend_failure(state, &target, &e.to_string());
-                BackendFault::set(fault, &target, FaultPhase::OutcomeUnknown, &e);
+                e.progress.bytes += injected;
+                BackendFault::set_response(fault, &target, &e);
                 #[cfg(feature = "query-analytics")]
                 if let Some(sql) = analytics_sql.as_deref() {
                     Self::record_analytics(
@@ -5358,7 +5426,7 @@ impl ProxyServer {
                     )
                     .await;
                 }
-                Err(e)
+                Err(e.error)
             }
         }
     }
@@ -5460,83 +5528,96 @@ impl ProxyServer {
         backend: &mut TcpStream,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
-    ) -> Result<u64> {
+    ) -> std::result::Result<u64, ResponseFailure> {
         let client_write_timeout = state.limits.client_write_timeout;
         let backend_read_timeout = state.limits.backend_read_timeout;
         let mut buf = BytesMut::with_capacity(16384);
         let mut sent: u64 = 0;
         let mut had_error = false;
+        let mut command_complete = false;
 
-        loop {
-            // Walk complete frames in `buf`, stopping at a boundary frame.
-            let mut consumed = 0usize;
-            let mut ready_status: Option<u8> = None;
-            let mut yield_for_copy = false;
+        let response = async {
             loop {
-                let rem = &buf[consumed..];
-                if rem.len() < 5 {
-                    break;
+                // Walk complete frames in `buf`, stopping at a boundary frame.
+                let mut consumed = 0usize;
+                let mut ready_status: Option<u8> = None;
+                let mut yield_for_copy = false;
+                loop {
+                    let rem = &buf[consumed..];
+                    if rem.len() < 5 {
+                        break;
+                    }
+                    let len = u32::from_be_bytes([rem[1], rem[2], rem[3], rem[4]]) as usize;
+                    if len < 4 || rem.len() < len + 1 {
+                        break; // incomplete or malformed length — need more bytes
+                    }
+                    let frame_total = len + 1;
+                    let mtype = rem[0];
+                    consumed += frame_total;
+                    if mtype == b'E' {
+                        had_error = true;
+                    }
+                    command_complete |= mtype == b'C';
+                    if mtype == b'Z' {
+                        // ReadyForQuery: payload is one status byte at rem[5].
+                        ready_status = Some(if frame_total >= 6 { rem[5] } else { b'I' });
+                        break;
+                    }
+                    if mtype == b'G' || mtype == b'W' {
+                        // CopyInResponse / CopyBothResponse: the backend now wants
+                        // CopyData from the client — forward up to here and yield.
+                        yield_for_copy = true;
+                        break;
+                    }
                 }
-                let len = u32::from_be_bytes([rem[1], rem[2], rem[3], rem[4]]) as usize;
-                if len < 4 || rem.len() < len + 1 {
-                    break; // incomplete or malformed length — need more bytes
-                }
-                let frame_total = len + 1;
-                let mtype = rem[0];
-                consumed += frame_total;
-                if mtype == b'E' {
-                    had_error = true;
-                }
-                if mtype == b'Z' {
-                    // ReadyForQuery: payload is one status byte at rem[5].
-                    ready_status = Some(if frame_total >= 6 { rem[5] } else { b'I' });
-                    break;
-                }
-                if mtype == b'G' || mtype == b'W' {
-                    // CopyInResponse / CopyBothResponse: the backend now wants
-                    // CopyData from the client — forward up to here and yield.
-                    yield_for_copy = true;
-                    break;
-                }
-            }
 
-            if consumed > 0 {
-                tokio::time::timeout(client_write_timeout, client.write_all(&buf[..consumed]))
+                if consumed > 0 {
+                    tokio::time::timeout(client_write_timeout, client.write_all(&buf[..consumed]))
+                        .await
+                        .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
+                        .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+                    sent += consumed as u64;
+                    let _ = buf.split_to(consumed);
+                }
+
+                if let Some(status) = ready_status {
+                    Self::note_ready_for_query(session, status, had_error);
+                    return Ok(sent);
+                }
+                if yield_for_copy {
+                    // The backend now awaits CopyData from the client; the session
+                    // is mid-COPY, not at a clean boundary. Mark it so pool release
+                    // is suppressed until the COPY drains (cleared in the CopyDone
+                    // path). Harmless in session mode (release is a no-op there).
+                    session
+                        .copy_in_progress
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(sent);
+                }
+
+                // Read straight into the frame accumulator — no zeroed scratch, no
+                // copy. `read_buf` appends to `buf`'s spare capacity.
+                buf.reserve(16384);
+                let n = tokio::time::timeout(backend_read_timeout, backend.read_buf(&mut buf))
                     .await
-                    .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
-                    .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
-                sent += consumed as u64;
-                let _ = buf.split_to(consumed);
-            }
-
-            if let Some(status) = ready_status {
-                Self::note_ready_for_query(session, status, had_error);
-                return Ok(sent);
-            }
-            if yield_for_copy {
-                // The backend now awaits CopyData from the client; the session
-                // is mid-COPY, not at a clean boundary. Mark it so pool release
-                // is suppressed until the COPY drains (cleared in the CopyDone
-                // path). Harmless in session mode (release is a no-op there).
-                session
-                    .copy_in_progress
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                return Ok(sent);
-            }
-
-            // Read straight into the frame accumulator — no zeroed scratch, no
-            // copy. `read_buf` appends to `buf`'s spare capacity.
-            buf.reserve(16384);
-            let n = tokio::time::timeout(backend_read_timeout, backend.read_buf(&mut buf))
-                .await
-                .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
-                .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
-            if n == 0 {
-                return Err(ProxyError::Connection(
-                    "Backend closed mid-response".to_string(),
-                ));
+                    .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
+                    .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
+                if n == 0 {
+                    return Err(ProxyError::Connection(
+                        "Backend closed mid-response".to_string(),
+                    ));
+                }
             }
         }
+        .await;
+        response.map_err(|error| ResponseFailure {
+            error,
+            progress: ResponseProgress {
+                bytes: sent,
+                terminal: had_error || command_complete,
+                raw: false,
+            },
+        })
     }
 
     /// Like `stream_until_ready` but also captures the full response bytes for
@@ -5569,117 +5650,130 @@ impl ProxyServer {
         backend_read_timeout: Duration,
         max_capture_bytes: usize,
         metrics: &ServerMetrics,
-    ) -> Result<(u64, Vec<u8>, bool, usize)> {
+    ) -> std::result::Result<(u64, Vec<u8>, bool, usize), ResponseFailure> {
         let mut buf = BytesMut::with_capacity(16384);
         let mut sent: u64 = 0;
         let mut captured: Vec<u8> = Vec::with_capacity(4096);
         let mut had_error = false;
+        let mut command_complete = false;
         let mut saw_async = false;
         let mut row_count: usize = 0;
         // Set once the response outgrows `max_capture_bytes`; `captured` is
         // then empty and stays empty for the rest of the response.
         let mut oversize = false;
 
-        loop {
-            let mut consumed = 0usize;
-            let mut ready_status: Option<u8> = None;
-            let mut yield_for_copy = false;
+        let response = async {
             loop {
-                let rem = &buf[consumed..];
-                if rem.len() < 5 {
-                    break;
-                }
-                let len = u32::from_be_bytes([rem[1], rem[2], rem[3], rem[4]]) as usize;
-                if len < 4 || rem.len() < len + 1 {
-                    break;
-                }
-                let frame_total = len + 1;
-                let mtype = rem[0];
-                if mtype == b'E' {
-                    had_error = true;
-                }
-                // Async backend frames (backend 'S' is unambiguous here —
-                // PortalSuspended is lowercase 's').
-                if mtype == b'A' || mtype == b'N' || mtype == b'S' {
-                    saw_async = true;
-                }
-                if mtype == b'C' {
-                    // CommandComplete tag, e.g. "SELECT 5" — take the row count.
-                    if let Some(tag) = rem.get(5..frame_total) {
-                        if let Some(end) = tag.iter().position(|&b| b == 0) {
-                            if let Ok(s) = std::str::from_utf8(&tag[..end]) {
-                                if let Some(n) =
-                                    s.rsplit(' ').next().and_then(|x| x.parse::<usize>().ok())
-                                {
-                                    row_count = n;
+                let mut consumed = 0usize;
+                let mut ready_status: Option<u8> = None;
+                let mut yield_for_copy = false;
+                loop {
+                    let rem = &buf[consumed..];
+                    if rem.len() < 5 {
+                        break;
+                    }
+                    let len = u32::from_be_bytes([rem[1], rem[2], rem[3], rem[4]]) as usize;
+                    if len < 4 || rem.len() < len + 1 {
+                        break;
+                    }
+                    let frame_total = len + 1;
+                    let mtype = rem[0];
+                    if mtype == b'E' {
+                        had_error = true;
+                    }
+                    command_complete |= mtype == b'C';
+                    // Async backend frames (backend 'S' is unambiguous here —
+                    // PortalSuspended is lowercase 's').
+                    if mtype == b'A' || mtype == b'N' || mtype == b'S' {
+                        saw_async = true;
+                    }
+                    if mtype == b'C' {
+                        // CommandComplete tag, e.g. "SELECT 5" — take the row count.
+                        if let Some(tag) = rem.get(5..frame_total) {
+                            if let Some(end) = tag.iter().position(|&b| b == 0) {
+                                if let Ok(s) = std::str::from_utf8(&tag[..end]) {
+                                    if let Some(n) =
+                                        s.rsplit(' ').next().and_then(|x| x.parse::<usize>().ok())
+                                    {
+                                        row_count = n;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                consumed += frame_total;
-                if mtype == b'Z' {
-                    ready_status = Some(if frame_total >= 6 { rem[5] } else { b'I' });
-                    break;
-                }
-                if mtype == b'G' || mtype == b'W' {
-                    yield_for_copy = true;
-                    break;
-                }
-            }
-
-            if consumed > 0 {
-                tokio::time::timeout(client_write_timeout, client.write_all(&buf[..consumed]))
-                    .await
-                    .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
-                    .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
-                if !oversize {
-                    if captured.len().saturating_add(consumed) > max_capture_bytes {
-                        oversize = true;
-                        // Free the transient NOW (`clear` alone keeps the
-                        // allocation alive for the rest of the response).
-                        captured = Vec::new();
-                        metrics
-                            .cache_capture_oversize
-                            .fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(
-                            target: "helios::cache",
-                            limit = max_capture_bytes,
-                            "response exceeds cache.max_cacheable_response_bytes — \
-                             capture abandoned, response not cached"
-                        );
-                    } else {
-                        captured.extend_from_slice(&buf[..consumed]);
+                    consumed += frame_total;
+                    if mtype == b'Z' {
+                        ready_status = Some(if frame_total >= 6 { rem[5] } else { b'I' });
+                        break;
+                    }
+                    if mtype == b'G' || mtype == b'W' {
+                        yield_for_copy = true;
+                        break;
                     }
                 }
-                sent += consumed as u64;
-                let _ = buf.split_to(consumed);
-            }
 
-            if let Some(status) = ready_status {
-                Self::note_ready_for_query(session, status, had_error);
-                let cacheable = !had_error && status == b'I' && !saw_async && !oversize;
-                return Ok((sent, captured, cacheable, row_count));
-            }
-            if yield_for_copy {
-                session
-                    .copy_in_progress
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                return Ok((sent, captured, false, row_count));
-            }
+                if consumed > 0 {
+                    tokio::time::timeout(client_write_timeout, client.write_all(&buf[..consumed]))
+                        .await
+                        .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
+                        .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+                    if !oversize {
+                        if captured.len().saturating_add(consumed) > max_capture_bytes {
+                            oversize = true;
+                            // Free the transient NOW (`clear` alone keeps the
+                            // allocation alive for the rest of the response).
+                            captured = Vec::new();
+                            metrics
+                                .cache_capture_oversize
+                                .fetch_add(1, Ordering::Relaxed);
+                            tracing::debug!(
+                                target: "helios::cache",
+                                limit = max_capture_bytes,
+                                "response exceeds cache.max_cacheable_response_bytes — \
+                                 capture abandoned, response not cached"
+                            );
+                        } else {
+                            captured.extend_from_slice(&buf[..consumed]);
+                        }
+                    }
+                    sent += consumed as u64;
+                    let _ = buf.split_to(consumed);
+                }
 
-            // Read straight into the frame accumulator — no zeroed scratch.
-            buf.reserve(16384);
-            let n = tokio::time::timeout(backend_read_timeout, backend.read_buf(&mut buf))
-                .await
-                .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
-                .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
-            if n == 0 {
-                return Err(ProxyError::Connection(
-                    "Backend closed mid-response".to_string(),
-                ));
+                if let Some(status) = ready_status {
+                    Self::note_ready_for_query(session, status, had_error);
+                    let cacheable = !had_error && status == b'I' && !saw_async && !oversize;
+                    return Ok((sent, captured, cacheable, row_count));
+                }
+                if yield_for_copy {
+                    session
+                        .copy_in_progress
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Ok((sent, captured, false, row_count));
+                }
+
+                // Read straight into the frame accumulator — no zeroed scratch.
+                buf.reserve(16384);
+                let n = tokio::time::timeout(backend_read_timeout, backend.read_buf(&mut buf))
+                    .await
+                    .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
+                    .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
+                if n == 0 {
+                    return Err(ProxyError::Connection(
+                        "Backend closed mid-response".to_string(),
+                    ));
+                }
             }
         }
+        .await;
+        response.map_err(|error| ResponseFailure {
+            error,
+            progress: ResponseProgress {
+                bytes: sent,
+                terminal: had_error || command_complete,
+                raw: false,
+            },
+        })
     }
 
     /// Relay whatever the backend has *already* produced in response to a
@@ -5700,35 +5794,51 @@ impl ProxyServer {
         backend: &mut TcpStream,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
-    ) -> Result<u64> {
-        let _ = (session, state);
+    ) -> std::result::Result<u64, ResponseFailure> {
+        let _ = session;
         // Reused across every read of this call via `try_read_buf`, which
         // writes straight into the buffer's spare capacity from the read
         // syscall — unlike `vec![0u8; 16384]`, nothing here is
         // zero-initialized before use.
         let mut read_buf = BytesMut::with_capacity(16384);
         let mut sent: u64 = 0;
-        loop {
-            read_buf.clear();
-            match backend.try_read_buf(&mut read_buf) {
-                Ok(0) => {
-                    return Err(ProxyError::Connection(
-                        "Backend closed mid-flush".to_string(),
-                    ))
-                }
-                Ok(n) => {
-                    client
-                        .write_all(&read_buf[..n])
+        let response = async {
+            loop {
+                read_buf.clear();
+                match backend.try_read_buf(&mut read_buf) {
+                    Ok(0) => {
+                        return Err(ProxyError::Connection(
+                            "Backend closed mid-flush".to_string(),
+                        ))
+                    }
+                    Ok(n) => {
+                        tokio::time::timeout(
+                            state.limits.client_write_timeout,
+                            client.write_all(&read_buf[..n]),
+                        )
                         .await
+                        .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
                         .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
-                    sent += n as u64;
+                        sent += n as u64;
+                    }
+                    // Nothing more instantly available — the backend watch delivers
+                    // any remaining Flush output as it arrives.
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(sent),
+                    Err(e) => {
+                        return Err(ProxyError::Network(format!("Backend read error: {}", e)))
+                    }
                 }
-                // Nothing more instantly available — the backend watch delivers
-                // any remaining Flush output as it arrives.
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(sent),
-                Err(e) => return Err(ProxyError::Network(format!("Backend read error: {}", e))),
             }
         }
+        .await;
+        response.map_err(|error| ResponseFailure {
+            error,
+            progress: ResponseProgress {
+                bytes: sent,
+                terminal: false,
+                raw: sent > 0,
+            },
+        })
     }
 
     /// Check if SQL query is a write operation
@@ -7818,13 +7928,41 @@ impl ProxyServer {
 /// Where a backend fault struck relative to the in-flight request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FaultPhase {
-    /// The request never reached the backend (connect failure, write error /
-    /// write timeout, or the socket died while the session was idle): it was
-    /// certainly NOT processed.
+    /// Dispatch has not begun (e.g. connect failure or an idle socket loss),
+    /// or a single Query frame was not completely delivered. Never use this
+    /// for a failed extended-batch write: complete prefix frames may have run.
     NotDelivered,
-    /// The request was written, then the connection failed before its
-    /// `ReadyForQuery`: the backend may or may not have processed it.
+    /// Dispatch was attempted, or the response was lost before ReadyForQuery.
+    /// The backend may have processed the whole request or complete prefix
+    /// frames of an extended batch; write_all failure does not establish zero delivery.
     OutcomeUnknown,
+}
+
+/// What the client has already seen from the interrupted response.
+#[derive(Debug, Clone, Copy, Default)]
+struct ResponseProgress {
+    bytes: u64,
+    /// A CommandComplete or ErrorResponse was already published. Neither may be
+    /// followed by a synthesized frame: a second ErrorResponse has no legal
+    /// place, and an ErrorResponse after a CommandComplete would report failure
+    /// for a statement the backend actually finished — a client that then
+    /// retries an INSERT double-applies it. The socket closes instead, which is
+    /// the one report a client cannot misread as "the statement did not run".
+    terminal: bool,
+    /// Flush forwarding may have ended inside a frame.
+    raw: bool,
+}
+
+#[derive(Debug)]
+struct ResponseFailure {
+    error: ProxyError,
+    progress: ResponseProgress,
+}
+
+impl std::fmt::Display for ResponseFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
 }
 
 /// A backend fault reported by the forward path to the session loop.
@@ -7833,6 +7971,9 @@ struct BackendFault {
     /// Address of the backend that failed.
     node: String,
     phase: FaultPhase,
+    progress: ResponseProgress,
+    /// Populated by recovery after classifying the whole interrupted request.
+    kind: Option<StmtKind>,
     /// Human-readable cause (used in the client-visible error message).
     error: String,
 }
@@ -7848,8 +7989,17 @@ impl BackendFault {
         *slot = Some(BackendFault {
             node: node.to_string(),
             phase,
+            progress: ResponseProgress::default(),
+            kind: None,
             error,
         });
+    }
+
+    fn set_response(slot: &mut Option<BackendFault>, node: &str, failure: &ResponseFailure) {
+        Self::set(slot, node, FaultPhase::OutcomeUnknown, &failure.error);
+        if let Some(fault) = slot {
+            fault.progress = failure.progress;
+        }
     }
 }
 
@@ -7879,6 +8029,8 @@ enum StmtKind {
 /// What the proxy does about a backend fault (see `tr_decide`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrAction {
+    /// A response may be complete or mid-frame: close without appending bytes.
+    CloseIncompleteResponse,
     /// Send `ErrorResponse(sqlstate)` + `ReadyForQuery`, then close the client.
     CloseWithError(&'static str),
     /// Re-home the session on a healthy primary, send ONE
@@ -7954,6 +8106,10 @@ struct TrSession {
     /// `ReadyForQuery` status before the statement being recorded.
     prev_status: u8,
     ext_cycle: Option<TrExtCycle>,
+    /// An open Flush cycle exceeded its recording budget before any RFQ.
+    ext_cycle_dropped: bool,
+    /// A Flush has dispatched part of the current cycle, regardless of TR mode.
+    ext_dispatched: bool,
 }
 
 impl TrSession {
@@ -7968,11 +8124,30 @@ impl TrSession {
             tx_aborted: false,
             prev_status: b'I',
             ext_cycle: None,
+            ext_cycle_dropped: false,
+            ext_dispatched: false,
         }
     }
 }
 
 impl ProxyServer {
+    /// Unlike a single Query frame, a partially written extended batch may
+    /// contain complete Execute/Sync frames. `write_all` and its timeout do not
+    /// report a trustworthy zero-delivery guarantee (including buffered TLS).
+    /// Conservatively preserve uncertainty even if the first write fails.
+    async fn tr_write_batch<W: tokio::io::AsyncWrite + Unpin>(
+        stream: &mut W,
+        batch: &[u8],
+        write_timeout: Duration,
+    ) -> std::result::Result<(), (ProxyError, FaultPhase)> {
+        let message = match tokio::time::timeout(write_timeout, stream.write_all(batch)).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) => format!("Backend write error: {}", e),
+            Err(_) => "Backend write timeout".to_string(),
+        };
+        Err((ProxyError::Network(message), FaultPhase::OutcomeUnknown))
+    }
+
     /// Record the `ReadyForQuery` that closed a response: the hot-path
     /// `in_transaction` flag plus the raw status byte and whether the response
     /// carried an `ErrorResponse` (both read by the in-session TR bookkeeping).
@@ -8058,6 +8233,29 @@ impl ProxyServer {
         }
     }
 
+    /// Never concatenate a replayed response to bytes already seen by the
+    /// client. Complete row frames can be followed by one error; terminal
+    /// responses and raw Flush fragments must end with a socket close. The
+    /// `raw`/`terminal` tests are deliberately independent of the byte count:
+    /// both already imply bytes were written, and predicating the close on that
+    /// would leave the invariant resting on a coincidence of two other
+    /// functions rather than on the flags themselves.
+    fn tr_response_action(
+        action: TrAction,
+        progress: ResponseProgress,
+        prior_flush: bool,
+    ) -> TrAction {
+        if prior_flush || progress.raw || progress.terminal {
+            return TrAction::CloseIncompleteResponse;
+        }
+        if progress.bytes > 0
+            && matches!(action, TrAction::Reexecute | TrAction::ReplayThenReexecute)
+        {
+            return TrAction::ErrorAndContinue("08007");
+        }
+        action
+    }
+
     /// Case-insensitive keyword prefix with an identifier boundary after it
     /// (`SET x` matches `SET`, `SETTINGS` does not).
     fn starts_with_word_ci(s: &str, word: &str) -> bool {
@@ -8071,7 +8269,27 @@ impl ProxyServer {
     /// Classify one client statement for in-session TR (see `StmtKind`).
     /// Conservative by construction: anything not positively recognised as a
     /// read or as idempotent control is treated as a possible write.
+    /// Whether `sql` durably commits the transaction it ends, so SETs issued
+    /// inside that transaction survive. Distinct from `StmtKind::Commit`, which
+    /// answers the wider replay-safety question.
+    fn tr_commits_session_state(sql: &str) -> bool {
+        crate::replay_sql::boundaries(sql)
+            .map(|b| b.may_commit && !b.ends_tx)
+            .unwrap_or(false)
+    }
+
     fn tr_classify(sql: &str) -> StmtKind {
+        let Ok(boundaries) = crate::replay_sql::boundaries(sql) else {
+            // The session's lexical rules or malformed input make commit
+            // boundaries uncertain. Never replay a possibly durable outcome.
+            return StmtKind::Commit;
+        };
+        if boundaries.may_commit {
+            return StmtKind::Commit;
+        }
+        // Preserve the existing read/control eligibility restrictions. The
+        // lexical guard strengthens commit detection; it must not silently
+        // broaden the read subset before the volatility work in TR-03.
         let t = sql.trim();
         let core = t.strip_suffix(';').unwrap_or(t).trim_end();
         if core.is_empty() {
@@ -8239,8 +8457,161 @@ impl ProxyServer {
         crate::protocol::query_text(&body[name_end + 1..])
     }
 
-    /// Resolve the SQL an extended batch executes: its first `Parse`, else the
-    /// text of the first named statement it references (from the registry).
+    /// Classify every Execute in wire order, preserving Bind-time statement
+    /// identity (replacing a Parse does not change an already bound portal).
+    /// Borrow names from the bounded batch; never decode or rewrite Bind values.
+    /// References outside this batch are deliberately opaque: the routing
+    /// registry does not retain the acknowledged portal/statement generations.
+    /// Such a reference may be a COMMIT and cannot authorize recovery.
+    fn tr_extended_kind(batch: &[u8], unnamed: Option<&[u8]>, max_bindings: usize) -> StmtKind {
+        Self::tr_extended_cycle_kind(&[batch], unnamed, max_bindings)
+    }
+
+    fn tr_extended_cycle_kind(
+        batches: &[&[u8]],
+        unnamed: Option<&[u8]>,
+        max_bindings: usize,
+    ) -> StmtKind {
+        fn statement_kind(sql: &str) -> StmtKind {
+            let kind = ProxyServer::tr_classify(sql);
+            // ROLLBACK can expose subsequent Executes to autocommit. Reads and
+            // writes need no second lexical pass; only possible controls do.
+            if matches!(kind, StmtKind::Control | StmtKind::Other) {
+                if let Ok(boundaries) = crate::replay_sql::boundaries(sql) {
+                    if ProxyServer::starts_with_word_ci(boundaries.head, "ROLLBACK")
+                        || ProxyServer::starts_with_word_ci(boundaries.head, "ABORT")
+                    {
+                        return StmtKind::Commit;
+                    }
+                }
+            }
+            kind
+        }
+        fn cstring<'a>(body: &mut &'a [u8]) -> Option<&'a [u8]> {
+            let end = memchr::memchr(0, body)?;
+            let value = &body[..end];
+            *body = &body[end + 1..];
+            Some(value)
+        }
+        let mut statements = HashMap::<&[u8], StmtKind>::new();
+        let mut portals = HashMap::<&[u8], StmtKind>::new();
+        // The common unnamed Parse/Bind/Execute shape needs no map allocation.
+        let mut unnamed_statement = None;
+        let mut unnamed_portal = None;
+        if let Some(parse) = unnamed {
+            let Some(sql) = Self::parse_msg_sql(parse) else {
+                return StmtKind::Commit;
+            };
+            unnamed_statement = Some(statement_kind(sql));
+        }
+        let mut kind = StmtKind::Control;
+        for batch in batches {
+            let mut rest = *batch;
+            while !rest.is_empty() {
+                let Some(header) = rest.get(..5) else {
+                    return StmtKind::Commit;
+                };
+                let len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
+                if len < 4 {
+                    return StmtKind::Commit;
+                }
+                let Some(frame_len) = len.checked_add(1) else {
+                    return StmtKind::Commit;
+                };
+                let Some(mut body) = rest.get(5..frame_len) else {
+                    return StmtKind::Commit;
+                };
+                match header[0] {
+                    b'P' => {
+                        let Some(name) = cstring(&mut body) else {
+                            return StmtKind::Commit;
+                        };
+                        let Some(sql) =
+                            cstring(&mut body).and_then(|b| std::str::from_utf8(b).ok())
+                        else {
+                            return StmtKind::Commit;
+                        };
+                        if name.is_empty() {
+                            unnamed_statement = Some(statement_kind(sql));
+                        } else {
+                            if statements.len() >= max_bindings && !statements.contains_key(name) {
+                                return StmtKind::Commit;
+                            }
+                            statements.insert(name, statement_kind(sql));
+                        }
+                    }
+                    b'B' => {
+                        let Some(portal) = cstring(&mut body) else {
+                            return StmtKind::Commit;
+                        };
+                        let Some(name) = cstring(&mut body) else {
+                            return StmtKind::Commit;
+                        };
+                        let bound_kind = if name.is_empty() {
+                            unnamed_statement
+                        } else {
+                            statements.get(name).copied()
+                        }
+                        .unwrap_or(StmtKind::Commit);
+                        if portal.is_empty() {
+                            unnamed_portal = Some(bound_kind);
+                        } else {
+                            if portals.len() >= max_bindings && !portals.contains_key(portal) {
+                                return StmtKind::Commit;
+                            }
+                            portals.insert(portal, bound_kind);
+                        }
+                    }
+                    b'E' => {
+                        let Some(portal) = cstring(&mut body) else {
+                            return StmtKind::Commit;
+                        };
+                        let k = if portal.is_empty() {
+                            unnamed_portal
+                        } else {
+                            portals.get(portal).copied()
+                        }
+                        .unwrap_or(StmtKind::Commit);
+                        kind = match (kind, k) {
+                            (StmtKind::Commit, _) | (_, StmtKind::Commit) => {
+                                return StmtKind::Commit
+                            }
+                            (StmtKind::Write | StmtKind::Other, _)
+                            | (_, StmtKind::Write | StmtKind::Other) => StmtKind::Write,
+                            (StmtKind::Read, _) | (_, StmtKind::Read) => StmtKind::Read,
+                            _ => StmtKind::Control,
+                        };
+                    }
+                    b'C' => {
+                        let Some((&target, mut name)) = body.split_first() else {
+                            return StmtKind::Commit;
+                        };
+                        let Some(name) = cstring(&mut name) else {
+                            return StmtKind::Commit;
+                        };
+                        match target {
+                            b'S' if name.is_empty() => unnamed_statement = None,
+                            b'P' if name.is_empty() => unnamed_portal = None,
+                            b'S' => {
+                                statements.remove(name);
+                            }
+                            b'P' => {
+                                portals.remove(name);
+                            }
+                            _ => return StmtKind::Commit,
+                        }
+                    }
+                    b'D' | b'H' | b'S' => {}
+                    _ => return StmtKind::Commit,
+                }
+                rest = &rest[frame_len..];
+            }
+        }
+        kind
+    }
+
+    /// Representative SQL for logging/bookkeeping only. Never use routing SQL
+    /// as a recovery safety decision; a batch can execute several statements.
     fn tr_extended_sql<'a>(
         route_sql: Option<&'a str>,
         refs: &[String],
@@ -8277,15 +8648,16 @@ impl ProxyServer {
     /// simple-query or extended-protocol response. `sql` is the client's
     /// statement text (extended: the batch's resolved SQL); `entry` builds
     /// the replay record and is only invoked while inside an explicit
-    /// transaction in `select`/`transaction` mode. `simple` gates GUC
-    /// tracking (extended-protocol `SET`s are not tracked).
+    /// transaction in `select`/`transaction` mode. `extended_kind` supplies
+    /// the whole cycle's safety classification; None denotes simple protocol
+    /// and enables GUC tracking (extended SETs are not tracked).
     ///
     /// Hot-path cost outside a transaction: a few prefix compares, no
     /// allocation, no lock.
     async fn tr_after_response(
         tr: &mut TrSession,
         sql: Option<&str>,
-        simple: bool,
+        extended_kind: Option<StmtKind>,
         entry: impl FnOnce() -> StatementLog,
         entry_bytes: usize,
         session: &Arc<ClientSession>,
@@ -8323,7 +8695,8 @@ impl ProxyServer {
         let was_in_tx = prev_status != b'I';
         let sql = sql.unwrap_or("");
         // Classify lazily: only needed inside a transaction or for a SET.
-        let mut kind_cache: Option<StmtKind> = None;
+        let simple = extended_kind.is_none();
+        let mut kind_cache = extended_kind;
         let kind = |kind_cache: &mut Option<StmtKind>| -> StmtKind {
             *kind_cache.get_or_insert_with(|| Self::tr_classify(sql))
         };
@@ -8349,8 +8722,16 @@ impl ProxyServer {
             if was_in_tx && !now_in_tx {
                 // Transaction ended: SETs made inside it persist only if it
                 // committed (a failed transaction's COMMIT is a ROLLBACK).
-                let committed =
-                    prev_status == b'T' && !had_error && kind(&mut kind_cache) == StmtKind::Commit;
+                // `StmtKind::Commit` is the replay-safety classification: it is
+                // deliberately wide and also covers `ROLLBACK; <DML>`, where the
+                // trailing DML commits in autocommit but the transaction's own
+                // session state was DISCARDED. Promoting that transaction's SETs
+                // would restore settings the database never kept, so the durable
+                // commit is confirmed against the statement itself.
+                let committed = prev_status == b'T'
+                    && !had_error
+                    && kind(&mut kind_cache) == StmtKind::Commit
+                    && Self::tr_commits_session_state(sql);
                 if committed {
                     let pending = std::mem::take(&mut tr.pending_tx_gucs);
                     for s in pending {
@@ -8363,6 +8744,9 @@ impl ProxyServer {
         }
 
         // --- explicit-transaction statement recording ---
+        if !now_in_tx {
+            session.tr_replay_tainted.store(false, Ordering::Relaxed);
+        }
         if !tr.record_tx || (!now_in_tx && !was_in_tx) {
             return;
         }
@@ -8387,7 +8771,7 @@ impl ProxyServer {
         let tainted = session
             .tr_replay_tainted
             .swap(false, std::sync::atomic::Ordering::Relaxed);
-        if status == b'E' || tainted {
+        if status == b'E' || tainted || k == StmtKind::Commit {
             // A failed transaction can only be rolled back; a transformed
             // statement's recorded text is not what executed.
             ts.non_replayable = true;
@@ -8427,12 +8811,19 @@ impl ProxyServer {
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
     ) {
+        let incomplete_cycle = tr.ext_cycle.take().is_some();
+        if std::mem::take(&mut tr.ext_cycle_dropped) || incomplete_cycle {
+            // A simple Query can follow a Flush without Sync. The current
+            // entry cannot represent that earlier extended prefix, so never
+            // replay a transaction from this incomplete history.
+            session.tr_replay_tainted.store(true, Ordering::Relaxed);
+        }
         let sql = crate::protocol::query_text(&msg.payload);
         let bytes = sql.map(|s| s.len()).unwrap_or(0);
         Self::tr_after_response(
             tr,
             sql,
-            true,
+            None,
             || StatementLog {
                 sql: sql.unwrap_or("").to_string(),
                 params: Vec::new(),
@@ -8466,16 +8857,54 @@ impl ProxyServer {
         if !tr.record_tx {
             return;
         }
-        // Only accumulate while a transaction is (or may be) open — a Flush
-        // batch with no ReadyForQuery cannot itself tell us.
+        // A Flush may open BEGIN while the last RFQ still says Idle. Retain
+        // that bounded prefix until Sync establishes the transaction state.
         let in_tx_context = tr.prev_status != b'I'
             || session
                 .in_transaction
                 .load(std::sync::atomic::Ordering::Relaxed);
+        if !in_tx_context && wait_ready {
+            tr.ext_cycle = None;
+            if std::mem::take(&mut tr.ext_cycle_dropped) {
+                *session.tx_state.write().await = TransactionState::default();
+            }
+            return;
+        }
         if !wait_ready {
-            if !in_tx_context {
+            // A client can issue arbitrarily many Flushes without a Sync.
+            // Apply the replay budget before retaining each chunk, rather
+            // than only when the completed cycle becomes a history entry.
+            let mut ts = session.tx_state.write().await;
+            let retained = tr.ext_cycle.as_ref().map_or(0, |c| {
+                c.frames
+                    .len()
+                    .saturating_add(c.unnamed_parse.as_ref().map_or(0, |p| p.len()))
+            });
+            let projected = ts
+                .replay_bytes
+                .saturating_add(retained)
+                .saturating_add(batch.len())
+                .saturating_add(unnamed.map_or(0, |(p, _)| p.len()));
+            if !ts.non_replayable
+                && (projected > state.limits.tr_max_replay_bytes
+                    || ts.statements.len() >= state.limits.tr_max_replay_statements)
+            {
+                ts.non_replayable = true;
+                ts.statements = Vec::new();
+                ts.replay_bytes = 0;
+                state
+                    .metrics
+                    .tr
+                    .replay_cap_exceeded
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if ts.non_replayable {
+                tr.ext_cycle = None;
+                tr.ext_cycle_dropped = true;
                 return;
             }
+            drop(ts);
+            let first_chunk = tr.ext_cycle.is_none();
             let cycle = tr.ext_cycle.get_or_insert_with(|| TrExtCycle {
                 frames: BytesMut::new(),
                 unnamed_parse: None,
@@ -8484,7 +8913,13 @@ impl ProxyServer {
                 route_sql: None,
             });
             if let Some((p, _)) = unnamed {
-                cycle.unnamed_parse.get_or_insert_with(|| p.clone());
+                if first_chunk {
+                    cycle.unnamed_parse = Some(p.clone());
+                } else {
+                    // A later optimized Parse replaces the unnamed statement
+                    // at this point, after earlier Binds/Executes and Flushes.
+                    cycle.frames.extend_from_slice(p);
+                }
             }
             cycle.frames.extend_from_slice(batch);
             cycle.defines.extend(defines.iter().cloned());
@@ -8495,28 +8930,48 @@ impl ProxyServer {
             return;
         }
         let cycle = tr.ext_cycle.take();
+        let dropped = std::mem::take(&mut tr.ext_cycle_dropped);
         let cycle_route: Option<String> = cycle.as_ref().and_then(|c| c.route_sql.clone());
         let resolved = Self::tr_extended_sql(route_sql.or(cycle_route.as_deref()), refs, registry);
-        // The cycle's unnamed Parse is the one from its first batch (a later
-        // one only replaces it if none was held earlier) — mirror the entry
-        // builder below.
+        // The first held Parse remains a prefix; every later held Parse is
+        // retained at its actual position between chunks.
         let unnamed_len = cycle
             .as_ref()
             .and_then(|c| c.unnamed_parse.as_ref().map(|p| p.len()))
-            .or_else(|| unnamed.map(|(p, _)| p.len()))
-            .unwrap_or(0);
-        let entry_bytes =
-            batch.len() + cycle.as_ref().map(|c| c.frames.len()).unwrap_or(0) + unnamed_len;
+            .unwrap_or(0)
+            .saturating_add(unnamed.map_or(0, |(p, _)| p.len()));
+        let entry_bytes = batch
+            .len()
+            .saturating_add(cycle.as_ref().map_or(0, |c| c.frames.len()))
+            .saturating_add(unnamed_len);
         Self::tr_after_response(
             tr,
             resolved,
-            false,
+            Some(match &cycle {
+                _ if dropped => StmtKind::Commit,
+                Some(c) => Self::tr_extended_cycle_kind(
+                    &[
+                        &c.frames,
+                        unnamed.map_or(&[][..], |(p, _)| p.as_ref()),
+                        batch,
+                    ],
+                    c.unnamed_parse.as_deref(),
+                    state.limits.max_prepared_statements,
+                ),
+                None => Self::tr_extended_kind(
+                    batch,
+                    unnamed.map(|(p, _)| p.as_ref()),
+                    state.limits.max_prepared_statements,
+                ),
+            }),
             || {
                 let (frames, unnamed_parse, mut all_defines, mut all_refs) = match cycle {
                     Some(mut c) => {
+                        if let Some((p, _)) = unnamed {
+                            c.frames.extend_from_slice(p);
+                        }
                         c.frames.extend_from_slice(batch);
-                        let up = c.unnamed_parse.or_else(|| unnamed.map(|(p, _)| p.clone()));
-                        (c.frames.freeze(), up, c.defines, c.refs)
+                        (c.frames.freeze(), c.unnamed_parse, c.defines, c.refs)
                     }
                     None => (
                         batch.clone(),
@@ -8931,7 +9386,7 @@ impl ProxyServer {
         client: &mut ClientStream,
         conns: &mut HashMap<String, BackendConn>,
         current_node: &mut Option<String>,
-        fault: BackendFault,
+        mut fault: BackendFault,
         inflight: InFlight<'_>,
         tr: &mut TrSession,
         registry: &HashMap<String, bytes::Bytes>,
@@ -8946,20 +9401,28 @@ impl ProxyServer {
         let copying = session
             .copy_in_progress
             .load(std::sync::atomic::Ordering::Relaxed);
-        let (sql, wait_ready, is_extended) = match &inflight {
-            InFlight::Simple(msg) => (crate::protocol::query_text(&msg.payload), true, false),
-            InFlight::Extended {
-                route_sql,
-                wait_ready,
-                reprepare,
-                ..
-            } => (
-                Self::tr_extended_sql(*route_sql, reprepare, registry),
-                *wait_ready,
+        let (kind, wait_ready) = match &inflight {
+            InFlight::Simple(msg) => (
+                crate::protocol::query_text(&msg.payload)
+                    .map(Self::tr_classify)
+                    .unwrap_or(StmtKind::Commit),
                 true,
             ),
+            InFlight::Extended {
+                batch,
+                wait_ready,
+                unnamed,
+                ..
+            } => (
+                Self::tr_extended_kind(
+                    batch,
+                    unnamed.map(|(p, _)| p.as_ref()),
+                    state.limits.max_prepared_statements,
+                ),
+                *wait_ready,
+            ),
         };
-        let kind = sql.map(Self::tr_classify).unwrap_or(StmtKind::Other);
+        fault.kind = Some(kind);
         let (tx_has_writes, tx_replayable) = {
             let ts = session.tx_state.read().await;
             (
@@ -8967,18 +9430,20 @@ impl ProxyServer {
                 !ts.non_replayable && !ts.statements.is_empty(),
             )
         };
+        let prior_flush = tr.ext_dispatched;
+        if prior_flush {
+            // The current chunk may be unsent, but earlier Executes in this
+            // cycle may already have run (or even committed).
+            fault.phase = FaultPhase::OutcomeUnknown;
+        }
         let mut action = if copying {
             // The COPY data stream is unrecoverable in every mode.
             TrAction::CloseWithError("08006")
         } else {
             Self::tr_decide(mode, fault.phase, in_tx, tx_has_writes, tx_replayable, kind)
         };
-        // A proxy-side backend READ timeout is a slow statement, not a dead
-        // backend — never run it a second time. A Sync whose cycle had earlier
-        // Flush batches cannot be re-executed on its own (their responses were
-        // already relayed).
-        let partial_cycle = is_extended && tr.ext_cycle.is_some();
-        if (!Self::is_backend_fault(&fault.error) || partial_cycle)
+        // A backend read timeout does not establish that execution stopped.
+        if !Self::is_backend_fault(&fault.error)
             && matches!(action, TrAction::Reexecute | TrAction::ReplayThenReexecute)
         {
             action = TrAction::ErrorAndContinue(match fault.phase {
@@ -8986,7 +9451,14 @@ impl ProxyServer {
                 FaultPhase::OutcomeUnknown => "08007",
             });
         }
+        action = Self::tr_response_action(action, fault.progress, prior_flush);
+        state
+            .metrics
+            .bytes_sent
+            .fetch_add(fault.progress.bytes, Ordering::Relaxed);
         tr.ext_cycle = None;
+        tr.ext_cycle_dropped = false;
+        tr.ext_dispatched = false;
         tracing::warn!(
             target: "helios::tr",
             node = %fault.node,
@@ -9004,6 +9476,10 @@ impl ProxyServer {
         };
 
         match action {
+            TrAction::CloseIncompleteResponse => {
+                Self::tr_clear_tx(session).await;
+                Ok(None)
+            }
             TrAction::CloseWithError(code) => {
                 let message = if copying {
                     format!(
@@ -9036,7 +9512,9 @@ impl ProxyServer {
                     fault.node,
                     phase_desc,
                     fault.error,
-                    if in_tx {
+                    if code == "08007" {
+                        "; outcome unknown — verify the database outcome before retrying"
+                    } else if in_tx {
                         "; the transaction was aborted — ROLLBACK and retry"
                     } else {
                         ""
@@ -9175,6 +9653,19 @@ impl ProxyServer {
                             // Client-side failure: nothing left to do.
                             return Err(e);
                         };
+                        state
+                            .metrics
+                            .bytes_sent
+                            .fetch_add(f2.progress.bytes, Ordering::Relaxed);
+                        if Self::tr_response_action(
+                            TrAction::ErrorAndContinue("08006"),
+                            f2.progress,
+                            false,
+                        ) == TrAction::CloseIncompleteResponse
+                        {
+                            Self::tr_clear_tx(session).await;
+                            return Ok(None);
+                        }
                         // The replacement failed too: give this request up
                         // with one error rather than cascading recoveries.
                         tracing::warn!(
@@ -9184,18 +9675,16 @@ impl ProxyServer {
                             "replacement backend failed during re-execution"
                         );
                         let message = format!(
-                            "backend {} failed during failover re-execution ({}){}",
-                            f2.node,
-                            f2.error,
-                            if in_tx {
-                                "; the transaction was aborted — ROLLBACK and retry"
-                            } else {
-                                ""
-                            }
+                            "backend {} failed during failover re-execution ({}); verify the database outcome before retrying",
+                            f2.node, f2.error,
                         );
+                        let code = if f2.phase == FaultPhase::OutcomeUnknown {
+                            "08007"
+                        } else {
+                            "08006"
+                        };
                         let sent =
-                            Self::tr_send_error(client, "08006", &message, in_tx, wait_ready)
-                                .await?;
+                            Self::tr_send_error(client, code, &message, in_tx, wait_ready).await?;
                         Self::tr_enter_aborted(tr, in_tx, session).await;
                         *current_node = None;
                         Ok(Some((None, sent)))
@@ -9229,7 +9718,21 @@ impl ProxyServer {
                 fault.node, fault.error, err
             ),
         };
-        let _ = Self::tr_send_error(client, "08006", &message, in_tx, wait_ready).await;
+        // An autocommit INSERT whose response was lost may already be durable,
+        // exactly like a lost COMMIT: the client must be told to verify rather
+        // than shown a bare connection failure it would reasonably retry. Only
+        // reads and pure control statements can claim nothing was decided.
+        let uncertain = fault.phase == FaultPhase::OutcomeUnknown
+            && !matches!(fault.kind, Some(StmtKind::Read) | Some(StmtKind::Control));
+        let (code, message) = if uncertain {
+            (
+                "08007",
+                format!("{message}; verify the database outcome before retrying"),
+            )
+        } else {
+            ("08006", message)
+        };
+        let _ = Self::tr_send_error(client, code, &message, in_tx, wait_ready).await;
         Self::tr_clear_tx(session).await;
         Ok(None)
     }
@@ -11857,6 +12360,131 @@ mod tests {
         );
     }
 
+    /// Backend frames are only forwarded to the client once they are COMPLETE.
+    /// A truncated asynchronous frame (a large `NotificationResponse` split
+    /// across reads, say) must stay buffered: a client that receives half a
+    /// frame blocks forever waiting for the rest, and recovery can no longer
+    /// inject anything after it — not an ErrorResponse, and not the rows of a
+    /// re-executed statement, which would be appended inside the partial frame.
+    #[tokio::test]
+    async fn watch_relay_withholds_partial_backend_frames() {
+        use tokio::io::AsyncReadExt as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client_peer = TcpStream::connect(addr).await.unwrap();
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut stream = ClientStream::Plain(sock);
+
+        let blistener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let baddr = blistener.local_addr().unwrap();
+        let backend = TcpStream::connect(baddr).await.unwrap();
+        let (mut backend_peer, _) = blistener.accept().await.unwrap();
+        let mut conns: HashMap<String, BackendConn> = HashMap::new();
+        conns.insert("node-a".to_string(), BackendConn::new(backend));
+
+        let server = ProxyServer::new(test_config()).unwrap();
+        let mut buffer = BytesMut::with_capacity(64);
+        // One `NotificationResponse`, delivered in two pieces.
+        let payload = b"\x00\x00\x27\x0fchan\0hello\0".to_vec();
+        let mut whole = vec![b'A'];
+        whole.extend_from_slice(&((payload.len() + 4) as u32).to_be_bytes());
+        whole.extend_from_slice(&payload);
+        let split = whole.len() - 3;
+        backend_peer.write_all(&whole[..split]).await.unwrap();
+        backend_peer.flush().await.unwrap();
+
+        // The relay sees the head of the frame and must publish nothing.
+        let mut abuf = BytesMut::with_capacity(16384);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(120);
+        let outcome = ProxyServer::read_next_client_message(
+            &mut stream,
+            &mut buffer,
+            &mut conns,
+            Some("node-a"),
+            &mut abuf,
+            Some(deadline),
+            &server.state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ClientRead::IdleTimeout);
+        assert_eq!(
+            abuf.len(),
+            split,
+            "the partial frame must be retained for reassembly"
+        );
+        let mut peek = [0u8; 64];
+        let seen =
+            tokio::time::timeout(Duration::from_millis(50), client_peer.read(&mut peek)).await;
+        assert!(
+            seen.is_err(),
+            "no bytes of an incomplete frame may reach the client"
+        );
+
+        // The remainder completes the frame: now the whole thing is published.
+        backend_peer.write_all(&whole[split..]).await.unwrap();
+        backend_peer.flush().await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(120);
+        let outcome = ProxyServer::read_next_client_message(
+            &mut stream,
+            &mut buffer,
+            &mut conns,
+            Some("node-a"),
+            &mut abuf,
+            Some(deadline),
+            &server.state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ClientRead::IdleTimeout);
+        assert!(abuf.is_empty(), "a fully forwarded frame leaves no tail");
+        let mut got = vec![0u8; whole.len()];
+        tokio::time::timeout(Duration::from_millis(200), client_peer.read_exact(&mut got))
+            .await
+            .expect("the completed frame must be delivered")
+            .unwrap();
+        assert_eq!(got, whole, "the frame must arrive byte-exact");
+    }
+
+    /// The frame scanner returns only whole frames and rejects a length below
+    /// the 4-byte minimum instead of stalling reassembly on it.
+    #[test]
+    fn complete_frame_prefix_stops_at_frame_boundaries() {
+        fn f(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut v = vec![tag];
+            v.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+            v.extend_from_slice(body);
+            v
+        }
+        let a = f(b'A', b"one");
+        let b = f(b'N', b"two");
+        let both = [a.clone(), b.clone()].concat();
+        assert_eq!(
+            ProxyServer::complete_frame_prefix(&both).unwrap(),
+            both.len()
+        );
+        assert_eq!(ProxyServer::complete_frame_prefix(&a).unwrap(), a.len());
+        // A trailing partial frame is excluded, whole ones ahead of it are not.
+        let partial = [both.clone(), a[..3].to_vec()].concat();
+        assert_eq!(
+            ProxyServer::complete_frame_prefix(&partial).unwrap(),
+            both.len()
+        );
+        // Fewer than the 5 header bytes: nothing is complete.
+        assert_eq!(ProxyServer::complete_frame_prefix(&a[..4]).unwrap(), 0);
+        assert_eq!(ProxyServer::complete_frame_prefix(&[]).unwrap(), 0);
+        // Length below the self-counting minimum is malformed, not incomplete.
+        assert!(ProxyServer::complete_frame_prefix(&[b'A', 0, 0, 0, 3]).is_err());
+        // A huge declared length is merely incomplete; the caller's buffer cap
+        // is what bounds it.
+        assert_eq!(
+            ProxyServer::complete_frame_prefix(&[b'A', 0xff, 0xff, 0xff, 0xff, 1, 2]).unwrap(),
+            0
+        );
+    }
+
     /// The conditional-reset classifier must call every session-state-creating
     /// statement DIRTY (so it is reset before reuse) and only provably neutral
     /// statements CLEAN. A false "clean" would leak state across clients, so the
@@ -12419,7 +13047,7 @@ mod tests {
             use StmtKind::*;
             let c = ProxyServer::tr_classify;
             assert_eq!(c("SELECT 1"), Read);
-            assert_eq!(c("  select * from t where x = 'a;b' "), Write); // interior ';' -> opaque
+            assert_eq!(c("  select * from t where x = 'a;b' "), Write);
             assert_eq!(c("SELECT count(*) FROM t;"), Read);
             assert_eq!(c("SELECT CASE WHEN x THEN 1 END FROM t"), Read);
             assert_eq!(c("SELECT * INTO t2 FROM t"), Other);
@@ -12570,6 +13198,422 @@ mod tests {
             f.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
             f.extend_from_slice(body);
             f
+        }
+
+        #[test]
+        fn tr_commit_classification_guards_every_query_statement() {
+            for sql in [
+                "/* audit */ COMMIT",
+                "-- ignored\nEND WORK",
+                "PREPARE/* nested /* x */ */TRANSACTION 'tx'",
+                "SELECT ';COMMIT'; COMMIT PREPARED 'tx'",
+                "COMMIT AND CHAIN",
+                "ROLLBACK; INSERT INTO t VALUES (1)",
+                "SELECT $x$COMMIT$x$;END",
+            ] {
+                let kind = ProxyServer::tr_classify(sql);
+                assert_eq!(kind, StmtKind::Commit, "{sql}");
+                assert_eq!(
+                    ProxyServer::tr_decide(
+                        TrMode::Transaction,
+                        FaultPhase::OutcomeUnknown,
+                        true,
+                        true,
+                        true,
+                        kind
+                    ),
+                    TrAction::ErrorAndContinue("08007")
+                );
+            }
+        }
+
+        #[test]
+        fn tr_visible_response_progress_never_reexecutes() {
+            for action in [
+                TrAction::Reexecute,
+                TrAction::ReplayThenReexecute,
+                TrAction::ErrorAndContinue("08007"),
+                TrAction::CloseWithError("57P01"),
+            ] {
+                for raw in [false, true] {
+                    for terminal in [false, true] {
+                        let progress = ResponseProgress {
+                            bytes: 7,
+                            raw,
+                            terminal,
+                        };
+                        let guarded = ProxyServer::tr_response_action(action, progress, false);
+                        assert!(!matches!(
+                            guarded,
+                            TrAction::Reexecute | TrAction::ReplayThenReexecute
+                        ));
+                        if raw || terminal {
+                            assert_eq!(guarded, TrAction::CloseIncompleteResponse);
+                        }
+                        // Independent of the byte count: an unfinished frame or a
+                        // published terminal frame forbids injection even if this
+                        // call recorded no bytes of its own.
+                        let zero = ResponseProgress {
+                            bytes: 0,
+                            raw,
+                            terminal,
+                        };
+                        if raw || terminal {
+                            assert_eq!(
+                                ProxyServer::tr_response_action(action, zero, false),
+                                TrAction::CloseIncompleteResponse
+                            );
+                        }
+                    }
+                }
+                // Rows published without a terminal frame: re-execution is
+                // refused (it would append a second result), but the session can
+                // still be told what happened.
+                let published_rows = ResponseProgress {
+                    bytes: 7,
+                    raw: false,
+                    terminal: false,
+                };
+                let guarded = ProxyServer::tr_response_action(action, published_rows, false);
+                assert_ne!(guarded, TrAction::CloseIncompleteResponse);
+                assert!(!matches!(
+                    guarded,
+                    TrAction::Reexecute | TrAction::ReplayThenReexecute
+                ));
+                // Backend-watch output may be a raw prefix from an earlier
+                // Flush, even if this call has not sent any response bytes.
+                assert_eq!(
+                    ProxyServer::tr_response_action(action, ResponseProgress::default(), true),
+                    TrAction::CloseIncompleteResponse
+                );
+                assert_eq!(
+                    ProxyServer::tr_response_action(action, ResponseProgress::default(), false),
+                    action
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn tr_stream_fault_retains_visible_rows_and_terminal_frames() {
+            for (bytes, terminal) in [
+                (Vec::new(), false),
+                (
+                    [frame(b'T', b"description"), frame(b'D', b"row")].concat(),
+                    false,
+                ),
+                (
+                    [
+                        frame(b'T', b"description"),
+                        frame(b'D', b"row"),
+                        frame(b'C', b"SELECT 1\0"),
+                    ]
+                    .concat(),
+                    true,
+                ),
+                (frame(b'E', b"SERROR\0CXX000\0Mfailed\0\0"), true),
+            ] {
+                for capture in [false, true] {
+                    #[cfg(not(any(feature = "query-cache", feature = "edge-proxy")))]
+                    if capture {
+                        continue;
+                    }
+                    let (mut backend, mut peer) = pair().await;
+                    let (client, mut recipient) = pair().await;
+                    let mut client = ClientStream::Plain(client);
+                    let session = make_test_session();
+                    let server = ProxyServer::new(test_config()).unwrap();
+                    let sent = bytes.clone();
+                    let feed = tokio::spawn(async move {
+                        peer.write_all(&sent).await.unwrap();
+                    });
+                    let receive = tokio::spawn(async move {
+                        let mut received = Vec::new();
+                        recipient.read_to_end(&mut received).await.unwrap();
+                        received
+                    });
+                    let failure = if capture {
+                        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+                        {
+                            ProxyServer::stream_until_ready_capture(
+                                &mut client,
+                                &mut backend,
+                                &session,
+                                Duration::from_secs(1),
+                                Duration::from_secs(1),
+                                16,
+                                &server.state.metrics,
+                            )
+                            .await
+                            .unwrap_err()
+                        }
+                        #[cfg(not(any(feature = "query-cache", feature = "edge-proxy")))]
+                        {
+                            unreachable!()
+                        }
+                    } else {
+                        ProxyServer::stream_until_ready(
+                            &mut client,
+                            &mut backend,
+                            &session,
+                            &server.state,
+                        )
+                        .await
+                        .unwrap_err()
+                    };
+                    drop(client);
+                    feed.await.unwrap();
+                    assert_eq!(receive.await.unwrap(), bytes);
+                    assert_eq!(failure.progress.bytes, bytes.len() as u64);
+                    assert_eq!(failure.progress.terminal, terminal);
+                    assert!(!failure.progress.raw);
+                    let mut fault = None;
+                    BackendFault::set_response(&mut fault, "backend", &failure);
+                    assert_eq!(fault.unwrap().progress.bytes, bytes.len() as u64);
+                }
+            }
+        }
+
+        #[test]
+        fn tr_extended_execute_identity_and_commit_boundaries() {
+            fn parse(name: &str, sql: &str) -> Vec<u8> {
+                frame(b'P', &[cstr(name), cstr(sql), vec![0, 0]].concat())
+            }
+            fn bind(portal: &str, name: &str) -> Vec<u8> {
+                // Binary int32 parameter and binary results. Safety inspection
+                // must leave these opaque bytes intact, including embedded NULs.
+                frame(
+                    b'B',
+                    &[
+                        cstr(portal),
+                        cstr(name),
+                        vec![0, 1, 0, 1, 0, 1, 0, 0, 0, 4, 0, 0, 0, 7, 0, 1, 0, 1],
+                    ]
+                    .concat(),
+                )
+            }
+            fn execute(portal: &str) -> Vec<u8> {
+                frame(b'E', &[cstr(portal), vec![0; 4]].concat())
+            }
+            let classify =
+                |frames: Vec<Vec<u8>>| ProxyServer::tr_extended_kind(&frames.concat(), None, 256);
+            for end in ["COMMIT", "END", "PREPARE TRANSACTION 'x'", "ROLLBACK"] {
+                assert_eq!(
+                    classify(vec![
+                        parse("a", "SELECT 1"),
+                        bind("a", "a"),
+                        execute("a"),
+                        parse("b", end),
+                        bind("b", "b"),
+                        execute("b"),
+                        frame(b'S', &[])
+                    ]),
+                    StmtKind::Commit,
+                    "{end}"
+                );
+            }
+            // A portal owns the definition at Bind time, even after the unnamed
+            // statement is replaced. Looking up the last Parse would miss COMMIT.
+            assert_eq!(
+                classify(vec![
+                    parse("", "COMMIT"),
+                    bind("saved", ""),
+                    parse("", "SELECT 1"),
+                    execute("saved")
+                ]),
+                StmtKind::Commit
+            );
+            assert_eq!(
+                classify(vec![
+                    parse("", "SELECT 1"),
+                    bind("saved", ""),
+                    parse("", "COMMIT"),
+                    execute("saved")
+                ]),
+                StmtKind::Read
+            );
+            // The unexecuted Parse isn't sufficient evidence of the executed SQL.
+            assert_eq!(
+                classify(vec![parse("read", "SELECT 1"), execute("older")]),
+                StmtKind::Commit
+            );
+            assert_eq!(
+                classify(vec![bind("p", "older"), execute("p")]),
+                StmtKind::Commit
+            );
+            assert_eq!(
+                classify(vec![parse("s", "SELECT $1"), bind("p", "s"), execute("p")]),
+                StmtKind::Read
+            );
+            assert_eq!(
+                classify(vec![
+                    parse("s", "SELECT 1"),
+                    bind("p", "s"),
+                    frame(b'C', b"Pp\0"),
+                    execute("p")
+                ]),
+                StmtKind::Commit
+            );
+            let held = parse("", "COMMIT");
+            let batch = [bind("", ""), execute(""), frame(b'S', &[])].concat();
+            assert_eq!(
+                ProxyServer::tr_extended_kind(&batch, Some(&held), 256),
+                StmtKind::Commit
+            );
+            let unnamed_read = [parse("", "SELECT 1"), bind("", ""), execute("")].concat();
+            assert_eq!(
+                ProxyServer::tr_extended_kind(&unnamed_read, None, 0),
+                StmtKind::Read
+            );
+            let named_read = [parse("s", "SELECT 1"), bind("p", "s"), execute("p")].concat();
+            assert_eq!(
+                ProxyServer::tr_extended_kind(&named_read, None, 0),
+                StmtKind::Commit
+            );
+            assert_eq!(
+                ProxyServer::tr_extended_kind(&named_read, None, 1),
+                StmtKind::Read
+            );
+            let too_many_portals = [
+                parse("s", "SELECT 1"),
+                bind("p", "s"),
+                bind("q", "s"),
+                execute("q"),
+            ]
+            .concat();
+            assert_eq!(
+                ProxyServer::tr_extended_kind(&too_many_portals, None, 1),
+                StmtKind::Commit
+            );
+            // Every truncated header/body is opaque; a complete prefix that
+            // already Executes COMMIT must remain so, even before final Sync.
+            let wire = [held, batch].concat();
+            let commit_end = wire.len() - 5;
+            for offset in commit_end..=wire.len() {
+                assert_eq!(
+                    ProxyServer::tr_extended_kind(&wire[..offset], None, 256),
+                    StmtKind::Commit
+                );
+            }
+            for bytes in [
+                vec![b'E'],
+                vec![b'E', 0, 0, 0, 3],
+                vec![b'P', 255, 255, 255, 255],
+            ] {
+                assert_eq!(
+                    ProxyServer::tr_extended_kind(&bytes, None, 256),
+                    StmtKind::Commit
+                );
+            }
+        }
+
+        /// A transport that accepts exactly `limit` bytes, then errors, stalls,
+        /// or returns zero. This reproduces write_all losing its partial count.
+        struct PrefixWriter {
+            received: Vec<u8>,
+            limit: usize,
+            failure: u8,
+        }
+
+        impl tokio::io::AsyncWrite for PrefixWriter {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                bytes: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                use std::task::Poll;
+                let count = bytes.len().min(self.limit - self.received.len());
+                if count == 0 {
+                    return match self.failure {
+                        b'T' => Poll::Pending,
+                        b'Z' => Poll::Ready(Ok(0)),
+                        _ => Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into())),
+                    };
+                }
+                self.received.extend_from_slice(&bytes[..count]);
+                Poll::Ready(Ok(count))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        #[tokio::test]
+        async fn tr_partial_extended_writes_never_authorize_commit_reexecution() {
+            let mut batch = Vec::new();
+            for sql in ["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"] {
+                batch.extend(frame(b'P', &[cstr(""), cstr(sql), vec![0, 0]].concat()));
+                batch.extend(frame(b'B', &[0; 8]));
+                batch.extend(frame(b'E', &[0; 5]));
+            }
+            batch.extend(frame(b'S', &[]));
+            let kind = ProxyServer::tr_extended_kind(&batch, None, 16);
+            assert_eq!(kind, StmtKind::Commit);
+            // Every possible byte offset includes each frontend frame boundary
+            // and a complete COMMIT Execute followed by an incomplete final Sync.
+            for limit in 0..batch.len() {
+                let mut writer = PrefixWriter {
+                    received: Vec::new(),
+                    limit,
+                    failure: b'E',
+                };
+                let (_, phase) =
+                    ProxyServer::tr_write_batch(&mut writer, &batch, Duration::from_secs(1))
+                        .await
+                        .unwrap_err();
+                assert_eq!(writer.received, batch[..limit]);
+                for in_tx in [false, true] {
+                    assert_eq!(
+                        ProxyServer::tr_decide(TrMode::Transaction, phase, in_tx, true, true, kind),
+                        TrAction::ErrorAndContinue("08007"),
+                        "offset={limit}, in_tx={in_tx}"
+                    );
+                }
+            }
+            for failure in [b'T', b'Z'] {
+                let mut writer = PrefixWriter {
+                    received: Vec::new(),
+                    limit: batch.len() - 5,
+                    failure,
+                };
+                let (_, phase) =
+                    ProxyServer::tr_write_batch(&mut writer, &batch, Duration::from_millis(5))
+                        .await
+                        .unwrap_err();
+                assert_eq!(phase, FaultPhase::OutcomeUnknown);
+                assert_eq!(writer.received, batch[..batch.len() - 5]);
+            }
+            let mut writer = PrefixWriter {
+                received: Vec::new(),
+                limit: batch.len(),
+                failure: b'E',
+            };
+            assert!(
+                ProxyServer::tr_write_batch(&mut writer, &batch, Duration::from_secs(1))
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(writer.received, batch);
+            // A real pre-dispatch connection failure remains safe to retry.
+            assert_eq!(
+                ProxyServer::tr_decide(
+                    TrMode::Transaction,
+                    FaultPhase::NotDelivered,
+                    false,
+                    false,
+                    false,
+                    kind
+                ),
+                TrAction::Reexecute
+            );
         }
 
         /// One response per call (the replay/restore paths only ever have ONE
@@ -12793,6 +13837,58 @@ mod tests {
         /// recorded (with write tracking), the statement cap marks the
         /// transaction non-replayable (+ metric), COMMIT releases the record
         /// and promotes transaction-scoped SETs, and the SET cap stops tracking.
+        /// A transaction that ends in ROLLBACK discards its session state, so
+        /// SETs made inside it must never be restored on the replacement backend.
+        /// `ROLLBACK; <DML>` is the trap: for replay safety it classifies as a
+        /// possible commit (the trailing statement commits in autocommit), and
+        /// reusing that classification for the GUC decision would restore
+        /// settings the database threw away.
+        #[tokio::test]
+        async fn tr_recorder_does_not_promote_gucs_of_a_rolled_back_transaction() {
+            let server = ProxyServer::new(test_config()).unwrap();
+            let state = server.state.clone();
+            let session = make_test_session();
+            let mut tr = TrSession::new(TrMode::Transaction);
+
+            ProxyServer::note_ready_for_query(&session, b'T', false);
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("BEGIN"), &session, &state).await;
+            ProxyServer::tr_after_simple(
+                &mut tr,
+                &qmsg("SET work_mem = '512MB'"),
+                &session,
+                &state,
+            )
+            .await;
+            assert_eq!(tr.pending_tx_gucs, vec!["SET work_mem = '512MB'"]);
+
+            // Ends the transaction as a ROLLBACK, while the trailing statement
+            // commits on its own — `StmtKind::Commit`, but nothing of the
+            // transaction's own session state survived.
+            ProxyServer::note_ready_for_query(&session, b'I', false);
+            ProxyServer::tr_after_simple(
+                &mut tr,
+                &qmsg("ROLLBACK; INSERT INTO t VALUES (1)"),
+                &session,
+                &state,
+            )
+            .await;
+            assert!(
+                tr.gucs.is_empty(),
+                "a rolled-back transaction's SETs must not be restored: {:?}",
+                tr.gucs
+            );
+            assert!(tr.pending_tx_gucs.is_empty(), "pending set must be dropped");
+
+            // The same shape ending in a real COMMIT still promotes.
+            ProxyServer::note_ready_for_query(&session, b'T', false);
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("BEGIN"), &session, &state).await;
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("SET work_mem = '64MB'"), &session, &state)
+                .await;
+            ProxyServer::note_ready_for_query(&session, b'I', false);
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("COMMIT"), &session, &state).await;
+            assert_eq!(tr.gucs, vec!["SET work_mem = '64MB'"]);
+        }
+
         #[tokio::test]
         async fn tr_recorder_tracks_transaction_gucs_and_caps() {
             let mut config = test_config();
@@ -12956,10 +14052,20 @@ mod tests {
             // Already inside a transaction (BEGIN recorded via simple protocol).
             ProxyServer::note_ready_for_query(&session, b'T', false);
             ProxyServer::tr_after_simple(&mut tr, &qmsg("BEGIN"), &session, &state).await;
-            let flush_batch = bytes::Bytes::from_static(b"FLUSHBATCH");
-            let sync_batch = bytes::Bytes::from_static(b"SYNCBATCH");
+            let flush_batch = bytes::Bytes::from(
+                [
+                    frame(b'B', &[b"\0\0".to_vec(), vec![0; 6]].concat()),
+                    frame(b'E', &[0; 5]),
+                    frame(b'H', &[]),
+                ]
+                .concat(),
+            );
+            let sync_batch = bytes::Bytes::from(frame(b'S', &[]));
             let unnamed = (
-                bytes::Bytes::from_static(b"PARSE"),
+                bytes::Bytes::from(frame(
+                    b'P',
+                    &[cstr(""), cstr("INSERT INTO t VALUES ($1)"), vec![0; 2]].concat(),
+                )),
                 bytes::Bytes::from_static(b"sig"),
             );
             ProxyServer::tr_after_extended(
@@ -12995,11 +14101,257 @@ mod tests {
             assert_eq!(ts.statements.len(), 2);
             assert!(ts.has_writes);
             let ext = ts.statements[1].extended.as_ref().expect("extended entry");
-            assert_eq!(&ext.frames[..], b"FLUSHBATCHSYNCBATCH");
-            assert_eq!(ext.unnamed_parse.as_deref(), Some(&b"PARSE"[..]));
+            assert_eq!(
+                ext.frames,
+                [flush_batch.as_ref(), sync_batch.as_ref()].concat()
+            );
+            assert_eq!(ext.unnamed_parse.as_ref(), Some(&unnamed.0));
             assert_eq!(ext.defines, vec!["s1"]);
             assert_eq!(ts.statements[1].sql, "INSERT INTO t VALUES ($1)");
-            assert_eq!(ts.replay_bytes, "BEGIN".len() + 10 + 9 + 5);
+            assert_eq!(
+                ts.replay_bytes,
+                "BEGIN".len() + flush_batch.len() + sync_batch.len() + unnamed.0.len()
+            );
+        }
+
+        #[tokio::test]
+        async fn tr_recorder_does_not_retain_a_committed_transaction_prefix() {
+            let server = ProxyServer::new(test_config()).unwrap();
+            let session = make_test_session();
+            let mut tr = TrSession::new(TrMode::Transaction);
+            ProxyServer::note_ready_for_query(&session, b'T', false);
+            for sql in ["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT; BEGIN"] {
+                ProxyServer::tr_after_simple(&mut tr, &qmsg(sql), &session, &server.state).await;
+            }
+            let ts = session.tx_state.read().await;
+            assert!(ts.non_replayable);
+            assert!(ts.statements.is_empty());
+            assert_eq!(ts.replay_bytes, 0);
+        }
+
+        #[tokio::test]
+        async fn tr_recorder_preserves_later_held_parse_positions() {
+            for first_held in [false, true] {
+                let server = ProxyServer::new(test_config()).unwrap();
+                let session = make_test_session();
+                let mut tr = TrSession::new(TrMode::Transaction);
+                let registry = HashMap::new();
+                ProxyServer::note_ready_for_query(&session, b'T', false);
+                ProxyServer::tr_after_simple(&mut tr, &qmsg("BEGIN"), &session, &server.state)
+                    .await;
+                let mut expected = Vec::new();
+                for (index, sql) in ["SELECT 1", "SELECT 2", "SELECT 3"].iter().enumerate() {
+                    let parse = bytes::Bytes::from(frame(
+                        b'P',
+                        &[cstr(""), cstr(sql), vec![0; 2]].concat(),
+                    ));
+                    let mut frames = Vec::new();
+                    let held = if first_held || index > 0 {
+                        Some((parse.clone(), bytes::Bytes::new()))
+                    } else {
+                        frames.extend_from_slice(&parse);
+                        None
+                    };
+                    frames.extend_from_slice(&frame(b'B', &[0; 8]));
+                    frames.extend_from_slice(&frame(b'E', &[0; 5]));
+                    frames.extend_from_slice(&frame(if index == 2 { b'S' } else { b'H' }, &[]));
+                    if held.is_some() {
+                        expected.extend_from_slice(&parse);
+                    }
+                    expected.extend_from_slice(&frames);
+                    ProxyServer::tr_after_extended(
+                        &mut tr,
+                        &bytes::Bytes::from(frames),
+                        held.as_ref(),
+                        Some(sql),
+                        index == 2,
+                        &[],
+                        &[],
+                        &registry,
+                        &session,
+                        &server.state,
+                    )
+                    .await;
+                }
+                let ts = session.tx_state.read().await;
+                assert!(!ts.non_replayable);
+                assert_eq!(ts.statements.len(), 2);
+                let recorded = ts.statements[1].extended.as_ref().unwrap();
+                assert_eq!(
+                    [
+                        recorded.unnamed_parse.as_deref().unwrap_or(&[]),
+                        &recorded.frames
+                    ]
+                    .concat(),
+                    expected,
+                );
+                assert_eq!(ts.replay_bytes, "BEGIN".len() + expected.len());
+            }
+        }
+
+        #[tokio::test]
+        async fn tr_recorder_bounds_open_flush_cycle_before_sync() {
+            for statement_cap in [1, 256] {
+                let mut config = test_config();
+                config.limits.tr_max_replay_bytes = 64;
+                config.limits.tr_max_replay_statements = statement_cap;
+                let server = ProxyServer::new(config).unwrap();
+                let session = make_test_session();
+                let mut tr = TrSession::new(TrMode::Transaction);
+                ProxyServer::note_ready_for_query(&session, b'T', false);
+                ProxyServer::tr_after_simple(&mut tr, &qmsg("BEGIN"), &session, &server.state)
+                    .await;
+                let batch = bytes::Bytes::from(frame(b'H', &[]));
+                for _ in 0..32 {
+                    ProxyServer::tr_after_extended(
+                        &mut tr,
+                        &batch,
+                        None,
+                        None,
+                        false,
+                        &[],
+                        &[],
+                        &HashMap::new(),
+                        &session,
+                        &server.state,
+                    )
+                    .await;
+                    let retained = tr.ext_cycle.as_ref().map_or(0, |c| c.frames.len());
+                    assert!(retained + session.tx_state.read().await.replay_bytes <= 64);
+                }
+                assert!(tr.ext_cycle.is_none());
+                let ts = session.tx_state.read().await;
+                assert!(ts.non_replayable && ts.statements.is_empty());
+                assert_eq!(ts.replay_bytes, 0);
+                assert_eq!(
+                    server
+                        .state
+                        .metrics
+                        .tr
+                        .replay_cap_exceeded
+                        .load(Ordering::Relaxed),
+                    1
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn tr_recorder_retains_begin_before_first_sync_or_refuses_incomplete_history() {
+            for (cap, simple_end) in [(4096, false), (1, false), (4096, true)] {
+                let mut config = test_config();
+                config.limits.tr_max_replay_bytes = cap;
+                let server = ProxyServer::new(config).unwrap();
+                let session = make_test_session();
+                let mut tr = TrSession::new(TrMode::Transaction);
+                let parse = bytes::Bytes::from(frame(
+                    b'P',
+                    &[cstr(""), cstr("BEGIN"), vec![0; 2]].concat(),
+                ));
+                let held = (parse.clone(), bytes::Bytes::new());
+                let flush = bytes::Bytes::from(
+                    [frame(b'B', &[0; 8]), frame(b'E', &[0; 5]), frame(b'H', &[])].concat(),
+                );
+                // No RFQ has exposed BEGIN yet: both the client-visible and
+                // recorder status still say Idle when the Flush is retained.
+                ProxyServer::note_ready_for_query(&session, b'I', false);
+                ProxyServer::tr_after_extended(
+                    &mut tr,
+                    &flush,
+                    Some(&held),
+                    Some("BEGIN"),
+                    false,
+                    &[],
+                    &[],
+                    &HashMap::new(),
+                    &session,
+                    &server.state,
+                )
+                .await;
+                ProxyServer::note_ready_for_query(&session, b'T', false);
+                let sync = bytes::Bytes::from(frame(b'S', &[]));
+                if simple_end {
+                    ProxyServer::tr_after_simple(
+                        &mut tr,
+                        &qmsg("SELECT 1"),
+                        &session,
+                        &server.state,
+                    )
+                    .await;
+                } else {
+                    ProxyServer::tr_after_extended(
+                        &mut tr,
+                        &sync,
+                        None,
+                        None,
+                        true,
+                        &[],
+                        &[],
+                        &HashMap::new(),
+                        &session,
+                        &server.state,
+                    )
+                    .await;
+                }
+                let ts = session.tx_state.read().await;
+                if cap == 1 || simple_end {
+                    assert!(ts.non_replayable && ts.statements.is_empty());
+                } else {
+                    assert!(!ts.non_replayable);
+                    assert_eq!(ts.statements.len(), 1);
+                    let entry = ts.statements[0].extended.as_ref().unwrap();
+                    assert_eq!(
+                        [entry.unnamed_parse.as_deref().unwrap_or(&[]), &entry.frames].concat(),
+                        [parse.as_ref(), flush.as_ref(), sync.as_ref()].concat(),
+                    );
+                }
+                assert!(tr.ext_cycle.is_none());
+                assert!(!tr.ext_cycle_dropped);
+            }
+        }
+
+        #[tokio::test]
+        async fn tr_recorder_idle_flush_cap_does_not_taint_next_transaction() {
+            let mut config = test_config();
+            config.limits.tr_max_replay_bytes = 64;
+            let server = ProxyServer::new(config).unwrap();
+            let session = make_test_session();
+            let mut tr = TrSession::new(TrMode::Transaction);
+            ProxyServer::note_ready_for_query(&session, b'I', false);
+            for _ in 0..16 {
+                ProxyServer::tr_after_extended(
+                    &mut tr,
+                    &bytes::Bytes::from(frame(b'H', &[])),
+                    None,
+                    None,
+                    false,
+                    &[],
+                    &[],
+                    &HashMap::new(),
+                    &session,
+                    &server.state,
+                )
+                .await;
+            }
+            assert!(tr.ext_cycle_dropped);
+            ProxyServer::tr_after_extended(
+                &mut tr,
+                &bytes::Bytes::from(frame(b'S', &[])),
+                None,
+                None,
+                true,
+                &[],
+                &[],
+                &HashMap::new(),
+                &session,
+                &server.state,
+            )
+            .await;
+            assert!(!session.tx_state.read().await.non_replayable);
+            ProxyServer::note_ready_for_query(&session, b'T', false);
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("BEGIN"), &session, &server.state).await;
+            let ts = session.tx_state.read().await;
+            assert!(!ts.non_replayable);
+            assert_eq!(ts.statements.len(), 1);
         }
 
         #[test]

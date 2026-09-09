@@ -1,0 +1,51 @@
+{
+  "comparison": "Rebuilt unmodified baseline versus preserved TR-01 candidate benchmark executables",
+  "baseline_commit": "1dca229a9f87e2203cebb0a313e0432d21537dd5",
+  "binaries": {
+    "pooling": {
+      "candidate_binary": "/tmp/proxy-tr01-20260908/bench-control/candidate-pooling",
+      "candidate_sha256": "343329888745b65e85dfbaa600fcf2f16c26e683c357f793f7bcafa2b02619c2",
+      "build_output": "/home/gpc/HDB/Proxy/target-integ/release/deps/pooling-c0906c330ad84c20",
+      "baseline_binary": "/tmp/proxy-tr01-20260908/bench-control/baseline-pooling",
+      "baseline_sha256": "343329888745b65e85dfbaa600fcf2f16c26e683c357f793f7bcafa2b02619c2",
+      "identical_binary": true,
+      "candidate_text_sha256": "c9621c78914b34b436ce2a99876b898bfead4f8ef47ed7e020582276c30b6f18",
+      "baseline_text_sha256": "c9621c78914b34b436ce2a99876b898bfead4f8ef47ed7e020582276c30b6f18",
+      "identical_text": true
+    },
+    "protocol": {
+      "candidate_binary": "/tmp/proxy-tr01-20260908/bench-control/candidate-protocol",
+      "candidate_sha256": "915889d76d1b8afe6c947d53f573a4fc1a75c302eaa072f0e07ee1dac2d905a7",
+      "build_output": "/home/gpc/HDB/Proxy/target-integ/release/deps/protocol-146ec3e6530262ad",
+      "baseline_binary": "/tmp/proxy-tr01-20260908/bench-control/baseline-protocol",
+      "baseline_sha256": "915889d76d1b8afe6c947d53f573a4fc1a75c302eaa072f0e07ee1dac2d905a7",
+      "identical_binary": true,
+      "candidate_text_sha256": "c3ed354d9283d5183fbd5973e7142d8a2299764681657cda3cf6eb3e492b595a",
+      "baseline_text_sha256": "c3ed354d9283d5183fbd5973e7142d8a2299764681657cda3cf6eb3e492b595a",
+      "identical_text": true
+    },
+    "relay": {
+      "candidate_binary": "/tmp/proxy-tr01-20260908/bench-control/candidate-relay",
+      "candidate_sha256": "7a36dc1c2e76b6d36a0d2a112193627bf319909de3d3b13f0e3741a996a15921",
+      "build_output": "/home/gpc/HDB/Proxy/target-integ/release/deps/relay-cb64cbb865d2182d",
+      "baseline_binary": "/tmp/proxy-tr01-20260908/bench-control/baseline-relay",
+      "baseline_sha256": "7a36dc1c2e76b6d36a0d2a112193627bf319909de3d3b13f0e3741a996a15921",
+      "identical_binary": true,
+      "candidate_text_sha256": "33fcd1b384228faa6560ce0fc6b911cc6032a10acfe69df0be12ef0ab5524df4",
+      "baseline_text_sha256": "33fcd1b384228faa6560ce0fc6b911cc6032a10acfe69df0be12ef0ab5524df4",
+      "identical_text": true
+    },
+    "routing": {
+      "candidate_binary": "/tmp/proxy-tr01-20260908/bench-control/candidate-routing",
+      "candidate_sha256": "1172adb1c278ee723d0eafb5c0cb3f9752c9bd0af6fbedc0d719cd81ca0a9c39",
+      "build_output": "/home/gpc/HDB/Proxy/target-integ/release/deps/routing-78afbc60c16fcf35",
+      "baseline_binary": "/tmp/proxy-tr01-20260908/bench-control/baseline-routing",
+      "baseline_sha256": "1172adb1c278ee723d0eafb5c0cb3f9752c9bd0af6fbedc0d719cd81ca0a9c39",
+      "identical_binary": true,
+      "candidate_text_sha256": "1be0011c68c2149f44236c0dfc1e24e9819a04340ad94b589911735c355e38ae",
+      "baseline_text_sha256": "1be0011c68c2149f44236c0dfc1e24e9819a04340ad94b589911735c355e38ae",
+      "identical_text": true
+    }
+  },
+  "limitation": "Binary/text identity checks do not measure the daemon relay or establish its performance."
+}

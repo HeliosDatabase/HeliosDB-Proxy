@@ -1,0 +1,165 @@
+{
+  "date": "2026-09-08",
+  "commit": "1dca229a9f87e2203cebb0a313e0432d21537dd5",
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+  "scope": {
+    "memory_max": "24G",
+    "memory_swap_max": 0,
+    "build_jobs": 2,
+    "test_threads": 2,
+    "fleet_build_lock": true
+  },
+  "backend_environment": "No live backend configured; fixture-dependent integration tests can return early.",
+  "gates": [
+    {
+      "gate": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--check"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/proxy-audit-20260908/fmt.log",
+      "results": [],
+      "warnings": []
+    },
+    {
+      "gate": "test-default",
+      "command": [
+        "cargo",
+        "test",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/proxy-audit-20260908/test-default.log",
+      "results": [
+        "test result: ok. 404 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.79s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 45 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.06s"
+      ],
+      "warnings": []
+    },
+    {
+      "gate": "test-ha-tr",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--features",
+        "ha-tr"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/proxy-audit-20260908/test-ha-tr.log",
+      "results": [
+        "test result: ok. 490 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.83s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 45 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.07s"
+      ],
+      "warnings": []
+    },
+    {
+      "gate": "test-all",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--features",
+        "all-features"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/proxy-audit-20260908/test-all.log",
+      "results": [
+        "test result: ok. 1698 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.57s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 45 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.03s",
+        "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 1 passed; 0 failed; 12 ignored; 0 measured; 0 filtered out; finished in 0.09s"
+      ],
+      "warnings": []
+    },
+    {
+      "gate": "test-all-pg",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--features",
+        "all-features,postgres-topology"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/proxy-audit-20260908/test-all-pg.log",
+      "results": [
+        "test result: ok. 1699 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.56s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 45 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.03s",
+        "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 1 passed; 0 failed; 12 ignored; 0 measured; 0 filtered out; finished in 0.08s"
+      ],
+      "warnings": []
+    },
+    {
+      "gate": "test-no-default",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/proxy-audit-20260908/test-no-default.log",
+      "results": [
+        "test result: ok. 323 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.76s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 45 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s"
+      ],
+      "warnings": [
+        "warning: field `dirty` is never read",
+        "warning: `heliosdb-proxy` (lib) generated 1 warning",
+        "warning: `heliosdb-proxy` (lib test) generated 1 warning (1 duplicate)"
+      ]
+    },
+    {
+      "gate": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--features",
+        "all-features",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/proxy-audit-20260908/clippy.log",
+      "results": [],
+      "warnings": []
+    },
+    {
+      "gate": "msrv",
+      "command": [
+        "cargo",
+        "+1.86",
+        "check",
+        "--locked",
+        "--features",
+        "msrv-features"
+      ],
+      "exit_code": 0,
+      "log": "/tmp/proxy-audit-20260908/msrv.log",
+      "results": [],
+      "warnings": []
+    }
+  ]
+}
