@@ -1,0 +1,96 @@
+{
+  "fixture": "disposable PostgreSQL; response dropped after successful COMMIT/PREPARE RFQ",
+  "postgres_version": "18.4 (Debian 18.4-1.pgdg12+1)",
+  "binary": "/tmp/proxy-tr01-20260908/proxy-default",
+  "sha256": "a61522336afea846d3b807938b2edd26ac7bcb5d64c79e58016d77c08a4cf83f",
+  "cases": [
+    {
+      "case": "plain_commit",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "ledger_rows": 1,
+      "invariant": "PASS"
+    },
+    {
+      "case": "commented_commit",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "ledger_rows": 1,
+      "invariant": "PASS"
+    },
+    {
+      "case": "commented_end",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "ledger_rows": 1,
+      "invariant": "PASS"
+    },
+    {
+      "case": "multi_query_commit",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "ledger_rows": 1,
+      "invariant": "PASS"
+    },
+    {
+      "case": "extended_commit",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "ledger_rows": 1,
+      "invariant": "PASS"
+    },
+    {
+      "case": "commit_and_begin",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "ledger_rows": 1,
+      "invariant": "PASS"
+    },
+    {
+      "case": "prepared_transaction",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "prepared_outcomes": [
+        "audit_prepared"
+      ],
+      "ledger_rows": 1,
+      "invariant": "PASS"
+    }
+  ],
+  "failures": 0
+}

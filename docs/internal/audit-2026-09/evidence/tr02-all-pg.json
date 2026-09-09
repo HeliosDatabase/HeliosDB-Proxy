@@ -1,0 +1,357 @@
+{
+  "binary": "/tmp/proxy-tr02-20260909/proxy-all-pg",
+  "sha256": "cd6c86db3c40b5980521c01a3b4b077d65943ef63eefb5698be743269dbd8a1e",
+  "fixture": "synthetic PG-wire; no database",
+  "cases": [
+    {
+      "case": "plain_commit_unknown",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "commented_commit_unknown",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "extended_commit_unknown",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "partial_select",
+      "mode": "select",
+      "response_tags": "TDEZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 1,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "partial_select_large",
+      "mode": "select",
+      "response_tags": "TDEZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 1,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "partial_select_slow_reader",
+      "mode": "select",
+      "response_tags": "TDEZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 1,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "partial_none",
+      "mode": "none",
+      "response_tags": "TDEZ",
+      "sqlstates": [
+        "57P01"
+      ],
+      "data_rows": 1,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "partial_session",
+      "mode": "session",
+      "response_tags": "TDEZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 1,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "partial_transaction",
+      "mode": "transaction",
+      "response_tags": "TDEZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 1,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "partial_select_complete",
+      "mode": "select",
+      "response_tags": "TDC",
+      "sqlstates": [],
+      "data_rows": 1,
+      "replacement_queries": [],
+      "connection_closed": true,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "partial_select_error",
+      "mode": "select",
+      "response_tags": "E",
+      "sqlstates": [
+        "XX000"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "connection_closed": true,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "partial_extended",
+      "mode": "select",
+      "response_tags": "12TDEZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 1,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "partial_extended_flush",
+      "mode": "select",
+      "response_tags": "12TD",
+      "sqlstates": [],
+      "data_rows": 1,
+      "replacement_queries": [],
+      "connection_closed": true,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "partial_extended_fragment",
+      "mode": "select",
+      "response_tags": "12",
+      "sqlstates": [],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "connection_closed": true,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 3,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "partial_unnamed",
+      "mode": "select",
+      "response_tags": "12TDEZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 1,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": true,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "partial_unnamed_warm",
+      "mode": "select",
+      "response_tags": "12TDEZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 1,
+      "replacement_queries": [],
+      "connection_closed": false,
+      "unnamed": true,
+      "warm": true,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "partial_unnamed_fragment",
+      "mode": "select",
+      "response_tags": "12",
+      "sqlstates": [],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "connection_closed": true,
+      "unnamed": true,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 3,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "partial_none_flush",
+      "mode": "none",
+      "response_tags": "12TD",
+      "sqlstates": [],
+      "data_rows": 1,
+      "replacement_queries": [],
+      "connection_closed": true,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "partial_session_flush",
+      "mode": "session",
+      "response_tags": "12TD",
+      "sqlstates": [],
+      "data_rows": 1,
+      "replacement_queries": [],
+      "connection_closed": true,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "transaction_replay_control",
+      "mode": "transaction",
+      "response_tags": "TDDCZ",
+      "sqlstates": [],
+      "data_rows": 2,
+      "replacement_queries": [
+        "BEGIN",
+        "INSERT INTO audit VALUES (1)",
+        "SELECT 1"
+      ],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    },
+    {
+      "case": "extended_replay_control",
+      "mode": "transaction",
+      "response_tags": "12TDDCZ",
+      "sqlstates": [],
+      "data_rows": 2,
+      "replacement_queries": [
+        "BEGIN",
+        "INSERT INTO audit VALUES (1)",
+        "SELECT 1"
+      ],
+      "connection_closed": false,
+      "unnamed": false,
+      "warm": false,
+      "response_timed_out": false,
+      "trailing_response_bytes": 0,
+      "malformed_response": false,
+      "invariant": "PASS"
+    }
+  ],
+  "failures": 0
+}

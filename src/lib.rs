@@ -78,6 +78,7 @@ pub mod pipeline;
 pub mod plugin_registry;
 pub mod primary_tracker;
 pub mod protocol;
+mod replay_sql;
 pub mod request;
 pub mod server;
 pub mod switchover_buffer;

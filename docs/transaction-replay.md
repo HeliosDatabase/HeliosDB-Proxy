@@ -1,5 +1,22 @@
 # Transaction Replay (TR) — Deep Dive
 
+> **Historical implementation description:** this guide predates 1.6.0's in-session
+> replay. That recovery path now runs in core, including builds without `ha-tr`;
+> `ha-tr` gates the separate journal and administrative replay modules. The
+> [2026-09-08 audit](internal/audit-2026-09/README.md) documents the current paths
+> and remaining work. The unknown-COMMIT and partial-result retry defects it recorded
+> are fixed: a possibly-committed statement is never re-executed, and recovery never
+> appends a second result to a response the client has already partly received.
+> Use that audit when assessing current replay guarantees.
+>
+> **Two limits worth knowing.** Replay resends the client's original SQL, so a
+> statement whose commit boundary cannot be established lexically is refused rather
+> than guessed — including a literal where a backslash could hide a statement
+> separator under `standard_conforming_strings = off`. And an `Execute` whose `Bind`
+> or `Parse` came from an earlier completed protocol cycle is opaque to recovery: the
+> statement still runs normally, but an uncertain outcome returns `08007` instead of
+> replaying.
+
 Transaction Replay is HeliosProxy's failover-continuity subsystem: a per-write
 transaction journal plus a replay engine that can re-execute journaled statements on a
 new backend after a primary change, so that a failover looks to the client like a slow
