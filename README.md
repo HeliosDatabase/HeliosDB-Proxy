@@ -10,6 +10,12 @@ HeliosProxy operates at the PostgreSQL wire protocol level, making it compatible
 
 HeliosProxy sits between your application and your database cluster, providing transparent connection pooling, automatic failover, intelligent query routing, programmable plugins, and operations tooling without application code changes.
 
+**Verification status (2026-09-08):** the [1.6.0 feature audit](docs/internal/audit-2026-09/README.md)
+records passing build/test gates, reproducible Transaction Replay safety defects,
+and advertised library capabilities that are not wired into the daemon. Consult
+that support assessment and the [prioritized improvement backlog](docs/internal/audit-2026-09/IMPROVEMENTS.md)
+when evaluating HA, replay, or distributed deployment guarantees.
+
 ```
 ┌──────────────┐     ┌─────────────────────────────────────────────────┐     ┌──────────────┐
 │              │     │                  HeliosProxy                    │     │   Primary    │

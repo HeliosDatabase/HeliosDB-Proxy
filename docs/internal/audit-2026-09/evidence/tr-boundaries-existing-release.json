@@ -1,0 +1,130 @@
+{
+  "binary": "/home/gpc/HDB/Proxy/target-integ/release/heliosdb-proxy",
+  "sha256": "0c486ef053c8fd8718767f7951f41c704869b4a01df30f4c71a743acba4f83d4",
+  "fixture": "synthetic PG-wire; no database",
+  "cases": [
+    {
+      "case": "plain_commit_unknown",
+      "mode": "transaction",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "invariant": "PASS"
+    },
+    {
+      "case": "commented_commit_unknown",
+      "mode": "transaction",
+      "response_tags": "CZ",
+      "sqlstates": [],
+      "data_rows": 0,
+      "replacement_queries": [
+        "BEGIN",
+        "INSERT INTO audit VALUES (1)",
+        "/* audit */ COMMIT"
+      ],
+      "invariant": "FAIL"
+    },
+    {
+      "case": "extended_commit_unknown",
+      "mode": "transaction",
+      "response_tags": "12TDDC12CZ",
+      "sqlstates": [],
+      "data_rows": 2,
+      "replacement_queries": [
+        "BEGIN",
+        "INSERT INTO audit VALUES (1)",
+        "SELECT 1",
+        "COMMIT"
+      ],
+      "invariant": "FAIL"
+    },
+    {
+      "case": "partial_select",
+      "mode": "select",
+      "response_tags": "TDTDDCZ",
+      "sqlstates": [],
+      "data_rows": 3,
+      "replacement_queries": [
+        "SELECT 1"
+      ],
+      "invariant": "FAIL"
+    },
+    {
+      "case": "volatile_select",
+      "mode": "select",
+      "response_tags": "TDDCZ",
+      "sqlstates": [],
+      "data_rows": 2,
+      "replacement_queries": [
+        "SELECT audit_side_effect()"
+      ],
+      "invariant": "FAIL"
+    },
+    {
+      "case": "guc_cap",
+      "mode": "session",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [
+        "SET application_name = 'first'"
+      ],
+      "invariant": "FAIL"
+    },
+    {
+      "case": "guc_savepoint",
+      "mode": "session",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [
+        "SET application_name = 'base'",
+        "SET application_name = 'undone'"
+      ],
+      "invariant": "FAIL"
+    },
+    {
+      "case": "guc_reset_rollback",
+      "mode": "session",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "08007"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "invariant": "FAIL"
+    },
+    {
+      "case": "none_control",
+      "mode": "none",
+      "response_tags": "EZ",
+      "sqlstates": [
+        "57P01"
+      ],
+      "data_rows": 0,
+      "replacement_queries": [],
+      "invariant": "PASS"
+    },
+    {
+      "case": "transaction_replay_control",
+      "mode": "transaction",
+      "response_tags": "TDDCZ",
+      "sqlstates": [],
+      "data_rows": 2,
+      "replacement_queries": [
+        "BEGIN",
+        "INSERT INTO audit VALUES (1)",
+        "SELECT 1"
+      ],
+      "invariant": "PASS"
+    }
+  ],
+  "failures": 7
+}
