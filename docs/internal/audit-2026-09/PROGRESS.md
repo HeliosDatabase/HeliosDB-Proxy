@@ -12,7 +12,7 @@ complete. Global guarantees must remain consistent with actual backend capabilit
 | TR-01 | Commit-boundary safeguards passed initial gates; held-Parse/Flush follow-ups queued | Acknowledged cross-cycle statement/portal identity; validate follow-ups and complete acceptance evidence |
 | TR-05 | Conservative partial-write handling passed functional/lint/MSRV gates | Investigate per-benchmark regressions before final acceptance |
 | TR-02 | Streaming guard and recorder follow-ups passed targeted validation; the uncovered backend-watch publication path found in review is now frame-aligned | Optional bounded response buffering and performance/memory acceptance |
-| H-07 | Newly recorded P0 finding; the idle backend-watch path now validates frame lengths and bounds reassembly | Enforce response-frame bounds on the remaining streaming paths, with malformed/slow-drip tests |
+| H-07 | Frame-header validation applied on EVERY backend streaming relay (`stream_until_ready`, capture, replay drain, pool reset, re-prepare reader, idle watch) via `backend_frame_len` and the new `[limits] max_backend_frame_bytes` (default 100 MiB); malformed (< 4) or oversize headers close the backend immediately; the re-prepare reader no longer allocates the advertised body size | Slow-drip: a backend dripping bytes inside one frame resets the per-read `backend_read_timeout` each time — a whole-response deadline is TR-06's "one recovery deadline"; track there |
 | Other items | Open | Work through the dependency order in IMPROVEMENTS.md |
 
 ## Independent review, 2026-09-09 (Claude)

@@ -180,6 +180,41 @@ fn anomaly_fingerprint(sql: &str) -> String {
 /// client-facing buffers in this file already use to bound frame/pending
 /// accumulation (see the `max_pending_bytes` checks above in the data
 /// path), reused here rather than inventing a second size limit.
+/// Read one backend frame header out of `rem` and validate it (H-07).
+///
+/// `Ok(None)` when fewer than the 5 header bytes are present. `Err` when the
+/// declared length is below the 4-byte protocol minimum (no further bytes can
+/// make it a valid frame, so waiting is a hang) or above `max` (the accumulator
+/// would otherwise grow toward whatever the backend advertises). `Ok(Some(len))`
+/// is the declared length; the frame occupies `len + 1` bytes, and because
+/// `len <= max <= usize::MAX - 1` is enforced here that addition cannot overflow.
+fn backend_frame_len(rem: &[u8], max: usize) -> Result<Option<usize>> {
+    if rem.len() < 5 {
+        return Ok(None);
+    }
+    let len = u32::from_be_bytes([rem[1], rem[2], rem[3], rem[4]]) as usize;
+    if len < 4 {
+        return Err(ProxyError::Protocol(format!(
+            "backend frame '{}' declares length {} below the 4-byte minimum",
+            rem[0] as char, len
+        )));
+    }
+    validate_backend_frame_len(len, max.min(usize::MAX - 1))?;
+    Ok(Some(len))
+}
+
+/// The budgets one streaming relay needs, resolved from `[limits]`. Only the
+/// cache-capture relay takes them as a bundle (clippy's argument cap); the plain
+/// relays read `state.limits` directly, so this is gated with that relay.
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+#[derive(Debug, Clone, Copy)]
+struct RelayLimits {
+    client_write_timeout: Duration,
+    backend_read_timeout: Duration,
+    /// H-07 backend frame budget (`[limits] max_backend_frame_bytes`).
+    max_frame_bytes: usize,
+}
+
 fn validate_backend_frame_len(len: usize, max: usize) -> Result<()> {
     if len > max {
         return Err(ProxyError::Protocol(format!(
@@ -206,6 +241,9 @@ struct ResolvedLimits {
     max_prepared_statements: usize,
     max_prepared_bytes: usize,
     max_pending_bytes: usize,
+    /// Cap on one backend response frame's declared length on every streaming
+    /// relay (H-07); `[limits] max_backend_frame_bytes`.
+    max_backend_frame_bytes: usize,
     /// Only read on the pool-modes data path; gated to avoid a dead-field
     /// warning on feature-off builds.
     #[cfg(feature = "pool-modes")]
@@ -228,6 +266,15 @@ struct ResolvedLimits {
 }
 
 impl ResolvedLimits {
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    fn relay(&self) -> RelayLimits {
+        RelayLimits {
+            client_write_timeout: self.client_write_timeout,
+            backend_read_timeout: self.backend_read_timeout,
+            max_frame_bytes: self.max_backend_frame_bytes,
+        }
+    }
+
     fn from_toml(l: &crate::config::LimitsToml) -> Self {
         Self {
             max_cancel_keys: l.max_cancel_keys,
@@ -239,6 +286,7 @@ impl ResolvedLimits {
             max_prepared_statements: l.max_prepared_statements,
             max_prepared_bytes: l.max_prepared_bytes,
             max_pending_bytes: l.max_pending_bytes,
+            max_backend_frame_bytes: l.max_backend_frame_bytes,
             #[cfg(feature = "pool-modes")]
             max_total_idle_backend_conns: l.max_total_idle_backend_conns,
             pool_reap_interval: Duration::from_secs(l.pool_reap_interval_secs),
@@ -2427,19 +2475,9 @@ impl ProxyServer {
     /// error for a length below the 4-byte minimum: that is a malformed frame,
     /// and treating it as "incomplete" would stall reassembly until the session
     /// buffer cap instead of surfacing the fault (H-07).
-    fn complete_frame_prefix(buf: &[u8]) -> Result<usize> {
+    fn complete_frame_prefix(buf: &[u8], max_frame_bytes: usize) -> Result<usize> {
         let mut off = 0usize;
-        while off + 5 <= buf.len() {
-            let len = u32::from_be_bytes([buf[off + 1], buf[off + 2], buf[off + 3], buf[off + 4]])
-                as usize;
-            if len < 4 {
-                return Err(ProxyError::Protocol(format!(
-                    "backend frame '{}' declares length {} below the 4-byte minimum",
-                    buf[off] as char, len
-                )));
-            }
-            // `len` is at most u32::MAX and `off` is bounded by the buffer, so
-            // this cannot overflow on any supported platform.
+        while let Some(len) = backend_frame_len(&buf[off..], max_frame_bytes)? {
             let end = off + 1 + len;
             if end > buf.len() {
                 break;
@@ -2500,7 +2538,7 @@ impl ProxyServer {
                             // not an ErrorResponse, and certainly not the rows of
                             // a re-executed statement, which would be appended to
                             // whatever the partial frame turns out to be.
-                            let whole = Self::complete_frame_prefix(abuf)?;
+                            let whole = Self::complete_frame_prefix(abuf, state.limits.max_backend_frame_bytes)?;
                             if whole > 0 {
                                 tokio::time::timeout(state.limits.client_write_timeout, stream.write_all(&abuf[..whole]))
                                     .await
@@ -4484,6 +4522,7 @@ impl ProxyServer {
         stream: &mut S,
         reset_sql: &str,
         backend_write_timeout: Duration,
+        max_frame_bytes: usize,
     ) -> Result<()> {
         let msg = crate::protocol::QueryMessage {
             query: reset_sql.to_string(),
@@ -4503,11 +4542,10 @@ impl ProxyServer {
             let mut ready_status: Option<u8> = None;
             loop {
                 let rem = &buf[consumed..];
-                if rem.len() < 5 {
+                let Some(len) = backend_frame_len(rem, max_frame_bytes)? else {
                     break;
-                }
-                let len = u32::from_be_bytes([rem[1], rem[2], rem[3], rem[4]]) as usize;
-                if len < 4 || rem.len() < len + 1 {
+                };
+                if rem.len() < len + 1 {
                     break;
                 }
                 let mtype = rem[0];
@@ -4602,6 +4640,7 @@ impl ProxyServer {
             &mut bc.stream,
             &config.pool_mode.reset_query,
             state.limits.backend_write_timeout,
+            state.limits.max_backend_frame_bytes,
         )
         .await
         .is_ok()
@@ -5023,8 +5062,7 @@ impl ProxyServer {
                     client,
                     &mut backend.stream,
                     session,
-                    state.limits.client_write_timeout,
-                    state.limits.backend_read_timeout,
+                    state.limits.relay(),
                     config.cache.max_cacheable_response_bytes,
                     &state.metrics,
                 )
@@ -5307,6 +5345,7 @@ impl ProxyServer {
                 &mut backend.stream,
                 parse_bytes,
                 state.limits.reprepare_timeout,
+                state.limits.max_backend_frame_bytes,
             )
             .await
             {
@@ -5440,6 +5479,7 @@ impl ProxyServer {
         backend: &mut S,
         parse_bytes: &[u8],
         reprepare_timeout: Duration,
+        max_frame_bytes: usize,
     ) -> Result<()> {
         tokio::time::timeout(reprepare_timeout, backend.write_all(parse_bytes))
             .await
@@ -5450,9 +5490,12 @@ impl ProxyServer {
             .await
             .map_err(|_| ProxyError::Network("re-prepare flush timeout".to_string()))?
             .map_err(|e| ProxyError::Network(format!("re-prepare flush error: {}", e)))?;
-        let mtype = tokio::time::timeout(reprepare_timeout, Self::read_one_frame_type(backend))
-            .await
-            .map_err(|_| ProxyError::Network("re-prepare read timeout".to_string()))??;
+        let mtype = tokio::time::timeout(
+            reprepare_timeout,
+            Self::read_one_frame_type(backend, max_frame_bytes),
+        )
+        .await
+        .map_err(|_| ProxyError::Network("re-prepare read timeout".to_string()))??;
         match mtype {
             b'1' => Ok(()), // ParseComplete
             b'E' => Err(ProxyError::Protocol(
@@ -5468,20 +5511,27 @@ impl ProxyServer {
     /// Read exactly one backend message frame (5-byte header + body) and return
     /// its type byte, discarding the body. Used to consume the `ParseComplete`
     /// produced by an out-of-band re-prepare.
-    async fn read_one_frame_type<S: AsyncReadExt + Unpin>(backend: &mut S) -> Result<u8> {
+    async fn read_one_frame_type<S: AsyncReadExt + Unpin>(
+        backend: &mut S,
+        max_frame_bytes: usize,
+    ) -> Result<u8> {
         let mut header = [0u8; 5];
         backend
             .read_exact(&mut header)
             .await
             .map_err(|e| ProxyError::Network(format!("re-prepare read error: {}", e)))?;
-        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-        let body_len = len.saturating_sub(4);
-        if body_len > 0 {
-            let mut body = vec![0u8; body_len];
+        // H-07: validate before trusting the length, and never allocate the
+        // advertised body size — discard it through a fixed scratch buffer.
+        let len = backend_frame_len(&header, max_frame_bytes)?.expect("5 header bytes were read");
+        let mut remaining = len - 4;
+        let mut scratch = [0u8; 16 * 1024];
+        while remaining > 0 {
+            let n = remaining.min(scratch.len());
             backend
-                .read_exact(&mut body)
+                .read_exact(&mut scratch[..n])
                 .await
                 .map_err(|e| ProxyError::Network(format!("re-prepare body read error: {}", e)))?;
+            remaining -= n;
         }
         Ok(header[0])
     }
@@ -5544,12 +5594,15 @@ impl ProxyServer {
                 let mut yield_for_copy = false;
                 loop {
                     let rem = &buf[consumed..];
-                    if rem.len() < 5 {
+                    // H-07: a malformed header (len < 4, or above the budget) is
+                    // an error NOW, not "wait for more bytes" — no byte count can
+                    // make it valid and the accumulator must not chase it.
+                    let Some(len) = backend_frame_len(rem, state.limits.max_backend_frame_bytes)?
+                    else {
                         break;
-                    }
-                    let len = u32::from_be_bytes([rem[1], rem[2], rem[3], rem[4]]) as usize;
-                    if len < 4 || rem.len() < len + 1 {
-                        break; // incomplete or malformed length — need more bytes
+                    };
+                    if rem.len() < len + 1 {
+                        break; // incomplete — need more bytes
                     }
                     let frame_total = len + 1;
                     let mtype = rem[0];
@@ -5646,8 +5699,7 @@ impl ProxyServer {
         client: &mut ClientStream,
         backend: &mut TcpStream,
         session: &Arc<ClientSession>,
-        client_write_timeout: Duration,
-        backend_read_timeout: Duration,
+        relay: RelayLimits,
         max_capture_bytes: usize,
         metrics: &ServerMetrics,
     ) -> std::result::Result<(u64, Vec<u8>, bool, usize), ResponseFailure> {
@@ -5669,11 +5721,10 @@ impl ProxyServer {
                 let mut yield_for_copy = false;
                 loop {
                     let rem = &buf[consumed..];
-                    if rem.len() < 5 {
+                    let Some(len) = backend_frame_len(rem, relay.max_frame_bytes)? else {
                         break;
-                    }
-                    let len = u32::from_be_bytes([rem[1], rem[2], rem[3], rem[4]]) as usize;
-                    if len < 4 || rem.len() < len + 1 {
+                    };
+                    if rem.len() < len + 1 {
                         break;
                     }
                     let frame_total = len + 1;
@@ -5713,10 +5764,13 @@ impl ProxyServer {
                 }
 
                 if consumed > 0 {
-                    tokio::time::timeout(client_write_timeout, client.write_all(&buf[..consumed]))
-                        .await
-                        .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
-                        .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+                    tokio::time::timeout(
+                        relay.client_write_timeout,
+                        client.write_all(&buf[..consumed]),
+                    )
+                    .await
+                    .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
+                    .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
                     if !oversize {
                         if captured.len().saturating_add(consumed) > max_capture_bytes {
                             oversize = true;
@@ -5754,10 +5808,11 @@ impl ProxyServer {
 
                 // Read straight into the frame accumulator — no zeroed scratch.
                 buf.reserve(16384);
-                let n = tokio::time::timeout(backend_read_timeout, backend.read_buf(&mut buf))
-                    .await
-                    .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
-                    .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
+                let n =
+                    tokio::time::timeout(relay.backend_read_timeout, backend.read_buf(&mut buf))
+                        .await
+                        .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
+                        .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
                 if n == 0 {
                     return Err(ProxyError::Connection(
                         "Backend closed mid-response".to_string(),
@@ -9069,6 +9124,7 @@ impl ProxyServer {
     async fn drain_until_ready<S: AsyncReadExt + Unpin>(
         backend: &mut S,
         read_timeout: Duration,
+        max_frame_bytes: usize,
     ) -> Result<(u8, bool)> {
         let mut buf = BytesMut::with_capacity(4096);
         let mut had_error = false;
@@ -9077,15 +9133,9 @@ impl ProxyServer {
             let mut ready: Option<u8> = None;
             loop {
                 let rem = &buf[consumed..];
-                if rem.len() < 5 {
+                let Some(len) = backend_frame_len(rem, max_frame_bytes)? else {
                     break;
-                }
-                let len = u32::from_be_bytes([rem[1], rem[2], rem[3], rem[4]]) as usize;
-                if len < 4 {
-                    return Err(ProxyError::Protocol(
-                        "malformed backend frame during replay".to_string(),
-                    ));
-                }
+                };
                 if rem.len() < len + 1 {
                     break;
                 }
@@ -9131,6 +9181,7 @@ impl ProxyServer {
         sql: &str,
         write_timeout: Duration,
         read_timeout: Duration,
+        max_frame_bytes: usize,
     ) -> Result<u8> {
         let msg = crate::protocol::QueryMessage {
             query: sql.to_string(),
@@ -9141,7 +9192,8 @@ impl ProxyServer {
             .await
             .map_err(|_| ProxyError::Network("replay write timeout".to_string()))?
             .map_err(|e| ProxyError::Network(format!("replay write error: {}", e)))?;
-        let (status, had_error) = Self::drain_until_ready(backend, read_timeout).await?;
+        let (status, had_error) =
+            Self::drain_until_ready(backend, read_timeout, max_frame_bytes).await?;
         if had_error {
             return Err(ProxyError::Protocol(format!(
                 "backend rejected replayed statement: {}",
@@ -9175,9 +9227,11 @@ impl ProxyServer {
         gucs: &[String],
         write_timeout: Duration,
         read_timeout: Duration,
+        max_frame_bytes: usize,
     ) -> Result<usize> {
         for sql in gucs {
-            Self::tr_run_discard(backend, sql, write_timeout, read_timeout).await?;
+            Self::tr_run_discard(backend, sql, write_timeout, read_timeout, max_frame_bytes)
+                .await?;
         }
         Ok(gucs.len())
     }
@@ -9206,6 +9260,7 @@ impl ProxyServer {
                         &tr.gucs,
                         state.limits.backend_write_timeout,
                         state.limits.backend_read_timeout,
+                        state.limits.max_backend_frame_bytes,
                     )
                     .await
                     {
@@ -9265,10 +9320,11 @@ impl ProxyServer {
         })?;
         let wt = state.limits.backend_write_timeout;
         let rt = state.limits.backend_read_timeout;
+        let mf = state.limits.max_backend_frame_bytes;
         let total = entries.len();
         for (i, st) in entries.iter().enumerate() {
             let status = match &st.extended {
-                None => Self::tr_run_discard(&mut bc.stream, &st.sql, wt, rt)
+                None => Self::tr_run_discard(&mut bc.stream, &st.sql, wt, rt, mf)
                     .await
                     .map_err(|e| match e {
                         ProxyError::Protocol(_) => ReplayFailure::Statement(format!(
@@ -9291,6 +9347,7 @@ impl ProxyServer {
                             &mut bc.stream,
                             parse_bytes,
                             state.limits.reprepare_timeout,
+                            state.limits.max_backend_frame_bytes,
                         )
                         .await
                         .map_err(|e| match e {
@@ -9322,7 +9379,7 @@ impl ProxyServer {
                                 e
                             )))
                         })?;
-                    let (status, had_error) = Self::drain_until_ready(&mut bc.stream, rt)
+                    let (status, had_error) = Self::drain_until_ready(&mut bc.stream, rt, mf)
                         .await
                         .map_err(ReplayFailure::Backend)?;
                     if had_error {
@@ -9575,6 +9632,7 @@ impl ProxyServer {
                                             "ROLLBACK",
                                             state.limits.backend_write_timeout,
                                             state.limits.backend_read_timeout,
+                                            state.limits.max_backend_frame_bytes,
                                         )
                                         .await;
                                     }
@@ -10639,10 +10697,14 @@ mod tests {
         // frame 1: '1' + len(4) + no body; frame 2: 'Z' + len(5) + 'I'.
         let bytes = [b'1', 0, 0, 0, 4, b'Z', 0, 0, 0, 5, b'I'];
         b.write_all(&bytes).await.unwrap();
-        let t = ProxyServer::read_one_frame_type(&mut a).await.unwrap();
+        let t = ProxyServer::read_one_frame_type(&mut a, usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(t, b'1');
         // The next frame's type byte is still readable -> we stopped cleanly.
-        let t2 = ProxyServer::read_one_frame_type(&mut a).await.unwrap();
+        let t2 = ProxyServer::read_one_frame_type(&mut a, usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(t2, b'Z');
     }
 
@@ -10658,20 +10720,26 @@ mod tests {
             p.extend_from_slice(&[0, 0]);
             p
         };
-        assert!(
-            ProxyServer::reprepare_statement(&mut client, &parse, Duration::from_secs(15))
-                .await
-                .is_ok()
-        );
+        assert!(ProxyServer::reprepare_statement(
+            &mut client,
+            &parse,
+            Duration::from_secs(15),
+            usize::MAX
+        )
+        .await
+        .is_ok());
 
         // Backend answers ErrorResponse -> Err.
         let (mut client2, mut backend2) = tokio::io::duplex(64);
         backend2.write_all(&[b'E', 0, 0, 0, 4]).await.unwrap();
-        assert!(
-            ProxyServer::reprepare_statement(&mut client2, &parse, Duration::from_secs(15))
-                .await
-                .is_err()
-        );
+        assert!(ProxyServer::reprepare_statement(
+            &mut client2,
+            &parse,
+            Duration::from_secs(15),
+            usize::MAX
+        )
+        .await
+        .is_err());
     }
 
     // ---- routing-hints: SQL-comment hint → RouteOverride mapping ----
@@ -11447,8 +11515,11 @@ mod tests {
                 &mut client,
                 &mut backend,
                 &session,
-                Duration::from_secs(60),
-                Duration::from_secs(30),
+                RelayLimits {
+                    client_write_timeout: Duration::from_secs(60),
+                    backend_read_timeout: Duration::from_secs(30),
+                    max_frame_bytes: usize::MAX,
+                },
                 usize::MAX,
                 &metrics,
             )
@@ -11545,8 +11616,11 @@ mod tests {
                 &mut client,
                 &mut backend,
                 &session,
-                Duration::from_secs(60),
-                Duration::from_secs(30),
+                RelayLimits {
+                    client_write_timeout: Duration::from_secs(60),
+                    backend_read_timeout: Duration::from_secs(30),
+                    max_frame_bytes: usize::MAX,
+                },
                 CAP,
                 &metrics,
             )
@@ -12448,6 +12522,117 @@ mod tests {
         assert_eq!(got, whole, "the frame must arrive byte-exact");
     }
 
+    /// H-07: every relay validates a backend frame header the moment it is
+    /// readable. A length below the 4-byte minimum or above the configured
+    /// budget is an error immediately — never "wait for more bytes", and never
+    /// an accumulator growing toward the advertised size.
+    #[test]
+    fn backend_frame_len_rejects_malformed_and_oversize_headers() {
+        // Incomplete header: undecided, not an error.
+        assert!(backend_frame_len(&[b'D', 0, 0], 1024).unwrap().is_none());
+        assert!(backend_frame_len(&[], 1024).unwrap().is_none());
+        // Smallest legal frame (ReadyForQuery, len 5) passes a budget of 5.
+        assert_eq!(
+            backend_frame_len(&[b'Z', 0, 0, 0, 5, b'I'], 5).unwrap(),
+            Some(5)
+        );
+        // Below the self-counting minimum: malformed, fail closed now.
+        for len in [0u32, 1, 2, 3] {
+            let mut h = vec![b'D'];
+            h.extend_from_slice(&len.to_be_bytes());
+            assert!(backend_frame_len(&h, 1024).is_err(), "len {len}");
+        }
+        // Above the budget: refused before any accumulation.
+        let mut big = vec![b'D'];
+        big.extend_from_slice(&1025u32.to_be_bytes());
+        assert!(backend_frame_len(&big, 1024).is_err());
+        assert_eq!(backend_frame_len(&big, 1025).unwrap(), Some(1025));
+        // usize::MAX budget must not overflow the `len + 1` frame arithmetic.
+        let mut max = vec![b'D'];
+        max.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(
+            backend_frame_len(&max, usize::MAX).unwrap(),
+            Some(u32::MAX as usize)
+        );
+    }
+
+    /// A streaming relay hits a malformed header and fails immediately with a
+    /// protocol error, instead of waiting out the read timeout for bytes that
+    /// can never complete the frame.
+    #[tokio::test]
+    async fn stream_until_ready_fails_fast_on_malformed_backend_frame() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut client_side, _client_peer) = tokio::io::duplex(4096);
+        let _ = &mut client_side;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_sock = TcpStream::connect(addr).await.unwrap();
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut client = ClientStream::Plain(sock);
+        let _keep = client_sock;
+
+        let blistener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let baddr = blistener.local_addr().unwrap();
+        let mut backend = TcpStream::connect(baddr).await.unwrap();
+        let (mut backend_peer, _) = blistener.accept().await.unwrap();
+
+        let mut config = test_config();
+        config.limits.backend_read_timeout_secs = 30; // would be the old stall
+        let server = ProxyServer::new(config).unwrap();
+        let session = make_test_session();
+
+        // Tag 'D' with a declared length of 2: can never be a valid frame.
+        backend_peer.write_all(&[b'D', 0, 0, 0, 2]).await.unwrap();
+        backend_peer.flush().await.unwrap();
+        let started = std::time::Instant::now();
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            ProxyServer::stream_until_ready(&mut client, &mut backend, &session, &server.state),
+        )
+        .await
+        .expect("must not wait out the 30 s read timeout");
+        assert!(
+            matches!(r, Err(ref f) if matches!(f.error, ProxyError::Protocol(_))),
+            "malformed frame must be a protocol error: {r:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// The out-of-band re-prepare reader refuses an oversize declared body
+    /// without allocating it: an advertised 4 GiB frame used to be a
+    /// `vec![0u8; len]` sized by the backend.
+    #[tokio::test]
+    async fn read_one_frame_type_refuses_oversize_without_allocating() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut a, mut b) = tokio::io::duplex(64);
+        let mut hdr = vec![b'1'];
+        hdr.extend_from_slice(&u32::MAX.to_be_bytes());
+        b.write_all(&hdr).await.unwrap();
+        let r = ProxyServer::read_one_frame_type(&mut a, 1024 * 1024).await;
+        assert!(matches!(r, Err(ProxyError::Protocol(_))), "{r:?}");
+        // Within budget, a body larger than the scratch buffer is discarded
+        // in chunks and the type byte comes back.
+        let (mut a2, mut b2) = tokio::io::duplex(64 * 1024);
+        let body = vec![7u8; 40_000];
+        let mut frame = vec![b'1'];
+        frame.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+        frame.extend_from_slice(&body);
+        frame.extend_from_slice(&[b'Z', 0, 0, 0, 5, b'I']);
+        tokio::spawn(async move { b2.write_all(&frame).await.unwrap() });
+        assert_eq!(
+            ProxyServer::read_one_frame_type(&mut a2, 1024 * 1024)
+                .await
+                .unwrap(),
+            b'1'
+        );
+        assert_eq!(
+            ProxyServer::read_one_frame_type(&mut a2, 1024 * 1024)
+                .await
+                .unwrap(),
+            b'Z'
+        );
+    }
+
     /// The frame scanner returns only whole frames and rejects a length below
     /// the 4-byte minimum instead of stalling reassembly on it.
     #[test]
@@ -12462,25 +12647,35 @@ mod tests {
         let b = f(b'N', b"two");
         let both = [a.clone(), b.clone()].concat();
         assert_eq!(
-            ProxyServer::complete_frame_prefix(&both).unwrap(),
+            ProxyServer::complete_frame_prefix(&both, usize::MAX).unwrap(),
             both.len()
         );
-        assert_eq!(ProxyServer::complete_frame_prefix(&a).unwrap(), a.len());
+        assert_eq!(
+            ProxyServer::complete_frame_prefix(&a, usize::MAX).unwrap(),
+            a.len()
+        );
         // A trailing partial frame is excluded, whole ones ahead of it are not.
         let partial = [both.clone(), a[..3].to_vec()].concat();
         assert_eq!(
-            ProxyServer::complete_frame_prefix(&partial).unwrap(),
+            ProxyServer::complete_frame_prefix(&partial, usize::MAX).unwrap(),
             both.len()
         );
         // Fewer than the 5 header bytes: nothing is complete.
-        assert_eq!(ProxyServer::complete_frame_prefix(&a[..4]).unwrap(), 0);
-        assert_eq!(ProxyServer::complete_frame_prefix(&[]).unwrap(), 0);
+        assert_eq!(
+            ProxyServer::complete_frame_prefix(&a[..4], usize::MAX).unwrap(),
+            0
+        );
+        assert_eq!(
+            ProxyServer::complete_frame_prefix(&[], usize::MAX).unwrap(),
+            0
+        );
         // Length below the self-counting minimum is malformed, not incomplete.
-        assert!(ProxyServer::complete_frame_prefix(&[b'A', 0, 0, 0, 3]).is_err());
+        assert!(ProxyServer::complete_frame_prefix(&[b'A', 0, 0, 0, 3], usize::MAX).is_err());
         // A huge declared length is merely incomplete; the caller's buffer cap
         // is what bounds it.
         assert_eq!(
-            ProxyServer::complete_frame_prefix(&[b'A', 0xff, 0xff, 0xff, 0xff, 1, 2]).unwrap(),
+            ProxyServer::complete_frame_prefix(&[b'A', 0xff, 0xff, 0xff, 0xff, 1, 2], usize::MAX)
+                .unwrap(),
             0
         );
     }
@@ -12596,9 +12791,14 @@ mod tests {
         resp.extend_from_slice(&rfq(b'I'));
         server.write_all(&resp).await.unwrap();
         assert!(
-            ProxyServer::reset_backend(&mut client, "DISCARD ALL", Duration::from_secs(30))
-                .await
-                .is_ok(),
+            ProxyServer::reset_backend(
+                &mut client,
+                "DISCARD ALL",
+                Duration::from_secs(30),
+                usize::MAX
+            )
+            .await
+            .is_ok(),
             "clean reset must succeed"
         );
 
@@ -12608,9 +12808,14 @@ mod tests {
         resp.extend_from_slice(&rfq(b'I'));
         server.write_all(&resp).await.unwrap();
         assert!(
-            ProxyServer::reset_backend(&mut client, "DISCARD ALL", Duration::from_secs(30))
-                .await
-                .is_err(),
+            ProxyServer::reset_backend(
+                &mut client,
+                "DISCARD ALL",
+                Duration::from_secs(30),
+                usize::MAX
+            )
+            .await
+            .is_err(),
             "reset that errored must be rejected"
         );
 
@@ -12620,9 +12825,14 @@ mod tests {
         resp.extend_from_slice(&rfq(b'T'));
         server.write_all(&resp).await.unwrap();
         assert!(
-            ProxyServer::reset_backend(&mut client, "DISCARD ALL", Duration::from_secs(30))
-                .await
-                .is_err(),
+            ProxyServer::reset_backend(
+                &mut client,
+                "DISCARD ALL",
+                Duration::from_secs(30),
+                usize::MAX
+            )
+            .await
+            .is_err(),
             "reset leaving a non-idle txn must be rejected"
         );
     }
@@ -13338,8 +13548,11 @@ mod tests {
                                 &mut client,
                                 &mut backend,
                                 &session,
-                                Duration::from_secs(1),
-                                Duration::from_secs(1),
+                                RelayLimits {
+                                    client_write_timeout: Duration::from_secs(1),
+                                    backend_read_timeout: Duration::from_secs(1),
+                                    max_frame_bytes: usize::MAX,
+                                },
                                 16,
                                 &server.state.metrics,
                             )
@@ -13625,29 +13838,31 @@ mod tests {
             let mut wire = frame(b'C', &cstr("INSERT 0 1"));
             wire.extend_from_slice(&frame(b'Z', b"T"));
             b.write_all(&wire).await.unwrap();
-            let (status, err) = ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5))
-                .await
-                .unwrap();
+            let (status, err) =
+                ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5), usize::MAX)
+                    .await
+                    .unwrap();
             assert_eq!((status, err), (b'T', false));
             // Error frames are reported, not fatal.
             let mut wire = frame(b'E', &[b'S', 0, b'C', 0, 0]);
             wire.extend_from_slice(&frame(b'Z', b"E"));
             b.write_all(&wire).await.unwrap();
-            let (status, err) = ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5))
-                .await
-                .unwrap();
+            let (status, err) =
+                ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5), usize::MAX)
+                    .await
+                    .unwrap();
             assert_eq!((status, err), (b'E', true));
             // A COPY-in request cannot be satisfied during a replay.
             b.write_all(&frame(b'G', &[0, 0, 0])).await.unwrap();
             assert!(
-                ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5))
+                ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5), usize::MAX)
                     .await
                     .is_err()
             );
             // EOF is an error.
             drop(b);
             assert!(
-                ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5))
+                ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5), usize::MAX)
                     .await
                     .is_err()
             );
@@ -13656,7 +13871,8 @@ mod tests {
         #[tokio::test]
         async fn drain_until_ready_times_out_on_silent_backend() {
             let (mut a, _b) = tokio::io::duplex(64);
-            let r = ProxyServer::drain_until_ready(&mut a, Duration::from_millis(50)).await;
+            let r =
+                ProxyServer::drain_until_ready(&mut a, Duration::from_millis(50), usize::MAX).await;
             assert!(matches!(r, Err(ProxyError::Network(_))));
         }
 
@@ -13693,6 +13909,7 @@ mod tests {
                 &gucs,
                 Duration::from_secs(5),
                 Duration::from_secs(5),
+                usize::MAX,
             )
             .await;
             assert!(matches!(r, Err(ProxyError::Protocol(_))), "{r:?}");
@@ -13712,7 +13929,8 @@ mod tests {
                     &mut a2,
                     &[],
                     Duration::from_secs(1),
-                    Duration::from_secs(1)
+                    Duration::from_secs(1),
+                    usize::MAX,
                 )
                 .await
                 .unwrap(),

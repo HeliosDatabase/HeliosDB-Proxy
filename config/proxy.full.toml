@@ -105,6 +105,13 @@ write_timeout_secs = 30
 # # Per-session cap on the un-flushed extended-protocol buffer: a client must
 # # reach a Sync/Flush boundary before this many bytes pile up. 64 MiB.
 # max_pending_bytes = 67108864
+# Upper bound on ONE backend response frame's declared length on every streaming
+# relay (query responses, cache capture, replay drain, pool reset, idle backend
+# watch). A frame header above this, or below the 4-byte protocol minimum, closes
+# the backend connection as malformed instead of buffering toward the advertised
+# size. Bounds a single frame, not a result set. Default 100 MiB = the frontend
+# message cap.
+# max_backend_frame_bytes = 104857600
 # # Global ceiling on idle connections parked in the data-path backend pool
 # # across ALL (node,user,db) identities (pool-modes feature only).
 # max_total_idle_backend_conns = 8192
