@@ -203,6 +203,424 @@ fn backend_frame_len(rem: &[u8], max: usize) -> Result<Option<usize>> {
     Ok(Some(len))
 }
 
+/// PostgreSQL built-in functions that have no side effects when re-executed
+/// (TR-03). This is the whole basis for calling an interrupted read
+/// re-executable on an unknown outcome: a read calling anything NOT listed here
+/// — a user-defined function, `nextval`, `pg_notify`, `set_config`, advisory
+/// locks, large-object or replication functions — may already have run once and
+/// is never run again by the proxy. Nondeterminism (`random`, `now`, `pg_sleep`)
+/// is deliberately allowed: an unknown-outcome autocommit read published nothing
+/// to the client, so only side effects matter. Sorted; looked up by binary
+/// search on the ASCII-lowercased call name.
+const TR_PURE_BUILTINS: &[&str] = &[
+    "abs",
+    "acos",
+    "acosh",
+    "age",
+    "array_agg",
+    "array_append",
+    "array_cat",
+    "array_dims",
+    "array_fill",
+    "array_length",
+    "array_lower",
+    "array_ndims",
+    "array_position",
+    "array_positions",
+    "array_prepend",
+    "array_remove",
+    "array_replace",
+    "array_to_json",
+    "array_to_string",
+    "array_upper",
+    "ascii",
+    "asin",
+    "asinh",
+    "atan",
+    "atan2",
+    "atanh",
+    "avg",
+    "bit_and",
+    "bit_count",
+    "bit_length",
+    "bit_or",
+    "bit_xor",
+    "bool_and",
+    "bool_or",
+    "btrim",
+    "cardinality",
+    "cbrt",
+    "ceil",
+    "ceiling",
+    "char_length",
+    "character_length",
+    "chr",
+    "clock_timestamp",
+    "coalesce",
+    "col_description",
+    "concat",
+    "concat_ws",
+    "convert",
+    "convert_from",
+    "convert_to",
+    "corr",
+    "cos",
+    "cosh",
+    "cot",
+    "count",
+    "covar_pop",
+    "covar_samp",
+    "cume_dist",
+    "current_database",
+    "current_query",
+    "current_schema",
+    "current_schemas",
+    "current_setting",
+    "date_bin",
+    "date_part",
+    "date_trunc",
+    "decode",
+    "degrees",
+    "dense_rank",
+    "div",
+    "encode",
+    "every",
+    "exp",
+    "extract",
+    "factorial",
+    "first_value",
+    "floor",
+    "format",
+    "gcd",
+    "gen_random_uuid",
+    "generate_series",
+    "generate_subscripts",
+    "get_bit",
+    "get_byte",
+    "greatest",
+    "has_column_privilege",
+    "has_database_privilege",
+    "has_function_privilege",
+    "has_schema_privilege",
+    "has_table_privilege",
+    "inet_client_addr",
+    "inet_client_port",
+    "inet_server_addr",
+    "inet_server_port",
+    "initcap",
+    "isfinite",
+    "json_agg",
+    "json_array_elements",
+    "json_array_elements_text",
+    "json_array_length",
+    "json_build_array",
+    "json_build_object",
+    "json_each",
+    "json_each_text",
+    "json_extract_path",
+    "json_extract_path_text",
+    "json_object",
+    "json_object_agg",
+    "json_object_keys",
+    "json_populate_record",
+    "json_populate_recordset",
+    "json_strip_nulls",
+    "json_to_record",
+    "json_to_recordset",
+    "json_typeof",
+    "jsonb_agg",
+    "jsonb_array_elements",
+    "jsonb_array_elements_text",
+    "jsonb_array_length",
+    "jsonb_build_array",
+    "jsonb_build_object",
+    "jsonb_each",
+    "jsonb_each_text",
+    "jsonb_extract_path",
+    "jsonb_extract_path_text",
+    "jsonb_insert",
+    "jsonb_object",
+    "jsonb_object_agg",
+    "jsonb_object_keys",
+    "jsonb_path_exists",
+    "jsonb_path_match",
+    "jsonb_path_query",
+    "jsonb_path_query_array",
+    "jsonb_path_query_first",
+    "jsonb_populate_record",
+    "jsonb_populate_recordset",
+    "jsonb_pretty",
+    "jsonb_set",
+    "jsonb_set_lax",
+    "jsonb_strip_nulls",
+    "jsonb_to_record",
+    "jsonb_to_recordset",
+    "jsonb_typeof",
+    "justify_days",
+    "justify_hours",
+    "justify_interval",
+    "lag",
+    "last_value",
+    "lcm",
+    "lead",
+    "least",
+    "left",
+    "length",
+    "ln",
+    "localtime",
+    "localtimestamp",
+    "log",
+    "log10",
+    "lower",
+    "lpad",
+    "ltrim",
+    "make_date",
+    "make_interval",
+    "make_time",
+    "make_timestamp",
+    "make_timestamptz",
+    "max",
+    "md5",
+    "min",
+    "mod",
+    "mode",
+    "nlevel",
+    "now",
+    "nth_value",
+    "ntile",
+    "nullif",
+    "num_nonnulls",
+    "num_nulls",
+    "obj_description",
+    "octet_length",
+    "overlay",
+    "parse_ident",
+    "percent_rank",
+    "percentile_cont",
+    "percentile_disc",
+    "pg_backend_pid",
+    "pg_client_encoding",
+    "pg_column_size",
+    "pg_conf_load_time",
+    "pg_current_wal_flush_lsn",
+    "pg_current_wal_insert_lsn",
+    "pg_current_wal_lsn",
+    "pg_database_size",
+    "pg_get_constraintdef",
+    "pg_get_expr",
+    "pg_get_functiondef",
+    "pg_get_indexdef",
+    "pg_get_userbyid",
+    "pg_get_viewdef",
+    "pg_has_role",
+    "pg_indexes_size",
+    "pg_is_in_recovery",
+    "pg_last_wal_receive_lsn",
+    "pg_last_wal_replay_lsn",
+    "pg_last_xact_replay_timestamp",
+    "pg_postmaster_start_time",
+    "pg_relation_size",
+    "pg_size_bytes",
+    "pg_size_pretty",
+    "pg_sleep",
+    "pg_sleep_for",
+    "pg_sleep_until",
+    "pg_table_size",
+    "pg_total_relation_size",
+    "pg_typeof",
+    "pi",
+    "position",
+    "power",
+    "quote_ident",
+    "quote_literal",
+    "quote_nullable",
+    "radians",
+    "random",
+    "rank",
+    "regexp_count",
+    "regexp_instr",
+    "regexp_like",
+    "regexp_match",
+    "regexp_matches",
+    "regexp_replace",
+    "regexp_split_to_array",
+    "regexp_split_to_table",
+    "regexp_substr",
+    "regr_avgx",
+    "regr_avgy",
+    "regr_count",
+    "regr_intercept",
+    "regr_r2",
+    "regr_slope",
+    "regr_sxx",
+    "regr_sxy",
+    "regr_syy",
+    "repeat",
+    "replace",
+    "reverse",
+    "right",
+    "round",
+    "row_number",
+    "row_to_json",
+    "rpad",
+    "rtrim",
+    "scale",
+    "set_bit",
+    "set_byte",
+    "sha224",
+    "sha256",
+    "sha384",
+    "sha512",
+    "sign",
+    "sin",
+    "sinh",
+    "split_part",
+    "sqrt",
+    "starts_with",
+    "statement_timestamp",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "string_agg",
+    "string_to_array",
+    "string_to_table",
+    "strpos",
+    "substr",
+    "substring",
+    "sum",
+    "tan",
+    "tanh",
+    "timeofday",
+    "to_ascii",
+    "to_char",
+    "to_date",
+    "to_hex",
+    "to_json",
+    "to_jsonb",
+    "to_number",
+    "to_timestamp",
+    "to_tsquery",
+    "to_tsvector",
+    "transaction_timestamp",
+    "translate",
+    "trim",
+    "trim_scale",
+    "trunc",
+    "unnest",
+    "upper",
+    "var_pop",
+    "var_samp",
+    "variance",
+    "version",
+    "width_bucket",
+    "xmlagg",
+];
+
+/// SQL keywords that can be followed by `(` without being a function call.
+const TR_CALL_KEYWORDS: &[&str] = &[
+    "all",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "between",
+    "by",
+    "case",
+    "cast",
+    "collate",
+    "cross",
+    "date",
+    "desc",
+    "distinct",
+    "else",
+    "end",
+    "except",
+    "exists",
+    "filter",
+    "first",
+    "following",
+    "for",
+    "from",
+    "full",
+    "group",
+    "having",
+    "in",
+    "inner",
+    "intersect",
+    "interval",
+    "is",
+    "join",
+    "lateral",
+    "least",
+    "left",
+    "limit",
+    "natural",
+    "not",
+    "null",
+    "nulls",
+    "offset",
+    "on",
+    "or",
+    "order",
+    "outer",
+    "over",
+    "partition",
+    "preceding",
+    "range",
+    "returning",
+    "right",
+    "row",
+    "rows",
+    "select",
+    "some",
+    "table",
+    "then",
+    "time",
+    "timestamp",
+    "unbounded",
+    "union",
+    "using",
+    "values",
+    "when",
+    "where",
+    "window",
+    "with",
+    "within",
+];
+
+/// Operator-extended read-eligibility policy (`tr_read_functions`).
+#[derive(Debug, Default)]
+pub struct TrReadPolicy {
+    /// Lowercased extra function names treated as side-effect-free.
+    extra: std::collections::HashSet<String>,
+}
+
+impl TrReadPolicy {
+    pub fn from_config(names: &[String]) -> Self {
+        Self {
+            extra: names.iter().map(|n| n.to_ascii_lowercase()).collect(),
+        }
+    }
+
+    fn allows_call(&self, name: &str) -> bool {
+        // Names are ASCII identifiers by validation; fold without allocating
+        // for the overwhelmingly common short case.
+        let mut buf = [0u8; 64];
+        let lower: &str = if name.len() <= buf.len() && name.is_ascii() {
+            let b = &mut buf[..name.len()];
+            b.copy_from_slice(name.as_bytes());
+            b.make_ascii_lowercase();
+            std::str::from_utf8(b).unwrap_or(name)
+        } else {
+            return self.extra.contains(&name.to_ascii_lowercase());
+        };
+        TR_CALL_KEYWORDS.binary_search(&lower).is_ok()
+            || TR_PURE_BUILTINS.binary_search(&lower).is_ok()
+            || self.extra.contains(lower)
+    }
+}
+
 /// The budgets one streaming relay needs, resolved from `[limits]`. Only the
 /// cache-capture relay takes them as a bundle (clippy's argument cap); the plain
 /// relays read `state.limits` directly, so this is gated with that relay.
@@ -429,6 +847,8 @@ struct ServerState {
     /// journaling self-disables internally when not configured.
     #[cfg(feature = "ha-tr")]
     transaction_journal: Arc<crate::transaction_journal::TransactionJournal>,
+    /// TR-03 read re-execution eligibility (built-ins + `tr_read_functions`).
+    tr_read_policy: Arc<TrReadPolicy>,
     /// Anomaly detector (T3.1). Records every query and every
     /// auth outcome; surfaces detections via /api/anomalies.
     #[cfg(feature = "anomaly-detection")]
@@ -1501,6 +1921,7 @@ impl ProxyServer {
             plugin_manager,
             #[cfg(feature = "ha-tr")]
             transaction_journal: Arc::new(crate::transaction_journal::TransactionJournal::new()),
+            tr_read_policy: Arc::new(TrReadPolicy::from_config(&config.tr_read_functions)),
             #[cfg(feature = "anomaly-detection")]
             anomaly_detector: Arc::new(crate::anomaly::AnomalyDetector::new(
                 config.anomaly.to_anomaly_config(),
@@ -8333,7 +8754,28 @@ impl ProxyServer {
             .unwrap_or(false)
     }
 
-    fn tr_classify(sql: &str) -> StmtKind {
+    /// TR-03: can this read-shaped statement be re-executed on an unknown
+    /// outcome? Only if every syntactic function call is a PostgreSQL built-in
+    /// known to be side-effect-free (or operator-listed), no quoted identifier
+    /// is called (its case is opaque to the policy), and the statement does not
+    /// select INTO or consume a sequence. Anything else is `Other`: it may have
+    /// run once already, so the proxy will not run it again.
+    fn tr_read_eligible(core: &str, policy: &TrReadPolicy) -> bool {
+        if Self::contains_word_ci(core, "into") {
+            return false;
+        }
+        let mut ok = true;
+        let scanned = crate::replay_sql::words(core, |w| {
+            if w.call && (w.quoted || !policy.allows_call(w.text)) {
+                ok = false;
+                return false;
+            }
+            true
+        });
+        scanned.is_ok() && ok
+    }
+
+    fn tr_classify(sql: &str, policy: &TrReadPolicy) -> StmtKind {
         let Ok(boundaries) = crate::replay_sql::boundaries(sql) else {
             // The session's lexical rules or malformed input make commit
             // boundaries uncertain. Never replay a possibly durable outcome.
@@ -8379,15 +8821,10 @@ impl ProxyServer {
             return StmtKind::Control;
         }
         if kw("SELECT") || kw("VALUES") || kw("TABLE") {
-            // `SELECT ... INTO t` creates a table; `nextval`/`setval` consume
-            // sequence values — neither may be silently re-run.
-            return if Self::contains_word_ci(core, "into")
-                || Self::contains_word_ci(core, "nextval")
-                || Self::contains_word_ci(core, "setval")
-            {
-                StmtKind::Other
-            } else {
+            return if Self::tr_read_eligible(core, policy) {
                 StmtKind::Read
+            } else {
+                StmtKind::Other
             };
         }
         if kw("SHOW") {
@@ -8400,8 +8837,10 @@ impl ProxyServer {
                 || Self::contains_word_ci(core, "merge")
             {
                 StmtKind::Write
-            } else {
+            } else if Self::tr_read_eligible(core, policy) {
                 StmtKind::Read
+            } else {
+                StmtKind::Other
             };
         }
         if kw("COPY") {
@@ -8518,17 +8957,23 @@ impl ProxyServer {
     /// References outside this batch are deliberately opaque: the routing
     /// registry does not retain the acknowledged portal/statement generations.
     /// Such a reference may be a COMMIT and cannot authorize recovery.
-    fn tr_extended_kind(batch: &[u8], unnamed: Option<&[u8]>, max_bindings: usize) -> StmtKind {
-        Self::tr_extended_cycle_kind(&[batch], unnamed, max_bindings)
+    fn tr_extended_kind(
+        batch: &[u8],
+        unnamed: Option<&[u8]>,
+        max_bindings: usize,
+        policy: &TrReadPolicy,
+    ) -> StmtKind {
+        Self::tr_extended_cycle_kind(&[batch], unnamed, max_bindings, policy)
     }
 
     fn tr_extended_cycle_kind(
         batches: &[&[u8]],
         unnamed: Option<&[u8]>,
         max_bindings: usize,
+        policy: &TrReadPolicy,
     ) -> StmtKind {
-        fn statement_kind(sql: &str) -> StmtKind {
-            let kind = ProxyServer::tr_classify(sql);
+        let statement_kind = |sql: &str| -> StmtKind {
+            let kind = ProxyServer::tr_classify(sql, policy);
             // ROLLBACK can expose subsequent Executes to autocommit. Reads and
             // writes need no second lexical pass; only possible controls do.
             if matches!(kind, StmtKind::Control | StmtKind::Other) {
@@ -8541,7 +8986,7 @@ impl ProxyServer {
                 }
             }
             kind
-        }
+        };
         fn cstring<'a>(body: &mut &'a [u8]) -> Option<&'a [u8]> {
             let end = memchr::memchr(0, body)?;
             let value = &body[..end];
@@ -8753,7 +9198,7 @@ impl ProxyServer {
         let simple = extended_kind.is_none();
         let mut kind_cache = extended_kind;
         let kind = |kind_cache: &mut Option<StmtKind>| -> StmtKind {
-            *kind_cache.get_or_insert_with(|| Self::tr_classify(sql))
+            *kind_cache.get_or_insert_with(|| Self::tr_classify(sql, &state.tr_read_policy))
         };
 
         // --- session GUC tracking (simple protocol only) ---
@@ -9012,11 +9457,13 @@ impl ProxyServer {
                     ],
                     c.unnamed_parse.as_deref(),
                     state.limits.max_prepared_statements,
+                    &state.tr_read_policy,
                 ),
                 None => Self::tr_extended_kind(
                     batch,
                     unnamed.map(|(p, _)| p.as_ref()),
                     state.limits.max_prepared_statements,
+                    &state.tr_read_policy,
                 ),
             }),
             || {
@@ -9461,7 +9908,7 @@ impl ProxyServer {
         let (kind, wait_ready) = match &inflight {
             InFlight::Simple(msg) => (
                 crate::protocol::query_text(&msg.payload)
-                    .map(Self::tr_classify)
+                    .map(|sql| Self::tr_classify(sql, &state.tr_read_policy))
                     .unwrap_or(StmtKind::Commit),
                 true,
             ),
@@ -9475,6 +9922,7 @@ impl ProxyServer {
                     batch,
                     unnamed.map(|(p, _)| p.as_ref()),
                     state.limits.max_prepared_statements,
+                    &state.tr_read_policy,
                 ),
                 *wait_ready,
             ),
@@ -10608,6 +11056,7 @@ mod tests {
             plugin_manager: Some(pm),
             #[cfg(feature = "ha-tr")]
             transaction_journal: Arc::new(crate::transaction_journal::TransactionJournal::new()),
+            tr_read_policy: Arc::new(TrReadPolicy::default()),
             #[cfg(feature = "anomaly-detection")]
             anomaly_detector: Arc::new(crate::anomaly::AnomalyDetector::new(
                 ProxyConfig::default().anomaly.to_anomaly_config(),
@@ -12522,6 +12971,37 @@ mod tests {
         assert_eq!(got, whole, "the frame must arrive byte-exact");
     }
 
+    /// The TR-03 allowlists are binary-searched, so they must stay sorted and
+    /// lowercase, and no side-effecting name may creep in.
+    #[test]
+    fn tr_pure_builtins_are_sorted_and_exclude_side_effects() {
+        for list in [TR_PURE_BUILTINS, TR_CALL_KEYWORDS] {
+            assert!(list.windows(2).all(|w| w[0] < w[1]), "sorted, unique");
+            assert!(list.iter().all(|n| *n == n.to_ascii_lowercase()));
+        }
+        for bad in [
+            "nextval",
+            "setval",
+            "currval",
+            "lastval",
+            "pg_notify",
+            "set_config",
+            "pg_advisory_lock",
+            "pg_try_advisory_lock",
+            "txid_current",
+            "setseed",
+            "lo_import",
+            "pg_terminate_backend",
+            "dblink",
+            "pg_reload_conf",
+        ] {
+            assert!(
+                TR_PURE_BUILTINS.binary_search(&bad).is_err(),
+                "{bad} must not be pure"
+            );
+        }
+    }
+
     /// H-07: every relay validates a backend frame header the moment it is
     /// readable. A length below the 4-byte minimum or above the configured
     /// budget is an error immediately — never "wait for more bytes", and never
@@ -13255,7 +13735,7 @@ mod tests {
         #[test]
         fn tr_classify_table() {
             use StmtKind::*;
-            let c = ProxyServer::tr_classify;
+            let c = |sql: &str| ProxyServer::tr_classify(sql, &TrReadPolicy::default());
             assert_eq!(c("SELECT 1"), Read);
             assert_eq!(c("  select * from t where x = 'a;b' "), Write);
             assert_eq!(c("SELECT count(*) FROM t;"), Read);
@@ -13263,6 +13743,38 @@ mod tests {
             assert_eq!(c("SELECT * INTO t2 FROM t"), Other);
             assert_eq!(c("SELECT nextval('s')"), Other);
             assert_eq!(c("SELECT pg_sleep(0.5), 42"), Read);
+            // TR-03: a read is re-executable only if every call is a known
+            // side-effect-free built-in. Anything else may already have run.
+            assert_eq!(c("SELECT audit_side_effect()"), Other);
+            assert_eq!(c("SELECT my_schema.my_udf(1)"), Other);
+            assert_eq!(c("SELECT lower(name), count(*) FROM t"), Read);
+            assert_eq!(c("SELECT pg_catalog.upper('x')"), Read);
+            assert_eq!(c("SELECT \"MyFn\"(1)"), Other);
+            assert_eq!(c("SELECT currval('s')"), Other);
+            assert_eq!(c("SELECT pg_notify('c', 'p')"), Other);
+            assert_eq!(c("SELECT set_config('a', 'b', false)"), Other);
+            assert_eq!(c("SELECT pg_advisory_lock(1)"), Other);
+            assert_eq!(c("SELECT random(), now(), gen_random_uuid()"), Read);
+            assert_eq!(c("SELECT 'f(x)' AS s, $$g()$$ FROM t"), Read); // calls only in literals
+            assert_eq!(
+                c("WITH x AS (SELECT audit_side_effect()) SELECT * FROM x"),
+                Other
+            );
+            assert_eq!(
+                c("SELECT * FROM t WHERE id IN (1, 2) AND EXISTS (SELECT 1)"),
+                Read
+            );
+            assert_eq!(c("SELECT CAST(x AS int), COALESCE(a, b) FROM t"), Read);
+            // Operator-listed UDFs become eligible.
+            let policy = TrReadPolicy::from_config(&["Audit_Side_Effect".to_string()]);
+            assert_eq!(
+                ProxyServer::tr_classify("SELECT audit_side_effect()", &policy),
+                Read
+            );
+            assert_eq!(
+                ProxyServer::tr_classify("SELECT other_udf()", &policy),
+                Other
+            );
             assert_eq!(c("SHOW application_name"), Read);
             assert_eq!(c("VALUES (1)"), Read);
             assert_eq!(c("TABLE t"), Read);
@@ -13421,7 +13933,7 @@ mod tests {
                 "ROLLBACK; INSERT INTO t VALUES (1)",
                 "SELECT $x$COMMIT$x$;END",
             ] {
-                let kind = ProxyServer::tr_classify(sql);
+                let kind = ProxyServer::tr_classify(sql, &TrReadPolicy::default());
                 assert_eq!(kind, StmtKind::Commit, "{sql}");
                 assert_eq!(
                     ProxyServer::tr_decide(
@@ -13607,8 +14119,9 @@ mod tests {
             fn execute(portal: &str) -> Vec<u8> {
                 frame(b'E', &[cstr(portal), vec![0; 4]].concat())
             }
-            let classify =
-                |frames: Vec<Vec<u8>>| ProxyServer::tr_extended_kind(&frames.concat(), None, 256);
+            let classify = |frames: Vec<Vec<u8>>| {
+                ProxyServer::tr_extended_kind(&frames.concat(), None, 256, &TrReadPolicy::default())
+            };
             for end in ["COMMIT", "END", "PREPARE TRANSACTION 'x'", "ROLLBACK"] {
                 assert_eq!(
                     classify(vec![
@@ -13669,21 +14182,21 @@ mod tests {
             let held = parse("", "COMMIT");
             let batch = [bind("", ""), execute(""), frame(b'S', &[])].concat();
             assert_eq!(
-                ProxyServer::tr_extended_kind(&batch, Some(&held), 256),
+                ProxyServer::tr_extended_kind(&batch, Some(&held), 256, &TrReadPolicy::default()),
                 StmtKind::Commit
             );
             let unnamed_read = [parse("", "SELECT 1"), bind("", ""), execute("")].concat();
             assert_eq!(
-                ProxyServer::tr_extended_kind(&unnamed_read, None, 0),
+                ProxyServer::tr_extended_kind(&unnamed_read, None, 0, &TrReadPolicy::default()),
                 StmtKind::Read
             );
             let named_read = [parse("s", "SELECT 1"), bind("p", "s"), execute("p")].concat();
             assert_eq!(
-                ProxyServer::tr_extended_kind(&named_read, None, 0),
+                ProxyServer::tr_extended_kind(&named_read, None, 0, &TrReadPolicy::default()),
                 StmtKind::Commit
             );
             assert_eq!(
-                ProxyServer::tr_extended_kind(&named_read, None, 1),
+                ProxyServer::tr_extended_kind(&named_read, None, 1, &TrReadPolicy::default()),
                 StmtKind::Read
             );
             let too_many_portals = [
@@ -13694,7 +14207,7 @@ mod tests {
             ]
             .concat();
             assert_eq!(
-                ProxyServer::tr_extended_kind(&too_many_portals, None, 1),
+                ProxyServer::tr_extended_kind(&too_many_portals, None, 1, &TrReadPolicy::default()),
                 StmtKind::Commit
             );
             // Every truncated header/body is opaque; a complete prefix that
@@ -13703,7 +14216,12 @@ mod tests {
             let commit_end = wire.len() - 5;
             for offset in commit_end..=wire.len() {
                 assert_eq!(
-                    ProxyServer::tr_extended_kind(&wire[..offset], None, 256),
+                    ProxyServer::tr_extended_kind(
+                        &wire[..offset],
+                        None,
+                        256,
+                        &TrReadPolicy::default()
+                    ),
                     StmtKind::Commit
                 );
             }
@@ -13713,7 +14231,7 @@ mod tests {
                 vec![b'P', 255, 255, 255, 255],
             ] {
                 assert_eq!(
-                    ProxyServer::tr_extended_kind(&bytes, None, 256),
+                    ProxyServer::tr_extended_kind(&bytes, None, 256, &TrReadPolicy::default()),
                     StmtKind::Commit
                 );
             }
@@ -13768,7 +14286,7 @@ mod tests {
                 batch.extend(frame(b'E', &[0; 5]));
             }
             batch.extend(frame(b'S', &[]));
-            let kind = ProxyServer::tr_extended_kind(&batch, None, 16);
+            let kind = ProxyServer::tr_extended_kind(&batch, None, 16, &TrReadPolicy::default());
             assert_eq!(kind, StmtKind::Commit);
             // Every possible byte offset includes each frontend frame boundary
             // and a complete COMMIT Execute followed by an incomplete final Sync.

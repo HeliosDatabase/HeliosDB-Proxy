@@ -140,6 +140,7 @@ admin_address  = "127.0.0.1:9090"
 # admin_allow_insecure = false
 tr_enabled     = true
 tr_mode        = "session"
+tr_read_functions = []
 write_timeout_secs        = 30
 optimize_unnamed_parse    = true
 shutdown_drain_timeout_secs = 60
@@ -153,6 +154,7 @@ shutdown_drain_timeout_secs = 60
 | `admin_allow_insecure` | bool | `false` | Explicit opt-in to expose the admin API on a non-loopback address **without** a token. |
 | `tr_enabled` | bool | `true` | Enable Transaction Replay. *(Required in a config file.)* |
 | `tr_mode` | string | `"session"` | Transaction Replay mode: `none`, `session`, `select`, `transaction`. *(Required in a config file.)* |
+| `tr_read_functions` | array of string | `[]` | TR-03 read re-execution policy extension. In-session replay re-executes an interrupted read on an unknown outcome only when every function it calls is a PostgreSQL built-in known to be side-effect-free; list additional provably pure functions (unqualified names, case-insensitive) here. Reads calling anything else, quoted-identifier calls, `SELECT … INTO`, and sequence functions are classified as opaque and never re-executed. |
 | `write_timeout_secs` | u64 | `30` | Seconds to buffer writes during failover before returning an error. |
 | `optimize_unnamed_parse` | bool | `true` | Skip re-forwarding an identical unnamed extended-protocol `Parse` a backend already holds, synthesizing `ParseComplete` locally. A kill-switch for drivers that depend on the redundant round trip. |
 | `shutdown_drain_timeout_secs` | u64 | `60` | How long a SIGUSR2 binary-handoff drain keeps serving in-flight connections before dropping them. Runtime override: `HELIOS_DRAIN_TIMEOUT_SECS`. |
@@ -1114,3 +1116,32 @@ require_client_cert = false
 - [Architecture](architecture.md)
 - [Feature Flags](feature-flags.md)
 - [Admin API Reference](admin-api.md)
+
+
+## Transaction Replay: the re-executable read subset (TR-03)
+
+`tr_mode = select` and `transaction` re-execute an interrupted statement on the
+replacement backend only when its outcome on the failed backend cannot have had a
+side effect. The proxy decides lexically, without a catalog round trip:
+
+- Statement shape: `SELECT`, `VALUES`, `TABLE`, `SHOW`, `EXPLAIN` (without
+  `ANALYZE`), `COPY … TO`, or a `WITH` whose CTEs contain no `INSERT`/`UPDATE`/
+  `DELETE`/`MERGE`.
+- No `INTO` (creates a table).
+- Every syntactic function call — an identifier followed by `(` outside strings,
+  quoted identifiers, dollar quotes and comments — must be a PostgreSQL built-in
+  from the proxy's side-effect-free list (aggregates, string/math/date/JSON/array
+  functions, `pg_sleep`, `random`, `now`, `current_setting`, size/introspection
+  helpers) or listed in `tr_read_functions`. Schema qualification is ignored
+  (`pg_catalog.lower(...)` is `lower`).
+- A call through a quoted identifier (`"MyFn"(...)`) is never eligible: its
+  case is opaque to the policy.
+
+Everything else — user-defined functions, `nextval`/`setval`/`currval`/`lastval`,
+`pg_notify`, `set_config`, `pg_advisory_*`, `txid_current`, `setseed`, large-object
+and replication functions — makes the statement opaque: on an unknown outcome the
+client receives SQLSTATE `08007` and the proxy does not run it again. Inside an
+explicit transaction an opaque statement also marks the transaction as containing
+a possible write, so `select` mode will not replay it. Nondeterministic but
+side-effect-free calls are allowed because an unknown-outcome autocommit read
+published nothing to the client before the fault.
