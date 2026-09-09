@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- In-session Transaction Replay no longer treats every `SELECT` as re-executable.
+  An interrupted read is re-run on the replacement backend only when every function
+  it calls is a PostgreSQL built-in known to be side-effect-free (or is listed in the
+  new top-level `tr_read_functions`); a read calling a user-defined function,
+  `nextval`, `pg_notify`, `set_config`, an advisory lock or any unlisted name is
+  classified opaque, returns `08007` on an unknown outcome and is never run twice.
+  The supported subset is documented in `docs/configuration.md` (TR-03).
+
 - Every backend streaming relay (query responses, cache capture, replay drain, pool
   reset, and the idle backend-watch) now validates each response frame header
   immediately against the new `[limits] max_backend_frame_bytes` (default 100 MiB,

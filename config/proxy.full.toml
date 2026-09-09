@@ -61,6 +61,12 @@ admin_address  = "${HELIOS_PROXY_ADMIN:-127.0.0.1:9090}"
 #   tr_unknown_outcome_errors_total (+ *_cap_exceeded_total) on /metrics.
 tr_enabled = true
 tr_mode    = "session"
+# TR-03: which interrupted READS may be re-executed on an unknown outcome. The
+# built-in policy allows only PostgreSQL's side-effect-free functions; a read that
+# calls a user-defined function, nextval/setval, pg_notify, set_config, advisory
+# locks or any other unlisted name is never run again (it may already have run).
+# List your own provably pure functions to make reads calling them eligible.
+# tr_read_functions = ["my_pure_udf", "tenant_scope"]
 
 # Seconds to wait for a new primary during failover before returning an error.
 write_timeout_secs = 30
