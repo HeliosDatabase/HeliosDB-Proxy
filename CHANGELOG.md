@@ -5,6 +5,60 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Extended-batch write failures and timeouts now preserve an unknown outcome,
+  preventing retries based on the false assumption that no prefix frames executed.
+  Connection failures before dispatch retain their safe retry behavior.
+
+- Live transaction replay detects commented and batched commit boundaries and
+  classifies every extended-protocol Execute using its bound statement. Unknown
+  identities refuse replay; batches that already committed cannot remain in a
+  replayable transaction history. An uncertain commit reports `08007` and asks
+  clients to verify its outcome before retrying. See the [TR-01 implementation
+  notes](docs/internal/audit-2026-09/TR-01.md) for supported cases and remaining work.
+
+- Recovery no longer appends a second result to a response the client has already
+  partly received. After published rows an interrupted statement returns one error
+  instead of re-running; after a published `ErrorResponse`, or after a `Flush`
+  fragment that may have ended mid-frame, the connection closes rather than
+  injecting protocol bytes the client cannot place. Closing is deliberate: an
+  `ErrorResponse` appended after a `CommandComplete` would report failure for a
+  statement the backend actually finished, and a client that then retried an
+  `INSERT` would double-apply it. See the [TR-02 implementation
+  notes](docs/internal/audit-2026-09/TR-02.md).
+
+- The idle backend-watch relay forwards only COMPLETE backend frames. A large
+  asynchronous frame (`NotificationResponse` from `LISTEN`/`NOTIFY`, `NoticeResponse`,
+  `ParameterStatus`) split across reads is now reassembled instead of being published
+  truncated: a client holding half a frame blocks forever, and nothing can safely be
+  written after it. A frame declaring a length below the 4-byte minimum is rejected,
+  and reassembly is bounded by `[limits] max_pending_bytes`.
+
+- Session `SET`s made inside a transaction that was rolled back are no longer restored
+  after a failover. `ROLLBACK; <DML>` classifies as a possible commit for replay safety
+  (the trailing statement commits in autocommit), but the transaction's own session
+  state was discarded, so promoting its GUCs restored settings the database never kept.
+
+- An uncertain autocommit write that finds no replacement primary now reports `08007`
+  with the same "verify the database outcome" guidance as an uncertain `COMMIT`, rather
+  than a bare `08006` connection failure a client would reasonably retry.
+
+- The held unnamed `Parse` write is bounded by `[limits] backend_write_timeout_secs`;
+  it was the one remaining unbounded backend write on the extended-protocol path.
+
+### Changed
+
+- Replay eligibility no longer depends on a statement being free of backslashes.
+  A backslash inside a single-quoted literal is session-dependent (it escapes only
+  when `standard_conforming_strings` is off, which the proxy does not track), and
+  refusing every such literal silently stripped `select`/`transaction` replay from
+  ordinary regexes, Windows paths and JSON escapes. The commit-boundary scan now runs
+  under both readings and refuses only when they disagree — which is exactly the
+  case where a backslash could hide a statement separator.
+
 ## [1.6.0] - 2026-09-04
 
 Performance & stability batch (21 fixes) from the September 2026 audit, plus **Transaction

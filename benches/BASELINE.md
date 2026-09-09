@@ -17,6 +17,31 @@ stay under 3%.
   candidate's CI does not overlap the baseline CI (Criterion's own change report says
   "regressed" / "improved" / "within noise").
 
+## 2026-09-08 — audit implementation session baseline (`1dca229`)
+
+Recorded before implementing TR-01/TR-05, from an isolated archive of HEAD while
+holding the fleet build lock in a 24 GiB scope, with two Cargo build jobs.
+All **107 cases completed** with `--features all-features` and the four declared
+bench targets (`pooling`, `routing`, `protocol`, `relay`). Host: **gpc001ca**.
+Criterion baseline name: `audit-tr01-before`, target directory: `target-integ`.
+The complete per-case sample median estimates and 95% confidence intervals are
+saved in [tr01-benchmarks-before.json](../docs/internal/audit-2026-09/evidence/tr01-benchmarks-before.json).
+This is a session baseline, not a candidate performance acceptance result. It
+uses sample median estimates explicitly; historical CLI interval centers above
+may use Criterion's regression slope estimator instead.
+
+## 2026-09-09 — initial TR-01/TR-05 candidate measurement
+
+All 107 cases completed under the same feature set, fleet lock and memory bound.
+Full measurements: [tr01-benchmarks.json](../docs/internal/audit-2026-09/evidence/tr01-benchmarks.json).
+The arithmetic mean of per-case sample-median deltas is +0.086%; the geometric
+mean is -0.202%. However, **39 sample-median confidence intervals show separated
+regressions**, including `pool/acquire_release/contention/2` at +22.89%.
+**Performance acceptance remains open.** A nearly flat aggregate does not satisfy
+the per-path gate. Keep this run's evidence and make a controlled baseline/candidate
+comparison before attributing these deltas to implementation or host variation.
+This frozen candidate predates the TR-02 and September 9 recorder follow-ups.
+
 ## 2026-09-04 — 1.6.0 post-release measurement (main `ce73809`, code = tag `v1.6.0`)
 
 Full-suite run of the released 1.6.0 (21 perf/stability fixes + F3 tr_mode failover) on this host —
@@ -479,10 +504,11 @@ as the header). Feature-free code, so the figures hold across every feature set.
 This is a shared, production-like host running several concurrent sessions; CPU-frequency
 scaling and co-tenant load make these ns/µs microbenchmarks noisy run-to-run (±10–15% on
 the sub-200ns cases is common). A **scattered** mix of "improved" and "regressed" verdicts
-across benchmarks — especially on code a change did not touch — is measurement variance, not
-a real regression. Judge a candidate by: (1) does the change touch benchmarked code at all
-(the benches import only `connection_pool` and `NodeEndpoint`/`NodeId`/`NodeRole`), and
-(2) is any regression *localized and consistent* to the changed hot path? For a decisive
+across benchmarks — especially on code a change did not touch — may reflect measurement
+variance, but that alone does not establish a performance pass. Check whether the
+change reaches the measured path and whether the regression is localized and repeatable.
+The suite now includes protocol, journal, pool-mode and routing paths in addition to
+connection pooling; its library measurements still do not cover the daemon relay. For a decisive
 comparison, record a fresh baseline of the base commit and the candidate back-to-back in the
 same quiescent window rather than comparing against a baseline taken at a different time.
 

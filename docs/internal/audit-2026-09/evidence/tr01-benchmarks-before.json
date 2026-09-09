@@ -1,0 +1,973 @@
+{
+  "commit": "1dca229a9f87e2203cebb0a313e0432d21537dd5",
+  "host": "gpc001ca",
+  "date": "2026-09-08",
+  "features": "all-features",
+  "baseline_name": "audit-tr01-before",
+  "metric": "Criterion sample median point estimate (ns)",
+  "benchmarks": [
+    {
+      "benchmark": "journal/add_entry/push",
+      "median_ns": 124.87474380972807,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 123.97181865919832,
+        "upper_bound": 126.21031379787725
+      }
+    },
+    {
+      "benchmark": "journal/entries_in_window/scan_500",
+      "median_ns": 56980.68337349397,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 54962.80844155844,
+        "upper_bound": 57249.37043189369
+      }
+    },
+    {
+      "benchmark": "journal/manager/begin_log_commit",
+      "median_ns": 499.3271468845887,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 492.5687302281052,
+        "upper_bound": 510.7761021872864
+      }
+    },
+    {
+      "benchmark": "journal/manager_contention/2",
+      "median_ns": 17057.924563492063,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 16995.70527777778,
+        "upper_bound": 17186.071111111112
+      }
+    },
+    {
+      "benchmark": "journal/manager_contention/32",
+      "median_ns": 93979.3300803001,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 90730.12023460411,
+        "upper_bound": 101237.95786524724
+      }
+    },
+    {
+      "benchmark": "journal/manager_contention/8",
+      "median_ns": 28015.05905647383,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 26670.821212121213,
+        "upper_bound": 28983.257575757576
+      }
+    },
+    {
+      "benchmark": "journal/rollback_to_savepoint/128",
+      "median_ns": 7896.937635281385,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 7830.745923913043,
+        "upper_bound": 7956.428043309703
+      }
+    },
+    {
+      "benchmark": "journal/rollback_to_savepoint/16",
+      "median_ns": 1044.5375601926164,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 970.4633791094466,
+        "upper_bound": 1385.620224719101
+      }
+    },
+    {
+      "benchmark": "journal/statement_type/ddl",
+      "median_ns": 33.981894080905526,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 33.79635051794814,
+        "upper_bound": 34.490929311183706
+      }
+    },
+    {
+      "benchmark": "journal/statement_type/delete",
+      "median_ns": 33.160843519170086,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 33.00489612729899,
+        "upper_bound": 33.35900925421883
+      }
+    },
+    {
+      "benchmark": "journal/statement_type/insert",
+      "median_ns": 25.62940196146866,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 25.556332325459394,
+        "upper_bound": 25.75869261429715
+      }
+    },
+    {
+      "benchmark": "journal/statement_type/other",
+      "median_ns": 35.05435365165681,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 34.40676528721953,
+        "upper_bound": 35.41162095530755
+      }
+    },
+    {
+      "benchmark": "journal/statement_type/select",
+      "median_ns": 22.284717571199746,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 22.13128676651933,
+        "upper_bound": 22.687817205230076
+      }
+    },
+    {
+      "benchmark": "journal/statement_type/set",
+      "median_ns": 32.586697507245376,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 32.45328376511609,
+        "upper_bound": 32.7396543417655
+      }
+    },
+    {
+      "benchmark": "journal/statement_type/txn",
+      "median_ns": 24.849158579890148,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 24.74908680679625,
+        "upper_bound": 25.423119092460453
+      }
+    },
+    {
+      "benchmark": "journal/statement_type/update",
+      "median_ns": 28.826286604105928,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 28.58703703703704,
+        "upper_bound": 29.138348421001055
+      }
+    },
+    {
+      "benchmark": "journal/total_size/1",
+      "median_ns": 6.1628801904030315,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 6.155368108259388,
+        "upper_bound": 6.178590272839495
+      }
+    },
+    {
+      "benchmark": "journal/total_size/128",
+      "median_ns": 768.927938874459,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 766.4644705882353,
+        "upper_bound": 772.6695005614035
+      }
+    },
+    {
+      "benchmark": "journal/total_size/16",
+      "median_ns": 106.29336728844578,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 106.15559132341063,
+        "upper_bound": 106.60244089516087
+      }
+    },
+    {
+      "benchmark": "pool/acquire_release/contention/2",
+      "median_ns": 18241.14292929293,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 18012.71611570248,
+        "upper_bound": 19065.464905043587
+      }
+    },
+    {
+      "benchmark": "pool/acquire_release/contention/32",
+      "median_ns": 405339.78125,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 384482.52684144815,
+        "upper_bound": 418709.9551282051
+      }
+    },
+    {
+      "benchmark": "pool/acquire_release/contention/8",
+      "median_ns": 100853.24769966875,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 99064.78484848485,
+        "upper_bound": 102523.58083945041
+      }
+    },
+    {
+      "benchmark": "pool/acquire_release/single",
+      "median_ns": 700.438167001268,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 681.6595179014533,
+        "upper_bound": 719.8617878831694
+      }
+    },
+    {
+      "benchmark": "pool/config/custom",
+      "median_ns": 3.741787436785959,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 3.7374716932162175,
+        "upper_bound": 3.7454608010599952
+      }
+    },
+    {
+      "benchmark": "pool/config/default",
+      "median_ns": 3.918990146351187,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 3.911764255011341,
+        "upper_bound": 3.927517528551538
+      }
+    },
+    {
+      "benchmark": "pool/create/10",
+      "median_ns": 61.61117019371934,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 61.463423812021944,
+        "upper_bound": 61.863562527814864
+      }
+    },
+    {
+      "benchmark": "pool/create/100",
+      "median_ns": 64.7725420524541,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 64.58157347726397,
+        "upper_bound": 65.74604687926097
+      }
+    },
+    {
+      "benchmark": "pool/create/50",
+      "median_ns": 61.67862694862275,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 61.498854571301806,
+        "upper_bound": 61.86680998884641
+      }
+    },
+    {
+      "benchmark": "pool/create/500",
+      "median_ns": 61.90016828641181,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 61.72046130472614,
+        "upper_bound": 62.01336597505606
+      }
+    },
+    {
+      "benchmark": "pool/metrics/read_metrics",
+      "median_ns": 4.836246215328109,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 4.800557203286452,
+        "upper_bound": 4.8796165285634014
+      }
+    },
+    {
+      "benchmark": "pool/node_endpoint/address",
+      "median_ns": 105.56884954734086,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 105.38303968947895,
+        "upper_bound": 105.83223961343239
+      }
+    },
+    {
+      "benchmark": "pool/node_endpoint/create",
+      "median_ns": 720.7954640360867,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 714.7438527221366,
+        "upper_bound": 728.1239406779661
+      }
+    },
+    {
+      "benchmark": "pool/node_endpoint/node_id",
+      "median_ns": 742.6531491312742,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 737.9013735958181,
+        "upper_bound": 750.018105041979
+      }
+    },
+    {
+      "benchmark": "pool/throughput/sequential_acquire/1",
+      "median_ns": 734.4113390585242,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 733.5024658885095,
+        "upper_bound": 735.9010250817885
+      }
+    },
+    {
+      "benchmark": "pool/throughput/sequential_acquire/10",
+      "median_ns": 7767.8115384615385,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 7729.413146853147,
+        "upper_bound": 7803.339644970414
+      }
+    },
+    {
+      "benchmark": "pool/throughput/sequential_acquire/50",
+      "median_ns": 37026.66644614765,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 36977.99323076923,
+        "upper_bound": 37115.46828571428
+      }
+    },
+    {
+      "benchmark": "pool_mode/manager_acquire_release/2",
+      "median_ns": 19142.954685080564,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 18570.797376295504,
+        "upper_bound": 20045.98015873016
+      }
+    },
+    {
+      "benchmark": "pool_mode/manager_acquire_release/32",
+      "median_ns": 183672.4586988304,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 182736.2973985891,
+        "upper_bound": 184716.39285714287
+      }
+    },
+    {
+      "benchmark": "pool_mode/manager_acquire_release/8",
+      "median_ns": 57676.76747099156,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 57251.296101774045,
+        "upper_bound": 57991.63888888889
+      }
+    },
+    {
+      "benchmark": "pool_mode/on_statement_complete/txn_sequence",
+      "median_ns": 284.1588561516662,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 283.5838715590139,
+        "upper_bound": 284.987087527281
+      }
+    },
+    {
+      "benchmark": "pool_mode/pool_key",
+      "median_ns": 165.1929887653232,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 164.34007984724875,
+        "upper_bound": 166.67465106278897
+      }
+    },
+    {
+      "benchmark": "pool_mode/prepared_parse/deallocate/all",
+      "median_ns": 51.234880221059484,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 51.09235678605867,
+        "upper_bound": 51.35969173555911
+      }
+    },
+    {
+      "benchmark": "pool_mode/prepared_parse/deallocate/named",
+      "median_ns": 64.16957004019287,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 63.33126389296134,
+        "upper_bound": 66.58265206204031
+      }
+    },
+    {
+      "benchmark": "pool_mode/prepared_parse/prepare/named",
+      "median_ns": 122.13656618503823,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 120.8206247665297,
+        "upper_bound": 122.48952807869506
+      }
+    },
+    {
+      "benchmark": "pool_mode/prepared_parse/prepare/typed",
+      "median_ns": 228.07391131966978,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 226.88195364113312,
+        "upper_bound": 229.37873308265267
+      }
+    },
+    {
+      "benchmark": "pool_mode/statement_safety/is_safe/safe_select",
+      "median_ns": 37.26834266046803,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 37.04021391745118,
+        "upper_bound": 37.56501671989371
+      }
+    },
+    {
+      "benchmark": "pool_mode/statement_safety/is_safe/safe_set_local",
+      "median_ns": 107.52830589032138,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 107.25909370054076,
+        "upper_bound": 107.83085258413735
+      }
+    },
+    {
+      "benchmark": "pool_mode/statement_safety/is_safe/unsafe_listen",
+      "median_ns": 24.68114828528973,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 24.612614467654105,
+        "upper_bound": 24.792455125241876
+      }
+    },
+    {
+      "benchmark": "pool_mode/statement_safety/is_safe/unsafe_prepare",
+      "median_ns": 26.79475271651316,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 26.65803553722416,
+        "upper_bound": 27.276517603354627
+      }
+    },
+    {
+      "benchmark": "pool_mode/statement_safety/is_safe/unsafe_set",
+      "median_ns": 147.7404791648077,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 147.34631480324796,
+        "upper_bound": 148.14201948057826
+      }
+    },
+    {
+      "benchmark": "pool_mode/statement_safety/warning/safe_select",
+      "median_ns": 38.26206494201094,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 37.89685657815824,
+        "upper_bound": 39.397312459744825
+      }
+    },
+    {
+      "benchmark": "pool_mode/statement_safety/warning/safe_set_local",
+      "median_ns": 104.20133858956757,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 102.95494195630334,
+        "upper_bound": 105.66199100562112
+      }
+    },
+    {
+      "benchmark": "pool_mode/statement_safety/warning/unsafe_listen",
+      "median_ns": 27.652804144947417,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 27.272856811808783,
+        "upper_bound": 28.216746480513542
+      }
+    },
+    {
+      "benchmark": "pool_mode/statement_safety/warning/unsafe_prepare",
+      "median_ns": 30.007688410426887,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 29.422266113892366,
+        "upper_bound": 30.53397857907401
+      }
+    },
+    {
+      "benchmark": "pool_mode/statement_safety/warning/unsafe_set",
+      "median_ns": 135.62126301362713,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 134.38737178633275,
+        "upper_bound": 137.35406813290052
+      }
+    },
+    {
+      "benchmark": "pool_mode/txn_event_detect/begin",
+      "median_ns": 8.69338893578487,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 8.650359399245431,
+        "upper_bound": 8.765694655874087
+      }
+    },
+    {
+      "benchmark": "pool_mode/txn_event_detect/commit",
+      "median_ns": 11.444358680597608,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 11.4234920168508,
+        "upper_bound": 11.468167106660683
+      }
+    },
+    {
+      "benchmark": "pool_mode/txn_event_detect/release",
+      "median_ns": 15.178678935867506,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 15.094046851992134,
+        "upper_bound": 15.263792994861083
+      }
+    },
+    {
+      "benchmark": "pool_mode/txn_event_detect/rollback",
+      "median_ns": 18.616915173659198,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 18.523346731683638,
+        "upper_bound": 18.737222734226265
+      }
+    },
+    {
+      "benchmark": "pool_mode/txn_event_detect/rollback_to",
+      "median_ns": 24.12169999457535,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 23.96581240646071,
+        "upper_bound": 24.391916888933068
+      }
+    },
+    {
+      "benchmark": "pool_mode/txn_event_detect/savepoint",
+      "median_ns": 14.523568656605004,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 14.414620961638693,
+        "upper_bound": 14.729373792914899
+      }
+    },
+    {
+      "benchmark": "pool_mode/txn_event_detect/start_txn",
+      "median_ns": 48.61356259804083,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 47.97354384845746,
+        "upper_bound": 49.883915747723925
+      }
+    },
+    {
+      "benchmark": "pool_mode/txn_event_detect/statement",
+      "median_ns": 13.307072474333271,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 13.222784486652245,
+        "upper_bound": 13.37164775833789
+      }
+    },
+    {
+      "benchmark": "protocol/backend_response/auth_md5",
+      "median_ns": 43.31543438356293,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 43.23196854248906,
+        "upper_bound": 43.83709721839713
+      }
+    },
+    {
+      "benchmark": "protocol/backend_response/auth_sasl",
+      "median_ns": 148.99995025450318,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 148.48174583963691,
+        "upper_bound": 149.65407463439232
+      }
+    },
+    {
+      "benchmark": "protocol/backend_response/command_complete",
+      "median_ns": 139.23481251404542,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 137.83795992283422,
+        "upper_bound": 139.6796686892035
+      }
+    },
+    {
+      "benchmark": "protocol/backend_response/error_response",
+      "median_ns": 487.33083967193824,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 485.16478644435796,
+        "upper_bound": 488.69309635653667
+      }
+    },
+    {
+      "benchmark": "protocol/decode_message/kilobyte_in_list",
+      "median_ns": 138.244313691519,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 134.42495982501293,
+        "upper_bound": 140.9682506444815
+      }
+    },
+    {
+      "benchmark": "protocol/decode_message/medium_where",
+      "median_ns": 66.06583961307749,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 65.68796929862962,
+        "upper_bound": 66.72439884271857
+      }
+    },
+    {
+      "benchmark": "protocol/decode_message/short_select",
+      "median_ns": 68.2862387299501,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 67.23818875686123,
+        "upper_bound": 69.45383847442085
+      }
+    },
+    {
+      "benchmark": "protocol/decode_startup/cancel_request",
+      "median_ns": 41.58522920571785,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 41.45993530127113,
+        "upper_bound": 42.032242387646235
+      }
+    },
+    {
+      "benchmark": "protocol/decode_startup/ssl_request",
+      "median_ns": 26.92073743396491,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 26.649542649737523,
+        "upper_bound": 27.116314466073742
+      }
+    },
+    {
+      "benchmark": "protocol/decode_startup/startup_params",
+      "median_ns": 800.8889905230883,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 799.3739416791858,
+        "upper_bound": 803.105078447564
+      }
+    },
+    {
+      "benchmark": "protocol/encode_message/kilobyte_in_list",
+      "median_ns": 76.49395717125208,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 76.36551345736616,
+        "upper_bound": 76.5911650851321
+      }
+    },
+    {
+      "benchmark": "protocol/encode_message/medium_where",
+      "median_ns": 24.185782877517287,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 24.03943115238978,
+        "upper_bound": 24.272552395662196
+      }
+    },
+    {
+      "benchmark": "protocol/encode_message/short_select",
+      "median_ns": 20.564454818510725,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 20.474074524427152,
+        "upper_bound": 20.808692664387216
+      }
+    },
+    {
+      "benchmark": "protocol/extended_parse/bind_message",
+      "median_ns": 217.4834521873821,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 215.86332991475984,
+        "upper_bound": 219.4166601133462
+      }
+    },
+    {
+      "benchmark": "protocol/extended_parse/parse_message",
+      "median_ns": 165.214120380077,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 164.02280224311397,
+        "upper_bound": 166.26948888522367
+      }
+    },
+    {
+      "benchmark": "protocol/query_text/kilobyte_in_list",
+      "median_ns": 360.65648287670456,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 360.29360862624617,
+        "upper_bound": 368.77089096508166
+      }
+    },
+    {
+      "benchmark": "protocol/query_text/medium_where",
+      "median_ns": 41.60427723852128,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 41.491126785092305,
+        "upper_bound": 41.72804811320367
+      }
+    },
+    {
+      "benchmark": "protocol/query_text/short_select",
+      "median_ns": 12.162035221166505,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 12.14178273962619,
+        "upper_bound": 12.18765107783107
+      }
+    },
+    {
+      "benchmark": "protocol/tag_dispatch/contains_ci",
+      "median_ns": 19.89828266278252,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 19.825531508106454,
+        "upper_bound": 19.943380496596358
+      }
+    },
+    {
+      "benchmark": "protocol/tag_dispatch/from_tag",
+      "median_ns": 12.807446836979418,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 12.781335058279453,
+        "upper_bound": 12.839661439677359
+      }
+    },
+    {
+      "benchmark": "protocol/tag_dispatch/starts_with_ci",
+      "median_ns": 5.701455884618829,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 5.57692493790744,
+        "upper_bound": 5.785826682843498
+      }
+    },
+    {
+      "benchmark": "routing/hint_parse/complex_query",
+      "median_ns": 1880.233857581802,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 1874.6512518409425,
+        "upper_bound": 1893.6840715985045
+      }
+    },
+    {
+      "benchmark": "routing/hint_parse/multiple_hints",
+      "median_ns": 3423.8845624920687,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 3370.000687765022,
+        "upper_bound": 3478.792377701934
+      }
+    },
+    {
+      "benchmark": "routing/hint_parse/no_hints",
+      "median_ns": 98.21770849931855,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 98.06066117318684,
+        "upper_bound": 98.29819940752938
+      }
+    },
+    {
+      "benchmark": "routing/hint_parse/single_hint",
+      "median_ns": 868.9963393619719,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 863.8199029780353,
+        "upper_bound": 878.0251688152241
+      }
+    },
+    {
+      "benchmark": "routing/hint_strip/no_hints",
+      "median_ns": 75.21638495266353,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 74.92164544761644,
+        "upper_bound": 75.77420981422543
+      }
+    },
+    {
+      "benchmark": "routing/hint_strip/single_hint",
+      "median_ns": 252.25523834050887,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 246.85632728229413,
+        "upper_bound": 266.8568250107942
+      }
+    },
+    {
+      "benchmark": "routing/hint_strip/two_hints",
+      "median_ns": 345.9378205060078,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 342.8405113508589,
+        "upper_bound": 349.09156320997374
+      }
+    },
+    {
+      "benchmark": "routing/node_select/batch_parse",
+      "median_ns": 336951.3709508882,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 334297.7791005291,
+        "upper_bound": 338912.72775372776
+      }
+    },
+    {
+      "benchmark": "routing/route/complex_hints",
+      "median_ns": 4163.1079877724615,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 4047.8052897395,
+        "upper_bound": 4266.224532824748
+      }
+    },
+    {
+      "benchmark": "routing/route/read_no_hints",
+      "median_ns": 2956.406541397947,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 2903.1908421777734,
+        "upper_bound": 3009.568493150685
+      }
+    },
+    {
+      "benchmark": "routing/route/read_with_hint",
+      "median_ns": 2749.882040110045,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 2727.479269041769,
+        "upper_bound": 2837.2226173541962
+      }
+    },
+    {
+      "benchmark": "routing/route/write",
+      "median_ns": 2467.5195553717704,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 2348.778644501279,
+        "upper_bound": 2606.8311631944443
+      }
+    },
+    {
+      "benchmark": "routing/write_detect/begin",
+      "median_ns": 48.296503811972755,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 48.14001029740849,
+        "upper_bound": 48.72787692800821
+      }
+    },
+    {
+      "benchmark": "routing/write_detect/create_table",
+      "median_ns": 51.198235997788245,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 51.15568806682066,
+        "upper_bound": 51.31275637033644
+      }
+    },
+    {
+      "benchmark": "routing/write_detect/delete",
+      "median_ns": 58.41445324783492,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 58.35259264453,
+        "upper_bound": 58.477469797634086
+      }
+    },
+    {
+      "benchmark": "routing/write_detect/insert",
+      "median_ns": 50.192522753556915,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 50.15261349104859,
+        "upper_bound": 50.25858333007932
+      }
+    },
+    {
+      "benchmark": "routing/write_detect/select",
+      "median_ns": 52.58142123842984,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 51.73394387672594,
+        "upper_bound": 53.36757227822399
+      }
+    },
+    {
+      "benchmark": "routing/write_detect/update",
+      "median_ns": 58.808011477896876,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 58.60409262139098,
+        "upper_bound": 59.0282006685224
+      }
+    },
+    {
+      "benchmark": "routing/write_detect/with_cte",
+      "median_ns": 54.255763304073916,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 53.82191985055056,
+        "upper_bound": 54.515609416092374
+      }
+    },
+    {
+      "benchmark": "switchover/buffer_query/enqueue_one",
+      "median_ns": 278.08035941292036,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 277.1631541346669,
+        "upper_bound": 278.95220575102695
+      }
+    },
+    {
+      "benchmark": "switchover/drain/1",
+      "median_ns": 381.253998263558,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 374.3590476190476,
+        "upper_bound": 394.10293135435995
+      }
+    },
+    {
+      "benchmark": "switchover/drain/16",
+      "median_ns": 1956.9082505570873,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 1915.691829819277,
+        "upper_bound": 2015.4096385542168
+      }
+    },
+    {
+      "benchmark": "switchover/drain/64",
+      "median_ns": 6459.381486000387,
+      "ci95": {
+        "confidence_level": 0.95,
+        "lower_bound": 6448.835456862032,
+        "upper_bound": 6486.546110314044
+      }
+    }
+  ]
+}
