@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- In-session replay now verifies what it replays. While a transaction is recorded
+  for `tr_mode = transaction`, each statement's response frames are hashed (up to
+  the new `[limits] tr_max_observation_bytes`, default 1 MiB); the replacement
+  backend's responses are hashed the same way during replay and any divergence
+  rolls the replay back and returns `40001`, instead of continuing a transaction
+  whose earlier results the client saw from a different snapshot. Transactions at
+  `SERIALIZABLE`/`REPEATABLE READ` are marked non-replayable. One recovery deadline,
+  `write_timeout_secs`, now bounds the whole failover — primary wait, connect/auth,
+  session restore, replay and re-execution — where per-operation timeouts could
+  previously add up beyond it (TR-06).
+
+- New `[limits] backend_response_timeout_secs` (default 0 = off) bounds one backend
+  response as a whole on every streaming relay. The per-read
+  `backend_read_timeout_secs` re-arms on each read, so a backend dripping bytes
+  inside a single response was never timed out (H-07 slow-drip).
+
 - Session `SET` tracking for failover restore is now transactional, mirroring
   PostgreSQL: a `SET` inside a transaction is restored only if that transaction
   commits, `ROLLBACK TO SAVEPOINT` discards the `SET`s made after the savepoint,

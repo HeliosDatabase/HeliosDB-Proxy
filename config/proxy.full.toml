@@ -118,6 +118,10 @@ write_timeout_secs = 30
 # size. Bounds a single frame, not a result set. Default 100 MiB = the frontend
 # message cap.
 # max_backend_frame_bytes = 104857600
+# Whole-response deadline for one backend response on the streaming relays (from
+# first byte to ReadyForQuery). backend_read_timeout_secs re-arms per read, so it
+# cannot catch a backend dripping bytes inside one response; this can. 0 = off.
+# backend_response_timeout_secs = 0
 # # Global ceiling on idle connections parked in the data-path backend pool
 # # across ALL (node,user,db) identities (pool-modes feature only).
 # max_total_idle_backend_conns = 8192
@@ -158,6 +162,7 @@ write_timeout_secs = 30
 # # In-session Transaction Replay (tr_mode != none): cap on tracked session
 # # SET/RESET statements replayed onto the replacement backend. Over the cap,
 # # tracking stops (tr_session_set_cap_exceeded_total) and the restore is partial.
+# tr_max_observation_bytes = 1048576   # response bytes hashed per recorded statement; replay verifies the digest (40001 on divergence)
 # tr_max_session_set_statements = 256   # distinct session variables tracked for restore;
 #                                        # over the cap a failover is refused (08006)
 

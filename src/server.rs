@@ -632,6 +632,77 @@ enum GucOp {
     ResetAll,
 }
 
+/// TR-06: a bounded, order-sensitive digest of the frames a client observed
+/// from one response. Recorded per statement while a transaction is being
+/// captured for replay; recomputed over the replacement backend's response at
+/// replay time and compared, so a replay never continues a transaction whose
+/// earlier results came from a different snapshot.
+struct Observation {
+    hasher: std::collections::hash_map::DefaultHasher,
+    bytes: usize,
+    cap: usize,
+    overflow: bool,
+}
+
+impl Observation {
+    fn new(cap: usize) -> Self {
+        Self {
+            hasher: std::collections::hash_map::DefaultHasher::new(),
+            bytes: 0,
+            cap,
+            overflow: false,
+        }
+    }
+
+    /// Frames that carry what the client sees of a result. Notices, parameter
+    /// status and notifications are asynchronous and excluded; ReadyForQuery is
+    /// the recorder's own bookkeeping.
+    fn observes(mtype: u8) -> bool {
+        matches!(mtype, b'T' | b'D' | b'C' | b'I')
+    }
+
+    fn note(&mut self, frame: &[u8]) {
+        if self.overflow || !Self::observes(frame[0]) {
+            return;
+        }
+        if self.bytes.saturating_add(frame.len()) > self.cap {
+            self.overflow = true;
+            return;
+        }
+        use std::hash::Hasher as _;
+        self.hasher.write(frame);
+        self.bytes += frame.len();
+    }
+
+    /// `None` when the response exceeded the budget (unverifiable); otherwise a
+    /// non-zero digest (zero is reserved for "none recorded").
+    fn finish(&self) -> Option<u64> {
+        use std::hash::Hasher as _;
+        (!self.overflow).then(|| self.hasher.finish().max(1))
+    }
+}
+
+/// Per-read timeout under an optional whole-response deadline (H-07 slow drip):
+/// the smaller of the per-read timeout and what is left of the deadline, or an
+/// error once the deadline has passed.
+fn read_budget(
+    per_read: Duration,
+    response_deadline: Option<tokio::time::Instant>,
+) -> Result<Duration> {
+    match response_deadline {
+        None => Ok(per_read),
+        Some(d) => {
+            let left = d.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return Err(ProxyError::Network(
+                    "Backend response timeout: whole-response deadline exceeded".to_string(),
+                ));
+            }
+            Ok(per_read.min(left))
+        }
+    }
+}
+
 /// The budgets one streaming relay needs, resolved from `[limits]`. Only the
 /// cache-capture relay takes them as a bundle (clippy's argument cap); the plain
 /// relays read `state.limits` directly, so this is gated with that relay.
@@ -642,6 +713,10 @@ struct RelayLimits {
     backend_read_timeout: Duration,
     /// H-07 backend frame budget (`[limits] max_backend_frame_bytes`).
     max_frame_bytes: usize,
+    /// Whole-response deadline; `None` = off.
+    response_timeout: Option<Duration>,
+    /// TR-06 observation byte budget.
+    observation_bytes: usize,
 }
 
 fn validate_backend_frame_len(len: usize, max: usize) -> Result<()> {
@@ -673,6 +748,11 @@ struct ResolvedLimits {
     /// Cap on one backend response frame's declared length on every streaming
     /// relay (H-07); `[limits] max_backend_frame_bytes`.
     max_backend_frame_bytes: usize,
+    /// Whole-response deadline on the streaming relays (H-07 slow-drip);
+    /// `None` = off. `[limits] backend_response_timeout_secs`.
+    backend_response_timeout: Option<Duration>,
+    /// TR-06 observation digest byte budget per recorded statement.
+    tr_max_observation_bytes: usize,
     /// Only read on the pool-modes data path; gated to avoid a dead-field
     /// warning on feature-off builds.
     #[cfg(feature = "pool-modes")]
@@ -701,6 +781,8 @@ impl ResolvedLimits {
             client_write_timeout: self.client_write_timeout,
             backend_read_timeout: self.backend_read_timeout,
             max_frame_bytes: self.max_backend_frame_bytes,
+            response_timeout: self.backend_response_timeout,
+            observation_bytes: self.tr_max_observation_bytes,
         }
     }
 
@@ -716,6 +798,9 @@ impl ResolvedLimits {
             max_prepared_bytes: l.max_prepared_bytes,
             max_pending_bytes: l.max_pending_bytes,
             max_backend_frame_bytes: l.max_backend_frame_bytes,
+            backend_response_timeout: (l.backend_response_timeout_secs > 0)
+                .then(|| Duration::from_secs(l.backend_response_timeout_secs)),
+            tr_max_observation_bytes: l.tr_max_observation_bytes,
             #[cfg(feature = "pool-modes")]
             max_total_idle_backend_conns: l.max_total_idle_backend_conns,
             pool_reap_interval: Duration::from_secs(l.pool_reap_interval_secs),
@@ -1007,6 +1092,14 @@ pub struct ClientSession {
     /// `ErrorResponse` frame. Lets the TR bookkeeping skip recording a
     /// `SET` that the backend rejected.
     pub last_response_error: std::sync::atomic::AtomicBool,
+    /// TR-06 observation digest of the most recent fully-relayed response
+    /// (RowDescription/DataRow/CommandComplete/EmptyQueryResponse frames),
+    /// `0` = none computed. Hashed only while inside an explicit transaction
+    /// under a recording `tr_mode`, so the autocommit hot path pays nothing.
+    pub last_response_digest: std::sync::atomic::AtomicU64,
+    /// The most recent response exceeded `tr_max_observation_bytes`: it has no
+    /// verifiable observation, so its transaction must not be replayed.
+    pub last_response_unverifiable: std::sync::atomic::AtomicBool,
     /// Set by the forward path when the statement it just sent was
     /// transformed on the way to the backend (query-rewrite rule fired,
     /// tenant filter injected): the client text the TR bookkeeping records is
@@ -2700,6 +2793,8 @@ impl ProxyServer {
             copy_in_progress: std::sync::atomic::AtomicBool::new(false),
             last_rfq_status: std::sync::atomic::AtomicU8::new(b'I'),
             last_response_error: std::sync::atomic::AtomicBool::new(false),
+            last_response_digest: std::sync::atomic::AtomicU64::new(0),
+            last_response_unverifiable: std::sync::atomic::AtomicBool::new(false),
             tr_replay_tainted: std::sync::atomic::AtomicBool::new(false),
             backend_credential: RwLock::new(None),
             tx_state: RwLock::new(TransactionState::default()),
@@ -6013,6 +6108,15 @@ impl ProxyServer {
     ) -> std::result::Result<u64, ResponseFailure> {
         let client_write_timeout = state.limits.client_write_timeout;
         let backend_read_timeout = state.limits.backend_read_timeout;
+        let response_deadline = state
+            .limits
+            .backend_response_timeout
+            .map(|d| tokio::time::Instant::now() + d);
+        // TR-06: observe only inside an explicit transaction under a recording
+        // mode; everything else pays no hashing.
+        let mut observation = (session.in_transaction.load(Ordering::Relaxed)
+            && matches!(session.tr_mode, TrMode::Select | TrMode::Transaction))
+        .then(|| Observation::new(state.limits.tr_max_observation_bytes));
         let mut buf = BytesMut::with_capacity(16384);
         let mut sent: u64 = 0;
         let mut had_error = false;
@@ -6043,6 +6147,9 @@ impl ProxyServer {
                         had_error = true;
                     }
                     command_complete |= mtype == b'C';
+                    if let Some(obs) = observation.as_mut() {
+                        obs.note(&rem[..frame_total]);
+                    }
                     if mtype == b'Z' {
                         // ReadyForQuery: payload is one status byte at rem[5].
                         ready_status = Some(if frame_total >= 6 { rem[5] } else { b'I' });
@@ -6067,6 +6174,7 @@ impl ProxyServer {
 
                 if let Some(status) = ready_status {
                     Self::note_ready_for_query(session, status, had_error);
+                    Self::note_observation(session, observation.as_ref());
                     return Ok(sent);
                 }
                 if yield_for_copy {
@@ -6083,10 +6191,13 @@ impl ProxyServer {
                 // Read straight into the frame accumulator — no zeroed scratch, no
                 // copy. `read_buf` appends to `buf`'s spare capacity.
                 buf.reserve(16384);
-                let n = tokio::time::timeout(backend_read_timeout, backend.read_buf(&mut buf))
-                    .await
-                    .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
-                    .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
+                let n = tokio::time::timeout(
+                    read_budget(backend_read_timeout, response_deadline)?,
+                    backend.read_buf(&mut buf),
+                )
+                .await
+                .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
+                .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
                 if n == 0 {
                     return Err(ProxyError::Connection(
                         "Backend closed mid-response".to_string(),
@@ -6145,6 +6256,12 @@ impl ProxyServer {
         // Set once the response outgrows `max_capture_bytes`; `captured` is
         // then empty and stays empty for the rest of the response.
         let mut oversize = false;
+        let response_deadline = relay
+            .response_timeout
+            .map(|d| tokio::time::Instant::now() + d);
+        let mut observation = (session.in_transaction.load(Ordering::Relaxed)
+            && matches!(session.tr_mode, TrMode::Select | TrMode::Transaction))
+        .then(|| Observation::new(relay.observation_bytes));
 
         let response = async {
             loop {
@@ -6165,6 +6282,9 @@ impl ProxyServer {
                         had_error = true;
                     }
                     command_complete |= mtype == b'C';
+                    if let Some(obs) = observation.as_mut() {
+                        obs.note(&rem[..frame_total]);
+                    }
                     // Async backend frames (backend 'S' is unambiguous here —
                     // PortalSuspended is lowercase 's').
                     if mtype == b'A' || mtype == b'N' || mtype == b'S' {
@@ -6228,6 +6348,7 @@ impl ProxyServer {
 
                 if let Some(status) = ready_status {
                     Self::note_ready_for_query(session, status, had_error);
+                    Self::note_observation(session, observation.as_ref());
                     let cacheable = !had_error && status == b'I' && !saw_async && !oversize;
                     return Ok((sent, captured, cacheable, row_count));
                 }
@@ -6240,11 +6361,13 @@ impl ProxyServer {
 
                 // Read straight into the frame accumulator — no zeroed scratch.
                 buf.reserve(16384);
-                let n =
-                    tokio::time::timeout(relay.backend_read_timeout, backend.read_buf(&mut buf))
-                        .await
-                        .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
-                        .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
+                let n = tokio::time::timeout(
+                    read_budget(relay.backend_read_timeout, response_deadline)?,
+                    backend.read_buf(&mut buf),
+                )
+                .await
+                .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
+                .map_err(|e| ProxyError::Network(format!("Backend read error: {}", e)))?;
                 if n == 0 {
                     return Err(ProxyError::Connection(
                         "Backend closed mid-response".to_string(),
@@ -7140,8 +7263,20 @@ impl ProxyServer {
         state: &Arc<ServerState>,
         config: &ProxyConfig,
     ) -> Result<String> {
-        let timeout = config.write_timeout();
-        let start = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + config.write_timeout();
+        Self::select_primary_until(session, state, config, deadline).await
+    }
+
+    /// `select_primary_with_timeout` against a caller-owned deadline, so one
+    /// recovery deadline can be carried through every phase (TR-06).
+    async fn select_primary_until(
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+        deadline: tokio::time::Instant,
+    ) -> Result<String> {
+        let start = tokio::time::Instant::now();
+        let timeout = deadline.saturating_duration_since(start);
         // Poll for the promoted primary fairly tightly so writes resume
         // quickly after a failover (was 500ms — a needless recovery floor).
         let check_interval = Duration::from_millis(100);
@@ -7168,8 +7303,8 @@ impl ProxyServer {
             }
             drop(health);
 
-            // Check if timeout exceeded
-            if start.elapsed() >= timeout {
+            // Check if the deadline passed
+            if tokio::time::Instant::now() >= deadline {
                 state.metrics.failovers.fetch_add(1, Ordering::Relaxed);
                 return Err(ProxyError::NoHealthyNodes);
             }
@@ -8646,6 +8781,58 @@ impl ProxyServer {
     /// Record the `ReadyForQuery` that closed a response: the hot-path
     /// `in_transaction` flag plus the raw status byte and whether the response
     /// carried an `ErrorResponse` (both read by the in-session TR bookkeeping).
+    /// Publish the TR-06 observation of the response that just completed (or
+    /// clear it when none was taken) for the recorder to attach to its entry.
+    fn note_observation(session: &ClientSession, obs: Option<&Observation>) {
+        let (digest, unverifiable) = match obs {
+            Some(o) => match o.finish() {
+                Some(d) => (d, false),
+                None => (0, true),
+            },
+            None => (0, false),
+        };
+        session
+            .last_response_digest
+            .store(digest, Ordering::Relaxed);
+        session
+            .last_response_unverifiable
+            .store(unverifiable, Ordering::Relaxed);
+    }
+
+    /// A transaction whose isolation level pins a snapshot cannot be replayed:
+    /// re-running it on another backend cannot reproduce that snapshot.
+    /// Detects an explicit level on BEGIN/START TRANSACTION or a later SET
+    /// TRANSACTION, and a session `default_transaction_isolation` above READ
+    /// COMMITTED tracked in the restore set.
+    fn tr_snapshot_sensitive(sql: &str, gucs: &[String]) -> bool {
+        let strict = |t: &str| {
+            Self::contains_word_ci(t, "isolation")
+                && (Self::contains_word_ci(t, "serializable")
+                    || Self::contains_word_ci(t, "repeatable"))
+        };
+        let head = sql.trim_start();
+        let opens = crate::protocol::starts_with_ci(head, "BEGIN")
+            || crate::protocol::starts_with_ci(head, "START");
+        if opens && strict(sql) {
+            return true;
+        }
+        if crate::protocol::starts_with_ci(head, "SET")
+            && Self::contains_word_ci(sql, "transaction")
+            && (strict(sql) || Self::contains_word_ci(sql, "snapshot"))
+        {
+            return true;
+        }
+        if opens && !Self::contains_word_ci(sql, "isolation") {
+            // Inherits the session default.
+            return gucs.iter().any(|g| {
+                Self::tr_guc_name(g).as_deref() == Some("default_transaction_isolation")
+                    && (Self::contains_word_ci(g, "serializable")
+                        || Self::contains_word_ci(g, "repeatable"))
+            });
+        }
+        false
+    }
+
     fn note_ready_for_query(session: &ClientSession, status: u8, had_error: bool) {
         let st = TransactionStatus::from_byte(status);
         session.in_transaction.store(
@@ -9490,7 +9677,35 @@ impl ProxyServer {
             );
             return;
         }
-        ts.statements.push(entry());
+        // TR-06: a statement executed inside the transaction must carry a
+        // verifiable observation, or the transaction cannot be replayed.
+        let mut logged = entry();
+        if prev_status == b'T' {
+            if session
+                .last_response_unverifiable
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                ts.non_replayable = true;
+                ts.statements = Vec::new();
+                ts.replay_bytes = 0;
+                tracing::debug!(
+                    target: "helios::tr",
+                    "response exceeded [limits] tr_max_observation_bytes; transaction marked non-replayable"
+                );
+                return;
+            }
+            let d = session
+                .last_response_digest
+                .swap(0, std::sync::atomic::Ordering::Relaxed);
+            logged.result_checksum = (d != 0).then_some(d);
+        }
+        if !sql.is_empty() && Self::tr_snapshot_sensitive(sql, &tr.gucs) {
+            ts.non_replayable = true;
+            ts.statements = Vec::new();
+            ts.replay_bytes = 0;
+            return;
+        }
+        ts.statements.push(logged);
         ts.replay_bytes += entry_bytes;
     }
 
@@ -9762,6 +9977,7 @@ impl ProxyServer {
         backend: &mut S,
         read_timeout: Duration,
         max_frame_bytes: usize,
+        mut observe: Option<&mut Observation>,
     ) -> Result<(u8, bool)> {
         let mut buf = BytesMut::with_capacity(4096);
         let mut had_error = false;
@@ -9778,6 +9994,9 @@ impl ProxyServer {
                 }
                 let mtype = rem[0];
                 let frame_total = len + 1;
+                if let Some(obs) = observe.as_deref_mut() {
+                    obs.note(&rem[..frame_total]);
+                }
                 consumed += frame_total;
                 match mtype {
                     b'E' => had_error = true,
@@ -9819,6 +10038,7 @@ impl ProxyServer {
         write_timeout: Duration,
         read_timeout: Duration,
         max_frame_bytes: usize,
+        expected: Option<(u64, usize)>,
     ) -> Result<u8> {
         let msg = crate::protocol::QueryMessage {
             query: sql.to_string(),
@@ -9829,13 +10049,22 @@ impl ProxyServer {
             .await
             .map_err(|_| ProxyError::Network("replay write timeout".to_string()))?
             .map_err(|e| ProxyError::Network(format!("replay write error: {}", e)))?;
+        let mut obs = expected.map(|(_, cap)| Observation::new(cap));
         let (status, had_error) =
-            Self::drain_until_ready(backend, read_timeout, max_frame_bytes).await?;
+            Self::drain_until_ready(backend, read_timeout, max_frame_bytes, obs.as_mut()).await?;
         if had_error {
             return Err(ProxyError::Protocol(format!(
                 "backend rejected replayed statement: {}",
                 Self::tr_short_sql(sql)
             )));
+        }
+        if let (Some((want, _)), Some(obs)) = (expected, obs.as_ref()) {
+            if obs.finish() != Some(want) {
+                return Err(ProxyError::Protocol(format!(
+                    "replayed statement returned a different result than the client observed: {}",
+                    Self::tr_short_sql(sql)
+                )));
+            }
         }
         Ok(status)
     }
@@ -9867,8 +10096,15 @@ impl ProxyServer {
         max_frame_bytes: usize,
     ) -> Result<usize> {
         for sql in gucs {
-            Self::tr_run_discard(backend, sql, write_timeout, read_timeout, max_frame_bytes)
-                .await?;
+            Self::tr_run_discard(
+                backend,
+                sql,
+                write_timeout,
+                read_timeout,
+                max_frame_bytes,
+                None,
+            )
+            .await?;
         }
         Ok(gucs.len())
     }
@@ -9885,22 +10121,33 @@ impl ProxyServer {
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,
+        deadline: tokio::time::Instant,
     ) -> Result<String> {
-        let deadline = std::time::Instant::now() + config.write_timeout();
+        let expired = || ProxyError::Network("recovery deadline exceeded".to_string());
         loop {
-            let node = Self::select_primary_with_timeout(session, state, config).await?;
-            let err = match Self::ensure_conn(conns, &node, session, config, state).await {
+            let node = Self::select_primary_until(session, state, config, deadline).await?;
+            let err = match tokio::time::timeout_at(
+                deadline,
+                Self::ensure_conn(conns, &node, session, config, state),
+            )
+            .await
+            .unwrap_or_else(|_| Err(expired()))
+            {
                 Ok(()) => {
                     let bc = conns.get_mut(&node).expect("just ensured");
                     Self::tr_restore_preflight(tr)?;
-                    match Self::tr_restore_session_state(
-                        &mut bc.stream,
-                        &tr.gucs,
-                        state.limits.backend_write_timeout,
-                        state.limits.backend_read_timeout,
-                        state.limits.max_backend_frame_bytes,
+                    match tokio::time::timeout_at(
+                        deadline,
+                        Self::tr_restore_session_state(
+                            &mut bc.stream,
+                            &tr.gucs,
+                            state.limits.backend_write_timeout,
+                            state.limits.backend_read_timeout,
+                            state.limits.max_backend_frame_bytes,
+                        ),
                     )
                     .await
+                    .unwrap_or_else(|_| Err(expired()))
                     {
                         Ok(n) => {
                             #[cfg(feature = "pool-modes")]
@@ -9934,7 +10181,7 @@ impl ProxyServer {
                 Err(e) => e,
             };
             Self::record_backend_failure(state, &node, &err.to_string());
-            if std::time::Instant::now() >= deadline {
+            if tokio::time::Instant::now() >= deadline {
                 return Err(err);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -9959,20 +10206,28 @@ impl ProxyServer {
         let wt = state.limits.backend_write_timeout;
         let rt = state.limits.backend_read_timeout;
         let mf = state.limits.max_backend_frame_bytes;
+        let ob = state.limits.tr_max_observation_bytes;
         let total = entries.len();
         for (i, st) in entries.iter().enumerate() {
             let status = match &st.extended {
-                None => Self::tr_run_discard(&mut bc.stream, &st.sql, wt, rt, mf)
-                    .await
-                    .map_err(|e| match e {
-                        ProxyError::Protocol(_) => ReplayFailure::Statement(format!(
-                            "statement {}/{} rejected: {}",
-                            i + 1,
-                            total,
-                            Self::tr_short_sql(&st.sql)
-                        )),
-                        other => ReplayFailure::Backend(other),
-                    })?,
+                None => Self::tr_run_discard(
+                    &mut bc.stream,
+                    &st.sql,
+                    wt,
+                    rt,
+                    mf,
+                    st.result_checksum.map(|d| (d, ob)),
+                )
+                .await
+                .map_err(|e| match e {
+                    ProxyError::Protocol(_) => ReplayFailure::Statement(format!(
+                        "statement {}/{} rejected: {}",
+                        i + 1,
+                        total,
+                        Self::tr_short_sql(&st.sql)
+                    )),
+                    other => ReplayFailure::Backend(other),
+                })?,
                 Some(ext) => {
                     for name in &ext.refs {
                         if bc.prepared.contains(name) || ext.defines.contains(name) {
@@ -10017,9 +10272,20 @@ impl ProxyServer {
                                 e
                             )))
                         })?;
-                    let (status, had_error) = Self::drain_until_ready(&mut bc.stream, rt, mf)
-                        .await
-                        .map_err(ReplayFailure::Backend)?;
+                    let mut obs = st.result_checksum.map(|_| Observation::new(ob));
+                    let (status, had_error) =
+                        Self::drain_until_ready(&mut bc.stream, rt, mf, obs.as_mut())
+                            .await
+                            .map_err(ReplayFailure::Backend)?;
+                    if let (Some(want), Some(o)) = (st.result_checksum, obs.as_ref()) {
+                        if o.finish() != Some(want) {
+                            return Err(ReplayFailure::Statement(format!(
+                                "extended batch {}/{} returned a different result than the client observed",
+                                i + 1,
+                                total
+                            )));
+                        }
+                    }
                     if had_error {
                         return Err(ReplayFailure::Statement(format!(
                             "extended batch {}/{} rejected: {}",
@@ -10089,6 +10355,10 @@ impl ProxyServer {
         state: &Arc<ServerState>,
         config: &ProxyConfig,
     ) -> Result<Option<(Option<String>, u64)>> {
+        // TR-06: ONE deadline for the whole recovery — primary wait, connect and
+        // auth, session restore, replay — instead of per-phase timeouts that
+        // could add up well beyond `write_timeout_secs`.
+        let deadline = tokio::time::Instant::now() + config.write_timeout();
         let mode = session.tr_mode;
         let in_tx = session
             .in_transaction
@@ -10194,7 +10464,9 @@ impl ProxyServer {
             }
             TrAction::ErrorAndContinue(code) => {
                 let node =
-                    match Self::tr_acquire_replacement(conns, tr, session, state, config).await {
+                    match Self::tr_acquire_replacement(conns, tr, session, state, config, deadline)
+                        .await
+                    {
                         Ok(n) => n,
                         Err(e) => {
                             return Self::tr_fail_no_replacement(
@@ -10230,7 +10502,9 @@ impl ProxyServer {
             }
             TrAction::Reexecute | TrAction::ReplayThenReexecute => {
                 let node =
-                    match Self::tr_acquire_replacement(conns, tr, session, state, config).await {
+                    match Self::tr_acquire_replacement(conns, tr, session, state, config, deadline)
+                        .await
+                    {
                         Ok(n) => n,
                         Err(e) => {
                             return Self::tr_fail_no_replacement(
@@ -10241,8 +10515,16 @@ impl ProxyServer {
                     };
                 if action == TrAction::ReplayThenReexecute {
                     let entries = session.tx_state.read().await.statements.clone();
-                    match Self::tr_replay_transaction(conns, &node, &entries, registry, state).await
-                    {
+                    match tokio::time::timeout_at(
+                        deadline,
+                        Self::tr_replay_transaction(conns, &node, &entries, registry, state),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(ReplayFailure::Backend(ProxyError::Network(
+                            "recovery deadline exceeded during replay".to_string(),
+                        )))
+                    }) {
                         Ok(()) => {
                             state
                                 .metrics
@@ -10272,6 +10554,7 @@ impl ProxyServer {
                                             state.limits.backend_write_timeout,
                                             state.limits.backend_read_timeout,
                                             state.limits.max_backend_frame_bytes,
+                                            None,
                                         )
                                         .await;
                                     }
@@ -10973,6 +11256,8 @@ mod tests {
             copy_in_progress: std::sync::atomic::AtomicBool::new(false),
             last_rfq_status: std::sync::atomic::AtomicU8::new(b'I'),
             last_response_error: std::sync::atomic::AtomicBool::new(false),
+            last_response_digest: std::sync::atomic::AtomicU64::new(0),
+            last_response_unverifiable: std::sync::atomic::AtomicBool::new(false),
             tr_replay_tainted: std::sync::atomic::AtomicBool::new(false),
             backend_credential: RwLock::new(None),
             tx_state: RwLock::new(TransactionState::default()),
@@ -12160,6 +12445,8 @@ mod tests {
                     client_write_timeout: Duration::from_secs(60),
                     backend_read_timeout: Duration::from_secs(30),
                     max_frame_bytes: usize::MAX,
+                    response_timeout: None,
+                    observation_bytes: usize::MAX,
                 },
                 usize::MAX,
                 &metrics,
@@ -12261,6 +12548,8 @@ mod tests {
                     client_write_timeout: Duration::from_secs(60),
                     backend_read_timeout: Duration::from_secs(30),
                     max_frame_bytes: usize::MAX,
+                    response_timeout: None,
+                    observation_bytes: usize::MAX,
                 },
                 CAP,
                 &metrics,
@@ -14256,6 +14545,8 @@ mod tests {
                                     client_write_timeout: Duration::from_secs(1),
                                     backend_read_timeout: Duration::from_secs(1),
                                     max_frame_bytes: usize::MAX,
+                                    response_timeout: None,
+                                    observation_bytes: usize::MAX,
                                 },
                                 16,
                                 &server.state.metrics,
@@ -14549,7 +14840,7 @@ mod tests {
             wire.extend_from_slice(&frame(b'Z', b"T"));
             b.write_all(&wire).await.unwrap();
             let (status, err) =
-                ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5), usize::MAX)
+                ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5), usize::MAX, None)
                     .await
                     .unwrap();
             assert_eq!((status, err), (b'T', false));
@@ -14558,31 +14849,38 @@ mod tests {
             wire.extend_from_slice(&frame(b'Z', b"E"));
             b.write_all(&wire).await.unwrap();
             let (status, err) =
-                ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5), usize::MAX)
+                ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5), usize::MAX, None)
                     .await
                     .unwrap();
             assert_eq!((status, err), (b'E', true));
             // A COPY-in request cannot be satisfied during a replay.
             b.write_all(&frame(b'G', &[0, 0, 0])).await.unwrap();
-            assert!(
-                ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5), usize::MAX)
-                    .await
-                    .is_err()
-            );
+            assert!(ProxyServer::drain_until_ready(
+                &mut a,
+                Duration::from_secs(5),
+                usize::MAX,
+                None
+            )
+            .await
+            .is_err());
             // EOF is an error.
             drop(b);
-            assert!(
-                ProxyServer::drain_until_ready(&mut a, Duration::from_secs(5), usize::MAX)
-                    .await
-                    .is_err()
-            );
+            assert!(ProxyServer::drain_until_ready(
+                &mut a,
+                Duration::from_secs(5),
+                usize::MAX,
+                None
+            )
+            .await
+            .is_err());
         }
 
         #[tokio::test]
         async fn drain_until_ready_times_out_on_silent_backend() {
             let (mut a, _b) = tokio::io::duplex(64);
             let r =
-                ProxyServer::drain_until_ready(&mut a, Duration::from_millis(50), usize::MAX).await;
+                ProxyServer::drain_until_ready(&mut a, Duration::from_millis(50), usize::MAX, None)
+                    .await;
             assert!(matches!(r, Err(ProxyError::Network(_))));
         }
 
@@ -14959,6 +15257,246 @@ mod tests {
             assert_eq!(n("SET \"Quoted.Var\" = 1").as_deref(), Some("quoted.var"));
             assert_eq!(n("RESET ALL"), None);
             assert_eq!(n("SELECT 1"), None);
+        }
+
+        /// TR-06: the observation digest is order-sensitive over the frames the
+        /// client sees, ignores asynchronous frames, and reports overflow
+        /// instead of a digest once the byte budget is exceeded.
+        #[test]
+        fn observation_digest_is_ordered_bounded_and_ignores_async_frames() {
+            let t = frame(b'T', b"desc");
+            let d1 = frame(b'D', b"row1");
+            let d2 = frame(b'D', b"row2");
+            let c = frame(b'C', b"SELECT 2\0");
+            let digest = |frames: &[&[u8]], cap: usize| {
+                let mut o = Observation::new(cap);
+                for f in frames {
+                    o.note(f);
+                }
+                o.finish()
+            };
+            let a = digest(&[&t, &d1, &d2, &c], usize::MAX).unwrap();
+            assert_eq!(
+                a,
+                digest(&[&t, &d1, &d2, &c], usize::MAX).unwrap(),
+                "deterministic"
+            );
+            assert_ne!(
+                a,
+                digest(&[&t, &d2, &d1, &c], usize::MAX).unwrap(),
+                "order matters"
+            );
+            assert_ne!(
+                a,
+                digest(&[&t, &d1, &c], usize::MAX).unwrap(),
+                "row count matters"
+            );
+            // Notices, parameter status and notifications are not observed.
+            let n = frame(b'N', b"SNOTICE\0\0");
+            let s_ = frame(b'S', b"application_name\0x\0");
+            let a_ = frame(b'A', b"\0\0\0\x01chan\0\0");
+            assert_eq!(
+                a,
+                digest(&[&n, &t, &s_, &d1, &a_, &d2, &c], usize::MAX).unwrap()
+            );
+            // Budget: the total of observed frame bytes must fit.
+            let total = t.len() + d1.len() + d2.len() + c.len();
+            assert!(digest(&[&t, &d1, &d2, &c], total).is_some());
+            assert!(
+                digest(&[&t, &d1, &d2, &c], total - 1).is_none(),
+                "over budget"
+            );
+            assert_ne!(a, 0, "zero is reserved for none");
+        }
+
+        /// A statement executed inside a recorded transaction carries the
+        /// response digest the relay published; a response over the budget
+        /// makes the transaction non-replayable; the opening BEGIN carries none.
+        #[tokio::test]
+        async fn tr_recorder_attaches_observations_and_refuses_unverifiable() {
+            let server = ProxyServer::new(test_config()).unwrap();
+            let state = server.state.clone();
+            let session = make_test_session();
+            let mut tr = TrSession::new(TrMode::Transaction);
+
+            ProxyServer::note_ready_for_query(&session, b'T', false);
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("BEGIN"), &session, &state).await;
+            // The relay observed the SELECT's response.
+            let mut o = Observation::new(usize::MAX);
+            o.note(&frame(b'T', b"d"));
+            o.note(&frame(b'D', b"r"));
+            o.note(&frame(b'C', b"SELECT 1\0"));
+            let d = o.finish().unwrap();
+            ProxyServer::note_ready_for_query(&session, b'T', false);
+            ProxyServer::note_observation(&session, Some(&o));
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("SELECT 1"), &session, &state).await;
+            {
+                let ts = session.tx_state.read().await;
+                assert_eq!(ts.statements.len(), 2);
+                assert_eq!(
+                    ts.statements[0].result_checksum, None,
+                    "BEGIN: nothing to verify"
+                );
+                assert_eq!(ts.statements[1].result_checksum, Some(d));
+                assert!(!ts.non_replayable);
+            }
+            // Over-budget response: unverifiable, so the transaction is dropped.
+            let mut big = Observation::new(4);
+            big.note(&frame(b'D', b"too large"));
+            assert!(big.finish().is_none());
+            ProxyServer::note_ready_for_query(&session, b'T', false);
+            ProxyServer::note_observation(&session, Some(&big));
+            ProxyServer::tr_after_simple(&mut tr, &qmsg("SELECT 2"), &session, &state).await;
+            let ts = session.tx_state.read().await;
+            assert!(ts.non_replayable && ts.statements.is_empty());
+        }
+
+        /// Snapshot-pinning isolation levels are never replayed: explicitly on
+        /// BEGIN/START, via SET TRANSACTION, or inherited from a tracked
+        /// `default_transaction_isolation`.
+        #[test]
+        fn tr_snapshot_sensitive_transactions_are_detected() {
+            let f = |sql: &str, gucs: &[&str]| {
+                let g: Vec<String> = gucs.iter().map(|x| x.to_string()).collect();
+                ProxyServer::tr_snapshot_sensitive(sql, &g)
+            };
+            assert!(f("BEGIN ISOLATION LEVEL SERIALIZABLE", &[]));
+            assert!(f("begin isolation level repeatable read", &[]));
+            assert!(f(
+                "START TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY",
+                &[]
+            ));
+            assert!(f("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", &[]));
+            assert!(f("SET TRANSACTION SNAPSHOT '00000003-0000001B-1'", &[]));
+            assert!(f(
+                "BEGIN",
+                &["SET default_transaction_isolation = 'serializable'"]
+            ));
+            assert!(!f(
+                "BEGIN",
+                &["SET default_transaction_isolation = 'read committed'"]
+            ));
+            assert!(!f("BEGIN", &["SET application_name = 'x'"]));
+            assert!(!f("BEGIN ISOLATION LEVEL READ COMMITTED", &[]));
+            assert!(!f(
+                "SELECT 1",
+                &["SET default_transaction_isolation = 'serializable'"]
+            ));
+            assert!(!f("SET application_name = 'serializable'", &[]));
+        }
+
+        /// Replay verifies each statement against the digest the client saw:
+        /// a divergent result is a protocol error (surfaced as 40001 + ROLLBACK
+        /// by the caller); a matching one passes.
+        #[tokio::test]
+        async fn tr_run_discard_verifies_the_observed_result() {
+            use tokio::io::AsyncReadExt as _;
+            use tokio::io::AsyncWriteExt as _;
+            async fn backend(mut b: tokio::io::DuplexStream, frames: Vec<u8>) {
+                let mut q = vec![0u8; 5];
+                b.read_exact(&mut q).await.unwrap();
+                let len = u32::from_be_bytes([q[1], q[2], q[3], q[4]]) as usize;
+                let mut rest = vec![0u8; len - 4];
+                b.read_exact(&mut rest).await.unwrap();
+                b.write_all(&frames).await.unwrap();
+            }
+            let good = [
+                frame(b'T', b"d"),
+                frame(b'D', b"r"),
+                frame(b'C', b"SELECT 1\0"),
+            ]
+            .concat();
+            let mut want = Observation::new(usize::MAX);
+            want.note(&frame(b'T', b"d"));
+            want.note(&frame(b'D', b"r"));
+            want.note(&frame(b'C', b"SELECT 1\0"));
+            let want = want.finish().unwrap();
+            let rfq = frame(b'Z', b"T");
+
+            let (mut a, b) = tokio::io::duplex(4096);
+            tokio::spawn(backend(b, [good.clone(), rfq.clone()].concat()));
+            let r = ProxyServer::tr_run_discard(
+                &mut a,
+                "SELECT 1",
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                usize::MAX,
+                Some((want, usize::MAX)),
+            )
+            .await;
+            assert_eq!(r.unwrap(), b'T', "matching observation replays");
+
+            let diverged = [
+                frame(b'T', b"d"),
+                frame(b'D', b"OTHER"),
+                frame(b'C', b"SELECT 1\0"),
+            ]
+            .concat();
+            let (mut a2, b2) = tokio::io::duplex(4096);
+            tokio::spawn(backend(b2, [diverged, rfq.clone()].concat()));
+            let r = ProxyServer::tr_run_discard(
+                &mut a2,
+                "SELECT 1",
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                usize::MAX,
+                Some((want, usize::MAX)),
+            )
+            .await;
+            assert!(matches!(r, Err(ProxyError::Protocol(_))), "{r:?}");
+
+            // No expectation recorded (e.g. the BEGIN): nothing is verified.
+            let (mut a3, b3) = tokio::io::duplex(4096);
+            tokio::spawn(backend(b3, [good, rfq].concat()));
+            assert!(ProxyServer::tr_run_discard(
+                &mut a3,
+                "SELECT 1",
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                usize::MAX,
+                None,
+            )
+            .await
+            .is_ok());
+        }
+
+        /// The whole-response deadline shrinks the per-read budget and refuses
+        /// once passed; disabled it leaves the per-read timeout alone.
+        #[test]
+        fn read_budget_honours_the_response_deadline() {
+            let per = Duration::from_secs(30);
+            assert_eq!(read_budget(per, None).unwrap(), per);
+            let soon = tokio::time::Instant::now() + Duration::from_millis(200);
+            assert!(read_budget(per, Some(soon)).unwrap() <= Duration::from_millis(200));
+            let past = tokio::time::Instant::now() - Duration::from_millis(1);
+            assert!(matches!(
+                read_budget(per, Some(past)),
+                Err(ProxyError::Network(_))
+            ));
+        }
+
+        /// A recovery deadline already in the past fails the primary wait
+        /// immediately instead of polling for `write_timeout_secs`.
+        #[tokio::test]
+        async fn select_primary_until_respects_a_passed_deadline() {
+            let mut config = test_config();
+            config.write_timeout_secs = 60;
+            // With every primary disabled only the deadline can end the wait.
+            for n in &mut config.nodes {
+                n.enabled = false;
+            }
+            let server = ProxyServer::new(config.clone()).unwrap();
+            let session = make_test_session();
+            let started = std::time::Instant::now();
+            let r = ProxyServer::select_primary_until(
+                &session,
+                &server.state,
+                &config,
+                tokio::time::Instant::now(),
+            )
+            .await;
+            assert!(matches!(r, Err(ProxyError::NoHealthyNodes)), "{r:?}");
+            assert!(started.elapsed() < Duration::from_secs(2));
         }
 
         #[tokio::test]

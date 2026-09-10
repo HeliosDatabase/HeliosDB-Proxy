@@ -549,6 +549,8 @@ max_prepared_statements = 8192
 max_prepared_bytes = 67108864
 max_pending_bytes = 67108864
 max_backend_frame_bytes = 104857600
+backend_response_timeout_secs = 0
+tr_max_observation_bytes = 1048576
 max_total_idle_backend_conns = 8192
 pool_reap_interval_secs = 30
 tr_max_replay_statements = 1000
@@ -568,6 +570,8 @@ tr_max_session_set_statements = 256
 | `max_prepared_bytes` | usize | `67108864` | Per-session cap on aggregate bytes retained in the statement registry (64 MiB). |
 | `max_pending_bytes` | usize | `67108864` | Per-session cap on the un-flushed extended-protocol `pending` buffer (64 MiB). |
 | `max_backend_frame_bytes` | usize | `104857600` | Cap on the declared length of one backend response frame on every streaming relay; a header above it or below the 4-byte minimum closes the backend as malformed (100 MiB, the frontend message cap). Bounds a frame, not a result set. |
+| `backend_response_timeout_secs` | u64 | `0` | Whole-response deadline for one backend response on the streaming relays, first read to `ReadyForQuery`. `backend_read_timeout_secs` re-arms per read and cannot catch a slow drip inside one response; this can. `0` disables (prior behaviour). |
+| `tr_max_observation_bytes` | usize | `1048576` | In-session TR: response bytes hashed per recorded statement into an observation digest, re-verified when the transaction is replayed; divergence rolls the replay back with `40001`. A response over the cap has no verifiable digest, so its transaction becomes non-replayable. |
 | `max_total_idle_backend_conns` | usize | `8192` | Global ceiling on idle backend-pool connections across all `(node,user,db)` identities. Only consumed with the `pool-modes` feature; parsed-and-ignored otherwise. |
 | `pool_reap_interval_secs` | u64 | `30` | How often the idle-connection reaper runs. |
 | `tr_max_replay_statements` | usize | `1000` | In-session TR (`tr_mode = select\|transaction`): cap on statements recorded per explicit transaction for failover replay. Over the cap the transaction is marked non-replayable (`transaction` degrades to `session` for it; `tr_replay_cap_exceeded_total`). |
@@ -1159,3 +1163,19 @@ transaction are likewise deferred until commit. `SET LOCAL`, `SET TRANSACTION` a
 by name (`SET TIME ZONE` is `timezone`, `SET SCHEMA` is `search_path`, `SET NAMES`
 is `client_encoding`), so repeated `SET`s of one variable cost one slot. Extended-
 protocol `SET`s, `SQL PREPARE`, temporary tables and cursors are not restored.
+
+### Replay verification and the recovery deadline (TR-06)
+
+While a transaction is recorded for `tr_mode = transaction` replay, the proxy hashes
+each statement's response frames (`RowDescription`, `DataRow`, `CommandComplete`,
+`EmptyQueryResponse`) up to `tr_max_observation_bytes`. When the transaction is
+replayed on the replacement backend, each response is hashed the same way; if any
+digest differs — the data the client already saw is not what the new backend would
+have returned — the replay is rolled back and the client receives `40001` for the
+interrupted statement. Transactions opened at `SERIALIZABLE` or `REPEATABLE READ`
+(explicitly, or through `default_transaction_isolation`) are never replayed: a
+replay cannot reproduce the old snapshot.
+
+One deadline, `write_timeout_secs`, bounds the whole recovery: waiting for a
+healthy primary, connecting and authenticating, restoring session `SET`s, replaying
+the transaction and re-executing the interrupted statement.
