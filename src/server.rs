@@ -621,6 +621,17 @@ impl TrReadPolicy {
     }
 }
 
+/// One deferred session-GUC change inside an explicit transaction (TR-04).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GucOp {
+    /// A `SET` statement to replay verbatim.
+    Set(String),
+    /// `RESET <name>`: forget the variable.
+    Reset(String),
+    /// `RESET ALL` / `DISCARD ALL`: forget every variable.
+    ResetAll,
+}
+
 /// The budgets one streaming relay needs, resolved from `[limits]`. Only the
 /// cache-capture relay takes them as a bundle (clippy's argument cap); the plain
 /// relays read `state.limits` directly, so this is gated with that relay.
@@ -8562,14 +8573,21 @@ struct TrSession {
     record_tx: bool,
     /// Track session `SET`/`RESET` for restore (`tr_mode != none`).
     track_gucs: bool,
-    /// Session-level `SET`/`RESET` statements to replay on a new backend, in
-    /// order, bounded by `[limits] tr_max_session_set_statements`.
+    /// Committed session-level `SET` statements to replay on a new backend, in
+    /// order, one per DISTINCT variable (a later `SET` of the same variable
+    /// replaces the earlier one), bounded by `[limits]
+    /// tr_max_session_set_statements`.
     gucs: Vec<String>,
-    /// Tracking stopped at the cap — the restore is incomplete.
+    /// Tracking stopped at the cap — the restore would be incomplete, so a
+    /// failover is refused rather than re-homing with partial state.
     guc_cap_hit: bool,
-    /// `SET`s issued inside the current explicit transaction: promoted into
-    /// `gucs` only if the transaction COMMITs (a rolled-back `SET` is undone).
-    pending_tx_gucs: Vec<String>,
+    /// GUC operations issued inside the current explicit transaction, applied
+    /// to `gucs` in order only if the transaction COMMITs. PostgreSQL rolls
+    /// `SET`/`RESET`/`RESET ALL` back with the transaction, so must we.
+    pending_tx_gucs: Vec<GucOp>,
+    /// Open savepoints of the current transaction: (name, length of
+    /// `pending_tx_gucs` when it was taken). `ROLLBACK TO` truncates to it.
+    tx_savepoints: Vec<(String, usize)>,
     /// The session's backend socket died while idle: the next request is a
     /// not-delivered fault against this node.
     lost_backend: Option<String>,
@@ -8596,6 +8614,7 @@ impl TrSession {
             gucs: Vec::new(),
             guc_cap_hit: false,
             pending_tx_gucs: Vec::new(),
+            tx_savepoints: Vec::new(),
             lost_backend: None,
             tx_aborted: false,
             prev_status: b'I',
@@ -9123,6 +9142,158 @@ impl ProxyServer {
         })
     }
 
+    /// The variable a session `SET`/`RESET` statement addresses, lowercased, so
+    /// repeated `SET`s of one variable share a slot and `RESET` can find it.
+    /// Special forms map to the GUC they set: `TIME ZONE` -> `timezone`,
+    /// `SCHEMA` -> `search_path`, `NAMES` -> `client_encoding`, `SESSION
+    /// AUTHORIZATION` -> `session_authorization`, `SEED` -> `seed`, `ROLE` ->
+    /// `role`. `SET SESSION CHARACTERISTICS` has no single GUC and keys on the
+    /// whole phrase.
+    fn tr_guc_name(sql: &str) -> Option<String> {
+        let t = sql.trim();
+        let core = t.strip_suffix(';').unwrap_or(t).trim_end();
+        let mut words = core.split_whitespace().peekable();
+        let verb = words.next()?;
+        if !(verb.eq_ignore_ascii_case("SET") || verb.eq_ignore_ascii_case("RESET")) {
+            return None;
+        }
+        if words
+            .peek()
+            .is_some_and(|w| w.eq_ignore_ascii_case("SESSION"))
+        {
+            words.next();
+            if words
+                .peek()
+                .is_some_and(|w| w.eq_ignore_ascii_case("AUTHORIZATION"))
+            {
+                return Some("session_authorization".to_string());
+            }
+            if words
+                .peek()
+                .is_some_and(|w| w.eq_ignore_ascii_case("CHARACTERISTICS"))
+            {
+                return Some("session characteristics".to_string());
+            }
+        }
+        let first = words.next()?;
+        let name = match first.to_ascii_lowercase().as_str() {
+            "time" if words.peek().is_some_and(|w| w.eq_ignore_ascii_case("ZONE")) => {
+                "timezone".to_string()
+            }
+            "schema" => "search_path".to_string(),
+            "names" => "client_encoding".to_string(),
+            "seed" => "seed".to_string(),
+            "role" => "role".to_string(),
+            other => other
+                .split(|c: char| c == '=' || c.is_whitespace())
+                .next()
+                .unwrap_or(other)
+                .trim_matches('"')
+                .to_string(),
+        };
+        (!name.is_empty() && name != "all").then_some(name)
+    }
+
+    /// Apply a `SET` to the committed restore set: replace the variable's
+    /// earlier statement in place, or append it honouring the cap.
+    fn tr_apply_set(tr: &mut TrSession, sql: &str, state: &Arc<ServerState>) {
+        let name = Self::tr_guc_name(sql);
+        if let Some(name) = name.as_deref() {
+            if let Some(slot) = tr
+                .gucs
+                .iter()
+                .position(|g| Self::tr_guc_name(g).as_deref() == Some(name))
+            {
+                tr.gucs[slot] = sql.to_string();
+                return;
+            }
+        }
+        Self::tr_push_guc(tr, sql, state);
+    }
+
+    /// Apply a `RESET <name>` to the committed restore set.
+    fn tr_apply_reset(tr: &mut TrSession, name: &str) {
+        tr.gucs
+            .retain(|g| Self::tr_guc_name(g).as_deref() != Some(name));
+    }
+
+    /// Apply one deferred transaction op at COMMIT.
+    fn tr_apply_guc_op(tr: &mut TrSession, op: GucOp, state: &Arc<ServerState>) {
+        match op {
+            GucOp::Set(sql) => Self::tr_apply_set(tr, &sql, state),
+            GucOp::Reset(name) => Self::tr_apply_reset(tr, &name),
+            GucOp::ResetAll => {
+                tr.gucs.clear();
+                tr.guc_cap_hit = false;
+            }
+        }
+    }
+
+    /// `SAVEPOINT s` / `RELEASE [SAVEPOINT] s` / `ROLLBACK TO [SAVEPOINT] s`
+    /// bookkeeping for deferred GUC ops. Unquoted names fold to lowercase.
+    fn tr_note_savepoint(tr: &mut TrSession, sql: &str) {
+        let t = sql.trim();
+        let core = t.strip_suffix(';').unwrap_or(t).trim_end();
+        let mut w = core.split_whitespace();
+        let Some(verb) = w.next() else { return };
+        let fold = |n: &str| -> String {
+            if let Some(q) = n.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+                q.replace("\"\"", "\"")
+            } else {
+                n.to_ascii_lowercase()
+            }
+        };
+        if verb.eq_ignore_ascii_case("SAVEPOINT") {
+            if let Some(name) = w.next() {
+                tr.tx_savepoints
+                    .push((fold(name), tr.pending_tx_gucs.len()));
+            }
+        } else if verb.eq_ignore_ascii_case("RELEASE") {
+            let mut name = w.next();
+            if name.is_some_and(|n| n.eq_ignore_ascii_case("SAVEPOINT")) {
+                name = w.next();
+            }
+            if let Some(name) = name.map(fold) {
+                // Release destroys the savepoint and every later one; the ops
+                // made since stay part of the transaction.
+                if let Some(i) = tr.tx_savepoints.iter().rposition(|(n, _)| *n == name) {
+                    tr.tx_savepoints.truncate(i);
+                }
+            }
+        } else if verb.eq_ignore_ascii_case("ROLLBACK") {
+            if !w.next().is_some_and(|n| n.eq_ignore_ascii_case("TO")) {
+                return;
+            }
+            let mut name = w.next();
+            if name.is_some_and(|n| n.eq_ignore_ascii_case("SAVEPOINT")) {
+                name = w.next();
+            }
+            if let Some(name) = name.map(fold) {
+                // Undo the ops made after the savepoint; the savepoint itself
+                // survives, later ones are destroyed.
+                if let Some(i) = tr.tx_savepoints.iter().rposition(|(n, _)| *n == name) {
+                    let len = tr.tx_savepoints[i].1;
+                    tr.pending_tx_gucs.truncate(len);
+                    tr.tx_savepoints.truncate(i + 1);
+                }
+            }
+        }
+    }
+
+    /// Before re-homing: an incomplete restore set is not something to hand
+    /// the client silently. Refuse the failover instead (surfaces as `08006`
+    /// "session state could not be restored").
+    fn tr_restore_preflight(tr: &TrSession) -> Result<()> {
+        if tr.guc_cap_hit {
+            return Err(ProxyError::Protocol(
+                "session SET tracking exceeded [limits] tr_max_session_set_statements; \
+                 the session state cannot be restored on a replacement backend"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Append one tracked session `SET`, honouring the cap.
     fn tr_push_guc(tr: &mut TrSession, sql: &str, state: &Arc<ServerState>) {
         if tr.guc_cap_hit {
@@ -9207,16 +9378,34 @@ impl ProxyServer {
                 || crate::protocol::starts_with_ci(sql.trim_start(), "RESET")
                 || crate::protocol::starts_with_ci(sql.trim_start(), "DISCARD");
             if is_set_like && !had_error {
-                if Self::tr_resets_all(sql) {
-                    tr.gucs.clear();
-                    tr.pending_tx_gucs.clear();
-                    tr.guc_cap_hit = false;
+                // Inside a transaction every GUC change is deferred: PostgreSQL
+                // rolls SET/RESET/RESET ALL back with the transaction, so the
+                // restore set must not learn them until COMMIT.
+                let op = if Self::tr_resets_all(sql) {
+                    Some(GucOp::ResetAll)
                 } else if Self::tr_is_session_set(sql) {
-                    if now_in_tx {
-                        tr.pending_tx_gucs.push(sql.to_string());
+                    if crate::protocol::starts_with_ci(sql.trim_start(), "RESET") {
+                        Self::tr_guc_name(sql).map(GucOp::Reset)
                     } else {
-                        Self::tr_push_guc(tr, sql, state);
+                        Some(GucOp::Set(sql.to_string()))
                     }
+                } else {
+                    None
+                };
+                if let Some(op) = op {
+                    if now_in_tx {
+                        tr.pending_tx_gucs.push(op);
+                    } else {
+                        Self::tr_apply_guc_op(tr, op, state);
+                    }
+                }
+            } else if now_in_tx && !had_error {
+                let head = sql.trim_start();
+                if crate::protocol::starts_with_ci(head, "SAVEPOINT")
+                    || crate::protocol::starts_with_ci(head, "RELEASE")
+                    || crate::protocol::starts_with_ci(head, "ROLLBACK")
+                {
+                    Self::tr_note_savepoint(tr, sql);
                 }
             }
             if was_in_tx && !now_in_tx {
@@ -9234,12 +9423,13 @@ impl ProxyServer {
                     && Self::tr_commits_session_state(sql);
                 if committed {
                     let pending = std::mem::take(&mut tr.pending_tx_gucs);
-                    for s in pending {
-                        Self::tr_push_guc(tr, &s, state);
+                    for op in pending {
+                        Self::tr_apply_guc_op(tr, op, state);
                     }
                 } else {
                     tr.pending_tx_gucs.clear();
                 }
+                tr.tx_savepoints.clear();
             }
         }
 
@@ -9702,6 +9892,7 @@ impl ProxyServer {
             let err = match Self::ensure_conn(conns, &node, session, config, state).await {
                 Ok(()) => {
                     let bc = conns.get_mut(&node).expect("just ensured");
+                    Self::tr_restore_preflight(tr)?;
                     match Self::tr_restore_session_state(
                         &mut bc.stream,
                         &tr.gucs,
@@ -10249,6 +10440,7 @@ impl ProxyServer {
     async fn tr_enter_aborted(tr: &mut TrSession, in_tx: bool, session: &Arc<ClientSession>) {
         Self::tr_clear_tx(session).await;
         tr.pending_tx_gucs.clear();
+        tr.tx_savepoints.clear();
         // The response the client just saw ended with ErrorResponse + RFQ.
         Self::note_ready_for_query(session, if in_tx { b'E' } else { b'I' }, true);
         if in_tx {
@@ -14595,7 +14787,10 @@ mod tests {
                 &state,
             )
             .await;
-            assert_eq!(tr.pending_tx_gucs, vec!["SET work_mem = '512MB'"]);
+            assert_eq!(
+                tr.pending_tx_gucs,
+                vec![GucOp::Set("SET work_mem = '512MB'".to_string())]
+            );
 
             // Ends the transaction as a ROLLBACK, while the trailing statement
             // commits on its own — `StmtKind::Commit`, but nothing of the
@@ -14623,6 +14818,147 @@ mod tests {
             ProxyServer::note_ready_for_query(&session, b'I', false);
             ProxyServer::tr_after_simple(&mut tr, &qmsg("COMMIT"), &session, &state).await;
             assert_eq!(tr.gucs, vec!["SET work_mem = '64MB'"]);
+        }
+
+        /// TR-04: the three harness scenarios that 1.6.1 failed. GUC changes
+        /// inside a transaction are deferred and follow PostgreSQL's own
+        /// rollback semantics, including savepoints; variables are keyed by
+        /// name so a repeated SET does not consume another cap slot.
+        #[tokio::test]
+        async fn tr_recorder_session_gucs_are_transactional_and_savepoint_scoped() {
+            let mut config = test_config();
+            config.limits.tr_max_session_set_statements = 1;
+            let server = ProxyServer::new(config).unwrap();
+            let state = server.state.clone();
+            let session = make_test_session();
+            let mut tr = TrSession::new(TrMode::Session);
+            async fn step(
+                tr: &mut TrSession,
+                session: &Arc<ClientSession>,
+                state: &Arc<ServerState>,
+                status: u8,
+                sql: &str,
+            ) {
+                ProxyServer::note_ready_for_query(session, status, false);
+                ProxyServer::tr_after_simple(tr, &qmsg(sql), session, state).await;
+            }
+
+            // guc_cap: a repeated SET of one variable replaces, cap 1 is enough
+            // and the LATEST value is what gets restored.
+            step(
+                &mut tr,
+                &session,
+                &state,
+                b'I',
+                "SET application_name = 'first'",
+            )
+            .await;
+            step(
+                &mut tr,
+                &session,
+                &state,
+                b'I',
+                "SET application_name = 'latest'",
+            )
+            .await;
+            assert_eq!(tr.gucs, vec!["SET application_name = 'latest'"]);
+            assert!(!tr.guc_cap_hit);
+            // A second DISTINCT variable exceeds the cap; the failover is then
+            // refused rather than restoring a partial set.
+            step(&mut tr, &session, &state, b'I', "SET work_mem = '64MB'").await;
+            assert!(tr.guc_cap_hit);
+            assert!(ProxyServer::tr_restore_preflight(&tr).is_err());
+            step(&mut tr, &session, &state, b'I', "RESET ALL").await;
+            assert!(tr.gucs.is_empty() && !tr.guc_cap_hit);
+            assert!(ProxyServer::tr_restore_preflight(&tr).is_ok());
+
+            // guc_savepoint: a SET after a savepoint that is rolled back to is
+            // undone; the base value committed before the transaction survives.
+            step(
+                &mut tr,
+                &session,
+                &state,
+                b'I',
+                "SET application_name = 'base'",
+            )
+            .await;
+            step(&mut tr, &session, &state, b'T', "BEGIN").await;
+            step(&mut tr, &session, &state, b'T', "SAVEPOINT s").await;
+            step(
+                &mut tr,
+                &session,
+                &state,
+                b'T',
+                "SET application_name = 'undone'",
+            )
+            .await;
+            step(&mut tr, &session, &state, b'T', "ROLLBACK TO s").await;
+            step(&mut tr, &session, &state, b'I', "COMMIT").await;
+            assert_eq!(tr.gucs, vec!["SET application_name = 'base'"]);
+            assert!(tr.pending_tx_gucs.is_empty() && tr.tx_savepoints.is_empty());
+
+            // RELEASE keeps the SET made after the savepoint.
+            step(&mut tr, &session, &state, b'T', "BEGIN").await;
+            step(&mut tr, &session, &state, b'T', "SAVEPOINT \"S2\"").await;
+            step(
+                &mut tr,
+                &session,
+                &state,
+                b'T',
+                "SET application_name = 'kept'",
+            )
+            .await;
+            step(&mut tr, &session, &state, b'T', "RELEASE SAVEPOINT \"S2\"").await;
+            step(&mut tr, &session, &state, b'I', "COMMIT").await;
+            assert_eq!(tr.gucs, vec!["SET application_name = 'kept'"]);
+
+            // guc_reset_rollback: RESET ALL inside a rolled-back transaction
+            // is undone — the committed value is still restored.
+            step(&mut tr, &session, &state, b'T', "BEGIN").await;
+            step(&mut tr, &session, &state, b'T', "RESET ALL").await;
+            assert_eq!(tr.pending_tx_gucs, vec![GucOp::ResetAll]);
+            assert_eq!(tr.gucs, vec!["SET application_name = 'kept'"], "deferred");
+            step(&mut tr, &session, &state, b'I', "ROLLBACK").await;
+            assert_eq!(tr.gucs, vec!["SET application_name = 'kept'"]);
+            // ...and applied when the transaction commits.
+            step(&mut tr, &session, &state, b'T', "BEGIN").await;
+            step(&mut tr, &session, &state, b'T', "RESET application_name").await;
+            step(&mut tr, &session, &state, b'I', "COMMIT").await;
+            assert!(tr.gucs.is_empty());
+        }
+
+        #[test]
+        fn tr_guc_name_identifies_the_variable() {
+            let n = |sql: &str| ProxyServer::tr_guc_name(sql);
+            assert_eq!(
+                n("SET application_name = 'x'").as_deref(),
+                Some("application_name")
+            );
+            assert_eq!(
+                n("set Application_Name to 'x';").as_deref(),
+                Some("application_name")
+            );
+            assert_eq!(
+                n("SET SESSION work_mem = '1MB'").as_deref(),
+                Some("work_mem")
+            );
+            assert_eq!(n("SET TIME ZONE 'UTC'").as_deref(), Some("timezone"));
+            assert_eq!(n("SET timezone TO 'UTC'").as_deref(), Some("timezone"));
+            assert_eq!(n("SET SCHEMA 'public'").as_deref(), Some("search_path"));
+            assert_eq!(n("SET NAMES 'UTF8'").as_deref(), Some("client_encoding"));
+            assert_eq!(n("SET ROLE readonly").as_deref(), Some("role"));
+            assert_eq!(
+                n("SET SESSION AUTHORIZATION bob").as_deref(),
+                Some("session_authorization")
+            );
+            assert_eq!(
+                n("RESET application_name").as_deref(),
+                Some("application_name")
+            );
+            assert_eq!(n("RESET ROLE").as_deref(), Some("role"));
+            assert_eq!(n("SET \"Quoted.Var\" = 1").as_deref(), Some("quoted.var"));
+            assert_eq!(n("RESET ALL"), None);
+            assert_eq!(n("SELECT 1"), None);
         }
 
         #[tokio::test]
@@ -14670,7 +15006,10 @@ mod tests {
             .await;
             // SET inside the transaction is pending until COMMIT.
             ProxyServer::tr_after_simple(&mut tr, &qmsg("SET b = 2"), &session, &state).await;
-            assert_eq!(tr.pending_tx_gucs, vec!["SET b = 2"]);
+            assert_eq!(
+                tr.pending_tx_gucs,
+                vec![GucOp::Set("SET b = 2".to_string())]
+            );
             {
                 let ts = session.tx_state.read().await;
                 assert_eq!(ts.statements.len(), 3);

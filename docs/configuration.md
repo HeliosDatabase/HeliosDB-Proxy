@@ -572,7 +572,7 @@ tr_max_session_set_statements = 256
 | `pool_reap_interval_secs` | u64 | `30` | How often the idle-connection reaper runs. |
 | `tr_max_replay_statements` | usize | `1000` | In-session TR (`tr_mode = select\|transaction`): cap on statements recorded per explicit transaction for failover replay. Over the cap the transaction is marked non-replayable (`transaction` degrades to `session` for it; `tr_replay_cap_exceeded_total`). |
 | `tr_max_replay_bytes` | usize | `4194304` | In-session TR: cap on bytes (statement text / raw extended-protocol frames) recorded per explicit transaction (4 MiB). Same degradation as above. |
-| `tr_max_session_set_statements` | usize | `256` | In-session TR (`tr_mode != none`): cap on tracked session `SET`/`RESET` statements replayed onto the replacement backend. Over the cap tracking stops (`tr_session_set_cap_exceeded_total`) and the restore is partial. |
+| `tr_max_session_set_statements` | usize | `256` | In-session TR (`tr_mode != none`): cap on DISTINCT session variables whose latest `SET` is replayed onto the replacement backend (a later `SET` of the same variable replaces the earlier one; `RESET name` removes it; `RESET ALL`/`DISCARD ALL` clear all). Over the cap tracking stops (`tr_session_set_cap_exceeded_total`) and a subsequent failover is refused with `08006` rather than re-homing the session with incomplete state. |
 
 ---
 
@@ -1145,3 +1145,17 @@ explicit transaction an opaque statement also marks the transaction as containin
 a possible write, so `select` mode will not replay it. Nondeterministic but
 side-effect-free calls are allowed because an unknown-outcome autocommit read
 published nothing to the client before the fault.
+
+### Session state across a failover (TR-04)
+
+`SET`/`RESET` issued through the simple query protocol are tracked per session and
+replayed, in order, onto the replacement backend when the session re-homes. The
+tracking is transactional, mirroring PostgreSQL: a `SET` inside an explicit
+transaction takes effect for restore only when that transaction commits; `ROLLBACK`
+discards it; `ROLLBACK TO SAVEPOINT` discards the `SET`s made after the savepoint
+(`RELEASE` keeps them); `RESET name`, `RESET ALL` and `DISCARD ALL` inside a
+transaction are likewise deferred until commit. `SET LOCAL`, `SET TRANSACTION` and
+`SET CONSTRAINTS` are transaction-scoped and never tracked. Variables are identified
+by name (`SET TIME ZONE` is `timezone`, `SET SCHEMA` is `search_path`, `SET NAMES`
+is `client_encoding`), so repeated `SET`s of one variable cost one slot. Extended-
+protocol `SET`s, `SQL PREPARE`, temporary tables and cursors are not restored.
