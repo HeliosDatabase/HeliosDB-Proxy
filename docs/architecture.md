@@ -66,14 +66,20 @@ These modules form the minimum viable proxy. They are compiled unconditionally a
 | `pool::transaction` | `src/pool/transaction.rs` | Transaction-mode pool backend |
 | `pool::statement` | `src/pool/statement.rs` | Statement-mode pool backend |
 
-### Transaction Replay (`ha-tr`)
+### Transaction Replay
 
-| Module | Source | Responsibility |
-|--------|--------|----------------|
-| `transaction_journal` | `src/transaction_journal.rs` | Write-ahead journal for in-flight transactions |
-| `failover_replay` | `src/failover_replay.rs` | Replay coordinator during failover |
-| `session_migrate` | `src/session_migrate.rs` | Session state capture and restore (SET parameters, prepared statements) |
-| `cursor_restore` | `src/cursor_restore.rs` | Cursor position preservation across failover |
+The recovery path a live client takes is **in core** — it needs no feature flag. The
+`ha-tr` feature adds the journal and the operator-driven replay tooling, which are
+separate from that path.
+
+| Module | Feature Flag | Source | Responsibility |
+|--------|-------------|--------|----------------|
+| In-session recovery | *(core)* | `src/server.rs` | Records statements, session state and a bounded response digest inside a transaction; on a backend fault classifies delivery, re-homes the session, restores `SET` state and replays under one deadline |
+| Replay SQL lexer | *(core)* | `src/replay_sql.rs` | Bounded statement scan: commit boundaries, transaction ends, function calls — decides what may be re-executed |
+| `transaction_journal` | `ha-tr` | `src/transaction_journal.rs` | Post-response journal of write SQL, for operator replay |
+| `failover_replay` | `ha-tr` | `src/failover_replay.rs` | Replay coordinator for embedded/programmatic use |
+| `session_migrate` | `ha-tr` | `src/session_migrate.rs` | Session state capture/restore library. **Not on the recovery path** — the core path does its own `SET` tracking |
+| `cursor_restore` | `ha-tr` | `src/cursor_restore.rs` | Cursor position library. **Not on the recovery path**; cursors are not restored across a failover |
 
 ### Query Intelligence
 
@@ -204,7 +210,8 @@ Client Connection (TCP, PostgreSQL wire protocol)
         v
   +-----------+
   | Pipeline  |  Batch Parse/Bind/Execute for reduced round trips
-  | Engine    |  [ha-tr] Journal statement in transaction journal
+  | Engine    |  Record statement + response digest when in a transaction (core)
+  |           |  [ha-tr] Journal statement for operator replay
   +-----------+
         |
         v
@@ -288,7 +295,42 @@ Events are broadcast to all subscribers (load balancer, failover controller, swi
 
 ## Failover Sequence
 
-When the primary becomes unreachable, the proxy orchestrates the following sequence:
+### What a live session does (core path)
+
+This is what a connected client experiences when its backend dies. It runs in every
+build, with or without `ha-tr`.
+
+```
+1. Backend fault detected mid-statement
+      |
+2. Classify how far the statement got:
+   a. Not delivered            -> safe to recover
+   b. Outcome unknown          -> NEVER re-executed; client gets 08007
+   c. Response already visible -> session closed rather than append a second result
+      |
+3. One deadline starts (write_timeout_secs) and covers steps 4-7
+      |
+4. Wait for a healthy primary
+      |
+5. Connect and authenticate the replacement backend
+      |
+6. Restore tracked session state (SET/RESET, savepoint-scoped, cap-checked)
+      |
+7. Replay the recorded transaction, verifying each statement's response digest
+   against what the client already saw -- divergence => ROLLBACK + 40001
+      |
+8. Re-execute the interrupted statement and resume streaming to the client
+```
+
+Recovery is declined, conservatively, for a `SERIALIZABLE`/`REPEATABLE READ`
+transaction, a response too large to have been digested, a read calling anything
+outside the side-effect-free set, or a session whose tracked `SET` count exceeded its
+cap. See [transaction-replay.md](transaction-replay.md#in-session-replay-the-core-path).
+
+### Controller sequence (embedded / library use)
+
+`FailoverController`, `PrimaryTracker` and `SwitchoverBuffer` are library components
+for embedded use; the standalone daemon does not drive them. They orchestrate:
 
 ```
 1. Health checker detects primary failure (failure_threshold consecutive failures)
@@ -308,9 +350,11 @@ When the primary becomes unreachable, the proxy orchestrates the following seque
       |
 7. [ha-tr] Failover replay re-executes journaled statements on new primary
       |
-8. [ha-tr] Session migrate restores SET parameters and prepared statements
+8. [library, not wired] Session migrate would restore SET parameters and prepared
+   statements. The core path restores SET state itself; prepared statements and
+   cursors are not restored by either path
       |
-9. [ha-tr] Cursor restore repositions open cursors
+9. [library, not wired] Cursor restore would reposition open cursors
       |
 10. Primary tracker confirmed, switchover buffer drains to new primary
       |

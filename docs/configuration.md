@@ -155,7 +155,7 @@ shutdown_drain_timeout_secs = 60
 | `tr_enabled` | bool | `true` | Enable Transaction Replay. *(Required in a config file.)* |
 | `tr_mode` | string | `"session"` | Transaction Replay mode: `none`, `session`, `select`, `transaction`. *(Required in a config file.)* |
 | `tr_read_functions` | array of string | `[]` | TR-03 read re-execution policy extension. In-session replay re-executes an interrupted read on an unknown outcome only when every function it calls is a PostgreSQL built-in known to be side-effect-free; list additional provably pure functions (unqualified names, case-insensitive) here. Reads calling anything else, quoted-identifier calls, `SELECT … INTO`, and sequence functions are classified as opaque and never re-executed. |
-| `write_timeout_secs` | u64 | `30` | Seconds to buffer writes during failover before returning an error. |
+| `write_timeout_secs` | u64 | `30` | Seconds to buffer writes during failover before returning an error — and, since 1.7.0, the **single deadline for a whole session recovery**: waiting for a primary, connect/auth, session-state restore and replay all draw on it, instead of each having its own timeout. |
 | `optimize_unnamed_parse` | bool | `true` | Skip re-forwarding an identical unnamed extended-protocol `Parse` a backend already holds, synthesizing `ParseComplete` locally. A kill-switch for drivers that depend on the redundant round trip. |
 | `shutdown_drain_timeout_secs` | u64 | `60` | How long a SIGUSR2 binary-handoff drain keeps serving in-flight connections before dropping them. Runtime override: `HELIOS_DRAIN_TIMEOUT_SECS`. |
 
@@ -178,8 +178,8 @@ run) and **outcome-unknown** (written, then the connection failed before
 |------|-------------|
 | `none` | One `ErrorResponse` (SQLSTATE `57P01`, naming the failed node) + `ReadyForQuery`, then the client connection is closed. |
 | `session` (default) | The client connection stays open. The proxy waits for a healthy primary (`write_timeout_secs`), reconnects (startup parameters re-sent), replays the session's tracked `SET`/`RESET` statements, and re-prepares named prepared statements lazily. A not-delivered statement issued **outside** an explicit transaction is re-executed transparently. Anything else gets ONE error — `57P01` (not delivered inside a transaction) or `08007 transaction_resolution_unknown` — the client-visible transaction is aborted (`ROLLBACK` and retry; other statements get `25P02` until then) and the session continues on the new primary. |
-| `select` | `session`, plus: an outcome-unknown **read** (`SELECT`/`SHOW`/`VALUES`/read-only `WITH`/`COPY … TO`; never a write, never `nextval()`) is re-executed transparently outside a transaction; a **read-only** explicit transaction is replayed from its `BEGIN` first and the interrupted statement re-run inside it. |
-| `transaction` | `select`, plus: an **uncommitted** explicit transaction is replayed from its `BEGIN` on the new primary (recorded simple-protocol text / raw extended-protocol batches; responses discarded — the client already saw them) and the in-flight statement is re-executed inside it. If a replayed statement fails the replay is rolled back and the client gets `40001` (`transaction replay failed after failover: …`). A `COMMIT`/`END`/`PREPARE TRANSACTION`/`COMMIT PREPARED` whose outcome is unknown is **never** retried (`08007`). Opt-in: blind replay is only correct for deterministic statements (`now()`, `random()`, `RETURNING` serials may differ on the second run). |
+| `select` | `session`, plus: an outcome-unknown **read** (`SELECT`/`SHOW`/`VALUES`/read-only `WITH`/`COPY … TO`) is re-executed transparently outside a transaction, **but only when every function it calls is known side-effect-free** — a PostgreSQL built-in on the allowlist or a name you listed in `tr_read_functions`. A read calling a user-defined function, `nextval`, `pg_notify`, `set_config`, an advisory lock, a quoted-identifier call, or using `SELECT … INTO` is opaque: it returns `08007` and is never run twice. A **read-only** explicit transaction is replayed from its `BEGIN` first and the interrupted statement re-run inside it. |
+| `transaction` | `select`, plus: an **uncommitted** explicit transaction is replayed from its `BEGIN` on the new primary (recorded simple-protocol text / raw extended-protocol batches) and the in-flight statement is re-executed inside it. Replay is **verified**: each statement's original response frames were digested as the client saw them (within `[limits] tr_max_observation_bytes`) and the replacement backend's responses are digested the same way — any divergence rolls the replay back and returns `40001`, so a replay that would silently continue on different rows fails loudly instead. A failed replayed statement produces the same `40001`. A `COMMIT`/`END`/`PREPARE TRANSACTION`/`COMMIT PREPARED` whose outcome is unknown is **never** retried (`08007`). Still opt-in: verification catches divergent *results*, it does not make `now()` or a `RETURNING` serial reproduce its first value. |
 
 Hard rules in every mode: a write whose outcome is unknown is never re-executed
 except as part of `transaction` mode's replay of an uncommitted transaction (the
@@ -189,10 +189,21 @@ statements; a `COPY` in progress at the fault → `08006` and the connection is
 closed. A transaction is marked non-replayable (so `transaction` degrades to
 `session` for it) when it exceeds `[limits] tr_max_replay_statements` /
 `tr_max_replay_bytes`, enters the failed state, contains a `COPY`, or one of
-its statements was transformed by query-rewrite / multi-tenancy. Session `SET`
-tracking covers simple-protocol statements only (extended-protocol `SET`s as
-sent by JDBC, and SQL-level `PREPARE`, are not restored) and is capped by
-`tr_max_session_set_statements`.
+its statements was transformed by query-rewrite / multi-tenancy, runs at
+`SERIALIZABLE` or `REPEATABLE READ` (explicitly, via `SET TRANSACTION`, or
+inherited from a tracked `default_transaction_isolation` — no replay can
+reproduce that snapshot), or produced a response too large to have been digested
+within `[limits] tr_max_observation_bytes`.
+
+Session `SET` tracking is transactional: a `SET` inside a transaction takes effect
+in the restore set only when that transaction commits, `ROLLBACK TO SAVEPOINT`
+discards the ones made after the savepoint, and `RESET`/`RESET ALL`/`DISCARD ALL`
+inside a transaction are deferred to commit. Variables are keyed by name, so
+repeating a `SET` reuses its slot; the cap `tr_max_session_set_statements` counts
+**distinct variables**, and exceeding it refuses the failover with `08006` rather
+than re-homing a session with incomplete state. It covers simple-protocol
+statements only — extended-protocol `SET`s as sent by JDBC, SQL-level `PREPARE`,
+session temp tables and cursors are not restored.
 
 **Backend credentials.** Re-homing a session means opening a *fresh* backend
 connection. In pass-through auth mode the proxy never sees the client's

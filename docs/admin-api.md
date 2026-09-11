@@ -247,7 +247,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 ## Failover & Chaos
 
-Failover between backends is **automatic** (health-driven, with transaction replay when `ha-tr` is enabled). There is **no `/failover` endpoint.** To *force* a failover for testing, mark a node unhealthy via the chaos API.
+Failover between backends is **automatic** (health-driven; in-session Transaction Replay is core and governed by `tr_mode`, while `ha-tr` adds the journal behind `/api/replay`). There is **no `/failover` endpoint.** To *force* a failover for testing, mark a node unhealthy via the chaos API.
 
 ### GET /api/chaos
 

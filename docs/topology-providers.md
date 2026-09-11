@@ -31,8 +31,11 @@ The write path (`select_primary_with_timeout` in `src/server.rs`) looks for
 `n.role == NodeRole::Primary && n.enabled` and a passing health entry. If that node is
 healthy, writes go to it. If it is not, the proxy buffers the write, polling health every
 100 ms for up to `write_timeout_secs` (default 30) for a healthy primary to appear; on
-timeout it increments the `failovers` metric and returns `NoHealthyNodes`. (See
-[transaction-replay.md](transaction-replay.md#what-happens-on-the-live-write-path).)
+timeout it increments the `failovers` metric and returns `NoHealthyNodes`. During a
+session recovery the same wait runs as `select_primary_until`, sharing the single
+`write_timeout_secs` deadline with connect/auth, session restore and replay rather than
+getting a full window of its own. (See
+[transaction-replay.md](transaction-replay.md#in-session-replay-the-core-path).)
 
 The admin view (`compute_topology` in `src/admin.rs`) uses the same rule: `currentPrimary`
 is the address of the first node with `role = "primary"` (case-insensitive) whose health

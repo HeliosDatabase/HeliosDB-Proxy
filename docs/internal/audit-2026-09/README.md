@@ -1,5 +1,13 @@
 # HeliosProxy feature audit — 2026-09-08
 
+> **Status, 2026-09-11 (1.7.0):** every Transaction Replay defect recorded below is
+> fixed and shipped — TR-01/TR-02/TR-05 in 1.6.1, TR-03/TR-04/TR-06 and H-07 in 1.7.0.
+> Replay now verifies its own results and refuses what it cannot reproduce. This file
+> is preserved as the original audit; current state lives in
+> [PROGRESS.md](PROGRESS.md) and [IMPROVEMENTS.md](IMPROVEMENTS.md). The HA,
+> promotion and sharded-routing findings below are still open.
+
+
 **Verdict: 1.6.0 has real in-session replay, but the advertised feature set is not
 fully honored by the daemon. Replay has reproducible safety defects. Global HA,
 automatic promotion, and general sharded routing are not established capabilities.**

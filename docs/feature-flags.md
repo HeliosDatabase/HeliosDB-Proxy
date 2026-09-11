@@ -23,7 +23,7 @@ All of the following are **off by default**. Enable them individually or via the
 | Feature | Pulls extra deps | Description |
 |---------|------------------|-------------|
 | `pool-modes` | None | Connection pooling modes (Session/Transaction/Statement). Enabled by default. |
-| `ha-tr` | None | Transaction Replay -- failover replay, cursor restore, session migration. |
+| `ha-tr` | None | Transaction Replay **journal and operator tooling** (`/api/replay`, `/api/shadow`, failover library). The in-session recovery a client experiences is core and needs no flag. |
 | `query-cache` | None | L1 hot / L2 warm / L3 semantic query result caching. |
 | `routing-hints` | None | SQL comment-based query routing hints. |
 | `lag-routing` | None | Replica lag-aware routing with read-your-writes consistency. |
@@ -87,19 +87,32 @@ Enables three connection pooling modes that control when backend connections are
 
 Includes prepared statement tracking, connection reset sequences, lease management, and pool hardening.
 
-### `ha-tr` -- Transaction Replay
+### `ha-tr` -- Transaction Replay journal and operator tooling
 
 **Modules:** `src/transaction_journal.rs`, `src/failover_replay.rs`, `src/session_migrate.rs`, `src/cursor_restore.rs`
 
-Provides zero-data-loss failover for in-flight transactions. When the primary fails during an active transaction, the proxy:
+**The recovery a live client experiences does not need this flag.** Since 1.6.0, in-session
+Transaction Replay is in core: the proxy records the statements, session state and response
+digests of an open transaction, and on a backend fault re-homes the session to a new primary,
+restores its `SET` state and replays the transaction under one `write_timeout_secs` deadline,
+verifying each replayed response against what the client already saw. It is configured with
+`tr_mode`; see [transaction-replay.md](transaction-replay.md).
 
-1. Journals all statements issued within the transaction.
-2. Detects failover and identifies a new primary.
-3. Re-executes the journaled statements on the new primary.
-4. Restores session state (SET parameters, prepared statements).
-5. Repositions open cursors.
+What `ha-tr` adds on top:
 
-The client experiences a brief pause but does not receive an error.
+1. A post-response journal of write SQL, bounded in memory and not persisted.
+2. The operator-driven `POST /api/replay` endpoint — replay a time window of that journal
+   against a target backend, for failover validation, staging hydration or forensics.
+3. `POST /api/shadow` — dual-execute a query against two backends and diff the results.
+4. The `FailoverController`/`PrimaryTracker`/`SwitchoverBuffer` library components for
+   embedded use.
+
+`session_migrate` and `cursor_restore` are library modules and are **not** on the recovery
+path: prepared statements and cursors do not survive a failover in either build.
+
+Recovery is transparent where it can be. Where it cannot be — an unknown `COMMIT` outcome,
+a response already partly delivered, a snapshot-pinned transaction — the client gets a
+clear SQLSTATE (`08007`, `40001`, `08006`) instead of a silently wrong result.
 
 ### `query-cache` -- Query Caching
 
@@ -292,7 +305,7 @@ Connection pooling with full failover protection and topology discovery.
 cargo build --release --features "pool-modes,ha-tr,postgres-topology"
 ```
 
-Included: all of the above plus Transaction Replay, cursor restore, session migration, and automatic primary discovery via PostgreSQL polling.
+Included: all of the above plus the Transaction Replay journal and operator replay tooling, and automatic primary discovery via PostgreSQL polling. (In-session replay itself is core.)
 
 ### Intelligent Query Proxy
 
