@@ -1,21 +1,11 @@
 # Transaction Replay (TR) — Deep Dive
 
-> **Historical implementation description:** this guide predates 1.6.0's in-session
-> replay. That recovery path now runs in core, including builds without `ha-tr`;
-> `ha-tr` gates the separate journal and administrative replay modules. The
-> [2026-09-08 audit](internal/audit-2026-09/README.md) documents the current paths
-> and remaining work. The unknown-COMMIT and partial-result retry defects it recorded
-> are fixed: a possibly-committed statement is never re-executed, and recovery never
-> appends a second result to a response the client has already partly received.
-> Use that audit when assessing current replay guarantees.
->
-> **Two limits worth knowing.** Replay resends the client's original SQL, so a
-> statement whose commit boundary cannot be established lexically is refused rather
-> than guessed — including a literal where a backslash could hide a statement
-> separator under `standard_conforming_strings = off`. And an `Execute` whose `Bind`
-> or `Parse` came from an earlier completed protocol cycle is opaque to recovery: the
-> statement still runs normally, but an uncertain outcome returns `08007` instead of
-> replaying.
+> **How to read this guide.** [In-session replay](#in-session-replay-the-core-path)
+> describes the recovery path a live client actually takes; it runs in core, including
+> builds without `ha-tr`. Everything about the transaction journal, the replay engine and
+> time-travel replay describes the separate `ha-tr` administrative modules, which are not
+> on that path. The [2026-09 audit](internal/audit-2026-09/README.md) records what was
+> fixed and what remains.
 
 Transaction Replay is HeliosProxy's failover-continuity subsystem: a per-write
 transaction journal plus a replay engine that can re-execute journaled statements on a
@@ -28,7 +18,10 @@ key, default, mode name, behavior — is verifiable in `src/transaction_journal.
 `src/replay/mod.rs`, and the TR fields of `ProxyConfig` in `src/config.rs`. Where the
 narrative describes intent rather than shipped runtime behavior, it says so explicitly.
 
-**Last verified against commit `ab909be`.**
+**Last verified against 1.7.0.** The in-session recovery path described in
+[In-session replay](#in-session-replay-the-core-path) is the current behavior; the
+journal and administrative replay sections below describe the separate `ha-tr`
+modules, which are unchanged.
 
 ---
 
@@ -111,7 +104,12 @@ write_timeout_secs = 30
 |-----|------|---------|---------|
 | `tr_enabled` | bool | `true` | Enables the write-path journaling hook. Required in a config file (no serde default; the in-code `Default` is `true`). |
 | `tr_mode` | enum | `session` | Selects the replay policy (see below). Stored on each session and surfaced at `/config`. Also required in a config file (no serde default — the `#[default]` on `TrMode` only feeds `ProxyConfig::default()`, so omitting `tr_mode` from `proxy.toml` fails deserialization with "missing field `tr_mode`"). |
-| `write_timeout_secs` | u64 | `30` | `default_write_timeout_secs()` = 30. Exposed as `ProxyConfig::write_timeout()` → `Duration`; consumed by `select_primary_with_timeout` (`src/server.rs`). |
+| `write_timeout_secs` | u64 | `30` | `default_write_timeout_secs()` = 30. Exposed as `ProxyConfig::write_timeout()` → `Duration`. Since 1.7.0 it is **one deadline for the whole recovery** — waiting for a primary, connect/auth, session restore and replay all share it, rather than each having its own timeout. |
+| `tr_read_functions` | list | `[]` | Extra function names to treat as side-effect-free when deciding whether an interrupted read may be re-executed. Plain identifiers only. |
+| `[limits] tr_max_observation_bytes` | usize | `1048576` | Per-statement budget for the response digest used to verify a replay. A response beyond it makes the transaction non-replayable. |
+| `[limits] tr_max_session_set_statements` | usize | see `configuration.md` | Cap on **distinct** tracked `SET` variables. Exceeding it refuses failover with `08006` rather than re-homing with incomplete state. |
+| `[limits] max_backend_frame_bytes` | usize | `104857600` | Ceiling on any single backend protocol frame on every streaming relay. |
+| `[limits] backend_response_timeout_secs` | u64 | `0` (off) | Whole-response deadline; bounds a backend that drips bytes inside one response, which the per-read timeout cannot. |
 
 > **No `tr_max_journal_bytes` or `switchover_drain_timeout_secs` key exists.** Earlier
 > revisions of this document invented both. Journal size caps are code constants (see
@@ -131,20 +129,57 @@ the authoritative one-line semantics:
 | `select` | Re-execute SELECT queries. |
 | `transaction` | Full transaction replay. |
 
-**Honest caveat on `tr_mode`.** As of `ab909be`, `tr_mode` is parsed, stored on the
-`ClientSession` (`session.tr_mode = config.tr_mode`), and reported through `/config`, but
-the live write-path journaling branches only on `tr_enabled` — it does not yet select
-different journaling behavior per mode. Mode-specific replay (session-only vs. re-run
-SELECTs vs. full DML replay) is expressed by the **replay engine's** `ReplayConfig`
-(e.g. `skip_read_only`), not by a `tr_mode` switch in the server hot path. Treat `tr_mode`
-as the declared policy that the replay/coordination layer honors, not as a runtime toggle
-on the forwarding path.
+**`tr_mode` is live.** Since 1.6.0 the mode is enforced on the session's own recovery
+path, not only reported: `none` aborts, `session` re-establishes the connection and its
+tracked session state, `select` additionally re-executes an interrupted read when that
+read is provably side-effect-free, and `transaction` replays the recorded transaction.
+The modes are cumulative — each does everything the one before it does.
 
 ---
 
-## What Happens on the Live Write Path
+## In-session replay (the core path)
 
-Two mechanisms cover a primary change in the running daemon:
+This is what a client actually experiences when its backend dies mid-session. It runs in
+core, in builds with and without `ha-tr`, and is independent of the journal and
+administrative replay modules documented further down.
+
+**What is recorded.** While a session is inside a transaction under `tr_mode = select` or
+`transaction`, the proxy records each statement, the session state it changed, and a
+bounded digest of the response frames the client was shown (`[limits]
+tr_max_observation_bytes`, default 1 MiB). Autocommit traffic records nothing.
+
+**What happens on a backend fault.** The proxy classifies how far the statement got. If
+the outcome is *not delivered*, recovery is safe. If the outcome is *unknown* — the
+statement may have committed — it is never re-executed; the client receives `08007` with
+instructions to verify. Once any part of a response has reached the client, the session is
+closed rather than have a second result appended to the first.
+
+**What recovery does.** Under one deadline (`write_timeout_secs`) it waits for a healthy
+primary, connects and authenticates, restores the session's tracked `SET` state, and
+replays the recorded transaction. Each replayed statement's response is hashed and
+compared with what the client originally saw; any divergence rolls the replay back and
+returns `40001` rather than continuing on top of rows the client never observed.
+
+**What it refuses.** Recovery is declined, conservatively, when:
+
+- the transaction ran at `SERIALIZABLE` or `REPEATABLE READ` — no replay can reproduce
+  that snapshot;
+- a response was larger than `tr_max_observation_bytes`, so it cannot be verified;
+- a read calls anything that is not a known side-effect-free built-in and is not listed in
+  `tr_read_functions` (a user-defined function, `nextval`, `pg_notify`, `set_config`, an
+  advisory lock);
+- the number of distinct tracked `SET` variables exceeded
+  `[limits] tr_max_session_set_statements`, so the session cannot be restored completely
+  (`08006`);
+- a commit boundary cannot be established lexically, or an `Execute` refers to a `Parse`
+  or `Bind` from an earlier completed protocol cycle.
+
+---
+
+## What happens on the live write path (the `ha-tr` journal hook)
+
+Beyond the in-session recovery above, two `ha-tr` mechanisms observe a primary change
+in the running daemon:
 
 **1. Write journaling** (`src/server.rs`, `journal_write`, `#[cfg(feature = "ha-tr")]`).
 When `tr_enabled` and the statement is a write, the proxy records it in the shared
@@ -327,23 +362,32 @@ feature still routes `POST /api/replay`, but the handler returns
 
 ### Journal is in-memory and best-effort on the hot path
 The journal lives in process memory and is bounded by the code constants above; it is not
-persisted. The live write-path hook records SQL text only — parameter values, result
-checksums, and row counts are part of the journal model but are not populated by the
-forwarding path today, so hot-path replay verification degrades to "did the statement
-run" rather than "did it produce identical results".
+persisted. The live write-path hook records SQL text only — parameter values and row
+counts are part of the journal model but are not populated by the forwarding path today.
+This applies to the `ha-tr` journal, **not** to in-session recovery: that path records its
+own per-statement response digest and verifies it during replay (see
+[In-session replay](#in-session-replay-the-core-path)).
 
-### Session state is not migrated on the replay path
-The replay engine re-executes journaled SQL statements. It does **not** re-establish
-`SET`/GUC parameters, re-`PREPARE` named statements, restore cursor positions, re-create
-session temp tables, or re-acquire advisory locks on the new primary. The `ha-tr` feature
-line's "cursor restore, session migrate" capabilities *are* implemented — but as
-standalone library modules, not on the replay path: `src/cursor_restore.rs`
-(`CursorRestore::restore_cursor`) and `src/session_migrate.rs`
-(`SessionState::generate_restore_statements`, which regenerates `SET`/`PREPARE`/temp-table
-statements) exist and are unit-tested, yet nothing in `server.rs`, `failover_replay.rs`,
-or `failover_controller.rs` references them, so they are unreachable from a failover
-today. Applications that depend on pre-transaction session state surviving a failover need
-application-level coordination.
+### Session state: `SET` is restored, the rest is not
+The in-session path tracks `SET`/`RESET` transactionally — a `SET` inside a transaction is
+restored only if that transaction commits, `ROLLBACK TO SAVEPOINT` discards the ones made
+after the savepoint — and replays the resulting state onto the replacement backend, up to
+`[limits] tr_max_session_set_statements` distinct variables. Beyond that cap the failover
+is refused (`08006`) rather than completed with incomplete state.
+
+Not restored: named `PREPARE`d statements, cursor positions, session temp tables and
+advisory locks. `SET`s issued through the extended protocol are also not tracked. The
+`ha-tr` library modules `src/cursor_restore.rs` and `src/session_migrate.rs` implement
+parts of this but remain unwired from the recovery path. Applications depending on that
+state surviving a failover still need application-level coordination.
+
+### Snapshot-pinned transactions are not replayed
+A transaction at `SERIALIZABLE` or `REPEATABLE READ` — set on `BEGIN`, through
+`SET TRANSACTION`, or inherited from `default_transaction_isolation` — is marked
+non-replayable. Its reads were taken against a snapshot that no replacement backend can
+reproduce, so recovery reports the failure instead of silently continuing against a
+different snapshot. The same applies to a response too large to have been digested within
+`[limits] tr_max_observation_bytes`.
 
 ### Non-deterministic functions and sequences
 `random()`, `clock_timestamp()`, `txid_current()`, and `nextval()` produce different
@@ -373,8 +417,8 @@ controller/tracker automatically.
 | DML statement replay (journal-driven) | Yes (replay engine) | No | Yes | No |
 | SELECT re-execution | Yes (`skip_read_only = false`) | Yes (read-only) | Yes | No |
 | WAL-LSN wait before replay | Yes (`pg_last_wal_replay_lsn()`) | N/A | Yes | No |
-| Row-count / checksum verification | Row count; checksum best-effort | Basic | Full | N/A |
-| Cursor / session-state migration | Library modules, unwired | Yes | Yes | No |
+| Result verification on replay | Ordered response digest, verified; divergence returns `40001` | Basic | Full | N/A |
+| Session-state migration | `SET` state restored transactionally; cursors/`PREPARE`/temp tables not | Yes | Yes | No |
 | Planned-switchover buffering | Yes (`SwitchoverBuffer`) | No | Yes | No |
 | Persisted journal | No (in-memory) | N/A | N/A | N/A |
 | Open source | Yes | No | No | Yes |
