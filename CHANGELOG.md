@@ -5,7 +5,25 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.7.0] - 2026-09-11
+
+Transaction Replay correctness is complete. Replay now verifies its own results,
+refuses what it cannot reproduce, restores session state transactionally, and runs
+the whole recovery under one deadline. Every P0 safety item in the Transaction
+Replay group of the September 2026 audit is closed; what remains there is the
+`ha-tr` journal and operator replay tooling (TR-07) and two availability
+follow-ups (TR-08, TR-09).
+
+### Added
+
+- `tr_read_functions` (top level) — extra function names that an interrupted read
+  may call and still be re-executed on a replacement backend.
+- `[limits] tr_max_observation_bytes` (default 1 MiB) — per-statement budget for the
+  response digest replay is verified against.
+- `[limits] backend_response_timeout_secs` (default 0 = off) — whole-response
+  deadline for a backend that drips bytes inside one response.
+- `[limits] max_backend_frame_bytes` (default 100 MiB) — ceiling on any single
+  backend protocol frame, applied on every streaming relay.
 
 ### Fixed
 
