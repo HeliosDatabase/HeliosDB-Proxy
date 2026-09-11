@@ -22,6 +22,23 @@ promotion authority, commit-driven invalidation, security/session-aware cache
 identity, and aggregate resource admission. Optimizing hit rate before these can
 make incorrect responses faster or overload the surviving primary during failover.
 
+## GitHub tracking
+
+Open items are mirrored as GitHub issues so the work is discoverable outside this
+repository. [#54](https://github.com/HeliosDatabase/HeliosDB-Proxy/issues/54) is the
+tracking issue for everything not filed individually.
+
+| Item | Issue | Item | Issue |
+|---|---|---|---|
+| TR-07 | [#49](https://github.com/HeliosDatabase/HeliosDB-Proxy/issues/49) | O-01 | [#44](https://github.com/HeliosDatabase/HeliosDB-Proxy/issues/44) |
+| TR-08 | [#50](https://github.com/HeliosDatabase/HeliosDB-Proxy/issues/50) | O-02 | [#45](https://github.com/HeliosDatabase/HeliosDB-Proxy/issues/45) |
+| TR-09 | [#51](https://github.com/HeliosDatabase/HeliosDB-Proxy/issues/51) | O-03 | [#46](https://github.com/HeliosDatabase/HeliosDB-Proxy/issues/46) |
+| H-01 | [#52](https://github.com/HeliosDatabase/HeliosDB-Proxy/issues/52) | O-04 | [#47](https://github.com/HeliosDatabase/HeliosDB-Proxy/issues/47) |
+| H-02 | [#53](https://github.com/HeliosDatabase/HeliosDB-Proxy/issues/53) | O-05 | [#48](https://github.com/HeliosDatabase/HeliosDB-Proxy/issues/48) |
+
+Everything else (H-03..H-06, C-01..C-09, D-01..D-05, P-01..P-03, V-01, V-02) is listed
+in #54 with its priority; open an individual issue when work starts on one.
+
 ## First: protect Transaction Replay
 
 - [x] **TR-01 · P0 — classify every possible commit boundary.** *(2026-09-11: shipped in 1.6.1. Bounded lexer over leading/nested comments, quoted text, BEGIN/END, PREPARE/COMMIT PREPARED, multi-statement Query strings and every Execute in a pipelined batch; an unknown commit outcome stays unknown and is reported `08007`. Acceptance: both COMMIT probes pass and the real-PG commit-outcome suite is 7/7 where the pre-change binary failed 4 (`evidence/tr01-postgres.json`, `evidence/tr01-postgres-before.json`). The residual cross-cycle statement/portal identity work is availability, not safety, and is re-filed as TR-08.)* Reuse a bounded
