@@ -217,8 +217,13 @@ pub struct ProxyConfig {
     pub nodes: Vec<NodeConfig>,
     /// TLS configuration
     pub tls: Option<TlsConfig>,
-    /// Write timeout during failover (seconds)
-    /// When primary is unavailable, wait this long for a new primary before returning error
+    /// Recovery deadline during failover (seconds). ONE deadline bounds the
+    /// whole in-session recovery: waiting for a healthy primary, dialing and
+    /// authenticating to it, restoring session state, replaying the recorded
+    /// transaction and re-executing the interrupted statement. Previously only
+    /// the wait for a primary was bounded and the per-operation timeouts could
+    /// add up beyond this value (TR-06). Expiry surfaces to the client as
+    /// `08006`/`08007` exactly like an unavailable primary.
     #[serde(default = "default_write_timeout_secs")]
     pub write_timeout_secs: u64,
     /// Plugin system configuration. Only consumed when the `wasm-plugins`
@@ -863,6 +868,24 @@ pub struct LimitsToml {
     /// applies to client (frontend) messages.
     #[serde(default = "default_max_backend_frame_bytes")]
     pub max_backend_frame_bytes: usize,
+    /// Whole-response deadline (seconds) for one backend response on the
+    /// streaming relays, measured from the first read until ReadyForQuery.
+    /// `backend_read_timeout_secs` is re-armed on every read, so a backend that
+    /// drips one byte per interval inside a single response is never timed out
+    /// by it; this bounds the response as a whole (H-07 slow-drip). `0` = off,
+    /// the prior behaviour.
+    #[serde(default)]
+    pub backend_response_timeout_secs: u64,
+    /// In-session Transaction Replay: cap on response bytes hashed per recorded
+    /// statement to form its observation digest (RowDescription/DataRow/
+    /// CommandComplete frames). At replay the replacement backend's response is
+    /// hashed the same way; a divergence rolls the replayed transaction back
+    /// and reports `40001`. A statement whose response exceeds this cap has no
+    /// verifiable observation, so its transaction is marked non-replayable
+    /// (`transaction` degrades to `session`) rather than claiming the old
+    /// snapshot was preserved (TR-06).
+    #[serde(default = "default_tr_max_observation_bytes")]
+    pub tr_max_observation_bytes: usize,
     /// Global ceiling on idle connections parked in the data-path backend pool
     /// across ALL `(node,user,db)` identities — bounds total file descriptors
     /// regardless of how many distinct identities connect. Only consumed when
@@ -969,6 +992,9 @@ fn default_max_pending_bytes() -> usize {
 fn default_max_backend_frame_bytes() -> usize {
     100 * 1024 * 1024
 }
+fn default_tr_max_observation_bytes() -> usize {
+    1024 * 1024
+}
 fn default_max_total_idle_backend_conns() -> usize {
     8192
 }
@@ -1014,6 +1040,8 @@ impl Default for LimitsToml {
             max_prepared_bytes: default_max_prepared_bytes(),
             max_pending_bytes: default_max_pending_bytes(),
             max_backend_frame_bytes: default_max_backend_frame_bytes(),
+            backend_response_timeout_secs: 0,
+            tr_max_observation_bytes: default_tr_max_observation_bytes(),
             max_total_idle_backend_conns: default_max_total_idle_backend_conns(),
             pool_reap_interval_secs: default_pool_reap_interval_secs(),
             max_client_connections: default_max_client_connections(),
@@ -1913,6 +1941,11 @@ impl ProxyConfig {
                         "tr_read_functions entry {f:?} is not a plain function name"
                     )));
                 }
+            }
+            if l.tr_max_observation_bytes == 0 {
+                return Err(ProxyError::Config(
+                    "limits.tr_max_observation_bytes must be >= 1".to_string(),
+                ));
             }
             if l.max_backend_frame_bytes < 5 {
                 return Err(ProxyError::Config(
@@ -3080,6 +3113,8 @@ mod tests {
         assert_eq!(l.max_pending_bytes, 64 * 1024 * 1024);
         // H-07: matches ProtocolCodec's frontend `max_message_size` (100 MiB).
         assert_eq!(l.max_backend_frame_bytes, 100 * 1024 * 1024);
+        assert_eq!(l.backend_response_timeout_secs, 0, "off = prior behaviour");
+        assert_eq!(l.tr_max_observation_bytes, 1024 * 1024);
         assert_eq!(l.max_total_idle_backend_conns, 8192);
         assert_eq!(l.pool_reap_interval_secs, 30);
         // The two opt-in bounds default to "off" so an existing config keeps
