@@ -24,7 +24,7 @@ make incorrect responses faster or overload the surviving primary during failove
 
 ## First: protect Transaction Replay
 
-- [ ] **TR-01 · P0 — classify every possible commit boundary.** Reuse a bounded
+- [x] **TR-01 · P0 — classify every possible commit boundary.** *(2026-09-11: shipped in 1.6.1. Bounded lexer over leading/nested comments, quoted text, BEGIN/END, PREPARE/COMMIT PREPARED, multi-statement Query strings and every Execute in a pipelined batch; an unknown commit outcome stays unknown and is reported `08007`. Acceptance: both COMMIT probes pass and the real-PG commit-outcome suite is 7/7 where the pre-change binary failed 4 (`evidence/tr01-postgres.json`, `evidence/tr01-postgres-before.json`). The residual cross-cycle statement/portal identity work is availability, not safety, and is re-filed as TR-08.)* Reuse a bounded
   PostgreSQL-aware lexer/parser for leading/nested comments, quoted text, BEGIN/END,
   PREPARE/COMMIT PREPARED, multi-statement Query strings and every Execute in a
   pipelined batch. Preserve statement/portal identity, including binary Bind params.
@@ -37,7 +37,7 @@ make incorrect responses faster or overload the surviving primary during failove
   are tracked in [TR-01.md](TR-01.md). The item stays open until the listed protocol
   identity and transport-boundary coverage is complete.
 
-- [ ] **TR-02 · P0 — track client-visible response progress.** Include emitted
+- [x] **TR-02 · P0 — track client-visible response progress.** *(2026-09-11: shipped in 1.6.1 and completed by the 2026-09-09 review fix. `ResponseProgress` carries emitted RowDescription/DataRow/CommandComplete/ErrorResponse bytes into the fault context; a visible result prefix closes the session instead of concatenating a second result; delivery uncertainty is preserved across Flush chunks; the idle backend-watch relay now publishes only complete frames. Acceptance: real-PG streaming suite 13/13, synthetic boundary harness 26/26. The opt-in bounded response buffering is an enhancement, not part of the safety contract, and is re-filed as TR-09.)* Include emitted
   RowDescription/DataRow/CommandComplete/ErrorResponse progress in the fault context.
   Once a result prefix is visible, fail cleanly rather than concatenate a new result.
   Preserve delivery uncertainty across Flush chunks: failure before sending a later
@@ -68,7 +68,7 @@ make incorrect responses faster or overload the surviving primary during failove
   extended and savepoint variants agree with direct PG, and a long SET-only
   transaction cannot exceed its budget.
 
-- [ ] **TR-05 · P0 — distinguish unsent frames from partially sent extended batches.**
+- [x] **TR-05 · P0 — distinguish unsent frames from partially sent extended batches.** *(2026-09-11: shipped in 1.6.1. Every extended-batch write failure preserves `OutcomeUnknown`; the deterministic partial-writer covers every byte offset, timeout and zero-length write; connect failure before any send stays eligible for the safe retry. The benchmark question that held acceptance open is resolved: the interrupted candidate run was superseded by the full 107-case post-release measurement on 1.6.0, which includes this code and passes gate 3 (92/92 comparable, mean +1.59%) — see `benches/BASELINE.md`.)*
   A failed `write_all(batch)` is not proof that earlier Execute messages never ran.
   Retain byte/frame delivery progress and classify uncertain prefixes conservatively.
   **Accept:** a deterministic writer that fails after each byte/frame offset cannot
@@ -99,6 +99,24 @@ make incorrect responses faster or overload the surviving primary during failove
   failed statements, binary/array parameters, interleaved clients and interrupted
   replay cannot produce partial committed ledger transfers; no backend means no
   successful replay report. Keep operator time-window replay explicitly distinct.
+
+- [ ] **TR-08 · P2 — acknowledged statement and portal identity across cycles.**
+  Residual of TR-01. Preserve named statement/portal identity, including binary
+  Bind parameters, for statements acknowledged in an earlier extended cycle so a
+  replay can re-establish them instead of refusing. Today the refusal is correct
+  but costs availability: an interrupted session that cannot re-derive identity
+  returns `08007` rather than re-homing. **Accept:** a pipelined client with named
+  statements prepared in an earlier cycle survives a backend loss mid-transaction
+  with identical results; no path gains a second dispatch of a possibly committed
+  statement.
+
+- [ ] **TR-09 · P2 — opt-in bounded response buffering for small reads.**
+  Residual of TR-02. For explicitly opted-in small reads, buffer the response
+  until it is complete so a fault before publication can be retried transparently;
+  streaming remains the default and keeps today's no-duplicate guarantee.
+  **Accept:** first-row latency and peak memory measured with and without the
+  option; a fault before publication retries, a fault after publication still
+  closes.
 
 ## Next: make HA and load-balancing contracts real
 
@@ -372,11 +390,64 @@ certified implementations or a reason to couple Proxy to an entire database buil
 | `../Full/heliosdb-cache/src/stampede_protection.rs` | Leader/follower miss coordination and cancellation/timeout design | Validate against the C-04 contract; source/test existence is not proof of live proxy coalescing |
 | `../Full/heliosdb-cache/src/distributed_sync.rs` | Version vectors, explicit consistency policy and partition vocabulary | Its transport is labeled simulated pub/sub and uses an unbounded in-process channel. Do **not** treat it as an already proven distributed consensus cache |
 
+## Carried over from the 2026-07 next-batch audit
+
+That tracker (`docs/perf-2026-07/NEXT-BATCH-audit.md`) was closed on 2026-09-11
+after re-checking every item against the code. Most of it shipped; these survived
+and keep their original identifiers so the history stays traceable. Two of its
+items need no new entry: **M1/M2** (gateways bypass policy and dial a fresh
+authenticated backend per request) are exactly H-06, and the missing per-gateway
+connection cap belongs to H-05's admission bounds.
+
+- [ ] **O-01 · P0 — `migration_ready` must not mask apply errors.** `mirror::status`
+  computes `lag = enqueued - mirrored - errors` and then reports
+  `migration_ready: lag == 0 && dropped == 0` (`src/mirror.rs:65`, `:75`), so a
+  mirrored write that failed to apply cancels itself out of the lag and the
+  endpoint declares the target safe to cut over. Report readiness only with zero
+  errors and zero drops, and expose the error and drop counts in the same payload.
+  **Accept:** a run with deliberately failing applies never reports
+  `migration_ready: true`; the operator sees why.
+
+- [ ] **O-02 · P1 — one query-timeout contract for the management backend client.**
+  `BackendClient::run_query` calls `stream_query_timeout()`, which returns a
+  hardcoded 30 s (`src/backend/client.rs:324`), while `BackendConfig.query_timeout`
+  is set by every caller (branch clone, mirror, replay, upgrade, the gateways) and
+  never read. This is also a gate-5 violation: a timeout that is not tunable.
+  **Accept:** the configured value is honored on every management query; a caller
+  that sets 5 s times out at 5 s; the default remains 30 s where nothing is set.
+
+- [ ] **O-03 · P1 — bound and actually parallelize shadow execution.**
+  `shadow_execute` buffers both backends' complete result sets with no ceiling,
+  and despite the doc comment it awaits the primary before starting the shadow
+  (`src/shadow_execute/mod.rs:68`), so the shadow adds its full latency to the
+  request. Compare under a configurable row/byte budget, degrade to a digest
+  beyond it, and run the two concurrently. **Accept:** a large result set compares
+  within the budget without unbounded RSS; shadow latency overlaps the primary.
+
+- [ ] **O-04 · P2 — operator replay: a deadline and a lock-free window scan.**
+  `TransactionJournal::entries_in_window` clones and sorts every matching entry
+  while holding the journal read lock (`src/transaction_journal.rs:414`), and the
+  replay driver has no overall deadline — only per-query timeouts. **Accept:** a
+  large window neither stalls live journal writers nor runs unbounded; a replay
+  that exceeds its deadline stops and reports partial progress.
+
+- [ ] **O-05 · P3 — extended-batch tracking and error-frame allocation.**
+  `batch_refs`/`batch_defines` are cleared only when a Sync ends the cycle
+  (`src/server.rs:3982`), so a client that never Syncs grows them without bound
+  and the re-prepare filter is quadratic over that growth; and
+  `create_severity_response` builds a `HashMap` plus four `String`s per error frame
+  (`src/server.rs:7576`). Both are cold or adversarial paths, not hot-path costs.
+  **Accept:** a never-Sync client has bounded per-session memory; error-frame
+  construction allocates once.
+
 ## Delivery sequence
 
-1. Close TR-01/02/03/05 and bound/restorably capture session state (TR-04); make the
-   new boundary probes green with real-PG counterparts. Publish an accurate support
-   matrix before widening replay promises.
+1. **Done (1.6.1 + 1.7.0).** TR-01/02/03/05 are closed and session state is bounded
+   and restorable (TR-04); replay observations are verified under one recovery
+   deadline (TR-06). The boundary probes are green against real PostgreSQL and the
+   support matrix in `docs/transaction-replay.md` states what replay does and does
+   not promise. What remains in this group is TR-07 (journal and operator replay
+   tooling), and the TR-08/TR-09 availability residuals.
 2. Wire H-01/02/03/04 and apply admission/observability. Establish real promotion,
    fencing and load-balancing acceptance with and without `ha-tr`.
 3. Address C-01/02/03/06, then active coalescing and freshness policy. Optimize

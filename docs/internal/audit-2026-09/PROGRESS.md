@@ -9,14 +9,28 @@ complete. Global guarantees must remain consistent with actual backend capabilit
 
 | Item | State | Remaining work |
 |---|---|---|
-| TR-01 | Commit-boundary safeguards passed initial gates; held-Parse/Flush follow-ups queued | Acknowledged cross-cycle statement/portal identity; validate follow-ups and complete acceptance evidence |
-| TR-05 | Conservative partial-write handling passed functional/lint/MSRV gates | Investigate per-benchmark regressions before final acceptance |
-| TR-02 | Streaming guard and recorder follow-ups passed targeted validation; the uncovered backend-watch publication path found in review is now frame-aligned | Optional bounded response buffering and performance/memory acceptance |
+| TR-01 | **Closed 2026-09-11** (shipped 1.6.1). Commit-boundary classification, held-Parse/Flush follow-ups and review fixes all landed; real-PG commit-outcome suite 7/7 against 4 failures on the pre-change binary | Residual acknowledged cross-cycle statement/portal identity is availability, not safety — re-filed as TR-08 |
+| TR-05 | **Closed 2026-09-11** (shipped 1.6.1). Conservative partial-write handling; deterministic partial-writer covers every byte offset, timeout and zero-length write | Benchmark question resolved: the interrupted candidate run was superseded by the full 107-case post-release measurement on 1.6.0 (gate 3 PASS, 92/92 comparable, mean +1.59%) |
+| TR-02 | **Closed 2026-09-11** (shipped 1.6.1 + review fix). Response-progress accounting, frame-aligned backend-watch publication, delivery uncertainty preserved across Flush chunks; real-PG streaming suite 13/13, synthetic harness 26/26 | Opt-in bounded response buffering is an enhancement outside the safety contract — re-filed as TR-09 |
 | H-07 | Frame-header validation applied on EVERY backend streaming relay (`stream_until_ready`, capture, replay drain, pool reset, re-prepare reader, idle watch) via `backend_frame_len` and the new `[limits] max_backend_frame_bytes` (default 100 MiB); malformed (< 4) or oversize headers close the backend immediately; the re-prepare reader no longer allocates the advertised body size | Slow-drip: a backend dripping bytes inside one frame resets the per-read `backend_read_timeout` each time — a whole-response deadline is TR-06's "one recovery deadline"; track there |
 | TR-03 | Lexical read-eligibility policy: every function call must be a listed side-effect-free built-in or in `tr_read_functions`; quoted-identifier calls, `INTO`, sequences are opaque. `volatile_select` probe green | Catalog-backed eligibility for PG-wire backends without catalogs; invalidation on UDF change |
 | TR-04 | Session GUC tracking is transactional: `SET`/`RESET`/`RESET ALL` inside a transaction are deferred to COMMIT, `ROLLBACK TO SAVEPOINT` discards ops after the savepoint, variables keyed by name (repeated `SET` = one slot), cap exceeded ⇒ failover refused with 08006. `guc_cap`/`guc_savepoint`/`guc_reset_rollback` green; synthetic harness 26/26 | Extended-protocol `SET`, SQL `PREPARE`, temp tables, cursors |
 | TR-06 | Observation digests recorded per statement and verified at replay (40001 on divergence); snapshot-pinning isolation levels non-replayable; one `write_timeout_secs` deadline across the recovery; whole-response `backend_response_timeout_secs` for slow drip | Digests cover simple and extended cycles equally but the replay's re-executed final statement is bounded by relay timeouts, not the deadline |
+| TR-07 | Open | Journal and operator replay tooling — the only unstarted item in the TR group |
 | Other items | Open | Work through the dependency order in IMPROVEMENTS.md |
+
+## 2026-07 next-batch audit closed, 2026-09-11
+
+`docs/perf-2026-07/NEXT-BATCH-audit.md` was re-checked item by item against the
+code and closed. Fourteen findings had shipped (admin loopback default and token
+enforcement, MCP auth, gateway body/header/timeout bounds, constant-time bearer
+comparison, admin connection semaphore, the MCP DML-in-CTE bypass, `Arc<ProxyConfig>`
+on the accept path, typed upgrade conninfo, and the edge registry/LRU/config work).
+Ten survived and were re-filed here with their original identifiers: M1 and M2 fold
+into H-06, the missing gateway connection cap into H-05, and the rest became O-01
+(`migration_ready` masks apply errors), O-02 (`query_timeout` never read), O-03
+(shadow buffering and false concurrency), O-04 (operator replay deadline and journal
+window lock) and O-05 (extended-batch tracking, error-frame allocation).
 
 ## Independent review, 2026-09-09 (Claude)
 

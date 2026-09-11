@@ -10,11 +10,14 @@ HeliosProxy operates at the PostgreSQL wire protocol level, making it compatible
 
 HeliosProxy sits between your application and your database cluster, providing transparent connection pooling, automatic failover, intelligent query routing, programmable plugins, and operations tooling without application code changes.
 
-**Verification status (2026-09-08):** the [1.6.0 feature audit](docs/internal/audit-2026-09/README.md)
-records passing build/test gates, reproducible Transaction Replay safety defects,
-and advertised library capabilities that are not wired into the daemon. Consult
-that support assessment and the [prioritized improvement backlog](docs/internal/audit-2026-09/IMPROVEMENTS.md)
-when evaluating HA, replay, or distributed deployment guarantees.
+**Verification status (2026-09-11):** the [September 2026 audit](docs/internal/audit-2026-09/README.md)
+found reproducible Transaction Replay safety defects; all of them are fixed as of
+1.7.0, verified against live PostgreSQL, and replay now checks its own work — a
+replayed statement whose results diverge from what the client already saw is rolled
+back rather than continued. The audit also records advertised library capabilities
+that are not wired into the daemon. Consult it and the
+[prioritized improvement backlog](docs/internal/audit-2026-09/IMPROVEMENTS.md) when
+evaluating HA, replay, or distributed deployment guarantees.
 
 ```
 ┌──────────────┐     ┌─────────────────────────────────────────────────┐     ┌──────────────┐
@@ -74,7 +77,7 @@ HeliosProxy features are grouped into a connection-routing tier and a programmab
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
 | **Failover Controller** | *(core)* | Automatic failover with candidate ranking by replication lag and configurable promotion policies |
-| **Transaction Replay (TR)** | *(core; journal/replay engine: `ha-tr`)* | `tr_mode` keeps client sessions alive across a backend failure: `session` re-homes the connection to the new primary and restores `SET` state, `select` transparently re-runs interrupted reads, and opt-in `transaction` replays the uncommitted transaction on the new primary and continues. A `COMMIT` with unknown outcome is never retried (client gets SQLSTATE 08007). Failing over onto password-protected backends requires the proxy to be the auth boundary (`[auth] mode = "scram"`). `ha-tr` adds the write journal and the operator-driven `/api/replay` engine |
+| **Transaction Replay (TR)** | *(core; journal/replay engine: `ha-tr`)* | `tr_mode` keeps client sessions alive across a backend failure: `session` re-homes the connection to the new primary and restores `SET` state, `select` transparently re-runs interrupted reads, and opt-in `transaction` replays the uncommitted transaction on the new primary and continues. A `COMMIT` with unknown outcome is never retried (client gets SQLSTATE 08007), a replay whose results diverge from what the client already saw is rolled back (40001), and a transaction pinned to a `SERIALIZABLE`/`REPEATABLE READ` snapshot is never replayed. Failing over onto password-protected backends requires the proxy to be the auth boundary (`[auth] mode = "scram"`). `ha-tr` adds the write journal and the operator-driven `/api/replay` engine |
 | **Session Migration** | `ha-tr` | Captures and restores full session state (SET parameters, prepared statements, advisory locks) when moving connections between nodes |
 | **Cursor Restore** | `ha-tr` | Preserves open cursor positions across failover — clients resume fetching without re-executing the query |
 | **Switchover Buffer** | *(core)* | Buffers incoming queries during planned switchover, drains them to the new primary once promotion completes |
