@@ -37,19 +37,34 @@ admin_address  = "${HELIOS_PROXY_ADMIN:-127.0.0.1:9090}"
 #               | a transaction / 08007 outcome unknown) and the transaction is aborted
 #               | (ROLLBACK and retry); the session then continues on the new primary.
 #   select      | session + an unknown-outcome READ (SELECT/SHOW/...; never a write) is
-#               | re-executed transparently outside a transaction; a READ-ONLY explicit
-#               | transaction is replayed from its BEGIN first.
+#               | re-executed transparently outside a transaction, but ONLY when every
+#               | function it calls is a known side-effect-free built-in or is listed in
+#               | tr_read_functions — a UDF, nextval, pg_notify, set_config, an advisory
+#               | lock or a quoted-identifier call makes it opaque (08007, never re-run).
+#               | A READ-ONLY explicit transaction is replayed from its BEGIN first.
 #   transaction | select + an UNCOMMITTED explicit transaction is replayed from its
-#               | BEGIN on the new primary (statement responses discarded — the client
-#               | already saw them) and the in-flight statement is re-executed inside
-#               | it. A COMMIT whose outcome is unknown is NEVER retried (08007).
-#               | Opt-in: blind replay is only correct for deterministic statements —
-#               | now(), random(), RETURNING serials may differ on the second run.
+#               | BEGIN on the new primary and the in-flight statement is re-executed
+#               | inside it. The replay is VERIFIED: each statement's responses were
+#               | digested as the client saw them (within tr_max_observation_bytes) and
+#               | the new backend's responses are digested the same way — divergence
+#               | rolls the replay back and returns 40001 instead of continuing on rows
+#               | the client never saw. A COMMIT whose outcome is unknown is NEVER
+#               | retried (08007). Still opt-in: verification catches divergent results,
+#               | it does not make now(), random() or a RETURNING serial reproduce.
 #   Replay caps: [limits] tr_max_replay_statements / tr_max_replay_bytes (a
 #   transaction over a cap degrades to `session` behaviour). A transaction that
-#   contained a COPY, entered the failed state, or had a statement transformed by
-#   query-rewrite/multi-tenancy is never replayed. Extended-protocol SETs (JDBC)
-#   and SQL-level PREPARE are not tracked for restore. COPY in progress at the
+#   contained a COPY, entered the failed state, had a statement transformed by
+#   query-rewrite/multi-tenancy, ran at SERIALIZABLE/REPEATABLE READ (explicit,
+#   SET TRANSACTION, or inherited from default_transaction_isolation), or produced a
+#   response too large to digest (tr_max_observation_bytes) is never replayed.
+#   SET restore is transactional: SETs inside a transaction apply only if it commits,
+#   ROLLBACK TO discards those after the savepoint, RESET/RESET ALL/DISCARD ALL inside
+#   a transaction are deferred to commit, variables are keyed by name, and exceeding
+#   tr_max_session_set_statements distinct variables refuses the failover (08006)
+#   instead of re-homing with incomplete state. Extended-protocol SETs (JDBC),
+#   SQL-level PREPARE, temp tables and cursors are not restored.
+#   One deadline: write_timeout_secs bounds the WHOLE recovery — primary wait,
+#   connect/auth, SET restore and replay — not each phase separately. COPY in progress at the
 #   fault -> 08006 and close, every mode.
 #   Credentials: re-homing opens a FRESH backend connection. In pass-through
 #   auth mode the proxy never holds the client's password, so only a trust

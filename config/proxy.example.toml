@@ -34,13 +34,19 @@ admin_address = "${HELIOS_PROXY_ADMIN:-127.0.0.1:9090}"
 #   session     -> connection kept; reconnect to a healthy primary, restore SET
 #                  state; a never-delivered autocommit statement is re-run, else
 #                  ONE error (57P01 / 08007) and the transaction is aborted
-#   select      -> session + unknown-outcome reads re-executed transparently
-#                  (read-only transactions replayed)
+#   select      -> session + unknown-outcome reads re-executed transparently, but
+#                  only when every function they call is known side-effect-free
+#                  (built-in allowlist + tr_read_functions); anything else -> 08007
 #   transaction -> select + uncommitted transactions replayed from BEGIN and the
-#                  in-flight statement re-executed; a COMMIT with unknown outcome
-#                  is never retried. Opt-in: needs deterministic statements.
-# Caps: [limits] tr_max_replay_statements / tr_max_replay_bytes /
-# tr_max_session_set_statements. See config/proxy.full.toml for the full table.
+#                  in-flight statement re-executed. The replay is verified against
+#                  a digest of what the client already saw — divergence rolls back
+#                  and returns 40001. A COMMIT with unknown outcome is never
+#                  retried. Opt-in: needs deterministic statements.
+# Never replayed: SERIALIZABLE/REPEATABLE READ transactions, responses too large to
+# digest, COPY, rewritten statements. write_timeout_secs is ONE deadline for the
+# whole recovery. Caps: [limits] tr_max_replay_statements / tr_max_replay_bytes /
+# tr_max_session_set_statements / tr_max_observation_bytes. See
+# config/proxy.full.toml for the full table.
 tr_enabled = false
 tr_mode = "session"   # none | session | select | transaction
 # tr_read_functions = []   # extra side-effect-free UDFs a `select`-mode re-execution may call

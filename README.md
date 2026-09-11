@@ -269,7 +269,7 @@ export DATABASE_URL="postgres://myapp:password@localhost:6432/mydb"
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `pool-modes` | Yes | Session, Transaction, and Statement connection pooling |
-| `ha-tr` | No | Transaction Replay — failover replay, cursor restore, session migration |
+| `ha-tr` | No | Transaction Replay **journal and operator tooling** (`/api/replay`, `/api/shadow`, failover library). In-session replay is core — see the Transaction Replay row above |
 | `query-cache` | No | L1/L2/L3 multi-tier query result caching |
 | `routing-hints` | No | SQL comment-based query routing hints |
 | `lag-routing` | No | Replica lag-aware routing with read-your-writes |

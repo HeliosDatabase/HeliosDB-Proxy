@@ -182,6 +182,8 @@ Proxy configuration (`config/proxy.toml`):
 ```toml
 listen_address = "0.0.0.0:6432"
 admin_address = "0.0.0.0:9090"
+# Required: a non-loopback admin bind without a token is refused at startup.
+admin_token = "replace-with-a-secret"
 tr_enabled = false
 write_timeout_secs = 30
 
@@ -340,6 +342,8 @@ HA proxy configuration (`config/ha-proxy.toml`):
 ```toml
 listen_address = "0.0.0.0:6432"
 admin_address = "0.0.0.0:9090"
+# Required: a non-loopback admin bind without a token is refused at startup.
+admin_token = "replace-with-a-secret"
 tr_enabled = true
 tr_mode = "session"
 write_timeout_secs = 30
