@@ -79,7 +79,7 @@ make incorrect responses faster or overload the surviving primary during failove
   preserve OutcomeUnknown; deterministic partial-writer coverage includes every byte
   offset, timeout and zero-length write. See [TR-05.md](TR-05.md).
 
-- [ ] **TR-06 · P1 — verify replay observations and apply one recovery deadline.**
+- [x] **TR-06 · P1 — verify replay observations and apply one recovery deadline.** *(2026-09-10: per-statement observation digest over T/D/C/I frames within `[limits] tr_max_observation_bytes`, re-verified at replay (40001 + ROLLBACK on divergence); over-budget responses make the transaction non-replayable; SERIALIZABLE/REPEATABLE READ (explicit or via default_transaction_isolation) non-replayable; ONE deadline (`write_timeout_secs`) carried through primary wait, connect/auth, restore and replay. `[limits] backend_response_timeout_secs` adds the whole-response bound for the H-07 slow-drip case. The final re-execution is bounded by the ordinary relay timeouts, not the recovery deadline.)*
   Capture result shape, ordered row digest and affected-row/command metadata for
   acknowledged statements within a configurable budget. Recompute during replay;
   divergence returns `40001` with the new transaction rolled back. Add eligibility
