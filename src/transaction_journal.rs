@@ -416,15 +416,20 @@ impl TransactionJournal {
         from: chrono::DateTime<chrono::Utc>,
         to: chrono::DateTime<chrono::Utc>,
     ) -> Vec<(Uuid, JournalEntry)> {
-        let journals = self.journals.read().await;
-        let mut out: Vec<(Uuid, JournalEntry)> = Vec::new();
-        for (tx_id, j) in journals.iter() {
-            for entry in &j.entries {
-                if entry.timestamp >= from && entry.timestamp <= to {
-                    out.push((*tx_id, entry.clone()));
+        // Collect under the read lock ONLY; the sort runs after the guard is
+        // dropped so a wide window cannot stall live journal writers (O-04).
+        let mut out: Vec<(Uuid, JournalEntry)> = {
+            let journals = self.journals.read().await;
+            let mut out: Vec<(Uuid, JournalEntry)> = Vec::new();
+            for (tx_id, j) in journals.iter() {
+                for entry in &j.entries {
+                    if entry.timestamp >= from && entry.timestamp <= to {
+                        out.push((*tx_id, entry.clone()));
+                    }
                 }
             }
-        }
+            out
+        };
         out.sort_by_key(|(_, e)| e.timestamp);
         out
     }

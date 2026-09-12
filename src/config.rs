@@ -962,6 +962,13 @@ pub struct LimitsToml {
     /// snapshot was preserved (TR-06).
     #[serde(default = "default_tr_max_observation_bytes")]
     pub tr_max_observation_bytes: usize,
+    /// Overall wall-clock deadline (seconds) for one operator time-window
+    /// replay (`POST /api/replay`). `query_timeout` bounds each individual
+    /// statement, but nothing bounded the replay as a whole (O-04). `0`
+    /// disables the overall deadline; otherwise a replay that exceeds it stops
+    /// cleanly at the current statement and reports partial progress.
+    #[serde(default = "default_replay_deadline_secs")]
+    pub replay_deadline_secs: u64,
     /// Global ceiling on idle connections parked in the data-path backend pool
     /// across ALL `(node,user,db)` identities — bounds total file descriptors
     /// regardless of how many distinct identities connect. Only consumed when
@@ -1071,6 +1078,9 @@ fn default_max_backend_frame_bytes() -> usize {
 fn default_tr_max_observation_bytes() -> usize {
     1024 * 1024
 }
+fn default_replay_deadline_secs() -> u64 {
+    300
+}
 fn default_max_total_idle_backend_conns() -> usize {
     8192
 }
@@ -1118,6 +1128,7 @@ impl Default for LimitsToml {
             max_backend_frame_bytes: default_max_backend_frame_bytes(),
             backend_response_timeout_secs: 0,
             tr_max_observation_bytes: default_tr_max_observation_bytes(),
+            replay_deadline_secs: default_replay_deadline_secs(),
             max_total_idle_backend_conns: default_max_total_idle_backend_conns(),
             pool_reap_interval_secs: default_pool_reap_interval_secs(),
             max_client_connections: default_max_client_connections(),
@@ -2005,7 +2016,7 @@ impl ProxyConfig {
             // A value beyond MAX_LIMIT_SECS (e.g. `u64::MAX`) overflows the
             // `Instant + Duration` computed at connect time in `server.rs` and
             // panics the per-connection task, so reject it up front.
-            let secs_checks: [(&str, u64); 6] = [
+            let secs_checks: [(&str, u64); 7] = [
                 ("limits.startup_timeout_secs", l.startup_timeout_secs),
                 (
                     "limits.backend_write_timeout_secs",
@@ -2021,6 +2032,7 @@ impl ProxyConfig {
                 ),
                 ("limits.reprepare_timeout_secs", l.reprepare_timeout_secs),
                 ("limits.pool_reap_interval_secs", l.pool_reap_interval_secs),
+                ("limits.replay_deadline_secs", l.replay_deadline_secs),
             ];
             for (name, value) in secs_checks {
                 if value > MAX_LIMIT_SECS {

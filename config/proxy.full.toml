@@ -181,6 +181,10 @@ write_timeout_secs = 30
 # tr_max_observation_bytes = 1048576   # response bytes hashed per recorded statement; replay verifies the digest (40001 on divergence)
 # tr_max_session_set_statements = 256   # distinct session variables tracked for restore;
 #                                        # over the cap a failover is refused (08006)
+# # Operator time-window replay (POST /api/replay): overall wall-clock deadline.
+# # query_timeout bounds each statement; this bounds the whole run. On expiry the
+# # replay stops cleanly and reports deadline_exceeded + partial progress. 0 = off.
+# replay_deadline_secs = 300
 
 # =============================================================================
 # POOL — Backend connection pool (proxy -> database)

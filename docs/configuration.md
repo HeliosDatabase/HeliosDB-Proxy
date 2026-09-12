@@ -617,6 +617,7 @@ backend_response_timeout_secs = 0
 tr_max_observation_bytes = 1048576
 max_total_idle_backend_conns = 8192
 pool_reap_interval_secs = 30
+replay_deadline_secs = 300
 tr_max_replay_statements = 1000
 tr_max_replay_bytes = 4194304
 tr_max_session_set_statements = 256
@@ -638,6 +639,7 @@ tr_max_session_set_statements = 256
 | `tr_max_observation_bytes` | usize | `1048576` | In-session TR: response bytes hashed per recorded statement into an observation digest, re-verified when the transaction is replayed; divergence rolls the replay back with `40001`. A response over the cap has no verifiable digest, so its transaction becomes non-replayable. |
 | `max_total_idle_backend_conns` | usize | `8192` | Global ceiling on idle backend-pool connections across all `(node,user,db)` identities. Only consumed with the `pool-modes` feature; parsed-and-ignored otherwise. |
 | `pool_reap_interval_secs` | u64 | `30` | How often the idle-connection reaper runs. |
+| `replay_deadline_secs` | u64 | `300` | Overall wall-clock deadline for one operator time-window replay (`POST /api/replay`). `query_timeout` bounds each statement; this bounds the run. On expiry the replay stops at the current statement and reports `deadline_exceeded` + partial progress. `0` disables the overall deadline. Max `31536000`. |
 | `tr_max_replay_statements` | usize | `1000` | In-session TR (`tr_mode = select\|transaction`): cap on statements recorded per explicit transaction for failover replay. Over the cap the transaction is marked non-replayable (`transaction` degrades to `session` for it; `tr_replay_cap_exceeded_total`). |
 | `tr_max_replay_bytes` | usize | `4194304` | In-session TR: cap on bytes (statement text / raw extended-protocol frames) recorded per explicit transaction (4 MiB). Same degradation as above. |
 | `tr_max_session_set_statements` | usize | `256` | In-session TR (`tr_mode != none`): cap on DISTINCT session variables whose latest `SET` is replayed onto the replacement backend (a later `SET` of the same variable replaces the earlier one; `RESET name` removes it; `RESET ALL`/`DISCARD ALL` clear all). Over the cap tracking stops (`tr_session_set_cap_exceeded_total`) and a subsequent failover is refused with `08006` rather than re-homing the session with incomplete state. |

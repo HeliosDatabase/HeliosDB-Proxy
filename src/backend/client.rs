@@ -65,6 +65,9 @@ pub struct BackendClient {
     /// BackendKeyData cached for potential cancel requests.
     pub backend_pid: Option<u32>,
     pub backend_secret: Option<u32>,
+    /// Per-query timeout resolved from [`BackendConfig::query_timeout`] at
+    /// connect time (O-02). Zero means "unset" and falls back to 30 s.
+    query_timeout: Duration,
 }
 
 impl BackendClient {
@@ -126,6 +129,7 @@ impl BackendClient {
                         server_parameters,
                         backend_pid,
                         backend_secret,
+                        query_timeout: cfg.query_timeout,
                     });
                 }
                 MessageType::ErrorResponse => {
@@ -322,9 +326,18 @@ impl BackendClient {
     }
 
     fn stream_query_timeout(&self) -> Duration {
-        // 30 seconds is a sane default for management queries; callers
-        // that need longer can wrap their own timeout around this call.
-        Duration::from_secs(30)
+        Self::effective_query_timeout(self.query_timeout)
+    }
+
+    /// Resolve the management-query timeout (O-02). `BackendConfig::query_timeout`
+    /// is honored on every `run_query`; a zero value (unset/forgotten by a
+    /// constructor) falls back to the historical 30 s default.
+    fn effective_query_timeout(configured: Duration) -> Duration {
+        if configured.is_zero() {
+            Duration::from_secs(30)
+        } else {
+            configured
+        }
     }
 
     async fn run_query_inner(stream: &mut Stream, sql: &str) -> BackendResult<QueryResult> {
@@ -429,6 +442,7 @@ impl BackendClient {
             server_parameters: std::collections::HashMap::new(),
             backend_pid: None,
             backend_secret: None,
+            query_timeout: Duration::ZERO,
         }
     }
 }
@@ -844,6 +858,20 @@ mod tests {
         );
         assert!(bytes.windows(5).any(|w| w == b"user\0"));
         assert!(bytes.windows(10).any(|w| w == b"database\0a"));
+    }
+
+    #[test]
+    fn test_effective_query_timeout_honors_config_and_defaults() {
+        // O-02: a configured timeout is honored exactly.
+        assert_eq!(
+            BackendClient::effective_query_timeout(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+        // Unset (zero) keeps the historical 30 s default.
+        assert_eq!(
+            BackendClient::effective_query_timeout(Duration::ZERO),
+            Duration::from_secs(30)
+        );
     }
 
     #[test]
