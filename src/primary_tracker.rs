@@ -16,6 +16,7 @@
 //! - **Manual/Standalone**: Programmatic set/clear via API calls.
 
 use parking_lot::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -300,6 +301,10 @@ pub struct PrimaryInfo {
     pub became_primary_at: Instant,
     /// Whether this is confirmed (vs pending switchover)
     pub is_confirmed: bool,
+    /// Authority epoch: increments on every observed leader change since
+    /// boot. A fenced consumer can refuse to write under an older epoch
+    /// (H-01; enforcement is H-02).
+    pub epoch: u64,
 }
 
 /// Primary change event
@@ -334,6 +339,8 @@ pub struct PrimaryTracker {
     event_tx: broadcast::Sender<PrimaryChangeEvent>,
     /// Tracking interval
     tracking_interval: Duration,
+    /// Authority epoch counter (H-01).
+    epoch: AtomicU64,
 }
 
 impl PrimaryTracker {
@@ -345,6 +352,7 @@ impl PrimaryTracker {
             current_primary: RwLock::new(None),
             event_tx,
             tracking_interval: Duration::from_millis(500),
+            epoch: AtomicU64::new(0),
         }
     }
 
@@ -356,6 +364,7 @@ impl PrimaryTracker {
             current_primary: RwLock::new(None),
             event_tx,
             tracking_interval: Duration::from_millis(500),
+            epoch: AtomicU64::new(0),
         }
     }
 
@@ -393,15 +402,23 @@ impl PrimaryTracker {
         self.current_primary.read().is_some()
     }
 
+    /// Current authority epoch (H-01): increments on every observed leader
+    /// change since boot. Zero means no leader has been observed yet.
+    pub fn get_epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
     /// Set primary manually (or called during switchover).
     pub fn set_primary(&self, node_id: Uuid, address: String) {
         let old_primary = self.current_primary.read().as_ref().map(|p| p.node_id);
+        let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
 
         let new_info = PrimaryInfo {
             node_id,
             address: address.clone(),
             became_primary_at: Instant::now(),
             is_confirmed: false,
+            epoch,
         };
 
         *self.current_primary.write() = Some(new_info);
@@ -496,11 +513,23 @@ impl PrimaryTracker {
 
     fn detect_primary_from_provider(&self, provider: &dyn TopologyProvider) {
         if let Some(primary) = provider.get_primary() {
+            // Only a change of address advances the authority epoch.
+            let same = self
+                .current_primary
+                .read()
+                .as_ref()
+                .map(|p| p.address == primary.client_addr)
+                .unwrap_or(false);
+            if same {
+                return;
+            }
+            let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
             let info = PrimaryInfo {
                 node_id: primary.node_id,
                 address: primary.client_addr.clone(),
                 became_primary_at: Instant::now(),
                 is_confirmed: true,
+                epoch,
             };
 
             *self.current_primary.write() = Some(info);
@@ -519,11 +548,13 @@ impl PrimaryTracker {
             .map(|n| n.client_addr)
             .unwrap_or_else(|| format!("{}:5432", new));
 
+        let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
         let info = PrimaryInfo {
             node_id: new,
             address: address.clone(),
             became_primary_at: Instant::now(),
             is_confirmed: true,
+            epoch,
         };
 
         *self.current_primary.write() = Some(info);
@@ -571,6 +602,23 @@ impl PrimaryTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_authority_epoch_increments_on_primary_change() {
+        let tracker = PrimaryTracker::new_standalone();
+        assert_eq!(tracker.get_epoch(), 0);
+        assert!(tracker.get_primary().is_none());
+
+        tracker.set_primary(Uuid::new_v4(), "a:5432".to_string());
+        assert_eq!(tracker.get_epoch(), 1);
+        assert_eq!(tracker.get_primary().unwrap().epoch, 1);
+
+        tracker.set_primary(Uuid::new_v4(), "b:5432".to_string());
+        assert_eq!(tracker.get_epoch(), 2);
+        let info = tracker.get_primary().unwrap();
+        assert_eq!(info.epoch, 2);
+        assert_eq!(info.address, "b:5432");
+    }
 
     #[test]
     fn test_standalone_primary_tracker() {

@@ -5,6 +5,22 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `[topology]` config section (H-01). `provider = "postgres"` makes topology discovery
+  authoritative for the write path: the daemon polls `pg_is_in_recovery()` on every
+  configured node (requires the `postgres-topology` cargo feature), routes writes only
+  to the provider's leader (which must be an enabled `[[nodes]]` entry), waits rather
+  than falling back to a configured role while no leader is known, and reports the
+  leader plus an authority epoch in `GET /topology`'s new `authoritative` block. A
+  promotion therefore moves the write destination without hand-editing `proxy.toml`.
+  The default `provider = "static"` preserves the historical role+health selection.
+- `PrimaryTracker`/`PrimaryInfo` now carry an authority `epoch`, incremented on every
+  observed leader change; the tracker is wired into the daemon for provider-backed
+  configurations.
+
 ## [1.8.0] - 2026-09-12
 
 ### Changed

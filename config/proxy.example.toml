@@ -59,6 +59,23 @@ tr_mode = "session"   # none | session | select | transaction
 write_timeout_secs = 30
 
 # -----------------------------------------------------------------------------
+# Authoritative topology (H-01)
+# -----------------------------------------------------------------------------
+# `static` (default) = the daemon picks the first enabled node with
+# role = "primary" whose health check passes, as it always has. `postgres`
+# polls pg_is_in_recovery() on every configured node (requires the
+# `postgres-topology` cargo feature) and makes the provider's answer
+# authoritative for the write path: promotion moves the write destination
+# without editing [[nodes]] roles, and a missing provider answer waits rather
+# than falling back to a stale role.
+#[topology]
+# provider = "static"          # static | postgres
+# poll_interval_secs = 2       # >= 1
+# user = "postgres"            # credentials for the provider's probe connections
+# password = "${HELIOS_PROXY_TOPOLOGY_PASSWORD}"   # optional
+# database = "postgres"
+
+# -----------------------------------------------------------------------------
 # Connection pool — controls backend (proxy -> database) connections
 # -----------------------------------------------------------------------------
 

@@ -5,25 +5,28 @@ writes correctly and buffer them across a failover. There are two distinct layer
 and this document keeps them separate because they behave differently:
 
 1. **The standalone daemon** determines the primary from static `[[nodes]]` roles plus
-   live health checks, and reports it at the admin `/topology` endpoint.
+   live health checks (the default), or from an **authoritative provider** when
+   `[topology] provider` is set — and reports either at the admin `/topology` endpoint.
 2. **The `TopologyProvider` library abstraction** (`PrimaryTracker` plus pluggable
-   providers) is a programmatic/embedded interface — used by unit tests and by the
-   HeliosDB-workspace build — for automatic, event-driven primary tracking.
+   providers) is the interface the daemon now wires for `provider = "postgres"`, and is
+   also usable programmatically/embedded.
 
 Every concrete claim below is grounded in `src/primary_tracker.rs`,
-`src/admin.rs` (`compute_topology`, `TopologyResponse`), and the node/config types in
-`src/config.rs`. Where the library abstraction is *not* wired into the shipped daemon, the
-document says so.
+`src/admin.rs` (`compute_topology`, `TopologyResponse`), `src/server.rs`
+(`build_primary_tracker`, `select_primary_until`) and the node/config types in
+`src/config.rs`.
 
-**Last verified against commit `9c5ff9b`.**
+**Last verified against the post-1.8.0 H-01 increment.**
 
 ---
 
 ## Layer 1 — How the Standalone Daemon Tracks the Primary
 
-In the running `heliosdb-proxy` daemon, the primary is **not** discovered by polling
-`pg_is_in_recovery()`. It is the configured `[[nodes]]` entry whose `role = "primary"`,
-that is `enabled`, and whose health check is currently passing.
+In the running `heliosdb-proxy` daemon with the default `[topology]` config, the primary
+is **not** discovered by polling `pg_is_in_recovery()`. It is the configured `[[nodes]]`
+entry whose `role = "primary"`, that is `enabled`, and whose health check is currently
+passing. Set `[topology] provider = "postgres"` (feature `postgres-topology`) to make the
+provider authoritative instead — see Layer 2.
 
 ### Determining the current primary
 
@@ -42,6 +45,14 @@ is the address of the first node with `role = "primary"` (case-insensitive) whos
 entry is `healthy = true`. `None` is the correct answer while a failover is in progress and
 no primary-role node is healthy.
 
+**When a provider is attached** (`[topology] provider != "static"`), `compute_topology`
+and the write path both take the provider's leader as authoritative. Writes go only to
+that address (it must be an enabled `[[nodes]]` entry); while the provider has no leader,
+new writes wait until `write_timeout_secs` expires rather than falling back to a
+configured role. The provider is authoritative because it observes the database itself,
+not because the proxy asserts an epoch — a proxy-side epoch cannot fence a client that
+connects around the proxy (H-02).
+
 ### The `/topology` response
 
 `GET /topology` returns `TopologyResponse` (camelCase to map cleanly into the Kubernetes
@@ -49,11 +60,12 @@ operator CRD status):
 
 | Field | Meaning |
 |-------|---------|
-| `currentPrimary` | Address of the first healthy `primary`-role node, or `null`. |
+| `currentPrimary` | Address of the provider's leader, or (static mode) the first healthy `primary`-role node; `null` when neither exists. |
 | `healthyNodes` | Count of nodes with a passing health check. |
 | `unhealthyNodes` | Count of nodes with a failing health check. |
 | `totalNodes` | Number of configured `[[nodes]]`. |
 | `lastFailoverAt` | RFC 3339 timestamp of the last observed primary change; `null` when none has been observed since boot (currently always `null` in `compute_topology`). |
+| `authoritative` | Present only when a topology provider is attached: `{address, epoch, confirmed}`. `epoch` increments on every observed leader change and is the basis for future write fencing (H-02). |
 
 ### Node configuration and manual control
 
@@ -79,17 +91,17 @@ via SIGHUP) or the failed primary node recovers under the same address.
 ## Layer 2 — The `TopologyProvider` Library Abstraction
 
 `src/primary_tracker.rs` defines a provider abstraction for **automatic** primary
-tracking. These types are compiled into the crate and covered by unit tests, and are the
-intended integration surface for embedding the proxy or building it inside the HeliosDB
-workspace. As of `9c5ff9b` they are **not** instantiated by the standalone daemon's
-forwarding loop — `PrimaryTracker`, `PostgresTopologyProvider`, and the HeliosDB bridge
-appear in the runtime only through the crate's test suite.
+tracking. Since H-01 the standalone daemon wires it when `[topology] provider` is not
+`static`: startup builds a `PostgresTopologyProvider` over the configured nodes and
+spawns `PrimaryTracker::run()`, and the write path (`select_primary_until`) consults the
+tracker before any configured-role scan. With the default `static` provider the tracker
+is standalone and the historical role+health selection is unchanged.
 
 ### The `PrimaryTracker`
 
 `PrimaryTracker` holds an optional `Arc<dyn TopologyProvider>` and the current
-`PrimaryInfo` (`node_id`, `address`, `became_primary_at`, `is_confirmed`). It can run in
-three modes:
+`PrimaryInfo` (`node_id`, `address`, `became_primary_at`, `is_confirmed`, `epoch`). It can
+run in three modes:
 
 1. **Provider-backed** — `PrimaryTracker::with_provider(provider)`; `run()` subscribes to
    the provider's event stream and updates on each `TopologyEvent`.
