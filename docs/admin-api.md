@@ -443,6 +443,8 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:9090/api/analytic
 
 Replay a window of the transaction journal against a target backend (typically a staging DB) — for failover validation, hydrating staging from prod, or forensics. Body is a `ReplayRequestBody`. **`503 {"error":"transaction replay disabled (tr_enabled = false)"}`** when TR is disabled at runtime; Transaction Replay ships in the default build.
 
+This is **operator time-window replay**, not committed-history replay (TR-07): it re-executes the journaled SQL text in timestamp order on one connection and does not reconstruct transaction boundaries, exclude rolled-back work, or stop on the first failure. The response says so explicitly — `"mode": "time_window"` and `"partial": true` whenever at least one statement failed. The journal itself is in-memory, bounded and non-durable: nothing survives a restart.
+
 ### POST /api/shadow
 
 Run a query against a source **and** a shadow backend in parallel and diff the results — used for major-version-upgrade validation, schema-migration canaries, and replica-drift detection. Body is a `ShadowRequestBody`. Available in the default build (not gated by `tr_enabled`).
