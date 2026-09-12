@@ -369,6 +369,40 @@ check_query = "SELECT 1"
 
 ---
 
+## Topology (`[topology]`)
+
+Authoritative primary tracking (H-01). Optional; absent = `provider = "static"`,
+which preserves the historical behaviour (the configured `role = "primary"` node whose
+health check passes is the primary).
+
+```toml
+[topology]
+provider = "static"          # static | postgres
+poll_interval_secs = 2
+user = "postgres"
+# password = "${HELIOS_PROXY_TOPOLOGY_PASSWORD}"
+database = "postgres"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `provider` | string | `"static"` | `static`: configured roles + the daemon health checker decide the primary. `postgres`: poll `pg_is_in_recovery()` on every configured node and treat the non-recovering node as the primary. `postgres` requires the `postgres-topology` cargo feature — a config that requests it on a build without that feature is rejected at startup. |
+| `poll_interval_secs` | u64 | `2` | Seconds between provider polls. **Must be ≥ 1** (0 is rejected at startup). |
+| `user` | string | `"postgres"` | User for the provider's own probe connections. |
+| `password` | string | *(none)* | Password for the probe user, if required. |
+| `database` | string | `"postgres"` | Database the probe connects to. |
+
+When a provider is configured it is **authoritative for the write path**: writes go only
+to the provider's leader (which must be an enabled `[[nodes]]` entry), the answer waits
+rather than falling back to a configured role while no leader is known, and
+`GET /topology` reports the leader plus an `authoritative` block with its authority
+epoch (incremented on every observed leader change). This is how a real promotion moves
+the write destination without hand-editing `proxy.toml` roles. A proxy-side epoch cannot
+fence clients that connect around the proxy — see
+[topology-providers.md](topology-providers.md).
+
+---
+
 ## Nodes (`[[nodes]]`)
 
 One entry per backend. At least one node with `role = "primary"` is required.

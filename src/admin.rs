@@ -80,6 +80,10 @@ pub struct AdminState {
     /// to wire a backend template; production startup attaches it via
     /// `with_replay_engine`. Endpoint returns 503 when missing.
     pub replay_engine: RwLock<Option<Arc<ReplayEngine>>>,
+    /// Authoritative primary tracker (H-01). Attached at startup; when
+    /// present, `/topology` reports the provider's leader and epoch instead
+    /// of re-deriving a primary from configured roles.
+    pub primary_tracker: RwLock<Option<Arc<crate::primary_tracker::PrimaryTracker>>>,
     /// WASM plugin manager. None when the proxy started without
     /// plugins (or with a different feature set). `/plugins`
     /// endpoint returns 503 when missing; UI panel says "no plugin
@@ -2010,13 +2014,31 @@ impl AdminServer {
         let health = state.node_health.read().await;
         let cfg = state.config_snapshot.read().await;
 
+        // H-01: when an authoritative tracker is attached, its leader is the
+        // answer; the configured-role scan is only the static-provider
+        // fallback.
+        let tracker = state.primary_tracker.read().await;
         let mut current_primary: Option<String> = None;
-        for n in &cfg.nodes {
-            if n.role.eq_ignore_ascii_case("primary") {
-                let healthy = health.get(&n.address).map(|h| h.healthy).unwrap_or(false);
-                if healthy {
-                    current_primary = Some(n.address.clone());
-                    break;
+        let mut authoritative = None;
+        if let Some(ref t) = *tracker {
+            if let Some(info) = t.get_primary() {
+                current_primary = Some(info.address.clone());
+                authoritative = Some(AuthoritativeTopology {
+                    address: info.address,
+                    epoch: info.epoch,
+                    confirmed: info.is_confirmed,
+                });
+            }
+        }
+
+        if current_primary.is_none() {
+            for n in &cfg.nodes {
+                if n.role.eq_ignore_ascii_case("primary") {
+                    let healthy = health.get(&n.address).map(|h| h.healthy).unwrap_or(false);
+                    if healthy {
+                        current_primary = Some(n.address.clone());
+                        break;
+                    }
                 }
             }
         }
@@ -2031,6 +2053,7 @@ impl AdminServer {
             unhealthy_nodes,
             total_nodes,
             last_failover_at: None,
+            authoritative,
         }
     }
 
@@ -2257,6 +2280,7 @@ impl AdminState {
             #[cfg(feature = "circuit-breaker")]
             circuit_breaker: RwLock::new(None),
             replay_engine: RwLock::new(None),
+            primary_tracker: RwLock::new(None),
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: RwLock::new(None),
             chaos_overrides: RwLock::new(HashMap::new()),
@@ -2333,6 +2357,13 @@ impl AdminState {
     /// `/api/replay` endpoint returns 503 until this is set.
     pub async fn with_replay_engine(&self, engine: Arc<ReplayEngine>) {
         *self.replay_engine.write().await = Some(engine);
+    }
+
+    /// Attach the daemon's authoritative primary tracker (H-01). Production
+    /// startup calls this once so `/topology` reports the same leader the
+    /// write path uses, including the authority epoch.
+    pub async fn with_primary_tracker(&self, tracker: Arc<crate::primary_tracker::PrimaryTracker>) {
+        *self.primary_tracker.write().await = Some(tracker);
     }
 
     /// Attach a WASM plugin manager. Production startup calls this
@@ -2702,6 +2733,19 @@ struct TopologyResponse {
     /// `None` when the proxy hasn't observed a failover since boot.
     #[serde(rename = "lastFailoverAt")]
     last_failover_at: Option<String>,
+    /// H-01: present when an authoritative topology provider is attached.
+    /// `address` is the provider's leader, `epoch` its authority generation
+    /// (increments on every observed leader change), `confirmed` whether the
+    /// tracker has confirmed it.
+    #[serde(rename = "authoritative", skip_serializing_if = "Option::is_none")]
+    authoritative: Option<AuthoritativeTopology>,
+}
+
+#[derive(Serialize)]
+struct AuthoritativeTopology {
+    address: String,
+    epoch: u64,
+    confirmed: bool,
 }
 
 #[derive(Serialize)]
@@ -3065,6 +3109,29 @@ mod tests {
         let state = topology_state(&[("primary.svc:5432", "PRIMARY", true)]).await;
         let topo = AdminServer::compute_topology(&state).await;
         assert_eq!(topo.current_primary.as_deref(), Some("primary.svc:5432"));
+    }
+
+    #[tokio::test]
+    async fn test_topology_prefers_authoritative_tracker() {
+        // A provider says the standby is the leader: /topology must report
+        // the provider's answer and its authority epoch, not the configured
+        // "primary" role (H-01).
+        let state = topology_state(&[
+            ("primary.svc:5432", "primary", true),
+            ("standby.svc:5432", "standby", true),
+        ])
+        .await;
+        let tracker = Arc::new(crate::primary_tracker::PrimaryTracker::new_standalone());
+        tracker.set_primary(uuid::Uuid::new_v4(), "standby.svc:5432".to_string());
+        tracker.confirm_primary();
+        state.with_primary_tracker(tracker).await;
+
+        let topo = AdminServer::compute_topology(&state).await;
+        assert_eq!(topo.current_primary.as_deref(), Some("standby.svc:5432"));
+        let auth = topo.authoritative.expect("authoritative block present");
+        assert_eq!(auth.address, "standby.svc:5432");
+        assert_eq!(auth.epoch, 1);
+        assert!(auth.confirmed);
     }
 
     #[tokio::test]

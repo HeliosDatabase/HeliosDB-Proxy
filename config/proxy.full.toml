@@ -246,6 +246,22 @@ read_write_split = true
 latency_threshold_ms = 100
 
 # =============================================================================
+# TOPOLOGY — authoritative primary tracking (H-01)
+# =============================================================================
+# static (default): configured roles + the health checker decide the primary.
+# postgres: poll pg_is_in_recovery() on every configured node (requires the
+# `postgres-topology` cargo feature) and make that answer authoritative for
+# writes. A promotion then moves the write destination without editing roles,
+# and a missing provider answer waits (fail closed) instead of writing to a
+# stale primary.
+[topology]
+provider           = "static"   # static | postgres
+poll_interval_secs = 2          # >= 1
+user               = "postgres" # credentials for the provider's probes
+# password         = "${HELIOS_PROXY_TOPOLOGY_PASSWORD}"
+database           = "postgres"
+
+# =============================================================================
 # HEALTH — Backend health checks
 # =============================================================================
 

@@ -7,6 +7,7 @@ use crate::admin::{AdminServer, AdminState, ConfigSnapshot, NodeSnapshot};
 use crate::backend::{tls::default_client_config, BackendConfig, TlsMode};
 use crate::client_tls::{build_tls_acceptor, ClientStream};
 use crate::config::{HbaAction, HbaRule, NodeConfig, NodeRole, ProxyConfig, TrMode};
+use crate::primary_tracker::PrimaryTracker;
 #[cfg(feature = "wasm-plugins")]
 use crate::protocol::QueryMessage;
 use crate::protocol::{
@@ -820,6 +821,15 @@ impl Default for ResolvedLimits {
     }
 }
 
+/// Concrete provider poll task (H-01). The `static` provider has none; the
+/// postgres provider polls `pg_is_in_recovery()` in its own background task
+/// and publishes events the tracker consumes.
+enum TopologyPoller {
+    Static,
+    #[cfg(feature = "postgres-topology")]
+    Postgres(Arc<crate::primary_tracker::PostgresTopologyProvider>),
+}
+
 /// Server runtime state
 struct ServerState {
     /// Operational limits/timeouts resolved from `[limits]` config at startup.
@@ -884,6 +894,18 @@ struct ServerState {
     /// transparently redirected to the promoted target (the former mirror)
     /// instead of the configured primary. Set via POST /api/migration/cutover.
     cutover: Arc<ArcSwap<Option<Arc<crate::mirror::CutoverTarget>>>>,
+    /// Authoritative primary tracker (H-01). Standalone (manual) by default;
+    /// when `[topology] provider != "static"` it is backed by a topology
+    /// provider and its answer is authoritative for the write path.
+    primary_tracker: Arc<PrimaryTracker>,
+    /// True when `[topology] provider` is not `static`. The write path then
+    /// uses only the tracker's leader and never falls back to configured
+    /// roles, so a missing provider answer fails closed instead of writing
+    /// to a stale primary.
+    authoritative_topology: bool,
+    /// Provider poll task (H-01): `static` has none; `postgres` polls in
+    /// `run()` and feeds the tracker.
+    topology_poller: TopologyPoller,
     /// Load balancer state
     lb_state: LoadBalancerState,
     /// SQL-comment routing-hint parser. `Some` when `[routing_hints] enabled`
@@ -1969,6 +1991,9 @@ impl ProxyServer {
                 Some(Arc::new(tokio::sync::Semaphore::new(n)))
             }
         };
+        // H-01: authoritative topology tracker (static/standalone by default).
+        let (primary_tracker, authoritative_topology, topology_poller) =
+            Self::build_primary_tracker(&config);
         let state = Arc::new(ServerState {
             limits: resolved_limits,
             client_slots,
@@ -1983,6 +2008,9 @@ impl ProxyServer {
             auth_file,
             mirror,
             cutover: Arc::new(ArcSwap::from_pointee(None)),
+            primary_tracker,
+            authoritative_topology,
+            topology_poller,
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
             },
@@ -2249,6 +2277,25 @@ impl ProxyServer {
         // Start background tasks
         let health_task = self.spawn_health_checker();
         let pool_task = self.spawn_pool_manager();
+        // H-01: authoritative topology loop. Only spawned when a provider is
+        // configured; static configs keep the historical routing path. Two
+        // tasks: the provider polls the database, the tracker translates its
+        // events into the leader the write path and /topology consume.
+        let topology_task = if self.state.authoritative_topology {
+            let tracker = self.state.primary_tracker.clone();
+            let poller: Option<tokio::task::JoinHandle<()>> = match &self.state.topology_poller {
+                TopologyPoller::Static => None,
+                #[cfg(feature = "postgres-topology")]
+                TopologyPoller::Postgres(p) => {
+                    let p = p.clone();
+                    Some(tokio::spawn(async move { p.start().await }))
+                }
+            };
+            let tracker_task = tokio::spawn(async move { tracker.run().await });
+            Some((poller, tracker_task))
+        } else {
+            None
+        };
 
         // Single background analytics consumer. Everything expensive about
         // recording a query (fingerprint normalization, statistics, slow-query
@@ -2426,6 +2473,12 @@ impl ProxyServer {
         // Wait for background tasks
         health_task.abort();
         pool_task.abort();
+        if let Some((poller, tracker_task)) = topology_task {
+            if let Some(t) = poller {
+                t.abort();
+            }
+            tracker_task.abort();
+        }
         admin_task.abort();
         // Drain what the connection tasks already queued before killing the
         // consumer, so a graceful handoff does not silently lose the last few
@@ -2462,6 +2515,12 @@ impl ProxyServer {
         tokio::spawn(async move {
             // Create admin state
             let admin_state = Arc::new(AdminState::new());
+
+            // H-01: share the daemon's authoritative tracker so `/topology`
+            // reports the same leader the write path uses.
+            admin_state
+                .with_primary_tracker(state.primary_tracker.clone())
+                .await;
 
             // Initialize config snapshot
             {
@@ -7260,6 +7319,66 @@ impl ProxyServer {
         Self::select_primary_until(session, state, config, deadline).await
     }
 
+    /// Build the authoritative primary tracker from `[topology]` (H-01).
+    ///
+    /// `static` (the default) returns a standalone tracker and
+    /// `authoritative = false`, preserving the historical write-path
+    /// behaviour. `postgres` builds a `PostgresTopologyProvider` over every
+    /// configured node (feature `postgres-topology`) and marks the tracker
+    /// authoritative, so a promotion moves the write destination without any
+    /// `proxy.toml` edit.
+    fn build_primary_tracker(config: &ProxyConfig) -> (Arc<PrimaryTracker>, bool, TopologyPoller) {
+        #[cfg(feature = "postgres-topology")]
+        {
+            if config.topology.provider == crate::config::TopologyProviderKind::Postgres {
+                let nodes = config
+                    .nodes
+                    .iter()
+                    .map(|n| crate::primary_tracker::PostgresNode {
+                        node_id: uuid::Uuid::new_v4(),
+                        host: n.host.clone(),
+                        port: n.port,
+                        user: config.topology.user.clone(),
+                        password: config.topology.password.clone(),
+                        database: config.topology.database.clone(),
+                    })
+                    .collect();
+                let provider = Arc::new(
+                    crate::primary_tracker::PostgresTopologyProvider::new(nodes)
+                        .with_poll_interval(Duration::from_secs(
+                            config.topology.poll_interval_secs.max(1),
+                        )),
+                );
+                tracing::info!(
+                    nodes = config.nodes.len(),
+                    poll_interval_secs = config.topology.poll_interval_secs,
+                    "authoritative topology provider enabled: postgres (pg_is_in_recovery polling)"
+                );
+                let tracker = Arc::new(PrimaryTracker::with_provider(provider.clone()));
+                return (tracker, true, TopologyPoller::Postgres(provider));
+            }
+        }
+        let _ = config;
+        (
+            Arc::new(PrimaryTracker::new_standalone()),
+            false,
+            TopologyPoller::Static,
+        )
+    }
+
+    /// Resolve the authoritative provider's leader against the configured
+    /// nodes (H-01). Returns `Some(address)` only when the provider reported
+    /// a leader that is an **enabled** configured node; `None` means the
+    /// write path must wait (fail closed) instead of falling back to roles.
+    fn authoritative_leader(config: &ProxyConfig, tracker: &PrimaryTracker) -> Option<String> {
+        let addr = tracker.get_primary_address()?;
+        config
+            .nodes
+            .iter()
+            .any(|n| n.enabled && n.address() == addr)
+            .then_some(addr)
+    }
+
     /// `select_primary_with_timeout` against a caller-owned deadline, so one
     /// recovery deadline can be carried through every phase (TR-06).
     async fn select_primary_until(
@@ -7275,6 +7394,28 @@ impl ProxyServer {
         let check_interval = Duration::from_millis(100);
 
         loop {
+            // H-01: when a topology provider is authoritative, only its
+            // leader is eligible. If the provider has no leader (or the
+            // leader is disabled) new writes wait — they must never fall
+            // back to a configured role the provider has not authorised.
+            if state.authoritative_topology {
+                if let Some(addr) = Self::authoritative_leader(config, &state.primary_tracker) {
+                    let mut current = session.current_node.write().await;
+                    *current = Some(addr.clone());
+                    return Ok(addr);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    state.metrics.failovers.fetch_add(1, Ordering::Relaxed);
+                    return Err(ProxyError::NoHealthyNodes);
+                }
+                tracing::warn!(
+                    "Authoritative topology has no eligible primary; waiting... ({:.1}s elapsed)",
+                    start.elapsed().as_secs_f64()
+                );
+                tokio::time::sleep(check_interval).await;
+                continue;
+            }
+
             // Try to find a healthy primary. Every enabled primary is
             // considered in config order (not just the first): a config that
             // lists a promoted/secondary primary must be able to fail over to
@@ -11500,6 +11641,9 @@ mod tests {
             auth_file: None,
             mirror: None,
             cutover: Arc::new(ArcSwap::from_pointee(None)),
+            primary_tracker: Arc::new(PrimaryTracker::new_standalone()),
+            authoritative_topology: false,
+            topology_poller: TopologyPoller::Static,
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
             },
@@ -15488,6 +15632,32 @@ mod tests {
             .await;
             assert!(matches!(r, Err(ProxyError::NoHealthyNodes)), "{r:?}");
             assert!(started.elapsed() < Duration::from_secs(2));
+        }
+
+        #[test]
+        fn authoritative_leader_requires_an_enabled_configured_node() {
+            let mut config = ProxyConfig::default();
+            config.add_node("primary-a:5432", "primary").unwrap();
+            config.add_node("primary-b:5432", "primary").unwrap();
+
+            let tracker = PrimaryTracker::new_standalone();
+            // No provider answer yet: wait, never fall back to roles.
+            assert_eq!(ProxyServer::authoritative_leader(&config, &tracker), None);
+
+            tracker.set_primary(uuid::Uuid::new_v4(), "primary-b:5432".to_string());
+            assert_eq!(
+                ProxyServer::authoritative_leader(&config, &tracker).as_deref(),
+                Some("primary-b:5432")
+            );
+
+            // A provider answer that is not a configured node is ignored.
+            tracker.set_primary(uuid::Uuid::new_v4(), "unknown:5432".to_string());
+            assert_eq!(ProxyServer::authoritative_leader(&config, &tracker), None);
+
+            // A disabled configured node is not eligible either.
+            tracker.set_primary(uuid::Uuid::new_v4(), "primary-a:5432".to_string());
+            config.nodes[0].enabled = false;
+            assert_eq!(ProxyServer::authoritative_leader(&config, &tracker), None);
         }
 
         #[tokio::test]

@@ -226,6 +226,14 @@ pub struct ProxyConfig {
     /// `08006`/`08007` exactly like an unavailable primary.
     #[serde(default = "default_write_timeout_secs")]
     pub write_timeout_secs: u64,
+    /// Authoritative topology provider (H-01). `static` (default) keeps the
+    /// historical behaviour: the primary is the configured `role = "primary"`
+    /// node whose health check passes. `postgres` polls `pg_is_in_recovery()`
+    /// (requires the `postgres-topology` feature) and makes the provider's
+    /// answer authoritative for the write path, so a promotion moves the write
+    /// destination without editing `proxy.toml`.
+    #[serde(default)]
+    pub topology: TopologyConfig,
     /// Plugin system configuration. Only consumed when the `wasm-plugins`
     /// feature is enabled; on a feature-off build, values are parsed and
     /// ignored so existing configs don't break.
@@ -627,6 +635,64 @@ pub enum HbaAction {
 
 fn default_write_timeout_secs() -> u64 {
     30 // 30 seconds default write timeout during failover
+}
+
+fn default_topology_poll_secs() -> u64 {
+    2
+}
+
+fn default_topology_user() -> String {
+    "postgres".to_string()
+}
+
+fn default_topology_database() -> String {
+    "postgres".to_string()
+}
+
+/// Which source is authoritative for the current primary (H-01).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TopologyProviderKind {
+    /// Configured `[[nodes]]` roles + the daemon health checker. The
+    /// historical behaviour and the default.
+    #[default]
+    Static,
+    /// Poll `pg_is_in_recovery()` on every configured node and treat the
+    /// non-recovering node as the primary. Requires the `postgres-topology`
+    /// cargo feature.
+    Postgres,
+}
+
+/// `[topology]` — authoritative primary tracking (H-01).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyConfig {
+    /// Provider kind. Defaults to `static` so existing configs are unchanged.
+    #[serde(default)]
+    pub provider: TopologyProviderKind,
+    /// Seconds between provider polls. Must be >= 1.
+    #[serde(default = "default_topology_poll_secs")]
+    pub poll_interval_secs: u64,
+    /// Credentials the provider uses for its own probe connections.
+    #[serde(default = "default_topology_user")]
+    pub user: String,
+    /// Password for the probe user, if the backend requires one.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Database the probe connects to.
+    #[serde(default = "default_topology_database")]
+    pub database: String,
+}
+
+impl Default for TopologyConfig {
+    fn default() -> Self {
+        Self {
+            provider: TopologyProviderKind::Static,
+            poll_interval_secs: default_topology_poll_secs(),
+            user: default_topology_user(),
+            password: None,
+            database: default_topology_database(),
+        }
+    }
 }
 
 /// A table exposed by the GraphQL gateway, with its selectable columns.
@@ -1348,6 +1414,7 @@ impl Default for ProxyConfig {
             nodes: Vec::new(),
             tls: None,
             write_timeout_secs: default_write_timeout_secs(),
+            topology: TopologyConfig::default(),
             plugins: PluginToml::default(),
             hba: Vec::new(),
             auth: AuthConfig::default(),
@@ -1650,6 +1717,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "nodes",
     "tls",
     "write_timeout_secs",
+    "topology",
     "plugins",
     "hba",
     "auth",
@@ -1805,6 +1873,26 @@ impl ProxyConfig {
         let has_primary = self.nodes.iter().any(|n| n.role == NodeRole::Primary);
         if !has_primary {
             return Err(ProxyError::Config("No primary node configured".to_string()));
+        }
+
+        // `[topology]` (H-01): the provider is authoritative for the write
+        // path, so an unusable provider must fail at startup, not silently
+        // fall back to static roles.
+        if self.topology.poll_interval_secs == 0 {
+            return Err(ProxyError::Config(
+                "topology.poll_interval_secs must be >= 1".to_string(),
+            ));
+        }
+        if self.topology.provider == TopologyProviderKind::Postgres {
+            #[cfg(not(feature = "postgres-topology"))]
+            {
+                return Err(ProxyError::Config(
+                    "topology.provider = \"postgres\" requires the `postgres-topology` \
+                     cargo feature; rebuild with --features postgres-topology or set \
+                     topology.provider = \"static\""
+                        .to_string(),
+                ));
+            }
         }
 
         // Validate pool config
@@ -2482,6 +2570,55 @@ mod tests {
             TrMode::None,
             "tr_enabled = false must force TR off even when tr_mode requests replay"
         );
+    }
+
+    #[test]
+    fn topology_defaults_are_static_and_parse_from_toml() {
+        let config = ProxyConfig::default();
+        assert_eq!(config.topology.provider, TopologyProviderKind::Static);
+        assert_eq!(config.topology.poll_interval_secs, 2);
+        assert_eq!(config.topology.user, "postgres");
+        assert_eq!(config.topology.database, "postgres");
+        assert!(config.topology.password.is_none());
+
+        let with_section = r#"
+provider = "postgres"
+poll_interval_secs = 5
+user = "helios"
+password = "secret"
+database = "helios"
+"#;
+        let parsed: TopologyConfig =
+            toml::from_str(with_section).expect("[topology] section parses");
+        assert_eq!(parsed.provider, TopologyProviderKind::Postgres);
+        assert_eq!(parsed.poll_interval_secs, 5);
+        assert_eq!(parsed.user, "helios");
+        assert_eq!(parsed.password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn topology_poll_interval_zero_is_rejected() {
+        let mut config = ProxyConfig::default();
+        config.add_node("localhost:5432", "primary").unwrap();
+        config.topology.poll_interval_secs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("topology.poll_interval_secs"), "{err}");
+    }
+
+    #[test]
+    fn topology_postgres_provider_requires_feature() {
+        let mut config = ProxyConfig::default();
+        config.add_node("localhost:5432", "primary").unwrap();
+        config.topology.provider = TopologyProviderKind::Postgres;
+
+        #[cfg(feature = "postgres-topology")]
+        assert!(config.validate().is_ok());
+
+        #[cfg(not(feature = "postgres-topology"))]
+        {
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("postgres-topology"), "{err}");
+        }
     }
 
     #[test]
