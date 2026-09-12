@@ -88,23 +88,16 @@ pub mod switchover_buffer;
 pub mod pool;
 
 // ── TR (Transaction Replay) modules ─────────────────────────────────
-#[cfg(feature = "ha-tr")]
 pub mod cursor_restore;
-#[cfg(feature = "ha-tr")]
 pub mod failover_replay;
-#[cfg(feature = "ha-tr")]
 pub mod replay;
-#[cfg(feature = "ha-tr")]
 pub mod session_migrate;
-#[cfg(feature = "ha-tr")]
 pub mod transaction_journal;
 
 // ── Zero-downtime PG major-version upgrade orchestrator (T2.1) ─────
-#[cfg(feature = "ha-tr")]
 pub mod upgrade_orchestrator;
 
 // ── R&D: shadow execution (T3.4) ────────────────────────────────────
-#[cfg(feature = "ha-tr")]
 pub mod shadow_execute;
 
 // ── Query caching (L1/L2/L3 multi-tier cache) ──────────────────────
@@ -516,7 +509,6 @@ mod postgresql_compat_tests {
     }
 
     /// Transaction journal works for PostgreSQL transaction replay.
-    #[cfg(feature = "ha-tr")]
     #[tokio::test]
     async fn test_pg_transaction_replay() {
         use transaction_journal::*;
@@ -573,7 +565,6 @@ mod postgresql_compat_tests {
     }
 
     /// Session migration works for PostgreSQL session parameters.
-    #[cfg(feature = "ha-tr")]
     #[tokio::test]
     async fn test_pg_session_migration() {
         use session_migrate::*;

@@ -327,4 +327,3 @@ implementation, demonstrating the same pattern.
 - [Transaction Replay](transaction-replay.md) — how the primary is used on the write path.
 - [Admin API Reference](admin-api.md) — `/topology`, `/nodes/{addr}/enable|disable`, `/api/chaos`.
 - [Architecture](architecture.md) — system overview and module map.
-</content>

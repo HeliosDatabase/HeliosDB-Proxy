@@ -278,7 +278,6 @@ async fn test_module_06_failover_controller_config() {
 }
 
 /// Module 07 — Transaction Replay (journal + replay).
-#[cfg(feature = "ha-tr")]
 #[tokio::test]
 async fn test_module_07_transaction_replay_config() {
     use heliosdb_proxy::transaction_journal::{JournalValue, StatementType, TransactionJournal};
@@ -314,15 +313,6 @@ async fn test_module_07_transaction_replay_config() {
     assert!(journal.get_journal(&tx_id).await.is_none());
 }
 
-/// Module 07 stub when ha-tr feature is off.
-#[cfg(not(feature = "ha-tr"))]
-#[test]
-fn test_module_07_transaction_replay_config() {
-    // ha-tr not enabled; tr_enabled field still present on ProxyConfig.
-    let cfg = heliosdb_proxy::config::ProxyConfig::default();
-    let _ = cfg.tr_enabled;
-}
-
 /// Module 08 — Session Migration.
 ///
 /// Registers a session with parameters and a prepared statement, verifies
@@ -330,7 +320,6 @@ fn test_module_07_transaction_replay_config() {
 /// Without `backend_template`, `execute_statement` is a no-op, so the
 /// migration succeeds with counts = 0 but `success = true`.
 /// Appends a live SET/SHOW round-trip through an HA proxy when configured.
-#[cfg(feature = "ha-tr")]
 #[tokio::test]
 async fn test_module_08_session_migration_config() {
     use heliosdb_proxy::session_migrate::{PreparedStatementInfo, SessionMigrate, SessionState};
@@ -420,20 +409,11 @@ async fn test_module_08_session_migration_config() {
     }
 }
 
-/// Module 08 stub when ha-tr feature is off.
-#[cfg(not(feature = "ha-tr"))]
-#[test]
-fn test_module_08_session_migration_config() {
-    let cfg = heliosdb_proxy::config::ProxyConfig::default();
-    let _ = cfg.tr_enabled;
-}
-
 /// Module 09 — Cursor Restore.
 ///
 /// Saves a cursor, updates its fetch position, gets it back, then calls
 /// `restore_cursor()`. Without `backend_template`, `recreate_cursor` is
 /// a no-op that returns `success = true`.
-#[cfg(feature = "ha-tr")]
 #[tokio::test]
 async fn test_module_09_cursor_restore_config() {
     use heliosdb_proxy::cursor_restore::{CursorDirection, CursorRestore, CursorState};
@@ -496,14 +476,6 @@ async fn test_module_09_cursor_restore_config() {
         .expect("close_cursor");
     let stats2 = restore.stats().await;
     assert_eq!(stats2.active_cursors, 0);
-}
-
-/// Module 09 stub when ha-tr feature is off.
-#[cfg(not(feature = "ha-tr"))]
-#[test]
-fn test_module_09_cursor_restore_config() {
-    let cfg = heliosdb_proxy::config::ProxyConfig::default();
-    let _ = cfg.tr_enabled;
 }
 
 /// Module 10 — Switchover Buffer.
@@ -597,7 +569,6 @@ fn test_module_11_primary_tracker_config() {
 }
 
 /// Module 12 — Transaction Journal (WAL, statement-level).
-#[cfg(feature = "ha-tr")]
 #[tokio::test]
 async fn test_module_12_transaction_journal_roundtrip() {
     use heliosdb_proxy::transaction_journal::{JournalValue, TransactionJournal};
@@ -651,13 +622,6 @@ async fn test_module_12_transaction_journal_roundtrip() {
     journal.commit_transaction(tx2).await.unwrap();
     assert!(journal.get_journal(&tx1).await.is_none());
     assert!(journal.get_journal(&tx2).await.is_none());
-}
-
-/// Module 12 stub when ha-tr is off.
-#[cfg(not(feature = "ha-tr"))]
-#[test]
-fn test_module_12_transaction_journal_roundtrip() {
-    // ha-tr not compiled in.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

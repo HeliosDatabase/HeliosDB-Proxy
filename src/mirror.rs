@@ -48,11 +48,13 @@ pub struct MigrationStatus {
     pub mirrored: u64,
     pub dropped: u64,
     pub errors: u64,
-    /// Statements accepted but not yet applied (queue backlog).
+    /// Statements accepted but not yet successfully applied: queue backlog
+    /// plus statements whose apply failed (see `errors`). A failed apply must
+    /// not cancel itself out of this number.
     pub lag: u64,
     /// True when the mirror is enabled, the backlog is drained, and nothing
-    /// has been dropped — i.e. the secondary is caught up and a cutover is
-    /// safe with respect to the mirrored write set.
+    /// has been dropped or failed — i.e. the secondary is caught up and a
+    /// cutover is safe with respect to the mirrored write set.
     pub migration_ready: bool,
 }
 
@@ -62,7 +64,7 @@ pub fn status(target: &str, writes_only: bool, m: &MirrorMetrics) -> MigrationSt
     let mirrored = m.mirrored.load(Ordering::Relaxed);
     let dropped = m.dropped.load(Ordering::Relaxed);
     let errors = m.errors.load(Ordering::Relaxed);
-    let lag = enqueued.saturating_sub(mirrored).saturating_sub(errors);
+    let lag = enqueued.saturating_sub(mirrored);
     MigrationStatus {
         enabled: true,
         target: target.to_string(),
@@ -72,7 +74,7 @@ pub fn status(target: &str, writes_only: bool, m: &MirrorMetrics) -> MigrationSt
         dropped,
         errors,
         lag,
-        migration_ready: lag == 0 && dropped == 0,
+        migration_ready: lag == 0 && dropped == 0 && errors == 0,
     }
 }
 
@@ -454,5 +456,46 @@ mod tests {
         assert_eq!(enc(&TextValue::Text("a\\b".into())), "a\\\\b");
         // A literal backslash-N in data must not be confused with NULL.
         assert_eq!(enc(&TextValue::Text("\\N".into())), "\\\\N");
+    }
+
+    #[test]
+    fn migration_status_clean_is_ready() {
+        let m = MirrorMetrics::default();
+        m.enqueued.store(2, Ordering::Relaxed);
+        m.mirrored.store(2, Ordering::Relaxed);
+        let st = status("mirror:5432", true, &m);
+        assert_eq!(st.lag, 0);
+        assert!(st.migration_ready, "a drained mirror is ready");
+    }
+
+    #[test]
+    fn migration_status_apply_errors_block_readiness() {
+        let m = MirrorMetrics::default();
+        m.enqueued.store(3, Ordering::Relaxed);
+        m.mirrored.store(2, Ordering::Relaxed);
+        m.errors.store(1, Ordering::Relaxed);
+        let st = status("mirror:5432", true, &m);
+        assert_eq!(st.errors, 1, "apply errors stay visible in the payload");
+        assert_eq!(
+            st.lag, 1,
+            "a failed apply must not cancel itself out of the lag"
+        );
+        assert!(
+            !st.migration_ready,
+            "apply errors must block migration_ready"
+        );
+    }
+
+    #[test]
+    fn migration_status_drops_block_readiness() {
+        let m = MirrorMetrics::default();
+        m.enqueued.store(2, Ordering::Relaxed);
+        m.mirrored.store(2, Ordering::Relaxed);
+        m.dropped.store(1, Ordering::Relaxed);
+        let st = status("mirror:5432", true, &m);
+        assert!(
+            !st.migration_ready,
+            "dropped writes must block migration_ready"
+        );
     }
 }

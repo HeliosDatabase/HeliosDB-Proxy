@@ -23,7 +23,7 @@ All of the following are **off by default**. Enable them individually or via the
 | Feature | Pulls extra deps | Description |
 |---------|------------------|-------------|
 | `pool-modes` | None | Connection pooling modes (Session/Transaction/Statement). Enabled by default. |
-| `ha-tr` | None | Transaction Replay **journal and operator tooling** (`/api/replay`, `/api/shadow`, failover library). The in-session recovery a client experiences is core and needs no flag. |
+| `ha-tr` | None | **Deprecated no-op.** Transaction Replay (in-session recovery, journal, `/api/replay`, `/api/shadow`) ships in the default build and is toggled by `tr_enabled` in `proxy.toml`. The feature name is kept so downstream mappings keep resolving. |
 | `query-cache` | None | L1 hot / L2 warm / L3 semantic query result caching. |
 | `routing-hints` | None | SQL comment-based query routing hints. |
 | `lag-routing` | None | Replica lag-aware routing with read-your-writes consistency. |
@@ -54,9 +54,13 @@ Topology providers are independent of each other. Choose one based on your backe
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `observability` | No | Pulls the `prometheus` and `opentelemetry` crate dependencies **only**. See the caveat below -- in the current tree it wires no code. |
+| `observability` | No | Reserved **no-op**. Historically pulled `prometheus`/`opentelemetry` without wiring any code; those unused dependencies were removed (they carried the protobuf advisory). `/metrics` and `/metrics/prometheus` are always served by the admin API. |
 
-> **Caveat (verify before relying on it):** `observability = ["dep:prometheus", "dep:opentelemetry"]` has **zero** `#[cfg(feature = "observability")]` guards anywhere in `src/` (grep count: 0). Enabling it compiles the two dependency crates into the binary but activates no exporter, tracer, or metrics wiring. Prometheus-style metrics are served regardless of this flag by the Admin HTTP API at `GET /metrics` and `GET /metrics/prometheus` (`src/admin.rs`), which are independent of `observability`.
+> **Note:** `observability = []` compiles nothing extra and activates no exporter,
+> tracer, or metrics wiring; grep still finds zero `#[cfg(feature = "observability")]`
+> guards in `src/`. Prometheus-style metrics are served regardless of this flag by the
+> Admin HTTP API at `GET /metrics` and `GET /metrics/prometheus` (`src/admin.rs`).
+> Wiring a real observability stack is tracked as P-03 in the reliability backlog.
 
 ### Bundle Features
 
@@ -87,18 +91,25 @@ Enables three connection pooling modes that control when backend connections are
 
 Includes prepared statement tracking, connection reset sequences, lease management, and pool hardening.
 
-### `ha-tr` -- Transaction Replay journal and operator tooling
+### `ha-tr` -- deprecated no-op (Transaction Replay is in the default build)
 
-**Modules:** `src/transaction_journal.rs`, `src/failover_replay.rs`, `src/session_migrate.rs`, `src/cursor_restore.rs`
+**Modules (always compiled since the post-1.7.0 change):** `src/transaction_journal.rs`,
+`src/failover_replay.rs`, `src/replay/`, `src/session_migrate.rs`, `src/cursor_restore.rs`,
+`src/upgrade_orchestrator.rs`, `src/shadow_execute/`.
 
-**The recovery a live client experiences does not need this flag.** Since 1.6.0, in-session
-Transaction Replay is in core: the proxy records the statements, session state and response
-digests of an open transaction, and on a backend fault re-homes the session to a new primary,
-restores its `SET` state and replays the transaction under one `write_timeout_secs` deadline,
-verifying each replayed response against what the client already saw. It is configured with
-`tr_mode`; see [transaction-replay.md](transaction-replay.md).
+Transaction Replay is **on by default**; the `ha-tr` cargo feature gates nothing. The
+runtime switch is `tr_enabled` in `proxy.toml` (`--tr=false` on the CLI). Setting it to
+`false` stops write journaling, forces the effective `tr_mode` to `none`, and makes
+`POST /api/replay` return `503`. `POST /api/shadow` stays available: it is an explicit
+validation tool, not part of failover recovery.
 
-What `ha-tr` adds on top:
+In-session recovery is the same path the client always took: the proxy records the
+statements, session state and response digests of an open transaction, and on a backend
+fault re-homes the session to a new primary, restores its `SET` state and replays the
+transaction under one `write_timeout_secs` deadline, verifying each replayed response
+against what the client already saw. See [transaction-replay.md](transaction-replay.md).
+
+The operator tooling built on the same journal:
 
 1. A post-response journal of write SQL, bounded in memory and not persisted.
 2. The operator-driven `POST /api/replay` endpoint — replay a time window of that journal
@@ -108,7 +119,7 @@ What `ha-tr` adds on top:
    embedded use.
 
 `session_migrate` and `cursor_restore` are library modules and are **not** on the recovery
-path: prepared statements and cursors do not survive a failover in either build.
+path: prepared statements and cursors do not survive a failover.
 
 Recovery is transparent where it can be. Where it cannot be — an unknown `COMMIT` outcome,
 a response already partly delivered, a snapshot-pinned transaction — the client gets a
@@ -339,7 +350,8 @@ For the HeliosDB-Lite workspace build, swap the topology provider:
 cargo build --release --features "all-features,heliosdb-topology"
 ```
 
-> `observability` may be appended, but note it only compiles the `prometheus`/`opentelemetry` deps and wires no code (see the Observability caveat). The `/metrics` endpoints work without it.
+> `observability` may be appended, but it is a no-op: it compiles nothing extra and
+> wires no code (see the Observability note). The `/metrics` endpoints work without it.
 
 ### MSRV Verification
 
@@ -356,5 +368,3 @@ cargo check --locked --features msrv-features
 - [Architecture](architecture.md) -- Module map and data-flow pipeline
 - [Configuration Reference](configuration.md) -- Every configuration key documented
 - [Deployment Guides](deployment/) -- Standalone, Docker, and Kubernetes deployment
-</content>
-</invoke>

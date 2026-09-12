@@ -4,7 +4,6 @@
 //! Implements PostgreSQL wire protocol forwarding with TWR (Transparent Write Routing).
 
 use crate::admin::{AdminServer, AdminState, ConfigSnapshot, NodeSnapshot};
-#[cfg(feature = "ha-tr")]
 use crate::backend::{tls::default_client_config, BackendConfig, TlsMode};
 use crate::client_tls::{build_tls_acceptor, ClientStream};
 use crate::config::{HbaAction, HbaRule, NodeConfig, NodeRole, ProxyConfig, TrMode};
@@ -77,7 +76,6 @@ impl HangupNever {
 /// `_config` is kept in the signature so future iterations can pull
 /// shared TLS / timeout settings from the proxy config without
 /// changing the call site.
-#[cfg(feature = "ha-tr")]
 fn build_replay_backend_template(_config: &ProxyConfig) -> BackendConfig {
     BackendConfig {
         host: "placeholder".to_string(),
@@ -939,9 +937,8 @@ struct ServerState {
     plugin_manager: Option<Arc<PluginManager>>,
     /// Shared transaction journal — single sink for per-session
     /// statement journaling. The replay engine reads windows from
-    /// this directly. Always present when the `ha-tr` feature is on;
-    /// journaling self-disables internally when not configured.
-    #[cfg(feature = "ha-tr")]
+    /// this directly. Always present; journaling is skipped when
+    /// `tr_enabled = false`.
     transaction_journal: Arc<crate::transaction_journal::TransactionJournal>,
     /// TR-03 read re-execution eligibility (built-ins + `tr_read_functions`).
     tr_read_policy: Arc<TrReadPolicy>,
@@ -2023,7 +2020,6 @@ impl ProxyServer {
             backend_pool,
             #[cfg(feature = "wasm-plugins")]
             plugin_manager,
-            #[cfg(feature = "ha-tr")]
             transaction_journal: Arc::new(crate::transaction_journal::TransactionJournal::new()),
             tr_read_policy: Arc::new(TrReadPolicy::from_config(&config.tr_read_functions)),
             #[cfg(feature = "anomaly-detection")]
@@ -2474,7 +2470,7 @@ impl ProxyServer {
                     listen_address: config.listen_address.clone(),
                     admin_address: config.admin_address.clone(),
                     tr_enabled: config.tr_enabled,
-                    tr_mode: format!("{:?}", config.tr_mode),
+                    tr_mode: format!("{:?}", config.effective_tr_mode()),
                     pool_min_connections: config.pool.min_connections,
                     pool_max_connections: config.pool.max_connections,
                     nodes: config
@@ -2554,7 +2550,6 @@ impl ProxyServer {
             // Per-call credential overrides land via FU-21's
             // ReplayRequestBody.target_user / target_password /
             // target_database fields.
-            #[cfg(feature = "ha-tr")]
             {
                 let template = build_replay_backend_template(&config);
                 let engine = Arc::new(crate::replay::ReplayEngine::new(
@@ -2800,7 +2795,7 @@ impl ProxyServer {
             tx_state: RwLock::new(TransactionState::default()),
             variables: RwLock::new(HashMap::new()),
             created_at: chrono::Utc::now(),
-            tr_mode: config.tr_mode,
+            tr_mode: config.effective_tr_mode(),
             #[cfg(feature = "lag-routing")]
             last_write_at: RwLock::new(None),
             #[cfg(feature = "pool-modes")]
@@ -5725,7 +5720,6 @@ impl ProxyServer {
                     }
                 }
                 // Transaction Replay: journal the write for failover/time-travel.
-                #[cfg(feature = "ha-tr")]
                 if is_write && config.tr_enabled {
                     if let Some(sql) = crate::protocol::query_text(&forward_msg.payload) {
                         Self::journal_write(state, session, sql).await;
@@ -7196,7 +7190,6 @@ impl ProxyServer {
     /// recorded as its own auto-commit transaction so the time-travel/failover
     /// replay engine can re-apply it onto a promoted primary or a staging
     /// target. Best-effort: journal errors never fail the client query.
-    #[cfg(feature = "ha-tr")]
     async fn journal_write(state: &Arc<ServerState>, session: &Arc<ClientSession>, sql: &str) {
         // One lock acquisition and one cheap id draw per write: `begin_and_log`
         // is the fused begin+log, and the auto-commit id comes from the
@@ -11531,7 +11524,6 @@ mod tests {
             #[cfg(feature = "pool-modes")]
             backend_pool: None,
             plugin_manager: Some(pm),
-            #[cfg(feature = "ha-tr")]
             transaction_journal: Arc::new(crate::transaction_journal::TransactionJournal::new()),
             tr_read_policy: Arc::new(TrReadPolicy::default()),
             #[cfg(feature = "anomaly-detection")]
@@ -12768,9 +12760,8 @@ mod tests {
         }
     }
 
-    // ---- ha-tr: the journal records statements the replay engine reads ----
+    // ---- TR: the journal records statements the replay engine reads ----
 
-    #[cfg(feature = "ha-tr")]
     mod ha_tr {
         use crate::transaction_journal::TransactionJournal;
         use crate::NodeId;

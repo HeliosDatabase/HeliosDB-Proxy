@@ -14,9 +14,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 
 // TR (Transaction Replay) imports
-#[cfg(feature = "ha-tr")]
 use super::failover_replay::{FailoverReplay, ReplayConfig, ReplayResult};
-#[cfg(feature = "ha-tr")]
 use super::transaction_journal::TransactionJournal;
 
 /// Failover configuration
@@ -719,7 +717,6 @@ impl FailoverController {
     /// 2. Waiting for the new primary to catch up to the required LSN
     /// 3. Replaying each transaction's statements on the new primary
     /// 4. Verifying results match the original execution (via checksums)
-    #[cfg(feature = "ha-tr")]
     pub async fn coordinate_failover_replay(
         &self,
         journal: &TransactionJournal,
@@ -860,7 +857,6 @@ impl FailoverController {
     }
 
     /// Wait for a node to catch up to a specific LSN
-    #[cfg(feature = "ha-tr")]
     async fn wait_for_lsn_catchup(&self, node: NodeId, target_lsn: u64) -> Result<()> {
         if target_lsn == 0 {
             return Ok(());
@@ -902,7 +898,6 @@ impl FailoverController {
 }
 
 /// Result of coordinated transaction replay after failover
-#[cfg(feature = "ha-tr")]
 #[derive(Debug, Clone)]
 pub struct CoordinatedReplayResult {
     /// Total number of transactions replayed
@@ -919,7 +914,6 @@ pub struct CoordinatedReplayResult {
     pub new_primary: NodeId,
 }
 
-#[cfg(feature = "ha-tr")]
 impl CoordinatedReplayResult {
     /// Check if all transactions were replayed successfully
     pub fn all_successful(&self) -> bool {
@@ -1021,7 +1015,6 @@ mod tests {
         assert_eq!(best.node_id, sync_node);
     }
 
-    #[cfg(feature = "ha-tr")]
     #[tokio::test]
     async fn test_coordinate_failover_replay_empty() {
         use super::super::transaction_journal::TransactionJournal;
@@ -1044,7 +1037,6 @@ mod tests {
         assert_eq!(result.success_rate(), 100.0);
     }
 
-    #[cfg(feature = "ha-tr")]
     #[tokio::test]
     async fn test_coordinate_failover_replay_with_transactions() {
         use super::super::transaction_journal::{JournalValue, TransactionJournal};
@@ -1098,7 +1090,6 @@ mod tests {
         assert!(result.all_successful());
     }
 
-    #[cfg(feature = "ha-tr")]
     #[test]
     fn test_coordinated_replay_result_methods() {
         let result = CoordinatedReplayResult {

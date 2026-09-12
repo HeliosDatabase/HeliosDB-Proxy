@@ -18,12 +18,13 @@ listen_address = "${HELIOS_PROXY_LISTEN:-0.0.0.0:6432}"
 # to a non-loopback address requires admin_token (or admin_allow_insecure = true).
 admin_address  = "${HELIOS_PROXY_ADMIN:-127.0.0.1:9090}"
 
-# Transaction Replay.
-#   tr_enabled — journal auto-commit writes for the operator-driven replay engine
-#                (POST /api/replay, time-travel; needs the `ha-tr` feature).
+# Transaction Replay (ships in the default build; no cargo feature needed).
+#   tr_enabled — master switch: journal auto-commit writes for the operator-driven
+#                replay engine (POST /api/replay, time-travel) AND allow in-session
+#                failover recovery. false forces the effective mode to `none`.
 #   tr_mode    — in-session failover: what a LIVE client session experiences when
 #                its backend connection fails mid-request (write error/timeout,
-#                read error, EOF, reset) or dies while idle. Always available.
+#                read error, EOF, reset) or dies while idle. Always compiled in.
 #
 #   mode        | on a backend fault
 #   ------------+-------------------------------------------------------------------

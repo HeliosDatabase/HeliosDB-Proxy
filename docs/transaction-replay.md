@@ -1,10 +1,11 @@
 # Transaction Replay (TR) — Deep Dive
 
 > **How to read this guide.** [In-session replay](#in-session-replay-the-core-path)
-> describes the recovery path a live client actually takes; it runs in core, including
-> builds without `ha-tr`. Everything about the transaction journal, the replay engine and
-> time-travel replay describes the separate `ha-tr` administrative modules, which are not
-> on that path. The [2026-09 audit](internal/audit-2026-09/README.md) records what was
+> describes the recovery path a live client actually takes. Transaction Replay ships in
+> the default build; `tr_enabled = false` (or `--tr=false`) turns it off at runtime.
+> Everything about the transaction journal, the replay engine and time-travel replay
+> describes the operator tooling behind `POST /api/replay`, which is not on that
+> recovery path. The [2026-09 audit](internal/audit-2026-09/README.md) records what was
 > fixed and what remains.
 
 Transaction Replay is HeliosProxy's failover-continuity subsystem: a per-write
@@ -12,16 +13,17 @@ transaction journal plus a replay engine that can re-execute journaled statement
 new backend after a primary change, so that a failover looks to the client like a slow
 query rather than a dropped connection.
 
-This document is grounded in the code. Every concrete claim below — feature flag, config
-key, default, mode name, behavior — is verifiable in `src/transaction_journal.rs`,
+This document is grounded in the code. Every concrete claim below — config key, default,
+mode name, behavior — is verifiable in `src/transaction_journal.rs`,
 `src/failover_replay.rs`, `src/failover_controller.rs`, `src/switchover_buffer.rs`,
 `src/replay/mod.rs`, and the TR fields of `ProxyConfig` in `src/config.rs`. Where the
 narrative describes intent rather than shipped runtime behavior, it says so explicitly.
 
-**Last verified against 1.7.0.** The in-session recovery path described in
-[In-session replay](#in-session-replay-the-core-path) is the current behavior; the
-journal and administrative replay sections below describe the separate `ha-tr`
-modules, which are unchanged.
+**Last verified against the post-1.7.0 tree that moved TR into the default build.** The
+in-session recovery path described in [In-session replay](#in-session-replay-the-core-path)
+is the current behavior; the journal and administrative replay sections below describe
+the operator tooling, which is compiled into every build and disabled at runtime by
+`tr_enabled = false`.
 
 ---
 
@@ -51,35 +53,33 @@ Oracle Database has offered comparable capabilities for years:
 - **Oracle TAC (Transparent Application Continuity)** — full transaction replay including
   DML, introduced in Oracle 12c.
 
-HeliosProxy's `ha-tr` feature is aimed at the same problem space for PostgreSQL-wire
+HeliosProxy's Transaction Replay is aimed at the same problem space for PostgreSQL-wire
 backends, built on an in-memory journal rather than a driver-side capture buffer.
 
 ---
 
-## Feature Gating
+## Build and Runtime Gating
 
-Transaction Replay lives behind the **`ha-tr`** cargo feature
-(`Cargo.toml`: `ha-tr = []`; described there as "Transaction Replay (TR) — failover
-replay, cursor restore, session migrate"). It is included in `all-features` and in the
-CI feature matrix (`cargo test --features ha-tr`).
+Transaction Replay is **in the default build** — there is no cargo feature to enable.
+`ha-tr` is retained as a deprecated no-op (`Cargo.toml`: `ha-tr = []`) so downstream
+feature mappings keep resolving, but it gates nothing.
 
-What the feature actually gates — `ha-tr` compiles out whole modules, not just a hook:
+`tr_enabled` is the runtime master switch (`proxy.toml`, or `--tr` on the CLI). Setting
+it to `false`:
 
-- **Entire modules**, behind `#[cfg(feature = "ha-tr")]` in `src/lib.rs`:
-  `transaction_journal`, `failover_replay`, `replay`, `cursor_restore`,
-  `session_migrate`, `upgrade_orchestrator`, and `shadow_execute`. Without the feature
-  these types do not exist at all.
-- The **`ServerState` journal field** (`transaction_journal:
-  Arc<TransactionJournal>`, `src/server.rs`) and the **write-path journaling hook**
-  (`journal_write`, invoked on writes when `tr_enabled`).
-- The **coordinated post-failover replay** on `FailoverController`
-  (`coordinate_failover_replay`, `wait_for_lsn_catchup`, `CoordinatedReplayResult`).
-- The **`POST /api/replay` admin endpoint**: with the feature off the route returns
-  `503 {"error": "ha-tr feature not compiled in"}` (`src/admin.rs`).
+- **stops write journaling** — the write-path `journal_write` hook is skipped, so no new
+  entries are recorded;
+- **disables in-session recovery** — `effective_tr_mode()` returns `TrMode::None`
+  regardless of `tr_mode`, so a backend fault gets the plain one-error-then-close
+  behavior instead of replay;
+- **makes `POST /api/replay` return `503`** with
+  `{"error": "transaction replay disabled (tr_enabled = false)"}`.
 
-Only `FailoverController` (`src/failover_controller.rs`) and `SwitchoverBuffer`
-(`src/switchover_buffer.rs`) are compiled unconditionally; everything else this document
-describes — journal, replay engine, time-travel replay endpoint — requires `ha-tr`.
+The modules (`transaction_journal`, `failover_replay`, `replay`, `cursor_restore`,
+`session_migrate`, `upgrade_orchestrator`, `shadow_execute`), the `ServerState` journal
+field and the `FailoverController` coordinated replay are always compiled. `POST
+/api/shadow` stays available with `tr_enabled = false`: it is an explicit operator
+validation tool, not part of failover recovery.
 
 ---
 
@@ -102,7 +102,7 @@ write_timeout_secs = 30
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `tr_enabled` | bool | `true` | Enables the write-path journaling hook. Required in a config file (no serde default; the in-code `Default` is `true`). |
+| `tr_enabled` | bool | `true` | Master switch for Transaction Replay: journaling, in-session replay (forces `tr_mode = none` when off) and `POST /api/replay`. Required in a config file (no serde default; the in-code `Default` is `true`). |
 | `tr_mode` | enum | `session` | Selects the replay policy (see below). Stored on each session and surfaced at `/config`. Also required in a config file (no serde default — the `#[default]` on `TrMode` only feeds `ProxyConfig::default()`, so omitting `tr_mode` from `proxy.toml` fails deserialization with "missing field `tr_mode`"). |
 | `write_timeout_secs` | u64 | `30` | `default_write_timeout_secs()` = 30. Exposed as `ProxyConfig::write_timeout()` → `Duration`. Since 1.7.0 it is **one deadline for the whole recovery** — waiting for a primary, connect/auth, session restore and replay all share it, rather than each having its own timeout. |
 | `tr_read_functions` | list | `[]` | Extra function names to treat as side-effect-free when deciding whether an interrupted read may be re-executed. Plain identifiers only. |
@@ -139,9 +139,9 @@ The modes are cumulative — each does everything the one before it does.
 
 ## In-session replay (the core path)
 
-This is what a client actually experiences when its backend dies mid-session. It runs in
-core, in builds with and without `ha-tr`, and is independent of the journal and
-administrative replay modules documented further down.
+This is what a client actually experiences when its backend dies mid-session. It is
+independent of the journal and administrative replay modules documented further down;
+both ship in the default build and both are turned off together by `tr_enabled = false`.
 
 **What is recorded.** While a session is inside a transaction under `tr_mode = select` or
 `transaction`, the proxy records each statement, the session state it changed, and a
@@ -176,13 +176,13 @@ returns `40001` rather than continuing on top of rows the client never observed.
 
 ---
 
-## What happens on the live write path (the `ha-tr` journal hook)
+## What happens on the live write path (the journal hook)
 
-Beyond the in-session recovery above, two `ha-tr` mechanisms observe a primary change
+Beyond the in-session recovery above, two mechanisms observe a primary change
 in the running daemon:
 
-**1. Write journaling** (`src/server.rs`, `journal_write`, `#[cfg(feature = "ha-tr")]`).
-When `tr_enabled` and the statement is a write, the proxy records it in the shared
+**1. Write journaling** (`src/server.rs`, `journal_write`). When `tr_enabled` and the
+statement is a write, the proxy records it in the shared
 `TransactionJournal`. Each write is journaled as its own auto-commit transaction — a fresh
 `tx_id`, `begin_transaction` then `log_statement`, never committed. Because these journals
 never commit, the journal manager bounds the map with a global cap and evicts the oldest
@@ -307,7 +307,7 @@ and exposes `get_state`, `get_progress`, `cancel_replay`, `history`, and `stats`
   `pg_basebackup` out of band — so the controller only probes and emits
   `OldPrimaryRecovered`, logging loudly if the recovered node still reports itself primary.
 
-**Coordinated replay** (`coordinate_failover_replay`, `ha-tr`): collect the failed node's
+**Coordinated replay** (`coordinate_failover_replay`): collect the failed node's
 active transactions (`get_transactions_for_node`), compute their maximum `start_lsn`,
 `wait_for_lsn_catchup` on the new primary, then run `FailoverReplay` (with
 `wait_for_wal_sync = false`, since the wait already happened) over each transaction. The
@@ -352,9 +352,9 @@ via `BackendClient`, returning a `ReplaySummary` (`statements_replayed`, `failur
 against staging" path, distinct from post-failover replay but built on the same journal.
 See [admin-api.md](admin-api.md) for the request/response shape.
 
-Like the journal it reads from, this endpoint is `ha-tr`-gated: a proxy built without the
-feature still routes `POST /api/replay`, but the handler returns
-`503 {"error": "ha-tr feature not compiled in"}` (`src/admin.rs`).
+Like the journal it reads from, this endpoint is controlled by `tr_enabled`: with
+`tr_enabled = false` the route still exists, but the handler returns
+`503 {"error": "transaction replay disabled (tr_enabled = false)"}` (`src/admin.rs`).
 
 ---
 
@@ -364,7 +364,7 @@ feature still routes `POST /api/replay`, but the handler returns
 The journal lives in process memory and is bounded by the code constants above; it is not
 persisted. The live write-path hook records SQL text only — parameter values and row
 counts are part of the journal model but are not populated by the forwarding path today.
-This applies to the `ha-tr` journal, **not** to in-session recovery: that path records its
+This applies to the write journal, **not** to in-session recovery: that path records its
 own per-statement response digest and verifies it during replay (see
 [In-session replay](#in-session-replay-the-core-path)).
 
@@ -377,7 +377,7 @@ is refused (`08006`) rather than completed with incomplete state.
 
 Not restored: named `PREPARE`d statements, cursor positions, session temp tables and
 advisory locks. `SET`s issued through the extended protocol are also not tracked. The
-`ha-tr` library modules `src/cursor_restore.rs` and `src/session_migrate.rs` implement
+library modules `src/cursor_restore.rs` and `src/session_migrate.rs` implement
 parts of this but remain unwired from the recovery path. Applications depending on that
 state surviving a failover still need application-level coordination.
 
@@ -411,7 +411,7 @@ controller/tracker automatically.
 
 ## Comparison
 
-| Capability | HeliosProxy TR (`ha-tr`) | Oracle TAF | Oracle TAC | PgBouncer |
+| Capability | HeliosProxy TR | Oracle TAF | Oracle TAC | PgBouncer |
 |---|---|---|---|---|
 | Failover write-buffering (bounded by `write_timeout_secs`) | Yes | N/A | N/A | No |
 | DML statement replay (journal-driven) | Yes (replay engine) | No | Yes | No |
@@ -432,5 +432,3 @@ controller/tracker automatically.
 - [Topology Providers](topology-providers.md) — how the current primary is determined.
 - [Admin API Reference](admin-api.md) — `/topology`, `/api/replay`, `/api/chaos`.
 - [Architecture](architecture.md) — system overview and module map.
-</content>
-</invoke>
