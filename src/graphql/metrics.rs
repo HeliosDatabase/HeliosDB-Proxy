@@ -456,9 +456,7 @@ impl LatencyHistogram {
 
     /// Reset histogram
     fn reset(&mut self) {
-        for count in &mut self.counts {
-            *count = 0;
-        }
+        self.counts.fill(0);
         self.values.clear();
     }
 }

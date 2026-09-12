@@ -146,7 +146,7 @@ pub struct GraphQLError {
     /// Path to the field that caused the error
     pub path: Option<Vec<PathSegment>>,
     /// Error extensions
-    pub extensions: Option<HashMap<String, serde_json::Value>>,
+    pub extensions: Option<Box<HashMap<String, serde_json::Value>>>,
     /// Error code
     pub code: ErrorCode,
 }
@@ -202,7 +202,9 @@ impl GraphQLError {
 
     /// Add extension
     pub fn with_extension(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
-        let extensions = self.extensions.get_or_insert_with(HashMap::new);
+        let extensions = self
+            .extensions
+            .get_or_insert_with(|| Box::new(HashMap::new()));
         extensions.insert(key.into(), value);
         self
     }
@@ -236,7 +238,7 @@ impl GraphQLError {
             result.insert("path".to_string(), serde_json::Value::Array(path_array));
         }
 
-        let mut extensions = self.extensions.clone().unwrap_or_default();
+        let mut extensions = self.extensions.as_deref().cloned().unwrap_or_default();
         extensions.insert(
             "code".to_string(),
             serde_json::Value::String(format!("{:?}", self.code)),
