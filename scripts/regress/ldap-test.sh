@@ -17,7 +17,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 NAME=helios-ldap-test
 IMG="${LDAP_IMAGE:-osixia/openldap:1.5.0}"
-PORT=1389                       # host port -> container 389
+PORT=389                        # slapd's listener on the host (--network host; no published-port DNAT)
 ROOT="dc=example,dc=org"
 ADMIN_DN="cn=admin,$ROOT"
 ADMIN_PW=adminpw
@@ -33,7 +33,10 @@ trap cleanup EXIT
 cleanup
 
 echo "== ldap-auth live test  image=$IMG =="
-docker run -d --name "$NAME" -p 127.0.0.1:$PORT:389 \
+# --network host: every other regress script avoids docker's published-port DNAT
+# (unavailable on hosts without the DOCKER nat chain, issue #40). slapd binds
+# the host's :389 directly; the ready-check already probes 127.0.0.1:389.
+docker run -d --name "$NAME" --network host \
   -e LDAP_ORGANISATION="Helios Test" \
   -e LDAP_DOMAIN="example.org" \
   -e LDAP_ADMIN_PASSWORD="$ADMIN_PW" \

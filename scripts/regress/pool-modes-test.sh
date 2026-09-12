@@ -21,15 +21,17 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="${1:?usage: pool-modes-test.sh <proxy-binary>}"
 CFG="$HERE/proxy-pg-poolmodes.toml"
 IMG="postgres:18.4-bookworm"
+ADMIN=127.0.0.1:9099
 PROXY_HOST=127.0.0.1; PROXY_PORT=6432
 BUSER=bench; BPASS=benchpass; BDB=benchdb
 APP=poolprobe
 
 OUT="${OUT:-/tmp/regress-poolmodes}"; mkdir -p "$OUT"
 LOG="$OUT/proxy.log"
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 ok(){  PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m %s %s\n' "$1" "${2:-}"; }
 bad(){ FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s %s\n' "$1" "${2:-}"; }
+skip(){ SKIP=$((SKIP+1)); printf '  \033[33mSKIP\033[0m %s %s\n' "$1" "${2:-}"; }
 
 # Through the proxy, with a distinctive application_name so we can count the
 # proxy's backend connections in pg_stat_activity.
@@ -66,19 +68,29 @@ reuses=$(grep -c 'reused pooled backend connection' "$LOG")
 
 # 2. RESET proof: a temp table from one autocommit statement is discarded
 # before the next, because the parked connection is DISCARD ALL-reset.
+# Backend capability probe first (issue #41): Nano accepts DISCARD ALL but does
+# not drop temp tables, so the assertion is only meaningful where the backend
+# actually resets. `t` means the temp table was gone after DISCARD ALL.
+reset_capable=$(pP -tAc "create temp table __cap(x int); discard all; select to_regclass('pg_temp.__cap') is null" 2>&1 | tr -d '[:space:]')
 printf 'create temp table pooltmp(x int);\nselect count(*) from pooltmp;\n' > "$OUT/reset.sql"
 rout=$(pP -tA -f /w/reset.sql 2>&1)
-printf '%s\n' "$rout" | grep -qiE 'pooltmp.*does not exist|relation .*pooltmp.* does not exist' \
-  && ok reset_discards_temp_table "(temp table gone after park/reset)" \
-  || bad reset_discards_temp_table "temp table survived (no reset?): $rout"
+if [ "$reset_capable" = "t" ]; then
+  printf '%s\n' "$rout" | grep -qiE 'pooltmp.*does not exist|relation .*pooltmp.* does not exist' \
+    && ok reset_discards_temp_table "(temp table gone after park/reset)" \
+    || bad reset_discards_temp_table "temp table survived (no reset?): $rout"
+else
+  skip reset_discards_temp_table "backend's DISCARD ALL does not drop temp tables (Nano)"
+fi
 
 # 4. RETAIN proof: after the client sessions ended, the proxy still holds a
 # parked backend connection (idle) for this identity, rather than closing it.
+# Read the PROXY's pool stats (issue #42) instead of pg_stat_activity: the
+# admin metric is backend-agnostic and deterministic on Nano too.
 sleep 1
-parked=$(pD -tAc "select count(*) from pg_stat_activity where application_name='$APP'" 2>/dev/null | tr -d '[:space:]')
-[ "${parked:-0}" -ge 1 ] 2>/dev/null && ok connection_parked_for_reuse "(idle backend conns=$parked)" \
-  || bad connection_parked_for_reuse "no parked backend conn (count=$parked)"
+parked=$(curl -s "http://$ADMIN/pools" | jq -r '[.[].idle_connections] | max // 0' 2>/dev/null)
+[ "${parked:-0}" -ge 1 ] 2>/dev/null && ok connection_parked_for_reuse "(proxy idle backend conns=$parked)" \
+  || bad connection_parked_for_reuse "no parked backend conn per /pools (count=$parked)"
 
-echo "== pool-modes: PASS=$PASS FAIL=$FAIL =="
+echo "== pool-modes: PASS=$PASS FAIL=$FAIL SKIP=$SKIP =="
 echo "   (pool log lines:)"; grep 'helios::pool' "$LOG" | sed 's/^/   /' | head -12
 [ "$FAIL" -eq 0 ]

@@ -20,9 +20,10 @@ BUSER=bench; BPASS=benchpass; BDB=benchdb
 
 OUT="${OUT:-/tmp/regress-analytics}"; mkdir -p "$OUT"
 LOG="$OUT/proxy.log"
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 ok(){  PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m %s %s\n' "$1" "${2:-}"; }
 bad(){ FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s %s\n' "$1" "${2:-}"; }
+skip(){ SKIP=$((SKIP+1)); printf '  \033[33mSKIP\033[0m %s %s\n' "$1" "${2:-}"; }
 
 pP(){ docker run --rm --network host -e PGPASSWORD="$BPASS" "$IMG" \
         psql -h $PROXY_HOST -p $PROXY_PORT -U "$BUSER" -d "$BDB" "$@"; }
@@ -45,7 +46,10 @@ done
 pP -tAc "select 1"            >/dev/null 2>&1
 pP -tAc "select 2"           >/dev/null 2>&1
 pP -tAc "select 3"           >/dev/null 2>&1
-pP -tAc "select pg_sleep(0.25)" >/dev/null 2>&1
+# pg_sleep is PostgreSQL-only; Nano has no such function (issue #41). Probe it
+# and SKIP the slow-query assertion below rather than reporting a proxy FAIL.
+slow_ok=0
+if pP -tAc "select pg_sleep(0.25)" >/dev/null 2>&1; then slow_ok=1; fi
 sleep 0.5
 
 json=$(curl -s "http://$ADMIN/api/analytics")
@@ -63,8 +67,12 @@ normseen=$(printf '%s' "$json" | jq -r '[.top_queries[].normalized] | join(" | "
 [ "${maxcalls:-0}" -ge 2 ] 2>/dev/null && ok literals_collapse_to_one_fingerprint "(max calls=$maxcalls)" \
   || bad literals_collapse_to_one_fingerprint "max calls=$maxcalls (expected >=2; normalized: $normseen)"
 
-[ "${slow:-0}" -ge 1 ] 2>/dev/null && ok slow_query_logged "(slow=$slow)" \
-  || bad slow_query_logged "slow_query_count=$slow (expected >=1)"
+if [ "$slow_ok" = 1 ]; then
+  [ "${slow:-0}" -ge 1 ] 2>/dev/null && ok slow_query_logged "(slow=$slow)" \
+    || bad slow_query_logged "slow_query_count=$slow (expected >=1)"
+else
+  skip slow_query_logged "backend has no pg_sleep() (Nano); slow-query log not applicable"
+fi
 
-echo "== analytics: PASS=$PASS FAIL=$FAIL =="
+echo "== analytics: PASS=$PASS FAIL=$FAIL SKIP=$SKIP =="
 [ "$FAIL" -eq 0 ]
