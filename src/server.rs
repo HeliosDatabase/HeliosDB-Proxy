@@ -14783,7 +14783,7 @@ mod tests {
                     );
                 }
             }
-            for failure in [b'T', b'Z'] {
+            for failure in *b"TZ" {
                 let mut writer = PrefixWriter {
                     received: Vec::new(),
                     limit: batch.len() - 5,
