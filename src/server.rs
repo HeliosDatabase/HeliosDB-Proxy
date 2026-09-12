@@ -2516,11 +2516,14 @@ impl ProxyServer {
             // Create admin state
             let admin_state = Arc::new(AdminState::new());
 
-            // H-01: share the daemon's authoritative tracker so `/topology`
-            // reports the same leader the write path uses.
-            admin_state
-                .with_primary_tracker(state.primary_tracker.clone())
-                .await;
+            // H-01/H-02: share the daemon's authoritative tracker only when a
+            // provider is configured; static configs keep the historical
+            // role+health topology response.
+            if state.authoritative_topology {
+                admin_state
+                    .with_primary_tracker(state.primary_tracker.clone())
+                    .await;
+            }
 
             // Initialize config snapshot
             {
@@ -7352,9 +7355,14 @@ impl ProxyServer {
                 tracing::info!(
                     nodes = config.nodes.len(),
                     poll_interval_secs = config.topology.poll_interval_secs,
+                    lease_timeout_secs = config.topology.lease_timeout_secs,
                     "authoritative topology provider enabled: postgres (pg_is_in_recovery polling)"
                 );
-                let tracker = Arc::new(PrimaryTracker::with_provider(provider.clone()));
+                let tracker = Arc::new(
+                    PrimaryTracker::with_provider(provider.clone()).with_lease_timeout(
+                        Duration::from_secs(config.topology.lease_timeout_secs.max(1)),
+                    ),
+                );
                 return (tracker, true, TopologyPoller::Postgres(provider));
             }
         }
@@ -7367,10 +7375,15 @@ impl ProxyServer {
     }
 
     /// Resolve the authoritative provider's leader against the configured
-    /// nodes (H-01). Returns `Some(address)` only when the provider reported
-    /// a leader that is an **enabled** configured node; `None` means the
-    /// write path must wait (fail closed) instead of falling back to roles.
+    /// nodes (H-01/H-02). Returns `Some(address)` only while the tracker's
+    /// authority lease is valid (the provider was reached within
+    /// `topology.lease_timeout_secs`) and the leader is an **enabled**
+    /// configured node; `None` means the write path must wait (fail closed)
+    /// instead of falling back to roles or using stale knowledge.
     fn authoritative_leader(config: &ProxyConfig, tracker: &PrimaryTracker) -> Option<String> {
+        if !tracker.authority_valid() {
+            return None;
+        }
         let addr = tracker.get_primary_address()?;
         config
             .nodes

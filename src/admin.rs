@@ -2027,6 +2027,8 @@ impl AdminServer {
                     address: info.address,
                     epoch: info.epoch,
                     confirmed: info.is_confirmed,
+                    valid: t.authority_valid(),
+                    lease_remaining_ms: t.lease_remaining().map(|d| d.as_millis() as u64),
                 });
             }
         }
@@ -2746,6 +2748,13 @@ struct AuthoritativeTopology {
     address: String,
     epoch: u64,
     confirmed: bool,
+    /// H-02: `false` once the authority lease has expired (the provider was
+    /// not reached within `topology.lease_timeout_secs`).
+    valid: bool,
+    /// Milliseconds left on the authority lease; absent for expired or
+    /// standalone (manual, non-expiring) authority.
+    #[serde(rename = "leaseRemainingMs", skip_serializing_if = "Option::is_none")]
+    lease_remaining_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -3132,6 +3141,9 @@ mod tests {
         assert_eq!(auth.address, "standby.svc:5432");
         assert_eq!(auth.epoch, 1);
         assert!(auth.confirmed);
+        // Standalone/manual authority does not expire and has no lease.
+        assert!(auth.valid);
+        assert!(auth.lease_remaining_ms.is_none());
     }
 
     #[tokio::test]

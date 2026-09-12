@@ -341,6 +341,13 @@ pub struct PrimaryTracker {
     tracking_interval: Duration,
     /// Authority epoch counter (H-01).
     epoch: AtomicU64,
+    /// How long a provider observation stays authoritative without a refresh
+    /// (H-02). Provider-backed trackers only: a manual/standalone authority
+    /// does not expire.
+    lease_timeout: Duration,
+    /// Last time the provider confirmed the current leader (or the primary was
+    /// set manually). `None` before the first observation.
+    last_refresh: RwLock<Option<Instant>>,
 }
 
 impl PrimaryTracker {
@@ -353,6 +360,8 @@ impl PrimaryTracker {
             event_tx,
             tracking_interval: Duration::from_millis(500),
             epoch: AtomicU64::new(0),
+            lease_timeout: Duration::from_secs(10),
+            last_refresh: RwLock::new(None),
         }
     }
 
@@ -365,12 +374,22 @@ impl PrimaryTracker {
             event_tx,
             tracking_interval: Duration::from_millis(500),
             epoch: AtomicU64::new(0),
+            lease_timeout: Duration::from_secs(10),
+            last_refresh: RwLock::new(None),
         }
     }
 
     /// Set tracking interval.
     pub fn with_tracking_interval(mut self, interval: Duration) -> Self {
         self.tracking_interval = interval;
+        self
+    }
+
+    /// Set how long a provider observation stays authoritative without a
+    /// refresh (H-02). Must be non-zero; the caller's config validation
+    /// rejects 0.
+    pub fn with_lease_timeout(mut self, timeout: Duration) -> Self {
+        self.lease_timeout = timeout;
         self
     }
 
@@ -408,6 +427,30 @@ impl PrimaryTracker {
         self.epoch.load(Ordering::Relaxed)
     }
 
+    /// Whether the current authority is still valid (H-02). A provider-backed
+    /// tracker's authority expires `lease_timeout` after the last successful
+    /// provider observation, so a lost provider (or a partitioned control
+    /// path) fails closed instead of authorizing writes on stale knowledge.
+    /// A standalone/manual authority never expires.
+    pub fn authority_valid(&self) -> bool {
+        if self.current_primary.read().is_none() {
+            return false;
+        }
+        if self.provider.is_none() {
+            return true;
+        }
+        self.lease_remaining().is_some()
+    }
+
+    /// Remaining lease, or `None` when the authority has expired or was never
+    /// observed. Standalone/manual trackers have no lease and return `None`.
+    pub fn lease_remaining(&self) -> Option<Duration> {
+        self.provider.as_ref()?;
+        let last = *self.last_refresh.read();
+        let last = last?;
+        self.lease_timeout.checked_sub(last.elapsed())
+    }
+
     /// Set primary manually (or called during switchover).
     pub fn set_primary(&self, node_id: Uuid, address: String) {
         let old_primary = self.current_primary.read().as_ref().map(|p| p.node_id);
@@ -422,6 +465,7 @@ impl PrimaryTracker {
         };
 
         *self.current_primary.write() = Some(new_info);
+        *self.last_refresh.write() = Some(Instant::now());
 
         let _ = self.event_tx.send(PrimaryChangeEvent::Changed {
             old: old_primary,
@@ -442,6 +486,7 @@ impl PrimaryTracker {
             info.is_confirmed = true;
             let node_id = info.node_id;
             drop(guard);
+            *self.last_refresh.write() = Some(Instant::now());
 
             let _ = self
                 .event_tx
@@ -453,6 +498,7 @@ impl PrimaryTracker {
     /// Clear primary (called when primary is lost).
     pub fn clear_primary(&self) {
         let old_primary = self.current_primary.write().take();
+        *self.last_refresh.write() = None;
 
         if let Some(info) = old_primary {
             let _ = self
@@ -513,7 +559,9 @@ impl PrimaryTracker {
 
     fn detect_primary_from_provider(&self, provider: &dyn TopologyProvider) {
         if let Some(primary) = provider.get_primary() {
-            // Only a change of address advances the authority epoch.
+            // A heartbeat on the same address refreshes the lease; only an
+            // address change advances the authority epoch.
+            *self.last_refresh.write() = Some(Instant::now());
             let same = self
                 .current_primary
                 .read()
@@ -558,6 +606,7 @@ impl PrimaryTracker {
         };
 
         *self.current_primary.write() = Some(info);
+        *self.last_refresh.write() = Some(Instant::now());
 
         let _ = self
             .event_tx
@@ -586,11 +635,26 @@ impl PrimaryTracker {
         let current_id = self.current_primary.read().as_ref().map(|p| p.node_id);
 
         if let Some(id) = current_id {
-            if let Some(node) = provider.get_node(id) {
+            let provider_primary = provider.get_primary();
+            if provider_primary.as_ref().map(|p| p.node_id) == Some(id) {
+                // Heartbeat: the provider still reports this leader, so the
+                // authority lease is refreshed (H-02).
+                *self.last_refresh.write() = Some(Instant::now());
+            } else if let Some(node) = provider.get_node(id) {
                 if !node.is_healthy {
                     tracing::warn!("Primary {} is unhealthy in periodic check", id);
                 }
             } else {
+                self.clear_primary();
+            }
+
+            // Loss of authority: the provider reports no primary and the last
+            // observation has expired. Drop the stale leader so the write path
+            // fails closed instead of authorizing on stale knowledge (H-02).
+            if provider_primary.is_none() && !self.authority_valid() {
+                tracing::warn!(
+                    "Primary tracker: authority lease expired with no provider primary; clearing"
+                );
                 self.clear_primary();
             }
         } else {
@@ -621,6 +685,62 @@ mod tests {
     }
 
     #[test]
+    fn test_authority_lease_expires_and_heartbeats_refresh_it() {
+        let topo = Arc::new(MockTopology::new());
+        topo.set_primary(Uuid::new_v4(), "primary-a:5432");
+        let tracker = PrimaryTracker::with_provider(topo.clone())
+            .with_lease_timeout(Duration::from_millis(120));
+
+        assert!(
+            !tracker.authority_valid(),
+            "no provider observation yet: invalid"
+        );
+
+        tracker.detect_primary_from_provider(&*topo);
+        assert!(tracker.authority_valid());
+        assert!(tracker.lease_remaining().is_some());
+
+        // A heartbeat within the lease refreshes it.
+        std::thread::sleep(Duration::from_millis(80));
+        tracker.detect_primary_from_provider(&*topo);
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            tracker.authority_valid(),
+            "same-address heartbeat must refresh the lease"
+        );
+
+        // Stop refreshing: the lease expires and authority fails closed.
+        std::thread::sleep(Duration::from_millis(140));
+        assert!(!tracker.authority_valid());
+        assert!(tracker.lease_remaining().is_none());
+    }
+
+    #[test]
+    fn test_expired_authority_clears_when_provider_loses_primary() {
+        let topo = Arc::new(MockTopology::new());
+        topo.set_primary(Uuid::new_v4(), "primary-a:5432");
+        let tracker = PrimaryTracker::with_provider(topo.clone())
+            .with_lease_timeout(Duration::from_millis(60));
+        tracker.detect_primary_from_provider(&*topo);
+        assert!(tracker.has_primary());
+
+        // Provider loses the primary; within the lease the tracker keeps it
+        // (a brief probe gap must not flap the write path).
+        topo.lose_primary();
+        tracker.periodic_check(&*topo);
+        assert!(tracker.has_primary(), "within lease: not dropped yet");
+
+        // Past the lease, the stale leader is dropped so writes fail closed.
+        std::thread::sleep(Duration::from_millis(90));
+        tracker.periodic_check(&*topo);
+        assert!(
+            !tracker.has_primary(),
+            "expired lease clears the stale leader"
+        );
+        assert!(!tracker.authority_valid());
+    }
+
+    #[test]
     fn test_standalone_primary_tracker() {
         let tracker = PrimaryTracker::new_standalone();
 
@@ -635,6 +755,9 @@ mod tests {
             tracker.get_primary_address(),
             Some("localhost:5432".to_string())
         );
+        // Manual/standalone authority does not expire and has no lease.
+        assert!(tracker.authority_valid());
+        assert!(tracker.lease_remaining().is_none());
 
         // Not confirmed yet
         let info = tracker.get_primary().unwrap();
@@ -648,12 +771,16 @@ mod tests {
         // Clear
         tracker.clear_primary();
         assert!(!tracker.has_primary());
+        assert!(!tracker.authority_valid());
     }
 
     /// Minimal mock topology provider for testing.
     struct MockTopology {
         event_tx: broadcast::Sender<TopologyEvent>,
         primary: RwLock<Option<TopologyNodeInfo>>,
+        /// Known nodes, kept even after they stop being primary so `get_node`
+        /// mirrors the postgres provider (which knows its configured nodes).
+        nodes: RwLock<std::collections::HashMap<Uuid, TopologyNodeInfo>>,
     }
 
     impl MockTopology {
@@ -662,15 +789,24 @@ mod tests {
             Self {
                 event_tx,
                 primary: RwLock::new(None),
+                nodes: RwLock::new(std::collections::HashMap::new()),
             }
         }
 
         fn set_primary(&self, node_id: Uuid, addr: &str) {
-            *self.primary.write() = Some(TopologyNodeInfo {
+            let info = TopologyNodeInfo {
                 node_id,
                 client_addr: addr.to_string(),
                 is_healthy: true,
-            });
+            };
+            self.nodes.write().insert(node_id, info.clone());
+            *self.primary.write() = Some(info);
+        }
+
+        /// Simulate the provider losing track of the primary while the node
+        /// itself remains known (the unreachable/quorum-lost case).
+        fn lose_primary(&self) {
+            *self.primary.write() = None;
         }
     }
 
@@ -684,8 +820,7 @@ mod tests {
         }
 
         fn get_node(&self, id: Uuid) -> Option<TopologyNodeInfo> {
-            let p = self.primary.read();
-            p.as_ref().filter(|n| n.node_id == id).cloned()
+            self.nodes.read().get(&id).cloned()
         }
     }
 
