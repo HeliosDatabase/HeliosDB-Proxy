@@ -1133,6 +1133,13 @@ pub struct ClientSession {
     /// proxy never sees the client's password there, so a fresh connection
     /// can only be opened to a backend that does not challenge (trust).
     pub backend_credential: RwLock<Option<String>>,
+    /// Tables written earlier in the CURRENT explicit transaction, so the
+    /// query cache can re-invalidate them at COMMIT (C-02): a reader may
+    /// refill an entry between the write statement's response and the commit,
+    /// and only a commit-time pass closes that visibility window. Cleared on
+    /// ROLLBACK/ABORT and when the session goes idle outside a transaction.
+    #[cfg(feature = "query-cache")]
+    pub tx_written_tables: std::sync::Mutex<Vec<String>>,
     /// Rich transaction state (tx id, statement log, savepoints) for
     /// Transaction-Replay/library consumers. Only touched on the per-query
     /// path while the session is inside an explicit transaction AND
@@ -1433,6 +1440,26 @@ thread_local! {
 #[cfg(test)]
 fn stmt_fact_classifications() -> usize {
     STMT_FACT_CLASSIFICATIONS.with(std::cell::Cell::get)
+}
+
+/// What the query cache should do after a successfully-executed write
+/// statement (C-02). Produced by [`ProxyServer::cache_invalidation_plan`] and
+/// applied by the simple-query forwarding path.
+#[cfg(feature = "query-cache")]
+#[derive(Debug, PartialEq, Eq)]
+struct CacheInvalidationPlan {
+    /// This statement's normalized tables — always invalidated immediately so
+    /// a write cannot be followed by a stale hit before its commit.
+    immediate: Vec<String>,
+    /// Remember `immediate` in the session's transaction set.
+    stash: bool,
+    /// Re-invalidate the session's staged set now (the statement is a commit
+    /// point): closes the window where a reader refilled between the write and
+    /// its commit.
+    flush_stash: bool,
+    /// Discard the session's staged set (ROLLBACK/ABORT): rolled-back work is
+    /// never presented as committed history.
+    clear_stash: bool,
 }
 
 /// The cheap lexical facts about ONE simple-query statement, memoized so each
@@ -2854,6 +2881,8 @@ impl ProxyServer {
             last_response_unverifiable: std::sync::atomic::AtomicBool::new(false),
             tr_replay_tainted: std::sync::atomic::AtomicBool::new(false),
             backend_credential: RwLock::new(None),
+            #[cfg(feature = "query-cache")]
+            tx_written_tables: std::sync::Mutex::new(Vec::new()),
             tx_state: RwLock::new(TransactionState::default()),
             variables: RwLock::new(HashMap::new()),
             created_at: chrono::Utc::now(),
@@ -5736,12 +5765,51 @@ impl ProxyServer {
             Ok(sent) => {
                 #[cfg(feature = "circuit-breaker")]
                 Self::circuit_record(state, &target, true, "");
-                // Invalidate cached reads referencing tables this write touched.
+                // Invalidate cached reads referencing tables this write touched
+                // (C-02): immediately, and staged for a commit-time re-pass when
+                // the statement runs inside an explicit transaction.
                 #[cfg(feature = "query-cache")]
                 if is_write {
                     if let Some(qc) = state.query_cache.as_ref() {
                         let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
-                        qc.invalidate_query(sql).await;
+                        let tables = qc.query_tables(sql);
+                        let plan = Self::cache_invalidation_plan(
+                            sql,
+                            session.in_transaction.load(Ordering::Relaxed),
+                            &tables,
+                        );
+                        if !plan.immediate.is_empty() {
+                            qc.invalidate_tables(&plan.immediate).await;
+                        }
+                        if plan.stash {
+                            let mut staged = session
+                                .tx_written_tables
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            for table in &plan.immediate {
+                                if !staged.contains(table) {
+                                    staged.push(table.clone());
+                                }
+                            }
+                        }
+                        if plan.flush_stash {
+                            let staged = std::mem::take(
+                                &mut *session
+                                    .tx_written_tables
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner()),
+                            );
+                            if !staged.is_empty() {
+                                qc.invalidate_tables(&staged).await;
+                            }
+                        }
+                        if plan.clear_stash {
+                            session
+                                .tx_written_tables
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clear();
+                        }
                     }
                 }
                 // Edge cache: drop local entries for the touched tables and
@@ -6508,6 +6576,63 @@ impl ProxyServer {
     }
 
     /// Check if SQL query is a write operation
+    /// Decide what the query cache does after a successfully-executed write
+    /// statement (C-02).
+    ///
+    /// Semantics: the tables of the statement are invalidated immediately, and
+    /// when the statement runs inside an explicit transaction they are also
+    /// staged in the session so the commit can re-invalidate them. A concurrent
+    /// reader can refill an entry between the write's response and its COMMIT,
+    /// so only a commit-time pass closes the visibility window. Autocommit
+    /// writes (and the statement that ends a transaction) are their own commit
+    /// point and flush the staged set; ROLLBACK/ABORT discards it.
+    #[cfg(feature = "query-cache")]
+    fn cache_invalidation_plan(
+        sql: &str,
+        in_tx_after: bool,
+        tables: &[String],
+    ) -> CacheInvalidationPlan {
+        use crate::protocol::starts_with_ci;
+        let t = sql.trim();
+        let core = t.strip_suffix(';').unwrap_or(t).trim_end();
+        let rollback = starts_with_ci(core, "ROLLBACK") || starts_with_ci(core, "ABORT");
+        let commit = starts_with_ci(core, "COMMIT")
+            || starts_with_ci(core, "END")
+            || starts_with_ci(core, "COMMIT PREPARED");
+
+        if rollback {
+            return CacheInvalidationPlan {
+                immediate: tables.to_vec(),
+                stash: false,
+                flush_stash: false,
+                clear_stash: true,
+            };
+        }
+        if commit {
+            return CacheInvalidationPlan {
+                immediate: tables.to_vec(),
+                stash: false,
+                flush_stash: true,
+                clear_stash: false,
+            };
+        }
+        if in_tx_after {
+            CacheInvalidationPlan {
+                immediate: tables.to_vec(),
+                stash: true,
+                flush_stash: false,
+                clear_stash: false,
+            }
+        } else {
+            CacheInvalidationPlan {
+                immediate: tables.to_vec(),
+                stash: false,
+                flush_stash: true,
+                clear_stash: false,
+            }
+        }
+    }
+
     fn is_write_query(sql: &str) -> bool {
         use crate::protocol::starts_with_ci;
         let trimmed = sql.trim();
@@ -11407,6 +11532,8 @@ mod tests {
             last_response_unverifiable: std::sync::atomic::AtomicBool::new(false),
             tr_replay_tainted: std::sync::atomic::AtomicBool::new(false),
             backend_credential: RwLock::new(None),
+            #[cfg(feature = "query-cache")]
+            tx_written_tables: std::sync::Mutex::new(Vec::new()),
             tx_state: RwLock::new(TransactionState::default()),
             variables: RwLock::new(HashMap::new()),
             created_at: chrono::Utc::now(),
@@ -12177,6 +12304,45 @@ mod tests {
     #[cfg(feature = "query-cache")]
     mod query_cache {
         use super::ProxyServer;
+
+        #[test]
+        fn cache_invalidation_plan_defers_to_commit() {
+            let tables = vec!["accounts".to_string()];
+
+            // Write inside an explicit transaction: invalidate now AND stage
+            // for the commit-time re-pass.
+            let in_tx = ProxyServer::cache_invalidation_plan(
+                "INSERT INTO accounts VALUES (1)",
+                true,
+                &tables,
+            );
+            assert_eq!(in_tx.immediate, tables);
+            assert!(in_tx.stash && !in_tx.flush_stash && !in_tx.clear_stash);
+
+            // Autocommit write: this response is the commit point.
+            let autocommit =
+                ProxyServer::cache_invalidation_plan("UPDATE accounts SET x = 1", false, &tables);
+            assert!(autocommit.flush_stash && !autocommit.stash);
+
+            // COMMIT/END flush the staged set; ROLLBACK/ABORT discard it.
+            let commit = ProxyServer::cache_invalidation_plan("COMMIT;", false, &[]);
+            assert!(commit.flush_stash && !commit.clear_stash);
+            let end = ProxyServer::cache_invalidation_plan("END", false, &[]);
+            assert!(end.flush_stash && !end.clear_stash);
+            let rollback = ProxyServer::cache_invalidation_plan("ROLLBACK;", false, &[]);
+            assert!(rollback.clear_stash && !rollback.flush_stash);
+            let abort = ProxyServer::cache_invalidation_plan("ABORT", false, &[]);
+            assert!(abort.clear_stash && !abort.flush_stash);
+
+            // A multi-statement string that ends the transaction is idle after
+            // its response: treat it as a commit point.
+            let multi = ProxyServer::cache_invalidation_plan(
+                "INSERT INTO accounts VALUES (1); COMMIT",
+                false,
+                &tables,
+            );
+            assert!(multi.flush_stash && !multi.stash);
+        }
 
         #[test]
         fn plain_selects_are_cacheable() {

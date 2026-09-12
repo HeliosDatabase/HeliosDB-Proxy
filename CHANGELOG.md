@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `leaseRemainingMs`. Docs state the fencing limit explicitly: a proxy-side lease cannot
   fence direct clients and is not a zero-RPO guarantee for async replicas.
 
+### Fixed
+
+- Query-cache invalidation is now commit-aware for simple-query writes (C-02, first
+  slice). The tables a write touches inside an explicit transaction are staged per
+  session and re-invalidated when that transaction COMMITs (discarded on
+  ROLLBACK/ABORT), closing the window where a concurrent reader could refill an entry
+  between the write's response and its commit. Extended-protocol writes, `COPY`, and
+  DDL/unknown dependencies are not yet staged; invalidation for those remains
+  statement-observation plus TTL.
+
 ## [1.8.0] - 2026-09-12
 
 ### Changed

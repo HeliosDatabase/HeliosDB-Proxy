@@ -498,6 +498,15 @@ max_result_bytes = 1048576
 | `ttl_secs` | u64 | `300` | Time-to-live for cached results. |
 | `max_result_bytes` | usize | `1048576` | Largest single result to cache; larger results bypass. |
 
+**Invalidation is commit-aware for simple-query writes (C-02).** A write's tables are
+invalidated when its response completes, and when the write runs inside an explicit
+transaction they are also staged on the session and re-invalidated when that transaction
+COMMITs. This closes the window where a concurrent reader could refill an entry between
+the write's response and its commit; ROLLBACK/ABORT discards the staged set so
+rolled-back work is not re-applied at commit. Extended-protocol writes, `COPY` and
+DDL/unknown dependencies are not yet covered by the staging path — for those, invalidation
+remains statement-observation plus TTL.
+
 ---
 
 ## Lag-Aware Routing (`[lag_routing]`)
