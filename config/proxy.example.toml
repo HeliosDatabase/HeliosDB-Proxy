@@ -27,8 +27,11 @@ listen_address = "${HELIOS_PROXY_LISTEN:-0.0.0.0:6432}"
 admin_address = "${HELIOS_PROXY_ADMIN:-127.0.0.1:9090}"
 
 # Transaction Replay (TR).
-# tr_enabled journals auto-commit writes for the operator-driven replay engine
-# (POST /api/replay; `ha-tr` feature). tr_mode is in-session failover — what a
+# tr_enabled is the TR master switch: journals auto-commit writes for the
+# operator-driven replay engine (POST /api/replay) AND enables in-session
+# failover recovery. TR ships in the default build; there is no cargo feature
+# to add. Setting tr_enabled=false forces the effective mode to `none`.
+# tr_mode is in-session failover — what a
 # live client session experiences when its backend connection fails:
 #   none        -> one ErrorResponse (57P01), connection closed
 #   session     -> connection kept; reconnect to a healthy primary, restore SET

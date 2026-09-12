@@ -108,8 +108,8 @@ Auth column: **token** = requires bearer token when `admin_token` is set; **open
 | `GET` | `/analytics`, `/api/analytics` | Top queries + slow-query log (`?limit=N`) | `query-analytics` | token |
 | `GET` | `/api/chaos` | Read current chaos overrides | — | token |
 | `POST` | `/api/chaos` | Inject/clear a fault (`force_unhealthy`/`restore`/`reset`) | — | token |
-| `POST` | `/api/replay` | Replay a journal window against a target backend | `ha-tr` | token |
-| `POST` | `/api/shadow` | Dual-execute a query and diff the results | `ha-tr` | token |
+| `POST` | `/api/replay` | Replay a journal window against a target backend (503 when `tr_enabled = false`) | *(default build)* | token |
+| `POST` | `/api/shadow` | Dual-execute a query and diff the results | *(default build)* | token |
 | `GET` | `/api/circuit` | Per-node circuit-breaker state | `circuit-breaker` | token |
 | `GET` | `/api/edge` | Edge/geo cache + registered-edge stats | `edge-proxy` | token |
 | `POST` | `/api/edge/register` | Register an edge with the home proxy | `edge-proxy` | token |
@@ -247,7 +247,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 ## Failover & Chaos
 
-Failover between backends is **automatic** (health-driven; in-session Transaction Replay is core and governed by `tr_mode`, while `ha-tr` adds the journal behind `/api/replay`). There is **no `/failover` endpoint.** To *force* a failover for testing, mark a node unhealthy via the chaos API.
+Failover between backends is **automatic** (health-driven; in-session Transaction Replay is governed by `tr_mode` and `tr_enabled`, with the write journal behind `/api/replay` shipping in the default build). There is **no `/failover` endpoint.** To *force* a failover for testing, mark a node unhealthy via the chaos API.
 
 ### GET /api/chaos
 
@@ -437,15 +437,15 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:9090/api/analytic
 
 ---
 
-## HA / Time-Travel (feature `ha-tr`)
+## HA / Time-Travel
 
 ### POST /api/replay
 
-Replay a window of the transaction journal against a target backend (typically a staging DB) — for failover validation, hydrating staging from prod, or forensics. Body is a `ReplayRequestBody`. **`503 {"error":"ha-tr feature not compiled in"}`** without the feature.
+Replay a window of the transaction journal against a target backend (typically a staging DB) — for failover validation, hydrating staging from prod, or forensics. Body is a `ReplayRequestBody`. **`503 {"error":"transaction replay disabled (tr_enabled = false)"}`** when TR is disabled at runtime; Transaction Replay ships in the default build.
 
 ### POST /api/shadow
 
-Run a query against a source **and** a shadow backend in parallel and diff the results — used for major-version-upgrade validation, schema-migration canaries, and replica-drift detection. Body is a `ShadowRequestBody`. **`503`** without the `ha-tr` feature.
+Run a query against a source **and** a shadow backend in parallel and diff the results — used for major-version-upgrade validation, schema-migration canaries, and replica-drift detection. Body is a `ShadowRequestBody`. Available in the default build (not gated by `tr_enabled`).
 
 ---
 
@@ -482,7 +482,9 @@ These routes are always compiled in but return `503 {"error":"traffic mirroring 
 
 ### GET /api/migration/status
 
-Mirror lag/backlog/drop counters plus a `cutover_active` flag.
+Mirror lag/backlog/drop counters plus a `cutover_active` flag. `migration_ready` is
+true only when `lag == 0`, `dropped == 0` **and** `errors == 0`: a mirrored write whose
+apply failed stays visible in both `errors` and `lag`, and blocks an unforced cutover.
 
 ### POST /api/migration/snapshot
 
@@ -627,5 +629,3 @@ Note: `/metrics/prometheus` wraps the exposition text in a JSON `text` field, so
 - [Architecture](architecture.md)
 - [Configuration Reference](configuration.md)
 - [Deployment Guides](deployment/)
-</content>
-</invoke>

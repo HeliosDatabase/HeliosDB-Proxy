@@ -68,18 +68,18 @@ These modules form the minimum viable proxy. They are compiled unconditionally a
 
 ### Transaction Replay
 
-The recovery path a live client takes is **in core** — it needs no feature flag. The
-`ha-tr` feature adds the journal and the operator-driven replay tooling, which are
-separate from that path.
+The recovery path a live client takes and the journal/operator tooling both ship in the
+**default build**. `tr_enabled = false` disables journaling, in-session recovery and the
+`/api/replay` endpoint at runtime.
 
 | Module | Feature Flag | Source | Responsibility |
 |--------|-------------|--------|----------------|
 | In-session recovery | *(core)* | `src/server.rs` | Records statements, session state and a bounded response digest inside a transaction; on a backend fault classifies delivery, re-homes the session, restores `SET` state and replays under one deadline |
 | Replay SQL lexer | *(core)* | `src/replay_sql.rs` | Bounded statement scan: commit boundaries, transaction ends, function calls — decides what may be re-executed |
-| `transaction_journal` | `ha-tr` | `src/transaction_journal.rs` | Post-response journal of write SQL, for operator replay |
-| `failover_replay` | `ha-tr` | `src/failover_replay.rs` | Replay coordinator for embedded/programmatic use |
-| `session_migrate` | `ha-tr` | `src/session_migrate.rs` | Session state capture/restore library. **Not on the recovery path** — the core path does its own `SET` tracking |
-| `cursor_restore` | `ha-tr` | `src/cursor_restore.rs` | Cursor position library. **Not on the recovery path**; cursors are not restored across a failover |
+| `transaction_journal` | *(default)* | `src/transaction_journal.rs` | Post-response journal of write SQL, for operator replay |
+| `failover_replay` | *(default)* | `src/failover_replay.rs` | Replay coordinator for embedded/programmatic use |
+| `session_migrate` | *(default)* | `src/session_migrate.rs` | Session state capture/restore library. **Not on the recovery path** — the core path does its own `SET` tracking |
+| `cursor_restore` | *(default)* | `src/cursor_restore.rs` | Cursor position library. **Not on the recovery path**; cursors are not restored across a failover |
 
 ### Query Intelligence
 
@@ -211,7 +211,7 @@ Client Connection (TCP, PostgreSQL wire protocol)
   +-----------+
   | Pipeline  |  Batch Parse/Bind/Execute for reduced round trips
   | Engine    |  Record statement + response digest when in a transaction (core)
-  |           |  [ha-tr] Journal statement for operator replay
+  |           |  [TR] Journal statement for operator replay
   +-----------+
         |
         v
@@ -298,7 +298,7 @@ Events are broadcast to all subscribers (load balancer, failover controller, swi
 ### What a live session does (core path)
 
 This is what a connected client experiences when its backend dies. It runs in every
-build, with or without `ha-tr`.
+build; `tr_enabled = false` disables it (`tr_mode` is forced to `none`).
 
 ```
 1. Backend fault detected mid-statement
@@ -346,9 +346,9 @@ for embedded use; the standalone daemon does not drive them. They orchestrate:
       |
 5. Best candidate selected, primary tracker updated
       |
-6. [ha-tr] Transaction journal identifies in-flight transactions
+6. [TR] Transaction journal identifies in-flight transactions
       |
-7. [ha-tr] Failover replay re-executes journaled statements on new primary
+7. [TR] Failover replay re-executes journaled statements on new primary
       |
 8. [library, not wired] Session migrate would restore SET parameters and prepared
    statements. The core path restores SET state itself; prepared statements and

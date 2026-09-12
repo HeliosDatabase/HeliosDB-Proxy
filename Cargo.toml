@@ -36,7 +36,10 @@ default = ["pool-modes"]
 # Connection pooling modes (Session/Transaction/Statement)
 pool-modes = []
 
-# Transaction Replay (TR) - failover replay, cursor restore, session migrate
+# Deprecated no-op: Transaction Replay ships in the default build and is
+# toggled at runtime by `tr_enabled` in proxy.toml / `--tr`. The feature name
+# is kept so downstream feature mappings (e.g. Lite's `heliosdb-proxy?/ha-tr`)
+# keep resolving.
 ha-tr = []
 
 # ── Topology providers ──────────────────────────────────────────────
@@ -104,8 +107,11 @@ edge-proxy = ["dep:lru"]
 
 # ── Observability ────────────────────────────────────────────────────
 
-# Full observability (metrics, tracing)
-observability = ["dep:prometheus", "dep:opentelemetry"]
+# Reserved no-op. `/metrics` and `/metrics/prometheus` are always served by the
+# admin API. This feature historically pulled the `prometheus`/`opentelemetry`
+# crates without wiring any code; the unused dependencies were removed to drop
+# the protobuf advisory from the graph. Kept so downstream mappings resolve.
+observability = []
 
 # ── Bundle features ─────────────────────────────────────────────────
 
@@ -164,10 +170,10 @@ arc-swap = "1"
 # O(1) LRU map backing the edge-proxy result cache and the L1 hot query
 # cache. Optional — only compiled with the `edge-proxy` or `query-cache`
 # feature.
-lru = { version = "0.12", optional = true }
+lru = { version = "0.18", optional = true }
 # SO_REUSEPORT for zero-downtime binary handoff (a new process binds the same
 # listen address while the old one drains).
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 
 # Configuration
 config = "0.14"
@@ -192,7 +198,7 @@ rand = "0.8"
 # HTTP (used by auth OAuth introspection + the L3 semantic cache). rustls-tls
 # so HTTPS identity providers (RFC 7662 introspection) work without OpenSSL —
 # consistent with the crate's pure-Rust rustls stack.
-reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 # Compression (used by distribcache tiers)
 zstd = "0.13"
@@ -235,11 +241,7 @@ include_dir = "0.7"
 # default builds don't pay the (~3 MB compiled) cost. The cranelift
 # backend is the JIT; we strip wasi/component-model since the plugin
 # ABI is bare extern "C" exports against linear memory.
-wasmtime = { version = "26", default-features = false, features = ["cranelift", "runtime", "parallel-compilation"], optional = true }
-
-# Optional: Metrics
-prometheus = { version = "0.13", optional = true }
-opentelemetry = { version = "0.21", optional = true }
+wasmtime = { version = "36", default-features = false, features = ["cranelift", "runtime", "parallel-compilation"], optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -280,8 +282,9 @@ name = "protocol"
 harness = false
 
 # Relay / failover / pool-contention in-process paths. No `required-features`:
-# the ha-tr and pool-modes work is `#[cfg]`-gated inside the bench (with no-op
-# fallbacks), so it compiles under every feature set.
+# the pool-modes work is `#[cfg]`-gated inside the bench (with no-op fallbacks),
+# so it compiles under every feature set. The TR journal benches always compile
+# now that TR is in the default build.
 [[bench]]
 name = "relay"
 harness = false

@@ -117,10 +117,9 @@ fn bench_switchover_drain(c: &mut Criterion) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Transaction journal (ha-tr)
+// Transaction journal
 // ─────────────────────────────────────────────────────────────────────
 
-#[cfg(feature = "ha-tr")]
 mod journal_benches {
     use super::*;
     use heliosdb_proxy::transaction_journal::{
@@ -383,24 +382,6 @@ mod journal_benches {
         });
         group.finish();
     }
-}
-
-// When `ha-tr` is disabled, provide no-op stand-ins so the group still resolves.
-#[cfg(not(feature = "ha-tr"))]
-mod journal_benches {
-    use super::*;
-
-    pub fn bench_statement_type_from_sql(c: &mut Criterion) {
-        c.bench_function("journal/noop_requires_ha_tr_feature", |b| {
-            b.iter(|| black_box(42));
-        });
-    }
-    pub fn bench_total_size(_c: &mut Criterion) {}
-    pub fn bench_add_entry(_c: &mut Criterion) {}
-    pub fn bench_rollback_to_savepoint(_c: &mut Criterion) {}
-    pub fn bench_journal_manager(_c: &mut Criterion) {}
-    pub fn bench_journal_contention(_c: &mut Criterion) {}
-    pub fn bench_entries_in_window(_c: &mut Criterion) {}
 }
 
 // ─────────────────────────────────────────────────────────────────────

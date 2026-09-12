@@ -77,12 +77,12 @@ HeliosProxy features are grouped into a connection-routing tier and a programmab
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
 | **Failover Controller** | *(core)* | Automatic failover with candidate ranking by replication lag and configurable promotion policies |
-| **Transaction Replay (TR)** | *(core; journal/replay engine: `ha-tr`)* | `tr_mode` keeps client sessions alive across a backend failure: `session` re-homes the connection to the new primary and restores `SET` state, `select` transparently re-runs interrupted reads, and opt-in `transaction` replays the uncommitted transaction on the new primary and continues. A `COMMIT` with unknown outcome is never retried (client gets SQLSTATE 08007), a replay whose results diverge from what the client already saw is rolled back (40001), and a transaction pinned to a `SERIALIZABLE`/`REPEATABLE READ` snapshot is never replayed. Failing over onto password-protected backends requires the proxy to be the auth boundary (`[auth] mode = "scram"`). `ha-tr` adds the write journal and the operator-driven `/api/replay` engine |
-| **Session Migration** | `ha-tr` | Captures and restores full session state (SET parameters, prepared statements, advisory locks) when moving connections between nodes |
-| **Cursor Restore** | `ha-tr` | Preserves open cursor positions across failover — clients resume fetching without re-executing the query |
+| **Transaction Replay (TR)** | *(default build)* | `tr_mode` keeps client sessions alive across a backend failure: `session` re-homes the connection to the new primary and restores `SET` state, `select` transparently re-runs interrupted reads, and opt-in `transaction` replays the uncommitted transaction on the new primary and continues. A `COMMIT` with unknown outcome is never retried (client gets SQLSTATE 08007), a replay whose results diverge from what the client already saw is rolled back (40001), and a transaction pinned to a `SERIALIZABLE`/`REPEATABLE READ` snapshot is never replayed. Failing over onto password-protected backends requires the proxy to be the auth boundary (`[auth] mode = "scram"`). `tr_enabled = false` turns TR off (journaling, in-session recovery, `/api/replay`) |
+| **Session Migration** | *(default build; library)* | Captures and restores full session state (SET parameters, prepared statements, advisory locks) when moving connections between nodes — not wired into the recovery path |
+| **Cursor Restore** | *(default build; library)* | Preserves open cursor positions across failover — not wired into the recovery path |
 | **Switchover Buffer** | *(core)* | Buffers incoming queries during planned switchover, drains them to the new primary once promotion completes |
 | **Primary Tracker** | *(core)* | Pluggable topology discovery — tracks the current primary via `pg_is_in_recovery()` polling (PostgreSQL), HeliosDB topology events, or manual API calls |
-| **Transaction Journal** | `ha-tr` | Write-ahead journal for in-flight transactions with statement-level granularity, parameter capture, and configurable retention |
+| **Transaction Journal** | *(default build)* | Write-ahead journal for in-flight transactions with statement-level granularity, parameter capture, and configurable retention |
 
 ### Query Intelligence
 
@@ -269,7 +269,7 @@ export DATABASE_URL="postgres://myapp:password@localhost:6432/mydb"
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `pool-modes` | Yes | Session, Transaction, and Statement connection pooling |
-| `ha-tr` | No | Transaction Replay **journal and operator tooling** (`/api/replay`, `/api/shadow`, failover library). In-session replay is core — see the Transaction Replay row above |
+| `ha-tr` | n/a | **Deprecated no-op.** Transaction Replay ships in the default build and is toggled by `tr_enabled` in `proxy.toml` — see the Transaction Replay row above |
 | `query-cache` | No | L1/L2/L3 multi-tier query result caching |
 | `routing-hints` | No | SQL comment-based query routing hints |
 | `lag-routing` | No | Replica lag-aware routing with read-your-writes |
@@ -287,7 +287,7 @@ export DATABASE_URL="postgres://myapp:password@localhost:6432/mydb"
 | `edge-proxy` | No | Cache-first edge / geo proxy mode with last-write-wins TTL coherence |
 | `postgres-topology` | No | PostgreSQL primary discovery via `pg_is_in_recovery()` |
 | `heliosdb-topology` | No | HeliosDB native topology integration |
-| `observability` | No | Pulls in the `prometheus` and `opentelemetry` crates as dependencies; it does not itself wire any metrics or tracing. The `/metrics` and `/metrics/prometheus` admin endpoints are always available regardless of this flag |
+| `observability` | No | Reserved no-op. It does not pull any dependency or wire any metrics/tracing; `/metrics` and `/metrics/prometheus` are always available regardless of this flag |
 | `ldap-auth` | No | LDAP directory authentication (search + bind) inside `auth-proxy`; pulls the `ldap3` client. Enable in addition to `auth-proxy` for directory-backed auth |
 | `all-features` | No | Enables all proxy features (choose a topology provider separately) |
 | `msrv-features` | No | MSRV verification bundle — `all-features` minus `wasm-plugins` and `ldap-auth` so the Rust 1.86 `cargo check` step compiles in reasonable time |
@@ -301,8 +301,8 @@ cargo build --release
 # Production — all features with PostgreSQL topology
 cargo build --release --features "all-features,postgres-topology"
 
-# Lightweight — pooling + failover only
-cargo build --release --features "pool-modes,ha-tr"
+# Lightweight — pooling only (Transaction Replay is always in the default build)
+cargo build --release --features "pool-modes"
 
 # With HeliosDB integration
 cargo build --release --features "all-features,heliosdb-topology"

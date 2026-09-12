@@ -1703,6 +1703,17 @@ impl ProxyConfig {
         Duration::from_secs(self.write_timeout_secs)
     }
 
+    /// Effective in-session Transaction Replay mode. `tr_enabled = false`
+    /// forces `TrMode::None`: the boolean is the master switch for TR, which
+    /// ships in the default build (there is no `ha-tr` compile gate).
+    pub fn effective_tr_mode(&self) -> TrMode {
+        if self.tr_enabled {
+            self.tr_mode
+        } else {
+            TrMode::None
+        }
+    }
+
     /// Load configuration from file
     pub fn from_file(path: &str) -> Result<Self> {
         let path = Path::new(path);
@@ -2451,6 +2462,26 @@ mod tests {
         let config = ProxyConfig::default();
         assert_eq!(config.listen_address, "0.0.0.0:5432");
         assert!(config.tr_enabled);
+    }
+
+    #[test]
+    fn effective_tr_mode_tracks_tr_enabled() {
+        let config = ProxyConfig {
+            tr_mode: TrMode::Transaction,
+            ..ProxyConfig::default()
+        };
+        assert_eq!(config.effective_tr_mode(), TrMode::Transaction);
+
+        let disabled = ProxyConfig {
+            tr_enabled: false,
+            tr_mode: TrMode::Transaction,
+            ..ProxyConfig::default()
+        };
+        assert_eq!(
+            disabled.effective_tr_mode(),
+            TrMode::None,
+            "tr_enabled = false must force TR off even when tr_mode requests replay"
+        );
     }
 
     #[test]

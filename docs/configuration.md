@@ -152,7 +152,7 @@ shutdown_drain_timeout_secs = 60
 | `admin_address` | string | `"127.0.0.1:9090"` | Address/port for the admin HTTP API. Loopback by default. *(Required in a config file.)* |
 | `admin_token` | string | *(none)* | Bearer token required on every admin endpoint except liveness probes. See [Admin API Security](#admin-api-security). |
 | `admin_allow_insecure` | bool | `false` | Explicit opt-in to expose the admin API on a non-loopback address **without** a token. |
-| `tr_enabled` | bool | `true` | Enable Transaction Replay. *(Required in a config file.)* |
+| `tr_enabled` | bool | `true` | Master switch for Transaction Replay, which ships in the default build. When `false`: the write journal stops recording, `tr_mode` is forced to `none`, and `POST /api/replay` returns `503`. *(Required in a config file.)* |
 | `tr_mode` | string | `"session"` | Transaction Replay mode: `none`, `session`, `select`, `transaction`. *(Required in a config file.)* |
 | `tr_read_functions` | array of string | `[]` | TR-03 read re-execution policy extension. In-session replay re-executes an interrupted read on an unknown outcome only when every function it calls is a PostgreSQL built-in known to be side-effect-free; list additional provably pure functions (unqualified names, case-insensitive) here. Reads calling anything else, quoted-identifier calls, `SELECT … INTO`, and sequence functions are classified as opaque and never re-executed. |
 | `write_timeout_secs` | u64 | `30` | Seconds to buffer writes during failover before returning an error — and, since 1.7.0, the **single deadline for a whole session recovery**: waiting for a primary, connect/auth, session-state restore and replay all draw on it, instead of each having its own timeout. |
@@ -167,9 +167,10 @@ listed below is optional and defaults to disabled/off.
 
 `tr_mode` governs **in-session failover**: what a live client session experiences
 when its backend connection fails while a request is in flight (write error /
-timeout, read error, EOF, reset) or dies while idle. It is independent of
-`tr_enabled` (the write journal for the operator-driven `POST /api/replay`
-engine) and needs no cargo feature. Two fault phases are distinguished:
+timeout, read error, EOF, reset) or dies while idle. It needs no cargo feature —
+Transaction Replay is in the default build — but `tr_enabled = false` forces the
+effective mode to `none` and disables the operator-driven `POST /api/replay`
+engine at the same time. Two fault phases are distinguished:
 **not-delivered** (the request never reached the backend — it certainly did not
 run) and **outcome-unknown** (written, then the connection failed before
 `ReadyForQuery`).

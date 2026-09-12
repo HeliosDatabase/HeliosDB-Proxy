@@ -5,6 +5,45 @@ All notable changes to HeliosProxy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Transaction Replay now ships in the default build.** The `ha-tr` cargo feature
+  becomes a deprecated no-op (kept so downstream feature mappings still resolve);
+  the TR modules (transaction journal, replay engine, cursor restore, session
+  migrate, upgrade orchestrator, shadow execution) are always compiled.
+  `tr_enabled` is the runtime master switch: setting it to `false` stops write
+  journaling, forces the effective `tr_mode` to `none` (so in-session recovery is
+  disabled), and makes `POST /api/replay` return `503`. `POST /api/shadow` remains
+  available because it is an explicit validation tool, not part of failover.
+
+- Dependency security updates: `reqwest` 0.11 → 0.12 (rustls 0.23 stack), which
+  removes rustls-webpki 0.101.7 and h2 0.3.27 from the graph; `wasmtime` 26 → 36.0.15,
+  which clears all 17 wasmtime advisories; `lru` 0.12 → 0.18.4 (RUSTSEC-2026-0002,
+  RUSTSEC-2026-0253); `anyhow` ≥ 1.0.103 and `crossbeam-epoch` ≥ 0.9.20. `socket2`
+  now declares the `all` feature explicitly instead of relying on another
+  dependency's feature unification.
+
+- Removed the unused `prometheus` and `opentelemetry` optional dependencies (they
+  were declared but referenced nowhere in `src/`, and `prometheus` pulled
+  `protobuf` 2.28.0 with RUSTSEC-2024-0437). The `observability` feature name is
+  kept as a documented no-op; `/metrics` and `/metrics/prometheus` were always
+  served independently of it.
+
+- `docs/transaction-replay.md` no longer claims Transaction Replay lives behind the
+  `ha-tr` feature; the Feature Gating section now describes build and runtime gating.
+
+### Fixed
+
+- `GET /api/migration/status` no longer masks apply errors: `lag` is reported as
+  accepted-but-not-applied without subtracting failed applies, and
+  `migration_ready` now requires zero errors and zero drops. A mirror whose writes
+  failed to apply can no longer report safe-to-cut-over (#44).
+
+- Removed stray `</content>` / `</invoke>` tool-call tags from the end of four docs
+  and corrected the stale `ha-tr` description in `Cargo.toml` (#55).
+
 ## [1.7.0] - 2026-09-11
 
 Transaction Replay correctness is complete. Replay now verifies its own results,
