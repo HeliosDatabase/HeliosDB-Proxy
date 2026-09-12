@@ -752,6 +752,8 @@ struct ResolvedLimits {
     backend_response_timeout: Option<Duration>,
     /// TR-06 observation digest byte budget per recorded statement.
     tr_max_observation_bytes: usize,
+    /// Overall operator-replay deadline (O-04); `None` when disabled (`0`).
+    replay_deadline: Option<Duration>,
     /// Only read on the pool-modes data path; gated to avoid a dead-field
     /// warning on feature-off builds.
     #[cfg(feature = "pool-modes")]
@@ -800,6 +802,8 @@ impl ResolvedLimits {
             backend_response_timeout: (l.backend_response_timeout_secs > 0)
                 .then(|| Duration::from_secs(l.backend_response_timeout_secs)),
             tr_max_observation_bytes: l.tr_max_observation_bytes,
+            replay_deadline: (l.replay_deadline_secs > 0)
+                .then(|| Duration::from_secs(l.replay_deadline_secs)),
             #[cfg(feature = "pool-modes")]
             max_total_idle_backend_conns: l.max_total_idle_backend_conns,
             pool_reap_interval: Duration::from_secs(l.pool_reap_interval_secs),
@@ -2641,10 +2645,10 @@ impl ProxyServer {
             // target_database fields.
             {
                 let template = build_replay_backend_template(&config);
-                let engine = Arc::new(crate::replay::ReplayEngine::new(
-                    state.transaction_journal.clone(),
-                    template,
-                ));
+                let engine = Arc::new(
+                    crate::replay::ReplayEngine::new(state.transaction_journal.clone(), template)
+                        .with_deadline(state.limits.replay_deadline),
+                );
                 admin_state.with_replay_engine(engine).await;
             }
 
@@ -3701,7 +3705,11 @@ impl ProxyServer {
                                     }
                                     stmt_registry.insert(name.clone(), encoded);
                                     stmt_registry_bytes = projected;
-                                    batch_defines.push(name);
+                                    Self::remember_batch_name(
+                                        &mut batch_defines,
+                                        &name,
+                                        state.limits.max_prepared_statements,
+                                    );
                                 }
                                 if pending_route_sql.is_none() {
                                     if let Some(end) = msg.payload.iter().position(|&b| b == 0) {
@@ -3797,17 +3805,29 @@ impl ProxyServer {
                                     edge_batch_bound_unnamed = true;
                                 }
                                 if let Some(name) = stmt_ref {
-                                    batch_refs.push(name.to_string());
+                                    Self::remember_batch_name(
+                                        &mut batch_refs,
+                                        name,
+                                        state.limits.max_prepared_statements,
+                                    );
                                 }
                             }
                             MessageType::Describe => {
                                 if let Some(name) = Self::stmt_kind_name(&msg.payload) {
-                                    batch_refs.push(name.to_string());
+                                    Self::remember_batch_name(
+                                        &mut batch_refs,
+                                        name,
+                                        state.limits.max_prepared_statements,
+                                    );
                                 }
                             }
                             MessageType::Close => {
                                 if let Some(name) = Self::stmt_kind_name(&msg.payload) {
-                                    batch_closes.push(name.to_string());
+                                    Self::remember_batch_name(
+                                        &mut batch_closes,
+                                        name,
+                                        state.limits.max_prepared_statements,
+                                    );
                                 }
                             }
                             _ => {}
@@ -6633,6 +6653,17 @@ impl ProxyServer {
         }
     }
 
+    /// Append `name` to a per-cycle extended-batch tracker at most once,
+    /// bounded by the session's named-statement cap (O-05). A client that
+    /// never sends Sync cannot grow `batch_refs`/`batch_defines`/`batch_closes`
+    /// without bound, and the re-prepare filter stays linear in the cap.
+    fn remember_batch_name(list: &mut Vec<String>, name: &str, cap: usize) {
+        if list.len() >= cap || list.iter().any(|n| n == name) {
+            return;
+        }
+        list.push(name.to_string());
+    }
+
     fn is_write_query(sql: &str) -> bool {
         use crate::protocol::starts_with_ci;
         let trimmed = sql.trim();
@@ -7846,14 +7877,28 @@ impl ProxyServer {
     }
 
     fn create_severity_response(severity: &str, code: &str, message: &str) -> Vec<u8> {
-        let mut fields = HashMap::new();
-        fields.insert('S', severity.to_string());
-        fields.insert('V', severity.to_string());
-        fields.insert('C', code.to_string());
-        fields.insert('M', message.to_string());
+        // One allocation, no HashMap + four Strings per error frame (O-05).
+        // Framing is byte-identical to `ErrorResponse { fields }.encode()
+        // .encode()`: 'E' tag, u32 length (payload + 4), fields S/V/C/M each
+        // followed by NUL, then the payload terminator.
+        let mut payload = Vec::with_capacity(16 + severity.len() * 2 + code.len() + message.len());
+        for (field, value) in [
+            ('S', severity),
+            ('V', severity),
+            ('C', code),
+            ('M', message),
+        ] {
+            payload.push(field as u8);
+            payload.extend_from_slice(value.as_bytes());
+            payload.push(0);
+        }
+        payload.push(0);
 
-        let err = ErrorResponse { fields };
-        err.encode().encode().to_vec()
+        let mut frame = Vec::with_capacity(payload.len() + 5);
+        frame.push(b'E');
+        frame.extend_from_slice(&((payload.len() + 4) as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
     }
 
     /// Create a `ReadyForQuery` frame with the given transaction-status byte
@@ -15837,6 +15882,42 @@ mod tests {
             tracker.set_primary(uuid::Uuid::new_v4(), "primary-a:5432".to_string());
             config.nodes[0].enabled = false;
             assert_eq!(ProxyServer::authoritative_leader(&config, &tracker), None);
+        }
+
+        #[test]
+        fn remember_batch_name_dedups_and_caps() {
+            let mut list: Vec<String> = Vec::new();
+            ProxyServer::remember_batch_name(&mut list, "s1", 3);
+            ProxyServer::remember_batch_name(&mut list, "s1", 3);
+            ProxyServer::remember_batch_name(&mut list, "s2", 3);
+            ProxyServer::remember_batch_name(&mut list, "s3", 3);
+            ProxyServer::remember_batch_name(&mut list, "s4", 3);
+            assert_eq!(
+                list,
+                vec!["s1".to_string(), "s2".to_string(), "s3".to_string()]
+            );
+        }
+
+        #[test]
+        fn severity_response_frames_fields_once() {
+            let bytes = ProxyServer::create_severity_response("ERROR", "57P01", "backend down");
+            assert_eq!(bytes[0], b'E');
+            let len = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
+            assert_eq!(len + 1, bytes.len(), "frame length covers payload + itself");
+            let payload = &bytes[5..];
+            for field in [
+                b"SERROR\0".as_slice(),
+                b"VERROR\0".as_slice(),
+                b"C57P01\0".as_slice(),
+                b"Mbackend down\0".as_slice(),
+            ] {
+                assert!(
+                    payload.windows(field.len()).any(|w| w == field),
+                    "missing field {:?}",
+                    field
+                );
+            }
+            assert_eq!(*payload.last().unwrap(), 0, "payload terminator");
         }
 
         #[tokio::test]

@@ -29,6 +29,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `BackendConfig.query_timeout` is now honored on every management query (O-02).
+  `BackendClient::run_query` used a hardcoded 30 s while the configured value was set by
+  every caller and never read; the resolved timeout is captured at connect and a zero
+  value keeps the 30 s default.
+
+- Operator replay has an overall deadline and no longer stalls live journal writers
+  (O-04). `TransactionJournal::entries_in_window` clones under the lock and sorts after
+  releasing it; `[limits] replay_deadline_secs` (default 300, 0 = off) bounds the whole
+  `POST /api/replay` run, which stops cleanly at the current statement and reports
+  `deadline_exceeded` + partial progress.
+
+- Extended-batch tracking is bounded and error frames allocate once (O-05).
+  `batch_refs`/`batch_defines`/`batch_closes` now de-duplicate and cap at the configured
+  `max_prepared_statements` (a never-Sync client can no longer grow them without bound,
+  and the re-prepare filter stays linear), and `create_severity_response` builds the
+  `ErrorResponse` frame directly instead of a `HashMap` plus four `String`s.
+
 - Operator/failover replay no longer reports success without a backend (TR-07).
   `FailoverReplay::execute_statement` returns an explicit failure when no backend
   template/endpoint is configured, `wait_for_wal_sync` refuses a non-zero LSN it cannot

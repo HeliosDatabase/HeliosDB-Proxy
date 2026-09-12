@@ -52,9 +52,12 @@ pub struct ReplaySummary {
     pub statements_replayed: u64,
     /// Statements that failed (first error preserved in `first_error`).
     pub failures: u64,
-    /// True when at least one statement failed: the target received a partial
-    /// history and must not be treated as a faithful copy of the source.
+    /// True when at least one statement failed or the overall deadline cut the
+    /// run short: the target received a partial history and must not be treated
+    /// as a faithful copy of the source.
     pub partial: bool,
+    /// True when the overall replay deadline (O-04) stopped the run early.
+    pub deadline_exceeded: bool,
     /// Wall-clock duration of the replay.
     pub elapsed_ms: u64,
     /// The window that was replayed.
@@ -72,6 +75,8 @@ pub struct ReplayEngine {
     journal: Arc<TransactionJournal>,
     /// Template BackendConfig; host/port are swapped per `TimeTravelRequest`.
     backend_template: BackendConfig,
+    /// Overall wall-clock budget for one replay (O-04). `None` = unbounded.
+    deadline: Option<std::time::Duration>,
 }
 
 impl ReplayEngine {
@@ -79,6 +84,41 @@ impl ReplayEngine {
         Self {
             journal,
             backend_template,
+            deadline: None,
+        }
+    }
+
+    /// Bound one whole replay run. `None` leaves it unbounded. When the
+    /// deadline expires the engine stops cleanly at the current statement and
+    /// reports `deadline_exceeded` + partial progress (O-04).
+    pub fn with_deadline(mut self, deadline: Option<std::time::Duration>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    fn remaining(
+        start: std::time::Instant,
+        deadline: Option<std::time::Duration>,
+    ) -> Option<std::time::Duration> {
+        deadline.map(|d| d.saturating_sub(start.elapsed()))
+    }
+
+    /// Early-return summary for a deadline that expired before any work ran.
+    fn deadline_summary(
+        req: &TimeTravelRequest,
+        start: std::time::Instant,
+        detail: String,
+    ) -> ReplaySummary {
+        ReplaySummary {
+            mode: "time_window",
+            statements_replayed: 0,
+            failures: 0,
+            partial: true,
+            deadline_exceeded: true,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            from: req.from,
+            to: req.to,
+            first_error: Some(detail),
         }
     }
 
@@ -124,12 +164,47 @@ impl ReplayEngine {
         }
 
         let start = std::time::Instant::now();
-        let mut client = BackendClient::connect(&cfg)
-            .await
-            .map_err(|e| ProxyError::ReplayFailed(format!("connect to target: {}", e)))?;
+
+        // O-04: the overall deadline also bounds connecting.
+        let connect = BackendClient::connect(&cfg);
+        let mut client = match Self::remaining(start, self.deadline) {
+            Some(remaining) if remaining.is_zero() => {
+                return Ok(Self::deadline_summary(
+                    req,
+                    start,
+                    format!(
+                        "replay deadline of {:?} exceeded before connecting to {}:{}",
+                        self.deadline.unwrap_or_default(),
+                        req.target_host,
+                        req.target_port
+                    ),
+                ))
+            }
+            Some(remaining) => match tokio::time::timeout(remaining, connect).await {
+                Ok(r) => {
+                    r.map_err(|e| ProxyError::ReplayFailed(format!("connect to target: {}", e)))?
+                }
+                Err(_) => {
+                    return Ok(Self::deadline_summary(
+                        req,
+                        start,
+                        format!(
+                            "replay deadline of {:?} exceeded while connecting to {}:{}",
+                            self.deadline.unwrap_or_default(),
+                            req.target_host,
+                            req.target_port
+                        ),
+                    ))
+                }
+            },
+            None => connect
+                .await
+                .map_err(|e| ProxyError::ReplayFailed(format!("connect to target: {}", e)))?,
+        };
 
         let mut statements_replayed: u64 = 0;
         let mut failures: u64 = 0;
+        let mut deadline_exceeded = false;
         let mut first_error: Option<String> = None;
 
         for (tx_id, entry) in entries {
@@ -139,10 +214,45 @@ impl ReplayEngine {
                 .map(journal_value_to_param)
                 .collect();
 
-            let outcome = if params.is_empty() {
-                client.simple_query(&entry.statement).await
-            } else {
-                client.query_with_params(&entry.statement, &params).await
+            let statement = async {
+                if params.is_empty() {
+                    client.simple_query(&entry.statement).await
+                } else {
+                    client.query_with_params(&entry.statement, &params).await
+                }
+            };
+
+            // O-04: stop starting new statements once the budget is spent, and
+            // bound the in-flight statement by the remaining budget.
+            let outcome = match Self::remaining(start, self.deadline) {
+                Some(remaining) if remaining.is_zero() => {
+                    deadline_exceeded = true;
+                    first_error.get_or_insert_with(|| {
+                        format!(
+                            "replay deadline of {:?} exceeded at tx {} seq {}",
+                            self.deadline.unwrap_or_default(),
+                            tx_id,
+                            entry.sequence
+                        )
+                    });
+                    break;
+                }
+                Some(remaining) => match tokio::time::timeout(remaining, statement).await {
+                    Ok(res) => res,
+                    Err(_) => {
+                        deadline_exceeded = true;
+                        first_error.get_or_insert_with(|| {
+                            format!(
+                                "replay deadline of {:?} exceeded at tx {} seq {}",
+                                self.deadline.unwrap_or_default(),
+                                tx_id,
+                                entry.sequence
+                            )
+                        });
+                        break;
+                    }
+                },
+                None => statement.await,
             };
 
             match outcome {
@@ -170,7 +280,8 @@ impl ReplayEngine {
             mode: "time_window",
             statements_replayed,
             failures,
-            partial: failures > 0,
+            partial: failures > 0 || deadline_exceeded,
+            deadline_exceeded,
             elapsed_ms: start.elapsed().as_millis() as u64,
             from: req.from,
             to: req.to,
@@ -402,6 +513,7 @@ mod tests {
             statements_replayed: 5,
             failures: 1,
             partial: true,
+            deadline_exceeded: false,
             elapsed_ms: 42,
             from: Utc::now(),
             to: Utc::now(),
@@ -412,7 +524,32 @@ mod tests {
         assert!(j.contains("\"statements_replayed\":5"));
         assert!(j.contains("\"failures\":1"));
         assert!(j.contains("\"partial\":true"));
+        assert!(j.contains("\"deadline_exceeded\":false"));
         assert!(j.contains("oops"));
+    }
+
+    #[tokio::test]
+    async fn test_replay_deadline_stops_before_connect() {
+        // Zero budget: the engine must stop cleanly, report partial progress
+        // and NOT attempt (or claim) a connection (O-04).
+        let journal = Arc::new(TransactionJournal::new());
+        let engine =
+            ReplayEngine::new(journal, test_template()).with_deadline(Some(Duration::ZERO));
+        let now = Utc::now();
+        let req = TimeTravelRequest {
+            from: now - chrono::Duration::minutes(1),
+            to: now,
+            target_host: "127.0.0.1".into(),
+            target_port: 1, // would be refused if we connected
+            target_user: None,
+            target_password: None,
+            target_database: None,
+        };
+        let summary = engine.replay_window(&req).await.unwrap();
+        assert!(summary.deadline_exceeded);
+        assert!(summary.partial);
+        assert_eq!(summary.statements_replayed, 0);
+        assert!(summary.first_error.unwrap_or_default().contains("deadline"));
     }
 
     #[tokio::test]
