@@ -450,6 +450,17 @@ impl QueryCache {
         }
     }
 
+    /// The tables a (write) query references, without invalidating anything.
+    ///
+    /// Used by the commit-aware invalidation path (C-02): the tables touched
+    /// inside an explicit transaction are remembered per session and
+    /// re-invalidated when that transaction COMMITs, closing the window where
+    /// a concurrent reader could refill an entry between the write statement
+    /// and its commit.
+    pub fn query_tables(&self, sql: &str) -> Vec<String> {
+        self.normalizer.normalize(sql).tables
+    }
+
     /// Invalidate cache entries for specific tables
     pub async fn invalidate_tables(&self, tables: &[String]) {
         for table in tables {
