@@ -1085,9 +1085,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.total_transactions, 1);
-        assert_eq!(result.successful_replays, 1);
-        assert_eq!(result.failed_replays, 0);
-        assert!(result.all_successful());
+        // TR-07: coordinated replay constructs its FailoverReplay without a
+        // backend template, so it must report failure -- never a synthetic
+        // success for a replay that never executed.
+        assert_eq!(result.successful_replays, 0);
+        assert_eq!(result.failed_replays, 1);
+        assert!(!result.all_successful());
     }
 
     #[test]

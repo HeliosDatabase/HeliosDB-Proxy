@@ -43,10 +43,18 @@ pub struct TimeTravelRequest {
 /// Summary of a replay run.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReplaySummary {
+    /// Replay mode. Always `"time_window"`: this engine re-executes journaled
+    /// SQL text in timestamp order. It does NOT reconstruct committed
+    /// transactions (boundaries, rollbacks, outcomes) — that is a separate,
+    /// not-yet-shipped capability (TR-07).
+    pub mode: &'static str,
     /// Number of statements actually executed on the target.
     pub statements_replayed: u64,
     /// Statements that failed (first error preserved in `first_error`).
     pub failures: u64,
+    /// True when at least one statement failed: the target received a partial
+    /// history and must not be treated as a faithful copy of the source.
+    pub partial: bool,
     /// Wall-clock duration of the replay.
     pub elapsed_ms: u64,
     /// The window that was replayed.
@@ -85,6 +93,11 @@ impl ReplayEngine {
     pub async fn replay_window(&self, req: &TimeTravelRequest) -> Result<ReplaySummary> {
         if req.from > req.to {
             return Err(ProxyError::Internal("replay window: from > to".to_string()));
+        }
+        if req.target_host.trim().is_empty() || req.target_port == 0 {
+            return Err(ProxyError::ReplayFailed(
+                "target host and port are required for an operator replay".to_string(),
+            ));
         }
 
         let entries = self.journal.entries_in_window(req.from, req.to).await;
@@ -154,8 +167,10 @@ impl ReplayEngine {
         client.close().await;
 
         Ok(ReplaySummary {
+            mode: "time_window",
             statements_replayed,
             failures,
+            partial: failures > 0,
             elapsed_ms: start.elapsed().as_millis() as u64,
             from: req.from,
             to: req.to,
@@ -383,16 +398,38 @@ mod tests {
     #[test]
     fn test_replay_summary_serializes() {
         let s = ReplaySummary {
+            mode: "time_window",
             statements_replayed: 5,
             failures: 1,
+            partial: true,
             elapsed_ms: 42,
             from: Utc::now(),
             to: Utc::now(),
             first_error: Some("oops".into()),
         };
         let j = serde_json::to_string(&s).unwrap();
+        assert!(j.contains("\"mode\":\"time_window\""));
         assert!(j.contains("\"statements_replayed\":5"));
         assert!(j.contains("\"failures\":1"));
+        assert!(j.contains("\"partial\":true"));
         assert!(j.contains("oops"));
+    }
+
+    #[tokio::test]
+    async fn test_replay_requires_a_target() {
+        let journal = Arc::new(TransactionJournal::new());
+        let engine = ReplayEngine::new(journal, test_template());
+        let now = Utc::now();
+        let req = TimeTravelRequest {
+            from: now - chrono::Duration::minutes(1),
+            to: now,
+            target_host: "   ".into(),
+            target_port: 5432,
+            target_user: None,
+            target_password: None,
+            target_database: None,
+        };
+        let err = engine.replay_window(&req).await.unwrap_err();
+        assert!(matches!(err, ProxyError::ReplayFailed(_)));
     }
 }

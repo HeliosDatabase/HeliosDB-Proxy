@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Operator/failover replay no longer reports success without a backend (TR-07).
+  `FailoverReplay::execute_statement` returns an explicit failure when no backend
+  template/endpoint is configured, `wait_for_wal_sync` refuses a non-zero LSN it cannot
+  verify, and `/api/replay` rejects a blank target. `ReplaySummary` now labels the run
+  `mode: "time_window"` with `partial: true` on failures, and the docs state the journal's
+  real retention (in-memory, bounded, nothing survives restart) and keep operator
+  time-window replay explicitly distinct from committed-history replay.
+
 - Query-cache invalidation is now commit-aware for simple-query writes (C-02, first
   slice). The tables a write touches inside an explicit transaction are staged per
   session and re-invalidated when that transaction COMMITs (discarded on

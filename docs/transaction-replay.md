@@ -318,16 +318,16 @@ helpers.
 > **What this actually does today.** `coordinate_failover_replay` builds its
 > `FailoverReplay` via `FailoverReplay::new(ReplayConfig { .. })` and never calls
 > `with_backend_template` or `register_endpoint` on it — there is no API to attach a
-> backend to the instance it constructs. Every statement therefore takes the skeleton
-> path above (`execute_statement` returns `(true, true, true, None)` without opening a
-> connection), so **no statement is executed against the new primary** and each
-> per-transaction result reports success unconditionally. Likewise `wait_for_lsn_catchup`
-> does **not** query `pg_last_wal_replay_lsn()`; it polls the tracked candidate's
-> in-memory `lag_bytes` (code comment: "In a real implementation, we'd query the node's
-> current LSN") and returns immediately when `target_lsn == 0` — always the case for
-> hot-path journals, since `journal_write` records `start_lsn = 0`. Coordinated replay is
-> wired end-to-end, but its executing half is a no-op until a backend is attached to the
-> `FailoverReplay` it creates.
+> backend to the instance it constructs. Since TR-07 every statement therefore returns a
+> **failure** ("no backend configured … refusing to report a replay that never executed")
+> instead of the old synthetic success, so `successful_replays` is `0` and the coordinated
+> result is honestly failed. Likewise `wait_for_lsn_catchup` does **not** query
+> `pg_last_wal_replay_lsn()`; it polls the tracked candidate's in-memory `lag_bytes` (code
+> comment: "In a real implementation, we'd query the node's current LSN") and returns
+> immediately when `target_lsn == 0` — always the case for hot-path journals, since
+> `journal_write` records `start_lsn = 0`. Coordinated replay is wired end-to-end, but its
+> executing half is inert until a backend is attached to the `FailoverReplay` it creates;
+> until then it fails rather than claims success.
 
 ### 4. Switchover Buffer
 
@@ -367,6 +367,22 @@ counts are part of the journal model but are not populated by the forwarding pat
 This applies to the write journal, **not** to in-session recovery: that path records its
 own per-statement response digest and verifies it during replay (see
 [In-session replay](#in-session-replay-the-core-path)).
+
+**Retention is honest (TR-07):** the journal is a per-process, in-memory ring bounded by
+its global cap. **Nothing survives a restart**, entries are evicted oldest-first under
+load, and it is not a write-ahead log — no real transaction boundaries, commit order,
+parameter values, source identity or outcome are preserved. Do not use it as a durability
+or audit record.
+
+**Operator time-window replay is not committed-history replay (TR-07).** `POST /api/replay`
+re-executes the SQL text found in a timestamp window, in timestamp order, on one target
+connection. It does not reconstruct committed transactions: rolled-back or failed source
+statements are not excluded, interleaved clients are flattened into timestamp order, and
+individual failures do not abort the run — the summary carries `mode: "time_window"` and
+`partial: true` when anything failed. A *committed-history* replay (only durable commits,
+real boundaries and parameters, stop-on-failure) is a separate, not-yet-shipped
+capability; the API and this guide now keep the two distinct instead of implying the
+journal provides the stronger one.
 
 ### Session state: `SET` is restored, the rest is not
 The in-session path tracks `SET`/`RESET` transactionally — a `SET` inside a transaction is

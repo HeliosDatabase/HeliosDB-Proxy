@@ -383,9 +383,9 @@ impl FailoverReplay {
     /// Execute a single journaled statement against the target node.
     ///
     /// Returns `(success, checksum_matched, rows_matched, error)`.
-    /// When no backend template / endpoint is configured, returns
-    /// `(true, true, true, None)` — the skeleton-test path that
-    /// preserves pre-T0-TR5 behaviour for unit tests.
+    /// With no backend template / endpoint configured this is a **failure**,
+    /// not a synthetic success: replay that never touched a database must
+    /// never be reported as replayed (TR-07).
     async fn execute_statement(
         &self,
         entry: &JournalEntry,
@@ -394,7 +394,19 @@ impl FailoverReplay {
         let endpoint = self.endpoints.read().await.get(&target_node).cloned();
         let cfg = match endpoint.as_ref().and_then(|e| self.build_config(e)) {
             Some(c) => c,
-            None => return (true, true, true, None),
+            None => {
+                return (
+                    false,
+                    false,
+                    false,
+                    Some(
+                        "no backend configured: attach a BackendConfig via \
+                         with_backend_template and register the target endpoint; refusing to \
+                         report a replay that never executed (TR-07)"
+                            .to_string(),
+                    ),
+                )
+            }
         };
 
         let mut client = match BackendClient::connect(&cfg).await {
@@ -444,9 +456,17 @@ impl FailoverReplay {
         let cfg = match endpoint.as_ref().and_then(|e| self.build_config(e)) {
             Some(c) => c,
             None => {
-                // Skeleton path: short pause for state-machine ordering.
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                return Ok(());
+                // No backend to wait on. `start_lsn == 0` is the documented
+                // "no position to wait for" case; anything else would be a
+                // false claim of synchronization (TR-07).
+                if start_lsn == 0 {
+                    return Ok(());
+                }
+                return Err(ProxyError::ReplayFailed(
+                    "no backend configured to wait for WAL sync; attach a BackendConfig \
+                     and register the target endpoint (TR-07)"
+                        .to_string(),
+                ));
             }
         };
 
@@ -709,7 +729,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_replay() {
-        let replay = FailoverReplay::new(ReplayConfig::default());
+        // TR-07: replay with no backend configured must FAIL, not report a
+        // synthetic success. Retries off so the refusal is immediate.
+        let replay = FailoverReplay::new(ReplayConfig {
+            retry_on_error: false,
+            ..ReplayConfig::default()
+        });
         let journal = make_journal();
         let tx_id = journal.tx_id;
         let target = NodeId::new();
@@ -717,9 +742,34 @@ mod tests {
         replay.start_replay(journal, target).await.unwrap();
         let result = replay.execute_replay(tx_id).await.unwrap();
 
-        assert!(result.success);
-        assert_eq!(result.statements_replayed, 2);
-        assert_eq!(result.statements_failed, 0);
+        assert!(!result.success, "no-backend replay must not succeed");
+        assert_eq!(result.statements_replayed, 0);
+        assert_eq!(result.statements_failed, 2);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Some statements failed"));
+        // The per-statement refusal names the missing backend.
+        assert!(result.statement_results.iter().all(|r| !r.success));
+        assert!(result.statement_results.iter().all(|r| r
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("no backend")));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_wal_sync_without_backend_fails_unless_nothing_to_wait_for() {
+        let replay = FailoverReplay::new(ReplayConfig::default());
+        let node = NodeId::new();
+
+        // No position to wait for: no-op.
+        replay.wait_for_wal_sync(node, 0).await.unwrap();
+
+        // A real position with no backend is a false synchronization claim.
+        let err = replay.wait_for_wal_sync(node, 12345).await.unwrap_err();
+        assert!(err.to_string().contains("no backend"));
     }
 
     #[tokio::test]
