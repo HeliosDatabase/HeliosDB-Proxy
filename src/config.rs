@@ -641,6 +641,10 @@ fn default_topology_poll_secs() -> u64 {
     2
 }
 
+fn default_topology_lease_secs() -> u64 {
+    10
+}
+
 fn default_topology_user() -> String {
     "postgres".to_string()
 }
@@ -672,6 +676,11 @@ pub struct TopologyConfig {
     /// Seconds between provider polls. Must be >= 1.
     #[serde(default = "default_topology_poll_secs")]
     pub poll_interval_secs: u64,
+    /// How long a provider observation stays authoritative without a refresh
+    /// (H-02). When the provider cannot be reached, writes stop after at most
+    /// this long instead of proceeding on stale knowledge. Must be >= 1.
+    #[serde(default = "default_topology_lease_secs")]
+    pub lease_timeout_secs: u64,
     /// Credentials the provider uses for its own probe connections.
     #[serde(default = "default_topology_user")]
     pub user: String,
@@ -688,6 +697,7 @@ impl Default for TopologyConfig {
         Self {
             provider: TopologyProviderKind::Static,
             poll_interval_secs: default_topology_poll_secs(),
+            lease_timeout_secs: default_topology_lease_secs(),
             user: default_topology_user(),
             password: None,
             database: default_topology_database(),
@@ -1883,6 +1893,11 @@ impl ProxyConfig {
                 "topology.poll_interval_secs must be >= 1".to_string(),
             ));
         }
+        if self.topology.lease_timeout_secs == 0 {
+            return Err(ProxyError::Config(
+                "topology.lease_timeout_secs must be >= 1".to_string(),
+            ));
+        }
         if self.topology.provider == TopologyProviderKind::Postgres {
             #[cfg(not(feature = "postgres-topology"))]
             {
@@ -2577,6 +2592,7 @@ mod tests {
         let config = ProxyConfig::default();
         assert_eq!(config.topology.provider, TopologyProviderKind::Static);
         assert_eq!(config.topology.poll_interval_secs, 2);
+        assert_eq!(config.topology.lease_timeout_secs, 10);
         assert_eq!(config.topology.user, "postgres");
         assert_eq!(config.topology.database, "postgres");
         assert!(config.topology.password.is_none());
@@ -2584,6 +2600,7 @@ mod tests {
         let with_section = r#"
 provider = "postgres"
 poll_interval_secs = 5
+lease_timeout_secs = 7
 user = "helios"
 password = "secret"
 database = "helios"
@@ -2592,6 +2609,7 @@ database = "helios"
             toml::from_str(with_section).expect("[topology] section parses");
         assert_eq!(parsed.provider, TopologyProviderKind::Postgres);
         assert_eq!(parsed.poll_interval_secs, 5);
+        assert_eq!(parsed.lease_timeout_secs, 7);
         assert_eq!(parsed.user, "helios");
         assert_eq!(parsed.password.as_deref(), Some("secret"));
     }
@@ -2603,6 +2621,15 @@ database = "helios"
         config.topology.poll_interval_secs = 0;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("topology.poll_interval_secs"), "{err}");
+    }
+
+    #[test]
+    fn topology_lease_timeout_zero_is_rejected() {
+        let mut config = ProxyConfig::default();
+        config.add_node("localhost:5432", "primary").unwrap();
+        config.topology.lease_timeout_secs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("topology.lease_timeout_secs"), "{err}");
     }
 
     #[test]

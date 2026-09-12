@@ -379,6 +379,7 @@ health check passes is the primary).
 [topology]
 provider = "static"          # static | postgres
 poll_interval_secs = 2
+lease_timeout_secs = 10
 user = "postgres"
 # password = "${HELIOS_PROXY_TOPOLOGY_PASSWORD}"
 database = "postgres"
@@ -388,6 +389,7 @@ database = "postgres"
 |-----|------|---------|-------------|
 | `provider` | string | `"static"` | `static`: configured roles + the daemon health checker decide the primary. `postgres`: poll `pg_is_in_recovery()` on every configured node and treat the non-recovering node as the primary. `postgres` requires the `postgres-topology` cargo feature — a config that requests it on a build without that feature is rejected at startup. |
 | `poll_interval_secs` | u64 | `2` | Seconds between provider polls. **Must be ≥ 1** (0 is rejected at startup). |
+| `lease_timeout_secs` | u64 | `10` | How long a provider observation stays authoritative without a refresh (H-02). When the provider cannot be reached, the write path stops after at most this long instead of proceeding on stale knowledge. **Must be ≥ 1**. |
 | `user` | string | `"postgres"` | User for the provider's own probe connections. |
 | `password` | string | *(none)* | Password for the probe user, if required. |
 | `database` | string | `"postgres"` | Database the probe connects to. |
@@ -396,10 +398,17 @@ When a provider is configured it is **authoritative for the write path**: writes
 to the provider's leader (which must be an enabled `[[nodes]]` entry), the answer waits
 rather than falling back to a configured role while no leader is known, and
 `GET /topology` reports the leader plus an `authoritative` block with its authority
-epoch (incremented on every observed leader change). This is how a real promotion moves
-the write destination without hand-editing `proxy.toml` roles. A proxy-side epoch cannot
-fence clients that connect around the proxy — see
-[topology-providers.md](topology-providers.md).
+epoch (incremented on every observed leader change), `valid`, and the remaining lease.
+This is how a real promotion moves the write destination without hand-editing
+`proxy.toml` roles.
+
+**Fencing limits (H-02).** A proxy-side epoch/lease cannot fence a client that connects
+directly to a database node: the proxy can only refuse to route, and it fails closed once
+the lease expires (`valid: false`, writes wait). Preventing two sides of a partition from
+both accepting writes requires enforcement by the database (synchronous replication and
+promotion fencing) or by exclusive network/backend control. The proxy never advertises
+zero-loss (RPO 0) for an asynchronous replica that has not acknowledged the last commit —
+configure synchronous replication at the database if that is your requirement.
 
 ---
 

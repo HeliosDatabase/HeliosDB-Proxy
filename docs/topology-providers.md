@@ -46,12 +46,14 @@ entry is `healthy = true`. `None` is the correct answer while a failover is in p
 no primary-role node is healthy.
 
 **When a provider is attached** (`[topology] provider != "static"`), `compute_topology`
-and the write path both take the provider's leader as authoritative. Writes go only to
-that address (it must be an enabled `[[nodes]]` entry); while the provider has no leader,
-new writes wait until `write_timeout_secs` expires rather than falling back to a
-configured role. The provider is authoritative because it observes the database itself,
-not because the proxy asserts an epoch — a proxy-side epoch cannot fence a client that
-connects around the proxy (H-02).
+and the write path both take the provider's leader as authoritative, **while its lease is
+valid**. A provider observation is a heartbeat: it refreshes the lease, and authority
+expires `topology.lease_timeout_secs` (default 10) after the last successful observation.
+Writes go only to the leased leader (it must be an enabled `[[nodes]]` entry); while the
+provider has no leader or the lease has expired, new writes wait until
+`write_timeout_secs` expires rather than falling back to a configured role. See
+[Authority leases and fencing limits](#authority-leases-and-fencing-limits-h-02) for what
+this does and does not guarantee.
 
 ### The `/topology` response
 
@@ -65,7 +67,34 @@ operator CRD status):
 | `unhealthyNodes` | Count of nodes with a failing health check. |
 | `totalNodes` | Number of configured `[[nodes]]`. |
 | `lastFailoverAt` | RFC 3339 timestamp of the last observed primary change; `null` when none has been observed since boot (currently always `null` in `compute_topology`). |
-| `authoritative` | Present only when a topology provider is attached: `{address, epoch, confirmed}`. `epoch` increments on every observed leader change and is the basis for future write fencing (H-02). |
+| `authoritative` | Present only when a topology provider is attached: `{address, epoch, confirmed, valid, leaseRemainingMs}`. `epoch` increments on every observed leader change; `valid` is `false` once the lease expires (`leaseRemainingMs` is then absent). |
+
+### Authority leases and fencing limits (H-02)
+
+A provider-backed tracker keeps a **lease**. Every provider observation refreshes the
+tracker's `last_refresh`; authority is valid only while
+`now - last_refresh <= topology.lease_timeout_secs`. `select_primary_until` consults
+`authority_valid()` before touching any configured node, so when the provider — or the
+control path to it — is unreachable:
+
+- writes keep flowing for at most the lease, so a brief probe gap does not flap traffic;
+- after that the tracker drops the stale leader (publishing `PrimaryChanged`/`Lost`) and
+  writes wait, failing with `NoHealthyNodes` at `write_timeout_secs` — never falling
+  back to a configured role.
+
+The authority epoch is monotonic per process and increments on every observed leader
+change, so a tracked address is only ever the provider's most recent answer. Provider
+probes use their own `BackendClient` connections with the `[topology]` credentials and
+application name (`helios-topology`), separate from the pooled data path.
+
+**What this does not do.** The proxy cannot stop a client that connects directly to a
+database node, and it cannot prove quorum by itself. Preventing both sides of a partition
+from accepting writes requires database-side fencing (Patroni + watchdog, synchronous
+replication, `pg_promote` ordering) or exclusive network/backend control. The lease
+bounds *the proxy's own* authorization window and refuses stale knowledge; it does not
+create zero-loss semantics. A healthy `currentPrimary` is **not** a zero-RPO guarantee
+for an asynchronous replica that has not acknowledged the last commit — configure
+synchronous replication at the database if that is the requirement.
 
 ### Node configuration and manual control
 

@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `PrimaryTracker`/`PrimaryInfo` now carry an authority `epoch`, incremented on every
   observed leader change; the tracker is wired into the daemon for provider-backed
   configurations.
+- `[topology] lease_timeout_secs` (default 10, H-02): a provider observation is a lease
+  heartbeat. If the provider cannot be reached within the lease, the tracker drops the
+  stale leader and the write path fails closed (`NoHealthyNodes`) instead of authorizing
+  on stale knowledge. `GET /topology`'s `authoritative` block now reports `valid` and
+  `leaseRemainingMs`. Docs state the fencing limit explicitly: a proxy-side lease cannot
+  fence direct clients and is not a zero-RPO guarantee for async replicas.
 
 ## [1.8.0] - 2026-09-12
 

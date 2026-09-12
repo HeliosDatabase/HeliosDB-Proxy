@@ -257,6 +257,8 @@ latency_threshold_ms = 100
 [topology]
 provider           = "static"   # static | postgres
 poll_interval_secs = 2          # >= 1
+lease_timeout_secs = 10         # >= 1: authority expires this long after the
+                                # last successful provider observation (H-02)
 user               = "postgres" # credentials for the provider's probes
 # password         = "${HELIOS_PROXY_TOPOLOGY_PASSWORD}"
 database           = "postgres"
