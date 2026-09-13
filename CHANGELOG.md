@@ -29,6 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The daemon now honors `[load_balancer] read_strategy` on the read path (H-03).
+  `select_read_node` used to hardcode round-robin while the configured strategy was set
+  by every caller and read by none. `round_robin`, `weighted_round_robin`,
+  `least_connections` (fewest attached sessions), `latency_based` (measured health-probe
+  latency), `random` and the new `power_of_two` (sample two, prefer fewer attached
+  sessions then lower latency) are all applied to the already-eligible standby set; the
+  default configuration is unchanged. Health policy was re-verified at the same time:
+  `check_query` and `success_threshold` are honored by the health checker.
+
 - Shadow execution is actually concurrent and budget-bounded (O-03). The shadow side now
   runs in its own task/connection while the primary is awaited (the doc had claimed
   concurrency but the code awaited the primary first), the two full result sets are no

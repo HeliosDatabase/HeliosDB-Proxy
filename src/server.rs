@@ -6,7 +6,7 @@
 use crate::admin::{AdminServer, AdminState, ConfigSnapshot, NodeSnapshot};
 use crate::backend::{tls::default_client_config, BackendConfig, TlsMode};
 use crate::client_tls::{build_tls_acceptor, ClientStream};
-use crate::config::{HbaAction, HbaRule, NodeConfig, NodeRole, ProxyConfig, TrMode};
+use crate::config::{HbaAction, HbaRule, NodeConfig, NodeRole, ProxyConfig, Strategy, TrMode};
 use crate::primary_tracker::PrimaryTracker;
 #[cfg(feature = "wasm-plugins")]
 use crate::protocol::QueryMessage;
@@ -7623,6 +7623,93 @@ impl ProxyServer {
         }
     }
 
+    /// Choose one index among the eligible read nodes for `strategy` (H-03).
+    ///
+    /// Pure and unit-tested: callers pass parallel per-node arrays (weights,
+    /// measured health-probe latency, sessions currently attached) plus the
+    /// monotonic round-robin ticket. `ticket` also seeds the Random and
+    /// PowerOfTwo samplers so the sequence stays deterministic in tests while
+    /// behaving as a uniform stream in production.
+    ///
+    /// Strategies that need load accounting are only invoked after the caller
+    /// gathered it, so the default RoundRobin path stays O(1).
+    fn pick_read_node(
+        strategy: crate::config::Strategy,
+        weights: &[u32],
+        latency_ms: &[f64],
+        attached: &[u64],
+        ticket: u64,
+    ) -> Option<usize> {
+        use crate::config::Strategy;
+        let len = weights.len();
+        if len == 0 || latency_ms.len() != len || attached.len() != len {
+            return None;
+        }
+        // splitmix64: deterministic, cheap, uniform enough for sampling.
+        fn mix(mut x: u64) -> u64 {
+            x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+        let pick_pair = |t: u64, len: usize| -> (usize, usize) {
+            let i = (mix(t) % len as u64) as usize;
+            let mut j = (mix(t ^ 0x5deece66d) % len as u64) as usize;
+            if j == i {
+                j = (j + 1) % len;
+            }
+            (i, j)
+        };
+
+        match strategy {
+            Strategy::RoundRobin => Some((ticket % len as u64) as usize),
+            Strategy::WeightedRoundRobin => {
+                let total: u64 = weights.iter().map(|w| *w as u64).sum();
+                if total == 0 {
+                    return Some((ticket % len as u64) as usize);
+                }
+                let mut target = ticket % total;
+                for (i, w) in weights.iter().enumerate() {
+                    if target < *w as u64 {
+                        return Some(i);
+                    }
+                    target -= *w as u64;
+                }
+                Some(len - 1)
+            }
+            Strategy::LeastConnections | Strategy::PowerOfTwo => {
+                let score = |i: usize| (attached[i], latency_ms[i]);
+                if strategy == Strategy::LeastConnections {
+                    return (0..len).min_by(|a, b| {
+                        score(*a)
+                            .partial_cmp(&score(*b))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then(a.cmp(b))
+                    });
+                }
+                let (i, j) = pick_pair(ticket, len);
+                let (a, b) = (score(i), score(j));
+                Some(
+                    if a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+                        != std::cmp::Ordering::Greater
+                    {
+                        i
+                    } else {
+                        j
+                    },
+                )
+            }
+            Strategy::LatencyBased => (0..len).min_by(|a, b| {
+                latency_ms[*a]
+                    .partial_cmp(&latency_ms[*b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.cmp(b))
+            }),
+            Strategy::Random => Some((mix(ticket) % len as u64) as usize),
+        }
+    }
+
     /// Select node for read operations with load balancing
     async fn select_read_node(
         session: &Arc<ClientSession>,
@@ -7665,9 +7752,43 @@ impl ProxyServer {
             .collect();
 
         if !healthy_standbys.is_empty() {
-            // Round-robin across healthy standbys
+            let strategy = config.load_balancer.read_strategy;
+            let weights: Vec<u32> = healthy_standbys.iter().map(|n| n.weight).collect();
+            let latency: Vec<f64> = healthy_standbys
+                .iter()
+                .map(|n| health.get(n.address()).map(|h| h.latency_ms).unwrap_or(0.0))
+                .collect();
+            // Load accounting is only gathered for the strategies that use it,
+            // so the default RoundRobin path stays O(1). "Attached" is the
+            // best-effort load signal available on the data path: how many
+            // live sessions currently have this node as their backend.
+            let attached: Vec<u64> =
+                if matches!(strategy, Strategy::LeastConnections | Strategy::PowerOfTwo) {
+                    healthy_standbys
+                        .iter()
+                        .map(|n| {
+                            let addr = n.address();
+                            state
+                                .sessions
+                                .iter()
+                                .filter(|s| {
+                                    s.current_node
+                                        .try_read()
+                                        .ok()
+                                        .and_then(|g| g.clone())
+                                        .map(|cur| cur == addr)
+                                        .unwrap_or(false)
+                                })
+                                .count() as u64
+                        })
+                        .collect()
+                } else {
+                    vec![0; healthy_standbys.len()]
+                };
+
             let ticket = state.lb_state.rr_counter.fetch_add(1, Ordering::Relaxed);
-            let index = ticket as usize % healthy_standbys.len();
+            let index = Self::pick_read_node(strategy, &weights, &latency, &attached, ticket)
+                .unwrap_or_else(|| (ticket as usize) % healthy_standbys.len());
             let node_addr = healthy_standbys[index].address().to_string();
 
             let mut current = session.current_node.write().await;
@@ -15856,6 +15977,87 @@ mod tests {
             .await;
             assert!(matches!(r, Err(ProxyError::NoHealthyNodes)), "{r:?}");
             assert!(started.elapsed() < Duration::from_secs(2));
+        }
+
+        #[test]
+        fn pick_read_node_honors_each_strategy() {
+            use crate::config::Strategy;
+
+            // Round-robin cycles deterministically.
+            let rr = |t: u64| {
+                ProxyServer::pick_read_node(Strategy::RoundRobin, &[1, 1], &[0.0, 0.0], &[0, 0], t)
+                    .unwrap()
+            };
+            assert_eq!((rr(0), rr(1), rr(2), rr(3)), (0, 1, 0, 1));
+
+            // Weighted round-robin: 1:3 over 400 tickets.
+            let mut counts = [0usize; 2];
+            for t in 0..400 {
+                let i = ProxyServer::pick_read_node(
+                    Strategy::WeightedRoundRobin,
+                    &[1, 3],
+                    &[0.0, 0.0],
+                    &[0, 0],
+                    t,
+                )
+                .unwrap();
+                counts[i] += 1;
+            }
+            assert!(
+                counts[1] > counts[0] * 2,
+                "weighted distribution wrong: {counts:?}"
+            );
+
+            // Least-connections and latency pick the better node.
+            assert_eq!(
+                ProxyServer::pick_read_node(
+                    Strategy::LeastConnections,
+                    &[1, 1],
+                    &[1.0, 9.0],
+                    &[5, 1],
+                    0
+                ),
+                Some(1)
+            );
+            assert_eq!(
+                ProxyServer::pick_read_node(
+                    Strategy::LatencyBased,
+                    &[1, 1],
+                    &[50.0, 5.0],
+                    &[0, 0],
+                    0
+                ),
+                Some(1)
+            );
+
+            // Random stays in range and samples both nodes.
+            let mut seen = [false; 2];
+            for t in 0..64 {
+                let i =
+                    ProxyServer::pick_read_node(Strategy::Random, &[1, 1], &[0.0, 0.0], &[0, 0], t)
+                        .unwrap();
+                assert!(i < 2);
+                seen[i] = true;
+            }
+            assert!(seen[0] && seen[1], "random must sample both nodes");
+
+            // Power-of-two-choices favours the unloaded node.
+            let mut p2c = [0usize; 2];
+            for t in 0..200 {
+                let i = ProxyServer::pick_read_node(
+                    Strategy::PowerOfTwo,
+                    &[1, 1],
+                    &[1.0, 1.0],
+                    &[0, 20],
+                    t,
+                )
+                .unwrap();
+                p2c[i] += 1;
+            }
+            assert!(
+                p2c[0] > p2c[1],
+                "p2c should prefer the unloaded node: {p2c:?}"
+            );
         }
 
         #[test]

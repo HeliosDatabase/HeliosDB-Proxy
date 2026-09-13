@@ -340,9 +340,15 @@ latency_threshold_ms = 100
 |----------|-------------|
 | `round_robin` | Rotate through nodes equally. |
 | `weighted_round_robin` | Rotate proportionally to each node's `weight`. |
-| `least_connections` | Route to the node with the fewest active connections. |
-| `latency_based` | Route to the lowest-latency node. |
+| `least_connections` | Route to the node with the fewest live sessions currently attached to it. |
+| `latency_based` | Route to the node with the lowest measured health-probe latency. |
 | `random` | Pick a node at random. |
+| `power_of_two` | Sample two eligible nodes and pick the one with fewer attached sessions, breaking ties on measured latency (H-03). Cheaper and more herd-resistant than global least-connections. |
+
+All strategies are applied to the healthy, enabled standbys after circuit-breaker and
+lag exclusion; a strategy is only ever asked to choose among eligible nodes. The daemon
+honors `[load_balancer] read_strategy` on the read path (the pre-1.8.1 daemon hardcoded
+round-robin).
 
 ---
 
