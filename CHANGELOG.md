@@ -29,6 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fault-tolerant client admission and reconnect (H-05). `[limits]
+  client_admission_wait_secs` (default 0 = immediate refusal, unchanged) makes the
+  `max_client_connections` cap a bounded fair queue: a connection arriving at the cap
+  waits up to the configured budget for a permit instead of being refused with 53300 at
+  once. The primary-wait loops now use per-session full-jitter exponential backoff (base
+  100 ms, 2 s cap) instead of a fixed 100 ms poll, so a fleet that lost the same primary
+  does not reconnect in lockstep. Health/admin capacity is unaffected (health probes hold
+  no client slot; admin is a separate listener).
+
 - The daemon now honors `[load_balancer] read_strategy` on the read path (H-03).
   `select_read_node` used to hardcode round-robin while the configured strategy was set
   by every caller and read by none. `round_robin`, `weighted_round_robin`,

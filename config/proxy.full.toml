@@ -169,6 +169,11 @@ write_timeout_secs = 30
 # # left idle inside an open transaction is terminated by this timeout too. Read
 # # once at startup.
 # client_idle_timeout_secs = 0
+# # Bounded fair-admission queue (H-05): when max_client_connections is reached,
+# # a new connection waits up to this many seconds for a permit (FIFO) before
+# # being refused with 53300. 0 (default) refuses immediately. Read once at
+# # startup.
+# client_admission_wait_secs = 0
 # # In-session Transaction Replay (tr_mode = select | transaction): caps on the
 # # statements / bytes recorded per explicit transaction for replay after a
 # # failover. Over a cap the transaction is marked non-replayable (transaction

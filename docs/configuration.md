@@ -627,6 +627,9 @@ tr_max_observation_bytes = 1048576
 max_total_idle_backend_conns = 8192
 pool_reap_interval_secs = 30
 replay_deadline_secs = 300
+max_client_connections = 0
+client_idle_timeout_secs = 0
+client_admission_wait_secs = 0
 tr_max_replay_statements = 1000
 tr_max_replay_bytes = 4194304
 tr_max_session_set_statements = 256
@@ -649,6 +652,9 @@ tr_max_session_set_statements = 256
 | `max_total_idle_backend_conns` | usize | `8192` | Global ceiling on idle backend-pool connections across all `(node,user,db)` identities. Only consumed with the `pool-modes` feature; parsed-and-ignored otherwise. |
 | `pool_reap_interval_secs` | u64 | `30` | How often the idle-connection reaper runs. |
 | `replay_deadline_secs` | u64 | `300` | Overall wall-clock deadline for one operator time-window replay (`POST /api/replay`). `query_timeout` bounds each statement; this bounds the run. On expiry the replay stops at the current statement and reports `deadline_exceeded` + partial progress. `0` disables the overall deadline. Max `31536000`. |
+| `max_client_connections` | usize | `0` | Ceiling on concurrently-served client connections on the PG-wire listener. `0` = unlimited. Excess connections are refused with SQLSTATE 53300 (see `client_admission_wait_secs`). Applied at startup; a SIGHUP change is ignored with a warning. |
+| `client_idle_timeout_secs` | u64 | `0` | Close an authenticated idle session after this many seconds. `0` = wait forever (historical behaviour). Applied at startup. |
+| `client_admission_wait_secs` | u64 | `0` | Bounded fair-admission queue (H-05): when `max_client_connections` is reached, a new connection waits up to this many seconds for a permit before being refused with 53300. `0` refuses immediately. Health/admin traffic is unaffected (health probes hold no client slot; admin is a separate listener). Applied at startup. |
 | `tr_max_replay_statements` | usize | `1000` | In-session TR (`tr_mode = select\|transaction`): cap on statements recorded per explicit transaction for failover replay. Over the cap the transaction is marked non-replayable (`transaction` degrades to `session` for it; `tr_replay_cap_exceeded_total`). |
 | `tr_max_replay_bytes` | usize | `4194304` | In-session TR: cap on bytes (statement text / raw extended-protocol frames) recorded per explicit transaction (4 MiB). Same degradation as above. |
 | `tr_max_session_set_statements` | usize | `256` | In-session TR (`tr_mode != none`): cap on DISTINCT session variables whose latest `SET` is replayed onto the replacement backend (a later `SET` of the same variable replaces the earlier one; `RESET name` removes it; `RESET ALL`/`DISCARD ALL` clear all). Over the cap tracking stops (`tr_session_set_cap_exceeded_total`) and a subsequent failover is refused with `08006` rather than re-homing the session with incomplete state. |

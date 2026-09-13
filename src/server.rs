@@ -767,6 +767,9 @@ struct ResolvedLimits {
     /// `client_idle_timeout_secs = 0` (the default), which is the pre-timeout
     /// behaviour: the query loop then waits on the client forever.
     client_idle_timeout: Option<Duration>,
+    /// Bounded admission wait for the `max_client_connections` cap (H-05).
+    /// `None` when `client_admission_wait_secs = 0` (refuse immediately).
+    client_admission_wait: Option<Duration>,
     /// In-session TR: cap on recorded statements per explicit transaction.
     tr_max_replay_statements: usize,
     /// In-session TR: cap on recorded bytes per explicit transaction.
@@ -812,6 +815,10 @@ impl ResolvedLimits {
                 0 => None,
                 secs => Some(Duration::from_secs(secs)),
             },
+            client_admission_wait: match l.client_admission_wait_secs {
+                0 => None,
+                secs => Some(Duration::from_secs(secs)),
+            },
             tr_max_replay_statements: l.tr_max_replay_statements,
             tr_max_replay_bytes: l.tr_max_replay_bytes,
             tr_max_session_set_statements: l.tr_max_session_set_statements,
@@ -832,6 +839,16 @@ enum TopologyPoller {
     Static,
     #[cfg(feature = "postgres-topology")]
     Postgres(Arc<crate::primary_tracker::PostgresTopologyProvider>),
+}
+
+/// Deterministic 64-bit mix (splitmix64), used for jitter and sampling
+/// (H-03/H-05).
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 /// Parse PostgreSQL's textual LSN (`"0/16B3748"`) into the standard u64
@@ -2233,19 +2250,23 @@ impl ProxyServer {
         // rather than let an operator believe a SIGHUP armed them.
         if new_config.limits.max_client_connections != old.limits.max_client_connections
             || new_config.limits.client_idle_timeout_secs != old.limits.client_idle_timeout_secs
+            || new_config.limits.client_admission_wait_secs != old.limits.client_admission_wait_secs
         {
             tracing::warn!(
                 old_max_client_connections = old.limits.max_client_connections,
                 new_max_client_connections = new_config.limits.max_client_connections,
                 old_client_idle_timeout_secs = old.limits.client_idle_timeout_secs,
                 new_client_idle_timeout_secs = new_config.limits.client_idle_timeout_secs,
-                "[limits] max_client_connections / client_idle_timeout_secs changed on SIGHUP but are applied at startup only — keeping the running values (restart to apply)"
+                old_client_admission_wait_secs = old.limits.client_admission_wait_secs,
+                new_client_admission_wait_secs = new_config.limits.client_admission_wait_secs,
+                "[limits] max_client_connections / client_idle_timeout_secs / client_admission_wait_secs changed on SIGHUP but are applied at startup only — keeping the running values (restart to apply)"
             );
             // Keep the published config truthful: `/config` must not advertise
             // a cap/idle timeout that is not the one in effect (same treatment
             // as `[edge]` above).
             new_config.limits.max_client_connections = old.limits.max_client_connections;
             new_config.limits.client_idle_timeout_secs = old.limits.client_idle_timeout_secs;
+            new_config.limits.client_admission_wait_secs = old.limits.client_admission_wait_secs;
         }
         if new_config.listen_address != old.listen_address {
             tracing::warn!(old = %old.listen_address, new = %new_config.listen_address,
@@ -2794,7 +2815,7 @@ impl ProxyServer {
     /// and refusing it would make query cancellation impossible exactly when
     /// the proxy is saturated — PostgreSQL likewise handles cancels in the
     /// postmaster without taking a `max_connections` slot.
-    fn admit_client_slot(
+    async fn admit_client_slot(
         state: &Arc<ServerState>,
         first: &StartupMessage,
     ) -> std::result::Result<Option<tokio::sync::OwnedSemaphorePermit>, ()> {
@@ -2804,15 +2825,31 @@ impl ProxyServer {
         let Some(sem) = state.client_slots.as_ref() else {
             return Ok(None);
         };
-        match Arc::clone(sem).try_acquire_owned() {
-            Ok(permit) => Ok(Some(permit)),
-            Err(_) => {
-                state
-                    .metrics
-                    .connections_rejected
-                    .fetch_add(1, Ordering::Relaxed);
-                Err(())
-            }
+        match state.limits.client_admission_wait {
+            // Pre-H-05 behaviour: refuse immediately at the cap.
+            None => match Arc::clone(sem).try_acquire_owned() {
+                Ok(permit) => Ok(Some(permit)),
+                Err(_) => {
+                    state
+                        .metrics
+                        .connections_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                    Err(())
+                }
+            },
+            // Bounded fair queue (H-05): wait up to the configured budget for
+            // a permit before refusing, so a reconnect burst is absorbed
+            // instead of answered with a wall of 53300s.
+            Some(wait) => match tokio::time::timeout(wait, Arc::clone(sem).acquire_owned()).await {
+                Ok(Ok(permit)) => Ok(Some(permit)),
+                _ => {
+                    state
+                        .metrics
+                        .connections_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                    Err(())
+                }
+            },
         }
     }
 
@@ -2996,7 +3033,7 @@ impl ProxyServer {
                 match first {
                     // Client closed before sending a complete startup message.
                     Ok(None) => Ok(()),
-                    Ok(Some(msg)) => match Self::admit_client_slot(&state, &msg) {
+                    Ok(Some(msg)) => match Self::admit_client_slot(&state, &msg).await {
                         Ok(slot) => {
                             _session_guard._client_slot = slot;
                             Self::client_loop(
@@ -7577,6 +7614,21 @@ impl ProxyServer {
             .then_some(addr)
     }
 
+    /// Full-jitter exponential backoff for the primary-wait loops (H-05):
+    /// base 100 ms doubling to a 2 s cap, mixed with a per-session seed so a
+    /// fleet waking after the same failover does not stampede the promoted
+    /// primary in lockstep. Deterministic per `(seed, attempt)`.
+    fn reconnect_backoff(attempt: u32, seed: u64) -> Duration {
+        let base_ms = 100u64;
+        let cap_ms = 2_000u64;
+        let window = base_ms
+            .saturating_mul(1u64 << attempt.min(5))
+            .clamp(1, cap_ms);
+        Duration::from_millis(
+            splitmix64(seed ^ (attempt as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)) % window + 1,
+        )
+    }
+
     /// `select_primary_with_timeout` against a caller-owned deadline, so one
     /// recovery deadline can be carried through every phase (TR-06).
     async fn select_primary_until(
@@ -7587,9 +7639,10 @@ impl ProxyServer {
     ) -> Result<String> {
         let start = tokio::time::Instant::now();
         let timeout = deadline.saturating_duration_since(start);
-        // Poll for the promoted primary fairly tightly so writes resume
-        // quickly after a failover (was 500ms — a needless recovery floor).
-        let check_interval = Duration::from_millis(100);
+        // H-05: per-session full-jitter backoff instead of a fixed 100 ms poll,
+        // so a fleet that lost the same primary does not reconnect in lockstep.
+        let backoff_seed = session.id.as_u128() as u64;
+        let mut attempt: u32 = 0;
 
         loop {
             // H-01: when a topology provider is authoritative, only its
@@ -7610,7 +7663,8 @@ impl ProxyServer {
                     "Authoritative topology has no eligible primary; waiting... ({:.1}s elapsed)",
                     start.elapsed().as_secs_f64()
                 );
-                tokio::time::sleep(check_interval).await;
+                tokio::time::sleep(Self::reconnect_backoff(attempt, backoff_seed)).await;
+                attempt = attempt.saturating_add(1);
                 continue;
             }
 
@@ -7647,8 +7701,9 @@ impl ProxyServer {
                 timeout.as_secs_f64()
             );
 
-            // Wait before retry
-            tokio::time::sleep(check_interval).await;
+            // Wait before retry (jittered exponential backoff, H-05).
+            tokio::time::sleep(Self::reconnect_backoff(attempt, backoff_seed)).await;
+            attempt = attempt.saturating_add(1);
         }
     }
 
@@ -7674,17 +7729,9 @@ impl ProxyServer {
         if len == 0 || latency_ms.len() != len || attached.len() != len {
             return None;
         }
-        // splitmix64: deterministic, cheap, uniform enough for sampling.
-        fn mix(mut x: u64) -> u64 {
-            x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = x;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        }
         let pick_pair = |t: u64, len: usize| -> (usize, usize) {
-            let i = (mix(t) % len as u64) as usize;
-            let mut j = (mix(t ^ 0x5deece66d) % len as u64) as usize;
+            let i = (splitmix64(t) % len as u64) as usize;
+            let mut j = (splitmix64(t ^ 0x5deece66d) % len as u64) as usize;
             if j == i {
                 j = (j + 1) % len;
             }
@@ -7735,7 +7782,7 @@ impl ProxyServer {
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then(a.cmp(b))
             }),
-            Strategy::Random => Some((mix(ticket) % len as u64) as usize),
+            Strategy::Random => Some((splitmix64(ticket) % len as u64) as usize),
         }
     }
 
@@ -13833,16 +13880,33 @@ mod tests {
         }
     }
 
+    /// H-05: full-jitter backoff is bounded by the 2 s cap and differs across
+    /// sessions for the same attempt (no lockstep reconnect wave).
+    #[test]
+    fn reconnect_backoff_is_capped_and_seed_sensitive() {
+        for attempt in 0..12u32 {
+            let d = ProxyServer::reconnect_backoff(attempt, 0);
+            assert!(d >= Duration::from_millis(1), "attempt {attempt}: {d:?}");
+            assert!(d <= Duration::from_secs(2), "attempt {attempt}: {d:?}");
+        }
+        assert_ne!(
+            ProxyServer::reconnect_backoff(3, 1),
+            ProxyServer::reconnect_backoff(3, 2),
+            "different sessions must desynchronise"
+        );
+    }
+
     /// Admission control: a real Startup takes a slot; when none is free it is
     /// refused and `connections_rejected` counts it.
-    #[test]
-    fn admission_takes_a_slot_and_counts_a_refusal() {
+    #[tokio::test]
+    async fn admission_takes_a_slot_and_counts_a_refusal() {
         let mut config = test_config();
         config.limits.max_client_connections = 1;
         let server = ProxyServer::new(config).unwrap();
         let state = server.state.clone();
 
         let slot = ProxyServer::admit_client_slot(&state, &startup_msg())
+            .await
             .expect("the first connection is admitted");
         assert!(slot.is_some(), "a configured cap must hand out a slot");
         assert_eq!(
@@ -13851,7 +13915,9 @@ mod tests {
         );
 
         // Cap saturated: the next Startup is refused and counted.
-        assert!(ProxyServer::admit_client_slot(&state, &startup_msg()).is_err());
+        assert!(ProxyServer::admit_client_slot(&state, &startup_msg())
+            .await
+            .is_err());
         assert_eq!(
             state.metrics.connections_rejected.load(Ordering::Relaxed),
             1,
@@ -13860,15 +13926,17 @@ mod tests {
 
         // Releasing the slot re-admits.
         drop(slot);
-        assert!(ProxyServer::admit_client_slot(&state, &startup_msg()).is_ok());
+        assert!(ProxyServer::admit_client_slot(&state, &startup_msg())
+            .await
+            .is_ok());
     }
 
     /// A CancelRequest must be admitted even with the cap saturated — it is a
     /// throwaway connection that never becomes a session, and refusing it would
     /// make query cancellation impossible exactly when it is needed. It must
     /// also never consume a slot, nor count as a rejection.
-    #[test]
-    fn cancel_request_is_admitted_while_the_cap_is_saturated() {
+    #[tokio::test]
+    async fn cancel_request_is_admitted_while_the_cap_is_saturated() {
         let mut config = test_config();
         config.limits.max_client_connections = 1;
         let server = ProxyServer::new(config).unwrap();
@@ -13881,6 +13949,7 @@ mod tests {
             &state,
             &StartupMessage::CancelRequest { pid: 1, key: 2 },
         )
+        .await
         .expect("a cancel request must never be refused");
         assert!(slot.is_none(), "a cancel request must not consume a slot");
         assert_eq!(
