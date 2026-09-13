@@ -51,17 +51,69 @@ pub struct ShadowExecuteReport {
     pub primary_error: Option<String>,
     /// Error from shadow, if any.
     pub shadow_error: Option<String>,
+    /// True when either side exceeded the comparison budget (row or byte
+    /// ceiling). The comparison is still an exact order-independent digest,
+    /// but an oversized run is deliberately **not** certified clean — the
+    /// operator asked for a bounded comparison (O-03).
+    pub budget_exceeded: bool,
 }
 
 impl ShadowExecuteReport {
     pub fn is_clean(&self) -> bool {
-        self.both_succeeded && self.row_count_match && self.row_hash_match
+        self.both_succeeded && self.row_count_match && self.row_hash_match && !self.budget_exceeded
     }
 }
 
-/// Run `sql` on `primary` and `shadow` concurrently. Returns the
-/// primary's result for the application to consume, plus a shadow
-/// report containing the comparison.
+/// Row/byte ceiling for one shadow comparison (O-03). Defaults are documented
+/// in `docs/admin-api.md` and can be overridden per request.
+#[derive(Debug, Clone, Copy)]
+pub struct ShadowBudget {
+    pub max_rows: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for ShadowBudget {
+    fn default() -> Self {
+        Self {
+            max_rows: 10_000,
+            max_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+impl ShadowBudget {
+    /// Does this result exceed the budget? O(rows) with an early exit once the
+    /// byte ceiling is crossed, so it never walks a multi-GiB result to the end.
+    pub fn exceeded(&self, qr: &QueryResult) -> bool {
+        if qr.rows.len() > self.max_rows {
+            return true;
+        }
+        let mut bytes = 0usize;
+        for r in &qr.rows {
+            for v in r {
+                bytes = bytes.saturating_add(match v {
+                    TextValue::Null => 1,
+                    TextValue::Text(s) => s.len(),
+                });
+                if bytes > self.max_bytes {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Run `sql` on `primary` and `shadow` **concurrently**. Returns the primary's
+/// result for the application to consume, plus a shadow report containing the
+/// comparison.
+///
+/// The shadow side runs in its own tokio task (own connection) started before
+/// the primary is awaited, so its latency overlaps the primary's instead of
+/// being added to it. Comparison is order-independent digest + row count; no
+/// copy of either result set is retained beyond what the backend client itself
+/// materialised, and a result over `budget` marks the report
+/// `budget_exceeded` (not certified clean).
 ///
 /// `params` are interpolated into the SQL using the same text-format
 /// substitution the failover-replay engine uses (no extended protocol).
@@ -70,7 +122,17 @@ pub async fn shadow_execute(
     shadow_cfg: &BackendConfig,
     sql: &str,
     params: &[ParamValue],
+    budget: ShadowBudget,
 ) -> Result<(QueryResult, ShadowExecuteReport)> {
+    // Start the shadow side first so it overlaps the primary. It owns its
+    // config/SQL/params so the task is independent of the borrow above.
+    let shadow_task = {
+        let cfg = shadow_cfg.clone();
+        let sql = sql.to_string();
+        let params = params.to_vec();
+        tokio::spawn(async move { run_shadow(&cfg, &sql, &params).await })
+    };
+
     let primary_start = Instant::now();
     let primary_outcome = if params.is_empty() {
         primary.simple_query(sql).await
@@ -79,33 +141,35 @@ pub async fn shadow_execute(
     };
     let primary_elapsed_us = primary_start.elapsed().as_micros() as u64;
 
-    let shadow_outcome = run_shadow(shadow_cfg, sql, params).await;
-
-    let primary_qr = primary_outcome.as_ref().ok().cloned();
-    let shadow_qr = shadow_outcome.0.as_ref().ok().cloned();
-
-    let (row_count_match, row_hash_match) = match (&primary_qr, &shadow_qr) {
-        (Some(p), Some(s)) => {
-            let count_match = p.rows.len() == s.rows.len();
-            let hash_match = if count_match {
-                row_set_hash(&p.rows) == row_set_hash(&s.rows)
-            } else {
-                false
-            };
-            (count_match, hash_match)
-        }
-        _ => (false, false),
+    let shadow_outcome = match shadow_task.await {
+        Ok(v) => v,
+        Err(e) => (
+            Err(ProxyError::Internal(format!("shadow task join: {}", e))),
+            0,
+        ),
     };
+
+    let (row_count_match, row_hash_match, budget_exceeded) =
+        match (primary_outcome.as_ref(), shadow_outcome.0.as_ref()) {
+            (Ok(p), Ok(s)) => {
+                let count_match = p.rows.len() == s.rows.len();
+                let over = budget.exceeded(p) || budget.exceeded(s);
+                let hash_match = count_match && row_set_hash(&p.rows) == row_set_hash(&s.rows);
+                (count_match, hash_match, over)
+            }
+            _ => (false, false, false),
+        };
 
     let report = ShadowExecuteReport {
         sql: sql.to_string(),
-        both_succeeded: primary_qr.is_some() && shadow_qr.is_some(),
+        both_succeeded: primary_outcome.is_ok() && shadow_outcome.0.is_ok(),
         row_count_match,
         row_hash_match,
         primary_elapsed_us,
         shadow_elapsed_us: shadow_outcome.1,
         primary_error: primary_outcome.as_ref().err().map(|e| e.to_string()),
-        shadow_error: shadow_outcome.0.err().map(|e| e.to_string()),
+        shadow_error: shadow_outcome.0.as_ref().err().map(|e| e.to_string()),
+        budget_exceeded,
     };
 
     let qr =
@@ -236,6 +300,7 @@ mod tests {
             shadow_elapsed_us: 1,
             primary_error: None,
             shadow_error: None,
+            budget_exceeded: false,
         };
         assert!(r.is_clean());
 
@@ -246,6 +311,37 @@ mod tests {
         let mut r3 = r.clone();
         r3.both_succeeded = false;
         assert!(!r3.is_clean());
+
+        // An oversized comparison is matched but deliberately not certified.
+        let mut r4 = r.clone();
+        r4.budget_exceeded = true;
+        assert!(!r4.is_clean());
+    }
+
+    #[test]
+    fn budget_flags_oversized_results() {
+        let qr = |rows: usize| QueryResult {
+            columns: Vec::new(),
+            rows: (0..rows)
+                .map(|i| vec![TextValue::Text(format!("row-{i}"))])
+                .collect(),
+            command_tag: String::new(),
+        };
+        let budget = ShadowBudget {
+            max_rows: 3,
+            max_bytes: 1024,
+        };
+        assert!(!budget.exceeded(&qr(3)));
+        assert!(budget.exceeded(&qr(4)), "row ceiling");
+
+        let byte_budget = ShadowBudget {
+            max_rows: 100,
+            max_bytes: 4,
+        };
+        assert!(
+            byte_budget.exceeded(&qr(3)),
+            "byte ceiling: 3 rows exceed 4 bytes"
+        );
     }
 
     #[test]

@@ -449,6 +449,8 @@ This is **operator time-window replay**, not committed-history replay (TR-07): i
 
 Run a query against a source **and** a shadow backend in parallel and diff the results — used for major-version-upgrade validation, schema-migration canaries, and replica-drift detection. Body is a `ShadowRequestBody`. Available in the default build (not gated by `tr_enabled`).
 
+The two sides now execute **concurrently**: the shadow runs in its own task and connection while the primary is awaited, so its latency overlaps instead of adding to the request (O-03). Two optional body fields bound the comparison: `max_rows` (default `10000`) and `max_bytes` (default 16 MiB). A result over either ceiling is returned with `"budget_exceeded": true` and is deliberately **not** certified clean (`"is_clean": false`) even when counts and digests match. The comparison is an order-independent digest and retains no copy of either result set beyond what the backend client materialises.
+
 ---
 
 ## Edge / Geo Mode (feature `edge-proxy`)
