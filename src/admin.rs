@@ -1721,7 +1721,17 @@ impl AdminServer {
             .map(ParamValue::Text)
             .collect();
 
-        let outcome = shadow_execute(&mut source, &shadow_cfg, &req.sql, &params).await;
+        let outcome = shadow_execute(
+            &mut source,
+            &shadow_cfg,
+            &req.sql,
+            &params,
+            crate::shadow_execute::ShadowBudget {
+                max_rows: req.max_rows.max(1),
+                max_bytes: req.max_bytes.max(1),
+            },
+        )
+        .await;
         source.close().await;
 
         match outcome {
@@ -1736,6 +1746,7 @@ impl AdminServer {
                     "shadow_elapsed_us":  report.shadow_elapsed_us,
                     "primary_error":      report.primary_error,
                     "shadow_error":       report.shadow_error,
+                    "budget_exceeded":    report.budget_exceeded,
                     "is_clean":           report.is_clean(),
                 }),
             )),
@@ -2659,6 +2670,24 @@ struct ShadowRequestBody {
     shadow_password: Option<String>,
     #[serde(default)]
     shadow_database: Option<String>,
+
+    /// Comparison budget: maximum rows on either side before the run is
+    /// reported `budget_exceeded` and is not certified clean (O-03).
+    /// Default 10000.
+    #[serde(default = "default_shadow_max_rows")]
+    max_rows: usize,
+    /// Comparison budget: maximum total text bytes across a result's rows
+    /// before the run is reported `budget_exceeded`. Default 16 MiB.
+    #[serde(default = "default_shadow_max_bytes")]
+    max_bytes: usize,
+}
+
+fn default_shadow_max_rows() -> usize {
+    10_000
+}
+
+fn default_shadow_max_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 /// Chaos actions the proxy supports today. Forward-compatible —

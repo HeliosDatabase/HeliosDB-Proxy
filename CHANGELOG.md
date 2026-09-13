@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Shadow execution is actually concurrent and budget-bounded (O-03). The shadow side now
+  runs in its own task/connection while the primary is awaited (the doc had claimed
+  concurrency but the code awaited the primary first), the two full result sets are no
+  longer cloned for comparison, and `POST /api/shadow` accepts `max_rows` (default 10000)
+  / `max_bytes` (default 16 MiB): a result over either ceiling returns
+  `budget_exceeded: true` and is not certified clean.
+
 - `BackendConfig.query_timeout` is now honored on every management query (O-02).
   `BackendClient::run_query` used a hardcoded 30 s while the configured value was set by
   every caller and never read; the resolved timeout is captured at connect and a zero
