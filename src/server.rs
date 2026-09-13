@@ -834,6 +834,15 @@ enum TopologyPoller {
     Postgres(Arc<crate::primary_tracker::PostgresTopologyProvider>),
 }
 
+/// Parse PostgreSQL's textual LSN (`"0/16B3748"`) into the standard u64
+/// encoding (high 32 bits / low 32 bits), used for WAL-lag arithmetic (H-04).
+fn parse_pg_lsn(text: &str) -> Option<u64> {
+    let (hi, lo) = text.trim().split_once('/')?;
+    let hi = u64::from_str_radix(hi, 16).ok()?;
+    let lo = u64::from_str_radix(lo, 16).ok()?;
+    Some((hi << 32) | (lo & 0xffff_ffff))
+}
+
 /// Server runtime state
 struct ServerState {
     /// Operational limits/timeouts resolved from `[limits]` config at startup.
@@ -992,12 +1001,18 @@ pub struct NodeHealth {
     pub last_check: chrono::DateTime<chrono::Utc>,
     /// Consecutive failures
     pub failure_count: u32,
+    /// Consecutive successful probes (H-03 recovery threshold)
+    pub success_count: u32,
     /// Last error message
     pub last_error: Option<String>,
     /// Average latency (ms)
     pub latency_ms: f64,
-    /// Replication lag (if applicable)
+    /// Replication lag (if a WAL-position probe succeeded; H-04). `None`
+    /// means unknown — a strict policy can refuse unknown lag.
     pub replication_lag_bytes: Option<u64>,
+    /// When `replication_lag_bytes` was last sampled (H-04). `None` when lag
+    /// has never been measured.
+    pub lag_sampled_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Server metrics
@@ -1689,9 +1704,11 @@ impl ProxyServer {
                     healthy: true, // Assume healthy until proven otherwise
                     last_check: chrono::Utc::now(),
                     failure_count: 0,
+                    success_count: 0,
                     last_error: None,
                     latency_ms: 0.0,
                     replication_lag_bytes: None,
+                    lag_sampled_at: None,
                 },
             );
         }
@@ -2277,9 +2294,11 @@ impl ProxyServer {
                             healthy: true,
                             last_check: chrono::Utc::now(),
                             failure_count: 0,
+                            success_count: 0,
                             last_error: None,
                             latency_ms: 0.0,
                             replication_lag_bytes: None,
+                            lag_sampled_at: None,
                         },
                     );
                 }
@@ -7281,8 +7300,18 @@ impl ProxyServer {
     /// given its measured lag and the configured ceiling? `max=0` disables
     /// exclusion; unknown lag (None) never excludes. Pure for testing.
     #[cfg(feature = "lag-routing")]
-    fn lag_excludes_standby(lag_bytes: Option<u64>, max_lag_bytes: u64) -> bool {
-        max_lag_bytes > 0 && lag_bytes.map(|l| l > max_lag_bytes).unwrap_or(false)
+    fn lag_excludes_standby(
+        lag_bytes: Option<u64>,
+        max_lag_bytes: u64,
+        require_known: bool,
+    ) -> bool {
+        match lag_bytes {
+            Some(lag) => max_lag_bytes > 0 && lag > max_lag_bytes,
+            // Unknown lag is allowed by default (historical behaviour); a
+            // strict policy refuses it rather than treating `None` as fresh
+            // (H-04).
+            None => require_known,
+        }
     }
 
     /// Pure predicate: is `sql` a plain, deterministic, SINGLE-statement
@@ -7746,6 +7775,7 @@ impl ProxyServer {
                             .get(n.address())
                             .and_then(|h| h.replication_lag_bytes),
                         config.lag_routing.max_lag_bytes,
+                        config.lag_routing.require_known_lag,
                     );
                 base
             })
@@ -8679,11 +8709,22 @@ impl ProxyServer {
         // Probe every node in parallel (owned address + timeout so each
         // probe is 'static and runs on its own task).
         let timeout = Duration::from_secs(config.health.check_timeout_secs);
+        // H-04: with credentials configured, sample the primary's current WAL
+        // position once per sweep so each standby's replay position becomes a
+        // byte lag. Best-effort; any failure leaves lag unknown.
+        let primary_lsn = if config.health.user.is_some() && config.lag_routing.enabled {
+            Self::probe_primary_lsn(config, timeout).await
+        } else {
+            None
+        };
+
         let mut set = tokio::task::JoinSet::new();
         for node in &config.nodes {
             let addr = node.address().to_string();
+            let health_cfg = config.health.clone();
+            let role = node.role;
             set.spawn(async move {
-                let r = Self::check_node_addr(&addr, timeout).await;
+                let r = Self::probe_node(&health_cfg, &addr, role, primary_lsn, timeout).await;
                 (addr, r)
             });
         }
@@ -8703,30 +8744,218 @@ impl ProxyServer {
         let mut next = (*state.health.load_full()).clone();
         for (addr, result) in results {
             if let Some(node_health) = next.get_mut(&addr) {
-                match result {
-                    Ok(latency) => {
-                        node_health.healthy = true;
-                        node_health.failure_count = 0;
-                        node_health.latency_ms = latency;
-                        node_health.last_error = None;
-                    }
+                let (ok, latency, lag) = match result {
+                    Ok((latency, lag)) => (true, Some(latency), lag),
                     Err(e) => {
-                        node_health.failure_count += 1;
                         node_health.last_error = Some(e.to_string());
-                        if node_health.failure_count >= config.health.failure_threshold {
-                            node_health.healthy = false;
-                            tracing::warn!(
-                                "Node {} marked unhealthy after {} failures",
-                                addr,
-                                node_health.failure_count
-                            );
-                        }
+                        (false, None, None)
                     }
+                };
+                let (healthy, sc, fc) = Self::advance_health(
+                    node_health.healthy,
+                    node_health.success_count,
+                    node_health.failure_count,
+                    ok,
+                    config.health.failure_threshold,
+                    config.health.success_threshold,
+                );
+                let was_healthy = node_health.healthy;
+                node_health.healthy = healthy;
+                node_health.success_count = sc;
+                node_health.failure_count = fc;
+                if let Some(latency) = latency {
+                    node_health.latency_ms = latency;
+                    node_health.last_error = None;
+                }
+                if let Some(lag) = lag {
+                    node_health.replication_lag_bytes = Some(lag);
+                    node_health.lag_sampled_at = Some(chrono::Utc::now());
+                }
+                if was_healthy && !healthy {
+                    tracing::warn!(
+                        "Node {} marked unhealthy after {} failures",
+                        addr,
+                        node_health.failure_count
+                    );
+                } else if !was_healthy && healthy {
+                    tracing::info!(
+                        "Node {} recovered after {} consecutive successes",
+                        addr,
+                        node_health.success_count
+                    );
                 }
                 node_health.last_check = chrono::Utc::now();
             }
         }
         state.health.store(Arc::new(next));
+    }
+
+    /// Advance the consecutive success/failure counters and decide health
+    /// (H-03). A healthy node stays healthy on success; a node marked
+    /// unhealthy only returns to healthy after `success_threshold` consecutive
+    /// successes. Failures always count toward `failure_threshold`. Pure so the
+    /// policy is unit-tested without a backend.
+    fn advance_health(
+        healthy: bool,
+        success_count: u32,
+        failure_count: u32,
+        ok: bool,
+        failure_threshold: u32,
+        success_threshold: u32,
+    ) -> (bool, u32, u32) {
+        if ok {
+            let sc = success_count.saturating_add(1);
+            (healthy || sc >= success_threshold.max(1), sc, 0)
+        } else {
+            let fc = failure_count.saturating_add(1);
+            let now_healthy = if fc >= failure_threshold.max(1) {
+                false
+            } else {
+                healthy
+            };
+            (now_healthy, 0, fc)
+        }
+    }
+
+    /// One node probe (H-03/H-04): a credential-less protocol probe by default,
+    /// or `check_query` plus a standby WAL-position lag probe when
+    /// `[health] user` is configured. Returns `(latency_ms, lag_bytes)`.
+    async fn probe_node(
+        health: &crate::config::HealthConfig,
+        addr: &str,
+        role: NodeRole,
+        primary_lsn: Option<u64>,
+        timeout: Duration,
+    ) -> Result<(f64, Option<u64>)> {
+        if health.user.is_none() {
+            return Self::check_node_addr(addr, timeout)
+                .await
+                .map(|l| (l, None));
+        }
+        Self::check_node_query(health, addr, role, primary_lsn, timeout).await
+    }
+
+    /// Credentialed probe: connect, run `[health] check_query` and, for a
+    /// standby/read-replica with a known primary LSN, `pg_last_wal_replay_lsn()`
+    /// to compute the byte lag. The lag probe is best-effort and never fails
+    /// the health check (non-PostgreSQL backends simply report unknown lag).
+    async fn check_node_query(
+        health: &crate::config::HealthConfig,
+        addr: &str,
+        role: NodeRole,
+        primary_lsn: Option<u64>,
+        timeout: Duration,
+    ) -> Result<(f64, Option<u64>)> {
+        use crate::backend::{
+            tls::default_client_config, BackendClient, BackendConfig, TextValue, TlsMode,
+        };
+        let (host, port) = addr
+            .rsplit_once(':')
+            .ok_or_else(|| ProxyError::HealthCheck(format!("bad node address {}", addr)))?;
+        let port: u16 = port
+            .parse()
+            .map_err(|_| ProxyError::HealthCheck(format!("bad node port {}", addr)))?;
+        let mk_cfg = |user: String| BackendConfig {
+            host: host.to_string(),
+            port,
+            user,
+            password: health.password.clone(),
+            database: health.database.clone(),
+            application_name: Some("heliosdb-proxy-health".into()),
+            tls_mode: TlsMode::Prefer,
+            connect_timeout: timeout,
+            query_timeout: timeout,
+            tls_config: default_client_config(),
+        };
+        let cfg = mk_cfg(
+            health
+                .user
+                .clone()
+                .unwrap_or_else(|| "postgres".to_string()),
+        );
+        let start = std::time::Instant::now();
+        let mut client = tokio::time::timeout(timeout, BackendClient::connect(&cfg))
+            .await
+            .map_err(|_| ProxyError::HealthCheck(format!("Timeout connecting to {}", addr)))?
+            .map_err(|e| ProxyError::HealthCheck(format!("connect {}: {}", addr, e)))?;
+        tokio::time::timeout(timeout, client.simple_query(&health.check_query))
+            .await
+            .map_err(|_| ProxyError::HealthCheck(format!("{} check_query timed out", addr)))?
+            .map_err(|e| ProxyError::HealthCheck(format!("{} check_query: {}", addr, e)))?;
+        let latency = start.elapsed().as_secs_f64() * 1000.0;
+
+        let mut lag = None;
+        if matches!(role, NodeRole::Standby | NodeRole::ReadReplica) {
+            if let Some(primary) = primary_lsn {
+                if let Ok(res) = client
+                    .simple_query("SELECT pg_last_wal_replay_lsn()::text")
+                    .await
+                {
+                    let text = res
+                        .rows
+                        .first()
+                        .and_then(|r| r.first())
+                        .and_then(|v| match v {
+                            TextValue::Text(s) => Some(s.clone()),
+                            TextValue::Null => None,
+                        });
+                    if let Some(text) = text.as_deref().and_then(parse_pg_lsn) {
+                        lag = Some(primary.saturating_sub(text));
+                    }
+                }
+            }
+        }
+        client.close().await;
+        Ok((latency, lag))
+    }
+
+    /// Sample the configured primary's current WAL position once per sweep.
+    /// `None` on any failure (the standby probes then report unknown lag).
+    async fn probe_primary_lsn(config: &ProxyConfig, timeout: Duration) -> Option<u64> {
+        use crate::backend::{
+            tls::default_client_config, BackendClient, BackendConfig, TextValue, TlsMode,
+        };
+        let primary = config
+            .nodes
+            .iter()
+            .find(|n| n.role == NodeRole::Primary && n.enabled)?;
+        let cfg = BackendConfig {
+            host: primary.host.clone(),
+            port: primary.port,
+            user: config
+                .health
+                .user
+                .clone()
+                .unwrap_or_else(|| "postgres".to_string()),
+            password: config.health.password.clone(),
+            database: config.health.database.clone(),
+            application_name: Some("heliosdb-proxy-health".into()),
+            tls_mode: TlsMode::Prefer,
+            connect_timeout: timeout,
+            query_timeout: timeout,
+            tls_config: default_client_config(),
+        };
+        let mut client = tokio::time::timeout(timeout, BackendClient::connect(&cfg))
+            .await
+            .ok()?
+            .ok()?;
+        let out = tokio::time::timeout(
+            timeout,
+            client.simple_query("SELECT pg_current_wal_lsn()::text"),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        client.close().await;
+        let text = out
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|v| match v {
+                TextValue::Text(s) => Some(s.as_str()),
+                TextValue::Null => None,
+            })?;
+        parse_pg_lsn(text)
     }
 
     /// Check health of a single node with a protocol-level liveness probe.
@@ -12455,13 +12684,14 @@ mod tests {
         #[test]
         fn lag_exclusion_thresholds() {
             // max=0 disables exclusion.
-            assert!(!ProxyServer::lag_excludes_standby(Some(999_999), 0));
-            // unknown lag never excludes.
-            assert!(!ProxyServer::lag_excludes_standby(None, 1000));
+            assert!(!ProxyServer::lag_excludes_standby(Some(999_999), 0, false));
+            // unknown lag never excludes unless the strict policy is on.
+            assert!(!ProxyServer::lag_excludes_standby(None, 1000, false));
+            assert!(ProxyServer::lag_excludes_standby(None, 1000, true));
             // within ceiling stays in rotation.
-            assert!(!ProxyServer::lag_excludes_standby(Some(500), 1000));
+            assert!(!ProxyServer::lag_excludes_standby(Some(500), 1000, false));
             // beyond ceiling is dropped.
-            assert!(ProxyServer::lag_excludes_standby(Some(2000), 1000));
+            assert!(ProxyServer::lag_excludes_standby(Some(2000), 1000, false));
         }
     }
 
@@ -15977,6 +16207,58 @@ mod tests {
             .await;
             assert!(matches!(r, Err(ProxyError::NoHealthyNodes)), "{r:?}");
             assert!(started.elapsed() < Duration::from_secs(2));
+        }
+
+        #[test]
+        fn advance_health_applies_success_threshold_on_recovery() {
+            // Healthy nodes stay healthy on the first success.
+            assert_eq!(
+                ProxyServer::advance_health(true, 0, 0, true, 3, 2),
+                (true, 1, 0)
+            );
+            // An unhealthy node needs `success_threshold` consecutive successes.
+            assert_eq!(
+                ProxyServer::advance_health(false, 0, 3, true, 3, 2),
+                (false, 1, 0)
+            );
+            assert_eq!(
+                ProxyServer::advance_health(false, 1, 0, true, 3, 2),
+                (true, 2, 0)
+            );
+            // Failures count toward `failure_threshold` and reset successes.
+            assert_eq!(
+                ProxyServer::advance_health(true, 5, 0, false, 3, 2),
+                (true, 0, 1)
+            );
+            assert_eq!(
+                ProxyServer::advance_health(true, 5, 2, false, 3, 2),
+                (false, 0, 3)
+            );
+        }
+
+        #[cfg(feature = "lag-routing")]
+        #[test]
+        fn lag_policy_treats_unknown_as_fresh_unless_strict() {
+            // Known lag over the threshold is excluded (when a threshold is set).
+            assert!(ProxyServer::lag_excludes_standby(Some(100), 10, false));
+            assert!(!ProxyServer::lag_excludes_standby(Some(5), 10, false));
+            assert!(!ProxyServer::lag_excludes_standby(Some(100), 0, false));
+            // Unknown lag: allowed by default, excluded under the strict policy.
+            assert!(!ProxyServer::lag_excludes_standby(None, 10, false));
+            assert!(ProxyServer::lag_excludes_standby(None, 10, true));
+        }
+
+        #[test]
+        fn parse_pg_lsn_roundtrip() {
+            assert_eq!(parse_pg_lsn("0/0"), Some(0));
+            assert_eq!(parse_pg_lsn("0/16B3748"), Some(0x016B_3748));
+            assert_eq!(parse_pg_lsn("1/0"), Some(1 << 32));
+            assert_eq!(
+                parse_pg_lsn("16/B374D848"),
+                Some((0x16 << 32) | 0xB374_D848)
+            );
+            assert_eq!(parse_pg_lsn("not-an-lsn"), None);
+            assert_eq!(parse_pg_lsn(""), None);
         }
 
         #[test]

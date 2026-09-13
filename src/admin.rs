@@ -2523,6 +2523,9 @@ struct NodeHealthResponse {
     last_error: Option<String>,
     latency_ms: f64,
     replication_lag_bytes: Option<u64>,
+    /// When the lag byte count was sampled (H-04); `None` when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lag_sampled_at: Option<String>,
 }
 
 impl From<NodeHealth> for NodeHealthResponse {
@@ -2535,6 +2538,7 @@ impl From<NodeHealth> for NodeHealthResponse {
             last_error: h.last_error,
             latency_ms: h.latency_ms,
             replication_lag_bytes: h.replication_lag_bytes,
+            lag_sampled_at: h.lag_sampled_at.map(|t| t.to_rfc3339()),
         }
     }
 }
@@ -2870,6 +2874,8 @@ mod tests {
                     last_error: None,
                     latency_ms: 1.0,
                     replication_lag_bytes: None,
+                    success_count: 0,
+                    lag_sampled_at: None,
                 },
             );
         }
@@ -2936,6 +2942,8 @@ mod tests {
                     last_error: None,
                     latency_ms: 1.0,
                     replication_lag_bytes: None,
+                    success_count: 0,
+                    lag_sampled_at: None,
                 },
             );
         }
@@ -3093,6 +3101,8 @@ mod tests {
                         last_error: None,
                         latency_ms: 1.0,
                         replication_lag_bytes: None,
+                        success_count: 0,
+                        lag_sampled_at: None,
                     },
                 );
             }
@@ -3542,6 +3552,8 @@ mod tests {
                 last_error: None,
                 latency_ms: 1.0,
                 replication_lag_bytes: None,
+                success_count: 0,
+                lag_sampled_at: None,
             },
         );
         state
@@ -3599,6 +3611,8 @@ mod tests {
                 last_error: None,
                 latency_ms: 1.0,
                 replication_lag_bytes: None,
+                success_count: 0,
+                lag_sampled_at: None,
             },
         );
         for addr in &["a:5432", "b:5432"] {

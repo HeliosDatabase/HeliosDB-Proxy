@@ -282,6 +282,23 @@ check_timeout_secs  = 3
 failure_threshold   = 3     # Failures before marking unhealthy
 success_threshold   = 2     # Successes before marking healthy again
 check_query         = "SELECT 1"
+# Optional credentials for the daemon's health and WAL-lag probes (H-03/H-04).
+# When unset, the daemon uses a credential-less PostgreSQL protocol probe
+# (SSLRequest); check_query and lag measurement then stay unused/unknown.
+# user     = "postgres"
+# password = "${HELIOS_PROXY_HEALTH_PASSWORD}"
+# database = "postgres"
+
+# =============================================================================
+# LAG-AWARE ROUTING — replica freshness (feature `lag-routing`)
+# =============================================================================
+# [lag_routing]
+# enabled = true
+# ryw_window_ms = 500          # reads within this window after a session write
+#                              # pin to the primary (read-your-writes)
+# max_lag_bytes = 16777216     # exclude a standby lagging beyond this (0 = off)
+# require_known_lag = false    # true = exclude standbys whose lag is unknown
+#                              # (never measured) instead of treating them as fresh
 
 # =============================================================================
 # NODES — Backend database cluster members

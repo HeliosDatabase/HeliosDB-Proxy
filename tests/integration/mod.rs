@@ -118,6 +118,9 @@ fn test_module_03_health_checker_config() {
         failure_threshold: 5,
         success_threshold: 3,
         check_query: "SELECT pg_is_in_recovery()".to_string(),
+        user: None,
+        password: None,
+        database: None,
     };
     assert_eq!(cfg.failure_threshold, 5);
     assert_eq!(cfg.success_threshold, 3);

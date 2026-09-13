@@ -370,8 +370,9 @@ check_query = "SELECT 1"
 | `check_interval_secs` | u64 | `5` | Interval between probes. **Must be ≥ 1** (0 is rejected at startup). |
 | `check_timeout_secs` | u64 | `3` | Max wait for a probe response. |
 | `failure_threshold` | u32 | `3` | Consecutive failures before marking a node unhealthy. |
-| `success_threshold` | u32 | `2` | Consecutive successes before marking a node healthy again. |
-| `check_query` | string | `"SELECT 1"` | Health-check query. |
+| `success_threshold` | u32 | `2` | Consecutive successes before a node marked unhealthy is considered healthy again. |
+| `check_query` | string | `"SELECT 1"` | Health-check query. Used by the daemon only when `[health] user` is set; the default credential-less probe is a PostgreSQL `SSLRequest` liveness check. |
+| `user` / `password` / `database` | string / string / string | *(none)* | Optional credentials for the daemon's health and lag probes (H-03/H-04). When set, the daemon connects and runs `check_query` (and, for standbys, WAL-position lag probes) instead of the credential-less protocol probe. |
 
 ---
 
@@ -525,13 +526,15 @@ feature and `enabled = true`.
 enabled = true
 ryw_window_ms = 500
 max_lag_bytes = 0
+require_known_lag = false
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Enable lag-aware read routing + read-your-writes. |
 | `ryw_window_ms` | u64 | `500` | Reads within this many ms of a write in the same session pin to the primary (read-your-writes). 0 disables the window. |
-| `max_lag_bytes` | u64 | `0` | Exclude a standby when its replication lag exceeds this many bytes. 0 = no lag-based exclusion. |
+| `max_lag_bytes` | u64 | `0` | Exclude a standby when its measured replication lag exceeds this many bytes. 0 = no lag-based exclusion. |
+| `require_known_lag` | bool | `false` | Strict freshness: when `true`, a standby whose lag was never measured is excluded instead of being treated as fresh. Lag is measured only when `[health] user` is configured and this feature is enabled. |
 
 ---
 

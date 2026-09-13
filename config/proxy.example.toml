@@ -184,7 +184,21 @@ success_threshold = 2
 
 # The SQL query used as a health check. SELECT 1 works on all PostgreSQL
 # versions. For deeper checks, consider pg_is_in_recovery() or custom queries.
+# The daemon runs it only when [health] user is set; otherwise it uses a
+# credential-less protocol probe.
 check_query = "SELECT 1"
+
+# Optional credentials for the daemon's health and WAL-lag probes (H-03/H-04).
+# user     = "postgres"
+# password = "${HELIOS_PROXY_HEALTH_PASSWORD}"
+# database = "postgres"
+
+# Replica freshness (feature `lag-routing`):
+# [lag_routing]
+# enabled = true
+# ryw_window_ms = 500
+# max_lag_bytes = 16777216
+# require_known_lag = false    # true = never treat an unmeasured standby as fresh
 
 # -----------------------------------------------------------------------------
 # Backend nodes — define your database cluster

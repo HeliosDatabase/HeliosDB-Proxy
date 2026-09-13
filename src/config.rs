@@ -1155,6 +1155,12 @@ pub struct LagRoutingToml {
     /// exceeds this many bytes. 0 = no lag-based exclusion (default; the proxy
     /// does not yet populate per-node lag without a configured monitor).
     pub max_lag_bytes: u64,
+    /// Strict freshness: when `true`, a standby whose lag is **unknown**
+    /// (`None`) is excluded from reads instead of being treated as fresh
+    /// (H-04). Lag is measured only when `[health] user` is configured and
+    /// `lag_routing.enabled` is set; otherwise every standby is unknown.
+    #[serde(default)]
+    pub require_known_lag: bool,
 }
 
 impl Default for LagRoutingToml {
@@ -1163,6 +1169,7 @@ impl Default for LagRoutingToml {
             enabled: false,
             ryw_window_ms: 500,
             max_lag_bytes: 0,
+            require_known_lag: false,
         }
     }
 }
@@ -2446,6 +2453,17 @@ pub struct HealthConfig {
     pub success_threshold: u32,
     /// Health check query
     pub check_query: String,
+    /// Optional credentials for the daemon's health/lag probes. When unset the
+    /// daemon uses a credential-less protocol probe (SSLRequest) and
+    /// `check_query`/lag measurement are not available; when set it connects
+    /// and runs `check_query` (H-03) and, for standbys, the WAL-position lag
+    /// probes (H-04).
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub database: Option<String>,
 }
 
 impl Default for HealthConfig {
@@ -2456,6 +2474,9 @@ impl Default for HealthConfig {
             failure_threshold: 3,
             success_threshold: 2,
             check_query: "SELECT 1".to_string(),
+            user: None,
+            password: None,
+            database: None,
         }
     }
 }
