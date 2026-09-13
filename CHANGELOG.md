@@ -35,8 +35,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `least_connections` (fewest attached sessions), `latency_based` (measured health-probe
   latency), `random` and the new `power_of_two` (sample two, prefer fewer attached
   sessions then lower latency) are all applied to the already-eligible standby set; the
-  default configuration is unchanged. Health policy was re-verified at the same time:
-  `check_query` and `success_threshold` are honored by the health checker.
+  default configuration is unchanged. (The earlier note in this file that health policy
+  was "re-verified" referred to the library checker; the daemon-side fix is below.)
+
+- Daemon health policy is now real (H-03 follow-up). The health sweep applies
+  `success_threshold` — an unhealthy node must pass N consecutive probes to return —
+  and runs `[health] check_query` when optional `[health] user/password/database`
+  credentials are configured; without them it keeps the credential-less SSLRequest
+  probe. `success_threshold` previously did not exist in the daemon's health state.
+
+- Real replica-lag measurement and strict freshness (H-04). With health credentials and
+  `[lag_routing] enabled`, each sweep samples the primary's `pg_current_wal_lsn()` once
+  and each standby's `pg_last_wal_replay_lsn()`, recording byte lag plus sample time per
+  node (surfaced at `/nodes`). `[lag_routing] require_known_lag = true` excludes a
+  standby whose lag was never measured instead of treating unknown as fresh.
 
 - Shadow execution is actually concurrent and budget-bounded (O-03). The shadow side now
   runs in its own task/connection while the primary is awaited (the doc had claimed
