@@ -2427,6 +2427,10 @@ pub enum Strategy {
     LatencyBased,
     /// Random selection
     Random,
+    /// Power-of-two-choices: sample two eligible nodes and pick the one with
+    /// fewer attached sessions, breaking ties on measured latency (H-03).
+    /// Cheaper and more herd-resistant than global least-connections.
+    PowerOfTwo,
 }
 
 /// Health check configuration
