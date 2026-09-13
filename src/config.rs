@@ -1021,6 +1021,14 @@ pub struct LimitsToml {
     /// connected and is not re-read).
     #[serde(default = "default_client_idle_timeout_secs")]
     pub client_idle_timeout_secs: u64,
+    /// Bounded admission queue for the `max_client_connections` cap (H-05).
+    /// When > 0, a connection arriving at the cap waits up to this many
+    /// seconds for a permit (fair, FIFO) before being refused with SQLSTATE
+    /// 53300; 0 refuses immediately (the pre-H-05 behaviour). Reserved
+    /// capacity for health/admin traffic is unaffected: health probes hold no
+    /// client slot and the admin API is a separate listener.
+    #[serde(default = "default_client_admission_wait_secs")]
+    pub client_admission_wait_secs: u64,
     /// In-session Transaction Replay (`tr_mode = "select" | "transaction"`):
     /// maximum number of statements recorded for the current explicit
     /// transaction. A transaction that exceeds this cap is marked
@@ -1095,6 +1103,10 @@ fn default_client_idle_timeout_secs() -> u64 {
     // 0 = disabled: preserves the pre-timeout behaviour byte-for-byte.
     0
 }
+fn default_client_admission_wait_secs() -> u64 {
+    // 0 = refuse immediately, preserving the pre-H-05 admission behaviour.
+    0
+}
 fn default_tr_max_replay_statements() -> usize {
     1000
 }
@@ -1133,6 +1145,7 @@ impl Default for LimitsToml {
             pool_reap_interval_secs: default_pool_reap_interval_secs(),
             max_client_connections: default_max_client_connections(),
             client_idle_timeout_secs: default_client_idle_timeout_secs(),
+            client_admission_wait_secs: default_client_admission_wait_secs(),
             tr_max_replay_statements: default_tr_max_replay_statements(),
             tr_max_replay_bytes: default_tr_max_replay_bytes(),
             tr_max_session_set_statements: default_tr_max_session_set_statements(),
@@ -2101,6 +2114,11 @@ impl ProxyConfig {
                     "limits.client_idle_timeout_secs must be <= {MAX_LIMIT_SECS} seconds (1 year)"
                 )));
             }
+            if l.client_admission_wait_secs > MAX_LIMIT_SECS {
+                return Err(ProxyError::Config(format!(
+                    "limits.client_admission_wait_secs must be <= {MAX_LIMIT_SECS} seconds (1 year)"
+                )));
+            }
             if l.max_client_connections > tokio::sync::Semaphore::MAX_PERMITS {
                 return Err(ProxyError::Config(format!(
                     "limits.max_client_connections must be <= {}",
@@ -2602,6 +2620,17 @@ mod tests {
         let config = ProxyConfig::default();
         assert_eq!(config.listen_address, "0.0.0.0:5432");
         assert!(config.tr_enabled);
+    }
+
+    #[test]
+    fn client_admission_wait_defaults_and_parses() {
+        let cfg = ProxyConfig::default();
+        assert_eq!(
+            cfg.limits.client_admission_wait_secs, 0,
+            "default must preserve immediate refusal"
+        );
+        let l: LimitsToml = toml::from_str("client_admission_wait_secs = 5\n").unwrap();
+        assert_eq!(l.client_admission_wait_secs, 5);
     }
 
     #[test]
