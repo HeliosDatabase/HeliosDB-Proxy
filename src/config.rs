@@ -1029,6 +1029,12 @@ pub struct LimitsToml {
     /// client slot and the admin API is a separate listener.
     #[serde(default = "default_client_admission_wait_secs")]
     pub client_admission_wait_secs: u64,
+    /// How many authenticated idle backend clients the non-PG-wire gateways
+    /// (HTTP SQL, MCP, GraphQL) keep per backend identity for reuse (H-06).
+    /// 0 disables pooling (every gateway request dials, the pre-H-06
+    /// behaviour). Default 16.
+    #[serde(default = "default_gateway_pool_max_idle")]
+    pub gateway_pool_max_idle: usize,
     /// In-session Transaction Replay (`tr_mode = "select" | "transaction"`):
     /// maximum number of statements recorded for the current explicit
     /// transaction. A transaction that exceeds this cap is marked
@@ -1107,6 +1113,9 @@ fn default_client_admission_wait_secs() -> u64 {
     // 0 = refuse immediately, preserving the pre-H-05 admission behaviour.
     0
 }
+fn default_gateway_pool_max_idle() -> usize {
+    16
+}
 fn default_tr_max_replay_statements() -> usize {
     1000
 }
@@ -1146,6 +1155,7 @@ impl Default for LimitsToml {
             max_client_connections: default_max_client_connections(),
             client_idle_timeout_secs: default_client_idle_timeout_secs(),
             client_admission_wait_secs: default_client_admission_wait_secs(),
+            gateway_pool_max_idle: default_gateway_pool_max_idle(),
             tr_max_replay_statements: default_tr_max_replay_statements(),
             tr_max_replay_bytes: default_tr_max_replay_bytes(),
             tr_max_session_set_statements: default_tr_max_session_set_statements(),

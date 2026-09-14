@@ -21,19 +21,19 @@ use tokio::net::TcpListener;
 
 use crate::backend::client::QueryResult;
 use crate::backend::types::TextValue;
-use crate::backend::{
-    tls::default_client_config, BackendClient, BackendConfig, ParamValue, TlsMode,
-};
+use crate::backend::{tls::default_client_config, BackendConfig, ParamValue, TlsMode};
 use crate::config::HttpGatewayConfig;
+use crate::gateway_pool::{statement_is_session_neutral, SharedBackendPool};
 use crate::{ProxyError, Result};
 
 pub struct HttpGateway {
     config: HttpGatewayConfig,
+    pool: SharedBackendPool,
 }
 
 impl HttpGateway {
-    pub fn new(config: HttpGatewayConfig) -> Self {
-        Self { config }
+    pub fn new(config: HttpGatewayConfig, pool: SharedBackendPool) -> Self {
+        Self { config, pool }
     }
 
     pub async fn run(self) -> Result<()> {
@@ -47,6 +47,7 @@ impl HttpGateway {
             })?;
         tracing::info!(addr = %self.config.listen_address, "HTTP SQL gateway listening");
         let cfg = Arc::new(self.config);
+        let pool = self.pool.clone();
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(x) => x,
@@ -56,15 +57,20 @@ impl HttpGateway {
                 }
             };
             let cfg = cfg.clone();
+            let pool = pool.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle(stream, cfg).await {
+                if let Err(e) = Self::handle(stream, cfg, pool).await {
                     tracing::debug!(%peer, "HTTP gateway error: {}", e);
                 }
             });
         }
     }
 
-    async fn handle(mut stream: tokio::net::TcpStream, cfg: Arc<HttpGatewayConfig>) -> Result<()> {
+    async fn handle(
+        mut stream: tokio::net::TcpStream,
+        cfg: Arc<HttpGatewayConfig>,
+        pool: SharedBackendPool,
+    ) -> Result<()> {
         use crate::http_util;
         let (reader, mut writer) = stream.split();
         let mut reader = BufReader::new(reader);
@@ -134,7 +140,7 @@ impl HttpGateway {
         }
         let params = parse_params(req.get("params"));
 
-        match Self::run_sql(&cfg, sql, &params).await {
+        match Self::run_sql(&cfg, &pool, sql, &params).await {
             Ok(qr) => {
                 let body = neon_result(&qr, array_mode);
                 Self::respond(&mut writer, 200, &body).await
@@ -145,6 +151,7 @@ impl HttpGateway {
 
     async fn run_sql(
         cfg: &HttpGatewayConfig,
+        pool: &SharedBackendPool,
         sql: &str,
         params: &[ParamValue],
     ) -> std::result::Result<QueryResult, String> {
@@ -160,7 +167,8 @@ impl HttpGateway {
             query_timeout: Duration::from_secs(30),
             tls_config: default_client_config(),
         };
-        let mut client = BackendClient::connect(&bcfg)
+        let mut client = pool
+            .acquire(&bcfg)
             .await
             .map_err(|e| format!("backend connect: {}", e))?;
         let res = if params.is_empty() {
@@ -168,8 +176,22 @@ impl HttpGateway {
         } else {
             client.query_with_params(sql, params).await
         };
-        client.close().await;
-        res.map_err(|e| format!("{}", e))
+        match res {
+            Ok(qr) => {
+                // H-06: reuse the authenticated connection only when the
+                // statement left no session state behind.
+                if statement_is_session_neutral(sql) {
+                    pool.release(&bcfg, client);
+                } else {
+                    pool.discard(client);
+                }
+                Ok(qr)
+            }
+            Err(e) => {
+                pool.discard(client);
+                Err(format!("{}", e))
+            }
+        }
     }
 
     async fn respond(

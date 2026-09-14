@@ -29,6 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The non-PG-wire gateways now reuse backend connections instead of dialing per
+  request (H-06 first slice). The HTTP SQL, MCP and GraphQL gateways each own a small
+  idle pool (`[limits] gateway_pool_max_idle`, default 16) of authenticated
+  `BackendClient`s; a connection is returned only for session-neutral SQL and is
+  discarded otherwise, so a request cannot inherit another request's transaction or
+  session state. Pools are separate per gateway so a session policy (MCP read-only GUC)
+  cannot leak across interfaces. `0` disables pooling (the previous behaviour). The
+  per-interface contract and remaining parity gaps (rate limiter, circuit breaker,
+  tenant identity) are documented in `docs/internal/H-06-interface-contract.md`.
+
 - Fault-tolerant client admission and reconnect (H-05). `[limits]
   client_admission_wait_secs` (default 0 = immediate refusal, unchanged) makes the
   `max_client_connections` cap a bounded fair queue: a connection arriving at the cap

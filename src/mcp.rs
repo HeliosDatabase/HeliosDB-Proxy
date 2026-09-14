@@ -22,7 +22,7 @@ use tokio::net::TcpListener;
 use crate::agent_contract::{self, AgentContract};
 use crate::backend::client::QueryResult;
 use crate::backend::types::TextValue;
-use crate::backend::{tls::default_client_config, BackendClient, BackendConfig, TlsMode};
+use crate::backend::{tls::default_client_config, BackendConfig, TlsMode};
 use crate::config::McpConfig;
 use crate::{ProxyError, Result};
 
@@ -32,11 +32,20 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 pub struct McpServer {
     config: McpConfig,
     contract: Option<AgentContract>,
+    pool: crate::gateway_pool::SharedBackendPool,
 }
 
 impl McpServer {
-    pub fn new(config: McpConfig, contract: Option<AgentContract>) -> Self {
-        Self { config, contract }
+    pub fn new(
+        config: McpConfig,
+        contract: Option<AgentContract>,
+        pool: crate::gateway_pool::SharedBackendPool,
+    ) -> Self {
+        Self {
+            config,
+            contract,
+            pool,
+        }
     }
 
     /// Bind and serve the MCP HTTP endpoint until the task is dropped.
@@ -50,6 +59,7 @@ impl McpServer {
             contract = ?self.contract.as_ref().map(|c| &c.id), "MCP agent gateway listening");
         let cfg = Arc::new(self.config);
         let contract = Arc::new(self.contract);
+        let pool = self.pool.clone();
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(x) => x,
@@ -60,8 +70,9 @@ impl McpServer {
             };
             let cfg = cfg.clone();
             let contract = contract.clone();
+            let pool = pool.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_connection(stream, cfg, contract).await {
+                if let Err(e) = Self::handle_connection(stream, cfg, contract, pool).await {
                     tracing::debug!(%peer, "MCP connection error: {}", e);
                 }
             });
@@ -72,6 +83,7 @@ impl McpServer {
         mut stream: tokio::net::TcpStream,
         cfg: Arc<McpConfig>,
         contract: Arc<Option<AgentContract>>,
+        pool: crate::gateway_pool::SharedBackendPool,
     ) -> Result<()> {
         use crate::http_util;
         let (reader, mut writer) = stream.split();
@@ -122,7 +134,7 @@ impl McpServer {
             Err(_) => return Ok(()),
         };
 
-        let response = Self::dispatch(&body, &cfg, (*contract).as_ref()).await;
+        let response = Self::dispatch(&body, &cfg, (*contract).as_ref(), &pool).await;
         match response {
             Some(v) => {
                 let payload = serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string());
@@ -138,6 +150,7 @@ impl McpServer {
         body: &str,
         cfg: &McpConfig,
         contract: Option<&AgentContract>,
+        pool: &crate::gateway_pool::SharedBackendPool,
     ) -> Option<Value> {
         let req: Value = match serde_json::from_str(body) {
             Ok(v) => v,
@@ -166,7 +179,7 @@ impl McpServer {
             "notifications/initialized" | "notifications/cancelled" => None,
             "ping" => Some(rpc_ok(id, json!({}))),
             "tools/list" => Some(rpc_ok(id, json!({ "tools": Self::tool_defs(cfg) }))),
-            "tools/call" => Some(Self::handle_tool_call(id, &params, cfg, contract).await),
+            "tools/call" => Some(Self::handle_tool_call(id, &params, cfg, contract, pool).await),
             other => Some(rpc_error(
                 id,
                 -32601,
@@ -213,6 +226,7 @@ impl McpServer {
         params: &Value,
         cfg: &McpConfig,
         contract: Option<&AgentContract>,
+        pool: &crate::gateway_pool::SharedBackendPool,
     ) -> Value {
         let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -229,7 +243,7 @@ impl McpServer {
                 } else {
                     match Self::check_policy(cfg, contract, sql) {
                         Err(hint) => Err(hint),
-                        Ok(()) => Self::run_sql(cfg, sql, effective_read_only(cfg, contract))
+                        Ok(()) => Self::run_sql(cfg, pool, sql, effective_read_only(cfg, contract))
                             .await
                             .map(|r| format_result(&r)),
                     }
@@ -239,7 +253,7 @@ impl McpServer {
                 let sql = "SELECT table_schema, table_name FROM information_schema.tables \
                            WHERE table_schema NOT IN ('pg_catalog','information_schema') \
                            ORDER BY table_schema, table_name";
-                Self::run_sql(cfg, sql, effective_read_only(cfg, contract))
+                Self::run_sql(cfg, pool, sql, effective_read_only(cfg, contract))
                     .await
                     .map(|r| format_result(&r))
             }
@@ -259,6 +273,7 @@ impl McpServer {
                         // prefix is applied only for execution.
                         Ok(()) => Self::run_sql(
                             cfg,
+                            pool,
                             &format!("EXPLAIN {}", sql),
                             effective_read_only(cfg, contract),
                         )
@@ -361,6 +376,7 @@ impl McpServer {
     /// role if that matters for your deployment.
     async fn run_sql(
         cfg: &McpConfig,
+        pool: &crate::gateway_pool::SharedBackendPool,
         sql: &str,
         read_only: bool,
     ) -> std::result::Result<QueryResult, String> {
@@ -376,21 +392,39 @@ impl McpServer {
             query_timeout: Duration::from_secs(30),
             tls_config: default_client_config(),
         };
-        let mut client = BackendClient::connect(&bcfg)
+        let mut client = pool
+            .acquire(&bcfg)
             .await
             .map_err(|e| format!("backend connect: {}", e))?;
         if read_only {
+            // Re-assert on every checkout: this pool is MCP-only and every
+            // connection it retains has the GUC set, but asserting again is
+            // cheap and makes the backstop independent of pool history.
             if let Err(e) = client
                 .execute("SET default_transaction_read_only = on")
                 .await
             {
-                client.close().await;
+                pool.discard(client);
                 return Err(format!("failed to enforce read-only mode: {}", e));
             }
         }
-        let res = client.simple_query(sql).await.map_err(|e| format!("{}", e));
-        client.close().await;
-        res
+        match client.simple_query(sql).await {
+            Ok(qr) => {
+                // read_only connections are retained (their only state is the
+                // GUC, re-asserted on checkout); otherwise only session-neutral
+                // statements may be pooled (H-06).
+                if read_only || crate::gateway_pool::statement_is_session_neutral(sql) {
+                    pool.release(&bcfg, client);
+                } else {
+                    pool.discard(client);
+                }
+                Ok(qr)
+            }
+            Err(e) => {
+                pool.discard(client);
+                Err(format!("{}", e))
+            }
+        }
     }
 
     async fn write_http(
@@ -1077,6 +1111,11 @@ mod tests {
         assert!(effective_read_only(&rw, Some(&ro_contract)));
     }
 
+    /// Zero-capacity pool: dispatch tests never reach a backend.
+    fn test_pool() -> crate::gateway_pool::SharedBackendPool {
+        std::sync::Arc::new(crate::gateway_pool::BackendClientPool::new(0))
+    }
+
     #[tokio::test]
     async fn initialize_and_tools_list() {
         let cfg = McpConfig::default();
@@ -1084,6 +1123,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
             &cfg,
             None,
+            &test_pool(),
         )
         .await
         .unwrap();
@@ -1094,6 +1134,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
             &cfg,
             None,
+            &test_pool(),
         )
         .await
         .unwrap();
@@ -1115,6 +1156,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
             &cfg,
             None,
+            &test_pool(),
         )
         .await;
         assert!(r.is_none());
@@ -1127,6 +1169,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query","arguments":{"sql":"DELETE FROM t"}}}"#,
             &cfg,
             None,
+            &test_pool(),
         )
         .await
         .unwrap();

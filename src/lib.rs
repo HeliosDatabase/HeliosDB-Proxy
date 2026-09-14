@@ -68,6 +68,7 @@ pub mod client_tls;
 pub mod config;
 pub mod connection_pool;
 pub mod failover_controller;
+pub mod gateway_pool;
 pub mod health_checker;
 pub mod http_gateway;
 pub(crate) mod http_util;

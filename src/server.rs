@@ -770,6 +770,9 @@ struct ResolvedLimits {
     /// Bounded admission wait for the `max_client_connections` cap (H-05).
     /// `None` when `client_admission_wait_secs = 0` (refuse immediately).
     client_admission_wait: Option<Duration>,
+    /// Idle authenticated clients kept per backend identity by the non-PG-wire
+    /// gateways (H-06).
+    gateway_pool_max_idle: usize,
     /// In-session TR: cap on recorded statements per explicit transaction.
     tr_max_replay_statements: usize,
     /// In-session TR: cap on recorded bytes per explicit transaction.
@@ -819,6 +822,7 @@ impl ResolvedLimits {
                 0 => None,
                 secs => Some(Duration::from_secs(secs)),
             },
+            gateway_pool_max_idle: l.gateway_pool_max_idle,
             tr_max_replay_statements: l.tr_max_replay_statements,
             tr_max_replay_bytes: l.tr_max_replay_bytes,
             tr_max_session_set_statements: l.tr_max_session_set_statements,
@@ -2392,9 +2396,21 @@ impl ProxyServer {
         // Start admin server
         let admin_task = self.spawn_admin_server();
 
+        // H-06: per-gateway idle pools for the non-PG-wire gateways, so the
+        // HTTP, MCP and GraphQL gateways reuse authenticated backend
+        // connections instead of dialing per request. Kept separate because a
+        // pool's session policy (e.g. MCP read-only GUC) must not leak into
+        // another gateway's connections.
+        let gw_max = self.state.limits.gateway_pool_max_idle;
+        let mcp_pool = Arc::new(crate::gateway_pool::BackendClientPool::new(gw_max));
+        let http_pool = Arc::new(crate::gateway_pool::BackendClientPool::new(gw_max));
+        #[cfg(feature = "graphql-gateway")]
+        let gql_pool = Arc::new(crate::gateway_pool::BackendClientPool::new(gw_max));
+
         // Start the MCP agent gateway when enabled.
         let mcp_task = if self.config.mcp.enabled {
             let mcp_cfg = self.config.mcp.clone();
+            let pool = mcp_pool.clone();
             // Resolve the configured agent contract (scoped grants) by id.
             let contract = mcp_cfg.contract.as_ref().and_then(|id| {
                 let found = self.config.agent_contracts.iter().find(|c| &c.id == id).cloned();
@@ -2404,7 +2420,10 @@ impl ProxyServer {
                 found
             });
             Some(tokio::spawn(async move {
-                if let Err(e) = crate::mcp::McpServer::new(mcp_cfg, contract).run().await {
+                if let Err(e) = crate::mcp::McpServer::new(mcp_cfg, contract, pool)
+                    .run()
+                    .await
+                {
                     tracing::error!("MCP gateway error: {}", e);
                 }
             }))
@@ -2415,8 +2434,12 @@ impl ProxyServer {
         // Start the HTTP SQL gateway (Neon-serverless compatible) when enabled.
         let http_gw_task = if self.config.http_gateway.enabled {
             let gw_cfg = self.config.http_gateway.clone();
+            let pool = http_pool.clone();
             Some(tokio::spawn(async move {
-                if let Err(e) = crate::http_gateway::HttpGateway::new(gw_cfg).run().await {
+                if let Err(e) = crate::http_gateway::HttpGateway::new(gw_cfg, pool)
+                    .run()
+                    .await
+                {
                     tracing::error!("HTTP gateway error: {}", e);
                 }
             }))
@@ -2428,8 +2451,9 @@ impl ProxyServer {
         #[cfg(feature = "graphql-gateway")]
         let _graphql_gw_task = if self.config.graphql_gateway.enabled {
             let gw_cfg = self.config.graphql_gateway.clone();
+            let pool = gql_pool.clone();
             Some(tokio::spawn(async move {
-                if let Err(e) = crate::graphql_gateway::GraphqlGateway::new(gw_cfg)
+                if let Err(e) = crate::graphql_gateway::GraphqlGateway::new(gw_cfg, pool)
                     .run()
                     .await
                 {

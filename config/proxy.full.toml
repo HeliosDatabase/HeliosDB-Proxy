@@ -174,6 +174,10 @@ write_timeout_secs = 30
 # # being refused with 53300. 0 (default) refuses immediately. Read once at
 # # startup.
 # client_admission_wait_secs = 0
+# # Idle authenticated backend connections kept per identity by each
+# # non-PG-wire gateway (HTTP SQL, MCP, GraphQL) for reuse (H-06). 0 disables
+# # pooling (each request dials). Gateways pool separately.
+# gateway_pool_max_idle = 16
 # # In-session Transaction Replay (tr_mode = select | transaction): caps on the
 # # statements / bytes recorded per explicit transaction for replay after a
 # # failover. Over a cap the transaction is marked non-replayable (transaction
