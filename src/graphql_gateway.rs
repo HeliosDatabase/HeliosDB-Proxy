@@ -25,7 +25,7 @@ pub struct GraphqlGateway {
 }
 
 impl GraphqlGateway {
-    pub fn new(config: GraphqlGatewayConfig) -> Self {
+    pub fn new(config: GraphqlGatewayConfig, pool: crate::gateway_pool::SharedBackendPool) -> Self {
         // Build the GraphQL schema from the configured tables.
         let tabledefs: Vec<TableDefinition> = config
             .tables
@@ -61,7 +61,9 @@ impl GraphqlGateway {
             query_timeout: Duration::from_secs(30),
             tls_config: default_client_config(),
         };
-        let engine = GraphQLEngine::new(GraphQLConfig::default(), schema).with_backend(bcfg);
+        let engine = GraphQLEngine::new(GraphQLConfig::default(), schema)
+            .with_backend(bcfg)
+            .with_pool(pool);
 
         Self {
             config: Arc::new(config),

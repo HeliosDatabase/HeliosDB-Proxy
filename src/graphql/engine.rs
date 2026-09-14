@@ -374,6 +374,9 @@ pub struct GraphQLEngine {
     /// Backend the generated SQL is executed against. `None` => the engine runs
     /// in offline mode and returns empty results (used in tests).
     backend: Option<crate::backend::BackendConfig>,
+    /// Optional shared idle pool (H-06): when present, generated queries reuse
+    /// authenticated connections instead of dialing per query.
+    pool: Option<crate::gateway_pool::SharedBackendPool>,
 }
 
 impl GraphQLEngine {
@@ -389,12 +392,20 @@ impl GraphQLEngine {
             config,
             schema,
             backend: None,
+            pool: None,
         }
     }
 
     /// Attach the backend the generated SQL runs against.
     pub fn with_backend(mut self, backend: crate::backend::BackendConfig) -> Self {
         self.backend = Some(backend);
+        self
+    }
+
+    /// Attach a shared idle pool (H-06) so generated queries reuse backend
+    /// connections instead of dialing per query.
+    pub fn with_pool(mut self, pool: crate::gateway_pool::SharedBackendPool) -> Self {
+        self.pool = Some(pool);
         self
     }
 
@@ -883,9 +894,11 @@ impl GraphQLEngine {
 
         let mut out = Vec::with_capacity(queries.len());
         for q in queries {
-            let mut client = BackendClient::connect(&bcfg)
-                .await
-                .map_err(|e| GraphQLError::internal(format!("backend connect: {}", e)))?;
+            let mut client = match self.pool.as_ref() {
+                Some(pool) => pool.acquire(&bcfg).await,
+                None => BackendClient::connect(&bcfg).await,
+            }
+            .map_err(|e| GraphQLError::internal(format!("backend connect: {}", e)))?;
             let qr = client
                 .simple_query(&q.sql)
                 .await
@@ -905,6 +918,15 @@ impl GraphQLEngine {
                     serde_json::Value::Object(obj)
                 })
                 .collect();
+            // H-06: return the connection to the pool only when the generated
+            // statement is session-neutral; otherwise drop it.
+            if let Some(pool) = self.pool.as_ref() {
+                if crate::gateway_pool::statement_is_session_neutral(&q.sql) {
+                    pool.release(&bcfg, client);
+                } else {
+                    pool.discard(client);
+                }
+            }
             out.push(rows);
         }
         Ok(out)
@@ -966,6 +988,7 @@ impl Clone for GraphQLEngine {
             validator: QueryValidator::new(self.config.clone()),
             metrics: self.metrics.clone(),
             backend: self.backend.clone(),
+            pool: self.pool.clone(),
         }
     }
 }
