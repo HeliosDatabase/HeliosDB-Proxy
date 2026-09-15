@@ -17,6 +17,9 @@ listen_address = "${HELIOS_PROXY_LISTEN:-0.0.0.0:6432}"
 # Loopback-only by default. The admin API runs privileged operations; binding it
 # to a non-loopback address requires admin_token (or admin_allow_insecure = true).
 admin_address  = "${HELIOS_PROXY_ADMIN:-127.0.0.1:9090}"
+# Opt-in strict configuration (D-05): fail startup when an enabled subsystem was
+# not compiled in, or when an unknown top-level key is present.
+# strict_config = false
 
 # Transaction Replay (ships in the default build; no cargo feature needed).
 #   tr_enabled — master switch: journal auto-commit writes for the operator-driven

@@ -90,6 +90,7 @@ Auth column: **token** = requires bearer token when `admin_token` is set; **open
 | `GET` | `/metrics` | Server metrics (JSON) | — | token |
 | `GET` | `/metrics/prometheus` | Server metrics (Prometheus text, wrapped in JSON `text`) | — | token |
 | `GET` | `/version` | Proxy version | — | token |
+| `GET` | `/capabilities` | Per-subsystem compiled/enabled/wired manifest + `strict_config` flag (D-05); also at `/api/capabilities` | — | token |
 | `GET` | `/config` | Current configuration snapshot | — | token |
 | `GET` | `/topology` | Primary + healthy/unhealthy node sets in one call | — | token |
 | `GET` | `/nodes` | All backend nodes with health | — | token |

@@ -64,6 +64,7 @@ pub mod auth_scram;
 pub mod backend;
 pub mod batch;
 pub mod branch;
+pub mod capabilities;
 pub mod client_tls;
 pub mod config;
 pub mod connection_pool;
