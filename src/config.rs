@@ -190,6 +190,12 @@ pub struct ProxyConfig {
     /// with your own authenticating proxy/network policy.
     #[serde(default)]
     pub admin_allow_insecure: bool,
+    /// Opt-in strict configuration (D-05): reject settings that promise
+    /// behavior this binary cannot deliver (e.g. `[cache] enabled = true` on a
+    /// build without `query-cache`) and unknown top-level sections/keys.
+    /// Default `false` keeps the historical warn-and-continue behaviour.
+    #[serde(default)]
+    pub strict_config: bool,
     /// Enable TR (Transaction Replay)
     pub tr_enabled: bool,
     /// TR mode
@@ -1455,6 +1461,7 @@ impl Default for ProxyConfig {
             admin_address: "127.0.0.1:9090".to_string(),
             admin_token: None,
             admin_allow_insecure: false,
+            strict_config: false,
             tr_enabled: true,
             tr_mode: TrMode::Session,
             tr_read_functions: Vec::new(),
@@ -1758,6 +1765,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "admin_address",
     "admin_token",
     "admin_allow_insecure",
+    "strict_config",
     "tr_enabled",
     "tr_mode",
     "tr_read_functions",
@@ -1862,7 +1870,14 @@ impl ProxyConfig {
         // there is no `deny_unknown_fields`, so deserialization already ignores
         // unknown fields and pre-existing configs with such sections keep
         // loading. Nested unknown keys are out of scope.
-        for key in unknown_top_level_keys(&contents) {
+        let unknown = unknown_top_level_keys(&contents);
+        if config.strict_config && !unknown.is_empty() {
+            return Err(ProxyError::Config(format!(
+                "strict_config: unknown top-level sections/keys: {}",
+                unknown.join(", ")
+            )));
+        }
+        for key in unknown {
             tracing::warn!(
                 "unknown config section/key '{}' ignored (not part of ProxyConfig)",
                 key
@@ -1938,6 +1953,17 @@ impl ProxyConfig {
             return Err(ProxyError::Config(
                 "topology.lease_timeout_secs must be >= 1".to_string(),
             ));
+        }
+        // D-05 strict mode: a setting must not promise behavior the binary
+        // cannot deliver.
+        if self.strict_config {
+            let unavailable = crate::capabilities::unavailable_enabled(self);
+            if !unavailable.is_empty() {
+                return Err(ProxyError::Config(format!(
+                    "strict_config: enabled but not compiled into this build: {}",
+                    unavailable.join(", ")
+                )));
+            }
         }
         if self.topology.provider == TopologyProviderKind::Postgres {
             #[cfg(not(feature = "postgres-topology"))]
@@ -2641,6 +2667,46 @@ mod tests {
         );
         let l: LimitsToml = toml::from_str("client_admission_wait_secs = 5\n").unwrap();
         assert_eq!(l.client_admission_wait_secs, 5);
+    }
+
+    #[test]
+    fn strict_config_rejects_unavailable_enabled_features() {
+        let mut config = ProxyConfig::default();
+        config.add_node("localhost:5432", "primary").unwrap();
+        config.strict_config = true;
+        config.cache.enabled = true;
+        let result = config.validate();
+        if cfg!(feature = "query-cache") {
+            assert!(result.is_ok(), "a compiled feature must pass strict mode");
+        } else {
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("strict_config") && err.contains("cache.enabled"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_config_rejects_unknown_top_level_keys() {
+        let src =
+            std::fs::read_to_string("config/proxy.example.toml").expect("example config present");
+        // Top-level keys must precede the first table header.
+        let strict = format!("strict_config = true\nnonsense_top_level = 1\n{src}");
+        let path = std::env::temp_dir().join(format!(
+            "helios-strict-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, strict).unwrap();
+        let err = ProxyConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("unknown top-level"), "{err}");
     }
 
     #[test]

@@ -138,6 +138,7 @@ listen_address = "0.0.0.0:5432"
 admin_address  = "127.0.0.1:9090"
 # admin_token          = "..."     # bearer token for the admin API (see below)
 # admin_allow_insecure = false
+# strict_config        = false     # reject settings this build cannot deliver (D-05)
 tr_enabled     = true
 tr_mode        = "session"
 tr_read_functions = []
@@ -152,6 +153,7 @@ shutdown_drain_timeout_secs = 60
 | `admin_address` | string | `"127.0.0.1:9090"` | Address/port for the admin HTTP API. Loopback by default. *(Required in a config file.)* |
 | `admin_token` | string | *(none)* | Bearer token required on every admin endpoint except liveness probes. See [Admin API Security](#admin-api-security). |
 | `admin_allow_insecure` | bool | `false` | Explicit opt-in to expose the admin API on a non-loopback address **without** a token. |
+| `strict_config` | bool | `false` | Opt-in strict configuration (D-05): startup fails when an enabled subsystem was not compiled into the binary (e.g. `[cache] enabled = true` without the `query-cache` feature) or when an unknown top-level section/key is present. Default `false` keeps the historical warn-and-continue behaviour. `GET /capabilities` reports the per-subsystem compiled/enabled/wired state. |
 | `tr_enabled` | bool | `true` | Master switch for Transaction Replay, which ships in the default build. When `false`: the write journal stops recording, `tr_mode` is forced to `none`, and `POST /api/replay` returns `503`. *(Required in a config file.)* |
 | `tr_mode` | string | `"session"` | Transaction Replay mode: `none`, `session`, `select`, `transaction`. *(Required in a config file.)* |
 | `tr_read_functions` | array of string | `[]` | TR-03 read re-execution policy extension. In-session replay re-executes an interrupted read on an unknown outcome only when every function it calls is a PostgreSQL built-in known to be side-effect-free; list additional provably pure functions (unqualified names, case-insensitive) here. Reads calling anything else, quoted-identifier calls, `SELECT … INTO`, and sequence functions are classified as opaque and never re-executed. |

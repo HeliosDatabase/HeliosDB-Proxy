@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Capabilities manifest and opt-in strict configuration (D-05). `GET /capabilities`
+  (and `/api/capabilities`) reports every subsystem's `compiled` / `enabled` / `wired`
+  state plus the `strict_config` flag. With `strict_config = true`, startup fails when
+  an enabled subsystem was not compiled into the binary (e.g. `[cache] enabled = true`
+  without the `query-cache` feature) or when an unknown top-level section/key is present;
+  the default `false` keeps the historical warn-and-continue behaviour so existing
+  configs are unaffected.
+
 - `[topology]` config section (H-01). `provider = "postgres"` makes topology discovery
   authoritative for the write path: the daemon polls `pg_is_in_recovery()` on every
   configured node (requires the `postgres-topology` cargo feature), routes writes only

@@ -895,6 +895,23 @@ impl AdminServer {
                 Ok((200, serde_json::to_value(response)?))
             }
 
+            // Capabilities manifest (D-05): per-subsystem compiled/enabled/
+            // wired state, so an operator can see what this binary and config
+            // actually provide.
+            ("GET", "/capabilities") | ("GET", "/api/capabilities") => {
+                let cfg = state.proxy_config.read().await;
+                match cfg.as_ref() {
+                    Some(c) => Ok((
+                        200,
+                        serde_json::json!({
+                            "strict_config": c.strict_config,
+                            "capabilities": crate::capabilities::manifest(c),
+                        }),
+                    )),
+                    None => Ok((503, serde_json::json!({ "error": "config not attached" }))),
+                }
+            }
+
             // Plugin KV — runtime configuration of loaded plugins.
             // Prefix-guard arm: placed AFTER every exact-path match so it
             // can never shadow one. `/admin/kv/` is a unique prefix no
