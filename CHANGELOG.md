@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Capability reachability test and explicit live-test skips (V-01). A new test asserts
+  that every advertised capability the config enables is actually wired on the running
+  state (`pool-modes`, `query-cache`, `routing-hints`, `rate-limiting`,
+  `circuit-breaker`, `query-analytics`) — removing a construction hook fails the test,
+  not just a config struct. `HELIOS_REQUIRE_LIVE=1` turns a missing backend env var in
+  `tests/integration/fixture.rs` into a hard failure instead of a silent skip, so a
+  live-validation job cannot pass by skipping. The claim → evidence map lives in
+  `docs/internal/V-01-claim-map.md`.
+
 - Capabilities manifest and opt-in strict configuration (D-05). `GET /capabilities`
   (and `/api/capabilities`) reports every subsystem's `compiled` / `enabled` / `wired`
   state plus the `strict_config` flag. With `strict_config = true`, startup fails when

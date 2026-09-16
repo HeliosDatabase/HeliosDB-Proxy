@@ -16435,6 +16435,72 @@ mod tests {
             );
         }
 
+        /// V-01: every advertised capability that the config enables must be
+        /// actually wired on the running state — not merely present as a struct
+        /// field. Deleting a construction hook (or gating it out) fails this test.
+        #[test]
+        fn enabled_capabilities_are_actually_wired() {
+            let mut config = test_config();
+            // Unconditional mutation keeps `mut` meaningful in minimal builds.
+            config.tr_enabled = true;
+
+            #[cfg(feature = "query-cache")]
+            {
+                config.cache.enabled = true;
+            }
+            #[cfg(feature = "routing-hints")]
+            {
+                config.routing_hints.enabled = true;
+            }
+            #[cfg(feature = "rate-limiting")]
+            {
+                config.rate_limit.enabled = true;
+            }
+            #[cfg(feature = "circuit-breaker")]
+            {
+                config.circuit_breaker.enabled = true;
+            }
+            #[cfg(feature = "query-analytics")]
+            {
+                config.analytics.enabled = true;
+            }
+
+            let server = ProxyServer::new(config).unwrap();
+            let state = &server.state;
+
+            #[cfg(feature = "pool-modes")]
+            assert!(
+                state.pool_manager.is_some(),
+                "pool-modes compiled but not wired"
+            );
+
+            #[cfg(feature = "query-cache")]
+            assert!(
+                state.query_cache.is_some(),
+                "query-cache enabled but not wired"
+            );
+            #[cfg(feature = "routing-hints")]
+            assert!(
+                state.hint_parser.is_some(),
+                "routing-hints enabled but not wired"
+            );
+            #[cfg(feature = "rate-limiting")]
+            assert!(
+                state.rate_limiter.is_some(),
+                "rate-limiting enabled but not wired"
+            );
+            #[cfg(feature = "circuit-breaker")]
+            assert!(
+                state.circuit_breaker.is_some(),
+                "circuit-breaker enabled but not wired"
+            );
+            #[cfg(feature = "query-analytics")]
+            assert!(
+                state.analytics.is_some(),
+                "query-analytics enabled but not wired"
+            );
+        }
+
         #[test]
         fn authoritative_leader_requires_an_enabled_configured_node() {
             let mut config = ProxyConfig::default();

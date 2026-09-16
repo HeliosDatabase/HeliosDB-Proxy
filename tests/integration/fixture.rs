@@ -83,7 +83,7 @@ fn pick_free_port() -> u16 {
 
 /// Read standby coordinates from HELIOS_TEST_STANDBY_* env vars.
 fn read_standby_info() -> Option<StandbyInfo> {
-    let host = std::env::var("HELIOS_TEST_STANDBY_HOST").ok()?;
+    let host = require_or_skip("HELIOS_TEST_STANDBY_HOST")?;
     let port: u16 = std::env::var("HELIOS_TEST_STANDBY_PORT")
         .unwrap_or_else(|_| "5434".into())
         .parse()
@@ -107,8 +107,24 @@ fn read_standby_info() -> Option<StandbyInfo> {
 }
 
 /// Read backend info from environment variables.
+///
+/// With `HELIOS_REQUIRE_LIVE=1` a missing backend variable is a hard failure
+/// instead of a silent skip, so a job that claims to run live validation
+/// cannot pass by skipping everything (V-01).
+fn require_or_skip(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            if std::env::var("HELIOS_REQUIRE_LIVE").is_ok() {
+                panic!("HELIOS_REQUIRE_LIVE is set but {name} is unset: live test cannot run");
+            }
+            None
+        }
+    }
+}
+
 fn read_backend_info() -> Option<BackendInfo> {
-    let host = std::env::var("HELIOS_TEST_PG_HOST").ok()?;
+    let host = require_or_skip("HELIOS_TEST_PG_HOST")?;
     let port: u16 = std::env::var("HELIOS_TEST_PG_PORT")
         .unwrap_or_else(|_| "5432".into())
         .parse()
