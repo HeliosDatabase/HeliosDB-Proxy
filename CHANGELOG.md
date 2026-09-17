@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- User-path benchmark harness for P-01: `scripts/regress/bench-usertp.sh` measures
+  committed TPS (`pgbench -b simple-update`), read TPS with p50/p95/p99/p999 tails
+  (per-transaction log), a first-row latency proxy, failed/unknown client outcomes and
+  proxy RSS/CPU — against direct PostgreSQL and HeliosProxy in session/transaction pool
+  modes, writing a machine-readable JSON per run. The comparison rules (identical
+  capacity/TLS/durability/timeouts, same-window baseline/candidate, per-critical-path
+  gates plus the 3% cumulative budget) live in `docs/internal/P-01-measurement-plan.md`.
+
 - Admission and recovery-wave metrics (P-03). `/metrics/prometheus` now exports
   `heliosdb_proxy_admission_waited_total` (admissions that queued on the bounded H-05
   cap), `heliosdb_proxy_admission_timeout_total` (bounded waits that expired) and
