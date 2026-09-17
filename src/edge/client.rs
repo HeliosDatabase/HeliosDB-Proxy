@@ -108,6 +108,16 @@ async fn run_subscribe_loop(cfg: EdgeConfig, cache: Arc<EdgeCache>) {
                     url = %subscribe_url,
                     "edge client: subscribed to home invalidation stream"
                 );
+                // C-03: invalidations emitted while the stream was down may
+                // have been missed, so a (re)connect starts from a cold cache.
+                let dropped = cache.flush_all();
+                if dropped > 0 {
+                    tracing::warn!(
+                        edge_id = %edge_id,
+                        dropped,
+                        "edge client: flushed cache on (re)connect to avoid serving stale entries (invalidation gap)"
+                    );
+                }
                 // Successful connect resets the backoff ladder.
                 backoff = BACKOFF_INITIAL;
                 match pump_stream(resp, &cache).await {

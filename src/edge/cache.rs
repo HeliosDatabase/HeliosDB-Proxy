@@ -81,6 +81,11 @@ pub struct EdgeCacheStats {
     /// Entries refused because their response body exceeded
     /// `[cache] max_cacheable_response_bytes`.
     pub oversize_rejected: u64,
+    /// Invalidation-gap flushes (C-03): the edge dropped its whole cache on a
+    /// (re)connect because invalidations may have been missed while the stream
+    /// was down. A non-zero counter is expected after any home restart or
+    /// network blip; a rising one means the subscription is flapping.
+    pub gap_flushes: u64,
 }
 
 /// LRU + version + TTL cache. Cheap to clone via Arc.
@@ -174,6 +179,8 @@ struct EdgeCacheInner {
     max_entry_bytes: usize,
     /// Aggregate retained-byte budget (C-01). `usize::MAX` = disabled.
     max_total_bytes: usize,
+    /// Count of gap flushes (C-03).
+    gap_flushes: AtomicU64,
 }
 
 /// Cache key. `database`/`user` are verbatim tenant identity — two
@@ -249,6 +256,7 @@ impl EdgeCache {
                 oversize_rejected: AtomicU64::new(0),
                 max_entry_bytes,
                 max_total_bytes,
+                gap_flushes: AtomicU64::new(0),
             }),
         }
     }
@@ -324,6 +332,10 @@ impl EdgeCache {
         let n = map.lru.len();
         map.lru.clear();
         map.by_table.clear();
+        map.total_bytes = 0;
+        if n > 0 {
+            self.inner.gap_flushes.fetch_add(1, Ordering::Relaxed);
+        }
         n
     }
 
@@ -531,6 +543,22 @@ impl EdgeCache {
         drop_keys.len()
     }
 
+    /// Drop every entry WITHOUT raising the invalidation high-water mark
+    /// (C-03). Called on every edge (re)connect: invalidations emitted while
+    /// the stream was down may have been missed, so the only safe starting
+    /// state is a cold cache. Returns the number of entries dropped.
+    pub fn flush(&self) -> usize {
+        let mut map = self.lock();
+        let dropped = map.lru.len();
+        map.lru.clear();
+        map.by_table.clear();
+        map.total_bytes = 0;
+        if dropped > 0 {
+            self.inner.gap_flushes.fetch_add(1, Ordering::Relaxed);
+        }
+        dropped
+    }
+
     /// Aggregate retained payload bytes, including per-entry overhead (C-01).
     pub fn retained_bytes(&self) -> usize {
         self.lock().total_bytes
@@ -545,6 +573,7 @@ impl EdgeCache {
             entries_evicted: self.inner.evictions.load(Ordering::Relaxed),
             current_entries: self.lock().lru.len(),
             oversize_rejected: self.inner.oversize_rejected.load(Ordering::Relaxed),
+            gap_flushes: self.inner.gap_flushes.load(Ordering::Relaxed),
         }
     }
 
@@ -598,6 +627,28 @@ mod tests {
         // Invalidation reclaims the retained bytes exactly.
         c.invalidate(10, &[]);
         assert_eq!(c.retained_bytes(), 0);
+    }
+
+    /// C-03: a gap flush drops everything, reclaims the byte budget and does
+    /// not poison later inserts.
+    #[test]
+    fn gap_flush_reclaims_and_does_not_poison_inserts() {
+        let c = EdgeCache::new(10);
+        let k = CacheKey::new("fp1", "p1");
+        c.insert(
+            k.clone(),
+            entry(1, b"row", &["users"], Duration::from_secs(60)),
+        );
+        assert!(c.retained_bytes() > 0);
+        assert_eq!(c.flush_all(), 1, "one entry dropped");
+        assert_eq!(c.retained_bytes(), 0, "byte budget reclaimed");
+        assert_eq!(c.stats().gap_flushes, 1);
+        // A fresh entry still inserts (the flush did not raise the hwm).
+        c.insert(
+            k.clone(),
+            entry(2, b"row2", &["users"], Duration::from_secs(60)),
+        );
+        assert!(c.get(&k).is_some());
     }
 
     #[test]
