@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Admission and recovery-wave metrics (P-03). `/metrics/prometheus` now exports
+  `heliosdb_proxy_admission_waited_total` (admissions that queued on the bounded H-05
+  cap), `heliosdb_proxy_admission_timeout_total` (bounded waits that expired) and
+  `heliosdb_proxy_reconnect_attempts_total` (jittered waits in the primary-select
+  recovery loops) — the signals that explain a failover's reconnect wave, alongside the
+  existing connection/query/failover/TR/cache counters.
+
 - Capability reachability test and explicit live-test skips (V-01). A new test asserts
   that every advertised capability the config enables is actually wired on the running
   state (`pool-modes`, `query-cache`, `routing-hints`, `rate-limiting`,

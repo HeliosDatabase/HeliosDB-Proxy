@@ -1065,6 +1065,16 @@ struct ServerMetrics {
     /// receives every byte) — either the workload returns huge result sets or
     /// the ceiling is set too low.
     cache_capture_oversize: AtomicU64,
+    /// P-03: client admissions that had to wait for a permit at the
+    /// `max_client_connections` cap (the bounded H-05 queue bit).
+    admission_waited: AtomicU64,
+    /// P-03: admissions whose bounded wait expired and were refused with 53300.
+    /// A subset of `connections_rejected`; the difference is the immediate
+    /// refusals.
+    admission_timeouts: AtomicU64,
+    /// P-03: jittered waits performed by the primary-select recovery loops. A
+    /// large burst after a failover is the reconnect wave H-05 bounds.
+    reconnect_attempts: AtomicU64,
     /// In-session Transaction Replay (`tr_mode`) counters.
     tr: TrMetrics,
 }
@@ -2784,6 +2794,18 @@ impl ProxyServer {
                                 .metrics
                                 .cache_capture_oversize
                                 .load(Ordering::Relaxed),
+                            admission_waited: server_state
+                                .metrics
+                                .admission_waited
+                                .load(Ordering::Relaxed),
+                            admission_timeouts: server_state
+                                .metrics
+                                .admission_timeouts
+                                .load(Ordering::Relaxed),
+                            reconnect_attempts: server_state
+                                .metrics
+                                .reconnect_attempts
+                                .load(Ordering::Relaxed),
                             tr: server_state.metrics.tr.snapshot(),
                         };
                         let mut admin_metrics = admin_state_sync.metrics.write().await;
@@ -2864,9 +2886,29 @@ impl ProxyServer {
             // Bounded fair queue (H-05): wait up to the configured budget for
             // a permit before refusing, so a reconnect burst is absorbed
             // instead of answered with a wall of 53300s.
-            Some(wait) => match tokio::time::timeout(wait, Arc::clone(sem).acquire_owned()).await {
-                Ok(Ok(permit)) => Ok(Some(permit)),
-                _ => {
+            Some(wait) => match Arc::clone(sem).try_acquire_owned() {
+                Ok(permit) => Ok(Some(permit)),
+                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    state
+                        .metrics
+                        .admission_waited
+                        .fetch_add(1, Ordering::Relaxed);
+                    match tokio::time::timeout(wait, Arc::clone(sem).acquire_owned()).await {
+                        Ok(Ok(permit)) => Ok(Some(permit)),
+                        _ => {
+                            state
+                                .metrics
+                                .admission_timeouts
+                                .fetch_add(1, Ordering::Relaxed);
+                            state
+                                .metrics
+                                .connections_rejected
+                                .fetch_add(1, Ordering::Relaxed);
+                            Err(())
+                        }
+                    }
+                }
+                Err(tokio::sync::TryAcquireError::Closed) => {
                     state
                         .metrics
                         .connections_rejected
@@ -7687,6 +7729,10 @@ impl ProxyServer {
                     "Authoritative topology has no eligible primary; waiting... ({:.1}s elapsed)",
                     start.elapsed().as_secs_f64()
                 );
+                state
+                    .metrics
+                    .reconnect_attempts
+                    .fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(Self::reconnect_backoff(attempt, backoff_seed)).await;
                 attempt = attempt.saturating_add(1);
                 continue;
@@ -7726,6 +7772,10 @@ impl ProxyServer {
             );
 
             // Wait before retry (jittered exponential backoff, H-05).
+            state
+                .metrics
+                .reconnect_attempts
+                .fetch_add(1, Ordering::Relaxed);
             tokio::time::sleep(Self::reconnect_backoff(attempt, backoff_seed)).await;
             attempt = attempt.saturating_add(1);
         }
@@ -9262,6 +9312,17 @@ impl ProxyServer {
                 .state
                 .metrics
                 .cache_capture_oversize
+                .load(Ordering::Relaxed),
+            admission_waited: self.state.metrics.admission_waited.load(Ordering::Relaxed),
+            admission_timeouts: self
+                .state
+                .metrics
+                .admission_timeouts
+                .load(Ordering::Relaxed),
+            reconnect_attempts: self
+                .state
+                .metrics
+                .reconnect_attempts
                 .load(Ordering::Relaxed),
             tr: self.state.metrics.tr.snapshot(),
         }
@@ -11485,6 +11546,12 @@ pub struct ServerMetricsSnapshot {
     /// Cacheable reads whose response outgrew
     /// `[cache] max_cacheable_response_bytes` and were therefore not cached.
     pub cache_capture_oversize: u64,
+    /// P-03: admissions that waited on the bounded cap queue (H-05).
+    pub admission_waited: u64,
+    /// P-03: admissions whose bounded wait expired (subset of rejections).
+    pub admission_timeouts: u64,
+    /// P-03: jittered waits in the primary-select recovery loops.
+    pub reconnect_attempts: u64,
     /// In-session Transaction Replay (`tr_mode`) counters.
     pub tr: TrMetricsSnapshot,
 }
@@ -13953,6 +14020,52 @@ mod tests {
         assert!(ProxyServer::admit_client_slot(&state, &startup_msg())
             .await
             .is_ok());
+    }
+
+    /// P-03/H-05: with a bounded admission wait, a saturated cap makes the next
+    /// connection wait (counted) and admit when a slot frees — or time out.
+    #[tokio::test]
+    async fn bounded_admission_waits_and_admits_or_times_out() {
+        let mut config = test_config();
+        config.limits.max_client_connections = 1;
+        config.limits.client_admission_wait_secs = 1;
+        let server = ProxyServer::new(config).unwrap();
+        let state = server.state.clone();
+
+        let held = ProxyServer::admit_client_slot(&state, &startup_msg())
+            .await
+            .unwrap()
+            .unwrap();
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(held);
+        });
+        let permit = ProxyServer::admit_client_slot(&state, &startup_msg())
+            .await
+            .unwrap();
+        assert!(
+            permit.is_some(),
+            "waiter must be admitted when a slot frees"
+        );
+        drop(permit);
+        releaser.await.unwrap();
+        assert_eq!(state.metrics.admission_waited.load(Ordering::Relaxed), 1);
+        assert_eq!(state.metrics.admission_timeouts.load(Ordering::Relaxed), 0);
+
+        // Hold the slot past the 1 s budget: the waiter times out and is counted.
+        let _held2 = ProxyServer::admit_client_slot(&state, &startup_msg())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ProxyServer::admit_client_slot(&state, &startup_msg())
+            .await
+            .is_err());
+        assert_eq!(state.metrics.admission_waited.load(Ordering::Relaxed), 2);
+        assert_eq!(state.metrics.admission_timeouts.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            state.metrics.connections_rejected.load(Ordering::Relaxed),
+            1
+        );
     }
 
     /// A CancelRequest must be admitted even with the cap saturated — it is a

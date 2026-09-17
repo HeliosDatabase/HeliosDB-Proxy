@@ -2166,6 +2166,33 @@ impl AdminServer {
             metrics.cache_capture_oversize
         ));
 
+        output.push_str(
+            "# HELP heliosdb_proxy_admission_waited_total Client admissions that waited on the bounded cap queue (H-05)\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_admission_waited_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_admission_waited_total {}\n",
+            metrics.admission_waited
+        ));
+
+        output.push_str(
+            "# HELP heliosdb_proxy_admission_timeout_total Admissions whose bounded cap wait expired (subset of rejections)\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_admission_timeout_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_admission_timeout_total {}\n",
+            metrics.admission_timeouts
+        ));
+
+        output.push_str(
+            "# HELP heliosdb_proxy_reconnect_attempts_total Jittered waits in the primary-select recovery loops (H-05)\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_reconnect_attempts_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_reconnect_attempts_total {}\n",
+            metrics.reconnect_attempts
+        ));
+
         // In-session Transaction Replay (tr_mode) counters.
         let tr = &metrics.tr;
         for (name, help, value) in [
@@ -2290,6 +2317,9 @@ impl AdminState {
                 bytes_sent: 0,
                 failovers: 0,
                 cache_capture_oversize: 0,
+                admission_waited: 0,
+                admission_timeouts: 0,
+                reconnect_attempts: 0,
                 tr: Default::default(),
             }),
             active_sessions: RwLock::new(0),
@@ -3008,6 +3038,9 @@ mod tests {
             bytes_sent: 100000,
             failovers: 2,
             cache_capture_oversize: 7,
+            admission_waited: 0,
+            admission_timeouts: 0,
+            reconnect_attempts: 0,
             tr: crate::server::TrMetricsSnapshot {
                 failovers: 4,
                 statements_reexecuted: 5,
@@ -3034,6 +3067,10 @@ mod tests {
         assert!(output.contains("heliosdb_proxy_tr_unknown_outcome_errors_total 2"));
         assert!(output.contains("heliosdb_proxy_tr_replay_cap_exceeded_total 3"));
         assert!(output.contains("heliosdb_proxy_tr_session_set_cap_exceeded_total 8"));
+        // P-03: admission/reconnect counters are scrapeable.
+        assert!(output.contains("heliosdb_proxy_admission_waited_total 0"));
+        assert!(output.contains("heliosdb_proxy_admission_timeout_total 0"));
+        assert!(output.contains("heliosdb_proxy_reconnect_attempts_total 0"));
     }
 
     /// Shed analytics samples must be exposed on `/metrics/prometheus`,
@@ -3076,6 +3113,9 @@ mod tests {
             bytes_sent: 20000,
             failovers: 1,
             cache_capture_oversize: 3,
+            admission_waited: 0,
+            admission_timeouts: 0,
+            reconnect_attempts: 0,
             tr: crate::server::TrMetricsSnapshot {
                 transactions_replayed: 9,
                 ..Default::default()
