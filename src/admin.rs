@@ -405,8 +405,16 @@ impl AdminServer {
             }
             let region = params.get("region").map(String::as_str).unwrap_or("");
             let base_url = params.get("base_url").map(String::as_str).unwrap_or("");
-            return Self::handle_edge_subscribe(&mut writer, &state, edge_id, region, base_url)
-                .await;
+            let cursor = params.get("last_event_id").map(String::as_str);
+            return Self::handle_edge_subscribe(
+                &mut writer,
+                &state,
+                edge_id,
+                region,
+                base_url,
+                cursor,
+            )
+            .await;
         }
 
         // Read request body for POST/PUT requests (size already bounded above).
@@ -1371,6 +1379,7 @@ impl AdminServer {
         edge_id: &str,
         region: &str,
         base_url: &str,
+        cursor: Option<&str>,
     ) -> Result<()> {
         let registry = match state.edge_registry.read().await.clone() {
             Some(r) => r,
@@ -1385,8 +1394,8 @@ impl AdminServer {
             }
         };
         let now = chrono::Utc::now().to_rfc3339();
-        let mut rx = match registry.register(edge_id, region, base_url, &now) {
-            Ok(rx) => rx,
+        let (mut rx, resume) = match registry.register_at(edge_id, region, base_url, &now, cursor) {
+            Ok(v) => v,
             // CapacityExceeded — same 503 shape as the JSON register path.
             Err(e) => {
                 Self::send_json_response(
@@ -1415,15 +1424,32 @@ impl AdminServer {
             return Ok(());
         }
 
+        // C-03 resume marker: a comment frame so pre-C-03 edges ignore
+        // it, carrying whether the home replayed the missed tail.
+        let marker = match resume {
+            crate::edge::Resume::Warm { replayed } => {
+                format!(": resume warm replayed={replayed}\n\n")
+            }
+            crate::edge::Resume::Gap => ": resume gap\n\n".to_string(),
+        };
+        if !Self::write_sse(writer, marker.as_bytes()).await {
+            return Ok(());
+        }
+
         // Hello frame: an invalidate event carrying the home's
         // per-boot epoch and current version. The edge (a) detects a
         // home restart immediately instead of at the first post-restart
-        // write, (b) re-syncs its observed-home clock, and (c) flushes
-        // entries cached while it was disconnected (empty table set =
-        // wildcard), closing the missed-event window on reconnect.
+        // write, (b) re-syncs its observed-home clock, and (c) — on a
+        // GAP resume (or pre-C-03 edge) — flushes entries cached while
+        // it was disconnected (empty table set = wildcard), closing the
+        // missed-event window on reconnect. A WARM resume replays the
+        // missed events instead, so the hello carries version 0 (epoch
+        // check only, no wildcard drop).
         if let Some(cache) = state.edge_cache.read().await.clone() {
+            let warm = matches!(resume, crate::edge::Resume::Warm { .. });
             let hello = InvalidationEvent {
-                up_to_version: cache.current_version(),
+                seq: 0,
+                up_to_version: if warm { 0 } else { cache.current_version() },
                 tables: Vec::new(),
                 committed_at: now.clone(),
                 epoch: cache.epoch(),
@@ -1452,7 +1478,11 @@ impl AdminServer {
                             // framing contract (exactly one `data:` line).
                             let json = serde_json::to_string(&ev)
                                 .map_err(|e| ProxyError::Internal(format!("JSON error: {}", e)))?;
-                            let frame = format!("event: invalidate\ndata: {}\n\n", json);
+                            let frame = if ev.seq > 0 {
+                                format!("event: invalidate\nid: {}\ndata: {}\n\n", ev.seq, json)
+                            } else {
+                                format!("event: invalidate\ndata: {}\n\n", json)
+                            };
                             if !Self::write_sse(writer, frame.as_bytes()).await {
                                 // Edge gone (or wedged past the write
                                 // timeout). Returning drops `rx`; the
@@ -1559,6 +1589,7 @@ impl AdminServer {
         let dropped_local = cache.invalidate(version, &req.tables);
         // Fan out to every registered edge.
         let ev = InvalidationEvent {
+            seq: 0,
             up_to_version: version,
             tables: req.tables.clone(),
             committed_at: chrono::Utc::now().to_rfc3339(),
@@ -4125,6 +4156,7 @@ mod tests {
         // A broadcast arrives as an SSE invalidate frame.
         let (sent, _) = registry
             .broadcast(InvalidationEvent {
+                seq: 0,
                 up_to_version: 7,
                 tables: vec!["users".into()],
                 committed_at: "ts".into(),

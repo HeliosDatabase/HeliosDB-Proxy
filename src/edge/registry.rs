@@ -15,12 +15,23 @@
 //! cache TTL: stale entries age out within `default_ttl`. That's the
 //! explicit "bounded staleness" contract from the module doc.
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// How many recent invalidations the home keeps for warm resumption
+/// (C-03). Bounded so replay memory is a fixed ~`cap` events per home,
+/// never proportional to write rate.
+const REGISTRY_HISTORY_CAP: usize = 256;
+
+/// Parse a `boot:seq` resumption cursor.
+fn parse_cursor(cursor: &str) -> Option<(u64, u64)> {
+    let (boot, seq) = cursor.split_once(':')?;
+    Some((boot.parse().ok()?, seq.parse().ok()?))
+}
 
 /// One registered edge node from the home's perspective.
 #[derive(Debug, Clone, Serialize)]
@@ -55,6 +66,92 @@ pub struct InvalidationEvent {
     /// homes that predate this field) disables epoch handling.
     #[serde(default)]
     pub epoch: u64,
+    /// Monotonic stream offset assigned by the home when the event is
+    /// broadcast (C-03). `0` (the serde default) means unsequenced —
+    /// an event from a home that predates cursor resumption.
+    #[serde(default)]
+    pub seq: u64,
+}
+
+/// Outcome of a cursor-aware (re)subscribe (C-03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resume {
+    /// The home replayed everything the edge missed. The cache is warm;
+    /// only the queued/streamed events need applying.
+    Warm {
+        /// Number of history events replayed into the channel.
+        replayed: usize,
+    },
+    /// The cursor was absent, came from a different home boot, or is
+    /// older than the bounded history. The edge must flush its cache.
+    Gap,
+}
+
+/// Bounded ring of recent invalidations with monotonic offsets, so a
+/// reconnecting edge can replay what it missed (C-03).
+struct InvalidationLog {
+    next_seq: u64,
+    history: VecDeque<InvalidationEvent>,
+    cap: usize,
+}
+
+impl InvalidationLog {
+    fn new(cap: usize) -> Self {
+        Self {
+            next_seq: 0,
+            history: VecDeque::new(),
+            cap,
+        }
+    }
+
+    /// Assign the next offset, record a copy (trimming the oldest beyond
+    /// `cap`), and return the offset.
+    fn record(&mut self, ev: &mut InvalidationEvent) -> u64 {
+        ev.seq = self.next_seq;
+        self.next_seq += 1;
+        self.history.push_back(ev.clone());
+        while self.history.len() > self.cap {
+            self.history.pop_front();
+        }
+        ev.seq
+    }
+
+    /// Queue history after `boot:seq` into `tx`. Bounded by the channel
+    /// capacity: more to replay than the channel can hold means a flush
+    /// is safer than a silently truncated history.
+    fn resume(
+        &self,
+        home_boot: u64,
+        cursor_boot: u64,
+        cursor: u64,
+        tx: &mpsc::Sender<InvalidationEvent>,
+    ) -> Resume {
+        if cursor_boot != home_boot || self.next_seq == 0 {
+            return Resume::Gap; // different boot, or nothing streamed yet
+        }
+        let last = self.next_seq - 1;
+        if cursor >= last {
+            return Resume::Warm { replayed: 0 }; // already caught up
+        }
+        match self.history.front() {
+            Some(first) if first.seq <= cursor + 1 => {
+                let replay: Vec<&InvalidationEvent> =
+                    self.history.iter().filter(|e| e.seq > cursor).collect();
+                if replay.len() >= 60 {
+                    return Resume::Gap;
+                }
+                let mut replayed = 0usize;
+                for ev in replay {
+                    if tx.try_send(ev.clone()).is_err() {
+                        return Resume::Gap;
+                    }
+                    replayed += 1;
+                }
+                Resume::Warm { replayed }
+            }
+            _ => Resume::Gap,
+        }
+    }
 }
 
 /// Per-edge in-process channel the registry pushes events into.
@@ -72,6 +169,12 @@ struct EdgeSubscription {
 pub struct EdgeRegistry {
     inner: Arc<RwLock<HashMap<String, EdgeSubscription>>>,
     max_edges: usize,
+    /// Per-boot identity mixed into resumption cursors: a cursor from a
+    /// previous home process (or a different home) can never be mistaken
+    /// for a position in this boot's stream.
+    boot_id: u64,
+    /// Bounded replay history (C-03).
+    log: Arc<Mutex<InvalidationLog>>,
     /// Edges that don't ack within this window get expired on the
     /// next broadcast pass.
     liveness_window: Duration,
@@ -79,9 +182,15 @@ pub struct EdgeRegistry {
 
 impl EdgeRegistry {
     pub fn new(max_edges: usize, liveness_window: Duration) -> Self {
+        let boot_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(1);
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
             max_edges,
+            boot_id,
+            log: Arc::new(Mutex::new(InvalidationLog::new(REGISTRY_HISTORY_CAP))),
             liveness_window,
         }
     }
@@ -101,6 +210,22 @@ impl EdgeRegistry {
         base_url: &str,
         now_iso: &str,
     ) -> Result<mpsc::Receiver<InvalidationEvent>, RegistryError> {
+        self.register_at(edge_id, region, base_url, now_iso, None)
+            .map(|(rx, _)| rx)
+    }
+
+    /// Cursor-aware registration (C-03): when the edge presents a valid
+    /// `boot:seq` cursor still inside the bounded history, the missed
+    /// events are replayed into the returned channel before the
+    /// subscription goes live, and the edge may keep its warm cache.
+    pub fn register_at(
+        &self,
+        edge_id: &str,
+        region: &str,
+        base_url: &str,
+        now_iso: &str,
+        cursor: Option<&str>,
+    ) -> Result<(mpsc::Receiver<InvalidationEvent>, Resume), RegistryError> {
         let mut g = self.inner.write();
         if !g.contains_key(edge_id) && g.len() >= self.max_edges {
             return Err(RegistryError::CapacityExceeded(self.max_edges));
@@ -115,11 +240,15 @@ impl EdgeRegistry {
                 last_seen: now_iso.to_string(),
                 invalidations_sent: 0,
             },
-            sender: tx,
+            sender: tx.clone(),
             last_seen_inst: Instant::now(),
         };
+        let resume = match (self.boot_id, cursor.and_then(parse_cursor)) {
+            (boot, Some((c_boot, c_seq))) => self.log.lock().resume(boot, c_boot, c_seq, &tx),
+            _ => Resume::Gap,
+        };
         g.insert(edge_id.to_string(), sub);
-        Ok(rx)
+        Ok((rx, resume))
     }
 
     /// Remove an edge — used when the home decides to evict
@@ -138,12 +267,13 @@ impl EdgeRegistry {
     /// pruned here; a persistently-stuck edge stops getting `last_seen`
     /// bumps and ages out via `prune_stale` instead) and the missed
     /// event is covered by the bounded-staleness TTL contract.
-    pub async fn broadcast(&self, ev: InvalidationEvent) -> (u32, u32) {
+    pub async fn broadcast(&self, mut ev: InvalidationEvent) -> (u32, u32) {
         use tokio::sync::mpsc::error::TrySendError;
 
         // try_send never awaits, so doing the whole pass under the
         // write lock is safe (no lock held across an await point).
         let mut g = self.inner.write();
+        self.log.lock().record(&mut ev);
         let mut sent = 0u32;
         let mut dead: Vec<String> = Vec::new();
         for (id, sub) in g.iter_mut() {
@@ -255,6 +385,7 @@ mod tests {
         assert_eq!(r.count(), 1);
         let (sent, pruned) = r
             .broadcast(InvalidationEvent {
+                seq: 0,
                 up_to_version: 5,
                 tables: vec!["users".into()],
                 committed_at: "ts".into(),
@@ -278,6 +409,7 @@ mod tests {
         }
         let (sent, pruned) = r
             .broadcast(InvalidationEvent {
+                seq: 0,
                 up_to_version: 1,
                 tables: vec![],
                 committed_at: "ts".into(),
@@ -332,6 +464,7 @@ mod tests {
         // Broadcasts reach only the new subscription.
         let (sent, pruned) = r
             .broadcast(InvalidationEvent {
+                seq: 0,
                 up_to_version: 9,
                 tables: vec![],
                 committed_at: "ts".into(),
@@ -372,6 +505,7 @@ mod tests {
         for _ in 0..3 {
             let _ = r
                 .broadcast(InvalidationEvent {
+                    seq: 0,
                     up_to_version: 1,
                     tables: vec![],
                     committed_at: "ts".into(),
@@ -434,6 +568,7 @@ mod tests {
         for i in 0..64 {
             let (sent, pruned) = r
                 .broadcast(InvalidationEvent {
+                    seq: 0,
                     up_to_version: i,
                     tables: vec![],
                     committed_at: "ts".into(),
@@ -447,6 +582,7 @@ mod tests {
         // but the edge is NOT pruned — slowness isn't death.
         let (sent, pruned) = r
             .broadcast(InvalidationEvent {
+                seq: 0,
                 up_to_version: 64,
                 tables: vec![],
                 committed_at: "ts".into(),
@@ -464,6 +600,7 @@ mod tests {
         assert_eq!(first.up_to_version, 0);
         let (sent, _) = r
             .broadcast(InvalidationEvent {
+                seq: 0,
                 up_to_version: 65,
                 tables: vec![],
                 committed_at: "ts".into(),
@@ -471,5 +608,63 @@ mod tests {
             })
             .await;
         assert_eq!(sent, 1);
+    }
+
+    fn ev(v: u64) -> InvalidationEvent {
+        InvalidationEvent {
+            seq: 0,
+            up_to_version: v,
+            tables: vec!["t".into()],
+            committed_at: "ts".into(),
+            epoch: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_replays_missed_tail_warm() {
+        let r = EdgeRegistry::new(10, Duration::from_secs(60));
+        let mut rx = r.register("e1", "us", "u", "ts").unwrap();
+        r.broadcast(ev(1)).await;
+        r.broadcast(ev(2)).await;
+        let (seq1, ev1) = {
+            let e = rx.recv().await.unwrap();
+            (e.seq, e)
+        };
+        assert_eq!(seq1, 0);
+        assert_eq!(ev1.up_to_version, 1);
+        drop(rx); // network drop
+
+        let cursor = format!("{}:{}", r.boot_id, seq1);
+        let (mut rx2, resume) = r
+            .register_at("e1", "us", "u", "ts2", Some(&cursor))
+            .unwrap();
+        assert_eq!(resume, Resume::Warm { replayed: 1 });
+        let replayed = rx2.recv().await.unwrap();
+        assert_eq!(replayed.seq, 1);
+        assert_eq!(replayed.up_to_version, 2);
+        assert!(rx2.try_recv().is_err(), "nothing else queued");
+    }
+
+    #[tokio::test]
+    async fn resume_gap_when_cursor_foreign_stale_or_missing() {
+        let r = EdgeRegistry::new(10, Duration::from_secs(60));
+        // Nothing streamed yet.
+        let (_rx, resume) = r.register_at("e1", "us", "u", "ts", Some("123:0")).unwrap();
+        assert_eq!(resume, Resume::Gap);
+        // Foreign boot id.
+        r.broadcast(ev(1)).await;
+        let (_rx2, resume) = r
+            .register_at("e1", "us", "u", "ts", Some("999999:0"))
+            .unwrap();
+        assert_eq!(resume, Resume::Gap);
+        // Malformed / absent cursor.
+        let (_rx3, resume) = r.register_at("e1", "us", "u", "ts", Some("junk")).unwrap();
+        assert_eq!(resume, Resume::Gap);
+        let (_rx4, resume) = r.register_at("e1", "us", "u", "ts", None).unwrap();
+        assert_eq!(resume, Resume::Gap);
+        // Caught-up cursor resumes warm with no replay.
+        let cursor = format!("{}:{}", r.boot_id, 0);
+        let (_rx5, resume) = r.register_at("e1", "us", "u", "ts", Some(&cursor)).unwrap();
+        assert_eq!(resume, Resume::Warm { replayed: 0 });
     }
 }

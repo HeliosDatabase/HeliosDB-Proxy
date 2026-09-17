@@ -7035,6 +7035,7 @@ impl ProxyServer {
             let (notified, pruned) = state
                 .edge_registry
                 .broadcast(crate::edge::InvalidationEvent {
+                    seq: 0,
                     up_to_version: version,
                     tables,
                     committed_at: chrono::Utc::now().to_rfc3339(),

@@ -60,7 +60,7 @@ pub mod registry;
 #[cfg(feature = "edge-proxy")]
 pub use cache::{CacheEntry, CacheKey, EdgeCache, EdgeCacheStats};
 #[cfg(feature = "edge-proxy")]
-pub use registry::{EdgeNode, EdgeRegistry, InvalidationEvent};
+pub use registry::{EdgeNode, EdgeRegistry, InvalidationEvent, Resume};
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;

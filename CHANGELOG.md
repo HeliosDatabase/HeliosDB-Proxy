@@ -59,6 +59,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `leaseRemainingMs`. Docs state the fencing limit explicitly: a proxy-side lease cannot
   fence direct clients and is not a zero-RPO guarantee for async replicas.
 
+- Cursor-aware invalidation resumption on the home side (C-03, first half): the edge
+  registry now assigns every broadcast a monotonic stream offset (`seq`), keeps the
+  last 256 events in a bounded replay ring, and accepts a `last_event_id=<boot>:<seq>`
+  cursor on `GET /api/edge/subscribe`. A reconnect inside the ring gets the missed
+  tail replayed (`: resume warm replayed=N` comment marker, hello carries version 0 so
+  a warm cache is not wildcard-flushed); anything else — first connect, unknown format,
+  foreign home boot, evicted history, or nothing streamed yet — falls back to
+  `: resume gap` plus the existing wildcard hello flush. Pre-C-03 edges ignore the
+  comment/id lines and keep flushing on reconnect; the edge-client half (sending the
+  cursor and honouring the marker) is the remaining C-03 work.
+
 ### Fixed
 
 - **Cache byte budgets (C-01, part 2):** L1 per-connection and L3 semantic
