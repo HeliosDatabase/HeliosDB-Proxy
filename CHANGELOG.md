@@ -61,6 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The edge cache now has an aggregate retained-byte budget (C-01). `[edge]
+  max_total_bytes` (default 256 MiB, `0` = off) bounds the payload across all entries;
+  on insert the cache evicts LRU entries until the retained response bodies plus
+  per-entry overhead fit, and the accounting is exact across insert, replacement,
+  removal and invalidation. Previously `max_entries` alone allowed
+  `max_entries × max_cacheable_response_bytes` of payload (defaults ≈ 39 GiB).
+
 - The non-PG-wire gateways now reuse backend connections instead of dialing per
   request (H-06 first slice). The HTTP SQL, MCP and GraphQL gateways each own a small
   idle pool (`[limits] gateway_pool_max_idle`, default 16) of authenticated

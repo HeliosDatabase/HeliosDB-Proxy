@@ -2134,9 +2134,14 @@ impl ProxyServer {
                 config.anomaly.to_anomaly_config(),
             )),
             #[cfg(feature = "edge-proxy")]
-            edge_cache: Arc::new(crate::edge::EdgeCache::with_limits(
+            edge_cache: Arc::new(crate::edge::EdgeCache::with_budget(
                 config.edge.max_entries.max(1),
                 config.cache.max_cacheable_response_bytes,
+                if config.edge.max_total_bytes == 0 {
+                    usize::MAX
+                } else {
+                    config.edge.max_total_bytes
+                },
             )),
             #[cfg(feature = "edge-proxy")]
             edge_registry: Arc::new(crate::edge::EdgeRegistry::new(

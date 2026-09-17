@@ -96,6 +96,15 @@ struct MapState {
     /// every insert/pop/eviction, so `invalidate(tables)` visits only
     /// candidate keys instead of scanning the whole LRU.
     by_table: HashMap<String, HashSet<CacheKey>>,
+    /// Aggregate retained payload bytes (C-01): response bodies plus a
+    /// fixed per-entry overhead for the key and index links.
+    total_bytes: usize,
+}
+
+/// Bytes one entry charges against the aggregate budget (C-01): the
+/// shared response buffer plus a fixed overhead for the key and index.
+fn entry_charge(entry: &CacheEntry) -> usize {
+    entry.response_bytes.len().saturating_add(128)
 }
 
 impl MapState {
@@ -122,6 +131,7 @@ impl MapState {
     /// Pop `key` and unindex it. Returns the removed entry.
     fn pop(&mut self, key: &CacheKey) -> Option<Arc<CacheEntry>> {
         let entry = self.lru.pop(key)?;
+        self.total_bytes = self.total_bytes.saturating_sub(entry_charge(&entry));
         let tables = entry.tables.clone();
         self.index_remove(key, &tables);
         Some(entry)
@@ -162,6 +172,8 @@ struct EdgeCacheInner {
     /// `max_entries` bounds the entry COUNT only, so without this one
     /// giant entry blows the whole memory budget on its own.
     max_entry_bytes: usize,
+    /// Aggregate retained-byte budget (C-01). `usize::MAX` = disabled.
+    max_total_bytes: usize,
 }
 
 /// Cache key. `database`/`user` are verbatim tenant identity — two
@@ -203,18 +215,26 @@ impl EdgeCache {
     /// Entry-count bound only; no per-entry byte ceiling. Kept for
     /// tests/tools — production wiring uses [`EdgeCache::with_limits`].
     pub fn new(max_entries: usize) -> Self {
-        Self::with_limits(max_entries, usize::MAX)
+        Self::with_budget(max_entries, usize::MAX, usize::MAX)
     }
 
     /// Entry-count bound plus a per-entry body ceiling
     /// (`[cache] max_cacheable_response_bytes`).
     pub fn with_limits(max_entries: usize, max_entry_bytes: usize) -> Self {
+        Self::with_budget(max_entries, max_entry_bytes, usize::MAX)
+    }
+
+    /// Entry-count bound, per-entry ceiling and an aggregate retained-byte
+    /// budget (C-01). The budget is enforced on insert by evicting LRU
+    /// entries until the retained payload fits; `usize::MAX` disables it.
+    pub fn with_budget(max_entries: usize, max_entry_bytes: usize, max_total_bytes: usize) -> Self {
         let cap = NonZeroUsize::new(max_entries).expect("max_entries must be > 0");
         Self {
             inner: Arc::new(EdgeCacheInner {
                 map: Mutex::new(MapState {
                     lru: LruCache::new(cap),
                     by_table: HashMap::new(),
+                    total_bytes: 0,
                 }),
                 next_version: AtomicU64::new(1),
                 observed_home: AtomicU64::new(0),
@@ -228,6 +248,7 @@ impl EdgeCache {
                 evictions: AtomicU64::new(0),
                 oversize_rejected: AtomicU64::new(0),
                 max_entry_bytes,
+                max_total_bytes,
             }),
         }
     }
@@ -422,7 +443,24 @@ impl EdgeCache {
         // the LRU victim when capacity forced one out.
         let updating = map.lru.contains(&key);
         map.index_add(&key, &tables);
+        let charge = entry_charge(&entry);
         let displaced = map.lru.push(key, Arc::new(entry));
+        map.total_bytes = map.total_bytes.saturating_add(charge);
+        if let Some((_old_key, old_entry)) = &displaced {
+            map.total_bytes = map.total_bytes.saturating_sub(entry_charge(old_entry));
+        }
+        // C-01: aggregate budget — evict LRU entries until the retained
+        // payload fits (a single over-budget entry is evicted too).
+        while map.total_bytes > self.inner.max_total_bytes {
+            let victim = map.lru.pop_lru();
+            match victim {
+                Some((_k, v)) => {
+                    map.total_bytes = map.total_bytes.saturating_sub(entry_charge(&v));
+                    self.inner.evictions.fetch_add(1, Ordering::Relaxed);
+                }
+                None => break,
+            }
+        }
         if let Some((old_key, old_entry)) = &displaced {
             if updating {
                 // Same-key overwrite: drop index links the new entry
@@ -493,6 +531,11 @@ impl EdgeCache {
         drop_keys.len()
     }
 
+    /// Aggregate retained payload bytes, including per-entry overhead (C-01).
+    pub fn retained_bytes(&self) -> usize {
+        self.lock().total_bytes
+    }
+
     pub fn stats(&self) -> EdgeCacheStats {
         EdgeCacheStats {
             hits: self.inner.hits.load(Ordering::Relaxed),
@@ -523,6 +566,38 @@ mod tests {
             tables: tables.iter().map(|s| s.to_string()).collect(),
             expires_at: Instant::now() + ttl,
         }
+    }
+
+    /// C-01: aggregate byte budget evicts LRU entries; accounting is exact
+    /// across insert, replacement and invalidation.
+    #[test]
+    fn aggregate_byte_budget_evicts_and_accounts_exactly() {
+        let per = 100usize + 128; // body + fixed overhead
+        let c = EdgeCache::with_budget(10, usize::MAX, per * 2);
+        let k1 = CacheKey::new("fp1", "p1");
+        let k2 = CacheKey::new("fp2", "p2");
+        let k3 = CacheKey::new("fp3", "p3");
+        let e = |v: u64| entry(v, &[b'x'; 100], &["users"], Duration::from_secs(60));
+
+        c.insert(k1.clone(), e(1));
+        c.insert(k2.clone(), e(2));
+        assert_eq!(c.retained_bytes(), per * 2);
+        assert_eq!(c.stats().entries_evicted, 0);
+
+        // Third entry forces the aggregate budget: LRU (k1) is evicted.
+        c.insert(k3.clone(), e(3));
+        assert_eq!(c.retained_bytes(), per * 2, "budget enforced exactly");
+        assert_eq!(c.stats().entries_evicted, 1, "one LRU eviction");
+        assert!(c.get(&k1).is_none(), "LRU victim gone");
+        assert!(c.get(&k3).is_some(), "new entry retained");
+
+        // Same-key replacement must not double-charge.
+        c.insert(k3.clone(), e(4));
+        assert_eq!(c.retained_bytes(), per * 2);
+
+        // Invalidation reclaims the retained bytes exactly.
+        c.invalidate(10, &[]);
+        assert_eq!(c.retained_bytes(), 0);
     }
 
     #[test]

@@ -1059,6 +1059,7 @@ auth_token = "${EDGE_HOME_TOKEN}"     # edge: home admin bearer
 allow_insecure_home_url = false
 default_ttl_secs = 60
 max_entries = 10000
+max_total_bytes = 268435456
 max_edges = 32
 liveness_window_secs = 120
 subscribe_gc_secs = 30
@@ -1075,6 +1076,7 @@ edge_id = "edge-a"
 | `allow_insecure_home_url` | bool | `false` | *(edge)* Allow presenting `auth_token` to a plain-http `home_url` (private links only). |
 | `default_ttl_secs` | u64 | `60` | Default TTL for cache entries when the home supplies none. Must be ≥ 1 when edge is enabled. |
 | `max_entries` | usize | `10000` | Cache entries before LRU eviction. |
+| `max_total_bytes` | usize | `268435456` | Aggregate retained-payload budget (C-01): response bodies plus per-entry overhead. On insert the cache evicts LRU entries until the retained payload fits. `0` disables the budget (entry count x per-entry ceiling then bounds memory). |
 | `max_edges` | usize | `32` | *(home)* Maximum simultaneously-registered edges. |
 | `liveness_window_secs` | u64 | `120` | *(home)* Edges not seen within this window are GC-pruned. Keep comfortably above ~45s. Must be ≥ 1 when edge is enabled. |
 | `subscribe_gc_secs` | u64 | `30` | *(home)* Registry GC sweep cadence. Must be ≥ 1 when edge is enabled. |

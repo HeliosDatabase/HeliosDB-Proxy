@@ -406,6 +406,7 @@ storage           = "memory"     # memory | mmap
 enabled              = false
 # similarity_threshold = 0.92    # Cosine similarity threshold for a cache hit
 # max_entries          = 5000
+# max_total_bytes      = 268435456   # aggregate retained-payload budget (C-01; 0 = off)
 # ttl_secs             = 3600
 # embedding_endpoint   = "http://ollama:11434"
 # embedding_model      = "all-minilm"

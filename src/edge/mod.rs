@@ -112,6 +112,14 @@ pub struct EdgeConfig {
     #[serde(default = "default_max_entries")]
     pub max_entries: usize,
 
+    /// Aggregate retained-payload budget in bytes (C-01). On insert the
+    /// cache evicts LRU entries until the retained response bodies plus
+    /// per-entry overhead fit. Without it, `max_entries` alone allows
+    /// `max_entries x max_cacheable_response_bytes` of payload (the
+    /// defaults allow ~10,000 x 4 MiB). `0` disables the budget.
+    #[serde(default = "default_max_total_bytes")]
+    pub max_total_bytes: usize,
+
     /// For home: maximum simultaneous registered edge nodes.
     #[serde(default = "default_max_edges")]
     pub max_edges: usize,
@@ -151,6 +159,10 @@ fn default_max_entries() -> usize {
     10_000
 }
 
+fn default_max_total_bytes() -> usize {
+    256 * 1024 * 1024
+}
+
 fn default_max_edges() -> usize {
     32
 }
@@ -181,6 +193,7 @@ impl Default for EdgeConfig {
             allow_insecure_home_url: false,
             default_ttl_secs: default_cache_ttl_secs(),
             max_entries: default_max_entries(),
+            max_total_bytes: default_max_total_bytes(),
             max_edges: default_max_edges(),
             liveness_window_secs: default_liveness_window_secs(),
             subscribe_gc_secs: default_subscribe_gc_secs(),
