@@ -26,6 +26,7 @@
 //! that's an accepted trade of strict expiry-preference for O(1) puts.
 
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use lru::LruCache;
 use parking_lot::RwLock;
@@ -44,6 +45,14 @@ pub struct L1HotCache {
 
     /// Cache entries indexed by exact query string, in LRU order.
     entries: RwLock<LruCache<String, L1Entry>>,
+
+    /// Aggregate retained bytes (C-01), including fixed per-entry overhead.
+    retained_bytes: AtomicUsize,
+}
+
+/// Heap charge of one entry: payload + key bytes + fixed struct overhead.
+fn entry_charge(entry: &L1Entry) -> usize {
+    entry.result.size() + entry.query.len() + std::mem::size_of::<L1Entry>()
 }
 
 impl L1HotCache {
@@ -56,6 +65,7 @@ impl L1HotCache {
         let cap = NonZeroUsize::new(config.size).unwrap_or(NonZeroUsize::MIN);
         Self {
             entries: RwLock::new(LruCache::new(cap)),
+            retained_bytes: AtomicUsize::new(0),
             config,
         }
     }
@@ -102,17 +112,41 @@ impl L1HotCache {
 
         // Insert or update entry (promotes to most-recently-used).
         let entry = L1Entry::new(query.clone(), adjusted_result);
-        entries.put(query, entry);
+        let charge = entry_charge(&entry);
+        if let Some(old) = entries.put(query, entry) {
+            self.retained_bytes
+                .fetch_sub(entry_charge(&old), Ordering::Relaxed);
+        }
+        self.retained_bytes.fetch_add(charge, Ordering::Relaxed);
+        // C-01: trim to the aggregate byte budget, LRU-first.
+        if self.config.max_bytes > 0 {
+            while self.retained_bytes.load(Ordering::Relaxed) > self.config.max_bytes {
+                let Some((_, victim)) = entries.pop_lru() else {
+                    break;
+                };
+                self.retained_bytes
+                    .fetch_sub(entry_charge(&victim), Ordering::Relaxed);
+            }
+        }
     }
 
     /// Remove an entry from the cache
     pub fn remove(&self, query: &str) {
-        self.entries.write().pop(query);
+        if let Some(old) = self.entries.write().pop(query) {
+            self.retained_bytes
+                .fetch_sub(entry_charge(&old), Ordering::Relaxed);
+        }
     }
 
     /// Clear all entries
     pub fn clear(&self) {
         self.entries.write().clear();
+        self.retained_bytes.store(0, Ordering::Relaxed);
+    }
+
+    /// Aggregate retained bytes, including per-entry overhead (C-01).
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes.load(Ordering::Relaxed)
     }
 
     /// Get current entry count
@@ -154,7 +188,10 @@ impl L1HotCache {
             .collect();
 
         for key in &expired {
-            entries.pop(key);
+            if let Some(old) = entries.pop(key) {
+                self.retained_bytes
+                    .fetch_sub(entry_charge(&old), Ordering::Relaxed);
+            }
         }
     }
 }
@@ -194,6 +231,7 @@ mod tests {
     #[test]
     fn test_basic_get_put() {
         let config = L1Config {
+            max_bytes: usize::MAX,
             enabled: true,
             size: 100,
             ttl: Duration::from_secs(60),
@@ -216,6 +254,7 @@ mod tests {
     #[test]
     fn test_exact_match() {
         let config = L1Config {
+            max_bytes: usize::MAX,
             enabled: true,
             size: 100,
             ttl: Duration::from_secs(60),
@@ -238,6 +277,7 @@ mod tests {
     #[test]
     fn test_expiration() {
         let config = L1Config {
+            max_bytes: usize::MAX,
             enabled: true,
             size: 100,
             ttl: Duration::from_millis(10),
@@ -258,6 +298,7 @@ mod tests {
     #[test]
     fn test_lru_eviction() {
         let config = L1Config {
+            max_bytes: usize::MAX,
             enabled: true,
             size: 3,
             ttl: Duration::from_secs(60),
@@ -284,6 +325,7 @@ mod tests {
     #[test]
     fn test_clear() {
         let config = L1Config {
+            max_bytes: usize::MAX,
             enabled: true,
             size: 100,
             ttl: Duration::from_secs(60),
@@ -304,6 +346,7 @@ mod tests {
     #[test]
     fn test_remove() {
         let config = L1Config {
+            max_bytes: usize::MAX,
             enabled: true,
             size: 100,
             ttl: Duration::from_secs(60),
@@ -322,6 +365,7 @@ mod tests {
     #[test]
     fn test_disabled_cache() {
         let config = L1Config {
+            max_bytes: usize::MAX,
             enabled: false,
             size: 100,
             ttl: Duration::from_secs(60),
@@ -335,6 +379,7 @@ mod tests {
     #[test]
     fn test_stats() {
         let config = L1Config {
+            max_bytes: usize::MAX,
             enabled: true,
             size: 100,
             ttl: Duration::from_secs(60),
@@ -359,6 +404,7 @@ mod tests {
     #[test]
     fn test_evict_expired() {
         let config = L1Config {
+            max_bytes: usize::MAX,
             enabled: true,
             size: 100,
             ttl: Duration::from_millis(10),
@@ -378,6 +424,7 @@ mod tests {
     #[test]
     fn test_update_existing() {
         let config = L1Config {
+            max_bytes: usize::MAX,
             enabled: true,
             size: 100,
             ttl: Duration::from_secs(60),
@@ -407,6 +454,7 @@ mod tests {
         use std::thread;
 
         let cache = Arc::new(L1HotCache::new(L1Config {
+            max_bytes: usize::MAX,
             enabled: true,
             size: 100,
             ttl: Duration::from_secs(60),
@@ -447,6 +495,7 @@ mod tests {
     #[test]
     fn test_capacity_invariant_under_heavy_churn() {
         let config = L1Config {
+            max_bytes: usize::MAX,
             enabled: true,
             size: 128,
             ttl: Duration::from_secs(60),
@@ -479,6 +528,7 @@ mod tests {
     #[test]
     fn test_put_on_full_cache_evicts_least_recently_used() {
         let config = L1Config {
+            max_bytes: usize::MAX,
             enabled: true,
             size: 3,
             ttl: Duration::from_secs(60),
@@ -512,6 +562,7 @@ mod tests {
     #[test]
     fn test_get_purges_expired_entry_on_read() {
         let config = L1Config {
+            max_bytes: usize::MAX,
             enabled: true,
             size: 100,
             ttl: Duration::from_millis(10),
@@ -529,5 +580,73 @@ mod tests {
             0,
             "expired entry was not removed by the read that found it expired"
         );
+    }
+}
+
+#[cfg(test)]
+mod byte_budget_tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::time::Duration;
+
+    fn result(payload: &[u8]) -> CachedResult {
+        CachedResult::new(
+            Bytes::copy_from_slice(payload),
+            1,
+            Duration::from_secs(60),
+            vec!["t".to_string()],
+            Duration::from_millis(1),
+        )
+    }
+
+    #[test]
+    fn byte_budget_evicts_lru_and_accounts_exactly() {
+        let config = L1Config {
+            enabled: true,
+            size: 100,
+            max_bytes: 0,
+            ttl: Duration::from_secs(60),
+        };
+        let probe = L1HotCache::new(config.clone());
+        probe.put("k".to_string(), result(b"xxxx"));
+        let charge = probe.retained_bytes();
+
+        // Budget for exactly two entries.
+        let cache = L1HotCache::new(L1Config {
+            max_bytes: charge * 2,
+            ..config.clone()
+        });
+        cache.put("a".to_string(), result(b"aaaa"));
+        cache.put("b".to_string(), result(b"bbbb"));
+        cache.get("a");
+        assert_eq!(cache.retained_bytes(), charge * 2);
+        // Third insert must evict the LRU entry ("b") and stay within budget.
+        cache.put("c".to_string(), result(b"cccc"));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.retained_bytes(), charge * 2);
+        assert!(cache.get("b").is_none(), "LRU entry evicted");
+        assert!(cache.get("a").is_some() && cache.get("c").is_some());
+        // Replace and remove keep accounting exact.
+        cache.put("a".to_string(), result(b"aaaa"));
+        assert_eq!(cache.retained_bytes(), charge * 2);
+        cache.remove("a");
+        assert_eq!(cache.retained_bytes(), charge);
+        cache.clear();
+        assert_eq!(cache.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn byte_budget_zero_is_unbounded() {
+        let cache = L1HotCache::new(L1Config {
+            enabled: true,
+            size: 100,
+            max_bytes: usize::MAX,
+            ttl: Duration::from_secs(60),
+        });
+        for i in 0..50 {
+            cache.put(format!("q{i}"), result(b"payload"));
+        }
+        assert_eq!(cache.len(), 50);
+        assert!(cache.retained_bytes() > 0);
     }
 }

@@ -61,6 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cache byte budgets (C-01, part 2):** L1 per-connection and L3 semantic
+  query caches now enforce aggregate retained-byte budgets (defaults 32 MiB and
+  64 MiB) in addition to entry counts. Byte accounting is exact across
+  insert/replace/remove/expiry and both tiers evict oldest-first when the
+  budget is exceeded; previously only L2 (`size_mb`) and the edge cache were
+  byte-bounded. `max_bytes = 0` on `L1Config`/`L3Config` means unbounded (the
+  entry count still applies).
 - The edge cache now has an aggregate retained-byte budget (C-01). `[edge]
   max_total_bytes` (default 256 MiB, `0` = off) bounds the payload across all entries;
   on insert the cache evicts LRU entries until the retained response bodies plus

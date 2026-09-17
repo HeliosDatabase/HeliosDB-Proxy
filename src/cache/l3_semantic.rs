@@ -3,6 +3,7 @@
 //! Vector similarity cache for AI/RAG workloads.
 //! Uses embeddings to find semantically similar queries.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -24,6 +25,9 @@ pub struct L3SemanticCache {
 
     /// Cache entries
     entries: RwLock<Vec<L3Entry>>,
+
+    /// Aggregate retained bytes across entries + embeddings (C-01).
+    retained_bytes: AtomicUsize,
 
     /// Embedding service client
     embedding_client: EmbeddingClient,
@@ -51,6 +55,33 @@ pub struct EmbeddingClient {
     client: reqwest::Client,
 }
 
+/// Trim oldest-access-first until the aggregate byte budget is met, keeping
+/// `retained` exact (C-01).
+fn trim_to_budget(entries: &mut Vec<L3Entry>, retained: &AtomicUsize, max_bytes: usize) {
+    while max_bytes > 0 && retained.load(Ordering::Relaxed) > max_bytes {
+        let victim = match entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, e)| e.last_access)
+            .map(|(i, _)| i)
+        {
+            Some(i) => entries.remove(i),
+            None => break,
+        };
+        retained.fetch_sub(entry_charge(&victim), Ordering::Relaxed);
+    }
+}
+
+/// Heap charge of one semantic entry: result + query + embedding + context.
+fn entry_charge(entry: &L3Entry) -> usize {
+    entry.result.size()
+        + entry.query.len()
+        + entry.embedding.len() * std::mem::size_of::<f32>()
+        + entry.context.database.len()
+        + entry.context.user.as_ref().map_or(0, |u| u.len())
+        + std::mem::size_of::<L3Entry>()
+}
+
 impl L3SemanticCache {
     /// Create a new L3 semantic cache
     pub fn new(config: L3Config) -> Self {
@@ -63,6 +94,7 @@ impl L3SemanticCache {
         Self {
             config: config.clone(),
             entries: RwLock::new(Vec::with_capacity(config.max_entries)),
+            retained_bytes: AtomicUsize::new(0),
             embedding_client,
             embedding_semaphore: Semaphore::new(10), // Max 10 concurrent embedding requests
             embedding_cache: DashMap::new(),
@@ -145,7 +177,12 @@ impl L3SemanticCache {
             self.evict(&mut entries);
         }
 
+        let charge = entry_charge(&entry);
         entries.push(entry);
+        self.retained_bytes.fetch_add(charge, Ordering::Relaxed);
+
+        // C-01: trim to the aggregate byte budget, oldest-access-first.
+        trim_to_budget(&mut entries, &self.retained_bytes, self.config.max_bytes);
     }
 
     /// Clear all entries
@@ -153,7 +190,13 @@ impl L3SemanticCache {
         if let Ok(mut entries) = self.entries.write() {
             entries.clear();
         }
+        self.retained_bytes.store(0, Ordering::Relaxed);
         self.embedding_cache.clear();
+    }
+
+    /// Aggregate retained bytes across semantic entries (C-01).
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes.load(Ordering::Relaxed)
     }
 
     /// Get entry count
@@ -211,7 +254,15 @@ impl L3SemanticCache {
     /// Evict entries to make room for new ones
     fn evict(&self, entries: &mut Vec<L3Entry>) {
         // First, remove expired entries
-        entries.retain(|e| !e.is_expired());
+        let mut freed = 0usize;
+        entries.retain(|e| {
+            if e.is_expired() {
+                freed += entry_charge(e);
+                false
+            } else {
+                true
+            }
+        });
 
         // If still full, remove LRU entries
         while entries.len() >= self.config.max_entries {
@@ -221,10 +272,14 @@ impl L3SemanticCache {
                 .min_by_key(|(_, e)| e.last_access)
                 .map(|(i, _)| i)
             {
+                freed += entry_charge(&entries[lru_idx]);
                 entries.remove(lru_idx);
             } else {
                 break;
             }
+        }
+        if freed > 0 {
+            self.retained_bytes.fetch_sub(freed, Ordering::Relaxed);
         }
     }
 
@@ -492,6 +547,7 @@ mod tests {
     #[tokio::test]
     async fn test_l3_cache_disabled() {
         let config = L3Config {
+            max_bytes: usize::MAX,
             enabled: false,
             ..Default::default()
         };
@@ -518,6 +574,7 @@ mod tests {
     #[test]
     fn test_l3_stats() {
         let config = L3Config {
+            max_bytes: usize::MAX,
             enabled: true,
             max_entries: 1000,
             similarity_threshold: 0.9,
@@ -535,6 +592,7 @@ mod tests {
     fn test_eviction() {
         // Test that eviction logic works
         let config = L3Config {
+            max_bytes: usize::MAX,
             enabled: true,
             max_entries: 3,
             ..Default::default()
@@ -559,5 +617,63 @@ mod tests {
             // Should have at most max_entries
             assert!(entries.len() <= 3);
         }
+    }
+}
+
+#[cfg(test)]
+mod byte_budget_tests {
+    use super::*;
+    use crate::cache::CacheContext;
+    use bytes::Bytes;
+    use std::time::Duration as StdDuration;
+
+    fn entry_of(query: &str, payload: usize) -> L3Entry {
+        let result = CachedResult::new(
+            Bytes::from(vec![0u8; payload]),
+            1,
+            StdDuration::from_secs(60),
+            vec!["t".to_string()],
+            StdDuration::from_millis(1),
+        );
+        L3Entry::new(
+            query.to_string(),
+            vec![0.0f32; 4],
+            CacheContext::default(),
+            result,
+        )
+    }
+
+    #[test]
+    fn byte_budget_trim_reclaims_and_accounts_exactly() {
+        let total = AtomicUsize::new(0);
+        let mut entries = Vec::new();
+        for q in ["a", "b", "c"] {
+            let e = entry_of(q, 100);
+            total.fetch_add(entry_charge(&e), Ordering::Relaxed);
+            entries.push(e);
+        }
+        let all = total.load(Ordering::Relaxed);
+        let per = entry_charge(&entries[0]);
+        assert_eq!(all, per * 3);
+
+        trim_to_budget(&mut entries, &total, per * 2);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(total.load(Ordering::Relaxed), per * 2);
+        assert_eq!(entries[0].query, "b", "oldest access evicted first");
+        // Replacing/clearing keeps the counter exact.
+        let victim = entries.remove(0);
+        total.fetch_sub(entry_charge(&victim), Ordering::Relaxed);
+        assert_eq!(total.load(Ordering::Relaxed), per);
+    }
+
+    #[test]
+    fn byte_budget_disabled_when_zero() {
+        let total = AtomicUsize::new(0);
+        let mut entries = vec![entry_of("a", 100), entry_of("b", 100)];
+        for e in &entries {
+            total.fetch_add(entry_charge(e), Ordering::Relaxed);
+        }
+        trim_to_budget(&mut entries, &total, 0);
+        assert_eq!(entries.len(), 2, "0 means unbounded");
     }
 }

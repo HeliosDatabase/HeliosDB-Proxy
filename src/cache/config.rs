@@ -116,6 +116,10 @@ impl CacheConfig {
             return Err("L1 cache size cannot be 0 when enabled".to_string());
         }
 
+        if self.l1.max_bytes == 0 && self.l1.enabled {
+            return Err("L1 cache max_bytes cannot be 0 when enabled".to_string());
+        }
+
         if self.l2.size_mb == 0 && self.l2.enabled {
             return Err("L2 cache size cannot be 0 when enabled".to_string());
         }
@@ -137,6 +141,10 @@ pub struct L1Config {
     /// Maximum entries per connection
     pub size: usize,
 
+    /// Aggregate byte budget for retained payloads (C-01). `0` means
+    /// unbounded (entry count still applies). Default 32 MiB.
+    pub max_bytes: usize,
+
     /// Time-to-live for cached entries
     pub ttl: Duration,
 }
@@ -146,6 +154,7 @@ impl Default for L1Config {
         Self {
             enabled: true,
             size: 500,
+            max_bytes: 32 * 1024 * 1024,
             ttl: Duration::from_secs(30),
         }
     }
@@ -208,6 +217,10 @@ pub struct L3Config {
     /// Maximum entries in semantic cache
     pub max_entries: usize,
 
+    /// Aggregate byte budget for retained entries and embeddings (C-01).
+    /// `0` means unbounded (entry count still applies). Default 64 MiB.
+    pub max_bytes: usize,
+
     /// Time-to-live for semantic cache entries
     pub ttl: Duration,
 
@@ -227,6 +240,7 @@ impl Default for L3Config {
             enabled: false, // Disabled by default (requires Ollama)
             similarity_threshold: 0.92,
             max_entries: 5000,
+            max_bytes: 64 * 1024 * 1024,
             ttl: Duration::from_secs(3600),
             embedding_endpoint: "http://localhost:11434".to_string(),
             embedding_model: "all-minilm".to_string(),
