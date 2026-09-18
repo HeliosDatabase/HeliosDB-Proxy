@@ -3,6 +3,7 @@
 //! Tracks prepared statements for recreation when switching connections
 //! in transaction or statement pooling modes.
 
+use crate::protocol::starts_with_ci;
 use std::collections::HashMap;
 
 /// Prepared statement information
@@ -223,11 +224,14 @@ fn oid_to_type_name(oid: u32) -> String {
 /// Parse PREPARE statement to extract components
 ///
 /// Returns (name, param_types, query) if successful.
+///
+/// Runs on every statement in transaction pool mode, so the keyword tests
+/// are ASCII case-insensitive prefix checks — no uppercased copy of the
+/// (possibly kilobytes-long) statement is made for a non-PREPARE query.
 pub fn parse_prepare_statement(sql: &str) -> Option<(String, Vec<String>, String)> {
     let sql = sql.trim();
-    let upper = sql.to_uppercase();
 
-    if !upper.starts_with("PREPARE ") {
+    if !starts_with_ci(sql, "PREPARE ") {
         return None;
     }
 
@@ -260,8 +264,7 @@ pub fn parse_prepare_statement(sql: &str) -> Option<(String, Vec<String>, String
     };
 
     // Check for AS
-    let upper_rest = rest.to_uppercase();
-    if !upper_rest.starts_with("AS ") {
+    if !starts_with_ci(rest, "AS ") {
         return None;
     }
 
@@ -275,20 +278,21 @@ pub fn parse_prepare_statement(sql: &str) -> Option<(String, Vec<String>, String
 /// Returns the statement name or None for DEALLOCATE ALL.
 pub fn parse_deallocate_statement(sql: &str) -> Option<Option<String>> {
     let sql = sql.trim();
-    let upper = sql.to_uppercase();
 
-    if !upper.starts_with("DEALLOCATE ") {
+    if !starts_with_ci(sql, "DEALLOCATE ") {
         return None;
     }
 
     let rest = sql[11..].trim();
-    let upper_rest = rest.to_uppercase();
 
-    if upper_rest == "ALL" || upper_rest.starts_with("ALL ") || upper_rest.starts_with("ALL;") {
+    if rest.eq_ignore_ascii_case("ALL")
+        || starts_with_ci(rest, "ALL ")
+        || starts_with_ci(rest, "ALL;")
+    {
         Some(None) // DEALLOCATE ALL
     } else {
         // Remove optional PREPARE keyword
-        let name = if upper_rest.starts_with("PREPARE ") {
+        let name = if starts_with_ci(rest, "PREPARE ") {
             rest[8..].trim()
         } else {
             rest
@@ -404,6 +408,37 @@ mod tests {
             Some(Some("stmt2".to_string()))
         );
         assert_eq!(parse_deallocate_statement("SELECT 1"), None);
+    }
+
+    #[test]
+    fn test_parse_prepare_deallocate_case_insensitive() {
+        // Keyword matching is case-insensitive; names and bodies keep their case.
+        let (name, types, query) = parse_prepare_statement(
+            "  prepare GetUser (int, Text) as select * from u where id = $1",
+        )
+        .unwrap();
+        assert_eq!(name, "GetUser");
+        assert_eq!(types, vec!["int", "Text"]);
+        assert_eq!(query, "select * from u where id = $1");
+        assert_eq!(parse_prepare_statement("PREPARE"), None);
+        assert_eq!(parse_prepare_statement("PREPARED stmt AS SELECT 1"), None);
+        assert_eq!(parse_prepare_statement("PREPARE stmt SELECT 1"), None);
+        assert_eq!(
+            parse_prepare_statement("prepare 'ünï' as select 1").map(|t| t.0),
+            Some("'ünï'".to_string())
+        );
+
+        assert_eq!(parse_deallocate_statement("deallocate all"), Some(None));
+        assert_eq!(parse_deallocate_statement("DEALLOCATE All;"), Some(None));
+        assert_eq!(
+            parse_deallocate_statement("deallocate Prepare Stmt2;"),
+            Some(Some("Stmt2".to_string()))
+        );
+        assert_eq!(
+            parse_deallocate_statement("DEALLOCATE allstmt"),
+            Some(Some("allstmt".to_string()))
+        );
+        assert_eq!(parse_deallocate_statement("DEALLOCATE"), None);
     }
 
     #[test]

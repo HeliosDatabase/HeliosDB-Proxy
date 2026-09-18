@@ -4,6 +4,7 @@
 //! Enables Oracle-grade TAF+TAC merged functionality.
 
 use super::{NodeId, ProxyError, Result};
+use crate::protocol::starts_with_ci;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -65,29 +66,35 @@ pub enum StatementType {
 }
 
 impl StatementType {
-    /// Determine statement type from SQL
+    /// Determine statement type from SQL.
+    ///
+    /// Runs on every journaled statement, so it must not allocate: the
+    /// prefix tests are ASCII case-insensitive comparisons on the trimmed
+    /// input instead of an uppercased copy. Keyword semantics are unchanged
+    /// (bare prefix match, no word boundary), matching the original
+    /// `to_uppercase().starts_with(..)` classification.
     pub fn from_sql(sql: &str) -> Self {
-        let upper = sql.trim().to_uppercase();
-        if upper.starts_with("SELECT") {
+        let s = sql.trim();
+        if starts_with_ci(s, "SELECT") {
             StatementType::Select
-        } else if upper.starts_with("INSERT") {
+        } else if starts_with_ci(s, "INSERT") {
             StatementType::Insert
-        } else if upper.starts_with("UPDATE") {
+        } else if starts_with_ci(s, "UPDATE") {
             StatementType::Update
-        } else if upper.starts_with("DELETE") {
+        } else if starts_with_ci(s, "DELETE") {
             StatementType::Delete
-        } else if upper.starts_with("CREATE")
-            || upper.starts_with("ALTER")
-            || upper.starts_with("DROP")
+        } else if starts_with_ci(s, "CREATE")
+            || starts_with_ci(s, "ALTER")
+            || starts_with_ci(s, "DROP")
         {
             StatementType::Ddl
-        } else if upper.starts_with("BEGIN")
-            || upper.starts_with("COMMIT")
-            || upper.starts_with("ROLLBACK")
-            || upper.starts_with("SAVEPOINT")
+        } else if starts_with_ci(s, "BEGIN")
+            || starts_with_ci(s, "COMMIT")
+            || starts_with_ci(s, "ROLLBACK")
+            || starts_with_ci(s, "SAVEPOINT")
         {
             StatementType::Transaction
-        } else if upper.starts_with("SET") {
+        } else if starts_with_ci(s, "SET") {
             StatementType::Set
         } else {
             StatementType::Other
@@ -734,6 +741,55 @@ mod tests {
         assert_eq!(
             StatementType::from_sql("SET search_path = public"),
             StatementType::Set
+        );
+    }
+
+    #[test]
+    fn test_statement_type_detection_case_and_whitespace() {
+        // Mixed case and surrounding whitespace classify exactly as the
+        // uppercased-copy implementation did.
+        assert_eq!(
+            StatementType::from_sql("  select 1  "),
+            StatementType::Select
+        );
+        assert_eq!(
+            StatementType::from_sql("\n\tInSeRt into t values (1)"),
+            StatementType::Insert
+        );
+        assert_eq!(
+            StatementType::from_sql("alter table t add c int"),
+            StatementType::Ddl
+        );
+        assert_eq!(StatementType::from_sql("drop table t"), StatementType::Ddl);
+        assert_eq!(
+            StatementType::from_sql("commit"),
+            StatementType::Transaction
+        );
+        assert_eq!(
+            StatementType::from_sql("Rollback"),
+            StatementType::Transaction
+        );
+        assert_eq!(
+            StatementType::from_sql("savepoint sp1"),
+            StatementType::Transaction
+        );
+        assert_eq!(
+            StatementType::from_sql("set local x = 1"),
+            StatementType::Set
+        );
+        assert_eq!(
+            StatementType::from_sql("EXPLAIN ANALYZE SELECT 1"),
+            StatementType::Other
+        );
+        assert_eq!(StatementType::from_sql(""), StatementType::Other);
+        assert_eq!(StatementType::from_sql("   "), StatementType::Other);
+        // Prefix shorter than the keyword must not panic or match.
+        assert_eq!(StatementType::from_sql("SEL"), StatementType::Other);
+        // Non-ASCII bytes are compared verbatim, never case-folded.
+        assert_eq!(StatementType::from_sql("ßELECT 1"), StatementType::Other);
+        assert_eq!(
+            StatementType::from_sql("select 'ünïcode'"),
+            StatementType::Select
         );
     }
 

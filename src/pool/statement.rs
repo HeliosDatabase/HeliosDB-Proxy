@@ -6,6 +6,7 @@
 use super::lease::{ClientId, ConnectionLease, LeaseAction};
 use super::mode::{PoolingMode, TransactionEvent};
 use crate::connection_pool::PooledConnection;
+use crate::protocol::{contains_ci, starts_with_ci};
 
 /// Statement mode handler
 ///
@@ -124,66 +125,80 @@ impl StatementModeHandler {
     /// Check if a query is safe for statement mode
     ///
     /// Returns false for queries that require session state.
+    ///
+    /// Runs per statement on the pool-mode path, so it must not allocate:
+    /// ASCII case-insensitive prefix/substring tests on the trimmed input
+    /// replace the uppercased copy. Semantics are unchanged.
     pub fn is_safe_query(&self, sql: &str) -> bool {
-        let upper = sql.trim().to_uppercase();
+        let s = sql.trim();
 
         // These are not safe for statement mode
-        if upper.starts_with("LISTEN")
-            || upper.starts_with("UNLISTEN")
-            || upper.starts_with("PREPARE")
-            || upper.starts_with("EXECUTE")
-            || upper.starts_with("DEALLOCATE")
-            || upper.starts_with("DECLARE")
-            || upper.starts_with("FETCH")
-            || upper.starts_with("CLOSE")
-            || upper.starts_with("MOVE")
-            || upper.contains("CREATE TEMP")
-            || upper.contains("CREATE TEMPORARY")
+        if starts_with_ci(s, "LISTEN")
+            || starts_with_ci(s, "UNLISTEN")
+            || starts_with_ci(s, "PREPARE")
+            || starts_with_ci(s, "EXECUTE")
+            || starts_with_ci(s, "DEALLOCATE")
+            || starts_with_ci(s, "DECLARE")
+            || starts_with_ci(s, "FETCH")
+            || starts_with_ci(s, "CLOSE")
+            || starts_with_ci(s, "MOVE")
+            || Self::creates_temp(s)
         {
             return false;
         }
 
         // SET commands that affect session state
-        if upper.starts_with("SET ")
-            && !upper.starts_with("SET LOCAL")
-            && !upper.starts_with("SET TRANSACTION")
-        {
+        if Self::is_session_set(s) {
             return false;
         }
 
         true
     }
 
+    /// `CREATE TEMP ...` / `CREATE TEMPORARY ...` anywhere in the statement
+    /// (multi-statement strings included). One scan: `CREATE TEMPORARY`
+    /// starts with `CREATE TEMP`, so the second substring test was redundant.
+    #[inline]
+    fn creates_temp(trimmed: &str) -> bool {
+        contains_ci(trimmed, "CREATE TEMP")
+    }
+
+    /// `SET ...` that is neither `SET LOCAL` nor `SET TRANSACTION` — i.e. a
+    /// session-scoped setting that would not survive statement pooling.
+    #[inline]
+    fn is_session_set(trimmed: &str) -> bool {
+        starts_with_ci(trimmed, "SET ")
+            && !starts_with_ci(trimmed, "SET LOCAL")
+            && !starts_with_ci(trimmed, "SET TRANSACTION")
+    }
+
     /// Get warning if query is unsafe for statement mode
     pub fn get_query_warning(&self, sql: &str) -> Option<&'static str> {
-        let upper = sql.trim().to_uppercase();
+        let s = sql.trim();
 
-        if upper.starts_with("LISTEN") || upper.starts_with("UNLISTEN") {
+        if starts_with_ci(s, "LISTEN") || starts_with_ci(s, "UNLISTEN") {
             return Some(
                 "LISTEN/UNLISTEN not supported in statement mode - notifications will be lost",
             );
         }
 
-        if upper.starts_with("PREPARE")
-            || upper.starts_with("EXECUTE")
-            || upper.starts_with("DEALLOCATE")
+        if starts_with_ci(s, "PREPARE")
+            || starts_with_ci(s, "EXECUTE")
+            || starts_with_ci(s, "DEALLOCATE")
         {
             return Some("Prepared statements not supported in statement mode");
         }
 
-        if upper.starts_with("DECLARE") || upper.starts_with("FETCH") || upper.starts_with("CLOSE")
+        if starts_with_ci(s, "DECLARE") || starts_with_ci(s, "FETCH") || starts_with_ci(s, "CLOSE")
         {
             return Some("Cursors not supported in statement mode outside explicit transactions");
         }
 
-        if upper.contains("CREATE TEMP") || upper.contains("CREATE TEMPORARY") {
+        if Self::creates_temp(s) {
             return Some("Temporary tables may not persist correctly in statement mode");
         }
 
-        if upper.starts_with("SET ")
-            && !upper.starts_with("SET LOCAL")
-            && !upper.starts_with("SET TRANSACTION")
-        {
+        if Self::is_session_set(s) {
             return Some("Session variables may not persist in statement mode - use SET LOCAL within transaction");
         }
 
@@ -281,6 +296,39 @@ mod tests {
         assert!(!handler.is_safe_query("DECLARE cursor CURSOR FOR SELECT 1"));
         assert!(!handler.is_safe_query("CREATE TEMP TABLE t (id int)"));
         assert!(!handler.is_safe_query("SET work_mem = '1GB'"));
+    }
+
+    #[test]
+    fn test_safe_query_detection_case_and_whitespace() {
+        let handler = StatementModeHandler::new();
+        // Mixed case + leading whitespace behave exactly like the uppercased copy did.
+        assert!(!handler.is_safe_query("  listen ch"));
+        assert!(!handler.is_safe_query("\nUnListen ch"));
+        assert!(!handler.is_safe_query("prepare p as select 1"));
+        assert!(!handler.is_safe_query("fetch 10 from c"));
+        assert!(!handler.is_safe_query("move forward 1 in c"));
+        assert!(!handler.is_safe_query("close c"));
+        assert!(!handler
+            .is_safe_query("insert into x select * from y; create temporary table z (i int)"));
+        assert!(!handler.is_safe_query("set work_mem = '1GB'"));
+        assert!(handler.is_safe_query("set local work_mem = '1GB'"));
+        assert!(handler.is_safe_query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"));
+        // "SET" without a trailing space (e.g. SETTINGS, or bare SET) is not the
+        // session-variable form and stays safe, as before.
+        assert!(handler.is_safe_query("SET"));
+        assert!(handler.is_safe_query("select 'ünïcode'"));
+        assert!(handler.is_safe_query(""));
+        assert!(handler.is_safe_query("LIS"));
+        assert!(handler.get_query_warning("  listen ch").is_some());
+        assert!(handler.get_query_warning("move forward 1 in c").is_none());
+        assert!(handler
+            .get_query_warning("select 1 /* create temp */")
+            .is_some());
+        assert!(!handler.is_safe_query("CREATE TEMPORARY TABLE t (i int)"));
+        assert!(!handler.is_safe_query("create temp table t (i int)"));
+        assert!(handler.is_safe_query("CREATE TABLE t (i int)"));
+        assert!(handler.get_query_warning("SET").is_none());
+        assert!(handler.get_query_warning("SEt LOCAL x = 1").is_none());
     }
 
     #[test]

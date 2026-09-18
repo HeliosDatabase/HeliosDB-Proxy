@@ -17,6 +17,78 @@ stay under 3%.
   candidate's CI does not overlap the baseline CI (Criterion's own change report says
   "regressed" / "improved" / "within noise").
 
+## 2026-09-18 — 1.8.0 codegen-regression recovery (sprinter `1d70b68fa7cc`)
+
+Controlled A/B with the new `scripts/bench-gate.sh`: baseline tree = pre-change `main`
+`3b97470` (worktree `/home/gpc/HDB/Proxy-base-1.8.0`), candidate = the same commit plus
+the allocation-free classifier change; **3 interleaved rounds per tree (A B / B A / A B),
+own target dir per tree, fleet build lock + 24 GiB bounded scope, rustc 1.95.0, host
+gpc001ca, governor `performance`, `--features all-features`, all 107 cases.** Per-case
+medians across rounds; evidence archived under
+`/home/gpc/HDB/sprint/baselines/proxy/1.8.1-perf-final/` (`bench-gate-summary.txt`,
+`bench-gate.json`, per-round Criterion logs, `stamp.txt`).
+
+**Aggregate: mean delta −13.64%, median −1.34%, 30 separated improvements, 7 separated
+regressions (all in untouched code, see waiver).** The +7.3% cluster that 1.8.0 shipped
+with a waiver is eliminated with margin — every case in it is now faster than the 1.7.0
+tree as well (1.7.0 values from `1.8.0-rc/criterion-rounds-summary.txt`):
+
+| case | 1.8.0 base ns | candidate ns | delta |
+|---|---:|---:|---:|
+| journal/statement_type/select | 22.56 | 9.23 | −59.1% |
+| journal/statement_type/insert | 25.60 | 9.05 | −64.6% |
+| journal/statement_type/update | 29.20 | 9.18 | −68.6% |
+| journal/statement_type/delete | 33.03 | 9.60 | −71.0% |
+| journal/statement_type/ddl | 34.39 | 9.67 | −71.9% |
+| journal/statement_type/set | 32.41 | 13.21 | −59.2% |
+| journal/statement_type/txn | 23.69 | 9.09 | −61.6% |
+| journal/statement_type/other | 33.67 | 11.71 | −65.2% |
+| pool_mode/statement_safety/is_safe/safe_select | 48.48 | 22.98 | −52.6% |
+| pool_mode/statement_safety/warning/safe_select | 38.80 | 22.08 | −43.1% |
+| pool_mode/statement_safety/is_safe/unsafe_listen | 24.60 | 9.94 | −59.6% |
+| pool_mode/statement_safety/is_safe/unsafe_prepare | 35.86 | 11.76 | −67.2% |
+| pool_mode/statement_safety/is_safe/unsafe_set | 136.28 | 27.96 | −79.5% |
+| pool_mode/statement_safety/is_safe/safe_set_local | 108.51 | 28.37 | −73.9% |
+| pool_mode/statement_safety/warning/unsafe_listen | 26.61 | 10.00 | −62.4% |
+| pool_mode/statement_safety/warning/unsafe_prepare | 28.20 | 11.16 | −60.4% |
+| pool_mode/statement_safety/warning/unsafe_set | 136.79 | 27.76 | −79.7% |
+| pool_mode/statement_safety/warning/safe_set_local | 105.82 | 30.43 | −71.3% |
+| pool_mode/prepared_parse/prepare/named | 97.25 | 74.71 | −23.2% |
+| pool_mode/prepared_parse/prepare/typed | 229.28 | 177.83 | −22.4% |
+| pool_mode/prepared_parse/deallocate/named | 88.82 | 36.37 | −59.1% |
+| pool_mode/prepared_parse/deallocate/all | 67.02 | 16.42 | −75.5% |
+
+What changed: `StatementType::from_sql`, `StatementModeHandler::{is_safe_query,
+get_query_warning}` and `parse_prepare_statement` / `parse_deallocate_statement` no longer
+allocate an uppercased copy of every statement; they use the existing allocation-free
+`protocol::{starts_with_ci, contains_ci}` helpers. Same classification semantics.
+
+**Separated regressions and waiver (all untouched code — `git diff 3b97470` touches only
+`src/transaction_journal.rs`, `src/pool/statement.rs`, `src/pool/prepared.rs`):**
+
+| case | base ns | cand ns | delta | attribution |
+|---|---:|---:|---:|---|
+| pool_mode/manager_acquire_release/32 | 185389 | 208812 | +12.6% | tokio 32-task contention bench; candidate rounds 208.8k / 233.1k / **186.2k** — round 3 equals the baseline; the first full run had the *baseline* at 222.9k in one round. Scheduler scatter, not a shift: the 5-round re-probe (`1.8.1-perf-probe`) is **not separated** — baseline rounds 195.5k–240.1k, candidate 191.4k–232.1k, median +5.3% inside the overlap. |
+| switchover/drain/16 | 1856 | 2070 | +11.5% | untouched switchover buffer; candidate rounds 2100 / 2070 / **1946**; first full run showed +5.6% non-separated; the 5-round re-probe is **not separated** (median +0.9%, baseline 1864–1888 ns, candidate 1847–1994 ns). |
+| pool_mode/txn_event_detect/{statement,release,begin} | 8.8–15.3 | 9.2–16.0 | +4–5% | untouched `TransactionEvent::detect`; sub-nanosecond shifts that flip sign between builds (subA: statement +3.5%, subB-aligned: start_txn +12.9%, release −5.2%). Link-layout sensitivity of <20 ns benches. |
+| routing/write_detect/create_table, protocol/decode_startup/ssl_request | 25.9–31.6 | 27.0–33.1 | +4–5% | untouched; ≤1.5 ns; same class. |
+
+Layout sensitivity was measured directly: the same 36-case subset was re-run with both
+trees built with `-C llvm-args=-align-all-functions=6` (`1.8.1-perf-subB-align`).
+Alignment removed one artefact (`journal/add_entry/push` +5.9% → −5.3%) but produced new
+ones of the same size in other untouched sub-50 ns cases, so **function alignment does
+not make the microbenchmarks layout-robust and was not adopted**; `[profile.bench]` stays
+equal to the shipped release profile so the gate measures shipped codegen. The
+separated-regression rule in `bench-gate.sh` is kept strict on purpose: it is the reviewer's
+job to attribute each one (touched code → fix; untouched code → evidence like the above),
+not the gate's job to hide it.
+
+**Gate 3 status: PASS on the cumulative budget (−13.64% vs 3%) with the seven residuals
+explained and waived by the evidence above.** Full earlier passes for the record:
+`1.8.1-perf` (first pass, mean −10.19%, one touched-code separated regression
+`warning/safe_select` +43% caused by a redundant second `contains_ci` scan — fixed),
+`1.8.1-perf-subA` (second pass, 36-case subset, mean −37.8%).
+
 ## 2026-09-08 — audit implementation session baseline (`1dca229`)
 
 Recorded before implementing TR-01/TR-05, from an isolated archive of HEAD while
