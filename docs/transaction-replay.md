@@ -251,7 +251,7 @@ savepoints — so a replay reflects the post-rollback statement set.
 sets `max_entries = 10_000`, `max_size = 64 MiB` per journal, and a global
 `max_journals = 50_000`. `log_statement` rejects entries past `max_entries` or `max_size`.
 When the global cap is reached, `begin_transaction` evicts the oldest journals (by
-`started_at`) down to 90% of the cap in one pass — this is the leak guard for the
+insertion order) down to 90% of the cap in one pass — this is the leak guard for the
 never-committed auto-commit journals produced by the write path. `commit_transaction` /
 `rollback_transaction` remove a transaction's journal immediately.
 
@@ -295,12 +295,12 @@ Replay proceeds through the `ReplayState` machine — `Pending` → `WaitingForW
 `FailoverReplay` keeps `active_replays`, a bounded `completed_replays` history (last 100),
 and exposes `get_state`, `get_progress`, `cancel_replay`, `history`, and `stats`.
 
-> **Skeleton path.** When no backend template/endpoint is attached to the
-> `FailoverReplay`, the backend-touching calls short-circuit to success without opening a
-> connection (`execute_statement` returns `(true, true, true, None)`). Real replay
-> requires `with_backend_template` plus `register_endpoint`. Nothing in the daemon calls
-> those, so this is not merely the unit-test configuration — it is the only configuration
-> reachable through `coordinate_failover_replay` (see
+> **No-backend path.** Without an attached backend template/endpoint, the
+> backend-touching calls now fail explicitly instead of reporting a synthetic success:
+> `execute_statement` refuses when no template or endpoint is attached,
+> `wait_for_wal_sync` refuses a nonzero LSN it cannot verify, and `/api/replay` rejects a
+> blank target — so a coordinated replay reports `successful_replays: 0`. Real replay
+> requires `with_backend_template` plus `register_endpoint` (see
 > [Failover Coordination](#3-failover-coordination)).
 
 ### 3. Failover Coordination
