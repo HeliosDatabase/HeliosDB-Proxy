@@ -1426,11 +1426,14 @@ impl AdminServer {
 
         // C-03 resume marker: a comment frame so pre-C-03 edges ignore
         // it, carrying whether the home replayed the missed tail.
+        let boot = registry.boot_id();
         let marker = match resume {
-            crate::edge::Resume::Warm { replayed } => {
-                format!(": resume warm replayed={replayed}\n\n")
+            crate::edge::Resume::Warm { replayed, upto } => {
+                format!(": resume warm boot={boot} upto={upto} replayed={replayed}\n\n")
             }
-            crate::edge::Resume::Gap => ": resume gap\n\n".to_string(),
+            crate::edge::Resume::Gap { upto } => {
+                format!(": resume gap boot={boot} upto={upto}\n\n")
+            }
         };
         if !Self::write_sse(writer, marker.as_bytes()).await {
             return Ok(());

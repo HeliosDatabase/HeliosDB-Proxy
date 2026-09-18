@@ -67,8 +67,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a warm cache is not wildcard-flushed); anything else — first connect, unknown format,
   foreign home boot, evicted history, or nothing streamed yet — falls back to
   `: resume gap` plus the existing wildcard hello flush. Pre-C-03 edges ignore the
-  comment/id lines and keep flushing on reconnect; the edge-client half (sending the
-  cursor and honouring the marker) is the remaining C-03 work.
+  comment/id lines and keep flushing on reconnect. The edge client now sends its
+  `last_event_id` cursor on reconnect and honours the marker: `warm` keeps the cache and
+  applies the replayed tail, `gap` flushes, and a first connect (or a pre-C-03 home)
+  still starts cold — closing C-03 end-to-end.
 
 ### Fixed
 

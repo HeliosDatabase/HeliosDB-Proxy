@@ -99,8 +99,11 @@ async fn run_subscribe_loop(cfg: EdgeConfig, cache: Arc<EdgeCache>) {
     };
 
     let mut backoff = BACKOFF_INITIAL;
+    // Highest `boot:seq` stream position applied so far (C-03). Sent back on
+    // reconnect so the home can replay only the missed tail.
+    let mut cursor: Option<(u64, u64)> = None;
     loop {
-        match open_stream(&client, &subscribe_url, &cfg, &edge_id).await {
+        match open_stream(&client, &subscribe_url, &cfg, &edge_id, cursor).await {
             Ok(resp) => {
                 tracing::info!(
                     edge_id = %edge_id,
@@ -108,19 +111,22 @@ async fn run_subscribe_loop(cfg: EdgeConfig, cache: Arc<EdgeCache>) {
                     url = %subscribe_url,
                     "edge client: subscribed to home invalidation stream"
                 );
-                // C-03: invalidations emitted while the stream was down may
-                // have been missed, so a (re)connect starts from a cold cache.
-                let dropped = cache.flush_all();
-                if dropped > 0 {
-                    tracing::warn!(
-                        edge_id = %edge_id,
-                        dropped,
-                        "edge client: flushed cache on (re)connect to avoid serving stale entries (invalidation gap)"
-                    );
+                // C-03: with no cursor there is nothing to resume — start
+                // cold. With a cursor the home's `: resume` marker decides:
+                // `warm` keeps the cache, `gap` flushes it (see pump_stream).
+                if cursor.is_none() {
+                    let dropped = cache.flush_all();
+                    if dropped > 0 {
+                        tracing::warn!(
+                            edge_id = %edge_id,
+                            dropped,
+                            "edge client: cold start — flushed any pre-existing cache entries"
+                        );
+                    }
                 }
                 // Successful connect resets the backoff ladder.
                 backoff = BACKOFF_INITIAL;
-                match pump_stream(resp, &cache).await {
+                match pump_stream(resp, &cache, &mut cursor).await {
                     // Clean EOF: home closed us (shutdown, an eviction,
                     // or a same-id re-register replaced this stream) —
                     // reconnecting re-registers. Healthy idle edges are
@@ -158,15 +164,22 @@ async fn open_stream(
     url: &str,
     cfg: &EdgeConfig,
     edge_id: &str,
+    cursor: Option<(u64, u64)>,
 ) -> Result<reqwest::Response, String> {
     // `query` url-encodes the values. `base_url` is the callback slot
     // the registry records for future ack-checks — empty today (the
     // edge has no HTTP listener of its own to advertise).
-    let mut req = client.get(url).query(&[
-        ("edge_id", edge_id),
-        ("region", cfg.region.as_str()),
-        ("base_url", ""),
-    ]);
+    let mut params: Vec<(&str, String)> = vec![
+        ("edge_id", edge_id.to_string()),
+        ("region", cfg.region.clone()),
+        ("base_url", String::new()),
+    ];
+    if let Some((boot, seq)) = cursor {
+        // C-03 warm-resume cursor: only meaningful to homes that emitted
+        // `id:` offsets; pre-C-03 homes ignore the unknown query key.
+        params.push(("last_event_id", format!("{boot}:{seq}")));
+    }
+    let mut req = client.get(url).query(&params);
     if !cfg.auth_token.is_empty() {
         req = req.bearer_auth(&cfg.auth_token);
     }
@@ -184,7 +197,11 @@ async fn open_stream(
 ///
 /// `bytes_stream()` needs reqwest's `stream` feature, which this crate
 /// doesn't enable — `Response::chunk()` in a loop is the equivalent.
-async fn pump_stream(mut resp: reqwest::Response, cache: &EdgeCache) -> Result<(), String> {
+async fn pump_stream(
+    mut resp: reqwest::Response,
+    cache: &EdgeCache,
+    cursor: &mut Option<(u64, u64)>,
+) -> Result<(), String> {
     let mut parser = SseParser::default();
     loop {
         let chunk = match tokio::time::timeout(IDLE_TIMEOUT, resp.chunk()).await {
@@ -198,10 +215,49 @@ async fn pump_stream(mut resp: reqwest::Response, cache: &EdgeCache) -> Result<(
             Ok(Ok(None)) => return Ok(()), // clean EOF
             Ok(Ok(Some(c))) => c,
         };
+        // The home declares resume status before any event (C-03).
+        if let Some(marker) = parser.take_resume() {
+            if let Some(rest) = marker.strip_prefix("resume ") {
+                let boot = field(rest, "boot=");
+                let upto = field(rest, "upto=").unwrap_or(0);
+                if let Some(boot) = boot {
+                    let warm = rest.starts_with("warm");
+                    *cursor = Some((boot, upto));
+                    if warm {
+                        tracing::info!(
+                            boot,
+                            upto,
+                            "edge client: warm resume — cache kept, replaying missed tail"
+                        );
+                    } else {
+                        let dropped = cache.flush_all();
+                        tracing::warn!(
+                            boot,
+                            upto,
+                            dropped,
+                            "edge client: invalidation gap — flushed cache before resuming"
+                        );
+                    }
+                }
+            }
+        }
         for payload in parser.feed(&chunk) {
             apply_invalidation(&payload, cache);
         }
+        if let Some(last) = parser.last_id() {
+            match cursor {
+                Some((_, seq)) if *seq < last => *seq = last,
+                _ => {}
+            }
+        }
     }
+}
+
+/// Extract `name<digits>` from a resume marker (space-delimited fields).
+fn field(s: &str, name: &str) -> Option<u64> {
+    s.split_whitespace()
+        .find_map(|f| f.strip_prefix(name))
+        .and_then(|v| v.parse().ok())
 }
 
 /// Parse one `data:` payload as an `InvalidationEvent` and apply it.
@@ -276,6 +332,10 @@ struct SseParser {
     buf: Vec<u8>,
     /// `data:` lines of the event currently being accumulated.
     data_lines: Vec<String>,
+    /// Last `id:` offset seen on the stream (C-03).
+    last_id: Option<u64>,
+    /// Last `: resume ...` marker seen (C-03).
+    resume: Option<String>,
 }
 
 impl SseParser {
@@ -303,6 +363,16 @@ impl SseParser {
         completed
     }
 
+    /// Highest stream offset seen so far (C-03), if any.
+    fn last_id(&self) -> Option<u64> {
+        self.last_id
+    }
+
+    /// Take the most recent `: resume` marker, if one arrived (C-03).
+    fn take_resume(&mut self) -> Option<String> {
+        self.resume.take()
+    }
+
     fn process_line(&mut self, line: &[u8], completed: &mut Vec<String>) {
         if line.is_empty() {
             // Blank line = event boundary: dispatch what accumulated.
@@ -313,7 +383,29 @@ impl SseParser {
             return;
         }
         if line.starts_with(b":") {
-            return; // comment — the home's keepalive heartbeat
+            // Comment — the keepalive heartbeat, or the C-03 resume marker.
+            let text = String::from_utf8_lossy(&line[1..]).trim().to_string();
+            if text.starts_with("resume ") {
+                self.resume = Some(text);
+            }
+            return;
+        }
+        if let Some(rest) = line.strip_prefix(b"id:") {
+            if let Ok(id) = rest
+                .strip_prefix(b" ")
+                .unwrap_or(rest)
+                .iter()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .fold(String::new(), |mut s, b| {
+                    s.push(*b as char);
+                    s
+                })
+                .parse()
+            {
+                self.last_id = Some(id);
+            }
+            return;
         }
         if let Some(rest) = line.strip_prefix(b"data:") {
             // The SSE spec strips exactly one space after the colon.
@@ -480,5 +572,31 @@ mod tests {
             b = next_backoff(b);
         }
         assert_eq!(seen, vec![500, 1000, 2000, 4000, 8000, 10000, 10000, 10000]);
+    }
+}
+
+#[cfg(test)]
+mod c03_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn parses_resume_marker_and_stream_ids() {
+        let mut p = SseParser::default();
+        let frames = p.feed(
+            b": resume warm boot=7 upto=41 replayed=2\n\
+              : keepalive\n\n\
+              event: invalidate\nid: 42\ndata: {\"v\":1}\n\n",
+        );
+        assert_eq!(
+            p.take_resume().as_deref(),
+            Some("resume warm boot=7 upto=41 replayed=2")
+        );
+        assert_eq!(p.last_id(), Some(42));
+        assert_eq!(frames, vec!["{\"v\":1}".to_string()]);
+        assert!(p.take_resume().is_none(), "marker taken once");
+
+        let gap = p.feed(b": resume gap boot=8 upto=0\n\n");
+        assert!(gap.is_empty());
+        assert_eq!(p.take_resume().as_deref(), Some("resume gap boot=8 upto=0"));
     }
 }

@@ -81,10 +81,15 @@ pub enum Resume {
     Warm {
         /// Number of history events replayed into the channel.
         replayed: usize,
+        /// Highest stream offset the edge is caught up through.
+        upto: u64,
     },
     /// The cursor was absent, came from a different home boot, or is
     /// older than the bounded history. The edge must flush its cache.
-    Gap,
+    Gap {
+        /// Highest stream offset represented by the forced flush.
+        upto: u64,
+    },
 }
 
 /// Bounded ring of recent invalidations with monotonic offsets, so a
@@ -126,30 +131,34 @@ impl InvalidationLog {
         cursor: u64,
         tx: &mpsc::Sender<InvalidationEvent>,
     ) -> Resume {
+        let upto = self.next_seq.saturating_sub(1);
         if cursor_boot != home_boot || self.next_seq == 0 {
-            return Resume::Gap; // different boot, or nothing streamed yet
+            return Resume::Gap { upto }; // different boot, or nothing streamed yet
         }
         let last = self.next_seq - 1;
         if cursor >= last {
-            return Resume::Warm { replayed: 0 }; // already caught up
+            return Resume::Warm {
+                replayed: 0,
+                upto: last,
+            }; // already caught up
         }
         match self.history.front() {
             Some(first) if first.seq <= cursor + 1 => {
                 let replay: Vec<&InvalidationEvent> =
                     self.history.iter().filter(|e| e.seq > cursor).collect();
                 if replay.len() >= 60 {
-                    return Resume::Gap;
+                    return Resume::Gap { upto };
                 }
                 let mut replayed = 0usize;
                 for ev in replay {
                     if tx.try_send(ev.clone()).is_err() {
-                        return Resume::Gap;
+                        return Resume::Gap { upto };
                     }
                     replayed += 1;
                 }
-                Resume::Warm { replayed }
+                Resume::Warm { replayed, upto }
             }
-            _ => Resume::Gap,
+            _ => Resume::Gap { upto },
         }
     }
 }
@@ -214,6 +223,11 @@ impl EdgeRegistry {
             .map(|(rx, _)| rx)
     }
 
+    /// The home's per-boot stream identity (C-03 cursors).
+    pub fn boot_id(&self) -> u64 {
+        self.boot_id
+    }
+
     /// Cursor-aware registration (C-03): when the edge presents a valid
     /// `boot:seq` cursor still inside the bounded history, the missed
     /// events are replayed into the returned channel before the
@@ -245,7 +259,7 @@ impl EdgeRegistry {
         };
         let resume = match (self.boot_id, cursor.and_then(parse_cursor)) {
             (boot, Some((c_boot, c_seq))) => self.log.lock().resume(boot, c_boot, c_seq, &tx),
-            _ => Resume::Gap,
+            _ => Resume::Gap { upto: 0 },
         };
         g.insert(edge_id.to_string(), sub);
         Ok((rx, resume))
@@ -638,7 +652,13 @@ mod tests {
         let (mut rx2, resume) = r
             .register_at("e1", "us", "u", "ts2", Some(&cursor))
             .unwrap();
-        assert_eq!(resume, Resume::Warm { replayed: 1 });
+        assert_eq!(
+            resume,
+            Resume::Warm {
+                replayed: 1,
+                upto: 1
+            }
+        );
         let replayed = rx2.recv().await.unwrap();
         assert_eq!(replayed.seq, 1);
         assert_eq!(replayed.up_to_version, 2);
@@ -650,21 +670,27 @@ mod tests {
         let r = EdgeRegistry::new(10, Duration::from_secs(60));
         // Nothing streamed yet.
         let (_rx, resume) = r.register_at("e1", "us", "u", "ts", Some("123:0")).unwrap();
-        assert_eq!(resume, Resume::Gap);
+        assert_eq!(resume, Resume::Gap { upto: 0 });
         // Foreign boot id.
         r.broadcast(ev(1)).await;
         let (_rx2, resume) = r
             .register_at("e1", "us", "u", "ts", Some("999999:0"))
             .unwrap();
-        assert_eq!(resume, Resume::Gap);
+        assert_eq!(resume, Resume::Gap { upto: 0 });
         // Malformed / absent cursor.
         let (_rx3, resume) = r.register_at("e1", "us", "u", "ts", Some("junk")).unwrap();
-        assert_eq!(resume, Resume::Gap);
+        assert_eq!(resume, Resume::Gap { upto: 0 });
         let (_rx4, resume) = r.register_at("e1", "us", "u", "ts", None).unwrap();
-        assert_eq!(resume, Resume::Gap);
+        assert_eq!(resume, Resume::Gap { upto: 0 });
         // Caught-up cursor resumes warm with no replay.
         let cursor = format!("{}:{}", r.boot_id, 0);
         let (_rx5, resume) = r.register_at("e1", "us", "u", "ts", Some(&cursor)).unwrap();
-        assert_eq!(resume, Resume::Warm { replayed: 0 });
+        assert_eq!(
+            resume,
+            Resume::Warm {
+                replayed: 0,
+                upto: 0
+            }
+        );
     }
 }
