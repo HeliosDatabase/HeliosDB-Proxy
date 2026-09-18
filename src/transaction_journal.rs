@@ -645,6 +645,7 @@ impl TransactionJournal {
             active_transactions: journals.len(),
             total_entries,
             total_size_bytes: total_size,
+            max_journals: self.max_journals,
             enabled: self.enabled,
         }
     }
@@ -696,6 +697,9 @@ pub struct JournalStats {
     pub total_entries: usize,
     /// Total size of journals in bytes
     pub total_size_bytes: usize,
+    /// Global cap on retained journals; at the cap the oldest journals are
+    /// evicted first (code constant, not a `proxy.toml` key).
+    pub max_journals: usize,
     /// Whether journaling is enabled
     pub enabled: bool,
 }

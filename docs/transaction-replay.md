@@ -19,7 +19,7 @@ mode name, behavior — is verifiable in `src/transaction_journal.rs`,
 `src/replay/mod.rs`, and the TR fields of `ProxyConfig` in `src/config.rs`. Where the
 narrative describes intent rather than shipped runtime behavior, it says so explicitly.
 
-**Last verified against the post-1.7.0 tree that moved TR into the default build.** The
+**Last verified against the post-1.8.0 tree with both TR-07 honesty slices.** The
 in-session recovery path described in [In-session replay](#in-session-replay-the-core-path)
 is the current behavior; the journal and administrative replay sections below describe
 the operator tooling, which is compiled into every build and disabled at runtime by
@@ -189,6 +189,22 @@ never commit, the journal manager bounds the map with a global cap and evicts th
 entries (see below). The live hook records the **SQL text**; the parameter, checksum, and
 row-count fields of a journal entry exist in the data model but are passed as
 `None`/empty by this hook today.
+
+**Journal coverage is narrow, and the API now states it (TR-07).** The hook fires on the
+**simple-query path only**, after the backend's response frames have been relayed to the
+client. It records any statement the routing classifier treats as a write — DML/DDL, but
+also `BEGIN` / `COMMIT` / `ROLLBACK` / `SET` — one synthetic single-statement auto-commit
+transaction each. It does **not** inspect that response for an `ErrorResponse`, so a
+statement the backend rejected (or that was later rolled back) is journaled just like a
+committed one: the window is raw statement text in arrival order, not a list of
+successful or committed operations. Extended-protocol batches (`Parse` / `Bind` /
+`Execute`) compute the same write classification for routing but are **never journaled**,
+so their `Bind` parameter values do not exist anywhere in the journal; and because each
+entry is its own never-committed auto-commit journal, explicit transactions are not
+preserved as transactions. `POST /api/replay` reports this in the `coverage` block of
+every response (`transaction_boundaries`, `parameter_values`, `outcomes` and
+`survives_restart` are all `false`), and a request with `mode: "committed_history"` is
+refused with `501` rather than silently downgraded to the weaker time-window replay.
 
 **2. Failover write-buffering** (`src/server.rs`, `select_primary_with_timeout`).
 When a write needs the primary and the configured-primary node is not healthy, the proxy
@@ -379,9 +395,13 @@ re-executes the SQL text found in a timestamp window, in timestamp order, on one
 connection. It does not reconstruct committed transactions: rolled-back or failed source
 statements are not excluded, interleaved clients are flattened into timestamp order, and
 individual failures do not abort the run — the summary carries `mode: "time_window"` and
-`partial: true` when anything failed. A *committed-history* replay (only durable commits,
-real boundaries and parameters, stop-on-failure) is a separate, not-yet-shipped
-capability; the API and this guide now keep the two distinct instead of implying the
+`partial: true` when anything failed or the deadline cut the run short. Every response
+also carries a `coverage` block that reports the journal's retained size and states
+explicitly that it preserves no transaction boundaries, parameter values or per-statement
+outcomes and does not survive a restart. A *committed-history* replay (only durable
+commits, real boundaries and parameters, stop-on-failure) is a separate, not-yet-shipped
+capability; a request for `mode: "committed_history"` is refused with `501` instead of
+being silently downgraded, and this guide keeps the two distinct instead of implying the
 journal provides the stronger one.
 
 ### Session state: `SET` is restored, the rest is not

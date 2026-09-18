@@ -70,6 +70,42 @@ pub struct ReplaySummary {
     pub first_error: Option<String>,
 }
 
+/// Honest descriptor of what the journal behind a replay currently retains and
+/// what it structurally captures (TR-07).
+///
+/// This exists so a replay response never has to be read as more than it is:
+/// the journal is a bounded, per-process memory sample of simple-protocol
+/// statement text, with no transaction boundaries, protocol parameter values,
+/// per-statement outcomes or restart durability. The booleans describe the
+/// current implementation and are reported, not configured; the counters are a
+/// snapshot taken at replay time.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct JournalCoverage {
+    /// Journals retained at replay time (the bounded sample the window
+    /// is read from).
+    pub retained_transactions: usize,
+    /// Statement entries retained across those journals.
+    pub retained_entries: usize,
+    /// Retained bytes (statement text + parameters).
+    pub retained_bytes: usize,
+    /// Code-constant cap on retained journals; eviction is oldest-first.
+    pub max_journals: usize,
+    /// True when the journal persists across a process restart. Always
+    /// false: retention is per-process and in-memory.
+    pub survives_restart: bool,
+    /// True when the journal preserves committed transaction boundaries.
+    /// Always false: the hot path records each statement as its own
+    /// synthetic auto-commit transaction and never commits it.
+    pub transaction_boundaries: bool,
+    /// True when protocol-level Bind parameter values are captured.
+    /// Always false: the hot path records SQL text only.
+    pub parameter_values: bool,
+    /// True when a per-statement commit/failure outcome is captured.
+    /// Always false: statements are recorded after the response was
+    /// relayed, with no outcome field populated.
+    pub outcomes: bool,
+}
+
 /// Replay engine backed by an existing transaction journal.
 pub struct ReplayEngine {
     journal: Arc<TransactionJournal>,
@@ -94,6 +130,22 @@ impl ReplayEngine {
     pub fn with_deadline(mut self, deadline: Option<std::time::Duration>) -> Self {
         self.deadline = deadline;
         self
+    }
+
+    /// Snapshot the journal's retained size and its structural coverage so a
+    /// replay caller can see exactly what backed the run (TR-07).
+    pub async fn journal_coverage(&self) -> JournalCoverage {
+        let stats = self.journal.stats().await;
+        JournalCoverage {
+            retained_transactions: stats.active_transactions,
+            retained_entries: stats.total_entries,
+            retained_bytes: stats.total_size_bytes,
+            max_journals: stats.max_journals,
+            survives_restart: false,
+            transaction_boundaries: false,
+            parameter_values: false,
+            outcomes: false,
+        }
     }
 
     fn remaining(
@@ -526,6 +578,51 @@ mod tests {
         assert!(j.contains("\"partial\":true"));
         assert!(j.contains("\"deadline_exceeded\":false"));
         assert!(j.contains("oops"));
+    }
+
+    /// The coverage descriptor must report the journal's retained sample and
+    /// must not claim boundaries, parameters, outcomes or restart durability
+    /// (TR-07). It has to serialize in exactly that shape for the API.
+    #[tokio::test]
+    async fn test_journal_coverage_reports_honest_limits() {
+        let journal = Arc::new(TransactionJournal::new());
+        let tx = Uuid::new_v4();
+        journal
+            .begin_transaction(tx, Uuid::new_v4(), NodeId::new(), 0)
+            .await
+            .unwrap();
+        journal
+            .log_statement(
+                tx,
+                "insert into t values (1)".to_string(),
+                vec![],
+                None,
+                None,
+                0,
+            )
+            .await
+            .unwrap();
+
+        let engine = ReplayEngine::new(journal, test_template());
+        let cov = engine.journal_coverage().await;
+        assert_eq!(cov.retained_transactions, 1);
+        assert_eq!(cov.retained_entries, 1);
+        assert!(cov.retained_bytes > 0);
+        assert_eq!(cov.max_journals, 50_000);
+        assert!(!cov.survives_restart);
+        assert!(!cov.transaction_boundaries);
+        assert!(!cov.parameter_values);
+        assert!(!cov.outcomes);
+
+        let json = serde_json::to_string(&cov).unwrap();
+        for field in [
+            "\"survives_restart\":false",
+            "\"transaction_boundaries\":false",
+            "\"parameter_values\":false",
+            "\"outcomes\":false",
+        ] {
+            assert!(json.contains(field), "coverage must serialize {field}");
+        }
     }
 
     #[tokio::test]

@@ -1243,7 +1243,9 @@ impl AdminServer {
 
     /// Handle `POST /api/replay`. Body is a JSON `ReplayRequestBody`.
     /// Returns 503 when no replay engine is attached, 400 on a malformed
-    /// body or inverted window, 200 with `ReplaySummary` on success.
+    /// body, inverted window or unknown `mode`, 501 when the requested
+    /// `"committed_history"` mode is asked for (not implemented — the journal
+    /// cannot back it, TR-07), and 200 with the replay summary on success.
     async fn handle_replay_request(
         body: Option<&str>,
         state: &Arc<AdminState>,
@@ -1259,6 +1261,37 @@ impl AdminServer {
                 ));
             }
         };
+        // Refuse an unimplemented mode before anything else: silently running
+        // the weaker time-window replay for a caller who asked for committed
+        // history would be exactly the kind of implied guarantee TR-07 exists
+        // to remove.
+        match req.mode.as_deref() {
+            None | Some("time_window") => {}
+            Some("committed_history") => {
+                return Ok((
+                    501,
+                    serde_json::json!({
+                        "error": "committed-history replay is not implemented: the journal \
+                                  does not preserve transaction boundaries, parameter values, \
+                                  outcomes or commit order, and does not survive a restart \
+                                  (TR-07). The only implemented mode is \"time_window\".",
+                        "requested_mode": "committed_history",
+                        "available_mode": "time_window",
+                    }),
+                ));
+            }
+            Some(other) => {
+                return Ok((
+                    400,
+                    serde_json::json!({
+                        "error": format!(
+                            "unknown replay mode {:?}: only \"time_window\" is implemented",
+                            other
+                        ),
+                    }),
+                ));
+            }
+        }
         let engine = match state.replay_engine.read().await.clone() {
             Some(e) => e,
             None => {
@@ -1278,7 +1311,19 @@ impl AdminServer {
             target_database: req.target_database,
         };
         match engine.replay_window(&tt).await {
-            Ok(summary) => Ok((200, serde_json::to_value(summary)?)),
+            Ok(summary) => {
+                let mut resp = serde_json::to_value(summary)?;
+                // Attach the journal's retained size and its structural
+                // coverage so the summary can never be read as a committed
+                // history (TR-07).
+                if let Some(obj) = resp.as_object_mut() {
+                    obj.insert(
+                        "coverage".to_string(),
+                        serde_json::to_value(engine.journal_coverage().await)?,
+                    );
+                }
+                Ok((200, resp))
+            }
             Err(e) => Ok((
                 500,
                 serde_json::json!({ "error": format!("replay failed: {}", e) }),
@@ -2819,6 +2864,14 @@ struct ReplayRequestBody {
     target_host: String,
     /// Target backend port.
     target_port: u16,
+    /// Requested replay semantics. Omitted or `"time_window"` runs the
+    /// implemented best-effort window replay. `"committed_history"` is
+    /// reserved for a recovery-grade replay (real transaction boundaries,
+    /// parameters, outcomes, stop-on-failure) that does not exist yet and is
+    /// refused with `501` rather than silently downgraded (TR-07). Any other
+    /// value is a `400`.
+    #[serde(default)]
+    mode: Option<String>,
     /// Optional credential overrides — when omitted, the engine uses
     /// the template values set at server startup. Production callers
     /// targeting a separate staging DB pass these explicitly so the
@@ -3037,6 +3090,66 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(alias_status, status);
         assert_eq!(body, alias_body);
+    }
+
+    // ---- POST /api/replay: the mode contract (TR-07) ----
+
+    /// Route `/api/replay` with TR enabled on a fresh state (no engine is
+    /// attached, so an accepted request falls through to the 503 lookup).
+    async fn replay_route(body: &str) -> (u16, serde_json::Value) {
+        let state = Arc::new(AdminState::new());
+        state.config_snapshot.write().await.tr_enabled = true;
+        AdminServer::route_request("POST", "/api/replay", Some(body), &state)
+            .await
+            .expect("handler returns Ok")
+    }
+
+    #[tokio::test]
+    async fn replay_committed_history_mode_is_refused_not_downgraded() {
+        let body = r#"{"from":"2026-09-01T00:00:00Z","to":"2026-09-02T00:00:00Z",
+            "target_host":"staging","target_port":5432,"mode":"committed_history"}"#;
+        let (status, resp) = replay_route(body).await;
+        assert_eq!(status, 501, "response: {resp}");
+        assert_eq!(resp["requested_mode"], "committed_history");
+        assert_eq!(resp["available_mode"], "time_window");
+        let err = resp["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("not implemented"),
+            "refusal must say the mode is not implemented: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_unknown_mode_is_400() {
+        let body = r#"{"from":"2026-09-01T00:00:00Z","to":"2026-09-02T00:00:00Z",
+            "target_host":"staging","target_port":5432,"mode":"wal_replay"}"#;
+        let (status, resp) = replay_route(body).await;
+        assert_eq!(status, 400, "response: {resp}");
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown replay mode"),
+            "got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_time_window_mode_is_accepted() {
+        let body = r#"{"from":"2026-09-01T00:00:00Z","to":"2026-09-02T00:00:00Z",
+            "target_host":"staging","target_port":5432,"mode":"time_window"}"#;
+        let (status, resp) = replay_route(body).await;
+        assert_eq!(status, 503);
+        assert_eq!(resp["error"], "replay engine not attached");
+    }
+
+    #[tokio::test]
+    async fn replay_omitted_mode_defaults_to_time_window() {
+        let body = r#"{"from":"2026-09-01T00:00:00Z","to":"2026-09-02T00:00:00Z",
+            "target_host":"staging","target_port":5432}"#;
+        let (status, resp) = replay_route(body).await;
+        assert_eq!(status, 503);
+        assert_eq!(resp["error"], "replay engine not attached");
     }
 
     #[tokio::test]

@@ -444,7 +444,37 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:9090/api/analytic
 
 Replay a window of the transaction journal against a target backend (typically a staging DB) — for failover validation, hydrating staging from prod, or forensics. Body is a `ReplayRequestBody`. **`503 {"error":"transaction replay disabled (tr_enabled = false)"}`** when TR is disabled at runtime; Transaction Replay ships in the default build.
 
-This is **operator time-window replay**, not committed-history replay (TR-07): it re-executes the journaled SQL text in timestamp order on one connection and does not reconstruct transaction boundaries, exclude rolled-back work, or stop on the first failure. The response says so explicitly — `"mode": "time_window"` and `"partial": true` whenever at least one statement failed. The journal itself is in-memory, bounded and non-durable: nothing survives a restart.
+Body fields: `from` / `to` (RFC 3339), `target_host`, `target_port`, optional `target_user` / `target_password` / `target_database`, and optional `mode`.
+
+`mode` is the honesty switch (TR-07). Omitted or `"time_window"` selects the only implemented replay: it re-executes the journaled SQL text in timestamp order on one connection, runs each statement independently, and does not reconstruct transaction boundaries, exclude rolled-back work, or stop on the first failure. `"committed_history"` is the stronger recovery-grade mode and is **not implemented** — requesting it returns `501` with `requested_mode` / `available_mode` and an explanation, rather than silently running the weaker replay. Any other value is `400`.
+
+This is **operator time-window replay**, not committed-history replay. The response says so explicitly: `"mode": "time_window"`, `"partial": true` whenever at least one statement failed or the deadline cut the run short, and a `"coverage"` block with what the journal actually held (retained transactions/entries/bytes and its global cap) plus `false` flags for transaction boundaries, parameter values, per-statement outcomes and restart durability. The journal itself is in-memory, bounded and non-durable: nothing survives a restart.
+
+```json
+{
+  "mode": "time_window",
+  "statements_replayed": 42,
+  "failures": 1,
+  "partial": true,
+  "deadline_exceeded": false,
+  "elapsed_ms": 813,
+  "from": 1756684800,
+  "to": 1756771200,
+  "first_error": "tx … seq 7: duplicate key value violates unique constraint",
+  "coverage": {
+    "retained_transactions": 120,
+    "retained_entries": 120,
+    "retained_bytes": 8192,
+    "max_journals": 50000,
+    "survives_restart": false,
+    "transaction_boundaries": false,
+    "parameter_values": false,
+    "outcomes": false
+  }
+}
+```
+
+What the journal contains: **simple-protocol** statements the write classifier routes as writes (DML/DDL, plus `BEGIN`/`COMMIT`/`ROLLBACK`/`SET`), recorded after the backend response was relayed, SQL text only, one synthetic single-statement auto-commit transaction per statement. The hook does not inspect that response, so a statement the backend rejected is journaled just like a committed one — the window is raw statement text in arrival order, not a list of successful operations. Extended-protocol writes (`Parse`/`Bind`/`Execute`) are not journaled at all, and an explicit `BEGIN … COMMIT`/`ROLLBACK` block is not recorded as a transaction — only its individual simple statements are, in arrival order, with no commit/rollback outcome. A window is a best-effort sample of recent write text, never a ledger.
 
 ### POST /api/shadow
 

@@ -160,6 +160,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   real retention (in-memory, bounded, nothing survives restart) and keep operator
   time-window replay explicitly distinct from committed-history replay.
 
+- `/api/replay` refuses `"mode": "committed_history"` instead of silently running the
+  weaker time-window replay (TR-07). The stronger mode does not exist yet, so the request
+  gets `501` naming the requested and available modes; unknown modes get `400`. Every
+  successful response now carries a `coverage` block — retained transactions / entries /
+  bytes and the journal's global cap, plus explicit `false` flags for transaction
+  boundaries, parameter values, per-statement outcomes and restart durability — so the
+  summary cannot be read as a committed ledger. Retention documentation now states the
+  exact journal coverage: simple-protocol statements only, recorded after the response is
+  relayed and without inspecting it for a backend error (a rejected statement is
+  journaled too), extended-protocol writes not journaled at all, SQL text only, one
+  synthetic auto-commit transaction per statement.
+
 - Query-cache invalidation is now commit-aware for simple-query writes (C-02, first
   slice). The tables a write touches inside an explicit transaction are staged per
   session and re-invalidated when that transaction COMMITs (discarded on
