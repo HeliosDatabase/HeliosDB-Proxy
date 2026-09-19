@@ -57,6 +57,7 @@ max_connections = 32
 idle_timeout_secs = 60
 max_lifetime_secs = 300
 acquire_timeout_secs = 5
+test_on_acquire = false
 
 [pool_mode]
 mode = "$mode"
