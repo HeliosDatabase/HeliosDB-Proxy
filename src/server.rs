@@ -1358,6 +1358,7 @@ struct BackendConn {
     /// conservatively (any statement not provably session-neutral sets it), so
     /// the worst outcome of a misclassification is an unnecessary reset, never
     /// leaked state. Always `false` on a fresh/reused connection.
+    #[cfg(feature = "pool-modes")]
     dirty: bool,
 }
 
@@ -1367,6 +1368,7 @@ impl BackendConn {
             stream,
             prepared: HashSet::new(),
             unnamed_sig: None,
+            #[cfg(feature = "pool-modes")]
             dirty: false,
         }
     }
@@ -17068,6 +17070,9 @@ mod tests {
 
             let server = ProxyServer::new(config).unwrap();
             let state = &server.state;
+            // Feature-independent: a fresh server has no sessions. Keeps the
+            // binding used in a no-default-features build too.
+            assert!(state.sessions.is_empty(), "fresh server has sessions");
 
             #[cfg(feature = "pool-modes")]
             assert!(
