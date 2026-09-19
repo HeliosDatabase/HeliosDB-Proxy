@@ -101,6 +101,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   applies the replayed tail, `gap` flushes, and a first connect (or a pre-C-03 home)
   still starts cold — closing C-03 end-to-end.
 
+- Release-time downstream consumer check: `scripts/release/downstream-check.sh` reads
+  the version in `Cargo.toml`, verifies each known consumer's exact `heliosdb-proxy`
+  pin (HeliosDB-Lite today; `--apply` rewrites it), and compiles the consumer's
+  proxy-backed feature under the fleet build lock, so a version bump or a
+  library-API change that only breaks external constructors is caught before the
+  tag instead of hours after (sprinter `c57ebe1d1ae9`).
+
 ### Changed
 
 - **Allocation-free statement classifiers (perf, sprinter `1d70b68fa7cc`).** The

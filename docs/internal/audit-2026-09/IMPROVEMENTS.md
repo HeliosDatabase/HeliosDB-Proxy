@@ -149,7 +149,7 @@ in #54 with its priority; open an individual issue when work starts on one.
 
 ## Next: make HA and load-balancing contracts real
 
-- [ ] **H-01 · P0 — wire authoritative topology into the daemon.** Connect providers
+- [ ] **H-01 · P0 — wire authoritative topology into the daemon.** *(2026-09-12: first slice `3a09d23` — `[topology] provider = "postgres"` is authoritative for writes, fail-closed, authority epoch at `/topology`. Remaining (#52): Patroni/controller adapter, conflicting-primary rejection, one immutable snapshot consumed by reads and pool eviction.)* Connect providers
   to one immutable routing snapshot, including cluster/shard ID, leader identity,
   authority epoch, health freshness and replica positions. Consume it from startup,
   active-session recovery, reads, admin endpoints and pool eviction. Reject conflicting
@@ -159,7 +159,7 @@ in #54 with its priority; open an individual issue when work starts on one.
   hand-editing roles; a partitioned old primary never receives new accepted writes
   after authority changes. Run with and without `ha-tr`.
 
-- [ ] **H-02 · P0 — require quorum authority and fencing before promotion.** Backend
+- [ ] **H-02 · P0 — require quorum authority and fencing before promotion.** *(2026-09-12: proxy-side slice `d860787` — authority is a lease (`[topology] lease_timeout_secs`), expired lease stops writes, docs state the fencing and async-RPO limits. Remaining (#53): external quorum/fencing consumption and the V-02 partition validation.)* Backend
   liveness is not permission to become primary. Define lease expiry, fencing token
   enforcement, loss-of-quorum behavior, synchronous/asynchronous RPO, recovery and
   reintegration. A proxy-side epoch alone cannot fence independent direct clients:
@@ -169,7 +169,7 @@ in #54 with its priority; open an individual issue when work starts on one.
   return, witness loss and delayed messages. Never advertise zero-loss for an async
   replica that has not received an acknowledged commit.
 
-- [ ] **H-03 · P1 — implement configured routing and health policy.** Daemon reads
+- [ ] **H-03 · P1 — implement configured routing and health policy.** *(2026-09-13: `f965ebf` — `read_strategy` honored (round_robin, weighted, least_connections, latency_based, random, power_of_two); health policy honors `check_query` and `success_threshold` (`07d6be2`). Remaining: per-request inflight accounting, hysteresis and locality for P2C — folded into the H-05 remainder.)* Daemon reads
   currently choose RR regardless of `read_strategy`; health uses SSLRequest rather
   than `check_query` and ignores recovery `success_threshold`. Honor existing knobs
   or reject unsupported settings. Add measured inflight-load and latency EWMA to
@@ -178,7 +178,7 @@ in #54 with its priority; open an individual issue when work starts on one.
   distribution, unhealthy candidates are excluded, and N successes are required
   when N is configured. Benchmark primary work independently of read replicas.
 
-- [ ] **H-04 · P1 — measure lag and carry causal positions.** Populate real backend
+- [ ] **H-04 · P1 — measure lag and carry causal positions.** *(2026-09-13: `07d6be2` — real WAL-lag probes, `lagSampledAt`, strict `require_known_lag`. Remaining: per-session commit watermark and an authenticated reconnect/resume token across proxies.)* Populate real backend
   replay/flush/apply positions, timeline and sample time; `None` must not mean
   “within lag threshold” for a strict policy. Use backend-specific probes behind
   a capability adapter. Preserve a per-session commit watermark and offer an
@@ -186,7 +186,7 @@ in #54 with its priority; open an individual issue when work starts on one.
   migrate the client to another proxy, and verify a read waits/routes primary or
   fails within its deadline; it never returns older data as causally fresh.
 
-- [ ] **H-05 · P1 — fleet-aware connection and recovery admission.** Bound total
+- [ ] **H-05 · P1 — fleet-aware connection and recovery admission.** *(2026-09-13: `2a45db7` — bounded fair client admission (`[limits] client_admission_wait_secs`) and jittered reconnect backoff. Remaining: sprinter `31fae26a2e17` — per-tenant admission, per-node backend caps, fair backend/replay queues, reserved health/admin capacity, queue metrics.)* Bound total
   clients, active/idle backend connections, outstanding queries and replay bytes
   per process, tenant and backend. Default max clients is currently unlimited;
   per-session bounds do not bound the process. Add fair queues, max wait time,
@@ -195,7 +195,7 @@ in #54 with its priority; open an individual issue when work starts on one.
   stable RSS and queue delay, with reserved capacity for health/admin traffic and
   no starvation of a small tenant. Multi-proxy totals respect backend capacity.
 
-- [ ] **H-06 · P1 — one policy contract across PG, HTTP, GraphQL and MCP.** The HTTP
+- [ ] **H-06 · P1 — one policy contract across PG, HTTP, GraphQL and MCP.** *(2026-09-14: `cb8f8f5` — per-gateway backend connection pools (`[limits] gateway_pool_max_idle`), contract in `H-06-interface-contract.md`. Remaining: sprinter `597f3caab4ef` — policy parity (rate limit, circuit, rewrite, tenant), per-request identity, pool metrics, role-level MCP read-only, gateway limits.)* The HTTP
   SQL gateway dials/authenticates a BackendClient per request and gateways do not
   automatically inherit the wire path's pool/replay/policy behavior. Introduce a
   shared request executor without forcing binary PG results through JSON. Explicitly
@@ -223,7 +223,7 @@ in #54 with its priority; open an individual issue when work starts on one.
 
 ## Cache work in correctness-first order
 
-- [ ] **C-01 · P1 — aggregate byte budgets, not count × per-entry caps.** Add a
+- [x] **C-01 · P1 — aggregate byte budgets, not count × per-entry caps.** *(2026-09-17: shipped in `82d940e` + `47c4966` — every tier is byte-bounded: edge `[edge] max_total_bytes`, L1 32 MiB, L2 `size_mb`, L3 64 MiB, exact accounting and LRU/oldest-first trimming.)* Add a
   configurable process cache budget, per-tier and per-tenant allocation, and bounded
   miss-capture/coalescer memory. Include keys, reverse indexes and decompression
   buffers; avoid double charging shared Bytes while retaining a conservative RSS
@@ -231,7 +231,7 @@ in #54 with its priority; open an individual issue when work starts on one.
   overhead. **Accept:** mixed small/large entries plus concurrency remain within
   budget; replacements, expiry, invalidation and failure reclaim accounting exactly.
 
-- [ ] **C-02 · P0 — commit-aware invalidation for every result-cache tier.** The
+- [ ] **C-02 · P0 — commit-aware invalidation for every result-cache tier.** *(2026-09-12: first slice `9bfb91c` — simple-query writes stage per transaction and re-invalidate on COMMIT, discard on ROLLBACK. Remaining (#56, P0): extended-protocol writes, COPY, DDL/unknown dependencies, L1/L3 and edge, WAL/CDC for direct-backend writes — see `ROADMAP-2026-09-19.md` Phase 1.)* The
   query cache invalidates matching L2 keys after statements; L1 and L3 rely on TTL.
   A read can refill before another session's transaction commits, and COMMIT has no
   table dependencies in `invalidate_query`. Stage write sets until successful
@@ -241,7 +241,7 @@ in #54 with its priority; open an individual issue when work starts on one.
   direct-backend-write schedules cannot serve stale values under a strict policy;
   cover simple, extended, COPY, triggers, DDL and unknown dependencies.
 
-- [ ] **C-03 · P1 — recover gaps in invalidation delivery.** SSE buffers currently
+- [ ] **C-03 · P1 — recover gaps in invalidation delivery.** *(2026-09-17: `4271bad` flush-on-reconnect, then `f066ca6` end-to-end cursor resumption — monotonic `seq`, bounded replay ring, `last_event_id` warm/gap resume. Remaining: sprinter `752317ee59d4` — live reconnect drill and an SSE-path integration test.)* SSE buffers currently
   drop full-channel events and disconnected edges rely on TTL. Add monotonic stream
   offsets, cursor acknowledgements and a bounded durable invalidation log. On gaps,
   either replay events or flush affected caches before strict reads resume. Do not
@@ -347,7 +347,7 @@ in #54 with its priority; open an individual issue when work starts on one.
   queries have bounded concurrency/bytes and cancel all children on failure. AVG,
   ORDER BY/LIMIT, collations and joins require semantic tests before proxy fan-out.
 
-- [ ] **D-05 · P1 — independent feature profiles without `ha-tr`.** Keep connection
+- [ ] **D-05 · P1 — independent feature profiles without `ha-tr`.** *(2026-09-15: `4eea7f7` — `GET /capabilities` manifest and `strict_config`. TR now ships in the default build (1.8.0), superseding the `ha-tr` profile framing. Remaining: nested-section strictness; manifest as a CI acceptance source.)* Keep connection
   pooling, topology, fair admission, shard routing and cache/control-plane support
   usable without journal/admin-replay modules. Clarify the existing unconditional
   `tr_mode` behavior instead of assuming the flag disables it. Add a capabilities
@@ -358,7 +358,7 @@ in #54 with its priority; open an individual issue when work starts on one.
 
 ## Performance and validation gates
 
-- [ ] **P-01 · P1 — measure user-path success and tails, not a mean of microbenchmarks.**
+- [ ] **P-01 · P1 — measure user-path success and tails, not a mean of microbenchmarks.** *(2026-09-17: `f9de57e` — `scripts/regress/bench-usertp.sh` + `P-01-measurement-plan.md`. Remaining: the first same-window baseline/candidate run for the release record (blocked on the bench backend as of 2026-09-19).)*
   Use the existing 107-case baseline for attribution, then compare identical direct
   PG, HAProxy+Patroni, and HeliosProxy deployments under identical backend capacity,
   TLS, durability, pooling, timeouts and hardware. If adding PgBouncer to the baseline,
@@ -378,7 +378,7 @@ in #54 with its priority; open an individual issue when work starts on one.
   tail latency/CPU without incorrect eviction or lost invalidations. Do not raise
   host load beyond approved baseline sizes to chase a headline.
 
-- [ ] **P-03 · P1 — operational observability for continuity and cache trust.** Add
+- [ ] **P-03 · P1 — operational observability for continuity and cache trust.** *(2026-09-17: `aa39c84` — admission and reconnect-wave counters; TR-07 added journal counters. Remaining: latency histograms, replay-refusal reasons, cache gap/coalescer/retained-bytes/backlog.)* Add
   histograms for detection/reconnect/restore/replay time, queue waits and regional
   latency; counters for replay refusals by reason, uncertain outcomes, journal
   durability lag, cache gap recovery, coalescer leaders/followers, retained bytes and
@@ -387,7 +387,7 @@ in #54 with its priority; open an individual issue when work starts on one.
   parameters, session IDs or secrets as metric labels. **Accept:** a fault run can
   be explained from metrics, and alerting detects an edge serving outside its SLA.
 
-- [ ] **V-01 · P1 — turn advertised features into reachable acceptance tests.**
+- [ ] **V-01 · P1 — turn advertised features into reachable acceptance tests.** *(2026-09-16: `37ffe9c` — capability reachability test, `HELIOS_REQUIRE_LIVE=1`, claim map `V-01-claim-map.md`. Remaining: machine-check the map; feature-combination coverage via V-02.)*
   Maintain claim → config/CLI/API → runtime call → actual assertion → environment
   mapping. Surface early-return integration skips as skips; fail a live-required
   job if backend variables are absent. Cover protocol differences and combinations
@@ -428,7 +428,7 @@ items need no new entry: **M1/M2** (gateways bypass policy and dial a fresh
 authenticated backend per request) are exactly H-06, and the missing per-gateway
 connection cap belongs to H-05's admission bounds.
 
-- [ ] **O-01 · P0 — `migration_ready` must not mask apply errors.** `mirror::status`
+- [x] **O-01 · P0 — `migration_ready` must not mask apply errors.** *(2026-09-11: fixed in the 1.8.0 lane (`adf231e`) — readiness requires zero errors and zero drops, counts exposed; proof-first regression test. #44 closed.)* `mirror::status`
   computes `lag = enqueued - mirrored - errors` and then reports
   `migration_ready: lag == 0 && dropped == 0` (`src/mirror.rs:65`, `:75`), so a
   mirrored write that failed to apply cancels itself out of the lag and the
@@ -437,7 +437,7 @@ connection cap belongs to H-05's admission bounds.
   **Accept:** a run with deliberately failing applies never reports
   `migration_ready: true`; the operator sees why.
 
-- [ ] **O-02 · P1 — one query-timeout contract for the management backend client.**
+- [x] **O-02 · P1 — one query-timeout contract for the management backend client.** *(2026-09-12: `958f9fc` — `query_timeout` honored on every management query. #45 closed.)*
   `BackendClient::run_query` calls `stream_query_timeout()`, which returns a
   hardcoded 30 s (`src/backend/client.rs:324`), while `BackendConfig.query_timeout`
   is set by every caller (branch clone, mirror, replay, upgrade, the gateways) and
@@ -445,7 +445,7 @@ connection cap belongs to H-05's admission bounds.
   **Accept:** the configured value is honored on every management query; a caller
   that sets 5 s times out at 5 s; the default remains 30 s where nothing is set.
 
-- [ ] **O-03 · P1 — bound and actually parallelize shadow execution.**
+- [x] **O-03 · P1 — bound and actually parallelize shadow execution.** *(2026-09-13: `5c977cd` — concurrent shadow execution under a comparison budget. #46 closed.)*
   `shadow_execute` buffers both backends' complete result sets with no ceiling,
   and despite the doc comment it awaits the primary before starting the shadow
   (`src/shadow_execute/mod.rs:68`), so the shadow adds its full latency to the
@@ -453,14 +453,14 @@ connection cap belongs to H-05's admission bounds.
   beyond it, and run the two concurrently. **Accept:** a large result set compares
   within the budget without unbounded RSS; shadow latency overlaps the primary.
 
-- [ ] **O-04 · P2 — operator replay: a deadline and a lock-free window scan.**
+- [x] **O-04 · P2 — operator replay: a deadline and a lock-free window scan.** *(2026-09-12: `958f9fc` — replay deadline and lock-free window scan; superseded in part by TR-07's committed store. #47 closed.)*
   `TransactionJournal::entries_in_window` clones and sorts every matching entry
   while holding the journal read lock (`src/transaction_journal.rs:414`), and the
   replay driver has no overall deadline — only per-query timeouts. **Accept:** a
   large window neither stalls live journal writers nor runs unbounded; a replay
   that exceeds its deadline stops and reports partial progress.
 
-- [ ] **O-05 · P3 — extended-batch tracking and error-frame allocation.**
+- [x] **O-05 · P3 — extended-batch tracking and error-frame allocation.** *(2026-09-12: `958f9fc` — bounded extended-batch tracking, single-allocation error frames. #48 closed.)*
   `batch_refs`/`batch_defines` are cleared only when a Sync ends the cycle
   (`src/server.rs:3982`), so a client that never Syncs grows them without bound
   and the re-prepare filter is quadratic over that growth; and
