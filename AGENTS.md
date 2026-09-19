@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-HeliosProxy is a Rust 2021 crate (`heliosdb-proxy`) with MSRV 1.75. Core source lives in `src/`: `main.rs` is the binary entry point, `lib.rs` exposes feature-gated modules, and shared systems such as `config.rs`, `server.rs`, `protocol.rs`, `connection_pool.rs`, and `health_checker.rs` support the proxy runtime. Feature modules are organized by domain, for example `src/routing/`, `src/cache/`, `src/pool/`, `src/graphql/`, `src/schema_routing/`, and `src/distribcache/`. Integration and end-to-end tests live under `tests/`; Criterion benchmarks are in `benches/`. User-facing examples, Docker scenarios, demos, and deployment notes are under `examples/`, `docker/`, `demos/`, `docs/`, `operator/`, and `terraform/`.
+HeliosProxy is a Rust 2021 crate (`heliosdb-proxy`) with MSRV 1.86. Core source lives in `src/`: `main.rs` is the binary entry point, `lib.rs` exposes feature-gated modules, and shared systems such as `config.rs`, `server.rs`, `protocol.rs`, `connection_pool.rs`, and `health_checker.rs` support the proxy runtime. Feature modules are organized by domain, for example `src/routing/`, `src/cache/`, `src/pool/`, `src/graphql/`, `src/schema_routing/`, and `src/distribcache/`. Integration and end-to-end tests live under `tests/`; Criterion benchmarks are in `benches/`. User-facing examples, Docker scenarios, demos, and deployment notes are under `examples/`, `docker/`, `demos/`, `docs/`, `operator/`, and `terraform/`.
 
 ## Build, Test, and Development Commands
 
@@ -11,7 +11,7 @@ HeliosProxy is a Rust 2021 crate (`heliosdb-proxy`) with MSRV 1.75. Core source 
 - `cargo build --release --features all-features` creates an optimized release binary.
 - `cargo test` runs the default test suite.
 - `cargo test --features all-features` runs tests with the full feature bundle.
-- `cargo test --test integration -- --ignored` runs backend-dependent integration tests.
+- `cargo test --test integration --features all-features,postgres-topology -- --include-ignored` runs backend-dependent integration tests (needs a live backend; see `.github/workflows/ci.yml` env vars).
 - `cargo bench --features all-features` runs Criterion benchmarks.
 
 ## Coding Style & Naming Conventions

@@ -152,7 +152,7 @@ new feature module:
    - All tests pass: `cargo test --features all-features`
    - Code is formatted: `cargo fmt`
    - No clippy warnings: `cargo clippy --features all-features -- -D warnings`
-   - MSRV is respected: `cargo check` with Rust 1.75
+   - MSRV is respected: `cargo check --locked --features msrv-features` with Rust 1.86
 
 3. **Write tests** for new functionality. Aim for unit tests in the
    module and integration tests in `tests/integration/` if the feature
@@ -167,6 +167,18 @@ new feature module:
 
 6. **Address review feedback** promptly. PRs require at least one
    approval before merging.
+
+## Releasing
+
+1. Move `## [Unreleased]` in `CHANGELOG.md` to the new version and date; bump
+   `version` in `Cargo.toml`.
+2. Run `scripts/release/downstream-check.sh --apply`. HeliosDB-Lite pins this crate
+   exactly (`=X.Y.Z`, path dependency), so a version bump without the pin update
+   breaks every cargo command in that repository at dependency resolution, and an
+   API change visible only to external constructors (a new private field on a `pub`
+   struct) only surfaces when a consumer compiles. Commit the consumer's pin and
+   lockfile change alongside the release.
+3. Tag `vX.Y.Z` on the release commit and publish to crates.io.
 
 ## Project Structure
 

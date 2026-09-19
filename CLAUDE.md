@@ -5,9 +5,8 @@ connection router: pooling (session/transaction/statement), automatic failover w
 transaction replay, lag-aware query routing, caching, auth proxy, rate limiting, WASM
 plugins, GraphQL/HTTP/MCP gateways. Works against PostgreSQL, HeliosDB-Lite/Nano/Full,
 and any PG-wire backend. Repo conventions live in `AGENTS.md` — read it; this file adds
-the mandatory quality gates and does not duplicate it. (`AGENTS.md` is older: its
-"MSRV 1.75" and `cargo test --test integration -- --ignored` lines are stale — where it
-conflicts with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.)
+the mandatory quality gates and does not duplicate it. Where `AGENTS.md` conflicts
+with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
 
 ## Build & Test
 
