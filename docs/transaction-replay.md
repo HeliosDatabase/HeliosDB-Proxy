@@ -19,7 +19,7 @@ mode name, behavior — is verifiable in `src/transaction_journal.rs`,
 `src/replay/mod.rs`, and the TR fields of `ProxyConfig` in `src/config.rs`. Where the
 narrative describes intent rather than shipped runtime behavior, it says so explicitly.
 
-**Last verified against the post-1.8.0 tree with both TR-07 honesty slices.** The
+**Last verified against the post-1.8.0 tree with the TR-07 recovery-journal slice.** The
 in-session recovery path described in [In-session replay](#in-session-replay-the-core-path)
 is the current behavior; the journal and administrative replay sections below describe
 the operator tooling, which is compiled into every build and disabled at runtime by
@@ -67,8 +67,8 @@ feature mappings keep resolving, but it gates nothing.
 `tr_enabled` is the runtime master switch (`proxy.toml`, or `--tr` on the CLI). Setting
 it to `false`:
 
-- **stops write journaling** — the write-path `journal_write` hook is skipped, so no new
-  entries are recorded;
+- **stops write journaling** — the write-path capture hooks are skipped, so no new
+  transactions are recorded;
 - **disables in-session recovery** — `effective_tr_mode()` returns `TrMode::None`
   regardless of `tr_mode`, so a backend fault gets the plain one-error-then-close
   behavior instead of replay;
@@ -181,30 +181,39 @@ returns `40001` rather than continuing on top of rows the client never observed.
 Beyond the in-session recovery above, two mechanisms observe a primary change
 in the running daemon:
 
-**1. Write journaling** (`src/server.rs`, `journal_write`). When `tr_enabled` and the
-statement is a write, the proxy records it in the shared
-`TransactionJournal`. Each write is journaled as its own auto-commit transaction — a fresh
-`tx_id`, `begin_transaction` then `log_statement`, never committed. Because these journals
-never commit, the journal manager bounds the map with a global cap and evicts the oldest
-entries (see below). The live hook records the **SQL text**; the parameter, checksum, and
-row-count fields of a journal entry exist in the data model but are passed as
-`None`/empty by this hook today.
+**1. Write journaling** (`src/server.rs` capture hooks + `src/journal_capture.rs`).
+When `tr_enabled`, the proxy journals **real transactions** as the backend reports them
+(TR-07). The forward path registers what it sends — a simple-query string, or the
+`Parse`/`Bind`/`Execute`/`Close` messages of an extended batch including every bound
+parameter value byte for byte with its text/binary format and the declared type OIDs —
+and the relay observes what the backend answers: each `CommandComplete` tag,
+`PortalSuspended`, `EmptyQueryResponse`, the first `ErrorResponse`, and the
+`ReadyForQuery` status byte. A per-session state machine reconciles the two:
 
-**Journal coverage is narrow, and the API now states it (TR-07).** The hook fires on the
-**simple-query path only**, after the backend's response frames have been relayed to the
-client. It records any statement the routing classifier treats as a write — DML/DDL, but
-also `BEGIN` / `COMMIT` / `ROLLBACK` / `SET` — one synthetic single-statement auto-commit
-transaction each. It does **not** inspect that response for an `ErrorResponse`, so a
-statement the backend rejected (or that was later rolled back) is journaled just like a
-committed one: the window is raw statement text in arrival order, not a list of
-successful or committed operations. Extended-protocol batches (`Parse` / `Bind` /
-`Execute`) compute the same write classification for routing but are **never journaled**,
-so their `Bind` parameter values do not exist anywhere in the journal; and because each
-entry is its own never-committed auto-commit journal, explicit transactions are not
-preserved as transactions. `POST /api/replay` reports this in the `coverage` block of
-every response (`transaction_boundaries`, `parameter_values`, `outcomes` and
-`survives_restart` are all `false`), and a request with `mode: "committed_history"` is
-refused with `501` rather than silently downgraded to the weaker time-window replay.
+- `BEGIN` opens an active journal; each data-changing statement the backend completed is
+  appended with its command tag (and the rows it reported); `SAVEPOINT` / `ROLLBACK TO`
+  are applied structurally (a rollback to a savepoint truncates the entries after it);
+  the transaction moves into **committed history** only when the backend's closing tag
+  was `COMMIT` — a `COMMIT` in an aborted transaction answers `ROLLBACK` and is treated
+  as one. Auto-commit statements and implicit multi-statement transactions become one
+  committed transaction each.
+- A statement the backend rejected is never journaled; a rolled-back transaction, a
+  session that ends mid-transaction and a two-phase `PREPARE TRANSACTION` leave no
+  committed history.
+- Each committed transaction carries its source identity (client address, user,
+  database, backend node, tenant) and a **global commit sequence** assigned in the order
+  this proxy observed the commit responses.
+- Reads are not journaled (a read with side effects — `nextval`, `set_config`, a volatile
+  function — is not reproduced). A `COPY … FROM STDIN`, an `EXECUTE` of a session-scoped
+  prepared statement, a statement over `[journal] max_statement_bytes` or a
+  per-transaction cap marks the transaction *incomplete*: it stays in the journal, but
+  committed-history replay refuses it rather than apply it partially.
+- Only writes arm the relay's capture; an auto-commit read pays no capture work.
+
+Committed transactions are kept in a bounded in-memory store and, when
+`[journal] dir` is set, appended to a segmented on-disk journal and reloaded at startup
+(see [Transaction Journal](#1-transaction-journal)). `POST /api/replay` reports what
+backs every run in its `coverage` block.
 
 **2. Failover write-buffering** (`src/server.rs`, `select_primary_with_timeout`).
 When a write needs the primary and the configured-primary node is not healthy, the proxy
@@ -226,34 +235,53 @@ into the daemon's forwarding loop.
 
 ### 1. Transaction Journal
 
-`src/transaction_journal.rs`. An in-memory, per-transaction log of statements.
+`src/transaction_journal.rs`. The per-transaction log the capture feeds, plus the
+committed store and the durable sink.
 
-A `TransactionJournalEntry` holds: `tx_id`, `session_id`, `node_id`, `started_at`,
-`start_lsn` (for WAL anchoring), the ordered `entries`, `current_sequence`, `active`,
-`has_mutations`, and `savepoints`. Each `JournalEntry` captures:
+A `TransactionJournalEntry` holds: `tx_id`, `session_id`, `node_id` (derived from the
+backend address), `started_at`, `start_lsn`, the ordered `entries`, `current_sequence`,
+`active`, `has_mutations`, `savepoints`, the `source` identity, and — once committed —
+`commit_seq`, `committed_at`, `commit_tag`, and `incomplete_reason` when some effect could
+not be captured. Each `JournalEntry` captures:
 
 - `sequence` — monotonically increasing within the transaction.
-- `statement` — the SQL text.
-- `parameters: Vec<JournalValue>` — `Null` / `Bool` / `Int64` / `Float64` / `Text` /
-  `Bytes` / `Array`.
-- `result_checksum: Option<u64>` and `rows_affected: Option<u64>` — for verification.
-- `timestamp`, `statement_type`, `duration_ms`.
+- `statement` — the SQL text (a simple-query string may hold several statements).
+- `parameters: Vec<JournalValue>` — `Text` / `TextRaw` / `Binary` for captured `Bind`
+  values (format preserved), plus `Null` / `Bool` / `Int64` / `Float64` / `Bytes` /
+  `Array` for library callers; `param_types` — the OIDs declared in `Parse`.
+- `outcome` — `Succeeded { tag }` / `Failed { sqlstate, message }` / `Unobserved`;
+  `rows_affected` parsed from the tag; `protocol` (`Simple` / `Extended`).
+- `result_checksum`, `timestamp`, `statement_type`, `duration_ms`.
 
 `StatementType::from_sql` classifies by leading keyword into `Select`, `Insert`, `Update`,
 `Delete`, `Ddl`, `Transaction` (BEGIN/COMMIT/ROLLBACK/SAVEPOINT), `Set`, or `Other`.
-`is_read_only()` is true only for `Select`; `is_mutation()` covers Insert/Update/Delete/Ddl.
 
-**Savepoints.** `create_savepoint` records the sequence at the savepoint;
-`rollback_to_savepoint` truncates journal entries after that sequence and drops later
-savepoints — so a replay reflects the post-rollback statement set.
+**Commit order.** `commit_transaction` moves an active journal into the committed store
+and assigns the next `commit_seq`; `record_committed` does the same for an auto-commit
+transaction; `rollback_transaction` drops it. `committed_in_window(from, to)` returns
+committed transactions in commit order; `entries_in_window` (time-window replay) reads
+the committed store's statements in timestamp order. Empty transactions (nothing to
+replay) are not retained.
 
-**Memory bounds (code constants, not `proxy.toml` keys).** `TransactionJournal::new()`
-sets `max_entries = 10_000`, `max_size = 64 MiB` per journal, and a global
-`max_journals = 50_000`. `log_statement` rejects entries past `max_entries` or `max_size`.
-When the global cap is reached, `begin_transaction` evicts the oldest journals (by
-insertion order) down to 90% of the cap in one pass — this is the leak guard for the
-never-committed auto-commit journals produced by the write path. `commit_transaction` /
-`rollback_transaction` remove a transaction's journal immediately.
+**Bounds (`[journal]`, see [configuration.md](configuration.md#recovery-journal-journal)).**
+`max_active_transactions` caps open journals (oldest evicted), `max_entries_per_transaction`
+/ `max_bytes_per_transaction` cap one transaction (beyond them it is marked incomplete),
+`max_committed_transactions` / `max_committed_bytes` cap the committed store (oldest
+evicted), `max_statement_bytes` caps one statement's captured text.
+
+**Durability (`src/journal_store.rs`).** With `[journal] dir` set, every committed
+transaction is handed to a `JournalSink` backed by a writer thread that appends
+CRC-checked records to `journal-<first-commit-seq>.log` segments (rotated at
+`segment_bytes`, oldest segments retired beyond `retain_bytes`), fsync'ed per the
+`fsync` policy. The data path never waits on disk: the hand-off is a bounded queue, and
+a full queue drops the record and counts it (`coverage.dropped_transactions`). At startup
+the segments are read back, a torn or corrupt tail is truncated at the last intact record,
+the newest `max_committed_transactions` are reloaded and numbering continues after the
+highest recovered `commit_seq`. The record is written **after** the backend reported the
+commit — the proxy is not a participant in the backend's commit — so a crash in between
+loses that record: the store is a faithful log of what this proxy observed, not a WAL the
+backend waits on (the D-02 boundary). The segments contain statement text and bound parameter
+values in clear; protect the directory like the database's own data files.
 
 ### 2. Replay Engine
 
@@ -280,17 +308,17 @@ Replay proceeds through the `ReplayState` machine — `Pending` → `WaitingForW
 2. **Statement replay**, in strict `sequence` order. Read-only statements are skipped when
    `skip_read_only` is set; `Transaction`-control statements are always skipped (BEGIN/
    COMMIT/ROLLBACK are handled by the surrounding flow, not replayed verbatim).
-3. **Execution** via `crate::backend::BackendClient` — `simple_query` when there are no
-   parameters, `query_with_params` otherwise. Parameters are converted by
-   `journal_value_to_param` into **text-format** `ParamValue`s (`Bytes` → a `\x…` hex
-   literal; `Array` is not yet supported and degrades to `NULL`). That `NULL` surfaces as
-   a `rows_matched = false` mismatch **only** for entries that captured a `rows_affected`
-   count; hot-path journals record no count (`rows_affected = None`), so there the
-   degradation is silent.
+3. **Execution** on **one connection inside one `BEGIN … COMMIT`** (TR-07): each entry
+   goes through `BackendClient::execute_journaled`, the extended protocol with the
+   declared type OIDs and every parameter re-sent in its captured text/binary format
+   (typed library values are rendered as text; arrays as PostgreSQL array literals). The
+   first failure — a backend error, or a `rows_affected` mismatch under `verify_results`
+   — rolls the transaction back and stops; the target never holds a partial transaction.
 4. **Verification**: `rows_affected` is compared against the recorded count when one was
    captured. Checksum matching is best-effort — the engine does not recompute a
    server-side hash, so an entry with no recorded checksum counts as matched.
-5. **Retry**: on failure, up to `max_retries` with a 100 ms pause.
+5. **Retry**: `max_retries` (100 ms apart) applies to the connection attempt only; a
+   statement cannot be retried inside an aborted transaction.
 
 `FailoverReplay` keeps `active_replays`, a bounded `completed_replays` history (last 100),
 and exposes `get_state`, `get_progress`, `cancel_replay`, `history`, and `stats`.
@@ -341,7 +369,7 @@ helpers.
 > `pg_last_wal_replay_lsn()`; it polls the tracked candidate's in-memory `lag_bytes` (code
 > comment: "In a real implementation, we'd query the node's current LSN") and returns
 > immediately when `target_lsn == 0` — always the case for hot-path journals, since
-> `journal_write` records `start_lsn = 0`. Coordinated replay is wired end-to-end, but its
+> the capture records `start_lsn = 0`. Coordinated replay is wired end-to-end, but its
 > executing half is inert until a backend is attached to the `FailoverReplay` it creates;
 > until then it fails rather than claims success.
 
@@ -357,52 +385,65 @@ this is a library component with its own unit tests.
 
 ---
 
-## Time-Travel Replay (related)
+## Operator replay: time window and committed history
 
-The same journal powers **time-travel replay** (`src/replay/mod.rs`), surfaced by the
-admin endpoint `POST /api/replay`. Given a `[from, to]` timestamp window and a target
-host/port, the engine pulls `entries_in_window` from the shared `TransactionJournal`,
-sorts them by timestamp, and re-executes them against a target backend (typically staging)
-via `BackendClient`, returning a `ReplaySummary` (`statements_replayed`, `failures`,
-`elapsed_ms`, the window, and the first error). This is the "re-run yesterday 10:00–11:00
-against staging" path, distinct from post-failover replay but built on the same journal.
-See [admin-api.md](admin-api.md) for the request/response shape.
+The same journal powers the admin endpoint `POST /api/replay` (`src/replay/mod.rs`), which
+offers two modes (see [admin-api.md](admin-api.md#post-apireplay) for the request/response
+shape):
 
-Like the journal it reads from, this endpoint is controlled by `tr_enabled`: with
-`tr_enabled = false` the route still exists, but the handler returns
+- **`time_window`** (best effort): pulls the statements of every committed transaction in a
+  `[from, to]` timestamp window (`entries_in_window`), flattens them across transactions in
+  timestamp order and re-executes each independently on one target connection; failures
+  are counted, not fatal (`partial: true`). "Re-run yesterday 10:00–11:00 against staging."
+- **`committed_history`** (recovery grade, TR-07): selects the transactions whose *commit*
+  was observed in the window (`committed_in_window`, optionally after a resume point
+  `after_commit_seq`), and applies them in commit order, one at a time, each inside its own
+  `BEGIN … COMMIT` on one connection, with every parameter re-sent in its captured format
+  through the extended protocol. The first failure rolls that transaction back and stops
+  the run (`partial: true`, `stopped_at`), so the target holds exactly the transactions
+  up to `last_commit_seq` and nothing partial; a transaction marked incomplete is refused
+  before it starts. The overall `[limits] replay_deadline_secs` is honoured between and
+  inside transactions (a deadline mid-transaction rolls it back).
+
+Both modes carry the `coverage` block (retained active/committed counts and bytes, the
+caps, `commit_seq_high`, `dropped_transactions`, and the structural guarantees
+`transaction_boundaries` / `parameter_values` / `outcomes` — now `true` — plus
+`survives_restart`, `true` when `[journal] dir` is configured). Like the journal, the
+endpoint is controlled by `tr_enabled`: with `tr_enabled = false` the handler returns
 `503 {"error": "transaction replay disabled (tr_enabled = false)"}` (`src/admin.rs`).
 
 ---
 
 ## Limitations and Trade-offs
 
-### Journal is in-memory and best-effort on the hot path
-The journal lives in process memory and is bounded by the code constants above; it is not
-persisted. The live write-path hook records SQL text only — parameter values and row
-counts are part of the journal model but are not populated by the forwarding path today.
-This applies to the write journal, **not** to in-session recovery: that path records its
-own per-statement response digest and verifies it during replay (see
+### What the journal does and does not capture
+The journal records what the backend confirmed: completed data-changing statements with
+their outcomes, real transaction boundaries, savepoint structure, bound parameter values
+and a proxy-observed commit order. It does **not** record reads (so a read with side
+effects — `nextval`, `set_config`, a volatile function — is not reproduced), the data of
+a `COPY … FROM STDIN`, or the effect of an `EXECUTE` of a session-scoped prepared
+statement; those mark the transaction incomplete and committed-history replay refuses it.
+Sequence values, `now()`, `random()` and other non-deterministic expressions inside a
+journaled statement produce fresh values on replay — replay re-executes SQL, it does not
+copy rows.
+
+**Retention is bounded and documented (TR-07).** Without `[journal] dir` the journal is
+per-process memory bounded by `[journal] max_committed_*`: nothing survives a restart.
+With `dir` set, committed transactions survive a restart up to `retain_bytes` on disk and
+`max_committed_transactions` reloaded, subject to the fsync policy — a record is written
+after the backend reported the commit, so a crash between the two loses that record.
+The commit order is the order this proxy observed commits: a total order over everything
+routed through it, not necessarily the backend's WAL order for commits that raced on
+different sessions, and transactions that bypassed the proxy are not in it. This applies
+to the write journal, **not** to in-session recovery: that path records its own
+per-statement response digest and verifies it during replay (see
 [In-session replay](#in-session-replay-the-core-path)).
 
-**Retention is honest (TR-07):** the journal is a per-process, in-memory ring bounded by
-its global cap. **Nothing survives a restart**, entries are evicted oldest-first under
-load, and it is not a write-ahead log — no real transaction boundaries, commit order,
-parameter values, source identity or outcome are preserved. Do not use it as a durability
-or audit record.
-
-**Operator time-window replay is not committed-history replay (TR-07).** `POST /api/replay`
-re-executes the SQL text found in a timestamp window, in timestamp order, on one target
-connection. It does not reconstruct committed transactions: rolled-back or failed source
-statements are not excluded, interleaved clients are flattened into timestamp order, and
-individual failures do not abort the run — the summary carries `mode: "time_window"` and
-`partial: true` when anything failed or the deadline cut the run short. Every response
-also carries a `coverage` block that reports the journal's retained size and states
-explicitly that it preserves no transaction boundaries, parameter values or per-statement
-outcomes and does not survive a restart. A *committed-history* replay (only durable
-commits, real boundaries and parameters, stop-on-failure) is a separate, not-yet-shipped
-capability; a request for `mode: "committed_history"` is refused with `501` instead of
-being silently downgraded, and this guide keeps the two distinct instead of implying the
-journal provides the stronger one.
+**Time-window replay is not committed-history replay.** `time_window` flattens
+interleaved transactions into timestamp order and continues past failures; it is a
+best-effort tool for hydrating a staging copy. `committed_history` is the ledger-safe
+mode: commit order, one transaction at a time, stop on first failure. Both say which one
+they are (`mode`) and what backed them (`coverage`).
 
 ### Session state: `SET` is restored, the rest is not
 The in-session path tracks `SET`/`RESET` transactionally — a `SET` inside a transaction is
@@ -430,11 +471,13 @@ different snapshot. The same applies to a response too large to have been digest
 values on replay. Row-count verification will flag DML whose affected-row count diverges;
 sequence values are not synchronized. This is inherent to statement-level replay.
 
-### Array parameters
-`JournalValue::Array` is not yet supported by `journal_value_to_param` and degrades to
-`NULL`. The verification path surfaces that as a row-count mismatch only when the journal
-entry captured a `rows_affected` count; for the hot-path journals produced by the live
-write path (which record no counts) the degradation is silent.
+### Array and binary parameters
+Captured `Bind` values are replayed in their original format, so arrays and
+binary-encoded values reproduce exactly under `committed_history` and in the library
+replay. Library-recorded `JournalValue::Array` values render as PostgreSQL array
+literals. The text-interpolating `time_window` path cannot render a binary-format value
+and sends `NULL` for it; use `committed_history` for parameterised extended-protocol
+writes.
 
 ### Coordination is a library capability, not an auto-wired daemon loop
 `FailoverController`, `PrimaryTracker`, and `SwitchoverBuffer` are unit-tested library
@@ -456,7 +499,7 @@ controller/tracker automatically.
 | Result verification on replay | Ordered response digest, verified; divergence returns `40001` | Basic | Full | N/A |
 | Session-state migration | `SET` state restored transactionally; cursors/`PREPARE`/temp tables not | Yes | Yes | No |
 | Planned-switchover buffering | Yes (`SwitchoverBuffer`) | No | Yes | No |
-| Persisted journal | No (in-memory) | N/A | N/A | N/A |
+| Persisted journal | Optional (`[journal] dir`, segmented, CRC-checked) | N/A | N/A | N/A |
 | Open source | Yes | No | No | Yes |
 | Proxy-level (no app driver) | Yes | Requires OCI | Requires JDBC | Yes (no TR) |
 

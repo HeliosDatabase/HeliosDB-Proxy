@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Recovery-grade transaction journal and committed-history replay (TR-07, #49).**
+  The write path no longer journals post-response SQL text as never-committed synthetic
+  transactions. A per-session capture state machine (`src/journal_capture.rs`) registers
+  what is sent (simple-query strings, and extended-protocol `Parse`/`Bind`/`Execute` with
+  the bound parameter values byte for byte) and reconciles it with what the backend
+  answered (each `CommandComplete` tag, `ErrorResponse`, `ReadyForQuery` status), so the
+  journal now holds real transactions: `BEGIN`…`COMMIT` boundaries as the backend
+  reported them, per-statement outcomes, `SAVEPOINT`/`ROLLBACK TO` structure, source
+  identity (client, user, database, backend, tenant) and a global commit sequence.
+  Rejected statements, rolled-back transactions and two-phase transactions never enter
+  committed history; a `COPY … FROM STDIN` or `EXECUTE` marks its transaction incomplete.
+  Committed transactions are retained in a bounded store and, with `[journal] dir`
+  configured, appended to a segmented on-disk journal (`src/journal_store.rs`:
+  CRC-checked records, torn-tail truncation, rotation, size-based retention, `commit`/
+  `interval`/`none` fsync policy, non-blocking bounded writer queue) and reloaded at
+  startup. `POST /api/replay` gains `mode: "committed_history"`: committed transactions
+  in commit order, one per `BEGIN…COMMIT` on one connection, parameters re-sent in their
+  captured text/binary format through the extended protocol, stop-on-first-failure with
+  rollback and a `last_commit_seq` resume point; the previous `501` is gone.
+  `time_window` replay now reads committed history too (it no longer replays failed or
+  rolled-back statements). The library `FailoverReplay` applies a journaled transaction
+  on one connection inside one transaction and stops at the first failure instead of
+  opening a connection per statement; arrays render as PostgreSQL array literals instead
+  of degrading to `NULL`. New `[journal]` section (retention caps, `max_statement_bytes`,
+  `dir`, `segment_bytes`, `retain_bytes`, `fsync`, `fsync_interval_ms`, `writer_queue`);
+  new metrics `journal_committed_total`, `journal_rolled_back_total`,
+  `journal_statements_total`; the replay `coverage` block reports the real guarantees
+  plus committed counts, `commit_seq_high` and `dropped_transactions`.
+
 - User-path benchmark harness for P-01: `scripts/regress/bench-usertp.sh` measures
   committed TPS (`pgbench -b simple-update`), read TPS with p50/p95/p99/p999 tails
   (per-transaction log), a first-row latency proxy, failed/unknown client outcomes and

@@ -3,11 +3,9 @@
 //! Replays transactions on a new node after failover.
 //! Ensures transaction continuity with verification.
 
-use super::transaction_journal::{
-    JournalEntry, JournalValue, StatementType, TransactionJournalEntry,
-};
+use super::transaction_journal::{JournalEntry, StatementType, TransactionJournalEntry};
 use super::{NodeEndpoint, NodeId, ProxyError, Result};
-use crate::backend::{BackendClient, BackendConfig, ParamValue};
+use crate::backend::{BackendClient, BackendConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -231,14 +229,19 @@ impl FailoverReplay {
         replay.state = ReplayState::Replaying;
 
         let entries = replay.journal.entries.clone();
+        let target_node = replay.target_node;
         let mut statements_replayed = 0;
         let mut statements_skipped = 0;
         let mut statements_failed = 0;
         let mut verification_failures = 0;
 
-        // Replay each statement
+        // TR-07: one connection carries the whole transaction, as one
+        // `BEGIN` … `COMMIT`; the first failure rolls it back and stops, so
+        // the target never holds a partial transaction. Retries apply to the
+        // connection attempt only — a statement cannot be retried inside an
+        // aborted transaction.
+        let mut to_apply: Vec<&JournalEntry> = Vec::new();
         for entry in &entries {
-            // Skip read-only if configured
             if self.config.skip_read_only && entry.statement_type.is_read_only() {
                 statements_skipped += 1;
                 replay.results.push(StatementReplayResult {
@@ -252,46 +255,180 @@ impl FailoverReplay {
                 });
                 continue;
             }
-
-            // Skip transaction control statements (already handled)
+            // Transaction control is supplied by this driver, not replayed.
             if entry.statement_type == StatementType::Transaction {
                 statements_skipped += 1;
                 continue;
             }
+            to_apply.push(entry);
+        }
 
-            let result = self.replay_statement(entry, replay.target_node).await;
+        let fail_all = |replay: &mut ActiveReplay,
+                        to_apply: &[&JournalEntry],
+                        from: usize,
+                        error: &str,
+                        statements_failed: &mut usize| {
+            for entry in &to_apply[from..] {
+                *statements_failed += 1;
+                replay.results.push(StatementReplayResult {
+                    sequence: entry.sequence,
+                    success: false,
+                    checksum_matched: None,
+                    rows_matched: None,
+                    duration_ms: 0,
+                    error: Some(error.to_string()),
+                    retries: 0,
+                });
+            }
+        };
 
-            match result {
-                Ok(stmt_result) => {
-                    if stmt_result.success {
-                        statements_replayed += 1;
-
-                        // Check verification
-                        if self.config.verify_results {
-                            if let Some(false) = stmt_result.checksum_matched {
-                                verification_failures += 1;
+        let endpoint = self.endpoints.read().await.get(&target_node).cloned();
+        let cfg = endpoint.as_ref().and_then(|e| self.build_config(e));
+        let client = match cfg {
+            None => {
+                fail_all(
+                    replay,
+                    &to_apply,
+                    0,
+                    "no backend configured: attach a BackendConfig via with_backend_template \
+                     and register the target endpoint; refusing to report a replay that never \
+                     executed (TR-07)",
+                    &mut statements_failed,
+                );
+                None
+            }
+            Some(cfg) => {
+                let mut attempt = 0u32;
+                loop {
+                    match BackendClient::connect(&cfg).await {
+                        Ok(c) => break Some(c),
+                        Err(e) => {
+                            if !self.config.retry_on_error || attempt >= self.config.max_retries {
+                                fail_all(
+                                    replay,
+                                    &to_apply,
+                                    0,
+                                    &format!("connect: {}", e),
+                                    &mut statements_failed,
+                                );
+                                break None;
                             }
+                            attempt += 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
-                    } else {
-                        statements_failed += 1;
                     }
-                    replay.results.push(stmt_result);
-                }
-                Err(e) => {
-                    statements_failed += 1;
-                    replay.results.push(StatementReplayResult {
-                        sequence: entry.sequence,
-                        success: false,
-                        checksum_matched: None,
-                        rows_matched: None,
-                        duration_ms: 0,
-                        error: Some(e.to_string()),
-                        retries: 0,
-                    });
                 }
             }
+        };
 
-            replay.position += 1;
+        if let Some(mut client) = client {
+            let mut failed_at: Option<(usize, String)> = None;
+            if let Err(e) = client.simple_query("BEGIN").await {
+                failed_at = Some((0, format!("BEGIN: {}", e)));
+            }
+            if failed_at.is_none() {
+                for (i, entry) in to_apply.iter().enumerate() {
+                    let started = std::time::Instant::now();
+                    let res = client
+                        .execute_journaled(&entry.statement, &entry.param_types, &entry.parameters)
+                        .await;
+                    match res {
+                        Ok(qr) => {
+                            let rows_matched = match entry.rows_affected {
+                                Some(expected) => qr.rows_affected() == Some(expected),
+                                None => true,
+                            };
+                            // Checksums are not recomputed here; an entry with
+                            // no recorded checksum counts as matched.
+                            let checksum_matched = entry.result_checksum.is_none();
+                            let diverged =
+                                self.config.verify_results && (!rows_matched || !checksum_matched);
+                            replay.results.push(StatementReplayResult {
+                                sequence: entry.sequence,
+                                success: !diverged,
+                                checksum_matched: if self.config.verify_results
+                                    && entry.result_checksum.is_some()
+                                {
+                                    Some(checksum_matched)
+                                } else {
+                                    None
+                                },
+                                rows_matched: entry.rows_affected.map(|_| rows_matched),
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                error: diverged.then(|| {
+                                    "replay result diverged from the journaled outcome".to_string()
+                                }),
+                                retries: 0,
+                            });
+                            replay.position += 1;
+                            if diverged {
+                                verification_failures += 1;
+                                failed_at = Some((
+                                    i + 1,
+                                    "replay result diverged from the journaled outcome".to_string(),
+                                ));
+                                break;
+                            }
+                            statements_replayed += 1;
+                        }
+                        Err(e) => {
+                            statements_failed += 1;
+                            replay.results.push(StatementReplayResult {
+                                sequence: entry.sequence,
+                                success: false,
+                                checksum_matched: None,
+                                rows_matched: None,
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                error: Some(e.to_string()),
+                                retries: 0,
+                            });
+                            failed_at = Some((i + 1, e.to_string()));
+                            break;
+                        }
+                    }
+                }
+            }
+            match failed_at {
+                Some((next, error)) => {
+                    let _ = client.simple_query("ROLLBACK").await;
+                    // Statements after the failure never ran.
+                    fail_all(
+                        replay,
+                        &to_apply,
+                        next,
+                        &format!("not applied: transaction rolled back after: {}", error),
+                        &mut statements_failed,
+                    );
+                }
+                None => match client.simple_query("COMMIT").await {
+                    Ok(r) if r.command_tag.eq_ignore_ascii_case("COMMIT") => {}
+                    Ok(r) => {
+                        statements_failed += 1;
+                        replay.results.push(StatementReplayResult {
+                            sequence: replay.journal.current_sequence,
+                            success: false,
+                            checksum_matched: None,
+                            rows_matched: None,
+                            duration_ms: 0,
+                            error: Some(format!("COMMIT answered {:?}", r.command_tag)),
+                            retries: 0,
+                        });
+                    }
+                    Err(e) => {
+                        statements_failed += 1;
+                        replay.results.push(StatementReplayResult {
+                            sequence: replay.journal.current_sequence,
+                            success: false,
+                            checksum_matched: None,
+                            rows_matched: None,
+                            duration_ms: 0,
+                            error: Some(format!("COMMIT: {}", e)),
+                            retries: 0,
+                        });
+                    }
+                },
+            }
+            client.close().await;
         }
 
         replay.state = if statements_failed > 0 {
@@ -334,115 +471,6 @@ impl FailoverReplay {
         );
 
         Ok(result)
-    }
-
-    /// Replay a single statement
-    async fn replay_statement(
-        &self,
-        entry: &JournalEntry,
-        target_node: NodeId,
-    ) -> Result<StatementReplayResult> {
-        let start = std::time::Instant::now();
-        let mut retries = 0;
-
-        loop {
-            let (success, checksum_matched, rows_matched, error_msg) =
-                self.execute_statement(entry, target_node).await;
-
-            if success || !self.config.retry_on_error || retries >= self.config.max_retries {
-                return Ok(StatementReplayResult {
-                    sequence: entry.sequence,
-                    success,
-                    checksum_matched: if self.config.verify_results
-                        && entry.result_checksum.is_some()
-                    {
-                        Some(checksum_matched)
-                    } else {
-                        None
-                    },
-                    rows_matched: if entry.rows_affected.is_some() {
-                        Some(rows_matched)
-                    } else {
-                        None
-                    },
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    error: if success {
-                        None
-                    } else {
-                        Some(error_msg.unwrap_or_else(|| "statement execution failed".to_string()))
-                    },
-                    retries,
-                });
-            }
-
-            retries += 1;
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    }
-
-    /// Execute a single journaled statement against the target node.
-    ///
-    /// Returns `(success, checksum_matched, rows_matched, error)`.
-    /// With no backend template / endpoint configured this is a **failure**,
-    /// not a synthetic success: replay that never touched a database must
-    /// never be reported as replayed (TR-07).
-    async fn execute_statement(
-        &self,
-        entry: &JournalEntry,
-        target_node: NodeId,
-    ) -> (bool, bool, bool, Option<String>) {
-        let endpoint = self.endpoints.read().await.get(&target_node).cloned();
-        let cfg = match endpoint.as_ref().and_then(|e| self.build_config(e)) {
-            Some(c) => c,
-            None => {
-                return (
-                    false,
-                    false,
-                    false,
-                    Some(
-                        "no backend configured: attach a BackendConfig via \
-                         with_backend_template and register the target endpoint; refusing to \
-                         report a replay that never executed (TR-07)"
-                            .to_string(),
-                    ),
-                )
-            }
-        };
-
-        let mut client = match BackendClient::connect(&cfg).await {
-            Ok(c) => c,
-            Err(e) => return (false, false, false, Some(format!("connect: {}", e))),
-        };
-
-        let params: Vec<ParamValue> = entry
-            .parameters
-            .iter()
-            .map(journal_value_to_param)
-            .collect();
-
-        let result = if params.is_empty() {
-            client.simple_query(&entry.statement).await
-        } else {
-            client.query_with_params(&entry.statement, &params).await
-        };
-
-        let outcome = match result {
-            Ok(qr) => {
-                let rows_matched = match entry.rows_affected {
-                    Some(expected) => qr.rows_affected() == Some(expected),
-                    None => true,
-                };
-                // Checksum matching is best-effort: we don't recompute the
-                // server-side hash here. Treat as matched when no
-                // checksum was recorded; otherwise leave as `false` and
-                // let the caller surface it via `verify_results`.
-                let checksum_matched = entry.result_checksum.is_none();
-                (true, checksum_matched, rows_matched, None)
-            }
-            Err(e) => (false, false, false, Some(e.to_string())),
-        };
-        client.close().await;
-        outcome
     }
 
     /// Wait for the target node's WAL replay position to reach
@@ -550,35 +578,6 @@ impl FailoverReplay {
     }
 }
 
-/// Convert a `JournalValue` to a `ParamValue` for text-format
-/// interpolation into replay SQL.
-fn journal_value_to_param(v: &JournalValue) -> ParamValue {
-    match v {
-        JournalValue::Null => ParamValue::Null,
-        JournalValue::Bool(b) => ParamValue::Bool(*b),
-        JournalValue::Int64(i) => ParamValue::Int(*i),
-        JournalValue::Float64(f) => ParamValue::Float(*f),
-        JournalValue::Text(s) => ParamValue::Text(s.clone()),
-        JournalValue::Bytes(b) => {
-            // Render bytes as PG hex-escape literal text for text protocol.
-            let mut s = String::with_capacity(2 + b.len() * 2);
-            s.push_str("\\x");
-            for byte in b {
-                s.push_str(&format!("{:02x}", byte));
-            }
-            ParamValue::Text(s)
-        }
-        JournalValue::Array(_) => {
-            // Arrays not yet supported in replay — fall back to NULL so
-            // the statement at least compiles. Replay reporting shows
-            // `rows_matched=false` only for entries that recorded a
-            // `rows_affected` count; for hot-path journals (no recorded
-            // count) the degradation is silent.
-            ParamValue::Null
-        }
-    }
-}
-
 /// Parse a PostgreSQL `pg_lsn` text form (e.g. `"16/B3780A90"`) into
 /// its u64 numeric representation: `(hi << 32) | lo`. Returns `None`
 /// on malformed input.
@@ -607,7 +606,9 @@ pub struct ReplayStats {
 
 #[cfg(test)]
 mod tests {
-    use super::super::transaction_journal::TransactionJournalEntry;
+    use super::super::transaction_journal::{
+        StatementOutcome, TransactionJournalEntry, WireProtocol,
+    };
     use super::*;
 
     fn make_journal() -> TransactionJournalEntry {
@@ -626,6 +627,9 @@ mod tests {
             timestamp: chrono::Utc::now(),
             statement_type: StatementType::Insert,
             duration_ms: 10,
+            param_types: Vec::new(),
+            outcome: StatementOutcome::Unobserved,
+            protocol: WireProtocol::Simple,
         });
 
         journal.add_entry(JournalEntry {
@@ -637,6 +641,9 @@ mod tests {
             timestamp: chrono::Utc::now(),
             statement_type: StatementType::Select,
             duration_ms: 5,
+            param_types: Vec::new(),
+            outcome: StatementOutcome::Unobserved,
+            protocol: WireProtocol::Simple,
         });
 
         journal
@@ -675,42 +682,6 @@ mod tests {
         assert!(pg_lsn_to_u64("zz/zz").is_none());
         // `lo` must fit in u32 (PG text format guarantees this).
         assert!(pg_lsn_to_u64("0/100000000").is_none());
-    }
-
-    #[test]
-    fn test_journal_value_to_param_basic_types() {
-        use crate::backend::ParamValue;
-
-        assert!(matches!(
-            journal_value_to_param(&JournalValue::Null),
-            ParamValue::Null
-        ));
-        assert!(matches!(
-            journal_value_to_param(&JournalValue::Bool(true)),
-            ParamValue::Bool(true)
-        ));
-        assert!(matches!(
-            journal_value_to_param(&JournalValue::Int64(42)),
-            ParamValue::Int(42)
-        ));
-        match journal_value_to_param(&JournalValue::Float64(std::f64::consts::PI)) {
-            ParamValue::Float(f) => assert!((f - std::f64::consts::PI).abs() < 1e-9),
-            other => panic!("expected Float, got {:?}", other),
-        }
-        match journal_value_to_param(&JournalValue::Text("hi".into())) {
-            ParamValue::Text(s) => assert_eq!(s, "hi"),
-            other => panic!("expected Text, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_journal_value_bytes_to_hex_escape() {
-        use crate::backend::ParamValue;
-        let v = journal_value_to_param(&JournalValue::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]));
-        match v {
-            ParamValue::Text(s) => assert_eq!(s, "\\xdeadbeef"),
-            other => panic!("expected Text, got {:?}", other),
-        }
     }
 
     #[tokio::test]

@@ -106,7 +106,19 @@ in #54 with its priority; open an individual issue when work starts on one.
   between attempts and verify refusal; large replay histories remain within the
   configured time/memory ceiling and do not claim the old snapshot was preserved.
 
-- [ ] **TR-07 · P1 — separate and harden live replay, recovery journal and replay tools.**
+- [x] **TR-07 · P1 — separate and harden live replay, recovery journal and replay tools.**
+  *(2026-09-18: shipped. Honesty slices `ab0fc36`/`3647445`, then the recovery-journal
+  slice: per-session capture of real transactions on both protocols (boundaries from the
+  backend's own tags, `Bind` parameters byte-for-byte, outcomes, source identity, commit
+  order; rejected/rolled-back/2PC work never enters committed history), a segmented
+  CRC-checked durable store with restart recovery (`[journal] dir`), `POST /api/replay`
+  `mode: "committed_history"` (commit order, one transaction per `BEGIN…COMMIT` on one
+  connection, extended-protocol parameters, stop on first failure, resume point), and the
+  library `FailoverReplay` on one connection with stop-on-failure. Acceptance: the live
+  ledger test `test_tr07_committed_history_replay_reproduces_the_ledger` (rollback,
+  savepoint, failed statements, binary/array parameters, interleaved clients, interrupted
+  replay + resume, restart) passes against PostgreSQL 18.4. Boundary kept honest: the
+  journal is written after the backend reports the commit — D-02.)*
   The current global journal is post-response SQL text, not a durable WAL. Preserve
   actual transaction boundaries, parameters, source identity, outcome, commit order
   and tenant/session context before offering recovery-grade retention. Exclude

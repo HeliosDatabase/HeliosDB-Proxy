@@ -1276,3 +1276,366 @@ fn test_module_45_terraform_provider_skipped() {}
 #[test]
 #[ignore = "requires Pulumi SDK — not present in standard CI"]
 fn test_module_46_pulumi_provider_skipped() {}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TR-07 — committed-history ledger acceptance (needs a live PostgreSQL)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Minimal HTTP/1.1 POST to the admin port; returns `(status, json body)`.
+async fn tr07_admin_post(addr: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect admin");
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .expect("write admin request");
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .await
+        .expect("read admin response");
+    let text = String::from_utf8_lossy(&raw);
+    let status: u16 = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let json_body = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .and_then(|b| serde_json::from_str(b).ok())
+        .unwrap_or(serde_json::Value::Null);
+    (status, json_body)
+}
+
+fn tr07_conn_str(host: &str, port: u16, b: &fixture::BackendInfo, db: &str) -> String {
+    format!(
+        "host={host} port={port} user={} password={} dbname={db}",
+        b.user, b.password
+    )
+}
+
+async fn tr07_connect(conn_str: &str) -> tokio_postgres::Client {
+    let (client, conn) = tokio_postgres::connect(conn_str, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    tokio::spawn(conn);
+    client
+}
+
+/// The ledger as `(id, amount, tag, blob, arr)` rows.
+async fn tr07_ledger(
+    client: &tokio_postgres::Client,
+) -> Vec<(i32, i64, String, Vec<u8>, Vec<i64>)> {
+    client
+        .query(
+            "SELECT id, amount, tag, blob, arr FROM tr07_ledger ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("read ledger")
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
+        .collect()
+}
+
+/// TR-07 acceptance: rollback/savepoint, failed statements, binary and array
+/// parameters, interleaved clients, an interrupted replay and a restart cannot
+/// produce partial committed ledger transfers.
+///
+/// Needs `HELIOS_TEST_PG_*` and a user allowed to `CREATE DATABASE` (the replay
+/// target); otherwise the test explains and returns.
+#[tokio::test]
+async fn test_tr07_committed_history_replay_reproduces_the_ledger() {
+    let journal_dir = tempfile::tempdir().expect("tempdir");
+    let dir_str = journal_dir.path().to_string_lossy().to_string();
+    let dir_for_first = dir_str.clone();
+    let Some(fx) = fixture::start_proxy_with(move |c| {
+        c.tr_enabled = true;
+        c.journal.dir = dir_for_first;
+        c.journal.fsync = "interval".into();
+        c.journal.fsync_interval_ms = 20;
+    })
+    .await
+    else {
+        return;
+    };
+    let b = fx.backend.clone();
+    let source_db = b.dbname.clone();
+    let target_db = "tr07_target";
+
+    // Schema on both databases, set up DIRECTLY on the backend (not through the
+    // proxy) so the setup itself is not part of the journaled history.
+    let direct_src = tr07_connect(&tr07_conn_str(&b.host, b.port, &b, &source_db)).await;
+    match direct_src
+        .batch_execute(&format!("CREATE DATABASE {target_db}"))
+        .await
+    {
+        Ok(()) => {}
+        Err(e) if e.to_string().contains("already exists") => {}
+        Err(e) => {
+            eprintln!(
+                "[tr07] cannot CREATE DATABASE {target_db} ({e}); skipping ledger acceptance"
+            );
+            return;
+        }
+    }
+    let ddl = "DROP TABLE IF EXISTS tr07_ledger; \
+               CREATE TABLE tr07_ledger (id int PRIMARY KEY, amount bigint NOT NULL, \
+               tag text NOT NULL, blob bytea, arr bigint[])";
+    direct_src.batch_execute(ddl).await.expect("source ddl");
+    let direct_dst = tr07_connect(&tr07_conn_str(&b.host, b.port, &b, target_db)).await;
+    direct_dst.batch_execute(ddl).await.expect("target ddl");
+
+    // ---- workload through the proxy -----------------------------------
+    let via = tr07_conn_str("127.0.0.1", fx.proxy_port, &b, &source_db);
+    let mut a = tr07_connect(&via).await;
+    let mut b2 = tr07_connect(&via).await;
+    let blob: Vec<u8> = vec![0x00, 0xff, 0x27, 0x5c, 0x0a];
+    let arr: Vec<i64> = vec![1, -2, 3_000_000_000];
+
+    // S1 autocommit, extended protocol with binary bytea/int8[] parameters.
+    a.execute(
+        "INSERT INTO tr07_ledger (id, amount, tag, blob, arr) VALUES ($1, $2, $3, $4, $5)",
+        &[&1i32, &10i64, &"one", &blob, &arr],
+    )
+    .await
+    .expect("S1");
+    // A read in between: never journaled.
+    a.query("SELECT count(*) FROM tr07_ledger", &[])
+        .await
+        .expect("read");
+    // S2 explicit transaction, committed.
+    {
+        let tx = a.transaction().await.expect("S2 begin");
+        tx.execute(
+            "INSERT INTO tr07_ledger (id, amount, tag) VALUES ($1, $2, $3)",
+            &[&2i32, &20i64, &"two"],
+        )
+        .await
+        .expect("S2 insert");
+        tx.execute(
+            "UPDATE tr07_ledger SET amount = amount + 5 WHERE id = $1",
+            &[&1i32],
+        )
+        .await
+        .expect("S2 update");
+        tx.commit().await.expect("S2 commit");
+    }
+    // S3 explicit transaction, rolled back: nothing of it may be replayed.
+    {
+        let tx = a.transaction().await.expect("S3 begin");
+        tx.execute(
+            "INSERT INTO tr07_ledger (id, amount, tag) VALUES ($1, $2, $3)",
+            &[&3i32, &30i64, &"three"],
+        )
+        .await
+        .expect("S3 insert");
+        tx.rollback().await.expect("S3 rollback");
+    }
+    // S4 failed statement inside a transaction; COMMIT answers ROLLBACK.
+    {
+        let tx = a.transaction().await.expect("S4 begin");
+        tx.execute(
+            "INSERT INTO tr07_ledger (id, amount, tag) VALUES ($1, $2, $3)",
+            &[&4i32, &40i64, &"four"],
+        )
+        .await
+        .expect("S4 insert");
+        let dup = tx
+            .execute(
+                "INSERT INTO tr07_ledger (id, amount, tag) VALUES ($1, $2, $3)",
+                &[&4i32, &41i64, &"dup"],
+            )
+            .await;
+        assert!(dup.is_err(), "duplicate key must fail");
+        let _ = tx.commit().await; // backend replies ROLLBACK
+    }
+    // S5 savepoint: 5 kept, 6 undone, 7 kept.
+    {
+        let mut tx = a.transaction().await.expect("S5 begin");
+        tx.execute(
+            "INSERT INTO tr07_ledger (id, amount, tag) VALUES ($1, $2, $3)",
+            &[&5i32, &50i64, &"five"],
+        )
+        .await
+        .expect("S5 insert 5");
+        {
+            let sp = tx.savepoint("s").await.expect("S5 savepoint");
+            sp.execute(
+                "INSERT INTO tr07_ledger (id, amount, tag) VALUES ($1, $2, $3)",
+                &[&6i32, &60i64, &"six"],
+            )
+            .await
+            .expect("S5 insert 6");
+            sp.rollback().await.expect("S5 rollback to savepoint");
+        }
+        tx.execute(
+            "INSERT INTO tr07_ledger (id, amount, tag) VALUES ($1, $2, $3)",
+            &[&7i32, &70i64, &"seven"],
+        )
+        .await
+        .expect("S5 insert 7");
+        tx.commit().await.expect("S5 commit");
+    }
+    // S6 interleaved clients: A commits 8, then B commits 9 and 10.
+    {
+        let ta = a.transaction().await.expect("S6 A begin");
+        ta.execute(
+            "INSERT INTO tr07_ledger (id, amount, tag) VALUES ($1, $2, $3)",
+            &[&8i32, &80i64, &"eight"],
+        )
+        .await
+        .expect("S6 A insert");
+        let tb = b2.transaction().await.expect("S6 B begin");
+        tb.execute(
+            "INSERT INTO tr07_ledger (id, amount, tag) VALUES ($1, $2, $3)",
+            &[&9i32, &90i64, &"nine"],
+        )
+        .await
+        .expect("S6 B insert 9");
+        ta.commit().await.expect("S6 A commit");
+        tb.execute(
+            "INSERT INTO tr07_ledger (id, amount, tag) VALUES ($1, $2, $3)",
+            &[&10i32, &100i64, &"ten"],
+        )
+        .await
+        .expect("S6 B insert 10");
+        tb.commit().await.expect("S6 B commit");
+    }
+    // S7 simple-protocol multi-statement string (implicit transaction).
+    a.batch_execute(
+        "INSERT INTO tr07_ledger (id, amount, tag) VALUES (11, 110, 'eleven'); \
+         INSERT INTO tr07_ledger (id, amount, tag) VALUES (12, 120, 'twelve')",
+    )
+    .await
+    .expect("S7");
+    // S8 a failing simple-protocol autocommit statement: journals nothing.
+    assert!(a
+        .batch_execute("INSERT INTO tr07_ledger (id, amount, tag) VALUES (1, 0, 'dup')")
+        .await
+        .is_err());
+
+    let expected = tr07_ledger(&direct_src).await;
+    assert_eq!(
+        expected.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![1, 2, 5, 7, 8, 9, 10, 11, 12],
+        "source ledger after the workload"
+    );
+
+    // ---- committed-history replay onto the target ----------------------
+    let admin = format!("127.0.0.1:{}", fx.admin_port);
+    let now = chrono::Utc::now();
+    let window = |after: u64| {
+        format!(
+            r#"{{"from":"{}","to":"{}","mode":"committed_history","after_commit_seq":{after},
+                "target_host":"{}","target_port":{},"target_user":"{}",
+                "target_password":"{}","target_database":"{target_db}"}}"#,
+            (now - chrono::Duration::minutes(10)).to_rfc3339(),
+            (now + chrono::Duration::minutes(10)).to_rfc3339(),
+            b.host,
+            b.port,
+            b.user,
+            b.password
+        )
+    };
+    let (status, resp) = tr07_admin_post(&admin, "/api/replay", &window(0)).await;
+    assert_eq!(status, 200, "replay response: {resp}");
+    assert_eq!(resp["mode"], "committed_history");
+    assert_eq!(resp["partial"], false, "{resp}");
+    assert_eq!(resp["transactions_selected"], 6, "{resp}");
+    assert_eq!(resp["transactions_replayed"], 6, "{resp}");
+    assert_eq!(resp["statements_replayed"], 9, "{resp}");
+    assert_eq!(resp["coverage"]["transaction_boundaries"], true);
+    assert_eq!(resp["coverage"]["parameter_values"], true);
+    assert_eq!(resp["coverage"]["outcomes"], true);
+    assert_eq!(resp["coverage"]["survives_restart"], true);
+    let last_seq = resp["last_commit_seq"].as_u64().unwrap_or(0);
+    assert!(last_seq >= 6, "{resp}");
+    assert_eq!(
+        tr07_ledger(&direct_dst).await,
+        expected,
+        "target ledger == source ledger"
+    );
+
+    // ---- interrupted replay: stop on first failure, nothing partial ------
+    direct_dst
+        .batch_execute("TRUNCATE tr07_ledger; INSERT INTO tr07_ledger (id, amount, tag) VALUES (5, 0, 'conflict')")
+        .await
+        .expect("seed conflict");
+    let (status, resp) = tr07_admin_post(&admin, "/api/replay", &window(0)).await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(resp["partial"], true, "{resp}");
+    assert_eq!(
+        resp["transactions_replayed"], 2,
+        "S1 and S2 apply, S5 conflicts: {resp}"
+    );
+    let stopped_seq = resp["stopped_at"]["commit_seq"].as_u64().unwrap_or(0);
+    let resume_seq = resp["last_commit_seq"].as_u64().unwrap_or(0);
+    assert!(stopped_seq > resume_seq, "{resp}");
+    let after_stop = tr07_ledger(&direct_dst).await;
+    assert_eq!(
+        after_stop.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![1, 2, 5],
+        "no partial transaction on the target (7 must be absent): {after_stop:?}"
+    );
+    // Clear the conflict and resume after the last committed sequence.
+    direct_dst
+        .batch_execute("DELETE FROM tr07_ledger WHERE id = 5")
+        .await
+        .expect("clear conflict");
+    let (status, resp) = tr07_admin_post(&admin, "/api/replay", &window(resume_seq)).await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(resp["partial"], false, "{resp}");
+    assert_eq!(resp["transactions_replayed"], 4, "{resp}");
+    assert_eq!(
+        tr07_ledger(&direct_dst).await,
+        expected,
+        "resumed replay completes the ledger"
+    );
+
+    // ---- restart: a fresh proxy reloads the durable journal --------------
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await; // > fsync interval
+    drop(a);
+    drop(b2);
+    drop(fx);
+    let dir_for_second = dir_str.clone();
+    let fx2 = fixture::start_proxy_with(move |c| {
+        c.tr_enabled = true;
+        c.journal.dir = dir_for_second;
+    })
+    .await
+    .expect("second proxy");
+    direct_dst
+        .batch_execute("TRUNCATE tr07_ledger")
+        .await
+        .expect("reset target");
+    let admin2 = format!("127.0.0.1:{}", fx2.admin_port);
+    let (status, resp) = tr07_admin_post(&admin2, "/api/replay", &window(0)).await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(resp["partial"], false, "{resp}");
+    assert_eq!(
+        resp["transactions_replayed"], 6,
+        "recovered from disk: {resp}"
+    );
+    assert_eq!(resp["coverage"]["commit_seq_high"], last_seq, "{resp}");
+    assert_eq!(
+        tr07_ledger(&direct_dst).await,
+        expected,
+        "ledger reproduced after restart"
+    );
+
+    let _ = direct_src
+        .batch_execute("DROP TABLE IF EXISTS tr07_ledger")
+        .await;
+    let _ = direct_dst
+        .batch_execute("DROP TABLE IF EXISTS tr07_ledger")
+        .await;
+}

@@ -665,6 +665,51 @@ tr_max_session_set_statements = 256
 
 ---
 
+## Recovery Journal (`[journal]`)
+
+Retention and durability of the Transaction Replay recovery journal (TR-07) — the
+committed-transaction log behind `POST /api/replay`. Journaling itself follows the
+top-level `tr_enabled`; this section only bounds what is kept and where. Every key
+defaults to the value it had as a compiled-in constant, and an absent `[journal]`
+block keeps the journal in process memory only. `validate()` rejects `0` for every
+cap (a `0` would disable a safety bound), an unknown `fsync` value, and
+`fsync_interval_ms = 0` under `fsync = "interval"`.
+
+```toml
+[journal]
+max_active_transactions = 50000
+max_entries_per_transaction = 10000
+max_bytes_per_transaction = 67108864
+max_committed_transactions = 50000
+max_committed_bytes = 268435456
+max_statement_bytes = 1048576
+dir = ""
+segment_bytes = 67108864
+retain_bytes = 1073741824
+fsync = "interval"
+fsync_interval_ms = 100
+writer_queue = 4096
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_active_transactions` | usize | `50000` | Cap on **open** (uncommitted) transaction journals across all sessions; the oldest are evicted at the cap. Only bites when many sessions hold long transactions. |
+| `max_entries_per_transaction` | usize | `10000` | Statements journaled per transaction. Beyond it the transaction is kept but marked *incomplete* (committed-history replay refuses it rather than apply it partially). |
+| `max_bytes_per_transaction` | usize | `67108864` | Bytes (statement text + parameters) journaled per transaction (64 MiB). Same incomplete marking. |
+| `max_committed_transactions` | usize | `50000` | **Committed** transactions retained in memory for replay, oldest evicted first. Also the number reloaded from `dir` at startup. |
+| `max_committed_bytes` | usize | `268435456` | Bytes of committed transactions retained in memory (256 MiB). |
+| `max_statement_bytes` | usize | `1048576` | A single statement longer than this (1 MiB) is journaled without its text and marks its transaction incomplete — bounds per-statement memory on the capture path. |
+| `dir` | string | `""` | Directory of the durable segment store. Empty = memory only: **nothing survives a restart**. When set, every committed transaction is appended to `journal-<first-commit-seq>.log` segments there and the newest `max_committed_transactions` are reloaded at startup with commit numbering continuing after the highest recovered sequence. An unwritable directory fails startup. The segments hold statement text and bound parameter values of committed writes, unencrypted: protect the directory like the database's own data files. |
+| `segment_bytes` | u64 | `67108864` | Bytes after which the current segment is closed and a new one started (64 MiB). |
+| `retain_bytes` | u64 | `1073741824` | Total on-disk bytes to keep; the oldest whole segments beyond it are deleted (1 GiB). |
+| `fsync` | string | `"interval"` | When appended records reach stable storage: `"commit"` = `fdatasync` after every record, `"interval"` = group `fdatasync` every `fsync_interval_ms`, `"none"` = leave it to the OS page cache. The data path never waits on disk under any policy (see `writer_queue`). |
+| `fsync_interval_ms` | u64 | `100` | Group-`fsync` period for `fsync = "interval"`. |
+| `writer_queue` | usize | `4096` | Bounded queue between the data path and the segment writer thread. A full queue never stalls a client: the record is dropped and counted (`heliosdb_proxy_journal_dropped_total` is reported as `coverage.dropped_transactions` on replay responses). |
+
+What the journal records is described in [transaction-replay.md](transaction-replay.md#what-happens-on-the-live-write-path-the-journal-hook).
+
+---
+
 ## Query Analytics (`[analytics]`)
 
 Fingerprinting, per-query stats, slow-query log, pattern detection. Only active with the

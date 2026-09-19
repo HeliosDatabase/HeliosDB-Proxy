@@ -17,10 +17,48 @@ stay under 3%.
   candidate's CI does not overlap the baseline CI (Criterion's own change report says
   "regressed" / "improved" / "within noise").
 
+## 2026-09-19 — TR-07 recovery journal (sprinter `e11dbf2094f6`, #49)
+
+Controlled A/B with `scripts/bench-gate.sh`: baseline = main `4b25899` (worktree
+`/home/gpc/HDB/Proxy-base-1.8.0`), candidate = the TR-07 recovery-journal change; 3
+interleaved rounds per tree, own target dir per tree, fleet lock + bounded scope, rustc 1.95.0,
+host gpc001ca, `--features all-features`, all 107 cases. Evidence under
+`/home/gpc/HDB/sprint/baselines/proxy/1.8.1-tr07h-bench/`.
+
+**Aggregate: mean delta +2.97% (cumulative budget 3% — PASS), median +0.78%, 9 separated
+improvements, 14 separated regressions.** The strict separated-regression rule fails; each
+residual is attributed below.
+
+**Real, accepted costs — the journal-manager cluster (retention is the feature):**
+
+| case | base ns | cand ns | delta | why |
+|---|---:|---:|---:|---|
+| journal/manager/begin_log_commit | 443 | 758 | +71% | `commit_transaction` used to *drop* the journal; it now stamps it (commit sequence, timestamp, tag), wraps it in an `Arc`, appends it to the bounded committed store and evicts the oldest — ≈ +0.3 µs per committed transaction, paid once per transaction on a path that sits behind a backend round trip. Measured variants: two locks (867), one lock (779–823), batched eviction dropped on a blocking thread (2556 — concurrent deallocation storms; rejected), one lock + per-commit eviction outside the lock + no allocation for the `COMMIT` tag (758, adopted). |
+| journal/manager_contention/8, /32 | 27.0 µs, 104.5 µs | 40.6 µs, 154.9 µs | +51%, +48% | same per-commit cost under 8/32 concurrent tasks. |
+| journal/add_entry/push | 112 | 146 | +30% | `JournalEntry` grew by `param_types`, `outcome` and `protocol` (the capture payload): more bytes moved per push and per `Vec` growth. |
+| journal/rollback_to_savepoint/16, /128 | 1.06 µs, 7.2 µs | 1.50 µs, 8.1 µs | +41%, +12% | truncating a `Vec` of larger entries. |
+| journal/total_size/16 | 101 | 108 | +7% | two more `JournalValue` arms in the size walk. |
+
+These are nanoseconds per journaled statement or per commit; the user-path harness
+(`scripts/regress/bench-usertp.sh`, P-01) is the instrument that decides whether they are visible
+to a client and needs the owner's go-ahead (Docker pgbench against the live backend). Not run in
+this session.
+
+**Layout-class residuals (untouched code, ≤ 2 ns or inside same-binary scatter):**
+`pool_mode/prepared_parse/deallocate/named` +18% (6.5 ns; this function was rewritten by the
+previous commit and is not touched here), `journal/statement_type/update` +14% (1.2 ns; untouched,
+siblings −/+ within noise), `protocol/extended_parse/parse_message` +8%, `pool_config/default`
++5% (0.2 ns), `pool/acquire_release/single` +5%, `protocol/query_text/short_select` +5% (0.6 ns),
+`protocol/decode_startup/ssl_request` +4% (1 ns). Same class as the 2026-09-18 waiver below.
+
+**Improvement of note:** `journal/entries_in_window/scan_500` −31% (the window now scans the
+committed store's `VecDeque` instead of a `HashMap` of active journals; the bench was updated to
+commit its transactions, as the window is committed history only).
+
 ## 2026-09-18 — 1.8.0 codegen-regression recovery (sprinter `1d70b68fa7cc`)
 
 Controlled A/B with the new `scripts/bench-gate.sh`: baseline tree = pre-change `main`
-`3b97470` (worktree `/home/gpc/HDB/Proxy-base-1.8.0`), candidate = the same commit plus
+`a455707` (worktree `/home/gpc/HDB/Proxy-base-1.8.0`), candidate = the same commit plus
 the allocation-free classifier change; **3 interleaved rounds per tree (A B / B A / A B),
 own target dir per tree, fleet build lock + 24 GiB bounded scope, rustc 1.95.0, host
 gpc001ca, governor `performance`, `--features all-features`, all 107 cases.** Per-case
@@ -63,7 +101,7 @@ get_query_warning}` and `parse_prepare_statement` / `parse_deallocate_statement`
 allocate an uppercased copy of every statement; they use the existing allocation-free
 `protocol::{starts_with_ci, contains_ci}` helpers. Same classification semantics.
 
-**Separated regressions and waiver (all untouched code — `git diff 3b97470` touches only
+**Separated regressions and waiver (all untouched code — `git diff a455707` touches only
 `src/transaction_journal.rs`, `src/pool/statement.rs`, `src/pool/prepared.rs`):**
 
 | case | base ns | cand ns | delta | attribution |

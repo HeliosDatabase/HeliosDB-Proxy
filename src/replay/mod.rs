@@ -12,7 +12,7 @@
 //! client (added in the T0-TR sequence) — no new infrastructure.
 
 use crate::backend::{BackendClient, BackendConfig, ParamValue};
-use crate::transaction_journal::{JournalValue, TransactionJournal};
+use crate::transaction_journal::{JournalValue, TransactionJournal, TransactionJournalEntry};
 use crate::{ProxyError, Result};
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
@@ -70,39 +70,114 @@ pub struct ReplaySummary {
     pub first_error: Option<String>,
 }
 
-/// Honest descriptor of what the journal behind a replay currently retains and
-/// what it structurally captures (TR-07).
+/// A request to replay committed history (TR-07): every transaction whose
+/// commit this proxy observed inside `[from, to]`, in commit order.
+#[derive(Debug, Clone)]
+pub struct CommittedHistoryRequest {
+    /// Inclusive start of the commit-time window.
+    pub from: DateTime<Utc>,
+    /// Inclusive end of the commit-time window.
+    pub to: DateTime<Utc>,
+    /// Only transactions with `commit_seq > after_commit_seq` (resume point);
+    /// `0` = from the start of the window.
+    pub after_commit_seq: u64,
+    pub target_host: String,
+    pub target_port: u16,
+    pub target_user: Option<String>,
+    pub target_password: Option<String>,
+    pub target_database: Option<String>,
+}
+
+/// Where a committed-history replay stopped.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReplayStop {
+    /// Journal transaction id.
+    pub tx_id: String,
+    /// Global commit sequence of the transaction.
+    pub commit_seq: u64,
+    /// Statement sequence inside the transaction (`0` = before its first
+    /// statement, e.g. `BEGIN` failed or the transaction was refused).
+    pub sequence: u64,
+    /// Why.
+    pub error: String,
+}
+
+/// Summary of a committed-history replay (TR-07).
 ///
-/// This exists so a replay response never has to be read as more than it is:
-/// the journal is a bounded, per-process memory sample of simple-protocol
-/// statement text, with no transaction boundaries, protocol parameter values,
-/// per-statement outcomes or restart durability. The booleans describe the
-/// current implementation and are reported, not configured; the counters are a
-/// snapshot taken at replay time.
+/// Semantics: transactions are applied one at a time on one target
+/// connection, each inside its own `BEGIN` … `COMMIT`, in commit order. The
+/// first failure rolls that transaction back and stops the run; the target
+/// then holds exactly the transactions up to `last_commit_seq` and nothing
+/// partial. A transaction the journal could not capture completely (see
+/// `TransactionJournalEntry::incomplete_reason`) is refused before it starts,
+/// for the same reason.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CommittedReplaySummary {
+    /// Always `"committed_history"`.
+    pub mode: &'static str,
+    /// Transactions applied and committed on the target.
+    pub transactions_replayed: u64,
+    /// Statements executed inside those transactions.
+    pub statements_replayed: u64,
+    /// Transactions selected by the window (and resume point).
+    pub transactions_selected: u64,
+    /// Commit sequence of the last transaction committed on the target
+    /// (`0` = none); pass it back as `after_commit_seq` to resume.
+    pub last_commit_seq: u64,
+    /// True when the run stopped before the last selected transaction.
+    pub partial: bool,
+    /// The overall replay deadline (O-04) stopped the run.
+    pub deadline_exceeded: bool,
+    /// Where and why the run stopped, when `partial`.
+    pub stopped_at: Option<ReplayStop>,
+    pub elapsed_ms: u64,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub from: DateTime<Utc>,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub to: DateTime<Utc>,
+}
+
+/// Descriptor of what the journal behind a replay retains and structurally
+/// captures (TR-07), reported with every replay response so a summary can
+/// never be read as more than it is.
+///
+/// Since the TR-07 capture slice the journal records real transactions:
+/// boundaries (`BEGIN` … `COMMIT` as the backend reported them), the bound
+/// parameter values of extended-protocol statements, the backend's outcome
+/// of every statement, the source identity and a global commit order. The
+/// booleans below say so; `survives_restart` is true only when a durable
+/// `[journal] dir` is configured. The counters are a snapshot at replay time.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct JournalCoverage {
-    /// Journals retained at replay time (the bounded sample the window
-    /// is read from).
+    /// Active (open) transaction journals at replay time.
     pub retained_transactions: usize,
-    /// Statement entries retained across those journals.
+    /// Statement entries across those active journals.
     pub retained_entries: usize,
-    /// Retained bytes (statement text + parameters).
+    /// Bytes across those active journals (statement text + parameters).
     pub retained_bytes: usize,
-    /// Code-constant cap on retained journals; eviction is oldest-first.
+    /// `[journal] max_active_transactions`; eviction is oldest-first.
     pub max_journals: usize,
-    /// True when the journal persists across a process restart. Always
-    /// false: retention is per-process and in-memory.
+    /// Committed transactions retained for replay.
+    pub committed_transactions: usize,
+    /// Statements across the retained committed transactions.
+    pub committed_entries: usize,
+    /// Bytes across the retained committed transactions.
+    pub committed_bytes: usize,
+    /// `[journal] max_committed_transactions`.
+    pub max_committed_transactions: usize,
+    /// `[journal] max_committed_bytes`.
+    pub max_committed_bytes: usize,
+    /// Highest commit sequence assigned so far (`0` = none).
+    pub commit_seq_high: u64,
+    /// Committed transactions the durable sink could not accept since start.
+    pub dropped_transactions: u64,
+    /// Committed transactions are appended to a durable segment store.
     pub survives_restart: bool,
-    /// True when the journal preserves committed transaction boundaries.
-    /// Always false: the hot path records each statement as its own
-    /// synthetic auto-commit transaction and never commits it.
+    /// Committed transaction boundaries are preserved.
     pub transaction_boundaries: bool,
-    /// True when protocol-level Bind parameter values are captured.
-    /// Always false: the hot path records SQL text only.
+    /// Protocol-level `Bind` parameter values are captured.
     pub parameter_values: bool,
-    /// True when a per-statement commit/failure outcome is captured.
-    /// Always false: statements are recorded after the response was
-    /// relayed, with no outcome field populated.
+    /// Per-statement backend outcomes are captured.
     pub outcomes: bool,
 }
 
@@ -141,10 +216,17 @@ impl ReplayEngine {
             retained_entries: stats.total_entries,
             retained_bytes: stats.total_size_bytes,
             max_journals: stats.max_journals,
-            survives_restart: false,
-            transaction_boundaries: false,
-            parameter_values: false,
-            outcomes: false,
+            committed_transactions: stats.committed_transactions,
+            committed_entries: stats.committed_entries,
+            committed_bytes: stats.committed_bytes,
+            max_committed_transactions: stats.max_committed,
+            max_committed_bytes: stats.max_committed_bytes,
+            commit_seq_high: stats.commit_seq_high,
+            dropped_transactions: stats.dropped_total,
+            survives_restart: stats.durable,
+            transaction_boundaries: true,
+            parameter_values: true,
+            outcomes: true,
         }
     }
 
@@ -342,6 +424,213 @@ impl ReplayEngine {
     }
 }
 
+impl ReplayEngine {
+    /// Replay committed history (TR-07): the transactions whose commit was
+    /// observed in the window, in commit order, each as one transaction on
+    /// one target connection, stopping at the first failure.
+    pub async fn replay_committed(
+        &self,
+        req: &CommittedHistoryRequest,
+    ) -> Result<CommittedReplaySummary> {
+        if req.from > req.to {
+            return Err(ProxyError::Internal("replay window: from > to".to_string()));
+        }
+        if req.target_host.trim().is_empty() || req.target_port == 0 {
+            return Err(ProxyError::ReplayFailed(
+                "target host and port are required for an operator replay".to_string(),
+            ));
+        }
+        let start = std::time::Instant::now();
+        let selected: Vec<Arc<TransactionJournalEntry>> = self
+            .journal
+            .committed_in_window(req.from, req.to)
+            .await
+            .into_iter()
+            .filter(|t| t.commit_seq.unwrap_or(0) > req.after_commit_seq)
+            .collect();
+        let mut summary = CommittedReplaySummary {
+            mode: "committed_history",
+            transactions_replayed: 0,
+            statements_replayed: 0,
+            transactions_selected: selected.len() as u64,
+            last_commit_seq: 0,
+            partial: false,
+            deadline_exceeded: false,
+            stopped_at: None,
+            elapsed_ms: 0,
+            from: req.from,
+            to: req.to,
+        };
+        tracing::info!(
+            transactions = selected.len(),
+            from = %req.from,
+            to = %req.to,
+            after_commit_seq = req.after_commit_seq,
+            target = %format!("{}:{}", req.target_host, req.target_port),
+            "starting committed-history replay"
+        );
+        if selected.is_empty() {
+            summary.elapsed_ms = start.elapsed().as_millis() as u64;
+            return Ok(summary);
+        }
+
+        let mut cfg = self.backend_template.clone();
+        cfg.host = req.target_host.clone();
+        cfg.port = req.target_port;
+        if let Some(ref u) = req.target_user {
+            cfg.user = u.clone();
+        }
+        if let Some(ref p) = req.target_password {
+            cfg.password = Some(p.clone());
+        }
+        if let Some(ref d) = req.target_database {
+            cfg.database = Some(d.clone());
+        }
+
+        let deadline = self.deadline;
+        let budget = |start: std::time::Instant| Self::remaining(start, deadline);
+        let stop = |summary: &mut CommittedReplaySummary,
+                    tx: &TransactionJournalEntry,
+                    sequence: u64,
+                    error: String| {
+            summary.partial = true;
+            summary.stopped_at = Some(ReplayStop {
+                tx_id: tx.tx_id.to_string(),
+                commit_seq: tx.commit_seq.unwrap_or(0),
+                sequence,
+                error,
+            });
+        };
+
+        let connect = BackendClient::connect(&cfg);
+        let mut client = match budget(start) {
+            Some(r) if r.is_zero() => {
+                summary.deadline_exceeded = true;
+                stop(
+                    &mut summary,
+                    &selected[0],
+                    0,
+                    "replay deadline exceeded before connecting".into(),
+                );
+                summary.elapsed_ms = start.elapsed().as_millis() as u64;
+                return Ok(summary);
+            }
+            Some(r) => match tokio::time::timeout(r, connect).await {
+                Ok(c) => {
+                    c.map_err(|e| ProxyError::ReplayFailed(format!("connect to target: {}", e)))?
+                }
+                Err(_) => {
+                    summary.deadline_exceeded = true;
+                    stop(
+                        &mut summary,
+                        &selected[0],
+                        0,
+                        "replay deadline exceeded while connecting".into(),
+                    );
+                    summary.elapsed_ms = start.elapsed().as_millis() as u64;
+                    return Ok(summary);
+                }
+            },
+            None => connect
+                .await
+                .map_err(|e| ProxyError::ReplayFailed(format!("connect to target: {}", e)))?,
+        };
+
+        'txs: for tx in &selected {
+            if let Some(reason) = tx.incomplete_reason.as_deref() {
+                stop(
+                    &mut summary,
+                    tx,
+                    0,
+                    format!("transaction was not fully captured ({reason}); refusing to apply it partially"),
+                );
+                break;
+            }
+            // Deadline check before opening a transaction: never leave one open.
+            if matches!(budget(start), Some(r) if r.is_zero()) {
+                summary.deadline_exceeded = true;
+                stop(&mut summary, tx, 0, "replay deadline exceeded".into());
+                break;
+            }
+            if let Err(e) = Self::bounded(budget(start), client.simple_query("BEGIN")).await {
+                stop(&mut summary, tx, 0, format!("BEGIN: {e}"));
+                break;
+            }
+            for entry in &tx.entries {
+                let exec = client.execute_journaled(
+                    &entry.statement,
+                    &entry.param_types,
+                    &entry.parameters,
+                );
+                match Self::bounded(budget(start), exec).await {
+                    Ok(_) => summary.statements_replayed += 1,
+                    Err(e) => {
+                        let timed_out = e.to_string().contains("replay deadline");
+                        let _ = client.simple_query("ROLLBACK").await;
+                        summary.deadline_exceeded |= timed_out;
+                        stop(&mut summary, tx, entry.sequence, e.to_string());
+                        break 'txs;
+                    }
+                }
+            }
+            match Self::bounded(budget(start), client.simple_query("COMMIT")).await {
+                Ok(r) if r.command_tag.eq_ignore_ascii_case("COMMIT") => {
+                    summary.transactions_replayed += 1;
+                    summary.last_commit_seq = tx.commit_seq.unwrap_or(0);
+                }
+                Ok(r) => {
+                    let _ = client.simple_query("ROLLBACK").await;
+                    stop(
+                        &mut summary,
+                        tx,
+                        tx.current_sequence,
+                        format!("COMMIT answered {:?}", r.command_tag),
+                    );
+                    break;
+                }
+                Err(e) => {
+                    let _ = client.simple_query("ROLLBACK").await;
+                    summary.deadline_exceeded |= e.to_string().contains("replay deadline");
+                    stop(
+                        &mut summary,
+                        tx,
+                        tx.current_sequence,
+                        format!("COMMIT: {e}"),
+                    );
+                    break;
+                }
+            }
+        }
+        client.close().await;
+        summary.elapsed_ms = start.elapsed().as_millis() as u64;
+        if summary.partial {
+            tracing::warn!(stopped_at = ?summary.stopped_at, replayed = summary.transactions_replayed, "committed-history replay stopped");
+        }
+        Ok(summary)
+    }
+
+    /// Run `fut` within the remaining replay budget (`None` = unbounded).
+    async fn bounded<T>(
+        remaining: Option<std::time::Duration>,
+        fut: impl std::future::Future<Output = crate::backend::BackendResult<T>>,
+    ) -> Result<T> {
+        match remaining {
+            Some(r) if r.is_zero() => Err(ProxyError::ReplayFailed(
+                "replay deadline exceeded".to_string(),
+            )),
+            Some(r) => match tokio::time::timeout(r, fut).await {
+                Ok(res) => res.map_err(|e| ProxyError::ReplayFailed(e.to_string())),
+                Err(_) => Err(ProxyError::ReplayFailed(
+                    "replay deadline exceeded".to_string(),
+                )),
+            },
+            None => fut
+                .await
+                .map_err(|e| ProxyError::ReplayFailed(e.to_string())),
+        }
+    }
+}
+
 /// Convert a `JournalValue` to a `ParamValue` for text-format
 /// interpolation. Mirrors the translator in `failover_replay.rs`;
 /// kept local here to avoid cross-module coupling for three lines.
@@ -360,8 +649,55 @@ fn journal_value_to_param(v: &JournalValue) -> ParamValue {
             }
             ParamValue::Text(s)
         }
-        JournalValue::Array(_) => ParamValue::Null,
+        JournalValue::Array(items) => ParamValue::Text(array_literal(items)),
+        JournalValue::TextRaw(b) => ParamValue::Text(String::from_utf8_lossy(b).into_owned()),
+        // A binary-format value has no text rendering; the committed-history
+        // path sends it back in binary. Time-window replay interpolates text,
+        // so degrade to NULL rather than send garbage.
+        JournalValue::Binary(_) => ParamValue::Null,
     }
+}
+
+/// Render a journaled array as a PostgreSQL array literal (`{1,"a b",NULL}`).
+pub(crate) fn array_literal(items: &[JournalValue]) -> String {
+    fn elem(v: &JournalValue, out: &mut String) {
+        match v {
+            JournalValue::Null => out.push_str("NULL"),
+            JournalValue::Bool(b) => out.push_str(if *b { "t" } else { "f" }),
+            JournalValue::Int64(i) => out.push_str(&i.to_string()),
+            JournalValue::Float64(f) => out.push_str(&f.to_string()),
+            JournalValue::Text(s) => quote(s, out),
+            JournalValue::TextRaw(b) => quote(&String::from_utf8_lossy(b), out),
+            JournalValue::Bytes(b) | JournalValue::Binary(b) => {
+                let mut s = String::with_capacity(2 + b.len() * 2);
+                s.push_str("\\x");
+                for byte in b {
+                    s.push_str(&format!("{:02x}", byte));
+                }
+                quote(&s, out);
+            }
+            JournalValue::Array(inner) => out.push_str(&array_literal(inner)),
+        }
+    }
+    fn quote(s: &str, out: &mut String) {
+        out.push('"');
+        for c in s.chars() {
+            if c == '"' || c == '\\' {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out.push('"');
+    }
+    let mut out = String::from("{");
+    for (i, v) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        elem(v, &mut out);
+    }
+    out.push('}');
+    out
 }
 
 #[cfg(test)]
@@ -458,6 +794,9 @@ mod tests {
 
         let from = Utc::now() - chrono::Duration::seconds(5);
         let to = Utc::now() + chrono::Duration::seconds(5);
+        // TR-07: the window is committed history only.
+        assert!(journal.entries_in_window(from, to).await.is_empty());
+        journal.commit_transaction(tx_id).await.unwrap();
         let entries = journal.entries_in_window(from, to).await;
         assert_eq!(entries.len(), 1, "single in-window entry");
 
@@ -603,25 +942,42 @@ mod tests {
             .await
             .unwrap();
 
-        let engine = ReplayEngine::new(journal, test_template());
+        let engine = ReplayEngine::new(journal.clone(), test_template());
         let cov = engine.journal_coverage().await;
-        assert_eq!(cov.retained_transactions, 1);
+        assert_eq!(cov.retained_transactions, 1, "one active journal");
         assert_eq!(cov.retained_entries, 1);
         assert!(cov.retained_bytes > 0);
         assert_eq!(cov.max_journals, 50_000);
+        assert_eq!(cov.committed_transactions, 0);
+        assert_eq!(cov.commit_seq_high, 0);
+        // TR-07: the capture preserves boundaries, parameters and outcomes;
+        // durability depends on `[journal] dir` (none here).
         assert!(!cov.survives_restart);
-        assert!(!cov.transaction_boundaries);
-        assert!(!cov.parameter_values);
-        assert!(!cov.outcomes);
+        assert!(cov.transaction_boundaries);
+        assert!(cov.parameter_values);
+        assert!(cov.outcomes);
+        assert_eq!(cov.dropped_transactions, 0);
+        journal.commit_transaction(tx).await.unwrap();
+        let cov = engine.journal_coverage().await;
+        assert_eq!(cov.retained_transactions, 0);
+        assert_eq!(cov.committed_transactions, 1);
+        assert_eq!(cov.committed_entries, 1);
+        assert_eq!(cov.commit_seq_high, 1);
 
         let json = serde_json::to_string(&cov).unwrap();
         for field in [
             "\"survives_restart\":false",
-            "\"transaction_boundaries\":false",
-            "\"parameter_values\":false",
-            "\"outcomes\":false",
+            "\"transaction_boundaries\":true",
+            "\"parameter_values\":true",
+            "\"outcomes\":true",
+            "\"committed_transactions\":1",
+            "\"commit_seq_high\":1",
+            "\"dropped_transactions\":0",
         ] {
-            assert!(json.contains(field), "coverage must serialize {field}");
+            assert!(
+                json.contains(field),
+                "coverage must serialize {field}: {json}"
+            );
         }
     }
 

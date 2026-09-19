@@ -92,6 +92,8 @@ pub mod pool;
 // ── TR (Transaction Replay) modules ─────────────────────────────────
 pub mod cursor_restore;
 pub mod failover_replay;
+pub mod journal_capture;
+pub mod journal_store;
 pub mod replay;
 pub mod session_migrate;
 pub mod transaction_journal;
@@ -254,7 +256,7 @@ pub const DEFAULT_PORT: u16 = 5432;
 pub const DEFAULT_ADMIN_PORT: u16 = 9090;
 
 /// Node identifier
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct NodeId(pub Uuid);
 
 impl NodeId {
