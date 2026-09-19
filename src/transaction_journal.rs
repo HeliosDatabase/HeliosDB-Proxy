@@ -5,14 +5,15 @@
 
 use super::{NodeId, ProxyError, Result};
 use crate::protocol::starts_with_ci;
-use std::collections::{BTreeMap, HashMap};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 /// Journal entry for a single statement
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
     /// Entry sequence number
     pub sequence: u64,
@@ -20,6 +21,10 @@ pub struct JournalEntry {
     pub statement: String,
     /// Bound parameters
     pub parameters: Vec<JournalValue>,
+    /// Parameter type OIDs the client declared in its `Parse` (`0` = let the
+    /// backend infer). Empty for the simple protocol or an undeclared `Parse`.
+    #[serde(default)]
+    pub param_types: Vec<u32>,
     /// Result checksum (for verification after replay)
     pub result_checksum: Option<u64>,
     /// Number of rows affected
@@ -30,10 +35,26 @@ pub struct JournalEntry {
     pub statement_type: StatementType,
     /// Execution duration (ms)
     pub duration_ms: u64,
+    /// The backend's own verdict on this statement as the proxy relayed it
+    /// (TR-07). Library callers that log without observing a response leave
+    /// it `Unobserved`.
+    #[serde(default)]
+    pub outcome: StatementOutcome,
+    /// Which wire protocol carried the statement.
+    #[serde(default)]
+    pub protocol: WireProtocol,
 }
 
-/// Serializable parameter value
-#[derive(Debug, Clone)]
+/// Serializable parameter value.
+///
+/// The capture path (TR-07) records extended-protocol `Bind` values
+/// byte-for-byte: `Text` for a text-format value that is valid UTF-8,
+/// `TextRaw` for a text-format value that is not, `Binary` for a
+/// binary-format value. Replay sends each back in the same format, so arrays,
+/// binary-encoded types and anything else the client bound reproduce exactly.
+/// The typed variants (`Bool`/`Int64`/`Float64`/`Bytes`/`Array`) remain for
+/// library callers that journal already-decoded values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum JournalValue {
     Null,
     Bool(bool),
@@ -42,10 +63,72 @@ pub enum JournalValue {
     Text(String),
     Bytes(Vec<u8>),
     Array(Vec<JournalValue>),
+    /// Text-format (`0`) parameter bytes that were not valid UTF-8.
+    TextRaw(Vec<u8>),
+    /// Binary-format (`1`) parameter bytes, verbatim.
+    Binary(Vec<u8>),
+}
+
+/// Backend outcome of one journaled statement, as observed by the proxy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StatementOutcome {
+    /// No response was observed (library-recorded entry).
+    #[default]
+    Unobserved,
+    /// The backend answered `CommandComplete` with this tag.
+    Succeeded { tag: String },
+    /// The backend answered `ErrorResponse`. Boxed so the enum (and every
+    /// `JournalEntry`) stays small on the paths that move and drop entries.
+    Failed(Box<StatementFailure>),
+}
+
+/// The `ErrorResponse` behind `StatementOutcome::Failed`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatementFailure {
+    pub sqlstate: String,
+    pub message: String,
+}
+
+impl StatementOutcome {
+    /// Rows affected as parsed from the command tag (`INSERT 0 5` → 5,
+    /// `UPDATE 3` → 3); `None` when unobserved, failed or tag-less.
+    pub fn rows_affected(&self) -> Option<u64> {
+        match self {
+            StatementOutcome::Succeeded { tag } => {
+                tag.rsplit(' ').next().and_then(|n| n.parse::<u64>().ok())
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Which PostgreSQL wire protocol carried a statement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireProtocol {
+    /// `Query` message (simple protocol); the text may hold several statements.
+    #[default]
+    Simple,
+    /// `Parse`/`Bind`/`Execute` (extended protocol); one statement per entry.
+    Extended,
+}
+
+/// Where a journaled transaction came from (TR-07 source identity).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceIdentity {
+    /// Client socket address as accepted by the proxy.
+    pub client_addr: String,
+    /// Startup-packet user.
+    pub user: String,
+    /// Startup-packet database.
+    pub database: String,
+    /// Backend node (`host:port`) that executed the transaction.
+    pub backend: String,
+    /// Tenant id when multi-tenancy assigned one to the session.
+    pub tenant: Option<String>,
 }
 
 /// Statement type classification
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StatementType {
     /// SELECT query
     Select,
@@ -119,7 +202,7 @@ impl StatementType {
 }
 
 /// Transaction journal for a single transaction
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransactionJournalEntry {
     /// Transaction ID
     pub tx_id: Uuid,
@@ -141,10 +224,34 @@ pub struct TransactionJournalEntry {
     pub has_mutations: bool,
     /// Savepoints
     pub savepoints: Vec<Savepoint>,
+    /// Source identity (client, user, database, backend, tenant).
+    #[serde(default)]
+    pub source: SourceIdentity,
+    /// Global commit order assigned by the journal when the backend reported
+    /// the commit (TR-07). `None` while the transaction is active. The order is
+    /// the order in which this proxy observed the commit responses — a total
+    /// order over everything that went through this proxy, not the backend's
+    /// WAL order for commits that raced on different sessions.
+    #[serde(default)]
+    pub commit_seq: Option<u64>,
+    /// When the commit was observed.
+    #[serde(default)]
+    pub committed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The backend's command tag that closed the transaction (`COMMIT`, or
+    /// the tag of the last statement of an implicit/auto-commit transaction).
+    /// `Cow` so the common `COMMIT` costs no allocation per commit.
+    #[serde(default)]
+    pub commit_tag: Option<std::borrow::Cow<'static, str>>,
+    /// Set when some effect of this transaction could not be captured (a
+    /// `COPY ... FROM STDIN`, a statement over `journal.max_statement_bytes`,
+    /// a per-journal cap). Committed-history replay refuses such a
+    /// transaction instead of applying it partially.
+    #[serde(default)]
+    pub incomplete_reason: Option<String>,
 }
 
 /// Savepoint information
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Savepoint {
     /// Savepoint name
     pub name: String,
@@ -168,6 +275,24 @@ impl TransactionJournalEntry {
             active: true,
             has_mutations: false,
             savepoints: Vec::new(),
+            source: SourceIdentity::default(),
+            commit_seq: None,
+            committed_at: None,
+            commit_tag: None,
+            incomplete_reason: None,
+        }
+    }
+
+    /// Attach the source identity.
+    pub fn with_source(mut self, source: SourceIdentity) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// Mark the transaction as not fully captured (first reason wins).
+    pub fn mark_incomplete(&mut self, reason: impl Into<String>) {
+        if self.incomplete_reason.is_none() {
+            self.incomplete_reason = Some(reason.into());
         }
     }
 
@@ -240,8 +365,100 @@ fn estimate_params_size(params: &[JournalValue]) -> usize {
             JournalValue::Text(s) => s.len(),
             JournalValue::Bytes(b) => b.len(),
             JournalValue::Array(a) => estimate_params_size(a),
+            JournalValue::TextRaw(b) | JournalValue::Binary(b) => b.len(),
         })
         .sum()
+}
+
+/// Everything `TransactionJournal::log_entry` needs to append one statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewEntry {
+    pub statement: String,
+    pub parameters: Vec<JournalValue>,
+    pub param_types: Vec<u32>,
+    pub result_checksum: Option<u64>,
+    pub rows_affected: Option<u64>,
+    pub duration_ms: u64,
+    pub outcome: StatementOutcome,
+    pub protocol: WireProtocol,
+}
+
+impl NewEntry {
+    /// Materialize the entry with its sequence number and a timestamp of now.
+    pub fn into_journal_entry(self, sequence: u64) -> JournalEntry {
+        JournalEntry {
+            sequence,
+            statement_type: StatementType::from_sql(&self.statement),
+            statement: self.statement,
+            parameters: self.parameters,
+            param_types: self.param_types,
+            result_checksum: self.result_checksum,
+            rows_affected: self.rows_affected,
+            timestamp: chrono::Utc::now(),
+            duration_ms: self.duration_ms,
+            outcome: self.outcome,
+            protocol: self.protocol,
+        }
+    }
+}
+
+/// Where committed transactions go once the journal has ordered them (TR-07).
+///
+/// The in-memory committed store is always kept; a sink additionally receives
+/// every committed transaction, e.g. the segmented on-disk journal. `append`
+/// must not block the caller: it returns `false` when it could not accept the
+/// record (queue full, writer gone), and the journal counts that as a dropped
+/// record so `coverage` can report the gap honestly.
+pub trait JournalSink: Send + Sync {
+    /// Hand one committed transaction to the sink.
+    fn append(&self, tx: &Arc<TransactionJournalEntry>) -> bool;
+    /// Whether records this sink accepted survive a process restart.
+    fn durable(&self) -> bool;
+}
+
+/// Committed transactions in commit order, bounded by count and bytes.
+/// Lives inside `JournalStore` so a commit (take from active, push here) is
+/// one lock acquisition, the same as the pre-TR-07 write path paid.
+#[derive(Debug, Default)]
+struct CommittedStore {
+    /// `(transaction, its byte size)` — the size is computed once at push so
+    /// eviction never re-walks entries.
+    txs: VecDeque<(Arc<TransactionJournalEntry>, usize)>,
+    bytes: usize,
+    entries: usize,
+}
+
+impl CommittedStore {
+    /// Push one committed transaction and evict the oldest past the caps.
+    /// The evicted transactions are returned (no allocation for the usual
+    /// single eviction) so the caller drops them after releasing the lock.
+    fn push(
+        &mut self,
+        tx: Arc<TransactionJournalEntry>,
+        size: usize,
+        max_count: usize,
+        max_bytes: usize,
+    ) -> Evicted {
+        self.bytes += size;
+        self.entries += tx.entries.len();
+        self.txs.push_back((tx, size));
+        let mut evicted = Evicted::default();
+        while self.txs.len() > max_count.max(1) || (self.bytes > max_bytes && self.txs.len() > 1) {
+            match self.txs.pop_front() {
+                Some((old, size)) => {
+                    self.bytes = self.bytes.saturating_sub(size);
+                    self.entries = self.entries.saturating_sub(old.entries.len());
+                    evicted.push(old);
+                }
+                None => break,
+            }
+        }
+        evicted
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Arc<TransactionJournalEntry>> {
+        self.txs.iter().map(|(t, _)| t)
+    }
 }
 
 /// Fast unique transaction id for the auto-commit data path.
@@ -284,6 +501,8 @@ struct JournalStore {
     order: BTreeMap<u64, Uuid>,
     /// Next insertion sequence to hand out.
     next_seq: u64,
+    /// Committed transactions in commit order (TR-07).
+    committed: CommittedStore,
 }
 
 impl JournalStore {
@@ -306,10 +525,10 @@ impl JournalStore {
             .1
     }
 
-    fn remove(&mut self, tx_id: &Uuid) {
-        if let Some((seq, _)) = self.entries.remove(tx_id) {
-            self.order.remove(&seq);
-        }
+    fn take(&mut self, tx_id: &Uuid) -> Option<TransactionJournalEntry> {
+        let (seq, journal) = self.entries.remove(tx_id)?;
+        self.order.remove(&seq);
+        Some(journal)
     }
 
     fn get(&self, tx_id: &Uuid) -> Option<&TransactionJournalEntry> {
@@ -328,10 +547,6 @@ impl JournalStore {
         self.entries.values().map(|(_, j)| j)
     }
 
-    fn iter(&self) -> impl Iterator<Item = (&Uuid, &TransactionJournalEntry)> {
-        self.entries.iter().map(|(tx_id, (_, j))| (tx_id, j))
-    }
-
     /// Evict the oldest journals (insertion order) until at most
     /// `target_len` remain.
     fn evict_oldest(&mut self, target_len: usize) {
@@ -344,6 +559,51 @@ impl JournalStore {
     }
 }
 
+/// Commit metadata computed before the journal lock is taken.
+struct CommitStamp {
+    at: chrono::DateTime<chrono::Utc>,
+    tag: std::borrow::Cow<'static, str>,
+}
+
+impl CommitStamp {
+    fn now(tag: &str) -> Self {
+        let tag = if tag == "COMMIT" {
+            std::borrow::Cow::Borrowed("COMMIT")
+        } else {
+            std::borrow::Cow::Owned(tag.to_string())
+        };
+        Self {
+            at: chrono::Utc::now(),
+            tag,
+        }
+    }
+}
+
+/// Transactions evicted by one push: the first without allocating (the
+/// usual case is exactly one), any further ones in a `Vec`.
+#[derive(Default)]
+struct Evicted {
+    first: Option<Arc<TransactionJournalEntry>>,
+    rest: Vec<Arc<TransactionJournalEntry>>,
+}
+
+impl Evicted {
+    fn push(&mut self, tx: Arc<TransactionJournalEntry>) {
+        if self.first.is_none() {
+            self.first = Some(tx);
+        } else {
+            self.rest.push(tx);
+        }
+    }
+}
+
+/// What a commit produced under the lock; finished outside it.
+struct Committed {
+    seq: u64,
+    tx: Arc<TransactionJournalEntry>,
+    evicted: Evicted,
+}
+
 /// Transaction Journal Manager
 pub struct TransactionJournal {
     /// Active transaction journals, insertion-ordered for O(k) eviction
@@ -352,15 +612,29 @@ pub struct TransactionJournal {
     max_entries: usize,
     /// Maximum journal size (bytes)
     max_size: usize,
-    /// Global cap on the number of retained transaction journals. The data-path
-    /// write journaling records each write as its own auto-commit transaction
-    /// (a fresh tx_id, begin + log, never committed), so without a global bound
-    /// the map grows by one entry per write forever — an unbounded leak of the
-    /// full SQL of every write. When the cap is reached the oldest journals
-    /// (by start time) are evicted; replay only consults recent history.
+    /// Global cap on the number of retained *active* transaction journals.
+    /// Since TR-07 the data path journals real transactions and commits or
+    /// rolls them back, so this cap only bites when many sessions hold long
+    /// open transactions (or a library caller never commits). When it is
+    /// reached the oldest journals (by insertion) are evicted.
     max_journals: usize,
     /// Whether journaling is enabled
     enabled: bool,
+    /// Cap on retained committed transactions (count).
+    max_committed: usize,
+    /// Cap on retained committed bytes (statement text + parameters).
+    max_committed_bytes: usize,
+    /// Next commit sequence to assign (monotonic, starts at 1; a durable sink
+    /// restores it across restarts via `set_next_commit_seq`).
+    next_commit_seq: AtomicU64,
+    /// Optional sink (durable journal) fed on every commit.
+    sink: Option<Arc<dyn JournalSink>>,
+    /// Committed transactions observed since process start.
+    committed_total: AtomicU64,
+    /// Rolled-back transactions observed since process start.
+    rolled_back_total: AtomicU64,
+    /// Committed transactions the sink could not accept.
+    dropped_total: AtomicU64,
 }
 
 impl TransactionJournal {
@@ -372,7 +646,71 @@ impl TransactionJournal {
             max_size: 64 * 1024 * 1024, // 64MB
             max_journals: 50_000,
             enabled: true,
+            max_committed: 50_000,
+            max_committed_bytes: 256 * 1024 * 1024,
+            next_commit_seq: AtomicU64::new(1),
+            sink: None,
+            committed_total: AtomicU64::new(0),
+            rolled_back_total: AtomicU64::new(0),
+            dropped_total: AtomicU64::new(0),
         }
+    }
+
+    /// Configure the cap on retained committed transactions.
+    pub fn with_max_committed(mut self, max: usize) -> Self {
+        self.max_committed = max.max(1);
+        self
+    }
+
+    /// Configure the cap on retained committed bytes.
+    pub fn with_max_committed_bytes(mut self, max: usize) -> Self {
+        self.max_committed_bytes = max.max(1);
+        self
+    }
+
+    /// Attach a sink that receives every committed transaction.
+    pub fn with_sink(mut self, sink: Arc<dyn JournalSink>) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    /// Whether committed transactions are handed to a durable sink.
+    pub fn is_durable(&self) -> bool {
+        self.sink.as_ref().map(|s| s.durable()).unwrap_or(false)
+    }
+
+    /// Continue commit numbering after `seq` (restart recovery).
+    pub fn set_next_commit_seq(&self, next: u64) {
+        self.next_commit_seq.store(next.max(1), Ordering::SeqCst);
+    }
+
+    /// Highest commit sequence assigned so far (`0` = none).
+    pub fn commit_seq_high(&self) -> u64 {
+        self.next_commit_seq
+            .load(Ordering::SeqCst)
+            .saturating_sub(1)
+    }
+
+    /// Reload committed transactions recovered from a durable sink, in the
+    /// order given (oldest first). Their `commit_seq` values are kept and
+    /// numbering continues after the highest one. Does not feed the sink.
+    pub async fn load_committed(&self, txs: Vec<TransactionJournalEntry>) {
+        let mut store = self.journals.write().await;
+        let mut high = self.commit_seq_high();
+        for tx in txs {
+            if let Some(seq) = tx.commit_seq {
+                high = high.max(seq);
+            }
+            let size = tx.total_size();
+            let _ = store.committed.push(
+                Arc::new(tx),
+                size,
+                self.max_committed,
+                self.max_committed_bytes,
+            );
+        }
+        drop(store);
+        self.set_next_commit_seq(high + 1);
     }
 
     /// Configure maximum entries
@@ -409,15 +747,13 @@ impl TransactionJournal {
         self.enabled = enabled;
     }
 
-    /// Collect every journal entry across every active transaction
-    /// whose `timestamp` falls within the inclusive window
-    /// `[from, to]`. Results are sorted in timestamp order so the
-    /// caller can replay them chronologically regardless of which
-    /// transaction they came from.
+    /// Collect every statement of every **committed** transaction whose
+    /// `timestamp` falls within the inclusive window `[from, to]`, sorted in
+    /// timestamp order regardless of which transaction they came from.
     ///
-    /// Used by the time-travel replay engine (`src/replay/`) to
-    /// reconstruct "what happened at the source between these two
-    /// timestamps" against a staging target.
+    /// Used by the best-effort time-window replay (`src/replay/`). Since
+    /// TR-07 the source is the committed store: statements of transactions
+    /// that are still open, were rolled back or failed are not included.
     pub async fn entries_in_window(
         &self,
         from: chrono::DateTime<chrono::Utc>,
@@ -426,12 +762,12 @@ impl TransactionJournal {
         // Collect under the read lock ONLY; the sort runs after the guard is
         // dropped so a wide window cannot stall live journal writers (O-04).
         let mut out: Vec<(Uuid, JournalEntry)> = {
-            let journals = self.journals.read().await;
+            let store = self.journals.read().await;
             let mut out: Vec<(Uuid, JournalEntry)> = Vec::new();
-            for (tx_id, j) in journals.iter() {
+            for j in store.committed.iter() {
                 for entry in &j.entries {
                     if entry.timestamp >= from && entry.timestamp <= to {
-                        out.push((*tx_id, entry.clone()));
+                        out.push((j.tx_id, entry.clone()));
                     }
                 }
             }
@@ -439,6 +775,95 @@ impl TransactionJournal {
         };
         out.sort_by_key(|(_, e)| e.timestamp);
         out
+    }
+
+    /// Committed transactions whose commit was observed inside the inclusive
+    /// window `[from, to]`, in commit order (TR-07 committed history).
+    pub async fn committed_in_window(
+        &self,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<Arc<TransactionJournalEntry>> {
+        let store = self.journals.read().await;
+        store
+            .committed
+            .iter()
+            .filter(|t| {
+                t.committed_at
+                    .map(|c| c >= from && c <= to)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Committed transactions with `commit_seq > after`, in commit order.
+    pub async fn committed_after(&self, after: u64) -> Vec<Arc<TransactionJournalEntry>> {
+        let store = self.journals.read().await;
+        store
+            .committed
+            .iter()
+            .filter(|t| t.commit_seq.map(|s| s > after).unwrap_or(false))
+            .cloned()
+            .collect()
+    }
+
+    /// Order and retain one committed transaction under the caller's write
+    /// guard (one lock acquisition per commit). Returns the sequence, the
+    /// shared record for the sink and what the caps evicted.
+    fn push_committed_locked(
+        &self,
+        store: &mut JournalStore,
+        mut tx: TransactionJournalEntry,
+        stamp: CommitStamp,
+    ) -> Committed {
+        let seq = self.next_commit_seq.fetch_add(1, Ordering::SeqCst);
+        tx.commit_seq = Some(seq);
+        tx.committed_at = Some(stamp.at);
+        tx.commit_tag = Some(stamp.tag);
+        tx.active = false;
+        let size = tx.total_size();
+        let tx = Arc::new(tx);
+        let evicted = store.committed.push(
+            tx.clone(),
+            size,
+            self.max_committed,
+            self.max_committed_bytes,
+        );
+        Committed { seq, tx, evicted }
+    }
+
+    /// Count the commit, hand the record to the durable sink and drop what the
+    /// caps evicted — all outside the lock (the sink never blocks).
+    fn after_commit(&self, c: Committed) -> u64 {
+        self.committed_total.fetch_add(1, Ordering::Relaxed);
+        if let Some(sink) = self.sink.as_ref() {
+            if !sink.append(&c.tx) {
+                self.dropped_total.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        drop(c.evicted);
+        c.seq
+    }
+
+    /// Record a transaction that committed without an active phase (an
+    /// auto-commit statement or an implicit multi-statement transaction),
+    /// already populated with its entries. Empty transactions are dropped:
+    /// there is nothing to replay. Returns the commit sequence.
+    pub async fn record_committed(
+        &self,
+        tx: TransactionJournalEntry,
+        commit_tag: &str,
+    ) -> Option<u64> {
+        if !self.enabled || tx.entries.is_empty() {
+            return None;
+        }
+        let stamp = CommitStamp::now(commit_tag);
+        let committed = {
+            let mut store = self.journals.write().await;
+            self.push_committed_locked(&mut store, tx, stamp)
+        };
+        Some(self.after_commit(committed))
     }
 
     /// Start journaling a transaction
@@ -463,6 +888,26 @@ impl TransactionJournal {
         drop(journals);
 
         tracing::debug!("Started journaling transaction {:?}", tx_id);
+        Ok(())
+    }
+
+    /// `begin_transaction` with the TR-07 source identity attached.
+    pub async fn begin_transaction_with_source(
+        &self,
+        tx_id: Uuid,
+        session_id: Uuid,
+        node_id: NodeId,
+        start_lsn: u64,
+        source: SourceIdentity,
+    ) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let journal =
+            TransactionJournalEntry::new(tx_id, session_id, node_id, start_lsn).with_source(source);
+        let mut journals = self.journals.write().await;
+        self.enforce_cap_locked(&mut journals);
+        journals.insert(tx_id, journal);
         Ok(())
     }
 
@@ -519,11 +964,14 @@ impl TransactionJournal {
             sequence,
             statement,
             parameters,
+            param_types: Vec::new(),
             result_checksum,
             rows_affected,
             timestamp: chrono::Utc::now(),
             statement_type,
             duration_ms,
+            outcome: StatementOutcome::Unobserved,
+            protocol: WireProtocol::Simple,
         });
         drop(journals);
 
@@ -541,9 +989,38 @@ impl TransactionJournal {
         rows_affected: Option<u64>,
         duration_ms: u64,
     ) -> Result<()> {
+        self.log_entry(
+            tx_id,
+            NewEntry {
+                statement,
+                parameters,
+                param_types: Vec::new(),
+                result_checksum,
+                rows_affected,
+                duration_ms,
+                outcome: StatementOutcome::Unobserved,
+                protocol: WireProtocol::Simple,
+            },
+        )
+        .await
+    }
+
+    /// Log a statement with its full TR-07 capture (parameter types, observed
+    /// outcome, wire protocol).
+    pub async fn log_entry(&self, tx_id: Uuid, new: NewEntry) -> Result<()> {
         if !self.enabled {
             return Ok(());
         }
+        let NewEntry {
+            statement,
+            parameters,
+            param_types,
+            result_checksum,
+            rows_affected,
+            duration_ms,
+            outcome,
+            protocol,
+        } = new;
 
         let mut journals = self.journals.write().await;
         let journal = journals.get_mut(&tx_id).ok_or_else(|| {
@@ -570,11 +1047,14 @@ impl TransactionJournal {
             sequence,
             statement,
             parameters,
+            param_types,
             result_checksum,
             rows_affected,
             timestamp: chrono::Utc::now(),
             statement_type,
             duration_ms,
+            outcome,
+            protocol,
         };
 
         journal.add_entry(entry);
@@ -615,21 +1095,55 @@ impl TransactionJournal {
         Ok(())
     }
 
-    /// Commit transaction (clear journal)
+    /// Commit transaction: move its journal from the active set into the
+    /// committed store (commit order assigned here) and hand it to the sink.
+    /// A transaction with no entries is simply dropped.
     pub async fn commit_transaction(&self, tx_id: Uuid) -> Result<()> {
-        self.journals.write().await.remove(&tx_id);
-        tracing::debug!("Committed and cleared journal for transaction {:?}", tx_id);
+        self.commit_transaction_with_tag(tx_id, "COMMIT").await?;
         Ok(())
+    }
+
+    /// `commit_transaction` with the backend's closing command tag. Returns the
+    /// commit sequence, or `None` when nothing was retained (unknown tx or
+    /// no entries).
+    pub async fn commit_transaction_with_tag(
+        &self,
+        tx_id: Uuid,
+        commit_tag: &str,
+    ) -> Result<Option<u64>> {
+        // Everything that can be prepared before the lock is prepared before it.
+        let stamp = CommitStamp::now(commit_tag);
+        let committed = {
+            let mut journals = self.journals.write().await;
+            match journals.take(&tx_id) {
+                None => return Ok(None),
+                Some(tx) if tx.entries.is_empty() => return Ok(None),
+                Some(tx) => self.push_committed_locked(&mut journals, tx, stamp),
+            }
+        };
+        tracing::debug!("Committed journal for transaction {:?}", tx_id);
+        Ok(Some(self.after_commit(committed)))
     }
 
     /// Rollback transaction (clear journal)
     pub async fn rollback_transaction(&self, tx_id: Uuid) -> Result<()> {
-        self.journals.write().await.remove(&tx_id);
+        let removed = self.journals.write().await.take(&tx_id).is_some();
+        if removed {
+            self.rolled_back_total.fetch_add(1, Ordering::Relaxed);
+        }
         tracing::debug!(
             "Rolled back and cleared journal for transaction {:?}",
             tx_id
         );
         Ok(())
+    }
+
+    /// Mark an active transaction as not fully captured (see
+    /// `TransactionJournalEntry::incomplete_reason`).
+    pub async fn mark_incomplete(&self, tx_id: Uuid, reason: &str) {
+        if let Some(j) = self.journals.write().await.get_mut(&tx_id) {
+            j.mark_incomplete(reason);
+        }
     }
 
     /// Get journal for a transaction (for replay)
@@ -645,15 +1159,27 @@ impl TransactionJournal {
     /// Get statistics
     pub async fn stats(&self) -> JournalStats {
         let journals = self.journals.read().await;
+        let active_transactions = journals.len();
         let total_entries: usize = journals.values().map(|j| j.entries.len()).sum();
         let total_size: usize = journals.values().map(|j| j.total_size()).sum();
+        let committed = &journals.committed;
 
         JournalStats {
-            active_transactions: journals.len(),
+            active_transactions,
             total_entries,
             total_size_bytes: total_size,
             max_journals: self.max_journals,
             enabled: self.enabled,
+            committed_transactions: committed.txs.len(),
+            committed_entries: committed.entries,
+            committed_bytes: committed.bytes,
+            max_committed: self.max_committed,
+            max_committed_bytes: self.max_committed_bytes,
+            commit_seq_high: self.commit_seq_high(),
+            committed_total: self.committed_total.load(Ordering::Relaxed),
+            rolled_back_total: self.rolled_back_total.load(Ordering::Relaxed),
+            dropped_total: self.dropped_total.load(Ordering::Relaxed),
+            durable: self.is_durable(),
         }
     }
 
@@ -704,11 +1230,31 @@ pub struct JournalStats {
     pub total_entries: usize,
     /// Total size of journals in bytes
     pub total_size_bytes: usize,
-    /// Global cap on retained journals; at the cap the oldest journals are
-    /// evicted first (code constant, not a `proxy.toml` key).
+    /// Global cap on retained active journals; at the cap the oldest are
+    /// evicted first (`[journal] max_active_transactions`).
     pub max_journals: usize,
     /// Whether journaling is enabled
     pub enabled: bool,
+    /// Committed transactions currently retained (TR-07).
+    pub committed_transactions: usize,
+    /// Statements across the retained committed transactions.
+    pub committed_entries: usize,
+    /// Bytes across the retained committed transactions.
+    pub committed_bytes: usize,
+    /// `[journal] max_committed_transactions`.
+    pub max_committed: usize,
+    /// `[journal] max_committed_bytes`.
+    pub max_committed_bytes: usize,
+    /// Highest commit sequence assigned (`0` = none yet).
+    pub commit_seq_high: u64,
+    /// Commits observed since process start.
+    pub committed_total: u64,
+    /// Rollbacks observed since process start.
+    pub rolled_back_total: u64,
+    /// Committed transactions the durable sink could not accept.
+    pub dropped_total: u64,
+    /// Committed transactions are handed to a durable sink.
+    pub durable: bool,
 }
 
 #[cfg(test)]

@@ -16,6 +16,7 @@ use super::stream::Stream;
 use super::tls::{negotiate, TlsMode};
 use super::types::{encode_literal, ParamValue, TextValue};
 use crate::protocol::{Message, MessageType, ProtocolCodec};
+use crate::transaction_journal::JournalValue;
 use bytes::{Buf, BufMut, BytesMut};
 use std::sync::Arc;
 use std::time::Duration;
@@ -166,6 +167,127 @@ impl BackendClient {
     ) -> BackendResult<QueryResult> {
         let substituted = interpolate_params(sql, params)?;
         self.run_query(&substituted).await
+    }
+
+    /// Execute one journaled statement through the extended protocol (TR-07
+    /// committed-history replay): unnamed `Parse` carrying the parameter type
+    /// OIDs the original client declared, `Bind` with every value in the
+    /// format it was captured in (text or binary, byte for byte), `Describe`
+    /// portal, `Execute`, `Sync`. Nothing is interpolated, so arrays,
+    /// binary-encoded values and odd text all reproduce exactly.
+    pub async fn execute_journaled(
+        &mut self,
+        sql: &str,
+        param_types: &[u32],
+        params: &[JournalValue],
+    ) -> BackendResult<QueryResult> {
+        let t = self.stream_query_timeout();
+        tokio::time::timeout(
+            t,
+            Self::execute_journaled_inner(&mut self.stream, sql, param_types, params),
+        )
+        .await
+        .map_err(|_| {
+            BackendError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("statement exceeded {:?}: {}", t, truncate(sql, 64)),
+            ))
+        })?
+    }
+
+    async fn execute_journaled_inner(
+        stream: &mut Stream,
+        sql: &str,
+        param_types: &[u32],
+        params: &[JournalValue],
+    ) -> BackendResult<QueryResult> {
+        let mut batch = BytesMut::with_capacity(64 + sql.len());
+        // Parse (unnamed statement)
+        let mut p = BytesMut::with_capacity(sql.len() + 8 + param_types.len() * 4);
+        p.put_u8(0);
+        p.extend_from_slice(sql.as_bytes());
+        p.put_u8(0);
+        p.put_u16(param_types.len() as u16);
+        for t in param_types {
+            p.put_u32(*t);
+        }
+        Message::new(MessageType::Parse, p).encode_into(&mut batch);
+        // Bind (unnamed portal ← unnamed statement)
+        let encoded: Vec<(i16, Option<Vec<u8>>)> = params.iter().map(journal_param_wire).collect();
+        let mut b = BytesMut::with_capacity(
+            16 + encoded
+                .iter()
+                .map(|(_, v)| v.as_ref().map(|v| v.len() + 4).unwrap_or(4))
+                .sum::<usize>(),
+        );
+        b.put_u8(0);
+        b.put_u8(0);
+        b.put_u16(encoded.len() as u16);
+        for (format, _) in &encoded {
+            b.put_i16(*format);
+        }
+        b.put_u16(encoded.len() as u16);
+        for (_, value) in &encoded {
+            match value {
+                None => b.put_i32(-1),
+                Some(v) => {
+                    b.put_i32(v.len() as i32);
+                    b.extend_from_slice(v);
+                }
+            }
+        }
+        b.put_u16(0); // result columns: text
+        Message::new(MessageType::Bind, b).encode_into(&mut batch);
+        // Describe portal, Execute, Sync
+        let mut d = BytesMut::with_capacity(2);
+        d.put_u8(b'P');
+        d.put_u8(0);
+        Message::new(MessageType::Describe, d).encode_into(&mut batch);
+        let mut e = BytesMut::with_capacity(5);
+        e.put_u8(0);
+        e.put_i32(0);
+        Message::new(MessageType::Execute, e).encode_into(&mut batch);
+        Message::empty(MessageType::Sync).encode_into(&mut batch);
+        stream.write_all(&batch).await?;
+
+        let mut buffer = BytesMut::with_capacity(8192);
+        let codec = ProtocolCodec::new();
+        let mut columns: Vec<ColumnMeta> = Vec::new();
+        let mut rows: Vec<Vec<TextValue>> = Vec::new();
+        let mut command_tag = String::new();
+        let mut last_error: Option<String> = None;
+        loop {
+            let msg = read_one(stream, &mut buffer, &codec).await?;
+            match msg.msg_type {
+                MessageType::RowDescription => columns = parse_row_description(&msg.payload),
+                MessageType::DataRow => rows.push(parse_data_row(&msg.payload, columns.len())?),
+                MessageType::CommandComplete | MessageType::Close => {
+                    command_tag = parse_cstring(&msg.payload);
+                }
+                MessageType::EmptyQueryResponse => command_tag = String::new(),
+                MessageType::ErrorResponse => {
+                    if last_error.is_none() {
+                        last_error = Some(error_message(&msg.payload));
+                    }
+                }
+                MessageType::NoticeResponse => {
+                    tracing::debug!(notice = %error_message(&msg.payload), "backend notice");
+                }
+                MessageType::ReadyForQuery => {
+                    if let Some(e) = last_error {
+                        return Err(BackendError::BackendError(e));
+                    }
+                    return Ok(QueryResult {
+                        columns,
+                        rows,
+                        command_tag,
+                    });
+                }
+                // ParseComplete / BindComplete / NoData / ParameterDescription /
+                // PortalSuspended / ParameterStatus: nothing to keep.
+                _ => {}
+            }
+        }
     }
 
     /// Shorthand for a scalar lookup: runs `sql`, expects 1 column, 1 row.
@@ -526,6 +648,30 @@ fn parse_parameter_status(payload: &[u8]) -> Option<(String, String)> {
     Some((key, value))
 }
 
+/// Wire encoding of a journaled parameter: `(format code, value)` with
+/// `None` for SQL NULL. Captured `Bind` values keep their format and bytes;
+/// typed library values are rendered as text.
+fn journal_param_wire(v: &JournalValue) -> (i16, Option<Vec<u8>>) {
+    match v {
+        JournalValue::Null => (0, None),
+        JournalValue::Bool(b) => (0, Some(if *b { b"t".to_vec() } else { b"f".to_vec() })),
+        JournalValue::Int64(i) => (0, Some(i.to_string().into_bytes())),
+        JournalValue::Float64(f) => (0, Some(f.to_string().into_bytes())),
+        JournalValue::Text(s) => (0, Some(s.as_bytes().to_vec())),
+        JournalValue::TextRaw(b) => (0, Some(b.clone())),
+        JournalValue::Binary(b) => (1, Some(b.clone())),
+        JournalValue::Bytes(b) => {
+            let mut s = String::with_capacity(2 + b.len() * 2);
+            s.push_str("\\x");
+            for byte in b {
+                s.push_str(&format!("{:02x}", byte));
+            }
+            (0, Some(s.into_bytes()))
+        }
+        JournalValue::Array(items) => (0, Some(crate::replay::array_literal(items).into_bytes())),
+    }
+}
+
 fn parse_row_description(payload: &[u8]) -> Vec<ColumnMeta> {
     let mut p = BytesMut::from(payload);
     if p.remaining() < 2 {
@@ -880,6 +1026,43 @@ mod tests {
         let sql = "SELECT * FROM t WHERE id = $1 AND name = $2";
         let out = interpolate_params(sql, &params).unwrap();
         assert_eq!(out, "SELECT * FROM t WHERE id = 42 AND name = 'alice'");
+    }
+
+    #[test]
+    fn journal_param_wire_keeps_captured_formats_and_renders_typed_values() {
+        assert_eq!(journal_param_wire(&JournalValue::Null), (0, None));
+        assert_eq!(
+            journal_param_wire(&JournalValue::Text("a'b".into())),
+            (0, Some(b"a'b".to_vec()))
+        );
+        assert_eq!(
+            journal_param_wire(&JournalValue::TextRaw(vec![0xff])),
+            (0, Some(vec![0xff]))
+        );
+        assert_eq!(
+            journal_param_wire(&JournalValue::Binary(vec![0, 0, 0, 7])),
+            (1, Some(vec![0, 0, 0, 7]))
+        );
+        assert_eq!(
+            journal_param_wire(&JournalValue::Bool(true)),
+            (0, Some(b"t".to_vec()))
+        );
+        assert_eq!(
+            journal_param_wire(&JournalValue::Int64(-3)),
+            (0, Some(b"-3".to_vec()))
+        );
+        assert_eq!(
+            journal_param_wire(&JournalValue::Bytes(vec![0xde, 0xad])),
+            (0, Some(b"\\xdead".to_vec()))
+        );
+        assert_eq!(
+            journal_param_wire(&JournalValue::Array(vec![
+                JournalValue::Int64(1),
+                JournalValue::Text("a b".into()),
+                JournalValue::Null
+            ])),
+            (0, Some(b"{1,\"a b\",NULL}".to_vec()))
+        );
     }
 
     #[test]

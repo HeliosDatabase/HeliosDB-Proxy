@@ -357,6 +357,151 @@ pub struct ProxyConfig {
     /// config without a `[limits]` block is byte-for-byte unchanged.
     #[serde(default)]
     pub limits: LimitsToml,
+    /// Recovery journal retention and durability (TR-07): caps on retained
+    /// active/committed transactions, the on-disk segment store and its fsync
+    /// policy. Journaling itself follows `tr_enabled`. Every key defaults to
+    /// the value it had as a hardcoded constant; an absent `[journal]` keeps
+    /// the journal in memory only.
+    #[serde(default)]
+    pub journal: JournalToml,
+}
+
+/// `[journal]` — recovery-journal retention and durability (TR-07).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JournalToml {
+    /// Cap on retained **active** (open) transaction journals across all
+    /// sessions; the oldest are evicted at the cap. Prior constant
+    /// `max_journals = 50_000`.
+    #[serde(default = "default_journal_max_active_transactions")]
+    pub max_active_transactions: usize,
+    /// Cap on statements journaled per transaction. Beyond it the transaction
+    /// is kept but marked incomplete. Prior constant `max_entries = 10_000`.
+    #[serde(default = "default_journal_max_entries_per_transaction")]
+    pub max_entries_per_transaction: usize,
+    /// Cap on bytes (statement text + parameters) journaled per transaction.
+    /// Prior constant `max_size = 64 MiB`.
+    #[serde(default = "default_journal_max_bytes_per_transaction")]
+    pub max_bytes_per_transaction: usize,
+    /// Cap on **committed** transactions retained in memory for replay; the
+    /// oldest are evicted first.
+    #[serde(default = "default_journal_max_committed_transactions")]
+    pub max_committed_transactions: usize,
+    /// Cap on bytes of committed transactions retained in memory.
+    #[serde(default = "default_journal_max_committed_bytes")]
+    pub max_committed_bytes: usize,
+    /// A single statement longer than this is journaled without its text and
+    /// marks its transaction incomplete (bounds per-statement memory on the
+    /// capture path).
+    #[serde(default = "default_journal_max_statement_bytes")]
+    pub max_statement_bytes: usize,
+    /// Directory for the durable segment store. Empty (the default) keeps the
+    /// journal in process memory only: nothing survives a restart. When set,
+    /// every committed transaction is appended to `journal-<seq>.log`
+    /// segments there and reloaded at startup.
+    #[serde(default)]
+    pub dir: String,
+    /// Bytes after which the current segment file is closed and a new one
+    /// started.
+    #[serde(default = "default_journal_segment_bytes")]
+    pub segment_bytes: u64,
+    /// Total on-disk bytes to retain; the oldest whole segments beyond it are
+    /// deleted.
+    #[serde(default = "default_journal_retain_bytes")]
+    pub retain_bytes: u64,
+    /// When appended records reach disk: `"commit"` = `fsync` after every
+    /// record, `"interval"` = group `fsync` every `fsync_interval_ms`,
+    /// `"none"` = leave it to the OS page cache.
+    #[serde(default = "default_journal_fsync")]
+    pub fsync: String,
+    /// Group-`fsync` period for `fsync = "interval"`.
+    #[serde(default = "default_journal_fsync_interval_ms")]
+    pub fsync_interval_ms: u64,
+    /// Bounded queue between the data path and the segment writer. A full
+    /// queue never stalls a client: the record is dropped and counted
+    /// (`journal_dropped_total`, and `coverage.dropped_transactions`).
+    #[serde(default = "default_journal_writer_queue")]
+    pub writer_queue: usize,
+}
+
+fn default_journal_max_active_transactions() -> usize {
+    50_000
+}
+fn default_journal_max_entries_per_transaction() -> usize {
+    10_000
+}
+fn default_journal_max_bytes_per_transaction() -> usize {
+    64 * 1024 * 1024
+}
+fn default_journal_max_committed_transactions() -> usize {
+    50_000
+}
+fn default_journal_max_committed_bytes() -> usize {
+    256 * 1024 * 1024
+}
+fn default_journal_max_statement_bytes() -> usize {
+    1024 * 1024
+}
+fn default_journal_segment_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+fn default_journal_retain_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+fn default_journal_fsync() -> String {
+    "interval".to_string()
+}
+fn default_journal_fsync_interval_ms() -> u64 {
+    100
+}
+fn default_journal_writer_queue() -> usize {
+    4096
+}
+
+impl Default for JournalToml {
+    fn default() -> Self {
+        Self {
+            max_active_transactions: default_journal_max_active_transactions(),
+            max_entries_per_transaction: default_journal_max_entries_per_transaction(),
+            max_bytes_per_transaction: default_journal_max_bytes_per_transaction(),
+            max_committed_transactions: default_journal_max_committed_transactions(),
+            max_committed_bytes: default_journal_max_committed_bytes(),
+            max_statement_bytes: default_journal_max_statement_bytes(),
+            dir: String::new(),
+            segment_bytes: default_journal_segment_bytes(),
+            retain_bytes: default_journal_retain_bytes(),
+            fsync: default_journal_fsync(),
+            fsync_interval_ms: default_journal_fsync_interval_ms(),
+            writer_queue: default_journal_writer_queue(),
+        }
+    }
+}
+
+/// Durability policy parsed from `[journal] fsync`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalFsync {
+    /// `fsync` after every appended record.
+    Commit,
+    /// Group `fsync` every `fsync_interval_ms`.
+    Interval,
+    /// Never `fsync` explicitly.
+    None,
+}
+
+impl JournalToml {
+    /// The parsed fsync policy (`validate` guarantees it parses).
+    pub fn fsync_policy(&self) -> JournalFsync {
+        match self.fsync.trim().to_ascii_lowercase().as_str() {
+            "commit" => JournalFsync::Commit,
+            "none" => JournalFsync::None,
+            _ => JournalFsync::Interval,
+        }
+    }
+
+    /// `Some(dir)` when a durable segment store is configured.
+    pub fn dir(&self) -> Option<&str> {
+        let d = self.dir.trim();
+        (!d.is_empty()).then_some(d)
+    }
 }
 
 fn default_drain_timeout_secs() -> u64 {
@@ -1496,6 +1641,7 @@ impl Default for ProxyConfig {
             optimize_unnamed_parse: true,
             shutdown_drain_timeout_secs: default_drain_timeout_secs(),
             limits: LimitsToml::default(),
+            journal: JournalToml::default(),
         }
     }
 }
@@ -1800,6 +1946,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "optimize_unnamed_parse",
     "shutdown_drain_timeout_secs",
     "limits",
+    "journal",
 ];
 
 /// Detect TOP-LEVEL TOML keys that are not fields of [`ProxyConfig`] (silent
@@ -2174,6 +2321,53 @@ impl ProxyConfig {
             if l.tr_max_session_set_statements == 0 {
                 return Err(ProxyError::Config(
                     "limits.tr_max_session_set_statements must be >= 1".to_string(),
+                ));
+            }
+        }
+
+        // Recovery journal (TR-07): every cap is a safety bound, so zero is
+        // rejected rather than read as "unbounded".
+        {
+            let j = &self.journal;
+            let count_checks = [
+                ("journal.max_active_transactions", j.max_active_transactions),
+                (
+                    "journal.max_entries_per_transaction",
+                    j.max_entries_per_transaction,
+                ),
+                (
+                    "journal.max_bytes_per_transaction",
+                    j.max_bytes_per_transaction,
+                ),
+                (
+                    "journal.max_committed_transactions",
+                    j.max_committed_transactions,
+                ),
+                ("journal.max_committed_bytes", j.max_committed_bytes),
+                ("journal.max_statement_bytes", j.max_statement_bytes),
+                ("journal.writer_queue", j.writer_queue),
+            ];
+            for (name, value) in count_checks {
+                if value == 0 {
+                    return Err(ProxyError::Config(format!("{name} must be >= 1")));
+                }
+            }
+            if j.segment_bytes == 0 || j.retain_bytes == 0 {
+                return Err(ProxyError::Config(
+                    "journal.segment_bytes and journal.retain_bytes must be >= 1".to_string(),
+                ));
+            }
+            match j.fsync.trim().to_ascii_lowercase().as_str() {
+                "commit" | "interval" | "none" => {}
+                other => {
+                    return Err(ProxyError::Config(format!(
+                        "journal.fsync must be \"commit\", \"interval\" or \"none\" (got {other:?})"
+                    )));
+                }
+            }
+            if j.fsync_policy() == JournalFsync::Interval && j.fsync_interval_ms == 0 {
+                return Err(ProxyError::Config(
+                    "journal.fsync_interval_ms must be >= 1 for fsync = \"interval\"".to_string(),
                 ));
             }
         }
@@ -3485,6 +3679,75 @@ database = "helios"
         assert_eq!(limits.client_write_timeout_secs, 60);
         assert_eq!(limits.max_pending_bytes, 64 * 1024 * 1024);
         assert_eq!(limits.pool_reap_interval_secs, 30);
+    }
+
+    #[test]
+    fn test_journal_toml_defaults_and_partial_overrides() {
+        let base = || {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            c
+        };
+        let j = JournalToml::default();
+        assert_eq!(j.max_active_transactions, 50_000);
+        assert_eq!(j.max_entries_per_transaction, 10_000);
+        assert_eq!(j.max_bytes_per_transaction, 64 * 1024 * 1024);
+        assert_eq!(j.max_committed_transactions, 50_000);
+        assert_eq!(j.max_committed_bytes, 256 * 1024 * 1024);
+        assert_eq!(j.max_statement_bytes, 1024 * 1024);
+        assert_eq!(j.dir(), None, "memory-only by default");
+        assert_eq!(j.fsync_policy(), JournalFsync::Interval);
+        assert_eq!(j.fsync_interval_ms, 100);
+        assert_eq!(j.writer_queue, 4096);
+
+        let j: JournalToml = toml::from_str(
+            "dir = \"/var/lib/helios/journal\"\nfsync = \"Commit\"\nmax_committed_transactions = 7\n",
+        )
+        .expect("parse partial JournalToml");
+        assert_eq!(j.dir(), Some("/var/lib/helios/journal"));
+        assert_eq!(j.fsync_policy(), JournalFsync::Commit);
+        assert_eq!(j.max_committed_transactions, 7);
+        assert_eq!(j.segment_bytes, 64 * 1024 * 1024);
+
+        // Full config path: an absent [journal] section is the defaults.
+        let cfg = base();
+        assert_eq!(cfg.journal.max_active_transactions, 50_000);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_journal_toml_validation_rejects_zero_and_bad_fsync() {
+        let base = || {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            c
+        };
+        let mut cfg = base();
+        cfg.journal.max_committed_transactions = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("journal.max_committed_transactions"), "{err}");
+
+        let mut cfg = base();
+        cfg.journal.fsync = "sometimes".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("journal.fsync"), "{err}");
+
+        let mut cfg = base();
+        cfg.journal.fsync_interval_ms = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("fsync_interval_ms"), "{err}");
+
+        let mut cfg = base();
+        cfg.journal.fsync = "none".into();
+        cfg.journal.fsync_interval_ms = 0;
+        assert!(
+            cfg.validate().is_ok(),
+            "interval only matters for fsync = interval"
+        );
+
+        let mut cfg = base();
+        cfg.journal.retain_bytes = 0;
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

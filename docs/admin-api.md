@@ -442,39 +442,78 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:9090/api/analytic
 
 ### POST /api/replay
 
-Replay a window of the transaction journal against a target backend (typically a staging DB) — for failover validation, hydrating staging from prod, or forensics. Body is a `ReplayRequestBody`. **`503 {"error":"transaction replay disabled (tr_enabled = false)"}`** when TR is disabled at runtime; Transaction Replay ships in the default build.
+Replay journaled history against a target backend (typically a staging DB) — for
+failover validation, hydrating staging from prod, or forensics. Body is a
+`ReplayRequestBody`. **`503 {"error":"transaction replay disabled (tr_enabled = false)"}`**
+when TR is disabled at runtime; Transaction Replay ships in the default build.
 
-Body fields: `from` / `to` (RFC 3339), `target_host`, `target_port`, optional `target_user` / `target_password` / `target_database`, and optional `mode`.
+Body fields: `from` / `to` (RFC 3339), `target_host`, `target_port`, optional
+`target_user` / `target_password` / `target_database`, optional `mode`, and (for
+`committed_history`) optional `after_commit_seq`.
 
-`mode` is the honesty switch (TR-07). Omitted or `"time_window"` selects the only implemented replay: it re-executes the journaled SQL text in timestamp order on one connection, runs each statement independently, and does not reconstruct transaction boundaries, exclude rolled-back work, or stop on the first failure. `"committed_history"` is the stronger recovery-grade mode and is **not implemented** — requesting it returns `501` with `requested_mode` / `available_mode` and an explanation, rather than silently running the weaker replay. Any other value is `400`.
+`mode` selects one of two replays (TR-07); any other value is `400`:
 
-This is **operator time-window replay**, not committed-history replay. The response says so explicitly: `"mode": "time_window"`, `"partial": true` whenever at least one statement failed or the deadline cut the run short, and a `"coverage"` block with what the journal actually held (retained transactions/entries/bytes and its global cap) plus `false` flags for transaction boundaries, parameter values, per-statement outcomes and restart durability. The journal itself is in-memory, bounded and non-durable: nothing survives a restart.
+| `mode` | What is replayed | Order | On failure |
+|---|---|---|---|
+| omitted / `"time_window"` | The statement text of every **committed** transaction whose statements fall in `[from, to]` | timestamp order, flattened across transactions, each statement independent | continues; `partial: true`, first error reported |
+| `"committed_history"` | Every transaction whose **commit** was observed in `[from, to]` (and `commit_seq > after_commit_seq`) | commit order, one transaction at a time, each in its own `BEGIN … COMMIT` on one connection, parameters re-sent in their captured format | rolls that transaction back and **stops**; `partial: true`, `stopped_at` says where |
+
+Committed-history replay never leaves a partial transaction on the target: a transaction
+the journal could not capture completely (a `COPY … FROM STDIN`, an `EXECUTE` of a
+session-scoped prepared statement, a statement over `[journal] max_statement_bytes`, a
+per-transaction cap) is refused before it starts. `last_commit_seq` in the response is the
+resume point for the next call.
 
 ```json
 {
-  "mode": "time_window",
-  "statements_replayed": 42,
-  "failures": 1,
+  "mode": "committed_history",
+  "transactions_replayed": 12,
+  "statements_replayed": 41,
+  "transactions_selected": 15,
+  "last_commit_seq": 1042,
   "partial": true,
   "deadline_exceeded": false,
+  "stopped_at": { "tx_id": "…", "commit_seq": 1043, "sequence": 2,
+                  "error": "duplicate key value violates unique constraint" },
   "elapsed_ms": 813,
   "from": 1756684800,
   "to": 1756771200,
-  "first_error": "tx … seq 7: duplicate key value violates unique constraint",
   "coverage": {
-    "retained_transactions": 120,
-    "retained_entries": 120,
-    "retained_bytes": 8192,
+    "retained_transactions": 3,
+    "retained_entries": 7,
+    "retained_bytes": 512,
     "max_journals": 50000,
-    "survives_restart": false,
-    "transaction_boundaries": false,
-    "parameter_values": false,
-    "outcomes": false
+    "committed_transactions": 1042,
+    "committed_entries": 3901,
+    "committed_bytes": 1048576,
+    "max_committed_transactions": 50000,
+    "max_committed_bytes": 268435456,
+    "commit_seq_high": 1042,
+    "dropped_transactions": 0,
+    "survives_restart": true,
+    "transaction_boundaries": true,
+    "parameter_values": true,
+    "outcomes": true
   }
 }
 ```
 
-What the journal contains: **simple-protocol** statements the write classifier routes as writes (DML/DDL, plus `BEGIN`/`COMMIT`/`ROLLBACK`/`SET`), recorded after the backend response was relayed, SQL text only, one synthetic single-statement auto-commit transaction per statement. The hook does not inspect that response, so a statement the backend rejected is journaled just like a committed one — the window is raw statement text in arrival order, not a list of successful operations. Extended-protocol writes (`Parse`/`Bind`/`Execute`) are not journaled at all, and an explicit `BEGIN … COMMIT`/`ROLLBACK` block is not recorded as a transaction — only its individual simple statements are, in arrival order, with no commit/rollback outcome. A window is a best-effort sample of recent write text, never a ledger.
+A `time_window` response keeps its previous shape (`statements_replayed`, `failures`,
+`partial`, `deadline_exceeded`, `first_error`) plus the same `coverage` block.
+
+What the journal contains (TR-07): real transactions as the backend reported them. On
+both the simple and the extended protocol, every data-changing statement the backend
+completed is journaled with its `CommandComplete` tag, the extended-protocol `Bind`
+parameter values byte for byte with their text/binary format and the declared type OIDs,
+the source identity (client address, user, database, backend, tenant) and — once the
+backend answered `COMMIT` — a global commit sequence. Rejected statements, rolled-back
+transactions, work undone by `ROLLBACK TO SAVEPOINT` and two-phase transactions never
+enter committed history. Reads are not journaled, so a read with side effects (`nextval`,
+`set_config`, a volatile function) is not reproduced. `survives_restart` is true when
+`[journal] dir` is configured (see [configuration.md](configuration.md#recovery-journal-journal)).
+The commit order is the order this proxy observed the commit responses, which is a total
+order over everything routed through it but not necessarily the backend's WAL order for
+commits that raced on different sessions.
 
 ### POST /api/shadow
 

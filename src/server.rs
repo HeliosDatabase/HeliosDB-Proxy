@@ -51,6 +51,10 @@ pub struct ProxyServer {
     /// for a zero-downtime reload (Batch H). `None` when the config was built
     /// from CLI flags/defaults rather than a file.
     config_path: Option<String>,
+    /// TR-07: committed transactions recovered from `[journal] dir` at
+    /// construction, loaded into the journal's committed store when `run`
+    /// starts (the load takes the journal's async lock).
+    journal_recovered: std::sync::Mutex<Vec<crate::transaction_journal::TransactionJournalEntry>>,
 }
 
 /// Stand-in "signal stream" on platforms without Unix signals: its `recv()`
@@ -1075,6 +1079,13 @@ struct ServerMetrics {
     /// P-03: jittered waits performed by the primary-select recovery loops. A
     /// large burst after a failover is the reconnect wave H-05 bounds.
     reconnect_attempts: AtomicU64,
+    /// TR-07: transactions the recovery journal recorded as committed.
+    journal_committed: AtomicU64,
+    /// TR-07: captured transactions the backend rolled back (or that were
+    /// lost with their session) and were dropped from the active journal.
+    journal_rolled_back: AtomicU64,
+    /// TR-07: statements appended to the journal (committed or not).
+    journal_statements: AtomicU64,
     /// In-session Transaction Replay (`tr_mode`) counters.
     tr: TrMetrics,
 }
@@ -1190,6 +1201,18 @@ pub struct ClientSession {
     /// ROLLBACK/ABORT and when the session goes idle outside a transaction.
     #[cfg(feature = "query-cache")]
     pub tx_written_tables: std::sync::Mutex<Vec<String>>,
+    /// TR-07 recovery-journal capture: the per-session state machine that
+    /// turns registered statements + observed backend responses into
+    /// committed transactions (`journal_capture`). Locked briefly on the
+    /// forward path (register) and at each response boundary (observe).
+    pub journal: std::sync::Mutex<crate::journal_capture::SessionCapture>,
+    /// Set by the forward path when the current cycle registered a statement
+    /// whose outcome the relay must collect (writes / COPY / control). Reads
+    /// never arm it, so an autocommit read pays no capture work in the relay.
+    pub journal_armed: std::sync::atomic::AtomicBool,
+    /// Mirror of "the capture is inside an explicit transaction": with it
+    /// clear and the response idle, the relay skips the capture mutex.
+    pub journal_open: std::sync::atomic::AtomicBool,
     /// Rich transaction state (tx id, statement log, savepoints) for
     /// Transaction-Replay/library consumers. Only touched on the per-query
     /// path while the session is inside an explicit transaction AND
@@ -1725,6 +1748,42 @@ impl ProxyServer {
         // use site reads a ready value; stored on ServerState below.
         let resolved_limits = ResolvedLimits::from_toml(&config.limits);
 
+        // TR-07: the recovery journal, optionally backed by the durable
+        // segment store under `[journal] dir`. Recovery happens here (sync
+        // file I/O at startup); the recovered transactions are loaded into
+        // the committed store when `run` starts.
+        let mut journal = crate::transaction_journal::TransactionJournal::new()
+            .with_max_journals(config.journal.max_active_transactions)
+            .with_max_entries(config.journal.max_entries_per_transaction)
+            .with_max_size(config.journal.max_bytes_per_transaction)
+            .with_max_committed(config.journal.max_committed_transactions)
+            .with_max_committed_bytes(config.journal.max_committed_bytes);
+        let mut journal_recovered = Vec::new();
+        if let Some(store_cfg) = crate::journal_store::StoreConfig::from_toml(&config.journal) {
+            let dir = store_cfg.dir.clone();
+            let (store, recovered) = crate::journal_store::SegmentStore::open(
+                store_cfg,
+                config.journal.max_committed_transactions,
+                config.journal.max_committed_bytes,
+            )
+            .map_err(|e| ProxyError::Config(format!("journal.dir {}: {}", dir.display(), e)))?;
+            tracing::info!(
+                dir = %dir.display(),
+                segments = recovered.segments,
+                records = recovered.records_read,
+                retained = recovered.transactions.len(),
+                commit_seq_high = recovered.commit_seq_high,
+                truncated_bytes = recovered.truncated_bytes,
+                "recovery journal opened"
+            );
+            let sink = store.spawn_writer().map_err(|e| {
+                ProxyError::Config(format!("journal.dir {}: writer: {}", dir.display(), e))
+            })?;
+            journal = journal.with_sink(sink);
+            journal.set_next_commit_seq(recovered.commit_seq_high + 1);
+            journal_recovered = recovered.transactions;
+        }
+
         // Initialize health status
         let mut health = HashMap::new();
         for node in &config.nodes {
@@ -2127,7 +2186,7 @@ impl ProxyServer {
             backend_pool,
             #[cfg(feature = "wasm-plugins")]
             plugin_manager,
-            transaction_journal: Arc::new(crate::transaction_journal::TransactionJournal::new()),
+            transaction_journal: Arc::new(journal),
             tr_read_policy: Arc::new(TrReadPolicy::from_config(&config.tr_read_functions)),
             #[cfg(feature = "anomaly-detection")]
             anomaly_detector: Arc::new(crate::anomaly::AnomalyDetector::new(
@@ -2151,6 +2210,7 @@ impl ProxyServer {
         });
 
         Ok(Self {
+            journal_recovered: std::sync::Mutex::new(journal_recovered),
             config,
             state,
             shutdown_tx,
@@ -2352,6 +2412,23 @@ impl ProxyServer {
 
     /// Run the proxy server
     pub async fn run(&self) -> Result<()> {
+        // TR-07: make recovered committed history visible to replay before
+        // the first client is served.
+        let recovered = std::mem::take(
+            &mut *self
+                .journal_recovered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        if !recovered.is_empty() {
+            let n = recovered.len();
+            self.state
+                .transaction_journal
+                .load_committed(recovered)
+                .await;
+            tracing::info!(transactions = n, "recovery journal reloaded");
+        }
+
         // Bind with SO_REUSEPORT so a freshly-started binary can bind the SAME
         // listen address concurrently — the kernel load-balances new
         // connections across both processes. That is the mechanism behind the
@@ -2811,6 +2888,18 @@ impl ProxyServer {
                                 .metrics
                                 .reconnect_attempts
                                 .load(Ordering::Relaxed),
+                            journal_committed: server_state
+                                .metrics
+                                .journal_committed
+                                .load(Ordering::Relaxed),
+                            journal_rolled_back: server_state
+                                .metrics
+                                .journal_rolled_back
+                                .load(Ordering::Relaxed),
+                            journal_statements: server_state
+                                .metrics
+                                .journal_statements
+                                .load(Ordering::Relaxed),
                             tr: server_state.metrics.tr.snapshot(),
                         };
                         let mut admin_metrics = admin_state_sync.metrics.write().await;
@@ -3014,6 +3103,11 @@ impl ProxyServer {
             backend_credential: RwLock::new(None),
             #[cfg(feature = "query-cache")]
             tx_written_tables: std::sync::Mutex::new(Vec::new()),
+            journal: std::sync::Mutex::new(crate::journal_capture::SessionCapture::new(
+                config.journal.max_statement_bytes,
+            )),
+            journal_armed: std::sync::atomic::AtomicBool::new(false),
+            journal_open: std::sync::atomic::AtomicBool::new(false),
             tx_state: RwLock::new(TransactionState::default()),
             variables: RwLock::new(HashMap::new()),
             created_at: chrono::Utc::now(),
@@ -3135,6 +3229,10 @@ impl ProxyServer {
             }
             Err(e) => Err(e),
         };
+
+        // TR-07: a transaction still open when the session ends is rolled
+        // back by the backend; drop its active journal.
+        Self::journal_close(&session, &state).await;
 
         // Session deregistration, the connections-closed metric, and the L1
         // cache reclaim are all handled by `_session_guard`'s Drop (which runs
@@ -3637,11 +3735,13 @@ impl ProxyServer {
                             let mut resp = if Self::tr_ends_transaction(sql) {
                                 tr.tx_aborted = false;
                                 Self::note_ready_for_query(session, b'I', false);
+                                Self::journal_discard(session, b'I');
                                 let mut r = Self::create_command_complete("ROLLBACK");
                                 r.extend_from_slice(&Self::create_ready_for_query(b'I'));
                                 r
                             } else {
                                 Self::note_ready_for_query(session, b'E', true);
+                                Self::journal_discard(session, b'E');
                                 let mut r = Self::create_error_response(
                                     "25P02",
                                     "current transaction is aborted, commands ignored until end of transaction block (aborted by proxy failover)",
@@ -4002,6 +4102,7 @@ impl ProxyServer {
                                 if wait_ready {
                                     resp.extend_from_slice(&Self::create_ready_for_query(b'E'));
                                     Self::note_ready_for_query(session, b'E', !bare_sync);
+                                    Self::journal_discard(session, b'E');
                                 }
                                 if !resp.is_empty() {
                                     stream.write_all(&resp).await.map_err(|e| {
@@ -5807,6 +5908,15 @@ impl ProxyServer {
         // response frames ONCE and store them so a later identical read is
         // served from cache without a backend hit. Both caches share the one
         // captured buffer — never capture twice.
+        // TR-07: register the statement the backend is now executing so the
+        // relay collects its outcome (writes, COPY and transaction control
+        // only — reads register nothing and arm nothing).
+        if config.tr_enabled {
+            if let Some(sql) = crate::protocol::query_text(&forward_msg.payload) {
+                Self::journal_register_simple(session, sql);
+            }
+        }
+
         #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
         {
             #[cfg(feature = "query-cache")]
@@ -5884,6 +5994,9 @@ impl ProxyServer {
                             }
                         }
                         let _ = body;
+                        // TR-07: the capture relay has no journal handle; reconcile
+                        // the transaction state from the status it recorded.
+                        Self::journal_observe_status(session, state).await;
                         #[cfg(feature = "query-analytics")]
                         if let Some(sql) = analytics_sql.as_deref() {
                             Self::record_analytics(
@@ -5994,12 +6107,6 @@ impl ProxyServer {
                         } else {
                             Self::edge_invalidate_write(state, config, tables).await;
                         }
-                    }
-                }
-                // Transaction Replay: journal the write for failover/time-travel.
-                if is_write && config.tr_enabled {
-                    if let Some(sql) = crate::protocol::query_text(&forward_msg.payload) {
-                        Self::journal_write(state, session, sql).await;
                     }
                 }
                 #[cfg(feature = "query-analytics")]
@@ -6222,6 +6329,13 @@ impl ProxyServer {
             injected = 5;
         }
 
+        // TR-07: register the batch's Parse/Bind/Execute/Close (and the held
+        // unnamed Parse the backend already holds) so the relay collects each
+        // Execute's outcome with its bound parameter values.
+        if config.tr_enabled {
+            Self::journal_register_batch(session, batch, unnamed.map(|(m, _)| &m[..]));
+        }
+
         let r = if wait_ready {
             Self::stream_until_ready(client, &mut backend.stream, session, state).await
         } else {
@@ -6392,6 +6506,11 @@ impl ProxyServer {
         let mut sent: u64 = 0;
         let mut had_error = false;
         let mut command_complete = false;
+        // TR-07: per-statement completions and the first error are collected
+        // only when the forward path registered something for this cycle.
+        let capture_armed = session.journal_armed.load(Ordering::Relaxed);
+        let mut completions: Vec<crate::journal_capture::Completion> = Vec::new();
+        let mut first_error: Option<(String, String)> = None;
 
         let response = async {
             loop {
@@ -6421,6 +6540,13 @@ impl ProxyServer {
                     if let Some(obs) = observation.as_mut() {
                         obs.note(&rem[..frame_total]);
                     }
+                    if capture_armed {
+                        Self::journal_note_frame(
+                            &rem[..frame_total],
+                            &mut completions,
+                            &mut first_error,
+                        );
+                    }
                     if mtype == b'Z' {
                         // ReadyForQuery: payload is one status byte at rem[5].
                         ready_status = Some(if frame_total >= 6 { rem[5] } else { b'I' });
@@ -6446,6 +6572,16 @@ impl ProxyServer {
                 if let Some(status) = ready_status {
                     Self::note_ready_for_query(session, status, had_error);
                     Self::note_observation(session, observation.as_ref());
+                    Self::journal_observe(
+                        session,
+                        state,
+                        crate::journal_capture::ResponseOutcome {
+                            status,
+                            completions: std::mem::take(&mut completions),
+                            error: first_error.take(),
+                        },
+                    )
+                    .await;
                     return Ok(sent);
                 }
                 if yield_for_copy {
@@ -7542,31 +7678,259 @@ impl ProxyServer {
         }
     }
 
-    /// Journal a successful write statement (Transaction Replay). Each write is
-    /// recorded as its own auto-commit transaction so the time-travel/failover
-    /// replay engine can re-apply it onto a promoted primary or a staging
-    /// target. Best-effort: journal errors never fail the client query.
-    async fn journal_write(state: &Arc<ServerState>, session: &Arc<ClientSession>, sql: &str) {
-        // One lock acquisition and one cheap id draw per write: `begin_and_log`
-        // is the fused begin+log, and the auto-commit id comes from the
-        // per-process counter instead of the OS RNG (see
-        // `transaction_journal::next_auto_commit_tx_id`). Explicit
-        // transactions still use begin_transaction + log_statement.
-        let tx_id = crate::transaction_journal::next_auto_commit_tx_id();
-        let _ = state
-            .transaction_journal
-            .begin_and_log(
-                tx_id,
-                session.id,
-                crate::NodeId::new(),
-                0,
-                sql.to_string(),
-                Vec::new(),
-                None,
-                None,
-                0,
+    // ---- TR-07 recovery-journal capture hooks --------------------------
+
+    /// Register a simple-query string for capture; arms the relay when the
+    /// statement's outcome matters (write, COPY, EXECUTE, transaction control).
+    fn journal_register_simple(session: &ClientSession, sql: &str) {
+        let armed = session
+            .journal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register_simple(sql);
+        if armed {
+            session.journal_armed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Register every `Parse` / `Bind` / `Execute` / `Close` of an extended
+    /// batch (raw wire bytes), preceded by the held unnamed `Parse` message
+    /// when promotion kept it off the wire but the backend still holds it.
+    fn journal_register_batch(session: &ClientSession, batch: &[u8], held_unnamed: Option<&[u8]>) {
+        let mut cap = session.journal.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(msg) = held_unnamed {
+            if msg.len() >= 5 && msg[0] == b'P' {
+                Self::journal_note_parse(&mut cap, &msg[5..]);
+            }
+        }
+        let mut i = 0usize;
+        while i + 5 <= batch.len() {
+            let mtype = batch[i];
+            let len = u32::from_be_bytes([batch[i + 1], batch[i + 2], batch[i + 3], batch[i + 4]])
+                as usize;
+            if len < 4 || i + 1 + len > batch.len() {
+                break;
+            }
+            let payload = &batch[i + 5..i + 1 + len];
+            match mtype {
+                b'P' => Self::journal_note_parse(&mut cap, payload),
+                b'B' => cap.note_bind(payload),
+                b'E' => {
+                    let end = payload
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(payload.len());
+                    let portal = std::str::from_utf8(&payload[..end]).unwrap_or("");
+                    cap.note_execute(portal);
+                }
+                b'C' => cap.note_close(payload),
+                _ => {}
+            }
+            i += 1 + len;
+        }
+        if cap.armed() {
+            session.journal_armed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Decode a `Parse` payload (name, query, param type OIDs) into the capture.
+    fn journal_note_parse(cap: &mut crate::journal_capture::SessionCapture, payload: &[u8]) {
+        let Some(n_end) = payload.iter().position(|&b| b == 0) else {
+            return;
+        };
+        let name = std::str::from_utf8(&payload[..n_end]).unwrap_or("");
+        let rest = &payload[n_end + 1..];
+        let Some(q_end) = rest.iter().position(|&b| b == 0) else {
+            return;
+        };
+        let Ok(query) = std::str::from_utf8(&rest[..q_end]) else {
+            return;
+        };
+        let mut types = Vec::new();
+        let t = &rest[q_end + 1..];
+        if t.len() >= 2 {
+            let n = u16::from_be_bytes([t[0], t[1]]) as usize;
+            let mut off = 2;
+            for _ in 0..n {
+                if off + 4 > t.len() {
+                    break;
+                }
+                types.push(u32::from_be_bytes([
+                    t[off],
+                    t[off + 1],
+                    t[off + 2],
+                    t[off + 3],
+                ]));
+                off += 4;
+            }
+        }
+        cap.note_parse(name, query, types);
+    }
+
+    /// Note one backend frame for the capture: `CommandComplete` tags,
+    /// `PortalSuspended`, `EmptyQueryResponse` and the first `ErrorResponse`.
+    fn journal_note_frame(
+        frame: &[u8],
+        completions: &mut Vec<crate::journal_capture::Completion>,
+        first_error: &mut Option<(String, String)>,
+    ) {
+        use crate::journal_capture::Completion;
+        match frame.first() {
+            Some(b'C') => {
+                let body = frame.get(5..).unwrap_or(&[]);
+                let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+                completions.push(Completion::Tag(
+                    String::from_utf8_lossy(&body[..end]).into_owned(),
+                ));
+            }
+            Some(b's') => completions.push(Completion::Suspended),
+            Some(b'I') => completions.push(Completion::Empty),
+            Some(b'E') if first_error.is_none() => {
+                let mut code = String::new();
+                let mut message = String::new();
+                let mut body = frame.get(5..).unwrap_or(&[]);
+                while let Some((&field, rest)) = body.split_first() {
+                    if field == 0 {
+                        break;
+                    }
+                    let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+                    let value = String::from_utf8_lossy(&rest[..end]);
+                    match field {
+                        b'C' => code = value.into_owned(),
+                        b'M' => message = value.into_owned(),
+                        _ => {}
+                    }
+                    body = rest.get(end + 1..).unwrap_or(&[]);
+                }
+                *first_error = Some((code, message));
+            }
+            _ => {}
+        }
+    }
+
+    /// Source identity of the session's current transaction for the journal.
+    async fn journal_source(session: &ClientSession) -> crate::transaction_journal::SourceIdentity {
+        let (user, database, tenant) = {
+            let vars = session.variables.read().await;
+            (
+                vars.get("user").cloned().unwrap_or_default(),
+                vars.get("database").cloned().unwrap_or_default(),
+                vars.get("tenant_id").cloned(),
             )
-            .await;
+        };
+        let backend = session
+            .current_node
+            .read()
+            .await
+            .clone()
+            .unwrap_or_default();
+        crate::transaction_journal::SourceIdentity {
+            client_addr: session.client_addr.to_string(),
+            user,
+            database,
+            backend,
+            tenant,
+        }
+    }
+
+    /// Apply capture operations to the shared journal and count them.
+    async fn journal_apply(
+        session: &ClientSession,
+        state: &ServerState,
+        ops: Vec<crate::journal_capture::JournalOp>,
+    ) {
+        if ops.is_empty() {
+            return;
+        }
+        let source = Self::journal_source(session).await;
+        let node_id = crate::journal_capture::node_id_for_backend(&source.backend);
+        let applied = crate::journal_capture::apply_ops(
+            &state.transaction_journal,
+            ops,
+            session.id,
+            node_id,
+            &source,
+        )
+        .await;
+        if applied.committed > 0 {
+            state
+                .metrics
+                .journal_committed
+                .fetch_add(applied.committed, Ordering::Relaxed);
+        }
+        if applied.rolled_back > 0 {
+            state
+                .metrics
+                .journal_rolled_back
+                .fetch_add(applied.rolled_back, Ordering::Relaxed);
+        }
+        if applied.statements > 0 {
+            state
+                .metrics
+                .journal_statements
+                .fetch_add(applied.statements, Ordering::Relaxed);
+        }
+    }
+
+    /// A backend response completed (`ReadyForQuery` relayed): reconcile the
+    /// capture with what the backend answered and apply the journal ops.
+    async fn journal_observe(
+        session: &ClientSession,
+        state: &ServerState,
+        outcome: crate::journal_capture::ResponseOutcome,
+    ) {
+        let armed = session.journal_armed.swap(false, Ordering::Relaxed);
+        // Fast path: an idle autocommit response with nothing registered and
+        // no transaction being captured changes nothing.
+        if !armed && outcome.status == b'I' && !session.journal_open.load(Ordering::Relaxed) {
+            return;
+        }
+        let ops = {
+            let mut cap = session.journal.lock().unwrap_or_else(|e| e.into_inner());
+            let ops = cap.observe(&outcome);
+            session
+                .journal_open
+                .store(cap.in_transaction(), Ordering::Relaxed);
+            ops
+        };
+        Self::journal_apply(session, state, ops).await;
+    }
+
+    /// `journal_observe` for a relay that recorded only the status byte
+    /// (the cacheable-read relay never carries a registered statement).
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    async fn journal_observe_status(session: &ClientSession, state: &ServerState) {
+        let status = session.last_rfq_status.load(Ordering::Relaxed);
+        Self::journal_observe(
+            session,
+            state,
+            crate::journal_capture::ResponseOutcome::status_only(status),
+        )
+        .await;
+    }
+
+    /// The proxy synthesized the `ReadyForQuery` the client just saw: nothing
+    /// registered for the cycle reached the backend.
+    fn journal_discard(session: &ClientSession, status: u8) {
+        session.journal_armed.store(false, Ordering::Relaxed);
+        let mut cap = session.journal.lock().unwrap_or_else(|e| e.into_inner());
+        cap.discard(status);
+        // Keep the relay's fast path off until a deferred rollback has been
+        // applied by the next `observe` (it only runs under the lock).
+        session.journal_open.store(
+            cap.in_transaction() || cap.has_deferred(),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The session ended.
+    async fn journal_close(session: &ClientSession, state: &ServerState) {
+        let ops = {
+            let mut cap = session.journal.lock().unwrap_or_else(|e| e.into_inner());
+            cap.close()
+        };
+        session.journal_open.store(false, Ordering::Relaxed);
+        Self::journal_apply(session, state, ops).await;
     }
 
     /// Hand a forwarded query to the analytics engine. This only builds the
@@ -9329,6 +9693,17 @@ impl ProxyServer {
                 .state
                 .metrics
                 .reconnect_attempts
+                .load(Ordering::Relaxed),
+            journal_committed: self.state.metrics.journal_committed.load(Ordering::Relaxed),
+            journal_rolled_back: self
+                .state
+                .metrics
+                .journal_rolled_back
+                .load(Ordering::Relaxed),
+            journal_statements: self
+                .state
+                .metrics
+                .journal_statements
                 .load(Ordering::Relaxed),
             tr: self.state.metrics.tr.snapshot(),
         }
@@ -11531,6 +11906,7 @@ impl ProxyServer {
         tr.tx_savepoints.clear();
         // The response the client just saw ended with ErrorResponse + RFQ.
         Self::note_ready_for_query(session, if in_tx { b'E' } else { b'I' }, true);
+        Self::journal_discard(session, if in_tx { b'E' } else { b'I' });
         if in_tx {
             tr.tx_aborted = true;
         }
@@ -11558,6 +11934,12 @@ pub struct ServerMetricsSnapshot {
     pub admission_timeouts: u64,
     /// P-03: jittered waits in the primary-select recovery loops.
     pub reconnect_attempts: u64,
+    /// TR-07: transactions the recovery journal recorded as committed.
+    pub journal_committed: u64,
+    /// TR-07: captured transactions the backend rolled back.
+    pub journal_rolled_back: u64,
+    /// TR-07: statements appended to the journal.
+    pub journal_statements: u64,
     /// In-session Transaction Replay (`tr_mode`) counters.
     pub tr: TrMetricsSnapshot,
 }
@@ -12073,6 +12455,9 @@ mod tests {
             backend_credential: RwLock::new(None),
             #[cfg(feature = "query-cache")]
             tx_written_tables: std::sync::Mutex::new(Vec::new()),
+            journal: std::sync::Mutex::new(crate::journal_capture::SessionCapture::default()),
+            journal_armed: std::sync::atomic::AtomicBool::new(false),
+            journal_open: std::sync::atomic::AtomicBool::new(false),
             tx_state: RwLock::new(TransactionState::default()),
             variables: RwLock::new(HashMap::new()),
             created_at: chrono::Utc::now(),
@@ -13648,25 +14033,49 @@ mod tests {
             .await
             .unwrap();
             let to = chrono::Utc::now() + chrono::Duration::seconds(60);
+            // TR-07: the window is committed history only.
+            assert!(j.entries_in_window(from, to).await.is_empty());
+            j.commit_transaction(tx).await.unwrap();
             let entries = j.entries_in_window(from, to).await;
             assert_eq!(entries.len(), 1, "journaled statement should be in window");
             assert!(entries[0].1.statement.contains("insert"));
         }
 
-        /// The auto-commit write path (`journal_write`) records one
-        /// single-statement transaction per write via the fused
-        /// `begin_and_log`, with a distinct transaction id per write.
+        /// The write path registers each statement with the session capture
+        /// and the relay's observation commits it: an autocommit write becomes
+        /// one committed transaction with its outcome and source identity
+        /// (TR-07). Reads register nothing.
         #[tokio::test]
-        async fn journal_write_records_one_auto_commit_tx_per_write() {
+        async fn write_path_capture_commits_one_transaction_per_autocommit_write() {
             use super::{make_test_session, test_config};
+            use crate::journal_capture::{Completion, ResponseOutcome};
             use crate::server::ProxyServer;
+            use std::sync::atomic::Ordering;
 
             let server = ProxyServer::new(test_config()).unwrap();
             let session = make_test_session();
             let from = chrono::Utc::now() - chrono::Duration::seconds(60);
 
-            ProxyServer::journal_write(&server.state, &session, "insert into t values (1)").await;
-            ProxyServer::journal_write(&server.state, &session, "update t set a = 2").await;
+            for (sql, tag) in [
+                ("insert into t values (1)", "INSERT 0 1"),
+                ("update t set a = 2", "UPDATE 3"),
+            ] {
+                ProxyServer::journal_register_simple(&session, sql);
+                assert!(session.journal_armed.load(Ordering::Relaxed));
+                ProxyServer::journal_observe(
+                    &session,
+                    &server.state,
+                    ResponseOutcome {
+                        status: b'I',
+                        completions: vec![Completion::Tag(tag.into())],
+                        error: None,
+                    },
+                )
+                .await;
+                assert!(!session.journal_armed.load(Ordering::Relaxed));
+            }
+            ProxyServer::journal_register_simple(&session, "select 1");
+            assert!(!session.journal_armed.load(Ordering::Relaxed));
 
             let to = chrono::Utc::now() + chrono::Duration::seconds(60);
             let entries = server
@@ -13677,16 +14086,89 @@ mod tests {
             assert_eq!(entries.len(), 2, "one journal entry per write");
             assert_ne!(
                 entries[0].0, entries[1].0,
-                "each write gets its own auto-commit transaction id"
+                "each write is its own transaction"
             );
             assert_eq!(
                 server.state.transaction_journal.active_count().await,
-                2,
-                "each write is its own uncommitted journal"
+                0,
+                "autocommit writes are committed, never left active"
             );
-            for (_, e) in &entries {
-                assert_eq!(e.sequence, 1, "auto-commit journals hold one statement");
-            }
+            let committed = server.state.transaction_journal.committed_after(0).await;
+            assert_eq!(committed.len(), 2);
+            assert_eq!(committed[0].commit_seq, Some(1));
+            assert_eq!(committed[1].commit_seq, Some(2));
+            assert_eq!(committed[1].entries[0].rows_affected, Some(3));
+            assert_eq!(
+                committed[0].source.client_addr,
+                session.client_addr.to_string()
+            );
+            assert_eq!(
+                server
+                    .state
+                    .metrics
+                    .journal_committed
+                    .load(Ordering::Relaxed),
+                2
+            );
+        }
+
+        /// A write the backend rejected is never journaled, and a rolled-back
+        /// explicit transaction leaves no committed history (TR-07).
+        #[tokio::test]
+        async fn write_path_capture_excludes_failed_and_rolled_back_work() {
+            use super::{make_test_session, test_config};
+            use crate::journal_capture::{Completion, ResponseOutcome};
+            use crate::server::ProxyServer;
+            use std::sync::atomic::Ordering;
+
+            let server = ProxyServer::new(test_config()).unwrap();
+            let session = make_test_session();
+            let cycle = |sql: &str, status: u8, tags: &[&str], err: bool| {
+                let session = session.clone();
+                let sql = sql.to_string();
+                let tags: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
+                let state = server.state.clone();
+                async move {
+                    ProxyServer::journal_register_simple(&session, &sql);
+                    ProxyServer::journal_observe(
+                        &session,
+                        &state,
+                        ResponseOutcome {
+                            status,
+                            completions: tags.into_iter().map(Completion::Tag).collect(),
+                            error: err.then(|| ("23505".to_string(), "dup".to_string())),
+                        },
+                    )
+                    .await;
+                }
+            };
+            cycle("insert into t values (1)", b'I', &[], true).await;
+            cycle("BEGIN", b'T', &["BEGIN"], false).await;
+            assert!(session.journal_open.load(Ordering::Relaxed));
+            cycle("insert into t values (2)", b'T', &["INSERT 0 1"], false).await;
+            assert_eq!(server.state.transaction_journal.active_count().await, 1);
+            cycle("ROLLBACK", b'I', &["ROLLBACK"], false).await;
+            assert!(!session.journal_open.load(Ordering::Relaxed));
+            assert_eq!(server.state.transaction_journal.active_count().await, 0);
+            assert!(server
+                .state
+                .transaction_journal
+                .committed_after(0)
+                .await
+                .is_empty());
+            assert_eq!(
+                server
+                    .state
+                    .metrics
+                    .journal_rolled_back
+                    .load(Ordering::Relaxed),
+                1
+            );
+            // A session that ends mid-transaction drops its active journal.
+            cycle("BEGIN", b'T', &["BEGIN"], false).await;
+            cycle("insert into t values (3)", b'T', &["INSERT 0 1"], false).await;
+            ProxyServer::journal_close(&session, &server.state).await;
+            assert_eq!(server.state.transaction_journal.active_count().await, 0);
         }
     }
 

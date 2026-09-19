@@ -10,7 +10,7 @@ use crate::config::{NodeConfig, NodeRole, ProxyConfig};
 use crate::edge::{EdgeCache, EdgeRegistry, InvalidationEvent};
 #[cfg(feature = "wasm-plugins")]
 use crate::plugins::PluginManager;
-use crate::replay::{ReplayEngine, TimeTravelRequest};
+use crate::replay::{CommittedHistoryRequest, ReplayEngine, TimeTravelRequest};
 use crate::server::{NodeHealth, ServerMetricsSnapshot};
 use crate::{ProxyError, Result};
 use chrono::{DateTime, Utc};
@@ -1261,37 +1261,26 @@ impl AdminServer {
                 ));
             }
         };
-        // Refuse an unimplemented mode before anything else: silently running
-        // the weaker time-window replay for a caller who asked for committed
-        // history would be exactly the kind of implied guarantee TR-07 exists
-        // to remove.
-        match req.mode.as_deref() {
-            None | Some("time_window") => {}
-            Some("committed_history") => {
-                return Ok((
-                    501,
-                    serde_json::json!({
-                        "error": "committed-history replay is not implemented: the journal \
-                                  does not preserve transaction boundaries, parameter values, \
-                                  outcomes or commit order, and does not survive a restart \
-                                  (TR-07). The only implemented mode is \"time_window\".",
-                        "requested_mode": "committed_history",
-                        "available_mode": "time_window",
-                    }),
-                ));
-            }
+        // Resolve the mode before anything else so a caller is never handed
+        // a weaker replay than the one they asked for (TR-07).
+        let committed = match req.mode.as_deref() {
+            None | Some("time_window") => false,
+            Some("committed_history") => true,
             Some(other) => {
                 return Ok((
                     400,
                     serde_json::json!({
                         "error": format!(
-                            "unknown replay mode {:?}: only \"time_window\" is implemented",
+                            "unknown replay mode {:?}: implemented modes are \"time_window\" \
+                             (best-effort statement text in timestamp order) and \
+                             \"committed_history\" (committed transactions in commit order, \
+                             stop on first failure)",
                             other
                         ),
                     }),
                 ));
             }
-        }
+        };
         let engine = match state.replay_engine.read().await.clone() {
             Some(e) => e,
             None => {
@@ -1301,21 +1290,41 @@ impl AdminServer {
                 ));
             }
         };
-        let tt = TimeTravelRequest {
-            from: req.from,
-            to: req.to,
-            target_host: req.target_host,
-            target_port: req.target_port,
-            target_user: req.target_user,
-            target_password: req.target_password,
-            target_database: req.target_database,
+        let result = if committed {
+            let ch = CommittedHistoryRequest {
+                from: req.from,
+                to: req.to,
+                after_commit_seq: req.after_commit_seq,
+                target_host: req.target_host,
+                target_port: req.target_port,
+                target_user: req.target_user,
+                target_password: req.target_password,
+                target_database: req.target_database,
+            };
+            engine
+                .replay_committed(&ch)
+                .await
+                .and_then(|s| serde_json::to_value(s).map_err(Into::into))
+        } else {
+            let tt = TimeTravelRequest {
+                from: req.from,
+                to: req.to,
+                target_host: req.target_host,
+                target_port: req.target_port,
+                target_user: req.target_user,
+                target_password: req.target_password,
+                target_database: req.target_database,
+            };
+            engine
+                .replay_window(&tt)
+                .await
+                .and_then(|s| serde_json::to_value(s).map_err(Into::into))
         };
-        match engine.replay_window(&tt).await {
-            Ok(summary) => {
-                let mut resp = serde_json::to_value(summary)?;
+        match result {
+            Ok(mut resp) => {
                 // Attach the journal's retained size and its structural
-                // coverage so the summary can never be read as a committed
-                // history (TR-07).
+                // coverage so every summary states exactly what backed it
+                // (TR-07).
                 if let Some(obj) = resp.as_object_mut() {
                     obj.insert(
                         "coverage".to_string(),
@@ -2272,6 +2281,31 @@ impl AdminServer {
             metrics.reconnect_attempts
         ));
 
+        output.push_str(
+            "# HELP heliosdb_proxy_journal_committed_total Transactions the recovery journal recorded as committed (TR-07)\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_journal_committed_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_journal_committed_total {}\n",
+            metrics.journal_committed
+        ));
+        output.push_str(
+            "# HELP heliosdb_proxy_journal_rolled_back_total Captured transactions the backend rolled back (TR-07)\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_journal_rolled_back_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_journal_rolled_back_total {}\n",
+            metrics.journal_rolled_back
+        ));
+        output.push_str(
+            "# HELP heliosdb_proxy_journal_statements_total Statements appended to the recovery journal (TR-07)\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_journal_statements_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_journal_statements_total {}\n",
+            metrics.journal_statements
+        ));
+
         // In-session Transaction Replay (tr_mode) counters.
         let tr = &metrics.tr;
         for (name, help, value) in [
@@ -2399,6 +2433,9 @@ impl AdminState {
                 admission_waited: 0,
                 admission_timeouts: 0,
                 reconnect_attempts: 0,
+                journal_committed: 0,
+                journal_rolled_back: 0,
+                journal_statements: 0,
                 tr: Default::default(),
             }),
             active_sessions: RwLock::new(0),
@@ -2615,6 +2652,12 @@ struct MetricsResponse {
     tr_replay_cap_exceeded_total: u64,
     /// Sessions whose SET tracking hit `[limits] tr_max_session_set_statements`.
     tr_session_set_cap_exceeded_total: u64,
+    /// TR-07 recovery journal: transactions recorded as committed.
+    journal_committed_total: u64,
+    /// TR-07 recovery journal: captured transactions the backend rolled back.
+    journal_rolled_back_total: u64,
+    /// TR-07 recovery journal: statements appended.
+    journal_statements_total: u64,
 }
 
 impl From<ServerMetricsSnapshot> for MetricsResponse {
@@ -2636,6 +2679,9 @@ impl From<ServerMetricsSnapshot> for MetricsResponse {
             tr_unknown_outcome_errors_total: m.tr.unknown_outcome_errors,
             tr_replay_cap_exceeded_total: m.tr.replay_cap_exceeded,
             tr_session_set_cap_exceeded_total: m.tr.session_set_cap_exceeded,
+            journal_committed_total: m.journal_committed,
+            journal_rolled_back_total: m.journal_rolled_back,
+            journal_statements_total: m.journal_statements,
         }
     }
 }
@@ -2865,13 +2911,17 @@ struct ReplayRequestBody {
     /// Target backend port.
     target_port: u16,
     /// Requested replay semantics. Omitted or `"time_window"` runs the
-    /// implemented best-effort window replay. `"committed_history"` is
-    /// reserved for a recovery-grade replay (real transaction boundaries,
-    /// parameters, outcomes, stop-on-failure) that does not exist yet and is
-    /// refused with `501` rather than silently downgraded (TR-07). Any other
-    /// value is a `400`.
+    /// best-effort window replay (journaled statement text in timestamp
+    /// order, continues past failures). `"committed_history"` replays the
+    /// committed transactions whose commit fell in the window, in commit
+    /// order, one transaction at a time on one connection, stopping at the
+    /// first failure (TR-07). Any other value is a `400`.
     #[serde(default)]
     mode: Option<String>,
+    /// `committed_history` only: resume after this commit sequence (the
+    /// `last_commit_seq` of a previous partial run). Default `0`.
+    #[serde(default)]
+    after_commit_seq: u64,
     /// Optional credential overrides — when omitted, the engine uses
     /// the template values set at server startup. Production callers
     /// targeting a separate staging DB pass these explicitly so the
@@ -3105,18 +3155,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_committed_history_mode_is_refused_not_downgraded() {
+    async fn replay_committed_history_mode_is_accepted() {
+        // TR-07: the mode exists now; with no engine attached the accepted
+        // request falls through to the same 503 as time_window.
         let body = r#"{"from":"2026-09-01T00:00:00Z","to":"2026-09-02T00:00:00Z",
-            "target_host":"staging","target_port":5432,"mode":"committed_history"}"#;
+            "target_host":"staging","target_port":5432,"mode":"committed_history",
+            "after_commit_seq":7}"#;
         let (status, resp) = replay_route(body).await;
-        assert_eq!(status, 501, "response: {resp}");
-        assert_eq!(resp["requested_mode"], "committed_history");
-        assert_eq!(resp["available_mode"], "time_window");
-        let err = resp["error"].as_str().unwrap_or_default();
-        assert!(
-            err.contains("not implemented"),
-            "refusal must say the mode is not implemented: {err}"
-        );
+        assert_eq!(status, 503, "response: {resp}");
+        assert_eq!(resp["error"], "replay engine not attached");
     }
 
     #[tokio::test]
@@ -3188,6 +3235,9 @@ mod tests {
             admission_waited: 0,
             admission_timeouts: 0,
             reconnect_attempts: 0,
+            journal_committed: 0,
+            journal_rolled_back: 0,
+            journal_statements: 0,
             tr: crate::server::TrMetricsSnapshot {
                 failovers: 4,
                 statements_reexecuted: 5,
@@ -3218,6 +3268,7 @@ mod tests {
         assert!(output.contains("heliosdb_proxy_admission_waited_total 0"));
         assert!(output.contains("heliosdb_proxy_admission_timeout_total 0"));
         assert!(output.contains("heliosdb_proxy_reconnect_attempts_total 0"));
+        assert!(output.contains("heliosdb_proxy_journal_committed_total 0"));
     }
 
     /// Shed analytics samples must be exposed on `/metrics/prometheus`,
@@ -3263,6 +3314,9 @@ mod tests {
             admission_waited: 0,
             admission_timeouts: 0,
             reconnect_attempts: 0,
+            journal_committed: 0,
+            journal_rolled_back: 0,
+            journal_statements: 0,
             tr: crate::server::TrMetricsSnapshot {
                 transactions_replayed: 9,
                 ..Default::default()

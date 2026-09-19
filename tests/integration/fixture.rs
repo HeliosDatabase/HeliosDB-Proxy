@@ -166,6 +166,13 @@ fn wait_for_tcp(addr: &str, timeout: Duration) -> bool {
 ///
 /// Returns `None` if `HELIOS_TEST_PG_HOST` is not set.
 pub async fn start_proxy() -> Option<ProxyFixture> {
+    start_proxy_with(|_| {}).await
+}
+
+/// `start_proxy` with a hook to adjust the config before the server is built
+/// (e.g. enable Transaction Replay, point `[journal] dir` at a temp dir).
+#[allow(dead_code)]
+pub async fn start_proxy_with(customize: impl FnOnce(&mut ProxyConfig)) -> Option<ProxyFixture> {
     let backend = read_backend_info()?;
 
     let proxy_port = pick_free_port();
@@ -199,6 +206,8 @@ pub async fn start_proxy() -> Option<ProxyFixture> {
         // Disable optional subsystems that need real configuration
         ..Default::default()
     };
+    let mut config = config;
+    customize(&mut config);
 
     let server = match ProxyServer::new(config) {
         Ok(s) => s,

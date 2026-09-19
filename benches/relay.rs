@@ -123,7 +123,8 @@ fn bench_switchover_drain(c: &mut Criterion) {
 mod journal_benches {
     use super::*;
     use heliosdb_proxy::transaction_journal::{
-        JournalEntry, JournalValue, StatementType, TransactionJournal, TransactionJournalEntry,
+        JournalEntry, JournalValue, StatementOutcome, StatementType, TransactionJournal,
+        TransactionJournalEntry, WireProtocol,
     };
     use heliosdb_proxy::NodeId;
     use std::sync::Arc;
@@ -145,6 +146,9 @@ mod journal_benches {
             timestamp: chrono::Utc::now(),
             statement_type: StatementType::Update,
             duration_ms: 3,
+            param_types: Vec::new(),
+            outcome: StatementOutcome::Unobserved,
+            protocol: WireProtocol::Simple,
         }
     }
 
@@ -368,6 +372,8 @@ mod journal_benches {
                         .await
                         .unwrap();
                 }
+                // TR-07: the window reads committed history, so commit each.
+                journal.commit_transaction(tx).await.unwrap();
             }
         });
         // A window that spans every entry (500 entries across 20 transactions).
