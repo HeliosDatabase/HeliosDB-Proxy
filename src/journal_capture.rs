@@ -484,6 +484,10 @@ pub struct SessionCapture {
     /// Operations produced by a synchronous `discard` (a synthesized
     /// `ReadyForQuery`), emitted ahead of the next `observe`.
     deferred: Vec<JournalOp>,
+    /// The explicit transaction being journaled for this session, built
+    /// here and handed to the shared journal only when it commits (see
+    /// [`apply_ops`]).
+    active: Option<TransactionJournalEntry>,
 }
 
 impl Default for SessionCapture {
@@ -531,6 +535,7 @@ impl SessionCapture {
             execs: 0,
             max_statement_bytes: max_statement_bytes.max(1),
             deferred: Vec::new(),
+            active: None,
         }
     }
 
@@ -929,6 +934,11 @@ impl SessionCapture {
     }
 
     /// The session ended: an open transaction is rolled back by the backend.
+    /// The session-local transaction journal, for [`apply_ops`].
+    pub fn active_mut(&mut self) -> &mut Option<TransactionJournalEntry> {
+        &mut self.active
+    }
+
     pub fn close(&mut self) -> Vec<JournalOp> {
         self.pending.clear();
         self.portals.clear();
@@ -1029,54 +1039,83 @@ pub struct Applied {
     pub statements: u64,
 }
 
-/// Apply capture operations to the journal. Journal cap errors mark the
-/// transaction incomplete instead of failing the client.
-pub async fn apply_ops(
+/// Apply capture operations for one session.
+///
+/// An explicit transaction is built in the session's own `local` slot
+/// (`SessionCapture::active_mut`) — begin, every logged statement, savepoints
+/// and incomplete marks touch nothing shared — and reaches the journal's
+/// committed store exactly once, when the backend reports the commit.
+/// Auto-commit statements go straight to the committed store. Nothing here
+/// awaits: the journal's commit path is a short sync mutex, so the caller
+/// runs this under the session's capture lock. (Taking the shared async
+/// journal lock per statement parked every writer behind the scheduler's
+/// wake-up latency under concurrency: −40 % committed TPS at 16 clients in
+/// the P-01 harness, 2026-09-21.)
+pub fn apply_ops(
     journal: &TransactionJournal,
     ops: Vec<JournalOp>,
     session_id: Uuid,
     node_id: NodeId,
     source: &SourceIdentity,
+    local: &mut Option<TransactionJournalEntry>,
 ) -> Applied {
     let mut applied = Applied::default();
     for op in ops {
         match op {
             JournalOp::Begin { tx_id } => {
-                let _ = journal
-                    .begin_transaction_with_source(tx_id, session_id, node_id, 0, source.clone())
-                    .await;
+                if local.take().is_some() {
+                    // Cannot happen (the capture closes one transaction before
+                    // opening the next); treat a leftover as rolled back.
+                    journal.local_end();
+                    journal.note_rollback();
+                }
+                *local = Some(
+                    TransactionJournalEntry::new(tx_id, session_id, node_id, 0)
+                        .with_source(source.clone()),
+                );
+                journal.local_begin();
             }
             JournalOp::Log { tx_id, entry } => {
                 applied.statements += 1;
-                if let Err(e) = journal.log_entry(tx_id, entry).await {
-                    journal
-                        .mark_incomplete(tx_id, &format!("journal cap: {}", e))
-                        .await;
+                if let Some(tx) = local.as_mut().filter(|t| t.tx_id == tx_id) {
+                    if let Err(e) = journal.append_entry(tx, entry) {
+                        tx.mark_incomplete(format!("journal cap: {}", e));
+                    }
                 }
             }
             JournalOp::Savepoint { tx_id, name } => {
-                let _ = journal.create_savepoint(tx_id, name).await;
+                if let Some(tx) = local.as_mut().filter(|t| t.tx_id == tx_id) {
+                    tx.create_savepoint(name);
+                }
             }
             JournalOp::RollbackTo { tx_id, name } => {
-                if journal.rollback_to_savepoint(tx_id, &name).await.is_err() {
-                    journal
-                        .mark_incomplete(
-                            tx_id,
-                            &format!("ROLLBACK TO unknown journal savepoint {:?}", name),
-                        )
-                        .await;
+                if let Some(tx) = local.as_mut().filter(|t| t.tx_id == tx_id) {
+                    if tx.rollback_to_savepoint(&name).is_none() {
+                        tx.mark_incomplete(format!(
+                            "ROLLBACK TO unknown journal savepoint {:?}",
+                            name
+                        ));
+                    }
                 }
             }
             JournalOp::Incomplete { tx_id, reason } => {
-                journal.mark_incomplete(tx_id, &reason).await;
+                if let Some(tx) = local.as_mut().filter(|t| t.tx_id == tx_id) {
+                    tx.mark_incomplete(reason);
+                }
             }
             JournalOp::Commit { tx_id, tag } => {
-                if let Ok(Some(_)) = journal.commit_transaction_with_tag(tx_id, &tag).await {
-                    applied.committed += 1;
+                if let Some(tx) = local.take_if(|t| t.tx_id == tx_id) {
+                    journal.local_end();
+                    if journal.record_committed_sync(tx, &tag).is_some() {
+                        applied.committed += 1;
+                    }
                 }
             }
             JournalOp::Rollback { tx_id } => {
-                let _ = journal.rollback_transaction(tx_id).await;
+                if local.take_if(|t| t.tx_id == tx_id).is_some() {
+                    journal.local_end();
+                    journal.note_rollback();
+                }
                 applied.rolled_back += 1;
             }
             JournalOp::AutoCommit {
@@ -1096,7 +1135,7 @@ pub async fn apply_ops(
                 if let Some(r) = incomplete {
                     tx.mark_incomplete(r);
                 }
-                if journal.record_committed(tx, &tag).await.is_some() {
+                if journal.record_committed_sync(tx, &tag).is_some() {
                     applied.committed += 1;
                 }
             }
@@ -1625,7 +1664,8 @@ mod tests {
             ok(b'T', &["INSERT 0 1"]),
         ));
         all.extend(simple(&mut c, "COMMIT", ok(b'I', &["COMMIT"])));
-        let applied = apply_ops(&journal, all, sid, node, &src).await;
+        let mut local = None;
+        let applied = apply_ops(&journal, all, sid, node, &src, &mut local);
         assert_eq!(applied.committed, 1);
         assert_eq!(journal.active_count().await, 0);
         let committed = journal.committed_after(0).await;
@@ -1651,7 +1691,7 @@ mod tests {
 
         // An auto-commit write follows in commit order.
         let ops = simple(&mut c, "delete from t", ok(b'I', &["DELETE 2"]));
-        let applied = apply_ops(&journal, ops, sid, node, &src).await;
+        let applied = apply_ops(&journal, ops, sid, node, &src, &mut local);
         assert_eq!(applied.committed, 1);
         let committed = journal.committed_after(1).await;
         assert_eq!(committed.len(), 1);

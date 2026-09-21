@@ -7835,25 +7835,29 @@ impl ProxyServer {
         }
     }
 
-    /// Apply capture operations to the shared journal and count them.
-    async fn journal_apply(
-        session: &ClientSession,
+    /// Apply capture operations and count them. Runs under the session's
+    /// capture lock and never awaits: an open explicit transaction lives in
+    /// the session (`SessionCapture::active_mut`) and only a commit touches
+    /// shared state (`journal_capture::apply_ops`).
+    fn journal_apply(
         state: &ServerState,
         ops: Vec<crate::journal_capture::JournalOp>,
+        source: &crate::transaction_journal::SourceIdentity,
+        session_id: Uuid,
+        local: &mut Option<crate::transaction_journal::TransactionJournalEntry>,
     ) {
         if ops.is_empty() {
             return;
         }
-        let source = Self::journal_source(session).await;
         let node_id = crate::journal_capture::node_id_for_backend(&source.backend);
         let applied = crate::journal_capture::apply_ops(
             &state.transaction_journal,
             ops,
-            session.id,
+            session_id,
             node_id,
-            &source,
-        )
-        .await;
+            source,
+            local,
+        );
         if applied.committed > 0 {
             state
                 .metrics
@@ -7887,15 +7891,17 @@ impl ProxyServer {
         if !armed && outcome.status == b'I' && !session.journal_open.load(Ordering::Relaxed) {
             return;
         }
-        let ops = {
+        // The source identity is the only thing that awaits; it is read
+        // before the capture lock so nothing is held across an await.
+        let source = Self::journal_source(session).await;
+        {
             let mut cap = session.journal.lock().unwrap_or_else(|e| e.into_inner());
             let ops = cap.observe(&outcome);
             session
                 .journal_open
                 .store(cap.in_transaction(), Ordering::Relaxed);
-            ops
-        };
-        Self::journal_apply(session, state, ops).await;
+            Self::journal_apply(state, ops, &source, session.id, cap.active_mut());
+        }
     }
 
     /// `journal_observe` for a relay that recorded only the status byte
@@ -7927,12 +7933,11 @@ impl ProxyServer {
 
     /// The session ended.
     async fn journal_close(session: &ClientSession, state: &ServerState) {
-        let ops = {
-            let mut cap = session.journal.lock().unwrap_or_else(|e| e.into_inner());
-            cap.close()
-        };
+        let source = Self::journal_source(session).await;
+        let mut cap = session.journal.lock().unwrap_or_else(|e| e.into_inner());
+        let ops = cap.close();
         session.journal_open.store(false, Ordering::Relaxed);
-        Self::journal_apply(session, state, ops).await;
+        Self::journal_apply(state, ops, &source, session.id, cap.active_mut());
     }
 
     /// Hand a forwarded query to the analytics engine. This only builds the
