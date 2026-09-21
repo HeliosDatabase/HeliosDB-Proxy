@@ -417,8 +417,14 @@ pub trait JournalSink: Send + Sync {
 }
 
 /// Committed transactions in commit order, bounded by count and bytes.
-/// Lives inside `JournalStore` so a commit (take from active, push here) is
-/// one lock acquisition, the same as the pre-TR-07 write path paid.
+///
+/// Kept behind its own short `parking_lot::Mutex` on `TransactionJournal`,
+/// separate from the async lock over the *active* journals: an auto-commit
+/// write (the data path's common case) then never touches the async lock at
+/// all, and an explicit commit holds it only for the `take`. The critical
+/// section here is a `VecDeque` push plus bounded eviction (no allocation,
+/// no I/O), so contention never parks a task — which is what made the async
+/// lock a convoy under concurrent writers (P-01, 2026-09-21).
 #[derive(Debug, Default)]
 struct CommittedStore {
     /// `(transaction, its byte size)` — the size is computed once at push so
@@ -501,8 +507,6 @@ struct JournalStore {
     order: BTreeMap<u64, Uuid>,
     /// Next insertion sequence to hand out.
     next_seq: u64,
-    /// Committed transactions in commit order (TR-07).
-    committed: CommittedStore,
 }
 
 impl JournalStore {
@@ -608,6 +612,12 @@ struct Committed {
 pub struct TransactionJournal {
     /// Active transaction journals, insertion-ordered for O(k) eviction
     journals: Arc<RwLock<JournalStore>>,
+    /// Committed transactions in commit order (TR-07); see `CommittedStore`.
+    committed: parking_lot::Mutex<CommittedStore>,
+    /// Explicit transactions currently journaled session-locally (see
+    /// `journal_capture::apply_ops`): they never enter `journals`, so this
+    /// counter keeps `active_count` and the stats honest.
+    local_active: AtomicU64,
     /// Maximum entries per journal
     max_entries: usize,
     /// Maximum journal size (bytes)
@@ -642,6 +652,8 @@ impl TransactionJournal {
     pub fn new() -> Self {
         Self {
             journals: Arc::new(RwLock::new(JournalStore::default())),
+            committed: parking_lot::Mutex::new(CommittedStore::default()),
+            local_active: AtomicU64::new(0),
             max_entries: 10000,
             max_size: 64 * 1024 * 1024, // 64MB
             max_journals: 50_000,
@@ -695,21 +707,22 @@ impl TransactionJournal {
     /// order given (oldest first). Their `commit_seq` values are kept and
     /// numbering continues after the highest one. Does not feed the sink.
     pub async fn load_committed(&self, txs: Vec<TransactionJournalEntry>) {
-        let mut store = self.journals.write().await;
         let mut high = self.commit_seq_high();
-        for tx in txs {
-            if let Some(seq) = tx.commit_seq {
-                high = high.max(seq);
+        {
+            let mut store = self.committed.lock();
+            for tx in txs {
+                if let Some(seq) = tx.commit_seq {
+                    high = high.max(seq);
+                }
+                let size = tx.total_size();
+                let _ = store.push(
+                    Arc::new(tx),
+                    size,
+                    self.max_committed,
+                    self.max_committed_bytes,
+                );
             }
-            let size = tx.total_size();
-            let _ = store.committed.push(
-                Arc::new(tx),
-                size,
-                self.max_committed,
-                self.max_committed_bytes,
-            );
         }
-        drop(store);
         self.set_next_commit_seq(high + 1);
     }
 
@@ -759,12 +772,12 @@ impl TransactionJournal {
         from: chrono::DateTime<chrono::Utc>,
         to: chrono::DateTime<chrono::Utc>,
     ) -> Vec<(Uuid, JournalEntry)> {
-        // Collect under the read lock ONLY; the sort runs after the guard is
+        // Collect under the lock ONLY; the sort runs after the guard is
         // dropped so a wide window cannot stall live journal writers (O-04).
         let mut out: Vec<(Uuid, JournalEntry)> = {
-            let store = self.journals.read().await;
+            let store = self.committed.lock();
             let mut out: Vec<(Uuid, JournalEntry)> = Vec::new();
-            for j in store.committed.iter() {
+            for j in store.iter() {
                 for entry in &j.entries {
                     if entry.timestamp >= from && entry.timestamp <= to {
                         out.push((j.tx_id, entry.clone()));
@@ -784,9 +797,8 @@ impl TransactionJournal {
         from: chrono::DateTime<chrono::Utc>,
         to: chrono::DateTime<chrono::Utc>,
     ) -> Vec<Arc<TransactionJournalEntry>> {
-        let store = self.journals.read().await;
+        let store = self.committed.lock();
         store
-            .committed
             .iter()
             .filter(|t| {
                 t.committed_at
@@ -799,9 +811,8 @@ impl TransactionJournal {
 
     /// Committed transactions with `commit_seq > after`, in commit order.
     pub async fn committed_after(&self, after: u64) -> Vec<Arc<TransactionJournalEntry>> {
-        let store = self.journals.read().await;
+        let store = self.committed.lock();
         store
-            .committed
             .iter()
             .filter(|t| t.commit_seq.map(|s| s > after).unwrap_or(false))
             .cloned()
@@ -811,25 +822,28 @@ impl TransactionJournal {
     /// Order and retain one committed transaction under the caller's write
     /// guard (one lock acquisition per commit). Returns the sequence, the
     /// shared record for the sink and what the caps evicted.
-    fn push_committed_locked(
-        &self,
-        store: &mut JournalStore,
-        mut tx: TransactionJournalEntry,
-        stamp: CommitStamp,
-    ) -> Committed {
-        let seq = self.next_commit_seq.fetch_add(1, Ordering::SeqCst);
-        tx.commit_seq = Some(seq);
+    fn push_committed(&self, mut tx: TransactionJournalEntry, stamp: CommitStamp) -> Committed {
+        // Everything that allocates or walks the entries happens before the
+        // lock; under it: sequence assignment (so commit order == store
+        // order), one push and the bounded eviction.
         tx.committed_at = Some(stamp.at);
         tx.commit_tag = Some(stamp.tag);
         tx.active = false;
         let size = tx.total_size();
-        let tx = Arc::new(tx);
-        let evicted = store.committed.push(
+        let mut tx = Arc::new(tx);
+        let mut store = self.committed.lock();
+        let seq = self.next_commit_seq.fetch_add(1, Ordering::SeqCst);
+        // The Arc is still unique here: nothing has seen it before the push.
+        if let Some(t) = Arc::get_mut(&mut tx) {
+            t.commit_seq = Some(seq);
+        }
+        let evicted = store.push(
             tx.clone(),
             size,
             self.max_committed,
             self.max_committed_bytes,
         );
+        drop(store);
         Committed { seq, tx, evicted }
     }
 
@@ -855,14 +869,22 @@ impl TransactionJournal {
         tx: TransactionJournalEntry,
         commit_tag: &str,
     ) -> Option<u64> {
+        self.record_committed_sync(tx, commit_tag)
+    }
+
+    /// `record_committed` without an executor: nothing in the commit path
+    /// awaits (the committed store is a short sync mutex), so the data path
+    /// calls this under the session's capture lock.
+    pub fn record_committed_sync(
+        &self,
+        tx: TransactionJournalEntry,
+        commit_tag: &str,
+    ) -> Option<u64> {
         if !self.enabled || tx.entries.is_empty() {
             return None;
         }
         let stamp = CommitStamp::now(commit_tag);
-        let committed = {
-            let mut store = self.journals.write().await;
-            self.push_committed_locked(&mut store, tx, stamp)
-        };
+        let committed = self.push_committed(tx, stamp);
         Some(self.after_commit(committed))
     }
 
@@ -1011,6 +1033,27 @@ impl TransactionJournal {
         if !self.enabled {
             return Ok(());
         }
+        let mut journals = self.journals.write().await;
+        let journal = journals.get_mut(&tx_id).ok_or_else(|| {
+            ProxyError::Internal(format!("No journal for transaction {:?}", tx_id))
+        })?;
+        Self::push_entry(journal, new, self.max_entries, self.max_size)
+    }
+
+    /// Append a completed statement to a transaction journal the caller
+    /// holds (a session-local explicit transaction, see
+    /// `journal_capture::apply_ops`), applying the same per-transaction caps
+    /// and errors as `log_entry`. No shared state is touched.
+    pub fn append_entry(&self, tx: &mut TransactionJournalEntry, new: NewEntry) -> Result<()> {
+        Self::push_entry(tx, new, self.max_entries, self.max_size)
+    }
+
+    fn push_entry(
+        journal: &mut TransactionJournalEntry,
+        new: NewEntry,
+        max_entries: usize,
+        max_size: usize,
+    ) -> Result<()> {
         let NewEntry {
             statement,
             parameters,
@@ -1022,19 +1065,14 @@ impl TransactionJournal {
             protocol,
         } = new;
 
-        let mut journals = self.journals.write().await;
-        let journal = journals.get_mut(&tx_id).ok_or_else(|| {
-            ProxyError::Internal(format!("No journal for transaction {:?}", tx_id))
-        })?;
-
         // Check limits
-        if journal.entries.len() >= self.max_entries {
+        if journal.entries.len() >= max_entries {
             return Err(ProxyError::Internal(
                 "Transaction journal entries limit exceeded".to_string(),
             ));
         }
 
-        if journal.total_size() >= self.max_size {
+        if journal.total_size() >= max_size {
             return Err(ProxyError::Internal(
                 "Transaction journal size limit exceeded".to_string(),
             ));
@@ -1060,6 +1098,27 @@ impl TransactionJournal {
         journal.add_entry(entry);
 
         Ok(())
+    }
+
+    /// A session opened an explicit transaction that it journals locally.
+    pub fn local_begin(&self) {
+        self.local_active.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The session-local transaction ended (committed, rolled back or the
+    /// session closed).
+    pub fn local_end(&self) {
+        let _ = self
+            .local_active
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
+    }
+
+    /// Count a rolled-back transaction whose journal never entered the
+    /// shared map.
+    pub fn note_rollback(&self) {
+        self.rolled_back_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Create a savepoint
@@ -1113,14 +1172,12 @@ impl TransactionJournal {
     ) -> Result<Option<u64>> {
         // Everything that can be prepared before the lock is prepared before it.
         let stamp = CommitStamp::now(commit_tag);
-        let committed = {
-            let mut journals = self.journals.write().await;
-            match journals.take(&tx_id) {
-                None => return Ok(None),
-                Some(tx) if tx.entries.is_empty() => return Ok(None),
-                Some(tx) => self.push_committed_locked(&mut journals, tx, stamp),
-            }
+        let tx = match self.journals.write().await.take(&tx_id) {
+            None => return Ok(None),
+            Some(tx) if tx.entries.is_empty() => return Ok(None),
+            Some(tx) => tx,
         };
+        let committed = self.push_committed(tx, stamp);
         tracing::debug!("Committed journal for transaction {:?}", tx_id);
         Ok(Some(self.after_commit(committed)))
     }
@@ -1153,16 +1210,18 @@ impl TransactionJournal {
 
     /// Get active transaction count
     pub async fn active_count(&self) -> usize {
-        self.journals.read().await.len()
+        self.journals.read().await.len() + self.local_active.load(Ordering::Relaxed) as usize
     }
 
     /// Get statistics
     pub async fn stats(&self) -> JournalStats {
         let journals = self.journals.read().await;
-        let active_transactions = journals.len();
+        let active_transactions =
+            journals.len() + self.local_active.load(Ordering::Relaxed) as usize;
         let total_entries: usize = journals.values().map(|j| j.entries.len()).sum();
         let total_size: usize = journals.values().map(|j| j.total_size()).sum();
-        let committed = &journals.committed;
+        drop(journals);
+        let committed = self.committed.lock();
 
         JournalStats {
             active_transactions,

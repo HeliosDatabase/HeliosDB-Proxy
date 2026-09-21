@@ -17,6 +17,75 @@ stay under 3%.
   candidate's CI does not overlap the baseline CI (Criterion's own change report says
   "regressed" / "improved" / "within noise").
 
+## 2026-09-21 — user path (P-01) for TR-07, and the session-local journal fix
+
+First run of the user-path harness (`scripts/regress/bench-usertp.sh`, P-01) against the TR-07
+change, and the fix it forced. Backend PostgreSQL 18.4 at 127.0.0.1:25433 (host-network container
+on the bench volume), pgbench scale 10, host gpc001ca, proxy binaries `--features all-features`
+release profile, one heavy job at a time under the fleet lock. Evidence under
+`/home/gpc/HDB/sprint/baselines/proxy/1.8.1-tr07h-usertp/` (discovery, isolation runs, stack
+samples) and `/home/gpc/HDB/sprint/baselines/proxy/1.8.1-tr07fix/` (the fix).
+
+**What the Criterion A/B above did not show.** With `synchronous_commit=off` (the write path
+CPU-bound instead of fsync-bound; with it on, every commit is an fsync on the Docker volume and
+the same tree scatters 2× between passes, which makes proxy deltas unreadable), `pgbench -b
+simple-update` at 16 clients through `4f038ec` did **7,594 committed TPS against 12,686** on
+`4b25899` (−40 %; −34 % at 64 clients; −30 % in transaction mode), tight across three passes,
+with direct PostgreSQL unchanged and both the proxy and the backend idle. The read path was
+within ±1.5 % TPS / ±3.5 % p99. Cause: pgbench's script is an explicit `BEGIN…END` block; the
+capture applied begin, each logged statement and the commit through the shared async journal
+lock (four acquisitions per transaction where the old `journal_write` took two), and under 16
+writers each acquisition parked the task behind the scheduler's wake-up latency — 290 µs per
+statement by in-proxy segment timers, +0.8 voluntary context switches per statement. Ruled out
+by isolation runs: the allocator (mimalloc, glibc tcache/arena tunables), retention and eviction
+(cap 1 and cap 5,000,000), the committed-store lock on its own, the source-identity lookup.
+
+**Fix.** An explicit transaction is journaled in the session (`SessionCapture::active`) and
+handed to the committed store once, at the backend-reported commit, through a short sync mutex;
+`journal_capture::apply_ops` no longer awaits. Same bytes, same caps, same incomplete marking;
+the library API is unchanged.
+
+| mode / clients (write, `-b simple-update`) | 4b25899 base | 4f038ec TR-07 | fix | fix vs base |
+|---|---:|---:|---:|---:|
+| session / 16 — committed TPS | 12,169 | 7,594 | 15,110 | +24 % |
+| session / 16 — p99 ms | 2.3 | 2.6 | 1.6 | −33 % |
+| session / 64 — committed TPS | 10,329 | 6,760 | 19,273 | +87 % |
+| session / 64 — p99 ms | 10.1 | 10.9 | 4.7 | −53 % |
+| transaction / 16 — committed TPS | 11,922 | 7,842 | 14,026 | +18 % |
+| transaction / 16 — p99 ms | 2.4 | 2.5 | 1.8 | −26 % |
+| direct PostgreSQL / 16 (control) | 29,778 | — | 29,944 | +0.6 % |
+
+Medians over 3 interleaved passes, DUR 12 s; TR-07 column from the 2026-09-21 discovery run
+(same setup). Read paths: within noise — a dedicated 3-pass read probe at session/16 gives read TPS
+−2.7 % (57.3k → 55.7k, inside the pass scatter; p50 identical) and read p99 −2.6 %. `transaction / 64`
+returned 0 TPS on every binary —
+a pre-existing connect-burst failure in transaction pool mode, tracked as sprinter
+`5600bb2bced4`, excluded here. Unknown-outcome (`08007`) errors: 0 in every run; failed
+transactions: 0. The fix lands above the pre-TR-07 baseline because that path paid a smaller
+version of the same convoy (15.8k with journaling off → 12.5k on).
+
+**Rule going forward:** a change on the write path is measured with this harness at 16 clients,
+CPU-bound (`PGOPTIONS="-c synchronous_commit=off"`), before the Criterion verdict is trusted; the
+microbenchmarks run one task per lock acquisition and cannot show a scheduler convoy.
+
+**Criterion A/B for the fix** (`scripts/bench-gate.sh`, 3 interleaved rounds, 107 cases, vs
+`4b25899`, rustc 1.95.0, evidence `/home/gpc/HDB/sprint/baselines/proxy/1.8.1-tr07fix/`):
+**mean +2.96 % (cumulative budget 3 % — PASS), median +0.44 %, 11 separated improvements, 19
+separated regressions.** This is the cumulative TR-07 + fix delta against the pre-TR-07 tree, so
+the journal-manager cluster of the 2026-09-19 record is present unchanged — it is the cost of
+retaining committed transactions, not of this fix: `journal/manager/begin_log_commit` +77 %
+(443 → 784 ns; the library begin/log/commit path now takes the async lock for the `take` and the
+committed store's mutex for the push), `manager_contention/8, /32` +40 %, +46 % (was +51 %, +48 %),
+`add_entry/push` +31 %, `total_size/1, /16, /128` +33 %, +25 %, +25 % (2–190 ns; larger
+`JournalEntry`), `rollback_to_savepoint/16` +29 %. Everything else separated is untouched code
+at ≤ 13 ns absolute — `pool_mode/prepared_parse/prepare/named` +18 % (13 ns),
+`statement_safety/is_safe/*` +6..14 % (1–3 ns), `protocol/decode_message/*` +10 % (6–13 ns),
+`statement_type/ddl,other` +4..10 % (≤ 1 ns), `pool/acquire_release/single` +5 %,
+`protocol/encode_message/medium_where` +6 % (1.3 ns) — the layout class documented on
+2026-09-18, flipping sign between builds. Improvements of note: `entries_in_window/scan_500`
+−28 %, `statement_type/insert` −12 %. The microbenchmarks cannot express what the fix changes
+(one task per acquisition); the user-path table above is the verdict for it.
+
 ## 2026-09-19 — TR-07 recovery journal (sprinter `e11dbf2094f6`, #49)
 
 Controlled A/B with `scripts/bench-gate.sh`: baseline = main `4b25899` (worktree
@@ -41,8 +110,8 @@ residual is attributed below.
 
 These are nanoseconds per journaled statement or per commit; the user-path harness
 (`scripts/regress/bench-usertp.sh`, P-01) is the instrument that decides whether they are visible
-to a client and needs the owner's go-ahead (Docker pgbench against the live backend). Not run in
-this session.
+to a client. It was run on 2026-09-21 (section above): they were — not these nanoseconds, but the
+lock convoy behind `manager_contention`, at −40 % committed TPS — and the fix is recorded there.
 
 **Layout-class residuals (untouched code, ≤ 2 ns or inside same-binary scatter):**
 `pool_mode/prepared_parse/deallocate/named` +18% (6.5 ns; this function was rewritten by the

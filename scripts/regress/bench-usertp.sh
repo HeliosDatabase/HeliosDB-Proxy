@@ -33,12 +33,18 @@ CLIENTS="${CLIENTS:-1 16 64}"
 DUR="${DUR:-10}"
 MODES="${MODES:-direct session transaction}"
 OUT="${OUT:-/tmp/bench-usertp}"; mkdir -p "$OUT"
+[ -n "${PGOPTIONS:-}" ] && echo "PGOPTIONS=$PGOPTIONS"
+# TR_ENABLED=false / EXTRA_TOML=$'[journal]\nmax_committed_transactions = 1' isolate one subsystem's cost.
+[ -n "${TR_ENABLED:-}${EXTRA_TOML:-}" ] && echo "TR_ENABLED=${TR_ENABLED:-true} EXTRA_TOML=${EXTRA_TOML:-}"
 RUNS_JSON="$OUT/$LABEL-results.json"
 PROXYPID=""
 
 pg(){ docker run --rm --network host -e PGPASSWORD="$BPASS" "$IMG" "$@"; }
 # pgbench runs in a container: mount $OUT so its -l log lands on the host.
-pgv(){ docker run --rm --network host -v "$OUT":/w -e PGPASSWORD="$BPASS" "$IMG" "$@"; }
+# PGOPTIONS (e.g. "-c synchronous_commit=off") is passed through to pgbench so the
+# write path can be measured CPU-bound instead of fsync-bound when the backend's
+# commit latency would otherwise swamp the proxy's share.
+pgv(){ docker run --rm --network host -v "$OUT":/w -e PGPASSWORD="$BPASS" -e PGOPTIONS="${PGOPTIONS:-}" "$IMG" "$@"; }
 cleanup(){ [ -n "$PROXYPID" ] && kill "$PROXYPID" 2>/dev/null; wait "$PROXYPID" 2>/dev/null; }
 trap cleanup EXIT
 
@@ -46,8 +52,8 @@ write_proxy_config(){
   local mode=$1 path=$2
   cat > "$path" <<EOF
 listen_address = "127.0.0.1:$PXPORT"
-admin_address  = "127.0.0.1:$ADMIN"
-tr_enabled     = true
+admin_address  = "$ADMIN"
+tr_enabled     = ${TR_ENABLED:-true}
 tr_mode        = "session"
 write_timeout_secs = 30
 
@@ -81,6 +87,7 @@ port = $PGPORT
 role = "primary"
 weight = 100
 enabled = true
+${EXTRA_TOML:-}
 EOF
 }
 
@@ -123,7 +130,8 @@ run_pgbench(){
   echo "${tps:-0} ${failed:-0}"
 }
 
-# Percentile of the pgbench per-transaction latency log (seconds).
+# Percentiles of the pgbench per-transaction latency log. pgbench logs
+# microseconds; we report milliseconds, comma-separated (they go into a JSON array).
 percentiles(){
   local log=$1
   python3 - "$log" <<'PY'
@@ -139,25 +147,21 @@ for path in glob.glob(sys.argv[1] + ".*"):
                 except ValueError:
                     pass
 if not vals:
-    print("0 0 0 0 0")
+    print("0,0,0,0,0")
 else:
     vals.sort()
     def p(q): return vals[min(len(vals) - 1, int(q * len(vals)))]
-    print(f"{statistics.mean(vals)*1000:.3f} {p(.50)*1000:.3f} {p(.95)*1000:.3f} {p(.99)*1000:.3f} {p(.999)*1000:.3f}")
+    print(",".join(f"{v/1000:.3f}" for v in (statistics.mean(vals), p(.50), p(.95), p(.99), p(.999))))
 PY
 }
 
 # First-row latency proxy: N round-trips of a one-row SELECT through the target.
 first_row_ms(){
   local host=$1 port=$2
-  local start end
-  start=$(date +%s%N)
-  for _ in $(seq 1 20); do
-    pg psql -h "$host" -p "$port" -U "$BUSER" -d "$BDB" -tAc \
-      "select aid from pgbench_accounts limit 1" >/dev/null 2>&1
-  done
-  end=$(date +%s%N)
-  python3 -c "print(f'{($end - $start)/20_000_000:.2f}')"
+  # One container, 20 psql round-trips timed inside it: a container start per
+  # round-trip (~60 ms) would otherwise swamp a sub-millisecond first-row latency.
+  pg bash -c "s=\$(date +%s%N); for _ in \$(seq 1 20); do psql -h $host -p $port -U $BUSER -d $BDB -tAc 'select aid from pgbench_accounts limit 1' >/dev/null 2>&1; done; e=\$(date +%s%N); echo \$(( (e - s) / 20000 ))" \
+    | python3 -c "import sys; print(f'{int(sys.stdin.read().strip() or 0)/1000:.2f}')"
 }
 
 echo "[]" > "$RUNS_JSON"   # results are appended below by python3
@@ -196,11 +200,16 @@ for mode in $MODES; do
     echo "mode=$mode clients=$clients read_tps=$read_tps committed_tps=$write_tps failed=$write_failed"
   done
 
-  # Unknown-outcome signals in the proxy log (direct mode has none).
+  # Unknown-outcome signals (direct mode has none): the proxy's own counter of
+  # SQLSTATE 08007 errors returned, read from the admin API while it still runs.
   if [ "$mode" != "direct" ]; then
     log="$OUT/$LABEL-$mode.log"
-    unknown=$(grep -cE '08007|transaction_resolution_unknown' "$log" 2>/dev/null || true)
-    echo "mode=$mode unknown_outcome_events=${unknown:-0} log=$log"
+    unknown=$(curl -sS --max-time 3 "http://$ADMIN/metrics" 2>/dev/null \
+      | python3 -c 'import json,sys
+try:
+    m=json.load(sys.stdin); print(m.get("tr_unknown_outcome_errors_total", m.get("tr",{}).get("unknown_outcome_errors",0)))
+except Exception: print("n/a")')
+    echo "mode=$mode unknown_outcome_events=${unknown:-n/a} log=$log"
   fi
 
   cleanup

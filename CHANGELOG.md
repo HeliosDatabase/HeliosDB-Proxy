@@ -108,6 +108,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   library-API change that only breaks external constructors is caught before the
   tag instead of hours after (sprinter `c57ebe1d1ae9`).
 
+### Fixed
+
+- **Write-path throughput under concurrent writers (TR-07 follow-up, P-01).** The
+  recovery-journal capture took the shared async journal lock once per statement of an
+  explicit transaction (begin, every logged statement, commit), and under 16 concurrent
+  writers each acquisition parked the task behind the scheduler's wake-up latency:
+  `pgbench -b simple-update` through the proxy fell from 12.5k to 7.5k committed TPS
+  (session and transaction pool modes, `synchronous_commit=off`) while the proxy sat
+  idle. An explicit transaction is now journaled session-locally — begin, statements,
+  savepoints and incomplete marks touch nothing shared — and reaches the journal
+  exactly once, at the backend-reported commit, through a short sync mutex on the
+  committed store. Auto-commit statements take the same path. Committed TPS at 16
+  clients is now above the pre-TR-07 baseline (15.2k vs 13.3k) with write p99 down
+  from 2.3 ms to 1.5 ms; read paths unchanged. The pre-TR-07 baseline paid a smaller
+  version of the same convoy (15.8k with journaling off → 12.5k on), which is why the
+  fix lands above it. Evidence: `/home/gpc/HDB/sprint/baselines/proxy/1.8.1-tr07h-usertp/`.
+
+- `scripts/regress/bench-usertp.sh` (P-01 harness) produced no usable results: the
+  generated proxy config lacked the required `[pool] test_on_acquire` key and doubled
+  the admin listen address (`127.0.0.1:127.0.0.1:9099`, so the admin API never started);
+  latency percentiles were written space-separated into a JSON array (the results file
+  failed to parse) and treated pgbench's microsecond log as seconds (values off by
+  1000×); the "unknown outcome" count grepped `08007` and matched digits inside floats
+  in anomaly log lines; and the first-row probe timed one `docker run` per round-trip.
+  The harness now reads `tr_unknown_outcome_errors_total` from the admin API, reports
+  percentiles in milliseconds, and times the first-row probe inside one container.
+  New knobs for cost isolation: `PGOPTIONS` is passed through to pgbench (e.g.
+  `-c synchronous_commit=off` to measure the write path CPU-bound rather than
+  fsync-bound), `TR_ENABLED=false` and `EXTRA_TOML` splice into the generated proxy
+  config.
+
 ### Changed
 
 - **Allocation-free statement classifiers (perf, sprinter `1d70b68fa7cc`).** The
