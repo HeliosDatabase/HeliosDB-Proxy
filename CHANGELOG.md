@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-09-22
+
 ### Added
 
 - **Recovery-grade transaction journal and committed-history replay (TR-07, #49).**
@@ -108,6 +110,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   library-API change that only breaks external constructors is caught before the
   tag instead of hours after (sprinter `c57ebe1d1ae9`).
 
+### Changed
+
+- **Allocation-free statement classifiers (perf, sprinter `1d70b68fa7cc`).** The
+  per-statement classifiers on the write and pool-mode paths no longer build an
+  uppercased copy of every statement: `StatementType::from_sql` (transaction journal),
+  the statement-mode safety check/warning (`is_safe_query`, `get_query_warning`) and the
+  transaction-mode `PREPARE`/`DEALLOCATE` parsers now use ASCII case-insensitive
+  prefix/substring tests on the trimmed input. Classification is unchanged (same bare
+  prefix semantics; non-ASCII bytes compared verbatim). Controlled 3-round A/B against
+  the pre-change tree: `journal/statement_type/*` −58..−70%, `pool_mode/statement_safety/*`
+  −41..−80%, `pool_mode/prepared_parse/*` −22..−74%; this closes the 1.8.0 codegen
+  regression cluster with margin (details in `benches/BASELINE.md`).
+
+- `scripts/bench-gate.sh`: reproducible Criterion A/B gate — baseline and candidate
+  trees interleaved over N rounds, own target dir per tree, fleet build lock + bounded
+  scope per heavy step, per-case medians across rounds, and a verdict that fails on
+  a mean delta above 3% or any *separated* regression above 2% (every candidate round
+  slower than every baseline round). Archives per-round Criterion estimates, a per-case
+  table and JSON under `/home/gpc/HDB/sprint/baselines/proxy/<label>/`.
+
 ### Fixed
 
 - **Write-path throughput under concurrent writers (TR-07 follow-up, P-01).** The
@@ -138,28 +160,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-c synchronous_commit=off` to measure the write path CPU-bound rather than
   fsync-bound), `TR_ENABLED=false` and `EXTRA_TOML` splice into the generated proxy
   config.
-
-### Changed
-
-- **Allocation-free statement classifiers (perf, sprinter `1d70b68fa7cc`).** The
-  per-statement classifiers on the write and pool-mode paths no longer build an
-  uppercased copy of every statement: `StatementType::from_sql` (transaction journal),
-  the statement-mode safety check/warning (`is_safe_query`, `get_query_warning`) and the
-  transaction-mode `PREPARE`/`DEALLOCATE` parsers now use ASCII case-insensitive
-  prefix/substring tests on the trimmed input. Classification is unchanged (same bare
-  prefix semantics; non-ASCII bytes compared verbatim). Controlled 3-round A/B against
-  the pre-change tree: `journal/statement_type/*` −58..−70%, `pool_mode/statement_safety/*`
-  −41..−80%, `pool_mode/prepared_parse/*` −22..−74%; this closes the 1.8.0 codegen
-  regression cluster with margin (details in `benches/BASELINE.md`).
-
-- `scripts/bench-gate.sh`: reproducible Criterion A/B gate — baseline and candidate
-  trees interleaved over N rounds, own target dir per tree, fleet build lock + bounded
-  scope per heavy step, per-case medians across rounds, and a verdict that fails on
-  a mean delta above 3% or any *separated* regression above 2% (every candidate round
-  slower than every baseline round). Archives per-round Criterion estimates, a per-case
-  table and JSON under `/home/gpc/HDB/sprint/baselines/proxy/<label>/`.
-
-### Fixed
 
 - **Cache byte budgets (C-01, part 2):** L1 per-connection and L3 semantic
   query caches now enforce aggregate retained-byte budgets (defaults 32 MiB and

@@ -413,7 +413,7 @@ heliosdb-proxy --config /etc/heliosproxy/proxy.toml
 ### Docker
 
 ```dockerfile
-FROM rust:1.82 AS builder
+FROM rust:1.86 AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release --features "all-features,postgres-topology"
