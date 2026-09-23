@@ -170,6 +170,23 @@ new feature module:
 
 ## Releasing
 
+Before tagging any release, or before merging a change that touches
+`src/server.rs` relay paths, `src/journal_capture.rs`,
+`src/transaction_journal.rs`, or `src/pool/`, run the P-01 user-path gate:
+
+```bash
+scripts/perf-gate-userpath.sh <base-binary> <candidate-binary> <label>
+```
+
+It drives live pgbench traffic through both binaries (base vs candidate, 3
+interleaved passes) and fails if committed-write TPS or p99 regresses beyond
+budget — the class of regression Criterion's one-task-per-lock microbenchmarks
+(`scripts/bench-gate.sh`) cannot see, because they never contend the same lock
+across concurrent tasks. It needs a live PostgreSQL backend and Docker for the
+pgbench client image, and, per `CLAUDE.md`'s Resource Constraints, explicit
+owner approval for each run. Criterion still gates every change for
+microbenchmark regressions; this gate is in addition to it, not instead of it.
+
 1. Move `## [Unreleased]` in `CHANGELOG.md` to the new version and date; bump
    `version` in `Cargo.toml`.
 2. Run `scripts/release/downstream-check.sh --apply`. HeliosDB-Lite pins this crate

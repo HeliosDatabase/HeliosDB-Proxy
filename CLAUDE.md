@@ -41,6 +41,20 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
    `127.0.0.1:25433`; heavy — see Resource Constraints); its evidence
    baseline tables live in `docs/perf-2026-07/README.md` and are re-measured back-to-back
    with the candidate, never compared across days.
+   **User-path gate (mandatory for write-path changes and releases)**: Criterion runs one
+   task per lock and cannot see scheduler convoys under concurrent write load — on
+   2026-09-21 it passed a TR-07 candidate at +2.97% while the live-backend user-path harness
+   showed -40% committed TPS at 16 clients (async-lock convoy, fixed in 8f412dc). For any
+   change touching `src/server.rs` relay paths, `src/journal_capture.rs`,
+   `src/transaction_journal.rs`, or `src/pool/`, and before every release, run
+   `scripts/perf-gate-userpath.sh <base-binary> <candidate-binary> <label>`. It wraps
+   `scripts/regress/bench-usertp.sh` for 3 interleaved base/candidate passes
+   (`CLIENTS="16 64" DUR=12 PGOPTIONS="-c synchronous_commit=off" MODES="session transaction"`)
+   and gates on `scripts/regress/compare-usertp.py`, which exits 1 if any proxy-mode
+   `committed_write` cell regresses beyond a 3% budget (`BUDGET_PCT`) in TPS or p99 (medians
+   over passes). Like every Docker/pgbench harness here it needs a live PostgreSQL backend
+   and explicit owner approval per run (see Resource Constraints) — record that approval in
+   the GATE-RECORD.
 4. **Lint gates** (exact CI commands):
    - `cargo fmt --check`
    - `cargo clippy --features all-features -- -D warnings` (CI also runs the matrix: default,
