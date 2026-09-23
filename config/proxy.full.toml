@@ -8,6 +8,16 @@
 #
 # Environment variable substitution: ${VAR:-default}
 # Duration fields accept integer seconds unless noted otherwise.
+#
+# A prior draft of this file also carried a `[routing]`, `[lag]`, `[rewriter]`,
+# `[graphql]`, JWT/OAuth/LDAP `[auth.*]` sub-tables, `[cache.l1]`/`[cache.l2]`/
+# `[cache.l3]`/`[cache.invalidation]`, `[distribcache]`, `[ha]`, `[logging]`,
+# and `[metrics]` sections. None of those ever matched `ProxyConfig`
+# (src/config.rs) — TOML silently ignores unknown sections, so they loaded but
+# did nothing — and they have been removed here. The real sections with
+# similar intent are `[routing_hints]`, `[lag_routing]`, `[query_rewrite]`,
+# `[graphql_gateway]`, and the two-key `[auth]` below; see CLAUDE.md's
+# Interfaces list for the full, current set of sections `ProxyConfig` parses.
 
 # =============================================================================
 # PROXY — Core listener settings
@@ -382,161 +392,6 @@ enabled = ${HELIOS_PROXY_CACHE_ENABLED:-true}
 # see how often reads bypass the caches on size grounds.
 max_cacheable_response_bytes = 4194304
 
-# -- L1: Hot cache (per-connection, sub-microsecond lookups) ------------------
-
-[cache.l1]
-enabled  = true
-size     = 500            # Max entries per connection
-ttl_secs = 30             # Time-to-live for each entry
-
-# -- L2: Warm cache (shared across all connections) ---------------------------
-
-[cache.l2]
-enabled           = true
-size_mb           = 256          # Total shared cache size in megabytes
-ttl_secs          = 300          # Default TTL
-normalize_queries = true         # Normalise SQL before keying (improves hit rate)
-storage           = "memory"     # memory | mmap
-# mmap_path       = "/var/lib/helios/cache/l2.mmap"  # Path when storage = mmap
-# compression     = "lz4"        # none | lz4 — compression for cached results
-
-# -- L3: Semantic cache (AI/vector workloads — requires Ollama) ---------------
-
-[cache.l3]
-enabled              = false
-# similarity_threshold = 0.92    # Cosine similarity threshold for a cache hit
-# max_entries          = 5000
-# max_total_bytes      = 268435456   # aggregate retained-payload budget (C-01; 0 = off)
-# ttl_secs             = 3600
-# embedding_endpoint   = "http://ollama:11434"
-# embedding_model      = "all-minilm"
-# embedding_dim        = 384     # all-MiniLM-L6-v2 dimension
-
-# -- Cache invalidation -------------------------------------------------------
-
-[cache.invalidation]
-mode              = "wal"       # wal | ttl | manual
-wal_subscribe     = true        # Subscribe to WAL stream for instant invalidation
-ttl_fallback_secs = 60          # Fallback TTL when WAL is unavailable
-
-# -- Workload-specific TTLs ---------------------------------------------------
-
-# [cache.ttl]
-# oltp_secs      = 60           # Short for transactional queries
-# olap_secs      = 1800         # Long for analytics
-# vector_secs    = 300           # Medium for vector searches
-# ai_agent_secs  = 600           # AI agent conversations
-# rag_secs       = 900           # RAG pipelines
-# default_secs   = 300
-
-# -- Prefetching (predictive cache warming) ------------------------------------
-
-# [cache.prefetch]
-# enabled              = true
-# lookahead            = 3       # How many queries ahead to predict
-# confidence_threshold = 0.3    # Min prediction confidence to trigger prefetch
-# max_queue_size       = 100
-
-# -- Query normalisation -------------------------------------------------------
-
-# [cache.normalization]
-# enabled              = true
-# normalize_literals   = true   # Replace literal values with placeholders
-# normalize_whitespace = true   # Collapse whitespace
-
-# -- Table-specific cache rules -----------------------------------------------
-
-# Shorter TTL for frequently-updated tables:
-# [cache.tables.sessions]
-# ttl_secs = 10
-
-# Exclude sensitive tables from caching entirely:
-# [cache.tables.credentials]
-# exclude = true
-
-# =============================================================================
-# ROUTING — Query routing hints, consistency levels, and aliases
-# =============================================================================
-
-# [routing]
-# # Default routing policy
-# [routing.default]
-# read_target        = "standby"       # primary | standby | any
-# write_target       = "primary"
-# consistency        = "eventual"      # strong | bounded | eventual
-# timeout_secs       = 30
-# auto_detect_writes = true            # Auto-detect writes by SQL verb
-#
-# # Routing hints (SQL comment annotations: /* helios:route=primary */)
-# [routing.hints]
-# enabled            = true
-# allow_node_hints   = true            # Allow routing to specific nodes by name
-# allow_primary_reads = true           # Allow forcing reads to primary
-# require_auth       = false           # Require authentication for hint use
-# strip_hints        = true            # Remove hints before sending to backend
-# log_decisions      = false           # Log every routing decision (debug)
-# max_lag_override_secs = 60           # Max lag override a hint can request
-#
-# # Consistency levels
-# [routing.consistency.strong]
-# allowed_nodes = ["primary", "standby-sync"]
-# max_lag_ms    = 0
-#
-# [routing.consistency.bounded]
-# allowed_nodes = ["primary", "standby-sync", "standby-semisync"]
-# max_lag_ms    = 1000
-#
-# [routing.consistency.eventual]
-# allowed_nodes = ["*"]
-# max_lag_ms    = 0         # 0 = no limit
-#
-# # Route aliases — map a name to a set of nodes
-# [routing.aliases]
-# vector  = ["standby-vector-1", "standby-vector-2"]
-# reports = ["standby-analytics-1"]
-
-# =============================================================================
-# LAG — Replication lag monitoring and routing
-# =============================================================================
-
-# [lag]
-# enabled               = true
-# poll_interval_ms       = 100         # How often to poll lag status
-# default_max_lag_ms     = 1000        # Default max acceptable lag for reads
-# fresh_threshold_ms     = 100         # Below this = "fresh" node
-# stale_threshold_secs   = 10          # Above this = "stale" (excluded)
-#
-# # Fall back to primary when all standbys exceed lag threshold.
-# fallback_to_primary    = true
-# fallback_threshold_secs = 5
-#
-# # Read-Your-Writes (RYW) — after a write, route subsequent reads to nodes
-# # that have replayed past the write's LSN.
-# read_your_writes       = true
-# ryw_retention_secs     = 300         # How long to track RYW LSN per session
-#
-# # Lag calculation method: wal | time | hybrid
-# lag_calculation        = "hybrid"
-# wal_bytes_per_second   = 50000       # Estimated WAL throughput for lag estimation
-#
-# # Lag trend smoothing to avoid oscillation
-# enable_smoothing       = true
-# smoothing_window       = 10          # Number of samples to average
-# min_samples            = 3
-#
-# # Per-sync-mode lag limits
-# [lag.sync_mode.sync]
-# max_lag_ms = 0
-# weight     = 1.0
-#
-# [lag.sync_mode.semisync]
-# max_lag_ms = 500
-# weight     = 0.8
-#
-# [lag.sync_mode.async]
-# max_lag_ms = 10000
-# weight     = 0.5
-
 # =============================================================================
 # RATE LIMIT — Query rate and concurrency limiting
 # =============================================================================
@@ -731,123 +586,20 @@ ttl_fallback_secs = 60          # Fallback TTL when WAL is unavailable
 # # allow_ddl  = false
 
 # =============================================================================
-# AUTH — Authentication and authorisation
+# AUTH — Client authentication
 # =============================================================================
+# Only two keys exist (`AuthConfig` in src/config.rs). `passthrough` (default)
+# relays the client's auth exchange straight to the backend, so the proxy
+# never holds a password. `scram` makes the proxy terminate SCRAM-SHA-256
+# itself against `auth_file`, becoming the auth boundary — required for
+# pooling client credentials across pooled backend connections, and for
+# Transaction Replay recovery against a backend that challenges (a trust
+# backend is otherwise the only kind failover can re-authenticate to).
 
 # [auth]
-# enabled       = false
-# default_role  = "db_minimal"
-#
-# # Default backend credentials (passed through to PostgreSQL).
-# default_database = "${HELIOS_PROXY_DB:-mydb}"
-# default_user     = "${HELIOS_PROXY_USER:-appuser}"
-# default_password = "${HELIOS_PROXY_PASSWORD}"
-#
-# # JWT authentication
-# [auth.jwt]
-# jwks_url               = "https://auth.example.com/.well-known/jwks.json"
-# jwks_refresh_interval_secs = 3600
-# required_audience      = "heliosproxy"
-# clock_skew_secs        = 60
-# user_id_claim          = "sub"
-# roles_claim            = "roles"
-# allowed_algorithms     = ["RS256", "ES256"]
-# # allowed_issuers      = ["https://auth.example.com"]
-#
-# # OAuth token introspection
-# [auth.oauth]
-# introspection_url = "https://auth.example.com/oauth/introspect"
-# client_id         = "${OAUTH_CLIENT_ID}"
-# client_secret     = "${OAUTH_CLIENT_SECRET}"
-# cache_ttl_secs    = 60
-# # required_scopes = ["db:read", "db:write"]
-#
-# # LDAP authentication
-# [auth.ldap]
-# server_url       = "ldap://ldap.example.com:389"
-# bind_dn          = "cn=service,dc=example,dc=com"
-# bind_password    = "${LDAP_BIND_PASSWORD}"
-# user_search_base = "ou=users,dc=example,dc=com"
-# user_filter      = "(uid={0})"
-# group_attribute  = "memberOf"
-# timeout_secs     = 10
-# starttls         = true
-#
-# # API key authentication
-# [auth.api_keys]
-# header_name    = "X-API-Key"
-# prefix         = "hpk_"
-# hash_algorithm = "sha256"
-#
-# # Role mapping rules
-# [[auth.role_mapping]]
-# name      = "admins"
-# condition = { type = "jwt_claim", name = "role", value = "admin" }
-# db_role   = "db_admin"
-# priority  = 100
-#
-# [[auth.role_mapping]]
-# name      = "developers"
-# condition = { type = "group", name = "engineering" }
-# db_role   = "db_readwrite"
-# priority  = 50
-#
-# # Credential providers
-# [auth.credentials]
-# default_provider = "static"       # static | vault | aws_secrets
-# cache_ttl_secs   = 300
-#
-# # [auth.credentials.vault]
-# # address     = "https://vault.example.com"
-# # role        = "heliosproxy"
-# # secret_path = "database/creds/"
-# # tls_verify  = true
-#
-# # Session settings
-# [auth.session]
-# timeout_secs               = 3600
-# idle_timeout_secs          = 1800
-# absolute_timeout_secs      = 86400
-# max_sessions_per_user      = 10
-# extend_on_activity         = true
-#
-# # Auth rate limiting
-# [auth.rate_limit]
-# enabled               = true
-# max_attempts_per_ip    = 60
-# max_failures_per_ip    = 10
-# lockout_duration_secs  = 300
-
-# =============================================================================
-# REWRITER — Query rewriting and safety rules
-# =============================================================================
-
-# [rewriter]
-# enabled            = false
-# log_rewrites       = false
-# log_errors         = true
-# expand_select_star = false          # Expand SELECT * to explicit column list
-# add_default_limit  = false          # Inject LIMIT on queries without one
-# default_limit      = 1000
-# max_query_length   = 1000000
-# cache_enabled      = true
-# cache_ttl_secs     = 300
-# max_cache_entries  = 10000
-#
-# # Agent safety — restrictions applied to AI agent queries
-# [rewriter.agent_safety]
-# enabled         = true
-# max_rows        = 10000
-# max_timeout_secs = 30
-# block_ddl       = true
-# block_admin     = true
-# forbidden_tables = [
-#     "pg_catalog.*",
-#     "information_schema.*",
-#     "secrets",
-#     "credentials",
-# ]
-# # require_where_tables = ["large_events"]  # Force WHERE on big tables
+# mode      = "scram"                      # passthrough (default) | scram
+# auth_file = "/etc/heliosproxy/users.txt"  # "user:secret" per line; secret is
+#                                           # plaintext or "SCRAM-SHA-256$..."
 
 # =============================================================================
 # PLUGINS — WASM plugin runtime
@@ -881,63 +633,6 @@ ttl_fallback_secs = 60          # Fallback TTL when WAL is unavailable
 # # destination = "https://logging.example.com/ingest"
 
 # =============================================================================
-# GRAPHQL — GraphQL-to-SQL gateway
-# =============================================================================
-
-# [graphql]
-# enabled        = false
-# endpoint       = "/graphql"
-# playground     = true               # Enable interactive playground UI
-# introspection  = true               # Allow introspection queries
-#
-# # Schema generation
-# [graphql.schema]
-# auto_generate       = true          # Build schema from database metadata
-# refresh_interval_secs = 300
-# include_system_tables = false
-# excluded_schemas    = ["pg_catalog", "information_schema"]
-#
-# # Query complexity limits
-# [graphql.limits]
-# max_depth       = 10
-# max_complexity  = 1000
-# max_aliases     = 10
-# max_root_fields = 20
-# max_batch_size  = 1000
-# query_timeout_secs = 30
-#
-# # DataLoader batching
-# [graphql.batching]
-# enabled        = true
-# window_ms      = 10
-# max_batch_size = 100
-# dedupe         = true
-#
-# # Response caching
-# [graphql.caching]
-# enabled             = true
-# default_ttl_secs    = 60
-# cache_parsed_queries = true
-# max_cached_queries  = 10000
-#
-# # Table-specific settings
-# # [[graphql.tables]]
-# # name             = "users"
-# # graphql_name     = "User"
-# # exclude_columns  = ["password_hash", "mfa_secret"]
-# # enable_mutations = true
-# # max_depth        = 3
-#
-# # Custom relationships
-# # [[graphql.relationships]]
-# # name        = "author"
-# # from_table  = "posts"
-# # to_table    = "users"
-# # from_column = "user_id"
-# # to_column   = "id"
-# # relation_type = "many_to_one"
-
-# =============================================================================
 # SCHEMA ROUTING — Route queries based on schema/table/regex patterns
 # =============================================================================
 
@@ -956,92 +651,3 @@ ttl_fallback_secs = 60          # Fallback TTL when WAL is unavailable
 # # target     = "standby-vector-1"
 # # priority   = 90
 
-# =============================================================================
-# DISTRIBCACHE — Advanced distributed cache (multi-proxy mesh)
-# =============================================================================
-
-# [distribcache]
-# enabled = false
-#
-# # L1 Hot Cache
-# l1_size_mb         = 256
-# l1_max_entry_size  = 1048576          # 1 MB
-# l1_eviction_policy = "lfu"            # lru | lfu | arc
-#
-# # L2 Warm Cache (disk-backed)
-# l2_enabled     = true
-# l2_size_gb     = 5
-# l2_path        = "/var/lib/heliosproxy/cache"
-# l2_compression = "lz4"               # none | lz4 | zstd
-#
-# # L3 Distributed Cache (mesh across proxy instances)
-# l3_enabled           = false
-# l3_replication_factor = 2
-# l3_peers             = ["10.0.1.10:6433", "10.0.1.11:6433"]
-#
-# # Workload-specific TTLs
-# oltp_cache_ttl_secs       = 60
-# olap_cache_ttl_secs       = 1800
-# vector_cache_ttl_secs     = 300
-# ai_agent_cache_ttl_secs   = 600
-# rag_cache_ttl_secs        = 900
-# default_cache_ttl_secs    = 300
-#
-# # Prefetching
-# prefetch_enabled              = true
-# prefetch_lookahead            = 3
-# prefetch_confidence_threshold = 0.3
-# max_prefetch_queue            = 100
-#
-# # Invalidation
-# invalidation_mode = "hybrid"         # ttl | wal | hybrid
-# # wal_endpoint    = "postgres://primary:5432/mydb"
-# wal_lag_tolerance_ms = 100
-#
-# # Workload scheduling
-# scheduling_policy    = "weighted_fair"  # strict_priority | weighted_fair | time_based | adaptive
-# oltp_priority        = 1.0
-# olap_priority        = 0.3
-# vector_priority      = 0.5
-# ai_agent_priority    = 0.7
-# max_concurrent_oltp  = 500
-# max_concurrent_olap  = 50
-# max_concurrent_vector = 100
-# max_concurrent_ai    = 200
-#
-# # Heatmap analytics
-# heatmap_enabled       = true
-# heatmap_bucket_size_secs = 300
-# heatmap_retention_days   = 7
-#
-# # AI-specific cache settings
-# max_conversation_turns        = 50
-# semantic_similarity_threshold = 0.85
-
-# =============================================================================
-# HA / TR — High availability and Transaction Replay
-# =============================================================================
-
-[ha]
-enabled            = true
-auto_failover      = true
-failover_threshold = 3                # Health check failures before failover
-max_replica_lag_ms = 100              # Max lag for read routing to standbys
-
-# =============================================================================
-# LOGGING
-# =============================================================================
-
-[logging]
-# trace | debug | info | warn | error
-level  = "${HELIOS_PROXY_LOG_LEVEL:-info}"
-# pretty | compact | json
-format = "pretty"
-
-# =============================================================================
-# METRICS — Prometheus scrape endpoint
-# =============================================================================
-
-[metrics]
-enabled = true
-addr    = "0.0.0.0:9100"
