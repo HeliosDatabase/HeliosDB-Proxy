@@ -31,12 +31,18 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
    every new code path (`#[cfg(test)]` unit tests next to the code; `tests/integration/` when
    behavior crosses network/backend/process boundaries).
 3. **Benchmarks**: `cargo bench --features all-features` (Criterion: `benches/pooling.rs`,
-   `benches/routing.rs`; CI only compile-checks with `--no-run`). All available benchmarks
-   must be non-negative vs the recorded baseline, and CUMULATIVE performance degradation
-   across a work session must stay under 3% vs baseline. **No Criterion baseline is recorded
-   yet** — the FIRST task of any implementation session is to record one into
-   `/home/gpc/HDB/Proxy/benches/BASELINE.md` (bench name, metric, value, date, host, features,
-   commit). The proxy-path scalability harness is `scripts/regress/bench-scalability.sh
+   `benches/protocol.rs`, `benches/relay.rs`, `benches/routing.rs`; CI only compile-checks
+   with `--no-run`). All available benchmarks must be non-negative vs the recorded
+   baseline, and CUMULATIVE performance degradation across a work session must stay under
+   3% vs baseline. Criterion baselines are recorded in
+   `/home/gpc/HDB/Proxy/benches/BASELINE.md` (bench name, metric, value, date, host,
+   features, commit; entries through 2026-09-21) — add a new entry there when a change
+   introduces a benchable code path with no prior baseline. The gate tool is
+   `scripts/bench-gate.sh <baseline-tree> <candidate-tree> <label>`: 3 interleaved rounds
+   against a separate baseline worktree (e.g. `Proxy-base-1.8.0`, each tree with its own
+   `CARGO_TARGET_DIR`); FAILs on a cumulative mean regression over `BUDGET_PCT` (default 3)
+   or a run-to-run-scatter-proof separated regression over `SEP_PCT` (default 2). The
+   proxy-path scalability harness is `scripts/regress/bench-scalability.sh
    <proxy-binary>` (Dockerized pgbench against an already-running PG 18.4 backend at
    `127.0.0.1:25433`; heavy — see Resource Constraints); its evidence
    baseline tables live in `docs/perf-2026-07/README.md` and are re-measured back-to-back
@@ -82,7 +88,7 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
 - **Config file** `proxy.toml` — examples in `config/proxy.example.toml`,
   `config/proxy.full.toml`, `config/proxy.postgres.toml`; the working configs under
   `scripts/regress/*.toml` are the most current examples. Authoritative parser:
-  `ProxyConfig` in `src/config.rs` (~1850 lines).
+  `ProxyConfig` in `src/config.rs` (~4300 lines).
   Top-level keys: `listen_address`, `admin_address`, `admin_token`,
   `admin_allow_insecure`, `tr_enabled`, `tr_mode`, `write_timeout_secs`,
   `optimize_unnamed_parse`, `shutdown_drain_timeout_secs`.
@@ -127,7 +133,9 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
 
 ## Resource Constraints
 
-This host crashed ~16h ago (suspected OOM) and runs production-like services. Therefore:
+This host crashed on 2026-07-08 (suspected OOM; see
+`/home/gpc/HDB/sprint/status/incident-2026-07-08.md`) and runs production-like services.
+Therefore:
 
 - Run at most ONE heavy build/test/benchmark at a time — never in parallel; no
   `cargo build & cargo test &`, no parallel feature-matrix runs. Prefer sequential
@@ -143,8 +151,12 @@ This host crashed ~16h ago (suspected OOM) and runs production-like services. Th
   `scripts/regress/run.sh`, `scripts/regress/bench-scalability.sh`, and
   `benchmarks/bench-engines.sh` use Docker only for the psql/pgbench client tooling and
   REQUIRE an already-running backend (PG 18.4 at `127.0.0.1:25433` — the
-  `codex-pg184-bench` container — or a live Nano). Only run any of them with explicit
-  user approval, one at a time, and clean up afterwards.
+  `pg_bench_nano_hostnet` container, host network, same volume as the (stopped)
+  `pg_bench_nano` container it replaced on 2026-09-21 — or a live Nano). Docker's
+  published ports are broken on this host (firewalld) — that is why these harnesses'
+  client-image invocations always use `--network host` rather than a mapped port.
+  Only run any of them with explicit user approval, one at a time, and clean up
+  afterwards.
 
 ### Bounded benchmark invocation (mandatory — root cause of the 2026-07-08 host crash)
 A runaway benchmark (38 GiB RSS) livelocked this host for 16h. Run ANY heavy benchmark or load-generating process in a bounded scope so it dies alone instead of taking the host down:
