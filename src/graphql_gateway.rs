@@ -219,3 +219,185 @@ impl GraphqlGateway {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// A connected loopback TCP pair standing in for a real client/proxy
+    /// socket. `handle()` takes a concrete `tokio::net::TcpStream` (it calls
+    /// the inherent `TcpStream::split`, not a generic `AsyncRead + AsyncWrite`
+    /// split), so a `tokio::io::duplex` pair — which is what the plan asked
+    /// for — cannot be substituted for it. A loopback TCP pair is the
+    /// equivalent that satisfies the concrete type while still involving no
+    /// real backend. `respond()` below IS generic over `AsyncWriteExt`, so
+    /// that test uses a literal `tokio::io::duplex`.
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _peer) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    fn offline_engine() -> Arc<GraphQLEngine> {
+        // No `.with_backend`/`.with_pool`: the engine runs in offline mode
+        // (backend: None) and never dials out, so these tests exercise only
+        // the HTTP parsing/response path in `handle()`.
+        let schema = SchemaIntrospector::new().build_schema(&[]);
+        Arc::new(GraphQLEngine::new(GraphQLConfig::default(), schema))
+    }
+
+    async fn read_all(client: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    fn status_line(resp: &str) -> &str {
+        resp.lines().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn handle_rejects_non_post_with_405() {
+        let (mut client, server) = tcp_pair().await;
+        let cfg = Arc::new(GraphqlGatewayConfig::default());
+        let engine = offline_engine();
+        let task = tokio::spawn(GraphqlGateway::handle(server, cfg, engine));
+
+        client
+            .write_all(b"GET /graphql HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let resp = read_all(&mut client).await;
+        task.await.unwrap().unwrap();
+
+        assert_eq!(status_line(&resp), "HTTP/1.1 405 Method Not Allowed");
+        assert!(resp.contains("use POST with a GraphQL query"));
+    }
+
+    #[tokio::test]
+    async fn handle_rejects_malformed_json_with_400() {
+        let (mut client, server) = tcp_pair().await;
+        let cfg = Arc::new(GraphqlGatewayConfig::default());
+        let engine = offline_engine();
+        let task = tokio::spawn(GraphqlGateway::handle(server, cfg, engine));
+
+        let body = b"{not valid json";
+        let req = format!(
+            "POST /graphql HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        client.write_all(body).await.unwrap();
+        let resp = read_all(&mut client).await;
+        task.await.unwrap().unwrap();
+
+        assert_eq!(status_line(&resp), "HTTP/1.1 400 Bad Request");
+        assert!(resp.contains("invalid JSON"));
+    }
+
+    #[tokio::test]
+    async fn handle_rejects_missing_query_with_400() {
+        let (mut client, server) = tcp_pair().await;
+        let cfg = Arc::new(GraphqlGatewayConfig::default());
+        let engine = offline_engine();
+        let task = tokio::spawn(GraphqlGateway::handle(server, cfg, engine));
+
+        let body = b"{}";
+        let req = format!(
+            "POST /graphql HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        client.write_all(body).await.unwrap();
+        let resp = read_all(&mut client).await;
+        task.await.unwrap().unwrap();
+
+        assert_eq!(status_line(&resp), "HTTP/1.1 400 Bad Request");
+        assert!(resp.contains("missing 'query'"));
+    }
+
+    #[tokio::test]
+    async fn handle_rejects_oversized_declared_body_with_413() {
+        let (mut client, server) = tcp_pair().await;
+        let cfg = Arc::new(GraphqlGatewayConfig::default());
+        let engine = offline_engine();
+        let task = tokio::spawn(GraphqlGateway::handle(server, cfg, engine));
+
+        // MAX_HTTP_BODY_BYTES (8 MiB) is checked against the DECLARED
+        // Content-Length before any body bytes are read, so the client need
+        // not actually send that many bytes to trigger the 413.
+        let oversized = crate::http_util::MAX_HTTP_BODY_BYTES + 1;
+        let req = format!(
+            "POST /graphql HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            oversized
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        let resp = read_all(&mut client).await;
+        task.await.unwrap().unwrap();
+
+        assert_eq!(status_line(&resp), "HTTP/1.1 413 OK");
+        assert!(resp.contains("request body too large"));
+    }
+
+    #[tokio::test]
+    async fn handle_serves_health_without_post() {
+        let (mut client, server) = tcp_pair().await;
+        let cfg = Arc::new(GraphqlGatewayConfig::default());
+        let engine = offline_engine();
+        let task = tokio::spawn(GraphqlGateway::handle(server, cfg, engine));
+
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let resp = read_all(&mut client).await;
+        task.await.unwrap().unwrap();
+
+        assert_eq!(status_line(&resp), "HTTP/1.1 200 OK");
+        assert!(resp.contains("\"status\":\"ok\""));
+    }
+
+    #[tokio::test]
+    async fn respond_writes_status_line_content_type_and_length() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let body = json!({"data": {"ok": true}});
+        GraphqlGateway::respond(&mut server, 200, &body)
+            .await
+            .unwrap();
+        drop(server); // close the write half so the client sees EOF
+
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let resp = String::from_utf8(buf).unwrap();
+
+        let payload = serde_json::to_vec(&body).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resp.contains("Content-Type: application/json\r\n"));
+        assert!(resp.contains(&format!("Content-Length: {}\r\n", payload.len())));
+        assert!(resp.contains("Connection: close\r\n"));
+        assert!(resp.ends_with(&String::from_utf8(payload).unwrap()));
+    }
+
+    #[tokio::test]
+    async fn respond_reason_phrase_falls_back_to_ok_for_unlisted_status() {
+        // `respond()`'s reason-phrase match only covers 200/400/401/405; any
+        // other status code (e.g. the 413 used above) falls through to the
+        // "OK" default arm, so the status LINE carries the right numeric
+        // code but a misleading reason phrase. Documented here rather than
+        // "fixed" — production behaviour must not change.
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        GraphqlGateway::respond(&mut server, 413, &json!({"error":"too large"}))
+            .await
+            .unwrap();
+        drop(server);
+
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let resp = String::from_utf8(buf).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 413 OK\r\n"));
+    }
+}

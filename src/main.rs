@@ -247,3 +247,124 @@ fn load_config(cli: &Cli) -> Result<ProxyConfig> {
     config.validate()?;
     Ok(config)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_defaults_when_no_args() {
+        let cli = Cli::try_parse_from(["heliosdb-proxy"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.config, None);
+        assert_eq!(cli.listen, "0.0.0.0:5432");
+        assert_eq!(cli.admin, "127.0.0.1:9090");
+        assert_eq!(cli.primary, None);
+        assert!(cli.standby.is_empty());
+        assert!(cli.tr);
+        assert_eq!(cli.log_level, "info");
+        assert!(!cli.json_logs);
+    }
+
+    #[test]
+    fn parses_config_flag_short_and_long() {
+        let short = Cli::try_parse_from(["heliosdb-proxy", "-c", "proxy.toml"]).unwrap();
+        assert_eq!(short.config, Some("proxy.toml".to_string()));
+
+        let long = Cli::try_parse_from(["heliosdb-proxy", "--config", "proxy.toml"]).unwrap();
+        assert_eq!(long.config, Some("proxy.toml".to_string()));
+    }
+
+    #[test]
+    fn parses_listen_flag_short_and_long() {
+        let short = Cli::try_parse_from(["heliosdb-proxy", "-l", "0.0.0.0:6000"]).unwrap();
+        assert_eq!(short.listen, "0.0.0.0:6000");
+
+        let long = Cli::try_parse_from(["heliosdb-proxy", "--listen", "0.0.0.0:6001"]).unwrap();
+        assert_eq!(long.listen, "0.0.0.0:6001");
+    }
+
+    #[test]
+    fn parses_admin_flag() {
+        let cli = Cli::try_parse_from(["heliosdb-proxy", "--admin", "10.0.0.5:9999"]).unwrap();
+        assert_eq!(cli.admin, "10.0.0.5:9999");
+    }
+
+    #[test]
+    fn parses_primary_flag() {
+        let cli = Cli::try_parse_from(["heliosdb-proxy", "--primary", "10.0.0.1:5432"]).unwrap();
+        assert_eq!(cli.primary, Some("10.0.0.1:5432".to_string()));
+    }
+
+    #[test]
+    fn parses_repeated_standby_flags() {
+        let cli = Cli::try_parse_from([
+            "heliosdb-proxy",
+            "--standby",
+            "10.0.0.2:5432",
+            "--standby",
+            "10.0.0.3:5432",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.standby,
+            vec!["10.0.0.2:5432".to_string(), "10.0.0.3:5432".to_string()]
+        );
+    }
+
+    #[test]
+    fn tr_flag_is_a_presence_switch_not_a_valued_option() {
+        // `#[arg(long, default_value = "true")]` on a `bool` field still gets
+        // clap's automatic `ArgAction::SetTrue` for the type: `--tr` takes NO
+        // value. Passing `--tr false` does not set `tr = false` — "false" is
+        // left over and clap tries (and fails) to match it against the
+        // `Option<Command>` subcommand slot instead. This means there is
+        // currently no CLI-level way to disable TR by passing an explicit
+        // value; only omitting `--tr` (leaving it at its `true` default)
+        // or passing the bare `--tr` flag are meaningful, and both leave
+        // `tr == true`. Documented here rather than "fixed" — production
+        // behaviour must not change.
+        let cli = Cli::try_parse_from(["heliosdb-proxy", "--tr"]).unwrap();
+        assert!(cli.tr);
+
+        let err = Cli::try_parse_from(["heliosdb-proxy", "--tr", "false"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn parses_log_level_and_json_logs() {
+        let cli =
+            Cli::try_parse_from(["heliosdb-proxy", "--log-level", "debug", "--json-logs"]).unwrap();
+        assert_eq!(cli.log_level, "debug");
+        assert!(cli.json_logs);
+    }
+
+    #[test]
+    fn parses_install_skills_target_both_dry_run() {
+        let cli = Cli::try_parse_from([
+            "heliosdb-proxy",
+            "install",
+            "skills",
+            "--target",
+            "both",
+            "--dry-run",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Install {
+                what: InstallWhat::Skills(args),
+            }) => {
+                assert!(matches!(args.target, SkillTargetCli::Both));
+                assert!(args.dry_run);
+                assert!(!args.symlink);
+                assert!(!args.force);
+            }
+            other => panic!("expected Install{{Skills}} subcommand, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_flag() {
+        assert!(Cli::try_parse_from(["heliosdb-proxy", "--not-a-real-flag"]).is_err());
+    }
+}
