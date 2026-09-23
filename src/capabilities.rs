@@ -165,7 +165,7 @@ pub fn manifest(config: &ProxyConfig) -> Vec<Capability> {
         c(
             "postgres-topology",
             cfg!(feature = "postgres-topology"),
-            config.topology.provider == TopologyProviderKind::Postgres,
+            config.topology.provider != TopologyProviderKind::Static,
             cfg!(feature = "postgres-topology"),
             None,
         ),
@@ -273,7 +273,7 @@ pub fn unavailable_enabled(config: &ProxyConfig) -> Vec<&'static str> {
         ),
         (
             "topology.provider",
-            config.topology.provider == TopologyProviderKind::Postgres,
+            config.topology.provider != TopologyProviderKind::Static,
             cfg!(feature = "postgres-topology"),
         ),
         ("ldap_auth", false, cfg!(feature = "ldap-auth")),

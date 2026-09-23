@@ -393,22 +393,26 @@ health check passes is the primary).
 
 ```toml
 [topology]
-provider = "static"          # static | postgres
+provider = "static"          # static | postgres | patroni
 poll_interval_secs = 2
 lease_timeout_secs = 10
 user = "postgres"
 # password = "${HELIOS_PROXY_TOPOLOGY_PASSWORD}"
 database = "postgres"
+# patroni_endpoints = ["http://10.0.0.1:8008", "http://10.0.0.2:8008"]
+# patroni_request_timeout_ms = 2000
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `provider` | string | `"static"` | `static`: configured roles + the daemon health checker decide the primary. `postgres`: poll `pg_is_in_recovery()` on every configured node and treat the non-recovering node as the primary. `postgres` requires the `postgres-topology` cargo feature — a config that requests it on a build without that feature is rejected at startup. |
+| `provider` | string | `"static"` | `static`: configured roles + the daemon health checker decide the primary. `postgres`: poll `pg_is_in_recovery()` on every configured node and treat the non-recovering node as the primary. `patroni`: poll the Patroni REST API (`GET /cluster`) and treat the cluster's running leader as the primary. `postgres` and `patroni` require the `postgres-topology` cargo feature — a config that requests them on a build without that feature is rejected at startup. |
 | `poll_interval_secs` | u64 | `2` | Seconds between provider polls. **Must be ≥ 1** (0 is rejected at startup). |
 | `lease_timeout_secs` | u64 | `10` | How long a provider observation stays authoritative without a refresh (H-02). When the provider cannot be reached, the write path stops after at most this long instead of proceeding on stale knowledge. **Must be ≥ 1**. |
 | `user` | string | `"postgres"` | User for the provider's own probe connections. |
 | `password` | string | *(none)* | Password for the probe user, if required. |
 | `database` | string | `"postgres"` | Database the probe connects to. |
+| `patroni_endpoints` | list of URLs | `[]` | Patroni REST API base URLs (`http(s)://host:8008`), tried in order each poll; the first that answers is used. **Required** for `provider = "patroni"`; each must start with `http://` or `https://`. |
+| `patroni_request_timeout_ms` | u64 | `2000` | Timeout for one Patroni REST request. **Must be ≥ 1**. |
 
 When a provider is configured it is **authoritative for the write path**: writes go only
 to the provider's leader (which must be an enabled `[[nodes]]` entry), the answer waits

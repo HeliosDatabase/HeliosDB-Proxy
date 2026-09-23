@@ -62,6 +62,41 @@ pub trait TopologyProvider: Send + Sync + 'static {
 
     /// Look up a node by its UUID.
     fn get_node(&self, id: Uuid) -> Option<TopologyNodeInfo>;
+
+    /// Whether the provider currently sees conflicting authority: more than
+    /// one node claims to be the writable primary and the provider cannot
+    /// decide between them. The tracker then drops its leader at once, so
+    /// writes fail closed, instead of waiting for the lease to run out.
+    fn authority_conflict(&self) -> bool {
+        false
+    }
+}
+
+/// Pick the primary among nodes that each report themselves writable
+/// (H-01): the one on the strictly highest timeline — a promotion always
+/// starts a new timeline, so an old primary that kept running is behind.
+/// `None` when any timeline is unknown or the highest is shared: the
+/// conflict cannot be resolved and nothing may be authorized.
+pub fn choose_by_timeline(candidates: &[(usize, Option<u64>)]) -> Option<usize> {
+    let mut best: Option<(usize, u64)> = None;
+    let mut tied = false;
+    for &(idx, timeline) in candidates {
+        let t = timeline?;
+        match best {
+            None => best = Some((idx, t)),
+            Some((_, b)) if t > b => {
+                best = Some((idx, t));
+                tied = false;
+            }
+            Some((_, b)) if t == b => tied = true,
+            Some(_) => {}
+        }
+    }
+    if tied {
+        None
+    } else {
+        best.map(|(idx, _)| idx)
+    }
 }
 
 // ── PostgreSQL topology provider ────────────────────────────────────
@@ -86,6 +121,10 @@ pub struct PostgresTopologyProvider {
     tls_config: std::sync::Arc<rustls::ClientConfig>,
     /// TLS policy applied to every probe connection.
     tls_mode: crate::backend::TlsMode,
+    /// More than one node is writable and the timelines do not decide it.
+    conflict: std::sync::atomic::AtomicBool,
+    /// Polls that found conflicting writable nodes (resolved or not).
+    conflicts_total: AtomicU64,
 }
 
 #[cfg(feature = "postgres-topology")]
@@ -111,7 +150,14 @@ impl PostgresTopologyProvider {
             poll_interval: Duration::from_secs(2),
             tls_config: crate::backend::tls::default_client_config(),
             tls_mode: crate::backend::TlsMode::Prefer,
+            conflict: std::sync::atomic::AtomicBool::new(false),
+            conflicts_total: AtomicU64::new(0),
         }
+    }
+
+    /// Polls that found more than one writable node.
+    pub fn conflicts_total(&self) -> u64 {
+        self.conflicts_total.load(Ordering::Relaxed)
     }
 
     /// Set polling interval.
@@ -138,22 +184,17 @@ impl PostgresTopologyProvider {
 
     /// Poll all nodes and detect primary.
     async fn poll_nodes(&self) {
-        let mut next_primary: Option<TopologyNodeInfo> = None;
+        let mut writable: Vec<usize> = Vec::new();
 
-        for node in &self.nodes {
+        for (idx, node) in self.nodes.iter().enumerate() {
             match self.probe_recovery(node).await {
                 Ok(in_recovery) => {
-                    // The node reporting `pg_is_in_recovery() = false` is
-                    // the primary. In a healthy cluster there is exactly
-                    // one; we take the first we encounter so split-brain
-                    // (briefly possible during failover) still yields a
-                    // deterministic choice.
-                    if !in_recovery && next_primary.is_none() {
-                        next_primary = Some(TopologyNodeInfo {
-                            node_id: node.node_id,
-                            client_addr: format!("{}:{}", node.host, node.port),
-                            is_healthy: true,
-                        });
+                    // A node reporting `pg_is_in_recovery() = false` is
+                    // writable. More than one (an old primary that kept
+                    // running after a promotion) is resolved by timeline
+                    // below, never by probe order.
+                    if !in_recovery {
+                        writable.push(idx);
                     }
                 }
                 Err(e) => {
@@ -171,6 +212,40 @@ impl PostgresTopologyProvider {
             }
         }
 
+        let chosen = match writable.as_slice() {
+            [] => None,
+            [only] => Some(*only),
+            many => {
+                self.conflicts_total.fetch_add(1, Ordering::Relaxed);
+                let mut candidates = Vec::with_capacity(many.len());
+                for &idx in many {
+                    let timeline = self.probe_timeline(&self.nodes[idx]).await.ok();
+                    candidates.push((idx, timeline));
+                }
+                let pick = choose_by_timeline(&candidates);
+                tracing::warn!(
+                    writable = ?many
+                        .iter()
+                        .map(|&i| format!("{}:{}", self.nodes[i].host, self.nodes[i].port))
+                        .collect::<Vec<_>>(),
+                    timelines = ?candidates.iter().map(|c| c.1).collect::<Vec<_>>(),
+                    resolved = pick.is_some(),
+                    "topology: more than one writable node"
+                );
+                pick
+            }
+        };
+        self.conflict
+            .store(writable.len() > 1 && chosen.is_none(), Ordering::Relaxed);
+        let next_primary = chosen.map(|idx| {
+            let node = &self.nodes[idx];
+            TopologyNodeInfo {
+                node_id: node.node_id,
+                client_addr: format!("{}:{}", node.host, node.port),
+                is_healthy: true,
+            }
+        });
+
         let old_primary_id = self.current_primary.read().as_ref().map(|p| p.node_id);
         let new_primary_id = next_primary.as_ref().map(|p| p.node_id);
         if old_primary_id != new_primary_id {
@@ -184,14 +259,20 @@ impl PostgresTopologyProvider {
         }
     }
 
-    /// Connect to a single node and run `SELECT pg_is_in_recovery()`.
-    ///
-    /// Returns `Ok(true)` if the node is a standby, `Ok(false)` for a
-    /// primary. Errors propagate as `BackendError`.
-    async fn probe_recovery(&self, node: &PostgresNode) -> crate::backend::BackendResult<bool> {
-        use crate::backend::{BackendClient, BackendConfig};
+    /// The node's current timeline (`pg_control_checkpoint().timeline_id`).
+    /// Needs a role allowed to call the function (superuser, or granted
+    /// EXECUTE); when it cannot be read the conflict stays unresolved.
+    async fn probe_timeline(&self, node: &PostgresNode) -> crate::backend::BackendResult<u64> {
+        let mut client = crate::backend::BackendClient::connect(&self.probe_config(node)).await?;
+        let value = client
+            .query_scalar("SELECT timeline_id::bigint FROM pg_control_checkpoint()")
+            .await?;
+        client.close().await;
+        Ok(value.as_i64("timeline_id")?.unwrap_or(0).max(0) as u64)
+    }
 
-        let cfg = BackendConfig {
+    fn probe_config(&self, node: &PostgresNode) -> crate::backend::BackendConfig {
+        crate::backend::BackendConfig {
             host: node.host.clone(),
             port: node.port,
             user: node.user.clone(),
@@ -202,9 +283,15 @@ impl PostgresTopologyProvider {
             connect_timeout: self.poll_interval.min(Duration::from_secs(5)),
             query_timeout: self.poll_interval,
             tls_config: self.tls_config.clone(),
-        };
+        }
+    }
 
-        let mut client = BackendClient::connect(&cfg).await?;
+    /// Connect to a single node and run `SELECT pg_is_in_recovery()`.
+    ///
+    /// Returns `Ok(true)` if the node is a standby, `Ok(false)` for a
+    /// primary. Errors propagate as `BackendError`.
+    async fn probe_recovery(&self, node: &PostgresNode) -> crate::backend::BackendResult<bool> {
+        let mut client = crate::backend::BackendClient::connect(&self.probe_config(node)).await?;
         let value = client.query_scalar("SELECT pg_is_in_recovery()").await?;
         client.close().await;
         Ok(value.as_bool("pg_is_in_recovery")?.unwrap_or(false))
@@ -230,6 +317,251 @@ impl TopologyProvider for PostgresTopologyProvider {
                 client_addr: format!("{}:{}", n.host, n.port),
                 is_healthy: true, // Would be checked via actual connection
             })
+    }
+
+    fn authority_conflict(&self) -> bool {
+        self.conflict.load(Ordering::Relaxed)
+    }
+}
+
+// ── Patroni topology provider ───────────────────────────────────────
+
+/// A configured node the Patroni provider may resolve a leader to.
+#[derive(Debug, Clone)]
+pub struct PatroniNode {
+    pub node_id: Uuid,
+    /// `host:port` exactly as configured in `[[nodes]]`.
+    pub address: String,
+}
+
+/// What one `GET /cluster` answer says about write authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatroniView {
+    /// The configured node the running leader maps to.
+    pub leader: Option<(Uuid, String)>,
+    /// The leader's timeline (the authority epoch Patroni reports).
+    pub timeline: Option<u64>,
+    /// More than one member claims to be the running leader.
+    pub conflict: bool,
+    /// Why there is no leader, when there is none.
+    pub reason: Option<String>,
+}
+
+/// Decide the writable leader from a Patroni `GET /cluster` body (H-01).
+///
+/// Only a member whose role is `leader` (or the pre-3.0 `master`) and whose
+/// state is `running` counts; a `standby_leader` leads a standby cluster and
+/// is never writable. The leader must be one of the configured nodes (by
+/// `host:port`, host compared case-insensitively) — an unknown leader is not
+/// authorized. Two running leaders are a conflict: nothing is authorized.
+pub fn parse_patroni_cluster(body: &serde_json::Value, nodes: &[PatroniNode]) -> PatroniView {
+    let none = |reason: String, conflict: bool| PatroniView {
+        leader: None,
+        timeline: None,
+        conflict,
+        reason: Some(reason),
+    };
+    let Some(members) = body.get("members").and_then(|m| m.as_array()) else {
+        return none("response has no members array".into(), false);
+    };
+    let leaders: Vec<&serde_json::Value> = members
+        .iter()
+        .filter(|m| {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            let state = m.get("state").and_then(|s| s.as_str()).unwrap_or("");
+            (role == "leader" || role == "master") && state == "running"
+        })
+        .collect();
+    let leader = match leaders.as_slice() {
+        [] => return none("no running leader".into(), false),
+        [one] => *one,
+        many => {
+            return none(
+                format!("{} members claim to be the running leader", many.len()),
+                true,
+            )
+        }
+    };
+    let host = leader.get("host").and_then(|h| h.as_str()).unwrap_or("");
+    let port = leader.get("port").and_then(|p| p.as_u64()).unwrap_or(5432);
+    let address = format!("{host}:{port}");
+    let timeline = leader.get("timeline").and_then(|t| t.as_u64());
+    match nodes
+        .iter()
+        .find(|n| n.address.eq_ignore_ascii_case(&address))
+    {
+        Some(n) => PatroniView {
+            leader: Some((n.node_id, n.address.clone())),
+            timeline,
+            conflict: false,
+            reason: None,
+        },
+        None => PatroniView {
+            leader: None,
+            timeline,
+            conflict: false,
+            reason: Some(format!(
+                "leader {address} is not a configured [[nodes]] address"
+            )),
+        },
+    }
+}
+
+/// Patroni-based topology provider (H-01): the cluster's running leader, as
+/// Patroni's DCS sees it, is the write primary. Polls `GET /cluster` on the
+/// configured REST endpoints in order and uses the first answer. When no
+/// endpoint answers, it reports no primary, so the tracker's lease runs out
+/// and writes fail closed.
+#[cfg(feature = "postgres-topology")]
+pub struct PatroniTopologyProvider {
+    endpoints: Vec<String>,
+    nodes: Vec<PatroniNode>,
+    client: reqwest::Client,
+    poll_interval: Duration,
+    current: RwLock<Option<TopologyNodeInfo>>,
+    timeline: AtomicU64,
+    conflict: std::sync::atomic::AtomicBool,
+    conflicts_total: AtomicU64,
+    event_tx: broadcast::Sender<TopologyEvent>,
+}
+
+#[cfg(feature = "postgres-topology")]
+impl PatroniTopologyProvider {
+    /// `endpoints`: REST base URLs; `request_timeout` bounds each request.
+    pub fn new(endpoints: Vec<String>, nodes: Vec<PatroniNode>, request_timeout: Duration) -> Self {
+        let (event_tx, _) = broadcast::channel(16);
+        let client = reqwest::Client::builder()
+            .timeout(request_timeout)
+            .connect_timeout(request_timeout)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            endpoints,
+            nodes,
+            client,
+            poll_interval: Duration::from_secs(2),
+            current: RwLock::new(None),
+            timeline: AtomicU64::new(0),
+            conflict: std::sync::atomic::AtomicBool::new(false),
+            conflicts_total: AtomicU64::new(0),
+            event_tx,
+        }
+    }
+
+    /// Set polling interval.
+    pub fn with_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
+        self
+    }
+
+    /// The leader's timeline from the last successful poll (0 = none yet).
+    pub fn timeline(&self) -> u64 {
+        self.timeline.load(Ordering::Relaxed)
+    }
+
+    /// Polls whose answer named more than one running leader.
+    pub fn conflicts_total(&self) -> u64 {
+        self.conflicts_total.load(Ordering::Relaxed)
+    }
+
+    /// Poll forever.
+    pub async fn start(&self) {
+        let mut interval = tokio::time::interval(self.poll_interval);
+        loop {
+            interval.tick().await;
+            self.poll().await;
+        }
+    }
+
+    async fn fetch(&self, endpoint: &str) -> Result<serde_json::Value, String> {
+        let url = format!("{}/cluster", endpoint.trim_end_matches('/'));
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("{url}: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("{url}: HTTP {}", resp.status()));
+        }
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| format!("{url}: {e}"))
+    }
+
+    async fn poll(&self) {
+        let mut view = None;
+        for ep in &self.endpoints {
+            match self.fetch(ep).await {
+                Ok(body) => {
+                    view = Some(parse_patroni_cluster(&body, &self.nodes));
+                    break;
+                }
+                Err(e) => tracing::warn!(error = %e, "patroni topology: endpoint unavailable"),
+            }
+        }
+        // No endpoint answered: authority is unknown. Report no primary so
+        // the tracker's lease expires rather than being refreshed.
+        let view = view.unwrap_or(PatroniView {
+            leader: None,
+            timeline: None,
+            conflict: false,
+            reason: Some("no Patroni endpoint answered".into()),
+        });
+        self.apply(view);
+    }
+
+    fn apply(&self, view: PatroniView) {
+        if view.conflict {
+            self.conflicts_total.fetch_add(1, Ordering::Relaxed);
+        }
+        self.conflict.store(view.conflict, Ordering::Relaxed);
+        if let Some(t) = view.timeline {
+            self.timeline.store(t, Ordering::Relaxed);
+        }
+        if let Some(reason) = &view.reason {
+            tracing::warn!(%reason, "patroni topology: no writable leader");
+        }
+        let next = view.leader.map(|(node_id, address)| TopologyNodeInfo {
+            node_id,
+            client_addr: address,
+            is_healthy: true,
+        });
+        let old = self.current.read().as_ref().map(|p| p.node_id);
+        let new = next.as_ref().map(|p| p.node_id);
+        *self.current.write() = next;
+        if old != new {
+            if let Some(new_primary) = new {
+                let _ = self.event_tx.send(TopologyEvent::PrimaryChanged {
+                    old_primary: old,
+                    new_primary,
+                });
+            }
+        }
+    }
+}
+
+#[cfg(feature = "postgres-topology")]
+impl TopologyProvider for PatroniTopologyProvider {
+    fn subscribe(&self) -> broadcast::Receiver<TopologyEvent> {
+        self.event_tx.subscribe()
+    }
+
+    fn get_primary(&self) -> Option<TopologyNodeInfo> {
+        self.current.read().clone()
+    }
+
+    fn get_node(&self, id: Uuid) -> Option<TopologyNodeInfo> {
+        let n = self.nodes.iter().find(|n| n.node_id == id)?;
+        Some(TopologyNodeInfo {
+            node_id: n.node_id,
+            client_addr: n.address.clone(),
+            is_healthy: true,
+        })
+    }
+
+    fn authority_conflict(&self) -> bool {
+        self.conflict.load(Ordering::Relaxed)
     }
 }
 
@@ -632,6 +964,16 @@ impl PrimaryTracker {
     }
 
     fn periodic_check(&self, provider: &dyn TopologyProvider) {
+        // Conflicting authority (two writable primaries the provider cannot
+        // order): drop the leader now so writes fail closed, rather than
+        // routing to either until the lease runs out.
+        if provider.authority_conflict() {
+            if self.current_primary.read().is_some() {
+                tracing::warn!("Primary tracker: provider reports conflicting primaries; clearing");
+                self.clear_primary();
+            }
+            return;
+        }
         let current_id = self.current_primary.read().as_ref().map(|p| p.node_id);
 
         if let Some(id) = current_id {
@@ -666,6 +1008,159 @@ impl PrimaryTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeline_decides_between_writable_nodes() {
+        // One strictly highest timeline wins, wherever it sits.
+        assert_eq!(choose_by_timeline(&[(0, Some(3)), (1, Some(4))]), Some(1));
+        assert_eq!(choose_by_timeline(&[(0, Some(5)), (1, Some(4))]), Some(0));
+        assert_eq!(choose_by_timeline(&[(2, Some(7))]), Some(2));
+        // A tie or an unknown timeline cannot be resolved.
+        assert_eq!(choose_by_timeline(&[(0, Some(4)), (1, Some(4))]), None);
+        assert_eq!(choose_by_timeline(&[(0, Some(9)), (1, None)]), None);
+        // A tie below the maximum does not matter.
+        assert_eq!(
+            choose_by_timeline(&[(0, Some(2)), (1, Some(2)), (2, Some(3))]),
+            Some(2)
+        );
+    }
+
+    fn patroni_nodes() -> (Vec<PatroniNode>, Uuid, Uuid) {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        (
+            vec![
+                PatroniNode {
+                    node_id: a,
+                    address: "pg-a:5432".into(),
+                },
+                PatroniNode {
+                    node_id: b,
+                    address: "pg-b:5432".into(),
+                },
+            ],
+            a,
+            b,
+        )
+    }
+
+    fn member(host: &str, role: &str, state: &str, timeline: u64) -> serde_json::Value {
+        serde_json::json!({
+            "name": host, "host": host, "port": 5432,
+            "role": role, "state": state, "timeline": timeline
+        })
+    }
+
+    #[test]
+    fn patroni_cluster_resolves_the_running_leader() {
+        let (nodes, a, b) = patroni_nodes();
+        let body = serde_json::json!({ "members": [
+            member("pg-a", "replica", "streaming", 6),
+            member("PG-B", "leader", "running", 6),
+        ]});
+        let v = parse_patroni_cluster(&body, &nodes);
+        assert_eq!(v.leader, Some((b, "pg-b:5432".to_string())));
+        assert_eq!(v.timeline, Some(6));
+        assert!(!v.conflict);
+
+        // Pre-3.0 Patroni calls the leader "master".
+        let body = serde_json::json!({ "members": [member("pg-a", "master", "running", 2)] });
+        assert_eq!(
+            parse_patroni_cluster(&body, &nodes).leader.map(|l| l.0),
+            Some(a)
+        );
+    }
+
+    #[test]
+    fn patroni_cluster_authorizes_nothing_when_unsure() {
+        let (nodes, _, _) = patroni_nodes();
+        let cases = [
+            // A standby cluster's leader is not writable.
+            (
+                serde_json::json!({ "members": [member("pg-a", "standby_leader", "running", 3)] }),
+                false,
+            ),
+            // A leader that is not running.
+            (
+                serde_json::json!({ "members": [member("pg-a", "leader", "stopped", 3)] }),
+                false,
+            ),
+            // A leader outside the configured nodes.
+            (
+                serde_json::json!({ "members": [member("pg-z", "leader", "running", 3)] }),
+                false,
+            ),
+            // No members at all / malformed body.
+            (serde_json::json!({ "members": [] }), false),
+            (serde_json::json!({ "error": "x" }), false),
+            // Two running leaders: a conflict.
+            (
+                serde_json::json!({ "members": [
+                    member("pg-a", "leader", "running", 3),
+                    member("pg-b", "leader", "running", 4),
+                ]}),
+                true,
+            ),
+        ];
+        for (body, conflict) in cases {
+            let v = parse_patroni_cluster(&body, &nodes);
+            assert!(v.leader.is_none(), "{body}");
+            assert!(v.reason.is_some(), "{body}");
+            assert_eq!(v.conflict, conflict, "{body}");
+        }
+    }
+
+    /// A provider reporting conflicting authority makes the tracker drop its
+    /// leader on the next check, without waiting for the lease.
+    #[test]
+    fn tracker_drops_the_leader_on_conflicting_authority() {
+        struct Conflicted {
+            conflict: std::sync::atomic::AtomicBool,
+            leader: RwLock<Option<TopologyNodeInfo>>,
+            tx: broadcast::Sender<TopologyEvent>,
+        }
+        impl TopologyProvider for Conflicted {
+            fn subscribe(&self) -> broadcast::Receiver<TopologyEvent> {
+                self.tx.subscribe()
+            }
+            fn get_primary(&self) -> Option<TopologyNodeInfo> {
+                self.leader.read().clone()
+            }
+            fn get_node(&self, _id: Uuid) -> Option<TopologyNodeInfo> {
+                None
+            }
+            fn authority_conflict(&self) -> bool {
+                self.conflict.load(Ordering::Relaxed)
+            }
+        }
+        let id = Uuid::new_v4();
+        let p = Arc::new(Conflicted {
+            conflict: std::sync::atomic::AtomicBool::new(false),
+            leader: RwLock::new(Some(TopologyNodeInfo {
+                node_id: id,
+                client_addr: "pg-a:5432".into(),
+                is_healthy: true,
+            })),
+            tx: broadcast::channel(4).0,
+        });
+        let tracker =
+            PrimaryTracker::with_provider(p.clone()).with_lease_timeout(Duration::from_secs(3600));
+        tracker.periodic_check(p.as_ref());
+        assert!(tracker.has_primary(), "leader adopted");
+
+        p.conflict.store(true, Ordering::Relaxed);
+        *p.leader.write() = None;
+        tracker.periodic_check(p.as_ref());
+        assert!(
+            !tracker.has_primary(),
+            "conflict clears at once, lease notwithstanding"
+        );
+        tracker.periodic_check(p.as_ref());
+        assert!(
+            !tracker.has_primary(),
+            "and stays cleared while the conflict lasts"
+        );
+    }
 
     #[test]
     fn test_authority_epoch_increments_on_primary_change() {

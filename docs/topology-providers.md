@@ -221,6 +221,36 @@ RDS/Aurora, Google Cloud SQL, Azure Database for PostgreSQL) that expose replica
 
 ---
 
+## Patroni Provider (`postgres-topology`, `provider = "patroni"`)
+
+Polls a Patroni cluster's REST API — `GET /cluster` on each of `topology.patroni_endpoints`
+in order, using the first that answers — and treats the cluster's leader, as Patroni's DCS
+sees it, as the write primary.
+
+- Only a member with role `leader` (or the pre-3.0 `master`) **and** state `running`
+  counts. A `standby_leader` leads a standby cluster and is never writable.
+- The leader's `host:port` must match a configured `[[nodes]]` address (host compared
+  case-insensitively). Configure nodes with the same host names or addresses Patroni
+  reports; an unknown leader is not authorized.
+- Two members reported as running leaders are a **conflict**: nothing is authorized and
+  the tracker drops its current leader at once.
+- When no endpoint answers, the provider reports no primary: the authority lease is not
+  refreshed and writes stop at the lease boundary (`lease_timeout_secs`).
+- The leader's timeline is kept as the provider's epoch (`PatroniTopologyProvider::timeline`).
+
+Keep `lease_timeout_secs` below Patroni's own `ttl` minus `loop_wait` so the proxy never
+trusts a leader longer than Patroni does (enforcing that is part of H-02).
+
+### Conflicting primaries (`postgres` provider)
+
+When more than one node answers `pg_is_in_recovery() = false` — typically an old primary
+that kept running after a promotion — the `postgres` provider reads each node's timeline
+(`pg_control_checkpoint().timeline_id`) and picks the node on the strictly highest one; a
+promotion always starts a new timeline. If the timelines tie, or cannot be read (the probe
+role needs permission to call `pg_control_checkpoint()`: a superuser, or `GRANT EXECUTE`),
+there is no leader and writes fail closed at once. Earlier versions took the first writable
+node in probe order.
+
 ## HeliosDB Provider (`heliosdb-topology`)
 
 `HeliosTopologyProvider<T>` (feature `heliosdb-topology`, in the `heliosdb_provider`
