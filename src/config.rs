@@ -2881,6 +2881,28 @@ mod tests {
         }
     }
 
+    /// Every example configuration shipped in `config/` loads through the
+    /// real parser and validation (a generic TOML parse is not enough: it
+    /// cannot see a wrong type or a failed `validate()`).
+    #[test]
+    fn shipped_example_configs_load() {
+        let mut checked = 0;
+        for entry in std::fs::read_dir("config").expect("config/ present") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            if let Err(e) = ProxyConfig::from_file(path.to_str().unwrap()) {
+                panic!("{} does not load: {e}", path.display());
+            }
+            checked += 1;
+        }
+        assert!(
+            checked >= 3,
+            "expected the shipped example configs, found {checked}"
+        );
+    }
+
     #[test]
     fn strict_config_rejects_unknown_top_level_keys() {
         let src =
