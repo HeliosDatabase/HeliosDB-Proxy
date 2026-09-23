@@ -46,8 +46,16 @@ struct Cli {
     #[arg(long)]
     standby: Vec<String>,
 
-    /// Enable TR (Transaction Replay)
-    #[arg(long, default_value = "true")]
+    /// Enable TR (Transaction Replay). Takes an optional value: `--tr`,
+    /// `--tr true`, `--tr false` or `--tr=false` (a bare `bool` field would be
+    /// a presence switch that can never turn TR off).
+    #[arg(
+        long,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
     tr: bool,
 
     /// Log level (trace, debug, info, warn, error)
@@ -313,22 +321,31 @@ mod tests {
     }
 
     #[test]
-    fn tr_flag_is_a_presence_switch_not_a_valued_option() {
-        // `#[arg(long, default_value = "true")]` on a `bool` field still gets
-        // clap's automatic `ArgAction::SetTrue` for the type: `--tr` takes NO
-        // value. Passing `--tr false` does not set `tr = false` — "false" is
-        // left over and clap tries (and fails) to match it against the
-        // `Option<Command>` subcommand slot instead. This means there is
-        // currently no CLI-level way to disable TR by passing an explicit
-        // value; only omitting `--tr` (leaving it at its `true` default)
-        // or passing the bare `--tr` flag are meaningful, and both leave
-        // `tr == true`. Documented here rather than "fixed" — production
-        // behaviour must not change.
-        let cli = Cli::try_parse_from(["heliosdb-proxy", "--tr"]).unwrap();
-        assert!(cli.tr);
-
-        let err = Cli::try_parse_from(["heliosdb-proxy", "--tr", "false"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    fn tr_flag_accepts_an_optional_explicit_value() {
+        // Default and bare flag keep TR on; an explicit value can turn it off,
+        // as docs/configuration.md and docs/transaction-replay.md document.
+        assert!(Cli::try_parse_from(["heliosdb-proxy"]).unwrap().tr);
+        assert!(Cli::try_parse_from(["heliosdb-proxy", "--tr"]).unwrap().tr);
+        assert!(
+            Cli::try_parse_from(["heliosdb-proxy", "--tr", "true"])
+                .unwrap()
+                .tr
+        );
+        assert!(
+            !Cli::try_parse_from(["heliosdb-proxy", "--tr", "false"])
+                .unwrap()
+                .tr
+        );
+        assert!(
+            !Cli::try_parse_from(["heliosdb-proxy", "--tr=false"])
+                .unwrap()
+                .tr
+        );
+        // A bare `--tr` before other flags still parses as true.
+        let cli = Cli::try_parse_from(["heliosdb-proxy", "--tr", "--json-logs"]).unwrap();
+        assert!(cli.tr && cli.json_logs);
+        // Anything that is not a boolean is rejected, not silently ignored.
+        assert!(Cli::try_parse_from(["heliosdb-proxy", "--tr", "maybe"]).is_err());
     }
 
     #[test]

@@ -198,8 +198,14 @@ impl GraphqlGateway {
             200 => "OK",
             400 => "Bad Request",
             401 => "Unauthorized",
+            404 => "Not Found",
             405 => "Method Not Allowed",
-            _ => "OK",
+            413 => "Payload Too Large",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            503 => "Service Unavailable",
+            s if s < 400 => "OK",
+            _ => "Error",
         };
         let head = format!(
             "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -339,7 +345,7 @@ mod tests {
         let resp = read_all(&mut client).await;
         task.await.unwrap().unwrap();
 
-        assert_eq!(status_line(&resp), "HTTP/1.1 413 OK");
+        assert_eq!(status_line(&resp), "HTTP/1.1 413 Payload Too Large");
         assert!(resp.contains("request body too large"));
     }
 
@@ -383,21 +389,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn respond_reason_phrase_falls_back_to_ok_for_unlisted_status() {
-        // `respond()`'s reason-phrase match only covers 200/400/401/405; any
-        // other status code (e.g. the 413 used above) falls through to the
-        // "OK" default arm, so the status LINE carries the right numeric
-        // code but a misleading reason phrase. Documented here rather than
-        // "fixed" — production behaviour must not change.
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        GraphqlGateway::respond(&mut server, 413, &json!({"error":"too large"}))
-            .await
-            .unwrap();
-        drop(server);
-
-        let mut buf = Vec::new();
-        client.read_to_end(&mut buf).await.unwrap();
-        let resp = String::from_utf8(buf).unwrap();
-        assert!(resp.starts_with("HTTP/1.1 413 OK\r\n"));
+    async fn respond_reason_phrase_matches_the_status_code() {
+        for (status, line) in [
+            (413u16, "HTTP/1.1 413 Payload Too Large\r\n"),
+            (500, "HTTP/1.1 500 Internal Server Error\r\n"),
+            (204, "HTTP/1.1 204 OK\r\n"),
+            (418, "HTTP/1.1 418 Error\r\n"),
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            GraphqlGateway::respond(&mut server, status, &json!({"error":"x"}))
+                .await
+                .unwrap();
+            drop(server);
+            let mut buf = Vec::new();
+            client.read_to_end(&mut buf).await.unwrap();
+            let resp = String::from_utf8(buf).unwrap();
+            assert!(resp.starts_with(line), "{status}: {resp}");
+        }
     }
 }

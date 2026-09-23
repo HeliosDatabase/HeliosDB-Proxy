@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`--tr false` / `--tr=false` now turn Transaction Replay off.** The flag was declared
+  as a plain `bool`, which clap treats as a presence switch: `--tr false` was rejected
+  ("unrecognized subcommand") and `--tr=false` too, so TR could only be disabled through
+  `tr_enabled` in `proxy.toml`, contrary to the documented CLI. A bare `--tr` still means
+  `true`. Found by the new CLI parsing tests.
+- The GraphQL gateway's HTTP status line now carries the matching reason phrase for
+  404, 413, 429, 500 and 503 (it said `413 OK`).
+
 - **A burst of new clients no longer fails with a false "Authentication failed"
   when the backend is at `max_connections`.** Every pass-through login opens its own
   backend connection, while the transaction/statement pool keeps idle connections

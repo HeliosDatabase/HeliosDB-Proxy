@@ -41,7 +41,7 @@ heliosdb-proxy --config config.toml --json-logs
 | `--admin` | `127.0.0.1:9090` | Admin API listen address. Loopback by default — see [Admin API Security](#admin-api-security). |
 | `--primary` | *(none)* | Primary node `host:port`. |
 | `--standby` | *(none)* | Standby node `host:port` (repeatable). |
-| `--tr` | `true` | Enable Transaction Replay. |
+| `--tr` | `true` | Enable Transaction Replay. Takes an optional value: `--tr false` or `--tr=false` turns it off; a bare `--tr` means `true`. |
 | `--log-level` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error`. |
 | `--json-logs` | `false` | Emit logs in JSON format. |
 
