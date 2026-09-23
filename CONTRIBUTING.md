@@ -5,7 +5,7 @@ covers the development workflow, code standards, and how to submit changes.
 
 ## Prerequisites
 
-- **Rust 1.75+** (MSRV)
+- **Rust 1.86+** (MSRV)
 - **cargo** (comes with Rust)
 - **Git**
 

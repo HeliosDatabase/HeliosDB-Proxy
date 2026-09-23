@@ -97,7 +97,8 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
   `[limits]`, `[analytics]`, `[anomaly]`, `[multi_tenancy]`, `[auth]` (only `mode = "passthrough"|"scram"` +
   `auth_file`), `[[hba]]`, `[query_rewrite]` (+`[[query_rewrite.rules]]`), `[plugins]`,
   `[graphql_gateway]` (+`[[graphql_gateway.tables]]`), `[schema_routing]`, `[mcp]`,
-  `[[agent_contracts]]`, `[http_gateway]`, `[mirror]`, `[edge]`, `[branch]`.
+  `[[agent_contracts]]`, `[http_gateway]`, `[mirror]`, `[edge]`, `[branch]`, `[topology]`,
+  `[journal]`.
   CAUTION: unknown TOML sections are silently ignored (plain serde). The commented
   `[routing.*]`, `[lag]`, `[rewriter]`, `[graphql]`, `[auth.jwt]`-style, `[cache.l1]`-style
   blocks in `config/proxy.full.toml` — and its uncommented `[ha]`, `[logging]`, `[metrics]`

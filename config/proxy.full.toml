@@ -607,30 +607,20 @@ max_cacheable_response_bytes = 4194304
 
 # [plugins]
 # enabled       = false
-# plugin_dir    = "/etc/heliosproxy/plugins"
-# hot_reload    = false
-# memory_limit  = 67108864             # 64 MB per plugin
-# timeout_ms    = 100                  # Execution timeout per plugin call
+# plugin_dir    = "/etc/heliosproxy/plugins"   # scanned for *.wasm at startup
+# hot_reload    = false                        # watch plugin_dir and reload changed plugins
+# memory_limit_mb = 64                         # memory per plugin instance, MB
+# timeout_ms    = 100                          # execution timeout per hook call
 # max_plugins   = 20
-# fuel_metering = true                 # Limit CPU cycles per call
+# fuel_metering = true                         # bound CPU per call
 # fuel_limit    = 1000000
+# # trust_root  = "/etc/heliosproxy/trust"     # Ed25519 *.pub dir: every .wasm then needs a verifying .sig
 # kv_max_value_bytes     = 65536       # Max bytes per plugin-KV key OR value (kv_set / PUT /admin/kv); 0 = unlimited
 # kv_max_keys_per_plugin = 1024        # Max distinct keys per plugin KV namespace; 0 = unlimited
 # kv_max_plugins         = 256         # Max distinct plugin KV namespaces (bounds PUT /admin/kv namespace growth); 0 = unlimited
 # kv_max_total_bytes     = 67108864    # Max TOTAL retained bytes across ALL plugin KV namespaces (key+value+namespace-name); OOM backstop; 0 = unlimited
-# enable_simd   = true
-# enable_threads = false
-# cache_modules = true
-# # cache_dir   = "/var/lib/heliosproxy/plugin_cache"
-#
-# # Per-plugin configuration
-# # [plugins.audit_log]
-# # enabled     = true
-# # priority    = 100
-# # memory_limit = 33554432            # 32 MB override
-# # permissions = ["http_fetch"]
-# # [plugins.audit_log.config]
-# # destination = "https://logging.example.com/ingest"
+# # Per-plugin settings are pushed at runtime through PUT /admin/kv/<plugin>/<key>;
+# # there are no [plugins.<name>] tables.
 
 # =============================================================================
 # SCHEMA ROUTING — Route queries based on schema/table/regex patterns
