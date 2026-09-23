@@ -112,22 +112,29 @@ above) or the command-line arguments.
 
 ---
 
-## Unknown Keys Are Warned, Not Rejected
+## Unknown Keys Are Warned, Not Rejected (By Default)
 
-`ProxyConfig` does **not** use `deny_unknown_fields`. Any top-level TOML key that is not
-a recognized `ProxyConfig` field is parsed-and-ignored, and each one is logged once at
-startup as a warning:
+`ProxyConfig` does **not** use `deny_unknown_fields`. Any TOML key that is not a
+recognized `ProxyConfig` field — top-level *or nested inside a known section* — is
+parsed-and-ignored, and each one is logged once at startup as a warning, with its full
+dotted path:
 
 ```
-WARN unknown config section/key '<key>' ignored (not part of ProxyConfig)
+WARN unknown config key '<key>' ignored (not part of ProxyConfig)
+WARN unknown config key 'cache.l1_max_byts' ignored (not part of ProxyConfig)
 ```
 
-This makes silent doc-drift visible without breaking pre-existing configs. Historical
-example blocks such as `[ha]`, `[logging]`, `[metrics]`, `[routing]`, `[distribcache]`,
-`[graphql]`, `[[tenants]]`, and `[[schema_routes]]` are **not** part of `ProxyConfig` —
-they will be warned and ignored. Their real counterparts are documented below
-(`lag_routing`, `multi_tenancy`, `graphql_gateway`, `schema_routing`, …). Note that
-detection is top-level only: a nested unknown key (e.g. `[cache.l1]`) is not reported.
+This makes silent doc-drift and typos visible without breaking pre-existing configs.
+Historical example blocks such as `[ha]`, `[logging]`, `[metrics]`, `[routing]`,
+`[distribcache]`, `[graphql]`, `[[tenants]]`, and `[[schema_routes]]` are **not** part of
+`ProxyConfig` — they will be warned and ignored. Their real counterparts are documented
+below (`lag_routing`, `multi_tenancy`, `graphql_gateway`, `schema_routing`, …).
+
+Detection covers every nesting depth (built on `serde_ignored`, not a hand-maintained
+whitelist), so a typo inside an otherwise-valid section — e.g. `[cache] l1_max_byts = 1`
+instead of `max_result_bytes`, or `[journal] fsyncc = "commit"` instead of `fsync` — is
+caught exactly like an unknown top-level section. Set `strict_config = true` to turn
+every one of these warnings into a hard startup failure instead (see below).
 
 ---
 
@@ -153,7 +160,7 @@ shutdown_drain_timeout_secs = 60
 | `admin_address` | string | `"127.0.0.1:9090"` | Address/port for the admin HTTP API. Loopback by default. *(Required in a config file.)* |
 | `admin_token` | string | *(none)* | Bearer token required on every admin endpoint except liveness probes. See [Admin API Security](#admin-api-security). |
 | `admin_allow_insecure` | bool | `false` | Explicit opt-in to expose the admin API on a non-loopback address **without** a token. |
-| `strict_config` | bool | `false` | Opt-in strict configuration (D-05): startup fails when an enabled subsystem was not compiled into the binary (e.g. `[cache] enabled = true` without the `query-cache` feature) or when an unknown top-level section/key is present. Default `false` keeps the historical warn-and-continue behaviour. `GET /capabilities` reports the per-subsystem compiled/enabled/wired state. |
+| `strict_config` | bool | `false` | Opt-in strict configuration (D-05): startup fails when an enabled subsystem was not compiled into the binary (e.g. `[cache] enabled = true` without the `query-cache` feature) or when an unknown config key is present, at any nesting depth (an unknown top-level section, or a typo'd key inside a known section such as `[cache] l1_max_byts`). Default `false` keeps the historical warn-and-continue behaviour. `GET /capabilities` reports the per-subsystem compiled/enabled/wired state. |
 | `tr_enabled` | bool | `true` | Master switch for Transaction Replay, which ships in the default build. When `false`: the write journal stops recording, `tr_mode` is forced to `none`, and `POST /api/replay` returns `503`. *(Required in a config file.)* |
 | `tr_mode` | string | `"session"` | Transaction Replay mode: `none`, `session`, `select`, `transaction`. *(Required in a config file.)* |
 | `tr_read_functions` | array of string | `[]` | TR-03 read re-execution policy extension. In-session replay re-executes an interrupted read on an unknown outcome only when every function it calls is a PostgreSQL built-in known to be side-effect-free; list additional provably pure functions (unqualified names, case-insensitive) here. Reads calling anything else, quoted-identifier calls, `SELECT … INTO`, and sequence functions are classified as opaque and never re-executed. |
@@ -959,6 +966,8 @@ backend_user = "postgres"
 read_only = true
 # contract = "reporting-agent"
 auth_token = "${MCP_TOKEN}"
+query_timeout_ms = 30000
+max_concurrent_requests = 64
 
 [[agent_contracts]]
 id = "reporting-agent"
@@ -983,6 +992,8 @@ max_rows = 1000
 | `read_only` | bool | `true` | Refuse write/DDL — agents get a read-only surface. |
 | `contract` | string | *(none)* | Name of an `[[agent_contracts]]` entry to enforce on every tool call. |
 | `auth_token` | string | *(none)* | Bearer token required on every MCP request. Absent = open, so **set this for any non-loopback deployment** — MCP exposes SQL and must not be anonymous off localhost. |
+| `query_timeout_ms` | u64 | `30000` | Per-`tools/call` backend execution timeout, milliseconds. Was a hardcoded 30 s. Must be > 0. |
+| `max_concurrent_requests` | usize | `64` | Maximum `tools/call` requests admitted concurrently; beyond this the gateway answers a JSON-RPC error (code `-32000`) instead of queuing indefinitely. `initialize`/`ping`/`tools/list` and notifications are never gated. Must be > 0. |
 
 Each `[[agent_contracts]]` entry (scoped grants, referenced by `id` from `[mcp] contract`):
 
@@ -1013,6 +1024,8 @@ backend_user = "postgres"
 # backend_password = "..."
 # backend_database = "app"
 auth_token = "${HTTP_GW_TOKEN}"
+query_timeout_ms = 30000
+max_concurrent_requests = 64
 ```
 
 | Key | Type | Default | Description |
@@ -1025,6 +1038,8 @@ auth_token = "${HTTP_GW_TOKEN}"
 | `backend_password` | string | *(none)* | Backend password. |
 | `backend_database` | string | *(none)* | Backend database. |
 | `auth_token` | string | *(none)* | Optional Bearer token required on requests. |
+| `query_timeout_ms` | u64 | `30000` | Per-request backend execution timeout, milliseconds. Was a hardcoded 30 s. Must be > 0. |
+| `max_concurrent_requests` | usize | `64` | Maximum `/sql` requests admitted concurrently; beyond this the gateway answers `503 Service Unavailable` with a `Retry-After` header instead of queuing indefinitely (`/health` is never gated). Must be > 0. |
 
 ---
 
@@ -1043,6 +1058,8 @@ backend_user = "postgres"
 # backend_password = "..."
 # backend_database = "app"
 # auth_token = "..."
+query_timeout_ms = 30000
+max_concurrent_requests = 64
 
 [[graphql_gateway.tables]]
 name = "orders"
@@ -1062,6 +1079,8 @@ columns = ["id", "customer_id", "total", "created_at"]
 | `backend_database` | string | *(none)* | Backend database. |
 | `auth_token` | string | *(none)* | Optional Bearer token required on requests. |
 | `tables` | array | `[]` | Tables exposed as GraphQL types (`[[graphql_gateway.tables]]`). |
+| `query_timeout_ms` | u64 | `30000` | Per-request backend execution timeout, milliseconds. Was a hardcoded 30 s. Must be > 0. |
+| `max_concurrent_requests` | usize | `64` | Maximum GraphQL requests admitted concurrently; beyond this the gateway answers `503 Service Unavailable` with a `Retry-After` header instead of queuing indefinitely (`/health` is never gated). Must be > 0. |
 
 Each `[[graphql_gateway.tables]]`: `name` (string) and `columns` (array of strings).
 

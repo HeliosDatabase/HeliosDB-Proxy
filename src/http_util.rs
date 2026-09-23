@@ -17,6 +17,11 @@ pub(crate) const MAX_HTTP_HEADERS: usize = 100;
 pub(crate) const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 /// Max request body accepted — bounds the `vec![0u8; len]` allocation.
 pub(crate) const MAX_HTTP_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// `Retry-After` seconds sent with a gateway's `max_concurrent_requests`
+/// admission rejection (HTTP 503 for the HTTP/GraphQL gateways, a JSON-RPC
+/// error for MCP). Not itself a config knob — it just tells the client how
+/// long to back off before retrying a transient, load-shedding rejection.
+pub(crate) const GATEWAY_BUSY_RETRY_AFTER_SECS: u64 = 1;
 
 /// Constant-time equality over two strings' bytes (reveals nothing beyond the
 /// length via timing). Used for Bearer-token checks so a `==` short-circuit

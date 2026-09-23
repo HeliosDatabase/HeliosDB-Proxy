@@ -46,6 +46,12 @@ impl HttpGateway {
                 ))
             })?;
         tracing::info!(addr = %self.config.listen_address, "HTTP SQL gateway listening");
+        // Admission cap (H-06 `max_concurrent_requests`): the
+        // `(max_concurrent_requests + 1)`-th concurrent request is rejected
+        // with 503 + `Retry-After` instead of queuing forever.
+        let admission = Arc::new(tokio::sync::Semaphore::new(
+            self.config.max_concurrent_requests,
+        ));
         let cfg = Arc::new(self.config);
         let pool = self.pool.clone();
         loop {
@@ -58,8 +64,9 @@ impl HttpGateway {
             };
             let cfg = cfg.clone();
             let pool = pool.clone();
+            let admission = admission.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle(stream, cfg, pool).await {
+                if let Err(e) = Self::handle(stream, cfg, pool, admission).await {
                     tracing::debug!(%peer, "HTTP gateway error: {}", e);
                 }
             });
@@ -70,6 +77,7 @@ impl HttpGateway {
         mut stream: tokio::net::TcpStream,
         cfg: Arc<HttpGatewayConfig>,
         pool: SharedBackendPool,
+        admission: Arc<tokio::sync::Semaphore>,
     ) -> Result<()> {
         use crate::http_util;
         let (reader, mut writer) = stream.split();
@@ -140,6 +148,14 @@ impl HttpGateway {
         }
         let params = parse_params(req.get("params"));
 
+        // Admission cap (H-06 `max_concurrent_requests`): only the actual
+        // backend-hitting work is gated, not the health probe / auth-failure
+        // / malformed-request paths above.
+        let _permit = match admission.try_acquire() {
+            Ok(p) => p,
+            Err(_) => return Self::respond_busy(&mut writer).await,
+        };
+
         match Self::run_sql(&cfg, &pool, sql, &params).await {
             Ok(qr) => {
                 let body = neon_result(&qr, array_mode);
@@ -164,7 +180,7 @@ impl HttpGateway {
             application_name: Some("heliosproxy-http".to_string()),
             tls_mode: TlsMode::Disable,
             connect_timeout: Duration::from_secs(5),
-            query_timeout: Duration::from_secs(30),
+            query_timeout: Duration::from_millis(cfg.query_timeout_ms),
             tls_config: default_client_config(),
         };
         let mut client = pool
@@ -199,17 +215,40 @@ impl HttpGateway {
         status: u16,
         body: &Value,
     ) -> Result<()> {
+        Self::respond_with_extra_headers(writer, status, body, "").await
+    }
+
+    /// Admission-cap rejection (H-06 `max_concurrent_requests`): 503 +
+    /// `Retry-After`, telling the client this is transient load-shedding,
+    /// not a permanent error.
+    async fn respond_busy(writer: &mut tokio::net::tcp::WriteHalf<'_>) -> Result<()> {
+        let body = json!({"error":"too many concurrent /sql requests"});
+        let retry_after = format!(
+            "Retry-After: {}\r\n",
+            crate::http_util::GATEWAY_BUSY_RETRY_AFTER_SECS
+        );
+        Self::respond_with_extra_headers(writer, 503, &body, &retry_after).await
+    }
+
+    async fn respond_with_extra_headers(
+        writer: &mut tokio::net::tcp::WriteHalf<'_>,
+        status: u16,
+        body: &Value,
+        extra_headers: &str,
+    ) -> Result<()> {
         let payload = serde_json::to_vec(body).unwrap_or_default();
         let status_text = match status {
             200 => "OK",
             400 => "Bad Request",
             401 => "Unauthorized",
             405 => "Method Not Allowed",
+            413 => "Payload Too Large",
+            503 => "Service Unavailable",
             _ => "Error",
         };
         let head = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            status, status_text, payload.len()
+            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
+            status, status_text, payload.len(), extra_headers,
         );
         writer
             .write_all(head.as_bytes())
@@ -297,6 +336,8 @@ fn cell_to_json(v: &TextValue) -> Value {
 mod tests {
     use super::*;
     use crate::backend::client::ColumnMeta;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpStream;
 
     fn qr() -> QueryResult {
         QueryResult {
@@ -346,5 +387,60 @@ mod tests {
         assert!(matches!(p[2], ParamValue::Bool(true)));
         assert!(matches!(p[3], ParamValue::Null));
         assert!(matches!(p[4], ParamValue::Float(_)));
+    }
+
+    #[tokio::test]
+    async fn handle_health_bypasses_the_admission_cap() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (server, _peer) = listener.accept().await.unwrap();
+
+        let cfg = Arc::new(HttpGatewayConfig::default());
+        let pool: SharedBackendPool = Arc::new(crate::gateway_pool::BackendClientPool::new(0));
+        let admission = Arc::new(tokio::sync::Semaphore::new(0));
+        let task = tokio::spawn(HttpGateway::handle(server, cfg, pool, admission));
+
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let resp = String::from_utf8(buf).unwrap();
+        task.await.unwrap().unwrap();
+
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+
+    #[tokio::test]
+    async fn handle_rejects_with_503_and_retry_after_when_admission_cap_exhausted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (server, _peer) = listener.accept().await.unwrap();
+
+        let cfg = Arc::new(HttpGatewayConfig::default());
+        let pool: SharedBackendPool = Arc::new(crate::gateway_pool::BackendClientPool::new(0));
+        // Zero permits: the first request that reaches the admission check
+        // must be rejected as busy rather than hit a (nonexistent) backend.
+        let admission = Arc::new(tokio::sync::Semaphore::new(0));
+        let task = tokio::spawn(HttpGateway::handle(server, cfg, pool, admission));
+
+        let body = br#"{"query":"select 1"}"#;
+        let req = format!(
+            "POST /sql HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        client.write_all(body).await.unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let resp = String::from_utf8(buf).unwrap();
+        task.await.unwrap().unwrap();
+
+        assert!(resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(resp.contains("Retry-After: 1\r\n"));
+        assert!(resp.contains("too many concurrent /sql requests"));
     }
 }

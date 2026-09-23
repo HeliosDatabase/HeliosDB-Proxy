@@ -179,6 +179,10 @@ socket2 = { version = "0.5", features = ["all"] }
 config = "0.14"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
+# Reports the dotted path of every TOML key that `toml::from_str`/`serde` would
+# otherwise silently drop (typos inside a `[section]`, nested or top-level) —
+# backs `strict_config`'s unknown-key detection.
+serde_ignored = "0.1.14"
 
 # Regex (used by analytics, routing, rewriter)
 regex = "1"

@@ -192,8 +192,10 @@ pub struct ProxyConfig {
     pub admin_allow_insecure: bool,
     /// Opt-in strict configuration (D-05): reject settings that promise
     /// behavior this binary cannot deliver (e.g. `[cache] enabled = true` on a
-    /// build without `query-cache`) and unknown top-level sections/keys.
-    /// Default `false` keeps the historical warn-and-continue behaviour.
+    /// build without `query-cache`) and unknown config keys — top-level
+    /// sections AND keys nested inside a known section (a typo like
+    /// `[cache] l1_max_byts`). Default `false` keeps the historical
+    /// warn-and-continue behaviour.
     #[serde(default)]
     pub strict_config: bool,
     /// Enable TR (Transaction Replay)
@@ -635,6 +637,15 @@ pub struct HttpGatewayConfig {
     /// Optional Bearer token required on requests.
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Per-request backend execution timeout, milliseconds. Was a hardcoded
+    /// 30 s; must be > 0.
+    #[serde(default = "default_gateway_query_timeout_ms")]
+    pub query_timeout_ms: u64,
+    /// Maximum `/sql` requests admitted concurrently; beyond this the
+    /// gateway answers `503 Service Unavailable` with a `Retry-After` header
+    /// instead of queuing indefinitely. Must be > 0.
+    #[serde(default = "default_gateway_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
 }
 
 impl Default for HttpGatewayConfig {
@@ -648,6 +659,8 @@ impl Default for HttpGatewayConfig {
             backend_password: None,
             backend_database: None,
             auth_token: None,
+            query_timeout_ms: default_gateway_query_timeout_ms(),
+            max_concurrent_requests: default_gateway_max_concurrent_requests(),
         }
     }
 }
@@ -690,6 +703,15 @@ pub struct McpConfig {
     /// gateways, MCP exposes SQL and must not be anonymous off localhost.
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Per-request backend execution timeout, milliseconds. Was a hardcoded
+    /// 30 s; must be > 0.
+    #[serde(default = "default_gateway_query_timeout_ms")]
+    pub query_timeout_ms: u64,
+    /// Maximum JSON-RPC requests admitted concurrently; beyond this the
+    /// gateway answers with a JSON-RPC error (code -32000) instead of
+    /// queuing indefinitely. Must be > 0.
+    #[serde(default = "default_gateway_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
 }
 
 impl Default for McpConfig {
@@ -705,6 +727,8 @@ impl Default for McpConfig {
             read_only: true,
             contract: None,
             auth_token: None,
+            query_timeout_ms: default_gateway_query_timeout_ms(),
+            max_concurrent_requests: default_gateway_max_concurrent_requests(),
         }
     }
 }
@@ -723,6 +747,23 @@ fn default_pg_user() -> String {
 }
 fn default_true_bool() -> bool {
     true
+}
+/// Shared default for the three request gateways' `query_timeout_ms` (H-06):
+/// the per-request backend execution timeout, previously a hardcoded 30 s
+/// `Duration` in each gateway's `BackendConfig` construction
+/// (`graphql_gateway.rs`, `mcp.rs`, `http_gateway.rs`). Same value, now a
+/// tunable knob.
+fn default_gateway_query_timeout_ms() -> u64 {
+    30_000
+}
+/// Shared default for the three request gateways' `max_concurrent_requests`
+/// (H-06): the number of in-flight requests admitted before the gateway
+/// starts rejecting with 503 + `Retry-After` (a JSON-RPC error for MCP).
+/// Generous relative to the gateways' expected load (they proxy one SQL
+/// statement per request, not a whole client session) while still bounding
+/// worst-case backend fan-out from a single gateway listener.
+fn default_gateway_max_concurrent_requests() -> usize {
+    64
 }
 
 /// Client-side authentication configuration.
@@ -883,6 +924,15 @@ pub struct GraphqlGatewayConfig {
     pub auth_token: Option<String>,
     /// Tables exposed as GraphQL types.
     pub tables: Vec<GqlTableToml>,
+    /// Per-request backend execution timeout, milliseconds. Was a hardcoded
+    /// 30 s; must be > 0.
+    #[serde(default = "default_gateway_query_timeout_ms")]
+    pub query_timeout_ms: u64,
+    /// Maximum GraphQL requests admitted concurrently; beyond this the
+    /// gateway answers `503 Service Unavailable` with a `Retry-After` header
+    /// instead of queuing indefinitely. Must be > 0.
+    #[serde(default = "default_gateway_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
 }
 
 impl Default for GraphqlGatewayConfig {
@@ -897,6 +947,8 @@ impl Default for GraphqlGatewayConfig {
             backend_database: None,
             auth_token: None,
             tables: Vec::new(),
+            query_timeout_ms: default_gateway_query_timeout_ms(),
+            max_concurrent_requests: default_gateway_max_concurrent_requests(),
         }
     }
 }
@@ -1898,77 +1950,33 @@ fn parse_placeholder(body: &str) -> Result<Option<(String, usize)>> {
     }
 }
 
-/// Top-level keys recognised by [`ProxyConfig`]. Keep in sync with the struct's
-/// fields (there are no field-level `#[serde(rename)]`s, so these are the exact
-/// Rust field names). Used ONLY to warn on unknown top-level sections/keys;
-/// deserialization itself still silently ignores unknowns (there is no
-/// `deny_unknown_fields`), so a stale entry here only mutes or duplicates a
-/// warning — it can never reject a config. The
-/// `test_known_top_level_keys_cover_struct_fields` drift guard fails CI if a
-/// new non-optional field is added without updating this list.
-const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
-    "listen_address",
-    "admin_address",
-    "admin_token",
-    "admin_allow_insecure",
-    "strict_config",
-    "tr_enabled",
-    "tr_mode",
-    "tr_read_functions",
-    "pool",
-    "pool_mode",
-    "load_balancer",
-    "health",
-    "nodes",
-    "tls",
-    "write_timeout_secs",
-    "topology",
-    "plugins",
-    "hba",
-    "auth",
-    "mcp",
-    "agent_contracts",
-    "http_gateway",
-    "mirror",
-    "edge",
-    "branch",
-    "routing_hints",
-    "rate_limit",
-    "circuit_breaker",
-    "analytics",
-    "anomaly",
-    "lag_routing",
-    "cache",
-    "query_rewrite",
-    "multi_tenancy",
-    "schema_routing",
-    "graphql_gateway",
-    "optimize_unnamed_parse",
-    "shutdown_drain_timeout_secs",
-    "limits",
-    "journal",
-];
-
-/// Detect TOP-LEVEL TOML keys that are not fields of [`ProxyConfig`] (silent
-/// doc drift / typos). Pure and testable: parses `text` as a TOML table and
-/// diffs its top-level keys against [`KNOWN_TOP_LEVEL_KEYS`], returning the
-/// unknowns sorted. Nested unknown keys (e.g. `[cache.l1]`) are intentionally
-/// OUT OF SCOPE. If `text` does not parse as a TOML table this returns empty —
-/// the caller's `toml::from_str` already reports genuine parse errors.
-fn unknown_top_level_keys(text: &str) -> Vec<String> {
-    let Ok(value) = toml::from_str::<toml::Value>(text) else {
-        return Vec::new();
-    };
-    let Some(table) = value.as_table() else {
-        return Vec::new();
-    };
-    let mut unknown: Vec<String> = table
-        .keys()
-        .filter(|k| !KNOWN_TOP_LEVEL_KEYS.contains(&k.as_str()))
-        .cloned()
-        .collect();
-    unknown.sort();
-    unknown
+/// Deserialize `text` into a [`ProxyConfig`], additionally collecting the full
+/// dotted path of every TOML key present in `text` that no field of
+/// `ProxyConfig` — at ANY nesting depth — claimed. There is no
+/// `#[serde(deny_unknown_fields)]` anywhere in this config tree, so plain
+/// `toml::from_str` silently drops both an unknown top-level section (a
+/// documented-but-unimplemented `[ha]` block) and a typo'd key inside an
+/// otherwise-known section (`[cache] l1_max_byts = 1`, `[journal] fsyncc =
+/// "commit"`) with zero signal. `serde_ignored` wraps the deserializer and
+/// invokes the callback with the exact path serde's derive-generated visitor
+/// skipped, which — because every config struct here uses plain `#[derive(
+/// Deserialize)]` with no `flatten`/`deserialize_with`/manual impls — covers
+/// the whole nested tree, not just the top level.
+///
+/// Returns the parsed config plus the sorted, deduplicated list of ignored
+/// paths. A genuine parse error (bad TOML syntax, wrong type) is still
+/// returned as `Err`, formatted exactly as the old direct `toml::from_str`
+/// call was.
+fn deserialize_reporting_ignored_paths(text: &str) -> Result<(ProxyConfig, Vec<String>)> {
+    let mut ignored: Vec<String> = Vec::new();
+    let deserializer = toml::Deserializer::new(text);
+    let config: ProxyConfig = serde_ignored::deserialize(deserializer, |path| {
+        ignored.push(path.to_string());
+    })
+    .map_err(|e| ProxyError::Config(format!("Failed to parse config: {}", e)))?;
+    ignored.sort();
+    ignored.dedup();
+    Ok((config, ignored))
 }
 
 impl ProxyConfig {
@@ -2008,26 +2016,26 @@ impl ProxyConfig {
         // no `:-default` fallback.
         let contents = substitute_env(&raw)?;
 
-        let config: Self = toml::from_str(&contents)
-            .map_err(|e| ProxyError::Config(format!("Failed to parse config: {}", e)))?;
+        let (config, ignored) = deserialize_reporting_ignored_paths(&contents)?;
 
-        // Surface unknown TOP-LEVEL sections/keys (e.g. documented-but-
-        // unimplemented `[ha]`/`[logging]`/`[metrics]` blocks) as warnings so
-        // silent doc drift becomes visible. We deliberately do NOT reject them:
-        // there is no `deny_unknown_fields`, so deserialization already ignores
-        // unknown fields and pre-existing configs with such sections keep
-        // loading. Nested unknown keys are out of scope.
-        let unknown = unknown_top_level_keys(&contents);
-        if config.strict_config && !unknown.is_empty() {
+        // Surface unknown keys — top-level (a documented-but-unimplemented
+        // `[ha]`/`[logging]`/`[metrics]` block) AND nested (a typo inside a
+        // known section, e.g. `[cache] l1_max_byts = 1`) — as warnings so
+        // silent doc drift/typos become visible. We deliberately do NOT reject
+        // them by default: there is no `deny_unknown_fields`, so
+        // deserialization already ignores unknown fields and pre-existing
+        // configs with such keys keep loading. `strict_config = true` upgrades
+        // this to a hard startup failure.
+        if config.strict_config && !ignored.is_empty() {
             return Err(ProxyError::Config(format!(
-                "strict_config: unknown top-level sections/keys: {}",
-                unknown.join(", ")
+                "strict_config: unknown config keys: {}",
+                ignored.join(", ")
             )));
         }
-        for key in unknown {
+        for path in &ignored {
             tracing::warn!(
-                "unknown config section/key '{}' ignored (not part of ProxyConfig)",
-                key
+                "unknown config key '{}' ignored (not part of ProxyConfig)",
+                path
             );
         }
 
@@ -2540,6 +2548,44 @@ impl ProxyConfig {
             }
         }
 
+        // H-06 gateway policy: `query_timeout_ms` feeds an `Instant + Duration`
+        // backend-execution deadline in each gateway's `BackendConfig`, and
+        // `max_concurrent_requests` sizes a `tokio::sync::Semaphore` — zero
+        // would mean "every request times out instantly" / "no request is ever
+        // admitted" respectively, so both are rejected unconditionally
+        // (parsed on every build regardless of whether the gateway is
+        // enabled, exactly like the anomaly/analytics tunables above).
+        {
+            let checks: [(&str, u64); 6] = [
+                (
+                    "graphql_gateway.query_timeout_ms",
+                    self.graphql_gateway.query_timeout_ms,
+                ),
+                (
+                    "graphql_gateway.max_concurrent_requests",
+                    self.graphql_gateway.max_concurrent_requests as u64,
+                ),
+                ("mcp.query_timeout_ms", self.mcp.query_timeout_ms),
+                (
+                    "mcp.max_concurrent_requests",
+                    self.mcp.max_concurrent_requests as u64,
+                ),
+                (
+                    "http_gateway.query_timeout_ms",
+                    self.http_gateway.query_timeout_ms,
+                ),
+                (
+                    "http_gateway.max_concurrent_requests",
+                    self.http_gateway.max_concurrent_requests as u64,
+                ),
+            ];
+            for (name, value) in checks {
+                if value == 0 {
+                    return Err(ProxyError::Config(format!("{name} must be >= 1")));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -2883,7 +2929,12 @@ mod tests {
 
     /// Every example configuration shipped in `config/` loads through the
     /// real parser and validation (a generic TOML parse is not enough: it
-    /// cannot see a wrong type or a failed `validate()`).
+    /// cannot see a wrong type or a failed `validate()`) AND carries zero
+    /// unknown keys at any depth. `config/*.toml` is documentation — a
+    /// section/key that `ProxyConfig` silently ignores there (a stale
+    /// `[ha]`/`[logging]` block, a nested typo like `[cache] l1_max_byts`)
+    /// is a doc bug and must be fixed in the example, never worked around in
+    /// the parser.
     #[test]
     fn shipped_example_configs_load() {
         let mut checked = 0;
@@ -2892,14 +2943,75 @@ mod tests {
             if path.extension().and_then(|e| e.to_str()) != Some("toml") {
                 continue;
             }
-            if let Err(e) = ProxyConfig::from_file(path.to_str().unwrap()) {
+            let path_str = path.to_str().unwrap();
+            if let Err(e) = ProxyConfig::from_file(path_str) {
                 panic!("{} does not load: {e}", path.display());
             }
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let substituted = substitute_env(&raw)
+                .unwrap_or_else(|e| panic!("env substitution failed for {}: {e}", path.display()));
+            let (_, ignored) = deserialize_reporting_ignored_paths(&substituted)
+                .unwrap_or_else(|e| panic!("{} failed to parse: {e}", path.display()));
+            assert!(
+                ignored.is_empty(),
+                "{} has unknown keys not recognised by ProxyConfig (fix the \
+                 example, not the parser): {}",
+                path.display(),
+                ignored.join(", ")
+            );
             checked += 1;
         }
         assert!(
             checked >= 3,
             "expected the shipped example configs, found {checked}"
+        );
+    }
+
+    /// `scripts/regress/*.toml` are the live regression-harness configs (not
+    /// user-facing docs), but a typo there is exactly as silent as one in
+    /// `config/*.toml` and just as worth catching. Any path that is not an
+    /// obvious typo — i.e. a deliberate, still-undocumented knob someone
+    /// intends to add to `ProxyConfig` later — can be added to
+    /// `REGRESS_CONFIG_IGNORED_KEY_ALLOWLIST` with a comment explaining why;
+    /// today the list is empty because every ignored key found while writing
+    /// this test was a genuine typo, fixed in the same change.
+    #[test]
+    fn regress_configs_have_no_unexpected_ignored_keys() {
+        const REGRESS_CONFIG_IGNORED_KEY_ALLOWLIST: &[&str] = &[];
+
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let regress_dir = format!("{manifest}/scripts/regress");
+        let mut checked = 0;
+        let mut unexpected: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&regress_dir)
+            .unwrap_or_else(|e| panic!("regress dir {regress_dir} unreadable: {e}"))
+        {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let substituted = substitute_env(&raw)
+                .unwrap_or_else(|e| panic!("env substitution failed for {}: {e}", path.display()));
+            let (_, ignored) = deserialize_reporting_ignored_paths(&substituted)
+                .unwrap_or_else(|e| panic!("{} failed to parse: {e}", path.display()));
+            for path_key in ignored {
+                if !REGRESS_CONFIG_IGNORED_KEY_ALLOWLIST.contains(&path_key.as_str()) {
+                    unexpected.push(format!("{}: {path_key}", path.display()));
+                }
+            }
+            checked += 1;
+        }
+        assert!(
+            checked >= 1,
+            "expected at least one scripts/regress/*.toml, found {checked}"
+        );
+        assert!(
+            unexpected.is_empty(),
+            "scripts/regress/*.toml carry unknown config keys not on the \
+             allow-list (fix the typo, or add to \
+             REGRESS_CONFIG_IGNORED_KEY_ALLOWLIST with a reason):\n{}",
+            unexpected.join("\n")
         );
     }
 
@@ -2922,7 +3034,94 @@ mod tests {
             .unwrap_err()
             .to_string();
         let _ = std::fs::remove_file(&path);
-        assert!(err.contains("unknown top-level"), "{err}");
+        assert!(
+            err.contains("unknown config keys") && err.contains("nonsense_top_level"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn strict_config_rejects_unknown_nested_keys() {
+        // A typo INSIDE a known section (`[journal]`) must be caught too —
+        // this is the whole point of switching to `serde_ignored`: the old
+        // top-level-only check could never see this. `[journal]` is not in
+        // `config/proxy.example.toml` already, so appending it can't collide
+        // with an existing table header.
+        let src =
+            std::fs::read_to_string("config/proxy.example.toml").expect("example config present");
+        let strict = format!("strict_config = true\n{src}\n[journal]\nfsyncc = \"commit\"\n");
+        let path = std::env::temp_dir().join(format!(
+            "helios-strict-nested-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, strict).unwrap();
+        let err = ProxyConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            err.contains("unknown config keys") && err.contains("journal.fsyncc"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn non_strict_config_warns_but_loads_with_unknown_nested_keys() {
+        // strict_config = false (the default) must keep loading a config with
+        // an unknown nested key — only warn, never reject.
+        let src =
+            std::fs::read_to_string("config/proxy.example.toml").expect("example config present");
+        let lenient = format!("{src}\n[journal]\nfsyncc = \"commit\"\n");
+        let path = std::env::temp_dir().join(format!(
+            "helios-lenient-nested-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, lenient).unwrap();
+        let result = ProxyConfig::from_file(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn deserialize_reporting_ignored_paths_finds_top_level_and_nested() {
+        // Build off a serialised DEFAULT `ProxyConfig` (every required field
+        // already present and valid) so the only ignored paths are the two
+        // we inject — a hand-rolled partial snippet would fail to parse at
+        // all on a missing required field before ever reaching "ignored".
+        let mut value = toml::Value::try_from(ProxyConfig::default()).unwrap();
+        {
+            let table = value.as_table_mut().unwrap();
+            table.insert("ha".to_string(), toml::Value::Table(Default::default()));
+            let cache = table
+                .get_mut("cache")
+                .expect("cache is a required field of ProxyConfig")
+                .as_table_mut()
+                .unwrap();
+            cache.insert("l1_max_byts".to_string(), toml::Value::Integer(1));
+        }
+        let text = toml::to_string(&value).unwrap();
+        let (_, ignored) = deserialize_reporting_ignored_paths(&text).unwrap();
+        assert_eq!(
+            ignored,
+            vec!["cache.l1_max_byts".to_string(), "ha".to_string()]
+        );
+    }
+
+    #[test]
+    fn deserialize_reporting_ignored_paths_empty_for_clean_config() {
+        let src =
+            std::fs::read_to_string("config/proxy.example.toml").expect("example config present");
+        let substituted = substitute_env(&src).unwrap();
+        let (_, ignored) = deserialize_reporting_ignored_paths(&substituted).unwrap();
+        assert!(ignored.is_empty(), "{ignored:?}");
     }
 
     #[test]
@@ -3178,46 +3377,25 @@ database = "helios"
     }
 
     // -------------------------------------------------------------------------
-    // Unknown top-level key detection
+    // Unknown key detection (top-level AND nested — serde_ignored)
     // -------------------------------------------------------------------------
+    //
+    // There is no more `KNOWN_TOP_LEVEL_KEYS` whitelist to drift-guard: these
+    // tests exercise `deserialize_reporting_ignored_paths` directly against
+    // the real `ProxyConfig` struct (see
+    // `deserialize_reporting_ignored_paths_finds_top_level_and_nested` and
+    // `..._empty_for_clean_config` above, plus the `strict_config_rejects_*`
+    // end-to-end tests), so there is nothing to keep in sync by hand and
+    // nothing that can go stale.
 
     #[test]
-    fn test_unknown_top_level_keys_detection() {
-        let text = "listen_address = \"x\"\n\
-                    [pool]\nmin_connections = 1\n\
-                    [ha]\nenabled = true\n\
-                    [logging]\nlevel = \"info\"\n";
-        // `listen_address` and `pool` are known; `ha` and `logging` are not.
-        assert_eq!(
-            unknown_top_level_keys(text),
-            vec!["ha".to_string(), "logging".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_unknown_top_level_keys_nested_are_out_of_scope() {
-        // `[cache.l1]` is a NESTED unknown key under the known `cache` table;
-        // it must NOT be reported (nested detection is out of scope).
-        let text = "[cache]\nenabled = true\n[cache.l1]\nsize = 500\n";
-        assert!(unknown_top_level_keys(text).is_empty());
-    }
-
-    #[test]
-    fn test_known_top_level_keys_cover_struct_fields() {
-        // Drift guard: every key a default `ProxyConfig` serialises to must be
-        // present in `KNOWN_TOP_LEVEL_KEYS`. `Option` fields that default to
-        // `None` (`tls`, `admin_token`) are absent from the serialised form, so
-        // this is a subset check — it still catches a new non-optional field
-        // added without updating the list.
-        let value = toml::Value::try_from(ProxyConfig::default()).unwrap();
-        let table = value.as_table().unwrap();
-        for k in table.keys() {
-            assert!(
-                KNOWN_TOP_LEVEL_KEYS.contains(&k.as_str()),
-                "field '{k}' is present in a serialised default ProxyConfig but \
-                 missing from KNOWN_TOP_LEVEL_KEYS"
-            );
-        }
+    fn test_deserialize_reporting_ignored_paths_propagates_parse_errors() {
+        // A genuine TOML syntax error must still surface as `Err`, not be
+        // swallowed into an empty ignored-paths list.
+        let err = deserialize_reporting_ignored_paths("listen_address = [1, 2\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Failed to parse config"), "{err}");
     }
 
     // -------------------------------------------------------------------------
@@ -4320,5 +4498,124 @@ database = "helios"
         // Un-specified fields retain their defaults.
         assert_eq!(config.plugins.max_plugins, 20);
         assert!(config.plugins.fuel_metering);
+    }
+
+    // -------------------------------------------------------------------------
+    // H-06 slice 1 — gateway query_timeout_ms / max_concurrent_requests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn gateway_query_timeout_and_concurrency_defaults_preserve_prior_behaviour() {
+        // 30_000 ms / 64 must match the previously hardcoded 30 s timeout and
+        // a generous, previously-nonexistent concurrency cap, so an absent
+        // key changes nothing for an existing deployment.
+        let g = GraphqlGatewayConfig::default();
+        assert_eq!(g.query_timeout_ms, 30_000);
+        assert_eq!(g.max_concurrent_requests, 64);
+
+        let m = McpConfig::default();
+        assert_eq!(m.query_timeout_ms, 30_000);
+        assert_eq!(m.max_concurrent_requests, 64);
+
+        let h = HttpGatewayConfig::default();
+        assert_eq!(h.query_timeout_ms, 30_000);
+        assert_eq!(h.max_concurrent_requests, 64);
+    }
+
+    #[test]
+    fn gateway_query_timeout_and_concurrency_parse_from_toml() {
+        let toml_text = r#"
+            listen_address = "0.0.0.0:5432"
+            admin_address = "0.0.0.0:9090"
+            tr_enabled = true
+            tr_mode = "session"
+            nodes = []
+
+            [pool]
+            min_connections = 2
+            max_connections = 10
+            idle_timeout_secs = 300
+            max_lifetime_secs = 1800
+            acquire_timeout_secs = 30
+            test_on_acquire = true
+
+            [load_balancer]
+            read_strategy = "round_robin"
+            read_write_split = true
+            latency_threshold_ms = 100
+
+            [health]
+            check_interval_secs = 5
+            check_timeout_secs = 3
+            failure_threshold = 3
+            success_threshold = 2
+            check_query = "SELECT 1"
+
+            [graphql_gateway]
+            enabled = true
+            listen_address = "0.0.0.0:9091"
+            backend_host = "127.0.0.1"
+            backend_port = 5432
+            backend_user = "postgres"
+            query_timeout_ms = 5000
+            max_concurrent_requests = 8
+
+            [mcp]
+            enabled = true
+            listen_address = "127.0.0.1:9092"
+            backend_host = "127.0.0.1"
+            backend_port = 5432
+            backend_user = "postgres"
+            query_timeout_ms = 6000
+            max_concurrent_requests = 9
+
+            [http_gateway]
+            enabled = true
+            listen_address = "127.0.0.1:9093"
+            backend_host = "127.0.0.1"
+            backend_port = 5432
+            backend_user = "postgres"
+            query_timeout_ms = 7000
+            max_concurrent_requests = 10
+        "#;
+        let config: ProxyConfig = toml::from_str(toml_text).expect("parse");
+        assert_eq!(config.graphql_gateway.query_timeout_ms, 5000);
+        assert_eq!(config.graphql_gateway.max_concurrent_requests, 8);
+        assert_eq!(config.mcp.query_timeout_ms, 6000);
+        assert_eq!(config.mcp.max_concurrent_requests, 9);
+        assert_eq!(config.http_gateway.query_timeout_ms, 7000);
+        assert_eq!(config.http_gateway.max_concurrent_requests, 10);
+    }
+
+    /// A config key and a mutation that sets it to an invalid value.
+    type InvalidCase = (&'static str, fn(&mut ProxyConfig));
+
+    #[test]
+    fn gateway_query_timeout_and_concurrency_reject_zero() {
+        let cases: [InvalidCase; 6] = [
+            ("graphql_gateway.query_timeout_ms", |c| {
+                c.graphql_gateway.query_timeout_ms = 0
+            }),
+            ("graphql_gateway.max_concurrent_requests", |c| {
+                c.graphql_gateway.max_concurrent_requests = 0
+            }),
+            ("mcp.query_timeout_ms", |c| c.mcp.query_timeout_ms = 0),
+            ("mcp.max_concurrent_requests", |c| {
+                c.mcp.max_concurrent_requests = 0
+            }),
+            ("http_gateway.query_timeout_ms", |c| {
+                c.http_gateway.query_timeout_ms = 0
+            }),
+            ("http_gateway.max_concurrent_requests", |c| {
+                c.http_gateway.max_concurrent_requests = 0
+            }),
+        ];
+        for (name, mutate) in cases {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            mutate(&mut c);
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains(name), "{name}: unexpected error {err}");
+        }
     }
 }

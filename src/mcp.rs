@@ -57,6 +57,12 @@ impl McpServer {
             })?;
         tracing::info!(addr = %self.config.listen_address, read_only = self.config.read_only,
             contract = ?self.contract.as_ref().map(|c| &c.id), "MCP agent gateway listening");
+        // Admission cap (H-06 `max_concurrent_requests`): guards only
+        // `tools/call` (the method that runs SQL against the backend); the
+        // cheap protocol handshake methods and notifications are never gated.
+        let admission = Arc::new(tokio::sync::Semaphore::new(
+            self.config.max_concurrent_requests,
+        ));
         let cfg = Arc::new(self.config);
         let contract = Arc::new(self.contract);
         let pool = self.pool.clone();
@@ -71,8 +77,11 @@ impl McpServer {
             let cfg = cfg.clone();
             let contract = contract.clone();
             let pool = pool.clone();
+            let admission = admission.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_connection(stream, cfg, contract, pool).await {
+                if let Err(e) =
+                    Self::handle_connection(stream, cfg, contract, pool, admission).await
+                {
                     tracing::debug!(%peer, "MCP connection error: {}", e);
                 }
             });
@@ -84,6 +93,7 @@ impl McpServer {
         cfg: Arc<McpConfig>,
         contract: Arc<Option<AgentContract>>,
         pool: crate::gateway_pool::SharedBackendPool,
+        admission: Arc<tokio::sync::Semaphore>,
     ) -> Result<()> {
         use crate::http_util;
         let (reader, mut writer) = stream.split();
@@ -134,7 +144,7 @@ impl McpServer {
             Err(_) => return Ok(()),
         };
 
-        let response = Self::dispatch(&body, &cfg, (*contract).as_ref(), &pool).await;
+        let response = Self::dispatch(&body, &cfg, (*contract).as_ref(), &pool, &admission).await;
         match response {
             Some(v) => {
                 let payload = serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string());
@@ -151,6 +161,7 @@ impl McpServer {
         cfg: &McpConfig,
         contract: Option<&AgentContract>,
         pool: &crate::gateway_pool::SharedBackendPool,
+        admission: &tokio::sync::Semaphore,
     ) -> Option<Value> {
         let req: Value = match serde_json::from_str(body) {
             Ok(v) => v,
@@ -179,7 +190,23 @@ impl McpServer {
             "notifications/initialized" | "notifications/cancelled" => None,
             "ping" => Some(rpc_ok(id, json!({}))),
             "tools/list" => Some(rpc_ok(id, json!({ "tools": Self::tool_defs(cfg) }))),
-            "tools/call" => Some(Self::handle_tool_call(id, &params, cfg, contract, pool).await),
+            "tools/call" => {
+                // Admission cap (H-06 `max_concurrent_requests`): this is the
+                // one method that runs SQL against the backend, so it is the
+                // only one gated — a saturated gateway still answers cheap
+                // protocol calls (`initialize`/`ping`/`tools/list`).
+                let _permit = match admission.try_acquire() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return Some(rpc_error(
+                            id,
+                            -32000,
+                            "server busy: too many concurrent MCP requests, retry shortly",
+                        ))
+                    }
+                };
+                Some(Self::handle_tool_call(id, &params, cfg, contract, pool).await)
+            }
             other => Some(rpc_error(
                 id,
                 -32601,
@@ -389,7 +416,7 @@ impl McpServer {
             application_name: Some("heliosproxy-mcp".to_string()),
             tls_mode: TlsMode::Disable,
             connect_timeout: Duration::from_secs(5),
-            query_timeout: Duration::from_secs(30),
+            query_timeout: Duration::from_millis(cfg.query_timeout_ms),
             tls_config: default_client_config(),
         };
         let mut client = pool
@@ -1116,6 +1143,12 @@ mod tests {
         std::sync::Arc::new(crate::gateway_pool::BackendClientPool::new(0))
     }
 
+    /// Generous admission cap: dispatch tests other than the exhaustion test
+    /// itself must never be rejected as busy.
+    fn test_admission() -> tokio::sync::Semaphore {
+        tokio::sync::Semaphore::new(4)
+    }
+
     #[tokio::test]
     async fn initialize_and_tools_list() {
         let cfg = McpConfig::default();
@@ -1124,6 +1157,7 @@ mod tests {
             &cfg,
             None,
             &test_pool(),
+            &test_admission(),
         )
         .await
         .unwrap();
@@ -1135,6 +1169,7 @@ mod tests {
             &cfg,
             None,
             &test_pool(),
+            &test_admission(),
         )
         .await
         .unwrap();
@@ -1157,6 +1192,7 @@ mod tests {
             &cfg,
             None,
             &test_pool(),
+            &test_admission(),
         )
         .await;
         assert!(r.is_none());
@@ -1170,6 +1206,7 @@ mod tests {
             &cfg,
             None,
             &test_pool(),
+            &test_admission(),
         )
         .await
         .unwrap();
@@ -1178,5 +1215,43 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_rejected_with_jsonrpc_error_when_admission_cap_exhausted() {
+        let cfg = McpConfig::default();
+        let exhausted = tokio::sync::Semaphore::new(0);
+        let r = McpServer::dispatch(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT 1"}}}"#,
+            &cfg,
+            None,
+            &test_pool(),
+            &exhausted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["error"]["code"], -32000);
+        assert!(r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("too many concurrent MCP requests"));
+    }
+
+    #[tokio::test]
+    async fn other_methods_bypass_the_admission_cap() {
+        // Only `tools/call` is gated: `ping` must still succeed even when
+        // every permit is exhausted.
+        let cfg = McpConfig::default();
+        let exhausted = tokio::sync::Semaphore::new(0);
+        let r = McpServer::dispatch(
+            r#"{"jsonrpc":"2.0","id":5,"method":"ping","params":{}}"#,
+            &cfg,
+            None,
+            &test_pool(),
+            &exhausted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["result"], json!({}));
     }
 }
