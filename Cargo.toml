@@ -190,7 +190,10 @@ memchr = "2"
 
 # Encoding (used by auth, distribcache)
 base64 = "0.21"
-bincode = "1"
+# Binary serde codec for the durable journal segments (src/journal_store.rs) and the
+# DistribCache L2/L3 blobs. postcard replaced bincode 1 (RUSTSEC-2025-0141: bincode is
+# unmaintained in every version); its wire format is specified and stable across 1.x.
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 
 # Random (used by rate_limit, circuit_breaker)
 rand = "0.8"
@@ -210,8 +213,9 @@ lz4_flex = "0.13"
 # Kept lightweight: ring for crypto, no BoringSSL, no tokio-postgres.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-rustls-pki-types = "1"
-rustls-pemfile = "2"
+# PEM parsing for the client-facing TLS listener goes through `pki_types::pem::PemObject`
+# (rustls-pemfile is unmaintained: RUSTSEC-2025-0134).
+rustls-pki-types = "1.9"
 webpki-roots = "0.26"
 sha2 = "0.10"
 hmac = "0.12"

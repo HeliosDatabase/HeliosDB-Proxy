@@ -16,7 +16,10 @@
 //! policy (`commit` / `interval` / `none`) decides when appended records
 //! reach stable storage.
 //!
-//! Record layout: `MAGIC(4) | len(4, BE) | crc32(4, BE) | bincode(payload)`.
+//! Record layout: `MAGIC(4) | len(4, BE) | crc32(4, BE) | postcard(payload)`,
+//! MAGIC = `HJ02`. `HJ01` (bincode 1 payloads) was only ever written by
+//! pre-release builds of 1.9.0; a segment that starts with it is refused at
+//! startup with an explicit error instead of being truncated as corrupt.
 //! Boundary: the journal is written **after** the backend reported the commit
 //! (the proxy is not a participant in the backend's commit), so a crash
 //! between the two loses that record; the store is a faithful log of what
@@ -33,7 +36,9 @@ use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const MAGIC: [u8; 4] = *b"HJ01";
+const MAGIC: [u8; 4] = *b"HJ02";
+/// Record magic of the pre-release bincode format (never shipped in a release).
+const LEGACY_MAGIC: [u8; 4] = *b"HJ01";
 const HEADER: usize = 12;
 const SEGMENT_PREFIX: &str = "journal-";
 const SEGMENT_SUFFIX: &str = ".log";
@@ -195,6 +200,13 @@ fn read_record(r: &mut BufReader<File>) -> io::Result<Option<TransactionJournalE
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
+    if header[..4] == LEGACY_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "segment written by a pre-release build (record format HJ01, bincode); \
+             this version reads HJ02 only: move the journal directory aside to start fresh",
+        ));
+    }
     if header[..4] != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -218,7 +230,7 @@ fn read_record(r: &mut BufReader<File>) -> io::Result<Option<TransactionJournalE
             "record crc mismatch",
         ));
     }
-    bincode::deserialize::<TransactionJournalEntry>(&payload)
+    postcard::from_bytes::<TransactionJournalEntry>(&payload)
         .map(Some)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
@@ -261,6 +273,14 @@ impl SegmentStore {
                         }
                     }
                     Ok(None) => break,
+                    Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+                        // A format this build cannot read is not corruption:
+                        // refuse to start rather than truncate someone's log.
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            format!("{}: {}", path.display(), e),
+                        ));
+                    }
                     Err(e) => {
                         let total = fs::metadata(path)?.len();
                         let torn = total.saturating_sub(good_end);
@@ -428,7 +448,7 @@ impl Writer {
     }
 
     fn append(&mut self, tx: &TransactionJournalEntry) -> io::Result<()> {
-        let payload = bincode::serialize(tx)
+        let payload = postcard::to_stdvec(tx)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         if self.len >= self.cfg.segment_bytes && self.len > 0 {
             self.rotate(tx.commit_seq.unwrap_or(0))?;
@@ -523,6 +543,100 @@ mod tests {
         t.committed_at = Some(chrono::Utc::now());
         t.commit_tag = Some("COMMIT".into());
         t
+    }
+
+    /// Every shape a journaled transaction can take survives the segment codec
+    /// unchanged (postcard is not self-describing, so a serde attribute that
+    /// needs `deserialize_any` would fail here, not in production).
+    #[test]
+    fn every_journal_shape_round_trips_through_the_codec() {
+        let mut t = tx(7, "update t set a = $1 where b = any($2)");
+        t.add_entry(
+            NewEntry {
+                statement: "insert into u values ($1, $2, $3, $4, $5, $6)".into(),
+                parameters: vec![
+                    JournalValue::Bool(true),
+                    JournalValue::Int64(i64::MIN),
+                    JournalValue::Float64(-1.5e300),
+                    JournalValue::Bytes(vec![0xde, 0xad]),
+                    JournalValue::Array(vec![
+                        JournalValue::Int64(1),
+                        JournalValue::Array(vec![
+                            JournalValue::Null,
+                            JournalValue::Text("é".into()),
+                        ]),
+                    ]),
+                    JournalValue::TextRaw(vec![0xff, 0xfe]),
+                ],
+                param_types: vec![16, 20, 701, 17, 1016, 25],
+                result_checksum: Some(u64::MAX),
+                rows_affected: None,
+                duration_ms: 0,
+                outcome: StatementOutcome::Failed(Box::new(
+                    crate::transaction_journal::StatementFailure {
+                        sqlstate: "23505".into(),
+                        message: "duplicate key".into(),
+                    },
+                )),
+                protocol: WireProtocol::Simple,
+            }
+            .into_journal_entry(2),
+        );
+        t.add_entry(
+            NewEntry {
+                statement: "select 1".into(),
+                parameters: Vec::new(),
+                param_types: Vec::new(),
+                result_checksum: None,
+                rows_affected: None,
+                duration_ms: 1,
+                outcome: StatementOutcome::Unobserved,
+                protocol: WireProtocol::Extended,
+            }
+            .into_journal_entry(3),
+        );
+        t.create_savepoint("s1".into());
+        t.source.tenant = None;
+        t.commit_tag = Some(std::borrow::Cow::Owned("COMMIT PREPARED".into()));
+        t.mark_incomplete("COPY FROM STDIN");
+
+        let bytes = postcard::to_stdvec(&t).unwrap();
+        let back: TransactionJournalEntry = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            serde_json::to_value(&t).unwrap(),
+            serde_json::to_value(&back).unwrap()
+        );
+    }
+
+    /// A segment in the pre-release bincode format (`HJ01`) is refused with
+    /// an explicit error and left untouched, never truncated as corrupt.
+    #[test]
+    fn legacy_format_segment_is_refused_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = segment_path(dir.path(), 1);
+        let payload = b"not a postcard record";
+        let mut rec = Vec::new();
+        rec.extend_from_slice(&LEGACY_MAGIC);
+        rec.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        rec.extend_from_slice(&crc32(payload).to_be_bytes());
+        rec.extend_from_slice(payload);
+        fs::write(&path, &rec).unwrap();
+
+        let e = match SegmentStore::open(cfg(dir.path()), 1000, usize::MAX) {
+            Ok(_) => panic!("a legacy segment must not open"),
+            Err(e) => e,
+        };
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported);
+        let msg = e.to_string();
+        assert!(
+            msg.contains("HJ01") && msg.contains("move the journal directory aside"),
+            "{msg}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            rec,
+            "the legacy segment must be left intact"
+        );
     }
 
     #[test]

@@ -179,7 +179,7 @@ impl WarmCache {
         let decompressed = self.decompress(&compressed)?;
 
         // Deserialize
-        let entry: CacheEntry = bincode::deserialize(&decompressed).ok()?;
+        let entry: CacheEntry = postcard::from_bytes(&decompressed).ok()?;
 
         self.hits.fetch_add(1, Ordering::Relaxed);
         Some(entry)
@@ -190,7 +190,7 @@ impl WarmCache {
         let key = self.fingerprint_to_hash(&fingerprint);
 
         // Serialize
-        let serialized = match bincode::serialize(&entry) {
+        let serialized = match postcard::to_stdvec(&entry) {
             Ok(s) => s,
             Err(_) => return,
         };
