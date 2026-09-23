@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A burst of new clients no longer fails with a false "Authentication failed"
+  when the backend is at `max_connections`.** Every pass-through login opens its own
+  backend connection, while the transaction/statement pool keeps idle connections
+  parked; under a login burst PostgreSQL refused the excess with `53300 sorry, too many
+  clients already`, and the proxy relayed it and logged it as an authentication failure
+  (64-client burst after a 16-client run: 0 TPS in transaction mode). The backend's
+  refusal arrives before any authentication exchange, so the proxy now holds it back,
+  closes one idle pooled connection to that node and redials with jittered backoff,
+  bounded by `[pool] acquire_timeout_secs`; only then does the client receive the
+  53300. The same applies to transaction-mode redials. The same burst now completes
+  (68.8k read / 17.9k committed TPS at 64 clients). Startup errors are also reported
+  with their SQLSTATE: only class 28 is logged as an authentication failure, and a
+  full backend no longer demotes the node on the `auth_file` path. New Prometheus
+  counters `heliosdb_proxy_backend_capacity_waits_total` and
+  `heliosdb_proxy_backend_capacity_refusals_total`.
+
 ## [1.9.0] - 2026-09-22
 
 ### Added

@@ -271,7 +271,7 @@ skip_clean_reset = false
 | `min_idle` | u32 | `10` | Minimum idle connections to maintain. |
 | `idle_timeout_secs` | u64 | `600` | Close idle connections after this many seconds. |
 | `max_lifetime_secs` | u64 | `3600` | Recycle connections after this many seconds. |
-| `acquire_timeout_secs` | u64 | `5` | Max seconds to wait when acquiring from the pool. |
+| `acquire_timeout_secs` | u64 | `5` | Max seconds to wait when acquiring from the pool. Also bounds how long a new backend connection keeps retrying when PostgreSQL refuses it at `max_connections` (SQLSTATE 53300): each retry first closes one idle pooled connection to that node, and only after this timeout does the client receive the 53300. Size the backend's `max_connections` for the pool plus the expected burst of new client logins, since every pass-through login opens its own backend connection. |
 | `reset_query` | string | `"DISCARD ALL"` | SQL run when a connection returns to the pool. |
 | `prepared_statement_mode` | string | `"disable"` | Prepared-statement handling: `disable`, `track`, `named`. |
 | `skip_clean_reset` | bool | `false` | Transaction/Statement pooling only: park a connection that provably touched **no** session state (no `SET`/GUC, temp table, prepared statement, `LISTEN`, advisory lock, …) *without* running `reset_query`, saving a round-trip per clean transaction. Classification is conservative — a misclassification only ever costs an unnecessary reset, never leaks state. Intended for autocommit / simple-protocol workloads. |

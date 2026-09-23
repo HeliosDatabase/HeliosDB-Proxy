@@ -2282,6 +2282,24 @@ impl AdminServer {
         ));
 
         output.push_str(
+            "# HELP heliosdb_proxy_backend_capacity_waits_total Backend connections refused at max_connections (53300) and retried after freeing an idle pooled connection\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_backend_capacity_waits_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_backend_capacity_waits_total {}\n",
+            metrics.backend_capacity_waits
+        ));
+
+        output.push_str(
+            "# HELP heliosdb_proxy_backend_capacity_refusals_total Connections refused with 53300 after the backend stayed at max_connections for the whole acquire timeout\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_backend_capacity_refusals_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_backend_capacity_refusals_total {}\n",
+            metrics.backend_capacity_refusals
+        ));
+
+        output.push_str(
             "# HELP heliosdb_proxy_journal_committed_total Transactions the recovery journal recorded as committed (TR-07)\n",
         );
         output.push_str("# TYPE heliosdb_proxy_journal_committed_total counter\n");
@@ -2433,6 +2451,8 @@ impl AdminState {
                 admission_waited: 0,
                 admission_timeouts: 0,
                 reconnect_attempts: 0,
+                backend_capacity_waits: 0,
+                backend_capacity_refusals: 0,
                 journal_committed: 0,
                 journal_rolled_back: 0,
                 journal_statements: 0,
@@ -3235,6 +3255,8 @@ mod tests {
             admission_waited: 0,
             admission_timeouts: 0,
             reconnect_attempts: 0,
+            backend_capacity_waits: 0,
+            backend_capacity_refusals: 0,
             journal_committed: 0,
             journal_rolled_back: 0,
             journal_statements: 0,
@@ -3268,6 +3290,8 @@ mod tests {
         assert!(output.contains("heliosdb_proxy_admission_waited_total 0"));
         assert!(output.contains("heliosdb_proxy_admission_timeout_total 0"));
         assert!(output.contains("heliosdb_proxy_reconnect_attempts_total 0"));
+        assert!(output.contains("heliosdb_proxy_backend_capacity_waits_total 0"));
+        assert!(output.contains("heliosdb_proxy_backend_capacity_refusals_total 0"));
         assert!(output.contains("heliosdb_proxy_journal_committed_total 0"));
     }
 
@@ -3314,6 +3338,8 @@ mod tests {
             admission_waited: 0,
             admission_timeouts: 0,
             reconnect_attempts: 0,
+            backend_capacity_waits: 0,
+            backend_capacity_refusals: 0,
             journal_committed: 0,
             journal_rolled_back: 0,
             journal_statements: 0,
