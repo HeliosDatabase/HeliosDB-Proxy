@@ -70,6 +70,9 @@ pub struct BackendIdlePool {
     /// Connections parked WITHOUT running the reset query because they were
     /// provably clean (the `skip_clean_reset` conditional-reset optimisation).
     resets_skipped: AtomicU64,
+    /// Idle connections closed to make room on a backend that refused a new
+    /// connection with 53300 (`too_many_connections`).
+    capacity_evictions: AtomicU64,
 }
 
 impl BackendIdlePool {
@@ -89,6 +92,7 @@ impl BackendIdlePool {
             stale_evicted: AtomicU64::new(0),
             reaped: AtomicU64::new(0),
             resets_skipped: AtomicU64::new(0),
+            capacity_evictions: AtomicU64::new(0),
         }
     }
 
@@ -214,6 +218,33 @@ impl BackendIdlePool {
     pub fn stale_evicted(&self) -> u64 {
         self.stale_evicted.load(Ordering::Relaxed)
     }
+
+    /// Close the longest-parked idle connection to `node` (any identity), to
+    /// hand its backend slot to a new connection the backend just refused with
+    /// `53300 too_many_connections`. Parked connections hold backend capacity
+    /// that is idle by definition, and a pass-through client cannot borrow one
+    /// for its own authentication. Returns `false` when nothing to `node` is
+    /// parked.
+    pub fn evict_one_idle_for_node(&self, node: &str) -> bool {
+        let prefix = format!("{}\0", node);
+        for mut entry in self.idle.iter_mut() {
+            if !entry.key().starts_with(&prefix) || entry.value().is_empty() {
+                continue;
+            }
+            // Oldest first: index 0 was parked earliest (checkin pushes).
+            let (stream, _parked_at) = entry.value_mut().remove(0);
+            drop(stream);
+            self.total_idle.fetch_sub(1, Ordering::Relaxed);
+            self.capacity_evictions.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// Idle connections closed by [`Self::evict_one_idle_for_node`].
+    pub fn capacity_evictions(&self) -> u64 {
+        self.capacity_evictions.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -232,6 +263,50 @@ mod tests {
         // the caller; here we just return the client side. The accepted half is
         // dropped, which is fine for liveness tests that re-accept per stream.
         client.unwrap()
+    }
+
+    /// Both halves of a loopback connection, so the parked side stays alive.
+    async fn live_pair(listener: &TcpListener) -> (TcpStream, TcpStream) {
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        (client.unwrap(), accepted.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn capacity_eviction_closes_the_oldest_idle_connection_of_that_node_only() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Keep the accepted halves open so parked connections stay alive for
+        // the checkout probe below.
+        let mut server_halves = Vec::new();
+        let pool = BackendIdlePool::new(4, 1000);
+        let a1 = pool_key("10.0.0.1:5432", "u1", "d");
+        let a2 = pool_key("10.0.0.1:5432", "u2", "d");
+        // Same host, different port: must not match the node prefix.
+        let b = pool_key("10.0.0.1:54320", "u1", "d");
+        let mut park = |key: &str, pair: (TcpStream, TcpStream)| {
+            let addr = pair.0.local_addr().unwrap();
+            server_halves.push(pair.1);
+            assert!(pool.checkin(key, pair.0));
+            addr
+        };
+        let first_addr = park(&a1, live_pair(&listener).await);
+        park(&a1, live_pair(&listener).await);
+        park(&b, live_pair(&listener).await);
+        assert_eq!(pool.idle_count(), 3);
+
+        assert!(pool.evict_one_idle_for_node("10.0.0.1:5432"));
+        assert_eq!(pool.idle_count(), 2);
+        assert_eq!(pool.capacity_evictions(), 1);
+        // The oldest one went; the remaining a1 connection is the newer one.
+        let left = pool.checkout(&a1).expect("one a1 connection remains");
+        assert_ne!(left.local_addr().unwrap(), first_addr);
+
+        // Nothing parked for the node any more (a2 never had one), b untouched.
+        assert!(pool.checkout(&a2).is_none());
+        assert!(!pool.evict_one_idle_for_node("10.0.0.1:5432"));
+        assert!(!pool.evict_one_idle_for_node("10.9.9.9:5432"));
+        assert_eq!(pool.idle_count(), 1);
+        assert_eq!(pool.capacity_evictions(), 1);
     }
 
     #[test]

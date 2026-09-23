@@ -1079,6 +1079,12 @@ struct ServerMetrics {
     /// P-03: jittered waits performed by the primary-select recovery loops. A
     /// large burst after a failover is the reconnect wave H-05 bounds.
     reconnect_attempts: AtomicU64,
+    /// Backend connections the backend refused at `max_connections` (53300)
+    /// that were retried after freeing an idle pooled connection.
+    backend_capacity_waits: AtomicU64,
+    /// Clients (or transaction-mode redials) refused with 53300 because the
+    /// backend stayed at `max_connections` for the whole `acquire_timeout`.
+    backend_capacity_refusals: AtomicU64,
     /// TR-07: transactions the recovery journal recorded as committed.
     journal_committed: AtomicU64,
     /// TR-07: captured transactions the backend rolled back (or that were
@@ -1674,6 +1680,9 @@ impl<'a> StmtFacts<'a> {
         )
     }
 }
+
+/// SQLSTATE `too_many_connections`: the backend is at `max_connections`.
+const SQLSTATE_TOO_MANY_CONNECTIONS: &str = "53300";
 
 impl ProxyServer {
     /// Build a `PluginManager` from config and preload plugins from disk.
@@ -2889,6 +2898,14 @@ impl ProxyServer {
                             reconnect_attempts: server_state
                                 .metrics
                                 .reconnect_attempts
+                                .load(Ordering::Relaxed),
+                            backend_capacity_waits: server_state
+                                .metrics
+                                .backend_capacity_waits
+                                .load(Ordering::Relaxed),
+                            backend_capacity_refusals: server_state
+                                .metrics
+                                .backend_capacity_refusals
                                 .load(Ordering::Relaxed),
                             journal_committed: server_state
                                 .metrics
@@ -4871,34 +4888,124 @@ impl ProxyServer {
         // new client connects) demotes the node in-band too — not just failures
         // on the forward path — so a dead backend is detected on the very next
         // connection instead of waiting for the periodic health checker.
+        let params = &effective_params;
+        let mut backend = Self::dial_backend_startup(&node_addr, params, config, state).await?;
+
+        // A backend at `max_connections` refuses the new connection with 53300
+        // right after the startup packet — before any authentication exchange
+        // and before anything reaches the client. Parked pool connections hold
+        // backend slots that are idle by definition, and a pass-through client
+        // cannot borrow one for its own authentication, so free one idle
+        // connection to this node and redial with jittered backoff, bounded by
+        // `[pool] acquire_timeout_secs`; only then refuse the client with a
+        // truthful 53300. A full backend is not a failed node: nothing here
+        // demotes it.
+        let capacity_deadline = tokio::time::Instant::now() + config.pool.acquire_timeout();
+        let seed = session.id.as_u128() as u64;
+        let mut attempt: u32 = 0;
+        loop {
+            match Self::authenticate_backend(
+                client_stream,
+                &mut backend,
+                session,
+                state,
+                user,
+                &node_addr,
+            )
+            .await
+            {
+                Err(ProxyError::PoolExhausted(msg)) => {
+                    if !Self::backend_capacity_backoff(
+                        state,
+                        &node_addr,
+                        attempt,
+                        seed,
+                        capacity_deadline,
+                    )
+                    .await
+                    {
+                        state
+                            .metrics
+                            .backend_capacity_refusals
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            node = %node_addr,
+                            attempts = attempt + 1,
+                            "backend at max_connections for the whole acquire timeout; refusing the client with 53300"
+                        );
+                        let err = Self::create_error_response(SQLSTATE_TOO_MANY_CONNECTIONS, &msg);
+                        let _ = client_stream.write_all(&err).await;
+                        return Err(ProxyError::PoolExhausted(msg));
+                    }
+                    attempt += 1;
+                    backend = Self::dial_backend_startup(&node_addr, params, config, state).await?;
+                }
+                other => {
+                    other?;
+                    break;
+                }
+            }
+        }
+
+        // Store session variables
+        {
+            let mut vars = session.variables.write().await;
+            for (k, v) in params {
+                vars.insert(k.clone(), v.clone());
+            }
+        }
+
+        Ok((Some(backend), node_addr))
+    }
+
+    /// Dial `node_addr` and send the startup packet for `params`. A connect
+    /// failure demotes the node in-band (a dead backend is detected on the
+    /// next connection, not only by the periodic health checker).
+    async fn dial_backend_startup(
+        node_addr: &str,
+        params: &HashMap<String, String>,
+        config: &ProxyConfig,
+        state: &Arc<ServerState>,
+    ) -> Result<TcpStream> {
         let mut backend = match tokio::time::timeout(
             config.pool.acquire_timeout(),
-            TcpStream::connect(&node_addr),
+            TcpStream::connect(node_addr),
         )
         .await
         {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 let msg = format!("Failed to connect to {}: {}", node_addr, e);
-                Self::note_backend_failure(state, &node_addr, &msg);
+                Self::note_backend_failure(state, node_addr, &msg);
                 return Err(ProxyError::Connection(msg));
             }
             Err(_) => {
                 let msg = format!("Connection timeout to {}", node_addr);
-                Self::note_backend_failure(state, &node_addr, &msg);
+                Self::note_backend_failure(state, node_addr, &msg);
                 return Err(ProxyError::Connection(msg));
             }
         };
         let _ = backend.set_nodelay(true);
-
-        // Build and send startup message to backend
-        let params = &effective_params;
         let startup_bytes = Self::build_startup_message(params);
         backend
             .write_all(&startup_bytes)
             .await
             .map_err(|e| ProxyError::Network(format!("Backend startup write error: {}", e)))?;
+        Ok(backend)
+    }
 
+    /// Authenticate the freshly dialed startup connection: as the proxy when
+    /// an auth_file is configured, otherwise by relaying the client's own
+    /// exchange. Returns `PoolExhausted` — with nothing written to the client
+    /// — when the backend refused the connection at `max_connections`.
+    async fn authenticate_backend(
+        client_stream: &mut ClientStream,
+        backend: &mut TcpStream,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        user: &str,
+        node_addr: &str,
+    ) -> Result<()> {
         if let Some(af) = state.auth_file.as_ref() {
             // The proxy is the auth boundary: the client is already
             // authenticated, so the backend's challenges must NOT be relayed to
@@ -4908,7 +5015,7 @@ impl ProxyServer {
             // backend's own ParameterStatus/BackendKeyData/ReadyForQuery.
             let credential = af.password(user).map(str::to_string);
             let post_auth = match Self::complete_backend_auth(
-                &mut backend,
+                backend,
                 state.limits.max_pending_bytes,
                 user,
                 credential.as_deref(),
@@ -4916,8 +5023,11 @@ impl ProxyServer {
             .await
             {
                 Ok(frames) => frames,
+                // Capacity refusal: nothing was sent to the client; the caller
+                // frees idle capacity and redials (not a node failure).
+                Err(e @ ProxyError::PoolExhausted(_)) => return Err(e),
                 Err(e) => {
-                    Self::note_backend_failure(state, &node_addr, &e.to_string());
+                    Self::note_backend_failure(state, node_addr, &e.to_string());
                     let err = Self::create_error_response(
                         "08006",
                         &format!("backend authentication failed: {}", e),
@@ -4943,7 +5053,7 @@ impl ProxyServer {
                     let f = &post_auth[off..off + 1 + len];
                     let pid = u32::from_be_bytes([f[5], f[6], f[7], f[8]]);
                     let key = u32::from_be_bytes([f[9], f[10], f[11], f[12]]);
-                    Self::register_cancel_key(state, pid, key, &node_addr);
+                    Self::register_cancel_key(state, pid, key, node_addr);
                 }
                 off += 1 + len;
             }
@@ -4954,22 +5064,65 @@ impl ProxyServer {
                 .write_all(&to_client)
                 .await
                 .map_err(|e| ProxyError::Network(format!("Client auth write error: {}", e)))?;
+            Ok(())
         } else {
             // Pass-through: forward authentication messages between client and
             // backend. Registers the backend's BackendKeyData so a later
             // CancelRequest can be routed back to this node.
-            Self::proxy_authentication(client_stream, &mut backend, state, &node_addr).await?;
+            Self::proxy_authentication(client_stream, backend, state, node_addr).await
         }
+    }
 
-        // Store session variables
-        {
-            let mut vars = session.variables.write().await;
-            for (k, v) in params {
-                vars.insert(k.clone(), v.clone());
-            }
+    /// One capacity-wait step after a 53300 refusal: close one idle pooled
+    /// connection to `node` and sleep a jittered backoff. Returns `false`
+    /// (without sleeping) when the backoff would cross `deadline`.
+    async fn backend_capacity_backoff(
+        state: &ServerState,
+        node: &str,
+        attempt: u32,
+        seed: u64,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        let freed_idle = Self::release_idle_capacity(state, node);
+        let pause = Self::reconnect_backoff(attempt, seed);
+        if tokio::time::Instant::now() + pause >= deadline {
+            return false;
         }
+        state
+            .metrics
+            .backend_capacity_waits
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(%node, attempt, freed_idle, "backend at max_connections; retrying");
+        tokio::time::sleep(pause).await;
+        true
+    }
 
-        Ok((Some(backend), node_addr))
+    /// Close one idle pooled connection to `node`, returning whether one
+    /// was parked. Without the pool there is nothing to release.
+    fn release_idle_capacity(state: &ServerState, node: &str) -> bool {
+        #[cfg(feature = "pool-modes")]
+        if let Some(pool) = state.backend_pool.as_ref() {
+            return pool.evict_one_idle_for_node(node);
+        }
+        #[cfg(not(feature = "pool-modes"))]
+        let _ = (state, node);
+        false
+    }
+
+    /// `(SQLSTATE, message)` of a complete backend `ErrorResponse` frame
+    /// (tag and length included).
+    fn error_response_fields(frame: &[u8]) -> (String, String) {
+        let parsed = frame
+            .get(5..)
+            .map(BytesMut::from)
+            .and_then(|payload| ErrorResponse::parse(payload).ok());
+        match parsed {
+            Some(e) => (
+                e.code().unwrap_or("").to_string(),
+                e.message().unwrap_or("backend error").to_string(),
+            ),
+            None => (String::new(), "malformed backend error".to_string()),
+        }
     }
 
     /// Build PostgreSQL startup message
@@ -5079,6 +5232,10 @@ impl ProxyServer {
         let mut cbuf = vec![0u8; 4096];
         let mut bbuf = vec![0u8; 4096];
         let deadline = tokio::time::Instant::now() + state.limits.startup_timeout;
+        // Whether any backend frame has reached the client yet. A 53300 refusal
+        // arrives as the very first frame and is held back, so the caller can
+        // free idle capacity and redial without the client seeing it.
+        let mut relayed_any = false;
 
         loop {
             tokio::select! {
@@ -5099,13 +5256,12 @@ impl ProxyServer {
                             "Backend closed during auth".to_string(),
                         ));
                     }
-                    client_stream
-                        .write_all(&bbuf[..n])
-                        .await
-                        .map_err(|e| ProxyError::Network(format!("Client auth write error: {}", e)))?;
                     backend_buffer.extend_from_slice(&bbuf[..n]);
 
-                    // Walk complete frames by raw tag.
+                    // Walk complete frames by raw tag; relay each complete
+                    // frame (one write per read) and stop at a terminal one.
+                    let mut relay: Vec<u8> = Vec::with_capacity(n);
+                    let mut outcome: Option<Result<()>> = None;
                     loop {
                         if backend_buffer.len() < 5 {
                             break;
@@ -5125,6 +5281,32 @@ impl ProxyServer {
                         }
                         let tag = backend_buffer[0];
                         let frame = backend_buffer.split_to(len + 1);
+                        if tag == b'E' {
+                            let (code, message) = Self::error_response_fields(&frame);
+                            if !relayed_any
+                                && relay.is_empty()
+                                && code == SQLSTATE_TOO_MANY_CONNECTIONS
+                            {
+                                return Err(ProxyError::PoolExhausted(format!(
+                                    "backend {} is at max_connections ({}): {}",
+                                    node_addr, code, message
+                                )));
+                            }
+                            relay.extend_from_slice(&frame);
+                            // Relayed to the client below; report what the
+                            // backend actually said. Only class 28 is an
+                            // authentication failure.
+                            outcome = Some(Err(if code.starts_with("28") {
+                                ProxyError::Auth(format!("{}: {}", code, message))
+                            } else {
+                                ProxyError::Connection(format!(
+                                    "backend refused the session ({}): {}",
+                                    code, message
+                                ))
+                            }));
+                            break;
+                        }
+                        relay.extend_from_slice(&frame);
                         match tag {
                             // BackendKeyData: 5-byte header + pid(4) + key(4).
                             // Remember which backend owns this cancel key.
@@ -5138,14 +5320,22 @@ impl ProxyServer {
                                 Self::register_cancel_key(state, pid, key, node_addr);
                             }
                             // ReadyForQuery: authentication + startup complete.
-                            b'Z' => return Ok(()),
-                            // ErrorResponse: auth failed (already relayed to the
-                            // client above); surface the failure to the caller.
-                            b'E' => {
-                                return Err(ProxyError::Auth("Authentication failed".to_string()));
+                            b'Z' => {
+                                outcome = Some(Ok(()));
+                                break;
                             }
                             _ => {}
                         }
+                    }
+                    if !relay.is_empty() {
+                        client_stream
+                            .write_all(&relay)
+                            .await
+                            .map_err(|e| ProxyError::Network(format!("Client auth write error: {}", e)))?;
+                        relayed_any = true;
+                    }
+                    if let Some(result) = outcome {
+                        return result;
                     }
                 }
                 // Client -> backend: relay the client's auth response(s)
@@ -5282,30 +5472,61 @@ impl ProxyServer {
             }
         }
 
-        let mut backend =
-            tokio::time::timeout(config.pool.acquire_timeout(), TcpStream::connect(target))
-                .await
-                .map_err(|_| ProxyError::Connection(format!("Connection timeout to {}", target)))?
-                .map_err(|e| {
-                    ProxyError::Connection(format!("Failed to connect to {}: {}", target, e))
-                })?;
-        let _ = backend.set_nodelay(true);
-
         let params = session.variables.read().await.clone();
         let startup = Self::build_startup_message(&params);
-        backend
-            .write_all(&startup)
-            .await
-            .map_err(|e| ProxyError::Network(format!("Backend startup error: {}", e)))?;
         let user = params.get("user").map(String::as_str).unwrap_or("");
         let credential = session.backend_credential.read().await.clone();
-        Self::complete_backend_auth(
-            &mut backend,
-            state.limits.max_pending_bytes,
-            user,
-            credential.as_deref(),
-        )
-        .await?;
+        // A 53300 refusal (backend at max_connections) is retried after
+        // freeing one idle pooled connection to this node, bounded by the
+        // pool acquire timeout — see `connect_and_authenticate`.
+        let capacity_deadline = tokio::time::Instant::now() + config.pool.acquire_timeout();
+        let seed = session.id.as_u128() as u64;
+        let mut attempt: u32 = 0;
+        let backend = loop {
+            let mut backend =
+                tokio::time::timeout(config.pool.acquire_timeout(), TcpStream::connect(target))
+                    .await
+                    .map_err(|_| {
+                        ProxyError::Connection(format!("Connection timeout to {}", target))
+                    })?
+                    .map_err(|e| {
+                        ProxyError::Connection(format!("Failed to connect to {}: {}", target, e))
+                    })?;
+            let _ = backend.set_nodelay(true);
+            backend
+                .write_all(&startup)
+                .await
+                .map_err(|e| ProxyError::Network(format!("Backend startup error: {}", e)))?;
+            match Self::complete_backend_auth(
+                &mut backend,
+                state.limits.max_pending_bytes,
+                user,
+                credential.as_deref(),
+            )
+            .await
+            {
+                Ok(_) => break backend,
+                Err(ProxyError::PoolExhausted(msg)) => {
+                    if !Self::backend_capacity_backoff(
+                        state,
+                        target,
+                        attempt,
+                        seed,
+                        capacity_deadline,
+                    )
+                    .await
+                    {
+                        state
+                            .metrics
+                            .backend_capacity_refusals
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(ProxyError::PoolExhausted(msg));
+                    }
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        };
         #[cfg(feature = "pool-modes")]
         if state.backend_pool.is_some() {
             tracing::debug!(target: "helios::pool", node = %target, "dialed fresh backend connection (pool miss)");
@@ -8403,9 +8624,18 @@ impl ProxyServer {
                     // ErrorResponse: parse its message for a clear error.
                     b'E' => {
                         let payload = BytesMut::from(&frame[5..]);
-                        let err = ErrorResponse::parse(payload)
+                        let parsed = ErrorResponse::parse(payload).ok();
+                        let code = parsed.as_ref().and_then(|e| e.code()).unwrap_or("");
+                        let err = parsed
+                            .as_ref()
                             .map(|e| e.message().unwrap_or("Unknown error").to_string())
-                            .unwrap_or_else(|_| "authentication failed".to_string());
+                            .unwrap_or_else(|| "authentication failed".to_string());
+                        if code == SQLSTATE_TOO_MANY_CONNECTIONS {
+                            return Err(ProxyError::PoolExhausted(format!(
+                                "backend is at max_connections ({}): {}",
+                                code, err
+                            )));
+                        }
                         return Err(ProxyError::Auth(err));
                     }
                     // Authentication request: answer the challenge.
@@ -9700,6 +9930,16 @@ impl ProxyServer {
                 .state
                 .metrics
                 .reconnect_attempts
+                .load(Ordering::Relaxed),
+            backend_capacity_waits: self
+                .state
+                .metrics
+                .backend_capacity_waits
+                .load(Ordering::Relaxed),
+            backend_capacity_refusals: self
+                .state
+                .metrics
+                .backend_capacity_refusals
                 .load(Ordering::Relaxed),
             journal_committed: self.state.metrics.journal_committed.load(Ordering::Relaxed),
             journal_rolled_back: self
@@ -11941,6 +12181,10 @@ pub struct ServerMetricsSnapshot {
     pub admission_timeouts: u64,
     /// P-03: jittered waits in the primary-select recovery loops.
     pub reconnect_attempts: u64,
+    /// Startup / redial retries after the backend refused at `max_connections`.
+    pub backend_capacity_waits: u64,
+    /// Refusals passed to the client as 53300 after the capacity wait expired.
+    pub backend_capacity_refusals: u64,
     /// TR-07: transactions the recovery journal recorded as committed.
     pub journal_committed: u64,
     /// TR-07: captured transactions the backend rolled back.
@@ -17804,6 +18048,135 @@ mod tests {
                 }
                 other => panic!("expected Auth error, got {other:?}"),
             }
+        }
+
+        fn fatal(code: &str, message: &str) -> Vec<u8> {
+            let mut body = vec![b'S'];
+            body.extend_from_slice(format!("FATAL\0C{code}\0M{message}\0\0").as_bytes());
+            frame(b'E', &body)
+        }
+
+        /// A backend at `max_connections` answers the startup packet with
+        /// 53300: proxy-side backend auth reports capacity, not an auth failure.
+        #[tokio::test]
+        async fn complete_backend_auth_reports_capacity_refusal() {
+            let (mut proxy_side, mut backend_side) = tokio::io::duplex(8192);
+            tokio::spawn(async move {
+                backend_side
+                    .write_all(&fatal("53300", "sorry, too many clients already"))
+                    .await
+                    .unwrap();
+            });
+            match ProxyServer::complete_backend_auth(&mut proxy_side, 1 << 20, "bench", Some("pw"))
+                .await
+            {
+                Err(ProxyError::PoolExhausted(m)) => {
+                    assert!(m.contains("53300") && m.contains("too many clients"), "{m}")
+                }
+                other => panic!("expected PoolExhausted, got {other:?}"),
+            }
+        }
+
+        /// Pass-through relay: a 53300 first frame is held back from the client
+        /// (so the caller can free idle capacity and redial) and reported as
+        /// capacity.
+        #[tokio::test]
+        async fn passthrough_auth_holds_back_a_capacity_refusal() {
+            let server = ProxyServer::new(test_config()).unwrap();
+            let (mut backend, mut backend_peer) = pair().await;
+            let (client_raw, mut client_peer) = pair().await;
+            let mut client = ClientStream::Plain(client_raw);
+            backend_peer
+                .write_all(&fatal("53300", "sorry, too many clients already"))
+                .await
+                .unwrap();
+            let r = ProxyServer::proxy_authentication(
+                &mut client,
+                &mut backend,
+                &server.state,
+                "127.0.0.1:5432",
+            )
+            .await;
+            match r {
+                Err(ProxyError::PoolExhausted(m)) => {
+                    assert!(m.contains("max_connections") && m.contains("53300"), "{m}")
+                }
+                other => panic!("expected PoolExhausted, got {other:?}"),
+            }
+            drop(client);
+            let mut got = Vec::new();
+            client_peer.read_to_end(&mut got).await.unwrap();
+            assert!(
+                got.is_empty(),
+                "the refusal must not reach the client: {got:?}"
+            );
+        }
+
+        /// Any other backend error is relayed unchanged and reported with its
+        /// SQLSTATE: only class 28 is an authentication failure.
+        #[tokio::test]
+        async fn passthrough_auth_relays_errors_and_reports_their_sqlstate() {
+            for (code, is_auth) in [("28P01", true), ("3D000", false)] {
+                let server = ProxyServer::new(test_config()).unwrap();
+                let (mut backend, mut backend_peer) = pair().await;
+                let (client_raw, mut client_peer) = pair().await;
+                let mut client = ClientStream::Plain(client_raw);
+                let err = fatal(code, "refused");
+                backend_peer.write_all(&err).await.unwrap();
+                let r = ProxyServer::proxy_authentication(
+                    &mut client,
+                    &mut backend,
+                    &server.state,
+                    "127.0.0.1:5432",
+                )
+                .await;
+                match (r, is_auth) {
+                    (Err(ProxyError::Auth(m)), true) => assert!(m.starts_with(code), "{m}"),
+                    (Err(ProxyError::Connection(m)), false) => assert!(m.contains(code), "{m}"),
+                    (other, _) => panic!("{code}: unexpected {other:?}"),
+                }
+                drop(client);
+                let mut got = Vec::new();
+                client_peer.read_to_end(&mut got).await.unwrap();
+                assert_eq!(got, err, "{code}: the error reaches the client unchanged");
+            }
+        }
+
+        /// A successful startup is relayed byte for byte and the cancel key
+        /// is registered.
+        #[tokio::test]
+        async fn passthrough_auth_relays_a_successful_startup_unchanged() {
+            let server = ProxyServer::new(test_config()).unwrap();
+            let (mut backend, mut backend_peer) = pair().await;
+            let (client_raw, mut client_peer) = pair().await;
+            let mut client = ClientStream::Plain(client_raw);
+            let mut bytes = auth_frame(0, b"");
+            bytes.extend(frame(b'S', b"server_version\x0018.4\0"));
+            bytes.extend(frame(b'K', &[0, 0, 0, 7, 0, 0, 0, 9]));
+            bytes.extend(frame(b'Z', b"I"));
+            backend_peer.write_all(&bytes).await.unwrap();
+            ProxyServer::proxy_authentication(
+                &mut client,
+                &mut backend,
+                &server.state,
+                "127.0.0.1:5432",
+            )
+            .await
+            .expect("startup completes");
+            drop(client);
+            let mut got = Vec::new();
+            client_peer.read_to_end(&mut got).await.unwrap();
+            assert_eq!(got, bytes);
+        }
+
+        #[test]
+        fn error_response_fields_reads_code_and_message() {
+            let (code, msg) =
+                ProxyServer::error_response_fields(&fatal("53300", "too many clients"));
+            assert_eq!((code.as_str(), msg.as_str()), ("53300", "too many clients"));
+            let (code, msg) = ProxyServer::error_response_fields(&[b'E', 0, 0, 0, 4]);
+            assert_eq!(code, "");
+            assert!(!msg.is_empty());
         }
 
         /// Without a credential (pass-through mode) a challenge fails fast with
