@@ -73,9 +73,6 @@ reset_query = "DISCARD ALL"
 # when a client's queries land on a different backend connection.
 prepared_statement_mode = "track"
 
-# Lightweight check on every acquire.
-validation_query = "SELECT 1"
-
 # =============================================================================
 # LOAD BALANCER — Read/write splitting
 # =============================================================================
@@ -160,35 +157,16 @@ name    = "pg-async"
 enabled = false
 
 # =============================================================================
-# HA — High availability
+# HA, LOGGING, METRICS
 # =============================================================================
-
-[ha]
-enabled            = true
-
-# Automatically promote the synchronous standby if the primary becomes
-# unreachable. Requires an external promotion mechanism (e.g., Patroni,
-# pg_auto_failover, or a custom script invoked via webhook).
-auto_failover      = true
-failover_threshold = 3
-
-# Only route reads to standbys within this replication lag (milliseconds).
-# The synchronous standby will always be within this limit. The async
-# standby will be excluded when it falls behind.
-max_replica_lag_ms = 100
-
-# =============================================================================
-# LOGGING
-# =============================================================================
-
-[logging]
-level  = "${HELIOS_PROXY_LOG_LEVEL:-info}"
-format = "pretty"
-
-# =============================================================================
-# METRICS — Prometheus
-# =============================================================================
-
-[metrics]
-enabled = true
-addr    = "0.0.0.0:9100"
+#
+# There is no `[ha]`, `[logging]`, or `[metrics]` section — `ProxyConfig`
+# silently ignores unknown sections, so these looked configurable but never
+# did anything. The real equivalents:
+#   - HA / failover: automatic, driven by `[health]` + `[[nodes]]` roles above
+#     (promotion of the synchronous standby happens without a separate
+#     opt-in; an external orchestrator like Patroni still owns actual
+#     promotion of the PostgreSQL cluster itself).
+#   - Logging: CLI flags `--log-level` and `--json-logs`, not proxy.toml.
+#   - Metrics: always on at `/metrics` and `/metrics/prometheus` on
+#     `admin_address` — no opt-in section needed.

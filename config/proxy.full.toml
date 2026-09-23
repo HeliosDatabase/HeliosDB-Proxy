@@ -250,9 +250,6 @@ reset_query = "DISCARD ALL"
 #   named   — protocol-level named statements (session mode only)
 prepared_statement_mode = "track"
 
-# Validation query executed on acquire when test_on_acquire is true.
-validation_query = "SELECT 1"
-
 # How long clients wait in the queue when pool is exhausted (seconds).
 # queue_timeout_secs = 30
 

@@ -144,9 +144,6 @@ reset_query = "DISCARD ALL"
 #   named   — use protocol-level named statements (best for session mode)
 prepared_statement_mode = "track"
 
-# Validate connections with this query before handing them to a client.
-validation_query = "SELECT 1"
-
 # -----------------------------------------------------------------------------
 # Load balancer — read/write splitting and strategy
 # -----------------------------------------------------------------------------
@@ -253,30 +250,14 @@ enabled = false
 max_cacheable_response_bytes = 4194304
 
 # -----------------------------------------------------------------------------
-# High availability
+# High availability, logging, metrics
 # -----------------------------------------------------------------------------
-
-[ha]
-enabled = true
-auto_failover = true
-failover_threshold = 3         # health check failures before failover
-max_replica_lag_ms = 100       # max replication lag for read routing
-
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
-
-[logging]
-# Log level: trace | debug | info | warn | error
-level = "${HELIOS_PROXY_LOG_LEVEL:-info}"
-
-# Output format: pretty (human-readable) | compact | json
-format = "pretty"
-
-# -----------------------------------------------------------------------------
-# Prometheus metrics
-# -----------------------------------------------------------------------------
-
-[metrics]
-enabled = true
-addr = "0.0.0.0:9100"
+#
+# There is no `[ha]`, `[logging]`, or `[metrics]` section — `ProxyConfig`
+# silently ignores unknown sections, so these looked configurable but never
+# did anything. The real equivalents:
+#   - HA / failover: automatic, driven by `[health]` + `[[nodes]]` roles (and
+#     `[topology]` for a dynamic provider); there is no separate opt-in.
+#   - Logging: CLI flags `--log-level` and `--json-logs`, not proxy.toml.
+#   - Metrics: always on at `/metrics` and `/metrics/prometheus` on
+#     `admin_address` — no opt-in section needed.

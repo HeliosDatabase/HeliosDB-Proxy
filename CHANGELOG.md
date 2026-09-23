@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`strict_config` now catches unknown config keys at any nesting depth, not just
+  top-level sections.** A typo inside a known section (`[cache] l1_max_byts = 1`,
+  `[journal] fsyncc = "commit"`) was previously silently dropped by serde with no
+  warning at all; the top-level-only `unknown_top_level_keys` check could never see
+  it. Config loading now runs the whole `ProxyConfig` deserialization through
+  `serde_ignored`, which reports the full dotted path of every ignored key at any
+  depth. `strict_config = true` fails startup listing every offending path;
+  `strict_config = false` (default) logs one `WARN unknown config key '<path>'
+  ignored` per path, unchanged in spirit but now complete. The shipped
+  `config/*.toml` examples are asserted to have zero ignored keys (they are
+  documentation, so an ignored key there is a doc bug, not a parser gap).
+- **H-06 slice 1: configurable gateway timeouts and per-gateway concurrency caps.**
+  `[graphql_gateway]`, `[mcp]`, and `[http_gateway]` each gained `query_timeout_ms`
+  (default `30000`, matching the previous hardcoded 30 s) and `max_concurrent_requests`
+  (default `64`, a new cap — there was none before). Once `max_concurrent_requests`
+  in-flight requests are outstanding, the HTTP and GraphQL gateways answer further
+  requests with `503 Service Unavailable` + `Retry-After`, and MCP answers `tools/call`
+  with a JSON-RPC error (code `-32000`); in every gateway, health/liveness checks and
+  cheap protocol calls (MCP `initialize`/`ping`/`tools/list`, notifications) are never
+  gated. Both knobs are validated to be `> 0`. `src/gateway_pool.rs`'s
+  `BackendClientPool` also gained `reuse_count`/`discard_count`/`miss_count` counters
+  (plus the existing `idle_count` as the idle gauge) so pool effectiveness can be
+  inspected per gateway; not yet exported through `/metrics` (that needs the pool
+  instances threaded into `src/admin.rs`, which lives in `src/server.rs`).
+
 ### Fixed
 
 - **Query-cache invalidation is commit-aware on both protocols and every tier (C-02,

@@ -22,6 +22,11 @@ use crate::{ProxyError, Result};
 pub struct GraphqlGateway {
     config: Arc<GraphqlGatewayConfig>,
     engine: Arc<GraphQLEngine>,
+    /// Admission cap on in-flight requests (H-06 `max_concurrent_requests`).
+    /// A permit is held for the lifetime of one request's SQL execution; the
+    /// `(max_concurrent_requests + 1)`-th concurrent request is rejected with
+    /// `503 Service Unavailable` + `Retry-After` instead of queuing forever.
+    admission: Arc<tokio::sync::Semaphore>,
 }
 
 impl GraphqlGateway {
@@ -58,16 +63,18 @@ impl GraphqlGateway {
             application_name: Some("heliosproxy-graphql".to_string()),
             tls_mode: TlsMode::Disable,
             connect_timeout: Duration::from_secs(5),
-            query_timeout: Duration::from_secs(30),
+            query_timeout: Duration::from_millis(config.query_timeout_ms),
             tls_config: default_client_config(),
         };
         let engine = GraphQLEngine::new(GraphQLConfig::default(), schema)
             .with_backend(bcfg)
             .with_pool(pool);
+        let admission = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_requests));
 
         Self {
             config: Arc::new(config),
             engine: Arc::new(engine),
+            admission,
         }
     }
 
@@ -83,6 +90,7 @@ impl GraphqlGateway {
         tracing::info!(addr = %self.config.listen_address, "GraphQL gateway listening");
         let config = self.config.clone();
         let engine = self.engine.clone();
+        let admission = self.admission.clone();
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(x) => x,
@@ -93,8 +101,9 @@ impl GraphqlGateway {
             };
             let config = config.clone();
             let engine = engine.clone();
+            let admission = admission.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle(stream, config, engine).await {
+                if let Err(e) = Self::handle(stream, config, engine, admission).await {
                     tracing::debug!(%peer, "GraphQL gateway error: {}", e);
                 }
             });
@@ -105,6 +114,7 @@ impl GraphqlGateway {
         mut stream: tokio::net::TcpStream,
         cfg: Arc<GraphqlGatewayConfig>,
         engine: Arc<GraphQLEngine>,
+        admission: Arc<tokio::sync::Semaphore>,
     ) -> Result<()> {
         use crate::http_util;
         let (reader, mut writer) = stream.split();
@@ -178,6 +188,15 @@ impl GraphqlGateway {
             .await;
         }
 
+        // Admission cap (H-06 `max_concurrent_requests`): only the actual
+        // backend-hitting work is gated, not the health probe / auth-failure /
+        // malformed-request paths above, so a saturated gateway still answers
+        // liveness checks. The permit is held for the rest of this request.
+        let _permit = match admission.try_acquire() {
+            Ok(p) => p,
+            Err(_) => return Self::respond_busy(&mut writer).await,
+        };
+
         let response = engine.execute(GraphQLRequest::new(query)).await;
         let errors = response.errors.map(|errs| {
             errs.iter()
@@ -192,6 +211,27 @@ impl GraphqlGateway {
         writer: &mut W,
         status: u16,
         body: &Value,
+    ) -> Result<()> {
+        Self::respond_with_extra_headers(writer, status, body, "").await
+    }
+
+    /// Admission-cap rejection (H-06 `max_concurrent_requests`): 503 +
+    /// `Retry-After`, telling the client this is transient load-shedding, not
+    /// a permanent error.
+    async fn respond_busy<W: AsyncWriteExt + Unpin>(writer: &mut W) -> Result<()> {
+        let body = json!({"errors":[{"message":"too many concurrent GraphQL requests"}]});
+        let retry_after = format!(
+            "Retry-After: {}\r\n",
+            crate::http_util::GATEWAY_BUSY_RETRY_AFTER_SECS
+        );
+        Self::respond_with_extra_headers(writer, 503, &body, &retry_after).await
+    }
+
+    async fn respond_with_extra_headers<W: AsyncWriteExt + Unpin>(
+        writer: &mut W,
+        status: u16,
+        body: &Value,
+        extra_headers: &str,
     ) -> Result<()> {
         let payload = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
         let reason = match status {
@@ -208,10 +248,11 @@ impl GraphqlGateway {
             _ => "Error",
         };
         let head = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
             status,
             reason,
-            payload.len()
+            payload.len(),
+            extra_headers,
         );
         writer
             .write_all(head.as_bytes())
@@ -256,6 +297,10 @@ mod tests {
         Arc::new(GraphQLEngine::new(GraphQLConfig::default(), schema))
     }
 
+    fn admission(n: usize) -> Arc<tokio::sync::Semaphore> {
+        Arc::new(tokio::sync::Semaphore::new(n))
+    }
+
     async fn read_all(client: &mut TcpStream) -> String {
         let mut buf = Vec::new();
         client.read_to_end(&mut buf).await.unwrap();
@@ -271,7 +316,7 @@ mod tests {
         let (mut client, server) = tcp_pair().await;
         let cfg = Arc::new(GraphqlGatewayConfig::default());
         let engine = offline_engine();
-        let task = tokio::spawn(GraphqlGateway::handle(server, cfg, engine));
+        let task = tokio::spawn(GraphqlGateway::handle(server, cfg, engine, admission(4)));
 
         client
             .write_all(b"GET /graphql HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
@@ -289,7 +334,7 @@ mod tests {
         let (mut client, server) = tcp_pair().await;
         let cfg = Arc::new(GraphqlGatewayConfig::default());
         let engine = offline_engine();
-        let task = tokio::spawn(GraphqlGateway::handle(server, cfg, engine));
+        let task = tokio::spawn(GraphqlGateway::handle(server, cfg, engine, admission(4)));
 
         let body = b"{not valid json";
         let req = format!(
@@ -310,7 +355,7 @@ mod tests {
         let (mut client, server) = tcp_pair().await;
         let cfg = Arc::new(GraphqlGatewayConfig::default());
         let engine = offline_engine();
-        let task = tokio::spawn(GraphqlGateway::handle(server, cfg, engine));
+        let task = tokio::spawn(GraphqlGateway::handle(server, cfg, engine, admission(4)));
 
         let body = b"{}";
         let req = format!(
@@ -331,7 +376,7 @@ mod tests {
         let (mut client, server) = tcp_pair().await;
         let cfg = Arc::new(GraphqlGatewayConfig::default());
         let engine = offline_engine();
-        let task = tokio::spawn(GraphqlGateway::handle(server, cfg, engine));
+        let task = tokio::spawn(GraphqlGateway::handle(server, cfg, engine, admission(4)));
 
         // MAX_HTTP_BODY_BYTES (8 MiB) is checked against the DECLARED
         // Content-Length before any body bytes are read, so the client need
@@ -354,7 +399,7 @@ mod tests {
         let (mut client, server) = tcp_pair().await;
         let cfg = Arc::new(GraphqlGatewayConfig::default());
         let engine = offline_engine();
-        let task = tokio::spawn(GraphqlGateway::handle(server, cfg, engine));
+        let task = tokio::spawn(GraphqlGateway::handle(server, cfg, engine, admission(4)));
 
         client
             .write_all(b"GET /health HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
@@ -365,6 +410,49 @@ mod tests {
 
         assert_eq!(status_line(&resp), "HTTP/1.1 200 OK");
         assert!(resp.contains("\"status\":\"ok\""));
+    }
+
+    #[tokio::test]
+    async fn handle_health_bypasses_the_admission_cap() {
+        // A liveness probe must still succeed even when every permit is
+        // exhausted — only backend-hitting requests are gated.
+        let (mut client, server) = tcp_pair().await;
+        let cfg = Arc::new(GraphqlGatewayConfig::default());
+        let engine = offline_engine();
+        let task = tokio::spawn(GraphqlGateway::handle(server, cfg, engine, admission(0)));
+
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let resp = read_all(&mut client).await;
+        task.await.unwrap().unwrap();
+
+        assert_eq!(status_line(&resp), "HTTP/1.1 200 OK");
+    }
+
+    #[tokio::test]
+    async fn handle_rejects_with_503_and_retry_after_when_admission_cap_exhausted() {
+        let (mut client, server) = tcp_pair().await;
+        let cfg = Arc::new(GraphqlGatewayConfig::default());
+        let engine = offline_engine();
+        // Zero permits: the first request that reaches the admission check
+        // must be rejected as busy rather than block forever.
+        let task = tokio::spawn(GraphqlGateway::handle(server, cfg, engine, admission(0)));
+
+        let body = br#"{"query":"{ dummy }"}"#;
+        let req = format!(
+            "POST /graphql HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        client.write_all(body).await.unwrap();
+        let resp = read_all(&mut client).await;
+        task.await.unwrap().unwrap();
+
+        assert_eq!(status_line(&resp), "HTTP/1.1 503 Service Unavailable");
+        assert!(resp.contains("Retry-After: 1\r\n"));
+        assert!(resp.contains("too many concurrent GraphQL requests"));
     }
 
     #[tokio::test]
