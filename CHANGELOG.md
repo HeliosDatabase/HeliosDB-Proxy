@@ -33,6 +33,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (plus the existing `idle_count` as the idle gauge) so pool effectiveness can be
   inspected per gateway; not yet exported through `/metrics` (that needs the pool
   instances threaded into `src/admin.rs`, which lives in `src/server.rs`).
+- **Patroni topology provider (H-01, #52).** `[topology] provider = "patroni"` with
+  `patroni_endpoints` and `patroni_request_timeout_ms`: the cluster's running leader (as
+  Patroni's DCS reports it on `GET /cluster`) becomes the authoritative write primary; a
+  `standby_leader`, a leader that is not running, or one outside `[[nodes]]` is never
+  authorized; no reachable endpoint means no primary (writes stop at the lease
+  boundary). Requires the `postgres-topology` feature.
+
+### Changed
+
+- **Conflicting primaries are resolved by timeline, or fail closed (H-01).** With
+  `provider = "postgres"`, more than one node reporting `pg_is_in_recovery() = false` no
+  longer picks the first node probed: the node on the strictly highest timeline wins, and
+  a tie or an unreadable timeline authorizes nothing. A provider that reports conflicting
+  authority now makes the tracker drop its leader immediately instead of waiting for the
+  lease.
 
 ### Fixed
 

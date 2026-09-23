@@ -845,6 +845,10 @@ fn default_topology_database() -> String {
     "postgres".to_string()
 }
 
+fn default_patroni_request_timeout_ms() -> u64 {
+    2000
+}
+
 /// Which source is authoritative for the current primary (H-01).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -857,6 +861,10 @@ pub enum TopologyProviderKind {
     /// non-recovering node as the primary. Requires the `postgres-topology`
     /// cargo feature.
     Postgres,
+    /// Poll a Patroni cluster's REST API (`GET /cluster` on
+    /// `patroni_endpoints`) and treat its running leader as the primary.
+    /// Requires the `postgres-topology` cargo feature.
+    Patroni,
 }
 
 /// `[topology]` — authoritative primary tracking (H-01).
@@ -882,6 +890,14 @@ pub struct TopologyConfig {
     /// Database the probe connects to.
     #[serde(default = "default_topology_database")]
     pub database: String,
+    /// Patroni REST API base URLs (`http(s)://host:8008`), tried in order
+    /// each poll; the first that answers `GET /cluster` is used. Required
+    /// for `provider = "patroni"`.
+    #[serde(default)]
+    pub patroni_endpoints: Vec<String>,
+    /// Timeout for one Patroni REST request, in milliseconds. Must be >= 1.
+    #[serde(default = "default_patroni_request_timeout_ms")]
+    pub patroni_request_timeout_ms: u64,
 }
 
 impl Default for TopologyConfig {
@@ -893,6 +909,8 @@ impl Default for TopologyConfig {
             user: default_topology_user(),
             password: None,
             database: default_topology_database(),
+            patroni_endpoints: Vec::new(),
+            patroni_request_timeout_ms: default_patroni_request_timeout_ms(),
         }
     }
 }
@@ -2120,16 +2138,37 @@ impl ProxyConfig {
                 )));
             }
         }
-        if self.topology.provider == TopologyProviderKind::Postgres {
+        if self.topology.provider != TopologyProviderKind::Static {
             #[cfg(not(feature = "postgres-topology"))]
             {
+                return Err(ProxyError::Config(format!(
+                    "topology.provider = {:?} requires the `postgres-topology` cargo \
+                     feature; rebuild with --features postgres-topology or set \
+                     topology.provider = \"static\"",
+                    self.topology.provider
+                )));
+            }
+        }
+        if self.topology.provider == TopologyProviderKind::Patroni {
+            if self.topology.patroni_endpoints.is_empty() {
                 return Err(ProxyError::Config(
-                    "topology.provider = \"postgres\" requires the `postgres-topology` \
-                     cargo feature; rebuild with --features postgres-topology or set \
-                     topology.provider = \"static\""
+                    "topology.provider = \"patroni\" requires topology.patroni_endpoints \
+                     (the Patroni REST API base URLs, e.g. \"http://10.0.0.1:8008\")"
                         .to_string(),
                 ));
             }
+            for ep in &self.topology.patroni_endpoints {
+                if !(ep.starts_with("http://") || ep.starts_with("https://")) {
+                    return Err(ProxyError::Config(format!(
+                        "topology.patroni_endpoints: {ep:?} must be an http:// or https:// URL"
+                    )));
+                }
+            }
+        }
+        if self.topology.patroni_request_timeout_ms == 0 {
+            return Err(ProxyError::Config(
+                "topology.patroni_request_timeout_ms must be >= 1".to_string(),
+            ));
         }
 
         // Validate pool config
@@ -3187,6 +3226,49 @@ database = "helios"
         config.topology.lease_timeout_secs = 0;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("topology.lease_timeout_secs"), "{err}");
+    }
+
+    #[test]
+    fn topology_patroni_provider_validation() {
+        let base = || {
+            let mut c = ProxyConfig::default();
+            c.add_node("10.0.0.1:5432", "primary").unwrap();
+            c.topology.provider = TopologyProviderKind::Patroni;
+            c
+        };
+        #[cfg(feature = "postgres-topology")]
+        {
+            let err = base().validate().unwrap_err().to_string();
+            assert!(err.contains("patroni_endpoints"), "{err}");
+
+            let mut c = base();
+            c.topology.patroni_endpoints = vec!["10.0.0.1:8008".into()];
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("http://"), "{err}");
+
+            let mut c = base();
+            c.topology.patroni_endpoints = vec!["http://10.0.0.1:8008".into()];
+            assert!(c.validate().is_ok());
+
+            c.topology.patroni_request_timeout_ms = 0;
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("patroni_request_timeout_ms"), "{err}");
+        }
+        #[cfg(not(feature = "postgres-topology"))]
+        {
+            let mut c = base();
+            c.topology.patroni_endpoints = vec!["http://10.0.0.1:8008".into()];
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("postgres-topology"), "{err}");
+        }
+
+        let parsed: TopologyConfig = toml::from_str(
+            "provider = \"patroni\"\npatroni_endpoints = [\"http://a:8008\", \"https://b:8008\"]\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.provider, TopologyProviderKind::Patroni);
+        assert_eq!(parsed.patroni_endpoints.len(), 2);
+        assert_eq!(parsed.patroni_request_timeout_ms, 2000);
     }
 
     #[test]
