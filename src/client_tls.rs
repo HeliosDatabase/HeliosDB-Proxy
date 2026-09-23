@@ -88,12 +88,13 @@ impl AsyncWrite for ClientStream {
 /// certificate chain + private key (PEM), and — when `require_client_cert`
 /// is set — a client-certificate verifier rooted at `ca_path` (mTLS).
 pub fn build_tls_acceptor(tls: &TlsConfig) -> Result<TlsAcceptor, String> {
+    use rustls::pki_types::pem::{self, PemObject};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     let cert_chain: Vec<CertificateDer<'static>> = {
         let data = std::fs::read(&tls.cert_path)
             .map_err(|e| format!("reading cert {}: {}", tls.cert_path, e))?;
-        rustls_pemfile::certs(&mut &data[..])
+        CertificateDer::pem_slice_iter(&data)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("parsing cert {}: {}", tls.cert_path, e))?
     };
@@ -104,9 +105,10 @@ pub fn build_tls_acceptor(tls: &TlsConfig) -> Result<TlsAcceptor, String> {
     let key: PrivateKeyDer<'static> = {
         let data = std::fs::read(&tls.key_path)
             .map_err(|e| format!("reading key {}: {}", tls.key_path, e))?;
-        rustls_pemfile::private_key(&mut &data[..])
-            .map_err(|e| format!("parsing key {}: {}", tls.key_path, e))?
-            .ok_or_else(|| format!("no private key found in {}", tls.key_path))?
+        PrivateKeyDer::from_pem_slice(&data).map_err(|e| match e {
+            pem::Error::NoItemsFound => format!("no private key found in {}", tls.key_path),
+            e => format!("parsing key {}: {}", tls.key_path, e),
+        })?
     };
 
     let builder = rustls::ServerConfig::builder();
@@ -119,7 +121,7 @@ pub fn build_tls_acceptor(tls: &TlsConfig) -> Result<TlsAcceptor, String> {
         let ca_data =
             std::fs::read(ca_path).map_err(|e| format!("reading ca {}: {}", ca_path, e))?;
         let mut roots = rustls::RootCertStore::empty();
-        for ca in rustls_pemfile::certs(&mut &ca_data[..]) {
+        for ca in CertificateDer::pem_slice_iter(&ca_data) {
             let ca = ca.map_err(|e| format!("parsing ca {}: {}", ca_path, e))?;
             roots
                 .add(ca)
@@ -140,4 +142,85 @@ pub fn build_tls_acceptor(tls: &TlsConfig) -> Result<TlsAcceptor, String> {
     };
 
     Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> String {
+        format!("{}/tests/fixtures/tls/{}", env!("CARGO_MANIFEST_DIR"), name)
+    }
+
+    fn tls(cert: &str, key: &str) -> TlsConfig {
+        TlsConfig {
+            enabled: true,
+            cert_path: fixture(cert),
+            key_path: fixture(key),
+            ca_path: None,
+            require_client_cert: false,
+        }
+    }
+
+    fn err(cfg: &TlsConfig) -> String {
+        match build_tls_acceptor(cfg) {
+            Ok(_) => panic!("expected an error for {cfg:?}"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn accepts_every_supported_private_key_encoding() {
+        // PKCS#8 ("PRIVATE KEY"), SEC1 ("EC PRIVATE KEY"), PKCS#1 ("RSA PRIVATE KEY").
+        build_tls_acceptor(&tls("server-ec.pem", "server-ec.pkcs8.pem")).expect("PKCS#8 EC");
+        build_tls_acceptor(&tls("server-ec.pem", "server-ec.sec1.pem")).expect("SEC1 EC");
+        build_tls_acceptor(&tls("server-rsa.pem", "server-rsa.pkcs1.pem")).expect("PKCS#1 RSA");
+    }
+
+    #[test]
+    fn missing_files_name_the_path() {
+        let e = err(&tls("does-not-exist.pem", "server-ec.pkcs8.pem"));
+        assert!(
+            e.starts_with("reading cert") && e.contains("does-not-exist.pem"),
+            "{e}"
+        );
+        let e = err(&tls("server-ec.pem", "does-not-exist.pem"));
+        assert!(
+            e.starts_with("reading key") && e.contains("does-not-exist.pem"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn files_without_the_expected_pem_items_are_rejected() {
+        // A key file is not a certificate chain, and a certificate is not a key.
+        let e = err(&tls("server-ec.pkcs8.pem", "server-ec.pkcs8.pem"));
+        assert!(e.starts_with("no certificates found"), "{e}");
+        let e = err(&tls("server-ec.pem", "server-ec.pem"));
+        assert!(e.starts_with("no private key found"), "{e}");
+        // Non-PEM content yields no items rather than a parse panic.
+        let e = err(&tls("README.md", "server-ec.pkcs8.pem"));
+        assert!(e.starts_with("no certificates found"), "{e}");
+    }
+
+    #[test]
+    fn a_key_that_does_not_match_the_certificate_is_rejected() {
+        let e = err(&tls("server-rsa.pem", "server-ec.pkcs8.pem"));
+        assert!(e.starts_with("server config"), "{e}");
+    }
+
+    #[test]
+    fn client_certificate_verification_needs_a_ca() {
+        let mut cfg = tls("server-ec.pem", "server-ec.pkcs8.pem");
+        cfg.require_client_cert = true;
+        let e = err(&cfg);
+        assert!(e.contains("ca_path is missing"), "{e}");
+
+        cfg.ca_path = Some(fixture("ca.pem"));
+        build_tls_acceptor(&cfg).expect("mTLS with a CA bundle");
+
+        cfg.ca_path = Some(fixture("server-ec.pkcs8.pem"));
+        let e = err(&cfg);
+        assert!(e.starts_with("building client verifier"), "{e}");
+    }
 }

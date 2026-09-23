@@ -196,7 +196,7 @@ impl PeerConnection {
         };
 
         // Build request message
-        let fp_bytes = match bincode::serialize(fingerprint) {
+        let fp_bytes = match postcard::to_stdvec(fingerprint) {
             Ok(b) => b,
             Err(_) => return Err("Serialization failed"),
         };
@@ -241,7 +241,7 @@ impl PeerConnection {
 
         // Deserialize entry
         let entry: CacheEntry =
-            bincode::deserialize(&data).map_err(|_| "Deserialization failed")?;
+            postcard::from_bytes(&data).map_err(|_| "Deserialization failed")?;
 
         Ok(entry)
     }
@@ -265,8 +265,8 @@ impl PeerConnection {
         };
 
         // Serialize fingerprint and entry
-        let fp_bytes = bincode::serialize(&fingerprint).map_err(|_| "FP serialization failed")?;
-        let entry_bytes = bincode::serialize(&entry).map_err(|_| "Entry serialization failed")?;
+        let fp_bytes = postcard::to_stdvec(&fingerprint).map_err(|_| "FP serialization failed")?;
+        let entry_bytes = postcard::to_stdvec(&entry).map_err(|_| "Entry serialization failed")?;
 
         // Build message: [type: u8][fp_len: u32][entry_len: u32][fp_data][entry_data]
         let mut message = Vec::with_capacity(1 + 4 + 4 + fp_bytes.len() + entry_bytes.len());
@@ -340,7 +340,7 @@ impl PeerConnection {
             Err(_) => return Err("Connection timeout"),
         };
 
-        let fp_bytes = bincode::serialize(fingerprint).map_err(|_| "Serialization failed")?;
+        let fp_bytes = postcard::to_stdvec(fingerprint).map_err(|_| "Serialization failed")?;
 
         let mut message = vec![MessageType::Invalidate as u8];
         message.extend_from_slice(&(fp_bytes.len() as u32).to_le_bytes());
@@ -651,14 +651,14 @@ impl DistributedCache {
                 reader.read_exact(&mut fp_bytes).await?;
 
                 // Look up the requested fingerprint in the local owned map.
-                let payload = match bincode::deserialize::<QueryFingerprint>(&fp_bytes) {
+                let payload = match postcard::from_bytes::<QueryFingerprint>(&fp_bytes) {
                     Ok(fp) => {
                         let key = self.fingerprint_to_hash(&fp);
                         self.local.get(&key).and_then(|e| {
                             if e.is_expired() {
                                 None
                             } else {
-                                bincode::serialize(e.value()).ok()
+                                postcard::to_stdvec(e.value()).ok()
                             }
                         })
                     }
@@ -689,8 +689,8 @@ impl DistributedCache {
                 reader.read_exact(&mut entry_bytes).await?;
 
                 if let (Ok(fp), Ok(entry)) = (
-                    bincode::deserialize::<QueryFingerprint>(&fp_bytes),
-                    bincode::deserialize::<CacheEntry>(&entry_bytes),
+                    postcard::from_bytes::<QueryFingerprint>(&fp_bytes),
+                    postcard::from_bytes::<CacheEntry>(&entry_bytes),
                 ) {
                     let key = self.fingerprint_to_hash(&fp);
                     self.local.insert(key, entry);
@@ -714,7 +714,7 @@ impl DistributedCache {
                 let fp_len = u32::from_le_bytes(len_buf) as usize;
                 let mut fp_bytes = vec![0u8; fp_len];
                 reader.read_exact(&mut fp_bytes).await?;
-                if let Ok(fp) = bincode::deserialize::<QueryFingerprint>(&fp_bytes) {
+                if let Ok(fp) = postcard::from_bytes::<QueryFingerprint>(&fp_bytes) {
                     let key = self.fingerprint_to_hash(&fp);
                     self.local.remove(&key);
                 }

@@ -112,6 +112,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Binary codec: postcard replaces bincode 1** (RUSTSEC-2025-0141, bincode is unmaintained
+  in every version). Used for the durable journal segments (`[journal] dir`) and the
+  DistribCache L2/L3 blobs. Journal records now carry the magic `HJ02`; a directory written
+  by a pre-release 1.9.0 build (`HJ01`) is refused at startup with an explicit error instead
+  of being truncated as corrupt. No released version ever wrote `HJ01`.
+- **TLS PEM loading uses `rustls-pki-types`** (`PemObject`) instead of the unmaintained
+  `rustls-pemfile` (RUSTSEC-2025-0134). Certificates and PKCS#8, SEC1 and PKCS#1 keys load as
+  before; `src/client_tls.rs` gained unit tests for every key encoding, missing files, wrong
+  item types, key/certificate mismatch and the mTLS CA path. `cargo deny --all-features check
+  advisories` now reports no findings.
+
 - **Allocation-free statement classifiers (perf, sprinter `1d70b68fa7cc`).** The
   per-statement classifiers on the write and pool-mode paths no longer build an
   uppercased copy of every statement: `StatementType::from_sql` (transaction journal),
@@ -266,6 +277,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   between the write's response and its commit. Extended-protocol writes, `COPY`, and
   DDL/unknown dependencies are not yet staged; invalidation for those remains
   statement-observation plus TTL.
+
+### Security
+
+- **rustls 0.23.45** (from 0.23.40): fixes RUSTSEC-2026-0285, TLS 1.3 handshake messages
+  accepted at the wrong encryption level. Affects the client-facing TLS listener (`[tls]`)
+  and every rustls client in the proxy (backend TLS, gateways' HTTPS clients). The yanked
+  `chacha20 0.10.0` is refreshed to 0.10.2.
 
 ## [1.8.0] - 2026-09-12
 

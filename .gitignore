@@ -9,6 +9,8 @@ __pycache__/
 .env
 *.key
 *.pem
+# Test-only TLS fixtures (self-signed, protect nothing): see tests/fixtures/tls/README.md
+!tests/fixtures/tls/*.pem
 
 # Agent/FleetView scratch worktrees — never commit
 .claude/worktrees/
