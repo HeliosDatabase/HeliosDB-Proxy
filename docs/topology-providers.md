@@ -67,7 +67,8 @@ operator CRD status):
 | `unhealthyNodes` | Count of nodes with a failing health check. |
 | `totalNodes` | Number of configured `[[nodes]]`. |
 | `lastFailoverAt` | RFC 3339 timestamp of the last observed primary change; `null` when none has been observed since boot (currently always `null` in `compute_topology`). |
-| `authoritative` | Present only when a topology provider is attached: `{address, epoch, confirmed, valid, leaseRemainingMs}`. `epoch` increments on every observed leader change; `valid` is `false` once the lease expires (`leaseRemainingMs` is then absent). |
+| `authoritative` | Present only when a topology provider is attached and has a leader: `{address, epoch, timeline, confirmed, valid, leaseRemainingMs}`. `epoch` increments on every observed leader change; `timeline` is the leader's database timeline when the provider reports one (`patroni`); `valid` is `false` once the lease expires (`leaseRemainingMs` is then absent). |
+| `conflictingPrimariesTotal` | Present whenever a topology provider is configured, also while there is no leader: provider polls that found more than one node claiming write authority (resolved by timeline or failed closed). The same count is exported to Prometheus as `heliosdb_proxy_topology_conflicting_primaries_total`. |
 
 ### Authority leases and fencing limits (H-02)
 
@@ -236,7 +237,22 @@ sees it, as the write primary.
   the tracker drops its current leader at once.
 - When no endpoint answers, the provider reports no primary: the authority lease is not
   refreshed and writes stop at the lease boundary (`lease_timeout_secs`).
-- The leader's timeline is kept as the provider's epoch (`PatroniTopologyProvider::timeline`).
+- The leader's timeline is reported as `authoritative.timeline` on `GET /topology`.
+- Each poll that sees two running leaders counts toward `conflictingPrimariesTotal` /
+  `heliosdb_proxy_topology_conflicting_primaries_total`.
+
+Example:
+
+```toml
+[topology]
+provider = "patroni"
+patroni_endpoints = ["http://pg-a:8008", "http://pg-b:8008", "http://pg-c:8008"]
+patroni_request_timeout_ms = 2000   # per request; the default
+poll_interval_secs = 2
+lease_timeout_secs = 10
+
+# [[nodes]] addresses must match the host:port Patroni reports for each member.
+```
 
 Keep `lease_timeout_secs` below Patroni's own `ttl` minus `loop_wait` so the proxy never
 trusts a leader longer than Patroni does (enforcing that is part of H-02).
