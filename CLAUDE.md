@@ -91,7 +91,7 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
   `ProxyConfig` in `src/config.rs` (~4300 lines).
   Top-level keys: `listen_address`, `admin_address`, `admin_token`,
   `admin_allow_insecure`, `tr_enabled`, `tr_mode`, `write_timeout_secs`,
-  `optimize_unnamed_parse`, `shutdown_drain_timeout_secs`.
+  `optimize_unnamed_parse`, `shutdown_drain_timeout_secs`, `strict_config`.
   Sections: `[pool]`, `[pool_mode]`, `[load_balancer]`, `[health]`, `[[nodes]]`, `[tls]`,
   `[cache]`, `[routing_hints]`, `[lag_routing]`, `[rate_limit]`, `[circuit_breaker]`,
   `[limits]`, `[analytics]`, `[anomaly]`, `[multi_tenancy]`, `[auth]` (only `mode = "passthrough"|"scram"` +
@@ -99,10 +99,14 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
   `[graphql_gateway]` (+`[[graphql_gateway.tables]]`), `[schema_routing]`, `[mcp]`,
   `[[agent_contracts]]`, `[http_gateway]`, `[mirror]`, `[edge]`, `[branch]`, `[topology]`,
   `[journal]`.
-  CAUTION: unknown TOML sections are silently ignored (plain serde). The commented
-  `[routing.*]`, `[lag]`, `[rewriter]`, `[graphql]`, `[auth.jwt]`-style, `[cache.l1]`-style
-  blocks in `config/proxy.full.toml` — and its uncommented `[ha]`, `[logging]`, `[metrics]`
-  sections — do NOT exist in `ProxyConfig` and are ignored. There is no `[distribcache]`
+  CAUTION: keys `ProxyConfig` does not know, at any depth, are ignored by the parser;
+  startup logs one warning per ignored key path, and `strict_config = true` makes them
+  (and enabled features not compiled into the build) a startup error instead. The
+  commented `[routing.*]`, `[lag]`, `[rewriter]`, `[graphql]`, `[auth.jwt]`-style,
+  `[cache.l1]`-style blocks in `config/proxy.full.toml` do NOT exist in `ProxyConfig`;
+  the shipped examples and `scripts/regress/*.toml` are tested to load with zero ignored
+  keys (`shipped_example_configs_load`, `regress_configs_have_no_unexpected_ignored_keys`).
+  There is no `[distribcache]`
   section (distribcache is a library module, not proxy.toml-wired). NOTE: as of the
   1.4.1 config batch, anomaly detection IS proxy.toml-wired via the `[anomaly]` section
   (its defaults reproduce the old hardcoded `AnomalyConfig::default()` +
