@@ -841,12 +841,15 @@ impl Default for ResolvedLimits {
 }
 
 /// Concrete provider poll task (H-01). The `static` provider has none; the
-/// postgres provider polls `pg_is_in_recovery()` in its own background task
-/// and publishes events the tracker consumes.
+/// postgres provider polls `pg_is_in_recovery()` and the patroni provider
+/// polls Patroni's `GET /cluster`, each in its own background task,
+/// publishing events the tracker consumes.
 enum TopologyPoller {
     Static,
     #[cfg(feature = "postgres-topology")]
     Postgres(Arc<crate::primary_tracker::PostgresTopologyProvider>),
+    #[cfg(feature = "postgres-topology")]
+    Patroni(Arc<crate::primary_tracker::PatroniTopologyProvider>),
 }
 
 /// Deterministic 64-bit mix (splitmix64), used for jitter and sampling
@@ -2478,6 +2481,11 @@ impl ProxyServer {
                 TopologyPoller::Static => None,
                 #[cfg(feature = "postgres-topology")]
                 TopologyPoller::Postgres(p) => {
+                    let p = p.clone();
+                    Some(tokio::spawn(async move { p.start().await }))
+                }
+                #[cfg(feature = "postgres-topology")]
+                TopologyPoller::Patroni(p) => {
                     let p = p.clone();
                     Some(tokio::spawn(async move { p.start().await }))
                 }
@@ -8296,12 +8304,48 @@ impl ProxyServer {
     /// `static` (the default) returns a standalone tracker and
     /// `authoritative = false`, preserving the historical write-path
     /// behaviour. `postgres` builds a `PostgresTopologyProvider` over every
-    /// configured node (feature `postgres-topology`) and marks the tracker
-    /// authoritative, so a promotion moves the write destination without any
-    /// `proxy.toml` edit.
+    /// configured node and `patroni` a `PatroniTopologyProvider` over
+    /// `topology.patroni_endpoints` (both feature `postgres-topology`); either
+    /// marks the tracker authoritative, so a promotion moves the write
+    /// destination without any `proxy.toml` edit.
     fn build_primary_tracker(config: &ProxyConfig) -> (Arc<PrimaryTracker>, bool, TopologyPoller) {
         #[cfg(feature = "postgres-topology")]
         {
+            if config.topology.provider == crate::config::TopologyProviderKind::Patroni {
+                // The leader Patroni names must be one of these addresses,
+                // exactly as `[[nodes]]` spells them, or nothing is authorized.
+                let nodes = config
+                    .nodes
+                    .iter()
+                    .map(|n| crate::primary_tracker::PatroniNode {
+                        node_id: uuid::Uuid::new_v4(),
+                        address: n.address().to_string(),
+                    })
+                    .collect();
+                let provider = Arc::new(
+                    crate::primary_tracker::PatroniTopologyProvider::new(
+                        config.topology.patroni_endpoints.clone(),
+                        nodes,
+                        Duration::from_millis(config.topology.patroni_request_timeout_ms.max(1)),
+                    )
+                    .with_poll_interval(Duration::from_secs(
+                        config.topology.poll_interval_secs.max(1),
+                    )),
+                );
+                tracing::info!(
+                    endpoints = config.topology.patroni_endpoints.len(),
+                    nodes = config.nodes.len(),
+                    poll_interval_secs = config.topology.poll_interval_secs,
+                    lease_timeout_secs = config.topology.lease_timeout_secs,
+                    "authoritative topology provider enabled: patroni (GET /cluster polling)"
+                );
+                let tracker = Arc::new(
+                    PrimaryTracker::with_provider(provider.clone()).with_lease_timeout(
+                        Duration::from_secs(config.topology.lease_timeout_secs.max(1)),
+                    ),
+                );
+                return (tracker, true, TopologyPoller::Patroni(provider));
+            }
             if config.topology.provider == crate::config::TopologyProviderKind::Postgres {
                 let nodes = config
                     .nodes
@@ -13556,6 +13600,26 @@ mod tests {
             // beyond ceiling is dropped.
             assert!(ProxyServer::lag_excludes_standby(Some(2000), 1000, false));
         }
+    }
+
+    /// `provider = "patroni"` builds an authoritative, provider-backed
+    /// tracker with a Patroni poll task (H-01).
+    #[cfg(feature = "postgres-topology")]
+    #[test]
+    fn patroni_provider_makes_the_tracker_authoritative() {
+        let mut config = ProxyConfig::default();
+        config.topology.provider = crate::config::TopologyProviderKind::Patroni;
+        config.topology.patroni_endpoints = vec!["http://127.0.0.1:8008".into()];
+        let (tracker, authoritative, poller) = ProxyServer::build_primary_tracker(&config);
+        assert!(authoritative);
+        assert!(tracker.has_provider());
+        assert!(matches!(poller, TopologyPoller::Patroni(_)));
+
+        let (tracker, authoritative, poller) =
+            ProxyServer::build_primary_tracker(&ProxyConfig::default());
+        assert!(!authoritative);
+        assert!(!tracker.has_provider());
+        assert!(matches!(poller, TopologyPoller::Static));
     }
 
     // ---- query-cache: which read SQL is safe to cache ----

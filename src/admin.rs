@@ -539,8 +539,15 @@ impl AdminServer {
             }
             ("GET", "/metrics/prometheus") => {
                 let metrics = state.metrics.read().await.clone();
-                #[allow(unused_mut)]
                 let mut prometheus = Self::format_prometheus_metrics(&metrics);
+                if let Some(t) = state.primary_tracker.read().await.as_ref() {
+                    if t.has_provider() {
+                        Self::push_topology_prometheus(
+                            &mut prometheus,
+                            t.provider_conflicts_total(),
+                        );
+                    }
+                }
                 // Shed analytics samples belong next to the other counters, so
                 // an operator can alert on them without polling the JSON
                 // `/api/analytics` endpoint.
@@ -2136,12 +2143,17 @@ impl AdminServer {
         let tracker = state.primary_tracker.read().await;
         let mut current_primary: Option<String> = None;
         let mut authoritative = None;
+        let mut conflicting_primaries_total = None;
         if let Some(ref t) = *tracker {
+            if t.has_provider() {
+                conflicting_primaries_total = Some(t.provider_conflicts_total());
+            }
             if let Some(info) = t.get_primary() {
                 current_primary = Some(info.address.clone());
                 authoritative = Some(AuthoritativeTopology {
                     address: info.address,
                     epoch: info.epoch,
+                    timeline: t.provider_leader_timeline(),
                     confirmed: info.is_confirmed,
                     valid: t.authority_valid(),
                     lease_remaining_ms: t.lease_remaining().map(|d| d.as_millis() as u64),
@@ -2172,7 +2184,21 @@ impl AdminServer {
             total_nodes,
             last_failover_at: None,
             authoritative,
+            conflicting_primaries_total,
         }
+    }
+
+    /// Append the topology provider's counters (H-01) to a Prometheus body.
+    /// Only emitted when a provider backs the tracker: a static topology
+    /// has no provider to disagree with itself.
+    fn push_topology_prometheus(output: &mut String, conflicting_primaries_total: u64) {
+        output.push_str(
+            "# HELP heliosdb_proxy_topology_conflicting_primaries_total Provider polls that found more than one node claiming write authority\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_topology_conflicting_primaries_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_topology_conflicting_primaries_total {conflicting_primaries_total}\n"
+        ));
     }
 
     /// Format metrics as Prometheus text format
@@ -2978,12 +3004,24 @@ struct TopologyResponse {
     /// tracker has confirmed it.
     #[serde(rename = "authoritative", skip_serializing_if = "Option::is_none")]
     authoritative: Option<AuthoritativeTopology>,
+    /// H-01: provider polls that found more than one node claiming write
+    /// authority (resolved by timeline or failed closed). Present whenever a
+    /// topology provider is configured, also while there is no leader.
+    #[serde(
+        rename = "conflictingPrimariesTotal",
+        skip_serializing_if = "Option::is_none"
+    )]
+    conflicting_primaries_total: Option<u64>,
 }
 
 #[derive(Serialize)]
 struct AuthoritativeTopology {
     address: String,
     epoch: u64,
+    /// The leader's database timeline, for a provider that reports it
+    /// (Patroni).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeline: Option<u64>,
     confirmed: bool,
     /// H-02: `false` once the authority lease has expired (the provider was
     /// not reached within `topology.lease_timeout_secs`).
@@ -3467,6 +3505,68 @@ mod tests {
         // Standalone/manual authority does not expire and has no lease.
         assert!(auth.valid);
         assert!(auth.lease_remaining_ms.is_none());
+    }
+
+    /// With a topology provider attached, `/topology` carries the provider's
+    /// conflict count (also without a leader) and the leader's timeline, and
+    /// the Prometheus body carries the conflict counter (H-01).
+    #[tokio::test]
+    async fn test_topology_reports_provider_conflicts_and_timeline() {
+        use crate::primary_tracker::{TopologyEvent, TopologyNodeInfo, TopologyProvider};
+        struct Fake {
+            leader: parking_lot::RwLock<Option<TopologyNodeInfo>>,
+            tx: tokio::sync::broadcast::Sender<TopologyEvent>,
+        }
+        impl TopologyProvider for Fake {
+            fn subscribe(&self) -> tokio::sync::broadcast::Receiver<TopologyEvent> {
+                self.tx.subscribe()
+            }
+            fn get_primary(&self) -> Option<TopologyNodeInfo> {
+                self.leader.read().clone()
+            }
+            fn get_node(&self, _id: uuid::Uuid) -> Option<TopologyNodeInfo> {
+                None
+            }
+            fn conflicts_total(&self) -> u64 {
+                2
+            }
+            fn leader_timeline(&self) -> Option<u64> {
+                self.leader.read().as_ref().map(|_| 7)
+            }
+        }
+        let state = topology_state(&[("pg-a:5432", "standby", true)]).await;
+        let fake = Arc::new(Fake {
+            leader: parking_lot::RwLock::new(None),
+            tx: tokio::sync::broadcast::channel(4).0,
+        });
+        let tracker = Arc::new(crate::primary_tracker::PrimaryTracker::with_provider(
+            fake.clone(),
+        ));
+        state.with_primary_tracker(tracker.clone()).await;
+
+        // No leader yet: no authoritative block, but the conflicts show.
+        let topo = serde_json::to_value(AdminServer::compute_topology(&state).await).unwrap();
+        assert!(topo.get("authoritative").is_none(), "{topo}");
+        assert_eq!(topo["conflictingPrimariesTotal"], 2);
+
+        *fake.leader.write() = Some(TopologyNodeInfo {
+            node_id: uuid::Uuid::new_v4(),
+            client_addr: "pg-a:5432".into(),
+            is_healthy: true,
+        });
+        tracker.set_primary(uuid::Uuid::new_v4(), "pg-a:5432".to_string());
+        let topo = serde_json::to_value(AdminServer::compute_topology(&state).await).unwrap();
+        assert_eq!(topo["authoritative"]["address"], "pg-a:5432");
+        assert_eq!(topo["authoritative"]["timeline"], 7);
+
+        let (status, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
+            .await
+            .expect("handler returns Ok");
+        assert_eq!(status, 200);
+        assert!(body["text"]
+            .as_str()
+            .unwrap()
+            .contains("heliosdb_proxy_topology_conflicting_primaries_total 2\n"));
     }
 
     #[tokio::test]

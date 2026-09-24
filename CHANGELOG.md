@@ -38,7 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Patroni's DCS reports it on `GET /cluster`) becomes the authoritative write primary; a
   `standby_leader`, a leader that is not running, or one outside `[[nodes]]` is never
   authorized; no reachable endpoint means no primary (writes stop at the lease
-  boundary). Requires the `postgres-topology` feature.
+  boundary). Requires the `postgres-topology` feature. `GET /topology` reports the
+  leader's timeline (`authoritative.timeline`) and, for any provider,
+  `conflictingPrimariesTotal`, also exported as the Prometheus counter
+  `heliosdb_proxy_topology_conflicting_primaries_total`.
 
 ### Changed
 
@@ -48,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a tie or an unreadable timeline authorizes nothing. A provider that reports conflicting
   authority now makes the tracker drop its leader immediately instead of waiting for the
   lease.
+- **The primary tracker follows a provider's new leader from its periodic check too
+  (H-01).** Only the provider's change event moved it; a missed or lagged event left the
+  old leader in place, its lease stopped being refreshed, and authoritative writes then
+  stalled until the next leader change. A duplicate change event no longer starts a
+  second authority epoch.
 
 ### Fixed
 

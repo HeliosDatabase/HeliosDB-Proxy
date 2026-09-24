@@ -70,6 +70,19 @@ pub trait TopologyProvider: Send + Sync + 'static {
     fn authority_conflict(&self) -> bool {
         false
     }
+
+    /// Polls that found more than one node claiming write authority since
+    /// the provider started, resolved or not. Exported as
+    /// `heliosdb_proxy_topology_conflicting_primaries_total`.
+    fn conflicts_total(&self) -> u64 {
+        0
+    }
+
+    /// The database timeline of the current leader, for a provider that
+    /// reports one (Patroni). `None` without a leader or when unknown.
+    fn leader_timeline(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Pick the primary among nodes that each report themselves writable
@@ -322,6 +335,10 @@ impl TopologyProvider for PostgresTopologyProvider {
     fn authority_conflict(&self) -> bool {
         self.conflict.load(Ordering::Relaxed)
     }
+
+    fn conflicts_total(&self) -> u64 {
+        self.conflicts_total.load(Ordering::Relaxed)
+    }
 }
 
 // ── Patroni topology provider ───────────────────────────────────────
@@ -563,6 +580,16 @@ impl TopologyProvider for PatroniTopologyProvider {
     fn authority_conflict(&self) -> bool {
         self.conflict.load(Ordering::Relaxed)
     }
+
+    fn conflicts_total(&self) -> u64 {
+        self.conflicts_total.load(Ordering::Relaxed)
+    }
+
+    fn leader_timeline(&self) -> Option<u64> {
+        self.current.read().as_ref()?;
+        let t = self.timeline.load(Ordering::Relaxed);
+        (t > 0).then_some(t)
+    }
 }
 
 // ── HeliosDB topology provider (bridges to internal TopologyManager) ─
@@ -723,6 +750,23 @@ impl PrimaryTracker {
     pub fn with_lease_timeout(mut self, timeout: Duration) -> Self {
         self.lease_timeout = timeout;
         self
+    }
+
+    /// Whether a topology provider backs this tracker (any non-static
+    /// `[topology] provider`).
+    pub fn has_provider(&self) -> bool {
+        self.provider.is_some()
+    }
+
+    /// The provider's count of polls that saw conflicting write authority
+    /// (0 for a standalone tracker).
+    pub fn provider_conflicts_total(&self) -> u64 {
+        self.provider.as_ref().map_or(0, |p| p.conflicts_total())
+    }
+
+    /// The provider's leader timeline, when it reports one (Patroni).
+    pub fn provider_leader_timeline(&self) -> Option<u64> {
+        self.provider.as_ref()?.leader_timeline()
     }
 
     /// Subscribe to primary change events.
@@ -923,6 +967,12 @@ impl PrimaryTracker {
         old: Option<Uuid>,
         new: Uuid,
     ) {
+        // Already following `new` (the periodic check reconciled first, or a
+        // duplicate event): refresh the lease, do not start a new epoch.
+        if self.current_primary.read().as_ref().map(|p| p.node_id) == Some(new) {
+            *self.last_refresh.write() = Some(Instant::now());
+            return;
+        }
         let address = provider
             .get_node(new)
             .map(|n| n.client_addr)
@@ -978,10 +1028,18 @@ impl PrimaryTracker {
 
         if let Some(id) = current_id {
             let provider_primary = provider.get_primary();
-            if provider_primary.as_ref().map(|p| p.node_id) == Some(id) {
+            let provider_id = provider_primary.as_ref().map(|p| p.node_id);
+            if provider_id == Some(id) {
                 // Heartbeat: the provider still reports this leader, so the
                 // authority lease is refreshed (H-02).
                 *self.last_refresh.write() = Some(Instant::now());
+            } else if let Some(new) = provider_id {
+                // The provider names a different leader: follow it. Its change
+                // event normally gets here first; this reconciles a missed or
+                // lagged event, which would otherwise keep the old leader until
+                // its lease ran out and then stall writes for good.
+                self.handle_primary_changed(provider, Some(id), new);
+                return;
             } else if let Some(node) = provider.get_node(id) {
                 if !node.is_healthy {
                     tracing::warn!("Primary {} is unhealthy in periodic check", id);
@@ -1494,5 +1552,99 @@ mod tests {
             health_events >= 1,
             "expected at least one HealthChanged event"
         );
+    }
+
+    /// End to end over HTTP (H-01): the provider takes the first endpoint
+    /// that answers, the tracker follows Patroni's leader across a switchover
+    /// (with its timeline) from the periodic check alone, a late change event
+    /// does not start a second epoch, and a two-leader answer clears the
+    /// tracker's leader at once.
+    #[cfg(feature = "postgres-topology")]
+    #[tokio::test]
+    async fn patroni_provider_follows_the_leader_over_http() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let body = Arc::new(std::sync::Mutex::new(String::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = body.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut req = [0u8; 2048];
+                let _ = sock.read(&mut req).await;
+                let b = served.lock().unwrap().clone();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{b}",
+                    b.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let member = |host: &str, role: &str, timeline: u64| {
+            serde_json::json!({
+                "name": host, "host": host, "port": 5432,
+                "role": role, "state": "running", "timeline": timeline
+            })
+        };
+        let set = |members: Vec<serde_json::Value>| {
+            *body.lock().unwrap() = serde_json::json!({ "members": members }).to_string();
+        };
+
+        let (a_id, b_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let nodes = vec![
+            PatroniNode {
+                node_id: a_id,
+                address: "pg-a:5432".into(),
+            },
+            PatroniNode {
+                node_id: b_id,
+                address: "pg-b:5432".into(),
+            },
+        ];
+        // The first endpoint refuses connections; the second answers.
+        let p = Arc::new(PatroniTopologyProvider::new(
+            vec!["http://127.0.0.1:1".into(), format!("http://{addr}")],
+            nodes,
+            Duration::from_secs(2),
+        ));
+        let tracker =
+            PrimaryTracker::with_provider(p.clone()).with_lease_timeout(Duration::from_secs(3600));
+
+        set(vec![
+            member("pg-a", "leader", 3),
+            member("pg-b", "replica", 3),
+        ]);
+        p.poll().await;
+        tracker.periodic_check(p.as_ref());
+        assert_eq!(tracker.get_primary_address().as_deref(), Some("pg-a:5432"));
+        assert_eq!(tracker.provider_leader_timeline(), Some(3));
+
+        // Switchover: pg-b is promoted onto timeline 4.
+        set(vec![
+            member("pg-a", "replica", 4),
+            member("pg-b", "leader", 4),
+        ]);
+        p.poll().await;
+        tracker.periodic_check(p.as_ref());
+        // Followed by the periodic check alone (no change event consumed).
+        assert_eq!(tracker.get_primary_address().as_deref(), Some("pg-b:5432"));
+        assert_eq!(tracker.provider_leader_timeline(), Some(4));
+        assert_eq!(tracker.provider_conflicts_total(), 0);
+        assert_eq!(tracker.get_epoch(), 2);
+        // The change event arriving after the reconciliation is a no-op.
+        tracker.handle_primary_changed(p.as_ref(), Some(a_id), b_id);
+        assert_eq!(tracker.get_epoch(), 2);
+
+        // Split brain: two running leaders authorize nothing.
+        set(vec![
+            member("pg-a", "leader", 4),
+            member("pg-b", "leader", 4),
+        ]);
+        p.poll().await;
+        tracker.periodic_check(p.as_ref());
+        assert!(!tracker.has_primary());
+        assert_eq!(tracker.provider_leader_timeline(), None);
+        assert_eq!(tracker.provider_conflicts_total(), 1);
     }
 }
