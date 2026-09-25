@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-09-25
+
+A new major version: the HA topology, the result cache and Transaction Replay now share
+one model of what the backend actually committed. The query cache invalidates on commit
+for both wire protocols and every tier, a Patroni cluster can be the write authority,
+and conflicting primaries fail closed. The query cache stays **opt-in**
+(`[cache] enabled = false` by default): cached results are keyed by the SQL, database,
+user and branch, not by session state such as `SET ROLE`, `search_path` or a tenant
+setting read by row-level-security policies, and writes that bypass the proxy are only
+bounded by `ttl_secs` (see docs/configuration.md `[cache]`).
+
+### Upgrade notes (behaviour changes)
+
+- **Gateways have a concurrency cap by default.** `[graphql_gateway]`, `[mcp]` and
+  `[http_gateway]` now admit at most `max_concurrent_requests = 64` requests at once;
+  beyond that the HTTP and GraphQL gateways answer `503` + `Retry-After` and MCP answers a
+  JSON-RPC error for `tools/call`. Raise the key if you run more concurrent gateway
+  requests. `query_timeout_ms` (default `30000`) replaces the fixed 30 s timeout.
+- **Unknown config keys are reported at any nesting depth.** A typo inside a section
+  (`[cache] l1_max_byts`) now logs a warning at startup, and fails startup with
+  `strict_config = true` (previously only top-level keys were checked).
+- **Conflicting primaries fail closed** with `[topology] provider = "postgres"`: several
+  writable nodes are resolved by the strictly highest timeline, otherwise nothing is
+  authorized (previously the first writable node probed won).
+- **Query cache (when enabled):** writes on the extended protocol now invalidate it, a
+  stale entry is refused on every tier (L1 and L3 used to be served until TTL), and
+  DDL, `TRUNCATE`, `COPY ... FROM`, `EXECUTE`, `CALL` and `DO` invalidate the whole
+  cache. The transaction-journal capture now also runs when Transaction Replay is off
+  but the cache is on.
+- **Library API:** `TopologyProvider` gains defaulted `conflicts_total()` and
+  `leader_timeline()` (existing implementations keep compiling);
+  `QueryCache::purge_tables` no longer removes L2 entries itself (they are refused by
+  their write generation and replaced or evicted); new
+  `InvalidationManager::take_table`/`forget_keys`, `L2WarmCache::put_evicting`/`shed`/
+  `end_eviction`.
+
 ### Added
 
 - **`strict_config` now catches unknown config keys at any nesting depth, not just

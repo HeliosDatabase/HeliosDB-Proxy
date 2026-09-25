@@ -539,8 +539,17 @@ feeds the transaction journal), on the simple and the extended protocol alike:
 Not covered: writes that do not pass through this proxy (another proxy, a direct
 connection, a trigger or function writing a table other than the one named in the
 statement), and two-phase commit (`PREPARE TRANSACTION` / `COMMIT PREPARED`: the
-prepared transaction's tables are not invalidated when it is committed). Such changes become visible when the entry's `ttl_secs` expires; keep the
-TTL short, or leave the cache off, for tables written that way.
+prepared transaction's tables are not invalidated when it is committed). Such changes
+become visible when the entry's `ttl_secs` expires; keep the TTL short, or leave the
+cache off, for tables written that way.
+
+**Cache identity is the SQL, the database, the user and the branch — not session state.**
+Two sessions of the same user that differ only in `SET ROLE`, `search_path`, or a custom
+setting read by row-level-security policies (for example `app.tenant_id` set per request
+on a shared connection user) can be served each other's cached result. Leave the cache
+off for workloads whose results depend on such session state. The proxy's own
+`[multi_tenancy]` filtering is safe: it rewrites the SQL per tenant before the cache
+lookup. (Tracked as audit item C-06.)
 
 ---
 
