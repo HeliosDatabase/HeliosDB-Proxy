@@ -24,7 +24,8 @@
 #   OUT            this run's archive dir                (default $BASELINE_ROOT/$LABEL/usertp)
 #   LOCK           fleet-wide heavy-job lock file         (default /home/gpc/HDB/sprint/coordination/build.lock)
 #   MEM            systemd-run MemoryMax per heavy job    (default 24G)
-#   NO_LOCK=1      skip flock/systemd-run (CI containers only — matches scripts/bench-gate.sh)
+#   NO_LOCK=1      skip the per-pass flock/systemd-run (CI containers, or when the
+#                  caller already holds the lock around the whole run, see below)
 #
 # Prerequisites (same as scripts/regress/bench-usertp.sh): a PostgreSQL 18.4
 # backend already running at 127.0.0.1:25433, user bench/benchpass, db
@@ -38,10 +39,14 @@
 # per CLAUDE.md's "Bounded benchmark invocation" (root cause of the
 # 2026-07-08 host crash) — so invoke THIS script directly; do not also wrap
 # the whole invocation in another flock/systemd-run, or the nested flock on
-# the same lock file will deadlock. Running this gate needs the same explicit
-# owner approval as any other Docker/pgbench harness run in this repo — get
-# it before invoking this script, and record it in the GATE-RECORD alongside
-# the archived output.
+# the same lock file will deadlock. The one exception: to keep every pass
+# back to back in a single window (a contended lock otherwise spreads the six
+# passes over hours of changing host load), wrap the WHOLE run in one
+# `flock $LOCK systemd-run --user --scope -p MemoryMax=… -p MemorySwapMax=0`
+# and set NO_LOCK=1 so the per-pass lock is skipped. Running this gate needs
+# the same explicit owner approval as any other Docker/pgbench harness run in
+# this repo — get it before invoking this script, and record it in the
+# GATE-RECORD alongside the archived output.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

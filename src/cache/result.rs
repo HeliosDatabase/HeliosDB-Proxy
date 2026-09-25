@@ -30,6 +30,14 @@ pub struct CachedResult {
 
     /// Original query execution time
     pub execution_time: Duration,
+
+    /// Cache generation this result was fetched under (C-02): the sum of the
+    /// cache's global generation and the generations of `tables`, observed
+    /// when the lookup missed, i.e. before the backend fetch began. A hit is
+    /// served only while that sum is unchanged; any write to one of `tables`
+    /// (at statement time and again at its commit), or an invalidation of
+    /// unknown scope, moves it. `0` for results built outside the cache.
+    pub generation: u64,
 }
 
 impl CachedResult {
@@ -48,6 +56,7 @@ impl CachedResult {
             ttl,
             tables,
             execution_time,
+            generation: 0,
         }
     }
 

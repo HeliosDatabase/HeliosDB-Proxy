@@ -1201,12 +1201,13 @@ pub struct ClientSession {
     /// can only be opened to a backend that does not challenge (trust).
     pub backend_credential: RwLock<Option<String>>,
     /// Tables written earlier in the CURRENT explicit transaction, so the
-    /// query cache can re-invalidate them at COMMIT (C-02): a reader may
-    /// refill an entry between the write statement's response and the commit,
-    /// and only a commit-time pass closes that visibility window. Cleared on
-    /// ROLLBACK/ABORT and when the session goes idle outside a transaction.
+    /// query cache can re-invalidate them when the backend reports the commit
+    /// (C-02): a reader may refill an entry between the write statement's
+    /// response and the commit, and only a commit-time pass closes that
+    /// window. Driven by the journal capture's ops on both protocols; cleared
+    /// on rollback and at session end.
     #[cfg(feature = "query-cache")]
-    pub tx_written_tables: std::sync::Mutex<Vec<String>>,
+    pub(crate) tx_cache_stage: std::sync::Mutex<TxCacheStage>,
     /// TR-07 recovery-journal capture: the per-session state machine that
     /// turns registered statements + observed backend responses into
     /// committed transactions (`journal_capture`). Locked briefly on the
@@ -1523,24 +1524,36 @@ fn stmt_fact_classifications() -> usize {
     STMT_FACT_CLASSIFICATIONS.with(std::cell::Cell::get)
 }
 
-/// What the query cache should do after a successfully-executed write
-/// statement (C-02). Produced by [`ProxyServer::cache_invalidation_plan`] and
-/// applied by the simple-query forwarding path.
+/// Tables the current explicit transaction wrote, staged for a commit-time
+/// cache invalidation (C-02).
 #[cfg(feature = "query-cache")]
-#[derive(Debug, PartialEq, Eq)]
-struct CacheInvalidationPlan {
-    /// This statement's normalized tables — always invalidated immediately so
-    /// a write cannot be followed by a stale hit before its commit.
-    immediate: Vec<String>,
-    /// Remember `immediate` in the session's transaction set.
-    stash: bool,
-    /// Re-invalidate the session's staged set now (the statement is a commit
-    /// point): closes the window where a reader refilled between the write and
-    /// its commit.
-    flush_stash: bool,
-    /// Discard the session's staged set (ROLLBACK/ABORT): rolled-back work is
-    /// never presented as committed history.
-    clear_stash: bool,
+#[derive(Debug, Default)]
+pub(crate) struct TxCacheStage {
+    tables: Vec<String>,
+    /// A statement whose tables could not be determined (DDL, `EXECUTE`,
+    /// `COPY`, ...): the commit invalidates everything.
+    unknown: bool,
+}
+
+/// Cache invalidation owed by one observed request/response cycle (C-02).
+#[cfg(feature = "query-cache")]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CacheWork {
+    /// Tables to invalidate: written now, or staged by a transaction that
+    /// just committed.
+    tables: Vec<String>,
+    /// Invalidate everything (a write with an unknown table set).
+    all: bool,
+}
+
+/// Journal-capture ops of one completed cycle, observed before its
+/// `ReadyForQuery` reached the client (the cache generations already moved);
+/// the journal is applied after the client write.
+struct ObservedCycle {
+    ops: Vec<crate::journal_capture::JournalOp>,
+    /// Tables whose L2 entries to purge once the client has its answer.
+    #[cfg(feature = "query-cache")]
+    purge: Vec<String>,
 }
 
 /// The cheap lexical facts about ONE simple-query statement, memoized so each
@@ -3121,7 +3134,7 @@ impl ProxyServer {
             tr_replay_tainted: std::sync::atomic::AtomicBool::new(false),
             backend_credential: RwLock::new(None),
             #[cfg(feature = "query-cache")]
-            tx_written_tables: std::sync::Mutex::new(Vec::new()),
+            tx_cache_stage: std::sync::Mutex::new(TxCacheStage::default()),
             journal: std::sync::Mutex::new(crate::journal_capture::SessionCapture::new(
                 config.journal.max_statement_bytes,
             )),
@@ -6134,7 +6147,7 @@ impl ProxyServer {
         // TR-07: register the statement the backend is now executing so the
         // relay collects its outcome (writes, COPY and transaction control
         // only — reads register nothing and arm nothing).
-        if config.tr_enabled {
+        if config.tr_enabled || Self::cache_needs_capture(state) {
             if let Some(sql) = crate::protocol::query_text(&forward_msg.payload) {
                 Self::journal_register_simple(session, sql);
             }
@@ -6248,53 +6261,9 @@ impl ProxyServer {
             Ok(sent) => {
                 #[cfg(feature = "circuit-breaker")]
                 Self::circuit_record(state, &target, true, "");
-                // Invalidate cached reads referencing tables this write touched
-                // (C-02): immediately, and staged for a commit-time re-pass when
-                // the statement runs inside an explicit transaction.
-                #[cfg(feature = "query-cache")]
-                if is_write {
-                    if let Some(qc) = state.query_cache.as_ref() {
-                        let sql = crate::protocol::query_text(&forward_msg.payload).unwrap_or("");
-                        let tables = qc.query_tables(sql);
-                        let plan = Self::cache_invalidation_plan(
-                            sql,
-                            session.in_transaction.load(Ordering::Relaxed),
-                            &tables,
-                        );
-                        if !plan.immediate.is_empty() {
-                            qc.invalidate_tables(&plan.immediate).await;
-                        }
-                        if plan.stash {
-                            let mut staged = session
-                                .tx_written_tables
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            for table in &plan.immediate {
-                                if !staged.contains(table) {
-                                    staged.push(table.clone());
-                                }
-                            }
-                        }
-                        if plan.flush_stash {
-                            let staged = std::mem::take(
-                                &mut *session
-                                    .tx_written_tables
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner()),
-                            );
-                            if !staged.is_empty() {
-                                qc.invalidate_tables(&staged).await;
-                            }
-                        }
-                        if plan.clear_stash {
-                            session
-                                .tx_written_tables
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .clear();
-                        }
-                    }
-                }
+                // Query-cache invalidation for this write (C-02) already ran
+                // from the journal capture's ops in `stream_until_ready`, on
+                // both protocols, before the ReadyForQuery reached the client.
                 // Edge cache: drop local entries for the touched tables and
                 // (home role only) fan the invalidation out to every
                 // registered edge over SSE. Also fires for SELECT-leading
@@ -6555,7 +6524,7 @@ impl ProxyServer {
         // TR-07: register the batch's Parse/Bind/Execute/Close (and the held
         // unnamed Parse the backend already holds) so the relay collects each
         // Execute's outcome with its bound parameter values.
-        if config.tr_enabled {
+        if config.tr_enabled || Self::cache_needs_capture(state) {
             Self::journal_register_batch(session, batch, unnamed.map(|(m, _)| &m[..]));
         }
 
@@ -6783,6 +6752,27 @@ impl ProxyServer {
                     }
                 }
 
+                // C-02: with the query cache on, settle the cycle's capture
+                // ops — and move the cache generations of what it wrote —
+                // BEFORE the ReadyForQuery that acknowledges it reaches the
+                // client, so no read that starts after the acknowledgement is
+                // served a pre-commit entry. Without a cache nothing depends
+                // on that ordering, so the observation stays after the write,
+                // off the client's round trip (as before C-02).
+                let mut outcome =
+                    ready_status.map(|status| crate::journal_capture::ResponseOutcome {
+                        status,
+                        completions: std::mem::take(&mut completions),
+                        error: first_error.take(),
+                    });
+                let early = if Self::cache_needs_capture(state) {
+                    outcome
+                        .take()
+                        .and_then(|o| Self::journal_observe_sync(session, state, o))
+                } else {
+                    None
+                };
+
                 if consumed > 0 {
                     tokio::time::timeout(client_write_timeout, client.write_all(&buf[..consumed]))
                         .await
@@ -6795,16 +6785,14 @@ impl ProxyServer {
                 if let Some(status) = ready_status {
                     Self::note_ready_for_query(session, status, had_error);
                     Self::note_observation(session, observation.as_ref());
-                    Self::journal_observe(
-                        session,
-                        state,
-                        crate::journal_capture::ResponseOutcome {
-                            status,
-                            completions: std::mem::take(&mut completions),
-                            error: first_error.take(),
-                        },
-                    )
-                    .await;
+                    let observed = early.or_else(|| {
+                        outcome
+                            .take()
+                            .and_then(|o| Self::journal_observe_sync(session, state, o))
+                    });
+                    if let Some(cycle) = observed {
+                        Self::journal_observe_finish(session, state, cycle).await;
+                    }
                     return Ok(sent);
                 }
                 if yield_for_copy {
@@ -7079,64 +7067,6 @@ impl ProxyServer {
                 raw: sent > 0,
             },
         })
-    }
-
-    /// Check if SQL query is a write operation
-    /// Decide what the query cache does after a successfully-executed write
-    /// statement (C-02).
-    ///
-    /// Semantics: the tables of the statement are invalidated immediately, and
-    /// when the statement runs inside an explicit transaction they are also
-    /// staged in the session so the commit can re-invalidate them. A concurrent
-    /// reader can refill an entry between the write's response and its COMMIT,
-    /// so only a commit-time pass closes the visibility window. Autocommit
-    /// writes (and the statement that ends a transaction) are their own commit
-    /// point and flush the staged set; ROLLBACK/ABORT discards it.
-    #[cfg(feature = "query-cache")]
-    fn cache_invalidation_plan(
-        sql: &str,
-        in_tx_after: bool,
-        tables: &[String],
-    ) -> CacheInvalidationPlan {
-        use crate::protocol::starts_with_ci;
-        let t = sql.trim();
-        let core = t.strip_suffix(';').unwrap_or(t).trim_end();
-        let rollback = starts_with_ci(core, "ROLLBACK") || starts_with_ci(core, "ABORT");
-        let commit = starts_with_ci(core, "COMMIT")
-            || starts_with_ci(core, "END")
-            || starts_with_ci(core, "COMMIT PREPARED");
-
-        if rollback {
-            return CacheInvalidationPlan {
-                immediate: tables.to_vec(),
-                stash: false,
-                flush_stash: false,
-                clear_stash: true,
-            };
-        }
-        if commit {
-            return CacheInvalidationPlan {
-                immediate: tables.to_vec(),
-                stash: false,
-                flush_stash: true,
-                clear_stash: false,
-            };
-        }
-        if in_tx_after {
-            CacheInvalidationPlan {
-                immediate: tables.to_vec(),
-                stash: true,
-                flush_stash: false,
-                clear_stash: false,
-            }
-        } else {
-            CacheInvalidationPlan {
-                immediate: tables.to_vec(),
-                stash: false,
-                flush_stash: true,
-                clear_stash: false,
-            }
-        }
     }
 
     /// Append `name` to a per-cycle extended-batch tracker at most once,
@@ -8101,28 +8031,173 @@ impl ProxyServer {
 
     /// A backend response completed (`ReadyForQuery` relayed): reconcile the
     /// capture with what the backend answered and apply the journal ops.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy", test))]
     async fn journal_observe(
         session: &ClientSession,
         state: &ServerState,
         outcome: crate::journal_capture::ResponseOutcome,
     ) {
+        if let Some(cycle) = Self::journal_observe_sync(session, state, outcome) {
+            Self::journal_observe_finish(session, state, cycle).await;
+        }
+    }
+
+    /// Phase 1 of observing a completed cycle, synchronous and run before
+    /// the `ReadyForQuery` is forwarded: reconcile the capture with what the
+    /// backend answered and move the query-cache generations of the tables
+    /// the cycle wrote (C-02). `None` on the idle fast path.
+    fn journal_observe_sync(
+        session: &ClientSession,
+        state: &ServerState,
+        outcome: crate::journal_capture::ResponseOutcome,
+    ) -> Option<ObservedCycle> {
         let armed = session.journal_armed.swap(false, Ordering::Relaxed);
         // Fast path: an idle autocommit response with nothing registered and
         // no transaction being captured changes nothing.
         if !armed && outcome.status == b'I' && !session.journal_open.load(Ordering::Relaxed) {
-            return;
+            return None;
         }
-        // The source identity is the only thing that awaits; it is read
-        // before the capture lock so nothing is held across an await.
-        let source = Self::journal_source(session).await;
-        {
+        let ops = {
             let mut cap = session.journal.lock().unwrap_or_else(|e| e.into_inner());
             let ops = cap.observe(&outcome);
             session
                 .journal_open
                 .store(cap.in_transaction(), Ordering::Relaxed);
-            Self::journal_apply(state, ops, &source, session.id, cap.active_mut());
+            ops
+        };
+        #[cfg(feature = "query-cache")]
+        let purge = match state.query_cache.as_ref() {
+            Some(qc) if !ops.is_empty() => {
+                let work = {
+                    let mut stage = session
+                        .tx_cache_stage
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    Self::cache_work_from_ops(qc, &ops, &mut stage)
+                };
+                if work.all {
+                    qc.invalidate_all();
+                }
+                qc.mark_written(&work.tables);
+                work.tables
+            }
+            _ => Vec::new(),
+        };
+        #[cfg(not(feature = "query-cache"))]
+        let _ = state;
+        Some(ObservedCycle {
+            ops,
+            #[cfg(feature = "query-cache")]
+            purge,
+        })
+    }
+
+    /// Phase 2, after the client has its answer: purge the L2 entries of the
+    /// written tables and apply the journal ops (skipped when TR is off and
+    /// the capture ran only for the cache).
+    async fn journal_observe_finish(
+        session: &ClientSession,
+        state: &ServerState,
+        cycle: ObservedCycle,
+    ) {
+        #[cfg(feature = "query-cache")]
+        if !cycle.purge.is_empty() {
+            if let Some(qc) = state.query_cache.as_ref() {
+                qc.purge_tables(&cycle.purge).await;
+            }
         }
+        if cycle.ops.is_empty() || !state.live_config.load().tr_enabled {
+            return;
+        }
+        // The source identity is the only thing that awaits; it is read
+        // before the capture lock so nothing is held across an await.
+        let source = Self::journal_source(session).await;
+        let mut cap = session.journal.lock().unwrap_or_else(|e| e.into_inner());
+        Self::journal_apply(state, cycle.ops, &source, session.id, cap.active_mut());
+    }
+
+    /// Whether the journal capture must run for the query cache even when TR
+    /// is off: commit-aware invalidation (C-02) is driven by its ops.
+    fn cache_needs_capture(state: &ServerState) -> bool {
+        #[cfg(feature = "query-cache")]
+        {
+            state.query_cache.is_some()
+        }
+        #[cfg(not(feature = "query-cache"))]
+        {
+            let _ = state;
+            false
+        }
+    }
+
+    /// Translate one cycle's capture ops into cache invalidation (C-02).
+    /// Statement-time: every successful write invalidates its tables at once
+    /// (a later read must not hit a pre-write entry). Commit-time: the tables
+    /// an explicit transaction staged are invalidated again when the backend
+    /// reports the commit, closing the window in which another session
+    /// refilled an entry from pre-commit data. A rollback drops the stage.
+    /// A write whose tables cannot be read from its text invalidates
+    /// everything.
+    #[cfg(feature = "query-cache")]
+    fn cache_work_from_ops(
+        qc: &crate::cache::QueryCache,
+        ops: &[crate::journal_capture::JournalOp],
+        stage: &mut TxCacheStage,
+    ) -> CacheWork {
+        use crate::journal_capture::JournalOp;
+        let mut work = CacheWork::default();
+        let add = |tables: &mut Vec<String>, t: Vec<String>| {
+            for table in t {
+                if !tables.contains(&table) {
+                    tables.push(table);
+                }
+            }
+        };
+        for op in ops {
+            match op {
+                // Inside an explicit transaction a write is only staged: no
+                // other session can see it before the commit, and the
+                // session's own reads are never served from the cache while
+                // it is in a transaction. Marking it at statement time as well
+                // cost every in-transaction statement a generation bump and a
+                // purge before its ReadyForQuery (C-02 user-path gate).
+                JournalOp::Log { entry, .. } => match qc.write_tables(&entry.statement) {
+                    Some(t) => add(&mut stage.tables, t),
+                    None => stage.unknown = true,
+                },
+                JournalOp::Incomplete { .. } => stage.unknown = true,
+                JournalOp::AutoCommit {
+                    entries,
+                    incomplete,
+                    ..
+                } => {
+                    if incomplete.is_some() {
+                        work.all = true;
+                    }
+                    for e in entries {
+                        match qc.write_tables(&e.statement) {
+                            Some(t) => add(&mut work.tables, t),
+                            None => work.all = true,
+                        }
+                    }
+                }
+                JournalOp::Commit { .. } => {
+                    let staged = std::mem::take(&mut stage.tables);
+                    add(&mut work.tables, staged);
+                    if std::mem::take(&mut stage.unknown) {
+                        work.all = true;
+                    }
+                }
+                JournalOp::Rollback { .. } => {
+                    stage.tables.clear();
+                    stage.unknown = false;
+                }
+                JournalOp::Begin { .. }
+                | JournalOp::Savepoint { .. }
+                | JournalOp::RollbackTo { .. } => {}
+            }
+        }
+        work
     }
 
     /// `journal_observe` for a relay that recorded only the status byte
@@ -8154,6 +8229,14 @@ impl ProxyServer {
 
     /// The session ended.
     async fn journal_close(session: &ClientSession, state: &ServerState) {
+        #[cfg(feature = "query-cache")]
+        {
+            let mut stage = session
+                .tx_cache_stage
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *stage = TxCacheStage::default();
+        }
         let source = Self::journal_source(session).await;
         let mut cap = session.journal.lock().unwrap_or_else(|e| e.into_inner());
         let ops = cap.close();
@@ -12705,7 +12788,7 @@ mod tests {
             tr_replay_tainted: std::sync::atomic::AtomicBool::new(false),
             backend_credential: RwLock::new(None),
             #[cfg(feature = "query-cache")]
-            tx_written_tables: std::sync::Mutex::new(Vec::new()),
+            tx_cache_stage: std::sync::Mutex::new(TxCacheStage::default()),
             journal: std::sync::Mutex::new(crate::journal_capture::SessionCapture::default()),
             journal_armed: std::sync::atomic::AtomicBool::new(false),
             journal_open: std::sync::atomic::AtomicBool::new(false),
@@ -13480,45 +13563,6 @@ mod tests {
     #[cfg(feature = "query-cache")]
     mod query_cache {
         use super::ProxyServer;
-
-        #[test]
-        fn cache_invalidation_plan_defers_to_commit() {
-            let tables = vec!["accounts".to_string()];
-
-            // Write inside an explicit transaction: invalidate now AND stage
-            // for the commit-time re-pass.
-            let in_tx = ProxyServer::cache_invalidation_plan(
-                "INSERT INTO accounts VALUES (1)",
-                true,
-                &tables,
-            );
-            assert_eq!(in_tx.immediate, tables);
-            assert!(in_tx.stash && !in_tx.flush_stash && !in_tx.clear_stash);
-
-            // Autocommit write: this response is the commit point.
-            let autocommit =
-                ProxyServer::cache_invalidation_plan("UPDATE accounts SET x = 1", false, &tables);
-            assert!(autocommit.flush_stash && !autocommit.stash);
-
-            // COMMIT/END flush the staged set; ROLLBACK/ABORT discard it.
-            let commit = ProxyServer::cache_invalidation_plan("COMMIT;", false, &[]);
-            assert!(commit.flush_stash && !commit.clear_stash);
-            let end = ProxyServer::cache_invalidation_plan("END", false, &[]);
-            assert!(end.flush_stash && !end.clear_stash);
-            let rollback = ProxyServer::cache_invalidation_plan("ROLLBACK;", false, &[]);
-            assert!(rollback.clear_stash && !rollback.flush_stash);
-            let abort = ProxyServer::cache_invalidation_plan("ABORT", false, &[]);
-            assert!(abort.clear_stash && !abort.flush_stash);
-
-            // A multi-statement string that ends the transaction is idle after
-            // its response: treat it as a commit point.
-            let multi = ProxyServer::cache_invalidation_plan(
-                "INSERT INTO accounts VALUES (1); COMMIT",
-                false,
-                &tables,
-            );
-            assert!(multi.flush_stash && !multi.stash);
-        }
 
         #[test]
         fn plain_selects_are_cacheable() {
@@ -18177,6 +18221,150 @@ mod tests {
             let (code, msg) = ProxyServer::error_response_fields(&[b'E', 0, 0, 0, 4]);
             assert_eq!(code, "");
             assert!(!msg.is_empty());
+        }
+
+        #[cfg(feature = "query-cache")]
+        mod c02_cache_work {
+            use super::*;
+            use crate::cache::{CacheConfig, QueryCache};
+            use crate::journal_capture::JournalOp;
+            use crate::transaction_journal::{NewEntry, StatementOutcome, WireProtocol};
+
+            fn entry(sql: &str) -> NewEntry {
+                NewEntry {
+                    statement: sql.to_string(),
+                    parameters: Vec::new(),
+                    param_types: Vec::new(),
+                    result_checksum: None,
+                    rows_affected: Some(1),
+                    duration_ms: 0,
+                    outcome: StatementOutcome::Succeeded {
+                        tag: "UPDATE 1".into(),
+                    },
+                    protocol: WireProtocol::Extended,
+                }
+            }
+
+            fn run(ops: Vec<JournalOp>, stage: &mut TxCacheStage) -> CacheWork {
+                let qc = QueryCache::new(CacheConfig::default());
+                ProxyServer::cache_work_from_ops(&qc, &ops, stage)
+            }
+
+            #[test]
+            fn autocommit_write_invalidates_its_tables_at_once() {
+                let mut stage = TxCacheStage::default();
+                let w = run(
+                    vec![JournalOp::AutoCommit {
+                        entries: vec![entry("UPDATE accounts SET v = $1")],
+                        tag: "UPDATE 1".into(),
+                        incomplete: None,
+                    }],
+                    &mut stage,
+                );
+                assert_eq!(w.tables, vec!["accounts".to_string()]);
+                assert!(!w.all);
+                assert!(stage.tables.is_empty());
+            }
+
+            #[test]
+            fn explicit_transaction_invalidates_at_commit_only() {
+                let tx = uuid::Uuid::new_v4();
+                let mut stage = TxCacheStage::default();
+                let w = run(
+                    vec![
+                        JournalOp::Begin { tx_id: tx },
+                        JournalOp::Log {
+                            tx_id: tx,
+                            entry: entry("UPDATE accounts SET v = 3"),
+                        },
+                    ],
+                    &mut stage,
+                );
+                assert!(w.tables.is_empty() && !w.all, "nothing at statement time");
+                assert_eq!(stage.tables, vec!["accounts".to_string()], "staged");
+                let w = run(
+                    vec![JournalOp::Commit {
+                        tx_id: tx,
+                        tag: "COMMIT".into(),
+                    }],
+                    &mut stage,
+                );
+                assert_eq!(w.tables, vec!["accounts".to_string()], "commit time");
+                assert!(stage.tables.is_empty());
+            }
+
+            #[test]
+            fn rollback_drops_the_stage() {
+                let tx = uuid::Uuid::new_v4();
+                let mut stage = TxCacheStage::default();
+                run(
+                    vec![JournalOp::Log {
+                        tx_id: tx,
+                        entry: entry("DELETE FROM accounts"),
+                    }],
+                    &mut stage,
+                );
+                let w = run(vec![JournalOp::Rollback { tx_id: tx }], &mut stage);
+                assert!(w.tables.is_empty() && !w.all);
+                assert!(stage.tables.is_empty() && !stage.unknown);
+            }
+
+            #[test]
+            fn unknown_scope_invalidates_everything_at_commit() {
+                let tx = uuid::Uuid::new_v4();
+                for (ops, why) in [
+                    (
+                        vec![JournalOp::Log {
+                            tx_id: tx,
+                            entry: entry("ALTER TABLE accounts ADD COLUMN c int"),
+                        }],
+                        "DDL",
+                    ),
+                    (
+                        vec![
+                            JournalOp::Log {
+                                tx_id: tx,
+                                entry: entry("COPY accounts FROM STDIN"),
+                            },
+                            JournalOp::Incomplete {
+                                tx_id: tx,
+                                reason: "COPY FROM".into(),
+                            },
+                        ],
+                        "COPY",
+                    ),
+                    (
+                        vec![JournalOp::Log {
+                            tx_id: tx,
+                            entry: entry("EXECUTE upd(1)"),
+                        }],
+                        "EXECUTE",
+                    ),
+                ] {
+                    let mut stage = TxCacheStage::default();
+                    let w = run(ops, &mut stage);
+                    assert!(!w.all && w.tables.is_empty(), "{why}: staged only");
+                    assert!(stage.unknown, "{why}: staged as unknown");
+                    let w = run(
+                        vec![JournalOp::Commit {
+                            tx_id: tx,
+                            tag: "COMMIT".into(),
+                        }],
+                        &mut stage,
+                    );
+                    assert!(w.all, "{why}: commit time");
+                }
+                let mut stage = TxCacheStage::default();
+                let w = run(
+                    vec![JournalOp::AutoCommit {
+                        entries: vec![entry("TRUNCATE accounts")],
+                        tag: "TRUNCATE TABLE".into(),
+                        incomplete: None,
+                    }],
+                    &mut stage,
+                );
+                assert!(w.all, "autocommit TRUNCATE");
+            }
         }
 
         /// Without a credential (pass-through mode) a challenge fails fast with

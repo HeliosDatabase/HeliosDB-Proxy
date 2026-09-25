@@ -14,7 +14,7 @@
 #
 # Usage:  ./bench-usertp.sh /path/to/heliosdb-proxy [label]
 # Env:    CLIENTS="1 16 64"  DUR=10  MODES="direct session transaction"
-#         OUT=/tmp/bench-usertp
+#         OUT=/tmp/bench-usertp  CKPT_BEFORE_WRITE=1  WARMUP_SECS=8
 #
 # The script starts its own proxy per mode (Session / Transaction pool configs
 # are generated next to this script's conventions). It does NOT start the
@@ -46,6 +46,39 @@ pg(){ docker run --rm --network host -e PGPASSWORD="$BPASS" "$IMG" "$@"; }
 # commit latency would otherwise swamp the proxy's share.
 pgv(){ docker run --rm --network host -v "$OUT":/w -e PGPASSWORD="$BPASS" -e PGOPTIONS="${PGOPTIONS:-}" "$IMG" "$@"; }
 cleanup(){ [ -n "$PROXYPID" ] && kill "$PROXYPID" 2>/dev/null; wait "$PROXYPID" 2>/dev/null; }
+
+# PostgreSQL checkpoints are backend noise the proxy cannot influence. After a
+# checkpoint starts, the first write to each page logs a full-page image, and
+# the WAL burst stalls every client for 100-300 ms at a time for seconds. On
+# 2026-09-24 timed checkpoints (checkpoint_timeout = 5 min) landed in one base
+# and two candidate write cells at random and read as a -16% "regression".
+# Before each write cell the harness therefore takes a checkpoint itself, which
+# also restarts the 5-minute timer. It then runs WARMUP_SECS of unmeasured
+# writes directly against the backend, so the full-page-image burst is spent
+# before measurement starts. CKPT_BEFORE_WRITE=0 turns both off.
+# Every record carries the number of checkpoints the backend started during its
+# cell ("checkpoints"). A non-zero count means that cell measured the backend,
+# not the proxy.
+CKPT_BEFORE_WRITE="${CKPT_BEFORE_WRITE:-1}"
+WARMUP_SECS="${WARMUP_SECS:-8}"
+checkpoints_started(){
+  pg psql -h "$PGHOST" -p "$PGPORT" -U "$BUSER" -d "$BDB" -qAtc \
+    "select num_timed + num_requested from pg_stat_checkpointer" 2>/dev/null | tr -d '[:space:]'
+}
+settle_backend(){
+  [ "$CKPT_BEFORE_WRITE" = "1" ] || return 0
+  pg psql -h "$PGHOST" -p "$PGPORT" -U "$BUSER" -d "$BDB" -qAtc "CHECKPOINT" >/dev/null 2>&1 \
+    || echo "warning: CHECKPOINT before the write cell failed" >&2
+  if [ "$WARMUP_SECS" -gt 0 ]; then
+    pgv pgbench -h "$PGHOST" -p "$PGPORT" -U "$BUSER" -d "$BDB" -n -c 16 -j 4 \
+      -T "$WARMUP_SECS" -b simple-update >/dev/null 2>&1 \
+      || echo "warning: backend write warm-up failed" >&2
+  fi
+}
+# checkpoints the backend started between two checkpoints_started samples
+ckpt_delta(){
+  if [ -n "$1" ] && [ -n "$2" ]; then echo $(( $2 - $1 )); else echo -1; fi
+}
 trap cleanup EXIT
 
 write_proxy_config(){
@@ -168,8 +201,8 @@ echo "[]" > "$RUNS_JSON"   # results are appended below by python3
 RESULTS=()
 
 record(){
-  local mode=$1 clients=$2 kind=$3 tps=$4 failed=$5 p=$6 rss=$7 cpu=$8 frow=$9
-  RESULTS+=("{\"mode\":\"$mode\",\"clients\":$clients,\"workload\":\"$kind\",\"tps\":$tps,\"failed_txns\":$failed,\"latency_ms\":[$p],\"rss_kb\":${rss:-0},\"cpu_percent\":${cpu:-0},\"first_row_ms\":${frow:-0}}")
+  local mode=$1 clients=$2 kind=$3 tps=$4 failed=$5 p=$6 rss=$7 cpu=$8 frow=$9 ckpts=${10}
+  RESULTS+=("{\"mode\":\"$mode\",\"clients\":$clients,\"workload\":\"$kind\",\"tps\":$tps,\"failed_txns\":$failed,\"latency_ms\":[$p],\"rss_kb\":${rss:-0},\"cpu_percent\":${cpu:-0},\"first_row_ms\":${frow:-0},\"checkpoints\":${ckpts:--1}}")
 }
 
 for mode in $MODES; do
@@ -185,19 +218,24 @@ for mode in $MODES; do
     # Read path (select-only) — committed TPS is meaningless here, but the
     # tails are the read-path SLA.
     readlog="$OUT/$LABEL-$mode-read-$clients.log"
+    c0=$(checkpoints_started)
     read_out=$(run_pgbench "$host" "$port" "$clients" "$DUR" "$readlog" -S)
+    read_ckpts=$(ckpt_delta "$c0" "$(checkpoints_started)")
     read_tps=${read_out%% *}; read_failed=${read_out##* }
     read_p=$(percentiles "$readlog")
     sample=$(sample_proxy); rss=${sample%% *}; cpu=${sample##* }
-    record "$mode" "$clients" "read" "$read_tps" "$read_failed" "$read_p" "$rss" "$cpu" "$frow"
+    record "$mode" "$clients" "read" "$read_tps" "$read_failed" "$read_p" "$rss" "$cpu" "$frow" "$read_ckpts"
 
     # Write path (simple-update) — this is the committed TPS number.
     writelog="$OUT/$LABEL-$mode-write-$clients.log"
+    settle_backend
+    c0=$(checkpoints_started)
     write_out=$(run_pgbench "$host" "$port" "$clients" "$DUR" "$writelog" -b simple-update)
+    write_ckpts=$(ckpt_delta "$c0" "$(checkpoints_started)")
     write_tps=${write_out%% *}; write_failed=${write_out##* }
     write_p=$(percentiles "$writelog")
-    record "$mode" "$clients" "committed_write" "$write_tps" "$write_failed" "$write_p" "$rss" "$cpu" "$frow"
-    echo "mode=$mode clients=$clients read_tps=$read_tps committed_tps=$write_tps failed=$write_failed"
+    record "$mode" "$clients" "committed_write" "$write_tps" "$write_failed" "$write_p" "$rss" "$cpu" "$frow" "$write_ckpts"
+    echo "mode=$mode clients=$clients read_tps=$read_tps committed_tps=$write_tps failed=$write_failed checkpoints=$read_ckpts/$write_ckpts"
   done
 
   # Unknown-outcome signals (direct mode has none): the proxy's own counter of

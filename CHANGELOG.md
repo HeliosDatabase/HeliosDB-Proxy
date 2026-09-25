@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Query-cache invalidation is commit-aware on both protocols and every tier (C-02,
+  #56).** Extended-protocol writes (every prepared statement, i.e. most drivers and
+  ORMs) did not invalidate the query cache at all, and L1/L3 entries were never
+  invalidated by writes, only by TTL — so a read could return a value older than a
+  committed write until the entry expired. Each cached result now records the write
+  generation of the tables it read, taken before its backend fetch; an autocommit write
+  moves its tables' generations before the client sees the `ReadyForQuery` that
+  acknowledges it, an explicit transaction's tables move when the backend reports the
+  commit, before the client sees it (a rollback drops them), a result whose tables were
+  written during its fetch is not stored, and every L1/L2/L3 hit is checked. Writes are
+  taken from the transaction journal's capture of what the backend executed, which now
+  also runs when TR is off but the cache is on. DDL, `TRUNCATE`, `COPY`, `EXECUTE`,
+  `CALL` and `DO` invalidate the whole cache. L2 entries now keep their tables across
+  the serialized form (they were dropped, so an L2 entry promoted to L1 escaped table
+  invalidation). Writes that bypass the proxy, and two-phase commits, are still only
+  bounded by `ttl_secs` (documented).
+
+- **The first writes after a read-heavy phase no longer stall for seconds with the cache
+  on.** Every writer purging a table cloned the table's whole cached-key set (10^5-10^6
+  keys after a busy read phase), so the first concurrent commits paid for it once each: a
+  3-4 s maximum transaction latency on the user-path harness. A purge now only takes the
+  set out of the invalidation index (one purger per table gets it) and a dedicated
+  `cache-reclaim` thread drops it; the entries are not walked, since a stale one is
+  refused by its write generation and replaced by the next fill of its key or evicted by
+  the L2 size bound and TTL. When L2 has to make room, one eviction pass runs at a time
+  (every concurrent insert used to scan the whole cache and shed the same entries, a
+  multi-second stall for all readers): it collects every entry a write has retired along
+  with expired ones, instead of evicting live entries one full scan at a time, and the
+  `cache-reclaim` thread drops them (inserts meanwhile proceed, so the size bound is
+  soft for that long). A refill that replaces an entry for the same key no longer
+  triggers an eviction at all. L2's usage account no longer keeps the bytes of a replaced entry or of
+  an expired entry dropped on lookup (it only grew, so a full L2 evicted early and, on
+  every insert, scanned the whole cache).
+
 - **`--tr false` / `--tr=false` now turn Transaction Replay off.** The flag was declared
   as a plain `bool`, which clap treats as a presence switch: `--tr false` was rejected
   ("unrecognized subcommand") and `--tr=false` too, so TR could only be disabled through

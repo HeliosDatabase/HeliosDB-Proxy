@@ -1315,6 +1315,133 @@ async fn tr07_admin_post(addr: &str, path: &str, body: &str) -> (u16, serde_json
     (status, json_body)
 }
 
+/// C-02: with the query cache on, a read never returns a value older than
+/// the last write the proxy saw commit — on either protocol, around an
+/// explicit transaction a concurrent reader refilled before its commit, after
+/// a rollback, a multi-statement string, DDL and COPY. A write made directly
+/// on the backend (bypassing the proxy) is NOT seen until the entry's TTL:
+/// that proves the reads are served from the cache and is the documented
+/// limit of the in-proxy invalidation (logical-decoding source: follow-up).
+#[cfg(feature = "query-cache")]
+#[tokio::test]
+async fn test_c02_commit_aware_cache_invalidation_serves_no_stale_reads() {
+    let Some(fx) = fixture::start_proxy_with(|c| {
+        c.cache.enabled = true;
+        c.cache.ttl_secs = 300;
+    })
+    .await
+    else {
+        return;
+    };
+    let b = &fx.backend;
+    let direct = tr07_connect(&tr07_conn_str(&b.host, b.port, b, &b.dbname)).await;
+    let proxied = tr07_conn_str("127.0.0.1", fx.proxy_port, b, &b.dbname);
+    let writer = tr07_connect(&proxied).await;
+    let reader = tr07_connect(&proxied).await;
+
+    direct
+        .batch_execute(
+            "DROP TABLE IF EXISTS c02_t; \
+             CREATE TABLE c02_t (id int PRIMARY KEY, v int NOT NULL); \
+             INSERT INTO c02_t VALUES (1, 1);",
+        )
+        .await
+        .unwrap();
+
+    async fn scalar(c: &tokio_postgres::Client, sql: &str) -> i64 {
+        for m in c.simple_query(sql).await.unwrap() {
+            if let tokio_postgres::SimpleQueryMessage::Row(r) = m {
+                return r.get(0).unwrap().parse().unwrap();
+            }
+        }
+        panic!("no row for {sql}");
+    }
+    let read_v = "SELECT v FROM c02_t WHERE id = 1";
+    let read_n = "SELECT count(*) FROM c02_t";
+
+    assert_eq!(scalar(&reader, read_v).await, 1);
+    // Bypass the proxy: the cached value is still served (the cache is live).
+    direct
+        .batch_execute("UPDATE c02_t SET v = 100 WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(scalar(&reader, read_v).await, 1, "served from the cache");
+
+    // Autocommit write through the proxy, extended protocol.
+    writer
+        .execute("UPDATE c02_t SET v = $1 WHERE id = 1", &[&2i32])
+        .await
+        .unwrap();
+    assert_eq!(
+        scalar(&reader, read_v).await,
+        2,
+        "autocommit extended write"
+    );
+
+    // Explicit transaction; the reader refills from pre-commit data.
+    writer.batch_execute("BEGIN").await.unwrap();
+    writer
+        .execute("UPDATE c02_t SET v = $1 WHERE id = 1", &[&3i32])
+        .await
+        .unwrap();
+    assert_eq!(
+        scalar(&reader, read_v).await,
+        2,
+        "uncommitted write invisible"
+    );
+    assert_eq!(scalar(&reader, read_v).await, 2);
+    writer.batch_execute("COMMIT").await.unwrap();
+    assert_eq!(
+        scalar(&reader, read_v).await,
+        3,
+        "commit invalidates the refill"
+    );
+
+    // Rolled-back work is never presented.
+    writer
+        .batch_execute("BEGIN; UPDATE c02_t SET v = 4 WHERE id = 1;")
+        .await
+        .unwrap();
+    assert_eq!(scalar(&reader, read_v).await, 3);
+    writer.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(scalar(&reader, read_v).await, 3, "rollback");
+
+    // Multi-statement simple-query string.
+    writer
+        .batch_execute("UPDATE c02_t SET v = 5 WHERE id = 1; SELECT 1;")
+        .await
+        .unwrap();
+    assert_eq!(scalar(&reader, read_v).await, 5, "multi-statement string");
+
+    // DDL has an unknown dependency set: everything is invalidated, so even
+    // a proxy-bypassing change made before it becomes visible.
+    direct
+        .batch_execute("UPDATE c02_t SET v = 6 WHERE id = 1")
+        .await
+        .unwrap();
+    writer
+        .batch_execute("ALTER TABLE c02_t ADD COLUMN w int")
+        .await
+        .unwrap();
+    assert_eq!(
+        scalar(&reader, read_v).await,
+        6,
+        "DDL invalidates everything"
+    );
+
+    // COPY (server-side program source; needs a superuser backend role).
+    assert_eq!(scalar(&reader, read_n).await, 1);
+    match writer
+        .batch_execute("COPY c02_t (id, v) FROM PROGRAM 'printf ''2\\t7\\n'''")
+        .await
+    {
+        Ok(()) => assert_eq!(scalar(&reader, read_n).await, 2, "COPY invalidates"),
+        Err(e) => eprintln!("COPY FROM PROGRAM not permitted here, COPY step skipped: {e}"),
+    }
+
+    direct.batch_execute("DROP TABLE c02_t").await.unwrap();
+}
+
 fn tr07_conn_str(host: &str, port: u16, b: &fixture::BackendInfo, db: &str) -> String {
     format!(
         "host={host} port={port} user={} password={} dbname={db}",

@@ -120,6 +120,16 @@ for k in sorted(set(base_runs) | set(cand_runs)):
     fb, fc = med(b, lambda r: r.get("first_row_ms")), med(c, lambda r: r.get("first_row_ms"))
     failb = sum(r.get("failed_txns", 0) for r in b)
     failc = sum(r.get("failed_txns", 0) for r in c)
+    # passes whose cell overlapped a backend checkpoint ("checkpoints" is
+    # absent from results older than 2026-09-24, and -1 when unreadable)
+    ckb = sum(1 for r in b if (r.get("checkpoints") or 0) > 0)
+    ckc = sum(1 for r in c if (r.get("checkpoints") or 0) > 0)
+    if ckb or ckc:
+        warnings.append(
+            f"WARN: {mode} clients={clients} workload={workload}: a backend checkpoint "
+            f"started during {ckb} base / {ckc} cand pass(es) of this cell; those passes "
+            f"measured the backend, not the proxy, so re-run before trusting its delta"
+        )
 
     dt, tstatus = delta(tb, tc)
     dp, pstatus = delta(pb, pc)
@@ -181,6 +191,8 @@ for k in sorted(set(base_runs) | set(cand_runs)):
             "first_row_ms_cand": fc,
             "failed_txns_base": failb,
             "failed_txns_cand": failc,
+            "checkpoint_passes_base": ckb,
+            "checkpoint_passes_cand": ckc,
             "gated": gated,
             "verdict": verdict,
         }

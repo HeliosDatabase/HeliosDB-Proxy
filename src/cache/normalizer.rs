@@ -137,8 +137,18 @@ impl QueryNormalizer {
         }
     }
 
+    /// `sql` without comments and routing hints. Borrowed (no regex pass,
+    /// no allocation) when it contains neither `/*` nor `--`.
+    pub fn strip_comments<'a>(&self, sql: &'a str) -> std::borrow::Cow<'a, str> {
+        if !sql.contains("/*") && !sql.contains("--") {
+            return std::borrow::Cow::Borrowed(sql);
+        }
+        let sql = HINT_PATTERN.replace_all(sql, "");
+        std::borrow::Cow::Owned(COMMENT_PATTERN.replace_all(&sql, "").into_owned())
+    }
+
     /// Extract table names from a SQL query
-    fn extract_tables(&self, sql: &str) -> Vec<String> {
+    pub(crate) fn extract_tables(&self, sql: &str) -> Vec<String> {
         let mut tables = Vec::new();
 
         for cap in TABLE_PATTERN.captures_iter(sql) {
