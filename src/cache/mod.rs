@@ -115,6 +115,10 @@ pub struct QueryPrep {
     /// need it. Absent on a hint-skip or an L1 exact hit (neither normalizes);
     /// `put_prepared` then normalizes lazily, exactly as `put` always did.
     normalized: Option<NormalizedQuery>,
+    /// Cache generation of the query's tables when the lookup missed, i.e.
+    /// before the backend fetch (C-02). `put_prepared` refuses to store a
+    /// result whose tables were written while it was being fetched.
+    generation: Option<u64>,
 }
 
 /// Cache lookup result
@@ -173,6 +177,31 @@ pub struct QueryCache {
     /// Request coalescing for cache stampede prevention
     #[allow(dead_code)]
     pending_requests: DashMap<CacheKey, Arc<tokio::sync::Notify>>,
+
+    /// Per-table write generations (C-02). Bumped by every invalidation of the
+    /// table; a cached result stores the sum observed before its fetch and is
+    /// served only while the sum is unchanged, on every tier (L1/L2/L3).
+    table_generations: DashMap<String, u64>,
+
+    /// Generation of invalidations whose table set is unknown (DDL,
+    /// `EXECUTE`/`CALL`/`DO`, `COPY`, unparsable writes): part of every sum.
+    global_generation: std::sync::atomic::AtomicU64,
+
+    /// Work for the `cache-reclaim` thread, so bulk deallocation (10^5-10^6
+    /// entries after a read-heavy phase) never runs on a connection: key
+    /// sets a purge took out of the invalidation index, and L2 entries an
+    /// eviction pass retired. `None` if that thread could not be started
+    /// (callers then do the work themselves).
+    reclaim_tx: Option<std::sync::mpsc::Sender<Reclaim>>,
+}
+
+/// A job for the `cache-reclaim` thread.
+enum Reclaim {
+    /// A purged table's key set: dropped.
+    Keys(std::collections::HashSet<CacheKey>),
+    /// Hashes of L2 entries an eviction pass retired: shed, then the pass
+    /// ends.
+    Shed(Vec<u64>),
 }
 
 impl QueryCache {
@@ -192,6 +221,32 @@ impl QueryCache {
 
         let invalidator = Arc::new(InvalidationManager::new(config.invalidation.clone()));
 
+        // Purges run on the connection that acknowledged a write; dropping a
+        // table's key set there (10^5-10^6 keys after a read-heavy phase)
+        // would hold that client for hundreds of milliseconds. The set is
+        // dropped on this thread instead; it ends when the cache is dropped.
+        let reclaim_tx = {
+            let (tx, rx) = std::sync::mpsc::channel::<Reclaim>();
+            let l2 = l2_cache.clone();
+            std::thread::Builder::new()
+                .name("cache-reclaim".into())
+                .spawn(move || {
+                    while let Ok(job) = rx.recv() {
+                        match job {
+                            Reclaim::Keys(keys) => drop(keys),
+                            Reclaim::Shed(hashes) => {
+                                if let Some(l2) = &l2 {
+                                    l2.shed(&hashes);
+                                    l2.end_eviction();
+                                }
+                            }
+                        }
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        };
+
         Self {
             config: config.clone(),
             l1_caches: DashMap::new(),
@@ -201,6 +256,9 @@ impl QueryCache {
             invalidator,
             metrics: Arc::new(CacheMetrics::new()),
             pending_requests: DashMap::new(),
+            table_generations: DashMap::new(),
+            global_generation: std::sync::atomic::AtomicU64::new(0),
+            reclaim_tx,
         }
     }
 
@@ -250,6 +308,7 @@ impl QueryCache {
                 QueryPrep {
                     hints,
                     normalized: None,
+                    generation: None,
                 },
             );
         }
@@ -260,7 +319,16 @@ impl QueryCache {
         if self.config.l1.enabled {
             if let Some(conn_id) = context.connection_id {
                 let l1 = self.get_l1_cache(conn_id);
-                if let Some(result) = l1.get(query) {
+                let hit = match l1.get(query) {
+                    Some(result) if self.is_current(&result) => Some(result),
+                    Some(_) => {
+                        l1.remove(query);
+                        self.metrics.record_stale_rejected();
+                        None
+                    }
+                    None => None,
+                };
+                if let Some(result) = hit {
                     self.metrics.record_hit(CacheLevel::L1Hot, start.elapsed());
                     return (
                         CacheLookup::Hit {
@@ -270,6 +338,7 @@ impl QueryCache {
                         QueryPrep {
                             hints,
                             normalized: None,
+                            generation: None,
                         },
                     );
                 }
@@ -282,7 +351,16 @@ impl QueryCache {
 
         // L2: Check warm cache (normalized match)
         if let Some(ref l2) = self.l2_cache {
-            if let Some(result) = l2.get(&cache_key).await {
+            let hit = match l2.get(&cache_key).await {
+                Some(result) if self.is_current(&result) => Some(result),
+                Some(_) => {
+                    l2.remove(&cache_key).await;
+                    self.metrics.record_stale_rejected();
+                    None
+                }
+                None => None,
+            };
+            if let Some(result) = hit {
                 self.metrics.record_hit(CacheLevel::L2Warm, start.elapsed());
 
                 // Promote to L1
@@ -301,6 +379,7 @@ impl QueryCache {
                     QueryPrep {
                         hints,
                         normalized: Some(normalized),
+                        generation: None,
                     },
                 );
             }
@@ -309,7 +388,15 @@ impl QueryCache {
         // L3: Check semantic cache (similarity match)
         if hints.semantic_cache {
             if let Some(ref l3) = self.l3_cache {
-                if let Some(result) = l3.get(query, context).await {
+                let hit = match l3.get(query, context).await {
+                    Some(result) if self.is_current(&result) => Some(result),
+                    Some(_) => {
+                        self.metrics.record_stale_rejected();
+                        None
+                    }
+                    None => None,
+                };
+                if let Some(result) = hit {
                     self.metrics
                         .record_hit(CacheLevel::L3Semantic, start.elapsed());
                     return (
@@ -320,6 +407,7 @@ impl QueryCache {
                         QueryPrep {
                             hints,
                             normalized: Some(normalized),
+                            generation: None,
                         },
                     );
                 }
@@ -327,11 +415,13 @@ impl QueryCache {
         }
 
         self.metrics.record_miss(start.elapsed());
+        let generation = Some(self.generation_of(&normalized.tables));
         (
             CacheLookup::Miss,
             QueryPrep {
                 hints,
                 normalized: Some(normalized),
+                generation,
             },
         )
     }
@@ -348,6 +438,7 @@ impl QueryCache {
         let prep = QueryPrep {
             hints: parse_cache_hints(query),
             normalized: None,
+            generation: None,
         };
         self.put_prepared(query, context, &prep, data, row_count, execution_time)
             .await
@@ -401,6 +492,17 @@ impl QueryCache {
             return;
         }
 
+        // A write to one of these tables since the lookup missed (i.e. while
+        // the result was being fetched) means the rows may predate it: do not
+        // store them (C-02). Without a lookup snapshot (plain `put`) the
+        // generation is taken now, which is as strong as the old behaviour.
+        let current = self.generation_of(&normalized.tables);
+        let generation = prep.generation.unwrap_or(current);
+        if generation != current {
+            self.metrics.record_fill_raced();
+            return;
+        }
+
         // Create cached result
         let result = CachedResult {
             data,
@@ -409,6 +511,7 @@ impl QueryCache {
             ttl,
             tables: normalized.tables.clone(),
             execution_time,
+            generation,
         };
 
         // Store in L1 (exact match)
@@ -422,7 +525,15 @@ impl QueryCache {
         // Store in L2 (normalized)
         if let Some(ref l2) = self.l2_cache {
             let cache_key = CacheKey::new(normalized, context);
-            l2.put(cache_key.clone(), result.clone()).await;
+            // When L2 must make room, one pass sheds every write-retired
+            // entry, on the reclaim thread.
+            l2.put_evicting(
+                cache_key.clone(),
+                result.clone(),
+                |r| !self.is_current(r),
+                |hashes| self.hand_off_shed(hashes),
+            )
+            .await;
 
             // Register for invalidation
             for table in &normalized.tables {
@@ -461,25 +572,133 @@ impl QueryCache {
         self.normalizer.normalize(sql).tables
     }
 
-    /// Invalidate cache entries for specific tables
+    /// Invalidate cache entries for specific tables: [`Self::mark_written`]
+    /// then [`Self::purge_tables`].
     pub async fn invalidate_tables(&self, tables: &[String]) {
+        self.mark_written(tables);
+        self.purge_tables(tables).await;
+    }
+
+    /// Move the write generations of `tables` (C-02). Synchronous and cheap:
+    /// from here on no tier (L1/L2/L3) serves, and no in-flight fetch stores,
+    /// a result that read these tables before this point.
+    pub fn mark_written(&self, tables: &[String]) {
         for table in tables {
-            let keys = self.invalidator.get_keys_for_table(table);
-
-            // Invalidate L2
-            if let Some(ref l2) = self.l2_cache {
-                for key in &keys {
-                    l2.remove(key).await;
-                }
+            // Runs before the write's ReadyForQuery: a known table (the common
+            // case) is bumped in place without allocating its name again.
+            if let Some(mut g) = self.table_generations.get_mut(table.as_str()) {
+                *g += 1;
+            } else {
+                *self.table_generations.entry(table.clone()).or_insert(0) += 1;
             }
+        }
+    }
 
-            self.invalidator.invalidate_table(table);
+    /// Release the invalidation index of `tables` — the memory half of
+    /// [`Self::invalidate_tables`]. Serving their entries is already refused
+    /// on every tier once [`Self::mark_written`] moved their generations, so
+    /// the entries themselves are not walked: a stale L2 entry is replaced
+    /// by the next fill of its key or evicted by the L2 size bound and TTL,
+    /// like L1 and L3 entries.
+    ///
+    /// O(1) per table: the key set leaves the index in one step (so of the
+    /// writers purging a table at once only one gets it) and is dropped by
+    /// the `cache-reclaim` thread. Walking it per key instead (reverse index
+    /// and L2 removal of ~600k keys after a read-heavy phase) cost the
+    /// write path a lasting ~25 % of committed TPS on the user-path gate.
+    pub async fn purge_tables(&self, tables: &[String]) {
+        for table in tables {
+            let keys = self.invalidator.take_table(table);
+            if keys.is_empty() {
+                continue;
+            }
+            match &self.reclaim_tx {
+                // The thread only ends when the cache is dropped; if it died
+                // anyway, send hands the set back and it is dropped here.
+                Some(tx) => drop(tx.send(Reclaim::Keys(keys))),
+                None => drop(keys),
+            }
         }
 
-        // L1 caches are invalidated on next access (TTL-based)
-        // L3 semantic cache has its own TTL handling
-
         self.metrics.record_invalidation(tables.len());
+    }
+
+    /// Give an L2 eviction pass's retired hashes to the reclaim thread
+    /// (which sheds them and ends the pass); hands them back if it cannot.
+    fn hand_off_shed(&self, hashes: Vec<u64>) -> Result<(), Vec<u64>> {
+        let Some(tx) = &self.reclaim_tx else {
+            return Err(hashes);
+        };
+        tx.send(Reclaim::Shed(hashes)).map_err(|e| match e.0 {
+            Reclaim::Shed(hashes) => hashes,
+            Reclaim::Keys(_) => Vec::new(),
+        })
+    }
+
+    /// Invalidate everything, for a write whose table set is unknown (DDL,
+    /// `EXECUTE`/`CALL`/`DO`, `COPY`, a statement no table could be read
+    /// from). Every cached result on every tier stops being served.
+    pub fn invalidate_all(&self) {
+        self.global_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.metrics.record_invalidation(0);
+    }
+
+    /// The tables a write statement touches, or `None` when they cannot be
+    /// determined from its text (DDL, `EXECUTE`/`CALL`/`DO`, `COPY`, no
+    /// table found) — the caller then invalidates everything.
+    pub fn write_tables(&self, sql: &str) -> Option<Vec<String>> {
+        use crate::protocol::starts_with_ci;
+        const OPAQUE: &[&str] = &[
+            "CREATE", "ALTER", "DROP", "TRUNCATE", "COMMENT", "GRANT", "REVOKE", "EXECUTE", "CALL",
+            "DO", "COPY", "IMPORT", "SECURITY", "REFRESH", "REINDEX", "CLUSTER", "VACUUM", "LOCK",
+            "SELECT",
+        ];
+        // Only the table names are needed, and this runs before the client
+        // sees the write's ReadyForQuery: strip comments (so a leading one
+        // cannot hide a DDL keyword, nor an inner one a table name) and match
+        // tables, without the literal rewriting and hashing of `normalize`.
+        let stripped = self.normalizer.strip_comments(sql);
+        let t = stripped.trim_start();
+        if OPAQUE.iter().any(|kw| starts_with_ci(t, kw)) {
+            return None;
+        }
+        let tables = self.normalizer.extract_tables(&stripped);
+        if tables.is_empty() {
+            None
+        } else {
+            Some(tables)
+        }
+    }
+
+    /// Sum of the global generation and the generations of `tables`.
+    /// Generations only grow, so the sum changes whenever any of them does.
+    fn generation_of(&self, tables: &[String]) -> u64 {
+        let mut sum = self
+            .global_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        for table in tables {
+            if let Some(g) = self.table_generations.get(table) {
+                sum = sum.wrapping_add(*g);
+            }
+        }
+        sum
+    }
+
+    /// Whether `result` may still be served: nothing it read has been
+    /// written (or invalidated wholesale) since it was fetched.
+    fn is_current(&self, result: &CachedResult) -> bool {
+        result.generation == self.generation_of(&result.tables)
+    }
+
+    /// Hits refused because a table they read was written since the fetch.
+    pub fn stale_rejected(&self) -> u64 {
+        self.metrics.stale_rejected()
+    }
+
+    /// Fills not stored because a write raced their backend fetch.
+    pub fn fills_raced(&self) -> u64 {
+        self.metrics.fills_raced()
     }
 
     /// Clear all caches
@@ -559,6 +778,180 @@ mod tests {
 
     /// Per-connection L1 caches must be reclaimable so they don't leak per
     /// session. `get_l1_cache` creates one; `remove_l1_cache` reclaims it.
+    fn ctx(conn: u64) -> CacheContext {
+        CacheContext {
+            database: "db".into(),
+            connection_id: Some(conn),
+            ..Default::default()
+        }
+    }
+
+    async fn fill(cache: &QueryCache, sql: &str, conn: u64, payload: &'static [u8]) {
+        let (lookup, prep) = cache.get_with_prep(sql, &ctx(conn)).await;
+        assert!(
+            matches!(lookup, CacheLookup::Miss),
+            "{sql} should miss first"
+        );
+        cache
+            .put_prepared(
+                sql,
+                &ctx(conn),
+                &prep,
+                Bytes::from_static(payload),
+                1,
+                Duration::from_millis(1),
+            )
+            .await;
+    }
+
+    async fn is_hit(cache: &QueryCache, sql: &str, conn: u64) -> bool {
+        matches!(cache.get(sql, &ctx(conn)).await, CacheLookup::Hit { .. })
+    }
+
+    /// A write to a table stops every tier from serving results that read it
+    /// (C-02): the same connection (L1) and another connection (L2).
+    #[tokio::test]
+    async fn a_write_refuses_l1_and_l2_hits_of_its_tables_only() {
+        let cache = QueryCache::new(CacheConfig::default());
+        let q = "SELECT v FROM accounts WHERE id = 1";
+        let other = "SELECT name FROM users WHERE id = 1";
+        fill(&cache, q, 1, b"v=1").await;
+        fill(&cache, other, 1, b"n=a").await;
+        assert!(is_hit(&cache, q, 1).await, "L1 hit");
+        assert!(is_hit(&cache, q, 2).await, "L2 hit from another connection");
+
+        cache.mark_written(&["accounts".to_string()]);
+        assert!(
+            !is_hit(&cache, q, 1).await,
+            "L1 entry refused after the write"
+        );
+        assert!(
+            !is_hit(&cache, q, 2).await,
+            "L2 entry refused after the write"
+        );
+        assert!(
+            is_hit(&cache, other, 1).await,
+            "unrelated table still served"
+        );
+        assert!(cache.stale_rejected() >= 2);
+    }
+
+    /// A purge only releases the table's index (the set goes to the
+    /// `cache-reclaim` thread): stale L2 entries stay until a refill
+    /// replaces them, are never served meanwhile, and other tables are
+    /// untouched.
+    #[tokio::test]
+    async fn purge_releases_the_index_and_a_refill_replaces_the_stale_entry() {
+        let cache = QueryCache::new(CacheConfig::default());
+        assert!(cache.reclaim_tx.is_some(), "reclaimer thread started");
+        let l2 = cache.l2_cache.clone().expect("L2 on by default");
+        for id in 0..50 {
+            fill(
+                &cache,
+                &format!("SELECT v FROM accounts WHERE id = {id}"),
+                1,
+                b"v",
+            )
+            .await;
+        }
+        let users = "SELECT name FROM users WHERE id = 1";
+        fill(&cache, users, 1, b"n").await;
+        assert_eq!(l2.stats().entry_count, 51);
+        let usage = l2.memory_usage();
+
+        cache.invalidate_tables(&["accounts".to_string()]).await;
+        assert!(cache.invalidator.get_keys_for_table("accounts").is_empty());
+        assert_eq!(cache.invalidator.get_keys_for_table("users").len(), 1);
+        assert_eq!(l2.stats().entry_count, 51, "entries are not walked");
+        let q = "SELECT v FROM accounts WHERE id = 7";
+        assert!(!is_hit(&cache, q, 2).await, "stale L2 entry refused");
+        assert!(is_hit(&cache, users, 2).await, "other table still served");
+
+        // The refill replaces the stale entry in place: same count, and the
+        // byte account does not grow (it used to count both).
+        fill(&cache, q, 2, b"v").await;
+        assert!(is_hit(&cache, q, 3).await);
+        assert_eq!(l2.stats().entry_count, 51);
+        assert_eq!(l2.memory_usage(), usage);
+    }
+
+    /// A result whose table was written while it was being fetched is not
+    /// stored: it may predate the write (the reader-refill race).
+    #[tokio::test]
+    async fn a_fill_raced_by_a_write_is_not_stored() {
+        let cache = QueryCache::new(CacheConfig::default());
+        let q = "SELECT v FROM accounts WHERE id = 1";
+        let (lookup, prep) = cache.get_with_prep(q, &ctx(1)).await;
+        assert!(matches!(lookup, CacheLookup::Miss));
+        cache.mark_written(&["accounts".to_string()]);
+        cache
+            .put_prepared(
+                q,
+                &ctx(1),
+                &prep,
+                Bytes::from_static(b"old"),
+                1,
+                Duration::ZERO,
+            )
+            .await;
+        assert_eq!(cache.fills_raced(), 1);
+        assert!(!is_hit(&cache, q, 1).await);
+        assert!(!is_hit(&cache, q, 2).await);
+    }
+
+    /// An invalidation of unknown scope refuses every cached result.
+    #[tokio::test]
+    async fn invalidate_all_refuses_every_entry() {
+        let cache = QueryCache::new(CacheConfig::default());
+        let a = "SELECT v FROM accounts";
+        let b = "SELECT name FROM users";
+        fill(&cache, a, 1, b"a").await;
+        fill(&cache, b, 1, b"b").await;
+        cache.invalidate_all();
+        assert!(!is_hit(&cache, a, 1).await);
+        assert!(!is_hit(&cache, b, 2).await);
+        // New fills after the invalidation are served again.
+        fill(&cache, a, 1, b"a2").await;
+        assert!(is_hit(&cache, a, 1).await);
+    }
+
+    #[test]
+    fn write_tables_is_none_when_the_scope_is_unknown() {
+        let cache = QueryCache::new(CacheConfig::default());
+        for sql in [
+            "ALTER TABLE t ADD COLUMN c int",
+            "create index i on t (c)",
+            "DROP TABLE t",
+            "TRUNCATE t",
+            "EXECUTE upd(1)",
+            "CALL do_things()",
+            "DO $$ BEGIN END $$",
+            "COPY t FROM STDIN",
+            "SELECT pg_advisory_lock(1)",
+            "",
+        ] {
+            assert_eq!(cache.write_tables(sql), None, "{sql}");
+        }
+        assert_eq!(
+            cache.write_tables("UPDATE accounts SET v = 2 WHERE id = 1"),
+            Some(vec!["accounts".to_string()])
+        );
+        assert_eq!(
+            cache.write_tables("INSERT INTO audit SELECT * FROM public.accounts"),
+            Some(vec!["audit".to_string(), "accounts".to_string()])
+        );
+        // Comments neither hide a DDL keyword nor a written table.
+        assert_eq!(
+            cache.write_tables("/* migration */ ALTER TABLE t ADD c int"),
+            None
+        );
+        assert_eq!(cache.write_tables("-- note\nDROP TABLE t"), None);
+        assert_eq!(
+            cache.write_tables("UPDATE /*helios:route=primary*/ accounts SET v = 1"),
+            Some(vec!["accounts".to_string()])
+        );
+    }
+
     #[test]
     fn l1_cache_is_reclaimed_on_remove() {
         let cache = QueryCache::new(CacheConfig::default());

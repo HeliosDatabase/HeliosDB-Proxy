@@ -507,14 +507,29 @@ max_result_bytes = 1048576
 | `ttl_secs` | u64 | `300` | Time-to-live for cached results. |
 | `max_result_bytes` | usize | `1048576` | Largest single result to cache; larger results bypass. |
 
-**Invalidation is commit-aware for simple-query writes (C-02).** A write's tables are
-invalidated when its response completes, and when the write runs inside an explicit
-transaction they are also staged on the session and re-invalidated when that transaction
-COMMITs. This closes the window where a concurrent reader could refill an entry between
-the write's response and its commit; ROLLBACK/ABORT discards the staged set so
-rolled-back work is not re-applied at commit. Extended-protocol writes, `COPY` and
-DDL/unknown dependencies are not yet covered by the staging path — for those, invalidation
-remains statement-observation plus TTL.
+**Invalidation is commit-aware on both protocols (C-02).** Every cached result records
+the write generation of the tables it read, taken before its backend fetch, and every
+hit — L1, L2 or L3 — is served only while no write to those tables has happened since.
+Writes are recognised from what the backend actually executed (the same capture that
+feeds the transaction journal), on the simple and the extended protocol alike:
+
+- a successful autocommit write moves its tables' generation before the
+  `ReadyForQuery` that acknowledges it reaches the client, so no read that starts
+  afterwards can hit an older entry;
+- inside an explicit transaction the tables are staged (other sessions cannot see the
+  rows yet, and a session in a transaction is never served from the cache) and moved
+  when the backend reports the commit, before the client sees it, so an entry a
+  concurrent reader refilled from pre-commit data is refused; a rollback drops the
+  stage;
+- a result whose tables were written while it was being fetched is not stored;
+- a write whose tables cannot be read from its text — DDL, `TRUNCATE`, `COPY`,
+  `EXECUTE`, `CALL`, `DO` — invalidates the whole cache.
+
+Not covered: writes that do not pass through this proxy (another proxy, a direct
+connection, a trigger or function writing a table other than the one named in the
+statement), and two-phase commit (`PREPARE TRANSACTION` / `COMMIT PREPARED`: the
+prepared transaction's tables are not invalidated when it is committed). Such changes become visible when the entry's `ttl_secs` expires; keep the
+TTL short, or leave the cache off, for tables written that way.
 
 ---
 

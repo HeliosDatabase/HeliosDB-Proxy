@@ -41,6 +41,14 @@ pub struct CacheMetrics {
     /// Size exceeded rejections
     size_exceeded: AtomicU64,
 
+    /// Hits refused because a table they read was written since the fetch
+    /// began (C-02 generation check).
+    stale_rejected: AtomicU64,
+
+    /// Fills not stored because a write to one of their tables raced the
+    /// backend fetch (C-02).
+    fills_raced: AtomicU64,
+
     /// Creation time
     created_at: Instant,
 }
@@ -155,6 +163,8 @@ impl CacheMetrics {
             tables_invalidated: AtomicU64::new(0),
             clears: AtomicU64::new(0),
             size_exceeded: AtomicU64::new(0),
+            stale_rejected: AtomicU64::new(0),
+            fills_raced: AtomicU64::new(0),
             created_at: Instant::now(),
         }
     }
@@ -184,6 +194,26 @@ impl CacheMetrics {
     }
 
     /// Record cache invalidation
+    /// A hit was refused by the generation check (C-02).
+    pub fn record_stale_rejected(&self) {
+        self.stale_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A fill was not stored because a write raced its backend fetch (C-02).
+    pub fn record_fill_raced(&self) {
+        self.fills_raced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Hits refused by the generation check.
+    pub fn stale_rejected(&self) -> u64 {
+        self.stale_rejected.load(Ordering::Relaxed)
+    }
+
+    /// Fills dropped because a write raced the fetch.
+    pub fn fills_raced(&self) -> u64 {
+        self.fills_raced.load(Ordering::Relaxed)
+    }
+
     pub fn record_invalidation(&self, table_count: usize) {
         self.invalidations.fetch_add(1, Ordering::Relaxed);
         self.tables_invalidated

@@ -152,6 +152,19 @@ impl InvalidationManager {
 
     /// Invalidate all cache entries for a table
     pub fn invalidate_table(&self, table: &str) {
+        let keys = self.take_table(table);
+        self.forget_keys(table, &keys);
+    }
+
+    /// Invalidate a table and hand back the keys that were registered to it.
+    ///
+    /// O(1): the key set leaves the index in one step, so when several
+    /// writers purge the same table at once exactly one of them receives the
+    /// set and the others get an empty one. The reverse index still names
+    /// `table` for those keys until [`Self::forget_keys`] walks them
+    /// ([`Self::invalidate_table`] does; the query cache's write path does
+    /// not, since nothing on it reads the reverse index).
+    pub fn take_table(&self, table: &str) -> HashSet<CacheKey> {
         // Record invalidation time
         self.last_invalidation
             .insert(table.to_string(), Instant::now());
@@ -161,13 +174,21 @@ impl InvalidationManager {
             .event_tx
             .send(InvalidationEvent::Tables(vec![table.to_string()]));
 
-        // Clear table -> keys mapping
-        if let Some((_, keys)) = self.table_keys.remove(table) {
-            for key in keys {
-                if let Some(mut tables) = self.key_tables.get_mut(&key) {
-                    tables.remove(table);
-                }
-            }
+        self.table_keys
+            .remove(table)
+            .map(|(_, keys)| keys)
+            .unwrap_or_default()
+    }
+
+    /// Drop `table` from the reverse-index entries of `keys` (a set
+    /// [`Self::take_table`] returned); an entry left with no tables is
+    /// removed rather than kept as an empty set. O(keys).
+    pub fn forget_keys(&self, table: &str, keys: &HashSet<CacheKey>) {
+        for key in keys {
+            self.key_tables.remove_if_mut(key, |_, tables| {
+                tables.remove(table);
+                tables.is_empty()
+            });
         }
     }
 
@@ -440,6 +461,31 @@ mod tests {
         assert!(manager.get_keys_for_table("users").is_empty());
         assert!(!manager.get_keys_for_table("orders").is_empty());
         assert!(manager.last_invalidation_time("users").is_some());
+    }
+
+    #[test]
+    fn take_table_hands_the_key_set_to_one_purger() {
+        let manager = InvalidationManager::new(InvalidationConfig::default());
+        let shared = create_key(111);
+        let only_users = create_key(222);
+        manager.register(&shared, "users");
+        manager.register(&shared, "orders");
+        manager.register(&only_users, "users");
+
+        let taken = manager.take_table("users");
+        assert_eq!(taken.len(), 2);
+        assert!(taken.contains(&shared) && taken.contains(&only_users));
+        // A second purger of the same table gets nothing to do.
+        assert!(manager.take_table("users").is_empty());
+
+        // The reverse index keeps the other table and drops emptied keys.
+        manager.forget_keys("users", &taken);
+        assert_eq!(
+            manager.get_tables_for_key(&shared),
+            vec!["orders".to_string()]
+        );
+        assert!(!manager.key_tables.contains_key(&only_users));
+        assert_eq!(manager.get_keys_for_table("orders"), vec![shared]);
     }
 
     #[test]
