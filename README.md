@@ -10,12 +10,16 @@ HeliosProxy operates at the PostgreSQL wire protocol level, making it compatible
 
 HeliosProxy sits between your application and your database cluster, providing transparent connection pooling, automatic failover, intelligent query routing, programmable plugins, and operations tooling without application code changes.
 
-**Verification status (2026-09-11):** the [September 2026 audit](docs/internal/audit-2026-09/README.md)
+**Verification status (2026-09-25, 2.0.0):** the [September 2026 audit](docs/internal/audit-2026-09/README.md)
 found reproducible Transaction Replay safety defects; all of them are fixed as of
 1.7.0, verified against live PostgreSQL, and replay now checks its own work — a
 replayed statement whose results diverge from what the client already saw is rolled
-back rather than continued. The audit also records advertised library capabilities
-that are not wired into the daemon. Consult it and the
+back rather than continued. 1.9.0 added the recovery-grade transaction journal; 2.0.0
+makes query-cache invalidation commit-aware on both wire protocols and every tier and
+adds Patroni as a write authority with conflicting primaries failing closed. The query
+cache stays opt-in: its identity does not yet include session state (`SET ROLE`,
+`search_path`, tenant settings), see docs/configuration.md. The audit also records
+advertised library capabilities that are not wired into the daemon. Consult it and the
 [prioritized improvement backlog](docs/internal/audit-2026-09/IMPROVEMENTS.md) when
 evaluating HA, replay, or distributed deployment guarantees.
 
