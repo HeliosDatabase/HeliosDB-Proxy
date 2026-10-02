@@ -249,7 +249,7 @@ include_dir = "0.7"
 # default builds don't pay the (~3 MB compiled) cost. The cranelift
 # backend is the JIT; we strip wasi/component-model since the plugin
 # ABI is bare extern "C" exports against linear memory.
-wasmtime = { version = "36", default-features = false, features = ["cranelift", "runtime", "parallel-compilation"], optional = true }
+wasmtime = { version = "36.0.16", default-features = false, features = ["cranelift", "runtime", "parallel-compilation"], optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

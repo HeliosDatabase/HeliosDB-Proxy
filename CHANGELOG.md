@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- wasmtime 36.0.15 → 36.0.16 (the 36.0.x wasmtime/cranelift/pulley family),
+  fixing RUSTSEC-2026-0316 / GHSA-jqpg-j7w6-42pr: dynamic record lifting can
+  allocate beyond the hostcall fuel limit. Only builds with the optional
+  `wasm-plugins` feature include wasmtime. HeliosProxy builds wasmtime without
+  `component-model`, so the vulnerable path is not compiled in; the bump is defence
+  in depth and clears the advisory for downstream audits. The manifest now requires
+  `>=36.0.16`, so dependents cannot resolve the vulnerable release.
+
 ### Added
 
 - Minimal TOML configurations and partial pool, health, and load-balancer sections
