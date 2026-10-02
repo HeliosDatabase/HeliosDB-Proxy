@@ -173,7 +173,7 @@ Eight signed WASM plugins (shipped in the companion `HDB-HeliosDB-Proxy-Plugins`
 | Module | Description |
 |--------|-------------|
 | **`helios-plugin` CLI** | Pack, inspect, and verify WASM plugin artefacts as portable `.tar.gz` using the same Ed25519 trust-root format as the proxy loader |
-| **Kubernetes Operator** | CRDs for `HeliosProxy`, `PoolProfile`, `RoutingRule`, `AuditPolicy`, `TenantQuota`; reconciler renders ConfigMap + Deployment + Service and polls `/topology` for status |
+| **Kubernetes Operator** | CRDs for `HeliosProxy`, `PoolProfile`, `RoutingRule`, `AuditPolicy`, `TenantQuota`; reconciler renders ConfigMap + Deployment + Service and polls `/topology` for status. Available on request from [sales@heliosdb.com](mailto:sales@heliosdb.com); to deploy on Kubernetes without it, see the [Kubernetes deployment guide](https://heliosdb.com/docs/proxy/deployment/kubernetes/) |
 | **Terraform Provider** | Five resources mirroring the operator CRDs (`heliosproxy_instance`, `_pool_profile`, `_routing_rule`, `_audit_policy`, `_tenant_quota`) |
 | **Pulumi Provider** | Wraps the Terraform provider via `pulumi-terraform-bridge` — same five resources in TypeScript / Python / Go / .NET |
 
@@ -191,7 +191,7 @@ together across the same family.
 - **[HeliosDB Lite](https://www.heliosdb.com/lite.html)** — Production self-hosted database with HeliosProxy + HeliosCore baked in. SSPL-1.0; source is not publicly released.
 - **[HeliosDB Full](https://www.heliosdb.com/full.html)** — Distributed enterprise database with 14 native wire protocols. SSPL-1.0; source is not publicly released.
 - **[HeliosDatabase/HeliosDB-Proxy](https://github.com/HeliosDatabase/HeliosDB-Proxy)** — Programmable Postgres data-plane (PgBouncer drop-in + WASM plugins + zero-downtime PG-12->17 upgrade). Apache 2.0.
-- **[HeliosDatabase/HeliosDB-Proxy-Plugins](https://github.com/HeliosDatabase/HeliosDB-Proxy-Plugins)** — Plugin interfaces and examples for extending HeliosProxy. Apache 2.0. The Kubernetes Operator, Terraform provider, and Pulumi provider are not publicly released.
+- **[HeliosDatabase/HeliosDB-Proxy-Plugins](https://github.com/HeliosDatabase/HeliosDB-Proxy-Plugins)** — Plugin interfaces and examples for extending HeliosProxy. Apache 2.0. The Kubernetes Operator, Terraform provider, and Pulumi provider are not publicly released; they are available on request from [sales@heliosdb.com](mailto:sales@heliosdb.com). For Kubernetes, see the public [Kubernetes deployment guide](https://heliosdb.com/docs/proxy/deployment/kubernetes/).
 
 **[HeliosDatabase/HeliosDB-CodeKB-MCP](https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP)** provides an MCP server that turns HeliosDB codebases and docs into queryable technical knowledge for Claude Code, Codex, and other MCP clients.
 
