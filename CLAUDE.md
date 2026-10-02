@@ -40,8 +40,16 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
    introduces a benchable code path with no prior baseline. The gate tool is
    `scripts/bench-gate.sh <baseline-tree> <candidate-tree> <label>`: 3 interleaved rounds
    against a separate baseline worktree (e.g. `Proxy-base-1.8.0`, each tree with its own
-   `CARGO_TARGET_DIR`); FAILs on a cumulative mean regression over `BUDGET_PCT` (default 3)
-   or a run-to-run-scatter-proof separated regression over `SEP_PCT` (default 2). The
+   `CARGO_TARGET_DIR`); FAILs on a cumulative mean regression over `BUDGET_PCT` (default 3),
+   a separated regression over `SEP_PCT` (default 2), or a benchmark case removed from the
+   candidate; it is INVALID (exit 2) when any declared case is missing, malformed or stale
+   in any round, when outputs for the label already exist (labels are single-use per tree),
+   or when the executables that ran are not the ones built. Cases only the candidate
+   declares are reported as NEW (add a BASELINE.md entry). Every separated regression must
+   still be attributed by the reviewer; `bench-gate.json` / the summary classify each bench
+   executable pair by function body (`scripts/bench-gate-fde.py`): `body-identical` means
+   only placement changed (layout class), `code-changed` means a function body differs.
+   Comparator tests: `python3 scripts/tests/bench_gate_compare_test.py`. The
    proxy-path scalability harness is `scripts/regress/bench-scalability.sh
    <proxy-binary>` (Dockerized pgbench against an already-running PG 18.4 backend at
    `127.0.0.1:25433`; heavy — see Resource Constraints); its evidence

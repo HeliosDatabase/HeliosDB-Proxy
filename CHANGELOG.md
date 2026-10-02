@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Development
+
+- `scripts/bench-gate.sh` fails closed and records attribution evidence. The
+  comparison moves to `scripts/bench-gate-compare.py`. A run is now INVALID (exit 2),
+  never a PASS, if:
+  - any case the executables declare (`--list`) is missing, duplicated, malformed,
+    non-finite or stale in any round;
+  - outputs for the label already exist;
+  - the executables that ran differ from the ones built.
+
+  A benchmark removed from the candidate fails the gate. New candidate-only cases are
+  reported. `scripts/bench-gate-fde.py` classifies each base/candidate bench executable
+  pair by its function bodies (`.eh_frame` ranges, address-normalized instructions):
+  `body-identical` (only placement moved) or `code-changed`. The verdict rules are
+  unchanged and the reviewer still attributes every separated regression; the
+  classification is the evidence for that.
+
 ### Security
 
 - wasmtime 36.0.15 → 36.0.16 (the 36.0.x wasmtime/cranelift/pulley family),
