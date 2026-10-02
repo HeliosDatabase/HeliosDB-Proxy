@@ -127,6 +127,8 @@ jobs:
         with:
           key: bench
       - run: cargo bench --features all-features --no-run
+      - name: Criterion gate comparator tests
+        run: python3 scripts/tests/bench_gate_compare_test.py
 
   # ── Integration tests: PostgreSQL 18 primary + standby (REQUIRED) ────
   # Uses only the public postgres:18 image from Docker Hub, so it runs on every
