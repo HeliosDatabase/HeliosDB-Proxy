@@ -186,6 +186,11 @@ impl FailoverReplay {
         journal: TransactionJournalEntry,
         target_node: NodeId,
     ) -> Result<Uuid> {
+        if let Some(reason) = journal.incomplete_reason.as_deref() {
+            return Err(ProxyError::ReplayFailed(format!(
+                "transaction was not fully captured ({reason}); refusing to apply it partially"
+            )));
+        }
         let tx_id = journal.tx_id;
 
         let replay = ActiveReplay {
@@ -329,9 +334,7 @@ impl FailoverReplay {
             if failed_at.is_none() {
                 for (i, entry) in to_apply.iter().enumerate() {
                     let started = std::time::Instant::now();
-                    let res = client
-                        .execute_journaled(&entry.statement, &entry.param_types, &entry.parameters)
-                        .await;
+                    let res = client.execute_journal_entry(entry).await;
                     match res {
                         Ok(qr) => {
                             let rows_matched = match entry.rows_affected {
@@ -696,6 +699,21 @@ mod tests {
 
         let state = replay.get_state(&tx_id).await;
         assert_eq!(state, Some(ReplayState::Pending));
+    }
+
+    #[tokio::test]
+    async fn test_start_replay_refuses_incomplete_journal() {
+        let replay = FailoverReplay::new(ReplayConfig::default());
+        let mut journal = make_journal();
+        journal.mark_incomplete("statement capture limit");
+        let tx_id = journal.tx_id;
+        let error = replay
+            .start_replay(journal, NodeId::new())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not fully captured"));
+        assert!(error.to_string().contains("statement capture limit"));
+        assert_eq!(replay.get_state(&tx_id).await, None);
     }
 
     #[tokio::test]

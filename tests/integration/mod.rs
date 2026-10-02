@@ -1457,10 +1457,10 @@ async fn tr07_connect(conn_str: &str) -> tokio_postgres::Client {
     client
 }
 
-/// The ledger as `(id, amount, tag, blob, arr)` rows.
+/// The ledger as `(id, amount, tag, blob, arr)` rows, preserving SQL NULL values.
 async fn tr07_ledger(
     client: &tokio_postgres::Client,
-) -> Vec<(i32, i64, String, Vec<u8>, Vec<i64>)> {
+) -> Vec<(i32, i64, String, Option<Vec<u8>>, Option<Vec<i64>>)> {
     client
         .query(
             "SELECT id, amount, tag, blob, arr FROM tr07_ledger ORDER BY id",
@@ -1656,6 +1656,22 @@ async fn test_tr07_committed_history_replay_reproduces_the_ledger() {
         vec![1, 2, 5, 7, 8, 9, 10, 11, 12],
         "source ledger after the workload"
     );
+    assert_eq!(
+        expected[0].3.as_deref(),
+        Some(blob.as_slice()),
+        "source binary parameter bytes must remain intact"
+    );
+    assert_eq!(
+        expected[0].4.as_deref(),
+        Some(arr.as_slice()),
+        "source array parameter elements must remain intact"
+    );
+    for row in expected.iter().skip(1) {
+        assert!(
+            row.3.is_none() && row.4.is_none(),
+            "omitted blob/arr must remain SQL NULL, not empty values: {row:?}"
+        );
+    }
 
     // ---- committed-history replay onto the target ----------------------
     let admin = format!("127.0.0.1:{}", fx.admin_port);

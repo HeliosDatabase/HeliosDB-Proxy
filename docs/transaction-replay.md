@@ -398,10 +398,12 @@ shape):
 - **`committed_history`** (recovery grade, TR-07): selects the transactions whose *commit*
   was observed in the window (`committed_in_window`, optionally after a resume point
   `after_commit_seq`), and applies them in commit order, one at a time, each inside its own
-  `BEGIN … COMMIT` on one connection, with every parameter re-sent in its captured format
-  through the extended protocol. The first failure rolls that transaction back and stops
-  the run (`partial: true`, `stopped_at`), so the target holds exactly the transactions
-  up to `last_commit_seq` and nothing partial; a transaction marked incomplete is refused
+  `BEGIN … COMMIT` on one connection. Simple-query DML batches remain one unchanged
+  Query message; extended entries re-send every parameter in its captured format
+  through the extended protocol. The first failure attempts rollback and stops
+  the run (`partial: true`, `stopped_at`). `last_commit_seq` identifies the last
+  acknowledged commit; a lost COMMIT response still requires outcome reconciliation.
+  A transaction marked incomplete is refused
   before it starts. The overall `[limits] replay_deadline_secs` is honoured between and
   inside transactions (a deadline mid-transaction rolls it back).
 
@@ -426,6 +428,16 @@ statement; those mark the transaction incomplete and committed-history replay re
 Sequence values, `now()`, `random()` and other non-deterministic expressions inside a
 journaled statement produce fresh values on replay — replay re-executes SQL, it does not
 copy rows.
+
+Replay also refuses a journal entry containing transaction-ending SQL (`COMMIT`,
+`END`, `ROLLBACK`, `ABORT`, or `PREPARE TRANSACTION`) or ambiguous lexical boundaries
+before sending that entry. This includes historical entries and complete
+`BEGIN; ...; COMMIT` batches: replay owns the enclosing transaction, so an embedded
+commit must not escape it. Ordinary multi-statement DML batches remain supported.
+The guard conservatively refuses `ROLLBACK TO`; captured savepoints are handled by
+truncating the journal's rolled-back entries instead. Legacy library entries with
+bound parameters retain extended execution even when their protocol field defaults
+to Simple.
 
 **Retention is bounded and documented (TR-07).** Without `[journal] dir` the journal is
 per-process memory bounded by `[journal] max_committed_*`: nothing survives a restart.
@@ -480,11 +492,14 @@ and sends `NULL` for it; use `committed_history` for parameterised extended-prot
 writes.
 
 ### Coordination is a library capability, not an auto-wired daemon loop
-`FailoverController`, `PrimaryTracker`, and `SwitchoverBuffer` are unit-tested library
-components intended for embedded/programmatic use (and for the HeliosDB-workspace build).
-The standalone daemon's failover handling is the health-driven
-`select_primary_with_timeout` write-buffering described above; it does not drive the
-controller/tracker automatically.
+`FailoverController` and `SwitchoverBuffer` are library components intended for
+embedded/programmatic use. The standalone daemon does not drive the promotion
+controller. It buffers writes while waiting for an eligible primary, and it does
+drive `PrimaryTracker` when an authoritative `postgres` or `patroni` topology
+provider is configured (`postgres-topology` feature). An external HA manager or
+operator must promote the database and fence the old primary; the provider then
+moves the write destination. With static topology, configured roles must instead
+be updated after promotion. See [topology providers](topology-providers.md).
 
 ---
 

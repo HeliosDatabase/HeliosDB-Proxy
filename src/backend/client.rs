@@ -16,7 +16,7 @@ use super::stream::Stream;
 use super::tls::{negotiate, TlsMode};
 use super::types::{encode_literal, ParamValue, TextValue};
 use crate::protocol::{Message, MessageType, ProtocolCodec};
-use crate::transaction_journal::JournalValue;
+use crate::transaction_journal::{JournalEntry, JournalValue, WireProtocol};
 use bytes::{Buf, BufMut, BytesMut};
 use std::sync::Arc;
 use std::time::Duration;
@@ -169,6 +169,38 @@ impl BackendClient {
         self.run_query(&substituted).await
     }
 
+    /// Replay an entry using its captured wire protocol. Simple-query batches
+    /// remain one unmodified `Query`, preserving PostgreSQL's batch semantics.
+    /// Extended entries retain their declared OIDs and bound bytes, including
+    /// entries with no parameters. Older library-created journals defaulted
+    /// `protocol` to `Simple` even when carrying parameters; preserve their
+    /// historical extended execution rather than dropping or interpolating them.
+    /// Transaction-ending SQL is refused before any bytes are sent, including
+    /// in old persisted journals: the replay driver owns the enclosing transaction.
+    pub async fn execute_journal_entry(
+        &mut self,
+        entry: &JournalEntry,
+    ) -> BackendResult<QueryResult> {
+        match crate::replay_sql::boundaries(&entry.statement) {
+            Ok(boundaries) if !boundaries.may_commit && !boundaries.ends_tx => {}
+            _ => {
+                return Err(BackendError::Protocol(
+                    "journal entry may end the replay transaction or has ambiguous SQL boundaries"
+                        .into(),
+                ));
+            }
+        }
+        if entry.protocol == WireProtocol::Simple
+            && entry.parameters.is_empty()
+            && entry.param_types.is_empty()
+        {
+            self.simple_query(&entry.statement).await
+        } else {
+            self.execute_journaled(&entry.statement, &entry.param_types, &entry.parameters)
+                .await
+        }
+    }
+
     /// Execute one journaled statement through the extended protocol (TR-07
     /// committed-history replay): unnamed `Parse` carrying the parameter type
     /// OIDs the original client declared, `Bind` with every value in the
@@ -265,10 +297,8 @@ impl BackendClient {
                     command_tag = parse_cstring(&msg.payload);
                 }
                 MessageType::EmptyQueryResponse => command_tag = String::new(),
-                MessageType::ErrorResponse => {
-                    if last_error.is_none() {
-                        last_error = Some(error_message(&msg.payload));
-                    }
+                MessageType::ErrorResponse if last_error.is_none() => {
+                    last_error = Some(error_message(&msg.payload));
                 }
                 MessageType::NoticeResponse => {
                     tracing::debug!(notice = %error_message(&msg.payload), "backend notice");
@@ -981,6 +1011,223 @@ fn truncate(s: &str, n: usize) -> &str {
 mod tests {
     use super::*;
     use crate::backend::types::ParamValue;
+
+    async fn journal_replay_pair() -> (BackendClient, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, peer) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        (
+            BackendClient::from_tcp_for_test(client.unwrap()),
+            peer.unwrap().0,
+        )
+    }
+
+    async fn journal_replay_read(peer: &mut TcpStream) -> (u8, Vec<u8>) {
+        let tag = peer.read_u8().await.unwrap();
+        let size = peer.read_u32().await.unwrap();
+        assert!((4..4096).contains(&size));
+        let mut body = vec![0; (size - 4) as usize];
+        peer.read_exact(&mut body).await.unwrap();
+        (tag, body)
+    }
+
+    async fn journal_replay_reply(peer: &mut TcpStream, tag: u8, body: &[u8]) {
+        let mut frame = BytesMut::new();
+        frame.put_u8(tag);
+        frame.put_u32(body.len() as u32 + 4);
+        frame.extend_from_slice(body);
+        peer.write_all(&frame).await.unwrap();
+    }
+
+    fn journal_replay_entry(sql: &str, protocol: WireProtocol) -> JournalEntry {
+        crate::transaction_journal::NewEntry {
+            statement: sql.into(),
+            parameters: Vec::new(),
+            param_types: Vec::new(),
+            result_checksum: None,
+            rows_affected: None,
+            duration_ms: 0,
+            outcome: crate::transaction_journal::StatementOutcome::Unobserved,
+            protocol,
+        }
+        .into_journal_entry(1)
+    }
+
+    #[tokio::test]
+    async fn journal_replay_keeps_simple_batch_in_one_query_and_drains_all_tags() {
+        let sql = "INSERT INTO t VALUES ('a;COMMIT;'); \
+                   /* outer /* inner */ ROLLBACK */ UPDATE t SET v = $$END;$$";
+        let entry = journal_replay_entry(sql, WireProtocol::Simple);
+        let (mut client, mut peer) = journal_replay_pair().await;
+        let backend = tokio::spawn(async move {
+            assert_eq!(
+                journal_replay_read(&mut peer).await,
+                (b'Q', format!("{sql}\0").into_bytes())
+            );
+            journal_replay_reply(&mut peer, b'C', b"INSERT 0 1\0").await;
+            journal_replay_reply(&mut peer, b'C', b"UPDATE 3\0").await;
+            journal_replay_reply(&mut peer, b'Z', b"T").await;
+            assert_eq!(
+                journal_replay_read(&mut peer).await,
+                (b'Q', b"COMMIT\0".to_vec())
+            );
+            journal_replay_reply(&mut peer, b'C', b"COMMIT\0").await;
+            journal_replay_reply(&mut peer, b'Z', b"I").await;
+        });
+        let result = client.execute_journal_entry(&entry).await.unwrap();
+        assert_eq!(result.command_tag, "UPDATE 3");
+        assert_eq!(result.rows_affected(), Some(3));
+        assert_eq!(
+            client.simple_query("COMMIT").await.unwrap().command_tag,
+            "COMMIT"
+        );
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn journal_replay_simple_batch_error_is_drained_before_rollback() {
+        let entry = journal_replay_entry(
+            "INSERT INTO t VALUES (1); INSERT INTO t VALUES (1)",
+            WireProtocol::Simple,
+        );
+        let expected = format!("{}\0", entry.statement).into_bytes();
+        let (mut client, mut peer) = journal_replay_pair().await;
+        let backend = tokio::spawn(async move {
+            assert_eq!(journal_replay_read(&mut peer).await, (b'Q', expected));
+            journal_replay_reply(&mut peer, b'C', b"INSERT 0 1\0").await;
+            journal_replay_reply(&mut peer, b'E', b"SERROR\0C23505\0Mduplicate key\0\0").await;
+            journal_replay_reply(&mut peer, b'Z', b"E").await;
+            assert_eq!(
+                journal_replay_read(&mut peer).await,
+                (b'Q', b"ROLLBACK\0".to_vec())
+            );
+            journal_replay_reply(&mut peer, b'C', b"ROLLBACK\0").await;
+            journal_replay_reply(&mut peer, b'Z', b"I").await;
+        });
+        let error = client.execute_journal_entry(&entry).await.unwrap_err();
+        assert!(error.to_string().contains("duplicate key"));
+        assert_eq!(
+            client.simple_query("ROLLBACK").await.unwrap().command_tag,
+            "ROLLBACK"
+        );
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn journal_replay_preserves_extended_and_legacy_bound_parameter_frames() {
+        for (protocol, bound) in [
+            (WireProtocol::Extended, false),
+            (WireProtocol::Extended, true),
+            (WireProtocol::Simple, true),
+        ] {
+            let sql = if bound {
+                "INSERT INTO t VALUES ($1, $2)"
+            } else {
+                "INSERT INTO t VALUES (1, 'x')"
+            };
+            let mut entry = journal_replay_entry(sql, protocol);
+            if bound {
+                entry.param_types = vec![23, 25];
+                entry.parameters = vec![
+                    JournalValue::Binary(vec![0, 0, 0, 7]),
+                    JournalValue::Text("quote';semicolon".into()),
+                ];
+            }
+            let (mut client, mut peer) = journal_replay_pair().await;
+            let backend = tokio::spawn(async move {
+                let mut parse = BytesMut::new();
+                parse.put_u8(0);
+                parse.extend_from_slice(sql.as_bytes());
+                parse.put_u8(0);
+                parse.put_u16(if bound { 2 } else { 0 });
+                if bound {
+                    parse.put_u32(23);
+                    parse.put_u32(25);
+                }
+                assert_eq!(journal_replay_read(&mut peer).await, (b'P', parse.to_vec()));
+                let mut bind = BytesMut::new();
+                bind.extend_from_slice(&[0, 0]);
+                bind.put_u16(if bound { 2 } else { 0 });
+                if bound {
+                    bind.put_i16(1);
+                    bind.put_i16(0);
+                }
+                bind.put_u16(if bound { 2 } else { 0 });
+                if bound {
+                    bind.put_i32(4);
+                    bind.extend_from_slice(&[0, 0, 0, 7]);
+                    let text = b"quote';semicolon";
+                    bind.put_i32(text.len() as i32);
+                    bind.extend_from_slice(text);
+                }
+                bind.put_u16(0);
+                assert_eq!(journal_replay_read(&mut peer).await, (b'B', bind.to_vec()));
+                assert_eq!(
+                    journal_replay_read(&mut peer).await,
+                    (b'D', b"P\0".to_vec())
+                );
+                assert_eq!(journal_replay_read(&mut peer).await, (b'E', vec![0; 5]));
+                assert_eq!(journal_replay_read(&mut peer).await, (b'S', Vec::new()));
+                journal_replay_reply(&mut peer, b'1', b"").await;
+                journal_replay_reply(&mut peer, b'2', b"").await;
+                journal_replay_reply(&mut peer, b'n', b"").await;
+                journal_replay_reply(&mut peer, b'C', b"INSERT 0 1\0").await;
+                journal_replay_reply(&mut peer, b'Z', b"T").await;
+            });
+            assert_eq!(
+                client
+                    .execute_journal_entry(&entry)
+                    .await
+                    .unwrap()
+                    .command_tag,
+                "INSERT 0 1"
+            );
+            backend.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn journal_replay_refuses_transaction_boundaries_before_sending() {
+        let (mut client, mut peer) = journal_replay_pair().await;
+        for sql in [
+            "BEGIN; INSERT INTO t VALUES (1); COMMIT",
+            "INSERT INTO t VALUES (1); END",
+            "INSERT INTO t VALUES (1); ROLLBACK; INSERT INTO t VALUES (2)",
+            "INSERT INTO t VALUES (1); ABORT",
+            "INSERT INTO t VALUES (1); PREPARE /* comment */ TRANSACTION 'prepared'",
+            "COMMIT PREPARED 'prepared'",
+            "INSERT INTO t VALUES (1); /* outer /* inner */ ' */ COMMIT; \
+             INSERT INTO t VALUES (2); SELECT 'x'",
+            "INSERT INTO t VALUES ($tag$body$TAG$); COMMIT",
+            "INSERT INTO t VALUES ('unterminated",
+            "INSERT INTO t VALUES (1); /* unterminated",
+        ] {
+            for (protocol, legacy_bound) in [
+                (WireProtocol::Simple, false),
+                (WireProtocol::Extended, false),
+                (WireProtocol::Simple, true),
+            ] {
+                let mut entry = journal_replay_entry(sql, protocol);
+                if legacy_bound {
+                    entry.parameters = vec![JournalValue::Int64(1)];
+                }
+                let error = client.execute_journal_entry(&entry).await.unwrap_err();
+                assert!(
+                    error.to_string().contains("SQL boundaries"),
+                    "{sql}: {error}"
+                );
+            }
+        }
+        let mut byte = [0];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), peer.read(&mut byte))
+                .await
+                .is_err(),
+            "refused journal entries must not send any bytes"
+        );
+    }
 
     #[test]
     fn test_build_startup_has_user_and_protocol_version() {

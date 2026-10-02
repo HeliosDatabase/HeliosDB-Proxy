@@ -557,11 +557,7 @@ impl ReplayEngine {
                 break;
             }
             for entry in &tx.entries {
-                let exec = client.execute_journaled(
-                    &entry.statement,
-                    &entry.param_types,
-                    &entry.parameters,
-                );
+                let exec = client.execute_journal_entry(entry);
                 match Self::bounded(budget(start), exec).await {
                     Ok(_) => summary.statements_replayed += 1,
                     Err(e) => {
