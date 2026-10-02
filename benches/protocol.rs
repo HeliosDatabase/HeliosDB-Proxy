@@ -6,8 +6,9 @@
 //! over three payload sizes — a trivial `SELECT 1`, a ~60-char `WHERE`
 //! query, and a deterministically-built ~1 KiB `IN (...)` statement — so a
 //! regression shows up as both a per-call delta and a bytes/sec throughput
-//! change. Feature-free: only the always-public `protocol` API is exercised,
-//! so the bench compiles under every feature set.
+//! change. The optional anomaly group measures SQL inspection before relay
+//! when `anomaly-detection` is enabled. The bench compiles under every feature
+//! set; the other groups use the always-public `protocol` API.
 
 use bytes::{BufMut, BytesMut};
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
@@ -377,6 +378,69 @@ fn bench_tag_dispatch(c: &mut Criterion) {
     group.finish();
 }
 
+/// Production SQL-injection scan shape: reuse the lowercase scratch buffer,
+/// inspect every rule, then drop the returned pattern labels. Fixed small
+/// inputs and short sampling windows bound this added gate. The identical
+/// harness can run against the original scanner for per-case A/B comparisons.
+#[cfg(feature = "anomaly-detection")]
+fn bench_anomaly_scan(c: &mut Criterion) {
+    use heliosdb_proxy::anomaly::sql_injection::{lower_into, scan_lowered};
+    use std::time::Duration;
+
+    let cases = [
+        ("short_select", SHORT_SQL),
+        ("medium_where", MEDIUM_SQL),
+        (
+            "transaction_insert_commit",
+            "BEGIN; INSERT INTO test_replication (name) VALUES ('delta'); COMMIT;",
+        ),
+        (
+            "transaction_quoted_delimiters",
+            "BEGIN; INSERT INTO t VALUES ($tag$; COMMIT; DROP TABLE t;$tag$); COMMIT;",
+        ),
+        ("stacked_attack", "SELECT * FROM users; DROP TABLE logs;"),
+        ("transaction_ddl_attack", "BEGIN; DROP TABLE users; COMMIT;"),
+        (
+            "classic_or_positive",
+            "SELECT * FROM users WHERE id = 1 OR 1=1",
+        ),
+        (
+            "comment_escape_positive",
+            "SELECT * FROM users WHERE name = 'x'--",
+        ),
+        (
+            "combined_injection_positive",
+            "SELECT * FROM users WHERE name = '' OR '1'='1'--",
+        ),
+        (
+            "necessary_filter_near_miss",
+            "SELECT * FROM users WHERE id = 1 OR id = 2 -- ordinary disjunction",
+        ),
+        (
+            "transaction_negative_arithmetic",
+            "BEGIN; UPDATE accounts SET balance = balance - 1 WHERE id = 42; COMMIT;",
+        ),
+    ];
+    let mut group = c.benchmark_group("anomaly/sql_injection");
+    group.sample_size(50);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(1));
+    for (name, sql) in cases {
+        let mut scratch = String::with_capacity(sql.len());
+        group.throughput(Throughput::Bytes(sql.len() as u64));
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                lower_into(black_box(sql), &mut scratch);
+                black_box(scan_lowered(black_box(&scratch)));
+            });
+        });
+    }
+    group.finish();
+}
+
+#[cfg(not(feature = "anomaly-detection"))]
+fn bench_anomaly_scan(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_decode,
@@ -386,5 +450,6 @@ criterion_group!(
     bench_extended_parse,
     bench_backend_response,
     bench_tag_dispatch,
+    bench_anomaly_scan,
 );
 criterion_main!(benches);
