@@ -1108,11 +1108,18 @@ impl TransactionJournal {
     /// The session-local transaction ended (committed, rolled back or the
     /// session closed).
     pub fn local_end(&self) {
-        let _ = self
-            .local_active
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                Some(n.saturating_sub(1))
-            });
+        // Saturating decrement. This is the loop `fetch_update` runs, written
+        // out because that method is deprecated from Rust 1.99 and its
+        // replacement (`try_update`) does not exist on the 1.86 MSRV.
+        let mut current = self.local_active.load(Ordering::Relaxed);
+        while let Err(actual) = self.local_active.compare_exchange_weak(
+            current,
+            current.saturating_sub(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            current = actual;
+        }
     }
 
     /// Count a rolled-back transaction whose journal never entered the
