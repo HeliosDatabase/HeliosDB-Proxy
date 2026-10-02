@@ -7,18 +7,22 @@ related: [heliosproxy-overview, heliosproxy-install, heliosproxy-config]
 
 # Infrastructure-as-Code surfaces
 
-Three sibling repositories provide IaC entry points for HeliosProxy.
-Pick the one that matches your existing platform stack.
+Three IaC entry points exist for HeliosProxy. None of them is publicly
+released: the Kubernetes operator (with its Helm chart), the Terraform
+provider and the Pulumi provider are available on request from
+[sales@heliosdb.com](mailto:sales@heliosdb.com). To run HeliosProxy on
+Kubernetes without the operator, follow the public
+[Kubernetes deployment guide](https://heliosdb.com/docs/proxy/deployment/kubernetes/).
 
 🟠 Mutating — IaC tools change real cloud / cluster state.
 
 ## Pick a surface
 
-| Surface | Best for | Sibling repo |
+| Surface | Best for | Availability |
 |---|---|---|
-| **Kubernetes operator** + `HeliosProxy` CRD | Anyone running on k8s | [`HDB-HeliosDB-Proxy-Operator`](https://github.com/HeliosDatabase/HeliosDB-Proxy-Operator) |
-| **Terraform provider**                       | Multi-cloud, IaC pipelines | [`terraform-provider-HDB-HeliosDB-Proxy`](https://github.com/HeliosDatabase/terraform-provider-HeliosDB-Proxy) |
-| **Pulumi provider**                          | TypeScript / Python IaC | [`pulumi-HDB-HeliosDB-Proxy`](https://github.com/HeliosDatabase/pulumi-HeliosDB-Proxy) |
+| **Kubernetes operator** + `HeliosProxy` CRD | Anyone running on k8s | On request (sales@heliosdb.com) |
+| **Terraform provider**                       | Multi-cloud, IaC pipelines | On request (sales@heliosdb.com) |
+| **Pulumi provider**                          | TypeScript / Python IaC | On request (sales@heliosdb.com) |
 
 Operator and Terraform/Pulumi compose: many teams use the operator
 for k8s-native lifecycle and Terraform/Pulumi to declare the CR
@@ -29,10 +33,9 @@ itself.
 ### Recipe 1: Kubernetes operator quick-start
 
 ```bash
-# 1. Install CRDs + operator (Helm chart)
-helm repo add heliosproxy https://heliosdatabase.github.io/HDB-HeliosDB-Proxy-Operator
-helm repo update
-helm install heliosproxy heliosproxy/heliosproxy-operator \
+# 1. Install CRDs + operator from the Helm chart you received on request
+#    (<operator-chart> is the chart reference provided during onboarding)
+helm install heliosproxy <operator-chart> \
   --namespace heliosproxy --create-namespace
 ```
 
@@ -233,7 +236,7 @@ The TF provider patches the CR; the operator reconciles.
 - `heliosproxy-config` — what the rendered `proxy.toml` looks like
 - `heliosproxy-install` — same image used by container deploys
 - `heliosproxy-release` — how the image gets built and tagged
-- Operator repo: <https://github.com/HeliosDatabase/HeliosDB-Proxy-Operator>
-- TF provider: <https://github.com/HeliosDatabase/terraform-provider-HeliosDB-Proxy>
-- Pulumi provider: <https://github.com/HeliosDatabase/pulumi-HeliosDB-Proxy>
+- Operator, Terraform provider, Pulumi provider: available on request from
+  [sales@heliosdb.com](mailto:sales@heliosdb.com)
+- Kubernetes without the operator: <https://heliosdb.com/docs/proxy/deployment/kubernetes/>
 - Demos: [`demos/v0.4.0/{20-k8s-operator,21-terraform,22-pulumi}/`](../../demos/v0.4.0/)
