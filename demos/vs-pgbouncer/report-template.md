@@ -23,17 +23,15 @@ workload.
 
 ## Analysis
 
-PgBouncer is a connection pooler -- it has no awareness of PostgreSQL
-replication topology and cannot fail over to a standby. When the primary
-dies, all in-flight transactions fail and clients see errors until the
-primary is manually restored.
-
-HeliosProxy detects the primary failure, promotes the standby, and replays
-any in-flight transactions. Clients experience a brief pause but see zero
-(or near-zero) errors.
+Describe the actual database authority, promotion/fencing procedure, topology
+configuration, and measured client results here. Neither proxy initiates a
+database promotion in this demo. With static topology and no replacement
+primary, HeliosProxy writes can fail until the original primary recovers.
+With an external promotion and a compatible provider, it can route to the new
+leader and replay eligible work. Unknown `COMMIT` outcomes remain errors.
 
 ## Key Takeaway
 
-Connection pooling alone does not provide high availability. Transaction
-Replay is what makes the difference between "errors during failover" and
-"zero downtime failover."
+Connection routing and transaction replay depend on database promotion, fencing,
+replication, and replay eligibility. Draw conclusions from the recorded results;
+this template does not establish zero downtime or zero data loss.

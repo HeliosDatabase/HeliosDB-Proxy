@@ -1,8 +1,8 @@
 # HeliosProxy - Failover Demo with Transaction Replay
 #
-# Demonstrates automatic failover and Transaction Replay (TR):
-#   - Kill the primary and watch traffic re-route to standbys
-#   - Observe TR replaying sessions on the new target
+# Demonstrates outage detection with Transaction Replay (TR) configured:
+#   - Kill the primary; writes wait and may time out
+#   - No standby promotion authority is configured by this example
 #   - Restart the primary and see it rejoin the cluster
 #
 # Usage:

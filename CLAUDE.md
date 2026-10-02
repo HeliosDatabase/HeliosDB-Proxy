@@ -76,8 +76,9 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
 
 - **CLI `heliosdb-proxy`** (src/main.rs, clap):
   - Daemon flags: `-c/--config <file>`, `-l/--listen` (default `0.0.0.0:5432`),
-    `--admin` (default `127.0.0.1:9090`), `--primary <host:port>`, `--standby <host:port>`
-    (repeatable), `--tr` (default true), `--log-level`, `--json-logs`
+    `--admin` (default `127.0.0.1:9090`), `--admin-token <token>`, `--admin-allow-insecure`
+    (both CLI-mode only: rejected together with `--config`), `--primary <host:port>`,
+    `--standby <host:port>` (repeatable), `--tr` (default true), `--log-level`, `--json-logs`
   - Subcommand: `install skills [--target claude|codex|both] [--symlink] [--force] [--dry-run]`
   - Signals: SIGHUP = live config reload; SIGUSR2 = graceful drain for zero-downtime
     binary handoff (bounded by `shutdown_drain_timeout_secs`, env override
@@ -85,8 +86,9 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
     the process immediately
 - **CLI `helios-plugin`** (src/bin/helios-plugin.rs): `install`, `list`, `verify`, `new`
   (plugin registry / Ed25519 signature tooling)
-- **Config file** `proxy.toml` — examples in `config/proxy.example.toml`,
-  `config/proxy.full.toml`, `config/proxy.postgres.toml`; the working configs under
+- **Config file** `proxy.toml` — examples in `config/proxy.minimal.toml` (smallest valid
+  file: one `[[nodes]]` with `host` + `role`; every other key/section has a serde default),
+  `config/proxy.example.toml`, `config/proxy.full.toml`, `config/proxy.postgres.toml`; the working configs under
   `scripts/regress/*.toml` are the most current examples. Authoritative parser:
   `ProxyConfig` in `src/config.rs` (~4300 lines).
   Top-level keys: `listen_address`, `admin_address`, `admin_token`,
@@ -99,7 +101,10 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
   `[graphql_gateway]` (+`[[graphql_gateway.tables]]`), `[schema_routing]`, `[mcp]`,
   `[[agent_contracts]]`, `[http_gateway]`, `[mirror]`, `[edge]`, `[branch]`, `[topology]`,
   `[journal]`.
-  CAUTION: keys `ProxyConfig` does not know, at any depth, are ignored by the parser;
+  `[ha]` is REJECTED at startup even without `strict_config` (the proxy never promotes a
+  database; an external HA manager must, and `[topology]` tracks it); an empty
+  `admin_token` is a startup error.
+  CAUTION: other keys `ProxyConfig` does not know, at any depth, are ignored by the parser;
   startup logs one warning per ignored key path, and `strict_config = true` makes them
   (and enabled features not compiled into the build) a startup error instead. The
   commented `[routing.*]`, `[lag]`, `[rewriter]`, `[graphql]`, `[auth.jwt]`-style,

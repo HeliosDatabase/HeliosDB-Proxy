@@ -46,12 +46,9 @@ failure_threshold   = 2
 success_threshold   = 2
 check_query         = "SELECT 1"
 
-# ── HA / Failover ───────────────────────────────────────────────────
-[ha]
-enabled            = true
-auto_failover      = true
-failover_threshold = 2
-max_replica_lag_ms = 100
+# Static topology: the proxy does not promote a standby. An external HA
+# manager and compatible [topology] provider are required to follow promotions.
+# The unsupported [ha] section is rejected by current daemon builds.
 
 # ── Logging ──────────────────────────────────────────────────────────
 [logging]

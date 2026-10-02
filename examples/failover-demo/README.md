@@ -1,11 +1,12 @@
 # Failover Demo
 
-Step-by-step demonstration of HeliosProxy automatic failover with Transaction Replay (TR).
+Step-by-step demonstration of primary outage detection and recovery with
+Transaction Replay (TR) configured. No standby promotion authority is supplied.
 
 ## What This Demonstrates
 
-1. **Health-check driven failover** -- the proxy detects a dead backend within seconds and re-routes traffic.
-2. **Transaction Replay (TR)** -- in-flight sessions are replayed on the new target so clients do not see connection errors.
+1. **Health-check driven routing** -- the proxy detects an unavailable backend; writes wait for an eligible primary.
+2. **Transaction Replay (TR)** -- recovery of eligible work requires an available replacement; client errors remain possible and unknown `COMMIT` outcomes are not replayed.
 3. **Automatic recovery** -- when the failed node comes back, health checks detect it and restore it to the routing pool.
 
 ## Prerequisites

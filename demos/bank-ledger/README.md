@@ -2,15 +2,16 @@
 
 A financial integrity stress test. 20 concurrent workers perform random bank
 transfers while the primary database is killed and restarted 5 times. At the
-end, a single query proves that not a single cent was lost.
+end, a balance-sum query checks conservation of the seeded money.
 
 ## What invariant is tested?
 
 Every transfer is a paired DEBIT + CREDIT inside a single transaction.
 The total balance across all 100 accounts must always equal exactly
 **$1,000,000.00** -- the original seed amount. If any transaction is
-partially applied, double-applied, or lost during failover, this number
-will be wrong.
+partially applied, this number can be wrong. A lost or duplicated complete
+DEBIT+CREDIT pair can preserve the sum, so this check alone does not prove
+exactly-once execution or absence of lost acknowledged transfers.
 
 ## How to run
 
@@ -43,11 +44,15 @@ SUM(balance) = $1000000.00
 Zero cents lost across all failovers.
 ```
 
-HeliosProxy's Transaction Replay captures every statement in the active
-transaction. When the primary dies mid-commit, the proxy detects the failure,
-promotes the standby, and replays the exact sequence of statements. The
-client sees a brief pause but never an error -- and the DEBIT+CREDIT pair
-is always atomic.
+The legacy audit's "Zero cents lost" label describes its balance-sum check,
+not a durability guarantee. Compare unique acknowledged transfer IDs with
+persisted ledger entries to establish loss or duplication.
+
+This demo restarts the original primary; the daemon does not promote a standby.
+Promotion-based recovery needs an external manager with fencing and a compatible
+topology provider. Transaction Replay has explicit eligibility limits, and an
+unknown `COMMIT` outcome produces `08007` rather than a blind replay. Client
+errors during an outage are possible; inspect the actual workload results.
 
 ## Configuration
 

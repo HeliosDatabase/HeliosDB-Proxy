@@ -3,9 +3,9 @@
 # HeliosProxy — Impossible Query Demo
 # =============================================================================
 #
-# A 60-second marketing demo that proves HeliosProxy's Transaction Replay.
-# A client opens a transaction, the primary is KILLED mid-flight, and the
-# COMMIT still succeeds — zero errors, zero data loss.
+# Legacy marketing scenario. Each run_sql call opens a fresh session, so this
+# does not prove transaction replay. No database promotion authority is wired.
+# Review README.md limitations; verify SQL responses and persisted state.
 #
 # Usage:
 #   ./demo.sh            # Interactive mode (pauses between steps)
@@ -111,14 +111,14 @@ DEMO_START=$(date +%s)
 
 banner "HeliosProxy — The Impossible Query"
 
-echo -e "  ${DIM}This demo proves that HeliosProxy can transparently survive${RESET}"
-echo -e "  ${DIM}a primary database failure MID-TRANSACTION.${RESET}"
+echo -e "  ${DIM}Legacy scenario: separate SQL sessions, no promotion authority.${RESET}"
+echo -e "  ${DIM}This output does not prove transaction recovery or durability.${RESET}"
 echo -e ""
 echo -e "  ${DIM}The client will:${RESET}"
 echo -e "  ${DIM}  1. BEGIN a transaction${RESET}"
 echo -e "  ${DIM}  2. INSERT and UPDATE rows${RESET}"
 echo -e "  ${DIM}  3. Watch the primary get KILLED${RESET}"
-echo -e "  ${DIM}  4. COMMIT successfully anyway${RESET}"
+echo -e "  ${DIM}  4. Attempt COMMIT in a new session; inspect its response${RESET}"
 echo ""
 
 pause
@@ -217,8 +217,8 @@ run_sql "UPDATE inventory SET stock = stock - 50 WHERE product = 'Widget-X';" ||
 
 echo ""
 T3=$(( $(date +%s) - DEMO_START ))
-success "Transaction is open. Data is written but NOT committed."
-info "The transaction lives in HeliosProxy's replay buffer."
+info "These statements used separate client sessions; no transaction is held open."
+info "Their output cannot establish an in-flight replay record."
 elapsed "$T3"
 
 pause
@@ -243,8 +243,8 @@ sleep 1
 dramatic "PRIMARY IS DEAD"
 
 echo -e "  ${RED}The PostgreSQL primary has been killed with SIGKILL.${RESET}"
-echo -e "  ${RED}The client's transaction was in-flight.${RESET}"
-echo -e "  ${RED}With any normal connection pooler, this transaction is LOST.${RESET}"
+echo -e "  ${RED}This script did not retain a client transaction across the kill.${RESET}"
+echo -e "  ${RED}Inspect the database and client errors to establish outcomes.${RESET}"
 echo ""
 echo -e "  ${WHITE}But this client is connected through HeliosProxy...${RESET}"
 
@@ -253,13 +253,14 @@ pause
 # ── Step 6: COMMIT the transaction ───────────────────────────────────────────
 step 6 "COMMITTING the transaction (through HeliosProxy)"
 
-info "The standby is being promoted. HeliosProxy replays the transaction."
+info "No promotion is performed here; a missing primary may cause a timeout."
 echo ""
 
 COMMIT_START=$(date +%s%N)
 
 echo -e "  ${YELLOW}SQL>${RESET} COMMIT;"
-COMMIT_RESULT=$(run_sql "COMMIT;" 2>&1 || echo "COMMIT")
+COMMIT_STATUS=0
+COMMIT_RESULT=$(run_sql "COMMIT;" 2>&1) || COMMIT_STATUS=$?
 COMMIT_END=$(date +%s%N)
 
 COMMIT_MS=$(( (COMMIT_END - COMMIT_START) / 1000000 ))
@@ -268,9 +269,9 @@ echo -e "  ${GREEN}     -> ${COMMIT_RESULT}${RESET}"
 echo ""
 
 T6=$(( $(date +%s) - DEMO_START ))
-success "COMMIT succeeded in ${COMMIT_MS}ms."
-info "HeliosProxy detected the failure, promoted the standby,"
-info "and replayed the entire transaction transparently."
+info "COMMIT command returned exit status ${COMMIT_STATUS} in ${COMMIT_MS}ms."
+info "It used a new session; even success would not establish transaction replay."
+info "Database promotion and fencing require an external authority."
 elapsed "$T6"
 
 pause
@@ -289,7 +290,7 @@ echo -e "  ${GREEN}     -> ${STOCK_DATA}${RESET}"
 
 echo ""
 T7=$(( $(date +%s) - DEMO_START ))
-success "Data verified. Order exists, inventory decremented."
+info "Query output shown above; row contents have not been independently asserted."
 elapsed "$T7"
 
 pause
@@ -312,7 +313,7 @@ echo "$NODES_AFTER" | python3 -m json.tool 2>/dev/null | while read -r line; do
 done || echo -e "  ${DIM}${NODES_AFTER}${RESET}"
 
 T8=$(( $(date +%s) - DEMO_START ))
-success "Standby promoted to primary. Cluster is operational."
+info "Inspect topology above; this script does not promote a standby."
 elapsed "$T8"
 
 pause
@@ -324,18 +325,17 @@ banner "RESULT"
 
 echo -e "  ${GREEN}╔═══════════════════════════════════════════════════════════╗${RESET}"
 echo -e "  ${GREEN}║                                                           ║${RESET}"
-echo -e "  ${GREEN}║   Zero errors.  Zero data loss.                           ║${RESET}"
+echo -e "  ${GREEN}║   Outcomes require independent verification.             ║${RESET}"
 echo -e "  ${GREEN}║                                                           ║${RESET}"
-echo -e "  ${GREEN}║   The transaction was replayed transparently              ║${RESET}"
-echo -e "  ${GREEN}║   on the new primary after failover.                      ║${RESET}"
+echo -e "  ${GREEN}║   Separate SQL sessions were used.                       ║${RESET}"
+echo -e "  ${GREEN}║   No database promotion was performed.                   ║${RESET}"
 echo -e "  ${GREEN}║                                                           ║${RESET}"
 echo -e "  ${GREEN}║   Commit latency: ${COMMIT_MS}ms                                    ║${RESET}"
 echo -e "  ${GREEN}║   Total demo time: ${TOTAL_TIME}s                                     ║${RESET}"
 echo -e "  ${GREEN}║                                                           ║${RESET}"
 echo -e "  ${GREEN}╚═══════════════════════════════════════════════════════════╝${RESET}"
 echo ""
-echo -e "  ${WHITE}This is HeliosProxy's Transaction Replay (TR).${RESET}"
-echo -e "  ${DIM}Every in-flight transaction is buffered and can be replayed${RESET}"
-echo -e "  ${DIM}on a new backend after failover — completely transparent${RESET}"
-echo -e "  ${DIM}to the application.${RESET}"
+echo -e "  ${WHITE}See README.md for this legacy scenario's limitations.${RESET}"
+echo -e "  ${DIM}Replay eligibility and unknown COMMIT handling are documented${RESET}"
+echo -e "  ${DIM}in docs/transaction-replay.md; promotion is external.${RESET}"
 echo ""

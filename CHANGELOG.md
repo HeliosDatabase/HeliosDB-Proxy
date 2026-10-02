@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Minimal TOML configurations and partial pool, health, and load-balancer sections
+  now use the same defaults as the CLI. Backend `host` and `role` remain required;
+  omitted node port, weight, and enabled fields default to 5432, 100, and true.
+- CLI-only deployments can set `--admin-token` or explicitly opt into
+  `--admin-allow-insecure`. The new security flags cannot be combined with
+  `--config` (rejected rather than silently ignored).
+
+### Changed
+
+- An empty or whitespace-only `admin_token` (config file or `--admin-token`) is
+  now a startup error instead of an accepted empty credential.
+
+### Fixed
+
+- Journal replay preserves simple-query batches instead of submitting them as
+  prepared statements. Extended entries retain their captured bindings and OIDs.
+  Replay refuses transaction-ending or ambiguous SQL before sending it, including
+  historical entries, and refuses incomplete failover journals.
+- Ordinary complete `BEGIN; INSERT/UPDATE/DELETE/SELECT ...; COMMIT/ROLLBACK;`
+  batches no longer trigger the anomaly detector's stacked-query heuristic.
+  Suspicious statements and other injection heuristics remain active; ambiguous
+  quoting keeps the conservative alert. The detector also scans faster (−4 % to −63 %
+  per query). Operator note: the false positive also wrote one WARN line per such
+  transaction, about 370 MB in 12 s at 64 clients. That logging slowed clients down. On a
+  backend that is already CPU-saturated, removing it lets them push harder, so p99 for
+  this workload can rise even though TPS does not drop. Measured: +10–29 % at 64 clients
+  against a backend capped at 4 CPUs, and −32–35 % at 16 clients. With detection compiled
+  out of both builds the difference disappears.
+- The TR commit-boundary test fixture (`scripts/regress/tr-boundary-test.py`) enables TR
+  explicitly. Since 1.8.0, `tr_enabled = false` forces `tr_mode` to `none`, so the fixture
+  had silently stopped testing the mode it names; 7 of its 26 cases and all 7
+  commit-outcome cases failed for that reason. They pass on 2.0.0 and on this change.
+- Unsupported `[ha]` settings now fail startup with external-promotion and
+  topology-provider guidance. Documentation distinguishes database promotion
+  from proxy routing recovery and clarifies native WASM runtime requirements.
+
 ## [2.0.0] - 2026-09-25
 
 A new major version: the HA topology, the result cache and Transaction Replay now share

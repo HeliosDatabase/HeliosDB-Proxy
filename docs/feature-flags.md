@@ -243,6 +243,25 @@ Sandboxed WebAssembly plugin runtime:
 - **Sandbox:** Each plugin runs in an isolated WASM sandbox with configurable memory limits and an execution timeout.
 - **Host functions:** Plugins can call back into the proxy to read metrics, log messages, and modify query routing.
 
+The proxy and Wasmtime runtime build for the host target (for example,
+`x86_64-unknown-linux-gnu`). Installing `wasm32-unknown-unknown` is unnecessary
+when building or running the proxy, including `--features all-features`. That
+Rust target is needed only when compiling Rust plugin source into a `.wasm`
+artifact; loading a prebuilt plugin does not require it.
+
+To verify actual native-host execution without a Rust WASM toolchain or external
+plugin artifacts, run:
+
+```bash
+cargo test --features wasm-plugins plugins::runtime::tests::
+```
+
+These tests compile inline WAT fixtures and execute hooks through Wasmtime,
+including response payloads, host KV imports and execution timeouts. The separate
+`wasm_plugin_e2e` integration suite loads Rust-built artifacts from the sibling
+plugin workspace and skips those cases when artifacts are absent. A diagnostic
+string found by `strings` is not evidence of which runtime path was executed.
+
 Excluded from `msrv-features` because `wasmtime` significantly slows the MSRV compile.
 
 ### `graphql-gateway` -- GraphQL Gateway
@@ -277,7 +296,11 @@ The module itself implements multi-tier intelligent caching (L1 in-process / L2 
 
 ### `anomaly-detection` -- Anomaly Detection
 
-**Modules:** `src/anomaly/` (runs on hardcoded `AnomalyConfig::default()` -- there is no `proxy.toml` anomaly section)
+**Modules:** `src/anomaly/`
+
+Configure the detector through `[anomaly]` in `proxy.toml`: rate and authentication
+windows, alert thresholds, event-buffer size, novel-query reporting, and the
+fingerprint cap. An absent section uses the documented defaults.
 
 In-process, sliding-window heuristics with no external data store:
 
@@ -286,7 +309,12 @@ In-process, sliding-window heuristics with no external data store:
 - **SQL injection:** pattern heuristics over incoming SQL.
 - **Novel query shapes:** flags query fingerprints not seen before.
 
-Results are surfaced at the Admin API `/anomalies` endpoint.
+Results are surfaced at the Admin API `/anomalies` endpoint. The `stacked_queries`
+heuristic exempts complete ordinary DML batches enclosed by `BEGIN` (or
+`START TRANSACTION`) and `COMMIT`/`ROLLBACK`. Other injection patterns still run;
+DDL/COPY batches, dollar-quoted strings, and ambiguous or incomplete transaction
+boundaries retain the stacked-query heuristic. This detector reports suspicious patterns, not a SQL
+security guarantee.
 
 ### `edge-proxy` -- Edge / Geo Proxy
 

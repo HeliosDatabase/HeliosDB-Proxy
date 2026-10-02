@@ -1,10 +1,10 @@
 # =============================================================================
-# HeliosProxy - Minimal Example Configuration
+# HeliosProxy - Commented Starter Configuration
 # =============================================================================
 #
 # A starter configuration for HeliosProxy with one primary and one standby
 # node using transaction pooling. Copy this file to proxy.toml and edit to
-# match your environment.
+# match your environment. For the smallest working file see proxy.minimal.toml.
 #
 # Environment variable substitution: use ${VAR_NAME:-default_value} syntax.
 # All addresses, credentials, and tuning parameters support env var overrides.
@@ -222,7 +222,7 @@ weight = 100
 enabled = true
 
 # -----------------------------------------------------------------------------
-# Cache — query result caching (disabled in this minimal config)
+# Cache — query result caching (disabled in this starter config)
 # -----------------------------------------------------------------------------
 
 [cache]
@@ -253,11 +253,11 @@ max_cacheable_response_bytes = 4194304
 # High availability, logging, metrics
 # -----------------------------------------------------------------------------
 #
-# There is no `[ha]`, `[logging]`, or `[metrics]` section — `ProxyConfig`
-# silently ignores unknown sections, so these looked configurable but never
-# did anything. The real equivalents:
-#   - HA / failover: automatic, driven by `[health]` + `[[nodes]]` roles (and
-#     `[topology]` for a dynamic provider); there is no separate opt-in.
+# There is no `[ha]`, `[logging]`, or `[metrics]` section. `[ha]` is rejected;
+# other unknown sections warn, or fail when strict_config is true.
+#   - Routing: `[health]` checks availability; static `[[nodes]]` roles do not
+#     promote a standby. An external manager must fence/promote the database;
+#     a configured `[topology]` provider can discover its new primary.
 #   - Logging: CLI flags `--log-level` and `--json-logs`, not proxy.toml.
 #   - Metrics: always on at `/metrics` and `/metrics/prometheus` on
 #     `admin_address` — no opt-in section needed.

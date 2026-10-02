@@ -39,6 +39,8 @@ heliosdb-proxy --config config.toml --json-logs
 | `--config`, `-c` | *(none)* | Path to TOML configuration file. |
 | `--listen`, `-l` | `0.0.0.0:5432` | Client (PostgreSQL-wire) listen address. |
 | `--admin` | `127.0.0.1:9090` | Admin API listen address. Loopback by default — see [Admin API Security](#admin-api-security). |
+| `--admin-token` | *(none)* | Admin bearer token in CLI mode. Prefer a protected config file with `${VAR}` substitution when shell history/process arguments must not contain secrets. |
+| `--admin-allow-insecure` | `false` | Explicitly permit an unauthenticated admin listener in CLI mode. Development only; exposes privileged operations. |
 | `--primary` | *(none)* | Primary node `host:port`. |
 | `--standby` | *(none)* | Standby node `host:port` (repeatable). |
 | `--tr` | `true` | Enable Transaction Replay. Takes an optional value: `--tr false` or `--tr=false` turns it off; a bare `--tr` means `true`. |
@@ -50,7 +52,8 @@ There is also an `install skills` subcommand (`--target claude|codex|both`,
 
 When `--config` is provided, the file drives the whole configuration. Command-line node
 arguments (`--primary`, `--standby`) build an in-memory config only when no config file
-is supplied.
+is supplied. The two admin security flags also apply only in CLI mode; combining them with
+`--config` is rejected rather than silently ignoring authentication settings.
 
 ### Signals
 
@@ -114,7 +117,8 @@ above) or the command-line arguments.
 
 ## Unknown Keys Are Warned, Not Rejected (By Default)
 
-`ProxyConfig` does **not** use `deny_unknown_fields`. Any TOML key that is not a
+`ProxyConfig` does **not** use `deny_unknown_fields`. Except for the rejected `[ha]`
+section described below, any TOML key that is not a
 recognized `ProxyConfig` field — top-level *or nested inside a known section* — is
 parsed-and-ignored, and each one is logged once at startup as a warning, with its full
 dotted path:
@@ -125,10 +129,16 @@ WARN unknown config key 'cache.l1_max_byts' ignored (not part of ProxyConfig)
 ```
 
 This makes silent doc-drift and typos visible without breaking pre-existing configs.
-Historical example blocks such as `[ha]`, `[logging]`, `[metrics]`, `[routing]`,
+Historical example blocks such as `[logging]`, `[metrics]`, `[routing]`,
 `[distribcache]`, `[graphql]`, `[[tenants]]`, and `[[schema_routes]]` are **not** part of
 `ProxyConfig` — they will be warned and ignored. Their real counterparts are documented
 below (`lag_routing`, `multi_tenancy`, `graphql_gateway`, `schema_routing`, …).
+
+**Exception: `[ha]` is rejected even with `strict_config = false`.** Silently
+ignoring `auto_failover` would leave an operator expecting a promotion loop that
+the daemon does not run. Remove that section, configure database promotion and
+fencing externally, and select a compatible `[topology]` provider to discover
+the promoted leader. See [topology providers](topology-providers.md#setting-up-automatic-routing-after-promotion).
 
 Detection covers every nesting depth (built on `serde_ignored`, not a hand-maintained
 whitelist), so a typo inside an otherwise-valid section — e.g. `[cache] l1_max_byts = 1`
@@ -156,21 +166,38 @@ shutdown_drain_timeout_secs = 60
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `listen_address` | string | `"0.0.0.0:5432"` | Address/port for PostgreSQL client connections. *(Required in a config file.)* |
-| `admin_address` | string | `"127.0.0.1:9090"` | Address/port for the admin HTTP API. Loopback by default. *(Required in a config file.)* |
+| `listen_address` | string | `"0.0.0.0:5432"` | Address/port for PostgreSQL client connections. |
+| `admin_address` | string | `"127.0.0.1:9090"` | Address/port for the admin HTTP API. Loopback by default. |
 | `admin_token` | string | *(none)* | Bearer token required on every admin endpoint except liveness probes. See [Admin API Security](#admin-api-security). |
 | `admin_allow_insecure` | bool | `false` | Explicit opt-in to expose the admin API on a non-loopback address **without** a token. |
 | `strict_config` | bool | `false` | Opt-in strict configuration (D-05): startup fails when an enabled subsystem was not compiled into the binary (e.g. `[cache] enabled = true` without the `query-cache` feature) or when an unknown config key is present, at any nesting depth (an unknown top-level section, or a typo'd key inside a known section such as `[cache] l1_max_byts`). Default `false` keeps the historical warn-and-continue behaviour. `GET /capabilities` reports the per-subsystem compiled/enabled/wired state. |
-| `tr_enabled` | bool | `true` | Master switch for Transaction Replay, which ships in the default build. When `false`: the write journal stops recording, `tr_mode` is forced to `none`, and `POST /api/replay` returns `503`. *(Required in a config file.)* |
-| `tr_mode` | string | `"session"` | Transaction Replay mode: `none`, `session`, `select`, `transaction`. *(Required in a config file.)* |
+| `tr_enabled` | bool | `true` | Master switch for Transaction Replay, which ships in the default build. When `false`: the write journal stops recording, `tr_mode` is forced to `none`, and `POST /api/replay` returns `503`. |
+| `tr_mode` | string | `"session"` | Transaction Replay mode: `none`, `session`, `select`, `transaction`. |
 | `tr_read_functions` | array of string | `[]` | TR-03 read re-execution policy extension. In-session replay re-executes an interrupted read on an unknown outcome only when every function it calls is a PostgreSQL built-in known to be side-effect-free; list additional provably pure functions (unqualified names, case-insensitive) here. Reads calling anything else, quoted-identifier calls, `SELECT … INTO`, and sequence functions are classified as opaque and never re-executed. |
 | `write_timeout_secs` | u64 | `30` | Seconds to buffer writes during failover before returning an error — and, since 1.7.0, the **single deadline for a whole session recovery**: waiting for a primary, connect/auth, session-state restore and replay all draw on it, instead of each having its own timeout. |
 | `optimize_unnamed_parse` | bool | `true` | Skip re-forwarding an identical unnamed extended-protocol `Parse` a backend already holds, synthesizing `ParseComplete` locally. A kill-switch for drivers that depend on the redundant round trip. |
 | `shutdown_drain_timeout_secs` | u64 | `60` | How long a SIGUSR2 binary-handoff drain keeps serving in-flight connections before dropping them. Runtime override: `HELIOS_DRAIN_TIMEOUT_SECS`. |
 
-The sections `[pool]`, `[load_balancer]`, `[health]`, and at least one `[[nodes]]` entry
-are also required in a config file (they have no serde defaults). Every other section
-listed below is optional and defaults to disabled/off.
+Only backend identity is required: configure at least one `[[nodes]]` with `host`
+and `role`, including a primary. Node ports default to 5432, weight to 100, and
+`enabled` to true. Omitted top-level settings and omitted fields in `[pool]`,
+`[pool_mode]`, `[load_balancer]`, and `[health]` use their documented defaults.
+Explicit values still undergo validation; admin authentication is still required
+for non-loopback listeners. For example, this is a complete minimal file:
+
+```toml
+listen_address = "127.0.0.1:6432"
+
+[[nodes]]
+host = "127.0.0.1"
+role = "primary"
+```
+
+The explicit proxy port avoids conflicting with a local database on port 5432.
+Without this override, the proxy listener defaults to `0.0.0.0:5432`.
+
+See `config/proxy.minimal.toml` for a copyable minimal configuration and
+`config/proxy.example.toml` for a commented starter with tuning options.
 
 ### Transaction Replay Modes (`tr_mode`)
 
@@ -422,6 +449,14 @@ epoch (incremented on every observed leader change), `valid`, and the remaining 
 This is how a real promotion moves the write destination without hand-editing
 `proxy.toml` roles.
 
+The proxy does not initiate database promotion. A healthy `standby` is not a
+writable primary: if the primary fails and no replacement is authorized,
+`currentPrimary` becomes null and writes fail after `write_timeout_secs`.
+Configure promotion and fencing in the database HA manager, then use a compatible
+`postgres` or `patroni` provider to discover its result. `[ha] auto_failover = true`
+is not a supported proxy configuration option, and enabling `ha-tr` does not add
+a promotion loop. See [the failover setup guide](topology-providers.md#setting-up-automatic-routing-after-promotion).
+
 **Fencing limits (H-02).** A proxy-side epoch/lease cannot fence a client that connects
 directly to a database node: the proxy can only refuse to route, and it fails closed once
 the lease expires (`valid: false`, writes wait). Preventing two sides of a partition from
@@ -472,7 +507,7 @@ name = "standby-1"
 | Role | Description |
 |------|-------------|
 | `primary` | Read/write node. All writes and transaction-control statements route here. At least one required. |
-| `standby` | Promotable standby. Eligible for failover; receives reads when `read_write_split` is on. |
+| `standby` | Receives reads when `read_write_split` is on. Becomes a write destination only after external promotion and discovery by an authoritative provider, or an operator updates its configured role to `primary`. The proxy does not promote it. |
 | `replica` | Read-only replica. Not promotable; receives reads only. |
 
 ---

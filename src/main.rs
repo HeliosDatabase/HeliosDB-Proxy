@@ -11,7 +11,7 @@ use heliosdb_proxy::{
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// HeliosDB Proxy - Connection Router and Failover Manager
+/// HeliosDB Proxy - Connection Router and Failover Recovery
 #[derive(Parser, Debug)]
 #[command(name = "heliosdb-proxy")]
 #[command(version = VERSION)]
@@ -33,10 +33,17 @@ struct Cli {
     listen: String,
 
     /// Admin API address. Defaults to loopback: the admin API is privileged, so
-    /// the proxy refuses a non-loopback bind without an admin token (set one in
-    /// a config file, or set admin_allow_insecure).
+    /// the proxy refuses a non-loopback bind without an admin token.
     #[arg(long, default_value = "127.0.0.1:9090")]
     admin: String,
+
+    /// Admin bearer token (CLI mode). Prefer a protected config file for secrets.
+    #[arg(long, conflicts_with = "config")]
+    admin_token: Option<String>,
+
+    /// Allow an unauthenticated remote admin API (development only, CLI mode).
+    #[arg(long, conflicts_with = "config")]
+    admin_allow_insecure: bool,
 
     /// Primary node (host:port)
     #[arg(long)]
@@ -241,6 +248,8 @@ fn load_config(cli: &Cli) -> Result<ProxyConfig> {
     let mut config = ProxyConfig {
         listen_address: cli.listen.clone(),
         admin_address: cli.admin.clone(),
+        admin_token: cli.admin_token.clone(),
+        admin_allow_insecure: cli.admin_allow_insecure,
         tr_enabled: cli.tr,
         ..ProxyConfig::default()
     };
@@ -259,6 +268,47 @@ fn load_config(cli: &Cli) -> Result<ProxyConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deployment_issue9_admin_cli_credentials_are_enforced() {
+        let args = [
+            "heliosdb-proxy",
+            "--primary",
+            "127.0.0.1:5432",
+            "--admin",
+            "0.0.0.0:9090",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(load_config(&cli).is_err());
+        let mut authenticated = args.to_vec();
+        authenticated.extend(["--admin-token", "test-token"]);
+        let config = load_config(&Cli::try_parse_from(authenticated).unwrap()).unwrap();
+        assert_eq!(config.admin_token.as_deref(), Some("test-token"));
+        assert!(!config.admin_allow_insecure);
+        for token in ["", "   "] {
+            let mut empty = args.to_vec();
+            empty.extend(["--admin-token", token]);
+            assert!(load_config(&Cli::try_parse_from(empty).unwrap()).is_err());
+        }
+        let mut insecure = args.to_vec();
+        insecure.push("--admin-allow-insecure");
+        assert!(
+            load_config(&Cli::try_parse_from(insecure).unwrap())
+                .unwrap()
+                .admin_allow_insecure
+        );
+        for option in [
+            vec!["--admin-token", "test-token"],
+            vec!["--admin-allow-insecure"],
+        ] {
+            let mut args = vec!["heliosdb-proxy", "--config", "proxy.toml"];
+            args.extend(option);
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "must not silently ignore admin CLI security settings"
+            );
+        }
+    }
 
     #[test]
     fn daemon_defaults_when_no_args() {

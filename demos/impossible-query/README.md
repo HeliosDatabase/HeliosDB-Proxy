@@ -1,15 +1,18 @@
 # Impossible Query Demo
 
-A 60-second marketing demo that proves HeliosProxy can survive a primary database
-failure **mid-transaction** with zero errors and zero data loss.
+A legacy marketing scenario that kills a primary while issuing SQL through the
+proxy. **This script does not prove transaction recovery or zero data loss.**
 
-## What This Proves
+## Current limitations
 
-- **Transaction Replay (TR)** buffers in-flight transactions and replays them on a
-  new primary after failover.
-- The client sees a successful `COMMIT` even though the original primary was killed
-  with `SIGKILL` while the transaction was open.
-- Failover detection + promotion + replay happens in under 15 seconds.
+- `run_sql` opens a new `psql` session for every call. `BEGIN`, the writes, and
+  `COMMIT` therefore do not belong to one persistent transaction.
+- Several command failures are masked by fallback output. Treat output as
+  illustrative; verify SQL responses and persisted state independently.
+- The daemon does not promote standbys. This setup has no external promotion
+  authority, so primary failure can produce write timeouts until recovery.
+- A `COMMIT` with an unknown outcome is never blindly replayed. Replay modes and
+  their limits are described in [transaction replay](../../docs/transaction-replay.md).
 
 ## Prerequisites
 
@@ -31,26 +34,26 @@ failure **mid-transaction** with zero errors and zero data loss.
 
 1. A 2-node PostgreSQL cluster starts (1 primary + 1 streaming standby)
 2. HeliosProxy connects to both nodes with Transaction Replay enabled
-3. A client opens a transaction through the proxy: `BEGIN`, `INSERT`, `UPDATE`
+3. Separate client sessions issue `BEGIN`, `INSERT`, and `UPDATE`
 4. The primary is killed with `docker kill` (simulating hardware failure)
-5. The client issues `COMMIT` — HeliosProxy detects the failure, promotes the
-   standby, and replays the buffered transaction on the new primary
-6. `COMMIT` succeeds. A `SELECT` confirms the data exists.
+5. A new client session attempts `COMMIT`; no database promotion is initiated
+6. The script prints query responses for inspection
 
 ## Expected Output
 
-- Steps 1-3: Cluster starts, transaction opens normally
+- Steps 1-3: Cluster startup and separate SQL requests are attempted
 - Step 4: Primary is killed
-- Step 6: `COMMIT` succeeds (typically within 2-10 seconds)
-- Step 7: `SELECT` returns the inserted order and updated inventory
-- Step 9: Summary shows zero errors, zero data loss
+- Later SQL may fail while no primary is available. A successful standalone
+  `COMMIT` would not prove recovery of the earlier sessions.
+- The summary reports elapsed time, not a verified recovery or durability result.
 
 ## What to Look For
 
-- The **commit latency** — how long the client waited for the replay to complete
-- The **proxy logs** (`docker compose logs heliosproxy`) show the failover detection,
-  standby promotion, and transaction replay in real-time
-- After failover, the admin API (`/nodes`) shows the former standby as the new primary
+- Inspect raw SQL errors, persisted rows, and `GET /topology` rather than the
+  presentation text. `/nodes` roles alone do not establish database promotion.
+- A real recovery test needs one persistent client session, verified replication,
+  external promotion/fencing, and observation of the new leader through a
+  [compatible topology provider](../../docs/topology-providers.md).
 
 ## Cleanup
 

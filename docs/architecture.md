@@ -46,7 +46,7 @@ These modules form the minimum viable proxy. They are compiled unconditionally a
 | `connection_pool` | `src/connection_pool.rs` | Basic connection pool with min/max sizing, idle timeout, and health-on-acquire |
 | `load_balancer` | `src/load_balancer.rs` | Read/write splitting, five routing strategies, weighted node selection |
 | `health_checker` | `src/health_checker.rs` | Periodic backend health probes with configurable thresholds |
-| `failover_controller` | `src/failover_controller.rs` | Automatic failover with candidate ranking, sync-standby preference |
+| `failover_controller` | `src/failover_controller.rs` | Library promotion controller with candidate ranking and sync-standby preference; not driven by the standalone daemon |
 | `switchover_buffer` | `src/switchover_buffer.rs` | Query buffer during planned switchover, drains to new primary |
 | `primary_tracker` | `src/primary_tracker.rs` | Pluggable topology discovery, primary change events |
 | `pipeline` | `src/pipeline.rs` | Extended query protocol pipelining (Parse/Bind/Execute batching) |
@@ -271,13 +271,13 @@ pub enum TopologyEvent {
 |----------|-------------|------------------|--------------------|
 | PostgreSQL | `postgres-topology` | Polls `pg_is_in_recovery()` on each node | Detects role change across polling intervals |
 | HeliosDB | `heliosdb-topology` | Subscribes to internal TopologyManager events | Event-driven, zero polling |
-| Manual / Standalone | *(none)* | API calls: `set_primary()`, `clear_primary()` | External orchestration |
+| Manual / Standalone | *(none)* | In-process Rust calls: `set_primary()`, `clear_primary()` | Embedding application's orchestration |
 
 ### PrimaryTracker Operating Modes
 
 1. **Provider-backed** -- Created with `PrimaryTracker::with_provider()`. Subscribes to `TopologyEvent` broadcasts and runs a periodic consistency check. Fully automatic.
 
-2. **Standalone** -- Created with `PrimaryTracker::new_standalone()`. Primary is managed through explicit `set_primary()`, `confirm_primary()`, and `clear_primary()` calls. Suitable for external failover managers (Patroni, pg_auto_failover, Stolon) that notify the proxy via the Admin API.
+2. **Standalone** -- Created with `PrimaryTracker::new_standalone()`. An embedding application manages the primary through the Rust methods `set_primary()`, `confirm_primary()`, and `clear_primary()`. The daemon has no generic Admin API endpoint for these calls. For an externally managed database cluster, configure a supported [topology provider](topology-providers.md) to discover its primary; the database manager owns fencing and promotion.
 
 ### Primary Lifecycle
 
