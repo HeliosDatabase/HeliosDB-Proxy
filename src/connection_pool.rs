@@ -97,6 +97,23 @@ pub enum ConnectionState {
     Closed,
 }
 
+/// Subtract `n` from a gauge, saturating at zero instead of wrapping.
+///
+/// The compare-exchange loop `AtomicU64::fetch_update` runs, written out:
+/// that method is deprecated from Rust 1.99, and its replacement
+/// (`try_update`) does not exist on the 1.86 MSRV.
+fn saturating_sub_seqcst(gauge: &AtomicU64, n: u64) {
+    let mut current = gauge.load(Ordering::SeqCst);
+    while let Err(actual) = gauge.compare_exchange_weak(
+        current,
+        current.saturating_sub(n),
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    ) {
+        current = actual;
+    }
+}
+
 /// Per-node connection pool
 struct NodePool {
     /// Available connections
@@ -250,11 +267,7 @@ impl ConnectionPool {
     /// of connections evicted afterwards must not underflow the gauge to
     /// near-`u64::MAX`.
     fn dec_total_connections_by(&self, n: u64) {
-        let _ = self
-            .total_connections
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                Some(v.saturating_sub(n))
-            });
+        saturating_sub_seqcst(&self.total_connections, n);
     }
 
     /// Decrement the `total_connections` gauge by one without wrapping
@@ -268,11 +281,7 @@ impl ConnectionPool {
     /// outright, so a connection returned or closed afterwards must not
     /// underflow this gauge either.
     fn dec_active_connections(&self) {
-        let _ = self
-            .active_connections
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                Some(v.saturating_sub(1))
-            });
+        saturating_sub_seqcst(&self.active_connections, 1);
     }
 
     /// Liveness gate applied to an idle connection at checkout time,
