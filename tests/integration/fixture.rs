@@ -7,8 +7,7 @@ use heliosdb_proxy::config::{
     LoadBalancerConfig, NodeConfig, NodeRole, PoolConfig, ProxyConfig, Strategy,
 };
 use heliosdb_proxy::server::ProxyServer;
-use std::net::TcpStream;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::task::AbortHandle;
 
 /// Which backend database engine is being proxied.
@@ -149,17 +148,36 @@ fn read_backend_info() -> Option<BackendInfo> {
     })
 }
 
-/// Wait until `addr` accepts a TCP connection, up to `timeout`.
-fn wait_for_tcp(addr: &str, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
+/// Report an unavailable fixture, failing required-live runs instead of skipping.
+fn fixture_failure<T>(message: &str) -> Option<T> {
+    eprintln!("{message}");
+    assert!(
+        std::env::var("HELIOS_REQUIRE_LIVE").is_err(),
+        "HELIOS_REQUIRE_LIVE is set: {message}"
+    );
+    None
+}
+
+/// Wait cooperatively so a server spawned on this same runtime can start.
+async fn wait_for_tcp(addr: &str, timeout: Duration) -> bool {
     let parsed: std::net::SocketAddr = addr.parse().expect("parse socket addr");
-    while Instant::now() < deadline {
-        if TcpStream::connect_timeout(&parsed, Duration::from_millis(100)).is_ok() {
-            return true;
+    tokio::time::timeout(timeout, async {
+        loop {
+            if matches!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    tokio::net::TcpStream::connect(parsed),
+                )
+                .await,
+                Ok(Ok(_))
+            ) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
+    })
+    .await
+    .is_ok()
 }
 
 /// Spawn a proxy and wait for it to become ready.
@@ -212,8 +230,7 @@ pub async fn start_proxy_with(customize: impl FnOnce(&mut ProxyConfig)) -> Optio
     let server = match ProxyServer::new(config) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[fixture] ProxyServer::new failed: {e}");
-            return None;
+            return fixture_failure(&format!("[fixture] ProxyServer::new failed: {e}"));
         }
     };
 
@@ -226,10 +243,12 @@ pub async fn start_proxy_with(customize: impl FnOnce(&mut ProxyConfig)) -> Optio
 
     // Wait up to 5 s for the proxy port to accept connections.
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
-    if !wait_for_tcp(&proxy_addr, Duration::from_secs(5)) {
-        eprintln!("[fixture] proxy did not start in time on {proxy_addr}");
+    if !wait_for_tcp(&proxy_addr, Duration::from_secs(5)).await {
         abort.abort();
-        return None;
+        let _ = jh.await;
+        return fixture_failure(&format!(
+            "[fixture] proxy did not start in time on {proxy_addr}"
+        ));
     }
 
     Some(ProxyFixture {
@@ -288,8 +307,7 @@ pub async fn start_proxy_ha() -> Option<HaFixture> {
     let server = match ProxyServer::new(config) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[fixture-ha] ProxyServer::new failed: {e}");
-            return None;
+            return fixture_failure(&format!("[fixture-ha] ProxyServer::new failed: {e}"));
         }
     };
 
@@ -301,10 +319,12 @@ pub async fn start_proxy_ha() -> Option<HaFixture> {
     let abort = jh.abort_handle();
 
     let proxy_addr = format!("127.0.0.1:{}", proxy_port);
-    if !wait_for_tcp(&proxy_addr, Duration::from_secs(5)) {
-        eprintln!("[fixture-ha] HA proxy did not start in time on {proxy_addr}");
+    if !wait_for_tcp(&proxy_addr, Duration::from_secs(5)).await {
         abort.abort();
-        return None;
+        let _ = jh.await;
+        return fixture_failure(&format!(
+            "[fixture-ha] HA proxy did not start in time on {proxy_addr}"
+        ));
     }
 
     Some(HaFixture {
@@ -314,4 +334,29 @@ pub async fn start_proxy_ha() -> Option<HaFixture> {
         standby,
         abort,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn readiness_yields_to_current_thread_server() {
+        let addr = format!("127.0.0.1:{}", pick_free_port());
+        let server_addr = addr.clone();
+        let server = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let listener = tokio::net::TcpListener::bind(server_addr)
+                .await
+                .expect("bind test server");
+            listener.accept().await.expect("accept readiness probe");
+        });
+
+        let ready = wait_for_tcp(&addr, Duration::from_secs(2)).await;
+        if !ready {
+            server.abort();
+        }
+        assert!(ready, "readiness polling must let the spawned server run");
+        server.await.expect("readiness server completed");
+    }
 }
