@@ -1,7 +1,7 @@
 # HeliosProxy - Impossible Query Demo
 #
-# A 60-second marketing demo: kill the primary mid-transaction,
-# and the COMMIT still succeeds. Zero errors. Zero data loss.
+# Legacy marketing scenario; does not configure database promotion.
+# Separate SQL sessions and masked errors prevent this from proving recovery.
 #
 # Usage:
 #   ./demo.sh            # Interactive (pauses between steps)

@@ -2,7 +2,7 @@
 
 This directory contains the shareable assets for the three-demo talk:
 
-1. Lossless switchover with transaction journal and `POST /api/replay`
+1. Outage and journal replay exercise with `POST /api/replay`
 2. Shadow execution for PG major-version upgrades with `POST /api/shadow`
 3. Wire-edge anomaly detection with `GET /anomalies`
 4. Sixty-second WASM plugin tour across the first-party plugin demos
@@ -63,6 +63,11 @@ noninteractive setup command exits. If Nano is no longer reachable, check
 `tests/docker/upgrade-matrix.yml`; `anomaly` delegates to
 `demos/v0.4.0/01-anomaly-detection`; `plugins` prints the hot-reload plugin tour
 and points to runnable demos 11-18.
+
+The `switchover` label does not establish lossless recovery. The daemon does not
+promote a database; promotion/fencing require an external authority. The admin
+replay endpoint is an operator-driven replay tool, not proof of automatic HA or
+exactly-once execution. Inspect its response and independently verify outcomes.
 
 ## 46-Module Tour
 

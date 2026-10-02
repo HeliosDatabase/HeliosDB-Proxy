@@ -4,12 +4,13 @@ A side-by-side competitive comparison. Two identical PostgreSQL clusters run
 identical workloads. Both primaries are killed simultaneously. One cluster
 is fronted by PgBouncer, the other by HeliosProxy with Transaction Replay.
 
-## What this proves
+## What this measures
 
-PgBouncer is a connection pooler -- it does not handle failover. When the
-primary dies, clients get errors. HeliosProxy detects the failure, promotes
-the standby, and replays in-flight transactions. The difference is visible
-in a single table of numbers.
+The scripts collect client successes, errors, and recovery times under the
+configured outage. Neither proxy promotes a database in this setup. HeliosProxy
+can follow an external promotion through a compatible topology provider and
+replay eligible work; it does not guarantee error-free recovery or replay an
+unknown `COMMIT`. Review the actual HA configuration before interpreting results.
 
 ## Prerequisites
 
@@ -38,7 +39,7 @@ The script handles everything:
 
 Look at these columns:
 
-- **Client errors** -- PgBouncer will show many; HeliosProxy should show zero or near-zero
+- **Client errors** -- Measure both; no zero-error expectation is established
 - **Rows lost** -- Queries the client thought succeeded but are not in the database
 - **Max client downtime** -- How long clients saw errors
 
@@ -46,7 +47,7 @@ Look at these columns:
 
 ```
 Workload ──> HeliosProxy ──> hp-primary (killed)
-                         └─> hp-standby (promoted)
+                         └─> hp-standby (requires external promotion)
 
 Workload ──> PgBouncer ───> pb-primary (killed)
                         └─> pb-standby (unused by PgBouncer)

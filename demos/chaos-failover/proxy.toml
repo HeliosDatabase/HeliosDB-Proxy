@@ -1,7 +1,8 @@
 # HeliosProxy Configuration — Chaos Failover Stress Test
 #
-# All HA features enabled: TR, aggressive health checks, lag-aware routing,
-# auto-failover. Designed to survive random node kills and restarts.
+# TR and aggressive health checks for random node kills and restarts.
+# Static topology: writes wait for the original primary to recover. The proxy
+# does not promote standbys; promotion/fencing require an external HA manager.
 
 listen_address = "0.0.0.0:6432"
 admin_address  = "0.0.0.0:9090"
@@ -46,12 +47,9 @@ failure_threshold   = 2
 success_threshold   = 2
 check_query         = "SELECT 1"
 
-# ── HA / Failover ───────────────────────────────────────────────────
-[ha]
-enabled            = true
-auto_failover      = true
-failover_threshold = 2
-max_replica_lag_ms = 100
+# There is no supported [ha] auto_failover configuration section.
+# To follow external promotions, configure a compatible [topology] provider;
+# see ../../docs/topology-providers.md.
 
 # ── Lag-Aware Routing ───────────────────────────────────────────────
 [lag]

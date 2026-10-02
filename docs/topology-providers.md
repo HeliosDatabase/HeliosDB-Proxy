@@ -112,9 +112,49 @@ Because the daemon derives the primary from role + health, primary changes are d
 - **`POST /api/chaos`** — force a node unhealthy (or restore it) to exercise the failover
   path without external tooling.
 
-To promote a standby in this model, an external HA manager (Patroni, pg_auto_failover,
-etc.) performs the promotion, and the proxy's `[[nodes]]` roles are updated (config reload
-via SIGHUP) or the failed primary node recovers under the same address.
+To promote a standby in static mode, an external HA manager or operator performs
+the database promotion and fences the old primary. Update the proxy's `[[nodes]]`
+roles and reload via SIGHUP only after that promotion succeeds. Alternatively,
+configure an authoritative provider to observe the new leader automatically.
+
+### Setting up automatic routing after promotion
+
+`ha-tr` supplies replay components; it does not start a database promotion loop.
+There is no supported `[ha] auto_failover` daemon option. Marking a standby
+healthy, enabling it through the admin API, or forcing a primary unhealthy
+through `/api/chaos` does not change its database role. With no eligible primary,
+`currentPrimary: null` and a bounded write timeout are the expected safe result.
+
+For PostgreSQL with an external manager that promotes and fences database nodes:
+
+1. Build the daemon with `--features all-features,postgres-topology`.
+   `all-features` alone does not include `postgres-topology`.
+2. Keep both nodes in `[[nodes]]`, then configure `[topology] provider = "postgres"`
+   and the probe credentials, or `provider = "patroni"` and its REST endpoints.
+3. Confirm `GET /topology` reports the initial leader and a valid `authoritative`
+   lease. The default static provider cannot discover a changed database role.
+4. Exercise the HA manager's promotion procedure. Verify it fences the old
+   primary, the provider reports the new leader, and a new write reaches that node.
+   If the manager does not promote, the proxy continues to reject writes.
+
+For HeliosDB-Nano, verify that the selected discovery mechanism is actually
+supported by that deployment. PG-wire compatibility alone does not establish
+support for PostgreSQL role/timeline probes or the PostgreSQL `pg_promote`
+command. Use Nano's supported promotion and fencing procedure; with static
+topology, update proxy roles after the database role change succeeds. Fixing
+replication connectivity is a prerequisite to a meaningful replicated failover
+test, and the proxy cannot repair the replica's replication stream.
+
+The daemon routing regression can be run without a real database:
+
+```bash
+python3 tests/integration/topology_failover.py /path/to/heliosdb-proxy --output /tmp/topology-evidence.json
+```
+
+It uses disposable loopback PG-wire and Patroni fixtures to check that a standby
+receives no writes without authority and that a provider-observed leader change
+moves writes without a config edit. It tests routing, not database promotion,
+replication, fencing, or durability.
 
 ---
 

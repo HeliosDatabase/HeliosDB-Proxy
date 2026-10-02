@@ -1,0 +1,9 @@
+# Minimal operational configuration: other settings use documented defaults.
+# Change the backend address to your database. The admin API stays on loopback.
+# For a remote admin listener set admin_address and a nonempty admin_token.
+# Use a distinct listener when the database runs locally on its default port.
+listen_address = "127.0.0.1:6432"
+
+[[nodes]]
+host = "127.0.0.1"
+role = "primary"

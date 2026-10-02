@@ -48,7 +48,7 @@ psql_cmd() {
 
 demo_switchover() {
   cd "$PROXY_REPO"
-  echo "== Lossless switchover / transaction journal =="
+  echo "== Outage / transaction journal replay (verify outcomes independently) =="
   docker compose -f tests/docker/cluster.yml up --build --wait -d
   tests/docker/pgbench-chaos.sh init
   tests/docker/checksum.sh snapshot pre

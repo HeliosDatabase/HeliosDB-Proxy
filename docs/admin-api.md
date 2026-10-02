@@ -248,7 +248,15 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 ## Failover & Chaos
 
-Failover between backends is **automatic** (health-driven; in-session Transaction Replay is governed by `tr_mode` and `tr_enabled`, with the write journal behind `/api/replay` shipping in the default build). There is **no `/failover` endpoint.** To *force* a failover for testing, mark a node unhealthy via the chaos API.
+The proxy automatically routes to an eligible primary, but **does not promote a
+standby**. With static topology, eligibility requires a configured `primary` role
+and a passing health check. With an authoritative topology provider, it requires
+the provider's current leader. Promotion and fencing belong to the database or
+external HA manager; see [topology providers](topology-providers.md). In-session
+recovery is governed by `tr_mode`; setting the master switch `tr_enabled = false`
+disables both write journaling and in-session replay (effective mode `none`).
+There is **no `/failover` endpoint.** The chaos API changes health overrides; it
+does not change database roles or make a standby writable.
 
 ### GET /api/chaos
 
@@ -263,7 +271,7 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/api/chaos
 Inject or clear a controlled fault. Supported actions: `force_unhealthy`, `restore`, `reset`.
 
 ```bash
-# Force the primary unhealthy → triggers automatic failover to a standby
+# Force the primary unhealthy (does not promote a standby)
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"action":"force_unhealthy","target_node":"db-primary.internal:5432"}' \
@@ -668,11 +676,17 @@ done
 curl -X POST -H "$AUTH" "http://localhost:9090/nodes/$NODE/enable"
 ```
 
-### Force a failover drill
+### Simulate primary unavailability
+
+In static mode, with no other healthy configured primary, this drill makes
+`currentPrimary` null and writes fail after `write_timeout_secs`. Restore the
+override when done. To test successful failover, separately arrange a fenced
+database promotion and configure an authoritative provider to observe it. A
+chaos health override does not override that provider's leader authority.
 
 ```bash
 AUTH="Authorization: Bearer $ADMIN_TOKEN"
-# Mark the primary unhealthy → automatic failover kicks in
+# Mark the primary unhealthy; promotion requires the database HA manager
 curl -X POST -H "$AUTH" -H "Content-Type: application/json" \
   -d '{"action":"force_unhealthy","target_node":"db-primary.internal:5432"}' \
   http://localhost:9090/api/chaos

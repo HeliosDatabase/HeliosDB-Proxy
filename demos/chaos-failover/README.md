@@ -1,8 +1,8 @@
 # Chaos Failover Stress Test
 
 A 5-minute stress test that runs continuous database workload while randomly killing
-and restarting PostgreSQL nodes. Proves HeliosProxy maintains high availability under
-sustained failure conditions.
+and restarting PostgreSQL nodes. This legacy demo exercises outage detection and
+recovery of the original primary; it does not configure a promotion authority.
 
 ## Architecture
 
@@ -23,7 +23,12 @@ sustained failure conditions.
 - **pg-primary**: Read-write primary
 - **pg-standby-sync**: Synchronous streaming standby
 - **pg-standby-async**: Asynchronous streaming standby
-- **HeliosProxy**: Connection router with TR, lag-aware routing, auto-failover
+- **HeliosProxy**: Connection router with TR and health checks
+
+The static configuration does not promote standbys. Writes wait for the original
+primary to recover and fail after `write_timeout_secs` if it remains unavailable.
+For promotion-based failover, configure an external HA manager with fencing and
+a compatible [topology provider](../../docs/topology-providers.md).
 
 The chaos monkey kills nodes with weighted probability: 50% primary, 25% each standby.
 
@@ -71,11 +76,11 @@ docker compose ps
 
 Watch the dashboard for:
 - Node status changes (healthy -> unhealthy -> healthy)
-- Primary failover and promotion events
+- Primary unavailability and recovery
 - Pool metrics during failures
 
 Watch the workload for:
-- Failed operations during kills (should be minimal)
+- Failed operations during kills (including bounded write timeouts)
 - Recovery after restarts
 - Overall success rate
 
@@ -94,10 +99,10 @@ This checks:
 
 ## Expected Results
 
-- **Success rate**: 95%+ of operations succeed despite continuous node kills
-- **Failover time**: Proxy detects failures within ~4 seconds (2s interval, 2 failures)
+- **Success rate**: Measure it; primary outages can cause write failures until restart
+- **Detection time**: Health checks use a 2s interval and a 2-failure threshold; detection is separate from promotion
 - **Data consistency**: All reachable nodes converge to the same data after recovery
-- **Zero data loss**: Transaction Replay ensures committed transactions survive failover
+- **Durability**: Determined by PostgreSQL replication and commit settings; Transaction Replay does not guarantee zero data loss
 
 ## Cleanup
 

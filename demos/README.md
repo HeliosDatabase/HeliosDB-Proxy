@@ -1,6 +1,9 @@
 # HeliosProxy Demos
 
-Five self-contained demos that showcase HeliosProxy's capabilities. Each runs entirely in Docker and requires no external infrastructure.
+Five legacy Docker demos illustrating HeliosProxy scenarios. Review each demo's
+limitations before running it. They are not acceptance evidence for database
+promotion or zero data loss: the daemon requires an external promotion/fencing
+authority and a compatible topology provider for promotion-based recovery.
 
 ## Prerequisites
 
@@ -13,10 +16,10 @@ Five self-contained demos that showcase HeliosProxy's capabilities. Each runs en
 
 | # | Demo | Duration | Audience | What It Proves |
 |---|------|----------|----------|----------------|
-| 1 | [Impossible Query](impossible-query/) | 60 seconds | Executives, investors | Kill the primary mid-transaction — the COMMIT still succeeds. Zero errors, zero data loss. Transaction Replay in action. |
-| 2 | [Chaos Failover](chaos-failover/) | 5 minutes | DevOps, SREs | Continuous random failures (kill nodes, network partitions, disk pressure) while a pgbench workload runs. Zero failed transactions. |
-| 3 | [Bank Ledger](bank-ledger/) | 3 minutes | Developers, auditors | ACID-critical bank transfers survive primary failure mid-commit. Ledger balances always reconcile. |
-| 4 | [vs PgBouncer](vs-pgbouncer/) | 5 minutes | Technical evaluators | Side-by-side comparison: PgBouncer drops connections on failover, HeliosProxy replays them transparently. |
+| 1 | [Impossible Query](impossible-query/) | 60 seconds | Executives, investors | Legacy scripted scenario; separate SQL sessions and masked errors prevent it from proving transaction recovery. |
+| 2 | [Chaos Failover](chaos-failover/) | 5 minutes | DevOps, SREs | Measure errors and recovery while nodes are killed and restarted; no promotion authority configured. |
+| 3 | [Bank Ledger](bank-ledger/) | 3 minutes | Developers, auditors | Check balance conservation during primary restarts; conservation alone cannot detect a lost or duplicated whole transfer. |
+| 4 | [vs PgBouncer](vs-pgbouncer/) | 5 minutes | Technical evaluators | Record client errors and recovery for the actual HA configuration; neither proxy promotes a database in this setup. |
 | 5 | [Lag-Aware Routing](lag-aware-routing/) | 5 minutes | Developers, DBAs | Induce replication lag and watch reads automatically reroute to healthy standbys. Read-your-writes consistency guaranteed. |
 
 ## Quick Start

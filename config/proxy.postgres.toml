@@ -7,7 +7,7 @@
 #
 # Topology:
 #   pg-primary   — accepts all writes and can serve reads
-#   pg-sync      — synchronous standby (zero-lag, promotable)
+#   pg-sync      — standby with database-managed synchronous replication
 #   pg-async     — asynchronous standby (some lag, read-only overflow)
 #
 # No HeliosDB-specific features are enabled (no cache, no semantic layer,
@@ -126,9 +126,12 @@ enabled = true
 name    = "pg-primary"
 
 # ---------- Synchronous Standby ----------
-# Configured with synchronous_commit = on in postgresql.conf.
-# Zero data loss — every commit is confirmed replicated here before the
-# client receives OK. Safe for strong-consistency reads.
+# Configure synchronous_standby_names on the PostgreSQL primary and verify
+# that this node is a current synchronous standby. synchronous_commit = on
+# waits for durable WAL, not replay visibility; remote_apply waits for replay
+# on the acknowledging synchronous standbys. These proxy roles configure
+# neither replication nor read-consistency guarantees.
+# https://www.postgresql.org/docs/18/runtime-config-wal.html#GUC-SYNCHRONOUS-COMMIT
 [[nodes]]
 host    = "${PG_SYNC_HOST:-pg-sync}"
 port    = ${PG_SYNC_PORT:-5432}
@@ -160,13 +163,12 @@ enabled = false
 # HA, LOGGING, METRICS
 # =============================================================================
 #
-# There is no `[ha]`, `[logging]`, or `[metrics]` section — `ProxyConfig`
-# silently ignores unknown sections, so these looked configurable but never
-# did anything. The real equivalents:
-#   - HA / failover: automatic, driven by `[health]` + `[[nodes]]` roles above
-#     (promotion of the synchronous standby happens without a separate
-#     opt-in; an external orchestrator like Patroni still owns actual
-#     promotion of the PostgreSQL cluster itself).
+# There is no `[ha]`, `[logging]`, or `[metrics]` section. `[ha]` is rejected;
+# other unknown sections warn, or fail when strict_config is true.
+#   - Routing: `[health]` checks availability; the static roles above do not
+#     promote a standby. An external manager such as Patroni must fence and
+#     promote the database. Configure a `[topology]` provider to discover the
+#     new primary; see docs/topology-providers.md for the required feature.
 #   - Logging: CLI flags `--log-level` and `--json-logs`, not proxy.toml.
 #   - Metrics: always on at `/metrics` and `/metrics/prometheus` on
 #     `admin_address` — no opt-in section needed.

@@ -171,6 +171,7 @@ impl PoolModeConfig {
 
 /// Proxy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProxyConfig {
     /// Listen address for client connections
     pub listen_address: String,
@@ -2036,6 +2037,19 @@ impl ProxyConfig {
 
         let (config, ignored) = deserialize_reporting_ignored_paths(&contents)?;
 
+        // An ignored HA section can falsely promise automatic database promotion.
+        // Reject it even in permissive mode: health checks cannot fence a primary
+        // or make a read-only standby writable.
+        if ignored.iter().any(|path| path == "ha") {
+            return Err(ProxyError::Config(
+                "[ha] is not supported: HeliosProxy does not automatically promote databases. \
+                 Configure an external HA manager to fence/promote the database, then use \
+                 [topology] provider = \"postgres\" or \"patroni\" with the postgres-topology \
+                 feature to track its primary. Static topology uses configured node roles."
+                    .to_string(),
+            ));
+        }
+
         // Surface unknown keys — top-level (a documented-but-unimplemented
         // `[ha]`/`[logging]`/`[metrics]` block) AND nested (a typo inside a
         // known section, e.g. `[cache] l1_max_byts = 1`) — as warnings so
@@ -2218,6 +2232,15 @@ impl ProxyConfig {
         // so an anonymous non-loopback bind is a critical hole. Only enforced
         // when the address parses to a concrete IP; a hostname is left to the
         // operator's DNS/network policy.
+        if self
+            .admin_token
+            .as_ref()
+            .is_some_and(|token| token.trim().is_empty())
+        {
+            return Err(ProxyError::Config(
+                "admin_token must not be empty".to_string(),
+            ));
+        }
         if self.admin_token.is_none() && !self.admin_allow_insecure {
             if let Ok(sa) = self.admin_address.parse::<std::net::SocketAddr>() {
                 if !sa.ip().is_loopback() {
@@ -2687,6 +2710,7 @@ pub enum TrMode {
 
 /// Connection pool configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PoolConfig {
     /// Minimum connections per node
     pub min_connections: usize,
@@ -2734,6 +2758,7 @@ impl PoolConfig {
 
 /// Load balancer configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LoadBalancerConfig {
     /// Routing strategy for read queries
     pub read_strategy: Strategy,
@@ -2775,6 +2800,7 @@ pub enum Strategy {
 
 /// Health check configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HealthConfig {
     /// Check interval (seconds)
     pub check_interval_secs: u64,
@@ -2832,6 +2858,7 @@ pub struct NodeConfig {
     /// Node host
     pub host: String,
     /// Node port (PostgreSQL protocol)
+    #[serde(default = "default_node_port")]
     pub port: u16,
     /// Node HTTP API port (for SQL API forwarding)
     /// Defaults to 8080 if not specified
@@ -2840,8 +2867,10 @@ pub struct NodeConfig {
     /// Node role
     pub role: NodeRole,
     /// Weight for load balancing
+    #[serde(default = "default_node_weight")]
     pub weight: u32,
     /// Whether node is enabled
+    #[serde(default = "default_node_enabled")]
     pub enabled: bool,
     /// Optional node name for logging
     pub name: Option<String>,
@@ -2855,6 +2884,18 @@ pub struct NodeConfig {
 
 fn default_http_port() -> u16 {
     8080
+}
+
+fn default_node_port() -> u16 {
+    5432
+}
+
+fn default_node_weight() -> u32 {
+    100
+}
+
+fn default_node_enabled() -> bool {
+    true
 }
 
 impl Default for NodeConfig {

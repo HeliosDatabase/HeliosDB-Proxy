@@ -1,6 +1,6 @@
 # HeliosProxy
 
-**High-performance connection router, intelligent query processor, and failover manager for PostgreSQL-wire-compatible databases.**
+**High-performance connection router, intelligent query processor, and failover recovery for PostgreSQL-wire-compatible databases.**
 
 HeliosProxy operates at the PostgreSQL wire protocol level, making it compatible with any database that speaks the PostgreSQL protocol — including PostgreSQL, HeliosDB, CockroachDB, YugabyteDB, and others.
 
@@ -8,7 +8,7 @@ HeliosProxy operates at the PostgreSQL wire protocol level, making it compatible
 
 ## Overview
 
-HeliosProxy sits between your application and your database cluster, providing transparent connection pooling, automatic failover, intelligent query routing, programmable plugins, and operations tooling without application code changes.
+HeliosProxy sits between your application and your database cluster, providing transparent connection pooling, connection recovery after database failover, intelligent query routing, programmable plugins, and operations tooling without application code changes. Database promotion and fencing require an external HA manager.
 
 **Verification status (2026-09-25, 2.0.0):** the [September 2026 audit](docs/internal/audit-2026-09/README.md)
 found reproducible Transaction Replay safety defects; all of them are fixed as of
@@ -80,7 +80,7 @@ HeliosProxy features are grouped into a connection-routing tier and a programmab
 
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
-| **Failover Controller** | *(core)* | Automatic failover with candidate ranking by replication lag and configurable promotion policies |
+| **Failover Controller** | *(library API)* | Candidate ranking and promotion primitives for external orchestration; the daemon tracks an externally promoted primary |
 | **Transaction Replay (TR)** | *(default build)* | `tr_mode` keeps client sessions alive across a backend failure: `session` re-homes the connection to the new primary and restores `SET` state, `select` transparently re-runs interrupted reads, and opt-in `transaction` replays the uncommitted transaction on the new primary and continues. A `COMMIT` with unknown outcome is never retried (client gets SQLSTATE 08007), a replay whose results diverge from what the client already saw is rolled back (40001), and a transaction pinned to a `SERIALIZABLE`/`REPEATABLE READ` snapshot is never replayed. Failing over onto password-protected backends requires the proxy to be the auth boundary (`[auth] mode = "scram"`). `tr_enabled = false` turns TR off (journaling, in-session recovery, `/api/replay`) |
 | **Session Migration** | *(default build; library)* | Captures and restores full session state (SET parameters, prepared statements, advisory locks) when moving connections between nodes — not wired into the recovery path |
 | **Cursor Restore** | *(default build; library)* | Preserves open cursor positions across failover — not wired into the recovery path |
@@ -316,7 +316,16 @@ cargo build --release --features "all-features,heliosdb-topology"
 
 ## Topology Providers
 
-HeliosProxy supports pluggable topology discovery for automatic primary tracking:
+HeliosProxy supports pluggable topology discovery for automatic primary tracking.
+The daemon does not promote databases or fence failed primaries. A database HA manager
+must do that first; `[topology] provider = "postgres"` or `"patroni"` then tracks the
+writable primary (requires `postgres-topology`). Static topology uses configured roles.
+`[ha] auto_failover` is unsupported and rejected at startup. See
+[deployment and promotion setup](docs/topology-providers.md).
+
+For a minimal configuration, copy [config/proxy.minimal.toml](config/proxy.minimal.toml).
+Omitted settings use documented defaults; each backend still requires `host` and `role`.
+CLI-only deployments can set `--admin-token <TOKEN>` for remote admin access.
 
 ### PostgreSQL (`postgres-topology`)
 
@@ -330,11 +339,16 @@ Polls `pg_is_in_recovery()` on each configured node to detect the current primar
 
 ### HeliosDB (`heliosdb-topology`)
 
-Integrates with the HeliosDB internal topology manager for event-driven primary tracking. Zero-polling, instant failover detection.
+The library exposes an event-driven adapter for an embedded HeliosDB topology manager.
+This adapter is not selected by the standalone daemon configuration; for Nano deployments,
+verify compatible role probes and external promotion before choosing a daemon provider.
 
-### Manual / API
+### Manual / library API
 
-Set and update the primary programmatically via the Admin API — suitable for custom orchestration or external failover managers.
+Library users can update `PrimaryTracker` programmatically. The daemon admin API
+has no generic promote/set-primary endpoint. With static topology, update the
+configured node roles after database promotion and restart; for automatic tracking
+use a supported authoritative topology provider.
 
 ---
 
