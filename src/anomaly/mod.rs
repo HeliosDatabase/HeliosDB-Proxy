@@ -619,6 +619,32 @@ mod tests {
     }
 
     #[test]
+    fn transaction_batch_is_not_reported_as_sql_injection() {
+        let d = AnomalyDetector::new(AnomalyConfig::default());
+        let events = d.record_query(&obs(
+            "acme",
+            "transaction-batch",
+            "BEGIN; INSERT INTO test_replication (name) VALUES ('delta'); COMMIT;",
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AnomalyEvent::SqlInjection { .. })),
+            "normal transaction generated injection alert: {events:?}"
+        );
+        let events = d.record_query(&obs(
+            "acme",
+            "transaction-injection",
+            "BEGIN; DROP TABLE test_replication; COMMIT;",
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AnomalyEvent::SqlInjection { patterns_matched, .. }
+                if patterns_matched.iter().any(|pattern| pattern == "stacked_queries")
+        )));
+    }
+
+    #[test]
     fn injection_detection_is_case_and_unicode_stable_across_observations() {
         // The scan runs off a reused thread-local lower-case buffer;
         // a long non-ASCII statement followed by a short ASCII one

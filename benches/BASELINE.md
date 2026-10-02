@@ -17,6 +17,91 @@ stay under 3%.
   candidate's CI does not overlap the baseline CI (Criterion's own change report says
   "regressed" / "improved" / "within noise").
 
+## 2026-10-01 — SQL-injection scanner baseline (11 new cases) and the deployment-issues gate
+
+Deployment issues #2/#3/#4/#9 (anomaly false positive on `BEGIN; INSERT; COMMIT;`, journal
+replay of simple-query batches, minimal-config defaults, admin-token CLI flags, `[ha]`
+rejection). Host **gpc001ca**, rustc **1.95.0**, `--features all-features`, governor
+`performance`, one fleet-lock acquisition for the whole sequence. Base: `7d450aa` (2.0.0)
+with the candidate's `benches/protocol.rs` copied in, so both arms run the same 118 cases
+(SHA256 `d2d00c87…`). Gate: `scripts/bench-gate.sh`, 3 rounds AB/BA/AB, thresholds unchanged.
+Evidence: `/home/gpc/HDB/sprint/baselines/proxy/2.0.1-deploy-integ/perf/`. An independent
+audit (`criterion/audit.json`) reran the gate's maths from the raw outputs and found the run
+complete: 118 expected cases from each executable's `--list`, all present in all six rounds,
+no stale outputs, and the executables that ran are the ones that were built.
+
+New cases (ns, median of the three per-round `median.point_estimate`s; run 1 is the same
+candidate source measured on 2026-09-29 against code-identical `89acc20`):
+
+| Benchmark | Base ns | Candidate ns | Delta | Separated | Run 1 delta |
+|---|---:|---:|---:|---|---:|
+| `anomaly/sql_injection/short_select` | 302.4 | 110.8 | -63.35% | yes | -63.39% |
+| `anomaly/sql_injection/medium_where` | 387.1 | 231.4 | -40.20% | yes | -29.72% |
+| `anomaly/sql_injection/transaction_insert_commit` | 463.7 | 393.6 | -15.12% | yes | -4.49% |
+| `anomaly/sql_injection/transaction_quoted_delimiters` | 449.3 | 430.0 | -4.28% | yes | -1.13% |
+| `anomaly/sql_injection/stacked_attack` | 435.2 | 357.3 | -17.90% | yes | -21.44% |
+| `anomaly/sql_injection/transaction_ddl_attack` | 431.0 | 364.3 | -15.46% | yes | -19.32% |
+| `anomaly/sql_injection/classic_or_positive` | 416.6 | 374.3 | -10.14% | yes | -12.77% |
+| `anomaly/sql_injection/comment_escape_positive` | 375.4 | 362.0 | -3.58% | no | -16.03% |
+| `anomaly/sql_injection/combined_injection_positive` | 257.1 | 278.0 | +8.14% | no | +0.93% |
+| `anomaly/sql_injection/necessary_filter_near_miss` | 402.3 | 298.1 | -25.91% | yes | -22.93% |
+| `anomaly/sql_injection/transaction_negative_arithmetic` | 472.1 | 396.6 | -15.98% | yes | -4.88% |
+
+`transaction_quoted_delimiters` keeps its alert on purpose (dollar quoting is ambiguous), so
+it measures the conservative path. `combined_injection_positive` overlaps between rounds and
+was +0.93% in run 1; it is on the watch list below.
+
+**Gate verdict: FAIL, retained.**
+- Run 2 (this tree): mean **−0.201%**. Three separated regressions in code the change does not
+  touch: `pool_mode_manager_acquire_release/8` +11.97%, `protocol_decode_message/medium_where`
+  +19.60%, `protocol_extended_parse/parse_message` +16.99%. 14 separated improvements.
+- Run 1 (2026-09-29): mean −1.226%. Five different separated regressions: `txn_sequence`
+  +10.1%, `enqueue_one` +13.9%, `auth_md5` +9.3%, `statement` +5.1%, `savepoint` +4.3%.
+- None of the eight is separated in both runs.
+
+An independent Fable review attributed all eight to measurement and layout variation
+(`review/FABLE-REVIEW.md`):
+- The `pooling`, `relay` and `routing` bench executables have byte-identical `.text`,
+  `.rodata` and `.data` across the two arms. They differ only in build-id and panic-location
+  line numbers, so 86 of the 118 cases are A/A comparisons, including `manager_acquire_release/8`.
+- On those 86, the separated counts match what the 3-round range rule produces by chance.
+- Only the `protocol` executable differs (+6 KiB of scanner code). Its two flagged cases sit in
+  unchanged `src/protocol.rs`. The same functions given other inputs are flat or improved
+  (`short_select` +0.8%, `kilobyte_in_list` −4.6%, `bind_message` −2.4%), and they were
+  +1.9% / −1.8% in run 1.
+
+Watch list for the next gate: `medium_where`, `parse_message`, `enqueue_one`,
+`combined_injection_positive`. If a third build reproduces one of them at a consistent
+magnitude, investigate it on the product binary rather than re-running.
+
+**User path** (owned PostgreSQL 18.4, each container limited to 4 CPUs by a CFS quota, 16/64
+clients, 12 s, session and transaction modes, 3 interleaved passes):
+
+The ordinary pgbench gate **PASSES**. This is the controlling write-path evidence. Committed
+writes:
+
+| mode / clients | TPS delta | p99 delta |
+|---|---:|---:|
+| session / 16 | −0.7% | −2.5% |
+| session / 64 | −0.4% | −0.2% |
+| transaction / 16 | +1.3% | +1.8% |
+| transaction / 64 | −0.2% | +0.4% |
+
+The extra single-Query `BEGIN; INSERT; COMMIT` workload **FAILS at 64 clients**, retained:
+
+| mode / clients | p99 base → candidate | TPS delta |
+|---|---|---:|
+| session / 64 | 33.7 → 43.6 ms (+29.2%) | +1.9% |
+| transaction / 64 | 46.2 → 50.8 ms (+10.1%) | +0.7% |
+
+At 16 clients p99 improved −35% and −32%. The cause is the fix itself:
+- The base raised a false-positive alert and wrote a WARN line for every transaction: 1.28 M
+  lines (371 MB) in one 12 s cell. That work slowed the clients down before they reached a
+  CPU-saturated backend.
+- Control E2 compiled anomaly detection out of both arms and ran the order ABBABAAB. All 8
+  pairs came within ±0.62% p99 and ±1.6% TPS, and both arms sat at about 46.8 / 53.4 ms.
+- Evidence: `perf/userpath/`, `perf/batch-noanomaly/`.
+
 ## 2026-09-21 — user path (P-01) for TR-07, and the session-local journal fix
 
 First run of the user-path harness (`scripts/regress/bench-usertp.sh`, P-01) against the TR-07
