@@ -260,7 +260,9 @@ def scenario(binary, name, mode, setup, fault_sql, partial=False, cap=256, flush
             port, admin = free_port(), free_port()
             cfg = f'''listen_address = "127.0.0.1:{port}"
 admin_address = "127.0.0.1:{admin}"
-tr_enabled = false
+# tr_enabled is the TR master switch since 1.8.0: false forces the effective
+# tr_mode to "none", which would silently disable the mode under test.
+tr_enabled = true
 tr_mode = "{mode}"
 optimize_unnamed_parse = true
 write_timeout_secs = 2
