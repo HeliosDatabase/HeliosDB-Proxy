@@ -20,7 +20,7 @@ use super::transaction_journal::TransactionJournal;
 /// Failover configuration
 ///
 /// Library-only: `FailoverController` has no construction site in the
-/// `heliosdb-proxy` daemon today (`src/server.rs` runs its own independent
+/// `heliosdb-proxy` daemon today (`src/server/` runs its own independent
 /// primary-selection/health-tracking failover path and never builds one of
 /// these) — this type and its fields are reachable only through the library
 /// API, not through `proxy.toml`.

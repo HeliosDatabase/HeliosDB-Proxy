@@ -181,7 +181,7 @@ returns `40001` rather than continuing on top of rows the client never observed.
 Beyond the in-session recovery above, two mechanisms observe a primary change
 in the running daemon:
 
-**1. Write journaling** (`src/server.rs` capture hooks + `src/journal_capture.rs`).
+**1. Write journaling** (`src/server/journal_hooks.rs` capture hooks + `src/journal_capture.rs`).
 When `tr_enabled`, the proxy journals **real transactions** as the backend reports them
 (TR-07). The forward path registers what it sends — a simple-query string, or the
 `Parse`/`Bind`/`Execute`/`Close` messages of an extended batch including every bound
@@ -215,7 +215,7 @@ Committed transactions are kept in a bounded in-memory store and, when
 (see [Transaction Journal](#1-transaction-journal)). `POST /api/replay` reports what
 backs every run in its `coverage` block.
 
-**2. Failover write-buffering** (`src/server.rs`, `select_primary_with_timeout`).
+**2. Failover write-buffering** (`src/server/routing.rs`, `select_primary_with_timeout`).
 When a write needs the primary and the configured-primary node is not healthy, the proxy
 does **not** immediately error. It polls node health every 100 ms for up to
 `write_timeout_secs`, and as soon as a node with `role = "primary"` is enabled and healthy,

@@ -19,7 +19,7 @@
 //!   does carry reuse/discard/miss counters (H-06 slice 1, below) — not yet
 //!   exported through `/metrics`, since that needs the per-gateway pool
 //!   instances threaded into `src/admin.rs`'s state, which is wired in
-//!   `src/server.rs`.
+//!   `src/server/mod.rs`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

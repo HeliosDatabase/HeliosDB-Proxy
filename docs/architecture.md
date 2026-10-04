@@ -39,7 +39,7 @@ These modules form the minimum viable proxy. They are compiled unconditionally a
 
 | Module | Source | Responsibility |
 |--------|--------|----------------|
-| `server` | `src/server.rs` | TCP listener, client session management, PostgreSQL startup handshake |
+| `server` | `src/server/` | TCP listener, client session management, PostgreSQL startup handshake (`mod.rs` lifecycle/state; `client.rs`, `auth.rs`, `relay.rs`, `backend_conn.rs`, `routing.rs`, `tr.rs`, `journal_hooks.rs`, …) |
 | `protocol` | `src/protocol.rs` | PostgreSQL wire-protocol codec (frontend/backend message framing) |
 | `config` | `src/config.rs` | TOML configuration loading, validation, and environment variable overrides |
 | `admin` | `src/admin.rs` | REST API server on the admin port, Prometheus metrics, SQL routing API |
@@ -74,7 +74,7 @@ The recovery path a live client takes and the journal/operator tooling both ship
 
 | Module | Feature Flag | Source | Responsibility |
 |--------|-------------|--------|----------------|
-| In-session recovery | *(core)* | `src/server.rs` | Records statements, session state and a bounded response digest inside a transaction; on a backend fault classifies delivery, re-homes the session, restores `SET` state and replays under one deadline |
+| In-session recovery | *(core)* | `src/server/tr.rs` | Records statements, session state and a bounded response digest inside a transaction; on a backend fault classifies delivery, re-homes the session, restores `SET` state and replays under one deadline |
 | Replay SQL lexer | *(core)* | `src/replay_sql.rs` | Bounded statement scan: commit boundaries, transaction ends, function calls — decides what may be re-executed |
 | `transaction_journal` | *(default)* | `src/transaction_journal.rs` | Post-response journal of write SQL, for operator replay |
 | `failover_replay` | *(default)* | `src/failover_replay.rs` | Replay coordinator for embedded/programmatic use |

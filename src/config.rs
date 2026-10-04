@@ -1350,7 +1350,7 @@ fn default_tr_max_session_set_statements() -> usize {
 
 /// Upper bound (seconds) for any `[limits]` `*_secs` timeout that feeds a
 /// `Duration`/`Instant`. Each of these is added to a `tokio::time::Instant` at
-/// connect time (`server.rs`); an enormous value such as `u64::MAX` overflows
+/// connect time (`server/client.rs`); an enormous value such as `u64::MAX` overflows
 /// that `Instant + Duration` and panics the per-connection task. One year is
 /// far above any sane operational timeout while leaving enormous headroom below
 /// the overflow boundary, so [`ProxyConfig::validate`] rejects anything larger.
@@ -2287,7 +2287,7 @@ impl ProxyConfig {
             }
             // Upper-bound every `*_secs` timeout that feeds a `Duration`/`Instant`.
             // A value beyond MAX_LIMIT_SECS (e.g. `u64::MAX`) overflows the
-            // `Instant + Duration` computed at connect time in `server.rs` and
+            // `Instant + Duration` computed at connect time in `server/client.rs` and
             // panics the per-connection task, so reject it up front.
             let secs_checks: [(&str, u64); 7] = [
                 ("limits.startup_timeout_secs", l.startup_timeout_secs),

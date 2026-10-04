@@ -24,7 +24,7 @@
 //! ## Cleanliness
 //!
 //! A connection is `DISCARD ALL`-reset by the caller before it is parked
-//! (see the release path in `server.rs`), so the next borrower — possibly a
+//! (see the release path in `server/backend_conn.rs`), so the next borrower — possibly a
 //! *different* client of the same identity — never inherits GUCs, temp tables,
 //! prepared statements, or advisory locks. On checkout the connection is
 //! liveness-probed so a peer that closed the socket while idle is dropped

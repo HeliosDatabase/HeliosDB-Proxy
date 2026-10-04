@@ -939,7 +939,7 @@ impl TransactionJournal {
     /// Behaviourally identical to `begin_transaction` followed by
     /// `log_statement` (same eviction, same limit checks with the same error
     /// text, same sequence numbering), but takes the global journal lock once
-    /// instead of twice. Used by the auto-commit data path in `server.rs`,
+    /// instead of twice. Used by the auto-commit data path in `server/journal_hooks.rs`,
     /// which records every write as its own single-statement transaction;
     /// explicit multi-statement transactions keep using `begin_transaction` +
     /// `log_statement`.

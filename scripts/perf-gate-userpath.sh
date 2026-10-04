@@ -2,7 +2,7 @@
 # P-01 user-path performance gate: base proxy binary vs candidate, interleaved
 # passes of the live-backend harness, gated on committed-write TPS/p99 vs a
 # budget. This is the MANDATORY gate (CLAUDE.md gate 3, CONTRIBUTING.md
-# "Releasing") for changes that touch src/server.rs relay paths,
+# "Releasing") for changes that touch the src/server/ relay paths,
 # src/journal_capture.rs, src/transaction_journal.rs, or src/pool/, and for
 # every release. Criterion (scripts/bench-gate.sh) stays the gate for
 # microbenchmarks; it runs one task per lock and cannot see the scheduler

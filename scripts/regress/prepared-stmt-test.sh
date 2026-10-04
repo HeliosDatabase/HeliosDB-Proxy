@@ -8,7 +8,7 @@
 # bookkeeping corrupted the wire stream, these exchanges would desync and fail.
 #
 # (The transparent re-prepare-after-switch path itself is unit-tested in
-# server.rs against an in-memory duplex; a live trigger needs a mid-session
+# server/tests/mod.rs against an in-memory duplex; a live trigger needs a mid-session
 # backend failover, which this stock single-node harness does not stage.)
 set -u
 BIN="${1:-./target/release/heliosdb-proxy}"

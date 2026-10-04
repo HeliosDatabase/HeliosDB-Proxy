@@ -12,7 +12,7 @@ and this document keeps them separate because they behave differently:
    also usable programmatically/embedded.
 
 Every concrete claim below is grounded in `src/primary_tracker.rs`,
-`src/admin.rs` (`compute_topology`, `TopologyResponse`), `src/server.rs`
+`src/admin.rs` (`compute_topology`, `TopologyResponse`), `src/server/routing.rs`
 (`build_primary_tracker`, `select_primary_until`) and the node/config types in
 `src/config.rs`.
 
@@ -30,7 +30,7 @@ provider authoritative instead — see Layer 2.
 
 ### Determining the current primary
 
-The write path (`select_primary_with_timeout` in `src/server.rs`) looks for
+The write path (`select_primary_with_timeout` in `src/server/routing.rs`) looks for
 `n.role == NodeRole::Primary && n.enabled` and a passing health entry. If that node is
 healthy, writes go to it. If it is not, the proxy buffers the write, polling health every
 100 ms for up to `write_timeout_secs` (default 30) for a healthy primary to appear; on
