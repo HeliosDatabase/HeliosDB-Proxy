@@ -59,7 +59,8 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
    task per lock and cannot see scheduler convoys under concurrent write load — on
    2026-09-21 it passed a TR-07 candidate at +2.97% while the live-backend user-path harness
    showed -40% committed TPS at 16 clients (async-lock convoy, fixed in 8f412dc). For any
-   change touching `src/server.rs` relay paths, `src/journal_capture.rs`,
+   change touching the `src/server/` relay paths (`relay.rs`, `client.rs`,
+   `journal_hooks.rs`, `backend_conn.rs`), `src/journal_capture.rs`,
    `src/transaction_journal.rs`, or `src/pool/`, and before every release, run
    `scripts/perf-gate-userpath.sh <base-binary> <candidate-binary> <label>`. It wraps
    `scripts/regress/bench-usertp.sh` for 3 interleaved base/candidate passes

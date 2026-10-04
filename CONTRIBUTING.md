@@ -171,7 +171,8 @@ new feature module:
 ## Releasing
 
 Before tagging any release, or before merging a change that touches
-`src/server.rs` relay paths, `src/journal_capture.rs`,
+the `src/server/` relay paths (`relay.rs`, `client.rs`, `journal_hooks.rs`,
+`backend_conn.rs`), `src/journal_capture.rs`,
 `src/transaction_journal.rs`, or `src/pool/`, run the P-01 user-path gate:
 
 ```bash
@@ -204,7 +205,8 @@ src/
     main.rs              # Binary entry point
     lib.rs               # Library root (feature gates)
     config.rs            # Global configuration
-    server.rs            # Proxy server (wire protocol)
+    server/              # Proxy server (wire protocol): mod.rs (lifecycle, state),
+                         #   client, auth, relay, backend_conn, routing, tr, journal_hooks, ...
     protocol.rs          # PostgreSQL protocol codec
     admin.rs             # Admin REST API
     connection_pool.rs   # Core connection pool

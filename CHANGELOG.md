@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Development
 
+- Split the proxy server into focused modules under `src/server/`, with unit tests
+  grouped by area under `src/server/tests/`. Public `crate::server::` paths and
+  runtime behavior are unchanged. Updated contributor and architecture references
+  to the new module locations.
+
 - `scripts/bench-gate.sh` fails closed and records attribution evidence. The
   comparison moves to `scripts/bench-gate-compare.py`. A run is now INVALID (exit 2),
   never a PASS, if:

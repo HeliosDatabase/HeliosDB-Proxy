@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-HeliosProxy is a Rust 2021 crate (`heliosdb-proxy`) with MSRV 1.86. Core source lives in `src/`: `main.rs` is the binary entry point, `lib.rs` exposes feature-gated modules, and shared systems such as `config.rs`, `server.rs`, `protocol.rs`, `connection_pool.rs`, and `health_checker.rs` support the proxy runtime. Feature modules are organized by domain, for example `src/routing/`, `src/cache/`, `src/pool/`, `src/graphql/`, `src/schema_routing/`, and `src/distribcache/`. Integration and end-to-end tests live under `tests/`; Criterion benchmarks are in `benches/`. User-facing examples, Docker scenarios, demos, and deployment notes are under `examples/`, `docker/`, `demos/`, `docs/`, `operator/`, and `terraform/`.
+HeliosProxy is a Rust 2021 crate (`heliosdb-proxy`) with MSRV 1.86. Core source lives in `src/`: `main.rs` is the binary entry point, `lib.rs` exposes feature-gated modules, and shared systems such as `config.rs`, `server/`, `protocol.rs`, `connection_pool.rs`, and `health_checker.rs` support the proxy runtime. Feature modules are organized by domain, for example `src/routing/`, `src/cache/`, `src/pool/`, `src/graphql/`, `src/schema_routing/`, and `src/distribcache/`. Integration and end-to-end tests live under `tests/`; Criterion benchmarks are in `benches/`. User-facing examples, Docker scenarios, demos, and deployment notes are under `examples/`, `docker/`, `demos/`, `docs/`, `operator/`, and `terraform/`.
 
 ## Build, Test, and Development Commands
 
