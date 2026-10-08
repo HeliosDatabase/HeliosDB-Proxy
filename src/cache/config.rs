@@ -201,7 +201,7 @@ pub enum StorageBackend {
     /// In-process memory (lost on restart)
     #[default]
     Memory,
-    /// Memory-mapped file (survives restarts)
+    /// File-backed spill storage (index is process-local; no restart recovery)
     Mmap,
 }
 

@@ -289,6 +289,10 @@ harness = false
 name = "protocol"
 harness = false
 
+[[bench]]
+name = "cache"
+harness = false
+
 # Relay / failover / pool-contention in-process paths. No `required-features`:
 # the pool-modes work is `#[cfg]`-gated inside the bench (with no-op fallbacks),
 # so it compiles under every feature set. The TR journal benches always compile

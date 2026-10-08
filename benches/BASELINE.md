@@ -17,6 +17,47 @@ stay under 3%.
   candidate's CI does not overlap the baseline CI (Criterion's own change report says
   "regressed" / "improved" / "within noise").
 
+## 2026-10-07 — L2 cache baseline (2 new cases) and the L2 file-cache TTL gate
+
+L2 file-cache TTL repair (sprinter `21cc434afb5c`). Host **gpc001ca**, rustc **1.99.0**,
+`--features all-features`, governor `performance`, one fleet-lock acquisition, 24 GiB/no-swap
+scope. Base: `82d044c` with the candidate's `benches/cache.rs` and the same gate scripts, so
+both arms run the same 120 cases. Gate: `scripts/bench-gate.sh`, whole-arm mode, 3 rounds
+AB/BA/AB, thresholds unchanged. Evidence:
+`/home/gpc/HDB/sprint/baselines/proxy/l2-ttl-20261004/criterion-r3layout-full-r7-output/`;
+acceptance rules were written and hashed before launch (`R7-FULL-GATE-PLAN-20261007.md`).
+
+New `benches/cache.rs` target (ns, median of the three per-round medians). The two cases sit
+in their own executable, so the four existing bench executables stay byte-identical between
+arms:
+
+| Benchmark | Base ns | Candidate ns | Delta | Separated |
+|---|---:|---:|---:|---|
+| `cache/l2/memory_hit_1k` | 316.2 | 307.5 | -2.77% | no |
+| `cache/l2/mmap_read_promote_1k` | 6051.5 | 6054.9 | +0.06% | no |
+
+`memory_hit_1k` is a control: the repair does not touch the memory path.
+`mmap_read_promote_1k` reads, decodes and promotes a 1 KiB entry from a warm spill file on
+every iteration.
+
+**Gate verdict: FAIL, retained.** Mean **+0.629%**, median +0.001%. There are 13 separated
+regressions and 12 separated improvements, all on the four executables whose SHA256 is
+identical in both arms (`pooling`, `protocol`, `relay`, `routing`; 118 of 120 cases are
+A/A). The largest are `pool_mode_manager_acquire_release/2` +18.5% and
+`pool_mode_txn_event_detect/start_txn` +13.9%. Identical machine code cannot differ in
+behaviour, so all 13 are attributed to host measurement and layout variation. The only
+code-changed executable is `cache`, and neither of its cases separated.
+
+Two earlier full runs of the same candidate also failed on unchanged code. In those runs the
+cache cases were linked into the `protocol` executable:
+- Run 1: mean −0.867%, 5 separated.
+- Run 2, fixed CPUs: mean +0.871%, 7 separated.
+- Their flagged sets are disjoint from each other and mostly from this run.
+
+Watch list: `protocol_backend_response/command_complete` was +5.1%, +6.0% and +11.1% across
+the three runs. This run's measurement is on a byte-identical executable, so the rise is not
+caused by this change. If it recurs again, investigate it on the product binary.
+
 ## 2026-10-01 — SQL-injection scanner baseline (11 new cases) and the deployment-issues gate
 
 Deployment issues #2/#3/#4/#9 (anomaly false positive on `BEGIN; INSERT; COMMIT;`, journal
