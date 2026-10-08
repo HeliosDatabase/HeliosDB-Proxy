@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::RwLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -21,7 +21,8 @@ use super::result::{CacheKey, CachedResult, L2Entry};
 /// This cache stores normalized query results shared across all connections.
 /// It supports two storage backends:
 /// - Memory: Fast, volatile storage
-/// - Mmap: Memory-mapped file that survives restarts
+/// - Mmap: File-backed spill storage with a process-local index. Entries
+///   are not recovered after restart.
 #[derive(Debug)]
 pub struct L2WarmCache {
     /// Cache configuration
@@ -43,7 +44,8 @@ pub struct L2WarmCache {
     evicting: std::sync::atomic::AtomicBool,
 }
 
-/// Memory-mapped storage for persistent caching
+/// File-backed spill storage. The index, including monotonic entry timing,
+/// lives only in this process; the first write creates/truncates the file.
 #[derive(Debug)]
 struct MmapStorage {
     /// File path
@@ -68,8 +70,11 @@ struct MmapEntry {
     /// Size of the entry
     size: usize,
 
-    /// TTL expiration timestamp (seconds since epoch)
-    expires_at: u64,
+    /// Original cache insertion time, preserved through every demotion.
+    cached_at: Instant,
+
+    /// Original full-precision TTL; neither a disk read nor promotion renews it.
+    ttl: Duration,
 }
 
 impl L2WarmCache {
@@ -381,7 +386,9 @@ impl L2WarmCache {
         Ok(count)
     }
 
-    /// Load entries from mmap on startup
+    /// Report entries in the current process's file index.
+    ///
+    /// This does not recover an index or cached entries from a previous process.
     pub fn load_from_disk(&self) -> Result<usize, std::io::Error> {
         let Some(ref mmap) = self.mmap_storage else {
             return Ok(0);
@@ -408,13 +415,9 @@ impl MmapStorage {
     fn get(&self, hash: u64) -> Option<CachedResult> {
         let entry = self.index.get(&hash)?;
 
-        // Check expiration
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_secs();
-
-        if now > entry.expires_at {
+        // Preserve the original monotonic lifetime, including time spent in
+        // memory before demotion. Wall-clock adjustments cannot renew it.
+        if mmap_expired_at(entry.cached_at, entry.ttl, Instant::now()) {
             return None;
         }
 
@@ -427,8 +430,8 @@ impl MmapStorage {
             .ok()?;
         file.read_exact(&mut buffer).ok()?;
 
-        // Deserialize (simple format: ttl_secs:row_count:data)
-        deserialize_result(&buffer)
+        // Decoding checks expiry again: disk I/O may cross the deadline.
+        deserialize_result(&buffer, entry.cached_at, entry.ttl)
     }
 
     fn put(&mut self, hash: u64, result: &CachedResult) {
@@ -460,17 +463,13 @@ impl MmapStorage {
 
         let offset = self.file_size;
         if file.write_all(&data).is_ok() {
-            let expires_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() + result.ttl.as_secs())
-                .unwrap_or(0);
-
             self.index.insert(
                 hash,
                 MmapEntry {
                     offset,
                     size: data.len(),
-                    expires_at,
+                    cached_at: result.cached_at,
+                    ttl: result.ttl,
                 },
             );
             self.file_size += data.len();
@@ -508,7 +507,8 @@ impl MmapStorage {
 fn serialize_result(result: &CachedResult) -> Vec<u8> {
     let mut buffer = Vec::new();
 
-    // Write TTL (8 bytes)
+    // Keep the existing seconds field in the blob. The process-local index
+    // carries the authoritative original age and full-precision TTL.
     buffer.extend_from_slice(&result.ttl.as_secs().to_le_bytes());
 
     // Write row count (8 bytes)
@@ -531,13 +531,16 @@ fn serialize_result(result: &CachedResult) -> Vec<u8> {
     buffer
 }
 
-/// Deserialize a cached result from mmap storage
-fn deserialize_result(buffer: &[u8]) -> Option<CachedResult> {
+/// Deserialize with the original timing from the process-local file index.
+fn deserialize_result(buffer: &[u8], cached_at: Instant, ttl: Duration) -> Option<CachedResult> {
     if buffer.len() < 24 {
         return None;
     }
 
     let ttl_secs = u64::from_le_bytes(buffer[0..8].try_into().ok()?);
+    if ttl_secs != ttl.as_secs() {
+        return None;
+    }
     let row_count = u64::from_le_bytes(buffer[8..16].try_into().ok()?) as usize;
     let data_len = u64::from_le_bytes(buffer[16..24].try_into().ok()?) as usize;
 
@@ -566,15 +569,28 @@ fn deserialize_result(buffer: &[u8]) -> Option<CachedResult> {
         tables.push(String::from_utf8(take(len)?.to_vec()).ok()?);
     }
 
+    if mmap_expired_at(cached_at, ttl, Instant::now()) {
+        return None;
+    }
+
     Some(CachedResult {
         data,
         row_count,
-        cached_at: Instant::now(),
-        ttl: std::time::Duration::from_secs(ttl_secs),
+        cached_at,
+        ttl,
         tables,
         execution_time: std::time::Duration::from_millis(0),
         generation,
     })
+}
+
+/// An exhausted lifetime (including zero TTL) or invalid future insertion time
+/// is a miss. Comparing elapsed time avoids overflow for very large TTLs.
+fn mmap_expired_at(cached_at: Instant, ttl: Duration, now: Instant) -> bool {
+    match now.checked_duration_since(cached_at) {
+        Some(age) => age >= ttl,
+        None => true,
+    }
 }
 
 /// L2 cache statistics
@@ -613,6 +629,191 @@ mod tests {
 
     fn create_key(query_hash: u64) -> CacheKey {
         CacheKey::from_parts(query_hash, "test".to_string(), None, None)
+    }
+
+    #[test]
+    fn mmap_ttl_read_keeps_original_age_and_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = MmapStorage::new(dir.path().join("cache"));
+        let mut result = create_result("aged rows");
+        result.cached_at = Instant::now() - Duration::from_secs(45);
+        let deadline = result.cached_at + result.ttl;
+        storage.put(1, &result);
+
+        for _ in 0..3 {
+            let loaded = storage.get(1).unwrap();
+            assert_eq!(loaded.cached_at, result.cached_at);
+            assert_eq!(loaded.cached_at + loaded.ttl, deadline);
+            // Repeated demotion must not renew the entry's lifetime either.
+            storage.put(1, &loaded);
+        }
+    }
+
+    #[test]
+    fn mmap_ttl_read_preserves_subsecond_precision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = MmapStorage::new(dir.path().join("cache"));
+        let mut result = create_result("fractional ttl");
+        result.ttl = Duration::new(60, 123_456_789);
+        storage.put(1, &result);
+        assert_eq!(storage.get(1).unwrap().ttl, result.ttl);
+    }
+
+    #[test]
+    fn mmap_ttl_expired_result_is_not_revived_on_demotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = MmapStorage::new(dir.path().join("cache"));
+        let mut result = create_result("expired rows");
+        result.cached_at = Instant::now() - Duration::from_secs(120);
+        assert!(result.is_expired());
+        storage.put(1, &result);
+        assert!(storage.get(1).is_none());
+    }
+
+    #[tokio::test]
+    async fn mmap_ttl_promotion_keeps_age_and_l1_cap() {
+        use crate::cache::{config::L1Config, l1_hot::L1HotCache};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = L2WarmCache::new(L2Config {
+            storage: StorageBackend::Mmap,
+            mmap_path: Some(dir.path().join("cache")),
+            ..L2Config::default()
+        });
+        let key = create_key(1);
+        let mut result = create_result("aged rows");
+        result.cached_at = Instant::now() - Duration::from_secs(45);
+        cache.put(key.clone(), result.clone()).await;
+        assert_eq!(cache.flush_to_disk().unwrap(), 1);
+        cache.shed(&[key.hash_value()]);
+        assert!(cache.is_empty());
+
+        let promoted = cache.get(&key).await.unwrap();
+        let l1 = L1HotCache::new(L1Config {
+            ttl: Duration::from_secs(30),
+            ..L1Config::default()
+        });
+        l1.put("SELECT 1".to_string(), promoted);
+        assert!(l1.get("SELECT 1").is_none(), "L1 must cap the original age");
+        let in_memory = cache.get(&key).await.unwrap();
+        assert_eq!(in_memory.cached_at, result.cached_at);
+        assert_eq!(in_memory.ttl, result.ttl);
+    }
+
+    #[tokio::test]
+    async fn mmap_ttl_memory_storage_control_keeps_age() {
+        let cache = L2WarmCache::new(L2Config::default());
+        let key = create_key(1);
+        let mut result = create_result("memory control");
+        result.cached_at = Instant::now() - Duration::from_secs(45);
+        cache.put(key.clone(), result.clone()).await;
+        assert_eq!(cache.get(&key).await.unwrap().cached_at, result.cached_at);
+    }
+
+    #[test]
+    fn mmap_ttl_exact_expiry_boundary_and_future_time() {
+        let start = Instant::now();
+        let ttl = Duration::from_nanos(950);
+        assert!(!mmap_expired_at(
+            start,
+            ttl,
+            start + ttl - Duration::from_nanos(1)
+        ));
+        assert!(mmap_expired_at(start, ttl, start + ttl));
+        assert!(mmap_expired_at(
+            start,
+            ttl,
+            start + ttl + Duration::from_nanos(1)
+        ));
+        assert!(mmap_expired_at(start, Duration::ZERO, start));
+        assert!(mmap_expired_at(start, ttl, start - Duration::from_nanos(1)));
+        assert!(!mmap_expired_at(start, Duration::MAX, start + ttl));
+    }
+
+    #[test]
+    fn mmap_ttl_decode_rechecks_expiry_after_io() {
+        let result = create_result("valid payload");
+        let bytes = serialize_result(&result);
+        // The same valid payload is usable before its deadline, but a read
+        // completing after that deadline cannot revive it during decoding.
+        assert!(deserialize_result(&bytes, result.cached_at, result.ttl).is_some());
+        assert!(deserialize_result(
+            &bytes,
+            Instant::now() - Duration::from_secs(120),
+            result.ttl,
+        )
+        .is_none());
+        assert!(deserialize_result(
+            &bytes,
+            Instant::now() + Duration::from_secs(120),
+            result.ttl,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn mmap_ttl_decode_rejects_mismatched_index_timing() {
+        let result = create_result("valid payload");
+        let mut bytes = serialize_result(&result);
+        bytes[..8].copy_from_slice(&(result.ttl.as_secs() + 1).to_le_bytes());
+        assert!(deserialize_result(&bytes, result.cached_at, result.ttl).is_none());
+    }
+
+    #[test]
+    fn mmap_ttl_less_than_one_second_is_not_truncated_to_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = MmapStorage::new(dir.path().join("cache"));
+        let mut result = create_result("subsecond rows");
+        result.ttl = Duration::from_millis(950);
+        storage.put(1, &result);
+        let loaded = storage.get(1).unwrap();
+        assert_eq!(loaded.ttl, result.ttl);
+        assert_eq!(loaded.cached_at, result.cached_at);
+        assert!(!loaded.is_expired());
+    }
+
+    #[test]
+    fn mmap_ttl_zero_future_and_huge_lifetimes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = MmapStorage::new(dir.path().join("cache"));
+        let mut result = create_result("rows");
+        result.ttl = Duration::ZERO;
+        storage.put(1, &result);
+        assert!(storage.get(1).is_none());
+
+        result.ttl = Duration::MAX;
+        storage.put(1, &result);
+        assert_eq!(storage.get(1).unwrap().ttl, Duration::MAX);
+
+        result.cached_at = Instant::now() + Duration::from_secs(60);
+        storage.put(1, &result);
+        assert!(storage.get(1).is_none());
+    }
+
+    #[tokio::test]
+    async fn mmap_ttl_expired_memory_then_disk_remain_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = L2WarmCache::new(L2Config {
+            storage: StorageBackend::Mmap,
+            mmap_path: Some(dir.path().join("cache")),
+            ..L2Config::default()
+        });
+        let key = create_key(1);
+        let mut result = create_result("expired rows");
+        result.cached_at = Instant::now() - Duration::from_secs(120);
+        // Model an entry whose memory and disk copies have both aged out.
+        cache
+            .mmap_storage
+            .as_ref()
+            .unwrap()
+            .write()
+            .unwrap()
+            .put(key.hash_value(), &result);
+        cache.put(key.clone(), result).await;
+        assert!(cache.get(&key).await.is_none()); // Removes expired memory.
+        assert!(cache.is_empty());
+        assert!(cache.get(&key).await.is_none()); // Disk cannot resurrect it.
+        assert!(cache.is_empty());
     }
 
     #[tokio::test]
@@ -851,21 +1052,22 @@ mod tests {
         let mut result = create_result("rows");
         result.tables = vec!["accounts".to_string(), "users".to_string()];
         result.generation = 42;
-        let back = deserialize_result(&serialize_result(&result)).unwrap();
+        let back =
+            deserialize_result(&serialize_result(&result), result.cached_at, result.ttl).unwrap();
         assert_eq!(back.tables, result.tables);
         assert_eq!(back.generation, 42);
         assert_eq!(back.data, result.data);
         // A blob cut before its generation/tables trailer is not served.
         let mut short = serialize_result(&result);
         short.truncate(short.len() - 3);
-        assert!(deserialize_result(&short).is_none());
+        assert!(deserialize_result(&short, result.cached_at, result.ttl).is_none());
     }
 
     #[test]
     fn test_serialize_deserialize() {
         let result = create_result("test data for serialization");
         let serialized = serialize_result(&result);
-        let deserialized = deserialize_result(&serialized).unwrap();
+        let deserialized = deserialize_result(&serialized, result.cached_at, result.ttl).unwrap();
 
         assert_eq!(deserialized.data, result.data);
         assert_eq!(deserialized.row_count, result.row_count);

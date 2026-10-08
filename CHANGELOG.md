@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- File-backed L2 query-cache entries retain their original age and precise TTL
+  across demotion, disk reads and L1 promotion. Expired entries are no longer
+  revived by these transitions; wall-clock changes do not extend their lifetime.
+  The file index remains process-local, with no cache recovery after restart.
+
 ### Development
 
 - Split the proxy server into focused modules under `src/server/`, with unit tests

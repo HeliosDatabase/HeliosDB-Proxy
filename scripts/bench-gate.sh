@@ -34,7 +34,7 @@
 # Env:
 #   ROUNDS=3               interleaved rounds per tree
 #   FEATURES=all-features  cargo feature set
-#   BENCHES="pooling routing protocol relay"   bench targets (Criterion, harness=false)
+#   BENCHES="pooling routing protocol relay cache"   bench targets (Criterion, harness=false)
 #   FILTER=""              optional Criterion filter regex (subset run; also
 #                          restricts the declared case set)
 #   BUDGET_PCT=3 SEP_PCT=2 gate thresholds (percent)
@@ -56,7 +56,7 @@ CAND="${2:?usage: bench-gate.sh <baseline-tree> <candidate-tree> <label>}"
 LABEL="${3:?usage: bench-gate.sh <baseline-tree> <candidate-tree> <label>}"
 ROUNDS="${ROUNDS:-3}"
 FEATURES="${FEATURES:-all-features}"
-BENCHES="${BENCHES:-pooling routing protocol relay}"
+BENCHES="${BENCHES:-pooling routing protocol relay cache}"
 FILTER="${FILTER:-}"
 BUDGET_PCT="${BUDGET_PCT:-3}"
 SEP_PCT="${SEP_PCT:-2}"
