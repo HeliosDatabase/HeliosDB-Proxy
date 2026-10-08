@@ -59,14 +59,15 @@ def finite_positive(x):
 
 def read_cases(path):
     cases = {}
-    for line in open(path):
-        line = line.rstrip("\n")
-        if not line:
-            continue
-        target, full_id = line.split("\t", 1)
-        if full_id in cases:
-            raise SystemExit(f"duplicate case {full_id!r} in {path}")
-        cases[full_id] = target
+    with open(path) as source:
+        for line in source:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            target, full_id = line.split("\t", 1)
+            if full_id in cases:
+                raise SystemExit(f"duplicate case {full_id!r} in {path}")
+            cases[full_id] = target
     return cases
 
 
