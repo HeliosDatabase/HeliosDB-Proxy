@@ -35,6 +35,9 @@
 #   ROUNDS=3               interleaved rounds per tree
 #   FEATURES=all-features  cargo feature set
 #   BENCHES="pooling routing protocol relay cache"   bench targets (Criterion, harness=false)
+#   PAIR_CASES=0          set1 to run adjacent A/B per fullID; requires equal inventories,
+#                         uses fresh processes per case and records an invocation ledger
+#   PAIR_TIMEOUT_SECS=300  per-case deadline; Criterion timing remains unchanged
 #   FILTER=""              optional Criterion filter regex (subset run; also
 #                          restricts the declared case set)
 #   BUDGET_PCT=3 SEP_PCT=2 gate thresholds (percent)
@@ -58,6 +61,7 @@ ROUNDS="${ROUNDS:-3}"
 FEATURES="${FEATURES:-all-features}"
 BENCHES="${BENCHES:-pooling routing protocol relay cache}"
 FILTER="${FILTER:-}"
+PAIR_CASES="${PAIR_CASES:-0}"
 BUDGET_PCT="${BUDGET_PCT:-3}"
 SEP_PCT="${SEP_PCT:-2}"
 OUT="${OUT:-/home/gpc/HDB/sprint/baselines/proxy/$LABEL}"
@@ -70,6 +74,7 @@ die() { echo "bench-gate: $*" >&2; exit 2; }
 BASE="$(cd "$BASE" && pwd)"; CAND="$(cd "$CAND" && pwd)"
 [ "$BASE" != "$CAND" ] || die "baseline and candidate must be different trees"
 [[ "$ROUNDS" =~ ^[1-9][0-9]*$ ]] || die "ROUNDS must be a positive integer"
+[[ "$PAIR_CASES" = 0 || "$PAIR_CASES" = 1 ]] || die "PAIR_CASES must be 0 or 1"
 [[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]] || die "LABEL may only contain letters, digits, '.', '_' and '-'"
 python3 -c "import sys; [float(x) for x in sys.argv[1:]]" "$BUDGET_PCT" "$SEP_PCT" 2>/dev/null \
   || die "BUDGET_PCT and SEP_PCT must be numbers"
@@ -101,7 +106,7 @@ stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 say() { echo "[$(stamp)] $*" | tee -a "$LOG"; }
 
 {
-  echo "bench-gate label=$LABEL rounds=$ROUNDS features=$FEATURES benches=$BENCHES filter='${FILTER}'"
+  echo "bench-gate label=$LABEL rounds=$ROUNDS features=$FEATURES benches=$BENCHES pair_cases=$PAIR_CASES filter='${FILTER}'"
   echo "baseline:  $BASE @ $(git -C "$BASE" rev-parse --short HEAD) $(git -C "$BASE" status --porcelain | wc -l) dirty"
   echo "candidate: $CAND @ $(git -C "$CAND" rev-parse --short HEAD) $(git -C "$CAND" status --porcelain | wc -l) dirty"
   echo "rustflags: ${RUSTFLAGS:-<none>}"
@@ -159,13 +164,22 @@ run_tree() { # $1=tree $2=round $3=name(base|cand)
 }
 
 START=$(date +%s)
-for r in $(seq 1 "$ROUNDS"); do
-  if [ $((r % 2)) = 1 ]; then
-    run_tree "$BASE" "$r" base; run_tree "$CAND" "$r" cand
-  else
-    run_tree "$CAND" "$r" cand; run_tree "$BASE" "$r" base
-  fi
-done
+if [ "$PAIR_CASES" = 1 ]; then
+  # FILTER has already selected both declared inventories. The helper rejects
+  # differing target/full-ID mappings and verifies one fresh raw case per run.
+  say "adjacent case pairs (fresh process per case; AB/BA/AB round order)"
+  heavy python3 "$HERE/bench-gate-paired.py" --base "$BASE" --cand "$CAND" \
+    --out "$OUT" --label "$LABEL" --rounds "$ROUNDS" --timeout "${PAIR_TIMEOUT_SECS:-300}" >> "$LOG" 2>&1 \
+    || die "paired execution failed (see invocation ledger and bench-gate.log)"
+else
+  for r in $(seq 1 "$ROUNDS"); do
+    if [ $((r % 2)) = 1 ]; then
+      run_tree "$BASE" "$r" base; run_tree "$CAND" "$r" cand
+    else
+      run_tree "$CAND" "$r" cand; run_tree "$BASE" "$r" base
+    fi
+  done
+fi
 
 say "verify executables + collect + compare"
 exe_problem=""
@@ -174,10 +188,26 @@ for arm in base cand; do
   while read -r b sha path; do
     [ "$(sha256sum "$path" | cut -d' ' -f1)" = "$sha" ] || exe_problem+="$arm/$b executable changed during the run; "
   done < "$OUT/executables-$arm.txt"
+  if [ "$PAIR_CASES" = 1 ]; then
+    # Direct execution is bound through /proc and the invocation ledger, not
+    # fabricated Cargo output. Zero-case targets are still hashed above.
+    if ! python3 - "$OUT" "$arm" <<'VERIFY'
+import json, pathlib, sys
+out, arm = pathlib.Path(sys.argv[1]), sys.argv[2]
+targets = {line.split("\t", 1)[0] for line in (out / f"cases-{arm}.tsv").read_text().splitlines() if line}
+expected = {line.split(" ", 2)[2] for line in (out / f"executables-{arm}.txt").read_text().splitlines() if line.split(" ", 1)[0] in targets}
+records = [json.loads(line) for line in (out / "paired-invocations.jsonl").read_text().splitlines()]
+ran = {r["executable"] for r in records if r["arm"] == arm and r["event"] == "complete"}
+if ran != expected:
+    raise SystemExit("paired executable set differs from selected case inventory")
+VERIFY
+    then exe_problem+="$arm paired executable ledger mismatch; "; fi
+  else
   ran=$(cat "$OUT/$arm"-r*.log | sed -n 's|^ *Running benches/[^ ]* (\(.*\))$|\1|p' \
         | while read -r p; do case $p in /*) echo "$p" ;; *) echo "$tree/$p" ;; esac; done | sort -u)
   built=$(cut -d' ' -f3- "$OUT/executables-$arm.txt" | sort -u)
   [ "$ran" = "$built" ] || exe_problem+="$arm rounds ran executables other than the ones built; "
+  fi
 done
 
 INVALID_ARGS=(); [ -z "$exe_problem" ] || INVALID_ARGS=(--invalid "$exe_problem")
