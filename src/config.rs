@@ -243,6 +243,10 @@ pub struct ProxyConfig {
     /// destination without editing `proxy.toml`.
     #[serde(default)]
     pub topology: TopologyConfig,
+    /// Opt-in automatic standby promotion (see [`AutoPromoteConfig`]). Off by
+    /// default; requires `[topology] provider = "postgres"`.
+    #[serde(default)]
+    pub auto_promote: AutoPromoteConfig,
     /// Plugin system configuration. Only consumed when the `wasm-plugins`
     /// feature is enabled; on a feature-off build, values are parsed and
     /// ignored so existing configs don't break.
@@ -913,6 +917,175 @@ impl Default for TopologyConfig {
             patroni_endpoints: Vec::new(),
             patroni_request_timeout_ms: default_patroni_request_timeout_ms(),
         }
+    }
+}
+
+/// How `[auto_promote]` promotes the chosen standby.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromoteMethod {
+    /// `SELECT pg_promote(true, N)` on the standby (PostgreSQL 12+).
+    #[default]
+    PgPromote,
+    /// Run `promote_command` (argv, no shell) with the target in the
+    /// environment. For backends with their own promote tooling (Nano, ...).
+    Command,
+    /// `POST promote_url` with a JSON body naming the target.
+    Http,
+}
+
+/// `[auto_promote]` — opt-in automatic standby promotion.
+///
+/// Off by default. The proxy never promotes unless `enabled = true`, and then
+/// only when ALL of these hold: the authoritative topology has had no primary
+/// for `down_after_secs`; no configured node answers as a writable primary on
+/// a direct probe; the most advanced standby (by replay LSN) has a known lag
+/// within `max_lag_bytes`; and `fence_command`, when set, exits 0.
+///
+/// SINGLE-PROXY ONLY: two proxies with this enabled over one cluster can
+/// promote different standbys (split-brain). Enable it on exactly one proxy,
+/// or keep using an external HA manager (Patroni) with `[topology]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoPromoteConfig {
+    /// Master switch. Default `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Primary must be continuously absent this long before acting.
+    #[serde(default = "default_auto_promote_down_after_secs")]
+    pub down_after_secs: u64,
+    /// Seconds between decision-loop evaluations. Must be >= 1.
+    #[serde(default = "default_auto_promote_check_interval_secs")]
+    pub check_interval_secs: u64,
+    /// Maximum acceptable standby lag (bytes, last health sample).
+    #[serde(default = "default_auto_promote_max_lag_bytes")]
+    pub max_lag_bytes: u64,
+    /// Promote even when no lag sample exists (needs no `[health] user`).
+    /// Default `false`: unknown lag refuses promotion.
+    #[serde(default)]
+    pub allow_unknown_lag: bool,
+    /// Minimum seconds between two promotions.
+    #[serde(default = "default_auto_promote_cooldown_secs")]
+    pub cooldown_secs: u64,
+    /// Failed promotion attempts before the promoter stops for this outage.
+    #[serde(default = "default_auto_promote_max_attempts")]
+    pub max_attempts: u32,
+    /// Bound on the promote step (and the post-promote verification).
+    #[serde(default = "default_auto_promote_promote_timeout_secs")]
+    pub promote_timeout_secs: u64,
+    /// Promotion mechanism. Default `pg_promote`.
+    #[serde(default)]
+    pub method: PromoteMethod,
+    /// argv for `method = "command"`. Env: `HELIOS_PROMOTE_TARGET`
+    /// (`host:port`), `HELIOS_PROMOTE_OLD_PRIMARY` (may be empty).
+    #[serde(default)]
+    pub promote_command: Vec<String>,
+    /// URL for `method = "http"`; receives a JSON `{target, old_primary}` POST.
+    #[serde(default)]
+    pub promote_url: Option<String>,
+    /// Optional fence argv, run BEFORE promotion; a non-zero exit or timeout
+    /// aborts the attempt. Same environment as `promote_command`. Use it to
+    /// stop or isolate the old primary so it cannot take writes.
+    #[serde(default)]
+    pub fence_command: Vec<String>,
+    /// Bound on `fence_command`. Must be >= 1.
+    #[serde(default = "default_auto_promote_fence_timeout_secs")]
+    pub fence_timeout_secs: u64,
+}
+
+fn default_auto_promote_down_after_secs() -> u64 {
+    30
+}
+fn default_auto_promote_check_interval_secs() -> u64 {
+    5
+}
+fn default_auto_promote_max_lag_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+fn default_auto_promote_cooldown_secs() -> u64 {
+    300
+}
+fn default_auto_promote_max_attempts() -> u32 {
+    3
+}
+fn default_auto_promote_promote_timeout_secs() -> u64 {
+    60
+}
+fn default_auto_promote_fence_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for AutoPromoteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            down_after_secs: default_auto_promote_down_after_secs(),
+            check_interval_secs: default_auto_promote_check_interval_secs(),
+            max_lag_bytes: default_auto_promote_max_lag_bytes(),
+            allow_unknown_lag: false,
+            cooldown_secs: default_auto_promote_cooldown_secs(),
+            max_attempts: default_auto_promote_max_attempts(),
+            promote_timeout_secs: default_auto_promote_promote_timeout_secs(),
+            method: PromoteMethod::PgPromote,
+            promote_command: Vec::new(),
+            promote_url: None,
+            fence_command: Vec::new(),
+            fence_timeout_secs: default_auto_promote_fence_timeout_secs(),
+        }
+    }
+}
+
+impl AutoPromoteConfig {
+    /// Startup validation; only meaningful when `enabled`.
+    pub fn validate(&self, config: &ProxyConfig) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let bad = |m: &str| Err(ProxyError::Config(format!("auto_promote: {m}")));
+        if config.topology.provider != TopologyProviderKind::Postgres {
+            return bad(
+                "requires [topology] provider = \"postgres\" (the proxy must rediscover the \
+                 promoted node; with Patroni, let Patroni promote)",
+            );
+        }
+        if !config
+            .nodes
+            .iter()
+            .any(|n| n.enabled && n.role == NodeRole::Standby)
+        {
+            return bad("needs at least one enabled node with role = \"standby\"");
+        }
+        if self.down_after_secs == 0
+            || self.check_interval_secs == 0
+            || self.promote_timeout_secs == 0
+            || self.fence_timeout_secs == 0
+            || self.max_attempts == 0
+        {
+            return bad(
+                "down_after_secs, check_interval_secs, promote_timeout_secs, \
+                 fence_timeout_secs and max_attempts must be >= 1",
+            );
+        }
+        match self.method {
+            PromoteMethod::PgPromote => {}
+            PromoteMethod::Command => {
+                if self.promote_command.is_empty() || self.promote_command[0].trim().is_empty() {
+                    return bad("method = \"command\" requires a non-empty promote_command");
+                }
+            }
+            PromoteMethod::Http => {
+                let ok = self
+                    .promote_url
+                    .as_deref()
+                    .is_some_and(|u| u.starts_with("http://") || u.starts_with("https://"));
+                if !ok {
+                    return bad("method = \"http\" requires promote_url (http:// or https://)");
+                }
+            }
+        }
+        if !self.fence_command.is_empty() && self.fence_command[0].trim().is_empty() {
+            return bad("fence_command[0] must not be empty");
+        }
+        Ok(())
     }
 }
 
@@ -1689,6 +1862,7 @@ impl Default for ProxyConfig {
             tls: None,
             write_timeout_secs: default_write_timeout_secs(),
             topology: TopologyConfig::default(),
+            auto_promote: AutoPromoteConfig::default(),
             plugins: PluginToml::default(),
             hba: Vec::new(),
             auth: AuthConfig::default(),
@@ -2042,8 +2216,8 @@ impl ProxyConfig {
         // or make a read-only standby writable.
         if ignored.iter().any(|path| path == "ha") {
             return Err(ProxyError::Config(
-                "[ha] is not supported: HeliosProxy does not automatically promote databases. \
-                 Configure an external HA manager to fence/promote the database, then use \
+                "[ha] is not supported: HeliosProxy does not automatically promote databases unless the opt-in \
+                 [auto_promote] section (single proxy) is enabled. Otherwise configure an external HA manager to fence/promote, then use \
                  [topology] provider = \"postgres\" or \"patroni\" with the postgres-topology \
                  feature to track its primary. Static topology uses configured node roles."
                     .to_string(),
@@ -2141,6 +2315,7 @@ impl ProxyConfig {
                 "topology.lease_timeout_secs must be >= 1".to_string(),
             ));
         }
+        self.auto_promote.validate(self)?;
         // D-05 strict mode: a setting must not promise behavior the binary
         // cannot deliver.
         if self.strict_config {

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in automatic standby promotion, `[auto_promote]` (off by default, single-proxy).
+  After the topology has had no primary for `down_after_secs` and a direct probe finds
+  no writable node, the proxy promotes the standby with the highest replay LSN (lag
+  within `max_lag_bytes`) via `pg_promote()`, a `promote_command` or a `promote_url`,
+  after an optional `fence_command`. Requires `[topology] provider = "postgres"`.
+  Status at `GET /api/promotion`. The `[ha]` rejection message now points here.
+
 ### Fixed
 
 - File-backed L2 query-cache entries retain their original age and precise TTL

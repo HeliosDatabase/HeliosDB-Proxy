@@ -61,6 +61,7 @@
 pub mod admin;
 pub mod agent_contract;
 pub mod auth_scram;
+pub mod auto_promote;
 pub mod backend;
 pub mod batch;
 pub mod branch;

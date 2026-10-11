@@ -317,8 +317,9 @@ cargo build --release --features "all-features,heliosdb-topology"
 ## Topology Providers
 
 HeliosProxy supports pluggable topology discovery for automatic primary tracking.
-The daemon does not promote databases or fence failed primaries. A database HA manager
-must do that first; `[topology] provider = "postgres"` or `"patroni"` then tracks the
+By default the daemon does not promote databases or fence failed primaries. A database HA
+manager must do that first (or opt in to the single-proxy `[auto_promote]` described in
+[docs/configuration.md](docs/configuration.md)); `[topology] provider = "postgres"` or `"patroni"` then tracks the
 writable primary (requires `postgres-topology`). Static topology uses configured roles.
 `[ha] auto_failover` is unsupported and rejected at startup. See
 [deployment and promotion setup](docs/topology-providers.md).

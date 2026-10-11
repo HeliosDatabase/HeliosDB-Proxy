@@ -109,9 +109,10 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
   `auth_file`), `[[hba]]`, `[query_rewrite]` (+`[[query_rewrite.rules]]`), `[plugins]`,
   `[graphql_gateway]` (+`[[graphql_gateway.tables]]`), `[schema_routing]`, `[mcp]`,
   `[[agent_contracts]]`, `[http_gateway]`, `[mirror]`, `[edge]`, `[branch]`, `[topology]`,
-  `[journal]`.
-  `[ha]` is REJECTED at startup even without `strict_config` (the proxy never promotes a
-  database; an external HA manager must, and `[topology]` tracks it); an empty
+  `[journal]`, `[auto_promote]` (opt-in, off by default).
+  `[ha]` is REJECTED at startup even without `strict_config` (the proxy promotes only via the opt-in
+  `[auto_promote]` section, single-proxy; otherwise an external HA manager must, and
+  `[topology]` tracks it); an empty
   `admin_token` is a startup error.
   CAUTION: other keys `ProxyConfig` does not know, at any depth, are ignored by the parser;
   startup logs one warning per ignored key path, and `strict_config = true` makes them
@@ -137,7 +138,7 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
   `/metrics/prometheus`, `/version`, `/config`, `/topology`, `/nodes`, `/nodes/{addr}`,
   `/nodes/{addr}/enable|disable`, `/sessions`, `/pools`, `/plugins`, `/analytics`,
   `/anomalies`, `/branch`, `/api/sql`, `/api/chaos`, `/api/replay`, `/api/shadow`,
-  `/api/branch`, `/api/circuit`, `/api/analytics`,
+  `/api/branch`, `/api/circuit`, `/api/promotion`, `/api/analytics`,
   `/api/edge` (+`/register`, `/subscribe`, `/invalidate`),
   `/api/migration/{snapshot,cutover,cutover/rollback,status}`
 - **Web UI**: embedded admin dashboard at `GET /` and `/ui` on the admin port

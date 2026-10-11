@@ -249,7 +249,8 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 ## Failover & Chaos
 
 The proxy automatically routes to an eligible primary, but **does not promote a
-standby**. With static topology, eligibility requires a configured `primary` role
+standby** unless the opt-in `[auto_promote]` section is enabled (see
+`GET /api/promotion` below). With static topology, eligibility requires a configured `primary` role
 and a passing health check. With an authoritative topology provider, it requires
 the provider's current leader. Promotion and fencing belong to the database or
 external HA manager; see [topology providers](topology-providers.md). In-session
@@ -717,3 +718,13 @@ Note: `/metrics/prometheus` wraps the exposition text in a JSON `text` field, so
 - [Architecture](architecture.md)
 - [Configuration Reference](configuration.md)
 - [Deployment Guides](deployment/)
+
+---
+
+## Automatic promotion status
+
+`GET /api/promotion` reports the `[auto_promote]` loop: `enabled`, `state`
+(`idle`, `primary_absent`, `promoting`, `cooldown`, `gave_up`),
+`primary_absent_secs`, `attempts_this_outage`, `promotions_total`,
+`last_attempt_at`, `last_target`, `last_result`. With the feature off it
+returns `{"enabled": false, ...}`.
