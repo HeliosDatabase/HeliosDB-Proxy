@@ -1,14 +1,105 @@
 # HeliosProxy
 
-**High-performance connection router, intelligent query processor, and failover recovery for PostgreSQL-wire-compatible databases.**
+[![CI](https://github.com/HeliosDatabase/HeliosDB-Proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/HeliosDatabase/HeliosDB-Proxy/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/heliosdb-proxy.svg)](https://crates.io/crates/heliosdb-proxy)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/HeliosDatabase/HeliosDB-Proxy?style=social)](https://github.com/HeliosDatabase/HeliosDB-Proxy)
 
-HeliosProxy operates at the PostgreSQL wire protocol level, making it compatible with any database that speaks the PostgreSQL protocol — including PostgreSQL, HeliosDB, CockroachDB, YugabyteDB, and others.
+**One Rust binary in front of PostgreSQL: connection pooling (a PgBouncer-style pooler), read/write splitting and health checks (the routing half of what you use HAProxy for), and client sessions that survive a primary change through Transaction Replay.**
+
+HeliosProxy replaces HAProxy + PgBouncer in front of a Patroni-managed or RDS/Aurora cluster. It follows the primary that your HA manager promotes and keeps client sessions alive through supported failover behavior. It does **not** replace Patroni: it does not promote or fence databases by default (see [Status & guarantees](#status--guarantees)).
+
+It works at the PostgreSQL wire protocol level, so it fronts PostgreSQL, HeliosDB, CockroachDB, YugabyteDB, and other PG-wire databases without application changes.
+
+**[Quick start](#quick-start-60-seconds) · [Failover](#what-happens-on-failover) · [Comparison](#how-it-compares) · [Status & guarantees](#status--guarantees) · [Configuration](docs/configuration.md) · [All modules](#feature-modules)**
 
 ---
 
-## Overview
+## The four core jobs
 
-HeliosProxy sits between your application and your database cluster, providing transparent connection pooling, connection recovery after database failover, intelligent query routing, programmable plugins, and operations tooling without application code changes. Database promotion and fencing require an external HA manager.
+| Job | What you get | Where to read more |
+|-----|--------------|--------------------|
+| **Pool connections** | Session, transaction, and statement pooling with prepared-statement handling (`[pool_mode]`) | [docs/configuration.md](docs/configuration.md) |
+| **Route queries** | Read/write split, least-connections / latency / round-robin balancing, optional lag-aware reads with read-your-writes | [docs/configuration.md](docs/configuration.md) |
+| **Track the primary** | Health checks plus a topology provider (`postgres` via `pg_is_in_recovery()`, or `patroni` REST) that follows the writable primary your HA manager chose | [docs/topology-providers.md](docs/topology-providers.md) |
+| **Keep sessions alive** | Transaction Replay (`tr_mode`): re-home the session, restore `SET` state, re-run interrupted reads, or (opt-in) replay an uncommitted transaction with result verification | [docs/transaction-replay.md](docs/transaction-replay.md) |
+
+Everything else (query cache, auth proxy, rate limiting, WASM plugins, GraphQL/HTTP/MCP gateways, edge mode) is optional and feature-gated; see [Feature Modules](#feature-modules).
+
+```
+┌──────────────┐     ┌─────────────────────────────────────────────────┐     ┌──────────────┐
+│              │     │                  HeliosProxy                    │     │   Primary    │
+│  Application ├────►│                                                 ├────►│   (R/W)      │
+│              │     │  ┌───────────┐ ┌──────────┐ ┌───────────────┐  │     └──────────────┘
+│  (psql, any  │     │  │Connection │ │  Query   │ │   Primary     │  │     ┌──────────────┐
+│   PG driver) │     │  │  Pooling  │ │ Routing  │ │ tracking + TR │  ├────►│  Standby     │
+│              │     │  └───────────┘ └──────────┘ └───────────────┘  │     │  (Sync)      │
+└──────────────┘     │  ┌───────────┐ ┌──────────┐ ┌───────────────┐  │     └──────────────┘
+                     │  │  Caching  │ │   Auth   │ │  Rate Limit   │  │     ┌──────────────┐
+                     │  │  (L1/L2)  │ │  Proxy   │ │  & Circuit    │  ├────►│  Standby     │
+                     │  └───────────┘ └──────────┘ └───────────────┘  │     │  (Async)     │
+                     └─────────────────────────────────────────────────┘     └──────────────┘
+```
+
+---
+
+## Quick start (60 seconds)
+
+You need Docker and `psql`, plus Rust for `cargo install` (or download a prebuilt binary from the [GitHub Releases](https://github.com/HeliosDatabase/HeliosDB-Proxy/releases) page instead).
+
+```bash
+# 1. A throwaway PostgreSQL to point at
+docker run -d --name hp-demo-pg -e POSTGRES_PASSWORD=secret -p 5433:5432 postgres:18
+
+# 2. Install and start the proxy (listens on :6432, admin API on 127.0.0.1:9090)
+cargo install heliosdb-proxy --locked
+heliosdb-proxy --primary 127.0.0.1:5433 --listen 127.0.0.1:6432
+
+# 3. In another terminal, connect through the proxy like any PostgreSQL server
+PGPASSWORD=secret psql -h 127.0.0.1 -p 6432 -U postgres -c "select now()"
+curl -s http://127.0.0.1:9090/nodes     # backend health as the proxy sees it
+
+# Clean up
+docker rm -f hp-demo-pg
+```
+
+Add standbys with repeated `--standby host:port`, or use a config file (smallest valid file: [config/proxy.minimal.toml](config/proxy.minimal.toml); fuller examples under [Quick Start: config file](#connect-to-a-postgresql-cluster) below). A plain `cargo install` builds the default feature set (pooling and Transaction Replay); the `postgres` / `patroni` topology providers need `--features postgres-topology` (the prebuilt release binaries are built with `all-features` only and do not include them), and cache, auth, and plugins have their own flags (see [Feature Flags](#feature-flags)).
+
+If HeliosProxy saves you a PgBouncer plus an HAProxy, a ⭐ helps others find it.
+
+---
+
+## What happens on failover
+
+HeliosProxy never decides *which* database becomes primary. The sequence is:
+
+1. Your HA manager (Patroni, pg_auto_failover, Stolon, RDS/Aurora, or an operator) promotes a standby and fences the old primary.
+2. The topology provider (`provider = "postgres"` or `"patroni"`) observes the new writable primary and routes writes to it. Until a writable primary appears, writes wait up to `write_timeout_secs`.
+3. With Transaction Replay on, each client session reconnects to the new primary and restores its `SET` state. Depending on `tr_mode`, an interrupted read is re-run or an uncommitted transaction is replayed and verified. A `COMMIT` whose outcome is unknown is never retried (SQLSTATE `08007`), and a replay whose results diverge from what the client saw is rolled back (`40001`).
+
+Runnable material in this repo: [examples/failover-demo](examples/failover-demo/README.md) (outage detection and recovery of the original primary with TR configured), [demos/chaos-failover](demos/chaos-failover/README.md) (random node kills under load), and [docs/topology-providers.md](docs/topology-providers.md) (Patroni setup and a loopback test that a leader change moves writes). These demos do not configure a promotion authority, so they are not a recording of end-to-end promotion; a Patroni-backed demo is still to be produced (see the adoption notes).
+
+---
+
+## How it compares
+
+| | HeliosProxy | PgBouncer | HAProxy |
+|---|---|---|---|
+| Language | Rust | C | C |
+| Pooling modes | session, transaction, statement | session, transaction, statement | none (TCP/L4 balancing) |
+| Read/write split | yes (query classification, hints) | no | only with external health checks and separate ports |
+| Session survives a primary change | yes, via Transaction Replay (needs an externally promoted primary) | no | no (connections drop) |
+| Follows the promoted primary | yes (`postgres` / `patroni` providers) | no (re-point config) | via external health-check scripts |
+| Query result cache | yes, opt-in | no | no |
+| WASM plugins | yes (`wasm-plugins` feature) | no | Lua scripting instead |
+| Promotes / fences databases | no by default (external HA manager) | no | no |
+| Maturity and ecosystem | young | very mature | very mature |
+
+PgBouncer and HAProxy cells are summarized from their documented behavior and should be re-checked against their current docs before publishing. PgCat, Supavisor, and Odyssey are not yet in this table because their cells have not been verified.
+
+---
+
+## Status & guarantees
 
 **Verification status (2026-09-25, 2.0.0):** the [September 2026 audit](docs/internal/audit-2026-09/README.md)
 found reproducible Transaction Replay safety defects; all of them are fixed as of
@@ -23,20 +114,12 @@ advertised library capabilities that are not wired into the daemon. Consult it a
 [prioritized improvement backlog](docs/internal/audit-2026-09/IMPROVEMENTS.md) when
 evaluating HA, replay, or distributed deployment guarantees.
 
-```
-┌──────────────┐     ┌─────────────────────────────────────────────────┐     ┌──────────────┐
-│              │     │                  HeliosProxy                    │     │   Primary    │
-│  Application ├────►│                                                 ├────►│   (R/W)      │
-│              │     │  ┌───────────┐ ┌──────────┐ ┌───────────────┐  │     └──────────────┘
-│  (psql, any  │     │  │Connection │ │  Query   │ │   Failover    │  │     ┌──────────────┐
-│   PG driver) │     │  │  Pooling  │ │ Routing  │ │  Controller   │  ├────►│  Standby     │
-│              │     │  └───────────┘ └──────────┘ └───────────────┘  │     │  (Sync)      │
-└──────────────┘     │  ┌───────────┐ ┌──────────┐ ┌───────────────┐  │     └──────────────┘
-                     │  │  Caching  │ │   Auth   │ │  Rate Limit   │  │     ┌──────────────┐
-                     │  │  (L1/L2)  │ │  Proxy   │ │  & Circuit    │  ├────►│  Standby     │
-                     │  └───────────┘ └──────────┘ └───────────────┘  │     │  (Async)     │
-                     └─────────────────────────────────────────────────┘     └──────────────┘
-```
+Plainly:
+
+- **Database promotion and fencing require an external HA manager.** The daemon tracks the primary; `[ha] auto_failover` is rejected at startup.
+- **Transaction Replay is bounded.** Unknown `COMMIT` outcomes, snapshot-pinned (`SERIALIZABLE` / `REPEATABLE READ`) transactions, and diverging replays are never silently continued. Cursors, temp tables and `PREPARE`d state are not migrated. Details: [docs/transaction-replay.md](docs/transaction-replay.md).
+- **No zero-RPO claim.** A healthy tracked primary says nothing about asynchronous replica lag; use synchronous replication if you need that.
+- **Some modules are library-only** (for example Session Migration, Cursor Restore, Failover Controller primitives, `distribcache`); the module tables below mark which.
 
 ---
 
@@ -44,7 +127,7 @@ evaluating HA, replay, or distributed deployment guarantees.
 
 ### Protocol-Level Compatibility
 
-All 46 feature modules operate at the PostgreSQL wire protocol level. They inspect, route, cache, and transform queries without requiring changes to your application or database. Any client library that connects to PostgreSQL connects to HeliosProxy.
+The feature modules operate at the PostgreSQL wire protocol level. They inspect, route, cache, and transform queries without requiring changes to your application or database. Any client library that connects to PostgreSQL connects to HeliosProxy.
 
 ### Supported Backends
 
@@ -62,7 +145,7 @@ All 46 feature modules operate at the PostgreSQL wire protocol level. They inspe
 
 ## Feature Modules
 
-HeliosProxy features are grouped into a connection-routing tier and a programmable platform tier. Each module is independently enabled via Cargo feature flags, so deployments can range from a lightweight connection pooler to a full programmable data-plane.
+The four core jobs above are the product; everything below is optional. HeliosProxy features are grouped into a connection-routing tier and a programmable platform tier. Each module is independently enabled via Cargo feature flags, so deployments can range from a lightweight connection pooler to a full programmable data-plane.
 
 ## Connection-Routing Tier
 
