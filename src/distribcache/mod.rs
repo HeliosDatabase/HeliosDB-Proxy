@@ -331,10 +331,6 @@ pub struct HeliosDistribCache {
     tool_cache: Arc<ToolResultCache>,
     semantic_cache: Arc<SemanticQueryCache>,
 
-    /// Metrics
-    #[allow(dead_code)]
-    metrics: Arc<DistribCacheMetrics>,
-
     /// Configuration
     config: DistribCacheConfig,
 
@@ -379,7 +375,6 @@ impl HeliosDistribCache {
         let invalidator = Arc::new(WalInvalidator::new(config.clone()));
         let heatmap = Arc::new(CacheHeatmap::new());
         let scheduler = Arc::new(WorkloadScheduler::new(config.clone()));
-        let metrics = Arc::new(DistribCacheMetrics::new());
 
         // AI caches
         let conversation_cache = Arc::new(ConversationContextCache::new(1000, 50));
@@ -400,7 +395,6 @@ impl HeliosDistribCache {
             rag_cache,
             tool_cache,
             semantic_cache,
-            metrics,
             config,
             stats: CacheStatistics::default(),
         }

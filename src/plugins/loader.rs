@@ -75,15 +75,6 @@ struct ArtefactManifest {
     license: String,
     hooks: Vec<String>,
     wasm_sha256: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    signature_sha256: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    signature_algorithm: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    packed_at: String,
 }
 
 fn sha256_hex_local(bytes: &[u8]) -> String {

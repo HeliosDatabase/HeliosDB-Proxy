@@ -107,15 +107,12 @@ impl ConversationContext {
 /// LRU cache for conversation eviction
 struct LruTracker {
     order: Mutex<VecDeque<ConversationId>>,
-    #[allow(dead_code)]
-    max_size: usize,
 }
 
 impl LruTracker {
     fn new(max_size: usize) -> Self {
         Self {
             order: Mutex::new(VecDeque::with_capacity(max_size)),
-            max_size,
         }
     }
 

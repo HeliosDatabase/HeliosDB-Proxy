@@ -259,7 +259,6 @@ impl FilterOperator {
 #[derive(Debug)]
 pub struct SqlGenerator {
     /// Schema reference
-    #[allow(dead_code)]
     schema: Arc<GraphQLSchema>,
     /// Quote identifier character
     quote_char: char,
@@ -279,6 +278,11 @@ pub enum ParamStyle {
 }
 
 impl SqlGenerator {
+    /// Schema this generator was created for
+    pub fn schema(&self) -> &Arc<GraphQLSchema> {
+        &self.schema
+    }
+
     /// Create a new SQL generator
     pub fn new(schema: Arc<GraphQLSchema>) -> Self {
         Self {

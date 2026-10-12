@@ -292,7 +292,7 @@ impl PeerConnection {
     }
 
     /// Ping peer to check health
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub async fn ping(&self) -> bool {
         let _start = std::time::Instant::now();
 
@@ -377,8 +377,6 @@ pub struct DistributedCache {
     hits: AtomicU64,
     misses: AtomicU64,
     remote_hits: AtomicU64,
-    #[allow(dead_code)]
-    replication_lag_ms: AtomicU64,
     healthy_peers: AtomicU32,
 }
 
@@ -406,7 +404,6 @@ impl DistributedCache {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             remote_hits: AtomicU64::new(0),
-            replication_lag_ms: AtomicU64::new(0),
             healthy_peers: AtomicU32::new(peer_addrs.len() as u32),
         }
     }

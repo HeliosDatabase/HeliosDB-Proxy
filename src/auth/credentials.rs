@@ -151,10 +151,6 @@ pub struct CredentialManager {
 
     /// Credential cache
     cache: Arc<RwLock<CredentialCache>>,
-
-    /// Default provider index
-    #[allow(dead_code)]
-    default_provider: usize,
 }
 
 /// Credential cache
@@ -229,7 +225,6 @@ impl CredentialManager {
             config,
             providers: Vec::new(),
             cache: Arc::new(RwLock::new(CredentialCache::new(1000, cache_ttl))),
-            default_provider: 0,
         }
     }
 

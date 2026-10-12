@@ -229,33 +229,17 @@ pub struct AuthenticationHandler {
 /// API key entry
 #[derive(Debug, Clone)]
 struct ApiKeyEntry {
-    /// Key ID
-    #[allow(dead_code)]
-    key_id: String,
-
     /// Hashed key value
     key_hash: String,
 
     /// Associated identity
     identity: Identity,
 
-    /// Creation time
-    #[allow(dead_code)]
-    created_at: chrono::DateTime<chrono::Utc>,
-
     /// Expiration time
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Whether key is active
     active: bool,
-
-    /// Allowed scopes
-    #[allow(dead_code)]
-    scopes: Vec<String>,
-
-    /// Rate limit override
-    #[allow(dead_code)]
-    rate_limit: Option<u32>,
 }
 
 /// Rate limiter state
@@ -926,17 +910,13 @@ impl AuthenticationHandler {
         key_value: String,
         identity: Identity,
         expires_at: Option<chrono::DateTime<chrono::Utc>>,
-        scopes: Vec<String>,
+        _scopes: Vec<String>,
     ) {
         let entry = ApiKeyEntry {
-            key_id: key_id.clone(),
             key_hash: self.hash_api_key(&key_value),
             identity,
-            created_at: chrono::Utc::now(),
             expires_at,
             active: true,
-            scopes,
-            rate_limit: None,
         };
 
         self.api_keys.write().insert(key_id, entry);

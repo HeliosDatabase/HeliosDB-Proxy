@@ -54,9 +54,6 @@ pub struct QueryNormalizer {
 // Regex patterns for normalization
 static STRING_LITERAL: Lazy<Regex> = Lazy::new(|| Regex::new(r#"'(?:[^'\\]|\\.)*'"#).unwrap());
 
-#[allow(dead_code)]
-static DOUBLE_QUOTED: Lazy<Regex> = Lazy::new(|| Regex::new(r#""(?:[^"\\]|\\.)*""#).unwrap());
-
 static NUMBER_LITERAL: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\b\d+(?:\.\d+)?(?:e[+-]?\d+)?\b").unwrap());
 

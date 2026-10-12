@@ -515,10 +515,6 @@ pub struct TenantCostTracker {
     /// Cost per MB written
     cost_per_mb_written: f64,
 
-    /// Cost per connection-second
-    #[allow(dead_code)]
-    cost_per_conn_second: f64,
-
     /// Per-tenant accumulated costs
     costs: DashMap<TenantId, TenantCost>,
 }
@@ -531,7 +527,6 @@ impl TenantCostTracker {
             cost_per_1000_rows: 0.00001, // $0.01 per million rows
             cost_per_mb_read: 0.00001,   // $0.01 per GB read
             cost_per_mb_written: 0.0001, // $0.10 per GB written
-            cost_per_conn_second: 0.0,   // Free connections by default
             costs: DashMap::new(),
         }
     }

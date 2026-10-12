@@ -114,10 +114,6 @@ impl ApiKey {
 
 /// API key manager
 pub struct ApiKeyManager {
-    /// Configuration
-    #[allow(dead_code)]
-    config: ApiKeyConfig,
-
     /// Key store by ID
     keys_by_id: Arc<RwLock<HashMap<String, ApiKey>>>,
 
@@ -170,7 +166,6 @@ impl ApiKeyManager {
         let key_prefix = config.prefix.clone().unwrap_or_else(|| "hdb_".to_string());
 
         Self {
-            config,
             keys_by_id: Arc::new(RwLock::new(HashMap::new())),
             keys_by_hash: Arc::new(RwLock::new(HashMap::new())),
             rate_limits: Arc::new(RwLock::new(HashMap::new())),

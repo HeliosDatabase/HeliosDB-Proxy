@@ -320,10 +320,6 @@ pub struct TenantConnectionPool {
     /// Shared pool for small/unknown tenants
     shared_pool: Arc<TenantPool>,
 
-    /// Default pool configuration
-    #[allow(dead_code)]
-    default_config: TenantPoolConfig,
-
     /// Connection ID counter
     connection_counter: AtomicU64,
 
@@ -351,7 +347,6 @@ impl TenantConnectionPool {
         Self {
             pools: DashMap::new(),
             shared_pool,
-            default_config,
             connection_counter: AtomicU64::new(0),
             total_acquires: AtomicU64::new(0),
             total_timeouts: AtomicU64::new(0),

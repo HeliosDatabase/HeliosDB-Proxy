@@ -93,10 +93,6 @@ impl WorkloadQueue {
 
 /// Workload scheduler
 pub struct WorkloadScheduler {
-    /// Configuration
-    #[allow(dead_code)]
-    config: DistribCacheConfig,
-
     /// Queues per workload type
     queues: DashMap<WorkloadType, RwLock<WorkloadQueue>>,
 
@@ -206,7 +202,6 @@ impl WorkloadScheduler {
 
         Self {
             policy: config.scheduling_policy,
-            config,
             queues,
             limits,
             stats: SchedulerStats::default(),

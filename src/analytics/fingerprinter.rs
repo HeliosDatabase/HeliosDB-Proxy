@@ -317,7 +317,6 @@ impl QueryFingerprinter {
     }
 
     /// Detect operation type from an already-lowercased, trimmed statement.
-    #[allow(clippy::if_same_then_else)]
     fn detect_operation_lower(trimmed: &str) -> OperationType {
         if trimmed.starts_with("select") {
             OperationType::Select
@@ -327,21 +326,21 @@ impl QueryFingerprinter {
             OperationType::Update
         } else if trimmed.starts_with("delete") {
             OperationType::Delete
-        } else if trimmed.starts_with("create") {
+        } else if trimmed.starts_with("create")
+            || trimmed.starts_with("alter")
+            || trimmed.starts_with("drop")
+        {
             OperationType::Ddl
-        } else if trimmed.starts_with("alter") {
-            OperationType::Ddl
-        } else if trimmed.starts_with("drop") {
-            OperationType::Ddl
-        } else if trimmed.starts_with("begin") || trimmed.starts_with("start transaction") {
+        } else if trimmed.starts_with("begin")
+            || trimmed.starts_with("start transaction")
+            || trimmed.starts_with("commit")
+            || trimmed.starts_with("rollback")
+        {
             OperationType::Transaction
-        } else if trimmed.starts_with("commit") || trimmed.starts_with("rollback") {
-            OperationType::Transaction
-        } else if trimmed.starts_with("set") {
-            OperationType::Utility
-        } else if trimmed.starts_with("explain") {
-            OperationType::Utility
-        } else if trimmed.starts_with("analyze") {
+        } else if trimmed.starts_with("set")
+            || trimmed.starts_with("explain")
+            || trimmed.starts_with("analyze")
+        {
             OperationType::Utility
         } else {
             OperationType::Other
