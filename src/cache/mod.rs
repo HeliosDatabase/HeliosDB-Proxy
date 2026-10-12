@@ -174,10 +174,6 @@ pub struct QueryCache {
     /// Metrics collector
     metrics: Arc<CacheMetrics>,
 
-    /// Request coalescing for cache stampede prevention
-    #[allow(dead_code)]
-    pending_requests: DashMap<CacheKey, Arc<tokio::sync::Notify>>,
-
     /// Per-table write generations (C-02). Bumped by every invalidation of the
     /// table; a cached result stores the sum observed before its fetch and is
     /// served only while the sum is unchanged, on every tier (L1/L2/L3).
@@ -255,7 +251,6 @@ impl QueryCache {
             normalizer: Arc::new(QueryNormalizer::new()),
             invalidator,
             metrics: Arc::new(CacheMetrics::new()),
-            pending_requests: DashMap::new(),
             table_generations: DashMap::new(),
             global_generation: std::sync::atomic::AtomicU64::new(0),
             reclaim_tx,
