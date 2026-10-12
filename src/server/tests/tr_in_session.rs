@@ -3584,11 +3584,13 @@ fn tr08_refused_batch_registry_writes_are_undone() {
     let v = |s: &str| bytes::Bytes::from(s.to_string());
     let mut registry: HashMap<String, bytes::Bytes> = HashMap::new();
     registry.insert("s1".into(), v("defA"));
-    let mut undo = Vec::new();
-    // Close S1 / Parse S1 defB / Parse S2 / Parse S1 defC, all refused 25P02.
-    undo.push(("s1".to_string(), registry.insert("s1".into(), v("defB"))));
-    undo.push(("s2".to_string(), registry.insert("s2".into(), v("new"))));
-    undo.push(("s1".to_string(), registry.insert("s1".into(), v("defC"))));
+    // Close S1 / Parse S1 defB / Parse S2 / Parse S1 defC, all refused 25P02
+    // (elements evaluate in order, like the Parses arriving).
+    let undo = vec![
+        ("s1".to_string(), registry.insert("s1".into(), v("defB"))),
+        ("s2".to_string(), registry.insert("s2".into(), v("new"))),
+        ("s1".to_string(), registry.insert("s1".into(), v("defC"))),
+    ];
     ProxyServer::undo_map_writes(&mut registry, undo);
     assert_eq!(registry.len(), 1);
     assert_eq!(registry["s1"], v("defA"));
