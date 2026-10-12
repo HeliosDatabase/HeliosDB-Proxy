@@ -23,7 +23,6 @@ impl QueryValidator {
     }
 
     /// Validate a parsed document
-    #[allow(clippy::result_large_err)]
     pub fn validate(
         &self,
         document: &ParsedDocument,
@@ -82,7 +81,6 @@ impl QueryValidator {
     }
 
     /// Calculate query complexity
-    #[allow(clippy::result_large_err)]
     pub fn calculate_complexity(
         &self,
         document: &ParsedDocument,
@@ -98,7 +96,6 @@ impl QueryValidator {
     }
 
     /// Calculate complexity for a selection
-    #[allow(clippy::result_large_err)]
     fn calculate_selection_complexity(
         &self,
         selection: &ParsedSelection,
@@ -136,7 +133,6 @@ impl QueryValidator {
     }
 
     /// Validate fields against schema
-    #[allow(clippy::result_large_err)]
     fn validate_fields(
         &self,
         selections: &[ParsedSelection],
