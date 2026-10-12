@@ -86,16 +86,19 @@ Runnable material in this repo: [examples/failover-demo](examples/failover-demo/
 | | HeliosProxy | PgBouncer | HAProxy |
 |---|---|---|---|
 | Language | Rust | C | C |
-| Pooling modes | session, transaction, statement | session, transaction, statement | none (TCP/L4 balancing) |
-| Read/write split | yes (query classification, hints) | no | only with external health checks and separate ports |
-| Session survives a primary change | yes, via Transaction Replay (needs an externally promoted primary) | no | no (connections drop) |
-| Follows the promoted primary | yes (`postgres` / `patroni` providers) | no (re-point config) | via external health-check scripts |
-| Query result cache | yes, opt-in | no | no |
-| WASM plugins | yes (`wasm-plugins` feature) | no | Lua scripting instead |
+| Pooling modes | session, transaction, statement | session, transaction, statement [1] | none: TCP/L4 proxy [5] |
+| Prepared statements in transaction pooling | opt-in (`prepared_statement_mode = "track"`), default off | yes, on by default since 1.24 (`max_prepared_statements`, default 200) [2][3] | n/a |
+| Read/write split | yes (query classification, hints) | no: a `host` list is round-robined and "all hosts must be available at all times" [2] | separate ports/backends chosen by health checks, for example Patroni's `/primary` and `/replica` REST endpoints [4][5] |
+| Session survives a primary change | yes, via Transaction Replay (needs an externally promoted primary) | no: connections to the old server end and clients reconnect | no: a TCP proxy cannot re-home an established session |
+| Follows the promoted primary | yes (`postgres` / `patroni` providers) | no: re-point config or DNS [2] | via health checks: `pgsql-check` only tests that a server answers [5]; Patroni's REST check tests the role [4] |
+| Query result cache | yes, opt-in | no | no (HTTP cache only) |
+| Extensibility | WASM plugins (`wasm-plugins` feature) | none documented | Lua scripting [5] |
 | Promotes / fences databases | no by default (external HA manager) | no | no |
 | Maturity and ecosystem | young | very mature | very mature |
 
-PgBouncer and HAProxy cells are summarized from their documented behavior and should be re-checked against their current docs before publishing. PgCat, Supavisor, and Odyssey are not yet in this table because their cells have not been verified.
+Competitor cells were checked against the vendors' documentation on 2026-10-12. Cells without a numbered source (language, what happens to sessions on failover) follow from the architecture rather than a quotation. PgCat, Supavisor, and Odyssey are not in this table because their cells have not been verified.
+
+Sources: [1] [PgBouncer features](https://www.pgbouncer.org/features.html) · [2] [PgBouncer configuration](https://www.pgbouncer.org/config.html) (`pool_mode`, `max_prepared_statements`, `host`, `load_balance_hosts`) · [3] [PgBouncer 1.24.0 release notes](https://www.pgbouncer.org/2025/01/pgbouncer-1.24.0) · [4] [Patroni REST API](https://patroni.readthedocs.io/en/latest/rest_api.html) · [5] [HAProxy 3.0 configuration manual](https://docs.haproxy.org/3.0/configuration.html) (`option pgsql-check`, `mode tcp`, Lua).
 
 ---
 

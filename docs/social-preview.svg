@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-label="HeliosProxy: PgBouncer + HAProxy replacement for Postgres with failover-safe sessions">
+  <rect width="1280" height="640" fill="#0f172a"/>
+  <rect x="0" y="0" width="16" height="640" fill="#f59e0b"/>
+  <g font-family="Helvetica, Arial, sans-serif" fill="#f8fafc">
+    <text x="80" y="190" font-size="92" font-weight="700">HeliosProxy</text>
+    <text x="80" y="268" font-size="38" fill="#cbd5e1">PgBouncer + HAProxy replacement for Postgres</text>
+    <text x="80" y="318" font-size="38" fill="#cbd5e1">with failover-safe sessions. One Rust binary.</text>
+  </g>
+  <g font-family="Helvetica, Arial, sans-serif" font-size="26" fill="#0f172a" font-weight="600">
+    <rect x="80" y="380" width="230" height="52" rx="26" fill="#f59e0b"/><text x="106" y="415">connection pooling</text>
+    <rect x="330" y="380" width="230" height="52" rx="26" fill="#f59e0b"/><text x="356" y="415">read/write split</text>
+    <rect x="580" y="380" width="250" height="52" rx="26" fill="#f59e0b"/><text x="606" y="415">primary tracking</text>
+    <rect x="850" y="380" width="270" height="52" rx="26" fill="#f59e0b"/><text x="876" y="415">transaction replay</text>
+  </g>
+  <text x="80" y="560" font-family="Helvetica, Arial, sans-serif" font-size="28" fill="#94a3b8">Works with Patroni, RDS and Aurora. Apache-2.0.   github.com/HeliosDatabase/HeliosDB-Proxy</text>
+</svg>
