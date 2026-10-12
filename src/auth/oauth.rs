@@ -46,8 +46,6 @@ pub struct OAuthClient {
 
     /// HTTP client (placeholder - would use reqwest in real impl)
     client_id: String,
-    #[allow(dead_code)]
-    client_secret: String,
 }
 
 /// Token introspection response
@@ -250,14 +248,12 @@ impl OAuthClient {
     /// Create a new OAuth client
     pub fn new(config: OAuthConfig) -> Self {
         let client_id = config.client_id.clone();
-        let client_secret = config.client_secret.clone();
         let cache_ttl = config.cache_ttl;
 
         Self {
             config,
             cache: Arc::new(RwLock::new(TokenCache::new(10000, cache_ttl))),
             client_id,
-            client_secret,
         }
     }
 
