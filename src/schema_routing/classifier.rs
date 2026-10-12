@@ -208,9 +208,6 @@ pub struct QueryHistory {
     latencies: Vec<Duration>,
     /// Recent queries per minute samples
     qpm_samples: Vec<(Instant, u64)>,
-    /// Created time
-    #[allow(dead_code)]
-    created: Instant,
     /// Last updated
     last_updated: Instant,
 }
@@ -226,7 +223,6 @@ impl QueryHistory {
             type_counts: HashMap::new(),
             latencies: Vec::new(),
             qpm_samples: Vec::new(),
-            created: now,
             last_updated: now,
         }
     }

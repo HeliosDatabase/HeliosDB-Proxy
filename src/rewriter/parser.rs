@@ -8,7 +8,6 @@ use std::hash::{Hash, Hasher};
 /// SQL parser
 pub struct SqlParser {
     /// Dialect-specific settings
-    #[allow(dead_code)]
     dialect: SqlDialect,
 }
 
@@ -32,6 +31,11 @@ impl SqlParser {
     /// Create a parser with specific dialect
     pub fn with_dialect(dialect: SqlDialect) -> Self {
         Self { dialect }
+    }
+
+    /// Dialect this parser was created for
+    pub fn dialect(&self) -> SqlDialect {
+        self.dialect
     }
 
     /// Parse a SQL query
