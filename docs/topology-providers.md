@@ -55,6 +55,28 @@ provider has no leader or the lease has expired, new writes wait until
 [Authority leases and fencing limits](#authority-leases-and-fencing-limits-h-02) for what
 this does and does not guarantee.
 
+**One routing snapshot (H-01 step 3).** Writes, reads, pool eviction and `/topology` all
+read one published routing snapshot, rebuilt after every health-check sweep, in-band
+demotion and SIGHUP reload, and (with a provider) on every tracker event and once per
+tracker interval (500 ms), which keeps the snapshot's copy of the lease bound fresh. Under
+a provider:
+
+- the write target is the provider's leader while its lease is valid, as above;
+- the read set is every enabled, healthy node **except** the leader, whatever its
+  configured role: after a promotion the demoted former primary serves reads and the
+  promoted former standby stops being treated as one. While the provider has no valid
+  leader, reads fall back to the configured `standby`/`replica` nodes;
+- replica lag (`[lag_routing]`, credentialed `[health]`) is measured against the leader's
+  WAL position, on every other node;
+- when the leader moves from one node to another, idle pooled backend connections to the
+  former leader are closed (a demoted server is typically restarted by its HA manager).
+  Losing the leader without a successor (lease expiry, conflict) closes nothing.
+
+A session keeps reading from its current node while that node stays healthy; the read set
+applies when a session picks a node (for example per transaction under transaction
+pooling, or after its node fails). Static topology keeps routing by configured roles and
+health; its snapshot is published for `/topology`.
+
 ### The `/topology` response
 
 `GET /topology` returns `TopologyResponse` (camelCase to map cleanly into the Kubernetes
@@ -62,12 +84,13 @@ operator CRD status):
 
 | Field | Meaning |
 |-------|---------|
-| `currentPrimary` | Address of the provider's leader, or (static mode) the first healthy `primary`-role node; `null` when neither exists. |
+| `currentPrimary` | The routing snapshot's write target: the provider's leader while its lease is valid, or (static mode) the first enabled, healthy `primary`-role node; `null` when there is none. |
 | `healthyNodes` | Count of nodes with a passing health check. |
 | `unhealthyNodes` | Count of nodes with a failing health check. |
 | `totalNodes` | Number of configured `[[nodes]]`. |
 | `lastFailoverAt` | RFC 3339 timestamp of the last observed primary change; `null` when none has been observed since boot (currently always `null` in `compute_topology`). |
 | `authoritative` | Present only when a topology provider is attached and has a leader: `{address, epoch, timeline, confirmed, valid, leaseRemainingMs}`. `epoch` increments on every observed leader change; `timeline` is the leader's database timeline when the provider reports one (`patroni`); `valid` is `false` once the lease expires (`leaseRemainingMs` is then absent). |
+| `routing` | The routing snapshot the data path uses: `{epoch, authoritative, leader, leaderValidMs, replicas: [{address, weight, latencyMs, lagBytes}], ageMs, leaderChangesTotal, evictedIdleTotal}`. `epoch` is the provider's authority epoch, or (static) the number of leader changes since boot; `leaderValidMs` is how long a provider leader stays a write target without a newer snapshot; `replicas` is the read set before circuit-breaker and lag filtering; `leaderChangesTotal` counts moves from one node to another; `evictedIdleTotal` the idle pooled connections closed on those moves. |
 | `conflictingPrimariesTotal` | Present whenever a topology provider is configured, also while there is no leader: provider polls that found more than one node claiming write authority (resolved by timeline or failed closed). The same count is exported to Prometheus as `heliosdb_proxy_topology_conflicting_primaries_total`. |
 
 ### Authority leases and fencing limits (H-02)

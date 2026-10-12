@@ -83,6 +83,7 @@ pub mod primary_tracker;
 pub mod protocol;
 mod replay_sql;
 pub mod request;
+pub mod routing_snapshot;
 pub mod server;
 pub mod switchover_buffer;
 

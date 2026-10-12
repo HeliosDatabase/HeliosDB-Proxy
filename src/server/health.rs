@@ -55,19 +55,22 @@ impl ProxyServer {
         // H-04: with credentials configured, sample the primary's current WAL
         // position once per sweep so each standby's replay position becomes a
         // byte lag. Best-effort; any failure leaves lag unknown.
-        let primary_lsn = if config.health.user.is_some() && config.lag_routing.enabled {
-            Self::probe_primary_lsn(config, timeout).await
-        } else {
-            None
+        let lag_source = Self::lag_source(state, config);
+        let primary_lsn = match lag_source {
+            Some(source) if config.health.user.is_some() && config.lag_routing.enabled => {
+                Self::probe_primary_lsn(config, source, timeout).await
+            }
+            _ => None,
         };
 
         let mut set = tokio::task::JoinSet::new();
         for node in &config.nodes {
             let addr = node.address().to_string();
             let health_cfg = config.health.clone();
-            let role = node.role;
+            let samples_lag = Self::samples_lag(state, node, lag_source);
             set.spawn(async move {
-                let r = Self::probe_node(&health_cfg, &addr, role, primary_lsn, timeout).await;
+                let r =
+                    Self::probe_node(&health_cfg, &addr, samples_lag, primary_lsn, timeout).await;
                 (addr, r)
             });
         }
@@ -131,6 +134,7 @@ impl ProxyServer {
             }
         }
         state.health.store(Arc::new(next));
+        Self::publish_routing(state);
     }
 
     /// Advance the consecutive success/failure counters and decide health
@@ -160,13 +164,50 @@ impl ProxyServer {
         }
     }
 
+    /// The node whose WAL position replica lag is measured against (H-04).
+    /// Static topology: the first enabled configured primary. Under a
+    /// provider: the published write leader (H-01 step 3), so lag keeps being
+    /// measured against the real primary after a promotion.
+    pub(super) fn lag_source<'c>(
+        state: &ServerState,
+        config: &'c ProxyConfig,
+    ) -> Option<&'c NodeConfig> {
+        if state.authoritative_topology {
+            let snapshot = state.routing.load();
+            let leader = snapshot.write_leader(std::time::Instant::now())?;
+            return config
+                .nodes
+                .iter()
+                .find(|n| n.enabled && n.address() == leader);
+        }
+        config
+            .nodes
+            .iter()
+            .find(|n| n.role == NodeRole::Primary && n.enabled)
+    }
+
+    /// Whether `node`'s probe samples replica lag. Static topology: the
+    /// configured standbys and replicas. Under a provider: every node except
+    /// the leader, so a demoted former primary is measured and the promoted
+    /// former standby is not.
+    pub(super) fn samples_lag(
+        state: &ServerState,
+        node: &NodeConfig,
+        source: Option<&NodeConfig>,
+    ) -> bool {
+        if state.authoritative_topology {
+            return source.is_some_and(|s| s.address() != node.address());
+        }
+        matches!(node.role, NodeRole::Standby | NodeRole::ReadReplica)
+    }
+
     /// One node probe (H-03/H-04): a credential-less protocol probe by default,
-    /// or `check_query` plus a standby WAL-position lag probe when
-    /// `[health] user` is configured. Returns `(latency_ms, lag_bytes)`.
+    /// or `check_query` plus a WAL-position lag probe (when `samples_lag`)
+    /// when `[health] user` is configured. Returns `(latency_ms, lag_bytes)`.
     pub(super) async fn probe_node(
         health: &crate::config::HealthConfig,
         addr: &str,
-        role: NodeRole,
+        samples_lag: bool,
         primary_lsn: Option<u64>,
         timeout: Duration,
     ) -> Result<(f64, Option<u64>)> {
@@ -175,17 +216,17 @@ impl ProxyServer {
                 .await
                 .map(|l| (l, None));
         }
-        Self::check_node_query(health, addr, role, primary_lsn, timeout).await
+        Self::check_node_query(health, addr, samples_lag, primary_lsn, timeout).await
     }
 
     /// Credentialed probe: connect, run `[health] check_query` and, for a
-    /// standby/read-replica with a known primary LSN, `pg_last_wal_replay_lsn()`
+    /// lag-sampled node with a known primary LSN, `pg_last_wal_replay_lsn()`
     /// to compute the byte lag. The lag probe is best-effort and never fails
     /// the health check (non-PostgreSQL backends simply report unknown lag).
     pub(super) async fn check_node_query(
         health: &crate::config::HealthConfig,
         addr: &str,
-        role: NodeRole,
+        samples_lag: bool,
         primary_lsn: Option<u64>,
         timeout: Duration,
     ) -> Result<(f64, Option<u64>)> {
@@ -228,7 +269,7 @@ impl ProxyServer {
         let latency = start.elapsed().as_secs_f64() * 1000.0;
 
         let mut lag = None;
-        if matches!(role, NodeRole::Standby | NodeRole::ReadReplica) {
+        if samples_lag {
             if let Some(primary) = primary_lsn {
                 if let Ok(res) = client
                     .simple_query("SELECT pg_last_wal_replay_lsn()::text")
@@ -252,16 +293,16 @@ impl ProxyServer {
         Ok((latency, lag))
     }
 
-    /// Sample the configured primary's current WAL position once per sweep.
-    /// `None` on any failure (the standby probes then report unknown lag).
-    pub(super) async fn probe_primary_lsn(config: &ProxyConfig, timeout: Duration) -> Option<u64> {
+    /// Sample `primary`'s current WAL position once per sweep. `None` on any
+    /// failure (the replica probes then report unknown lag).
+    pub(super) async fn probe_primary_lsn(
+        config: &ProxyConfig,
+        primary: &NodeConfig,
+        timeout: Duration,
+    ) -> Option<u64> {
         use crate::backend::{
             tls::default_client_config, BackendClient, BackendConfig, TextValue, TlsMode,
         };
-        let primary = config
-            .nodes
-            .iter()
-            .find(|n| n.role == NodeRole::Primary && n.enabled)?;
         let cfg = BackendConfig {
             host: primary.host.clone(),
             port: primary.port,

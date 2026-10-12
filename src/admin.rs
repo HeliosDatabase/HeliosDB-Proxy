@@ -84,6 +84,10 @@ pub struct AdminState {
     /// present, `/topology` reports the provider's leader and epoch instead
     /// of re-deriving a primary from configured roles.
     pub primary_tracker: RwLock<Option<Arc<crate::primary_tracker::PrimaryTracker>>>,
+    /// The daemon's published routing view (H-01 step 3). Attached at
+    /// startup; `/topology` then reports the write leader and read set the
+    /// data path routes by, from the same snapshot.
+    pub routing: RwLock<Option<Arc<crate::routing_snapshot::RoutingView>>>,
     /// Live `[auto_promote]` status for `GET /api/promotion`.
     pub promoter: RwLock<Option<Arc<parking_lot::Mutex<crate::auto_promote::PromoterStatus>>>>,
     /// WASM plugin manager. None when the proxy started without
@@ -2173,7 +2177,38 @@ impl AdminServer {
             }
         }
 
-        if current_primary.is_none() {
+        // H-01 step 3: the published routing snapshot is what the data path
+        // routes by; when attached it names the primary.
+        let routing = state.routing.read().await.as_ref().map(|view| {
+            let snapshot = view.load();
+            let now = std::time::Instant::now();
+            RoutingTopology {
+                epoch: snapshot.epoch,
+                authoritative: snapshot.authoritative,
+                leader: snapshot.write_leader(now).map(str::to_string),
+                leader_valid_ms: snapshot
+                    .leader_valid_until
+                    .map(|until| until.saturating_duration_since(now).as_millis() as u64),
+                replicas: snapshot
+                    .replicas
+                    .iter()
+                    .map(|r| RoutingReplica {
+                        address: r.address.clone(),
+                        weight: r.weight,
+                        latency_ms: r.latency_ms,
+                        lag_bytes: r.lag_bytes,
+                    })
+                    .collect(),
+                age_ms: now.saturating_duration_since(snapshot.taken_at).as_millis() as u64,
+                leader_changes_total: view.leader_changes_total(),
+                evicted_idle_total: view.evicted_idle_total(),
+            }
+        });
+        if let Some(r) = &routing {
+            current_primary = r.leader.clone();
+        }
+
+        if current_primary.is_none() && routing.is_none() {
             for n in &cfg.nodes {
                 if n.role.eq_ignore_ascii_case("primary") {
                     let healthy = health.get(&n.address).map(|h| h.healthy).unwrap_or(false);
@@ -2197,6 +2232,7 @@ impl AdminServer {
             last_failover_at: None,
             authoritative,
             conflicting_primaries_total,
+            routing,
         }
     }
 
@@ -2515,6 +2551,7 @@ impl AdminState {
             circuit_breaker: RwLock::new(None),
             replay_engine: RwLock::new(None),
             primary_tracker: RwLock::new(None),
+            routing: RwLock::new(None),
             promoter: RwLock::new(None),
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: RwLock::new(None),
@@ -2607,6 +2644,12 @@ impl AdminState {
     /// write path uses, including the authority epoch.
     pub async fn with_primary_tracker(&self, tracker: Arc<crate::primary_tracker::PrimaryTracker>) {
         *self.primary_tracker.write().await = Some(tracker);
+    }
+
+    /// Attach the daemon's routing view (H-01 step 3), so `/topology`
+    /// reports the snapshot the data path routes by.
+    pub async fn with_routing_view(&self, routing: Arc<crate::routing_snapshot::RoutingView>) {
+        *self.routing.write().await = Some(routing);
     }
 
     /// Attach a WASM plugin manager. Production startup calls this
@@ -3033,6 +3076,46 @@ struct TopologyResponse {
         skip_serializing_if = "Option::is_none"
     )]
     conflicting_primaries_total: Option<u64>,
+    /// H-01 step 3: the routing snapshot the data path uses (write leader,
+    /// read set, leader-change counters). Present when the daemon attached
+    /// its routing view.
+    #[serde(rename = "routing", skip_serializing_if = "Option::is_none")]
+    routing: Option<RoutingTopology>,
+}
+
+#[derive(Serialize)]
+struct RoutingTopology {
+    /// Static topology: leader changes since boot. Provider: the tracker's
+    /// authority epoch.
+    epoch: u64,
+    authoritative: bool,
+    /// The current write target; `null` while there is none (outage, or a
+    /// provider whose authority lapsed).
+    leader: Option<String>,
+    /// Milliseconds the provider leader stays a write target without a newer
+    /// snapshot; absent for a static or non-expiring leader.
+    #[serde(rename = "leaderValidMs", skip_serializing_if = "Option::is_none")]
+    leader_valid_ms: Option<u64>,
+    /// Nodes eligible for reads before circuit and lag filtering.
+    replicas: Vec<RoutingReplica>,
+    #[serde(rename = "ageMs")]
+    age_ms: u64,
+    /// Leader moves from one node to another since boot.
+    #[serde(rename = "leaderChangesTotal")]
+    leader_changes_total: u64,
+    /// Idle pooled connections to a former leader closed on those moves.
+    #[serde(rename = "evictedIdleTotal")]
+    evicted_idle_total: u64,
+}
+
+#[derive(Serialize)]
+struct RoutingReplica {
+    address: String,
+    weight: u32,
+    #[serde(rename = "latencyMs")]
+    latency_ms: f64,
+    #[serde(rename = "lagBytes")]
+    lag_bytes: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -3526,6 +3609,73 @@ mod tests {
         // Standalone/manual authority does not expire and has no lease.
         assert!(auth.valid);
         assert!(auth.lease_remaining_ms.is_none());
+    }
+
+    /// With the daemon's routing view attached, `/topology` reports the
+    /// snapshot the data path routes by: its leader is `currentPrimary`, its
+    /// read set is listed (H-01 step 3).
+    #[tokio::test]
+    async fn test_topology_reports_the_routing_snapshot() {
+        use crate::config::NodeRole;
+        use crate::routing_snapshot::{Authority, NodeFacts, RoutingSnapshot, RoutingView};
+        let state = topology_state(&[
+            ("primary.svc:5432", "primary", true),
+            ("standby.svc:5432", "standby", true),
+        ])
+        .await;
+        let facts = [
+            NodeFacts {
+                address: "primary.svc:5432",
+                role: NodeRole::Primary,
+                enabled: true,
+                healthy: true,
+                weight: 100,
+                latency_ms: 1.0,
+                lag_bytes: Some(4096),
+            },
+            NodeFacts {
+                address: "standby.svc:5432",
+                role: NodeRole::Standby,
+                enabled: true,
+                healthy: true,
+                weight: 100,
+                latency_ms: 2.0,
+                lag_bytes: None,
+            },
+        ];
+        let view = Arc::new(RoutingView::new(true));
+        view.publish_with(|| {
+            RoutingSnapshot::build(
+                &facts,
+                Authority::Provider {
+                    leader: Some("standby.svc:5432"),
+                    epoch: 4,
+                    lease: Some(std::time::Duration::from_secs(10)),
+                },
+                std::time::Instant::now(),
+            )
+        });
+        state.with_routing_view(view).await;
+
+        let topo = AdminServer::compute_topology(&state).await;
+        assert_eq!(topo.current_primary.as_deref(), Some("standby.svc:5432"));
+        let routing = topo.routing.expect("routing block present");
+        assert_eq!(routing.epoch, 4);
+        assert!(routing.authoritative);
+        assert!(routing.leader_valid_ms.is_some_and(|ms| ms <= 10_000));
+        assert_eq!(routing.replicas.len(), 1);
+        assert_eq!(routing.replicas[0].address, "primary.svc:5432");
+        assert_eq!(routing.replicas[0].lag_bytes, Some(4096));
+        let body = serde_json::to_value(&routing).unwrap();
+        for key in [
+            "leaderValidMs",
+            "ageMs",
+            "leaderChangesTotal",
+            "evictedIdleTotal",
+        ] {
+            assert!(body.get(key).is_some(), "missing {key}");
+        }
+        assert!(body["replicas"][0].get("lagBytes").is_some());
     }
 
     /// With a topology provider attached, `/topology` carries the provider's

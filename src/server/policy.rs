@@ -159,6 +159,7 @@ impl ProxyServer {
                 );
             }
             state.health.store(Arc::new(next));
+            Self::publish_routing(state);
         }
     }
 

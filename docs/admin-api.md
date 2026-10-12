@@ -187,6 +187,30 @@ Joins the config (node roles) with live health so a controller can read the curr
 curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/topology
 ```
 
+```json
+{
+  "currentPrimary": "pg-b:5432",
+  "healthyNodes": 2,
+  "unhealthyNodes": 0,
+  "totalNodes": 2,
+  "lastFailoverAt": null,
+  "routing": {
+    "epoch": 2,
+    "authoritative": true,
+    "leader": "pg-b:5432",
+    "leaderValidMs": 7480,
+    "replicas": [{"address": "pg-a:5432", "weight": 1, "latencyMs": 0.6, "lagBytes": 0}],
+    "ageMs": 20,
+    "leaderChangesTotal": 1,
+    "evictedIdleTotal": 3
+  }
+}
+```
+
+`routing` is the snapshot writes, reads and pool eviction use (H-01 step 3); with a
+topology provider, `authoritative` and `conflictingPrimariesTotal` are present as well.
+Field reference: [topology-providers.md](topology-providers.md#the-topology-response).
+
 ### GET /nodes
 
 List all configured backend nodes with their current health status.

@@ -434,6 +434,7 @@ async fn test_apply_authenticate_hook_with_manager_no_plugins_defers() {
         cutover: Arc::new(ArcSwap::from_pointee(None)),
         primary_tracker: Arc::new(PrimaryTracker::new_standalone()),
         authoritative_topology: false,
+        routing: Arc::new(crate::routing_snapshot::RoutingView::new(false)),
         promoter: Arc::new(parking_lot::Mutex::new(Default::default())),
         topology_poller: TopologyPoller::Static,
         lb_state: LoadBalancerState {

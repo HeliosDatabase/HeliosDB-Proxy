@@ -2745,7 +2745,15 @@ fn authoritative_server() -> (ProxyServer, Arc<PrimaryTracker>, ProxyConfig) {
     let state = Arc::get_mut(&mut server.state).expect("fresh server state is unshared");
     state.authoritative_topology = true;
     state.primary_tracker = tracker.clone();
+    state.routing = Arc::new(crate::routing_snapshot::RoutingView::new(true));
     (server, tracker, config)
+}
+
+/// What the routing refresher does on a tracker event: set the provider's
+/// leader and republish the routing snapshot.
+fn promote(server: &ProxyServer, tracker: &PrimaryTracker, addr: &str) {
+    tracker.set_primary(uuid::Uuid::new_v4(), addr.to_string());
+    ProxyServer::publish_routing(&server.state);
 }
 
 /// Regression for Sprinter a1843fc5bd56: a NEW session opened after the
@@ -2756,7 +2764,7 @@ async fn new_session_after_promotion_selects_the_authoritative_leader() {
     let (server, tracker, config) = authoritative_server();
     let state = &server.state;
 
-    tracker.set_primary(uuid::Uuid::new_v4(), "pg-a:5432".to_string());
+    promote(&server, &tracker, "pg-a:5432");
     let s1 = make_test_session();
     assert_eq!(
         ProxyServer::select_node(&s1, state, &config).await.unwrap(),
@@ -2764,7 +2772,7 @@ async fn new_session_after_promotion_selects_the_authoritative_leader() {
     );
 
     // Promotion: the provider now reports pg-b. Config roles are unchanged.
-    tracker.set_primary(uuid::Uuid::new_v4(), "pg-b:5432".to_string());
+    promote(&server, &tracker, "pg-b:5432");
     let s2 = make_test_session();
     assert_eq!(
         ProxyServer::select_node(&s2, state, &config).await.unwrap(),
@@ -2782,7 +2790,7 @@ async fn writes_follow_the_authoritative_leader_not_the_configured_role() {
     let state = &server.state;
     let session = make_test_session();
 
-    tracker.set_primary(uuid::Uuid::new_v4(), "pg-b:5432".to_string());
+    promote(&server, &tracker, "pg-b:5432");
     assert!(!ProxyServer::is_write_target(state, &config, "pg-a:5432"));
     assert!(ProxyServer::is_write_target(state, &config, "pg-b:5432"));
 
@@ -2799,6 +2807,122 @@ async fn writes_follow_the_authoritative_leader_not_the_configured_role() {
             .await
             .unwrap();
     assert_eq!(target, "pg-b:5432");
+}
+
+/// H-01 step 3: after a promotion, reads leave the promoted node and use the
+/// demoted former primary, although `[[nodes]]` still calls them standby and
+/// primary.
+#[tokio::test]
+async fn reads_follow_the_authoritative_snapshot_after_promotion() {
+    let (server, tracker, config) = authoritative_server();
+    let state = &server.state;
+
+    promote(&server, &tracker, "pg-a:5432");
+    let s = make_test_session();
+    assert_eq!(
+        ProxyServer::select_read_node(&s, state, &config)
+            .await
+            .unwrap(),
+        "pg-b:5432"
+    );
+
+    promote(&server, &tracker, "pg-b:5432");
+    for _ in 0..4 {
+        let s = make_test_session();
+        assert_eq!(
+            ProxyServer::select_read_node(&s, state, &config)
+                .await
+                .unwrap(),
+            "pg-a:5432",
+            "the demoted primary is the only replica now"
+        );
+    }
+    let snapshot = state.routing.load();
+    assert_eq!(snapshot.leader.as_deref(), Some("pg-b:5432"));
+    assert_eq!(state.routing.leader_changes_total(), 1);
+}
+
+/// A lapsed provider authority stops writes, and reads fall back to the
+/// configured replicas rather than guessing which node leads.
+#[tokio::test]
+async fn lost_authority_stops_writes_and_reads_use_configured_replicas() {
+    let (server, tracker, config) = authoritative_server();
+    let state = &server.state;
+    promote(&server, &tracker, "pg-b:5432");
+    tracker.clear_primary();
+    ProxyServer::publish_routing(state);
+    assert!(!ProxyServer::is_write_target(state, &config, "pg-a:5432"));
+    assert!(!ProxyServer::is_write_target(state, &config, "pg-b:5432"));
+    let s = make_test_session();
+    assert_eq!(
+        ProxyServer::select_read_node(&s, state, &config)
+            .await
+            .unwrap(),
+        "pg-b:5432"
+    );
+    assert_eq!(
+        state.routing.leader_changes_total(),
+        0,
+        "losing the leader is not a move"
+    );
+}
+
+/// Lag is measured against the published leader, on every other node.
+#[test]
+fn lag_sampling_follows_the_authoritative_leader() {
+    let (server, tracker, config) = authoritative_server();
+    let state = &server.state;
+    let (a, b) = (&config.nodes[0], &config.nodes[1]);
+    assert!(ProxyServer::lag_source(state, &config).is_none());
+    promote(&server, &tracker, "pg-b:5432");
+    let source = ProxyServer::lag_source(state, &config);
+    assert_eq!(source.map(|n| n.address()), Some("pg-b:5432"));
+    assert!(ProxyServer::samples_lag(state, a, source));
+    assert!(!ProxyServer::samples_lag(state, b, source));
+
+    // Static: the configured primary is the source, the standby is sampled.
+    let static_server = ProxyServer::new(config.clone()).unwrap();
+    let st = &static_server.state;
+    let source = ProxyServer::lag_source(st, &config);
+    assert_eq!(source.map(|n| n.address()), Some("pg-a:5432"));
+    assert!(!ProxyServer::samples_lag(st, a, source));
+    assert!(ProxyServer::samples_lag(st, b, source));
+}
+
+/// A leader move closes the idle pooled connections to the old leader and
+/// keeps the others.
+#[cfg(feature = "pool-modes")]
+#[tokio::test]
+async fn leader_move_closes_idle_pooled_connections_to_the_old_leader() {
+    use tokio::net::{TcpListener, TcpStream};
+    let (mut server, tracker, _config) = authoritative_server();
+    let pool = Arc::new(crate::pool::BackendIdlePool::new(4, 64));
+    Arc::get_mut(&mut server.state)
+        .expect("fresh server state is unshared")
+        .backend_pool = Some(pool.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut peers = Vec::new();
+    for node in ["pg-a:5432", "pg-a:5432", "pg-b:5432"] {
+        let (client, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        peers.push(accepted.unwrap().0);
+        assert!(pool.checkin(&crate::pool::pool_key(node, "u", "d"), client.unwrap()));
+    }
+
+    promote(&server, &tracker, "pg-a:5432");
+    assert_eq!(
+        pool.idle_count(),
+        3,
+        "electing a first leader evicts nothing"
+    );
+    promote(&server, &tracker, "pg-b:5432");
+    assert_eq!(pool.idle_count(), 1);
+    assert_eq!(server.state.routing.evicted_idle_total(), 2);
+    assert!(pool
+        .checkout(&crate::pool::pool_key("pg-b:5432", "u", "d"))
+        .is_some());
 }
 
 /// Without a provider the configured role still decides (unchanged behaviour).

@@ -106,6 +106,8 @@ mod health;
 
 mod promotion;
 
+mod snapshot;
+
 /// Proxy server
 pub struct ProxyServer {
     config: ProxyConfig,
@@ -337,6 +339,11 @@ struct ServerState {
     /// roles, so a missing provider answer fails closed instead of writing
     /// to a stale primary.
     authoritative_topology: bool,
+    /// The published routing view (H-01 step 3): write leader, read
+    /// candidates and leader-change counters, rebuilt by every health write,
+    /// configuration reload and (with a provider) tracker change. Routing
+    /// under a provider and `/topology` read this one value.
+    routing: Arc<crate::routing_snapshot::RoutingView>,
     /// Live `[auto_promote]` status, shared with `GET /api/promotion`.
     promoter: Arc<parking_lot::Mutex<crate::auto_promote::PromoterStatus>>,
     /// Provider poll task (H-01): `static` has none; `postgres` polls in
@@ -1017,6 +1024,9 @@ impl ProxyServer {
             cutover: Arc::new(ArcSwap::from_pointee(None)),
             primary_tracker,
             authoritative_topology,
+            routing: Arc::new(crate::routing_snapshot::RoutingView::new(
+                authoritative_topology,
+            )),
             promoter: Arc::new(parking_lot::Mutex::new(Default::default())),
             topology_poller,
             lb_state: LoadBalancerState {
@@ -1078,6 +1088,7 @@ impl ProxyServer {
                 std::time::Duration::from_secs(config.edge.liveness_window_secs),
             )),
         });
+        Self::publish_routing(&state);
 
         Ok(Self {
             journal_recovered: std::sync::Mutex::new(journal_recovered),
@@ -1278,6 +1289,7 @@ impl ProxyServer {
             tracing::info!(node = %gone, "SIGHUP: node removed from config");
         }
         state.health.store(Arc::new(next));
+        Self::publish_routing(state);
     }
 
     /// Run the proxy server
@@ -1314,6 +1326,7 @@ impl ProxyServer {
         // Start background tasks
         let health_task = self.spawn_health_checker();
         let promoter_task = self.spawn_auto_promoter();
+        let routing_task = self.spawn_routing_refresher();
         let pool_task = self.spawn_pool_manager();
         // H-01: authoritative topology loop. Only spawned when a provider is
         // configured; static configs keep the historical routing path. Two
@@ -1535,6 +1548,9 @@ impl ProxyServer {
 
         // Wait for background tasks
         health_task.abort();
+        if let Some(t) = routing_task {
+            t.abort();
+        }
         if let Some(t) = promoter_task {
             t.abort();
         }
@@ -1590,6 +1606,7 @@ impl ProxyServer {
                     .with_primary_tracker(state.primary_tracker.clone())
                     .await;
             }
+            admin_state.with_routing_view(state.routing.clone()).await;
             admin_state.with_promoter(state.promoter.clone()).await;
 
             // Initialize config snapshot

@@ -744,6 +744,12 @@ impl PrimaryTracker {
         self
     }
 
+    /// How often the tracking loop re-checks the provider (and so refreshes
+    /// the authority lease).
+    pub fn tracking_interval(&self) -> Duration {
+        self.tracking_interval
+    }
+
     /// Set how long a provider observation stays authoritative without a
     /// refresh (H-02). Must be non-zero; the caller's config validation
     /// rejects 0.

@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- One routing snapshot for writes, reads, pool eviction and `GET /topology` (H-01
+  step 3). Under a topology provider, reads now follow it too: the read set is every
+  enabled, healthy node except the provider's leader, so after a promotion the demoted
+  former primary serves reads and the promoted former standby is no longer treated as
+  one (with no valid leader, reads use the configured standbys/replicas). Replica lag
+  is measured against the leader. When the leader moves to another node, idle pooled
+  connections to the former leader are closed. `/topology` gains a `routing` object
+  (leader, lease bound, read set, leader-change and eviction counters), and
+  `currentPrimary` is the snapshot's write target, `null` while a provider's lease has
+  lapsed. Static topology routes as before.
 - `JournalOp` gains a `PreparedCommitted` variant (cache notification for a
   successful `COMMIT PREPARED`). Downstream exhaustive matches on this public enum
   must handle it; it never creates replayable journal history.
@@ -29,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks the target against that leader instead of the configured
   `role = "primary"`. Previously the session started on the demoted node and its
   first write failed read-only. With no valid leader, writes wait (fail closed).
-  Static topology is unchanged. Reads still choose among nodes by configured role.
+  Static topology is unchanged.
 - A backend login rejection now reaches the client as exactly one terminal
   startup error; the proxy no longer appends a second `08006` after forwarding the
   backend's `28P01`. Proxy-generated startup errors are unchanged.

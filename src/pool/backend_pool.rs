@@ -241,6 +241,23 @@ impl BackendIdlePool {
         false
     }
 
+    /// Close every idle connection parked for `node` (any identity) and
+    /// return how many were closed. Used when `node` stops being the write
+    /// leader: its HA manager typically restarts a demoted server, so the
+    /// parked sockets are likely dead or about to be.
+    pub fn evict_idle_for_node(&self, node: &str) -> usize {
+        let prefix = format!("{}\0", node);
+        let mut closed = 0;
+        for mut entry in self.idle.iter_mut() {
+            if entry.key().starts_with(&prefix) {
+                closed += entry.value().len();
+                entry.value_mut().clear();
+            }
+        }
+        self.total_idle.fetch_sub(closed, Ordering::Relaxed);
+        closed
+    }
+
     /// Idle connections closed by [`Self::evict_one_idle_for_node`].
     pub fn capacity_evictions(&self) -> u64 {
         self.capacity_evictions.load(Ordering::Relaxed)
@@ -307,6 +324,35 @@ mod tests {
         assert!(!pool.evict_one_idle_for_node("10.9.9.9:5432"));
         assert_eq!(pool.idle_count(), 1);
         assert_eq!(pool.capacity_evictions(), 1);
+    }
+
+    #[tokio::test]
+    async fn leader_move_eviction_closes_every_idle_connection_of_that_node_only() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut server_halves = Vec::new();
+        let pool = BackendIdlePool::new(4, 1000);
+        let a1 = pool_key("10.0.0.1:5432", "u1", "d");
+        let a2 = pool_key("10.0.0.1:5432", "u2", "d");
+        // Same host, different port: must not match the node prefix.
+        let b = pool_key("10.0.0.1:54320", "u1", "d");
+        for key in [&a1, &a1, &a2, &b] {
+            let (client, accepted) = live_pair(&listener).await;
+            server_halves.push(accepted);
+            assert!(pool.checkin(key, client));
+        }
+        assert_eq!(pool.idle_count(), 4);
+
+        assert_eq!(pool.evict_idle_for_node("10.0.0.1:5432"), 3);
+        assert_eq!(pool.idle_count(), 1);
+        assert!(pool.checkout(&a1).is_none());
+        assert!(pool.checkout(&a2).is_none());
+        assert_eq!(pool.evict_idle_for_node("10.0.0.1:5432"), 0);
+        assert!(
+            pool.checkout(&b).is_some(),
+            "other nodes keep their connections"
+        );
+        assert_eq!(pool.idle_count(), 0);
+        assert_eq!(pool.capacity_evictions(), 0, "a separate counter");
     }
 
     #[test]

@@ -130,8 +130,11 @@ impl ProxyServer {
     /// must never be trusted once a provider is in charge.
     pub(super) fn is_write_target(state: &ServerState, config: &ProxyConfig, addr: &str) -> bool {
         if state.authoritative_topology {
-            return Self::authoritative_leader(config, &state.primary_tracker).as_deref()
-                == Some(addr);
+            return state.routing.load().write_leader(std::time::Instant::now()) == Some(addr)
+                && config
+                    .nodes
+                    .iter()
+                    .any(|n| n.enabled && n.address() == addr);
         }
         config
             .nodes
@@ -177,7 +180,7 @@ impl ProxyServer {
             // leader is disabled) new writes wait — they must never fall
             // back to a configured role the provider has not authorised.
             if state.authoritative_topology {
-                if let Some(addr) = Self::authoritative_leader(config, &state.primary_tracker) {
+                if let Some(addr) = Self::snapshot_leader(state, config) {
                     let mut current = session.current_node.write().await;
                     *current = Some(addr.clone());
                     return Ok(addr);
@@ -337,79 +340,166 @@ impl ProxyServer {
             }
         }
 
+        // H-01 step 3: under a topology provider the published snapshot names
+        // the read set, so a promotion moves reads too (the demoted former
+        // primary serves them, the new leader stops being treated as a
+        // standby) without a proxy.toml edit.
+        if state.authoritative_topology {
+            let snapshot = state.routing.load();
+            let mut candidates: Vec<&str> = Vec::with_capacity(snapshot.replicas.len());
+            let mut weights: Vec<u32> = Vec::with_capacity(snapshot.replicas.len());
+            let mut latency: Vec<f64> = Vec::with_capacity(snapshot.replicas.len());
+            for r in &snapshot.replicas {
+                if config
+                    .nodes
+                    .iter()
+                    .any(|n| n.enabled && n.address() == r.address)
+                    && Self::read_eligible(state, config, &r.address, r.lag_bytes)
+                {
+                    candidates.push(&r.address);
+                    weights.push(r.weight);
+                    latency.push(r.latency_ms);
+                }
+            }
+            let picked = Self::pin_read_target(
+                session,
+                state,
+                config,
+                &candidates,
+                |a| *a,
+                &weights,
+                &latency,
+            )
+            .await;
+            if let Some(addr) = picked {
+                return Ok(addr);
+            }
+            return Self::select_node(session, state, config).await;
+        }
+
         // Get healthy nodes (prefer standbys for reads)
         let health = state.health.load_full();
         let healthy_standbys: Vec<&NodeConfig> = config
             .nodes
             .iter()
             .filter(|n| {
-                let base = n.enabled
+                n.enabled
                     && (n.role == NodeRole::Standby || n.role == NodeRole::ReadReplica)
-                    && health.get(n.address()).map(|h| h.healthy).unwrap_or(false);
-                // Drop a standby whose circuit is open so reads avoid it.
-                #[cfg(feature = "circuit-breaker")]
-                let base = base && !Self::circuit_is_open(state, n.address());
-                // Drop a standby lagging beyond the configured byte threshold.
-                #[cfg(feature = "lag-routing")]
-                let base = base
-                    && !Self::lag_excludes_standby(
+                    && health.get(n.address()).map(|h| h.healthy).unwrap_or(false)
+                    && Self::read_eligible(
+                        state,
+                        config,
+                        n.address(),
                         health
                             .get(n.address())
                             .and_then(|h| h.replication_lag_bytes),
-                        config.lag_routing.max_lag_bytes,
-                        config.lag_routing.require_known_lag,
-                    );
-                base
+                    )
             })
             .collect();
 
         if !healthy_standbys.is_empty() {
-            let strategy = config.load_balancer.read_strategy;
             let weights: Vec<u32> = healthy_standbys.iter().map(|n| n.weight).collect();
             let latency: Vec<f64> = healthy_standbys
                 .iter()
                 .map(|n| health.get(n.address()).map(|h| h.latency_ms).unwrap_or(0.0))
                 .collect();
-            // Load accounting is only gathered for the strategies that use it,
-            // so the default RoundRobin path stays O(1). "Attached" is the
-            // best-effort load signal available on the data path: how many
-            // live sessions currently have this node as their backend.
-            let attached: Vec<u64> =
-                if matches!(strategy, Strategy::LeastConnections | Strategy::PowerOfTwo) {
-                    healthy_standbys
-                        .iter()
-                        .map(|n| {
-                            let addr = n.address();
-                            state
-                                .sessions
-                                .iter()
-                                .filter(|s| {
-                                    s.current_node
-                                        .try_read()
-                                        .ok()
-                                        .and_then(|g| g.clone())
-                                        .map(|cur| cur == addr)
-                                        .unwrap_or(false)
-                                })
-                                .count() as u64
-                        })
-                        .collect()
-                } else {
-                    vec![0; healthy_standbys.len()]
-                };
-
-            let ticket = state.lb_state.rr_counter.fetch_add(1, Ordering::Relaxed);
-            let index = Self::pick_read_node(strategy, &weights, &latency, &attached, ticket)
-                .unwrap_or_else(|| (ticket as usize) % healthy_standbys.len());
-            let node_addr = healthy_standbys[index].address().to_string();
-
-            let mut current = session.current_node.write().await;
-            *current = Some(node_addr.clone());
-            return Ok(node_addr);
+            let picked = Self::pin_read_target(
+                session,
+                state,
+                config,
+                &healthy_standbys,
+                |n| n.address(),
+                &weights,
+                &latency,
+            )
+            .await;
+            if let Some(addr) = picked {
+                return Ok(addr);
+            }
         }
 
         // Fall back to primary if no healthy standbys
         Self::select_node(session, state, config).await
+    }
+
+    /// Whether a healthy read candidate may serve reads right now: its
+    /// circuit is not open and it does not lag beyond `[lag_routing]`.
+    fn read_eligible(
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+        addr: &str,
+        lag_bytes: Option<u64>,
+    ) -> bool {
+        // Drop a standby whose circuit is open so reads avoid it.
+        #[cfg(feature = "circuit-breaker")]
+        if Self::circuit_is_open(state, addr) {
+            return false;
+        }
+        // Drop a standby lagging beyond the configured byte threshold.
+        #[cfg(feature = "lag-routing")]
+        if Self::lag_excludes_standby(
+            lag_bytes,
+            config.lag_routing.max_lag_bytes,
+            config.lag_routing.require_known_lag,
+        ) {
+            return false;
+        }
+        let _ = (state, config, addr, lag_bytes);
+        true
+    }
+
+    /// Pick one of the read candidates (parallel to `weights` / `latency`;
+    /// `addr_of` names each) with `[load_balancer] read_strategy` and pin the
+    /// session to it. `None` when there is no candidate.
+    async fn pin_read_target<C>(
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+        candidates: &[C],
+        addr_of: impl Fn(&C) -> &str,
+        weights: &[u32],
+        latency: &[f64],
+    ) -> Option<String> {
+        if candidates.is_empty() {
+            return None;
+        }
+        let strategy = config.load_balancer.read_strategy;
+        // Load accounting is only gathered for the strategies that use it,
+        // so the default RoundRobin path stays O(1). "Attached" is the
+        // best-effort load signal available on the data path: how many
+        // live sessions currently have this node as their backend.
+        let attached: Vec<u64> =
+            if matches!(strategy, Strategy::LeastConnections | Strategy::PowerOfTwo) {
+                candidates
+                    .iter()
+                    .map(|c| {
+                        let addr = addr_of(c);
+                        state
+                            .sessions
+                            .iter()
+                            .filter(|s| {
+                                s.current_node
+                                    .try_read()
+                                    .ok()
+                                    .and_then(|g| g.clone())
+                                    .map(|cur| cur == addr)
+                                    .unwrap_or(false)
+                            })
+                            .count() as u64
+                    })
+                    .collect()
+            } else {
+                vec![0; candidates.len()]
+            };
+
+        let ticket = state.lb_state.rr_counter.fetch_add(1, Ordering::Relaxed);
+        let index = Self::pick_read_node(strategy, weights, latency, &attached, ticket)
+            .unwrap_or_else(|| (ticket as usize) % candidates.len());
+        let node_addr = addr_of(&candidates[index]).to_string();
+
+        let mut current = session.current_node.write().await;
+        *current = Some(node_addr.clone());
+        Some(node_addr)
     }
 
     /// Select a backend node for the request
@@ -448,7 +538,7 @@ impl ProxyServer {
         // historical fallback below applies; the write path re-checks the
         // target with `is_write_target` before any write is sent.
         if state.authoritative_topology {
-            if let Some(addr) = Self::authoritative_leader(config, &state.primary_tracker) {
+            if let Some(addr) = Self::snapshot_leader(state, config) {
                 if healthy_nodes.iter().any(|n| n.address() == addr) {
                     let mut current = session.current_node.write().await;
                     *current = Some(addr.clone());
