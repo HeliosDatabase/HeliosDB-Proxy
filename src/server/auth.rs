@@ -83,6 +83,7 @@ impl ProxyServer {
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,
+        error_response_started: &mut bool,
     ) -> Result<(Option<TcpStream>, String)> {
         // Use the message already read during TLS negotiation, or read one
         // now (the TLS case, where the real startup follows the handshake).
@@ -114,7 +115,15 @@ impl ProxyServer {
                 Ok((None, String::new()))
             }
             Some(StartupMessage::Startup { params, .. }) => {
-                Self::connect_and_authenticate(client_stream, &params, session, state, config).await
+                Self::connect_and_authenticate(
+                    client_stream,
+                    &params,
+                    session,
+                    state,
+                    config,
+                    error_response_started,
+                )
+                .await
             }
             None => Err(ProxyError::Protocol(
                 "Incomplete startup message".to_string(),
@@ -298,6 +307,7 @@ impl ProxyServer {
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,
+        error_response_started: &mut bool,
     ) -> Result<(Option<TcpStream>, String)> {
         // pg_hba-style admission: reject disallowed (user, database, client
         // address) combinations before opening any backend connection.
@@ -309,6 +319,7 @@ impl ProxyServer {
                 "28000",
                 "connection rejected by proxy admission rules",
             );
+            *error_response_started = true;
             let _ = client_stream.write_all(&err).await;
             return Ok((None, String::new()));
         }
@@ -323,6 +334,7 @@ impl ProxyServer {
                 tracing::info!(%user, error = %e, "proxy SCRAM auth failed");
                 let err =
                     Self::create_error_response("28P01", &format!("authentication failed: {}", e));
+                *error_response_started = true;
                 let _ = client_stream.write_all(&err).await;
                 return Ok((None, String::new()));
             }
@@ -384,6 +396,7 @@ impl ProxyServer {
                 state,
                 user,
                 &node_addr,
+                error_response_started,
             )
             .await
             {
@@ -407,6 +420,7 @@ impl ProxyServer {
                             "backend at max_connections for the whole acquire timeout; refusing the client with 53300"
                         );
                         let err = Self::create_error_response(SQLSTATE_TOO_MANY_CONNECTIONS, &msg);
+                        *error_response_started = true;
                         let _ = client_stream.write_all(&err).await;
                         return Err(ProxyError::PoolExhausted(msg));
                     }
@@ -478,6 +492,7 @@ impl ProxyServer {
         state: &Arc<ServerState>,
         user: &str,
         node_addr: &str,
+        error_response_started: &mut bool,
     ) -> Result<()> {
         if let Some(af) = state.auth_file.as_ref() {
             // The proxy is the auth boundary: the client is already
@@ -505,6 +520,7 @@ impl ProxyServer {
                         "08006",
                         &format!("backend authentication failed: {}", e),
                     );
+                    *error_response_started = true;
                     let _ = client_stream.write_all(&err).await;
                     return Err(e);
                 }
@@ -542,7 +558,14 @@ impl ProxyServer {
             // Pass-through: forward authentication messages between client and
             // backend. Registers the backend's BackendKeyData so a later
             // CancelRequest can be routed back to this node.
-            Self::proxy_authentication(client_stream, backend, state, node_addr).await
+            Self::proxy_authentication(
+                client_stream,
+                backend,
+                state,
+                node_addr,
+                error_response_started,
+            )
+            .await
         }
     }
 
@@ -690,6 +713,7 @@ impl ProxyServer {
         backend_stream: &mut TcpStream,
         state: &Arc<ServerState>,
         node_addr: &str,
+        error_response_started: &mut bool,
     ) -> Result<()> {
         // Bidirectional relay driven by readiness, not a fixed poll. The old
         // loop read the backend (untimed), forwarded, then polled the client
@@ -806,6 +830,11 @@ impl ProxyServer {
                         }
                     }
                     if !relay.is_empty() {
+                        if matches!(outcome, Some(Err(_))) {
+                            // Mark before the write so a timeout/partial write
+                            // cannot make the caller append a synthetic error.
+                            *error_response_started = true;
+                        }
                         client_stream
                             .write_all(&relay)
                             .await

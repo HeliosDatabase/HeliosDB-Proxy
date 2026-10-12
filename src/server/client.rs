@@ -526,9 +526,21 @@ impl ProxyServer {
         // the real startup packet here, after negotiation). A client that opens
         // the connection but never completes startup must not hold the task and
         // its session slot open indefinitely.
+        // A startup handler may already have relayed or emitted a terminal
+        // ErrorResponse. Keep that fact outside the timed future: cancellation
+        // during its write must not append a second frame to a partial error.
+        let mut startup_error_started = false;
         let startup_result = match tokio::time::timeout(
             state.limits.startup_timeout,
-            Self::handle_startup(stream, &mut buffer, pre, session, state, config),
+            Self::handle_startup(
+                stream,
+                &mut buffer,
+                pre,
+                session,
+                state,
+                config,
+                &mut startup_error_started,
+            ),
         )
         .await
         {
@@ -546,10 +558,11 @@ impl ProxyServer {
             }
             Err(e) => {
                 tracing::error!("Startup failed: {}", e);
-                // Send error to client
-                let err_msg =
-                    Self::create_error_response("08006", &format!("Startup failed: {}", e));
-                let _ = stream.write_all(&err_msg).await;
+                if !startup_error_started {
+                    let err_msg =
+                        Self::create_error_response("08006", &format!("Startup failed: {}", e));
+                    let _ = stream.write_all(&err_msg).await;
+                }
                 return Err(e);
             }
         };

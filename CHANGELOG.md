@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `role = "primary"`. Previously the session started on the demoted node and its
   first write failed read-only. With no valid leader, writes wait (fail closed).
   Static topology is unchanged. Reads still choose among nodes by configured role.
+- A backend login rejection now reaches the client as exactly one terminal
+  startup error; the proxy no longer appends a second `08006` after forwarding the
+  backend's `28P01`. Proxy-generated startup errors are unchanged.
 - Cache fills no longer grow an unused key-to-tables reverse index that was
   never cleaned up after table invalidation. The public lookup and unregister
   APIs remain, scanning the forward index.

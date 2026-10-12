@@ -12,6 +12,7 @@ fn test_config() -> ProxyConfig {
 }
 
 // ---- single-pass statement facts ----
+mod startup_terminal;
 mod stmt_facts;
 
 /// A connected loopback `TcpStream` pair, shared by the relay tests

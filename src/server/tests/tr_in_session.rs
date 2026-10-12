@@ -2359,6 +2359,7 @@ async fn passthrough_auth_holds_back_a_capacity_refusal() {
         &mut backend,
         &server.state,
         "127.0.0.1:5432",
+        &mut false,
     )
     .await;
     match r {
@@ -2392,6 +2393,7 @@ async fn passthrough_auth_relays_errors_and_reports_their_sqlstate() {
             &mut backend,
             &server.state,
             "127.0.0.1:5432",
+            &mut false,
         )
         .await;
         match (r, is_auth) {
@@ -2419,9 +2421,15 @@ async fn passthrough_auth_relays_a_successful_startup_unchanged() {
     bytes.extend(frame(b'K', &[0, 0, 0, 7, 0, 0, 0, 9]));
     bytes.extend(frame(b'Z', b"I"));
     backend_peer.write_all(&bytes).await.unwrap();
-    ProxyServer::proxy_authentication(&mut client, &mut backend, &server.state, "127.0.0.1:5432")
-        .await
-        .expect("startup completes");
+    ProxyServer::proxy_authentication(
+        &mut client,
+        &mut backend,
+        &server.state,
+        "127.0.0.1:5432",
+        &mut false,
+    )
+    .await
+    .expect("startup completes");
     drop(client);
     let mut got = Vec::new();
     client_peer.read_to_end(&mut got).await.unwrap();
