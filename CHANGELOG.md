@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- In-session transaction replay covers named prepared statements and portals from earlier
+  protocol cycles (TR-08, GH #50). A transaction that binds a statement the session
+  prepared in an earlier cycle, or fetches more rows from a portal an earlier cycle bound,
+  is now replayed after a backend loss instead of being refused with `57P01`/`08007`. The
+  proxy keeps the named statements the backend acknowledged (their batch reached
+  `ReadyForQuery` without an error), records each cycle with the `Parse` it relied on, and
+  redefines that statement on the replacement connection before replaying the cycle.
+  Names it cannot vouch for (failed `Parse`/`Close`, SQL `PREPARE`/`DEALLOCATE`/`DISCARD`,
+  redefinition after use) still refuse. Bounded by `[limits] max_prepared_statements`.
+  `ExtendedBatchLog` gains a public `outside` field. Live check:
+  `tests/integration/tr_prepared_replay.py`.
+
 - Opt-in automatic standby promotion, `[auto_promote]` (off by default, single-proxy).
   After the topology has had no primary for `down_after_secs` and a direct probe finds
   no writable node, the proxy promotes the standby with the highest replay LSN (lag

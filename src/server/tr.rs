@@ -181,6 +181,40 @@ pub(super) struct TrExtCycle {
     pub(super) route_sql: Option<String>,
 }
 
+/// TR-08: a named statement the backend acknowledged — the batch that
+/// `Parse`d it reached `ReadyForQuery` without an error.
+#[derive(Debug, Clone)]
+pub(super) struct AckedStmt {
+    /// The client's encoded `Parse` (shared with the session registry).
+    pub(super) parse: bytes::Bytes,
+    /// Replay-safety classification of its SQL.
+    pub(super) kind: StmtKind,
+}
+
+/// TR-08: what earlier protocol cycles established, for classifying a cycle
+/// that `Bind`s a statement or `Execute`s a portal it does not define itself.
+#[derive(Clone, Copy)]
+pub(super) struct PriorCycles<'p> {
+    /// Acknowledged named statements of the session.
+    pub(super) statements: &'p HashMap<String, AckedStmt>,
+    /// Named portals bound by earlier cycles of the open transaction.
+    pub(super) portals: &'p HashMap<String, StmtKind>,
+    /// When set, an acknowledged statement counts only while the session
+    /// registry still holds the same `Parse`: re-executing an interrupted
+    /// batch re-prepares from the registry, so both must agree.
+    pub(super) registry: Option<&'p HashMap<String, bytes::Bytes>>,
+}
+
+/// TR-08: what a cycle scan learned besides its classification.
+#[derive(Debug, Default)]
+pub(super) struct CycleScan {
+    /// Statements the cycle uses from earlier cycles, in first-use order.
+    pub(super) outside: Vec<String>,
+    /// The cycle's named-portal `Bind`s (`Some(kind)`) and `Close`s (`None`),
+    /// in wire order.
+    pub(super) portal_updates: Vec<(String, Option<StmtKind>)>,
+}
+
 /// Per-session, loop-local state for in-session TR (no locks: only the
 /// session's own task touches it).
 pub(super) struct TrSession {
@@ -219,6 +253,17 @@ pub(super) struct TrSession {
     pub(super) ext_cycle_dropped: bool,
     /// A Flush has dispatched part of the current cycle, regardless of TR mode.
     pub(super) ext_dispatched: bool,
+    /// TR-08: the session's acknowledged named statements. A later cycle that
+    /// `Bind`s one is classified (and replayed) from here instead of being
+    /// refused as opaque. A name an errored batch `Parse`d or `Close`d, or any
+    /// name after a SQL `DEALLOCATE`/`DISCARD`/`PREPARE`, is dropped: what the
+    /// backend holds under it is uncertain, so a reference to it still
+    /// refuses. Bounded by the session's prepared-statement cap.
+    pub(super) acked: HashMap<String, AckedStmt>,
+    /// TR-08: named portals bound by completed cycles of the open transaction,
+    /// with the kind of the statement bound. Replaying the binding cycle
+    /// recreates the portal; cleared when the transaction ends.
+    pub(super) tx_portals: HashMap<String, StmtKind>,
 }
 
 impl TrSession {
@@ -236,6 +281,8 @@ impl TrSession {
             ext_cycle: None,
             ext_cycle_dropped: false,
             ext_dispatched: false,
+            acked: HashMap::new(),
+            tx_portals: HashMap::new(),
         }
     }
 }
@@ -637,50 +684,64 @@ impl ProxyServer {
         crate::protocol::query_text(&body[name_end + 1..])
     }
 
-    /// Classify every Execute in wire order, preserving Bind-time statement
-    /// identity (replacing a Parse does not change an already bound portal).
-    /// Borrow names from the bounded batch; never decode or rewrite Bind values.
-    /// References outside this batch are deliberately opaque: the routing
-    /// registry does not retain the acknowledged portal/statement generations.
-    /// Such a reference may be a COMMIT and cannot authorize recovery.
+    /// [`Self::tr_extended_cycle_scan`] of one batch with no earlier cycles:
+    /// every reference outside the batch is opaque.
+    #[cfg(test)]
     pub(super) fn tr_extended_kind(
         batch: &[u8],
         unnamed: Option<&[u8]>,
         max_bindings: usize,
         policy: &TrReadPolicy,
     ) -> StmtKind {
-        Self::tr_extended_cycle_kind(&[batch], unnamed, max_bindings, policy)
+        Self::tr_extended_cycle_scan(&[batch], unnamed, max_bindings, policy, None, None)
     }
 
-    pub(super) fn tr_extended_cycle_kind(
+    /// [`Self::tr_extended_cycle_scan`] of one batch, with the statements and
+    /// portals earlier cycles established (TR-08).
+    pub(super) fn tr_extended_kind_prior(
+        batch: &[u8],
+        unnamed: Option<&[u8]>,
+        max_bindings: usize,
+        policy: &TrReadPolicy,
+        prior: PriorCycles<'_>,
+    ) -> StmtKind {
+        Self::tr_extended_cycle_scan(&[batch], unnamed, max_bindings, policy, Some(prior), None)
+    }
+
+    /// Classify every Execute of a cycle in wire order, preserving Bind-time
+    /// statement identity (replacing a Parse does not change an already bound
+    /// portal). Borrow names from the bounded batches; never decode or rewrite
+    /// Bind values. Without `prior`, references outside the cycle are opaque:
+    /// a reference may be a COMMIT and cannot authorize recovery.
+    ///
+    /// With `prior` (TR-08), a
+    /// `Bind` of a statement the cycle has not defined (or closed) resolves
+    /// to the acknowledged statement of that name, and an `Execute` of a
+    /// portal it has not bound to an earlier cycle's portal; a name that is
+    /// not there stays opaque. A cycle that uses an earlier cycle's statement
+    /// and then re-`Parse`s that name is opaque too: replaying it would have
+    /// to restore both definitions in order. `scan` collects the outside
+    /// statements used and the named-portal changes.
+    pub(super) fn tr_extended_cycle_scan(
         batches: &[&[u8]],
         unnamed: Option<&[u8]>,
         max_bindings: usize,
         policy: &TrReadPolicy,
+        prior: Option<PriorCycles<'_>>,
+        mut scan: Option<&mut CycleScan>,
     ) -> StmtKind {
-        let statement_kind = |sql: &str| -> StmtKind {
-            let kind = ProxyServer::tr_classify(sql, policy);
-            // ROLLBACK can expose subsequent Executes to autocommit. Reads and
-            // writes need no second lexical pass; only possible controls do.
-            if matches!(kind, StmtKind::Control | StmtKind::Other) {
-                if let Ok(boundaries) = crate::replay_sql::boundaries(sql) {
-                    if ProxyServer::starts_with_word_ci(boundaries.head, "ROLLBACK")
-                        || ProxyServer::starts_with_word_ci(boundaries.head, "ABORT")
-                    {
-                        return StmtKind::Commit;
-                    }
-                }
-            }
-            kind
-        };
+        let statement_kind = |sql: &str| Self::tr_parse_kind(sql, policy);
         fn cstring<'a>(body: &mut &'a [u8]) -> Option<&'a [u8]> {
             let end = memchr::memchr(0, body)?;
             let value = &body[..end];
             *body = &body[end + 1..];
             Some(value)
         }
-        let mut statements = HashMap::<&[u8], StmtKind>::new();
-        let mut portals = HashMap::<&[u8], StmtKind>::new();
+        // `None` values: closed in this cycle (never resolved from `prior`).
+        let mut statements = HashMap::<&[u8], Option<StmtKind>>::new();
+        let mut portals = HashMap::<&[u8], Option<StmtKind>>::new();
+        // Statements this cycle used from `prior` (TR-08).
+        let mut used_prior: Vec<&[u8]> = Vec::new();
         // The common unnamed Parse/Bind/Execute shape needs no map allocation.
         let mut unnamed_statement = None;
         let mut unnamed_portal = None;
@@ -720,10 +781,13 @@ impl ProxyServer {
                         if name.is_empty() {
                             unnamed_statement = Some(statement_kind(sql));
                         } else {
+                            if used_prior.contains(&name) {
+                                return StmtKind::Commit;
+                            }
                             if statements.len() >= max_bindings && !statements.contains_key(name) {
                                 return StmtKind::Commit;
                             }
-                            statements.insert(name, statement_kind(sql));
+                            statements.insert(name, Some(statement_kind(sql)));
                         }
                     }
                     b'B' => {
@@ -736,7 +800,15 @@ impl ProxyServer {
                         let bound_kind = if name.is_empty() {
                             unnamed_statement
                         } else {
-                            statements.get(name).copied()
+                            match statements.get(name) {
+                                Some(defined) => *defined,
+                                None => Self::tr_prior_statement(
+                                    prior,
+                                    name,
+                                    &mut used_prior,
+                                    scan.as_deref_mut(),
+                                ),
+                            }
                         }
                         .unwrap_or(StmtKind::Commit);
                         if portal.is_empty() {
@@ -745,7 +817,13 @@ impl ProxyServer {
                             if portals.len() >= max_bindings && !portals.contains_key(portal) {
                                 return StmtKind::Commit;
                             }
-                            portals.insert(portal, bound_kind);
+                            portals.insert(portal, Some(bound_kind));
+                            if let Some(s) = scan.as_deref_mut() {
+                                s.portal_updates.push((
+                                    String::from_utf8_lossy(portal).into_owned(),
+                                    Some(bound_kind),
+                                ));
+                            }
                         }
                     }
                     b'E' => {
@@ -755,7 +833,14 @@ impl ProxyServer {
                         let k = if portal.is_empty() {
                             unnamed_portal
                         } else {
-                            portals.get(portal).copied()
+                            match portals.get(portal) {
+                                Some(bound) => *bound,
+                                None => prior.and_then(|p| {
+                                    std::str::from_utf8(portal)
+                                        .ok()
+                                        .and_then(|n| p.portals.get(n).copied())
+                                }),
+                            }
                         }
                         .unwrap_or(StmtKind::Commit);
                         kind = match (kind, k) {
@@ -779,21 +864,179 @@ impl ProxyServer {
                             b'S' if name.is_empty() => unnamed_statement = None,
                             b'P' if name.is_empty() => unnamed_portal = None,
                             b'S' => {
-                                statements.remove(name);
+                                statements.insert(name, None);
                             }
                             b'P' => {
-                                portals.remove(name);
+                                portals.insert(name, None);
+                                if let Some(s) = scan.as_deref_mut() {
+                                    s.portal_updates
+                                        .push((String::from_utf8_lossy(name).into_owned(), None));
+                                }
                             }
                             _ => return StmtKind::Commit,
                         }
                     }
-                    b'D' | b'H' | b'S' => {}
+                    b'D' => {
+                        // A Describe of an earlier cycle's statement needs it
+                        // on the replacement backend too.
+                        if let (Some(b'S'), Some(name)) = (
+                            body.first().copied(),
+                            body.get(1..).and_then(|mut b| cstring(&mut b)),
+                        ) {
+                            if !name.is_empty() && !statements.contains_key(name) {
+                                Self::tr_prior_statement(
+                                    prior,
+                                    name,
+                                    &mut used_prior,
+                                    scan.as_deref_mut(),
+                                );
+                            }
+                        }
+                    }
+                    b'H' | b'S' => {}
                     _ => return StmtKind::Commit,
                 }
                 rest = &rest[frame_len..];
             }
         }
         kind
+    }
+
+    /// Replay-safety kind of a `Parse`d statement's SQL. ROLLBACK can expose
+    /// subsequent Executes to autocommit, so it counts as a commit boundary.
+    /// Reads and writes need no second lexical pass; only possible controls do.
+    pub(super) fn tr_parse_kind(sql: &str, policy: &TrReadPolicy) -> StmtKind {
+        let kind = ProxyServer::tr_classify(sql, policy);
+        if matches!(kind, StmtKind::Control | StmtKind::Other) {
+            if let Ok(boundaries) = crate::replay_sql::boundaries(sql) {
+                if ProxyServer::starts_with_word_ci(boundaries.head, "ROLLBACK")
+                    || ProxyServer::starts_with_word_ci(boundaries.head, "ABORT")
+                {
+                    return StmtKind::Commit;
+                }
+            }
+        }
+        kind
+    }
+
+    /// SQL that can create, drop or replace a named statement behind the
+    /// protocol's back (`PREPARE`, `DEALLOCATE`, `DISCARD ALL`). Matches the
+    /// words anywhere: a false match only forgets acknowledged statements.
+    pub(super) fn tr_touches_statements(sql: &str) -> bool {
+        Self::contains_word_ci(sql, "deallocate")
+            || Self::contains_word_ci(sql, "discard")
+            || Self::contains_word_ci(sql, "prepare")
+    }
+
+    /// TR-08: bring the acknowledged statements up to date with a cycle that
+    /// just reached `ReadyForQuery`, in wire order. A named `Parse` is
+    /// acknowledged with the registry's copy of it (the client's latest
+    /// `Parse` of that name, which must be this very frame) unless the cycle
+    /// failed, in which case the name is forgotten: the backend may hold the
+    /// old definition, the new one, or none. A `Close` of a statement
+    /// forgets it. SQL that manages statements itself, or a frame that does
+    /// not parse, forgets every name.
+    pub(super) fn tr_note_definitions(
+        acked: &mut HashMap<String, AckedStmt>,
+        batches: &[&[u8]],
+        registry: &HashMap<String, bytes::Bytes>,
+        had_error: bool,
+        policy: &TrReadPolicy,
+    ) {
+        fn cstring<'a>(body: &mut &'a [u8]) -> Option<&'a [u8]> {
+            let end = memchr::memchr(0, body)?;
+            let value = &body[..end];
+            *body = &body[end + 1..];
+            Some(value)
+        }
+        let mut forget_all = false;
+        'frames: for batch in batches {
+            let mut rest = *batch;
+            while !rest.is_empty() {
+                let frame = rest
+                    .get(1..5)
+                    .map(|l| u32::from_be_bytes(l.try_into().unwrap()) as usize)
+                    .filter(|&len| len >= 4)
+                    .and_then(|len| rest.get(..len + 1));
+                let Some(frame) = frame else {
+                    forget_all = true;
+                    break 'frames;
+                };
+                let mut body = &frame[5..];
+                match frame[0] {
+                    b'P' => {
+                        let (Some(name), Some(sql)) = (
+                            cstring(&mut body).and_then(|n| std::str::from_utf8(n).ok()),
+                            cstring(&mut body).and_then(|s| std::str::from_utf8(s).ok()),
+                        ) else {
+                            forget_all = true;
+                            break 'frames;
+                        };
+                        if Self::tr_touches_statements(sql) {
+                            forget_all = true;
+                        }
+                        if !name.is_empty() {
+                            match registry.get(name) {
+                                Some(parse) if !had_error && parse[..] == *frame => {
+                                    acked.insert(
+                                        name.to_string(),
+                                        AckedStmt {
+                                            parse: parse.clone(),
+                                            kind: Self::tr_parse_kind(sql, policy),
+                                        },
+                                    );
+                                }
+                                _ => {
+                                    acked.remove(name);
+                                }
+                            }
+                        }
+                    }
+                    b'C' => {
+                        if let (Some(b'S'), Some(name)) = (
+                            body.first().copied(),
+                            body.get(1..).and_then(|mut b| cstring(&mut b)),
+                        ) {
+                            if let Ok(name) = std::str::from_utf8(name) {
+                                acked.remove(name);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                rest = &rest[frame.len()..];
+            }
+        }
+        if forget_all {
+            acked.clear();
+        }
+    }
+
+    /// Resolve a statement an earlier cycle defined (TR-08): its kind, noting
+    /// the first use in `used` and `scan`. `None` (opaque) without `prior` or
+    /// when the session holds no acknowledged statement of that name.
+    fn tr_prior_statement<'a>(
+        prior: Option<PriorCycles<'_>>,
+        name: &'a [u8],
+        used: &mut Vec<&'a [u8]>,
+        scan: Option<&mut CycleScan>,
+    ) -> Option<StmtKind> {
+        let text = std::str::from_utf8(name).ok()?;
+        let prior = prior?;
+        let acked = prior.statements.get(text)?;
+        if prior
+            .registry
+            .is_some_and(|r| r.get(text) != Some(&acked.parse))
+        {
+            return None;
+        }
+        if !used.contains(&name) {
+            used.push(name);
+            if let Some(s) = scan {
+                s.outside.push(text.to_string());
+            }
+        }
+        Some(acked.kind)
     }
 
     /// Representative SQL for logging/bookkeeping only. Never use routing SQL
@@ -1104,6 +1347,10 @@ impl ProxyServer {
         if !now_in_tx {
             session.tr_replay_tainted.store(false, Ordering::Relaxed);
         }
+        if (!now_in_tx || !was_in_tx) && !tr.tx_portals.is_empty() {
+            // Portals die with the transaction that bound them (TR-08).
+            tr.tx_portals.clear();
+        }
         if !tr.record_tx || (!now_in_tx && !was_in_tx) {
             return;
         }
@@ -1205,6 +1452,11 @@ impl ProxyServer {
             session.tr_replay_tainted.store(true, Ordering::Relaxed);
         }
         let sql = crate::protocol::query_text(&msg.payload);
+        if !tr.acked.is_empty() && sql.is_none_or(Self::tr_touches_statements) {
+            // PREPARE / DEALLOCATE / DISCARD ALL act on named statements
+            // behind the protocol's back (TR-08).
+            tr.acked.clear();
+        }
         let bytes = sql.map(|s| s.len()).unwrap_or(0);
         Self::tr_after_response(
             tr,
@@ -1249,7 +1501,37 @@ impl ProxyServer {
             || session
                 .in_transaction
                 .load(std::sync::atomic::Ordering::Relaxed);
+        // TR-08: did the cycle fail, as far as the acknowledged statements
+        // are concerned? An error answering a Flush-terminated chunk never
+        // reaches the Sync's response (the backend skips to the Sync), so a
+        // cycle with Flush chunks is treated as failed: its Parses are
+        // forgotten, never acknowledged. A chunk whose frames were not
+        // retained hides its Parses and Closes altogether: forget every name.
+        let uncertain = session
+            .last_response_error
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || tr.ext_cycle.is_some();
+        if wait_ready && tr.ext_cycle_dropped {
+            tr.acked.clear();
+        }
         if !in_tx_context && wait_ready {
+            if !tr.acked.is_empty()
+                || !defines.is_empty()
+                || tr.ext_cycle.as_ref().is_some_and(|c| !c.defines.is_empty())
+            {
+                let cycle = tr.ext_cycle.as_ref();
+                Self::tr_note_definitions(
+                    &mut tr.acked,
+                    &[
+                        cycle.map_or(&[][..], |c| &c.frames[..]),
+                        unnamed.map_or(&[][..], |(p, _)| &p[..]),
+                        batch,
+                    ],
+                    registry,
+                    uncertain,
+                    &state.tr_read_policy,
+                );
+            }
             tr.ext_cycle = None;
             if std::mem::take(&mut tr.ext_cycle_dropped) {
                 *session.tx_state.write().await = TransactionState::default();
@@ -1327,32 +1609,66 @@ impl ProxyServer {
             .and_then(|c| c.unnamed_parse.as_ref().map(|p| p.len()))
             .unwrap_or(0)
             .saturating_add(unnamed.map_or(0, |(p, _)| p.len()));
+        // TR-08: classify against the statements and portals established
+        // BEFORE this cycle, then learn what the cycle itself defined.
+        let mut scan = CycleScan::default();
+        let prior = PriorCycles {
+            statements: &tr.acked,
+            portals: &tr.tx_portals,
+            registry: None,
+        };
+        let kind = match &cycle {
+            _ if dropped => StmtKind::Commit,
+            Some(c) => Self::tr_extended_cycle_scan(
+                &[
+                    &c.frames,
+                    unnamed.map_or(&[][..], |(p, _)| p.as_ref()),
+                    batch,
+                ],
+                c.unnamed_parse.as_deref(),
+                state.limits.max_prepared_statements,
+                &state.tr_read_policy,
+                Some(prior),
+                Some(&mut scan),
+            ),
+            None => Self::tr_extended_cycle_scan(
+                &[batch],
+                unnamed.map(|(p, _)| p.as_ref()),
+                state.limits.max_prepared_statements,
+                &state.tr_read_policy,
+                Some(prior),
+                Some(&mut scan),
+            ),
+        };
+        // The definitions the replay restores before re-sending the cycle.
+        let outside: Vec<(String, bytes::Bytes)> = scan
+            .outside
+            .into_iter()
+            .filter_map(|name| {
+                let parse = tr.acked.get(&name)?.parse.clone();
+                Some((name, parse))
+            })
+            .collect();
+        Self::tr_note_definitions(
+            &mut tr.acked,
+            &[
+                cycle.as_ref().map_or(&[][..], |c| &c.frames[..]),
+                unnamed.map_or(&[][..], |(p, _)| &p[..]),
+                batch,
+            ],
+            registry,
+            uncertain,
+            &state.tr_read_policy,
+        );
         let entry_bytes = batch
             .len()
             .saturating_add(cycle.as_ref().map_or(0, |c| c.frames.len()))
-            .saturating_add(unnamed_len);
+            .saturating_add(unnamed_len)
+            .saturating_add(outside.iter().map(|(n, p)| n.len() + p.len()).sum());
         Self::tr_after_response(
             tr,
             resolved,
-            Some(match &cycle {
-                _ if dropped => StmtKind::Commit,
-                Some(c) => Self::tr_extended_cycle_kind(
-                    &[
-                        &c.frames,
-                        unnamed.map_or(&[][..], |(p, _)| p.as_ref()),
-                        batch,
-                    ],
-                    c.unnamed_parse.as_deref(),
-                    state.limits.max_prepared_statements,
-                    &state.tr_read_policy,
-                ),
-                None => Self::tr_extended_kind(
-                    batch,
-                    unnamed.map(|(p, _)| p.as_ref()),
-                    state.limits.max_prepared_statements,
-                    &state.tr_read_policy,
-                ),
-            }),
+            Some(kind),
             || {
                 let (frames, unnamed_parse, mut all_defines, mut all_refs) = match cycle {
                     Some(mut c) => {
@@ -1381,6 +1697,7 @@ impl ProxyServer {
                         unnamed_parse,
                         defines: all_defines,
                         refs: all_refs,
+                        outside,
                     }),
                 }
             },
@@ -1389,6 +1706,31 @@ impl ProxyServer {
             state,
         )
         .await;
+        // Named portals live until the transaction ends; a later cycle may
+        // Execute one this cycle bound (TR-08).
+        if !scan.portal_updates.is_empty()
+            && !uncertain
+            && session
+                .last_rfq_status
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == b'T'
+        {
+            for (portal, bound) in scan.portal_updates {
+                match bound {
+                    // Past the cap a later Execute of the portal stays opaque.
+                    Some(k)
+                        if tr.tx_portals.len() < state.limits.max_prepared_statements
+                            || tr.tx_portals.contains_key(&portal) =>
+                    {
+                        tr.tx_portals.insert(portal, k);
+                    }
+                    Some(_) => {}
+                    None => {
+                        tr.tx_portals.remove(&portal);
+                    }
+                }
+            }
+        }
     }
 
     /// Finish the bookkeeping for a COPY cycle once its CopyDone/CopyFail
@@ -1726,6 +2068,20 @@ impl ProxyServer {
                     other => ReplayFailure::Backend(other),
                 })?,
                 Some(ext) => {
+                    // TR-08: statements earlier cycles prepared, exactly as
+                    // the backend acknowledged them when this cycle ran.
+                    for (name, parse) in &ext.outside {
+                        Self::tr_redefine_statement(&mut bc.stream, name, parse, wt, rt, mf)
+                            .await
+                            .map_err(|e| match e {
+                                ProxyError::Protocol(_) => ReplayFailure::Statement(format!(
+                                    "re-prepare of statement '{}' rejected",
+                                    name
+                                )),
+                                other => ReplayFailure::Backend(other),
+                            })?;
+                        bc.prepared.insert(name.clone());
+                    }
                     for name in &ext.refs {
                         if bc.prepared.contains(name) || ext.defines.contains(name) {
                             continue;
@@ -1810,6 +2166,40 @@ impl ProxyServer {
         Ok(())
     }
 
+    /// TR-08: make `name` on a replacement connection exactly `parse`:
+    /// `Close` whatever the connection holds under that name, `Parse` it again
+    /// and `Sync`. Inside the replayed transaction block the Sync commits
+    /// nothing. `Err(Protocol)` if the backend rejects either.
+    pub(super) async fn tr_redefine_statement<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+        backend: &mut S,
+        name: &str,
+        parse: &[u8],
+        write_timeout: Duration,
+        read_timeout: Duration,
+        max_frame_bytes: usize,
+    ) -> Result<()> {
+        let mut wire = Vec::with_capacity(parse.len() + name.len() + 16);
+        wire.push(b'C');
+        wire.extend_from_slice(&((4 + 1 + name.len() + 1) as u32).to_be_bytes());
+        wire.push(b'S');
+        wire.extend_from_slice(name.as_bytes());
+        wire.push(0);
+        wire.extend_from_slice(parse);
+        wire.extend_from_slice(&[b'S', 0, 0, 0, 4]);
+        tokio::time::timeout(write_timeout, backend.write_all(&wire))
+            .await
+            .map_err(|_| ProxyError::Network("re-prepare write timeout".to_string()))?
+            .map_err(|e| ProxyError::Network(format!("re-prepare write error: {}", e)))?;
+        let (_, had_error) =
+            Self::drain_until_ready(backend, read_timeout, max_frame_bytes, None).await?;
+        if had_error {
+            return Err(ProxyError::Protocol(
+                "re-prepare rejected by backend".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Drop the session's recorded transaction (it died with the backend).
     pub(super) async fn tr_clear_tx(session: &Arc<ClientSession>) {
         *session.tx_state.write().await = TransactionState::default();
@@ -1878,11 +2268,19 @@ impl ProxyServer {
                 unnamed,
                 ..
             } => (
-                Self::tr_extended_kind(
+                // TR-08: a Bind of a statement an earlier cycle prepared is
+                // classified by its acknowledged SQL, as long as the
+                // registry (which re-execution re-prepares from) agrees.
+                Self::tr_extended_kind_prior(
                     batch,
                     unnamed.map(|(p, _)| p.as_ref()),
                     state.limits.max_prepared_statements,
                     &state.tr_read_policy,
+                    PriorCycles {
+                        statements: &tr.acked,
+                        portals: &tr.tx_portals,
+                        registry: Some(registry),
+                    },
                 ),
                 *wait_ready,
             ),

@@ -201,6 +201,11 @@ pub struct ExtendedBatchLog {
     /// Named statements the cycle references (Bind / Describe-S) — re-prepared
     /// from the session registry if the replacement connection lacks them.
     pub refs: Vec<String>,
+    /// TR-08: statements EARLIER cycles prepared that this cycle uses, with
+    /// the `Parse` the backend had acknowledged for each when the cycle ran.
+    /// Replay redefines them (Close + Parse) before re-sending the cycle, so a
+    /// later redefinition of the name in the session cannot leak into it.
+    pub outside: Vec<(String, bytes::Bytes)>,
 }
 
 /// A cached per-session backend connection plus the set of *named* prepared

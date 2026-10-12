@@ -171,8 +171,26 @@ returns `40001` rather than continuing on top of rows the client never observed.
 - the number of distinct tracked `SET` variables exceeded
   `[limits] tr_max_session_set_statements`, so the session cannot be restored completely
   (`08006`);
-- a commit boundary cannot be established lexically, or an `Execute` refers to a `Parse`
-  or `Bind` from an earlier completed protocol cycle.
+- a commit boundary cannot be established lexically;
+- an `Execute` refers to a named statement or portal the proxy cannot vouch for (see
+  below).
+
+**Named statements and portals from earlier cycles.** Drivers usually prepare a named
+statement once and `Bind`/`Execute` it in later protocol cycles, often inside a
+transaction opened afterwards. The proxy keeps, per session, the named statements the
+backend *acknowledged*: a `Parse` counts once the batch that carried it reached
+`ReadyForQuery` without an error. A later cycle that binds one is classified by that
+statement's SQL, recorded together with the acknowledged `Parse`, and on replay the
+replacement connection first gets exactly that definition (`Close` + `Parse` + `Sync`
+inside the replayed transaction block) before the cycle is re-sent. Likewise a named
+portal bound by an earlier cycle of the open transaction (a cursor-style fetch with a row
+limit) keeps the classification of the statement it was bound to; replaying the binding
+cycle recreates it, and its first fetches are verified like any other replayed response.
+The proxy forgets a name, so that a reference to it refuses as before, when a batch that
+`Parse`d or `Close`d it failed (the backend may hold the old definition, the new one or
+none), when the session runs SQL `PREPARE`, `DEALLOCATE` or `DISCARD`, and when a cycle
+uses a statement and then redefines it. Both registries are bounded by
+`[limits] max_prepared_statements`; past it, a reference refuses.
 
 ---
 

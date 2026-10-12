@@ -2948,3 +2948,488 @@ fn static_topology_still_uses_configured_roles_for_write_target() {
         "unknown:5432"
     ));
 }
+
+// ---- TR-08: statements and portals from earlier protocol cycles ----
+
+fn tr08_parse(name: &str, sql: &str) -> Vec<u8> {
+    frame(b'P', &[cstr(name), cstr(sql), vec![0, 0]].concat())
+}
+
+fn tr08_bind(portal: &str, name: &str) -> Vec<u8> {
+    frame(b'B', &[cstr(portal), cstr(name), vec![0; 6]].concat())
+}
+
+fn tr08_execute(portal: &str) -> Vec<u8> {
+    frame(b'E', &[cstr(portal), vec![0; 4]].concat())
+}
+
+fn tr08_acked(name: &str, sql: &str) -> (String, AckedStmt) {
+    (
+        name.to_string(),
+        AckedStmt {
+            parse: bytes::Bytes::from(tr08_parse(name, sql)),
+            kind: ProxyServer::tr_parse_kind(sql, &TrReadPolicy::default()),
+        },
+    )
+}
+
+/// A Bind of a statement an earlier cycle prepared is classified by the
+/// acknowledged SQL; anything the cycle closed, redefined after use, or the
+/// session cannot vouch for stays opaque (a possible COMMIT).
+#[test]
+fn tr08_prior_statements_and_portals_classify_later_cycles() {
+    let policy = TrReadPolicy::default();
+    let acked: HashMap<String, AckedStmt> = [
+        tr08_acked("r", "SELECT 1"),
+        tr08_acked("w", "INSERT INTO t VALUES ($1)"),
+        tr08_acked("c", "COMMIT"),
+        tr08_acked("rb", "ROLLBACK"),
+    ]
+    .into_iter()
+    .collect();
+    let portals: HashMap<String, StmtKind> = [("cur".to_string(), StmtKind::Read)].into();
+    let prior = PriorCycles {
+        statements: &acked,
+        portals: &portals,
+        registry: None,
+    };
+    let kind = |frames: Vec<Vec<u8>>| {
+        ProxyServer::tr_extended_kind_prior(&frames.concat(), None, 256, &policy, prior)
+    };
+    let read = vec![tr08_bind("", "r"), tr08_execute(""), frame(b'S', &[])];
+    // Without the prior cycles the reference is opaque, as before TR-08.
+    assert_eq!(
+        ProxyServer::tr_extended_kind(&read.concat(), None, 256, &policy),
+        StmtKind::Commit
+    );
+    assert_eq!(kind(read), StmtKind::Read);
+    assert_eq!(
+        kind(vec![tr08_bind("", "w"), tr08_execute("")]),
+        StmtKind::Write
+    );
+    for end in ["c", "rb", "unknown"] {
+        assert_eq!(
+            kind(vec![tr08_bind("", end), tr08_execute("")]),
+            StmtKind::Commit,
+            "{end}"
+        );
+    }
+    // Closed earlier in this cycle: not the acknowledged statement any more.
+    assert_eq!(
+        kind(vec![
+            frame(b'C', b"Sr\0"),
+            tr08_bind("", "r"),
+            tr08_execute("")
+        ]),
+        StmtKind::Commit
+    );
+    // Used, then redefined in the same cycle: opaque.
+    assert_eq!(
+        kind(vec![
+            tr08_bind("", "r"),
+            tr08_execute(""),
+            frame(b'C', b"Sr\0"),
+            tr08_parse("r", "SELECT 2"),
+            tr08_bind("", "r"),
+            tr08_execute("")
+        ]),
+        StmtKind::Commit
+    );
+    // Redefined before any use: the cycle's own definition wins.
+    assert_eq!(
+        kind(vec![
+            frame(b'C', b"Sw\0"),
+            tr08_parse("w", "SELECT 2"),
+            tr08_bind("", "w"),
+            tr08_execute("")
+        ]),
+        StmtKind::Read
+    );
+    // Portals bound by earlier cycles of the transaction.
+    assert_eq!(kind(vec![tr08_execute("cur")]), StmtKind::Read);
+    assert_eq!(
+        kind(vec![frame(b'C', b"Pcur\0"), tr08_execute("cur")]),
+        StmtKind::Commit
+    );
+    assert_eq!(kind(vec![tr08_execute("other")]), StmtKind::Commit);
+
+    // Re-execution re-prepares from the registry: it must hold the same Parse.
+    let mut registry: HashMap<String, bytes::Bytes> = HashMap::new();
+    registry.insert("r".to_string(), acked["r"].parse.clone());
+    let read = [tr08_bind("", "r"), tr08_execute("")].concat();
+    let guarded = |registry: &HashMap<String, bytes::Bytes>| {
+        ProxyServer::tr_extended_kind_prior(
+            &read,
+            None,
+            256,
+            &policy,
+            PriorCycles {
+                registry: Some(registry),
+                ..prior
+            },
+        )
+    };
+    assert_eq!(guarded(&registry), StmtKind::Read);
+    registry.insert(
+        "r".to_string(),
+        bytes::Bytes::from(tr08_parse("r", "DELETE FROM t")),
+    );
+    assert_eq!(guarded(&registry), StmtKind::Commit);
+    registry.remove("r");
+    assert_eq!(guarded(&registry), StmtKind::Commit);
+
+    // The scan reports the outside statements (first use, once each,
+    // Describe included) and the named-portal changes in wire order.
+    let mut scan = CycleScan::default();
+    let k = ProxyServer::tr_extended_cycle_scan(
+        &[&[
+            frame(b'D', b"Sw\0"),
+            tr08_bind("p", "r"),
+            tr08_execute("p"),
+            tr08_bind("", "r"),
+            tr08_execute(""),
+            frame(b'C', b"Pp\0"),
+        ]
+        .concat()],
+        None,
+        256,
+        &policy,
+        Some(prior),
+        Some(&mut scan),
+    );
+    assert_eq!(k, StmtKind::Read);
+    assert_eq!(scan.outside, vec!["w".to_string(), "r".to_string()]);
+    assert_eq!(
+        scan.portal_updates,
+        vec![
+            ("p".to_string(), Some(StmtKind::Read)),
+            ("p".to_string(), None)
+        ]
+    );
+}
+
+/// The acknowledged statements follow only cycles that reached
+/// ReadyForQuery cleanly; anything uncertain is forgotten.
+#[test]
+fn tr08_definitions_follow_acknowledged_cycles_only() {
+    let policy = TrReadPolicy::default();
+    let p_r = tr08_parse("r", "SELECT 1");
+    let mut registry: HashMap<String, bytes::Bytes> = HashMap::new();
+    registry.insert("r".to_string(), bytes::Bytes::from(p_r.clone()));
+    let mut acked = HashMap::new();
+    let clean = [p_r.clone(), frame(b'S', &[])].concat();
+    let note = |acked: &mut HashMap<String, AckedStmt>,
+                frames: &[u8],
+                registry: &HashMap<String, bytes::Bytes>,
+                had_error: bool| {
+        ProxyServer::tr_note_definitions(acked, &[frames], registry, had_error, &policy)
+    };
+
+    note(&mut acked, &clean, &registry, false);
+    assert_eq!(acked["r"].kind, StmtKind::Read);
+    assert_eq!(acked["r"].parse, registry["r"]);
+    // The backend may hold the old definition, the new one, or none.
+    note(&mut acked, &clean, &registry, true);
+    assert!(acked.is_empty());
+    // The registry's Parse must be this very frame.
+    note(&mut acked, &clean, &registry, false);
+    let mut other = registry.clone();
+    other.insert(
+        "r".to_string(),
+        bytes::Bytes::from(tr08_parse("r", "SELECT 2")),
+    );
+    note(&mut acked, &clean, &other, false);
+    assert!(acked.is_empty());
+    // Close forgets; Close then Parse in one cycle defines the new one.
+    note(&mut acked, &clean, &registry, false);
+    note(&mut acked, &frame(b'C', b"Sr\0"), &registry, false);
+    assert!(acked.is_empty());
+    note(
+        &mut acked,
+        &[frame(b'C', b"Sr\0"), p_r.clone()].concat(),
+        &registry,
+        false,
+    );
+    assert!(acked.contains_key("r"));
+    // SQL that manages statements itself forgets every name.
+    for sql in ["DEALLOCATE ALL", "DISCARD ALL", "PREPARE q AS SELECT 1"] {
+        note(&mut acked, &clean, &registry, false);
+        note(
+            &mut acked,
+            &[tr08_parse("", sql), tr08_bind("", ""), tr08_execute("")].concat(),
+            &registry,
+            false,
+        );
+        assert!(acked.is_empty(), "{sql}");
+    }
+    // An unparsable frame forgets every name.
+    note(&mut acked, &clean, &registry, false);
+    note(&mut acked, &[b'P', 0, 0], &registry, false);
+    assert!(acked.is_empty());
+}
+
+/// Read one frontend frame (tag, body) from a test backend's socket.
+async fn tr08_read_frame<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> (u8, Vec<u8>) {
+    use tokio::io::AsyncReadExt;
+    let mut header = [0u8; 5];
+    r.read_exact(&mut header).await.unwrap();
+    let len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
+    let mut body = vec![0u8; len - 4];
+    r.read_exact(&mut body).await.unwrap();
+    (header[0], body)
+}
+
+/// Redefinition closes whatever the connection holds under the name,
+/// re-Parses it and Syncs; a rejection is a protocol error.
+#[tokio::test]
+async fn tr08_redefine_closes_reparses_and_syncs() {
+    let parse = tr08_parse("ins", "INSERT INTO t VALUES ($1)");
+    for reject in [false, true] {
+        let (mut proxy, mut backend) = tokio::io::duplex(64 * 1024);
+        let fake = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            loop {
+                let f = tr08_read_frame(&mut backend).await;
+                let done = f.0 == b'S';
+                seen.push(f);
+                if done {
+                    break;
+                }
+            }
+            let reply = if reject {
+                [frame(b'E', b"SERROR\0C42601\0Mbad\0\0"), frame(b'Z', b"E")].concat()
+            } else {
+                [frame(b'3', &[]), frame(b'1', &[]), frame(b'Z', b"T")].concat()
+            };
+            backend.write_all(&reply).await.unwrap();
+            seen
+        });
+        let r = ProxyServer::tr_redefine_statement(
+            &mut proxy,
+            "ins",
+            &parse,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            1 << 20,
+        )
+        .await;
+        let seen = fake.await.unwrap();
+        assert_eq!(
+            seen.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            vec![b'C', b'P', b'S']
+        );
+        assert_eq!(seen[0].1, b"Sins\0");
+        assert_eq!(frame(b'P', &seen[1].1), parse);
+        if reject {
+            assert!(matches!(r, Err(ProxyError::Protocol(_))), "{r:?}");
+        } else {
+            r.unwrap();
+        }
+    }
+}
+
+/// Replay restores an outside statement from the snapshot the cycle was
+/// recorded with — not from the registry, which a later Parse may have
+/// changed — before re-sending the cycle.
+#[tokio::test]
+async fn tr08_replay_redefines_outside_statements_from_the_snapshot() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let fake = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut seen = Vec::new();
+        // Redefinition (C, P, S) then the recorded cycle (B, E, S).
+        let mut syncs = 0;
+        while syncs < 2 {
+            let f = tr08_read_frame(&mut sock).await;
+            let reply = match f.0 {
+                b'C' => frame(b'3', &[]),
+                b'P' => frame(b'1', &[]),
+                b'B' => frame(b'2', &[]),
+                b'E' => frame(b'C', b"INSERT 0 1\0"),
+                b'S' => {
+                    syncs += 1;
+                    frame(b'Z', b"T")
+                }
+                other => panic!("unexpected frame {}", other as char),
+            };
+            seen.push(f);
+            sock.write_all(&reply).await.unwrap();
+        }
+        seen
+    });
+    let server = ProxyServer::new(test_config()).unwrap();
+    let state = server.state.clone();
+    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    conns.insert(
+        addr.clone(),
+        BackendConn::new(TcpStream::connect(&addr).await.unwrap()),
+    );
+    let acknowledged = bytes::Bytes::from(tr08_parse("ins", "INSERT INTO t VALUES ($1)"));
+    // The session has since re-Parsed the name: the registry differs.
+    let mut registry: HashMap<String, bytes::Bytes> = HashMap::new();
+    registry.insert(
+        "ins".to_string(),
+        bytes::Bytes::from(tr08_parse("ins", "DELETE FROM t")),
+    );
+    let cycle = [tr08_bind("", "ins"), tr08_execute(""), frame(b'S', &[])].concat();
+    let entries = vec![StatementLog {
+        sql: "INSERT INTO t VALUES ($1)".to_string(),
+        params: Vec::new(),
+        result_checksum: None,
+        executed_at: chrono::Utc::now(),
+        extended: Some(ExtendedBatchLog {
+            frames: bytes::Bytes::from(cycle.clone()),
+            unnamed_parse: None,
+            defines: Vec::new(),
+            refs: vec!["ins".to_string()],
+            outside: vec![("ins".to_string(), acknowledged.clone())],
+        }),
+    }];
+    let r =
+        ProxyServer::tr_replay_transaction(&mut conns, &addr, &entries, &registry, &state).await;
+    assert!(r.is_ok());
+    let seen = fake.await.unwrap();
+    assert_eq!(
+        seen.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        vec![b'C', b'P', b'S', b'B', b'E', b'S']
+    );
+    assert_eq!(frame(b'P', &seen[1].1), acknowledged.to_vec());
+    assert!(conns[&addr].prepared.contains("ins"));
+}
+
+/// The recorder end to end: a statement prepared in its own cycle before
+/// BEGIN is acknowledged; a later cycle inside the transaction that binds
+/// it is recorded as replayable with the acknowledged Parse; a Parse that
+/// only a Flush-chunked cycle carried is never acknowledged.
+#[tokio::test]
+async fn tr08_recorder_snapshots_statements_from_earlier_cycles() {
+    let server = ProxyServer::new(test_config()).unwrap();
+    let state = server.state.clone();
+    let session = make_test_session();
+    let mut tr = TrSession::new(TrMode::Transaction);
+    let ins = tr08_parse("ins", "INSERT INTO t VALUES ($1)");
+    let late = tr08_parse("late", "SELECT 2");
+    let mut registry: HashMap<String, bytes::Bytes> = HashMap::new();
+    registry.insert("ins".to_string(), bytes::Bytes::from(ins.clone()));
+    registry.insert("late".to_string(), bytes::Bytes::from(late.clone()));
+    let sync = || bytes::Bytes::from(frame(b'S', &[]));
+
+    // Parse "ins" + Sync, outside any transaction.
+    ProxyServer::note_ready_for_query(&session, b'I', false);
+    let prepare = bytes::Bytes::from([ins.clone(), frame(b'S', &[])].concat());
+    ProxyServer::tr_after_extended(
+        &mut tr,
+        &prepare,
+        None,
+        Some("INSERT INTO t VALUES ($1)"),
+        true,
+        &["ins".to_string()],
+        &[],
+        &registry,
+        &session,
+        &state,
+    )
+    .await;
+    assert_eq!(tr.acked["ins"].kind, StmtKind::Write);
+
+    // Parse "late" + Flush, then Sync: the Flush answer could have carried
+    // an error the Sync never reports, so "late" stays unacknowledged.
+    let chunk = bytes::Bytes::from([late.clone(), frame(b'H', &[])].concat());
+    ProxyServer::tr_after_extended(
+        &mut tr,
+        &chunk,
+        None,
+        Some("SELECT 2"),
+        false,
+        &["late".to_string()],
+        &[],
+        &registry,
+        &session,
+        &state,
+    )
+    .await;
+    ProxyServer::tr_after_extended(
+        &mut tr,
+        &sync(),
+        None,
+        None,
+        true,
+        &[],
+        &[],
+        &registry,
+        &session,
+        &state,
+    )
+    .await;
+    assert!(!tr.acked.contains_key("late"));
+    assert!(tr.acked.contains_key("ins"));
+
+    // BEGIN, then Bind/Execute "ins" in a later cycle.
+    ProxyServer::note_ready_for_query(&session, b'T', false);
+    ProxyServer::tr_after_simple(&mut tr, &qmsg("BEGIN"), &session, &state).await;
+    let use_ins = bytes::Bytes::from(
+        [
+            tr08_bind("cur", "ins"),
+            tr08_execute("cur"),
+            frame(b'S', &[]),
+        ]
+        .concat(),
+    );
+    ProxyServer::tr_after_extended(
+        &mut tr,
+        &use_ins,
+        None,
+        None,
+        true,
+        &[],
+        &["ins".to_string()],
+        &registry,
+        &session,
+        &state,
+    )
+    .await;
+    {
+        let ts = session.tx_state.read().await;
+        assert!(
+            !ts.non_replayable,
+            "a bound acknowledged statement is replayable"
+        );
+        assert!(ts.has_writes);
+        let ext = ts.statements[1].extended.as_ref().expect("extended entry");
+        assert_eq!(
+            ext.outside,
+            vec![("ins".to_string(), registry["ins"].clone())]
+        );
+        assert_eq!(
+            ts.replay_bytes,
+            "BEGIN".len() + use_ins.len() + "ins".len() + ins.len()
+        );
+    }
+    assert_eq!(tr.tx_portals.get("cur"), Some(&StmtKind::Write));
+
+    // A statement only a Flush-chunked cycle defined stays opaque.
+    let use_late =
+        bytes::Bytes::from([tr08_bind("", "late"), tr08_execute(""), frame(b'S', &[])].concat());
+    ProxyServer::tr_after_extended(
+        &mut tr,
+        &use_late,
+        None,
+        None,
+        true,
+        &[],
+        &["late".to_string()],
+        &registry,
+        &session,
+        &state,
+    )
+    .await;
+    assert!(session.tx_state.read().await.non_replayable);
+
+    // DEALLOCATE forgets every name; COMMIT ends the portals.
+    ProxyServer::tr_after_simple(&mut tr, &qmsg("DEALLOCATE ALL"), &session, &state).await;
+    assert!(tr.acked.is_empty());
+    ProxyServer::note_ready_for_query(&session, b'I', false);
+    ProxyServer::tr_after_simple(&mut tr, &qmsg("COMMIT"), &session, &state).await;
+    assert!(tr.tx_portals.is_empty());
+}
