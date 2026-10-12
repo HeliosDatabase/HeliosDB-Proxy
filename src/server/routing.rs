@@ -122,6 +122,25 @@ impl ProxyServer {
             .then_some(addr)
     }
 
+    /// Whether `addr` is currently an eligible write target. Under an
+    /// authoritative topology provider only the provider's leader qualifies
+    /// (and nothing does while its authority lease is invalid); otherwise the
+    /// configured `role = "primary"` decides. A node the provider has demoted
+    /// stays `role = "primary"` in a static `[[nodes]]` list, so the role alone
+    /// must never be trusted once a provider is in charge.
+    pub(super) fn is_write_target(state: &ServerState, config: &ProxyConfig, addr: &str) -> bool {
+        if state.authoritative_topology {
+            return Self::authoritative_leader(config, &state.primary_tracker).as_deref()
+                == Some(addr);
+        }
+        config
+            .nodes
+            .iter()
+            .find(|n| n.address() == addr)
+            .map(|n| n.role == NodeRole::Primary)
+            .unwrap_or(false)
+    }
+
     /// Full-jitter exponential backoff for the primary-wait loops (H-05):
     /// base 100 ms doubling to a 2 s cap, mixed with a per-session seed so a
     /// fleet waking after the same failover does not stampede the promoted
@@ -421,6 +440,21 @@ impl ProxyServer {
 
         if healthy_nodes.is_empty() {
             return Err(ProxyError::NoHealthyNodes);
+        }
+
+        // Under an authoritative provider the initial connection goes to the
+        // provider's leader, not to whichever node is configured as primary
+        // (which the provider may have demoted). With no valid leader the
+        // historical fallback below applies; the write path re-checks the
+        // target with `is_write_target` before any write is sent.
+        if state.authoritative_topology {
+            if let Some(addr) = Self::authoritative_leader(config, &state.primary_tracker) {
+                if healthy_nodes.iter().any(|n| n.address() == addr) {
+                    let mut current = session.current_node.write().await;
+                    *current = Some(addr.clone());
+                    return Ok(addr);
+                }
+            }
         }
 
         // Try to find healthy primary first

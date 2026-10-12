@@ -43,13 +43,7 @@ impl ProxyServer {
             if !current_healthy {
                 true
             } else if is_write {
-                let is_primary = config
-                    .nodes
-                    .iter()
-                    .find(|n| n.address() == current)
-                    .map(|n| n.role == NodeRole::Primary)
-                    .unwrap_or(false);
-                !is_primary
+                !Self::is_write_target(state, config, current)
             } else {
                 false
             }

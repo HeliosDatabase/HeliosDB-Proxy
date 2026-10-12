@@ -2644,3 +2644,95 @@ async fn complete_backend_auth_answers_cleartext_and_md5() {
         .unwrap();
     backend.await.unwrap();
 }
+
+/// A server whose tracker is a provider-backed authority. `[[nodes]]` keeps
+/// `pg-a` as the configured primary, as it does in a static config after the
+/// provider has promoted `pg-b`.
+fn authoritative_server() -> (ProxyServer, Arc<PrimaryTracker>, ProxyConfig) {
+    let mut config = ProxyConfig::default();
+    config.add_node("pg-a:5432", "primary").unwrap();
+    config.add_node("pg-b:5432", "standby").unwrap();
+    let mut server = ProxyServer::new(config.clone()).unwrap();
+    let tracker = Arc::new(PrimaryTracker::new_standalone());
+    let state = Arc::get_mut(&mut server.state).expect("fresh server state is unshared");
+    state.authoritative_topology = true;
+    state.primary_tracker = tracker.clone();
+    (server, tracker, config)
+}
+
+/// Regression for Sprinter a1843fc5bd56: a NEW session opened after the
+/// provider promoted another node must start on the provider's leader, not on
+/// the configured (now demoted) primary.
+#[tokio::test]
+async fn new_session_after_promotion_selects_the_authoritative_leader() {
+    let (server, tracker, config) = authoritative_server();
+    let state = &server.state;
+
+    tracker.set_primary(uuid::Uuid::new_v4(), "pg-a:5432".to_string());
+    let s1 = make_test_session();
+    assert_eq!(
+        ProxyServer::select_node(&s1, state, &config).await.unwrap(),
+        "pg-a:5432"
+    );
+
+    // Promotion: the provider now reports pg-b. Config roles are unchanged.
+    tracker.set_primary(uuid::Uuid::new_v4(), "pg-b:5432".to_string());
+    let s2 = make_test_session();
+    assert_eq!(
+        ProxyServer::select_node(&s2, state, &config).await.unwrap(),
+        "pg-b:5432",
+        "a new session must connect to the promoted leader"
+    );
+}
+
+/// The write path must re-route a session whose current node is the
+/// configured primary once the provider has demoted it, and must not route
+/// writes anywhere while the provider has no valid leader.
+#[tokio::test]
+async fn writes_follow_the_authoritative_leader_not_the_configured_role() {
+    let (server, tracker, config) = authoritative_server();
+    let state = &server.state;
+    let session = make_test_session();
+
+    tracker.set_primary(uuid::Uuid::new_v4(), "pg-b:5432".to_string());
+    assert!(!ProxyServer::is_write_target(state, &config, "pg-a:5432"));
+    assert!(ProxyServer::is_write_target(state, &config, "pg-b:5432"));
+
+    // A session still sitting on the demoted configured primary is moved.
+    let target =
+        ProxyServer::choose_target_node(true, None, Some("pg-a:5432"), &session, state, &config)
+            .await
+            .unwrap();
+    assert_eq!(target, "pg-b:5432");
+
+    // A session already on the leader stays put.
+    let target =
+        ProxyServer::choose_target_node(true, None, Some("pg-b:5432"), &session, state, &config)
+            .await
+            .unwrap();
+    assert_eq!(target, "pg-b:5432");
+}
+
+/// Without a provider the configured role still decides (unchanged behaviour).
+#[test]
+fn static_topology_still_uses_configured_roles_for_write_target() {
+    let mut config = ProxyConfig::default();
+    config.add_node("pg-a:5432", "primary").unwrap();
+    config.add_node("pg-b:5432", "standby").unwrap();
+    let server = ProxyServer::new(config.clone()).unwrap();
+    assert!(ProxyServer::is_write_target(
+        &server.state,
+        &config,
+        "pg-a:5432"
+    ));
+    assert!(!ProxyServer::is_write_target(
+        &server.state,
+        &config,
+        "pg-b:5432"
+    ));
+    assert!(!ProxyServer::is_write_target(
+        &server.state,
+        &config,
+        "unknown:5432"
+    ));
+}
