@@ -777,6 +777,7 @@ tr_max_replay_statements = 1000
 tr_max_replay_bytes = 4194304
 tr_max_session_set_statements = 256
 latency_buckets_ms = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]
+tr_buffer_small_reads_bytes = 0
 ```
 
 | Key | Type | Default | Description |
@@ -804,6 +805,7 @@ latency_buckets_ms = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 1000
 | `tr_max_replay_bytes` | usize | `4194304` | In-session TR: cap on bytes (statement text / raw extended-protocol frames) recorded per explicit transaction (4 MiB). Same degradation as above. |
 | `backend_slot_wait_ms` | u64 | `5000` | How long a new backend connection waits for a slot on a node at its `[[nodes]] max_connections` before the client is refused with 53300 (H-05). Must be ≥ 1. Applied at startup. |
 | `latency_buckets_ms` | list of numbers | `[1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]` | Bucket upper bounds, in milliseconds, of every latency histogram on `/metrics` and `/metrics/prometheus` (failover reconnect, transaction replay, admission wait, journal apply, operator replay). 1 to 32 values, strictly increasing, each at least `0.001`; an implicit `+Inf` bucket follows. Applied at startup. |
+| `tr_buffer_small_reads_bytes` | usize | `0` | In-session TR (`tr_mode = select\|transaction`, TR-09): hold the response of a read the proxy may re-execute until its `ReadyForQuery`, up to this many bytes, so a backend fault before then has shown the client nothing and the read is retried transparently instead of the session being closed. A response that outgrows the bound is published at that point and streams on as usual. Costs the client its time to first row (the whole held response arrives at once) and up to this many bytes per session. `0` = off (stream every response). Applied at startup. |
 | `tr_max_session_set_statements` | usize | `256` | In-session TR (`tr_mode != none`): cap on DISTINCT session variables whose latest `SET` is replayed onto the replacement backend (a later `SET` of the same variable replaces the earlier one; `RESET name` removes it; `RESET ALL`/`DISCARD ALL` clear all). Over the cap tracking stops (`tr_session_set_cap_exceeded_total`) and a subsequent failover is refused with `08006` rather than re-homing the session with incomplete state. |
 
 ---

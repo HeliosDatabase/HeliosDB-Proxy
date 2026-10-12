@@ -556,6 +556,7 @@ async fn tr_stream_fault_retains_visible_rows_and_terminal_frames() {
                             max_frame_bytes: usize::MAX,
                             response_timeout: None,
                             observation_bytes: usize::MAX,
+                            hold_bytes: 0,
                         },
                         16,
                         &server.state.metrics,
@@ -3432,4 +3433,145 @@ async fn tr08_recorder_snapshots_statements_from_earlier_cycles() {
     ProxyServer::note_ready_for_query(&session, b'I', false);
     ProxyServer::tr_after_simple(&mut tr, &qmsg("COMMIT"), &session, &state).await;
     assert!(tr.tx_portals.is_empty());
+}
+
+// ---- TR-09: holding a re-executable read until ReadyForQuery ----
+
+/// Relay `response` (then EOF from the backend) with `hold`, through the
+/// plain or the capture relay; returns what the client received and the
+/// relay's result (bytes sent, or the failure's progress).
+async fn tr09_relay(
+    response: Vec<u8>,
+    hold: usize,
+    capture: bool,
+) -> (Vec<u8>, Result<u64, ResponseProgress>) {
+    let (mut backend, mut peer) = pair().await;
+    let (client, mut recipient) = pair().await;
+    let mut client = ClientStream::Plain(client);
+    let session = make_test_session();
+    let mut config = test_config();
+    config.limits.tr_buffer_small_reads_bytes = hold;
+    let server = ProxyServer::new(config).unwrap();
+    let feed = tokio::spawn(async move {
+        peer.write_all(&response).await.unwrap();
+    });
+    let receive = tokio::spawn(async move {
+        let mut received = Vec::new();
+        recipient.read_to_end(&mut received).await.unwrap();
+        received
+    });
+    let r = if capture {
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        {
+            ProxyServer::stream_until_ready_capture_buffered(
+                &mut client,
+                &mut backend,
+                &mut BytesMut::new(),
+                &session,
+                RelayLimits {
+                    hold_bytes: hold,
+                    ..server.state.limits.relay()
+                },
+                usize::MAX,
+                &server.state.metrics,
+            )
+            .await
+            .map(|(sent, ..)| sent)
+        }
+        #[cfg(not(any(feature = "query-cache", feature = "edge-proxy")))]
+        {
+            unreachable!()
+        }
+    } else {
+        ProxyServer::stream_until_ready_buffered(
+            &mut client,
+            &mut backend,
+            &mut BytesMut::new(),
+            &session,
+            &server.state,
+            hold,
+        )
+        .await
+    };
+    drop(client);
+    feed.await.unwrap();
+    (receive.await.unwrap(), r.map_err(|f| f.progress))
+}
+
+#[tokio::test]
+async fn tr09_held_read_publishes_nothing_before_ready_for_query() {
+    let rows = [
+        frame(b'T', b"description"),
+        frame(b'D', b"row one"),
+        frame(b'D', b"row two"),
+        frame(b'C', b"SELECT 2\0"),
+    ]
+    .concat();
+    let whole = [rows.clone(), frame(b'Z', b"I")].concat();
+    for capture in [false, true] {
+        #[cfg(not(any(feature = "query-cache", feature = "edge-proxy")))]
+        if capture {
+            continue;
+        }
+        // Held: the backend dies before ReadyForQuery, the client saw
+        // nothing and no terminal frame, so the read can be re-executed.
+        let (seen, r) = tr09_relay(rows.clone(), 1024, capture).await;
+        assert!(seen.is_empty(), "capture={capture}");
+        let progress = r.unwrap_err();
+        assert_eq!(progress.bytes, 0);
+        assert!(!progress.terminal);
+        assert_eq!(
+            ProxyServer::tr_response_action(TrAction::Reexecute, progress, false),
+            TrAction::Reexecute
+        );
+        // Held and complete: everything arrives, once.
+        let (seen, r) = tr09_relay(whole.clone(), 1024, capture).await;
+        assert_eq!(seen, whole);
+        assert_eq!(r.unwrap(), whole.len() as u64);
+        // Outgrown: published at the bound, then the fault keeps the usual
+        // publication rule (rows and CommandComplete were shown).
+        let (seen, r) = tr09_relay(rows.clone(), 8, capture).await;
+        assert_eq!(seen, rows);
+        let progress = r.unwrap_err();
+        assert_eq!(progress.bytes, rows.len() as u64);
+        assert!(progress.terminal);
+        // Off: streams as before.
+        let (seen, r) = tr09_relay(rows.clone(), 0, capture).await;
+        assert_eq!(seen, rows);
+        assert!(r.unwrap_err().terminal);
+    }
+}
+
+/// Only a read the proxy may re-execute, under select/transaction, is held.
+#[test]
+fn tr09_hold_applies_to_reexecutable_reads_only() {
+    let mut config = test_config();
+    config.limits.tr_buffer_small_reads_bytes = 4096;
+    let server = ProxyServer::new(config).unwrap();
+    let session = |mode| {
+        let mut s = make_test_session();
+        Arc::get_mut(&mut s).unwrap().tr_mode = mode;
+        s
+    };
+    for (mode, kind, want) in [
+        (TrMode::Transaction, StmtKind::Read, 4096),
+        (TrMode::Select, StmtKind::Read, 4096),
+        (TrMode::Transaction, StmtKind::Write, 0),
+        (TrMode::Transaction, StmtKind::Commit, 0),
+        (TrMode::Session, StmtKind::Read, 0),
+        (TrMode::None, StmtKind::Read, 0),
+    ] {
+        assert_eq!(
+            ProxyServer::tr_hold_bytes(&session(mode), &server.state, || kind),
+            want,
+            "{mode:?}/{kind:?}"
+        );
+    }
+    let off = ProxyServer::new(test_config()).unwrap();
+    assert_eq!(
+        ProxyServer::tr_hold_bytes(&session(TrMode::Transaction), &off.state, || {
+            panic!("not classified when off")
+        }),
+        0
+    );
 }

@@ -1205,6 +1205,21 @@ impl ProxyServer {
                                     ))
                                 }
                                 None => {
+                                    // TR-09: classified only when holding
+                                    // is configured.
+                                    let hold = Self::tr_hold_bytes(session, state, || {
+                                        Self::tr_extended_kind_prior(
+                                            &batch,
+                                            held_unnamed.as_ref().map(|(p, _)| p.as_ref()),
+                                            state.limits.max_prepared_statements,
+                                            &state.tr_read_policy,
+                                            PriorCycles {
+                                                statements: &tr.acked,
+                                                portals: &tr.tx_portals,
+                                                registry: Some(&stmt_registry),
+                                            },
+                                        )
+                                    });
                                     Self::forward_extended_batch(
                                         stream,
                                         &batch,
@@ -1216,6 +1231,7 @@ impl ProxyServer {
                                         &reprepare,
                                         &batch_defines,
                                         held_unnamed.as_ref(),
+                                        hold,
                                         session,
                                         state,
                                         config,
@@ -1430,6 +1446,7 @@ impl ProxyServer {
                                         &mut b.response_buf,
                                         session,
                                         state,
+                                        0,
                                     )
                                     .await;
                                     // Copy has drained back to ReadyForQuery — the

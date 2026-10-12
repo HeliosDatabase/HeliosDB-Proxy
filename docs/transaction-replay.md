@@ -107,6 +107,7 @@ write_timeout_secs = 30
 | `write_timeout_secs` | u64 | `30` | `default_write_timeout_secs()` = 30. Exposed as `ProxyConfig::write_timeout()` → `Duration`. Since 1.7.0 it is **one deadline for the whole recovery** — waiting for a primary, connect/auth, session restore and replay all share it, rather than each having its own timeout. |
 | `tr_read_functions` | list | `[]` | Extra function names to treat as side-effect-free when deciding whether an interrupted read may be re-executed. Plain identifiers only. |
 | `[limits] tr_max_observation_bytes` | usize | `1048576` | Per-statement budget for the response digest used to verify a replay. A response beyond it makes the transaction non-replayable. |
+| `[limits] tr_buffer_small_reads_bytes` | usize | `0` (off) | Hold a re-executable read's response until its `ReadyForQuery`, up to this many bytes, so a fault before then retries the read instead of closing the session (TR-09, below). |
 | `[limits] tr_max_session_set_statements` | usize | see `configuration.md` | Cap on **distinct** tracked `SET` variables. Exceeding it refuses failover with `08006` rather than re-homing with incomplete state. |
 | `[limits] max_backend_frame_bytes` | usize | `104857600` | Ceiling on any single backend protocol frame on every streaming relay. |
 | `[limits] backend_response_timeout_secs` | u64 | `0` (off) | Whole-response deadline; bounds a backend that drips bytes inside one response, which the per-read timeout cannot. |
@@ -153,6 +154,18 @@ the outcome is *not delivered*, recovery is safe. If the outcome is *unknown* �
 statement may have committed — it is never re-executed; the client receives `08007` with
 instructions to verify. Once any part of a response has reached the client, the session is
 closed rather than have a second result appended to the first.
+
+**Holding small reads (opt-in, TR-09).** Responses stream: the first rows reach the
+client while the backend is still producing the rest, so a backend that dies mid-result
+leaves the client with part of it and the session is closed. With `[limits]
+tr_buffer_small_reads_bytes` set, a read the proxy may re-execute (the same test as above:
+known side-effect-free, under `select` or `transaction`) is held in the proxy until its
+`ReadyForQuery`, up to that many bytes, and then written at once. A fault while it is held
+has published nothing, so the read is re-executed (or the transaction replayed) and the
+client sees one complete result. A response that outgrows the bound is published at that
+point and streams on, with the usual rule from then on. The cost is the time to first row
+(nothing is shown until the whole held response arrived) and up to the bound in memory per
+session; writes, COPY and every response outside these modes are never held.
 
 **What recovery does.** Under one deadline (`write_timeout_secs`) it waits for a healthy
 primary, connects and authenticates, restores the session's tracked `SET` state, and

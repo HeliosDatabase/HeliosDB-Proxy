@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Opt-in holding of small re-executable reads (TR-09, GH #51): `[limits]
+  tr_buffer_small_reads_bytes` (default 0 = off). Under `tr_mode = "select"` or
+  `"transaction"`, the response of a read the proxy may re-execute is held until its
+  `ReadyForQuery`, up to that many bytes, so a backend fault before then retries the read
+  transparently instead of closing the session. A larger response is published at the
+  bound and streams on as before. Costs time to first row and the bound in memory per
+  session.
+
 - In-session transaction replay covers named prepared statements and portals from earlier
   protocol cycles (TR-08, GH #50). A transaction that binds a statement the session
   prepared in an earlier cycle, or fetches more rows from a portal an earlier cycle bound,

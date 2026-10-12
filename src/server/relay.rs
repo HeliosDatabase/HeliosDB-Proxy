@@ -391,6 +391,14 @@ impl ProxyServer {
             return Err(e);
         }
 
+        // TR-09: a read the proxy may re-execute can be held until its
+        // ReadyForQuery (opt-in), so a fault before then retries it.
+        let hold = Self::tr_hold_bytes(session, state, || {
+            crate::protocol::query_text(&forward_msg.payload).map_or(StmtKind::Commit, |sql| {
+                Self::tr_classify(sql, &state.tr_read_policy)
+            })
+        });
+
         // Cacheable read miss (query-cache and/or edge cache): capture the
         // response frames ONCE and store them so a later identical read is
         // served from cache without a backend hit. Both caches share the one
@@ -420,7 +428,10 @@ impl ProxyServer {
                     &mut backend.stream,
                     &mut backend.response_buf,
                     session,
-                    state.limits.relay(),
+                    RelayLimits {
+                        hold_bytes: hold,
+                        ..state.limits.relay()
+                    },
                     config.cache.max_cacheable_response_bytes,
                     &state.metrics,
                 )
@@ -515,6 +526,7 @@ impl ProxyServer {
             &mut backend.response_buf,
             session,
             state,
+            hold,
         )
         .await
         {
@@ -616,6 +628,7 @@ impl ProxyServer {
         reprepare: &[String],
         defines: &[String],
         unnamed: Option<&(bytes::Bytes, bytes::Bytes)>,
+        hold: usize,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,
@@ -801,6 +814,7 @@ impl ProxyServer {
                 &mut backend.response_buf,
                 session,
                 state,
+                hold,
             )
             .await
         } else {
@@ -957,16 +971,21 @@ impl ProxyServer {
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
     ) -> std::result::Result<u64, ResponseFailure> {
-        Self::stream_until_ready_buffered(client, backend, &mut BytesMut::new(), session, state)
+        Self::stream_until_ready_buffered(client, backend, &mut BytesMut::new(), session, state, 0)
             .await
     }
 
+    /// `hold` (TR-09, see [`Self::tr_hold_bytes`]): keep complete frames in
+    /// `buf` instead of writing them until ReadyForQuery, while they total at
+    /// most this many bytes; past that they are published and the response
+    /// streams on. A fault while holding has published nothing. 0 = stream.
     pub(super) async fn stream_until_ready_buffered(
         client: &mut ClientStream,
         backend: &mut TcpStream,
         buf: &mut BytesMut,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
+        hold: usize,
     ) -> std::result::Result<u64, ResponseFailure> {
         let client_write_timeout = state.limits.client_write_timeout;
         let backend_read_timeout = state.limits.backend_read_timeout;
@@ -982,6 +1001,12 @@ impl ProxyServer {
         let mut sent: u64 = 0;
         let mut had_error = false;
         let mut command_complete = false;
+        // TR-09: bytes of complete frames held in `buf`, and whether what the
+        // client has been shown includes a CommandComplete/ErrorResponse.
+        let holding = hold > 0;
+        let mut hold = hold;
+        let mut held = 0usize;
+        let mut published_terminal = false;
         // TR-07: per-statement completions and the first error are collected
         // only when the forward path registered something for this cycle.
         let capture_armed = session.journal_armed.load(Ordering::Relaxed);
@@ -990,8 +1015,9 @@ impl ProxyServer {
 
         let response = async {
             loop {
-                // Walk complete frames in `buf`, stopping at a boundary frame.
-                let mut consumed = 0usize;
+                // Walk complete frames in `buf` (after any held ones), stopping
+                // at a boundary frame.
+                let mut consumed = held;
                 let mut ready_status: Option<u8> = None;
                 let mut yield_for_copy = false;
                 loop {
@@ -1057,7 +1083,10 @@ impl ProxyServer {
                     None
                 };
 
-                if consumed > 0 {
+                // TR-09: a held response is published at its ReadyForQuery,
+                // at a COPY yield, or once it outgrows `hold`.
+                let publish = ready_status.is_some() || yield_for_copy || consumed > hold;
+                if publish && consumed > 0 {
                     Self::observe_prepared_commit_frames(&buf[..consumed], state);
                     tokio::time::timeout(client_write_timeout, client.write_all(&buf[..consumed]))
                         .await
@@ -1065,6 +1094,11 @@ impl ProxyServer {
                         .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
                     sent += consumed as u64;
                     let _ = buf.split_to(consumed);
+                    published_terminal = had_error || command_complete;
+                    held = 0;
+                    hold = 0;
+                } else if !publish {
+                    held = consumed;
                 }
 
                 if let Some(status) = ready_status {
@@ -1113,7 +1147,11 @@ impl ProxyServer {
             error,
             progress: ResponseProgress {
                 bytes: sent,
-                terminal: had_error || command_complete,
+                terminal: if holding {
+                    published_terminal
+                } else {
+                    had_error || command_complete
+                },
                 raw: false,
             },
         })
@@ -1187,10 +1225,15 @@ impl ProxyServer {
         let mut observation = (session.in_transaction.load(Ordering::Relaxed)
             && matches!(session.tr_mode, TrMode::Select | TrMode::Transaction))
         .then(|| Observation::new(relay.observation_bytes));
+        // TR-09 holding, as in `stream_until_ready_buffered`.
+        let holding = relay.hold_bytes > 0;
+        let mut hold = relay.hold_bytes;
+        let mut held = 0usize;
+        let mut published_terminal = false;
 
         let response = async {
             loop {
-                let mut consumed = 0usize;
+                let mut consumed = held;
                 let mut ready_status: Option<u8> = None;
                 let mut yield_for_copy = false;
                 loop {
@@ -1240,7 +1283,10 @@ impl ProxyServer {
                     }
                 }
 
-                if consumed > 0 {
+                let publish = ready_status.is_some() || yield_for_copy || consumed > hold;
+                if !publish {
+                    held = consumed;
+                } else if consumed > 0 {
                     tokio::time::timeout(
                         relay.client_write_timeout,
                         client.write_all(&buf[..consumed]),
@@ -1269,6 +1315,9 @@ impl ProxyServer {
                     }
                     sent += consumed as u64;
                     let _ = buf.split_to(consumed);
+                    published_terminal = had_error || command_complete;
+                    held = 0;
+                    hold = 0;
                 }
 
                 if let Some(status) = ready_status {
@@ -1305,7 +1354,11 @@ impl ProxyServer {
             error,
             progress: ResponseProgress {
                 bytes: sent,
-                terminal: had_error || command_complete,
+                terminal: if holding {
+                    published_terminal
+                } else {
+                    had_error || command_complete
+                },
                 raw: false,
             },
         })

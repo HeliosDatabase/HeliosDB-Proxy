@@ -55,8 +55,11 @@ pub use metrics::{ServerMetricsSnapshot, TrMetricsSnapshot};
 
 mod tr;
 #[cfg(test)]
-use tr::{AckedStmt, CycleScan, PriorCycles, ReplayFailure, StmtKind, TrAction};
-use tr::{BackendFault, FaultPhase, InFlight, ResponseFailure, ResponseProgress, TrSession};
+use tr::{AckedStmt, CycleScan, ReplayFailure, TrAction};
+use tr::{
+    BackendFault, FaultPhase, InFlight, PriorCycles, ResponseFailure, ResponseProgress, StmtKind,
+    TrSession,
+};
 
 mod tr_policy;
 pub use tr_policy::TrReadPolicy;

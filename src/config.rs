@@ -1541,6 +1541,16 @@ pub struct LimitsToml {
     /// must be > 0. Default 5000.
     #[serde(default = "default_backend_slot_wait_ms")]
     pub backend_slot_wait_ms: u64,
+    /// TR-09: under `tr_mode = "select"` or `"transaction"`, hold the response
+    /// of a read the proxy may re-execute in the proxy until its
+    /// ReadyForQuery, up to this many bytes. A backend fault before then has
+    /// shown the client nothing, so the read is retried transparently instead
+    /// of the session being closed. A response that outgrows the bound is
+    /// published at that point and streams on as usual. The client sees the
+    /// first row only once the whole held response arrived, and each session
+    /// may hold this many bytes. Default 0 = off (stream every response).
+    #[serde(default)]
+    pub tr_buffer_small_reads_bytes: usize,
 }
 
 fn default_backend_slot_wait_ms() -> u64 {
@@ -1649,6 +1659,7 @@ impl Default for LimitsToml {
             tr_max_session_set_statements: default_tr_max_session_set_statements(),
             latency_buckets_ms: crate::metrics_hist::default_latency_buckets_ms(),
             backend_slot_wait_ms: default_backend_slot_wait_ms(),
+            tr_buffer_small_reads_bytes: 0,
         }
     }
 }

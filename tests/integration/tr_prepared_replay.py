@@ -127,14 +127,15 @@ def kill_backend(pid):
     time.sleep(0.5)  # let the proxy's idle watch see the closed socket
 
 
-def start_proxy(binary, temp, pg_port):
+def start_proxy(binary, temp, pg_port, mode="transaction", top="", limits=""):
     port, admin = wire.free_port(), wire.free_port()
     cfg = f'''listen_address = "127.0.0.1:{port}"
 admin_address = "127.0.0.1:{admin}"
 tr_enabled = true
-tr_mode = "transaction"
+tr_mode = "{mode}"
 write_timeout_secs = 15
-[pool_mode]
+{top}[limits]
+{limits}[pool_mode]
 mode = "session"
 [health]
 check_interval_secs = 1
@@ -204,6 +205,27 @@ def case_named_portal(client):
     return report
 
 
+def start_postgres(name):
+    """Start the disposable PostgreSQL on PG_ADDRESS; returns its version."""
+    subprocess.run(["docker", "run", "--detach", "--rm", "--pull=never", "--name", name,
+                    "--memory=768m", "--memory-swap=768m", "--cpus=1", "--pids-limit=64",
+                    "--network", "host", "--tmpfs", "/var/lib/postgresql:rw,size=256m",
+                    "--env", "PGDATA=/var/lib/postgresql/audit",
+                    "--env", f"PGPORT={PG_ADDRESS[1]}",
+                    "--env", "POSTGRES_HOST_AUTH_METHOD=trust", "--env", "POSTGRES_USER=audit",
+                    "--env", "POSTGRES_DB=audit", "postgres:18.4-bookworm",
+                    "-c", "listen_addresses=127.0.0.1", "-p", str(PG_ADDRESS[1])],
+                   check=True, capture_output=True, timeout=30)
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            return pg_query("SHOW server_version")[0][0]
+        except (OSError, EOFError, RuntimeError):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("isolated PostgreSQL did not become ready")
+            time.sleep(0.2)
+
+
 def main():
     global PG_ADDRESS
     parser = argparse.ArgumentParser(description=__doc__)
@@ -214,24 +236,7 @@ def main():
     PG_ADDRESS = ("127.0.0.1", wire.free_port())
     reports = []
     try:
-        subprocess.run(["docker", "run", "--detach", "--rm", "--pull=never", "--name", name,
-                        "--memory=768m", "--memory-swap=768m", "--cpus=1", "--pids-limit=64",
-                        "--network", "host", "--tmpfs", "/var/lib/postgresql:rw,size=256m",
-                        "--env", "PGDATA=/var/lib/postgresql/audit",
-                        "--env", f"PGPORT={PG_ADDRESS[1]}",
-                        "--env", "POSTGRES_HOST_AUTH_METHOD=trust", "--env", "POSTGRES_USER=audit",
-                        "--env", "POSTGRES_DB=audit", "postgres:18.4-bookworm",
-                        "-c", "listen_addresses=127.0.0.1", "-p", str(PG_ADDRESS[1])],
-                       check=True, capture_output=True, timeout=30)
-        deadline = time.monotonic() + 30
-        while True:
-            try:
-                version = pg_query("SHOW server_version")[0][0]
-                break
-            except (OSError, EOFError, RuntimeError):
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("isolated PostgreSQL did not become ready")
-                time.sleep(0.2)
+        version = start_postgres(name)
         cases = [
             ("named_insert", lambda c: case_named_insert(c, "tr08_ledger"),
              lambda r: (r["second_insert_sqlstates"] == [] and r["commit_sqlstates"] == []

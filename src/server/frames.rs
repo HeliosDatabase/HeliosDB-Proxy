@@ -72,6 +72,9 @@ pub(super) struct RelayLimits {
     pub(super) response_timeout: Option<Duration>,
     /// TR-06 observation byte budget.
     pub(super) observation_bytes: usize,
+    /// TR-09: hold this response until ReadyForQuery, up to this many bytes
+    /// (0 = stream). Per response, see `ProxyServer::tr_hold_bytes`.
+    pub(super) hold_bytes: usize,
 }
 
 pub(super) fn validate_backend_frame_len(len: usize, max: usize) -> Result<()> {

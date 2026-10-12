@@ -53,6 +53,9 @@ pub(super) struct ResolvedLimits {
     pub(super) tr_max_session_set_statements: usize,
     /// Wait for a backend slot on a node at its `max_connections` (H-05).
     pub(super) backend_slot_wait: Duration,
+    /// TR-09: bytes of a re-executable read's response held until its
+    /// ReadyForQuery; 0 = off.
+    pub(super) tr_buffer_small_reads: usize,
 }
 
 impl ResolvedLimits {
@@ -64,6 +67,7 @@ impl ResolvedLimits {
             max_frame_bytes: self.max_backend_frame_bytes,
             response_timeout: self.backend_response_timeout,
             observation_bytes: self.tr_max_observation_bytes,
+            hold_bytes: 0,
         }
     }
 
@@ -101,6 +105,7 @@ impl ResolvedLimits {
             tr_max_replay_bytes: l.tr_max_replay_bytes,
             tr_max_session_set_statements: l.tr_max_session_set_statements,
             backend_slot_wait: Duration::from_millis(l.backend_slot_wait_ms),
+            tr_buffer_small_reads: l.tr_buffer_small_reads_bytes,
         }
     }
 }

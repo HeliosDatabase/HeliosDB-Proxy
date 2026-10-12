@@ -2166,6 +2166,26 @@ impl ProxyServer {
         Ok(())
     }
 
+    /// TR-09: how many bytes of the response to the request being forwarded
+    /// may be held until its ReadyForQuery: `[limits]
+    /// tr_buffer_small_reads_bytes` for a read the proxy may re-execute
+    /// (`kind` is `Read`) under `tr_mode = "select"`/`"transaction"`, else 0.
+    /// `kind` is only evaluated when holding is configured.
+    pub(super) fn tr_hold_bytes(
+        session: &ClientSession,
+        state: &ServerState,
+        kind: impl FnOnce() -> StmtKind,
+    ) -> usize {
+        let limit = state.limits.tr_buffer_small_reads;
+        if limit == 0
+            || !matches!(session.tr_mode, TrMode::Select | TrMode::Transaction)
+            || kind() != StmtKind::Read
+        {
+            return 0;
+        }
+        limit
+    }
+
     /// TR-08: make `name` on a replacement connection exactly `parse`:
     /// `Close` whatever the connection holds under that name, `Parse` it again
     /// and `Sync`. Inside the replayed transaction block the Sync commits
@@ -2556,6 +2576,7 @@ impl ProxyServer {
                             reprepare,
                             defines,
                             unnamed,
+                            Self::tr_hold_bytes(session, state, || kind),
                             session,
                             state,
                             config,
