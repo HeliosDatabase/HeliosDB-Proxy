@@ -140,7 +140,6 @@ impl QueryClassifier {
     /// default table patterns are ASCII, so the two folds agree; a table
     /// pattern configured with non-ASCII uppercase letters would only match
     /// case-sensitively on that path.
-    #[allow(clippy::if_same_then_else)]
     pub fn classify_lower(&self, lower: &str) -> QueryIntent {
         let head = lower.trim_start();
 
@@ -184,12 +183,12 @@ impl QueryClassifier {
         }
 
         // Check for embedding operations
-        if self.matches_table_pattern(lower, &self.embedding_tables) {
-            if head.starts_with("select") {
-                return QueryIntent::Embedding;
-            } else if head.starts_with("insert") || head.starts_with("update") {
-                return QueryIntent::Embedding;
-            }
+        if self.matches_table_pattern(lower, &self.embedding_tables)
+            && (head.starts_with("select")
+                || head.starts_with("insert")
+                || head.starts_with("update"))
+        {
+            return QueryIntent::Embedding;
         }
 
         // Check for agent memory operations
