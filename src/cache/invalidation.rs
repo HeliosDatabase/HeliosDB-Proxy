@@ -43,9 +43,6 @@ pub struct InvalidationManager {
     /// Table -> cache keys mapping
     table_keys: DashMap<String, HashSet<CacheKey>>,
 
-    /// Cache key -> tables mapping (reverse index)
-    key_tables: DashMap<CacheKey, HashSet<String>>,
-
     /// Last invalidation time per table
     last_invalidation: DashMap<String, Instant>,
 
@@ -99,7 +96,6 @@ impl InvalidationManager {
         Self {
             config,
             table_keys: DashMap::new(),
-            key_tables: DashMap::new(),
             last_invalidation: DashMap::new(),
             event_tx,
             wal_connected: std::sync::atomic::AtomicBool::new(false),
@@ -115,23 +111,18 @@ impl InvalidationManager {
             .entry(table.to_string())
             .or_default()
             .insert(key.clone());
-
-        // Add to key -> tables mapping
-        self.key_tables
-            .entry(key.clone())
-            .or_default()
-            .insert(table.to_string());
     }
 
-    /// Unregister a cache key
+    /// Unregister a cache key from every tracked table, removing empty sets.
+    ///
+    /// Scans the table index without retaining a separate reverse index.
+    /// Like other multi-table operations, this is not an atomic snapshot:
+    /// a concurrent registration may occur after its table has been visited.
     pub fn unregister(&self, key: &CacheKey) {
-        if let Some((_, tables)) = self.key_tables.remove(key) {
-            for table in tables {
-                if let Some(mut keys) = self.table_keys.get_mut(&table) {
-                    keys.remove(key);
-                }
-            }
-        }
+        self.table_keys.retain(|_, keys| {
+            keys.remove(key);
+            !keys.is_empty()
+        });
     }
 
     /// Get all cache keys associated with a table
@@ -142,28 +133,30 @@ impl InvalidationManager {
             .unwrap_or_default()
     }
 
-    /// Get all tables associated with a cache key
+    /// Get all currently tracked tables associated with a cache key.
+    ///
+    /// Scans the table index; concurrent registrations and invalidations may
+    /// change other tables during the scan.
     pub fn get_tables_for_key(&self, key: &CacheKey) -> Vec<String> {
-        self.key_tables
-            .get(key)
-            .map(|tables| tables.iter().cloned().collect())
-            .unwrap_or_default()
+        self.table_keys
+            .iter()
+            .filter(|entry| entry.value().contains(key))
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 
     /// Invalidate all cache entries for a table
     pub fn invalidate_table(&self, table: &str) {
-        let keys = self.take_table(table);
-        self.forget_keys(table, &keys);
+        drop(self.take_table(table));
     }
 
     /// Invalidate a table and hand back the keys that were registered to it.
     ///
     /// O(1): the key set leaves the index in one step, so when several
     /// writers purge the same table at once exactly one of them receives the
-    /// set and the others get an empty one. The reverse index still names
-    /// `table` for those keys until [`Self::forget_keys`] walks them
-    /// ([`Self::invalidate_table`] does; the query cache's write path does
-    /// not, since nothing on it reads the reverse index).
+    /// set and the others get an empty one (unless new keys are registered
+    /// between purges). No separate reverse index retains the detached keys.
+    /// The caller owns the set and can defer its destruction off the write path.
     pub fn take_table(&self, table: &str) -> HashSet<CacheKey> {
         // Record invalidation time
         self.last_invalidation
@@ -180,17 +173,12 @@ impl InvalidationManager {
             .unwrap_or_default()
     }
 
-    /// Drop `table` from the reverse-index entries of `keys` (a set
-    /// [`Self::take_table`] returned); an entry left with no tables is
-    /// removed rather than kept as an empty set. O(keys).
-    pub fn forget_keys(&self, table: &str, keys: &HashSet<CacheKey>) {
-        for key in keys {
-            self.key_tables.remove_if_mut(key, |_, tables| {
-                tables.remove(table);
-                tables.is_empty()
-            });
-        }
-    }
+    /// Compatibility cleanup for a key set returned by [`Self::take_table`].
+    ///
+    /// This is now a no-op: detaching the table removes all of its tracking
+    /// state. In particular, delayed cleanup must not remove registrations
+    /// added after that detach. Use [`Self::unregister`] to remove a live key.
+    pub fn forget_keys(&self, _table: &str, _keys: &HashSet<CacheKey>) {}
 
     /// Invalidate multiple tables
     pub fn invalidate_tables(&self, tables: &[String]) {
@@ -313,7 +301,6 @@ impl InvalidationManager {
     /// Clear all tracking data
     pub fn clear(&self) {
         self.table_keys.clear();
-        self.key_tables.clear();
         self.last_invalidation.clear();
 
         if let Ok(mut pending) = self.pending_invalidations.write() {
@@ -478,14 +465,144 @@ mod tests {
         // A second purger of the same table gets nothing to do.
         assert!(manager.take_table("users").is_empty());
 
-        // The reverse index keeps the other table and drops emptied keys.
+        // Detaching one table leaves the other table's registrations intact.
         manager.forget_keys("users", &taken);
         assert_eq!(
             manager.get_tables_for_key(&shared),
             vec!["orders".to_string()]
         );
-        assert!(!manager.key_tables.contains_key(&only_users));
+        assert!(manager.get_tables_for_key(&only_users).is_empty());
         assert_eq!(manager.get_keys_for_table("orders"), vec![shared]);
+    }
+
+    #[test]
+    fn take_table_releases_tracking_without_forget_keys() {
+        let manager = InvalidationManager::new(InvalidationConfig::default());
+        let shared = create_key(111);
+        let only_users = create_key(222);
+        manager.register(&shared, "users");
+        manager.register(&shared, "orders");
+        manager.register(&only_users, "users");
+
+        let taken = manager.take_table("users");
+        assert_eq!(taken, HashSet::from([shared.clone(), only_users.clone()]));
+        // QueryCache::purge_tables hands this set to the reclaimer without
+        // calling forget_keys. No key-to-table tracking may survive that path.
+        drop(taken);
+        assert!(manager.get_tables_for_key(&only_users).is_empty());
+        assert_eq!(manager.get_tables_for_key(&shared), vec!["orders"]);
+        assert_eq!(manager.get_keys_for_table("orders"), vec![shared]);
+    }
+
+    #[test]
+    fn repeated_fill_and_purge_leaves_no_key_tracking() {
+        let manager = InvalidationManager::new(InvalidationConfig::default());
+        for cycle in 0..16 {
+            let keys: HashSet<_> = (0..64).map(|i| create_key(cycle * 64 + i)).collect();
+            for key in &keys {
+                manager.register(key, "users");
+            }
+            assert_eq!(manager.take_table("users"), keys);
+            assert_eq!(manager.stats().tracked_tables, 0);
+            assert_eq!(manager.stats().tracked_keys, 0);
+            for key in &keys {
+                assert!(manager.get_tables_for_key(key).is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn query_cache_fill_and_purge_releases_key_tracking() {
+        use crate::cache::{CacheConfig, CacheContext, QueryCache};
+
+        let cache = QueryCache::new(CacheConfig::default());
+        let context = CacheContext::default();
+        for cycle in 0..4 {
+            for column in 0..8 {
+                let sql = format!("SELECT value_{}_{} FROM users", cycle, column);
+                cache
+                    .put(
+                        &sql,
+                        &context,
+                        bytes::Bytes::from_static(b"row"),
+                        1,
+                        Duration::from_millis(1),
+                    )
+                    .await;
+            }
+            let keys = cache.invalidator.get_keys_for_table("users");
+            assert_eq!(keys.len(), 8, "fills must register distinct query keys");
+            // Exercises the real generation update, take_table and deferred
+            // key-set reclamation path, which never calls forget_keys.
+            cache.invalidate_tables(&["users".to_string()]).await;
+            assert_eq!(cache.invalidator.stats().tracked_keys, 0);
+            for key in keys {
+                assert!(cache.invalidator.get_tables_for_key(&key).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn delayed_forget_preserves_reregistered_key() {
+        let manager = InvalidationManager::new(InvalidationConfig::default());
+        let key = create_key(111);
+        manager.register(&key, "users");
+        let taken = manager.take_table("users");
+
+        manager.register(&key, "users");
+        manager.forget_keys("users", &taken);
+        manager.forget_keys("users", &taken);
+        assert_eq!(manager.get_tables_for_key(&key), vec!["users"]);
+        assert_eq!(manager.get_keys_for_table("users"), vec![key.clone()]);
+        // A delayed cleanup must not hide this registration from unregister.
+        manager.unregister(&key);
+        assert!(manager.get_keys_for_table("users").is_empty());
+        assert!(manager.get_tables_for_key(&key).is_empty());
+    }
+
+    #[test]
+    fn unregister_preserves_other_keys_and_removes_empty_tables() {
+        let manager = InvalidationManager::new(InvalidationConfig::default());
+        let shared = create_key(111);
+        let remaining = create_key(222);
+        manager.register(&shared, "users");
+        manager.register(&shared, "users");
+        manager.register(&shared, "orders");
+        manager.register(&remaining, "orders");
+
+        manager.unregister(&shared);
+        manager.unregister(&shared);
+        assert!(manager.get_tables_for_key(&shared).is_empty());
+        assert_eq!(manager.get_tables_for_key(&remaining), vec!["orders"]);
+        assert_eq!(manager.get_keys_for_table("orders"), vec![remaining]);
+        assert_eq!(manager.stats().tracked_tables, 1);
+        assert_eq!(manager.stats().tracked_keys, 1);
+    }
+
+    #[test]
+    fn concurrent_take_table_has_one_owner() {
+        use std::sync::Barrier;
+
+        let manager = InvalidationManager::new(InvalidationConfig::default());
+        let keys: HashSet<_> = (0..64).map(create_key).collect();
+        for key in &keys {
+            manager.register(key, "users");
+        }
+        let barrier = Barrier::new(2);
+        let (first, second) = std::thread::scope(|scope| {
+            let take = || {
+                barrier.wait();
+                manager.take_table("users")
+            };
+            let first = scope.spawn(take);
+            let second = scope.spawn(take);
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert!(first.is_empty() ^ second.is_empty());
+        assert_eq!(first.union(&second).cloned().collect::<HashSet<_>>(), keys);
+        for key in &keys {
+            assert!(manager.get_tables_for_key(key).is_empty());
+        }
     }
 
     #[test]

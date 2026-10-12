@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `role = "primary"`. Previously the session started on the demoted node and its
   first write failed read-only. With no valid leader, writes wait (fail closed).
   Static topology is unchanged. Reads still choose among nodes by configured role.
+- Cache fills no longer grow an unused key-to-tables reverse index that was
+  never cleaned up after table invalidation. The public lookup and unregister
+  APIs remain, scanning the forward index.
 - File-backed L2 query-cache entries retain their original age and precise TTL
   across demotion, disk reads and L1 promotion. Expired entries are no longer
   revived by these transitions; wall-clock changes do not extend their lifetime.
