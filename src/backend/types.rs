@@ -308,14 +308,10 @@ mod tests {
     }
 
     #[test]
-    // The `3.14` here is the expected parse result of the string "3.14", not a
-    // use of the mathematical constant; substituting `std::f64::consts::PI`
-    // would break this string→f64 round-trip assertion.
-    #[allow(clippy::approx_constant)]
     fn test_text_value_f64() {
         assert_eq!(
-            TextValue::Text("3.14".to_string()).as_f64("x").unwrap(),
-            Some(3.14)
+            TextValue::Text("2.5".to_string()).as_f64("x").unwrap(),
+            Some(2.5)
         );
         assert!(TextValue::Text("oops".to_string()).as_f64("x").is_err());
     }

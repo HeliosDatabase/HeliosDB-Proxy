@@ -428,7 +428,6 @@ impl LoadBalancer {
     }
 
     /// Update node health based on combined metrics
-    #[allow(clippy::if_same_then_else)]
     pub async fn update_node_metrics(
         &self,
         node_id: &NodeId,
@@ -444,9 +443,7 @@ impl LoadBalancer {
             // Only adjust health if not transitioning
             if node.health != NodeHealth::Transitioning {
                 // Determine health based on all factors
-                let new_health = if !Self::is_responsive(latency_ms) {
-                    NodeHealth::Unhealthy
-                } else if replication_lag_ms > 30000 {
+                let new_health = if !Self::is_responsive(latency_ms) || replication_lag_ms > 30000 {
                     NodeHealth::Unhealthy
                 } else if replication_lag_ms > 5000
                     || failure_rate > 0.5

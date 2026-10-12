@@ -106,9 +106,6 @@ pub enum ReplayState {
 /// Active replay operation
 #[derive(Debug)]
 struct ActiveReplay {
-    /// Transaction ID
-    #[allow(dead_code)]
-    tx_id: Uuid,
     /// Target node
     target_node: NodeId,
     /// Journal being replayed
@@ -117,9 +114,6 @@ struct ActiveReplay {
     state: ReplayState,
     /// Current position (statement index)
     position: usize,
-    /// Start time
-    #[allow(dead_code)]
-    started_at: chrono::DateTime<chrono::Utc>,
     /// Results so far
     results: Vec<StatementReplayResult>,
 }
@@ -194,12 +188,10 @@ impl FailoverReplay {
         let tx_id = journal.tx_id;
 
         let replay = ActiveReplay {
-            tx_id,
             target_node,
             journal,
             state: ReplayState::Pending,
             position: 0,
-            started_at: chrono::Utc::now(),
             results: Vec::new(),
         };
 
