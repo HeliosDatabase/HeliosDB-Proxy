@@ -353,6 +353,9 @@ struct ServerState {
     routing: Arc<crate::routing_snapshot::RoutingView>,
     /// H-05: per-node backend connection caps (`[[nodes]] max_connections`).
     node_slots: Arc<crate::node_slots::NodeSlots>,
+    /// H-05: per-tenant client caps (`[multi_tenancy] max_clients_per_tenant`
+    /// / `tenant_max_clients`); empty without the `multi-tenancy` feature.
+    tenant_slots: Arc<crate::tenant_slots::TenantSlots>,
     /// H-06: per-gateway idle pools for the HTTP, MCP and GraphQL gateways
     /// (sized by `[limits] gateway_pool_max_idle`), shared with the admin API
     /// for their counters.
@@ -1050,6 +1053,10 @@ impl ProxyServer {
             )),
             gateway_pools,
             node_slots: Arc::new(crate::node_slots::NodeSlots::from_config(&config)),
+            #[cfg(feature = "multi-tenancy")]
+            tenant_slots: Arc::new(crate::tenant_slots::TenantSlots::from_config(&config)),
+            #[cfg(not(feature = "multi-tenancy"))]
+            tenant_slots: Arc::new(crate::tenant_slots::TenantSlots::default()),
             latency: Arc::new(crate::metrics_hist::ProxyLatency::new(
                 &config.limits.latency_buckets_ms,
             )),
@@ -1678,6 +1685,9 @@ impl ProxyServer {
             admin_state.with_latency(state.latency.clone()).await;
             admin_state.with_node_slots(state.node_slots.clone()).await;
             admin_state
+                .with_tenant_slots(state.tenant_slots.clone())
+                .await;
+            admin_state
                 .with_gateway_pools(state.gateway_pools.clone())
                 .await;
             #[cfg(feature = "query-cache")]
@@ -1833,6 +1843,10 @@ impl ProxyServer {
                             admission_timeouts: server_state
                                 .metrics
                                 .admission_timeouts
+                                .load(Ordering::Relaxed),
+                            admission_queue_depth: server_state
+                                .metrics
+                                .admission_queue_depth
                                 .load(Ordering::Relaxed),
                             reconnect_attempts: server_state
                                 .metrics
@@ -2076,6 +2090,11 @@ impl ProxyServer {
                 .state
                 .metrics
                 .admission_timeouts
+                .load(Ordering::Relaxed),
+            admission_queue_depth: self
+                .state
+                .metrics
+                .admission_queue_depth
                 .load(Ordering::Relaxed),
             reconnect_attempts: self
                 .state

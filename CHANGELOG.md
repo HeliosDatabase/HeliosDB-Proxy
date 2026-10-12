@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-tenant client admission (H-05 slice 2): `[multi_tenancy] max_clients_per_tenant`
+  (default 0 = off) and per-tenant overrides in `[multi_tenancy.tenant_max_clients]` cap
+  the client sessions each known tenant holds. The tenant is read from the startup packet;
+  a tenant at its cap waits up to `[limits] client_admission_wait_secs`, then gets 53300
+  naming it, without affecting other tenants. The tenant slot is taken before the
+  process-wide one. Metrics: `tenant_slots` on `/metrics`,
+  `heliosdb_proxy_tenant_{clients,client_limit,admission_queue_depth}` and
+  `heliosdb_proxy_tenant_admission_{waits,refusals}_total{tenant}`, plus
+  `heliosdb_proxy_admission_queue_depth`. `ServerMetricsSnapshot` gains a public
+  `admission_queue_depth` field.
+
 - Opt-in holding of small re-executable reads (TR-09, GH #51): `[limits]
   tr_buffer_small_reads_bytes` (default 0 = off). Under `tr_mode = "select"` or
   `"transaction"`, the response of a read the proxy may re-execute is held until its

@@ -59,8 +59,16 @@ impl ProxyServer {
                         .admission_waited
                         .fetch_add(1, Ordering::Relaxed);
                     let waiting = std::time::Instant::now();
+                    state
+                        .metrics
+                        .admission_queue_depth
+                        .fetch_add(1, Ordering::Relaxed);
                     let acquired =
                         tokio::time::timeout(wait, Arc::clone(sem).acquire_owned()).await;
+                    state
+                        .metrics
+                        .admission_queue_depth
+                        .fetch_sub(1, Ordering::Relaxed);
                     state.latency.admission_wait.record(waiting.elapsed());
                     match acquired {
                         Ok(Ok(permit)) => Ok(Some(permit)),
@@ -94,13 +102,75 @@ impl ProxyServer {
     /// reads cannot pin this task and the session slot it is being refused:
     /// worst case the frame is dropped and the connection closed anyway.
     pub(super) async fn refuse_over_capacity(stream: &mut ClientStream, write_timeout: Duration) {
-        let msg = Self::over_capacity_error_bytes();
+        Self::refuse_with(stream, &Self::over_capacity_error_bytes(), write_timeout).await;
+    }
+
+    /// Send `msg` (a FATAL `ErrorResponse`) and close, bounded like
+    /// [`Self::refuse_over_capacity`].
+    pub(super) async fn refuse_with(
+        stream: &mut ClientStream,
+        msg: &[u8],
+        write_timeout: Duration,
+    ) {
         let _ = tokio::time::timeout(write_timeout, async {
-            let _ = stream.write_all(&msg).await;
+            let _ = stream.write_all(msg).await;
             let _ = stream.flush().await;
             let _ = stream.shutdown().await;
         })
         .await;
+    }
+
+    /// Per-tenant admission (H-05): take the session's slot under its
+    /// tenant's client cap, read from the startup packet, before the
+    /// process-wide slot, so sessions queued at their tenant's cap never hold
+    /// process-wide capacity. Waits like [`Self::admit_client_slot`]
+    /// (`[limits] client_admission_wait_secs`). `Ok(None)`: no cap applies
+    /// (no capped tenant named, a `CancelRequest`, or no `multi-tenancy`).
+    pub(super) async fn admit_tenant_slot(
+        state: &Arc<ServerState>,
+        first: &StartupMessage,
+    ) -> std::result::Result<
+        Option<tokio::sync::OwnedSemaphorePermit>,
+        crate::tenant_slots::TenantRefusal,
+    > {
+        let StartupMessage::Startup { params, .. } = first else {
+            return Ok(None);
+        };
+        if state.tenant_slots.is_empty() {
+            return Ok(None);
+        }
+        let Some(tenant) = state.tenant_slots.tenant_of(params) else {
+            return Ok(None);
+        };
+        let wait = state.limits.client_admission_wait;
+        if wait.is_some() {
+            state
+                .metrics
+                .admission_queue_depth
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let acquired = state.tenant_slots.acquire(tenant, wait).await;
+        if wait.is_some() {
+            state
+                .metrics
+                .admission_queue_depth
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+        match acquired {
+            Ok((slot, waited)) => {
+                if let Some(w) = waited {
+                    state.latency.admission_wait.record(w);
+                }
+                Ok(slot)
+            }
+            Err(refusal) => {
+                state
+                    .metrics
+                    .connections_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(refusal)
+            }
+        }
     }
 
     /// PostgreSQL `ErrorResponse` bytes for a session terminated by the
@@ -216,6 +286,7 @@ impl ProxyServer {
             // Filled in below, once admission control has run: the guard owns
             // the slot so it is returned on every exit path, panics included.
             _client_slot: None,
+            _tenant_slot: None,
         };
 
         // Negotiate client TLS (if the client sent SSLRequest). Produces a
@@ -274,31 +345,49 @@ impl ProxyServer {
                 match first {
                     // Client closed before sending a complete startup message.
                     Ok(None) => Ok(()),
-                    Ok(Some(msg)) => match Self::admit_client_slot(&state, &msg).await {
-                        Ok(slot) => {
-                            _session_guard._client_slot = slot;
-                            Self::client_loop(
-                                &mut client_stream,
-                                Some(msg),
-                                buffer,
-                                &session,
-                                &state,
-                                &config,
-                            )
-                            .await
-                        }
-                        Err(()) => {
+                    Ok(Some(msg)) => match Self::admit_tenant_slot(&state, &msg).await {
+                        Err(refusal) => {
                             tracing::warn!(
                                 client = %addr,
-                                "client connection cap reached; refusing connection"
+                                tenant = %refusal.tenant,
+                                limit = refusal.limit,
+                                "tenant client cap reached; refusing connection"
                             );
-                            Self::refuse_over_capacity(
+                            Self::refuse_with(
                                 &mut client_stream,
+                                &Self::create_fatal_response("53300", &refusal.to_string()),
                                 state.limits.client_write_timeout,
                             )
                             .await;
                             Ok(())
                         }
+                        Ok(tenant_slot) => match Self::admit_client_slot(&state, &msg).await {
+                            Ok(slot) => {
+                                _session_guard._tenant_slot = tenant_slot;
+                                _session_guard._client_slot = slot;
+                                Self::client_loop(
+                                    &mut client_stream,
+                                    Some(msg),
+                                    buffer,
+                                    &session,
+                                    &state,
+                                    &config,
+                                )
+                                .await
+                            }
+                            Err(()) => {
+                                tracing::warn!(
+                                    client = %addr,
+                                    "client connection cap reached; refusing connection"
+                                );
+                                Self::refuse_over_capacity(
+                                    &mut client_stream,
+                                    state.limits.client_write_timeout,
+                                )
+                                .await;
+                                Ok(())
+                            }
+                        },
                     },
                     Err(e) => Err(e),
                 }

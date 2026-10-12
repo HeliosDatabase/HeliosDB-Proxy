@@ -36,6 +36,9 @@ pub(super) struct ServerMetrics {
     /// A subset of `connections_rejected`; the difference is the immediate
     /// refusals.
     pub(super) admission_timeouts: AtomicU64,
+    /// H-05: client connections waiting for admission right now, at the
+    /// process-wide cap or at their tenant's cap (a gauge).
+    pub(super) admission_queue_depth: AtomicU64,
     /// P-03: jittered waits performed by the primary-select recovery loops. A
     /// large burst after a failover is the reconnect wave H-05 bounds.
     pub(super) reconnect_attempts: AtomicU64,
@@ -110,6 +113,8 @@ pub struct ServerMetricsSnapshot {
     pub admission_waited: u64,
     /// P-03: admissions whose bounded wait expired (subset of rejections).
     pub admission_timeouts: u64,
+    /// H-05: client connections waiting for admission right now.
+    pub admission_queue_depth: u64,
     /// P-03: jittered waits in the primary-select recovery loops.
     pub reconnect_attempts: u64,
     /// Startup / redial retries after the backend refused at `max_connections`.

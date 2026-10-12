@@ -287,6 +287,9 @@ pub(super) struct SessionGuard {
     /// dropping the guard returns the slot — on a normal return AND on a panic
     /// unwind, which a release at the end of `handle_client` would miss.
     pub(super) _client_slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// H-05: the session's slot under its tenant's client cap, released the
+    /// same way (`None` when the tenant has no cap or is not known).
+    pub(super) _tenant_slot: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl Drop for SessionGuard {

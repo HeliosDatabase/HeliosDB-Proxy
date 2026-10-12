@@ -89,6 +89,7 @@ pub mod request;
 pub mod routing_snapshot;
 pub mod server;
 pub mod switchover_buffer;
+pub mod tenant_slots;
 
 // ── Connection pooling modes (Session/Transaction/Statement) ─────────
 #[cfg(feature = "pool-modes")]

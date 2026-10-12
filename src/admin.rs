@@ -97,6 +97,8 @@ pub struct AdminState {
     pub gateway_pools: RwLock<Option<Arc<crate::gateway_pool::GatewayPools>>>,
     /// Per-node backend connection caps (H-05), for `/metrics`.
     pub node_slots: RwLock<Option<Arc<crate::node_slots::NodeSlots>>>,
+    /// Per-tenant client caps (H-05), for `/metrics`.
+    pub tenant_slots: RwLock<Option<Arc<crate::tenant_slots::TenantSlots>>>,
     /// The query-result cache, for its counters and retained bytes on
     /// `/metrics` (P-03). Attached at startup when `[cache] enabled`.
     #[cfg(feature = "query-cache")]
@@ -562,6 +564,11 @@ impl AdminServer {
                     if let Some(s) = state.node_slots.read().await.as_ref() {
                         map.insert("node_slots".into(), serde_json::to_value(s.stats())?);
                     }
+                    if let Some(s) = state.tenant_slots.read().await.as_ref() {
+                        if !s.is_empty() {
+                            map.insert("tenant_slots".into(), serde_json::to_value(s.stats())?);
+                        }
+                    }
                     if let Some(p) = state.gateway_pools.read().await.as_ref() {
                         let pools: serde_json::Map<String, serde_json::Value> = p
                             .labelled()
@@ -624,6 +631,9 @@ impl AdminServer {
                 }
                 if let Some(s) = state.node_slots.read().await.as_ref() {
                     Self::push_node_slots_prometheus(&mut prometheus, &s.stats());
+                }
+                if let Some(s) = state.tenant_slots.read().await.as_ref() {
+                    Self::push_tenant_slots_prometheus(&mut prometheus, &s.stats());
                 }
                 #[cfg(feature = "query-cache")]
                 if let Some(c) = state.query_cache.read().await.as_ref() {
@@ -2388,6 +2398,62 @@ impl AdminServer {
         }
     }
 
+    /// Append the per-tenant client caps (H-05), labelled by tenant id (the
+    /// configured tenants only, so a bounded label set; escaped per the
+    /// Prometheus text format). Absent when no tenant is capped.
+    fn push_tenant_slots_prometheus(
+        output: &mut String,
+        stats: &[crate::tenant_slots::TenantSlotStats],
+    ) {
+        use std::fmt::Write as _;
+        if stats.is_empty() {
+            return;
+        }
+        for (name, kind, help, value) in [
+            (
+                "heliosdb_proxy_tenant_clients",
+                "gauge",
+                "Client sessions a capped tenant holds on this proxy",
+                (|s: &crate::tenant_slots::TenantSlotStats| s.in_use as u64)
+                    as fn(&crate::tenant_slots::TenantSlotStats) -> u64,
+            ),
+            (
+                "heliosdb_proxy_tenant_client_limit",
+                "gauge",
+                "The tenant's client cap ([multi_tenancy] max_clients_per_tenant / tenant_max_clients)",
+                |s| s.limit as u64,
+            ),
+            (
+                "heliosdb_proxy_tenant_admission_queue_depth",
+                "gauge",
+                "Client connections of the tenant waiting for one of its slots now",
+                |s| s.waiting as u64,
+            ),
+            (
+                "heliosdb_proxy_tenant_admission_waits_total",
+                "counter",
+                "Client connections of the tenant that had to wait at its cap",
+                |s| s.waits,
+            ),
+            (
+                "heliosdb_proxy_tenant_admission_refusals_total",
+                "counter",
+                "Client connections of the tenant refused (53300) at its cap",
+                |s| s.refusals,
+            ),
+        ] {
+            let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} {kind}");
+            for s in stats {
+                let tenant = s
+                    .tenant
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n");
+                let _ = writeln!(output, "{name}{{tenant=\"{tenant}\"}} {}", value(s));
+            }
+        }
+    }
+
     /// Append the gateway pools' counters and idle gauge, labelled by gateway
     /// (`mcp`, `http`, `graphql`), to a Prometheus body (H-06 / P-03).
     fn push_gateway_pool_prometheus(
@@ -2666,6 +2732,15 @@ impl AdminServer {
         ));
 
         output.push_str(
+            "# HELP heliosdb_proxy_admission_queue_depth Client connections waiting for admission now, at the process or tenant cap (H-05)\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_admission_queue_depth gauge\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_admission_queue_depth {}\n",
+            metrics.admission_queue_depth
+        ));
+
+        output.push_str(
             "# HELP heliosdb_proxy_reconnect_attempts_total Jittered waits in the primary-select recovery loops (H-05)\n",
         );
         output.push_str("# TYPE heliosdb_proxy_reconnect_attempts_total counter\n");
@@ -2843,6 +2918,7 @@ impl AdminState {
                 cache_capture_oversize: 0,
                 admission_waited: 0,
                 admission_timeouts: 0,
+                admission_queue_depth: 0,
                 reconnect_attempts: 0,
                 backend_capacity_waits: 0,
                 backend_capacity_refusals: 0,
@@ -2874,6 +2950,7 @@ impl AdminState {
             latency: RwLock::new(None),
             gateway_pools: RwLock::new(None),
             node_slots: RwLock::new(None),
+            tenant_slots: RwLock::new(None),
             #[cfg(feature = "query-cache")]
             query_cache: RwLock::new(None),
             promoter: RwLock::new(None),
@@ -2984,6 +3061,11 @@ impl AdminState {
     /// Attach the per-node connection caps so `/metrics` reports them (H-05).
     pub async fn with_node_slots(&self, slots: Arc<crate::node_slots::NodeSlots>) {
         *self.node_slots.write().await = Some(slots);
+    }
+
+    /// Attach the per-tenant client caps (H-05) so `/metrics` reports them.
+    pub async fn with_tenant_slots(&self, slots: Arc<crate::tenant_slots::TenantSlots>) {
+        *self.tenant_slots.write().await = Some(slots);
     }
 
     /// Attach the gateway idle pools so `/metrics` reports their counters.
@@ -3515,6 +3597,29 @@ struct VersionResponse {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tenant_slot_metrics_are_labelled_and_escaped() {
+        let mut out = String::new();
+        AdminServer::push_tenant_slots_prometheus(&mut out, &[]);
+        assert!(out.is_empty(), "no capped tenant, no series");
+        let stats = vec![crate::tenant_slots::TenantSlotStats {
+            tenant: "a\"b\\c".into(),
+            limit: 3,
+            in_use: 2,
+            waiting: 1,
+            waits: 4,
+            refusals: 5,
+        }];
+        AdminServer::push_tenant_slots_prometheus(&mut out, &stats);
+        assert!(
+            out.contains("heliosdb_proxy_tenant_clients{tenant=\"a\\\"b\\\\c\"} 2"),
+            "{out}"
+        );
+        assert!(out.contains("# TYPE heliosdb_proxy_tenant_client_limit gauge"));
+        assert!(out.contains("heliosdb_proxy_tenant_admission_queue_depth{tenant="));
+        assert!(out.contains("} 5\n"), "{out}");
+    }
+
     #[tokio::test]
     async fn test_admin_state_creation() {
         let state = AdminState::new();
@@ -3755,6 +3860,7 @@ mod tests {
             cache_capture_oversize: 7,
             admission_waited: 0,
             admission_timeouts: 0,
+            admission_queue_depth: 0,
             reconnect_attempts: 0,
             backend_capacity_waits: 0,
             backend_capacity_refusals: 0,
@@ -3838,6 +3944,7 @@ mod tests {
             cache_capture_oversize: 3,
             admission_waited: 0,
             admission_timeouts: 0,
+            admission_queue_depth: 0,
             reconnect_attempts: 0,
             backend_capacity_waits: 0,
             backend_capacity_refusals: 0,

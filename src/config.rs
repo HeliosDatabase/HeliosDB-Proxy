@@ -1204,6 +1204,17 @@ pub struct MultiTenancyToml {
     pub tenant_tables: Vec<String>,
     /// Known tenant ids.
     pub tenants: Vec<String>,
+    /// Most client sessions one known tenant may hold on this proxy at once
+    /// (H-05). A tenant at its cap waits up to `[limits]
+    /// client_admission_wait_secs` for one of its own sessions to end, then is
+    /// refused with 53300 naming the tenant; other tenants are unaffected.
+    /// The tenant is read from the startup packet (`identify_by`). Sessions
+    /// whose tenant is not in `tenants` count only against `[limits]
+    /// max_client_connections`. Default 0 = no per-tenant cap.
+    pub max_clients_per_tenant: usize,
+    /// Per-tenant overrides of `max_clients_per_tenant` (`0` = no cap for that
+    /// tenant). Every key must be in `tenants`.
+    pub tenant_max_clients: std::collections::BTreeMap<String, usize>,
 }
 
 impl Default for MultiTenancyToml {
@@ -1214,7 +1225,20 @@ impl Default for MultiTenancyToml {
             tenant_column: "tenant_id".to_string(),
             tenant_tables: Vec::new(),
             tenants: Vec::new(),
+            max_clients_per_tenant: 0,
+            tenant_max_clients: std::collections::BTreeMap::new(),
         }
+    }
+}
+
+impl MultiTenancyToml {
+    /// The client-session cap of a known tenant (H-05): its
+    /// `tenant_max_clients` override, else `max_clients_per_tenant`; 0 = none.
+    pub fn client_cap(&self, tenant: &str) -> usize {
+        self.tenant_max_clients
+            .get(tenant)
+            .copied()
+            .unwrap_or(self.max_clients_per_tenant)
     }
 }
 
@@ -2409,6 +2433,18 @@ impl ProxyConfig {
             return Err(ProxyError::Config("No primary node configured".to_string()));
         }
 
+        // `[multi_tenancy]` admission caps (H-05) name configured tenants.
+        if let Some(unknown) = self
+            .multi_tenancy
+            .tenant_max_clients
+            .keys()
+            .find(|k| !self.multi_tenancy.tenants.contains(k))
+        {
+            return Err(ProxyError::Config(format!(
+                "multi_tenancy.tenant_max_clients names {unknown:?}, which is not in multi_tenancy.tenants"
+            )));
+        }
+
         // `[topology]` (H-01): the provider is authoritative for the write
         // path, so an unusable provider must fail at startup, not silently
         // fall back to static roles.
@@ -3449,6 +3485,19 @@ mod tests {
              REGRESS_CONFIG_IGNORED_KEY_ALLOWLIST with a reason):\n{}",
             unexpected.join("\n")
         );
+    }
+
+    #[test]
+    fn tenant_client_caps_parse_and_name_known_tenants() {
+        let base = "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n[multi_tenancy]\nenabled = true\ntenants = [\"acme\", \"tiny\"]\nmax_clients_per_tenant = 5\n[multi_tenancy.tenant_max_clients]\n";
+        let ok: ProxyConfig = toml::from_str(&format!("{base}acme = 50\ntiny = 0\n")).unwrap();
+        ok.validate().unwrap();
+        assert_eq!(ok.multi_tenancy.client_cap("acme"), 50);
+        assert_eq!(ok.multi_tenancy.client_cap("tiny"), 0);
+        assert_eq!(ok.multi_tenancy.client_cap("other"), 5);
+        let bad: ProxyConfig = toml::from_str(&format!("{base}globex = 1\n")).unwrap();
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("tenant_max_clients names \"globex\""), "{err}");
     }
 
     #[test]

@@ -960,6 +960,10 @@ identify_by = "application_name"
 tenant_column = "tenant_id"
 tenant_tables = ["orders", "invoices"]
 tenants = ["acme", "globex"]
+max_clients_per_tenant = 50
+
+[multi_tenancy.tenant_max_clients]
+acme = 200
 ```
 
 | Key | Type | Default | Description |
@@ -969,6 +973,17 @@ tenants = ["acme", "globex"]
 | `tenant_column` | string | `"tenant_id"` | The row-level tenant column injected into queries. |
 | `tenant_tables` | array | `[]` | Tables that get the tenant filter injected; others pass through. |
 | `tenants` | array | `[]` | Known tenant ids. |
+| `max_clients_per_tenant` | usize | `0` | Most client sessions one known tenant may hold on this proxy at once (H-05). The tenant is read from the startup packet (`identify_by`; `database` falls back to `user` as PostgreSQL does). A tenant at its cap waits up to `[limits] client_admission_wait_secs` for one of its own sessions to end, then is refused with SQLSTATE 53300 naming the tenant; other tenants are not affected. The tenant slot is taken before the process-wide `[limits] max_client_connections` slot, so connections queued at their tenant's cap never hold process-wide capacity. Sessions naming no known tenant count only against `max_client_connections`. To guarantee a small tenant its share, keep the sum of tenant caps at or below `max_client_connections`. `0` = no per-tenant cap. Applied at startup. |
+| `tenant_max_clients` | table | `{}` | Per-tenant overrides of `max_clients_per_tenant` (`0` = no cap for that tenant). Every key must be in `tenants` (startup error otherwise). |
+
+`/metrics` reports `tenant_slots` (`tenant`, `limit`, `in_use`, `waiting`, `waits`,
+`refusals`) for capped tenants; Prometheus has `heliosdb_proxy_tenant_clients`,
+`heliosdb_proxy_tenant_client_limit`, `heliosdb_proxy_tenant_admission_queue_depth`,
+`heliosdb_proxy_tenant_admission_waits_total` and
+`heliosdb_proxy_tenant_admission_refusals_total`, labelled by `tenant`, and
+`heliosdb_proxy_admission_queue_depth` (all connections waiting for admission now).
+The caps bound client sessions; with session pooling that also bounds a tenant's backend
+connections, while transaction pooling shares backend connections across tenants.
 
 ---
 
