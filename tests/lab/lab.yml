@@ -61,6 +61,8 @@ services:
       - -c
       - max_replication_slots=10
       - -c
+      - wal_keep_size=256MB
+      - -c
       - max_connections=200
       - -c
       - log_min_messages=warning

@@ -10,8 +10,18 @@ chmod 700 "$PGDATA"
 until gosu postgres pg_isready -h 127.0.0.1 -p "$PRIMARY_PORT" -U lab -d lab >/dev/null 2>&1; do
   sleep 1
 done
-gosu postgres pg_basebackup --host=127.0.0.1 --port="$PRIMARY_PORT" --username=lab \
-  --pgdata="$PGDATA" --wal-method=stream --write-recovery-conf --no-password
+# Two standbys clone at once from a fresh primary; a clone that loses a race
+# with WAL recycling is retried from scratch (bounded).
+for attempt in 1 2 3 4 5; do
+  if gosu postgres pg_basebackup --host=127.0.0.1 --port="$PRIMARY_PORT" --username=lab \
+    --pgdata="$PGDATA" --wal-method=stream --write-recovery-conf --no-password; then
+    break
+  fi
+  [ "$attempt" = 5 ] && exit 1
+  echo "pg_basebackup attempt $attempt failed; retrying"
+  find "$PGDATA" -mindepth 1 -delete
+  sleep 2
+done
 # The base backup carries pg-a's postgresql.auto.conf. A standby must not keep
 # its synchronous_standby_names (a promoted pg-b would wait forever for a
 # standby named after itself), and hot standby needs connection/sender limits

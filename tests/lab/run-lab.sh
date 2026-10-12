@@ -74,7 +74,11 @@ admin_of() { case "$1" in proxy-a) echo 35790 ;; proxy-b) echo 35791 ;; esac; }
 admin_get() { curl -s -m 5 -H "Authorization: Bearer helios-lab-admin" "http://127.0.0.1:$(admin_of "$1")/$2"; }
 RELAY_PID=
 log() { echo "[$(date -u +%T)] $*" | tee -a "$OUT/driver.log"; }
-step() { timeout "$STEP_TIMEOUT" "$@"; }
+# Bound every step. `timeout` cannot run a shell function, so the lab's own
+# helpers (ledger, pg, via) bound themselves and are called directly.
+step() {
+  if declare -F "$1" >/dev/null; then "$@"; else timeout "$STEP_TIMEOUT" "$@"; fi
+}
 lab_objects() {
   docker ps -aq --filter "label=com.docker.compose.project=$PROJECT"
   docker network ls -q --filter "label=com.docker.compose.project=$PROJECT"
@@ -119,9 +123,9 @@ start_relay() { # the edge's path to its home's admin API (edge-resume)
 [ "$SCENARIO" = edge-resume ] && start_relay
 lab_start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 step "${COMPOSE[@]}" up --detach --wait --wait-timeout 150 >>"$OUT/driver.log" 2>&1
-ledger() { "${COMPOSE[@]}" exec -T ledger bash /lab/ledger.sh "$@"; }
-pg() { local node=$1; shift; "${COMPOSE[@]}" exec -T "$node" psql -X -At -h 127.0.0.1 -p "$(port_of "$node")" -U lab -d lab "$@"; }
-via() { local name=$1; shift; "${COMPOSE[@]}" exec -T ledger psql -X -At -h 127.0.0.1 -p "$(port_of "$name")" -U lab -d lab -v ON_ERROR_STOP=1 -c "$*"; }
+ledger() { timeout "$((STEP_TIMEOUT + LEDGER_SECS))" "${COMPOSE[@]}" exec -T ledger bash /lab/ledger.sh "$@"; }
+pg() { local node=$1; shift; timeout "$STEP_TIMEOUT" "${COMPOSE[@]}" exec -T "$node" psql -X -At -h 127.0.0.1 -p "$(port_of "$node")" -U lab -d lab "$@"; }
+via() { local name=$1; shift; timeout "$STEP_TIMEOUT" "${COMPOSE[@]}" exec -T ledger psql -X -At -h 127.0.0.1 -p "$(port_of "$name")" -U lab -d lab -v ON_ERROR_STOP=1 -c "$*"; }
 
 # Both proxies must be serving before the ledger starts.
 for p in proxy-a proxy-b; do
