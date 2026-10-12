@@ -44,8 +44,9 @@ pub fn pool_key(node: &str, user: &str, database: &str) -> String {
 /// A bounded set of idle, authenticated backend connections, partitioned by
 /// connection identity. Cheap to clone-share behind an `Arc`.
 pub struct BackendIdlePool {
-    /// identity-key -> stack of (idle authenticated stream, park time).
-    idle: DashMap<String, Vec<(TcpStream, Instant)>>,
+    /// identity-key -> stack of (idle authenticated stream, park time, the
+    /// connection's node slot (H-05), kept while it is parked).
+    idle: DashMap<String, Vec<(TcpStream, Instant, crate::node_slots::Slot)>>,
     /// Hard cap on idle connections parked per identity key.
     max_idle_per_key: usize,
     /// Hard cap on idle connections parked across ALL identities — bounds total
@@ -110,12 +111,18 @@ impl BackendIdlePool {
     /// usable one (caller then dials a fresh connection). Dead/stale parked
     /// connections are evicted in passing.
     pub fn checkout(&self, key: &str) -> Option<TcpStream> {
+        self.checkout_with_slot(key).map(|(stream, _slot)| stream)
+    }
+
+    /// [`Self::checkout`], also handing back the connection's node slot
+    /// (H-05) so it stays held while the connection is in use.
+    pub fn checkout_with_slot(&self, key: &str) -> Option<(TcpStream, crate::node_slots::Slot)> {
         let mut guard = self.idle.get_mut(key)?;
-        while let Some((stream, _parked_at)) = guard.pop() {
+        while let Some((stream, _parked_at, slot)) = guard.pop() {
             self.total_idle.fetch_sub(1, Ordering::Relaxed);
             if Self::probe_alive(&stream) {
                 self.reuses.fetch_add(1, Ordering::Relaxed);
-                return Some(stream);
+                return Some((stream, slot));
             }
             // Peer closed (or desynced) while idle — drop it and try the next.
             self.stale_evicted.fetch_add(1, Ordering::Relaxed);
@@ -128,6 +135,17 @@ impl BackendIdlePool {
     /// the connection is dropped (closed) by being moved in and discarded,
     /// shedding excess capacity.
     pub fn checkin(&self, key: &str, stream: TcpStream) -> bool {
+        self.checkin_with_slot(key, stream, None)
+    }
+
+    /// [`Self::checkin`] keeping the connection's node slot (H-05) parked
+    /// with it; a refused check-in drops (releases) the slot with the socket.
+    pub fn checkin_with_slot(
+        &self,
+        key: &str,
+        stream: TcpStream,
+        slot: crate::node_slots::Slot,
+    ) -> bool {
         // Global ceiling first — bounds total FDs across all identities. Reserve
         // the slot atomically (fetch_add, inspect the prior value) rather than
         // load-then-act: a plain load outside the lock lets N concurrent
@@ -146,7 +164,7 @@ impl BackendIdlePool {
             self.over_capacity.fetch_add(1, Ordering::Relaxed);
             return false; // `stream` dropped here → socket closed.
         }
-        entry.push((stream, Instant::now()));
+        entry.push((stream, Instant::now(), slot));
         self.parked.fetch_add(1, Ordering::Relaxed);
         true
     }
@@ -162,7 +180,7 @@ impl BackendIdlePool {
             let before = entry.value().len();
             entry
                 .value_mut()
-                .retain(|(_, parked_at)| parked_at.elapsed() < max_age);
+                .retain(|(_, parked_at, _)| parked_at.elapsed() < max_age);
             reaped += before - entry.value().len();
         }
         if reaped > 0 {
@@ -232,8 +250,8 @@ impl BackendIdlePool {
                 continue;
             }
             // Oldest first: index 0 was parked earliest (checkin pushes).
-            let (stream, _parked_at) = entry.value_mut().remove(0);
-            drop(stream);
+            let (stream, _parked_at, slot) = entry.value_mut().remove(0);
+            drop((stream, slot));
             self.total_idle.fetch_sub(1, Ordering::Relaxed);
             self.capacity_evictions.fetch_add(1, Ordering::Relaxed);
             return true;
@@ -267,6 +285,7 @@ impl BackendIdlePool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tokio::net::TcpListener;
 
     /// Open a connected TcpStream pair against a throwaway loopback listener so
@@ -353,6 +372,34 @@ mod tests {
         );
         assert_eq!(pool.idle_count(), 0);
         assert_eq!(pool.capacity_evictions(), 0, "a separate counter");
+    }
+
+    /// H-05: a parked connection keeps its node slot; checkout hands it back
+    /// and a refused check-in releases it with the socket.
+    #[tokio::test]
+    async fn parked_connections_keep_their_node_slot() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sem = Arc::new(tokio::sync::Semaphore::new(2));
+        let pool = BackendIdlePool::new(1, 1000);
+        let key = pool_key("db:5432", "u", "d");
+        let (c1, _s1) = live_pair(&listener).await;
+        let (c2, _s2) = live_pair(&listener).await;
+
+        assert!(pool.checkin_with_slot(&key, c1, Some(sem.clone().try_acquire_owned().unwrap())));
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the parked connection holds its slot"
+        );
+        // Per-key cap 1: refused, and its slot goes with the dropped socket.
+        assert!(!pool.checkin_with_slot(&key, c2, Some(sem.clone().try_acquire_owned().unwrap())));
+        assert_eq!(sem.available_permits(), 1);
+
+        let (_stream, slot) = pool.checkout_with_slot(&key).expect("parked connection");
+        assert!(slot.is_some());
+        assert_eq!(sem.available_permits(), 1, "still held while in use");
+        drop(slot);
+        assert_eq!(sem.available_permits(), 2);
     }
 
     #[test]

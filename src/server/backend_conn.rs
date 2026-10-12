@@ -96,13 +96,13 @@ impl ProxyServer {
         #[cfg(feature = "pool-modes")]
         if let Some(pool) = state.backend_pool.as_ref() {
             let key = Self::pool_key_for(target, session).await;
-            if let Some(stream) = pool.checkout(&key) {
+            if let Some((stream, slot)) = pool.checkout_with_slot(&key) {
                 tracing::info!(
                     target: "helios::pool",
                     node = %target,
                     "reused pooled backend connection"
                 );
-                conns.insert(target.to_string(), BackendConn::new(stream));
+                conns.insert(target.to_string(), BackendConn::with_slot(stream, slot));
                 return Ok(());
             }
         }
@@ -114,6 +114,8 @@ impl ProxyServer {
         // A 53300 refusal (backend at max_connections) is retried after
         // freeing one idle pooled connection to this node, bounded by the
         // pool acquire timeout — see `connect_and_authenticate`.
+        // H-05: hold a slot on the node's cap for the connection's life.
+        let slot = Self::acquire_node_slot(state, target).await?;
         let capacity_deadline = tokio::time::Instant::now() + config.pool.acquire_timeout();
         let seed = session.id.as_u128() as u64;
         let mut attempt: u32 = 0;
@@ -167,8 +169,38 @@ impl ProxyServer {
             tracing::debug!(target: "helios::pool", node = %target, "dialed fresh backend connection (pool miss)");
         }
         tracing::debug!(node = %target, "opened backend connection");
-        conns.insert(target.to_string(), BackendConn::new(backend));
+        conns.insert(target.to_string(), BackendConn::with_slot(backend, slot));
         Ok(())
+    }
+
+    /// Take a slot on `node`'s `max_connections` cap (H-05) before opening a
+    /// connection to it: a full node first gives up one idle pooled
+    /// connection, then the request waits up to `[limits]
+    /// backend_slot_wait_ms`, then fails with `PoolExhausted` (53300).
+    pub(super) async fn acquire_node_slot(
+        state: &ServerState,
+        node: &str,
+    ) -> Result<crate::node_slots::Slot> {
+        let (slot, waited) = state
+            .node_slots
+            .acquire(node, state.limits.backend_slot_wait, || {
+                Self::free_idle_backend(state, node)
+            })
+            .await
+            .map_err(|e| ProxyError::PoolExhausted(e.to_string()))?;
+        if let Some(waited) = waited {
+            state.latency.backend_slot_wait.record(waited);
+        }
+        Ok(slot)
+    }
+
+    fn free_idle_backend(state: &ServerState, node: &str) -> bool {
+        #[cfg(feature = "pool-modes")]
+        if let Some(pool) = state.backend_pool.as_ref() {
+            return pool.evict_one_idle_for_node(node);
+        }
+        let _ = (state, node);
+        false
     }
 
     /// Startup parameters that change how the backend interprets or renders
@@ -354,7 +386,7 @@ impl ProxyServer {
         let clean = !bc.dirty && bc.prepared.is_empty() && bc.unnamed_sig.is_none();
         if config.pool_mode.skip_clean_reset && clean {
             let key = Self::pool_key_for(node, session).await;
-            if pool.checkin(&key, bc.stream) {
+            if pool.checkin_with_slot(&key, bc.stream, bc.slot) {
                 pool.note_reset_skipped();
                 tracing::debug!(target: "helios::pool", node = %node, "parked clean backend connection (reset skipped)");
             }
@@ -371,7 +403,7 @@ impl ProxyServer {
         .is_ok()
         {
             let key = Self::pool_key_for(node, session).await;
-            if pool.checkin(&key, bc.stream) {
+            if pool.checkin_with_slot(&key, bc.stream, bc.slot) {
                 tracing::debug!(target: "helios::pool", node = %node, "parked backend connection for reuse");
             }
         }

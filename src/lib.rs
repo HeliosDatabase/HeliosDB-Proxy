@@ -79,6 +79,7 @@ pub mod load_balancer;
 pub mod mcp;
 pub mod metrics_hist;
 pub mod mirror;
+pub mod node_slots;
 pub mod pipeline;
 pub mod plugin_registry;
 pub mod primary_tracker;

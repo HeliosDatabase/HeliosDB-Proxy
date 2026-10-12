@@ -196,6 +196,8 @@ pub struct ProxyLatency {
     pub journal_apply: LatencyHistogram,
     /// Operator-driven `POST /api/replay` runs.
     pub operator_replay: LatencyHistogram,
+    /// Waits for a slot on a node at its `max_connections` cap (H-05).
+    pub backend_slot_wait: LatencyHistogram,
     refusals: [AtomicU64; ReplayRefusal::ALL.len()],
 }
 
@@ -207,6 +209,7 @@ impl ProxyLatency {
             admission_wait: LatencyHistogram::new(bounds_ms),
             journal_apply: LatencyHistogram::new(bounds_ms),
             operator_replay: LatencyHistogram::new(bounds_ms),
+            backend_slot_wait: LatencyHistogram::new(bounds_ms),
             refusals: Default::default(),
         }
     }
@@ -241,6 +244,7 @@ impl ProxyLatency {
             "admission_wait": hist(&self.admission_wait),
             "journal_apply": hist(&self.journal_apply),
             "operator_replay": hist(&self.operator_replay),
+            "backend_slot_wait": hist(&self.backend_slot_wait),
             "tr_replay_refusals": refusals,
         })
     }
@@ -273,6 +277,11 @@ impl ProxyLatency {
                 &self.operator_replay,
                 "heliosdb_proxy_operator_replay_seconds",
                 "Operator POST /api/replay runs",
+            ),
+            (
+                &self.backend_slot_wait,
+                "heliosdb_proxy_backend_slot_wait_seconds",
+                "Waits for a slot on a node at its max_connections cap",
             ),
         ] {
             hist.snapshot().write_prometheus(out, name, help);

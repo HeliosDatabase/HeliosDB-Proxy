@@ -124,7 +124,11 @@ impl ProxyServer {
     /// broken pipe), a backend *write* timeout (the backend is not draining its
     /// socket), and any connect-time failure.
     pub(super) fn is_backend_fault(err: &str) -> bool {
-        !err.contains("Client") && !err.contains("Backend read timeout")
+        !err.contains("Client")
+            && !err.contains("Backend read timeout")
+            // H-05: this proxy's own per-node cap refused a connection; the
+            // node itself is fine.
+            && !err.contains(crate::node_slots::REFUSAL_MARKER)
     }
 
     /// Errors that do not demote a backend are filtered via `is_backend_fault`:

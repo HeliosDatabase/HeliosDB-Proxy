@@ -1535,6 +1535,16 @@ pub struct LimitsToml {
     /// `[1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]`.
     #[serde(default = "crate::metrics_hist::default_latency_buckets_ms")]
     pub latency_buckets_ms: Vec<f64>,
+    /// How long a new backend connection waits for a slot on a node at its
+    /// `[[nodes]] max_connections` (after one idle pooled connection to it was
+    /// given up) before the client is refused with 53300 (H-05). Milliseconds;
+    /// must be > 0. Default 5000.
+    #[serde(default = "default_backend_slot_wait_ms")]
+    pub backend_slot_wait_ms: u64,
+}
+
+fn default_backend_slot_wait_ms() -> u64 {
+    5000
 }
 
 fn default_max_cancel_keys() -> usize {
@@ -1638,6 +1648,7 @@ impl Default for LimitsToml {
             tr_max_replay_bytes: default_tr_max_replay_bytes(),
             tr_max_session_set_statements: default_tr_max_session_set_statements(),
             latency_buckets_ms: crate::metrics_hist::default_latency_buckets_ms(),
+            backend_slot_wait_ms: default_backend_slot_wait_ms(),
         }
     }
 }
@@ -2365,6 +2376,7 @@ impl ProxyConfig {
             weight: 100,
             enabled: true,
             name: None,
+            max_connections: 0,
             addr_cache: OnceLock::new(),
         });
 
@@ -2705,6 +2717,11 @@ impl ProxyConfig {
             if l.tr_max_session_set_statements == 0 {
                 return Err(ProxyError::Config(
                     "limits.tr_max_session_set_statements must be >= 1".to_string(),
+                ));
+            }
+            if l.backend_slot_wait_ms == 0 {
+                return Err(ProxyError::Config(
+                    "limits.backend_slot_wait_ms must be >= 1".to_string(),
                 ));
             }
             if let Err(e) = crate::metrics_hist::validate_buckets_ms(&l.latency_buckets_ms) {
@@ -3193,6 +3210,14 @@ pub struct NodeConfig {
     pub enabled: bool,
     /// Optional node name for logging
     pub name: Option<String>,
+    /// Most backend connections this proxy keeps to the node at once (H-05),
+    /// in use and parked idle alike; `0` (default) = unlimited. A full node
+    /// first gives up one idle pooled connection, then waits up to `[limits]
+    /// backend_slot_wait_ms`, then refuses with SQLSTATE 53300. Health and
+    /// topology probes are not counted: leave the backend's
+    /// `max_connections` some headroom above this for them and for admins.
+    #[serde(default)]
+    pub max_connections: usize,
     /// Lazily-computed `"host:port"` string, cached so the hot query path
     /// (looked up several times per read query — health, circuit-breaker,
     /// lag, and the winning node) doesn't `format!()` a fresh `String` on
@@ -3227,6 +3252,7 @@ impl Default for NodeConfig {
             weight: 0,
             enabled: false,
             name: None,
+            max_connections: 0,
             addr_cache: OnceLock::new(),
         }
     }
@@ -4590,6 +4616,28 @@ database = "helios"
         let mut c = base();
         c.limits.tr_max_session_set_statements = 0;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn node_max_connections_and_slot_wait_parse_and_validate() {
+        let toml = "[[nodes]]\nhost = \"db\"\nport = 5432\nrole = \"primary\"\nmax_connections = 40\n\n[limits]\nbackend_slot_wait_ms = 250\n";
+        let c: ProxyConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(c.nodes[0].max_connections, 40);
+        assert_eq!(c.limits.backend_slot_wait_ms, 250);
+        assert!(c.validate().is_ok());
+        assert_eq!(LimitsToml::default().backend_slot_wait_ms, 5000);
+        assert_eq!(
+            NodeConfig::default().max_connections,
+            0,
+            "unlimited by default"
+        );
+        let mut c = c;
+        c.limits.backend_slot_wait_ms = 0;
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("backend_slot_wait_ms"));
     }
 
     #[test]

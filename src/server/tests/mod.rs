@@ -202,6 +202,7 @@ fn make_test_session() -> Arc<ClientSession> {
         pending_edge_copy_tables: std::sync::Mutex::new(None),
         #[cfg(feature = "rate-limiting")]
         rate_limit_key: std::sync::OnceLock::new(),
+        startup_slot: parking_lot::Mutex::new(None),
     })
 }
 
@@ -436,6 +437,7 @@ async fn test_apply_authenticate_hook_with_manager_no_plugins_defers() {
         authoritative_topology: false,
         routing: Arc::new(crate::routing_snapshot::RoutingView::new(false)),
         gateway_pools: Arc::new(crate::gateway_pool::GatewayPools::new(1)),
+        node_slots: Arc::new(crate::node_slots::NodeSlots::default()),
         latency: Arc::new(crate::metrics_hist::ProxyLatency::new(
             &crate::metrics_hist::default_latency_buckets_ms(),
         )),
@@ -1279,6 +1281,21 @@ async fn admission_takes_a_slot_and_counts_a_refusal() {
 }
 
 /// P-03/H-05: with a bounded admission wait, a saturated cap makes the next
+/// H-05: a refusal by this proxy's own per-node cap is not a backend fault
+/// (the node must not be demoted in-band for it).
+#[test]
+fn a_node_cap_refusal_does_not_demote_the_node() {
+    let refusal = crate::node_slots::SlotTimeout {
+        node: "db:5432".into(),
+        limit: 4,
+    }
+    .to_string();
+    assert!(!ProxyServer::is_backend_fault(&refusal), "{refusal}");
+    assert!(ProxyServer::is_backend_fault(
+        "Failed to connect to db:5432: refused"
+    ));
+}
+
 /// H-06: tenant filtering does not reach the gateways; strict_config refuses
 /// the combination, the default only warns.
 #[test]

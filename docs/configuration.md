@@ -537,6 +537,7 @@ name = "standby-1"
 | `http_port` | u16 | `8080` | No | HTTP API port on the backend node (SQL API forwarding). |
 | `role` | string | — | Yes | `primary`, `standby`, or `replica`. |
 | `weight` | u32 | — | Yes* | Load-balancing weight. |
+| `max_connections` | usize | `0` | No | Most backend connections this proxy keeps to the node at once, in use and parked idle alike (H-05); `0` = unlimited. A full node first gives up one idle pooled connection, then waits up to `[limits] backend_slot_wait_ms`, then refuses the request with SQLSTATE 53300 (the node is not marked unhealthy). Health and topology probes are not counted: keep the backend's own `max_connections` above the sum of every proxy's caps plus probes and admins. |
 | `enabled` | bool | — | Yes* | Whether the node is routable. Toggleable at runtime via the admin API. |
 | `name` | string | *(none)* | No | Human-readable name for logs/metrics/admin. |
 
@@ -801,6 +802,7 @@ latency_buckets_ms = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 1000
 | `gateway_pool_max_idle` | usize | `16` | Idle authenticated backend connections kept per identity by each non-PG-wire gateway (HTTP SQL, MCP, GraphQL) for reuse (H-06). `0` disables pooling (each gateway request dials, the pre-H-06 behaviour). Gateways have separate pools so a session policy (e.g. MCP read-only) cannot leak across interfaces. Applied at startup. |
 | `tr_max_replay_statements` | usize | `1000` | In-session TR (`tr_mode = select\|transaction`): cap on statements recorded per explicit transaction for failover replay. Over the cap the transaction is marked non-replayable (`transaction` degrades to `session` for it; `tr_replay_cap_exceeded_total`). |
 | `tr_max_replay_bytes` | usize | `4194304` | In-session TR: cap on bytes (statement text / raw extended-protocol frames) recorded per explicit transaction (4 MiB). Same degradation as above. |
+| `backend_slot_wait_ms` | u64 | `5000` | How long a new backend connection waits for a slot on a node at its `[[nodes]] max_connections` before the client is refused with 53300 (H-05). Must be ≥ 1. Applied at startup. |
 | `latency_buckets_ms` | list of numbers | `[1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]` | Bucket upper bounds, in milliseconds, of every latency histogram on `/metrics` and `/metrics/prometheus` (failover reconnect, transaction replay, admission wait, journal apply, operator replay). 1 to 32 values, strictly increasing, each at least `0.001`; an implicit `+Inf` bucket follows. Applied at startup. |
 | `tr_max_session_set_statements` | usize | `256` | In-session TR (`tr_mode != none`): cap on DISTINCT session variables whose latest `SET` is replayed onto the replacement backend (a later `SET` of the same variable replaces the earlier one; `RESET name` removes it; `RESET ALL`/`DISCARD ALL` clear all). Over the cap tracking stops (`tr_session_set_cap_exceeded_total`) and a subsequent failover is refused with `08006` rather than re-homing the session with incomplete state. |
 

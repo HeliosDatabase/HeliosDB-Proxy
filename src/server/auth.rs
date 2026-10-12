@@ -374,6 +374,17 @@ impl ProxyServer {
         // on the forward path — so a dead backend is detected on the very next
         // connection instead of waiting for the periodic health checker.
         let params = &effective_params;
+        // H-05: a slot on the node's cap, held by this connection for its life.
+        let slot = match Self::acquire_node_slot(state, &node_addr).await {
+            Ok(slot) => slot,
+            Err(ProxyError::PoolExhausted(msg)) => {
+                let err = Self::create_error_response(SQLSTATE_TOO_MANY_CONNECTIONS, &msg);
+                *error_response_started = true;
+                let _ = client_stream.write_all(&err).await;
+                return Err(ProxyError::PoolExhausted(msg));
+            }
+            Err(e) => return Err(e),
+        };
         let mut backend = Self::dial_backend_startup(&node_addr, params, config, state).await?;
 
         // A backend at `max_connections` refuses the new connection with 53300
@@ -433,6 +444,8 @@ impl ProxyServer {
                 }
             }
         }
+
+        *session.startup_slot.lock() = slot;
 
         // Store session variables
         {

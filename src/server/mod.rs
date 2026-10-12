@@ -348,6 +348,8 @@ struct ServerState {
     /// configuration reload and (with a provider) tracker change. Routing
     /// under a provider and `/topology` read this one value.
     routing: Arc<crate::routing_snapshot::RoutingView>,
+    /// H-05: per-node backend connection caps (`[[nodes]] max_connections`).
+    node_slots: Arc<crate::node_slots::NodeSlots>,
     /// H-06: per-gateway idle pools for the HTTP, MCP and GraphQL gateways
     /// (sized by `[limits] gateway_pool_max_idle`), shared with the admin API
     /// for their counters.
@@ -1044,6 +1046,7 @@ impl ProxyServer {
                 authoritative_topology,
             )),
             gateway_pools,
+            node_slots: Arc::new(crate::node_slots::NodeSlots::from_config(&config)),
             latency: Arc::new(crate::metrics_hist::ProxyLatency::new(
                 &config.limits.latency_buckets_ms,
             )),
@@ -1670,6 +1673,7 @@ impl ProxyServer {
 
             // P-03: latency histograms and the query cache's counters.
             admin_state.with_latency(state.latency.clone()).await;
+            admin_state.with_node_slots(state.node_slots.clone()).await;
             admin_state
                 .with_gateway_pools(state.gateway_pools.clone())
                 .await;

@@ -199,6 +199,7 @@ impl ProxyServer {
             pending_edge_copy_tables: std::sync::Mutex::new(None),
             #[cfg(feature = "rate-limiting")]
             rate_limit_key: std::sync::OnceLock::new(),
+            startup_slot: parking_lot::Mutex::new(None),
         });
 
         // Register the session, then attach an RAII guard that deregisters it on
@@ -538,7 +539,8 @@ impl ProxyServer {
         };
         let mut current_node: Option<String> = match startup_result {
             Ok((Some(stream_conn), node_addr)) => {
-                conns.insert(node_addr.clone(), BackendConn::new(stream_conn));
+                let slot = session.startup_slot.lock().take();
+                conns.insert(node_addr.clone(), BackendConn::with_slot(stream_conn, slot));
                 Some(node_addr)
             }
             Ok((None, _)) => {

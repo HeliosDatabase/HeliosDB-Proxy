@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fills and retained bytes per tier; edge cache retained bytes and gap flushes;
   gateway pool reuse/miss/discard counters and idle gauge per gateway (H-06).
   `TransactionState` gains a public `replay_cap_exceeded` field.
+- Per-node backend connection caps (H-05): `[[nodes]] max_connections` (default 0 =
+  unlimited) bounds the backend connections this proxy holds to a node, in use and parked
+  idle alike. A full node gives up one idle pooled connection, then waits up to the new
+  `[limits] backend_slot_wait_ms` (default 5000), then refuses with 53300 without marking
+  the node unhealthy. `/metrics` reports `node_slots`; Prometheus
+  `heliosdb_proxy_node_backend_*{node}` and `heliosdb_proxy_backend_slot_wait_seconds`.
 - `[cache] invalidation_source = "logical"` (C-02 slice 2, opt-in): the query cache also
   follows the database's committed changes from a `pgoutput` logical replication slot
   (`logical_dsn`, `logical_slot`, `logical_publication`, `logical_feedback_ms`,

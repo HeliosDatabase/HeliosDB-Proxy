@@ -95,6 +95,8 @@ pub struct AdminState {
     /// The gateway idle pools (H-06), for their per-gateway counters on
     /// `/metrics`. Attached at startup.
     pub gateway_pools: RwLock<Option<Arc<crate::gateway_pool::GatewayPools>>>,
+    /// Per-node backend connection caps (H-05), for `/metrics`.
+    pub node_slots: RwLock<Option<Arc<crate::node_slots::NodeSlots>>>,
     /// The query-result cache, for its counters and retained bytes on
     /// `/metrics` (P-03). Attached at startup when `[cache] enabled`.
     #[cfg(feature = "query-cache")]
@@ -557,6 +559,9 @@ impl AdminServer {
                     if let Some(l) = state.latency.read().await.as_ref() {
                         map.insert("latency".into(), l.to_json());
                     }
+                    if let Some(s) = state.node_slots.read().await.as_ref() {
+                        map.insert("node_slots".into(), serde_json::to_value(s.stats())?);
+                    }
                     if let Some(p) = state.gateway_pools.read().await.as_ref() {
                         let pools: serde_json::Map<String, serde_json::Value> = p
                             .labelled()
@@ -616,6 +621,9 @@ impl AdminServer {
                 }
                 if let Some(p) = state.gateway_pools.read().await.as_ref() {
                     Self::push_gateway_pool_prometheus(&mut prometheus, p);
+                }
+                if let Some(s) = state.node_slots.read().await.as_ref() {
+                    Self::push_node_slots_prometheus(&mut prometheus, &s.stats());
                 }
                 #[cfg(feature = "query-cache")]
                 if let Some(c) = state.query_cache.read().await.as_ref() {
@@ -2339,6 +2347,47 @@ impl AdminServer {
         ));
     }
 
+    /// Append the per-node connection caps (H-05), labelled by the configured
+    /// node address (a bounded label set). Absent when no node is capped.
+    fn push_node_slots_prometheus(output: &mut String, stats: &[crate::node_slots::NodeSlotStats]) {
+        use std::fmt::Write as _;
+        if stats.is_empty() {
+            return;
+        }
+        for (name, kind, help, value) in [
+            (
+                "heliosdb_proxy_node_backend_connections",
+                "gauge",
+                "Backend connections held (in use or parked) to a capped node",
+                (|s: &crate::node_slots::NodeSlotStats| s.in_use as u64)
+                    as fn(&crate::node_slots::NodeSlotStats) -> u64,
+            ),
+            (
+                "heliosdb_proxy_node_backend_connection_limit",
+                "gauge",
+                "The node's [[nodes]] max_connections",
+                |s| s.limit as u64,
+            ),
+            (
+                "heliosdb_proxy_node_backend_slot_waits_total",
+                "counter",
+                "New backend connections that had to wait for a slot",
+                |s| s.waits,
+            ),
+            (
+                "heliosdb_proxy_node_backend_slot_refusals_total",
+                "counter",
+                "New backend connections refused (53300) at the node's cap",
+                |s| s.refusals,
+            ),
+        ] {
+            let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} {kind}");
+            for s in stats {
+                let _ = writeln!(output, "{name}{{node=\"{}\"}} {}", s.node, value(s));
+            }
+        }
+    }
+
     /// Append the gateway pools' counters and idle gauge, labelled by gateway
     /// (`mcp`, `http`, `graphql`), to a Prometheus body (H-06 / P-03).
     fn push_gateway_pool_prometheus(
@@ -2824,6 +2873,7 @@ impl AdminState {
             routing: RwLock::new(None),
             latency: RwLock::new(None),
             gateway_pools: RwLock::new(None),
+            node_slots: RwLock::new(None),
             #[cfg(feature = "query-cache")]
             query_cache: RwLock::new(None),
             promoter: RwLock::new(None),
@@ -2929,6 +2979,11 @@ impl AdminState {
     /// Attach the daemon's latency histograms (P-03).
     pub async fn with_latency(&self, latency: Arc<crate::metrics_hist::ProxyLatency>) {
         *self.latency.write().await = Some(latency);
+    }
+
+    /// Attach the per-node connection caps so `/metrics` reports them (H-05).
+    pub async fn with_node_slots(&self, slots: Arc<crate::node_slots::NodeSlots>) {
+        *self.node_slots.write().await = Some(slots);
     }
 
     /// Attach the gateway idle pools so `/metrics` reports their counters.

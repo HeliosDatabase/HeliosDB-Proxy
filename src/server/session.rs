@@ -131,6 +131,9 @@ pub struct ClientSession {
     /// are present; see `ProxyServer::rate_limit_key`.
     #[cfg(feature = "rate-limiting")]
     pub rate_limit_key: std::sync::OnceLock<crate::rate_limit::CachedLimiterKey>,
+    /// The node slot (H-05) of the backend connection opened during startup,
+    /// handed to that connection's `BackendConn` once the session starts.
+    pub(crate) startup_slot: parking_lot::Mutex<crate::node_slots::Slot>,
 }
 
 /// Transaction state
@@ -235,6 +238,10 @@ pub(super) struct BackendConn {
     /// leaked state. Always `false` on a fresh/reused connection.
     #[cfg(feature = "pool-modes")]
     pub(super) dirty: bool,
+    /// This socket's slot on its node's `max_connections` cap (H-05); `None`
+    /// for an uncapped node. Released when the socket is dropped, parked with
+    /// it in the idle pool.
+    pub(super) slot: crate::node_slots::Slot,
 }
 
 impl BackendConn {
@@ -246,6 +253,15 @@ impl BackendConn {
             unnamed_sig: None,
             #[cfg(feature = "pool-modes")]
             dirty: false,
+            slot: None,
+        }
+    }
+
+    /// A connection that holds a node slot (H-05).
+    pub(super) fn with_slot(stream: TcpStream, slot: crate::node_slots::Slot) -> Self {
+        Self {
+            slot,
+            ..Self::new(stream)
         }
     }
 }
