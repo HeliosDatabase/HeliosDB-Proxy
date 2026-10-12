@@ -31,29 +31,17 @@ wait_for() {
 }
 export -f leader_ready
 
-# Static [[nodes]] roles mark pg-a as primary and new sessions start on the configured
-# primary (see README "Known limitation"), so make pg-a the Patroni leader before each scenario.
-leader_is_a() { curl -s -m 3 http://127.0.0.1:35690/topology | grep -q 'currentPrimary":"127.0.0.1:35601'; }
-export -f leader_is_a
-ensure_a_leader() {
-  wait_for 240 leader_ready
-  if ! leader_is_a; then
-    local r; r=$(curl -s -m 3 http://127.0.0.1:35611/cluster | grep -o '"name": "pg-b", "role": "leader"' >/dev/null && echo 35612 || echo 35611)
-    curl -s -X POST -d '{"leader":"pg-b","candidate":"pg-a"}' http://127.0.0.1:$r/switchover >/dev/null || true
-  fi
-  wait_for 240 "leader_ready && leader_is_a"
-}
-
 docker compose -p $P up -d --build
 wait_for 180 leader_ready
 "$BIN" --config proxy.toml >proxy.log 2>&1 & PROXY_PID=$!
 wait_for 30 "curl -s http://127.0.0.1:35690/topology | grep -q authoritative"
-ensure_a_leader
 
 echo "=== scenario 1: planned switchover with an open transaction ==="
 python3 demo.py switchover
 
-ensure_a_leader
+echo "=== scenario 2: a NEW session opened after the promotion must reach the new leader ==="
+wait_for 120 leader_ready
+python3 demo.py new-session
 
-echo "=== scenario 2: leader container stopped (unplanned failover) with an open transaction ==="
+echo "=== scenario 3: leader container stopped (unplanned failover) with an open transaction ==="
 python3 demo.py failover

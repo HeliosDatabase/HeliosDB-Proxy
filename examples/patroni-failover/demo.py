@@ -105,5 +105,27 @@ def main(mode):
     sys.exit(0 if ok else 1)
 
 
+def new_session():
+    """A brand-new client session opened AFTER a leader change must land on the current leader."""
+    lead = leader()
+    conn = psycopg2.connect(**PROXY, application_name="hp-demo-new-session")
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute("SELECT inet_server_port(), pg_is_in_recovery()")
+    port, in_rec = cur.fetchone()
+    outcome = {"mode": "new-session", "leader": lead, "backend_port": port, "in_recovery": in_rec}
+    try:
+        cur.execute("INSERT INTO hp_demo VALUES (3, 'new session after leader change')")
+        outcome["write"] = "ok"
+    except Exception as e:
+        outcome["write"] = f"{type(e).__name__}: {str(e).strip()}"
+    outcome["rows_on_leader"] = [r[0] for r in direct(lead, "SELECT id FROM hp_demo ORDER BY id")]
+    outcome["pass"] = (port == NODES[lead][0] and in_rec is False and outcome["write"] == "ok"
+                       and 3 in outcome["rows_on_leader"])
+    print(json.dumps(outcome, indent=2, default=str))
+    sys.exit(0 if outcome["pass"] else 1)
+
+
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "switchover")
+    mode = sys.argv[1] if len(sys.argv) > 1 else "switchover"
+    new_session() if mode == "new-session" else main(mode)
