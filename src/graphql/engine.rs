@@ -1013,6 +1013,7 @@ impl Clone for GraphQLEngine {
             validator: QueryValidator::new(self.config.clone()),
             metrics: self.metrics.clone(),
             backend: self.backend.clone(),
+            policy: self.policy.clone(),
             pool: self.pool.clone(),
         }
     }

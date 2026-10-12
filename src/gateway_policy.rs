@@ -198,6 +198,22 @@ impl GatewayPolicy {
     }
 }
 
+impl std::fmt::Debug for GatewayPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("GatewayPolicy");
+        #[cfg(feature = "rate-limiting")]
+        d.field(
+            "rate_limiter",
+            &self.rate_limiter.as_ref().map(|(_, key_by)| key_by),
+        );
+        #[cfg(feature = "query-rewriting")]
+        d.field("rewriter", &self.rewriter.is_some());
+        #[cfg(feature = "circuit-breaker")]
+        d.field("circuit_breaker", &self.circuit.is_some());
+        d.finish()
+    }
+}
+
 /// A policy shared by a gateway's tasks.
 pub type SharedGatewayPolicy = Arc<GatewayPolicy>;
 
