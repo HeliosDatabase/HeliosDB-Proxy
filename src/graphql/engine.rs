@@ -377,6 +377,9 @@ pub struct GraphQLEngine {
     /// Optional shared idle pool (H-06): when present, generated queries reuse
     /// authenticated connections instead of dialing per query.
     pool: Option<crate::gateway_pool::SharedBackendPool>,
+    /// H-06: the PG-wire rewrite rules and circuit breaker, applied to every
+    /// generated statement.
+    policy: Option<crate::gateway_policy::SharedGatewayPolicy>,
 }
 
 impl GraphQLEngine {
@@ -393,6 +396,7 @@ impl GraphQLEngine {
             schema,
             backend: None,
             pool: None,
+            policy: None,
         }
     }
 
@@ -407,6 +411,11 @@ impl GraphQLEngine {
     pub fn with_pool(mut self, pool: crate::gateway_pool::SharedBackendPool) -> Self {
         self.pool = Some(pool);
         self
+    }
+
+    /// Apply the gateway request policies to the generated SQL (H-06).
+    pub fn set_policy(&mut self, policy: crate::gateway_policy::SharedGatewayPolicy) {
+        self.policy = Some(policy);
     }
 
     /// Execute a GraphQL request
@@ -892,15 +901,31 @@ impl GraphQLEngine {
         };
         use crate::backend::BackendClient;
 
+        let node = format!("{}:{}", bcfg.host, bcfg.port);
         let mut out = Vec::with_capacity(queries.len());
         for q in queries {
-            let mut client = match self.pool.as_ref() {
+            if let Some(p) = &self.policy {
+                p.check_node(&node)
+                    .map_err(|denied| GraphQLError::internal(denied.to_string()))?;
+            }
+            let sql = match &self.policy {
+                Some(p) => p.rewrite(&q.sql),
+                None => std::borrow::Cow::Borrowed(q.sql.as_str()),
+            };
+            let connected = match self.pool.as_ref() {
                 Some(pool) => pool.acquire(&bcfg).await,
                 None => BackendClient::connect(&bcfg).await,
+            };
+            if let Some(p) = &self.policy {
+                match &connected {
+                    Ok(_) => p.record(&node, true, ""),
+                    Err(e) => p.record(&node, false, &e.to_string()),
+                }
             }
-            .map_err(|e| GraphQLError::internal(format!("backend connect: {}", e)))?;
+            let mut client =
+                connected.map_err(|e| GraphQLError::internal(format!("backend connect: {}", e)))?;
             let qr = client
-                .simple_query(&q.sql)
+                .simple_query(&sql)
                 .await
                 .map_err(|e| GraphQLError::internal(format!("backend query: {}", e)))?;
             let rows: Vec<serde_json::Value> = qr

@@ -27,6 +27,9 @@ pub struct GraphqlGateway {
     /// `(max_concurrent_requests + 1)`-th concurrent request is rejected with
     /// `503 Service Unavailable` + `Retry-After` instead of queuing forever.
     admission: Arc<tokio::sync::Semaphore>,
+    /// H-06: the PG-wire request policies (rate limit per request; rewrite
+    /// and circuit breaker per generated statement, in the engine).
+    policy: crate::gateway_policy::SharedGatewayPolicy,
 }
 
 impl GraphqlGateway {
@@ -75,7 +78,17 @@ impl GraphqlGateway {
             config: Arc::new(config),
             engine: Arc::new(engine),
             admission,
+            policy: Arc::new(crate::gateway_policy::GatewayPolicy::default()),
         }
+    }
+
+    /// Apply the PG-wire request policies to this gateway (H-06).
+    pub fn with_policy(mut self, policy: crate::gateway_policy::SharedGatewayPolicy) -> Self {
+        if let Some(engine) = Arc::get_mut(&mut self.engine) {
+            engine.set_policy(policy.clone());
+        }
+        self.policy = policy;
+        self
     }
 
     pub async fn run(self) -> Result<()> {
@@ -91,6 +104,7 @@ impl GraphqlGateway {
         let config = self.config.clone();
         let engine = self.engine.clone();
         let admission = self.admission.clone();
+        let policy = self.policy.clone();
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(x) => x,
@@ -102,19 +116,37 @@ impl GraphqlGateway {
             let config = config.clone();
             let engine = engine.clone();
             let admission = admission.clone();
+            let policy = policy.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle(stream, config, engine, admission).await {
+                if let Err(e) =
+                    Self::handle_with(stream, Some(peer.ip()), config, engine, admission, policy)
+                        .await
+                {
                     tracing::debug!(%peer, "GraphQL gateway error: {}", e);
                 }
             });
         }
     }
 
+    /// [`Self::handle_with`] with no request policies (tests).
+    #[cfg(test)]
     async fn handle(
-        mut stream: tokio::net::TcpStream,
+        stream: tokio::net::TcpStream,
         cfg: Arc<GraphqlGatewayConfig>,
         engine: Arc<GraphQLEngine>,
         admission: Arc<tokio::sync::Semaphore>,
+    ) -> Result<()> {
+        let policy = Arc::new(crate::gateway_policy::GatewayPolicy::default());
+        Self::handle_with(stream, None, cfg, engine, admission, policy).await
+    }
+
+    async fn handle_with(
+        mut stream: tokio::net::TcpStream,
+        peer: Option<std::net::IpAddr>,
+        cfg: Arc<GraphqlGatewayConfig>,
+        engine: Arc<GraphQLEngine>,
+        admission: Arc<tokio::sync::Semaphore>,
+        policy: crate::gateway_policy::SharedGatewayPolicy,
     ) -> Result<()> {
         use crate::http_util;
         let (reader, mut writer) = stream.split();
@@ -196,6 +228,21 @@ impl GraphqlGateway {
             Ok(p) => p,
             Err(_) => return Self::respond_busy(&mut writer).await,
         };
+
+        // H-06: the PG-wire rate limit applies per GraphQL request.
+        let who = crate::gateway_policy::RequestIdentity {
+            peer,
+            user: &cfg.backend_user,
+            database: cfg.backend_database.as_deref(),
+        };
+        if let Err(denied) = policy.admit_request(who).await {
+            return Self::respond(
+                &mut writer,
+                denied.http_status(),
+                &json!({"errors":[{"message": denied.to_string()}]}),
+            )
+            .await;
+        }
 
         let response = engine.execute(GraphQLRequest::new(query)).await;
         let errors = response.errors.map(|errs| {

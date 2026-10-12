@@ -1131,6 +1131,13 @@ Each `[[agent_contracts]]` entry (scoped grants, referenced by `id` from `[mcp] 
 
 ## HTTP SQL Gateway (`[http_gateway]`)
 
+> **Request policies (H-06), all three gateways (HTTP, GraphQL, MCP):** `[rate_limit]`
+> applies per request (keyed by `key_by`; HTTP 429 on denial), `[query_rewrite]` rules
+> rewrite every statement a gateway sends, and `[circuit_breaker]` fast-fails a gateway
+> (HTTP 503) while its backend's circuit is open. `[multi_tenancy]` filtering does **not**
+> reach the gateways (no per-request tenant identity); `strict_config = true` refuses
+> that combination at startup.
+
 Neon-serverless-driver-compatible `POST /sql` endpoint. Disabled by default.
 
 ```toml

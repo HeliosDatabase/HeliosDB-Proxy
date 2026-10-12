@@ -110,6 +110,8 @@ mod snapshot;
 
 mod cache_source;
 
+mod gateway;
+
 /// Proxy server
 pub struct ProxyServer {
     config: ProxyConfig,
@@ -628,6 +630,7 @@ impl ProxyServer {
 
     /// Create a new proxy server
     pub fn new(config: ProxyConfig) -> Result<Self> {
+        Self::check_gateway_tenancy(&config)?;
         let (shutdown_tx, _) = broadcast::channel(1);
 
         // Resolve the [limits] section once (secs -> Duration) so every hot-path
@@ -1401,6 +1404,9 @@ impl ProxyServer {
         // connections instead of dialing per request. Kept separate because a
         // pool's session policy (e.g. MCP read-only GUC) must not leak into
         // another gateway's connections.
+        // H-06: the gateways apply the PG-wire request policies (rate limit,
+        // rewrite rules, circuit breaker) through one shared policy object.
+        let gateway_policy = Arc::new(self.gateway_policy());
         let mcp_pool = self.state.gateway_pools.mcp.clone();
         let http_pool = self.state.gateway_pools.http.clone();
         #[cfg(feature = "graphql-gateway")]
@@ -1410,6 +1416,8 @@ impl ProxyServer {
         let mcp_task = if self.config.mcp.enabled {
             let mcp_cfg = self.config.mcp.clone();
             let pool = mcp_pool.clone();
+            let policy = gateway_policy.clone();
+            let strict = self.config.strict_config;
             // Resolve the configured agent contract (scoped grants) by id.
             let contract = mcp_cfg.contract.as_ref().and_then(|id| {
                 let found = self.config.agent_contracts.iter().find(|c| &c.id == id).cloned();
@@ -1420,6 +1428,8 @@ impl ProxyServer {
             });
             Some(tokio::spawn(async move {
                 if let Err(e) = crate::mcp::McpServer::new(mcp_cfg, contract, pool)
+                    .with_policy(policy)
+                    .with_strict_read_only_role(strict)
                     .run()
                     .await
                 {
@@ -1434,8 +1444,10 @@ impl ProxyServer {
         let http_gw_task = if self.config.http_gateway.enabled {
             let gw_cfg = self.config.http_gateway.clone();
             let pool = http_pool.clone();
+            let policy = gateway_policy.clone();
             Some(tokio::spawn(async move {
                 if let Err(e) = crate::http_gateway::HttpGateway::new(gw_cfg, pool)
+                    .with_policy(policy)
                     .run()
                     .await
                 {
@@ -1451,8 +1463,10 @@ impl ProxyServer {
         let _graphql_gw_task = if self.config.graphql_gateway.enabled {
             let gw_cfg = self.config.graphql_gateway.clone();
             let pool = gql_pool.clone();
+            let policy = gateway_policy.clone();
             Some(tokio::spawn(async move {
                 if let Err(e) = crate::graphql_gateway::GraphqlGateway::new(gw_cfg, pool)
+                    .with_policy(policy)
                     .run()
                     .await
                 {

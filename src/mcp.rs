@@ -24,15 +24,28 @@ use crate::backend::client::QueryResult;
 use crate::backend::types::TextValue;
 use crate::backend::{tls::default_client_config, BackendConfig, TlsMode};
 use crate::config::McpConfig;
+use crate::gateway_policy::{GatewayPolicy, RequestIdentity};
 use crate::{ProxyError, Result};
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// The backend side of one MCP connection: its pool, the request policies
+/// and the client's address (for the rate-limit key).
+struct Gateway<'a> {
+    pool: &'a crate::gateway_pool::SharedBackendPool,
+    policy: &'a GatewayPolicy,
+    peer: Option<std::net::IpAddr>,
+}
 
 /// The MCP gateway server.
 pub struct McpServer {
     config: McpConfig,
     contract: Option<AgentContract>,
     pool: crate::gateway_pool::SharedBackendPool,
+    policy: crate::gateway_policy::SharedGatewayPolicy,
+    /// Refuse to start in read-only mode when the backend role can write
+    /// (`strict_config`); otherwise only warn (H-06).
+    strict_read_only_role: bool,
 }
 
 impl McpServer {
@@ -45,7 +58,60 @@ impl McpServer {
             config,
             contract,
             pool,
+            policy: Arc::new(GatewayPolicy::default()),
+            strict_read_only_role: false,
         }
+    }
+
+    /// With `true` (the daemon passes `strict_config`), read-only mode
+    /// refuses to start when the backend role holds write privileges.
+    pub fn with_strict_read_only_role(mut self, strict: bool) -> Self {
+        self.strict_read_only_role = strict;
+        self
+    }
+
+    /// Whether the backend role can INSERT/UPDATE/DELETE/TRUNCATE any user
+    /// table. Read-only mode is then only the GUC backstop plus the lexical
+    /// guard, not a role-level guarantee.
+    async fn backend_role_can_write(cfg: &McpConfig) -> std::result::Result<bool, String> {
+        let bcfg = BackendConfig {
+            host: cfg.backend_host.clone(),
+            port: cfg.backend_port,
+            user: cfg.backend_user.clone(),
+            password: cfg.backend_password.clone(),
+            database: cfg.backend_database.clone(),
+            application_name: Some("heliosproxy-mcp-probe".to_string()),
+            tls_mode: TlsMode::Disable,
+            connect_timeout: Duration::from_millis(cfg.query_timeout_ms),
+            query_timeout: Duration::from_millis(cfg.query_timeout_ms),
+            tls_config: default_client_config(),
+        };
+        let mut client = crate::backend::BackendClient::connect(&bcfg)
+            .await
+            .map_err(|e| e.to_string())?;
+        let res = client
+            .simple_query(
+                "SELECT coalesce(bool_or(has_table_privilege(c.oid, \
+                 'INSERT,UPDATE,DELETE,TRUNCATE')), false) \
+                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relkind IN ('r', 'p') \
+                 AND n.nspname NOT IN ('pg_catalog', 'information_schema')",
+            )
+            .await
+            .map_err(|e| e.to_string());
+        client.close().await;
+        let res = res?;
+        Ok(matches!(
+            res.rows.first().and_then(|r| r.first()),
+            Some(TextValue::Text(v)) if v == "t"
+        ))
+    }
+
+    /// Apply the PG-wire request policies (rate limit, rewrite, circuit
+    /// breaker) to this gateway's tool calls (H-06).
+    pub fn with_policy(mut self, policy: crate::gateway_policy::SharedGatewayPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     /// Bind and serve the MCP HTTP endpoint until the task is dropped.
@@ -57,6 +123,31 @@ impl McpServer {
             })?;
         tracing::info!(addr = %self.config.listen_address, read_only = self.config.read_only,
             contract = ?self.contract.as_ref().map(|c| &c.id), "MCP agent gateway listening");
+        // H-06: read-only should be a role property, not only the GUC
+        // backstop + lexical guard (volatile functions can still write).
+        if self.config.read_only {
+            match Self::backend_role_can_write(&self.config).await {
+                Ok(true) if self.strict_read_only_role => {
+                    return Err(ProxyError::Config(format!(
+                        "[mcp] read_only = true but backend_user {:?} can write user tables; \
+                         use a role without INSERT/UPDATE/DELETE/TRUNCATE privileges \
+                         (strict_config = true refuses this)",
+                        self.config.backend_user
+                    )));
+                }
+                Ok(true) => tracing::warn!(
+                    backend_user = %self.config.backend_user,
+                    "[mcp] read_only = true but the backend role can write user tables; \
+                     read-only rests on the default_transaction_read_only backstop and the \
+                     statement guard only (volatile functions can still write)"
+                ),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "[mcp] could not check the backend role's write privileges"
+                ),
+            }
+        }
         // Admission cap (H-06 `max_concurrent_requests`): guards only
         // `tools/call` (the method that runs SQL against the backend); the
         // cheap protocol handshake methods and notifications are never gated.
@@ -66,6 +157,7 @@ impl McpServer {
         let cfg = Arc::new(self.config);
         let contract = Arc::new(self.contract);
         let pool = self.pool.clone();
+        let policy = self.policy.clone();
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(x) => x,
@@ -78,9 +170,11 @@ impl McpServer {
             let contract = contract.clone();
             let pool = pool.clone();
             let admission = admission.clone();
+            let policy = policy.clone();
             tokio::spawn(async move {
                 if let Err(e) =
-                    Self::handle_connection(stream, cfg, contract, pool, admission).await
+                    Self::handle_connection(stream, peer, cfg, contract, pool, policy, admission)
+                        .await
                 {
                     tracing::debug!(%peer, "MCP connection error: {}", e);
                 }
@@ -90,9 +184,11 @@ impl McpServer {
 
     async fn handle_connection(
         mut stream: tokio::net::TcpStream,
+        peer: std::net::SocketAddr,
         cfg: Arc<McpConfig>,
         contract: Arc<Option<AgentContract>>,
         pool: crate::gateway_pool::SharedBackendPool,
+        policy: crate::gateway_policy::SharedGatewayPolicy,
         admission: Arc<tokio::sync::Semaphore>,
     ) -> Result<()> {
         use crate::http_util;
@@ -144,7 +240,13 @@ impl McpServer {
             Err(_) => return Ok(()),
         };
 
-        let response = Self::dispatch(&body, &cfg, (*contract).as_ref(), &pool, &admission).await;
+        let gateway = Gateway {
+            pool: &pool,
+            policy: &policy,
+            peer: Some(peer.ip()),
+        };
+        let response =
+            Self::dispatch_with(&body, &cfg, (*contract).as_ref(), &gateway, &admission).await;
         match response {
             Some(v) => {
                 let payload = serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string());
@@ -155,12 +257,30 @@ impl McpServer {
         }
     }
 
-    /// Dispatch one JSON-RPC request. Returns `None` for notifications.
+    /// [`Self::dispatch_with`] with no gateway policy (tests).
+    #[cfg(test)]
     async fn dispatch(
         body: &str,
         cfg: &McpConfig,
         contract: Option<&AgentContract>,
         pool: &crate::gateway_pool::SharedBackendPool,
+        admission: &tokio::sync::Semaphore,
+    ) -> Option<Value> {
+        let policy = GatewayPolicy::default();
+        let gateway = Gateway {
+            pool,
+            policy: &policy,
+            peer: None,
+        };
+        Self::dispatch_with(body, cfg, contract, &gateway, admission).await
+    }
+
+    /// Dispatch one JSON-RPC request. Returns `None` for notifications.
+    async fn dispatch_with(
+        body: &str,
+        cfg: &McpConfig,
+        contract: Option<&AgentContract>,
+        gateway: &Gateway<'_>,
         admission: &tokio::sync::Semaphore,
     ) -> Option<Value> {
         let req: Value = match serde_json::from_str(body) {
@@ -205,7 +325,7 @@ impl McpServer {
                         ))
                     }
                 };
-                Some(Self::handle_tool_call(id, &params, cfg, contract, pool).await)
+                Some(Self::handle_tool_call(id, &params, cfg, contract, gateway).await)
             }
             other => Some(rpc_error(
                 id,
@@ -253,7 +373,7 @@ impl McpServer {
         params: &Value,
         cfg: &McpConfig,
         contract: Option<&AgentContract>,
-        pool: &crate::gateway_pool::SharedBackendPool,
+        gateway: &Gateway<'_>,
     ) -> Value {
         let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -270,9 +390,11 @@ impl McpServer {
                 } else {
                     match Self::check_policy(cfg, contract, sql) {
                         Err(hint) => Err(hint),
-                        Ok(()) => Self::run_sql(cfg, pool, sql, effective_read_only(cfg, contract))
-                            .await
-                            .map(|r| format_result(&r)),
+                        Ok(()) => {
+                            Self::run_sql(cfg, gateway, sql, effective_read_only(cfg, contract))
+                                .await
+                                .map(|r| format_result(&r))
+                        }
                     }
                 }
             }
@@ -280,7 +402,7 @@ impl McpServer {
                 let sql = "SELECT table_schema, table_name FROM information_schema.tables \
                            WHERE table_schema NOT IN ('pg_catalog','information_schema') \
                            ORDER BY table_schema, table_name";
-                Self::run_sql(cfg, pool, sql, effective_read_only(cfg, contract))
+                Self::run_sql(cfg, gateway, sql, effective_read_only(cfg, contract))
                     .await
                     .map(|r| format_result(&r))
             }
@@ -300,7 +422,7 @@ impl McpServer {
                         // prefix is applied only for execution.
                         Ok(()) => Self::run_sql(
                             cfg,
-                            pool,
+                            gateway,
                             &format!("EXPLAIN {}", sql),
                             effective_read_only(cfg, contract),
                         )
@@ -403,10 +525,25 @@ impl McpServer {
     /// role if that matters for your deployment.
     async fn run_sql(
         cfg: &McpConfig,
-        pool: &crate::gateway_pool::SharedBackendPool,
+        gateway: &Gateway<'_>,
         sql: &str,
         read_only: bool,
     ) -> std::result::Result<QueryResult, String> {
+        // H-06: the PG-wire rate limit, circuit breaker and rewrite rules
+        // apply to tool calls too (after the read-only guard saw the raw SQL).
+        let (pool, policy) = (gateway.pool, gateway.policy);
+        let node = format!("{}:{}", cfg.backend_host, cfg.backend_port);
+        policy
+            .admit_request(RequestIdentity {
+                peer: gateway.peer,
+                user: &cfg.backend_user,
+                database: cfg.backend_database.as_deref(),
+            })
+            .await
+            .and(policy.check_node(&node))
+            .map_err(|denied| denied.to_string())?;
+        let sql = policy.rewrite(sql);
+        let sql = sql.as_ref();
         let bcfg = BackendConfig {
             host: cfg.backend_host.clone(),
             port: cfg.backend_port,
@@ -419,10 +556,14 @@ impl McpServer {
             query_timeout: Duration::from_millis(cfg.query_timeout_ms),
             tls_config: default_client_config(),
         };
-        let mut client = pool
-            .acquire(&bcfg)
-            .await
-            .map_err(|e| format!("backend connect: {}", e))?;
+        let mut client = match pool.acquire(&bcfg).await {
+            Ok(c) => c,
+            Err(e) => {
+                policy.record(&node, false, &e.to_string());
+                return Err(format!("backend connect: {}", e));
+            }
+        };
+        policy.record(&node, true, "");
         if read_only {
             // Re-assert on every checkout: this pool is MCP-only and every
             // connection it retains has the GUC set, but asserting again is

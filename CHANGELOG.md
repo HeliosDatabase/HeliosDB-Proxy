@@ -33,6 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The HTTP SQL, GraphQL and MCP gateways now apply the PG-wire request policies (H-06):
+  `[rate_limit]` per request (keyed by `key_by`; denial = HTTP 429), `[query_rewrite]`
+  rules on every statement, and `[circuit_breaker]` (fast-fail with HTTP 503 while the
+  backend's circuit is open; connect outcomes recorded). `[multi_tenancy]` together with a
+  gateway is refused under `strict_config` and warned about otherwise (gateways have no
+  per-request tenant identity). `[mcp] read_only = true` probes the backend role at
+  startup: a role that can write user tables is refused under `strict_config` and warned
+  about otherwise.
 - With `[topology] provider = "patroni"`, the leader `/cluster` names now counts only
   while it holds Patroni's DCS leader lock: its own REST API must answer `GET /primary`
   with 200 (`patroni_confirm_leader_lock`, default on). Startup now rejects a

@@ -1279,6 +1279,26 @@ async fn admission_takes_a_slot_and_counts_a_refusal() {
 }
 
 /// P-03/H-05: with a bounded admission wait, a saturated cap makes the next
+/// H-06: tenant filtering does not reach the gateways; strict_config refuses
+/// the combination, the default only warns.
+#[test]
+fn multi_tenancy_with_a_gateway_is_refused_only_under_strict_config() {
+    let mut config = test_config();
+    config.multi_tenancy.enabled = true;
+    config.http_gateway.enabled = true;
+    assert!(ProxyServer::check_gateway_tenancy(&config).is_ok());
+    config.strict_config = true;
+    let err = ProxyServer::check_gateway_tenancy(&config)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("http_gateway") && err.contains("tenant"),
+        "{err}"
+    );
+    config.http_gateway.enabled = false;
+    assert!(ProxyServer::check_gateway_tenancy(&config).is_ok());
+}
+
 /// connection wait (counted) and admit when a slot frees — or time out.
 #[tokio::test]
 async fn bounded_admission_waits_and_admits_or_times_out() {

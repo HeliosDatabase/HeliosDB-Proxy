@@ -10,7 +10,7 @@ gateway, the GraphQL gateway and the MCP agent gateway.
 | Interface | Listener | Policy source | Connection model |
 |---|---|---|---|
 | PG-wire | `listen_address` (default `:5432`) | `[limits]`, `[rate_limit]`, `[circuit_breaker]`, `[multi_tenancy]`, `[query_rewrite]`, TR | Session holds backend connections (session/txn/statement pooling); H-05 admission applies |
-| HTTP SQL (`POST /sql`) | `[http_gateway] listen_address` | gateway config + `[limits] gateway_pool_max_idle`; **not** the PG-wire rate limiter/circuit breaker today | Per-request checkout from its own idle pool (H-06); session-neutral statements return the connection |
+| HTTP SQL (`POST /sql`) | `[http_gateway] listen_address` | gateway config + `[limits] gateway_pool_max_idle` + the shared gateway policy (`[rate_limit]`, `[query_rewrite]`, `[circuit_breaker]`) | Per-request checkout from its own idle pool (H-06); session-neutral statements return the connection |
 | GraphQL | `[graphql_gateway] listen_address` | gateway config + same pool rule | Engine checks out per generated query, releases when the generated SQL is session-neutral |
 | MCP | `[mcp] listen_address` | gateway config (+ optional agent contract) + same pool rule | Per-tool-call checkout; read-only mode re-asserts `default_transaction_read_only` on every checkout and retains those connections |
 
@@ -39,14 +39,28 @@ gateway, the GraphQL gateway and the MCP agent gateway.
   request returns an error; the caller retries. PG-wire transaction replay (TR) is the
   only automatic re-execution path and follows its own safety contract.
 
+## Shared request policy (slice 2, 2026-10-12)
+
+`src/gateway_policy.rs` (`GatewayPolicy`) carries the daemon's own rate limiter, query
+rewriter and circuit breaker into the three gateways:
+
+- `[rate_limit]`: one check per gateway request (HTTP `POST /sql`, GraphQL request, MCP
+  tool call), keyed by `[rate_limit] key_by` (`client_ip` = the HTTP peer, `user` /
+  `database` = the gateway's backend user / database, `global`); a throttle verdict waits
+  (capped at 5 s, as on PG-wire), a denial answers HTTP 429 (MCP: an in-band tool error);
+- `[query_rewrite]`: every statement a gateway sends (HTTP, MCP, each GraphQL-generated
+  statement) is rewritten by the same rules;
+- `[circuit_breaker]`: a gateway fast-fails while its backend's circuit is open (HTTP 503)
+  and records connect outcomes on it (an SQL error is the backend answering, not a fault).
+
 ## Known gaps (tracked in #54 / H-06)
 
-- Gateway requests do not consult the PG-wire rate limiter, circuit breaker, rewrite
-  rules or tenant manager. The next slice should route gateway execution through a shared
-  request-executor that applies those policies, or explicitly reject unsupported
-  combinations at startup.
-- `[mcp] read_only=true` is a backstop GUC plus a lexical guard, not a role-level
-  enforcement; volatile functions with side effects are still possible (documented in
-  `src/mcp.rs`).
-- Pooling metrics (hit/reuse/discard counters) and per-gateway admission caps are not
-  yet exposed; they belong with P-03 observability.
+- No per-request tenant identity on the gateways: `[multi_tenancy]` filtering does not
+  reach them. The daemon refuses that combination under `strict_config` and warns
+  otherwise.
+- `[mcp] read_only=true` is a backstop GUC plus a lexical guard; volatile functions with
+  side effects are still possible. At startup the MCP gateway now probes whether its
+  backend role can INSERT/UPDATE/DELETE/TRUNCATE any user table: `strict_config` refuses
+  to start then, otherwise it warns. A role without write privileges is the real fix.
+- Per-gateway pool metrics are exported (P-03); per-request identities (header/JWT) are
+  not implemented.

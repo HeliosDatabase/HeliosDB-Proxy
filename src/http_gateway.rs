@@ -23,17 +23,30 @@ use crate::backend::client::QueryResult;
 use crate::backend::types::TextValue;
 use crate::backend::{tls::default_client_config, BackendConfig, ParamValue, TlsMode};
 use crate::config::HttpGatewayConfig;
+use crate::gateway_policy::{GatewayPolicy, RequestIdentity, SharedGatewayPolicy};
 use crate::gateway_pool::{statement_is_session_neutral, SharedBackendPool};
 use crate::{ProxyError, Result};
 
 pub struct HttpGateway {
     config: HttpGatewayConfig,
     pool: SharedBackendPool,
+    policy: SharedGatewayPolicy,
 }
 
 impl HttpGateway {
     pub fn new(config: HttpGatewayConfig, pool: SharedBackendPool) -> Self {
-        Self { config, pool }
+        Self {
+            config,
+            pool,
+            policy: Arc::new(GatewayPolicy::default()),
+        }
+    }
+
+    /// Apply the PG-wire request policies (rate limit, rewrite, circuit
+    /// breaker) to this gateway's requests (H-06).
+    pub fn with_policy(mut self, policy: SharedGatewayPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     pub async fn run(self) -> Result<()> {
@@ -54,6 +67,7 @@ impl HttpGateway {
         ));
         let cfg = Arc::new(self.config);
         let pool = self.pool.clone();
+        let policy = self.policy.clone();
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(x) => x,
@@ -65,8 +79,9 @@ impl HttpGateway {
             let cfg = cfg.clone();
             let pool = pool.clone();
             let admission = admission.clone();
+            let policy = policy.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle(stream, cfg, pool, admission).await {
+                if let Err(e) = Self::handle(stream, peer, cfg, pool, admission, policy).await {
                     tracing::debug!(%peer, "HTTP gateway error: {}", e);
                 }
             });
@@ -75,9 +90,11 @@ impl HttpGateway {
 
     async fn handle(
         mut stream: tokio::net::TcpStream,
+        peer: std::net::SocketAddr,
         cfg: Arc<HttpGatewayConfig>,
         pool: SharedBackendPool,
         admission: Arc<tokio::sync::Semaphore>,
+        policy: SharedGatewayPolicy,
     ) -> Result<()> {
         use crate::http_util;
         let (reader, mut writer) = stream.split();
@@ -155,8 +172,27 @@ impl HttpGateway {
             Ok(p) => p,
             Err(_) => return Self::respond_busy(&mut writer).await,
         };
+        // H-06: the PG-wire rate limit and circuit breaker apply here too.
+        let who = RequestIdentity {
+            peer: Some(peer.ip()),
+            user: &cfg.backend_user,
+            database: cfg.backend_database.as_deref(),
+        };
+        let node = format!("{}:{}", cfg.backend_host, cfg.backend_port);
+        if let Err(denied) = policy
+            .admit_request(who)
+            .await
+            .and(policy.check_node(&node))
+        {
+            return Self::respond(
+                &mut writer,
+                denied.http_status(),
+                &json!({"error": denied.to_string()}),
+            )
+            .await;
+        }
 
-        match Self::run_sql(&cfg, &pool, sql, &params).await {
+        match Self::run_sql(&cfg, &pool, &policy, sql, &params).await {
             Ok(qr) => {
                 let body = neon_result(&qr, array_mode);
                 Self::respond(&mut writer, 200, &body).await
@@ -168,9 +204,13 @@ impl HttpGateway {
     async fn run_sql(
         cfg: &HttpGatewayConfig,
         pool: &SharedBackendPool,
+        policy: &GatewayPolicy,
         sql: &str,
         params: &[ParamValue],
     ) -> std::result::Result<QueryResult, String> {
+        let sql = policy.rewrite(sql);
+        let sql = sql.as_ref();
+        let node = format!("{}:{}", cfg.backend_host, cfg.backend_port);
         let bcfg = BackendConfig {
             host: cfg.backend_host.clone(),
             port: cfg.backend_port,
@@ -183,10 +223,14 @@ impl HttpGateway {
             query_timeout: Duration::from_millis(cfg.query_timeout_ms),
             tls_config: default_client_config(),
         };
-        let mut client = pool
-            .acquire(&bcfg)
-            .await
-            .map_err(|e| format!("backend connect: {}", e))?;
+        let mut client = match pool.acquire(&bcfg).await {
+            Ok(c) => c,
+            Err(e) => {
+                policy.record(&node, false, &e.to_string());
+                return Err(format!("backend connect: {}", e));
+            }
+        };
+        policy.record(&node, true, "");
         let res = if params.is_empty() {
             client.simple_query(sql).await
         } else {
@@ -243,6 +287,7 @@ impl HttpGateway {
             401 => "Unauthorized",
             405 => "Method Not Allowed",
             413 => "Payload Too Large",
+            429 => "Too Many Requests",
             503 => "Service Unavailable",
             _ => "Error",
         };
@@ -389,17 +434,73 @@ mod tests {
         assert!(matches!(p[4], ParamValue::Float(_)));
     }
 
+    /// H-06: an open circuit on the gateway's backend answers 503 before any
+    /// backend connection is attempted, as on the PG-wire listener.
+    #[cfg(feature = "circuit-breaker")]
+    #[tokio::test]
+    async fn handle_fast_fails_while_the_backend_circuit_is_open() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+
+        let cfg = Arc::new(HttpGatewayConfig::default());
+        let node = format!("{}:{}", cfg.backend_host, cfg.backend_port);
+        let cb = Arc::new(crate::circuit_breaker::CircuitBreakerManager::new(
+            crate::circuit_breaker::ManagerConfig::new(
+                crate::circuit_breaker::CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                },
+            ),
+        ));
+        let policy = GatewayPolicy::default().with_circuit_breaker(cb);
+        for _ in 0..5 {
+            policy.record(&node, false, "connection refused");
+        }
+        let pool: SharedBackendPool = Arc::new(crate::gateway_pool::BackendClientPool::new(0));
+        let admission = Arc::new(tokio::sync::Semaphore::new(4));
+        let task = tokio::spawn(HttpGateway::handle(
+            server,
+            peer,
+            cfg,
+            pool,
+            admission,
+            Arc::new(policy),
+        ));
+        let body = br#"{"query":"select 1"}"#;
+        let req = format!(
+            "POST /sql HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        client.write_all(body).await.unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let resp = String::from_utf8(buf).unwrap();
+        task.await.unwrap().unwrap();
+        assert!(resp.starts_with("HTTP/1.1 503"), "{resp}");
+        assert!(resp.contains("circuit open"), "{resp}");
+    }
+
     #[tokio::test]
     async fn handle_health_bypasses_the_admission_cap() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let (server, _peer) = listener.accept().await.unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
 
         let cfg = Arc::new(HttpGatewayConfig::default());
         let pool: SharedBackendPool = Arc::new(crate::gateway_pool::BackendClientPool::new(0));
         let admission = Arc::new(tokio::sync::Semaphore::new(0));
-        let task = tokio::spawn(HttpGateway::handle(server, cfg, pool, admission));
+        let task = tokio::spawn(HttpGateway::handle(
+            server,
+            peer,
+            cfg,
+            pool,
+            admission,
+            Arc::new(GatewayPolicy::default()),
+        ));
 
         client
             .write_all(b"GET /health HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
@@ -418,14 +519,21 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let (server, _peer) = listener.accept().await.unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
 
         let cfg = Arc::new(HttpGatewayConfig::default());
         let pool: SharedBackendPool = Arc::new(crate::gateway_pool::BackendClientPool::new(0));
         // Zero permits: the first request that reaches the admission check
         // must be rejected as busy rather than hit a (nonexistent) backend.
         let admission = Arc::new(tokio::sync::Semaphore::new(0));
-        let task = tokio::spawn(HttpGateway::handle(server, cfg, pool, admission));
+        let task = tokio::spawn(HttpGateway::handle(
+            server,
+            peer,
+            cfg,
+            pool,
+            admission,
+            Arc::new(GatewayPolicy::default()),
+        ));
 
         let body = br#"{"query":"select 1"}"#;
         let req = format!(
