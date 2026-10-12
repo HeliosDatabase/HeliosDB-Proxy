@@ -161,6 +161,9 @@ pub struct TransactionState {
     /// so its recorded client text is not what executed. `transaction` mode
     /// degrades to `session` behaviour for it.
     pub non_replayable: bool,
+    /// `non_replayable` because the transaction outgrew `[limits]
+    /// tr_max_replay_statements` / `tr_max_replay_bytes` (P-03 refusal reason).
+    pub replay_cap_exceeded: bool,
 }
 
 /// Logged statement for TR replay

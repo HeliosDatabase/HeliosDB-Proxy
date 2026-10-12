@@ -1452,6 +1452,14 @@ pub struct LimitsToml {
     /// with `08006` instead of re-homing with incomplete state (TR-04).
     #[serde(default = "default_tr_max_session_set_statements")]
     pub tr_max_session_set_statements: usize,
+    /// Upper bounds, in milliseconds, of the buckets of every latency
+    /// histogram on `/metrics/prometheus` (failover reconnect, replay,
+    /// admission wait, journal apply, operator replay): 1 to 32 values,
+    /// strictly increasing, each at least 0.001. An implicit `+Inf` bucket
+    /// follows the last bound. Default
+    /// `[1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]`.
+    #[serde(default = "crate::metrics_hist::default_latency_buckets_ms")]
+    pub latency_buckets_ms: Vec<f64>,
 }
 
 fn default_max_cancel_keys() -> usize {
@@ -1554,6 +1562,7 @@ impl Default for LimitsToml {
             tr_max_replay_statements: default_tr_max_replay_statements(),
             tr_max_replay_bytes: default_tr_max_replay_bytes(),
             tr_max_session_set_statements: default_tr_max_session_set_statements(),
+            latency_buckets_ms: crate::metrics_hist::default_latency_buckets_ms(),
         }
     }
 }
@@ -2567,6 +2576,11 @@ impl ProxyConfig {
                 return Err(ProxyError::Config(
                     "limits.tr_max_session_set_statements must be >= 1".to_string(),
                 ));
+            }
+            if let Err(e) = crate::metrics_hist::validate_buckets_ms(&l.latency_buckets_ms) {
+                return Err(ProxyError::Config(format!(
+                    "limits.latency_buckets_ms: {e}"
+                )));
             }
         }
 
@@ -4418,6 +4432,25 @@ database = "helios"
         let mut c = base();
         c.limits.tr_max_session_set_statements = 0;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn test_limits_latency_buckets_parse_and_validate() {
+        let limits: LimitsToml =
+            toml::from_str("latency_buckets_ms = [0.5, 5, 50]\n").expect("parse buckets");
+        assert_eq!(limits.latency_buckets_ms, vec![0.5, 5.0, 50.0]);
+        assert_eq!(
+            LimitsToml::default().latency_buckets_ms,
+            crate::metrics_hist::default_latency_buckets_ms()
+        );
+        let mut c = ProxyConfig::default();
+        c.add_node("localhost:5432", "primary").unwrap();
+        c.limits.latency_buckets_ms = vec![10.0, 5.0];
+        assert!(c.validate().is_err());
+        c.limits.latency_buckets_ms = Vec::new();
+        assert!(c.validate().is_err());
+        c.limits.latency_buckets_ms = vec![1.0, 10.0];
+        assert!(c.validate().is_ok());
     }
 
     #[test]

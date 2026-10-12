@@ -58,7 +58,11 @@ impl ProxyServer {
                         .metrics
                         .admission_waited
                         .fetch_add(1, Ordering::Relaxed);
-                    match tokio::time::timeout(wait, Arc::clone(sem).acquire_owned()).await {
+                    let waiting = std::time::Instant::now();
+                    let acquired =
+                        tokio::time::timeout(wait, Arc::clone(sem).acquire_owned()).await;
+                    state.latency.admission_wait.record(waiting.elapsed());
+                    match acquired {
                         Ok(Ok(permit)) => Ok(Some(permit)),
                         _ => {
                             state

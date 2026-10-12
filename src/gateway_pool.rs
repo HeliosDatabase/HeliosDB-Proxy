@@ -15,11 +15,9 @@
 //!   explicit transaction, or that changed session state — a gateway request
 //!   must never inherit another request's session.
 //! - The pool is intentionally dumb: no eviction task. Bounded by
-//!   `[limits] gateway_pool_max_idle` per identity; extras are dropped. It
-//!   does carry reuse/discard/miss counters (H-06 slice 1, below) — not yet
-//!   exported through `/metrics`, since that needs the per-gateway pool
-//!   instances threaded into `src/admin.rs`'s state, which is wired in
-//!   `src/server/mod.rs`.
+//!   `[limits] gateway_pool_max_idle` per identity; extras are dropped. Its
+//!   reuse/discard/miss counters and idle gauge are exported per gateway on
+//!   `/metrics` and `/metrics/prometheus` through [`GatewayPools`].
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -157,6 +155,35 @@ impl BackendClientPool {
 
 /// Convenience alias used by the gateway constructors.
 pub type SharedBackendPool = Arc<BackendClientPool>;
+
+/// The daemon's three gateway pools, one per gateway so a pool's session
+/// policy (e.g. the MCP read-only GUC) never leaks into another gateway.
+/// Shared with the admin API for the pool metrics.
+pub struct GatewayPools {
+    pub mcp: SharedBackendPool,
+    pub http: SharedBackendPool,
+    pub graphql: SharedBackendPool,
+}
+
+impl GatewayPools {
+    /// Each pool keeps at most `max_idle` idle clients per backend identity.
+    pub fn new(max_idle: usize) -> Self {
+        Self {
+            mcp: Arc::new(BackendClientPool::new(max_idle)),
+            http: Arc::new(BackendClientPool::new(max_idle)),
+            graphql: Arc::new(BackendClientPool::new(max_idle)),
+        }
+    }
+
+    /// `(gateway label, pool)` pairs, the label set being fixed.
+    pub fn labelled(&self) -> [(&'static str, &BackendClientPool); 3] {
+        [
+            ("mcp", &self.mcp),
+            ("http", &self.http),
+            ("graphql", &self.graphql),
+        ]
+    }
+}
 
 impl std::fmt::Debug for BackendClientPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

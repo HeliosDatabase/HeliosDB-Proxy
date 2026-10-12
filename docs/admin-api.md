@@ -357,6 +357,31 @@ Prometheus text exposition format, wrapped in a JSON `text` field:
 { "text": "# HELP heliosdb_proxy_connections_total ...\n..." }
 ```
 
+Besides the counters above, the body carries (P-03):
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `heliosdb_proxy_failover_reconnect_seconds` | histogram | — | Backend fault on a live session until a replacement backend is connected and authenticated. |
+| `heliosdb_proxy_tr_replay_seconds` | histogram | — | Replaying an open transaction's statements on the replacement backend (successful or not). |
+| `heliosdb_proxy_admission_wait_seconds` | histogram | — | Time a client waited for a slot at `[limits] max_client_connections` (only connections that had to wait). |
+| `heliosdb_proxy_journal_apply_seconds` | histogram | — | Applying a response's captured operations to the recovery journal. |
+| `heliosdb_proxy_operator_replay_seconds` | histogram | — | `POST /api/replay` runs. |
+| `heliosdb_proxy_tr_replay_refusals_total` | counter | `reason` = `outcome_unknown`, `not_replayable`, `cap_exceeded`, `diverged`, `deadline`, `backend_unavailable` | Backend faults Transaction Replay did not transparently continue. |
+| `heliosdb_proxy_cache_hits_total` | counter | `tier` = `l1`, `l2`, `l3` | Query cache hits (`[cache] enabled`). |
+| `heliosdb_proxy_cache_misses_total`, `_puts_total`, `_invalidations_total` | counter | — | Query cache misses, stores, invalidation operations. |
+| `heliosdb_proxy_cache_stale_rejected_total` | counter | — | Hits refused because a table they read was written since the fetch. |
+| `heliosdb_proxy_cache_fills_raced_total` | counter | — | Fills not stored because a write raced their backend fetch. |
+| `heliosdb_proxy_cache_retained_bytes` | gauge | `tier` | Bytes the query cache retains per tier (L1 includes per-entry overhead). |
+| `heliosdb_proxy_edge_cache_retained_bytes` | gauge | — | Bytes the edge cache retains (`edge-proxy` builds). |
+| `heliosdb_proxy_edge_gap_flushes_total` | counter | — | Edge cache flushes after an invalidation-stream gap (C-03). |
+| `heliosdb_proxy_gateway_pool_reuses_total`, `_misses_total`, `_discards_total` | counter | `gateway` = `mcp`, `http`, `graphql` | Gateway backend checkouts that reused a pooled connection, dialed a fresh one, or dropped one instead of pooling it (H-06). |
+| `heliosdb_proxy_gateway_pool_idle` | gauge | `gateway` | Idle pooled gateway backend connections. |
+
+Histogram buckets are `[limits] latency_buckets_ms`, exported in seconds as `_bucket{le="…"}`,
+`_sum` and `_count`. `GET /metrics` carries the same data as JSON under `latency`
+(`bounds_us`, cumulative counts, `sum_us`, `count`, and `tr_replay_refusals`),
+`gateway_pools`, `query_cache` and `edge_cache`.
+
 > This is not directly scrapable as raw Prometheus text — the payload is JSON with the exposition string in `text`, so a scraper must unwrap the `text` field. This endpoint is served unconditionally; there is no separate build flag that changes its format (the `observability` feature only pulls in the `prometheus`/`opentelemetry` crates and wires no exporter — see the feature-flags reference).
 
 ### GET /sessions

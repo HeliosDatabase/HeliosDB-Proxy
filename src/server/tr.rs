@@ -1,4 +1,5 @@
 use super::*;
+use crate::metrics_hist::ReplayRefusal;
 
 // ---------------------------------------------------------------------------
 // In-session Transaction Replay (`tr_mode`)
@@ -1143,6 +1144,7 @@ impl ProxyServer {
             || ts.replay_bytes.saturating_add(entry_bytes) > state.limits.tr_max_replay_bytes
         {
             ts.non_replayable = true;
+            ts.replay_cap_exceeded = true;
             ts.statements = Vec::new();
             ts.replay_bytes = 0;
             state
@@ -1274,6 +1276,7 @@ impl ProxyServer {
                     || ts.statements.len() >= state.limits.tr_max_replay_statements)
             {
                 ts.non_replayable = true;
+                ts.replay_cap_exceeded = true;
                 ts.statements = Vec::new();
                 ts.replay_bytes = 0;
                 state
@@ -1853,6 +1856,8 @@ impl ProxyServer {
         // auth, session restore, replay — instead of per-phase timeouts that
         // could add up well beyond `write_timeout_secs`.
         let deadline = tokio::time::Instant::now() + config.write_timeout();
+        // P-03: fault seen -> replacement connected, and replay duration.
+        let fault_seen = std::time::Instant::now();
         let mode = session.tr_mode;
         let in_tx = session
             .in_transaction
@@ -1883,12 +1888,19 @@ impl ProxyServer {
             ),
         };
         fault.kind = Some(kind);
-        let (tx_has_writes, tx_replayable) = {
+        let (tx_has_writes, tx_replayable, tx_cap_exceeded) = {
             let ts = session.tx_state.read().await;
             (
                 ts.has_writes,
                 !ts.non_replayable && !ts.statements.is_empty(),
+                ts.replay_cap_exceeded,
             )
+        };
+        // Why a non-continuing action refuses, for the P-03 refusal counter.
+        let not_replayable = if tx_cap_exceeded {
+            ReplayRefusal::CapExceeded
+        } else {
+            ReplayRefusal::NotReplayable
         };
         let prior_flush = tr.ext_dispatched;
         if prior_flush {
@@ -1937,10 +1949,12 @@ impl ProxyServer {
 
         match action {
             TrAction::CloseIncompleteResponse => {
+                state.latency.record_refusal(not_replayable);
                 Self::tr_clear_tx(session).await;
                 Ok(None)
             }
             TrAction::CloseWithError(code) => {
+                state.latency.record_refusal(not_replayable);
                 let message = if copying {
                     format!(
                         "backend {} failed during COPY ({}); connection closed",
@@ -1957,6 +1971,11 @@ impl ProxyServer {
                 Ok(None)
             }
             TrAction::ErrorAndContinue(code) => {
+                state.latency.record_refusal(if code == "08007" {
+                    ReplayRefusal::OutcomeUnknown
+                } else {
+                    not_replayable
+                });
                 let node =
                     match Self::tr_acquire_replacement(conns, tr, session, state, config, deadline)
                         .await
@@ -1969,6 +1988,10 @@ impl ProxyServer {
                             .await;
                         }
                     };
+                state
+                    .latency
+                    .failover_reconnect
+                    .record(fault_seen.elapsed());
                 let message = format!(
                     "backend {} failed {} ({}){}",
                     fault.node,
@@ -2001,15 +2024,27 @@ impl ProxyServer {
                     {
                         Ok(n) => n,
                         Err(e) => {
+                            state.latency.record_refusal(
+                                if tokio::time::Instant::now() >= deadline {
+                                    ReplayRefusal::Deadline
+                                } else {
+                                    ReplayRefusal::BackendUnavailable
+                                },
+                            );
                             return Self::tr_fail_no_replacement(
                                 client, &fault, &e, in_tx, wait_ready, session,
                             )
                             .await;
                         }
                     };
+                state
+                    .latency
+                    .failover_reconnect
+                    .record(fault_seen.elapsed());
                 if action == TrAction::ReplayThenReexecute {
                     let entries = session.tx_state.read().await.statements.clone();
-                    match tokio::time::timeout_at(
+                    let replay_started = std::time::Instant::now();
+                    let replayed = tokio::time::timeout_at(
                         deadline,
                         Self::tr_replay_transaction(conns, &node, &entries, registry, state),
                     )
@@ -2018,7 +2053,9 @@ impl ProxyServer {
                         Err(ReplayFailure::Backend(ProxyError::Network(
                             "recovery deadline exceeded during replay".to_string(),
                         )))
-                    }) {
+                    });
+                    state.latency.tr_replay.record(replay_started.elapsed());
+                    match replayed {
                         Ok(()) => {
                             state
                                 .metrics
@@ -2038,6 +2075,15 @@ impl ProxyServer {
                                 .tr
                                 .replay_failures
                                 .fetch_add(1, Ordering::Relaxed);
+                            state.latency.record_refusal(match &failure {
+                                ReplayFailure::Statement(_) => ReplayRefusal::Diverged,
+                                ReplayFailure::Backend(_)
+                                    if tokio::time::Instant::now() >= deadline =>
+                                {
+                                    ReplayRefusal::Deadline
+                                }
+                                ReplayFailure::Backend(_) => ReplayRefusal::BackendUnavailable,
+                            });
                             let detail = match failure {
                                 ReplayFailure::Statement(d) => {
                                     // Leave the new backend clean.

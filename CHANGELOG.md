@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   within `max_lag_bytes`) via `pg_promote()`, a `promote_command` or a `promote_url`,
   after an optional `fence_command`. Requires `[topology] provider = "postgres"`.
   Status at `GET /api/promotion`. The `[ha]` rejection message now points here.
+- Latency histograms and trust metrics (P-03) on `/metrics` and `/metrics/prometheus`:
+  failover reconnect, transaction replay, admission wait, journal apply and operator
+  replay durations (`heliosdb_proxy_*_seconds`, buckets from the new
+  `[limits] latency_buckets_ms`); `heliosdb_proxy_tr_replay_refusals_total{reason}`;
+  query cache hits per tier, misses, puts, invalidations, stale-hit refusals, raced
+  fills and retained bytes per tier; edge cache retained bytes and gap flushes;
+  gateway pool reuse/miss/discard counters and idle gauge per gateway (H-06).
+  `TransactionState` gains a public `replay_cap_exceeded` field.
 
 ### Changed
 

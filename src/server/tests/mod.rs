@@ -435,6 +435,10 @@ async fn test_apply_authenticate_hook_with_manager_no_plugins_defers() {
         primary_tracker: Arc::new(PrimaryTracker::new_standalone()),
         authoritative_topology: false,
         routing: Arc::new(crate::routing_snapshot::RoutingView::new(false)),
+        gateway_pools: Arc::new(crate::gateway_pool::GatewayPools::new(1)),
+        latency: Arc::new(crate::metrics_hist::ProxyLatency::new(
+            &crate::metrics_hist::default_latency_buckets_ms(),
+        )),
         promoter: Arc::new(parking_lot::Mutex::new(Default::default())),
         topology_poller: TopologyPoller::Static,
         lb_state: LoadBalancerState {
@@ -1314,6 +1318,11 @@ async fn bounded_admission_waits_and_admits_or_times_out() {
         .is_err());
     assert_eq!(state.metrics.admission_waited.load(Ordering::Relaxed), 2);
     assert_eq!(state.metrics.admission_timeouts.load(Ordering::Relaxed), 1);
+    // P-03: both waits are in the admission histogram, the timed-out one
+    // having waited the whole 1 s budget.
+    let waits = state.latency.admission_wait.snapshot();
+    assert_eq!(waits.count(), 2);
+    assert!(waits.sum_us >= 1_000_000, "sum {} us", waits.sum_us);
     assert_eq!(
         state.metrics.connections_rejected.load(Ordering::Relaxed),
         1

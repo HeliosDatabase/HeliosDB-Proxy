@@ -178,6 +178,7 @@ impl ProxyServer {
             return;
         }
         let node_id = crate::journal_capture::node_id_for_backend(&source.backend);
+        let applying = std::time::Instant::now();
         let applied = crate::journal_capture::apply_ops(
             &state.transaction_journal,
             ops,
@@ -186,6 +187,7 @@ impl ProxyServer {
             source,
             local,
         );
+        state.latency.journal_apply.record(applying.elapsed());
         if applied.committed > 0 {
             state
                 .metrics

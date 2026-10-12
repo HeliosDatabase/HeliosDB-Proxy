@@ -152,6 +152,14 @@ impl std::fmt::Display for CacheLevel {
 }
 
 /// Main query cache implementation
+/// Bytes a [`QueryCache`] retains in each tier.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct RetainedBytes {
+    pub l1: u64,
+    pub l2: u64,
+    pub l3: u64,
+}
+
 pub struct QueryCache {
     /// Configuration
     config: CacheConfig,
@@ -273,6 +281,26 @@ impl QueryCache {
     /// Remove L1 cache for a connection (on disconnect)
     pub fn remove_l1_cache(&self, connection_id: u64) {
         self.l1_caches.remove(&connection_id);
+    }
+
+    /// Bytes retained per tier, for `/metrics` (P-03): every connection's L1
+    /// (with per-entry overhead, C-01), L2 in memory, and L3.
+    pub fn retained_bytes(&self) -> RetainedBytes {
+        RetainedBytes {
+            l1: self
+                .l1_caches
+                .iter()
+                .map(|c| c.retained_bytes() as u64)
+                .sum(),
+            l2: self
+                .l2_cache
+                .as_ref()
+                .map_or(0, |c| c.memory_usage() as u64),
+            l3: self
+                .l3_cache
+                .as_ref()
+                .map_or(0, |c| c.retained_bytes() as u64),
+        }
     }
 
     /// Number of per-connection L1 caches currently retained. Grows by one per

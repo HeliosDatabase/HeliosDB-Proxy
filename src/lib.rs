@@ -76,6 +76,7 @@ pub mod http_gateway;
 pub(crate) mod http_util;
 pub mod load_balancer;
 pub mod mcp;
+pub mod metrics_hist;
 pub mod mirror;
 pub mod pipeline;
 pub mod plugin_registry;

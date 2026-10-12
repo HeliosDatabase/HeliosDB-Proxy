@@ -344,6 +344,14 @@ struct ServerState {
     /// configuration reload and (with a provider) tracker change. Routing
     /// under a provider and `/topology` read this one value.
     routing: Arc<crate::routing_snapshot::RoutingView>,
+    /// H-06: per-gateway idle pools for the HTTP, MCP and GraphQL gateways
+    /// (sized by `[limits] gateway_pool_max_idle`), shared with the admin API
+    /// for their counters.
+    gateway_pools: Arc<crate::gateway_pool::GatewayPools>,
+    /// P-03 latency histograms and replay-refusal counters, shared with the
+    /// admin API (`/metrics`, `/metrics/prometheus`). Buckets from `[limits]
+    /// latency_buckets_ms`, fixed at startup like the rest of `[limits]`.
+    latency: Arc<crate::metrics_hist::ProxyLatency>,
     /// Live `[auto_promote]` status, shared with `GET /api/promotion`.
     promoter: Arc<parking_lot::Mutex<crate::auto_promote::PromoterStatus>>,
     /// Provider poll task (H-01): `static` has none; `postgres` polls in
@@ -1008,6 +1016,9 @@ impl ProxyServer {
         // H-01: authoritative topology tracker (static/standalone by default).
         let (primary_tracker, authoritative_topology, topology_poller) =
             Self::build_primary_tracker(&config);
+        let gateway_pools = Arc::new(crate::gateway_pool::GatewayPools::new(
+            resolved_limits.gateway_pool_max_idle,
+        ));
         let state = Arc::new(ServerState {
             limits: resolved_limits,
             client_slots,
@@ -1026,6 +1037,10 @@ impl ProxyServer {
             authoritative_topology,
             routing: Arc::new(crate::routing_snapshot::RoutingView::new(
                 authoritative_topology,
+            )),
+            gateway_pools,
+            latency: Arc::new(crate::metrics_hist::ProxyLatency::new(
+                &config.limits.latency_buckets_ms,
             )),
             promoter: Arc::new(parking_lot::Mutex::new(Default::default())),
             topology_poller,
@@ -1382,11 +1397,10 @@ impl ProxyServer {
         // connections instead of dialing per request. Kept separate because a
         // pool's session policy (e.g. MCP read-only GUC) must not leak into
         // another gateway's connections.
-        let gw_max = self.state.limits.gateway_pool_max_idle;
-        let mcp_pool = Arc::new(crate::gateway_pool::BackendClientPool::new(gw_max));
-        let http_pool = Arc::new(crate::gateway_pool::BackendClientPool::new(gw_max));
+        let mcp_pool = self.state.gateway_pools.mcp.clone();
+        let http_pool = self.state.gateway_pools.http.clone();
         #[cfg(feature = "graphql-gateway")]
-        let gql_pool = Arc::new(crate::gateway_pool::BackendClientPool::new(gw_max));
+        let gql_pool = self.state.gateway_pools.graphql.clone();
 
         // Start the MCP agent gateway when enabled.
         let mcp_task = if self.config.mcp.enabled {
@@ -1630,6 +1644,16 @@ impl ProxyServer {
                         })
                         .collect(),
                 };
+            }
+
+            // P-03: latency histograms and the query cache's counters.
+            admin_state.with_latency(state.latency.clone()).await;
+            admin_state
+                .with_gateway_pools(state.gateway_pools.clone())
+                .await;
+            #[cfg(feature = "query-cache")]
+            if let Some(cache) = state.query_cache.as_ref() {
+                admin_state.with_query_cache(cache.clone()).await;
             }
 
             // Set proxy config for SQL routing

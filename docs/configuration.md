@@ -744,6 +744,7 @@ gateway_pool_max_idle = 16
 tr_max_replay_statements = 1000
 tr_max_replay_bytes = 4194304
 tr_max_session_set_statements = 256
+latency_buckets_ms = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]
 ```
 
 | Key | Type | Default | Description |
@@ -769,6 +770,7 @@ tr_max_session_set_statements = 256
 | `gateway_pool_max_idle` | usize | `16` | Idle authenticated backend connections kept per identity by each non-PG-wire gateway (HTTP SQL, MCP, GraphQL) for reuse (H-06). `0` disables pooling (each gateway request dials, the pre-H-06 behaviour). Gateways have separate pools so a session policy (e.g. MCP read-only) cannot leak across interfaces. Applied at startup. |
 | `tr_max_replay_statements` | usize | `1000` | In-session TR (`tr_mode = select\|transaction`): cap on statements recorded per explicit transaction for failover replay. Over the cap the transaction is marked non-replayable (`transaction` degrades to `session` for it; `tr_replay_cap_exceeded_total`). |
 | `tr_max_replay_bytes` | usize | `4194304` | In-session TR: cap on bytes (statement text / raw extended-protocol frames) recorded per explicit transaction (4 MiB). Same degradation as above. |
+| `latency_buckets_ms` | list of numbers | `[1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]` | Bucket upper bounds, in milliseconds, of every latency histogram on `/metrics` and `/metrics/prometheus` (failover reconnect, transaction replay, admission wait, journal apply, operator replay). 1 to 32 values, strictly increasing, each at least `0.001`; an implicit `+Inf` bucket follows. Applied at startup. |
 | `tr_max_session_set_statements` | usize | `256` | In-session TR (`tr_mode != none`): cap on DISTINCT session variables whose latest `SET` is replayed onto the replacement backend (a later `SET` of the same variable replaces the earlier one; `RESET name` removes it; `RESET ALL`/`DISCARD ALL` clear all). Over the cap tracking stops (`tr_session_set_cap_exceeded_total`) and a subsequent failover is refused with `08006` rather than re-homing the session with incomplete state. |
 
 ---

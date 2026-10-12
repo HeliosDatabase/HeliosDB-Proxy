@@ -88,6 +88,17 @@ pub struct AdminState {
     /// startup; `/topology` then reports the write leader and read set the
     /// data path routes by, from the same snapshot.
     pub routing: RwLock<Option<Arc<crate::routing_snapshot::RoutingView>>>,
+    /// P-03 latency histograms and replay-refusal counters (shared with the
+    /// data path). Attached at startup; `/metrics` and
+    /// `/metrics/prometheus` then include them.
+    pub latency: RwLock<Option<Arc<crate::metrics_hist::ProxyLatency>>>,
+    /// The gateway idle pools (H-06), for their per-gateway counters on
+    /// `/metrics`. Attached at startup.
+    pub gateway_pools: RwLock<Option<Arc<crate::gateway_pool::GatewayPools>>>,
+    /// The query-result cache, for its counters and retained bytes on
+    /// `/metrics` (P-03). Attached at startup when `[cache] enabled`.
+    #[cfg(feature = "query-cache")]
+    pub query_cache: RwLock<Option<Arc<crate::cache::QueryCache>>>,
     /// Live `[auto_promote]` status for `GET /api/promotion`.
     pub promoter: RwLock<Option<Arc<parking_lot::Mutex<crate::auto_promote::PromoterStatus>>>>,
     /// WASM plugin manager. None when the proxy started without
@@ -541,7 +552,46 @@ impl AdminServer {
             // Metrics
             ("GET", "/metrics") => {
                 let metrics = state.metrics.read().await.clone();
-                Ok((200, serde_json::to_value(MetricsResponse::from(metrics))?))
+                let mut body = serde_json::to_value(MetricsResponse::from(metrics))?;
+                if let Some(map) = body.as_object_mut() {
+                    if let Some(l) = state.latency.read().await.as_ref() {
+                        map.insert("latency".into(), l.to_json());
+                    }
+                    if let Some(p) = state.gateway_pools.read().await.as_ref() {
+                        let pools: serde_json::Map<String, serde_json::Value> = p
+                            .labelled()
+                            .iter()
+                            .map(|(gw, pool)| {
+                                (
+                                    gw.to_string(),
+                                    serde_json::json!({
+                                        "reuses": pool.reuse_count(),
+                                        "discards": pool.discard_count(),
+                                        "misses": pool.miss_count(),
+                                        "idle": pool.idle_count(),
+                                    }),
+                                )
+                            })
+                            .collect();
+                        map.insert("gateway_pools".into(), pools.into());
+                    }
+                    #[cfg(feature = "query-cache")]
+                    if let Some(c) = state.query_cache.read().await.as_ref() {
+                        map.insert("query_cache".into(), Self::query_cache_json(c));
+                    }
+                    #[cfg(feature = "edge-proxy")]
+                    if let Some(e) = state.edge_cache.read().await.as_ref() {
+                        let s = e.stats();
+                        map.insert(
+                            "edge_cache".into(),
+                            serde_json::json!({
+                                "retained_bytes": e.retained_bytes(),
+                                "gap_flushes": s.gap_flushes,
+                            }),
+                        );
+                    }
+                }
+                Ok((200, body))
             }
             ("GET", "/metrics/prometheus") => {
                 let metrics = state.metrics.read().await.clone();
@@ -560,6 +610,24 @@ impl AdminServer {
                 #[cfg(feature = "query-analytics")]
                 if let Some(a) = state.analytics.read().await.as_ref() {
                     Self::push_analytics_prometheus(&mut prometheus, a.dropped_total());
+                }
+                if let Some(l) = state.latency.read().await.as_ref() {
+                    l.write_prometheus(&mut prometheus);
+                }
+                if let Some(p) = state.gateway_pools.read().await.as_ref() {
+                    Self::push_gateway_pool_prometheus(&mut prometheus, p);
+                }
+                #[cfg(feature = "query-cache")]
+                if let Some(c) = state.query_cache.read().await.as_ref() {
+                    Self::push_query_cache_prometheus(&mut prometheus, c);
+                }
+                #[cfg(feature = "edge-proxy")]
+                if let Some(e) = state.edge_cache.read().await.as_ref() {
+                    Self::push_edge_cache_prometheus(
+                        &mut prometheus,
+                        e.retained_bytes() as u64,
+                        e.stats().gap_flushes,
+                    );
                 }
                 Ok((200, serde_json::json!({ "text": prometheus })))
             }
@@ -621,7 +689,12 @@ impl AdminServer {
                         }),
                     ));
                 }
-                Self::handle_replay_request(body, state).await
+                let started = std::time::Instant::now();
+                let result = Self::handle_replay_request(body, state).await;
+                if let Some(l) = state.latency.read().await.as_ref() {
+                    l.operator_replay.record(started.elapsed());
+                }
+                result
             }
 
             // Shadow execution (T3.4) — runs a query against a source
@@ -2249,6 +2322,139 @@ impl AdminServer {
         ));
     }
 
+    /// Append the gateway pools' counters and idle gauge, labelled by gateway
+    /// (`mcp`, `http`, `graphql`), to a Prometheus body (H-06 / P-03).
+    fn push_gateway_pool_prometheus(
+        output: &mut String,
+        pools: &crate::gateway_pool::GatewayPools,
+    ) {
+        use std::fmt::Write as _;
+        for (name, kind, help, value) in [
+            (
+                "heliosdb_proxy_gateway_pool_reuses_total",
+                "counter",
+                "Gateway checkouts that reused a pooled backend connection",
+                (|p: &crate::gateway_pool::BackendClientPool| p.reuse_count())
+                    as fn(&crate::gateway_pool::BackendClientPool) -> u64,
+            ),
+            (
+                "heliosdb_proxy_gateway_pool_misses_total",
+                "counter",
+                "Gateway checkouts that dialed a fresh backend connection",
+                |p| p.miss_count(),
+            ),
+            (
+                "heliosdb_proxy_gateway_pool_discards_total",
+                "counter",
+                "Gateway backend connections dropped instead of pooled",
+                |p| p.discard_count(),
+            ),
+            (
+                "heliosdb_proxy_gateway_pool_idle",
+                "gauge",
+                "Idle pooled gateway backend connections",
+                |p| p.idle_count() as u64,
+            ),
+        ] {
+            let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} {kind}");
+            for (gateway, pool) in pools.labelled() {
+                let _ = writeln!(output, "{name}{{gateway=\"{gateway}\"}} {}", value(pool));
+            }
+        }
+    }
+
+    /// The query cache's counters and retained bytes for `GET /metrics`.
+    #[cfg(feature = "query-cache")]
+    fn query_cache_json(cache: &crate::cache::QueryCache) -> serde_json::Value {
+        let s = cache.stats();
+        serde_json::json!({
+            "hits": {"l1": s.l1.hits, "l2": s.l2.hits, "l3": s.l3.hits},
+            "misses": s.total_misses,
+            "puts": s.puts,
+            "invalidations": s.invalidations,
+            "stale_rejected": cache.stale_rejected(),
+            "fills_raced": cache.fills_raced(),
+            "retained_bytes": cache.retained_bytes(),
+        })
+    }
+
+    /// Append the query cache's counters (C-02 trust signals included) and
+    /// per-tier retained bytes to a Prometheus body (P-03). Labels: tier only.
+    #[cfg(feature = "query-cache")]
+    fn push_query_cache_prometheus(output: &mut String, cache: &crate::cache::QueryCache) {
+        use std::fmt::Write as _;
+        let s = cache.stats();
+        let retained = cache.retained_bytes();
+        let _ = writeln!(
+            output,
+            "# HELP heliosdb_proxy_cache_hits_total Query cache hits by tier
+             # TYPE heliosdb_proxy_cache_hits_total counter
+             heliosdb_proxy_cache_hits_total{{tier=\"l1\"}} {}
+             heliosdb_proxy_cache_hits_total{{tier=\"l2\"}} {}
+             heliosdb_proxy_cache_hits_total{{tier=\"l3\"}} {}",
+            s.l1.hits, s.l2.hits, s.l3.hits
+        );
+        for (name, help, value) in [
+            (
+                "heliosdb_proxy_cache_misses_total",
+                "Query cache misses",
+                s.total_misses,
+            ),
+            (
+                "heliosdb_proxy_cache_puts_total",
+                "Query cache stores",
+                s.puts,
+            ),
+            (
+                "heliosdb_proxy_cache_invalidations_total",
+                "Query cache invalidation operations",
+                s.invalidations,
+            ),
+            (
+                "heliosdb_proxy_cache_stale_rejected_total",
+                "Hits refused because a table they read was written since the fetch",
+                cache.stale_rejected(),
+            ),
+            (
+                "heliosdb_proxy_cache_fills_raced_total",
+                "Fills not stored because a write raced their backend fetch",
+                cache.fills_raced(),
+            ),
+        ] {
+            let _ = writeln!(
+                output,
+                "# HELP {name} {help}
+# TYPE {name} counter
+{name} {value}"
+            );
+        }
+        let _ = writeln!(
+            output,
+            "# HELP heliosdb_proxy_cache_retained_bytes Bytes the query cache retains by tier
+             # TYPE heliosdb_proxy_cache_retained_bytes gauge
+             heliosdb_proxy_cache_retained_bytes{{tier=\"l1\"}} {}
+             heliosdb_proxy_cache_retained_bytes{{tier=\"l2\"}} {}
+             heliosdb_proxy_cache_retained_bytes{{tier=\"l3\"}} {}",
+            retained.l1, retained.l2, retained.l3
+        );
+    }
+
+    /// Append the edge cache's retained bytes and invalidation-gap flushes
+    /// (C-03) to a Prometheus body (P-03).
+    #[cfg(feature = "edge-proxy")]
+    fn push_edge_cache_prometheus(output: &mut String, retained_bytes: u64, gap_flushes: u64) {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            output,
+            "# HELP heliosdb_proxy_edge_cache_retained_bytes Bytes the edge cache retains
+             # TYPE heliosdb_proxy_edge_cache_retained_bytes gauge
+             heliosdb_proxy_edge_cache_retained_bytes {retained_bytes}
+             # HELP heliosdb_proxy_edge_gap_flushes_total Edge cache flushes on an invalidation-stream gap
+             # TYPE heliosdb_proxy_edge_gap_flushes_total counter
+             heliosdb_proxy_edge_gap_flushes_total {gap_flushes}"
+        );
+    }
+
     /// Format metrics as Prometheus text format
     /// Append the query-analytics counters to a Prometheus exposition body.
     ///
@@ -2552,6 +2758,10 @@ impl AdminState {
             replay_engine: RwLock::new(None),
             primary_tracker: RwLock::new(None),
             routing: RwLock::new(None),
+            latency: RwLock::new(None),
+            gateway_pools: RwLock::new(None),
+            #[cfg(feature = "query-cache")]
+            query_cache: RwLock::new(None),
             promoter: RwLock::new(None),
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: RwLock::new(None),
@@ -2650,6 +2860,22 @@ impl AdminState {
     /// reports the snapshot the data path routes by.
     pub async fn with_routing_view(&self, routing: Arc<crate::routing_snapshot::RoutingView>) {
         *self.routing.write().await = Some(routing);
+    }
+
+    /// Attach the daemon's latency histograms (P-03).
+    pub async fn with_latency(&self, latency: Arc<crate::metrics_hist::ProxyLatency>) {
+        *self.latency.write().await = Some(latency);
+    }
+
+    /// Attach the gateway idle pools so `/metrics` reports their counters.
+    pub async fn with_gateway_pools(&self, pools: Arc<crate::gateway_pool::GatewayPools>) {
+        *self.gateway_pools.write().await = Some(pools);
+    }
+
+    /// Attach the query-result cache so `/metrics` reports its counters (P-03).
+    #[cfg(feature = "query-cache")]
+    pub async fn with_query_cache(&self, cache: Arc<crate::cache::QueryCache>) {
+        *self.query_cache.write().await = Some(cache);
     }
 
     /// Attach a WASM plugin manager. Production startup calls this
@@ -3583,6 +3809,65 @@ mod tests {
         let state = topology_state(&[("primary.svc:5432", "PRIMARY", true)]).await;
         let topo = AdminServer::compute_topology(&state).await;
         assert_eq!(topo.current_primary.as_deref(), Some("primary.svc:5432"));
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_and_json_carry_latency_histograms() {
+        let state = Arc::new(AdminState::new());
+        let latency = Arc::new(crate::metrics_hist::ProxyLatency::new(&[1.0, 10.0]));
+        latency
+            .failover_reconnect
+            .record(std::time::Duration::from_millis(4));
+        latency.record_refusal(crate::metrics_hist::ReplayRefusal::OutcomeUnknown);
+        state.with_latency(latency).await;
+
+        let (code, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(code, 200);
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("heliosdb_proxy_failover_reconnect_seconds_bucket{le=\"0.001\"} 0\n"));
+        assert!(text.contains("heliosdb_proxy_failover_reconnect_seconds_bucket{le=\"0.01\"} 1\n"));
+        assert!(text.contains("heliosdb_proxy_failover_reconnect_seconds_count 1\n"));
+        assert!(text
+            .contains("heliosdb_proxy_tr_replay_refusals_total{reason=\"outcome_unknown\"} 1\n"));
+
+        let (_, json) = AdminServer::route_request("GET", "/metrics", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(json["latency"]["failover_reconnect"]["count"], 1);
+        assert_eq!(
+            json["latency"]["failover_reconnect"]["bounds_us"][1],
+            10_000
+        );
+        assert_eq!(json["latency"]["tr_replay_refusals"]["outcome_unknown"], 1);
+    }
+
+    #[cfg(feature = "query-cache")]
+    #[tokio::test]
+    async fn test_prometheus_carries_query_cache_counters() {
+        let state = Arc::new(AdminState::new());
+        let cache = Arc::new(crate::cache::QueryCache::new(
+            crate::cache::CacheConfig::default(),
+        ));
+        state.with_query_cache(cache).await;
+        let (_, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
+            .await
+            .unwrap();
+        let text = body["text"].as_str().unwrap();
+        for line in [
+            "heliosdb_proxy_cache_hits_total{tier=\"l1\"} 0",
+            "heliosdb_proxy_cache_misses_total 0",
+            "heliosdb_proxy_cache_stale_rejected_total 0",
+            "heliosdb_proxy_cache_fills_raced_total 0",
+            "heliosdb_proxy_cache_retained_bytes{tier=\"l3\"} 0",
+        ] {
+            assert!(text.contains(line), "missing {line}");
+        }
+        let (_, json) = AdminServer::route_request("GET", "/metrics", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(json["query_cache"]["retained_bytes"]["l1"], 0);
     }
 
     #[tokio::test]
