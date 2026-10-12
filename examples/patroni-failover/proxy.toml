@@ -1,0 +1,29 @@
+# HeliosProxy in front of the Patroni demo cluster. The proxy only FOLLOWS the leader
+# Patroni elects; Patroni (with etcd) promotes and fences.
+listen_address = "127.0.0.1:35600"
+admin_address  = "127.0.0.1:35690"
+tr_enabled = true
+tr_mode    = "transaction"
+write_timeout_secs = 60
+
+[health]
+check_interval_secs = 1
+check_timeout_secs  = 2
+failure_threshold   = 2
+success_threshold   = 1
+
+[topology]
+provider = "patroni"
+patroni_endpoints = ["http://127.0.0.1:35611", "http://127.0.0.1:35612"]
+poll_interval_secs = 1
+lease_timeout_secs = 8   # below Patroni ttl (15) minus loop_wait (5)
+
+[[nodes]]
+host = "127.0.0.1"
+port = 35601
+role = "primary"
+
+[[nodes]]
+host = "127.0.0.1"
+port = 35602
+role = "standby"

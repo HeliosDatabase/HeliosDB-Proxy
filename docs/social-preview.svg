@@ -7,10 +7,10 @@
     <text x="80" y="318" font-size="38" fill="#cbd5e1">with failover-safe sessions. One Rust binary.</text>
   </g>
   <g font-family="Helvetica, Arial, sans-serif" font-size="26" fill="#0f172a" font-weight="600">
-    <rect x="80" y="380" width="230" height="52" rx="26" fill="#f59e0b"/><text x="106" y="415">connection pooling</text>
-    <rect x="330" y="380" width="230" height="52" rx="26" fill="#f59e0b"/><text x="356" y="415">read/write split</text>
-    <rect x="580" y="380" width="250" height="52" rx="26" fill="#f59e0b"/><text x="606" y="415">primary tracking</text>
-    <rect x="850" y="380" width="270" height="52" rx="26" fill="#f59e0b"/><text x="876" y="415">transaction replay</text>
+    <rect x="80" y="380" width="270" height="52" rx="26" fill="#f59e0b"/><text x="106" y="415">connection pooling</text>
+    <rect x="370" y="380" width="250" height="52" rx="26" fill="#f59e0b"/><text x="396" y="415">read/write split</text>
+    <rect x="640" y="380" width="270" height="52" rx="26" fill="#f59e0b"/><text x="666" y="415">primary tracking</text>
+    <rect x="930" y="380" width="290" height="52" rx="26" fill="#f59e0b"/><text x="956" y="415">transaction replay</text>
   </g>
-  <text x="80" y="560" font-family="Helvetica, Arial, sans-serif" font-size="28" fill="#94a3b8">Works with Patroni, RDS and Aurora. Apache-2.0.   github.com/HeliosDatabase/HeliosDB-Proxy</text>
+  <text x="80" y="560" font-family="Helvetica, Arial, sans-serif" font-size="24" fill="#94a3b8">Works with Patroni, RDS and Aurora. Apache-2.0.   github.com/HeliosDatabase/HeliosDB-Proxy</text>
 </svg>

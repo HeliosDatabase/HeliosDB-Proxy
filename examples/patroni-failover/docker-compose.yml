@@ -1,0 +1,50 @@
+# Disposable Patroni cluster for the HeliosProxy failover demo.
+# Host networking (published ports are unreliable on some hosts). Ports:
+#   etcd 35620/35621, member pg-a PG 35601 REST 35611, member pg-b PG 35602 REST 35612.
+# Run with a fixed project name and remove only this project's resources:
+#   docker compose -p hp-patroni-demo up -d --build
+#   docker compose -p hp-patroni-demo down        # never use -v on a shared host; see run-demo.sh cleanup
+name: hp-patroni-demo
+services:
+  etcd:
+    container_name: hp-patroni-demo-etcd
+    image: quay.io/coreos/etcd:v3.5.17
+    network_mode: host
+    command:
+      - etcd
+      - --name=hp-demo
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://127.0.0.1:35620
+      - --advertise-client-urls=http://127.0.0.1:35620
+      - --listen-peer-urls=http://127.0.0.1:35621
+      - --initial-advertise-peer-urls=http://127.0.0.1:35621
+      - --initial-cluster=hp-demo=http://127.0.0.1:35621
+  pg-a:
+    container_name: hp-patroni-demo-pg-a
+    build: {context: ., network: host}
+    image: hp-patroni-demo:local
+    network_mode: host
+    depends_on: [etcd]
+    environment:
+      PATRONI_NAME: pg-a
+      PATRONI_RESTAPI_LISTEN: 127.0.0.1:35611
+      PATRONI_RESTAPI_CONNECT_ADDRESS: 127.0.0.1:35611
+      PATRONI_POSTGRESQL_LISTEN: 127.0.0.1:35601
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: 127.0.0.1:35601
+    volumes: ["pg-a-data:/pgdata"]
+  pg-b:
+    container_name: hp-patroni-demo-pg-b
+    build: {context: ., network: host}
+    image: hp-patroni-demo:local
+    network_mode: host
+    depends_on: [etcd]
+    environment:
+      PATRONI_NAME: pg-b
+      PATRONI_RESTAPI_LISTEN: 127.0.0.1:35612
+      PATRONI_RESTAPI_CONNECT_ADDRESS: 127.0.0.1:35612
+      PATRONI_POSTGRESQL_LISTEN: 127.0.0.1:35602
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: 127.0.0.1:35602
+    volumes: ["pg-b-data:/pgdata"]
+volumes:
+  pg-a-data: {name: hp-patroni-demo-pg-a-data}
+  pg-b-data: {name: hp-patroni-demo-pg-b-data}

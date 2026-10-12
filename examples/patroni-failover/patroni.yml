@@ -1,0 +1,30 @@
+# Shared Patroni config; per-member values come from PATRONI_* environment variables
+# (see docker-compose.yml). Demo only: loopback trust authentication, throwaway data.
+scope: hp-demo
+etcd3:
+  hosts: 127.0.0.1:35620
+bootstrap:
+  dcs:
+    ttl: 15
+    loop_wait: 5
+    retry_timeout: 5
+    maximum_lag_on_failover: 1048576
+    postgresql:
+      use_pg_rewind: true
+      parameters:
+        wal_level: replica
+        hot_standby: "on"
+        max_wal_senders: 10
+        max_replication_slots: 10
+  initdb:
+    - encoding: UTF8
+  pg_hba:
+    - local all all trust
+    - host all all 127.0.0.1/32 trust
+    - host replication all 127.0.0.1/32 trust
+postgresql:
+  data_dir: /pgdata
+  bin_dir: /usr/lib/postgresql/18/bin
+  authentication:
+    superuser: {username: postgres, password: demo-super}
+    replication: {username: replicator, password: demo-repl}

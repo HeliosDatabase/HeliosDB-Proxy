@@ -1,0 +1,54 @@
+=== scenario 1: planned switchover with an open transaction ===
+[patroni] leader before: pg-a
+[client] session on backend port 35601 (in_recovery=False)
+[client] transaction open, row 1 written, NOT committed
+[patroni] Successfully switched over to "pg-b"
+[patroni] leader after: pg-b
+{
+  "mode": "switchover",
+  "old_leader": "pg-a",
+  "new_leader": "pg-b",
+  "port_before": 35601,
+  "client_result": "continued: row 2 written and COMMIT succeeded on the same client connection",
+  "port_after": 35602,
+  "in_recovery_after": false,
+  "rows_on_new_leader": [
+    [
+      1,
+      "before leader change"
+    ],
+    [
+      2,
+      "after leader change"
+    ]
+  ],
+  "new_leader_in_recovery": false,
+  "pass": true
+}
+=== scenario 2: leader container stopped (unplanned failover) with an open transaction ===
+[patroni] leader before: pg-a
+[client] session on backend port 35601 (in_recovery=False)
+[client] transaction open, row 1 written, NOT committed
+[patroni] stopped leader container hp-patroni-demo-pg-a
+[patroni] leader after: pg-b
+{
+  "mode": "failover",
+  "old_leader": "pg-a",
+  "new_leader": "pg-b",
+  "port_before": 35601,
+  "client_result": "continued: row 2 written and COMMIT succeeded on the same client connection",
+  "port_after": 35602,
+  "in_recovery_after": false,
+  "rows_on_new_leader": [
+    [
+      1,
+      "before leader change"
+    ],
+    [
+      2,
+      "after leader change"
+    ]
+  ],
+  "new_leader_in_recovery": false,
+  "pass": true
+}
