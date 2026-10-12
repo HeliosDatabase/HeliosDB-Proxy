@@ -103,7 +103,7 @@ def stop_container(owned,name):
     try:
         inspected=subprocess.run(['docker','inspect',owned or name],capture_output=True,text=True,timeout=10)
         if inspected.returncode:
-            if 'No such' in inspected.stderr:
+            if 'no such' in inspected.stderr.lower():
                 record['removed']=True
                 return record
             raise RuntimeError(('docker inspect failed',inspected.stderr))
@@ -123,7 +123,7 @@ def stop_container(owned,name):
         while True:
             inspected=subprocess.run(['docker','inspect',owned],capture_output=True,text=True,timeout=5)
             if inspected.returncode:
-                if 'No such' in inspected.stderr:return True
+                if 'no such' in inspected.stderr.lower():return True
                 raise RuntimeError(('removal inspect failed',inspected.stderr))
             if time.monotonic()>=deadline:return False
             time.sleep(.1)
@@ -134,7 +134,7 @@ def stop_container(owned,name):
         try:
             # Exact verified ID only; fallback if stop or automatic removal failed.
             removed=subprocess.run(['docker','rm','--force',owned],capture_output=True,text=True,timeout=15)
-            if removed.returncode and 'No such' not in removed.stderr and 'already in progress' not in removed.stderr:
+            if removed.returncode and 'no such' not in removed.stderr.lower() and 'already in progress' not in removed.stderr:
                 record['errors'].append(('docker rm',removed.stderr))
         except Exception as e:record['errors'].append(repr(e))
         try:record['removed']=confirm_removed()
