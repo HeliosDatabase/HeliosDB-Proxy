@@ -467,6 +467,40 @@ configure synchronous replication at the database if that is your requirement.
 
 ---
 
+## Automatic promotion (`[auto_promote]`)
+
+Opt-in and **off by default**. Requires `[topology] provider = "postgres"` (so the
+proxy rediscovers the promoted node) and at least one enabled `role = "standby"`
+node. **Single-proxy only**: two proxies with this enabled over one cluster can
+promote different standbys. With Patroni or another HA manager, leave it off.
+
+Promotion happens only when the topology has had no primary for `down_after_secs`,
+a fresh probe of every node finds no writable primary, the standby with the highest
+replay LSN has a known lag within `max_lag_bytes`, and `fence_command` (if set)
+exits 0. The old primary is never demoted: use `fence_command` to stop or isolate it.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Master switch. |
+| `down_after_secs` | `30` | Primary must be absent this long. |
+| `check_interval_secs` | `5` | Decision-loop period. |
+| `max_lag_bytes` | `16777216` | Max last-sampled lag of the chosen standby. |
+| `allow_unknown_lag` | `false` | Promote without a lag sample (needs no `[health] user`). |
+| `cooldown_secs` | `300` | Minimum gap between promotions. |
+| `max_attempts` | `3` | Failed attempts per outage before giving up. |
+| `promote_timeout_secs` | `60` | Bound on promote and on verification. |
+| `method` | `"pg_promote"` | `pg_promote`, `command` or `http`. |
+| `promote_command` | `[]` | argv for `command`; env `HELIOS_PROMOTE_TARGET`, `HELIOS_PROMOTE_OLD_PRIMARY`. |
+| `promote_url` | none | URL for `http`; POSTs `{"target","old_primary"}`. |
+| `fence_command` | `[]` | argv run before promotion; non-zero exit aborts. |
+| `fence_timeout_secs` | `30` | Bound on `fence_command`. |
+
+Probes and `pg_promote` use `[topology] user/password/database`. Status:
+`GET /api/promotion`. Nano has no fenced promote of its own; use `method = "command"`
+with your own tooling.
+
+---
+
 ## Nodes (`[[nodes]]`)
 
 One entry per backend. At least one node with `role = "primary"` is required.

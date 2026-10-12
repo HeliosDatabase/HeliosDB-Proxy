@@ -84,6 +84,8 @@ pub struct AdminState {
     /// present, `/topology` reports the provider's leader and epoch instead
     /// of re-deriving a primary from configured roles.
     pub primary_tracker: RwLock<Option<Arc<crate::primary_tracker::PrimaryTracker>>>,
+    /// Live `[auto_promote]` status for `GET /api/promotion`.
+    pub promoter: RwLock<Option<Arc<parking_lot::Mutex<crate::auto_promote::PromoterStatus>>>>,
     /// WASM plugin manager. None when the proxy started without
     /// plugins (or with a different feature set). `/plugins`
     /// endpoint returns 503 when missing; UI panel says "no plugin
@@ -718,6 +720,16 @@ impl AdminServer {
                 503,
                 serde_json::json!({ "error": "circuit-breaker feature not enabled" }),
             )),
+
+            // Automatic-promotion status (`[auto_promote]`); `enabled:false`
+            // when the feature is off.
+            ("GET", "/api/promotion") => {
+                let st = match state.promoter.read().await.as_ref() {
+                    Some(p) => p.lock().clone(),
+                    None => Default::default(),
+                };
+                Ok((200, serde_json::to_value(st)?))
+            }
 
             // Migration / traffic-mirror status
             ("GET", "/api/migration/status") | ("GET", "/migration/status") => {
@@ -2503,6 +2515,7 @@ impl AdminState {
             circuit_breaker: RwLock::new(None),
             replay_engine: RwLock::new(None),
             primary_tracker: RwLock::new(None),
+            promoter: RwLock::new(None),
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: RwLock::new(None),
             chaos_overrides: RwLock::new(HashMap::new()),
@@ -2540,6 +2553,14 @@ impl AdminState {
     #[cfg(feature = "pool-modes")]
     pub async fn with_pool_manager(&self, manager: Arc<crate::pool::ConnectionPoolManager>) {
         *self.pool_manager.write().await = Some(manager);
+    }
+
+    /// Attach the automatic-promotion status so `/api/promotion` is live.
+    pub async fn with_promoter(
+        &self,
+        status: Arc<parking_lot::Mutex<crate::auto_promote::PromoterStatus>>,
+    ) {
+        *self.promoter.write().await = Some(status);
     }
 
     /// Attach the circuit-breaker manager so `/api/circuit` reports live

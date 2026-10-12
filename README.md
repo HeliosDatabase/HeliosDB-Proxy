@@ -121,7 +121,7 @@ evaluating HA, replay, or distributed deployment guarantees.
 
 Plainly:
 
-- **Database promotion and fencing require an external HA manager.** The daemon tracks the primary; `[ha] auto_failover` is rejected at startup.
+- **Database promotion and fencing require an external HA manager.** The daemon tracks the primary; `[ha] auto_failover` is rejected at startup. The opt-in `[auto_promote]` section (off by default) can promote a standby from a single proxy, but it is not a quorum: it does not stop a second proxy or operator from also promoting, so it is no substitute for Patroni ([docs/configuration.md](docs/configuration.md)).
 - **Transaction Replay is bounded.** Unknown `COMMIT` outcomes, snapshot-pinned (`SERIALIZABLE` / `REPEATABLE READ`) transactions, and diverging replays are never silently continued. Cursors, temp tables and `PREPARE`d state are not migrated. Details: [docs/transaction-replay.md](docs/transaction-replay.md).
 - **No zero-RPO claim.** A healthy tracked primary says nothing about asynchronous replica lag; use synchronous replication if you need that.
 - **Some modules are library-only** (for example Session Migration, Cursor Restore, Failover Controller primitives, `distribcache`); the module tables below mark which.
@@ -405,8 +405,9 @@ cargo build --release --features "all-features,heliosdb-topology"
 ## Topology Providers
 
 HeliosProxy supports pluggable topology discovery for automatic primary tracking.
-The daemon does not promote databases or fence failed primaries. A database HA manager
-must do that first; `[topology] provider = "postgres"` or `"patroni"` then tracks the
+By default the daemon does not promote databases or fence failed primaries. A database HA
+manager must do that first (or opt in to the single-proxy `[auto_promote]` described in
+[docs/configuration.md](docs/configuration.md)); `[topology] provider = "postgres"` or `"patroni"` then tracks the
 writable primary (requires `postgres-topology`). Static topology uses configured roles.
 `[ha] auto_failover` is unsupported and rejected at startup. See
 [deployment and promotion setup](docs/topology-providers.md).

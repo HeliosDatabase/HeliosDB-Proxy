@@ -104,6 +104,8 @@ mod hooks;
 
 mod health;
 
+mod promotion;
+
 /// Proxy server
 pub struct ProxyServer {
     config: ProxyConfig,
@@ -255,7 +257,7 @@ fn splitmix64(mut x: u64) -> u64 {
 
 /// Parse PostgreSQL's textual LSN (`"0/16B3748"`) into the standard u64
 /// encoding (high 32 bits / low 32 bits), used for WAL-lag arithmetic (H-04).
-fn parse_pg_lsn(text: &str) -> Option<u64> {
+pub(crate) fn parse_pg_lsn(text: &str) -> Option<u64> {
     let (hi, lo) = text.trim().split_once('/')?;
     let hi = u64::from_str_radix(hi, 16).ok()?;
     let lo = u64::from_str_radix(lo, 16).ok()?;
@@ -335,6 +337,8 @@ struct ServerState {
     /// roles, so a missing provider answer fails closed instead of writing
     /// to a stale primary.
     authoritative_topology: bool,
+    /// Live `[auto_promote]` status, shared with `GET /api/promotion`.
+    promoter: Arc<parking_lot::Mutex<crate::auto_promote::PromoterStatus>>,
     /// Provider poll task (H-01): `static` has none; `postgres` polls in
     /// `run()` and feeds the tracker.
     topology_poller: TopologyPoller,
@@ -1013,6 +1017,7 @@ impl ProxyServer {
             cutover: Arc::new(ArcSwap::from_pointee(None)),
             primary_tracker,
             authoritative_topology,
+            promoter: Arc::new(parking_lot::Mutex::new(Default::default())),
             topology_poller,
             lb_state: LoadBalancerState {
                 rr_counter: AtomicU64::new(0),
@@ -1308,6 +1313,7 @@ impl ProxyServer {
 
         // Start background tasks
         let health_task = self.spawn_health_checker();
+        let promoter_task = self.spawn_auto_promoter();
         let pool_task = self.spawn_pool_manager();
         // H-01: authoritative topology loop. Only spawned when a provider is
         // configured; static configs keep the historical routing path. Two
@@ -1529,6 +1535,9 @@ impl ProxyServer {
 
         // Wait for background tasks
         health_task.abort();
+        if let Some(t) = promoter_task {
+            t.abort();
+        }
         pool_task.abort();
         if let Some((poller, tracker_task)) = topology_task {
             if let Some(t) = poller {
@@ -1581,6 +1590,7 @@ impl ProxyServer {
                     .with_primary_tracker(state.primary_tracker.clone())
                     .await;
             }
+            admin_state.with_promoter(state.promoter.clone()).await;
 
             // Initialize config snapshot
             {
