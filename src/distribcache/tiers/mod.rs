@@ -13,7 +13,6 @@ pub use l2_warm::WarmCache;
 pub use l3_distributed::DistributedCache;
 
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime};
 
 /// Cache tier identifier
@@ -270,16 +269,12 @@ impl TierStats {
 pub struct LFUEviction {
     /// Access counts per key
     counts: dashmap::DashMap<u64, u64>,
-    /// Minimum frequency for fast eviction
-    #[allow(dead_code)]
-    min_freq: AtomicU64,
 }
 
 impl LFUEviction {
     pub fn new() -> Self {
         Self {
             counts: dashmap::DashMap::new(),
-            min_freq: AtomicU64::new(1),
         }
     }
 

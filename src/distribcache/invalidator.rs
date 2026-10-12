@@ -65,46 +65,26 @@ pub struct WalEntry {
 
 /// WAL stream subscriber with TCP connection
 pub struct WalStreamer {
-    /// Endpoint address (host:port)
-    #[allow(dead_code)]
-    endpoint: String,
     /// TCP connection to WAL server
     connection: Option<TcpStream>,
     /// Running flag
     running: Arc<AtomicBool>,
-    /// Current LSN
-    #[allow(dead_code)]
-    current_lsn: AtomicU64,
     /// Last heartbeat received
     last_heartbeat: Instant,
-    /// Reconnection attempts
-    #[allow(dead_code)]
-    reconnect_attempts: u32,
-    /// Maximum reconnection attempts
-    #[allow(dead_code)]
-    max_reconnect_attempts: u32,
-    /// Reconnect delay
-    #[allow(dead_code)]
-    reconnect_delay: Duration,
 }
 
 impl WalStreamer {
-    fn new(endpoint: &str) -> Self {
+    fn new() -> Self {
         Self {
-            endpoint: endpoint.to_string(),
             connection: None,
             running: Arc::new(AtomicBool::new(false)),
-            current_lsn: AtomicU64::new(0),
             last_heartbeat: Instant::now(),
-            reconnect_attempts: 0,
-            max_reconnect_attempts: 10,
-            reconnect_delay: Duration::from_secs(1),
         }
     }
 
     /// Connect to the WAL streaming endpoint
     async fn connect(endpoint: &str) -> CacheResult<Self> {
-        let mut streamer = Self::new(endpoint);
+        let mut streamer = Self::new();
 
         // Attempt TCP connection
         match TcpStream::connect_timeout(
@@ -175,61 +155,6 @@ impl WalStreamer {
             current_lsn: 0,
             buffer: Vec::with_capacity(64 * 1024),
         })
-    }
-
-    /// Attempt to reconnect to the WAL endpoint
-    #[allow(dead_code)]
-    async fn reconnect(&mut self) -> CacheResult<bool> {
-        if self.reconnect_attempts >= self.max_reconnect_attempts {
-            return Ok(false);
-        }
-
-        self.reconnect_attempts += 1;
-        let delay = self.reconnect_delay * self.reconnect_attempts;
-        tokio::time::sleep(delay).await;
-
-        tracing::info!(
-            "Attempting WAL reconnection (attempt {})",
-            self.reconnect_attempts
-        );
-
-        match TcpStream::connect_timeout(
-            &self
-                .endpoint
-                .parse()
-                .map_err(|_| CacheError::ConnectionError("Invalid endpoint".to_string()))?,
-            Duration::from_secs(5),
-        ) {
-            Ok(stream) => {
-                stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
-                stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-                stream.set_nodelay(true).ok();
-
-                self.connection = Some(stream);
-                self.reconnect_attempts = 0;
-                self.last_heartbeat = Instant::now();
-                tracing::info!("WAL reconnection successful");
-                Ok(true)
-            }
-            Err(e) => {
-                tracing::warn!("WAL reconnection failed: {}", e);
-                Ok(false)
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    fn disconnect(&mut self) {
-        self.running.store(false, Ordering::SeqCst);
-        if let Some(stream) = self.connection.take() {
-            drop(stream);
-        }
-    }
-
-    /// Check if connected
-    #[allow(dead_code)]
-    fn is_connected(&self) -> bool {
-        self.connection.is_some()
     }
 }
 
@@ -459,10 +384,6 @@ pub type InvalidationCallback = Arc<dyn Fn(&InvalidationTarget) + Send + Sync>;
 
 /// WAL-based cache invalidator
 pub struct WalInvalidator {
-    /// Configuration
-    #[allow(dead_code)]
-    config: DistribCacheConfig,
-
     /// WAL stream
     wal_stream: Option<WalStreamer>,
 
@@ -496,9 +417,8 @@ struct InvalidatorStats {
 
 impl WalInvalidator {
     /// Create a new invalidator
-    pub fn new(config: DistribCacheConfig) -> Self {
+    pub fn new(_config: DistribCacheConfig) -> Self {
         Self {
-            config,
             wal_stream: None,
             subscription: tokio::sync::RwLock::new(None),
             table_index: DashMap::new(),

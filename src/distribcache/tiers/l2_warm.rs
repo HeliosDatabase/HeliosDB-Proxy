@@ -103,7 +103,6 @@ pub struct WarmCache {
     hits: AtomicU64,
     misses: AtomicU64,
     compressed_size: AtomicU64,
-    #[allow(dead_code)]
     uncompressed_size: AtomicU64,
 }
 
@@ -112,9 +111,6 @@ pub struct WarmCache {
 struct EntryMetadata {
     /// Size of compressed data
     compressed_size: usize,
-    /// Size of uncompressed data
-    #[allow(dead_code)]
-    uncompressed_size: usize,
     /// Creation timestamp
     created_at: u64,
     /// TTL in seconds
@@ -218,7 +214,6 @@ impl WarmCache {
         // Create metadata
         let metadata = EntryMetadata {
             compressed_size,
-            uncompressed_size,
             created_at: entry.created_at,
             ttl_secs: entry.ttl_secs,
             tables: entry.tables.clone(),

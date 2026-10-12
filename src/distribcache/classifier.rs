@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use super::{DistribCacheConfig, QueryContext, QueryFingerprint, SessionId};
+use super::{DistribCacheConfig, QueryContext, SessionId};
 
 /// Workload types for cache strategy selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -40,8 +40,6 @@ pub enum WorkloadType {
 /// Query history entry for session-based classification
 #[derive(Debug, Clone)]
 struct QueryHistoryEntry {
-    #[allow(dead_code)]
-    fingerprint: QueryFingerprint,
     workload: WorkloadType,
     timestamp: Instant,
     latency_ms: u64,
@@ -149,10 +147,6 @@ pub struct ClassificationRule {
 
 /// Workload classifier
 pub struct WorkloadClassifier {
-    /// Configuration
-    #[allow(dead_code)]
-    config: DistribCacheConfig,
-
     /// Classification rules (priority-ordered)
     rules: Vec<ClassificationRule>,
 
@@ -180,11 +174,10 @@ struct ClassifierStats {
 
 impl WorkloadClassifier {
     /// Create a new workload classifier
-    pub fn new(config: DistribCacheConfig) -> Self {
+    pub fn new(_config: DistribCacheConfig) -> Self {
         let rules = Self::default_rules();
 
         Self {
-            config,
             rules,
             session_history: DashMap::new(),
             stats: ClassifierStats::default(),
@@ -305,21 +298,21 @@ impl WorkloadClassifier {
         // 2. Pattern-based classification
         if let Some(workload) = self.classify_by_pattern(query) {
             self.stats.rule_hits.fetch_add(1, Ordering::Relaxed);
-            self.record_query(context, query, workload);
+            self.record_query(context, workload);
             return workload;
         }
 
         // 3. Session history-based classification
         if let Some(workload) = self.classify_by_session(&context.session_id) {
             self.stats.session_hits.fetch_add(1, Ordering::Relaxed);
-            self.record_query(context, query, workload);
+            self.record_query(context, workload);
             return workload;
         }
 
         // 4. Default classification based on query structure
         let workload = self.classify_by_structure(query);
         self.stats.default_hits.fetch_add(1, Ordering::Relaxed);
-        self.record_query(context, query, workload);
+        self.record_query(context, workload);
         workload
     }
 
@@ -380,7 +373,7 @@ impl WorkloadClassifier {
     }
 
     /// Record a query for history tracking
-    fn record_query(&self, context: &QueryContext, query: &str, workload: WorkloadType) {
+    fn record_query(&self, context: &QueryContext, workload: WorkloadType) {
         // Update global stats
         match workload {
             WorkloadType::OLTP => self.stats.oltp_count.fetch_add(1, Ordering::Relaxed),
@@ -393,7 +386,6 @@ impl WorkloadClassifier {
 
         // Update session history
         let entry = QueryHistoryEntry {
-            fingerprint: QueryFingerprint::from_query(query),
             workload,
             timestamp: Instant::now(),
             latency_ms: 0, // Will be updated later

@@ -270,10 +270,6 @@ pub struct SemanticIndex {
     /// All vectors with their IDs
     vectors: DashMap<VectorId, Embedding>,
 
-    /// Index configuration
-    #[allow(dead_code)]
-    config: SemanticIndexConfig,
-
     /// Next ID
     next_id: AtomicU64,
 }
@@ -301,10 +297,9 @@ impl Default for SemanticIndexConfig {
 
 impl SemanticIndex {
     /// Create a new semantic index
-    pub fn new(config: SemanticIndexConfig) -> Self {
+    pub fn new(_config: SemanticIndexConfig) -> Self {
         Self {
             vectors: DashMap::new(),
-            config,
             next_id: AtomicU64::new(1),
         }
     }
