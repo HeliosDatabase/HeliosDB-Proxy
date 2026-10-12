@@ -1511,6 +1511,23 @@ impl ProxyServer {
         })
     }
 
+    /// Undo `map` writes recorded as (key, previous value) in arrival order:
+    /// restore each previous value, or remove a key that had none. Used for a
+    /// batch the aborted-transaction emulation refused without forwarding, so
+    /// the statement registry keeps what the backend kept.
+    pub(super) fn undo_map_writes<V>(map: &mut HashMap<String, V>, undo: Vec<(String, Option<V>)>) {
+        for (key, previous) in undo.into_iter().rev() {
+            match previous {
+                Some(v) => {
+                    map.insert(key, v);
+                }
+                None => {
+                    map.remove(&key);
+                }
+            }
+        }
+    }
+
     /// Append `name` to a per-cycle extended-batch tracker at most once,
     /// bounded by the session's named-statement cap (O-05). A client that
     /// never sends Sync cannot grow `batch_refs`/`batch_defines`/`batch_closes`

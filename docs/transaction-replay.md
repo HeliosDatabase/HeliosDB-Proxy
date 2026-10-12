@@ -165,7 +165,9 @@ has published nothing, so the read is re-executed (or the transaction replayed) 
 client sees one complete result. A response that outgrows the bound is published at that
 point and streams on, with the usual rule from then on. The cost is the time to first row
 (nothing is shown until the whole held response arrived) and up to the bound in memory per
-session; writes, COPY and every response outside these modes are never held.
+session; writes, COPY and every response outside these modes are never held. A batch
+whose unnamed `Parse` the proxy answered from its promotion cache has already shown the
+client a `ParseComplete`, so holding cannot make that batch retryable.
 
 **What recovery does.** Under one deadline (`write_timeout_secs`) it waits for a healthy
 primary, connects and authenticates, restores the session's tracked `SET` state, and
@@ -201,8 +203,12 @@ limit) keeps the classification of the statement it was bound to; replaying the 
 cycle recreates it, and its first fetches are verified like any other replayed response.
 The proxy forgets a name, so that a reference to it refuses as before, when a batch that
 `Parse`d or `Close`d it failed (the backend may hold the old definition, the new one or
-none), when the session runs SQL `PREPARE`, `DEALLOCATE` or `DISCARD`, and when a cycle
-uses a statement and then redefines it. Both registries are bounded by
+none), when its cycle had Flush-terminated chunks or yielded for `COPY` (an error there
+never reaches the cycle's `Sync`), when the session runs SQL `PREPARE`, `DEALLOCATE` or
+`DISCARD`, and when a cycle uses a statement and then redefines it. A batch the proxy
+itself refuses with `25P02` after a failover aborted the transaction is never forwarded,
+so its `Parse`s are undone: the statement registry keeps the definitions the backend
+kept. Both registries are bounded by
 `[limits] max_prepared_statements`; past it, a reference refuses.
 
 ---

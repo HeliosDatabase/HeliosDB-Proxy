@@ -3575,3 +3575,64 @@ fn tr09_hold_applies_to_reexecutable_reads_only() {
         0
     );
 }
+
+/// TR-08 review F1: a batch the aborted-transaction emulation refuses is
+/// never forwarded, so its Parses must not survive in the registry; undoing
+/// them in reverse restores what the backend kept.
+#[test]
+fn tr08_refused_batch_registry_writes_are_undone() {
+    let v = |s: &str| bytes::Bytes::from(s.to_string());
+    let mut registry: HashMap<String, bytes::Bytes> = HashMap::new();
+    registry.insert("s1".into(), v("defA"));
+    let mut undo = Vec::new();
+    // Close S1 / Parse S1 defB / Parse S2 / Parse S1 defC, all refused 25P02.
+    undo.push(("s1".to_string(), registry.insert("s1".into(), v("defB"))));
+    undo.push(("s2".to_string(), registry.insert("s2".into(), v("new"))));
+    undo.push(("s1".to_string(), registry.insert("s1".into(), v("defC"))));
+    ProxyServer::undo_map_writes(&mut registry, undo);
+    assert_eq!(registry.len(), 1);
+    assert_eq!(registry["s1"], v("defA"));
+}
+
+/// TR-08 review F3/F4: a cycle that yielded for COPY acknowledges nothing
+/// (the backend may never reach its later Parses), and a COPY drain that
+/// ends the transaction drops the transaction's portals.
+#[tokio::test]
+async fn tr08_copy_cycles_acknowledge_nothing_and_end_portals() {
+    let server = ProxyServer::new(test_config()).unwrap();
+    let state = server.state.clone();
+    let session = make_test_session();
+    let mut tr = TrSession::new(TrMode::Transaction);
+    let s2 = tr08_parse("s2", "SELECT 2");
+    let mut registry: HashMap<String, bytes::Bytes> = HashMap::new();
+    registry.insert("s2".to_string(), bytes::Bytes::from(s2.clone()));
+    ProxyServer::note_ready_for_query(&session, b'I', false);
+    session
+        .copy_in_progress
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let batch = bytes::Bytes::from([s2.clone(), frame(b'S', &[])].concat());
+    ProxyServer::tr_after_extended(
+        &mut tr,
+        &batch,
+        None,
+        Some("SELECT 2"),
+        true,
+        &["s2".to_string()],
+        &[],
+        &registry,
+        &session,
+        &state,
+    )
+    .await;
+    assert!(
+        tr.acked.is_empty(),
+        "a COPY-yielded cycle acknowledges no Parse"
+    );
+    session
+        .copy_in_progress
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    tr.tx_portals.insert("cur".to_string(), StmtKind::Read);
+    ProxyServer::note_ready_for_query(&session, b'I', false);
+    ProxyServer::tr_after_copy_drain(&mut tr, &session).await;
+    assert!(tr.tx_portals.is_empty());
+}

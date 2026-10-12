@@ -677,6 +677,13 @@ impl ProxyServer {
         let mut batch_defines: Vec<String> = Vec::new();
         let mut batch_refs: Vec<String> = Vec::new();
         let mut batch_closes: Vec<String> = Vec::new();
+        // Registry writes (name, previous value) of Parses that arrived while
+        // the aborted-transaction emulation was active: if their batch is then
+        // answered 25P02 without being forwarded, the backend kept the old
+        // definitions and these writes are undone (TR-08 review F1).
+        let mut aborted_undo: Vec<(String, Option<bytes::Bytes>)> = Vec::new();
+        #[cfg(feature = "edge-proxy")]
+        let mut aborted_edge_undo: Vec<(String, Option<Option<Vec<String>>>)> = Vec::new();
         // Edge invalidation metadata for extended-protocol statements,
         // memoized at Parse time (name -> Some(tables) when the statement is
         // DML, None when read-only) so steady-state Bind/Execute cycles of a
@@ -1085,7 +1092,10 @@ impl ProxyServer {
                                         );
                                         return Ok(());
                                     }
-                                    stmt_registry.insert(name.clone(), encoded);
+                                    let previous = stmt_registry.insert(name.clone(), encoded);
+                                    if tr.tx_aborted {
+                                        aborted_undo.push((name.clone(), previous));
+                                    }
                                     stmt_registry_bytes = projected;
                                     Self::remember_batch_name(
                                         &mut batch_defines,
@@ -1147,10 +1157,15 @@ impl ProxyServer {
                                             if unnamed {
                                                 edge_unnamed_meta = meta;
                                             } else {
-                                                edge_stmt_meta.insert(
-                                                    Self::parse_stmt_name(&msg.payload).to_string(),
-                                                    meta,
-                                                );
+                                                let key =
+                                                    Self::parse_stmt_name(&msg.payload).to_string();
+                                                if tr.tx_aborted {
+                                                    let previous =
+                                                        edge_stmt_meta.insert(key.clone(), meta);
+                                                    aborted_edge_undo.push((key, previous));
+                                                } else {
+                                                    edge_stmt_meta.insert(key, meta);
+                                                }
                                             }
                                         }
                                     }
@@ -1272,8 +1287,26 @@ impl ProxyServer {
                                 // Nothing was closed on the backend: forget the
                                 // batch's Close requests without pruning.
                                 batch_closes.clear();
+                                // ...and nothing was Parsed: the backend kept
+                                // the definitions the registry must keep too.
+                                if !aborted_undo.is_empty() {
+                                    Self::undo_map_writes(
+                                        &mut stmt_registry,
+                                        std::mem::take(&mut aborted_undo),
+                                    );
+                                    stmt_registry_bytes =
+                                        stmt_registry.values().map(|b| b.len()).sum();
+                                }
+                                #[cfg(feature = "edge-proxy")]
+                                Self::undo_map_writes(
+                                    &mut edge_stmt_meta,
+                                    std::mem::take(&mut aborted_edge_undo),
+                                );
                             }
                         }
+                        aborted_undo.clear();
+                        #[cfg(feature = "edge-proxy")]
+                        aborted_edge_undo.clear();
                         let (used_node, sent) = if skip_forward {
                             (None, 0)
                         } else {

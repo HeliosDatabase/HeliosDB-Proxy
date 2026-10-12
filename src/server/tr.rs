@@ -1507,10 +1507,15 @@ impl ProxyServer {
         // cycle with Flush chunks is treated as failed: its Parses are
         // forgotten, never acknowledged. A chunk whose frames were not
         // retained hides its Parses and Closes altogether: forget every name.
+        // A cycle that yielded for COPY has no ReadyForQuery yet: the backend
+        // may never reach its later Parses (CopyFail skips to the Sync).
         let uncertain = session
             .last_response_error
             .load(std::sync::atomic::Ordering::Relaxed)
-            || tr.ext_cycle.is_some();
+            || tr.ext_cycle.is_some()
+            || session
+                .copy_in_progress
+                .load(std::sync::atomic::Ordering::Relaxed);
         if wait_ready && tr.ext_cycle_dropped {
             tr.acked.clear();
         }
@@ -1742,6 +1747,10 @@ impl ProxyServer {
             .last_rfq_status
             .load(std::sync::atomic::Ordering::Relaxed);
         tr.prev_status = status;
+        if status == b'I' {
+            // The COPY's statement may have ended the transaction (TR-08).
+            tr.tx_portals.clear();
+        }
         if !tr.record_tx {
             return;
         }
