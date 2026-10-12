@@ -592,6 +592,13 @@ max_result_bytes = 1048576
 | `enabled` | bool | `false` | Serve read SELECT results from the L1/L2 cache. |
 | `ttl_secs` | u64 | `300` | Time-to-live for cached results. |
 | `max_result_bytes` | usize | `1048576` | Largest single result to cache; larger results bypass. |
+| `invalidation_source` | string | `"proxy"` | `proxy`: only writes through this proxy invalidate (below). `logical`: also every committed change decoded from a `pgoutput` logical replication slot on the primary — writes from other proxies, direct connections, triggers and cron jobs (C-02 slice 2). |
+| `logical_dsn` | string | `""` | *(logical)* libpq-style `host=... port=... user=... password=... dbname=...` of a role with `REPLICATION` on the primary; its own connection, separate from data-path credentials. Required for `logical`. |
+| `logical_slot` | string | `"heliosdb_proxy_cache"` | *(logical)* Slot name; created with the `pgoutput` plugin if missing. Lower-case identifier. **One slot per proxy instance**: reading a slot consumes its changes, so two proxies sharing one would each see only part of them. |
+| `logical_publication` | string | `"heliosdb_proxy_cache"` | *(logical)* Publication the slot decodes. Must exist: `CREATE PUBLICATION heliosdb_proxy_cache FOR ALL TABLES`. |
+| `logical_feedback_ms` | u64 | `1000` | *(logical)* Milliseconds between polls of the slot: how long a write that bypassed the proxy can still be served from cache. |
+| `logical_max_changes_per_poll` | u64 | `10000` | *(logical)* Changes read per poll (whole transactions); a full batch is followed by an immediate next poll. |
+| `logical_max_slot_lag_bytes` | u64 | `1073741824` | *(logical)* A slot lagging more than this behind the primary's WAL invalidates the whole cache and logs an error (an unread slot also retains WAL on the primary). |
 
 **Invalidation is commit-aware on both protocols (C-02).** Every cached result records
 the write generation of the tables it read, taken before its backend fetch, and every
@@ -615,12 +622,30 @@ feeds the transaction journal), on the simple and the extended protocol alike:
 - a write whose tables cannot be read from its text — DDL, `TRUNCATE`, `COPY`,
   `EXECUTE`, `CALL`, `DO` — invalidates the whole cache.
 
-Not covered: writes that do not pass through this proxy (another proxy, a direct
-connection, a trigger or function writing a table other than the one named in the
-statement). A `COMMIT PREPARED` sent through this proxy is covered even if the
-transaction was prepared elsewhere; a commit bypassing this proxy is not. Such changes
-become visible when the entry's `ttl_secs` expires; keep the TTL short, or leave the
-cache off, for tables written that way.
+Not covered with `invalidation_source = "proxy"` (the default): writes that do not pass
+through this proxy (another proxy, a direct connection, a trigger or function writing a
+table other than the one named in the statement). A `COMMIT PREPARED` sent through this
+proxy is covered even if the transaction was prepared elsewhere; a commit bypassing this
+proxy is not. Such changes become visible when the entry's `ttl_secs` expires; keep the
+TTL short, or leave the cache off, for tables written that way.
+
+**`invalidation_source = "logical"`** closes that gap. The proxy polls a `pgoutput`
+logical replication slot (`pg_logical_slot_get_binary_changes`, an ordinary connection,
+every `logical_feedback_ms`) and, for each committed transaction, moves the generation of
+every table it wrote, whoever wrote it. Requirements: `wal_level = logical` on the
+primary, the publication, and a `REPLICATION` role in `logical_dsn`; at startup the proxy
+checks the publication and creates the slot if needed, and refuses to start if it cannot.
+It invalidates the whole cache when it cannot account for a change: a relation it has no
+name for, a lost connection or slot (changes may have been consumed and not applied; the
+next successful attach invalidates everything once), or a slot lagging beyond
+`logical_max_slot_lag_bytes`. Staleness from a write that bypasses the proxy is then
+bounded by about one `logical_feedback_ms` plus the poll, not by `ttl_secs`. Limits: the
+slot lives on the node `logical_dsn` names — after a failover point it at the new
+primary (until then the source keeps reattaching and every reattach invalidates
+everything); and an unread slot retains WAL, so remove it (`SELECT
+pg_drop_replication_slot('heliosdb_proxy_cache')`) when you turn the source off.
+Status: `/metrics` (`query_cache.logical_source`) and
+`heliosdb_proxy_cache_logical_*` on `/metrics/prometheus`.
 
 **Cache identity is the SQL, the database, the user and the branch — not session state.**
 Two sessions of the same user that differ only in `SET ROLE`, `search_path`, or a custom

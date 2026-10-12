@@ -55,6 +55,7 @@ pub mod invalidation;
 pub mod l1_hot;
 pub mod l2_warm;
 pub mod l3_semantic;
+pub mod logical_source;
 pub mod metrics;
 pub mod normalizer;
 pub mod result;
@@ -201,6 +202,10 @@ pub struct QueryCache {
     /// eviction pass retired. `None` if that thread could not be started
     /// (callers then do the work themselves).
     reclaim_tx: Option<std::sync::mpsc::Sender<Reclaim>>,
+
+    /// Counters of the logical-decoding invalidation source (C-02 slice 2),
+    /// when `[cache] invalidation_source = "logical"`; read by `/metrics`.
+    logical: std::sync::OnceLock<Arc<logical_source::LogicalStats>>,
 }
 
 /// A job for the `cache-reclaim` thread.
@@ -267,7 +272,18 @@ impl QueryCache {
             table_generations: DashMap::new(),
             global_generation: std::sync::atomic::AtomicU64::new(0),
             reclaim_tx,
+            logical: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Attach the logical-decoding source's counters (set once at startup).
+    pub fn set_logical_stats(&self, stats: Arc<logical_source::LogicalStats>) {
+        let _ = self.logical.set(stats);
+    }
+
+    /// The logical-decoding source's counters, when that source runs.
+    pub fn logical_stats(&self) -> Option<&Arc<logical_source::LogicalStats>> {
+        self.logical.get()
     }
 
     /// Get or create L1 cache for a connection

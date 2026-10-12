@@ -2392,6 +2392,16 @@ impl AdminServer {
             "stale_rejected": cache.stale_rejected(),
             "fills_raced": cache.fills_raced(),
             "retained_bytes": cache.retained_bytes(),
+            "logical_source": cache.logical_stats().map(|l| {
+                use std::sync::atomic::Ordering::Relaxed;
+                serde_json::json!({
+                    "connected": l.connected.load(Relaxed) == 1,
+                    "lag_bytes": l.lag_bytes.load(Relaxed),
+                    "transactions_applied": l.transactions_applied.load(Relaxed),
+                    "full_invalidations": l.full_invalidations.load(Relaxed),
+                    "reconnects": l.reconnects.load(Relaxed),
+                })
+            }),
         })
     }
 
@@ -2454,6 +2464,43 @@ impl AdminServer {
              heliosdb_proxy_cache_retained_bytes{{tier=\"l3\"}} {}",
             retained.l1, retained.l2, retained.l3
         );
+        if let Some(l) = cache.logical_stats() {
+            use std::sync::atomic::Ordering::Relaxed;
+            for (name, kind, help, value) in [
+                (
+                    "heliosdb_proxy_cache_logical_connected",
+                    "gauge",
+                    "1 while the logical-decoding invalidation source is attached",
+                    l.connected.load(Relaxed),
+                ),
+                (
+                    "heliosdb_proxy_cache_logical_lag_bytes",
+                    "gauge",
+                    "Bytes the cache's logical slot lags behind the primary's WAL",
+                    l.lag_bytes.load(Relaxed),
+                ),
+                (
+                    "heliosdb_proxy_cache_logical_transactions_applied_total",
+                    "counter",
+                    "Committed transactions the logical source applied to the cache",
+                    l.transactions_applied.load(Relaxed),
+                ),
+                (
+                    "heliosdb_proxy_cache_logical_full_invalidations_total",
+                    "counter",
+                    "Whole-cache invalidations by the logical source (unknown relation, gap, slot lag)",
+                    l.full_invalidations.load(Relaxed),
+                ),
+                (
+                    "heliosdb_proxy_cache_logical_reconnects_total",
+                    "counter",
+                    "Times the logical source lost its connection or slot and reattached",
+                    l.reconnects.load(Relaxed),
+                ),
+            ] {
+                let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}");
+            }
+        }
     }
 
     /// Append the edge cache's retained bytes and invalidation-gap flushes

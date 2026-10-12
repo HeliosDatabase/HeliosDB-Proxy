@@ -1248,6 +1248,18 @@ pub struct QueryRewriteToml {
     pub rules: Vec<RewriteRuleToml>,
 }
 
+/// Where the query cache learns about committed writes (C-02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheInvalidationSource {
+    /// Writes that pass through this proxy only (commit-aware, C-02).
+    #[default]
+    Proxy,
+    /// Also the database's committed changes from a `pgoutput` logical
+    /// replication slot, so writes that bypass this proxy invalidate too.
+    Logical,
+}
+
 /// Query-result cache configuration (TOML-friendly, always present). Converted
 /// to `crate::cache::CacheConfig` at startup and only active when the
 /// `query-cache` feature is compiled in AND `enabled = true`.
@@ -1278,6 +1290,33 @@ pub struct CacheToml {
     /// per-session transient to a few MiB instead of a whole result set.
     /// MUST be > 0.
     pub max_cacheable_response_bytes: usize,
+    /// `proxy` (default): only writes through this proxy invalidate.
+    /// `logical`: also every committed change the database decodes into a
+    /// `pgoutput` logical replication slot (other proxies, direct
+    /// connections, triggers, cron jobs). Needs `wal_level = logical` on the
+    /// database, a publication (`logical_publication`) and `logical_dsn`.
+    pub invalidation_source: CacheInvalidationSource,
+    /// libpq-style DSN (`host=... port=... user=... password=... dbname=...`)
+    /// of a role with REPLICATION on the primary, for the logical source's
+    /// own connection (separate from data-path credentials).
+    pub logical_dsn: String,
+    /// Logical replication slot (created with the `pgoutput` plugin if
+    /// missing). Lower-case identifier. Default `heliosdb_proxy_cache`. Use
+    /// one slot per proxy instance: reading a slot consumes its changes.
+    pub logical_slot: String,
+    /// Publication the slot decodes; must exist (e.g. `CREATE PUBLICATION
+    /// heliosdb_proxy_cache FOR ALL TABLES`). Default `heliosdb_proxy_cache`.
+    pub logical_publication: String,
+    /// Milliseconds between polls of the slot: the bound on how long a write
+    /// that bypassed the proxy can still be served from cache. Default 1000.
+    pub logical_feedback_ms: u64,
+    /// Changes read per poll (whole transactions; a full batch is followed by
+    /// an immediate next poll). Default 10000.
+    pub logical_max_changes_per_poll: u64,
+    /// A slot lagging more than this many bytes behind the primary's WAL
+    /// invalidates the whole cache (and is logged as an error): an unread
+    /// slot also retains WAL on the primary. Default 1 GiB.
+    pub logical_max_slot_lag_bytes: u64,
 }
 
 impl Default for CacheToml {
@@ -1287,6 +1326,13 @@ impl Default for CacheToml {
             ttl_secs: 300,
             max_result_bytes: 1024 * 1024,
             max_cacheable_response_bytes: 4 * 1024 * 1024,
+            invalidation_source: CacheInvalidationSource::Proxy,
+            logical_dsn: String::new(),
+            logical_slot: "heliosdb_proxy_cache".to_string(),
+            logical_publication: "heliosdb_proxy_cache".to_string(),
+            logical_feedback_ms: 1000,
+            logical_max_changes_per_poll: 10_000,
+            logical_max_slot_lag_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -2445,6 +2491,48 @@ impl ProxyConfig {
         // looking like a working cache, and is more likely a typo than intent.
         // Checked unconditionally: the bound governs the shared response
         // capture used by the query-cache AND the edge cache.
+        if self.cache.enabled && self.cache.invalidation_source == CacheInvalidationSource::Logical
+        {
+            let c = &self.cache;
+            #[cfg(feature = "query-cache")]
+            if let Err(e) = crate::cache::logical_source::LogicalDsn::parse(&c.logical_dsn) {
+                return Err(ProxyError::Config(format!(
+                    "cache.invalidation_source = \"logical\" needs a valid cache.logical_dsn \
+                     (host=... user=... [port=... password=... dbname=...]): {e}"
+                )));
+            }
+            let plain = |s: &str| {
+                let mut ch = s.chars();
+                matches!(ch.next(), Some('a'..='z' | '_'))
+                    && ch.all(|c| matches!(c, 'a'..='z' | '0'..='9' | '_'))
+                    && s.len() <= 63
+            };
+            for (key, value) in [
+                ("cache.logical_slot", &c.logical_slot),
+                ("cache.logical_publication", &c.logical_publication),
+            ] {
+                if !plain(value) {
+                    return Err(ProxyError::Config(format!(
+                        "{key} must be a lower-case identifier ([a-z_][a-z0-9_]*, at most 63 chars), got {value:?}"
+                    )));
+                }
+            }
+            for (key, value) in [
+                ("cache.logical_feedback_ms", c.logical_feedback_ms),
+                (
+                    "cache.logical_max_changes_per_poll",
+                    c.logical_max_changes_per_poll,
+                ),
+                (
+                    "cache.logical_max_slot_lag_bytes",
+                    c.logical_max_slot_lag_bytes,
+                ),
+            ] {
+                if value == 0 {
+                    return Err(ProxyError::Config(format!("{key} must be >= 1")));
+                }
+            }
+        }
         if self.cache.max_cacheable_response_bytes == 0 {
             return Err(ProxyError::Config(
                 "cache.max_cacheable_response_bytes must be >= 1".to_string(),
@@ -4521,6 +4609,51 @@ database = "helios"
         assert!(c.validate().is_err());
         c.limits.latency_buckets_ms = vec![1.0, 10.0];
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn cache_logical_source_validation() {
+        let base = || {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            c.cache.enabled = true;
+            c.cache.invalidation_source = CacheInvalidationSource::Logical;
+            c.cache.logical_dsn = "host=pg-a user=repl dbname=app".into();
+            c
+        };
+        assert!(base().validate().is_ok());
+        let mut c = base();
+        c.cache.logical_slot = "Bad-Slot".into();
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("cache.logical_slot"));
+        let mut c = base();
+        c.cache.logical_feedback_ms = 0;
+        assert!(c.validate().is_err());
+        #[cfg(feature = "query-cache")]
+        {
+            let mut c = base();
+            c.cache.logical_dsn = "user=repl".into();
+            assert!(c
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("logical_dsn"));
+        }
+        // The default source needs none of it.
+        let mut c = base();
+        c.cache.invalidation_source = CacheInvalidationSource::Proxy;
+        c.cache.logical_dsn.clear();
+        assert!(c.validate().is_ok());
+        let parsed: CacheToml = toml::from_str(
+            "enabled = true\ninvalidation_source = \"logical\"\nlogical_dsn = \"host=h user=u\"\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.invalidation_source, CacheInvalidationSource::Logical);
+        assert_eq!(parsed.logical_feedback_ms, 1000);
+        assert_eq!(parsed.logical_slot, "heliosdb_proxy_cache");
     }
 
     #[test]

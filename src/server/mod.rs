@@ -108,6 +108,8 @@ mod promotion;
 
 mod snapshot;
 
+mod cache_source;
+
 /// Proxy server
 pub struct ProxyServer {
     config: ProxyConfig,
@@ -1342,6 +1344,8 @@ impl ProxyServer {
         let health_task = self.spawn_health_checker();
         let promoter_task = self.spawn_auto_promoter();
         let routing_task = self.spawn_routing_refresher();
+        #[cfg(feature = "query-cache")]
+        let cache_source_task = self.spawn_cache_logical_source().await?;
         let pool_task = self.spawn_pool_manager();
         // H-01: authoritative topology loop. Only spawned when a provider is
         // configured; static configs keep the historical routing path. Two
@@ -1563,6 +1567,10 @@ impl ProxyServer {
         // Wait for background tasks
         health_task.abort();
         if let Some(t) = routing_task {
+            t.abort();
+        }
+        #[cfg(feature = "query-cache")]
+        if let Some(t) = cache_source_task {
             t.abort();
         }
         if let Some(t) = promoter_task {

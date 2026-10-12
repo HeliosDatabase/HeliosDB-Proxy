@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fills and retained bytes per tier; edge cache retained bytes and gap flushes;
   gateway pool reuse/miss/discard counters and idle gauge per gateway (H-06).
   `TransactionState` gains a public `replay_cap_exceeded` field.
+- `[cache] invalidation_source = "logical"` (C-02 slice 2, opt-in): the query cache also
+  follows the database's committed changes from a `pgoutput` logical replication slot
+  (`logical_dsn`, `logical_slot`, `logical_publication`, `logical_feedback_ms`,
+  `logical_max_changes_per_poll`, `logical_max_slot_lag_bytes`), so writes that bypass the
+  proxy — other proxies, direct connections, triggers — invalidate within about one poll.
+  Unknown relations, a lost connection or slot, and excessive slot lag invalidate the
+  whole cache. The proxy refuses to start if the slot cannot be attached.
 
 ### Changed
 
