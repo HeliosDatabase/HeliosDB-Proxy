@@ -894,7 +894,7 @@ impl GraphQLEngine {
     async fn execute_queries(
         &self,
         queries: &[super::SqlQuery],
-        _context: &ExecutionContext,
+        context: &ExecutionContext,
     ) -> Result<Vec<Vec<serde_json::Value>>, GraphQLError> {
         let Some(bcfg) = self.backend.clone() else {
             return Ok(queries.iter().map(|_| Vec::new()).collect());
@@ -909,7 +909,21 @@ impl GraphQLEngine {
                     .map_err(|denied| GraphQLError::internal(denied.to_string()))?;
             }
             let sql = match &self.policy {
-                Some(p) => p.rewrite(&q.sql),
+                Some(p) => {
+                    // H-06: the request's tenant (set by the gateway) gets its
+                    // row filter, after the rewrite rules.
+                    let tenant = context
+                        .metadata
+                        .get(crate::gateway_policy::TENANT_METADATA_KEY)
+                        .map(|t| crate::gateway_policy::GatewayTenant(t.clone()));
+                    let rewritten = p.rewrite(&q.sql);
+                    match tenant {
+                        None => rewritten,
+                        Some(t) => {
+                            std::borrow::Cow::Owned(p.tenant_sql(&rewritten, Some(&t)).into_owned())
+                        }
+                    }
+                }
                 None => std::borrow::Cow::Borrowed(q.sql.as_str()),
             };
             let connected = match self.pool.as_ref() {

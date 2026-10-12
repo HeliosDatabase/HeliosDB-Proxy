@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-request tenant identity on the HTTP SQL, MCP and GraphQL gateways (H-06): with
+  `[multi_tenancy]` enabled, a gateway's new `tenant_header` key names the request header
+  that carries the tenant. A request must name a known tenant (403 otherwise), and every
+  statement it runs gets that tenant's row filter after the rewrite rules, as on the
+  PG-wire listener. `strict_config` now refuses `[multi_tenancy]` only together with a
+  gateway that has no `tenant_header`.
+
 - Per-tenant client admission (H-05 slice 2): `[multi_tenancy] max_clients_per_tenant`
   (default 0 = off) and per-tenant overrides in `[multi_tenancy.tenant_max_clients]` cap
   the client sessions each known tenant holds. The tenant is read from the startup packet;

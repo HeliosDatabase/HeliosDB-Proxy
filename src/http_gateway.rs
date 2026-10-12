@@ -23,7 +23,7 @@ use crate::backend::client::QueryResult;
 use crate::backend::types::TextValue;
 use crate::backend::{tls::default_client_config, BackendConfig, ParamValue, TlsMode};
 use crate::config::HttpGatewayConfig;
-use crate::gateway_policy::{GatewayPolicy, RequestIdentity, SharedGatewayPolicy};
+use crate::gateway_policy::{GatewayPolicy, GatewayTenant, RequestIdentity, SharedGatewayPolicy};
 use crate::gateway_pool::{statement_is_session_neutral, SharedBackendPool};
 use crate::{ProxyError, Result};
 
@@ -126,6 +126,18 @@ impl HttpGateway {
         if !authorized {
             return Self::respond(&mut writer, 401, &json!({"error":"unauthorized"})).await;
         }
+        // H-06: the tenant this request acts for, when `tenant_header` is set.
+        let tenant = match policy.request_tenant(|name| head.header(name)) {
+            Ok(t) => t,
+            Err(denied) => {
+                return Self::respond(
+                    &mut writer,
+                    denied.http_status(),
+                    &json!({"error": denied.to_string()}),
+                )
+                .await
+            }
+        };
         if method != "POST" {
             return Self::respond(&mut writer, 405, &json!({"error":"use POST /sql"})).await;
         }
@@ -192,7 +204,7 @@ impl HttpGateway {
             .await;
         }
 
-        match Self::run_sql(&cfg, &pool, &policy, sql, &params).await {
+        match Self::run_sql(&cfg, &pool, &policy, tenant.as_ref(), sql, &params).await {
             Ok(qr) => {
                 let body = neon_result(&qr, array_mode);
                 Self::respond(&mut writer, 200, &body).await
@@ -205,11 +217,13 @@ impl HttpGateway {
         cfg: &HttpGatewayConfig,
         pool: &SharedBackendPool,
         policy: &GatewayPolicy,
+        tenant: Option<&GatewayTenant>,
         sql: &str,
         params: &[ParamValue],
     ) -> std::result::Result<QueryResult, String> {
-        let sql = policy.rewrite(sql);
-        let sql = sql.as_ref();
+        let rewritten = policy.rewrite(sql);
+        let filtered = policy.tenant_sql(&rewritten, tenant);
+        let sql = filtered.as_ref();
         let node = format!("{}:{}", cfg.backend_host, cfg.backend_port);
         let bcfg = BackendConfig {
             host: cfg.backend_host.clone(),
@@ -481,6 +495,59 @@ mod tests {
         task.await.unwrap().unwrap();
         assert!(resp.starts_with("HTTP/1.1 503"), "{resp}");
         assert!(resp.contains("circuit open"), "{resp}");
+    }
+
+    /// H-06: with a tenant_header, a request that names no known tenant is
+    /// refused (403) before any backend work; the health probe still works.
+    #[cfg(feature = "multi-tenancy")]
+    #[tokio::test]
+    async fn handle_refuses_a_request_without_a_known_tenant() {
+        use crate::multi_tenancy::{
+            IsolationStrategy, MultiTenancyConfig, TenantConfig, TenantId, TenantManagerBuilder,
+        };
+        let tm = TenantManagerBuilder::new()
+            .config(MultiTenancyConfig {
+                enabled: true,
+                ..Default::default()
+            })
+            .build();
+        tm.register_tenant(TenantConfig::new(
+            TenantId::new("acme"),
+            IsolationStrategy::row("public", "tid"),
+        ));
+        let policy =
+            Arc::new(GatewayPolicy::default().with_tenancy(Arc::new(tm), "X-Helios-Tenant".into()));
+        for (header, want) in [
+            ("", "HTTP/1.1 403"),
+            ("X-Helios-Tenant: globex\r\n", "HTTP/1.1 403"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let (server, peer) = listener.accept().await.unwrap();
+            let pool: SharedBackendPool = Arc::new(crate::gateway_pool::BackendClientPool::new(0));
+            let task = tokio::spawn(HttpGateway::handle(
+                server,
+                peer,
+                Arc::new(HttpGatewayConfig::default()),
+                pool,
+                Arc::new(tokio::sync::Semaphore::new(4)),
+                policy.clone(),
+            ));
+            let body = br#"{"query":"select 1"}"#;
+            let req = format!(
+                "POST /sql HTTP/1.1\r\n{header}Content-Length: {}\r\n\r\n",
+                body.len()
+            );
+            client.write_all(req.as_bytes()).await.unwrap();
+            client.write_all(body).await.unwrap();
+            let mut buf = Vec::new();
+            client.read_to_end(&mut buf).await.unwrap();
+            let resp = String::from_utf8(buf).unwrap();
+            task.await.unwrap().unwrap();
+            assert!(resp.starts_with(want), "{resp}");
+            assert!(resp.contains("tenant required"), "{resp}");
+        }
     }
 
     #[tokio::test]

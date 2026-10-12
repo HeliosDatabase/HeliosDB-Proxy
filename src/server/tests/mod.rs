@@ -1298,8 +1298,9 @@ fn a_node_cap_refusal_does_not_demote_the_node() {
     ));
 }
 
-/// H-06: tenant filtering does not reach the gateways; strict_config refuses
-/// the combination, the default only warns.
+/// H-06: a gateway without a tenant_header has no per-request tenant;
+/// strict_config refuses that combination, the default only warns. With a
+/// tenant_header the gateway filters per request and is accepted.
 #[test]
 fn multi_tenancy_with_a_gateway_is_refused_only_under_strict_config() {
     let mut config = test_config();
@@ -1311,10 +1312,20 @@ fn multi_tenancy_with_a_gateway_is_refused_only_under_strict_config() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("http_gateway") && err.contains("tenant"),
+        err.contains("http_gateway") && err.contains("tenant_header"),
         "{err}"
     );
-    config.http_gateway.enabled = false;
+    config.http_gateway.tenant_header = "X-Helios-Tenant".into();
+    assert!(ProxyServer::check_gateway_tenancy(&config).is_ok());
+    config.mcp.enabled = true;
+    let err = ProxyServer::check_gateway_tenancy(&config)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("mcp") && !err.contains("http_gateway"),
+        "{err}"
+    );
+    config.mcp.tenant_header = "X-Helios-Tenant".into();
     assert!(ProxyServer::check_gateway_tenancy(&config).is_ok());
 }
 

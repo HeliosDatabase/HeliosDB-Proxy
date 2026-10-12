@@ -1420,6 +1420,23 @@ impl ProxyServer {
         // H-06: the gateways apply the PG-wire request policies (rate limit,
         // rewrite rules, circuit breaker) through one shared policy object.
         let gateway_policy = Arc::new(self.gateway_policy());
+        // H-06: a gateway with a `tenant_header` takes each request's tenant
+        // from it and filters its statements for that tenant.
+        let gateway_policy_for =
+            |tenant_header: &str| -> crate::gateway_policy::SharedGatewayPolicy {
+                #[cfg(feature = "multi-tenancy")]
+                if let (Some(tm), false) =
+                    (self.state.tenant_manager.as_ref(), tenant_header.is_empty())
+                {
+                    return Arc::new(
+                        (*gateway_policy)
+                            .clone()
+                            .with_tenancy(tm.clone(), tenant_header.to_string()),
+                    );
+                }
+                let _ = tenant_header;
+                gateway_policy.clone()
+            };
         let mcp_pool = self.state.gateway_pools.mcp.clone();
         let http_pool = self.state.gateway_pools.http.clone();
         #[cfg(feature = "graphql-gateway")]
@@ -1429,7 +1446,7 @@ impl ProxyServer {
         let mcp_task = if self.config.mcp.enabled {
             let mcp_cfg = self.config.mcp.clone();
             let pool = mcp_pool.clone();
-            let policy = gateway_policy.clone();
+            let policy = gateway_policy_for(&mcp_cfg.tenant_header);
             let strict = self.config.strict_config;
             // Resolve the configured agent contract (scoped grants) by id.
             let contract = mcp_cfg.contract.as_ref().and_then(|id| {
@@ -1457,7 +1474,7 @@ impl ProxyServer {
         let http_gw_task = if self.config.http_gateway.enabled {
             let gw_cfg = self.config.http_gateway.clone();
             let pool = http_pool.clone();
-            let policy = gateway_policy.clone();
+            let policy = gateway_policy_for(&gw_cfg.tenant_header);
             Some(tokio::spawn(async move {
                 if let Err(e) = crate::http_gateway::HttpGateway::new(gw_cfg, pool)
                     .with_policy(policy)
@@ -1476,7 +1493,7 @@ impl ProxyServer {
         let _graphql_gw_task = if self.config.graphql_gateway.enabled {
             let gw_cfg = self.config.graphql_gateway.clone();
             let pool = gql_pool.clone();
-            let policy = gateway_policy.clone();
+            let policy = gateway_policy_for(&gw_cfg.tenant_header);
             Some(tokio::spawn(async move {
                 if let Err(e) = crate::graphql_gateway::GraphqlGateway::new(gw_cfg, pool)
                     .with_policy(policy)

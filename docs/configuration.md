@@ -1132,6 +1132,7 @@ max_rows = 1000
 | `auth_token` | string | *(none)* | Bearer token required on every MCP request. Absent = open, so **set this for any non-loopback deployment** — MCP exposes SQL and must not be anonymous off localhost. |
 | `query_timeout_ms` | u64 | `30000` | Per-`tools/call` backend execution timeout, milliseconds. Was a hardcoded 30 s. Must be > 0. |
 | `max_concurrent_requests` | usize | `64` | Maximum `tools/call` requests admitted concurrently; beyond this the gateway answers a JSON-RPC error (code `-32000`) instead of queuing indefinitely. `initialize`/`ping`/`tools/list` and notifications are never gated. Must be > 0. |
+| `tenant_header` | string | `""` | With `[multi_tenancy]` (H-06): the request header naming the tenant (e.g. `X-Helios-Tenant`). Every request must name a known tenant in it (403 otherwise), and its statements get that tenant's row filter, as a PG-wire session does. Trusted as sent: put the gateway behind a front end that authenticates the caller and sets the header. Empty = no per-request tenant, which `[multi_tenancy]` refuses under `strict_config` (warns otherwise). |
 
 Each `[[agent_contracts]]` entry (scoped grants, referenced by `id` from `[mcp] contract`):
 
@@ -1185,6 +1186,7 @@ max_concurrent_requests = 64
 | `auth_token` | string | *(none)* | Optional Bearer token required on requests. |
 | `query_timeout_ms` | u64 | `30000` | Per-request backend execution timeout, milliseconds. Was a hardcoded 30 s. Must be > 0. |
 | `max_concurrent_requests` | usize | `64` | Maximum `/sql` requests admitted concurrently; beyond this the gateway answers `503 Service Unavailable` with a `Retry-After` header instead of queuing indefinitely (`/health` is never gated). Must be > 0. |
+| `tenant_header` | string | `""` | With `[multi_tenancy]` (H-06): the request header naming the tenant (e.g. `X-Helios-Tenant`). Every request must name a known tenant in it (403 otherwise), and its statements get that tenant's row filter, as a PG-wire session does. Trusted as sent: put the gateway behind a front end that authenticates the caller and sets the header. Empty = no per-request tenant, which `[multi_tenancy]` refuses under `strict_config` (warns otherwise). |
 
 ---
 
@@ -1226,6 +1228,7 @@ columns = ["id", "customer_id", "total", "created_at"]
 | `tables` | array | `[]` | Tables exposed as GraphQL types (`[[graphql_gateway.tables]]`). |
 | `query_timeout_ms` | u64 | `30000` | Per-request backend execution timeout, milliseconds. Was a hardcoded 30 s. Must be > 0. |
 | `max_concurrent_requests` | usize | `64` | Maximum GraphQL requests admitted concurrently; beyond this the gateway answers `503 Service Unavailable` with a `Retry-After` header instead of queuing indefinitely (`/health` is never gated). Must be > 0. |
+| `tenant_header` | string | `""` | With `[multi_tenancy]` (H-06): the request header naming the tenant (e.g. `X-Helios-Tenant`). Every request must name a known tenant in it (403 otherwise), and its statements get that tenant's row filter, as a PG-wire session does. Trusted as sent: put the gateway behind a front end that authenticates the caller and sets the header. Empty = no per-request tenant, which `[multi_tenancy]` refuses under `strict_config` (warns otherwise). |
 
 Each `[[graphql_gateway.tables]]`: `name` (string) and `columns` (array of strings).
 

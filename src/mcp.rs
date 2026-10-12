@@ -35,6 +35,8 @@ struct Gateway<'a> {
     pool: &'a crate::gateway_pool::SharedBackendPool,
     policy: &'a GatewayPolicy,
     peer: Option<std::net::IpAddr>,
+    /// The tenant the request acts for (`[multi_tenancy]` + `tenant_header`).
+    tenant: Option<&'a crate::gateway_policy::GatewayTenant>,
 }
 
 /// The MCP gateway server.
@@ -240,10 +242,26 @@ impl McpServer {
             Err(_) => return Ok(()),
         };
 
+        // H-06: the tenant this request acts for, when `tenant_header` is set.
+        let tenant = match policy.request_tenant(|name| head.header(name)) {
+            Ok(t) => t,
+            Err(denied) => {
+                let body = json!({ "error": denied.to_string() }).to_string();
+                Self::write_http(
+                    &mut writer,
+                    denied.http_status(),
+                    "application/json",
+                    body.as_bytes(),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
         let gateway = Gateway {
             pool: &pool,
             policy: &policy,
             peer: Some(peer.ip()),
+            tenant: tenant.as_ref(),
         };
         let response =
             Self::dispatch_with(&body, &cfg, (*contract).as_ref(), &gateway, &admission).await;
@@ -271,6 +289,7 @@ impl McpServer {
             pool,
             policy: &policy,
             peer: None,
+            tenant: None,
         };
         Self::dispatch_with(body, cfg, contract, &gateway, admission).await
     }
@@ -542,8 +561,9 @@ impl McpServer {
             .await
             .and(policy.check_node(&node))
             .map_err(|denied| denied.to_string())?;
-        let sql = policy.rewrite(sql);
-        let sql = sql.as_ref();
+        let rewritten = policy.rewrite(sql);
+        let filtered = policy.tenant_sql(&rewritten, gateway.tenant);
+        let sql = filtered.as_ref();
         let bcfg = BackendConfig {
             host: cfg.backend_host.clone(),
             port: cfg.backend_port,

@@ -26,30 +26,42 @@ impl ProxyServer {
         policy
     }
 
-    /// `[multi_tenancy]` has no per-request tenant identity on the HTTP,
-    /// GraphQL and MCP gateways, so their requests are not tenant-filtered.
-    /// Refused under `strict_config`; a loud warning otherwise.
+    /// `[multi_tenancy]` with an HTTP, GraphQL or MCP gateway that has no
+    /// `tenant_header`: that gateway has no per-request tenant identity, so
+    /// its requests are not tenant-filtered. Refused under `strict_config`; a
+    /// loud warning otherwise. A gateway with a `tenant_header` filters every
+    /// request for the tenant it names (H-06).
     pub(super) fn check_gateway_tenancy(config: &ProxyConfig) -> Result<()> {
         let gateways: Vec<&str> = [
-            ("http_gateway", config.http_gateway.enabled),
-            ("graphql_gateway", config.graphql_gateway.enabled),
-            ("mcp", config.mcp.enabled),
+            (
+                "http_gateway",
+                config.http_gateway.enabled && config.http_gateway.tenant_header.is_empty(),
+            ),
+            (
+                "graphql_gateway",
+                config.graphql_gateway.enabled && config.graphql_gateway.tenant_header.is_empty(),
+            ),
+            (
+                "mcp",
+                config.mcp.enabled && config.mcp.tenant_header.is_empty(),
+            ),
         ]
         .into_iter()
-        .filter_map(|(name, on)| on.then_some(name))
+        .filter_map(|(name, unattributed)| unattributed.then_some(name))
         .collect();
         if !config.multi_tenancy.enabled || gateways.is_empty() {
             return Ok(());
         }
         let msg = format!(
-            "[multi_tenancy] is enabled together with {}: those gateways have no per-request \
-             tenant identity, so their queries are NOT tenant-filtered (H-06)",
+            "[multi_tenancy] is enabled together with {} without a tenant_header: those \
+             gateways have no per-request tenant identity, so their queries are NOT \
+             tenant-filtered (H-06)",
             gateways.join(", ")
         );
         if config.strict_config {
             return Err(ProxyError::Config(format!(
-                "{msg}; disable the gateways or [multi_tenancy], or set strict_config = false \
-                 to accept it"
+                "{msg}; set tenant_header on each gateway, disable the gateways or \
+                 [multi_tenancy], or set strict_config = false to accept it"
             )));
         }
         tracing::warn!("{msg}");

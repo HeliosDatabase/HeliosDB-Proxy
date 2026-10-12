@@ -651,6 +651,15 @@ pub struct HttpGatewayConfig {
     /// instead of queuing indefinitely. Must be > 0.
     #[serde(default = "default_gateway_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
+    /// `[multi_tenancy]` on this gateway (H-06): the request header that names
+    /// the tenant (e.g. `X-Helios-Tenant`). Each request must carry a known
+    /// tenant in it (403 otherwise) and its statements get that tenant's row
+    /// filter, like a PG-wire session. Trusted as sent: put the gateway behind
+    /// a front end that authenticates the caller and sets the header. Empty
+    /// (default) = no per-request tenant, which `[multi_tenancy]` refuses under
+    /// `strict_config` (warns otherwise).
+    #[serde(default)]
+    pub tenant_header: String,
 }
 
 impl Default for HttpGatewayConfig {
@@ -666,6 +675,7 @@ impl Default for HttpGatewayConfig {
             auth_token: None,
             query_timeout_ms: default_gateway_query_timeout_ms(),
             max_concurrent_requests: default_gateway_max_concurrent_requests(),
+            tenant_header: String::new(),
         }
     }
 }
@@ -717,6 +727,15 @@ pub struct McpConfig {
     /// queuing indefinitely. Must be > 0.
     #[serde(default = "default_gateway_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
+    /// `[multi_tenancy]` on this gateway (H-06): the request header that names
+    /// the tenant (e.g. `X-Helios-Tenant`). Each request must carry a known
+    /// tenant in it (403 otherwise) and its statements get that tenant's row
+    /// filter, like a PG-wire session. Trusted as sent: put the gateway behind
+    /// a front end that authenticates the caller and sets the header. Empty
+    /// (default) = no per-request tenant, which `[multi_tenancy]` refuses under
+    /// `strict_config` (warns otherwise).
+    #[serde(default)]
+    pub tenant_header: String,
 }
 
 impl Default for McpConfig {
@@ -734,6 +753,7 @@ impl Default for McpConfig {
             auth_token: None,
             query_timeout_ms: default_gateway_query_timeout_ms(),
             max_concurrent_requests: default_gateway_max_concurrent_requests(),
+            tenant_header: String::new(),
         }
     }
 }
@@ -1154,6 +1174,14 @@ pub struct GraphqlGatewayConfig {
     /// instead of queuing indefinitely. Must be > 0.
     #[serde(default = "default_gateway_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
+    /// `[multi_tenancy]` on this gateway (H-06): the request header that names
+    /// the tenant (e.g. `X-Helios-Tenant`). Each request must carry a known
+    /// tenant in it (403 otherwise) and its statements get that tenant's row
+    /// filter, like a PG-wire session. Trusted as sent: put the gateway behind
+    /// a front end that authenticates the caller and sets the header. Empty
+    /// (default) = no per-request tenant, which `[multi_tenancy]` refuses under
+    /// `strict_config` (warns otherwise).
+    pub tenant_header: String,
 }
 
 impl Default for GraphqlGatewayConfig {
@@ -1170,6 +1198,7 @@ impl Default for GraphqlGatewayConfig {
             tables: Vec::new(),
             query_timeout_ms: default_gateway_query_timeout_ms(),
             max_concurrent_requests: default_gateway_max_concurrent_requests(),
+            tenant_header: String::new(),
         }
     }
 }

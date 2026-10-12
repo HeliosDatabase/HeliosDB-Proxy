@@ -176,6 +176,18 @@ impl GraphqlGateway {
         if !authorized {
             return Self::respond(&mut writer, 401, &json!({"error":"unauthorized"})).await;
         }
+        // H-06: the tenant this request acts for, when `tenant_header` is set.
+        let tenant = match policy.request_tenant(|name| head.header(name)) {
+            Ok(t) => t,
+            Err(denied) => {
+                return Self::respond(
+                    &mut writer,
+                    denied.http_status(),
+                    &json!({"errors":[{"message": denied.to_string()}]}),
+                )
+                .await
+            }
+        };
         if method != "POST" {
             return Self::respond(
                 &mut writer,
@@ -244,7 +256,15 @@ impl GraphqlGateway {
             .await;
         }
 
-        let response = engine.execute(GraphQLRequest::new(query)).await;
+        let mut context = crate::graphql::ExecutionContext::default();
+        if let Some(t) = tenant {
+            context
+                .metadata
+                .insert(crate::gateway_policy::TENANT_METADATA_KEY.to_string(), t.0);
+        }
+        let response = engine
+            .execute_with_context(GraphQLRequest::new(query), context)
+            .await;
         let errors = response.errors.map(|errs| {
             errs.iter()
                 .map(|e| json!({ "message": e.to_string() }))
