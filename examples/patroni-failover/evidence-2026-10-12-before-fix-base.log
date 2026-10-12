@@ -1,0 +1,8 @@
+=== scenario 1: planned switchover with an open transaction ===
+[patroni] leader before: pg-b
+Traceback (most recent call last):
+  File "/home/gpc/HDB/worktrees/proxy-authroute-20261012/examples/patroni-failover/demo.py", line 131, in <module>
+    new_session() if mode == "new-session" else main(mode)
+  File "/home/gpc/HDB/worktrees/proxy-authroute-20261012/examples/patroni-failover/demo.py", line 53, in main
+    cur.execute("DROP TABLE IF EXISTS hp_demo"); cur.execute("CREATE TABLE hp_demo(id int primary key, note text)")
+psycopg2.errors.ReadOnlySqlTransaction: cannot execute DROP TABLE in a read-only transaction

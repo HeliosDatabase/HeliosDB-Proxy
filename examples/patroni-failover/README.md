@@ -27,30 +27,28 @@ creates is named `hp-patroni-demo-*` and is removed when the script exits (exact
 5. Reads the new leader directly (bypassing the proxy) and passes only if the new leader is out of
    recovery and holds exactly rows 1 and 2.
 
-## Observed result (2026-10-12, proxy 2.0.0 + this tree, PostgreSQL 18.4)
+## Observed result (2026-10-12, PostgreSQL 18.4, proxy from branch fix/authoritative-new-session-20261012)
 
-Full output: [evidence-2026-10-12.log](evidence-2026-10-12.log). Both scenarios passed in the same run:
+Full output: [evidence-2026-10-12-after-fix.log](evidence-2026-10-12-after-fix.log). All three scenarios passed in one run:
 
-| Scenario | Leader | Client outcome | Rows on new leader |
+| Scenario | Leader | Client outcome | Rows on the leader |
 |---|---|---|---|
-| planned switchover | pg-a -> pg-b | open transaction continued and committed; session moved from backend port 35601 to 35602 | 1 and 2, once each |
-| leader container stopped | pg-a -> pg-b | same | 1 and 2, once each |
+| 1. planned switchover, transaction open | -> new member | transaction continued and committed on the same connection | 1 and 2, once each |
+| 2. brand-new session after the promotion | current leader | connected to the leader, write succeeded | row 3 present |
+| 3. leader container stopped, transaction open | -> other member | transaction continued and committed | 1 and 2, once each |
+
+Scenario 2 fails with the proxy built from `main` before the fix (`cannot execute ... in a read-only transaction`;
+[before-fix log](evidence-2026-10-12-before-fix-base.log): in that run Patroni happened to elect `pg-b`, the node
+configured as standby, so even the first setup write was refused).
 
 ## What this does and does not show
 
-- It shows one session with an open transaction surviving a Patroni leader change, with the
-  transaction replayed on the new leader. It is one run on one host, not a statistical or load test.
+- One session with an open transaction surviving a Patroni leader change, with the transaction replayed on the
+  new leader, and a new session reaching the new leader. One run on one host, not a statistical or load test.
 - The statements inside the transaction must replay to the same results: Transaction Replay verifies this
   and rolls back with SQLSTATE `40001` otherwise. In an earlier attempt of this demo, a
   `SELECT inet_server_port()` placed inside the transaction differed on the new backend and the proxy
   correctly refused to continue. That is why the script probes the backend outside the transaction.
 - No zero-RPO claim: Patroni's `maximum_lag_on_failover` here is 1 MiB, and a failover can lose
   asynchronously replicated commits. The demo only commits after the leader change.
-
-## Known limitation (found while building this demo)
-
-A NEW client session opened after the leader changed starts on the node configured with
-`role = "primary"`, which Patroni has by then demoted, and its first write fails with
-`cannot execute ... in a read-only transaction`. Sessions that were already open are re-homed correctly.
-Until that is fixed, keep the configured roles aligned with the Patroni leader (the script switches the leader
-back to pg-a before each scenario for this reason). Tracked in Sprinter.
+- Reads are still routed by configured node role, not by the provider's leader.

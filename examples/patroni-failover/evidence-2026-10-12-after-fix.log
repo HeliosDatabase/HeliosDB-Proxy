@@ -1,16 +1,16 @@
 === scenario 1: planned switchover with an open transaction ===
-[patroni] leader before: pg-a
-[client] session on backend port 35601 (in_recovery=False)
+[patroni] leader before: pg-b
+[client] session on backend port 35602 (in_recovery=False)
 [client] transaction open, row 1 written, NOT committed
-[patroni] Successfully switched over to "pg-b"
-[patroni] leader after: pg-b
+[patroni] Successfully switched over to "pg-a"
+[patroni] leader after: pg-a
 {
   "mode": "switchover",
-  "old_leader": "pg-a",
-  "new_leader": "pg-b",
-  "port_before": 35601,
+  "old_leader": "pg-b",
+  "new_leader": "pg-a",
+  "port_before": 35602,
   "client_result": "continued: row 2 written and COMMIT succeeded on the same client connection",
-  "port_after": 35602,
+  "port_after": 35601,
   "in_recovery_after": false,
   "rows_on_new_leader": [
     [
@@ -25,7 +25,21 @@
   "new_leader_in_recovery": false,
   "pass": true
 }
-=== scenario 2: leader container stopped (unplanned failover) with an open transaction ===
+=== scenario 2: a NEW session opened after the promotion must reach the new leader ===
+{
+  "mode": "new-session",
+  "leader": "pg-a",
+  "backend_port": 35601,
+  "in_recovery": false,
+  "write": "ok",
+  "rows_on_leader": [
+    1,
+    2,
+    3
+  ],
+  "pass": true
+}
+=== scenario 3: leader container stopped (unplanned failover) with an open transaction ===
 [patroni] leader before: pg-a
 [client] session on backend port 35601 (in_recovery=False)
 [client] transaction open, row 1 written, NOT committed

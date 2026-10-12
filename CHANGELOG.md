@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- With a topology provider (`patroni`, `postgres`), a new client session opened
+  after a promotion now connects to the provider's leader, and the write path
+  checks the target against that leader instead of the configured
+  `role = "primary"`. Previously the session started on the demoted node and its
+  first write failed read-only. With no valid leader, writes wait (fail closed).
+  Static topology is unchanged. Reads still choose among nodes by configured role.
 - File-backed L2 query-cache entries retain their original age and precise TTL
   across demotion, disk reads and L1 promotion. Expired entries are no longer
   revived by these transitions; wall-clock changes do not extend their lifetime.
