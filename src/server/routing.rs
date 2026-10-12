@@ -44,10 +44,12 @@ impl ProxyServer {
                     )
                     .with_poll_interval(Duration::from_secs(
                         config.topology.poll_interval_secs.max(1),
-                    )),
+                    ))
+                    .with_leader_lock_confirmation(config.topology.patroni_confirm_leader_lock),
                 );
                 tracing::info!(
                     endpoints = config.topology.patroni_endpoints.len(),
+                    confirm_leader_lock = config.topology.patroni_confirm_leader_lock,
                     nodes = config.nodes.len(),
                     poll_interval_secs = config.topology.poll_interval_secs,
                     lease_timeout_secs = config.topology.lease_timeout_secs,

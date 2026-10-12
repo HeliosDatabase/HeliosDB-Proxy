@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- With `[topology] provider = "patroni"`, the leader `/cluster` names now counts only
+  while it holds Patroni's DCS leader lock: its own REST API must answer `GET /primary`
+  with 200 (`patroni_confirm_leader_lock`, default on). Startup now rejects a
+  `lease_timeout_secs` that is not below the new `patroni_ttl_secs` (default 30) minus
+  `patroni_loop_wait_secs` (default 10), so the proxy never trusts a leader longer than
+  Patroni does; set them to the cluster's Patroni values. `/topology` lists Patroni's
+  members (role incl. `sync_standby`, state, lag) under `members` (H-02).
 - One routing snapshot for writes, reads, pool eviction and `GET /topology` (H-01
   step 3). Under a topology provider, reads now follow it too: the read set is every
   enabled, healthy node except the provider's leader, so after a promotion the demoted

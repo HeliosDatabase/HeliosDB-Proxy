@@ -18,6 +18,22 @@ loopback ports 35601-35621, starts the proxy on 35600 (admin 35690) and runs thr
 creates is named `hp-patroni-demo-*` and is removed when the script exits (exact names; it never uses
 `down -v` and never touches other containers). Demo only: loopback `trust` authentication.
 
+### H-02 drills (`./run-demo.sh <binary> h02`)
+
+Same cluster, but the proxy polls Patroni through two killable TCP relays
+(`scripts/regress/tcp-relay.py`, 35631/35632 -> 35611/35612), and two drills run under
+load (three writers, one fresh session per `INSERT`, plus a `/topology` sampler):
+
+- `lock-drill`: the leader container is frozen (`docker pause`); Patroni moves the leader
+  lock after its `ttl`; the old leader is unpaused 10 s later. Passes when no write the
+  client saw commit is missing on the new leader, none exists only on the returned old
+  leader, the proxy's routing never names the old leader once the lease has run out after
+  the move, and writes resume on the new leader.
+- `control-partition`: only the relays are frozen for 25 s (Patroni and the data path are
+  untouched). Passes when, once the lease (8 s) has run out, the proxy has no write target
+  and no write that started after that completes before the heal, and writes resume after
+  it with nothing acknowledged missing.
+
 ## What `demo.py` does
 
 1. Opens ONE client connection through the proxy and probes which backend it is on.

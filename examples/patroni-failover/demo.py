@@ -6,7 +6,7 @@ through the proxy, starts a transaction, asks Patroni to change leader, continue
 transaction, and then checks the databases directly. Exits non-zero if the session or data
 check fails. Requires psycopg2 and a running demo cluster + proxy (see run-demo.sh).
 """
-import json, sys, time, urllib.request
+import json, os, signal, subprocess, sys, threading, time, urllib.request
 import psycopg2
 
 PROXY = dict(host="127.0.0.1", port=35600, user="postgres", dbname="postgres", connect_timeout=10)
@@ -148,6 +148,165 @@ def new_session():
     sys.exit(0 if outcome["pass"] else 1)
 
 
+# --- H-02 drills: run with `run-demo.sh <binary> h02` (needs both members) ---------------
+
+ADMIN = "http://127.0.0.1:35690"
+LEASE_SECS = 8  # proxy.toml lease_timeout_secs
+
+
+def write_loop(stop, out, label):
+    """Fresh session per write so each write is routed anew; record what the client saw."""
+    i = 0
+    while not stop.is_set():
+        i += 1
+        rid, t0 = f"{label}-{i}", time.time()
+        try:
+            c = psycopg2.connect(**PROXY, application_name="hp-demo-writer")
+            c.autocommit = True
+            c.cursor().execute("INSERT INTO hp_lock VALUES (%s, now())", (rid,))
+            c.close()
+            out.append({"id": rid, "outcome": "committed", "t0": t0, "t1": time.time()})
+        except Exception as e:
+            code = getattr(e, "pgcode", None)
+            # 08007 or a dropped connection: the commit may or may not have happened.
+            outcome = "unknown" if code in (None, "08007") else "error"
+            out.append({"id": rid, "outcome": outcome, "code": code, "t0": t0, "t1": time.time(),
+                        "detail": str(e).strip()[:120]})
+        time.sleep(0.25)
+
+
+def sample_topology(stop, out):
+    while not stop.is_set():
+        try:
+            topo = json.load(urllib.request.urlopen(f"{ADMIN}/topology", timeout=2))
+            out.append({"t": time.time(), "leader": (topo.get("routing") or {}).get("leader"),
+                        "valid": (topo.get("authoritative") or {}).get("valid")})
+        except Exception as e:
+            out.append({"t": time.time(), "error": str(e)[:80]})
+        time.sleep(0.5)
+
+
+def ids_on(name):
+    for _ in range(30):
+        try:
+            return {r[0] for r in direct(name, "SELECT id FROM hp_lock")}
+        except Exception:
+            time.sleep(2)
+    return None
+
+
+def with_load(drill):
+    """Run `drill()` while 3 writers and a /topology sampler run; return their records."""
+    setup = psycopg2.connect(**PROXY)
+    setup.autocommit = True
+    setup.cursor().execute("DROP TABLE IF EXISTS hp_lock")
+    setup.cursor().execute("CREATE TABLE hp_lock(id text PRIMARY KEY, at timestamptz)")
+    setup.close()
+    stop, writes, topo = threading.Event(), [], []
+    threads = [threading.Thread(target=write_loop, args=(stop, writes, f"w{k}")) for k in range(3)]
+    threads.append(threading.Thread(target=sample_topology, args=(stop, topo)))
+    for th in threads:
+        th.start()
+    try:
+        marks = drill()
+    finally:
+        stop.set()
+        for th in threads:
+            th.join(timeout=90)
+    return marks, writes, topo
+
+
+def lock_drill():
+    """Freeze the leader (docker pause); Patroni moves the lock; the old leader returns.
+    The proxy must never acknowledge a write that is missing on the lock holder, never
+    route to the frozen or returned former leader after the move, and resume writes."""
+    old = leader()
+    def drill():
+        time.sleep(5)
+        t_pause = time.time()
+        subprocess.run(["docker", "pause", f"hp-patroni-demo-{old}"], check=True, capture_output=True)
+        new = wait_leader(old, timeout=120)
+        t_new = time.time()
+        time.sleep(10)
+        subprocess.run(["docker", "unpause", f"hp-patroni-demo-{old}"], check=True, capture_output=True)
+        t_unpause = time.time()
+        time.sleep(20)
+        return {"old": old, "new": new, "t_pause": t_pause, "t_new": t_new, "t_unpause": t_unpause}
+    marks, writes, topo = with_load(drill)
+    new, old_addr = marks["new"], f"127.0.0.1:{NODES[old][0]}"
+    on_new = ids_on(new) or set()
+    on_old = ids_on(old)  # the returned member, after Patroni rejoined it
+    committed = [w for w in writes if w["outcome"] == "committed"]
+    routed_old_after_move = [s for s in topo if s.get("t", 0) > marks["t_new"] + LEASE_SECS
+                             and s.get("leader") == old_addr]
+    outcome = {
+        "mode": "lock-drill", **{k: marks[k] for k in ("old", "new")},
+        "seconds_to_new_leader": round(marks["t_new"] - marks["t_pause"], 1),
+        "writes": {o: sum(w["outcome"] == o for w in writes) for o in ("committed", "error", "unknown")},
+        "committed_after_move": sum(w["t0"] > marks["t_new"] for w in committed),
+        "acknowledged_missing_on_new_leader": [w["id"] for w in committed if w["id"] not in on_new],
+        "acknowledged_only_on_old_leader": sorted(((on_old or set()) - on_new)
+                                                  & {w["id"] for w in committed}),
+        "old_leader_readable_after_return": on_old is not None,
+        "proxy_named_old_leader_after_move": len(routed_old_after_move),
+        "errors_seen": sorted({w.get("code") or "conn" for w in writes if w["outcome"] != "committed"}),
+    }
+    outcome["pass"] = (not outcome["acknowledged_missing_on_new_leader"]
+                       and not outcome["acknowledged_only_on_old_leader"]
+                       and outcome["proxy_named_old_leader_after_move"] == 0
+                       and outcome["committed_after_move"] > 0)
+    print(json.dumps(outcome, indent=2, default=str))
+    sys.exit(0 if outcome["pass"] else 1)
+
+
+def control_partition(relay_pids):
+    """Freeze the TCP relays that carry the proxy's GET /cluster polls (the data path and
+    Patroni itself are untouched). Once the lease runs out the proxy must stop writing (no
+    write that started after expiry completes before the heal) and resume after it."""
+    pids = [int(p) for p in relay_pids]
+    def drill():
+        time.sleep(5)
+        t_cut = time.time()
+        for p in pids:
+            os.kill(p, signal.SIGSTOP)
+        time.sleep(25)
+        t_heal = time.time()
+        for p in pids:
+            os.kill(p, signal.SIGCONT)
+        time.sleep(20)
+        return {"t_cut": t_cut, "t_heal": t_heal}
+    marks, writes, topo = with_load(drill)
+    lead = leader()
+    on_leader = ids_on(lead) or set()
+    expiry = marks["t_cut"] + LEASE_SECS + 2  # lease + one poll of slack
+    committed = [w for w in writes if w["outcome"] == "committed"]
+    completed_while_cut = [w["id"] for w in committed
+                           if w["t0"] > expiry and w["t1"] < marks["t_heal"]]
+    no_leader_samples = [s for s in topo if expiry < s.get("t", 0) < marks["t_heal"]
+                         and s.get("leader") is None]
+    outcome = {
+        "mode": "control-partition", "leader": lead,
+        "partition_seconds": round(marks["t_heal"] - marks["t_cut"], 1),
+        "writes": {o: sum(w["outcome"] == o for w in writes) for o in ("committed", "error", "unknown")},
+        "completed_after_lease_expiry_while_cut": completed_while_cut,
+        "topology_samples_without_write_target_while_cut": len(no_leader_samples),
+        "committed_after_heal": sum(w["t1"] > marks["t_heal"] for w in committed),
+        "acknowledged_missing_on_leader": [w["id"] for w in committed if w["id"] not in on_leader],
+    }
+    outcome["pass"] = (not completed_while_cut and bool(no_leader_samples)
+                       and outcome["committed_after_heal"] > 0
+                       and not outcome["acknowledged_missing_on_leader"])
+    print(json.dumps(outcome, indent=2, default=str))
+    sys.exit(0 if outcome["pass"] else 1)
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "switchover"
-    new_session() if mode == "new-session" else main(mode)
+    if mode == "new-session":
+        new_session()
+    elif mode == "lock-drill":
+        lock_drill()
+    elif mode == "control-partition":
+        control_partition(sys.argv[2:])
+    else:
+        main(mode)

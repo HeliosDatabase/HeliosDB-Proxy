@@ -300,6 +300,15 @@ sees it, as the write primary.
   the tracker drops its current leader at once.
 - When no endpoint answers, the provider reports no primary: the authority lease is not
   refreshed and writes stop at the lease boundary (`lease_timeout_secs`).
+- **Leader lock (H-02).** With `patroni_confirm_leader_lock = true` (the default), the
+  leader `/cluster` names counts only while its own REST API (its `api_url`) answers
+  `GET /primary` with 200 within `patroni_request_timeout_ms`. Patroni answers 200 there
+  only on the member that holds the DCS leader key and runs as primary, so a former
+  leader that lost the key (paused, partitioned from the DCS, or still restarting) is not
+  authorized even if a stale `/cluster` answer still lists it. A leader that reports no
+  `api_url`, or a `/primary` that does not answer 200, means "no leader" for that poll.
+- `/topology` lists every member as Patroni reports it under `members`
+  (`name`, `address`, `role` incl. `sync_standby`, `state`, `lagBytes`).
 - The leader's timeline is reported as `authoritative.timeline` on `GET /topology`.
 - Each poll that sees two running leaders counts toward `conflictingPrimariesTotal` /
   `heliosdb_proxy_topology_conflicting_primaries_total`.
@@ -311,14 +320,27 @@ Example:
 provider = "patroni"
 patroni_endpoints = ["http://pg-a:8008", "http://pg-b:8008", "http://pg-c:8008"]
 patroni_request_timeout_ms = 2000   # per request; the default
+patroni_ttl_secs = 30               # the cluster's Patroni `ttl`
+patroni_loop_wait_secs = 10         # the cluster's Patroni `loop_wait`
 poll_interval_secs = 2
-lease_timeout_secs = 10
+lease_timeout_secs = 10             # must be < patroni_ttl_secs - patroni_loop_wait_secs
 
 # [[nodes]] addresses must match the host:port Patroni reports for each member.
 ```
 
-Keep `lease_timeout_secs` below Patroni's own `ttl` minus `loop_wait` so the proxy never
-trusts a leader longer than Patroni does (enforcing that is part of H-02).
+`lease_timeout_secs` must be below `patroni_ttl_secs - patroni_loop_wait_secs`; startup
+rejects the config otherwise. A leader that stops renewing its key keeps it for up to
+`ttl`, and the other members act on its loss only at their next `loop_wait` tick, so this
+keeps the proxy from trusting a leader longer than Patroni itself does. Set the two keys to
+the values in the cluster's Patroni configuration.
+
+**What this does not give you.** The proxy refuses to route writes to anything but the
+lock-holding leader; it does not fence the database. A former primary that is still up and
+accepting connections can still be written to by clients that bypass the proxy; stopping
+that is Patroni's job (watchdog, `synchronous_mode_strict`, `pg_rewind` on rejoin). Zero
+loss across a failover is only possible when the promoted member was a synchronous standby
+(`role = "sync_standby"` in `members`) and `synchronous_commit` is on; promoting an
+asynchronous replica can lose commits the old primary acknowledged.
 
 ### Conflicting primaries (`postgres` provider)
 

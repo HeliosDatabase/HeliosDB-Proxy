@@ -854,6 +854,16 @@ fn default_patroni_request_timeout_ms() -> u64 {
     2000
 }
 
+fn default_patroni_ttl_secs() -> u64 {
+    // Patroni's own default `ttl`.
+    30
+}
+
+fn default_patroni_loop_wait_secs() -> u64 {
+    // Patroni's own default `loop_wait`.
+    10
+}
+
 /// Which source is authoritative for the current primary (H-01).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -903,6 +913,22 @@ pub struct TopologyConfig {
     /// Timeout for one Patroni REST request, in milliseconds. Must be >= 1.
     #[serde(default = "default_patroni_request_timeout_ms")]
     pub patroni_request_timeout_ms: u64,
+    /// Require the leader named by `GET /cluster` to hold Patroni's DCS
+    /// leader lock: its own REST API must answer `GET /primary` with 200,
+    /// or the poll counts as "no leader" and the lease is not refreshed
+    /// (H-02). Default `true`.
+    #[serde(default = "default_true")]
+    pub patroni_confirm_leader_lock: bool,
+    /// The cluster's Patroni `ttl` (seconds the DCS leader key lives without
+    /// renewal). With `provider = "patroni"`, `lease_timeout_secs` must be
+    /// below `patroni_ttl_secs - patroni_loop_wait_secs`, so the proxy never
+    /// trusts a leader longer than Patroni itself does. Default 30.
+    #[serde(default = "default_patroni_ttl_secs")]
+    pub patroni_ttl_secs: u64,
+    /// The cluster's Patroni `loop_wait` (seconds between HA loop runs).
+    /// Default 10.
+    #[serde(default = "default_patroni_loop_wait_secs")]
+    pub patroni_loop_wait_secs: u64,
 }
 
 impl Default for TopologyConfig {
@@ -916,6 +942,9 @@ impl Default for TopologyConfig {
             database: default_topology_database(),
             patroni_endpoints: Vec::new(),
             patroni_request_timeout_ms: default_patroni_request_timeout_ms(),
+            patroni_confirm_leader_lock: true,
+            patroni_ttl_secs: default_patroni_ttl_secs(),
+            patroni_loop_wait_secs: default_patroni_loop_wait_secs(),
         }
     }
 }
@@ -2362,6 +2391,19 @@ impl ProxyConfig {
                     )));
                 }
             }
+            // H-02: never trust a leader longer than Patroni does. A leader
+            // that stopped renewing its key keeps it for up to `ttl`, and the
+            // replicas notice only on their next `loop_wait` tick.
+            let t = &self.topology;
+            let window = t.patroni_ttl_secs.saturating_sub(t.patroni_loop_wait_secs);
+            if window == 0 || t.lease_timeout_secs >= window {
+                return Err(ProxyError::Config(format!(
+                    "topology.lease_timeout_secs ({}) must be below topology.patroni_ttl_secs \
+                     ({}) minus topology.patroni_loop_wait_secs ({}); set those two to the \
+                     cluster's Patroni ttl and loop_wait",
+                    t.lease_timeout_secs, t.patroni_ttl_secs, t.patroni_loop_wait_secs
+                )));
+            }
         }
         if self.topology.patroni_request_timeout_ms == 0 {
             return Err(ProxyError::Config(
@@ -3499,6 +3541,34 @@ database = "helios"
         assert_eq!(parsed.provider, TopologyProviderKind::Patroni);
         assert_eq!(parsed.patroni_endpoints.len(), 2);
         assert_eq!(parsed.patroni_request_timeout_ms, 2000);
+        assert!(parsed.patroni_confirm_leader_lock);
+        assert_eq!(parsed.patroni_ttl_secs, 30);
+        assert_eq!(parsed.patroni_loop_wait_secs, 10);
+    }
+
+    /// H-02: with Patroni, the proxy's lease must end before Patroni itself
+    /// would give the leader key away (ttl - loop_wait).
+    #[cfg(feature = "postgres-topology")]
+    #[test]
+    fn topology_patroni_lease_must_fit_inside_the_leader_key_ttl() {
+        let mut c = ProxyConfig::default();
+        c.add_node("10.0.0.1:5432", "primary").unwrap();
+        c.topology.provider = TopologyProviderKind::Patroni;
+        c.topology.patroni_endpoints = vec!["http://10.0.0.1:8008".into()];
+        c.topology.patroni_ttl_secs = 15;
+        c.topology.patroni_loop_wait_secs = 5;
+        c.topology.lease_timeout_secs = 8;
+        assert!(c.validate().is_ok());
+        c.topology.lease_timeout_secs = 10;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("patroni_ttl_secs"), "{err}");
+        c.topology.lease_timeout_secs = 1;
+        c.topology.patroni_loop_wait_secs = 15;
+        assert!(c.validate().is_err(), "ttl must exceed loop_wait");
+        // Static and postgres providers are not bound by Patroni's ttl.
+        c.topology.provider = TopologyProviderKind::Postgres;
+        c.topology.lease_timeout_secs = 60;
+        assert!(c.validate().is_ok());
     }
 
     #[test]

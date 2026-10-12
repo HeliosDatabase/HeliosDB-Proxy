@@ -35,6 +35,21 @@ pub struct TopologyNodeInfo {
     pub is_healthy: bool,
 }
 
+/// One cluster member as the provider reports it (for `/topology`), e.g. a
+/// Patroni member with its replication role and lag (H-02).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopologyMember {
+    pub name: String,
+    /// `host:port` as the provider reports it.
+    pub address: String,
+    /// Provider role, e.g. `leader`, `sync_standby`, `replica`.
+    pub role: String,
+    /// Provider state, e.g. `running`, `streaming`.
+    pub state: String,
+    /// Replication lag in bytes, when the provider reports a number.
+    pub lag_bytes: Option<u64>,
+}
+
 /// Events emitted by a topology provider.
 #[derive(Debug, Clone)]
 pub enum TopologyEvent {
@@ -82,6 +97,12 @@ pub trait TopologyProvider: Send + Sync + 'static {
     /// reports one (Patroni). `None` without a leader or when unknown.
     fn leader_timeline(&self) -> Option<u64> {
         None
+    }
+
+    /// The members as of the last poll, for a provider that reports them
+    /// (Patroni: role incl. `sync_standby`, state and lag). Empty otherwise.
+    fn members(&self) -> Vec<TopologyMember> {
+        Vec::new()
     }
 }
 
@@ -362,6 +383,11 @@ pub struct PatroniView {
     pub conflict: bool,
     /// Why there is no leader, when there is none.
     pub reason: Option<String>,
+    /// The leader member's REST API base (`api_url` minus `/patroni`), used
+    /// to confirm it holds the DCS leader lock (H-02).
+    pub leader_api: Option<String>,
+    /// Every member, for `/topology`.
+    pub members: Vec<TopologyMember>,
 }
 
 /// Decide the writable leader from a Patroni `GET /cluster` body (H-01).
@@ -372,14 +398,44 @@ pub struct PatroniView {
 /// `host:port`, host compared case-insensitively) — an unknown leader is not
 /// authorized. Two running leaders are a conflict: nothing is authorized.
 pub fn parse_patroni_cluster(body: &serde_json::Value, nodes: &[PatroniNode]) -> PatroniView {
+    let Some(members) = body.get("members").and_then(|m| m.as_array()) else {
+        return PatroniView {
+            leader: None,
+            timeline: None,
+            conflict: false,
+            reason: Some("response has no members array".into()),
+            leader_api: None,
+            members: Vec::new(),
+        };
+    };
+    let text = |m: &serde_json::Value, key: &str| {
+        m.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let reported: Vec<TopologyMember> = members
+        .iter()
+        .map(|m| TopologyMember {
+            name: text(m, "name"),
+            address: format!(
+                "{}:{}",
+                text(m, "host"),
+                m.get("port").and_then(|p| p.as_u64()).unwrap_or(5432)
+            ),
+            role: text(m, "role"),
+            state: text(m, "state"),
+            // Patroni reports "unknown" when it cannot compute the lag.
+            lag_bytes: m.get("lag").and_then(|l| l.as_u64()),
+        })
+        .collect();
     let none = |reason: String, conflict: bool| PatroniView {
         leader: None,
         timeline: None,
         conflict,
         reason: Some(reason),
-    };
-    let Some(members) = body.get("members").and_then(|m| m.as_array()) else {
-        return none("response has no members array".into(), false);
+        leader_api: None,
+        members: reported.clone(),
     };
     let leaders: Vec<&serde_json::Value> = members
         .iter()
@@ -403,6 +459,11 @@ pub fn parse_patroni_cluster(body: &serde_json::Value, nodes: &[PatroniNode]) ->
     let port = leader.get("port").and_then(|p| p.as_u64()).unwrap_or(5432);
     let address = format!("{host}:{port}");
     let timeline = leader.get("timeline").and_then(|t| t.as_u64());
+    let leader_api = leader.get("api_url").and_then(|u| u.as_str()).map(|u| {
+        u.trim_end_matches('/')
+            .trim_end_matches("/patroni")
+            .to_string()
+    });
     match nodes
         .iter()
         .find(|n| n.address.eq_ignore_ascii_case(&address))
@@ -412,6 +473,8 @@ pub fn parse_patroni_cluster(body: &serde_json::Value, nodes: &[PatroniNode]) ->
             timeline,
             conflict: false,
             reason: None,
+            leader_api,
+            members: reported,
         },
         None => PatroniView {
             leader: None,
@@ -420,6 +483,8 @@ pub fn parse_patroni_cluster(body: &serde_json::Value, nodes: &[PatroniNode]) ->
             reason: Some(format!(
                 "leader {address} is not a configured [[nodes]] address"
             )),
+            leader_api: None,
+            members: reported,
         },
     }
 }
@@ -435,6 +500,11 @@ pub struct PatroniTopologyProvider {
     nodes: Vec<PatroniNode>,
     client: reqwest::Client,
     poll_interval: Duration,
+    /// Confirm the leader named by `/cluster` against the DCS leader lock
+    /// (`GET /primary` on the leader's own REST API answers 200) before it
+    /// counts (H-02).
+    confirm_leader_lock: bool,
+    members: RwLock<Vec<TopologyMember>>,
     current: RwLock<Option<TopologyNodeInfo>>,
     timeline: AtomicU64,
     conflict: std::sync::atomic::AtomicBool,
@@ -457,6 +527,8 @@ impl PatroniTopologyProvider {
             nodes,
             client,
             poll_interval: Duration::from_secs(2),
+            confirm_leader_lock: false,
+            members: RwLock::new(Vec::new()),
             current: RwLock::new(None),
             timeline: AtomicU64::new(0),
             conflict: std::sync::atomic::AtomicBool::new(false),
@@ -468,6 +540,15 @@ impl PatroniTopologyProvider {
     /// Set polling interval.
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
+        self
+    }
+
+    /// Require the leader named by `/cluster` to also hold Patroni's DCS
+    /// leader lock: its REST API must answer `GET /primary` with 200 within
+    /// the request timeout, or the poll reports no leader (so the tracker's
+    /// lease is not refreshed and writes fail closed once it runs out).
+    pub fn with_leader_lock_confirmation(mut self, confirm: bool) -> Self {
+        self.confirm_leader_lock = confirm;
         self
     }
 
@@ -506,6 +587,24 @@ impl PatroniTopologyProvider {
             .map_err(|e| format!("{url}: {e}"))
     }
 
+    /// Whether the leader's own REST API says it holds the DCS leader lock:
+    /// Patroni answers `GET /primary` with 200 only on the member that holds
+    /// the leader key and runs as primary.
+    async fn holds_leader_lock(&self, api: &str) -> Result<(), String> {
+        let url = format!("{api}/primary");
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("{url}: {e}"))?;
+        if resp.status() == reqwest::StatusCode::OK {
+            Ok(())
+        } else {
+            Err(format!("{url}: HTTP {}", resp.status()))
+        }
+    }
+
     async fn poll(&self) {
         let mut view = None;
         for ep in &self.endpoints {
@@ -519,16 +618,29 @@ impl PatroniTopologyProvider {
         }
         // No endpoint answered: authority is unknown. Report no primary so
         // the tracker's lease expires rather than being refreshed.
-        let view = view.unwrap_or(PatroniView {
+        let mut view = view.unwrap_or(PatroniView {
             leader: None,
             timeline: None,
             conflict: false,
             reason: Some("no Patroni endpoint answered".into()),
+            leader_api: None,
+            members: Vec::new(),
         });
+        if self.confirm_leader_lock && view.leader.is_some() {
+            let confirmed = match view.leader_api.as_deref() {
+                Some(api) => self.holds_leader_lock(api).await,
+                None => Err("the leader member reports no api_url".to_string()),
+            };
+            if let Err(e) = confirmed {
+                view.leader = None;
+                view.reason = Some(format!("leader lock not confirmed ({e})"));
+            }
+        }
         self.apply(view);
     }
 
     fn apply(&self, view: PatroniView) {
+        *self.members.write() = view.members;
         if view.conflict {
             self.conflicts_total.fetch_add(1, Ordering::Relaxed);
         }
@@ -589,6 +701,10 @@ impl TopologyProvider for PatroniTopologyProvider {
         self.current.read().as_ref()?;
         let t = self.timeline.load(Ordering::Relaxed);
         (t > 0).then_some(t)
+    }
+
+    fn members(&self) -> Vec<TopologyMember> {
+        self.members.read().clone()
     }
 }
 
@@ -773,6 +889,15 @@ impl PrimaryTracker {
     /// The provider's leader timeline, when it reports one (Patroni).
     pub fn provider_leader_timeline(&self) -> Option<u64> {
         self.provider.as_ref()?.leader_timeline()
+    }
+
+    /// The provider's members as of its last poll (empty without a provider
+    /// or for one that does not report members).
+    pub fn provider_members(&self) -> Vec<TopologyMember> {
+        self.provider
+            .as_ref()
+            .map(|p| p.members())
+            .unwrap_or_default()
     }
 
     /// Subscribe to primary change events.
@@ -1133,6 +1258,35 @@ mod tests {
             parse_patroni_cluster(&body, &nodes).leader.map(|l| l.0),
             Some(a)
         );
+    }
+
+    #[test]
+    fn patroni_cluster_reports_members_and_the_leader_api() {
+        let (nodes, _, b) = patroni_nodes();
+        let mut leader = member("pg-b", "leader", "running", 7);
+        leader["api_url"] = serde_json::json!("http://pg-b:8008/patroni");
+        let mut sync = member("pg-a", "sync_standby", "streaming", 7);
+        sync["lag"] = serde_json::json!(4096);
+        let mut async_ = member("pg-c", "replica", "streaming", 7);
+        async_["lag"] = serde_json::json!("unknown");
+        let body = serde_json::json!({ "members": [sync, leader, async_] });
+        let v = parse_patroni_cluster(&body, &nodes);
+        assert_eq!(v.leader.map(|l| l.0), Some(b));
+        assert_eq!(v.leader_api.as_deref(), Some("http://pg-b:8008"));
+        let roles: Vec<_> = v
+            .members
+            .iter()
+            .map(|m| (m.name.as_str(), m.role.as_str(), m.lag_bytes))
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                ("pg-a", "sync_standby", Some(4096)),
+                ("pg-b", "leader", None),
+                ("pg-c", "replica", None),
+            ]
+        );
+        assert_eq!(v.members[0].address, "pg-a:5432");
     }
 
     #[test]
@@ -1652,5 +1806,67 @@ mod tests {
         assert!(!tracker.has_primary());
         assert_eq!(tracker.provider_leader_timeline(), None);
         assert_eq!(tracker.provider_conflicts_total(), 1);
+    }
+
+    /// H-02: with leader-lock confirmation on, the leader `/cluster` names
+    /// counts only while its own REST API answers `GET /primary` with 200.
+    #[cfg(feature = "postgres-topology")]
+    #[tokio::test]
+    async fn patroni_leader_counts_only_while_it_holds_the_lock() {
+        use std::sync::atomic::AtomicU16;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let primary_status = Arc::new(AtomicU16::new(200));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status = primary_status.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut req = [0u8; 2048];
+                let n = sock.read(&mut req).await.unwrap_or(0);
+                let line = String::from_utf8_lossy(&req[..n]).to_string();
+                let (code, body) = if line.starts_with("GET /primary") {
+                    (status.load(Ordering::Relaxed), String::new())
+                } else {
+                    let leader = serde_json::json!({
+                        "name": "pg-a", "host": "pg-a", "port": 5432,
+                        "role": "leader", "state": "running", "timeline": 2,
+                        "api_url": format!("http://{addr}/patroni"),
+                    });
+                    (200, serde_json::json!({ "members": [leader] }).to_string())
+                };
+                let resp = format!(
+                    "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let a_id = Uuid::new_v4();
+        let nodes = vec![PatroniNode {
+            node_id: a_id,
+            address: "pg-a:5432".into(),
+        }];
+        let p = PatroniTopologyProvider::new(
+            vec![format!("http://{addr}")],
+            nodes,
+            Duration::from_secs(2),
+        )
+        .with_leader_lock_confirmation(true);
+
+        p.poll().await;
+        assert_eq!(p.get_primary().map(|n| n.node_id), Some(a_id));
+        assert_eq!(p.members().len(), 1);
+
+        // The member still claims leadership in /cluster but no longer holds
+        // the lock (Patroni answers /primary with 503): not authorized.
+        primary_status.store(503, Ordering::Relaxed);
+        p.poll().await;
+        assert!(p.get_primary().is_none());
+
+        primary_status.store(200, Ordering::Relaxed);
+        p.poll().await;
+        assert_eq!(p.get_primary().map(|n| n.node_id), Some(a_id));
     }
 }

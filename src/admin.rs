@@ -2233,9 +2233,25 @@ impl AdminServer {
         let mut current_primary: Option<String> = None;
         let mut authoritative = None;
         let mut conflicting_primaries_total = None;
+        let mut members = None;
         if let Some(ref t) = *tracker {
             if t.has_provider() {
                 conflicting_primaries_total = Some(t.provider_conflicts_total());
+                let reported = t.provider_members();
+                if !reported.is_empty() {
+                    members = Some(
+                        reported
+                            .into_iter()
+                            .map(|m| TopologyMemberJson {
+                                name: m.name,
+                                address: m.address,
+                                role: m.role,
+                                state: m.state,
+                                lag_bytes: m.lag_bytes,
+                            })
+                            .collect(),
+                    );
+                }
             }
             if let Some(info) = t.get_primary() {
                 current_primary = Some(info.address.clone());
@@ -2306,6 +2322,7 @@ impl AdminServer {
             authoritative,
             conflicting_primaries_total,
             routing,
+            members,
         }
     }
 
@@ -3307,6 +3324,20 @@ struct TopologyResponse {
     /// its routing view.
     #[serde(rename = "routing", skip_serializing_if = "Option::is_none")]
     routing: Option<RoutingTopology>,
+    /// H-02: the provider's members (Patroni: role incl. `sync_standby`,
+    /// state, lag), when the provider reports them.
+    #[serde(rename = "members", skip_serializing_if = "Option::is_none")]
+    members: Option<Vec<TopologyMemberJson>>,
+}
+
+#[derive(Serialize)]
+struct TopologyMemberJson {
+    name: String,
+    address: String,
+    role: String,
+    state: String,
+    #[serde(rename = "lagBytes")]
+    lag_bytes: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -3968,7 +3999,9 @@ mod tests {
     /// the Prometheus body carries the conflict counter (H-01).
     #[tokio::test]
     async fn test_topology_reports_provider_conflicts_and_timeline() {
-        use crate::primary_tracker::{TopologyEvent, TopologyNodeInfo, TopologyProvider};
+        use crate::primary_tracker::{
+            TopologyEvent, TopologyMember, TopologyNodeInfo, TopologyProvider,
+        };
         struct Fake {
             leader: parking_lot::RwLock<Option<TopologyNodeInfo>>,
             tx: tokio::sync::broadcast::Sender<TopologyEvent>,
@@ -3988,6 +4021,15 @@ mod tests {
             }
             fn leader_timeline(&self) -> Option<u64> {
                 self.leader.read().as_ref().map(|_| 7)
+            }
+            fn members(&self) -> Vec<TopologyMember> {
+                vec![TopologyMember {
+                    name: "pg-b".into(),
+                    address: "pg-b:5432".into(),
+                    role: "sync_standby".into(),
+                    state: "streaming".into(),
+                    lag_bytes: Some(0),
+                }]
             }
         }
         let state = topology_state(&[("pg-a:5432", "standby", true)]).await;
@@ -4014,6 +4056,9 @@ mod tests {
         let topo = serde_json::to_value(AdminServer::compute_topology(&state).await).unwrap();
         assert_eq!(topo["authoritative"]["address"], "pg-a:5432");
         assert_eq!(topo["authoritative"]["timeline"], 7);
+        // H-02: the provider's members, with the sync standby visible.
+        assert_eq!(topo["members"][0]["role"], "sync_standby");
+        assert_eq!(topo["members"][0]["lagBytes"], 0);
 
         let (status, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
             .await

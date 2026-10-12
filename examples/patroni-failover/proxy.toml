@@ -17,6 +17,8 @@ provider = "patroni"
 patroni_endpoints = ["http://127.0.0.1:35611", "http://127.0.0.1:35612"]
 poll_interval_secs = 1
 lease_timeout_secs = 8   # below Patroni ttl (15) minus loop_wait (5)
+patroni_ttl_secs = 15    # patroni.yml ttl
+patroni_loop_wait_secs = 5  # patroni.yml loop_wait
 
 [[nodes]]
 host = "127.0.0.1"

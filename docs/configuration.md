@@ -428,6 +428,9 @@ user = "postgres"
 database = "postgres"
 # patroni_endpoints = ["http://10.0.0.1:8008", "http://10.0.0.2:8008"]
 # patroni_request_timeout_ms = 2000
+# patroni_confirm_leader_lock = true
+# patroni_ttl_secs = 30
+# patroni_loop_wait_secs = 10
 ```
 
 | Key | Type | Default | Description |
@@ -440,6 +443,9 @@ database = "postgres"
 | `database` | string | `"postgres"` | Database the probe connects to. |
 | `patroni_endpoints` | list of URLs | `[]` | Patroni REST API base URLs (`http(s)://host:8008`), tried in order each poll; the first that answers is used. **Required** for `provider = "patroni"`; each must start with `http://` or `https://`. |
 | `patroni_request_timeout_ms` | u64 | `2000` | Timeout for one Patroni REST request. **Must be ≥ 1**. |
+| `patroni_confirm_leader_lock` | bool | `true` | *(patroni)* Count the leader `GET /cluster` names only while its own REST API answers `GET /primary` with 200, i.e. it holds Patroni's DCS leader lock (H-02). |
+| `patroni_ttl_secs` | u64 | `30` | *(patroni)* The cluster's Patroni `ttl`. `lease_timeout_secs` must be below `patroni_ttl_secs - patroni_loop_wait_secs`, or startup fails. |
+| `patroni_loop_wait_secs` | u64 | `10` | *(patroni)* The cluster's Patroni `loop_wait`. |
 
 When a provider is configured it is **authoritative for the write path**: writes go only
 to the provider's leader (which must be an enabled `[[nodes]]` entry), the answer waits
