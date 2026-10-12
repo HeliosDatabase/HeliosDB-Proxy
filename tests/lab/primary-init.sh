@@ -9,3 +9,10 @@ psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_relo
 # logical invalidation source decodes. Harmless for the other scenarios.
 psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
   -c "CREATE PUBLICATION heliosdb_proxy_cache FOR ALL TABLES"
+# pg-b is the synchronous standby. Set here, not on the command line: the
+# image's init phase starts its temporary server with the command's -c
+# options, and every commit there (CREATE DATABASE included) would wait
+# forever for a standby that does not exist yet. ALTER SYSTEM takes effect
+# when the real server starts after init.
+psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c "ALTER SYSTEM SET synchronous_standby_names = 'pg_b'"

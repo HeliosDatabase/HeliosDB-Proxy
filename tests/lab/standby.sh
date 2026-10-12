@@ -12,10 +12,19 @@ until gosu postgres pg_isready -h 127.0.0.1 -p "$PRIMARY_PORT" -U lab -d lab >/d
 done
 gosu postgres pg_basebackup --host=127.0.0.1 --port="$PRIMARY_PORT" --username=lab \
   --pgdata="$PGDATA" --wal-method=stream --write-recovery-conf --no-password
+# The base backup carries pg-a's postgresql.auto.conf. A standby must not keep
+# its synchronous_standby_names (a promoted pg-b would wait forever for a
+# standby named after itself), and hot standby needs connection/sender limits
+# at least as high as the primary's (pg-a runs max_connections=200).
 cat >> "$PGDATA/postgresql.auto.conf" <<CONF
 primary_conninfo = 'host=127.0.0.1 port=$PRIMARY_PORT user=lab application_name=$STANDBY_NAME'
 hot_standby = on
 listen_addresses = '127.0.0.1'
 port = $PORT
+synchronous_standby_names = ''
+max_connections = 200
+max_wal_senders = 10
+max_replication_slots = 10
+wal_level = logical
 CONF
 exec gosu postgres postgres -D "$PGDATA"
