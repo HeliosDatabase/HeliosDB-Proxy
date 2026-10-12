@@ -180,6 +180,7 @@ async fn commit_fragment_survives_flush_watch_and_sync_handoffs() {
             &mut bc.response_buf,
             &session,
             &server.state,
+            0,
         ),
     )
     .await
@@ -228,6 +229,7 @@ async fn sync_finishes_partial_commit_before_later_error() {
             &mut backend.response_buf,
             &session,
             &server.state,
+            0,
         ),
     )
     .await

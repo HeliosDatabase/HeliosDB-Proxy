@@ -3444,7 +3444,7 @@ async fn tr09_relay(
     response: Vec<u8>,
     hold: usize,
     capture: bool,
-) -> (Vec<u8>, Result<u64, ResponseProgress>) {
+) -> (Vec<u8>, std::result::Result<u64, ResponseProgress>) {
     let (mut backend, mut peer) = pair().await;
     let (client, mut recipient) = pair().await;
     let mut client = ClientStream::Plain(client);

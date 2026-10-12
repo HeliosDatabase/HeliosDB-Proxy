@@ -438,6 +438,7 @@ async fn test_apply_authenticate_hook_with_manager_no_plugins_defers() {
         routing: Arc::new(crate::routing_snapshot::RoutingView::new(false)),
         gateway_pools: Arc::new(crate::gateway_pool::GatewayPools::new(1)),
         node_slots: Arc::new(crate::node_slots::NodeSlots::default()),
+        tenant_slots: Arc::new(crate::tenant_slots::TenantSlots::default()),
         latency: Arc::new(crate::metrics_hist::ProxyLatency::new(
             &crate::metrics_hist::default_latency_buckets_ms(),
         )),
@@ -990,6 +991,7 @@ async fn session_guard_deregisters_on_drop() {
             state: state.clone(),
             session_id: session.id,
             _client_slot: None,
+            _tenant_slot: None,
         };
     }
     assert!(state.sessions.is_empty(), "guard must deregister on drop");
@@ -1014,6 +1016,7 @@ async fn session_guard_deregisters_on_panic() {
             state: st,
             session_id: sid,
             _client_slot: None,
+            _tenant_slot: None,
         };
         panic!("simulated connection-task panic");
     }));
@@ -1071,6 +1074,7 @@ fn client_slot_cap_exhausts_and_guard_returns_the_permit() {
             state: state.clone(),
             session_id: session.id,
             _client_slot: Some(permit),
+            _tenant_slot: None,
         };
         assert_eq!(sem.available_permits(), 0, "slot held for the live session");
     }
@@ -1101,6 +1105,7 @@ fn client_slot_returned_on_panic_unwind() {
             state: st,
             session_id: sid,
             _client_slot: Some(permit),
+            _tenant_slot: None,
         };
         panic!("simulated connection-task panic");
     }));
