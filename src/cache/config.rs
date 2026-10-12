@@ -180,6 +180,15 @@ pub struct L2Config {
 
     /// Memory-mapped file path (for mmap backend)
     pub mmap_path: Option<PathBuf>,
+
+    /// Entries the `cache-reclaim` thread removes per step when an eviction
+    /// pass sheds write-retired entries (0 = all in one step).
+    pub shed_batch: usize,
+
+    /// Pause between those steps, so a shed of a whole retired working set
+    /// (10^5-10^6 entries) does not contend with concurrent readers for its
+    /// whole duration at full rate.
+    pub shed_pause: Duration,
 }
 
 impl Default for L2Config {
@@ -191,6 +200,8 @@ impl Default for L2Config {
             normalize_queries: true,
             storage: StorageBackend::Memory,
             mmap_path: None,
+            shed_batch: 1024,
+            shed_pause: Duration::from_millis(2),
         }
     }
 }

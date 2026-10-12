@@ -600,6 +600,8 @@ max_result_bytes = 1048576
 | `logical_feedback_ms` | u64 | `1000` | *(logical)* Milliseconds between polls of the slot: how long a write that bypassed the proxy can still be served from cache. |
 | `logical_max_changes_per_poll` | u64 | `10000` | *(logical)* Changes read per poll (whole transactions); a full batch is followed by an immediate next poll. |
 | `logical_max_slot_lag_bytes` | u64 | `1073741824` | *(logical)* A slot lagging more than this behind the primary's WAL invalidates the whole cache and logs an error (an unread slot also retains WAL on the primary). |
+| `l2_shed_batch` | usize | `1024` | When L2 is full and writes have retired entries, one eviction pass sheds them on the `cache-reclaim` thread, this many per step (`0` = all at once). |
+| `l2_shed_pause_us` | u64 | `2000` | Pause between those steps, microseconds (`0` = none). After a write retires a whole working set (10^5-10^6 entries) the shed then contends with concurrent readers at a lower rate, for longer, instead of at full rate for 3-5 s. |
 
 **Invalidation is commit-aware on both protocols (C-02).** Every cached result records
 the write generation of the tables it read, taken before its backend fetch, and every

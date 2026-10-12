@@ -899,6 +899,8 @@ impl ProxyServer {
                 },
                 l2: crate::cache::L2Config {
                     ttl,
+                    shed_batch: c.l2_shed_batch,
+                    shed_pause: Duration::from_micros(c.l2_shed_pause_us),
                     ..Default::default()
                 },
                 ..Default::default()

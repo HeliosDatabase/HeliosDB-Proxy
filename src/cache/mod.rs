@@ -249,7 +249,7 @@ impl QueryCache {
                             Reclaim::Keys(keys) => drop(keys),
                             Reclaim::Shed(hashes) => {
                                 if let Some(l2) = &l2 {
-                                    l2.shed(&hashes);
+                                    l2.shed_paced(&hashes);
                                     l2.end_eviction();
                                 }
                             }

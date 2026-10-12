@@ -1370,6 +1370,15 @@ pub struct CacheToml {
     /// invalidates the whole cache (and is logged as an error): an unread
     /// slot also retains WAL on the primary. Default 1 GiB.
     pub logical_max_slot_lag_bytes: u64,
+    /// When L2 is full and writes have retired entries, one eviction pass
+    /// sheds them all on the `cache-reclaim` thread; it removes this many
+    /// per step (`0` = all at once). Default 1024.
+    pub l2_shed_batch: usize,
+    /// Pause between those steps, microseconds (`0` = none). Spreads a shed
+    /// of a whole retired working set (10^5-10^6 entries) so it does not
+    /// contend with concurrent readers at full rate for its whole duration.
+    /// Default 2000.
+    pub l2_shed_pause_us: u64,
 }
 
 impl Default for CacheToml {
@@ -1386,6 +1395,8 @@ impl Default for CacheToml {
             logical_feedback_ms: 1000,
             logical_max_changes_per_poll: 10_000,
             logical_max_slot_lag_bytes: 1024 * 1024 * 1024,
+            l2_shed_batch: 1024,
+            l2_shed_pause_us: 2000,
         }
     }
 }

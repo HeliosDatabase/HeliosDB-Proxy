@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Paced L2 shed (`[cache] l2_shed_batch`, default 1024, and `l2_shed_pause_us`, default
+  2000): the `cache-reclaim` thread now removes write-retired L2 entries in steps with a
+  pause between them, instead of removing a whole retired working set at full rate while
+  concurrent readers wait on the same map shards. `L2Config` gains public `shed_batch` and
+  `shed_pause` fields.
+
 - Per-request tenant identity on the HTTP SQL, MCP and GraphQL gateways (H-06): with
   `[multi_tenancy]` enabled, a gateway's new `tenant_header` key names the request header
   that carries the tenant. A request must name a known tenant (403 otherwise), and every

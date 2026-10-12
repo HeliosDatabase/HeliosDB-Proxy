@@ -226,6 +226,26 @@ impl L2WarmCache {
         }
     }
 
+    /// [`Self::shed`] in steps of `shed_batch` entries with `shed_pause`
+    /// between them, for the `cache-reclaim` thread (blocking: never call it
+    /// on an async worker). Each removal is short; the pacing spreads a bulk
+    /// shed out so concurrent readers are not contended at full rate for its
+    /// whole duration.
+    pub fn shed_paced(&self, hashes: &[u64]) {
+        let batch = self.config.shed_batch;
+        if batch == 0 || self.config.shed_pause.is_zero() || hashes.len() <= batch {
+            self.shed(hashes);
+            return;
+        }
+        let mut chunks = hashes.chunks(batch).peekable();
+        while let Some(chunk) = chunks.next() {
+            self.shed(chunk);
+            if chunks.peek().is_some() {
+                std::thread::sleep(self.config.shed_pause);
+            }
+        }
+    }
+
     /// End the eviction pass [`Self::put_evicting`] handed off.
     pub fn end_eviction(&self) {
         self.evicting
@@ -884,6 +904,39 @@ mod tests {
     /// While an eviction pass is running (here: handed off and not yet
     /// ended), a put over the bound inserts without starting another scan;
     /// the handed-off hashes are exactly the retired entries.
+    /// The reclaim thread's paced shed removes every retired entry, in
+    /// steps of `shed_batch` with `shed_pause` between them.
+    #[test]
+    fn a_paced_shed_removes_everything_in_steps() {
+        let cache = L2WarmCache::new(L2Config {
+            size_mb: 64,
+            shed_batch: 3,
+            shed_pause: Duration::from_millis(5),
+            ..Default::default()
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for i in 0..10u64 {
+            rt.block_on(cache.put(create_key(i), sized(64)));
+        }
+        let hashes: Vec<u64> = (0..10u64).map(|i| create_key(i).hash_value()).collect();
+        let started = Instant::now();
+        cache.shed_paced(&hashes);
+        // 10 entries in steps of 3: 4 steps, 3 pauses.
+        assert!(started.elapsed() >= Duration::from_millis(15));
+        assert!(cache.is_empty());
+        assert_eq!(cache.memory_usage(), 0);
+        // Unpaced (batch 0): one step, no pause.
+        let unpaced = L2WarmCache::new(L2Config {
+            shed_batch: 0,
+            ..Default::default()
+        });
+        rt.block_on(unpaced.put(create_key(1), sized(64)));
+        unpaced.shed_paced(&[create_key(1).hash_value()]);
+        assert!(unpaced.is_empty());
+    }
+
     #[tokio::test]
     async fn one_eviction_pass_at_a_time() {
         let cache = L2WarmCache::new(L2Config {
