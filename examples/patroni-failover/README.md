@@ -14,7 +14,7 @@ cd examples/patroni-failover
 
 Needs Docker with Compose, `python3` with `psycopg2`, and `curl`. It builds a small Patroni image
 (`hp-patroni-demo:local`, PostgreSQL 18.4 + `pip install patroni[etcd3]`), starts etcd and two members on
-loopback ports 35601-35621, starts the proxy on 35600 (admin 35690) and runs two scenarios. Everything it
+loopback ports 35601-35621, starts the proxy on 35600 (admin 35690) and runs three scenarios. Everything it
 creates is named `hp-patroni-demo-*` and is removed when the script exits (exact names; it never uses
 `down -v` and never touches other containers). Demo only: loopback `trust` authentication.
 
@@ -51,4 +51,7 @@ configured as standby, so even the first setup write was refused).
   correctly refused to continue. That is why the script probes the backend outside the transaction.
 - No zero-RPO claim: Patroni's `maximum_lag_on_failover` here is 1 MiB, and a failover can lose
   asynchronously replicated commits. The demo only commits after the leader change.
-- Reads are still routed by configured node role, not by the provider's leader.
+- Read routing is checked only through the proxy's published routing snapshot
+  (`GET /topology` → `routing`: after the switchover it names the new leader as the write
+  target and the demoted former leader as the read replica). The demo's client sessions
+  stay on the node they started on, so no client read is routed to a replica here.

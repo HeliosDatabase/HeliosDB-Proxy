@@ -10,6 +10,7 @@ import json, sys, time, urllib.request
 import psycopg2
 
 PROXY = dict(host="127.0.0.1", port=35600, user="postgres", dbname="postgres", connect_timeout=10)
+ADMIN = "http://127.0.0.1:35690"
 NODES = {"pg-a": (35601, 35611), "pg-b": (35602, 35612)}
 
 
@@ -105,6 +106,24 @@ def main(mode):
     sys.exit(0 if ok else 1)
 
 
+def routing_view(lead, timeout=60):
+    """Wait until the proxy's published routing snapshot (GET /topology -> routing) names
+    Patroni's leader as the write target and the other member, once it is back and healthy,
+    as the only read replica. Returns what was last seen and how long it took."""
+    want_leader = f"127.0.0.1:{NODES[lead][0]}"
+    want_replicas = [f"127.0.0.1:{port}" for name, (port, _) in NODES.items() if name != lead]
+    start = time.time()
+    seen = {}
+    while time.time() - start < timeout:
+        routing = json.load(urllib.request.urlopen(f"{ADMIN}/topology", timeout=5)).get("routing") or {}
+        seen = {"leader": routing.get("leader"), "replicas": [r["address"] for r in routing.get("replicas", [])],
+                "epoch": routing.get("epoch"), "leader_changes_total": routing.get("leaderChangesTotal")}
+        if seen["leader"] == want_leader and seen["replicas"] == want_replicas:
+            return True, seen, round(time.time() - start, 1)
+        time.sleep(1)
+    return False, seen, round(time.time() - start, 1)
+
+
 def new_session():
     """A brand-new client session opened AFTER a leader change must land on the current leader."""
     lead = leader()
@@ -120,8 +139,11 @@ def new_session():
     except Exception as e:
         outcome["write"] = f"{type(e).__name__}: {str(e).strip()}"
     outcome["rows_on_leader"] = [r[0] for r in direct(lead, "SELECT id FROM hp_demo ORDER BY id")]
+    # The routing snapshot must have followed Patroni: the demoted former leader is the
+    # read replica now, whatever role proxy.toml gives it.
+    routing_ok, outcome["routing"], outcome["routing_settled_s"] = routing_view(lead)
     outcome["pass"] = (port == NODES[lead][0] and in_rec is False and outcome["write"] == "ok"
-                       and 3 in outcome["rows_on_leader"])
+                       and 3 in outcome["rows_on_leader"] and routing_ok)
     print(json.dumps(outcome, indent=2, default=str))
     sys.exit(0 if outcome["pass"] else 1)
 
