@@ -20,20 +20,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider still reported the same leader, but a provider keeps its previous answer while
   a poll is waiting on an unreachable endpoint. With the Patroni control path cut, writes
   continued about 4 s (two endpoint timeouts) past `lease_timeout_secs`. The lease now
-  runs from the start of the probe or request that last confirmed the leader. Startup warns when
-  `poll_interval_secs` is not below `lease_timeout_secs`.
+  runs from the start of the probe or request that last confirmed the leader. Startup
+  warns when `poll_interval_secs` is not below `lease_timeout_secs`.
 - Named prepared statements across a session's backend connections (F2). A `Close`
   reaches only the connection its batch is routed to, but the proxy kept listing the
   name as prepared on the session's other connections. When a session's batches reach
   more than one node (a `/*helios:node=...*/` routing hint, a read re-routed after its
   node failed), a statement closed and re-Parsed on a standby could still run its old
   definition when a later `Bind` stayed on the primary, a `Bind` of a closed name ran
-  instead of failing with `26000`, and a new `Parse` of the name failed with `42P05`. Those connections now
-  close the name before a batch uses or redefines it (bounded by
+  instead of failing with `26000`, and a new `Parse` of the name failed with `42P05`.
+  Those connections now close the name before a batch uses or redefines it (bounded by
   `reprepare_timeout_secs`). Separately, `Close s; Parse s ...` in one batch (the Npgsql
   replacement pattern) dropped `s` from the session's record, so it could not be
   re-prepared on another connection; the record now keeps the new definition. Live
   check: `tests/integration/prepared_close_routing.py`.
+
+### Changed
+
+- Dependencies: `dashmap` 5 → 6 (6.2.1), `socket2` 0.5 → 0.6 (0.6.5, the line tokio
+  already uses), `base64` 0.21 → 0.22 (the version `reqwest` and `hyper-util` use; 0.23
+  would add a third copy). Duplicate crate versions in the all-features tree drop from 45
+  to 43; `base64` 0.21 and `hashbrown` 0.14 remain through the `config` crate. A crate
+  that builds against this one with its own lock file needs
+  `cargo update -p dashmap -p socket2 -p base64`.
 
 ### Added
 
