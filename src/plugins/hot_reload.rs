@@ -201,11 +201,6 @@ impl HotReloader {
                         ReloadEventType::Added => {
                             events.push(ReloadEvent::Added(path.clone()));
                         }
-                        ReloadEventType::Removed => {
-                            if let Some(name) = self.get_plugin_name(path) {
-                                events.push(ReloadEvent::Removed(name));
-                            }
-                        }
                     }
                     to_remove.push(path.clone());
                 }
@@ -273,8 +268,6 @@ impl HotReloader {
 enum ReloadEventType {
     Modified,
     Added,
-    #[allow(dead_code)]
-    Removed,
 }
 
 /// Reload event
@@ -284,7 +277,6 @@ pub enum ReloadEvent {
     Modified(String),
 
     /// Plugin file was removed
-    #[allow(dead_code)]
     Removed(String),
 
     /// New plugin file was added

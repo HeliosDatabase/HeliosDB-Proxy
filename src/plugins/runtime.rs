@@ -35,7 +35,6 @@ use parking_lot::RwLock;
 use wasmtime::{Engine, Instance, InstancePre, Linker, Memory, Module, Store, TypedFunc};
 
 use super::config::PluginRuntimeConfig;
-use super::host_functions::HostFunctionRegistry;
 use super::host_imports::{register_crypto_imports, register_kv_imports, KvBackend, StoreCtx};
 use super::sandbox::{PluginSandbox, ResourceLimits, SecurityPolicy};
 use super::{
@@ -133,7 +132,6 @@ pub struct LoadedPlugin {
     instance_pre: OnceLock<InstancePre<StoreCtx>>,
 
     /// Security sandbox
-    #[allow(dead_code)]
     sandbox: PluginSandbox,
 
     /// Instance data (mock for non-wasmtime builds)
@@ -156,10 +154,6 @@ struct PluginInstanceData {
 
     /// Fuel consumed (if metering enabled)
     fuel_consumed: u64,
-
-    /// Custom state from plugin
-    #[allow(dead_code)]
-    state: HashMap<String, Vec<u8>>,
 }
 
 impl LoadedPlugin {
@@ -180,7 +174,6 @@ impl LoadedPlugin {
             instance_data: RwLock::new(PluginInstanceData {
                 memory_used: 0,
                 fuel_consumed: 0,
-                state: HashMap::new(),
             }),
             loaded_at: Instant::now(),
             last_invoked: RwLock::new(None),
@@ -188,12 +181,9 @@ impl LoadedPlugin {
         }
     }
 
-    /// Borrow the compiled module (Arc-cheap clone available via
-    /// `plugin.module.clone()` if the caller needs to outlive the
-    /// borrow).
-    #[allow(dead_code)]
-    pub(crate) fn module(&self) -> &Module {
-        &self.module
+    /// Security sandbox this plugin runs under
+    pub fn sandbox(&self) -> &PluginSandbox {
+        &self.sandbox
     }
 
     /// Get memory usage
@@ -243,10 +233,6 @@ pub struct WasmPluginRuntime {
     /// Stop flag for the background epoch ticker thread (see `new`).
     epoch_stop: Arc<AtomicBool>,
 
-    /// Host function registry
-    #[allow(dead_code)]
-    host_functions: Arc<HostFunctionRegistry>,
-
     /// Per-plugin KV backend bridged into wasmtime imports. Survives
     /// across calls so plugins can persist state between hooks.
     kv: KvBackend,
@@ -265,8 +251,6 @@ pub struct WasmPluginRuntime {
 impl WasmPluginRuntime {
     /// Create a new WASM runtime
     pub fn new(config: &PluginRuntimeConfig) -> Result<Self, PluginError> {
-        let host_functions = Arc::new(HostFunctionRegistry::new());
-
         let mut engine_config = wasmtime::Config::new();
         if config.fuel_metering {
             engine_config.consume_fuel(true);
@@ -320,7 +304,6 @@ impl WasmPluginRuntime {
             engine,
             linker,
             epoch_stop,
-            host_functions,
             kv: KvBackend::with_limits(
                 config.kv_max_value_bytes,
                 config.kv_max_keys_per_plugin,
@@ -338,17 +321,8 @@ impl WasmPluginRuntime {
     pub fn kv(&self) -> &KvBackend {
         &self.kv
     }
-
-    /// Borrow the shared host-import linker (used by the manager/tests to
-    /// pre-resolve modules against the same import set).
-    #[allow(dead_code)]
-    pub(crate) fn linker(&self) -> &Linker<StoreCtx> {
-        &self.linker
-    }
-
-    /// Expose the engine so tests + the plugin manager can build new
-    /// `Store`s against it.
-    #[allow(dead_code)]
+    /// Expose the engine so tests can build new `Store`s against it.
+    #[cfg(test)]
     pub(crate) fn engine(&self) -> &Engine {
         &self.engine
     }

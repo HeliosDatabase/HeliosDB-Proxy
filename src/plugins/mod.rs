@@ -344,10 +344,6 @@ pub struct PluginManager {
     /// Hooks registry
     hooks: RwLock<HashMap<HookType, Vec<String>>>,
 
-    /// Configuration
-    #[allow(dead_code)]
-    config: PluginRuntimeConfig,
-
     /// Hot reloader (if enabled)
     hot_reloader: Option<HotReloader>,
 
@@ -371,7 +367,6 @@ impl PluginManager {
             runtime,
             plugins: DashMap::new(),
             hooks: RwLock::new(HashMap::new()),
-            config,
             hot_reloader,
             metrics,
         })
