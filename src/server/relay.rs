@@ -414,10 +414,11 @@ impl ProxyServer {
             let edge_wants = edge_ctx.is_some();
             #[cfg(not(feature = "edge-proxy"))]
             let edge_wants = false;
-            if qc_wants || edge_wants {
-                return match Self::stream_until_ready_capture(
+            if (qc_wants || edge_wants) && backend.response_buf.is_empty() {
+                return match Self::stream_until_ready_capture_buffered(
                     client,
                     &mut backend.stream,
+                    &mut backend.response_buf,
                     session,
                     state.limits.relay(),
                     config.cache.max_cacheable_response_bytes,
@@ -508,7 +509,15 @@ impl ProxyServer {
             }
         }
 
-        match Self::stream_until_ready(client, &mut backend.stream, session, state).await {
+        match Self::stream_until_ready_buffered(
+            client,
+            &mut backend.stream,
+            &mut backend.response_buf,
+            session,
+            state,
+        )
+        .await
+        {
             Ok(sent) => {
                 #[cfg(feature = "circuit-breaker")]
                 Self::circuit_record(state, &target, true, "");
@@ -689,14 +698,20 @@ impl ProxyServer {
             let Some(parse_bytes) = registry.get(name) else {
                 continue; // unknown statement — let the batch surface the error
             };
-            match Self::reprepare_statement(
-                &mut backend.stream,
-                parse_bytes,
-                state.limits.reprepare_timeout,
-                state.limits.max_backend_frame_bytes,
-            )
-            .await
-            {
+            let prepared = async {
+                // Internal ParseComplete reads must start at a frame boundary,
+                // not at a suffix left by a previous Flush/watch read.
+                Self::finish_pending_backend_frames(client, backend, state).await?;
+                Self::reprepare_statement(
+                    &mut backend.stream,
+                    parse_bytes,
+                    state.limits.reprepare_timeout,
+                    state.limits.max_backend_frame_bytes,
+                )
+                .await
+            }
+            .await;
+            match prepared {
                 Ok(()) => {
                     backend.prepared.insert(name.clone());
                 }
@@ -780,9 +795,16 @@ impl ProxyServer {
         }
 
         let r = if wait_ready {
-            Self::stream_until_ready(client, &mut backend.stream, session, state).await
+            Self::stream_until_ready_buffered(
+                client,
+                &mut backend.stream,
+                &mut backend.response_buf,
+                session,
+                state,
+            )
+            .await
         } else {
-            Self::stream_flush(client, &mut backend.stream, session, state).await
+            Self::stream_flush(client, backend, session, state).await
         };
         match r {
             Ok(sent) => {
@@ -928,9 +950,21 @@ impl ProxyServer {
     /// than O(result). Also yields on CopyInResponse/CopyBothResponse so the
     /// client can supply COPY data. Updates `tx_state` from the RFQ status.
     /// Returns bytes streamed to the client.
+    #[cfg(test)]
     pub(super) async fn stream_until_ready(
         client: &mut ClientStream,
         backend: &mut TcpStream,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+    ) -> std::result::Result<u64, ResponseFailure> {
+        Self::stream_until_ready_buffered(client, backend, &mut BytesMut::new(), session, state)
+            .await
+    }
+
+    pub(super) async fn stream_until_ready_buffered(
+        client: &mut ClientStream,
+        backend: &mut TcpStream,
+        buf: &mut BytesMut,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
     ) -> std::result::Result<u64, ResponseFailure> {
@@ -945,7 +979,6 @@ impl ProxyServer {
         let mut observation = (session.in_transaction.load(Ordering::Relaxed)
             && matches!(session.tr_mode, TrMode::Select | TrMode::Transaction))
         .then(|| Observation::new(state.limits.tr_max_observation_bytes));
-        let mut buf = BytesMut::with_capacity(16384);
         let mut sent: u64 = 0;
         let mut had_error = false;
         let mut command_complete = false;
@@ -1025,6 +1058,7 @@ impl ProxyServer {
                 };
 
                 if consumed > 0 {
+                    Self::observe_prepared_commit_frames(&buf[..consumed], state);
                     tokio::time::timeout(client_write_timeout, client.write_all(&buf[..consumed]))
                         .await
                         .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
@@ -1062,7 +1096,7 @@ impl ProxyServer {
                 buf.reserve(16384);
                 let n = tokio::time::timeout(
                     read_budget(backend_read_timeout, response_deadline)?,
-                    backend.read_buf(&mut buf),
+                    backend.read_buf(&mut *buf),
                 )
                 .await
                 .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
@@ -1107,6 +1141,7 @@ impl ProxyServer {
     /// response is reported non-cacheable. Forwarding to the client is
     /// untouched — the client still receives every byte, byte-for-byte.
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    #[cfg(test)]
     pub(super) async fn stream_until_ready_capture(
         client: &mut ClientStream,
         backend: &mut TcpStream,
@@ -1115,7 +1150,28 @@ impl ProxyServer {
         max_capture_bytes: usize,
         metrics: &ServerMetrics,
     ) -> std::result::Result<(u64, Vec<u8>, bool, usize), ResponseFailure> {
-        let mut buf = BytesMut::with_capacity(16384);
+        Self::stream_until_ready_capture_buffered(
+            client,
+            backend,
+            &mut BytesMut::new(),
+            session,
+            relay,
+            max_capture_bytes,
+            metrics,
+        )
+        .await
+    }
+
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) async fn stream_until_ready_capture_buffered(
+        client: &mut ClientStream,
+        backend: &mut TcpStream,
+        buf: &mut BytesMut,
+        session: &Arc<ClientSession>,
+        relay: RelayLimits,
+        max_capture_bytes: usize,
+        metrics: &ServerMetrics,
+    ) -> std::result::Result<(u64, Vec<u8>, bool, usize), ResponseFailure> {
         let mut sent: u64 = 0;
         let mut captured: Vec<u8> = Vec::with_capacity(4096);
         let mut had_error = false;
@@ -1232,7 +1288,7 @@ impl ProxyServer {
                 buf.reserve(16384);
                 let n = tokio::time::timeout(
                     read_budget(relay.backend_read_timeout, response_deadline)?,
-                    backend.read_buf(&mut buf),
+                    backend.read_buf(&mut *buf),
                 )
                 .await
                 .map_err(|_| ProxyError::Network("Backend read timeout".to_string()))?
@@ -1255,6 +1311,99 @@ impl ProxyServer {
         })
     }
 
+    /// Observe validated whole backend frames before publishing them. A prepared
+    /// commit is independent of local journal history and cannot be undone by a
+    /// later error or a missing Sync. Never inspect row/notice payload substrings.
+    pub(super) fn observe_prepared_commit_frames(frames: &[u8], state: &ServerState) {
+        #[cfg(feature = "query-cache")]
+        if let Some(cache) = state.query_cache.as_ref() {
+            let mut rest = frames;
+            while rest.len() >= 5 {
+                let len = u32::from_be_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
+                let Some(frame) = rest.get(..len.saturating_add(1)) else {
+                    return;
+                };
+                if frame.first() == Some(&b'C')
+                    && frame.get(5..) == Some(b"COMMIT PREPARED\0".as_slice())
+                {
+                    cache.invalidate_all();
+                }
+                rest = &rest[frame.len()..];
+            }
+        }
+        #[cfg(not(feature = "query-cache"))]
+        let _ = (frames, state);
+    }
+
+    /// Publish only whole validated frames, keeping the remainder on its socket.
+    pub(super) async fn forward_buffered_backend_frames(
+        client: &mut ClientStream,
+        buf: &mut BytesMut,
+        state: &ServerState,
+    ) -> Result<usize> {
+        let whole = Self::complete_frame_prefix(buf, state.limits.max_backend_frame_bytes)?;
+        if whole > 0 {
+            Self::observe_prepared_commit_frames(&buf[..whole], state);
+            tokio::time::timeout(
+                state.limits.client_write_timeout,
+                client.write_all(&buf[..whole]),
+            )
+            .await
+            .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
+            .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+            let _ = buf.split_to(whole);
+        }
+        if buf.len() > state.limits.max_pending_bytes {
+            return Err(ProxyError::Protocol(format!(
+                "backend frame exceeds pending byte limit {}",
+                state.limits.max_pending_bytes,
+            )));
+        }
+        Ok(whole)
+    }
+
+    /// Finish a previously buffered frame before an internal backend exchange.
+    /// Existing re-prepare timeout bounds the whole drain, including slow drip.
+    pub(super) async fn finish_pending_backend_frames(
+        client: &mut ClientStream,
+        backend: &mut BackendConn,
+        state: &ServerState,
+    ) -> Result<()> {
+        if backend.response_buf.is_empty() {
+            return Ok(());
+        }
+        tokio::time::timeout(state.limits.reprepare_timeout, async {
+            while !backend.response_buf.is_empty() {
+                let sent =
+                    Self::forward_buffered_backend_frames(client, &mut backend.response_buf, state)
+                        .await?;
+                state
+                    .metrics
+                    .bytes_sent
+                    .fetch_add(sent as u64, Ordering::Relaxed);
+                if backend.response_buf.is_empty() {
+                    break;
+                }
+                backend.response_buf.reserve(16 * 1024);
+                let n = backend
+                    .stream
+                    .read_buf(&mut backend.response_buf)
+                    .await
+                    .map_err(|e| {
+                        ProxyError::Network(format!("pending backend frame read error: {}", e))
+                    })?;
+                if n == 0 {
+                    return Err(ProxyError::Network(
+                        "backend closed with a pending frame".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| ProxyError::Network("pending backend frame timeout".to_string()))?
+    }
+
     /// Relay whatever the backend has *already* produced in response to a
     /// `Flush` (which, unlike `Sync`, yields no ReadyForQuery), then return
     /// immediately — without waiting.
@@ -1270,36 +1419,25 @@ impl ProxyServer {
     /// final ReadyForQuery via `stream_until_ready`.
     pub(super) async fn stream_flush(
         client: &mut ClientStream,
-        backend: &mut TcpStream,
+        backend: &mut BackendConn,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
     ) -> std::result::Result<u64, ResponseFailure> {
         let _ = session;
-        // Reused across every read of this call via `try_read_buf`, which
-        // writes straight into the buffer's spare capacity from the read
-        // syscall — unlike `vec![0u8; 16384]`, nothing here is
-        // zero-initialized before use.
-        let mut read_buf = BytesMut::with_capacity(16384);
         let mut sent: u64 = 0;
         let response = async {
             loop {
-                read_buf.clear();
-                match backend.try_read_buf(&mut read_buf) {
+                sent +=
+                    Self::forward_buffered_backend_frames(client, &mut backend.response_buf, state)
+                        .await? as u64;
+                backend.response_buf.reserve(16 * 1024);
+                match backend.stream.try_read_buf(&mut backend.response_buf) {
                     Ok(0) => {
                         return Err(ProxyError::Connection(
                             "Backend closed mid-flush".to_string(),
                         ))
                     }
-                    Ok(n) => {
-                        tokio::time::timeout(
-                            state.limits.client_write_timeout,
-                            client.write_all(&read_buf[..n]),
-                        )
-                        .await
-                        .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
-                        .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
-                        sent += n as u64;
-                    }
+                    Ok(_) => {}
                     // Nothing more instantly available — the backend watch delivers
                     // any remaining Flush output as it arrives.
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(sent),

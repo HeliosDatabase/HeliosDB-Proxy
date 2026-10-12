@@ -338,6 +338,12 @@ impl ProxyServer {
             return;
         };
 
+        // A buffered response belongs to this socket's previous user. Never
+        // park it after discarding a partial frame and lose wire alignment.
+        if !bc.response_buf.is_empty() {
+            return;
+        }
+
         // Conditional reset: a connection that provably touched no session
         // state — no dirtying simple statement, no named prepared statement, no
         // unnamed prepared statement — can be parked WITHOUT the `DISCARD ALL`

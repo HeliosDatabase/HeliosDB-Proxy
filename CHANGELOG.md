@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after an optional `fence_command`. Requires `[topology] provider = "postgres"`.
   Status at `GET /api/promotion`. The `[ha]` rejection message now points here.
 
+### Changed
+
+- `JournalOp` gains a `PreparedCommitted` variant (cache notification for a
+  successful `COMMIT PREPARED`). Downstream exhaustive matches on this public enum
+  must handle it; it never creates replayable journal history.
+
 ### Fixed
 
 - With a topology provider (`patroni`, `postgres`), a new client session opened
@@ -27,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A backend login rejection now reaches the client as exactly one terminal
   startup error; the proxy no longer appends a second `08006` after forwarding the
   backend's `28P01`. Proxy-generated startup errors are unchanged.
+- A successful `COMMIT PREPARED` invalidates the whole query cache before its
+  completion reaches the client, including a transaction prepared by another
+  session and Execute/Flush without Sync. Failed commits and `ROLLBACK PREPARED`
+  do not invalidate. Partial backend frames now stay with their own connection
+  across Flush, the idle backend watch and Sync.
 - Cache fills no longer grow an unused key-to-tables reverse index that was
   never cleaned up after table invalidation. The public lookup and unregister
   APIs remain, scanning the forward index.

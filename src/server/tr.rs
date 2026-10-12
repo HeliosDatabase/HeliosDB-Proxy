@@ -1605,6 +1605,16 @@ impl ProxyServer {
         let expired = || ProxyError::Network("recovery deadline exceeded".to_string());
         loop {
             let node = Self::select_primary_until(session, state, config, deadline).await?;
+            // Routing can retain another node's socket with an unpublished
+            // Flush/watch tail. Internal restore reads require a fresh frame
+            // boundary; discard that socket rather than consume its suffix as
+            // the reply to a restore statement.
+            if conns
+                .get(&node)
+                .is_some_and(|bc| !bc.response_buf.is_empty())
+            {
+                conns.remove(&node);
+            }
             let err = match tokio::time::timeout_at(
                 deadline,
                 Self::ensure_conn(conns, &node, session, config, state),
@@ -1682,6 +1692,11 @@ impl ProxyServer {
         let bc = conns.get_mut(node).ok_or_else(|| {
             ReplayFailure::Backend(ProxyError::Connection("no connection".into()))
         })?;
+        if !bc.response_buf.is_empty() {
+            return Err(ReplayFailure::Backend(ProxyError::Protocol(
+                "cannot replay on a connection with an unpublished response frame".into(),
+            )));
+        }
         let wt = state.limits.backend_write_timeout;
         let rt = state.limits.backend_read_timeout;
         let mf = state.limits.max_backend_frame_bytes;

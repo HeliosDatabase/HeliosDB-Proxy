@@ -369,6 +369,10 @@ impl ProxyServer {
                     stage.tables.clear();
                     stage.unknown = false;
                 }
+                // COMMIT PREPARED can finish a transaction prepared by a
+                // different session or proxy. Its table set is unknown, so
+                // invalidate every tier before forwarding ReadyForQuery.
+                JournalOp::PreparedCommitted => work.all = true,
                 JournalOp::Begin { .. }
                 | JournalOp::Savepoint { .. }
                 | JournalOp::RollbackTo { .. } => {}

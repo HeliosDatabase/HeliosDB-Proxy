@@ -461,6 +461,9 @@ pub enum JournalOp {
     Commit { tx_id: Uuid, tag: String },
     /// The backend rolled the transaction back (or it was lost).
     Rollback { tx_id: Uuid },
+    /// A two-phase transaction committed, possibly from another session.
+    /// Its writes are not replayable journal history, but caches must expire.
+    PreparedCommitted,
     /// An auto-commit statement or an implicit multi-statement transaction
     /// committed: record it as one committed transaction.
     AutoCommit {
@@ -713,6 +716,17 @@ impl SessionCapture {
     /// return the journal operations to apply. Also clears the cycle.
     pub fn observe(&mut self, outcome: &ResponseOutcome) -> Vec<JournalOp> {
         let mut ops = std::mem::take(&mut self.deferred);
+        // CommandComplete is authoritative: the preparing session and its
+        // write set may be unknown here. Inspect every completion, including
+        // one followed by a later error in an extended-protocol cycle. That
+        // error cannot undo a prepared transaction already committed. Using
+        // the backend tag also covers comments and batches without parsing a
+        // global transaction identifier or changing journal replay semantics.
+        if outcome.completions.iter().any(
+            |completion| matches!(completion, Completion::Tag(tag) if tag.eq_ignore_ascii_case("COMMIT PREPARED")),
+        ) {
+            ops.push(JournalOp::PreparedCommitted);
+        }
         let pending = std::mem::take(&mut self.pending);
         self.execs = 0;
         let mut implicit: Vec<NewEntry> = Vec::new();
@@ -1118,6 +1132,9 @@ pub fn apply_ops(
                 }
                 applied.rolled_back += 1;
             }
+            // The preparing session's history is deliberately not retained
+            // at PREPARE TRANSACTION. Only cache observers consume this op.
+            JournalOp::PreparedCommitted => {}
             JournalOp::AutoCommit {
                 entries,
                 tag,
@@ -1430,6 +1447,42 @@ mod tests {
             failed(b'I', &["INSERT 0 1"])
         )
         .is_empty());
+    }
+
+    #[test]
+    fn prepared_commit_extended_completion_survives_later_error() {
+        let mut c = SessionCapture::default();
+        c.begin_cycle();
+        c.note_parse("commit", "COMMIT PREPARED 'remote'", vec![]);
+        c.note_bind(&bind_payload("commit_portal", "commit", &[], &[]));
+        assert!(c.note_execute("commit_portal"));
+        c.note_parse("later", "SELECT 1 / 0", vec![]);
+        c.note_bind(&bind_payload("later_portal", "later", &[], &[]));
+        assert!(!c.note_execute("later_portal"));
+        assert_eq!(
+            c.observe(&failed(b'I', &["COMMIT PREPARED"])),
+            vec![JournalOp::PreparedCommitted]
+        );
+        assert!(!c.in_transaction());
+        assert!(c.close().is_empty());
+    }
+
+    #[test]
+    fn prepared_commit_does_not_create_replay_history() {
+        let journal = TransactionJournal::new();
+        let mut local = None;
+        let applied = apply_ops(
+            &journal,
+            vec![JournalOp::PreparedCommitted],
+            Uuid::new_v4(),
+            node_id_for_backend("127.0.0.1:5432"),
+            &SourceIdentity::default(),
+            &mut local,
+        );
+        assert_eq!(applied.committed, 0);
+        assert_eq!(applied.statements, 0);
+        assert_eq!(applied.rolled_back, 0);
+        assert!(local.is_none());
     }
 
     #[test]

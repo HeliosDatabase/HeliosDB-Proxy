@@ -211,6 +211,9 @@ pub struct ExtendedBatchLog {
 /// know".
 pub(super) struct BackendConn {
     pub(super) stream: TcpStream,
+    /// Unpublished backend frame tail, owned by this socket across Flush,
+    /// idle watch and Sync. Dropped with the socket, never moved to another node.
+    pub(super) response_buf: BytesMut,
     pub(super) prepared: HashSet<String>,
     /// Signature (query text + parameter-type OIDs) of the *unnamed* prepared
     /// statement currently established on this socket, if any. When the client
@@ -235,6 +238,7 @@ impl BackendConn {
     pub(super) fn new(stream: TcpStream) -> Self {
         Self {
             stream,
+            response_buf: BytesMut::new(),
             prepared: HashSet::new(),
             unnamed_sig: None,
             #[cfg(feature = "pool-modes")]

@@ -601,14 +601,18 @@ feeds the transaction journal), on the simple and the extended protocol alike:
   when the backend reports the commit, before the client sees it, so an entry a
   concurrent reader refilled from pre-commit data is refused; a rollback drops the
   stage;
+- a successful `COMMIT PREPARED` invalidates the whole cache before its
+  completion reaches the client, even when another session prepared the
+  transaction or the client uses Execute/Flush without Sync; `PREPARE
+  TRANSACTION` and `ROLLBACK PREPARED` do not publish changes;
 - a result whose tables were written while it was being fetched is not stored;
 - a write whose tables cannot be read from its text — DDL, `TRUNCATE`, `COPY`,
   `EXECUTE`, `CALL`, `DO` — invalidates the whole cache.
 
 Not covered: writes that do not pass through this proxy (another proxy, a direct
 connection, a trigger or function writing a table other than the one named in the
-statement), and two-phase commit (`PREPARE TRANSACTION` / `COMMIT PREPARED`: the
-prepared transaction's tables are not invalidated when it is committed). Such changes
+statement). A `COMMIT PREPARED` sent through this proxy is covered even if the
+transaction was prepared elsewhere; a commit bypassing this proxy is not. Such changes
 become visible when the entry's `ttl_secs` expires; keep the TTL short, or leave the
 cache off, for tables written that way.
 

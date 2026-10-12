@@ -12,6 +12,7 @@ fn test_config() -> ProxyConfig {
 }
 
 // ---- single-pass statement facts ----
+mod prepared_commit_flush;
 mod startup_terminal;
 mod stmt_facts;
 
@@ -863,7 +864,8 @@ async fn stream_flush_relays_available_bytes_then_returns_without_blocking() {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt as _;
 
-    let (mut backend, mut backend_peer) = pair().await;
+    let (backend, mut backend_peer) = pair().await;
+    let mut backend = BackendConn::new(backend);
     let (client_raw, mut client_peer) = pair().await;
     let mut client = ClientStream::Plain(client_raw);
     let session = make_test_session();
@@ -873,7 +875,10 @@ async fn stream_flush_relays_available_bytes_then_returns_without_blocking() {
     // Larger than one 16 KiB read, so a correct implementation must
     // loop `try_read_buf` (clearing and refilling the same buffer)
     // rather than stopping after the first chunk.
-    let bytes: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    let mut bytes = vec![b'd'];
+    bytes.extend_from_slice(&((payload.len() + 4) as u32).to_be_bytes());
+    bytes.extend_from_slice(&payload);
 
     // Both sides of the relay run concurrently with the `stream_flush`
     // calls below, so the test does not depend on 40 KB fitting in the
@@ -896,7 +901,7 @@ async fn stream_flush_relays_available_bytes_then_returns_without_blocking() {
         got
     });
 
-    backend.readable().await.unwrap();
+    backend.stream.readable().await.unwrap();
     // `stream_flush` is non-blocking (`try_read_buf`), so a single call
     // may see only part of the payload if the kernel hasn't finished
     // delivering it yet on a loaded host: loop calls (each `clear()`ing
@@ -1511,7 +1516,6 @@ async fn read_next_client_message_times_out_while_watching_the_backend() {
         &mut buffer,
         &mut conns,
         Some("node-a"),
-        &mut BytesMut::with_capacity(16384),
         Some(deadline),
         &server.state,
     )
@@ -1560,14 +1564,12 @@ async fn watch_relay_withholds_partial_backend_frames() {
     backend_peer.flush().await.unwrap();
 
     // The relay sees the head of the frame and must publish nothing.
-    let mut abuf = BytesMut::with_capacity(16384);
     let deadline = tokio::time::Instant::now() + Duration::from_millis(120);
     let outcome = ProxyServer::read_next_client_message(
         &mut stream,
         &mut buffer,
         &mut conns,
         Some("node-a"),
-        &mut abuf,
         Some(deadline),
         &server.state,
     )
@@ -1575,7 +1577,7 @@ async fn watch_relay_withholds_partial_backend_frames() {
     .unwrap();
     assert_eq!(outcome, ClientRead::IdleTimeout);
     assert_eq!(
-        abuf.len(),
+        conns["node-a"].response_buf.len(),
         split,
         "the partial frame must be retained for reassembly"
     );
@@ -1595,14 +1597,16 @@ async fn watch_relay_withholds_partial_backend_frames() {
         &mut buffer,
         &mut conns,
         Some("node-a"),
-        &mut abuf,
         Some(deadline),
         &server.state,
     )
     .await
     .unwrap();
     assert_eq!(outcome, ClientRead::IdleTimeout);
-    assert!(abuf.is_empty(), "a fully forwarded frame leaves no tail");
+    assert!(
+        conns["node-a"].response_buf.is_empty(),
+        "a fully forwarded frame leaves no tail"
+    );
     let mut got = vec![0u8; whole.len()];
     tokio::time::timeout(Duration::from_millis(200), client_peer.read_exact(&mut got))
         .await

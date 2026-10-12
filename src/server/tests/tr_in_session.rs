@@ -2472,6 +2472,86 @@ mod c02_cache_work {
         ProxyServer::cache_work_from_ops(&qc, &ops, stage)
     }
 
+    // Regression coverage uses only pre-existing APIs so the same tests run
+    // against the unchanged baseline production implementation.
+    fn prepared_cycle(sql: &str, tags: &[&str], error: bool) -> CacheWork {
+        use crate::journal_capture::{Completion, ResponseOutcome, SessionCapture};
+        let mut capture = SessionCapture::default();
+        capture.begin_cycle();
+        assert!(capture.register_simple(sql));
+        let ops = capture.observe(&ResponseOutcome {
+            status: b'I',
+            completions: tags.iter().map(|s| Completion::Tag((*s).into())).collect(),
+            error: error.then(|| ("42704".into(), "prepared transaction missing".into())),
+        });
+        run(ops, &mut TxCacheStage::default())
+    }
+
+    #[test]
+    fn prepared_commit_invalidates_without_local_write_stage() {
+        let work = prepared_cycle(
+            "COMMIT PREPARED 'from_another_session'",
+            &["COMMIT PREPARED"],
+            false,
+        );
+        assert!(work.all, "a prepared transaction can modify unknown tables");
+        assert!(work.tables.is_empty());
+    }
+
+    #[test]
+    fn prepared_commit_comment_and_quoted_gid_invalidate() {
+        let work = prepared_cycle(
+            "COMMIT /* note */ PREPARED 'gid;with''quote'",
+            &["COMMIT PREPARED"],
+            false,
+        );
+        assert!(work.all);
+    }
+
+    #[test]
+    fn preparing_transaction_drops_stage_without_publishing() {
+        use crate::journal_capture::{Completion, ResponseOutcome, SessionCapture};
+        let qc = QueryCache::new(CacheConfig::default());
+        let mut capture = SessionCapture::default();
+        let mut stage = TxCacheStage::default();
+        for (sql, tag, status) in [
+            ("BEGIN", "BEGIN", b'T'),
+            ("UPDATE accounts SET v=1", "UPDATE 1", b'T'),
+            ("PREPARE TRANSACTION 'g'", "PREPARE TRANSACTION", b'I'),
+        ] {
+            capture.begin_cycle();
+            assert!(capture.register_simple(sql));
+            let ops = capture.observe(&ResponseOutcome {
+                status,
+                completions: vec![Completion::Tag(tag.into())],
+                error: None,
+            });
+            let work = ProxyServer::cache_work_from_ops(&qc, &ops, &mut stage);
+            assert!(!work.all && work.tables.is_empty(), "{sql} is not a commit");
+            if sql.starts_with("UPDATE") {
+                assert_eq!(stage.tables, vec!["accounts"]);
+            }
+        }
+        assert!(stage.tables.is_empty());
+        assert!(!stage.unknown);
+    }
+
+    #[test]
+    fn prepared_commit_requires_successful_backend_completion() {
+        for (sql, tags, error) in [
+            ("COMMIT PREPARED 'missing'", vec![], true),
+            ("COMMIT PREPARED 'not_executed'", vec![], false),
+            (
+                "ROLLBACK PREPARED 'discarded'",
+                vec!["ROLLBACK PREPARED"],
+                false,
+            ),
+        ] {
+            let work = prepared_cycle(sql, &tags, error);
+            assert!(!work.all && work.tables.is_empty(), "{sql}");
+        }
+    }
+
     #[test]
     fn autocommit_write_invalidates_its_tables_at_once() {
         let mut stage = TxCacheStage::default();

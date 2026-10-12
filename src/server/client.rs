@@ -405,7 +405,6 @@ impl ProxyServer {
         buffer: &mut BytesMut,
         conns: &mut HashMap<String, BackendConn>,
         watch_node: Option<&str>,
-        abuf: &mut BytesMut,
         idle_deadline: Option<tokio::time::Instant>,
         state: &Arc<ServerState>,
     ) -> Result<ClientRead> {
@@ -426,15 +425,17 @@ impl ProxyServer {
         loop {
             let mut backend_gone = false;
             let mut client_bytes: Option<usize> = None;
-            // `abuf` is the caller's session-scoped reassembly buffer (Fix S4:
-            // reused, never re-allocated, and never zero-filled — `read_buf`
-            // appends into spare capacity). It is deliberately NOT cleared here:
-            // one read can end mid-frame, and only whole frames may be forwarded,
-            // so any trailing partial frame stays buffered until the rest of it
-            // arrives.
-            abuf.reserve(16 * 1024);
+            // Every relay of this socket shares its unpublished frame tail.
             {
                 let bc = conns.get_mut(node).expect("watch_node is in conns");
+                let sent =
+                    Self::forward_buffered_backend_frames(stream, &mut bc.response_buf, state)
+                        .await?;
+                state
+                    .metrics
+                    .bytes_sent
+                    .fetch_add(sent as u64, Ordering::Relaxed);
+                bc.response_buf.reserve(16 * 1024);
                 tokio::select! {
                     r = stream.read_buf(buffer) => {
                         client_bytes = Some(r.map_err(|e| {
@@ -442,7 +443,7 @@ impl ProxyServer {
                         })?);
                     }
                     _ = &mut idle_wait => return Ok(ClientRead::IdleTimeout),
-                    r = bc.stream.read_buf(&mut *abuf) => match r {
+                    r = bc.stream.read_buf(&mut bc.response_buf) => match r {
                         Ok(0) => backend_gone = true,
                         Ok(_) => {
                             // Publish only COMPLETE frames. A truncated frame is
@@ -451,23 +452,8 @@ impl ProxyServer {
                             // not an ErrorResponse, and certainly not the rows of
                             // a re-executed statement, which would be appended to
                             // whatever the partial frame turns out to be.
-                            let whole = Self::complete_frame_prefix(abuf, state.limits.max_backend_frame_bytes)?;
-                            if whole > 0 {
-                                tokio::time::timeout(state.limits.client_write_timeout, stream.write_all(&abuf[..whole]))
-                                    .await
-                                    .map_err(|_| ProxyError::Network("Client write timeout".to_string()))?
-                                    .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
-                                let _ = abuf.split_to(whole);
-                                state.metrics.bytes_sent.fetch_add(whole as u64, Ordering::Relaxed);
-                            }
-                            // A single asynchronous frame must not grow the
-                            // session's memory without bound while it reassembles.
-                            if abuf.len() > state.limits.max_pending_bytes {
-                                return Err(ProxyError::Protocol(format!(
-                                    "backend asynchronous frame exceeds {} bytes",
-                                    state.limits.max_pending_bytes
-                                )));
-                            }
+                            let sent = Self::forward_buffered_backend_frames(stream, &mut bc.response_buf, state).await?;
+                            state.metrics.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
                         }
                         Err(e) => {
                             tracing::debug!(node = %node, error = %e, "backend read error while idle; dropping cached connection");
@@ -483,7 +469,6 @@ impl ProxyServer {
                 // frame dies with it: it was never published, so the client
                 // stream stays frame-aligned and a synthesized error or a
                 // re-executed statement can still be written safely.
-                abuf.clear();
                 conns.remove(node);
                 return Self::read_client_bytes(stream, buffer, idle_deadline).await;
             }
@@ -617,14 +602,6 @@ impl ProxyServer {
         // target connection is known. Holds (full Parse message, signature).
         let promote_unnamed = config.optimize_unnamed_parse;
         let mut held_unnamed: Option<(bytes::Bytes, bytes::Bytes)> = None;
-        // Scratch buffer for the backend-watch below, created once per
-        // session rather than once per client-message wait (a stack array
-        // here would force the whole `handle_client` future to carry 16 KiB
-        // live across every `.await` in this loop). Cleared — not
-        // re-allocated — before each backend read via the same `clear()` +
-        // `read_buf`-into-spare-capacity idiom `stream_flush` uses below, so
-        // steady state costs no allocation and no zero-fill.
-        let mut abuf = BytesMut::with_capacity(16384);
         // In-session Transaction Replay state (`tr_mode`): tracked session
         // SETs, the lost-while-idle backend, the aborted-transaction emulation
         // and the open extended-protocol cycle. See `tr_handle_fault`.
@@ -669,7 +646,6 @@ impl ProxyServer {
                 &mut buffer,
                 &mut conns,
                 watch_node,
-                &mut abuf,
                 idle_deadline,
                 state,
             )
@@ -1442,9 +1418,10 @@ impl ProxyServer {
                                 }
                                 if is_copy_end {
                                     let node = current_node.clone().unwrap();
-                                    let r = Self::stream_until_ready(
+                                    let r = Self::stream_until_ready_buffered(
                                         stream,
                                         &mut b.stream,
+                                        &mut b.response_buf,
                                         session,
                                         state,
                                     )
