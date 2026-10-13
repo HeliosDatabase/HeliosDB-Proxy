@@ -169,6 +169,20 @@ session; writes, COPY and every response outside these modes are never held. A b
 whose unnamed `Parse` the proxy answered from its promotion cache has already shown the
 client a `ParseComplete`, so holding cannot make that batch retryable.
 
+Measured on 2026-10-13 with the P-01 user-path harness (`scripts/regress/bench-usertp.sh`,
+16 clients, `tr_mode = "select"`, 3 interleaved passes, same binary, holding off vs
+`tr_buffer_small_reads_bytes = 65536`, PostgreSQL 18.4 on the same host):
+
+| pool mode | read TPS | read p99 | first-row latency | proxy RSS |
+|---|---|---|---|---|
+| session | 47,551 → 48,721 (+2.5 %) | 0.44 → 0.40 ms | 35.9 → 38.4 ms | 11.6 → 11.8 MB |
+| transaction | 34,108 → 34,235 (+0.4 %) | 0.60 → 0.55 ms | 37.8 → 37.7 ms | 14.2 → 14.2 MB |
+
+pgbench's reads return one row, which PostgreSQL sends in one flush, so holding costs
+nothing measurable there. The first-row column times 20 one-row `psql` round trips,
+including client start-up, and moves within its noise. The cost grows with the size of
+the held response, because no row reaches the client until the whole response arrived.
+
 **What recovery does.** Under one deadline (`write_timeout_secs`) it waits for a healthy
 primary, connects and authenticates, restores the session's tracked `SET` state, and
 replays the recorded transaction. Each replayed statement's response is hashed and
