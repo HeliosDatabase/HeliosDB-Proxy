@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replay was about to recover. With `tr_mode` other than `none` the frame is now dropped
   and the backend treated as gone. With `tr_mode = "none"` nothing is restored, so the
   FATAL still reaches the client as its notice that the session state is lost.
+- Topology authority lease (H-02): the tracker refreshed the lease to "now" whenever the
+  provider still reported the same leader, but a provider keeps its previous answer while
+  a poll is waiting on an unreachable endpoint. With the Patroni control path cut, writes
+  continued about 4 s (two endpoint timeouts) past `lease_timeout_secs`. The lease now
+  runs from the start of the probe or request that last confirmed the leader. Startup warns when
+  `poll_interval_secs` is not below `lease_timeout_secs`.
 
 ### Added
 

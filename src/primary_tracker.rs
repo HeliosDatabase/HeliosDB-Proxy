@@ -104,6 +104,16 @@ pub trait TopologyProvider: Send + Sync + 'static {
     fn members(&self) -> Vec<TopologyMember> {
         Vec::new()
     }
+
+    /// When the current primary was last confirmed: the start of the probe
+    /// or request whose answer named it. The tracker refreshes its authority
+    /// lease to this instant, never to "now": a poll that hangs on an
+    /// unreachable authority must not keep the lease alive from the previous
+    /// answer. `None` (the default) for a provider that pushes its state,
+    /// whose report is current when read.
+    fn confirmed_at(&self) -> Option<Instant> {
+        None
+    }
 }
 
 /// Pick the primary among nodes that each report themselves writable
@@ -159,6 +169,8 @@ pub struct PostgresTopologyProvider {
     conflict: std::sync::atomic::AtomicBool,
     /// Polls that found conflicting writable nodes (resolved or not).
     conflicts_total: AtomicU64,
+    /// Start of the probe that last found the current primary writable.
+    confirmed_at: RwLock<Option<Instant>>,
 }
 
 #[cfg(feature = "postgres-topology")]
@@ -186,6 +198,7 @@ impl PostgresTopologyProvider {
             tls_mode: crate::backend::TlsMode::Prefer,
             conflict: std::sync::atomic::AtomicBool::new(false),
             conflicts_total: AtomicU64::new(0),
+            confirmed_at: RwLock::new(None),
         }
     }
 
@@ -219,8 +232,11 @@ impl PostgresTopologyProvider {
     /// Poll all nodes and detect primary.
     async fn poll_nodes(&self) {
         let mut writable: Vec<usize> = Vec::new();
+        // When each node's probe started: the instant its answer stands for.
+        let mut probed_at = Vec::with_capacity(self.nodes.len());
 
         for (idx, node) in self.nodes.iter().enumerate() {
+            probed_at.push(Instant::now());
             match self.probe_recovery(node).await {
                 Ok(in_recovery) => {
                     // A node reporting `pg_is_in_recovery() = false` is
@@ -282,6 +298,7 @@ impl PostgresTopologyProvider {
 
         let old_primary_id = self.current_primary.read().as_ref().map(|p| p.node_id);
         let new_primary_id = next_primary.as_ref().map(|p| p.node_id);
+        *self.confirmed_at.write() = chosen.map(|idx| probed_at[idx]);
         if old_primary_id != new_primary_id {
             *self.current_primary.write() = next_primary;
             if let Some(new_id) = new_primary_id {
@@ -359,6 +376,10 @@ impl TopologyProvider for PostgresTopologyProvider {
 
     fn conflicts_total(&self) -> u64 {
         self.conflicts_total.load(Ordering::Relaxed)
+    }
+
+    fn confirmed_at(&self) -> Option<Instant> {
+        *self.confirmed_at.read()
     }
 }
 
@@ -509,6 +530,9 @@ pub struct PatroniTopologyProvider {
     timeline: AtomicU64,
     conflict: std::sync::atomic::AtomicBool,
     conflicts_total: AtomicU64,
+    /// Start of the `GET /cluster` request that last named (and, with lock
+    /// confirmation, confirmed) the current leader.
+    confirmed_at: RwLock<Option<Instant>>,
     event_tx: broadcast::Sender<TopologyEvent>,
 }
 
@@ -531,6 +555,7 @@ impl PatroniTopologyProvider {
             members: RwLock::new(Vec::new()),
             current: RwLock::new(None),
             timeline: AtomicU64::new(0),
+            confirmed_at: RwLock::new(None),
             conflict: std::sync::atomic::AtomicBool::new(false),
             conflicts_total: AtomicU64::new(0),
             event_tx,
@@ -607,10 +632,15 @@ impl PatroniTopologyProvider {
 
     async fn poll(&self) {
         let mut view = None;
+        // Start of the request that answered: endpoints that timed out
+        // before it do not age the answer.
+        let mut fetched_at = None;
         for ep in &self.endpoints {
+            let at = Instant::now();
             match self.fetch(ep).await {
                 Ok(body) => {
                     view = Some(parse_patroni_cluster(&body, &self.nodes));
+                    fetched_at = Some(at);
                     break;
                 }
                 Err(e) => tracing::warn!(error = %e, "patroni topology: endpoint unavailable"),
@@ -636,10 +666,11 @@ impl PatroniTopologyProvider {
                 view.reason = Some(format!("leader lock not confirmed ({e})"));
             }
         }
-        self.apply(view);
+        self.apply(view, fetched_at);
     }
 
-    fn apply(&self, view: PatroniView) {
+    fn apply(&self, view: PatroniView, fetched_at: Option<Instant>) {
+        *self.confirmed_at.write() = view.leader.as_ref().and(fetched_at);
         *self.members.write() = view.members;
         if view.conflict {
             self.conflicts_total.fetch_add(1, Ordering::Relaxed);
@@ -695,6 +726,10 @@ impl TopologyProvider for PatroniTopologyProvider {
 
     fn conflicts_total(&self) -> u64 {
         self.conflicts_total.load(Ordering::Relaxed)
+    }
+
+    fn confirmed_at(&self) -> Option<Instant> {
+        *self.confirmed_at.read()
     }
 
     fn leader_timeline(&self) -> Option<u64> {
@@ -1064,11 +1099,17 @@ impl PrimaryTracker {
 
     // ── Internal helpers ────────────────────────────────────────────
 
+    /// The instant a provider's current answer stands for: when it last
+    /// confirmed its primary, or now for a provider that does not say (H-02).
+    fn confirmed_by(provider: &dyn TopologyProvider) -> Instant {
+        provider.confirmed_at().unwrap_or_else(Instant::now)
+    }
+
     fn detect_primary_from_provider(&self, provider: &dyn TopologyProvider) {
         if let Some(primary) = provider.get_primary() {
             // A heartbeat on the same address refreshes the lease; only an
             // address change advances the authority epoch.
-            *self.last_refresh.write() = Some(Instant::now());
+            *self.last_refresh.write() = Some(Self::confirmed_by(provider));
             let same = self
                 .current_primary
                 .read()
@@ -1101,7 +1142,7 @@ impl PrimaryTracker {
         // Already following `new` (the periodic check reconciled first, or a
         // duplicate event): refresh the lease, do not start a new epoch.
         if self.current_primary.read().as_ref().map(|p| p.node_id) == Some(new) {
-            *self.last_refresh.write() = Some(Instant::now());
+            *self.last_refresh.write() = Some(Self::confirmed_by(provider));
             return;
         }
         let address = provider
@@ -1119,7 +1160,7 @@ impl PrimaryTracker {
         };
 
         *self.current_primary.write() = Some(info);
-        *self.last_refresh.write() = Some(Instant::now());
+        *self.last_refresh.write() = Some(Self::confirmed_by(provider));
 
         let _ = self
             .event_tx
@@ -1163,7 +1204,7 @@ impl PrimaryTracker {
             if provider_id == Some(id) {
                 // Heartbeat: the provider still reports this leader, so the
                 // authority lease is refreshed (H-02).
-                *self.last_refresh.write() = Some(Instant::now());
+                *self.last_refresh.write() = Some(Self::confirmed_by(provider));
             } else if let Some(new) = provider_id {
                 // The provider names a different leader: follow it. Its change
                 // event normally gets here first; this reconciles a missed or
@@ -1494,6 +1535,8 @@ mod tests {
         /// Known nodes, kept even after they stop being primary so `get_node`
         /// mirrors the postgres provider (which knows its configured nodes).
         nodes: RwLock<std::collections::HashMap<Uuid, TopologyNodeInfo>>,
+        /// What `confirmed_at` reports (`None`: a push-style provider).
+        confirmed: RwLock<Option<Instant>>,
     }
 
     impl MockTopology {
@@ -1503,6 +1546,7 @@ mod tests {
                 event_tx,
                 primary: RwLock::new(None),
                 nodes: RwLock::new(std::collections::HashMap::new()),
+                confirmed: RwLock::new(None),
             }
         }
 
@@ -1535,6 +1579,47 @@ mod tests {
         fn get_node(&self, id: Uuid) -> Option<TopologyNodeInfo> {
             self.nodes.read().get(&id).cloned()
         }
+
+        fn confirmed_at(&self) -> Option<Instant> {
+            *self.confirmed.read()
+        }
+    }
+
+    /// H-02: a poll that hangs on an unreachable authority leaves the
+    /// provider's cached leader in place. The tracker's heartbeats must not
+    /// extend the lease from that stale answer: the lease runs from the last
+    /// confirmation, so writes stop when it does (the Patroni demo's
+    /// control-partition drill saw them continue ~4 s past expiry).
+    #[test]
+    fn test_lease_runs_from_the_last_confirmation_not_the_last_heartbeat() {
+        let topo = Arc::new(MockTopology::new());
+        let leader = Uuid::new_v4();
+        topo.set_primary(leader, "primary-a:5432");
+        *topo.confirmed.write() = Some(Instant::now());
+        let tracker = PrimaryTracker::with_provider(topo.clone())
+            .with_lease_timeout(Duration::from_millis(100));
+        tracker.detect_primary_from_provider(&*topo);
+        assert!(tracker.authority_valid());
+
+        // The authority stops answering; the cached leader stays. Heartbeats
+        // keep arriving every 20 ms.
+        let deadline = Instant::now() + Duration::from_millis(160);
+        while Instant::now() < deadline {
+            tracker.periodic_check(&*topo);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !tracker.authority_valid(),
+            "heartbeats on a stale answer must not keep the lease alive"
+        );
+        assert_eq!(tracker.get_primary_id(), Some(leader));
+
+        // A fresh confirmation renews it, without a new epoch.
+        let epoch = tracker.get_epoch();
+        *topo.confirmed.write() = Some(Instant::now());
+        tracker.periodic_check(&*topo);
+        assert!(tracker.authority_valid());
+        assert_eq!(tracker.get_epoch(), epoch);
     }
 
     #[test]

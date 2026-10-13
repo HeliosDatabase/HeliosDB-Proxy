@@ -97,7 +97,13 @@ operator CRD status):
 
 A provider-backed tracker keeps a **lease**. Every provider observation refreshes the
 tracker's `last_refresh`; authority is valid only while
-`now - last_refresh <= topology.lease_timeout_secs`. `select_primary_until` consults
+`now - last_refresh <= topology.lease_timeout_secs`. `last_refresh` is when the
+provider's answer was obtained (the start of the node probe or `GET /cluster` request
+that named the leader), not the moment the tracker read it: while a poll hangs on an
+unreachable endpoint (up to `patroni_request_timeout_ms` per endpoint) the provider
+still reports its previous answer, and that answer only ages. Keep
+`poll_interval_secs` well below `lease_timeout_secs`; startup warns when it is not,
+because the lease would then lapse between healthy polls. `select_primary_until` consults
 `authority_valid()` before touching any configured node, so when the provider — or the
 control path to it — is unreachable:
 

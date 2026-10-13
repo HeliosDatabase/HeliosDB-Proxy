@@ -2498,6 +2498,19 @@ impl ProxyConfig {
                 "topology.lease_timeout_secs must be >= 1".to_string(),
             ));
         }
+        // H-02: the lease runs from the provider probe that last confirmed
+        // the leader, so a poll interval at least as long as the lease lets
+        // it lapse between healthy polls and writes pause until the next
+        // one. Warn only: such configs started before.
+        if self.topology.provider != TopologyProviderKind::Static
+            && self.topology.poll_interval_secs >= self.topology.lease_timeout_secs
+        {
+            tracing::warn!(
+                poll_interval_secs = self.topology.poll_interval_secs,
+                lease_timeout_secs = self.topology.lease_timeout_secs,
+                "topology.poll_interval_secs >= topology.lease_timeout_secs: the authority lease lapses between polls and writes pause until the next poll confirms the leader"
+            );
+        }
         self.auto_promote.validate(self)?;
         // D-05 strict mode: a setting must not promise behavior the binary
         // cannot deliver.
