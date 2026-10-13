@@ -229,76 +229,60 @@ jobs:
           --features "all-features,postgres-topology"
           -- --include-ignored
 
-  # ── Integration tests: HeliosDB Nano 3.58 primary + standby ─────────
-  # NON-BLOCKING (continue-on-error) — expected to stay red until a maintainer
-  # acts. See "MAINTAINER ACTION REQUIRED" below.
+  # ── Integration tests: HeliosDB Nano 4.41 primary + standby ─────────
+  # NON-BLOCKING (continue-on-error): Nano is a separately released engine, so a
+  # Nano regression shows here without blocking Proxy merges.
   #
-  #   MAINTAINER ACTION REQUIRED — GHCR package-visibility blocker:
-  #   The nano service image ghcr.io/heliosdatabase/heliosdb-nano:v3.58.1 is a
-  #   PRIVATE GHCR package. The default GITHUB_TOKEN used in `credentials` below
-  #   (github.actor / secrets.GITHUB_TOKEN) does NOT have read access to it, so
-  #   the service container fails to pull and this job goes red on every run —
-  #   which is why it was split out of the required integrate job and marked
-  #   `continue-on-error: true`. To make it green and eventually required again,
-  #   a maintainer must do ONE of:
-  #     1. Flip the package's visibility to public (Packages → heliosdb-nano →
-  #        Package settings → Danger Zone → Change visibility), OR
-  #     2. Grant THIS repository read access to the package (Package settings →
-  #        Manage Actions access → add this repo with Read role) so the default
-  #        GITHUB_TOKEN can pull it, OR
-  #     3. Provision a PAT/least-privilege token with `read:packages` as a repo
-  #        secret and reference it in `credentials.password` below instead of
-  #        secrets.GITHUB_TOKEN.
-  #   Once the pull succeeds, remove the `continue-on-error: true` line to make
-  #   this a required job again.
+  # The image's entrypoint takes the password from HELIOSDB_PASSWORD and starts
+  # with scram-sha-256 (Nano refuses trust auth on a non-loopback listener, and
+  # a service container listens on 0.0.0.0). v3.58.1, pinned here before, took
+  # auth only as command-line flags, which service containers cannot pass, so
+  # its containers exited at start.
   #
   # TEST SELECTION — identical suite to integrate-pg; the ONLY difference is the
   # HELIOS_TEST_* env vars point at the nano service (HELIOS_TEST_BACKEND=nano,
-  # port 5433 / standby 5435). tests/integration/ does not filter by engine (see
-  # the note on integrate-pg), so "nano tests" == "the same suite run with the
-  # nano env vars".
+  # port 5433 / standby 5435). Tests that hit a known Nano bug skip themselves
+  # when HELIOS_TEST_BACKEND=nano and name the Nano issue.
   integrate-nano:
-    name: Integration — HeliosDB Nano 3.58 (primary + standby)
+    name: Integration — HeliosDB Nano 4.41 (primary + standby)
     runs-on: ubuntu-latest
     needs: [fmt, clippy, test]
-    # Do not fail the overall workflow while the GHCR package-visibility blocker
-    # documented above is unresolved. Remove once the nano image can be pulled.
     continue-on-error: true
     permissions:
       packages: read
 
     services:
       nano:
-        image: ghcr.io/heliosdatabase/heliosdb-nano:v3.58.1
+        image: ghcr.io/heliosdatabase/heliosdb-nano:4.41.0
         credentials:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
         env:
-          NANO_PASSWORD: heliosdb
+          HELIOSDB_PASSWORD: heliosdb
         ports:
           - 5433:5432
         options: >-
-          --health-cmd "pg_isready -h 127.0.0.1 -p 5432 || true"
+          --health-cmd "curl -fsS http://127.0.0.1:8080/health >/dev/null || exit 1"
           --health-interval 5s
-          --health-timeout 10s
+          --health-timeout 5s
           --health-retries 20
-          --health-start-period 10s
+          --health-start-period 5s
       # ── HA standby (modules 06/08/09/10) ───────────────────────────
       nano-standby:
-        image: ghcr.io/heliosdatabase/heliosdb-nano:v3.58.1
+        image: ghcr.io/heliosdatabase/heliosdb-nano:4.41.0
         credentials:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
         env:
-          NANO_PASSWORD: heliosdb
+          HELIOSDB_PASSWORD: heliosdb
         ports:
           - 5435:5432
         options: >-
-          --health-cmd "pg_isready -h 127.0.0.1 -p 5432 || true"
+          --health-cmd "curl -fsS http://127.0.0.1:8080/health >/dev/null || exit 1"
           --health-interval 5s
-          --health-timeout 10s
+          --health-timeout 5s
           --health-retries 20
-          --health-start-period 10s
+          --health-start-period 5s
 
     steps:
       - name: Checkout
@@ -315,7 +299,7 @@ jobs:
       - name: Build proxy binary
         run: cargo build --features "all-features,postgres-topology"
 
-      - name: Integration tests against HeliosDB Nano 3.58
+      - name: Integration tests against HeliosDB Nano 4.41
         continue-on-error: false
         env:
           HELIOS_TEST_BACKEND: nano
@@ -330,7 +314,7 @@ jobs:
           -- --include-ignored
 
       # ── HA tests: modules 06 / 08 / 09 / 10 with live standby ─────
-      - name: HA integration tests — Nano 3.58 primary + standby (modules 06/08/09/10)
+      - name: HA integration tests — Nano 4.41 primary + standby (modules 06/08/09/10)
         continue-on-error: false
         env:
           HELIOS_TEST_BACKEND: nano

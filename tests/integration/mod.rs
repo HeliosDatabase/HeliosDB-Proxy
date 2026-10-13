@@ -687,6 +687,12 @@ async fn test_module_14_routing_hints_passthrough() {
     let Some(fx) = fixture::start_proxy().await else {
         return;
     };
+    if fx.backend.kind == fixture::BackendKind::Nano {
+        // Nano (through 4.41.0) answers any statement that starts with a block
+        // comment with no rows, directly as well (Sprinter nano 07a5ee1772ed).
+        eprintln!("[module_14] skipped on Nano: a leading comment returns no rows");
+        return;
+    }
     let conn_str = format!(
         "host=127.0.0.1 port={} user={} password={} dbname={}",
         fx.proxy_port, fx.backend.user, fx.backend.password, fx.backend.dbname
@@ -1522,6 +1528,12 @@ async fn test_tr07_committed_history_replay_reproduces_the_ledger() {
     else {
         return;
     };
+    if fx.backend.kind == fixture::BackendKind::Nano {
+        // Nano (through 4.41.0) describes the bigint[] parameter with an unknown
+        // type, so the client cannot bind it (Sprinter nano ca8e186c9c49).
+        eprintln!("[tr07] skipped on Nano: array parameters are not described");
+        return;
+    }
     let b = fx.backend.clone();
     let source_db = b.dbname.clone();
     let target_db = "tr07_target";
