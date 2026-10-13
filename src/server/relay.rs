@@ -345,7 +345,7 @@ impl ProxyServer {
                 facts.is_standby_read(&state.tr_read_policy)
             })
         };
-        let (mut target, offloaded) = Self::choose_target_node(
+        let (mut target, mut offloaded) = Self::choose_target_node(
             is_write,
             forced_target,
             current_node,
@@ -371,11 +371,32 @@ impl ProxyServer {
             return Ok((None, resp.len() as u64));
         }
 
-        // A connect/auth failure trips the breaker (and is propagated as today).
+        // A connect/auth failure trips the breaker (and is propagated as today);
+        // for an offloaded read the home serves it instead.
         if let Err(e) = Self::ensure_conn(conns, &target, session, config, state).await {
-            Self::record_backend_failure(state, &target, &e.to_string());
-            BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
-            return Err(e);
+            if !offloaded {
+                Self::record_backend_failure(state, &target, &e.to_string());
+                BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
+                return Err(e);
+            }
+            Self::offload_refused(state, session, &target, &e).await;
+            offloaded = false;
+            target = Self::choose_target_node(
+                false,
+                None,
+                current_node,
+                ReadRoute::Home,
+                session,
+                state,
+                config,
+            )
+            .await?
+            .0;
+            if let Err(e) = Self::ensure_conn(conns, &target, session, config, state).await {
+                Self::record_backend_failure(state, &target, &e.to_string());
+                BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
+                return Err(e);
+            }
         }
         // An offloaded read runs with the session's settings mirrored onto
         // the standby connection; if that cannot be done, the home serves it.
@@ -711,7 +732,7 @@ impl ProxyServer {
         #[cfg(feature = "query-analytics")]
         let started = std::time::Instant::now();
 
-        let (mut target, offloaded) = match route_sql {
+        let (mut target, mut offloaded) = match route_sql {
             Some(sql) => {
                 // Routing-hints, when active, can override the verb-based
                 // target (and recompute the write flag on the stripped SQL).
@@ -781,9 +802,30 @@ impl ProxyServer {
         }
 
         if let Err(e) = Self::ensure_conn(conns, &target, session, config, state).await {
-            Self::record_backend_failure(state, &target, &e.to_string());
-            BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
-            return Err(e);
+            if !offloaded {
+                Self::record_backend_failure(state, &target, &e.to_string());
+                BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
+                return Err(e);
+            }
+            // The standby cannot take this session: the home serves the batch.
+            Self::offload_refused(state, session, &target, &e).await;
+            offloaded = false;
+            target = Self::choose_target_node(
+                false,
+                None,
+                current_node,
+                ReadRoute::Home,
+                session,
+                state,
+                config,
+            )
+            .await?
+            .0;
+            if let Err(e) = Self::ensure_conn(conns, &target, session, config, state).await {
+                Self::record_backend_failure(state, &target, &e.to_string());
+                BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
+                return Err(e);
+            }
         }
         // An offloaded batch runs with the session's settings mirrored onto
         // the standby connection; if that cannot be done, the home serves it.

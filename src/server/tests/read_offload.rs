@@ -595,3 +595,151 @@ async fn home_tracking_and_stale_mirrors() {
     ProxyServer::mirror_now_home(&mut conns, "pg-s1:5432");
     assert!(!ProxyServer::mirror_stale(&conns, "pg-s1:5432", &reads));
 }
+
+/// A session that logged in as `user` to `database`.
+async fn session_as(user: &str, database: &str) -> Arc<ClientSession> {
+    let session = make_test_session();
+    let mut vars = session.variables.write().await;
+    vars.insert("user".to_string(), user.to_string());
+    vars.insert("database".to_string(), database.to_string());
+    drop(vars);
+    session
+}
+
+fn auth_refusal() -> ProxyError {
+    ProxyError::Auth("backend requires authentication".to_string())
+}
+
+/// With pass-through auth a session holds no credential for a second
+/// backend: a standby that wants a password refuses its login. The read falls
+/// back home, the session stops offloading, and other credential-less
+/// sessions of that login skip that standby; other logins (the standby may
+/// trust them) and sessions with a credential may still use it, and the node
+/// is not treated as failed.
+#[tokio::test]
+async fn a_standby_refusing_a_credential_less_login_is_skipped_for_it() {
+    let config = offload_config(StandbyReads::Async);
+    let server = ProxyServer::new(config.clone()).unwrap();
+    let app = ("app".to_string(), "shop".to_string());
+    let session = session_as("app", "shop").await;
+    assert_eq!(
+        ProxyServer::refusable_login(&server.state, &session).await,
+        None,
+        "nothing refused yet: routing does not build the login"
+    );
+    ProxyServer::offload_refused(&server.state, &session, "pg-s1:5432", &auth_refusal()).await;
+    assert!(session
+        .reads_pinned
+        .load(std::sync::atomic::Ordering::Relaxed));
+    assert!(server.state.offload_refusals.refused("pg-s1:5432", &app));
+    assert!(server.state.health.load_full()["pg-s1:5432"].healthy);
+    assert_eq!(
+        server
+            .state
+            .metrics
+            .read_mirror_failures
+            .load(Ordering::Relaxed),
+        1
+    );
+    for _ in 0..6 {
+        let other = session_as("app", "shop").await;
+        assert_eq!(
+            route(
+                &server,
+                &config,
+                &other,
+                false,
+                Some("pg-p:5432"),
+                ReadRoute::Offload
+            )
+            .await,
+            ("pg-s2:5432".to_string(), true)
+        );
+    }
+    assert!(!ProxyServer::still_read_target(
+        &server.state,
+        &config,
+        "pg-s1:5432",
+        false,
+        Some(&app)
+    ));
+
+    // Another login (another user, or the same user on another database) and
+    // a session holding a credential still offload to pg-s1.
+    let mut seen = HashSet::new();
+    for (user, database) in [("report", "shop"), ("app", "audit")] {
+        for _ in 0..6 {
+            let other = session_as(user, database).await;
+            seen.insert(
+                route(
+                    &server,
+                    &config,
+                    &other,
+                    false,
+                    Some("pg-p:5432"),
+                    ReadRoute::Offload,
+                )
+                .await,
+            );
+        }
+    }
+    assert!(seen.contains(&("pg-s1:5432".to_string(), true)), "{seen:?}");
+    let with_password = session_as("app", "shop").await;
+    *with_password.backend_credential.write().await = Some("secret".to_string());
+    assert_eq!(
+        ProxyServer::refusable_login(&server.state, &with_password).await,
+        None
+    );
+    assert!(ProxyServer::still_read_target(
+        &server.state,
+        &config,
+        "pg-s1:5432",
+        false,
+        None
+    ));
+    // A refusal despite a credential pins that session only.
+    ProxyServer::offload_refused(&server.state, &with_password, "pg-s2:5432", &auth_refusal())
+        .await;
+    assert!(with_password
+        .reads_pinned
+        .load(std::sync::atomic::Ordering::Relaxed));
+    assert!(!server.state.offload_refusals.refused("pg-s2:5432", &app));
+
+    // Any other failure does not pin the session.
+    let unlucky = session_as("app", "shop").await;
+    ProxyServer::offload_refused(
+        &server.state,
+        &unlucky,
+        "pg-s2:5432",
+        &ProxyError::Network("connection refused".to_string()),
+    )
+    .await;
+    assert!(!unlucky
+        .reads_pinned
+        .load(std::sync::atomic::Ordering::Relaxed));
+    assert!(!server.state.offload_refusals.refused("pg-s2:5432", &app));
+}
+
+/// A SIGHUP reload forgets the refusals (the standbys' auth may have changed
+/// with the config); a reload that fails to parse keeps them.
+#[tokio::test]
+async fn a_sighup_reload_retries_refused_standby_logins() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proxy.toml");
+    let config_file = "[[nodes]]\nhost = \"pg-p\"\nport = 5432\nrole = \"primary\"\n";
+    std::fs::write(&path, config_file).unwrap();
+    let server = ProxyServer::new(offload_config(StandbyReads::Async))
+        .unwrap()
+        .with_config_path(Some(path.to_string_lossy().into_owned()));
+    let app = ("app".to_string(), "shop".to_string());
+    server.state.offload_refusals.insert("pg-s1:5432", &app);
+
+    std::fs::write(&path, "[[nodes]]\nhost = ").unwrap();
+    server.reload_config().await;
+    assert!(server.state.offload_refusals.refused("pg-s1:5432", &app));
+
+    std::fs::write(&path, config_file).unwrap();
+    server.reload_config().await;
+    assert!(!server.state.offload_refusals.any());
+    assert!(!server.state.offload_refusals.refused("pg-s1:5432", &app));
+}

@@ -341,7 +341,7 @@ impl ProxyServer {
                 return Ok(node);
             }
         }
-        if let Some(addr) = Self::pick_standby(session, state, config, false).await {
+        if let Some(addr) = Self::pick_standby(session, state, config, false, None).await {
             return Ok(addr);
         }
         // Fall back to primary if no healthy standbys
@@ -351,20 +351,25 @@ impl ProxyServer {
     /// Pick a node that may serve reads right now — a healthy, enabled
     /// standby or read replica that is read-eligible (circuit closed, lag
     /// within `[lag_routing]`) — with `[load_balancer] read_strategy`, and pin
-    /// the session to it. `sync_only` keeps synchronous standbys only. `None`
-    /// when no node qualifies.
+    /// the session to it. `sync_only` keeps synchronous standbys only;
+    /// `refusable` (see [`Self::refusable_login`]) skips standbys that refused
+    /// that login. `None` when no node qualifies.
     pub(super) async fn pick_standby(
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,
         sync_only: bool,
+        refusable: Option<&(String, String)>,
     ) -> Option<String> {
         let members = if sync_only {
             state.primary_tracker.provider_members()
         } else {
             Vec::new()
         };
-        let sync_ok = |addr: &str| !sync_only || Self::is_sync_standby(config, &members, addr);
+        let sync_ok = |addr: &str| {
+            (!sync_only || Self::is_sync_standby(config, &members, addr))
+                && !refusable.is_some_and(|login| state.offload_refusals.refused(addr, login))
+        };
 
         // H-01 step 3: under a topology provider the published snapshot names
         // the read set, so a promotion moves reads too (the demoted former
@@ -444,8 +449,11 @@ impl ProxyServer {
         config: &ProxyConfig,
         addr: &str,
         sync_only: bool,
+        refusable: Option<&(String, String)>,
     ) -> bool {
-        if Self::is_write_target(state, config, addr) {
+        if Self::is_write_target(state, config, addr)
+            || refusable.is_some_and(|login| state.offload_refusals.refused(addr, login))
+        {
             return false;
         }
         if sync_only

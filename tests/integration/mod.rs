@@ -1449,6 +1449,34 @@ fn tr07_conn_str(host: &str, port: u16, b: &fixture::BackendInfo, db: &str) -> S
     )
 }
 
+/// Complete records in the journal segments in `dir` (`journal-*.log`; each
+/// record is the magic `HJ02`, a big-endian u32 payload length, a CRC and the
+/// payload).
+fn tr07_records_on_disk(dir: &std::path::Path) -> usize {
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("journal-") && name.ends_with(".log")) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        let mut at = 0;
+        while at + 12 <= bytes.len() && bytes[at..at + 4] == *b"HJ02" {
+            let len =
+                u32::from_be_bytes([bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]])
+                    as usize;
+            if at + 12 + len > bytes.len() {
+                break;
+            }
+            count += 1;
+            at += 12 + len;
+        }
+    }
+    count
+}
+
 async fn tr07_connect(conn_str: &str) -> tokio_postgres::Client {
     let (client, conn) = tokio_postgres::connect(conn_str, tokio_postgres::NoTls)
         .await
@@ -1506,10 +1534,12 @@ async fn test_tr07_committed_history_replay_reproduces_the_ledger() {
         .await
     {
         Ok(()) => {}
-        Err(e) if e.to_string().contains("already exists") => {}
+        // `Display` of a server error is only "db error": match its code, or
+        // every run after the first against one server skips silently.
+        Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::DUPLICATE_DATABASE) => {}
         Err(e) => {
             eprintln!(
-                "[tr07] cannot CREATE DATABASE {target_db} ({e}); skipping ledger acceptance"
+                "[tr07] cannot CREATE DATABASE {target_db} ({e:?}); skipping ledger acceptance"
             );
             return;
         }
@@ -1745,6 +1775,17 @@ async fn test_tr07_committed_history_replay_reproduces_the_ledger() {
     );
 
     // ---- restart: a fresh proxy reloads the durable journal --------------
+    // The writer thread appends off the commit path and an fsync can stall
+    // under host I/O, so wait for the six committed transactions on disk
+    // rather than for a fixed time.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while tr07_records_on_disk(journal_dir.path()) < 6 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the journal writer did not write the committed transactions"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await; // > fsync interval
     drop(a);
     drop(b2);

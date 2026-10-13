@@ -25,6 +25,12 @@ Cases (each on a new client connection unless noted):
   sync_none      standby_reads = "sync", standby not marked synchronous: primary.
   sync           standby_reads = "sync", [[nodes]] synchronous = true: standby.
   split_off      read_write_split = false: primary.
+  scram_login    pass-through auth and a login the standby wants a password for (a
+                 scram-sha-256 pg_hba row for user rr_pw, connecting with psql from the
+                 container): its reads fall back to the primary without an error, a later
+                 session of that login skips the standby (one fallback counted in
+                 heliosdb_proxy_read_mirror_failures_total), and a trusted login still
+                 reads from the standby.
 Exit 1 if any case fails its expectation.
 """
 import argparse
@@ -37,6 +43,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 import uuid
 
 sys.dont_write_bytecode = True
@@ -53,6 +60,8 @@ SYNC = tr08.SYNC
 PRIMARY, STANDBY = f2.PRIMARY, f2.STANDBY
 WHERE = "SELECT host(inet_server_addr())"
 RYW_WAIT = 1.3  # past the default read_your_writes_ms (1000)
+RR_PW_PASSWORD = "rr-pw-secret"
+METRICS_SYNC = 1.5  # the admin API's copy of the counters syncs once a second
 
 
 def query(client, sql):
@@ -72,7 +81,7 @@ def extended(client, name, sql, parse=True):
     return tr08.rows(r)[0][0] if tr08.rows(r) else (f"error {errs}" if errs else "no rows")
 
 
-def case_async(address):
+def case_async(address, _admin):
     r = {}
     with tr08.startup(address) as c:
         r["plain_read"] = where(c)
@@ -108,7 +117,7 @@ def case_async(address):
     return r
 
 
-def case_ryw_off(address):
+def case_ryw_off(address, _admin):
     r = {}
     with tr08.startup(address) as c:
         query(c, "INSERT INTO rr_t VALUES (3)")
@@ -118,10 +127,45 @@ def case_ryw_off(address):
 
 
 def case_expect(expected):
-    def run(address):
+    def run(address, _admin):
         with tr08.startup(address) as c:
             r = {"read": where(c)}
         r["ok"] = r["read"] == expected
+        return r
+    return run
+
+
+def psql_rr_pw(name, address, *sqls):
+    """Run `sqls` in one psql session (SCRAM login rr_pw) through the proxy."""
+    cmd = ["docker", "exec", "--env", f"PGPASSWORD={RR_PW_PASSWORD}", name, "psql", "-X", "-At",
+           "-v", "ON_ERROR_STOP=1",
+           f"host={address[0]} port={address[1]} user=rr_pw dbname=audit sslmode=disable"]
+    for sql in sqls:
+        cmd += ["-c", sql]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    return r.stdout.split() if r.returncode == 0 else [f"error {r.stderr.strip()[-300:]}"]
+
+
+def metric(admin, name):
+    """A counter from /metrics/prometheus (the exposition text is in its JSON `text` field)."""
+    with urllib.request.urlopen(f"http://127.0.0.1:{admin}/metrics/prometheus", timeout=5) as resp:
+        text = json.loads(resp.read())["text"]
+    for line in text.splitlines():
+        if line.startswith(name + " "):
+            return float(line.split()[1])
+    return None
+
+
+def case_scram_login(name):
+    def run(address, admin):
+        r = {"first_session": psql_rr_pw(name, address, WHERE, WHERE),
+             "second_session": psql_rr_pw(name, address, WHERE)}
+        time.sleep(METRICS_SYNC)
+        r["fallbacks"] = metric(admin, "heliosdb_proxy_read_mirror_failures_total")
+        with tr08.startup(address) as c:
+            r["trusted_login"] = where(c)
+        r["ok"] = (r["first_session"] == [PRIMARY, PRIMARY] and r["second_session"] == [PRIMARY]
+                   and r["fallbacks"] == 1 and r["trusted_login"] == STANDBY)
         return r
     return run
 
@@ -164,7 +208,7 @@ name = "pg-standby"
         try:
             with tr08.startup(address) as probe:
                 query(probe, "SELECT 1")
-                return proc, log, address
+                return proc, log, address, admin
         except (OSError, RuntimeError, EOFError):
             if proc.poll() is not None or time.monotonic() >= deadline:
                 log.seek(0)
@@ -188,19 +232,26 @@ def main():
         ("sync_none", 'standby_reads = "sync"', "", case_expect(PRIMARY)),
         ("sync", 'standby_reads = "sync"', "synchronous = true", case_expect(STANDBY)),
         ("split_off", "read_write_split = false", "", case_expect(PRIMARY)),
+        ("scram_login", "", "", case_scram_login(name)),
     ]
     try:
         version = f2.start_postgres(name, tr08.PG_ADDRESS[1])
         tr08.pg_query("CREATE TABLE rr_t (a int)")
+        tr08.pg_query(f"CREATE ROLE rr_pw LOGIN PASSWORD '{RR_PW_PASSWORD}'")
+        subprocess.run(["docker", "exec", name, "sh", "-c",
+                        'sed -i "1i host all rr_pw all scram-sha-256" "$PGDATA/pg_hba.conf"'],
+                       check=True, capture_output=True, timeout=20)
+        tr08.pg_query("SELECT pg_reload_conf()")
         for case, lb, standby_extra, run in cases:
             report = {"case": case}
             with tempfile.TemporaryDirectory(prefix="proxy-reads-") as temp:
                 temp = pathlib.Path(temp)
-                proc, log, address = start_proxy(args.binary, temp, tr08.PG_ADDRESS[1], lb, standby_extra)
+                proc, log, address, admin = start_proxy(args.binary, temp, tr08.PG_ADDRESS[1], lb,
+                                                        standby_extra)
                 try:
                     time.sleep(2.5)  # both nodes pass their health check
                     try:
-                        report.update(run(address))
+                        report.update(run(address, admin))
                     except Exception as e:  # report and continue with the next case
                         report.update({"ok": False, "exception": repr(e)})
                 finally:

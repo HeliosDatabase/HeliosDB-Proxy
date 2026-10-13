@@ -50,8 +50,9 @@ pub(super) struct ServerMetrics {
     pub(super) backend_capacity_refusals: AtomicU64,
     /// Requests served by a standby under `[load_balancer] standby_reads`.
     pub(super) reads_offloaded: AtomicU64,
-    /// Standby connections that could not take the session's settings, so
-    /// the read went to the primary.
+    /// Offloaded reads that went to the primary instead: the standby
+    /// connection could not be opened (e.g. it wants a password pass-through
+    /// auth does not hold) or could not take the session's settings.
     pub(super) read_mirror_failures: AtomicU64,
     /// TR-07: transactions the recovery journal recorded as committed.
     pub(super) journal_committed: AtomicU64,
@@ -128,7 +129,8 @@ pub struct ServerMetricsSnapshot {
     pub backend_capacity_refusals: u64,
     /// Requests served by a standby (read offload).
     pub reads_offloaded: u64,
-    /// Read-offload setting mirrors that failed (the read went to the primary).
+    /// Offloaded reads that fell back to the primary (standby connection or
+    /// settings mirror failed).
     pub read_mirror_failures: u64,
     /// TR-07: transactions the recovery journal recorded as committed.
     pub journal_committed: u64,

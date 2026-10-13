@@ -415,6 +415,15 @@ connection holds keeps its reads on the primary for the rest of its life: tempor
 more tracked `SET`s than `[limits] tr_max_session_set_statements`, or a `SET` the standby
 refuses.
 
+**Authentication.** A standby connection is opened by the proxy itself. With the default
+pass-through auth (`[auth] mode = "passthrough"`) the proxy holds no password for that, so a
+standby that requires one refuses it: the read is served by the primary, the session keeps
+its reads there, and later sessions of the same user and database without a credential skip
+that standby (one warning per standby, user and database; other logins keep offloading, and
+`heliosdb_proxy_read_mirror_failures_total` counts the fallbacks). A SIGHUP reload lets them
+try again. To offload with password-protected standbys, use `[auth] mode = "scram"` with an
+`auth_file` holding the users' passwords, or let the standbys trust the proxy's address.
+
 **Connections.** In session pooling a session that has offloaded a read keeps one standby
 connection besides its primary connection for its lifetime: size the standbys'
 `max_connections` (and `[[nodes]] max_connections`) for the session count. The idle

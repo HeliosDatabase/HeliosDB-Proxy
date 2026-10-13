@@ -437,6 +437,7 @@ async fn test_apply_authenticate_hook_with_manager_no_plugins_defers() {
         auth_file: None,
         mirror: None,
         cutover: Arc::new(ArcSwap::from_pointee(None)),
+        offload_refusals: OffloadRefusals::default(),
         primary_tracker: Arc::new(PrimaryTracker::new_standalone()),
         authoritative_topology: false,
         routing: Arc::new(crate::routing_snapshot::RoutingView::new(false)),

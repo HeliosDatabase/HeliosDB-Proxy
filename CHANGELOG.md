@@ -56,7 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (bound the lag with `[lag_routing]`, use `"sync"` with `synchronous_commit =
   remote_apply`, or set `standby_reads = "primary"` to keep the old routing). A
   `/*helios:route=standby*/` hint now sends the statement to a standby (it only cleared
-  the write flag before).
+  the write flag before). The proxy opens standby connections itself: with pass-through auth
+  it holds no password, so a standby that requires one refuses it, and the read is served
+  by the primary instead (the session then keeps its reads there, and later sessions of
+  that user and database without a credential skip that standby until a SIGHUP reload).
+  Offload to password-protected standbys needs `[auth] mode = "scram"` with an
+  `auth_file`, or a standby that trusts the proxy.
 - Dependencies: `dashmap` 5 → 6 (6.2.1), `socket2` 0.5 → 0.6 (0.6.5, the line tokio
   already uses), `base64` 0.21 → 0.22 (the version `reqwest` and `hyper-util` use; 0.23
   would add a third copy). Duplicate crate versions in the all-features tree drop from 45

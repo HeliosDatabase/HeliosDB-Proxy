@@ -2776,7 +2776,7 @@ impl AdminServer {
             metrics.reads_offloaded
         ));
         output.push_str(
-            "# HELP heliosdb_proxy_read_mirror_failures_total Standby connections that could not take the session's settings, so the read went to the primary\n",
+            "# HELP heliosdb_proxy_read_mirror_failures_total Offloaded reads served by the primary because the standby connection could not be opened or could not take the session's settings\n",
         );
         output.push_str("# TYPE heliosdb_proxy_read_mirror_failures_total counter\n");
         output.push_str(&format!(

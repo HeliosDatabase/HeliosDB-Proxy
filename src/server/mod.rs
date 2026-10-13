@@ -90,7 +90,7 @@ mod client;
 mod auth;
 
 mod backend_conn;
-use backend_conn::{ReadRoute, ReadRouting};
+use backend_conn::{OffloadRefusals, ReadRoute, ReadRouting};
 
 mod relay;
 
@@ -338,6 +338,10 @@ struct ServerState {
     /// transparently redirected to the promoted target (the former mirror)
     /// instead of the configured primary. Set via POST /api/migration/cutover.
     cutover: Arc<ArcSwap<Option<Arc<crate::mirror::CutoverTarget>>>>,
+    /// Standby logins refused for want of a password: with pass-through auth
+    /// a session holds no credential for a second backend, so such sessions
+    /// do not offload reads to a standby that refused their login.
+    offload_refusals: OffloadRefusals,
     /// Authoritative primary tracker (H-01). Standalone (manual) by default;
     /// when `[topology] provider != "static"` it is backed by a topology
     /// provider and its answer is authoritative for the write path.
@@ -1049,6 +1053,7 @@ impl ProxyServer {
             auth_file,
             mirror,
             cutover: Arc::new(ArcSwap::from_pointee(None)),
+            offload_refusals: OffloadRefusals::default(),
             primary_tracker,
             authoritative_topology,
             routing: Arc::new(crate::routing_snapshot::RoutingView::new(
@@ -1278,6 +1283,9 @@ impl ProxyServer {
         let nodes = new_config.nodes.len();
         let hba_rules = new_config.hba.len();
         let pool_max = new_config.pool.max_connections;
+        // Standbys that refused password-less logins get another try: their
+        // auth may have changed along with the config.
+        self.state.offload_refusals.clear();
         self.state.live_config.store(Arc::new(new_config));
         tracing::info!(
             nodes,

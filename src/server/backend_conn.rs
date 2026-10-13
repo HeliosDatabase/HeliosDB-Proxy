@@ -93,6 +93,50 @@ impl ReadRouting<'_> {
     }
 }
 
+/// Read offload under pass-through auth: the standbys that refused a login
+/// the proxy opened without a password, per (user, database) — `pg_hba.conf`
+/// decides per user and database, so a refusal says nothing about other
+/// logins. Sessions without a backend credential skip a standby that refused
+/// their login; a SIGHUP reload forgets every refusal.
+#[derive(Default)]
+pub(super) struct OffloadRefusals {
+    /// Set by the first refusal, so routing touches the set (and builds a
+    /// session's login) only once some standby has refused one.
+    any: std::sync::atomic::AtomicBool,
+    refused: dashmap::DashSet<(String, String, String)>,
+}
+
+impl OffloadRefusals {
+    /// Whether any standby refused any login.
+    pub(super) fn any(&self) -> bool {
+        self.any.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Remember that `node` refused `login` (user, database); true the
+    /// first time.
+    pub(super) fn insert(&self, node: &str, login: &(String, String)) -> bool {
+        let first = self
+            .refused
+            .insert((node.to_string(), login.0.clone(), login.1.clone()));
+        self.any.store(true, std::sync::atomic::Ordering::Relaxed);
+        first
+    }
+
+    /// Whether `node` refused `login`.
+    pub(super) fn refused(&self, node: &str, login: &(String, String)) -> bool {
+        self.any()
+            && self
+                .refused
+                .contains(&(node.to_string(), login.0.clone(), login.1.clone()))
+    }
+
+    /// Forget every refusal (the standbys' auth may have changed).
+    pub(super) fn clear(&self) {
+        self.any.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.refused.clear();
+    }
+}
+
 impl ProxyServer {
     /// Decide which node a request should be routed to, without doing any
     /// I/O. A write goes to the write target (reusing `current_node` when it
@@ -159,14 +203,17 @@ impl ProxyServer {
                 ReadRoute::Offload => {
                     let sync_only =
                         config.load_balancer.standby_reads == crate::config::StandbyReads::Sync;
+                    let login = Self::refusable_login(state, session).await;
                     let sticky = session.read_node.lock().clone();
                     if let Some(prev) = sticky {
-                        if Self::still_read_target(state, config, &prev, sync_only) {
+                        if Self::still_read_target(state, config, &prev, sync_only, login.as_ref())
+                        {
                             *session.current_node.write().await = Some(prev.clone());
                             return Ok((prev, true));
                         }
                     }
-                    if let Some(addr) = Self::pick_standby(session, state, config, sync_only).await
+                    if let Some(addr) =
+                        Self::pick_standby(session, state, config, sync_only, login.as_ref()).await
                     {
                         if !Self::is_write_target(state, config, &addr) {
                             *session.read_node.lock() = Some(addr.clone());
@@ -221,6 +268,70 @@ impl ProxyServer {
             }
         } else {
             Ok((current_node.unwrap().to_string(), false))
+        }
+    }
+
+    /// The (user, database) a session's backend connections log in as.
+    async fn login(session: &ClientSession) -> (String, String) {
+        let vars = session.variables.read().await;
+        let user = vars.get("user").cloned().unwrap_or_default();
+        let database = vars
+            .get("database")
+            .cloned()
+            .unwrap_or_else(|| user.clone());
+        (user, database)
+    }
+
+    /// The login a standby may have refused ([`OffloadRefusals`]): `None`
+    /// while no standby has refused any, or when the session holds a backend
+    /// credential (it can answer a password request).
+    pub(super) async fn refusable_login(
+        state: &ServerState,
+        session: &ClientSession,
+    ) -> Option<(String, String)> {
+        if !state.offload_refusals.any() || session.backend_credential.read().await.is_some() {
+            return None;
+        }
+        Some(Self::login(session).await)
+    }
+
+    /// An offloaded read could not open its standby connection; the caller
+    /// serves it from the home instead. A standby that wants a password the
+    /// proxy does not hold (pass-through auth) refuses this login for every
+    /// session without a credential: remember the refusal so those sessions
+    /// stop trying the node, keep this session's reads home, and do not count
+    /// it as a backend fault (the node is healthy). Any other failure demotes
+    /// the node as a failed connection always does.
+    pub(super) async fn offload_refused(
+        state: &Arc<ServerState>,
+        session: &ClientSession,
+        node: &str,
+        err: &ProxyError,
+    ) {
+        state
+            .metrics
+            .read_mirror_failures
+            .fetch_add(1, Ordering::Relaxed);
+        if !matches!(err, ProxyError::Auth(_)) {
+            Self::record_backend_failure(state, node, &err.to_string());
+            return;
+        }
+        session
+            .reads_pinned
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if session.backend_credential.read().await.is_some() {
+            return;
+        }
+        let login = Self::login(session).await;
+        if state.offload_refusals.insert(node, &login) {
+            tracing::warn!(
+                target: "helios::routing",
+                node = %node,
+                user = %login.0,
+                database = %login.1,
+                error = %err,
+                "standby refused a login without a password: with pass-through auth, this user's reads of this database stay on the primary for sessions without a backend credential until a SIGHUP reload (use [auth] mode = \"scram\" with an auth_file, or let the standby trust the proxy)"
+            );
         }
     }
 
