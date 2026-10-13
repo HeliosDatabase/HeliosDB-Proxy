@@ -244,9 +244,9 @@ pub(super) struct BackendConn {
     #[cfg(feature = "pool-modes")]
     pub(super) dirty: bool,
     /// This socket's slot on its node's `max_connections` cap (H-05); `None`
-    /// for an uncapped node. Released when the socket is dropped, parked with
-    /// it in the idle pool.
-    pub(super) slot: crate::node_slots::Slot,
+    /// for an uncapped node. Held for its `Drop`: released when the socket is
+    /// dropped, or moved into the idle pool with it (`pool-modes`).
+    pub(super) _slot: crate::node_slots::Slot,
 }
 
 impl BackendConn {
@@ -258,14 +258,14 @@ impl BackendConn {
             unnamed_sig: None,
             #[cfg(feature = "pool-modes")]
             dirty: false,
-            slot: None,
+            _slot: None,
         }
     }
 
     /// A connection that holds a node slot (H-05).
     pub(super) fn with_slot(stream: TcpStream, slot: crate::node_slots::Slot) -> Self {
         Self {
-            slot,
+            _slot: slot,
             ..Self::new(stream)
         }
     }

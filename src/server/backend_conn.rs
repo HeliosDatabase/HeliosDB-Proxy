@@ -386,7 +386,7 @@ impl ProxyServer {
         let clean = !bc.dirty && bc.prepared.is_empty() && bc.unnamed_sig.is_none();
         if config.pool_mode.skip_clean_reset && clean {
             let key = Self::pool_key_for(node, session).await;
-            if pool.checkin_with_slot(&key, bc.stream, bc.slot) {
+            if pool.checkin_with_slot(&key, bc.stream, bc._slot) {
                 pool.note_reset_skipped();
                 tracing::debug!(target: "helios::pool", node = %node, "parked clean backend connection (reset skipped)");
             }
@@ -403,7 +403,7 @@ impl ProxyServer {
         .is_ok()
         {
             let key = Self::pool_key_for(node, session).await;
-            if pool.checkin_with_slot(&key, bc.stream, bc.slot) {
+            if pool.checkin_with_slot(&key, bc.stream, bc._slot) {
                 tracing::debug!(target: "helios::pool", node = %node, "parked backend connection for reuse");
             }
         }
