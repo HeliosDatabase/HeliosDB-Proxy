@@ -181,11 +181,14 @@ if [ "$SCENARIO" = edge-resume ]; then
     for _ in $(seq 1 "$3"); do edge_log_has "$1" "$2" && return 0; sleep 1; done
     return 1
   }
-  step via proxy-a "CREATE TABLE kv (id int PRIMARY KEY, v int); INSERT INTO kv VALUES (1, 10), (2, 20)" >>"$OUT/driver.log" 2>&1
+  # Edge invalidation is per table: the entry the warm resume must keep lives
+  # in a table the missed write does not touch.
+  step via proxy-a "CREATE TABLE kv (id int PRIMARY KEY, v int); INSERT INTO kv VALUES (1, 10);
+    CREATE TABLE kv_other (id int PRIMARY KEY, v int); INSERT INTO kv_other VALUES (2, 20)" >>"$OUT/driver.log" 2>&1
   wait_log "$lab_start" "subscribed to home invalidation stream" 30 || log "edge never reported a subscription"
   for _ in 1 2 3; do
     via proxy-b "SELECT v FROM kv WHERE id = 1" >/dev/null
-    via proxy-b "SELECT v FROM kv WHERE id = 2" >/dev/null
+    via proxy-b "SELECT v FROM kv_other WHERE id = 2" >/dev/null
   done
   edge_api >"$OUT/edge-0-warmed.json"
   log "warm drill: cut the edge's stream (kill the relay), write through the home, restore it"
@@ -202,7 +205,7 @@ if [ "$SCENARIO" = edge-resume ]; then
   edge_api >"$OUT/edge-1-reconnected.json"
   read1="$(via proxy-b "SELECT v FROM kv WHERE id = 1")"
   edge_api >"$OUT/edge-2-after-id1.json"
-  read2="$(via proxy-b "SELECT v FROM kv WHERE id = 2")"
+  read2="$(via proxy-b "SELECT v FROM kv_other WHERE id = 2")"
   edge_api >"$OUT/edge-3-after-id2.json"
   log "gap drill: restart the home (new boot identity)"
   since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -210,7 +213,7 @@ if [ "$SCENARIO" = edge-resume ]; then
   if wait_log "$since" "invalidation gap\|home epoch changed" 90; then restarted=flushed; else restarted=none; fi
   log "edge after home restart: $restarted"
   edge_api >"$OUT/edge-4-home-restarted.json"
-  read3="$(via proxy-b "SELECT v FROM kv WHERE id = 2")"
+  read3="$(via proxy-b "SELECT v FROM kv_other WHERE id = 2")"
   edge_api >"$OUT/edge-5-after-id2.json"
   printf '{"resumed":"%s","read1":"%s","read2":"%s","home_restart":"%s","read3":"%s"}\n' \
     "$resumed" "$read1" "$read2" "$restarted" "$read3" >"$OUT/edge-drill.json"
