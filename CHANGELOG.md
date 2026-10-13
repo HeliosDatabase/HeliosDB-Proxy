@@ -17,12 +17,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the backend treated as gone. With `tr_mode = "none"` nothing is restored, so the
   FATAL still reaches the client as its notice that the session state is lost.
 
-### Changed
-
-- Dependencies: `dashmap` 5 → 6 (6.2.1), `socket2` 0.5 → 0.6 (the version tokio already
-  uses), `base64` 0.21 → 0.22. Duplicate crate versions in the all-features tree drop from
-  45 to 43; `base64` 0.21 and `hashbrown` 0.14 remain through the `config` crate.
-
 ### Added
 
 - Paced L2 shed (`[cache] l2_shed_batch`, default 1024, and `l2_shed_pause_us`, default
