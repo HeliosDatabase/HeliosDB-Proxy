@@ -3726,12 +3726,28 @@ async fn f2_stale_statement_is_closed_before_the_batch_uses_it() {
     let current = tr08_parse("s1", "SELECT v FROM t WHERE id = 1");
     let bind_batch = [tr08_bind("", "s1"), tr08_execute(""), frame(b'S', &[])].concat();
     let parse_batch = [current.clone(), bind_batch.clone()].concat();
-    // (batch, re-prepare list, defines, frames the backend must see)
-    let cases: [(&[u8], &[&str], &[&str], &[u8]); 2] = [
-        (&bind_batch, &["s1"], &[], b"CHPHBES"),
-        (&parse_batch, &[], &["s1"], b"CHPBES"),
+    struct Case {
+        batch: Vec<u8>,
+        reprepare: Vec<String>,
+        defines: Vec<String>,
+        /// Frame types the backend must see, in order.
+        want: &'static [u8],
+    }
+    let cases = [
+        Case {
+            batch: bind_batch,
+            reprepare: vec!["s1".to_string()],
+            defines: Vec::new(),
+            want: b"CHPHBES",
+        },
+        Case {
+            batch: parse_batch,
+            reprepare: Vec::new(),
+            defines: vec!["s1".to_string()],
+            want: b"CHPBES",
+        },
     ];
-    for (batch, reprepare, defines, want) in cases {
+    for case in cases {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let fake = tokio::spawn(f2_fake_backend(listener, b"SELECT 1\0"));
@@ -3747,19 +3763,17 @@ async fn f2_stale_statement_is_closed_before_the_batch_uses_it() {
         conns.insert(addr.clone(), bc);
         let mut registry: HashMap<String, bytes::Bytes> = HashMap::new();
         registry.insert("s1".to_string(), bytes::Bytes::from(current.clone()));
-        let reprepare: Vec<String> = reprepare.iter().map(|s| s.to_string()).collect();
-        let defines: Vec<String> = defines.iter().map(|s| s.to_string()).collect();
         let mut fault = None;
         let (node, _) = ProxyServer::forward_extended_batch(
             &mut client,
-            batch,
+            &case.batch,
             None,
             true,
             &mut conns,
             Some(addr.as_str()),
             &registry,
-            &reprepare,
-            &defines,
+            &case.reprepare,
+            &case.defines,
             None,
             0,
             &session,
@@ -3772,7 +3786,7 @@ async fn f2_stale_statement_is_closed_before_the_batch_uses_it() {
         assert_eq!(node.as_deref(), Some(addr.as_str()));
 
         let seen = fake.await.unwrap();
-        assert_eq!(seen.iter().map(|(t, _)| *t).collect::<Vec<_>>(), want);
+        assert_eq!(seen.iter().map(|(t, _)| *t).collect::<Vec<_>>(), case.want);
         assert_eq!(seen[0].1, b"Ss1\0");
         assert_eq!(frame(b'P', &seen[2].1), current, "the current definition");
         let bc = &conns[&addr];
@@ -3784,7 +3798,7 @@ async fn f2_stale_statement_is_closed_before_the_batch_uses_it() {
             frame(b'Z', b"I"),
         ]
         .concat();
-        if !defines.is_empty() {
+        if !case.defines.is_empty() {
             reply = [frame(b'1', &[]), reply].concat();
         }
         let mut got = vec![0u8; reply.len()];
