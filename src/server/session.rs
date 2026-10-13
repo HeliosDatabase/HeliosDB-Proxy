@@ -220,12 +220,20 @@ pub struct ExtendedBatchLog {
 /// references it (Batch F.4). The session keeps the canonical `Parse` bytes in
 /// a separate registry; this set is just "what does *this* socket already
 /// know".
+///
+/// A `Close` reaches only the connection its batch is routed to, so another
+/// cached connection of the session can still hold the closed definition. Such
+/// names move from `prepared` to `stale` and are closed on that socket before
+/// a later batch uses or redefines them (F2).
 pub(super) struct BackendConn {
     pub(super) stream: TcpStream,
     /// Unpublished backend frame tail, owned by this socket across Flush,
     /// idle watch and Sync. Dropped with the socket, never moved to another node.
     pub(super) response_buf: BytesMut,
     pub(super) prepared: HashSet<String>,
+    /// Named statements the session closed through another connection that
+    /// this socket may still hold. Never also in `prepared`.
+    pub(super) stale: HashSet<String>,
     /// Signature (query text + parameter-type OIDs) of the *unnamed* prepared
     /// statement currently established on this socket, if any. When the client
     /// re-sends an identical unnamed `Parse`, the proxy can skip forwarding it
@@ -240,7 +248,9 @@ pub(super) struct BackendConn {
     /// `!dirty && prepared.is_empty() && unnamed_sig.is_none()`. Set
     /// conservatively (any statement not provably session-neutral sets it), so
     /// the worst outcome of a misclassification is an unnecessary reset, never
-    /// leaked state. Always `false` on a fresh/reused connection.
+    /// leaked state. A batch that closed a named statement sets it too: the
+    /// `Close` may have been skipped after an error in the batch. Always
+    /// `false` on a fresh/reused connection.
     #[cfg(feature = "pool-modes")]
     pub(super) dirty: bool,
     /// This socket's slot on its node's `max_connections` cap (H-05); `None`
@@ -255,6 +265,7 @@ impl BackendConn {
             stream,
             response_buf: BytesMut::new(),
             prepared: HashSet::new(),
+            stale: HashSet::new(),
             unnamed_sig: None,
             #[cfg(feature = "pool-modes")]
             dirty: false,

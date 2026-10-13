@@ -2077,6 +2077,29 @@ impl ProxyServer {
                     other => ReplayFailure::Backend(other),
                 })?,
                 Some(ext) => {
+                    // F2: names the session closed through another
+                    // connection may still be defined on this one.
+                    if !bc.stale.is_empty() {
+                        for name in ext.refs.iter().chain(&ext.defines) {
+                            if !bc.stale.remove(name) {
+                                continue;
+                            }
+                            Self::close_statement(
+                                &mut bc.stream,
+                                name,
+                                state.limits.reprepare_timeout,
+                                mf,
+                            )
+                            .await
+                            .map_err(|e| match e {
+                                ProxyError::Protocol(_) => ReplayFailure::Statement(format!(
+                                    "close of statement '{}' rejected",
+                                    name
+                                )),
+                                other => ReplayFailure::Backend(other),
+                            })?;
+                        }
+                    }
                     // TR-08: statements earlier cycles prepared, exactly as
                     // the backend acknowledged them when this cycle ran.
                     for (name, parse) in &ext.outside {
@@ -2089,6 +2112,7 @@ impl ProxyServer {
                                 )),
                                 other => ReplayFailure::Backend(other),
                             })?;
+                        bc.stale.remove(name);
                         bc.prepared.insert(name.clone());
                     }
                     for name in &ext.refs {
@@ -2208,11 +2232,7 @@ impl ProxyServer {
         max_frame_bytes: usize,
     ) -> Result<()> {
         let mut wire = Vec::with_capacity(parse.len() + name.len() + 16);
-        wire.push(b'C');
-        wire.extend_from_slice(&((4 + 1 + name.len() + 1) as u32).to_be_bytes());
-        wire.push(b'S');
-        wire.extend_from_slice(name.as_bytes());
-        wire.push(0);
+        Self::push_close_statement(&mut wire, name);
         wire.extend_from_slice(parse);
         wire.extend_from_slice(&[b'S', 0, 0, 0, 4]);
         tokio::time::timeout(write_timeout, backend.write_all(&wire))

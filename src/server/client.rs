@@ -765,6 +765,11 @@ impl ProxyServer {
         let mut batch_defines: Vec<String> = Vec::new();
         let mut batch_refs: Vec<String> = Vec::new();
         let mut batch_closes: Vec<String> = Vec::new();
+        // The names the in-flight batch Closed and did not Parse again after
+        // the Close: what it leaves closed. Wire order matters here, so it is
+        // tracked per message, and like `batch_defines` it spans the batch's
+        // Flush-terminated parts until the Sync (F2).
+        let mut batch_left_closed: Vec<String> = Vec::new();
         // Registry writes (name, previous value) of Parses that arrived while
         // the aborted-transaction emulation was active: if their batch is then
         // answered 25P02 without being forwarded, the backend kept the old
@@ -1191,6 +1196,7 @@ impl ProxyServer {
                                         &name,
                                         state.limits.max_prepared_statements,
                                     );
+                                    Self::forget_batch_close(&mut batch_left_closed, &name);
                                 }
                                 if pending_route_sql.is_none() {
                                     if let Some(end) = msg.payload.iter().position(|&b| b == 0) {
@@ -1314,6 +1320,11 @@ impl ProxyServer {
                                         name,
                                         state.limits.max_prepared_statements,
                                     );
+                                    Self::remember_batch_name(
+                                        &mut batch_left_closed,
+                                        name,
+                                        state.limits.max_prepared_statements,
+                                    );
                                 }
                             }
                             _ => {}
@@ -1376,6 +1387,7 @@ impl ProxyServer {
                                 // Nothing was closed on the backend: forget the
                                 // batch's Close requests without pruning.
                                 batch_closes.clear();
+                                batch_left_closed.clear();
                                 // ...and nothing was Parsed: the backend kept
                                 // the definitions the registry must keep too.
                                 if !aborted_undo.is_empty() {
@@ -1496,6 +1508,7 @@ impl ProxyServer {
                                 },
                             }
                         };
+                        let forwarded = used_node.is_some();
                         if let Some(n) = used_node {
                             current_node = Some(n);
                         }
@@ -1565,34 +1578,43 @@ impl ProxyServer {
                             }
                             edge_batch_bound_unnamed = false;
                         }
-                        // Closed statements are deallocated everywhere — forget
-                        // their canonical Parse so they are never re-prepared.
-                        #[cfg(not(feature = "edge-proxy"))]
-                        for name in batch_closes.drain(..) {
-                            if let Some(removed) = stmt_registry.remove(&name) {
+                        // Statements the batch left closed are deallocated —
+                        // forget their canonical Parse so they are never
+                        // re-prepared. A name Closed and then Parsed again in
+                        // the batch keeps its new definition (F2).
+                        for name in &batch_left_closed {
+                            if let Some(removed) = stmt_registry.remove(name) {
                                 stmt_registry_bytes =
                                     stmt_registry_bytes.saturating_sub(removed.len());
                             }
                         }
+                        // ...and the session's other backend connections may
+                        // still hold their own copies (F2).
+                        Self::note_statement_closes(
+                            &mut conns,
+                            if forwarded {
+                                current_node.as_deref()
+                            } else {
+                                None
+                            },
+                            &batch_closes,
+                            &batch_left_closed,
+                        );
+                        #[cfg(not(feature = "edge-proxy"))]
+                        batch_closes.clear();
                         // Edge builds also prune per-statement invalidation metadata
                         // — but that metadata is consumed by the Sync-time hook ABOVE
                         // (which runs first) and must survive a Close seen at an
                         // earlier Flush of the same batch, and a name Closed then
                         // re-Parsed in this batch must keep its FRESH meta. So the
-                        // close queue is drained only at the Sync (stmt_registry is
-                        // still pruned every boundary — idempotent), and edge meta is
+                        // close queue is drained only at the Sync (re-noting its
+                        // names at each boundary is idempotent), and edge meta is
                         // removed there only for names not redefined this batch.
                         // Retaining meta for a genuinely-closed name is safe: a later
                         // re-Parse overwrites it, and a stale entry only ever
                         // over-invalidates.
                         #[cfg(feature = "edge-proxy")]
                         {
-                            for name in &batch_closes {
-                                if let Some(removed) = stmt_registry.remove(name) {
-                                    stmt_registry_bytes =
-                                        stmt_registry_bytes.saturating_sub(removed.len());
-                                }
-                            }
                             if wait_ready {
                                 for name in Self::edge_meta_prunable(&batch_closes, &batch_defines)
                                 {
@@ -1608,6 +1630,7 @@ impl ProxyServer {
                             pending_route_sql = None;
                             batch_defines.clear();
                             batch_refs.clear();
+                            batch_left_closed.clear();
                             state
                                 .metrics
                                 .queries_processed

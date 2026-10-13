@@ -382,8 +382,10 @@ impl ProxyServer {
         // round-trip, removing a backend RTT from the critical path for clean
         // autocommit workloads. Any of these three signals forces the full
         // reset. Extended-protocol traffic always has `prepared`/`unnamed_sig`
-        // set, so it is never clean-skipped (conservative by construction).
-        let clean = !bc.dirty && bc.prepared.is_empty() && bc.unnamed_sig.is_none();
+        // set (or `dirty`, after a Close), so it is never clean-skipped
+        // (conservative by construction).
+        let clean =
+            !bc.dirty && bc.prepared.is_empty() && bc.stale.is_empty() && bc.unnamed_sig.is_none();
         if config.pool_mode.skip_clean_reset && clean {
             let key = Self::pool_key_for(node, session).await;
             if pool.checkin_with_slot(&key, bc.stream, bc._slot) {

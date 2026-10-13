@@ -700,6 +700,38 @@ impl ProxyServer {
         }
         let backend = conns.get_mut(&target).expect("just ensured");
 
+        // F2: a name the session closed through another connection may still
+        // be defined on this one. Close it before the batch uses or redefines
+        // it, so a Bind cannot run the old definition and a Parse does not
+        // fail with 42P05. Each `Close` + `Flush` is answered by a
+        // `CloseComplete` consumed here, like a re-prepare's `ParseComplete`.
+        if !backend.stale.is_empty() {
+            for name in reprepare.iter().chain(defines) {
+                if !backend.stale.remove(name) {
+                    continue;
+                }
+                let closed = async {
+                    Self::finish_pending_backend_frames(client, backend, state).await?;
+                    Self::close_statement(
+                        &mut backend.stream,
+                        name,
+                        state.limits.reprepare_timeout,
+                        state.limits.max_backend_frame_bytes,
+                    )
+                    .await
+                }
+                .await;
+                if let Err(e) = closed {
+                    conns.remove(&target);
+                    if matches!(e, ProxyError::Network(_)) {
+                        Self::record_backend_failure(state, &target, &e.to_string());
+                        BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
         // Transparently re-prepare any referenced named statement this socket
         // is missing. Each is sent as its original `Parse` + `Flush`; the
         // resulting `ParseComplete` is consumed here so the client never sees
@@ -894,6 +926,47 @@ impl ProxyServer {
             )),
             other => Err(ProxyError::Protocol(format!(
                 "unexpected re-prepare reply: {}",
+                other as char
+            ))),
+        }
+    }
+
+    /// Append a statement-kind `Close` of `name` to `wire`.
+    pub(super) fn push_close_statement(wire: &mut Vec<u8>, name: &str) {
+        wire.push(b'C');
+        wire.extend_from_slice(&((4 + 1 + name.len() + 1) as u32).to_be_bytes());
+        wire.push(b'S');
+        wire.extend_from_slice(name.as_bytes());
+        wire.push(0);
+    }
+
+    /// Close the named statement `name` out of band (F2): `Close` + `Flush`,
+    /// consuming the `CloseComplete`. PostgreSQL does not treat closing a name
+    /// it does not hold as an error. Bounded by the re-prepare timeout.
+    pub(super) async fn close_statement<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+        backend: &mut S,
+        name: &str,
+        timeout: Duration,
+        max_frame_bytes: usize,
+    ) -> Result<()> {
+        let mut wire = Vec::with_capacity(name.len() + 11);
+        Self::push_close_statement(&mut wire, name);
+        wire.extend_from_slice(&[b'H', 0, 0, 0, 4]);
+        tokio::time::timeout(timeout, backend.write_all(&wire))
+            .await
+            .map_err(|_| ProxyError::Network("statement close write timeout".to_string()))?
+            .map_err(|e| ProxyError::Network(format!("statement close write error: {}", e)))?;
+        let mtype =
+            tokio::time::timeout(timeout, Self::read_one_frame_type(backend, max_frame_bytes))
+                .await
+                .map_err(|_| ProxyError::Network("statement close read timeout".to_string()))??;
+        match mtype {
+            b'3' => Ok(()), // CloseComplete
+            b'E' => Err(ProxyError::Protocol(
+                "statement close rejected by backend".to_string(),
+            )),
+            other => Err(ProxyError::Protocol(format!(
+                "unexpected statement close reply: {}",
                 other as char
             ))),
         }
@@ -1537,5 +1610,52 @@ impl ProxyServer {
             return;
         }
         list.push(name.to_string());
+    }
+
+    /// F2: a named `Parse` later in the batch defines `name` again, so an
+    /// earlier `Close` of it in the same batch no longer leaves it closed
+    /// (the close-and-replace pattern of drivers such as Npgsql).
+    pub(super) fn forget_batch_close(left_closed: &mut Vec<String>, name: &str) {
+        if let Some(i) = left_closed.iter().position(|n| n == name) {
+            left_closed.swap_remove(i);
+        }
+    }
+
+    /// F2: account for the named statements a batch closed. `closes` holds
+    /// every name it Closed, `left_closed` the ones it did not Parse again
+    /// afterwards. On `target`, the connection that ran the batch, the
+    /// `left_closed` names are no longer prepared; that socket is also no
+    /// longer provably clean for the conditional reset, since a `Close`
+    /// skipped after an error in the batch leaves its statement defined. Every
+    /// other cached connection may still hold its own copy of a closed name,
+    /// which becomes stale there. `target` is `None` when the batch reached no
+    /// backend: then every connection is "other", which only costs an extra
+    /// `Close` later.
+    pub(super) fn note_statement_closes(
+        conns: &mut HashMap<String, BackendConn>,
+        target: Option<&str>,
+        closes: &[String],
+        left_closed: &[String],
+    ) {
+        if closes.is_empty() {
+            return;
+        }
+        for (addr, bc) in conns.iter_mut() {
+            if Some(addr.as_str()) == target {
+                for name in left_closed {
+                    bc.prepared.remove(name);
+                }
+                #[cfg(feature = "pool-modes")]
+                {
+                    bc.dirty = true;
+                }
+            } else {
+                for name in closes {
+                    if bc.prepared.remove(name) {
+                        bc.stale.insert(name.clone());
+                    }
+                }
+            }
+        }
     }
 }

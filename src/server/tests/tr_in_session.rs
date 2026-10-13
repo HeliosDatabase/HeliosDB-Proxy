@@ -3638,3 +3638,199 @@ async fn tr08_copy_cycles_acknowledge_nothing_and_end_portals() {
     ProxyServer::tr_after_copy_drain(&mut tr, &session).await;
     assert!(tr.tx_portals.is_empty());
 }
+
+// ---- F2: a Close reaches only the connection its batch is routed to ----
+
+fn f2_names(set: &std::collections::HashSet<String>) -> Vec<&str> {
+    let mut names: Vec<&str> = set.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    names
+}
+
+/// A fake backend that answers one connection's frames until a Sync: Close,
+/// Parse and Bind complete, Execute reports `tag`, Flush gets no reply.
+async fn f2_fake_backend(
+    listener: tokio::net::TcpListener,
+    tag: &'static [u8],
+) -> Vec<(u8, Vec<u8>)> {
+    let (mut sock, _) = listener.accept().await.unwrap();
+    let mut seen = Vec::new();
+    loop {
+        let f = tr08_read_frame(&mut sock).await;
+        let reply = match f.0 {
+            b'C' => frame(b'3', &[]),
+            b'P' => frame(b'1', &[]),
+            b'B' => frame(b'2', &[]),
+            b'E' => frame(b'C', tag),
+            b'H' => Vec::new(),
+            b'S' => frame(b'Z', b"I"),
+            other => panic!("unexpected frame {}", other as char),
+        };
+        let done = f.0 == b'S';
+        seen.push(f);
+        sock.write_all(&reply).await.unwrap();
+        if done {
+            return seen;
+        }
+    }
+}
+
+/// Close bookkeeping: the connection that ran the batch drops the names the
+/// batch left closed (but keeps one it Parsed again after the Close) and is
+/// no longer provably clean; every other connection's copy of a closed name
+/// turns stale.
+#[tokio::test]
+async fn f2_closes_prune_the_target_and_mark_other_connections_stale() {
+    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    for addr in ["primary:5432", "standby:5432"] {
+        let mut bc = BackendConn::new(pair().await.0);
+        bc.prepared.extend(["keep", "s1", "s2"].map(String::from));
+        conns.insert(addr.to_string(), bc);
+    }
+    // `Close s1; Parse s1 ...; Close s2; Sync` ran on the standby.
+    let closes = ["s1", "s2"].map(String::from);
+    let mut left_closed = Vec::new();
+    ProxyServer::remember_batch_name(&mut left_closed, "s1", 8);
+    ProxyServer::forget_batch_close(&mut left_closed, "s1");
+    ProxyServer::remember_batch_name(&mut left_closed, "s2", 8);
+    assert_eq!(left_closed, vec!["s2".to_string()]);
+    ProxyServer::note_statement_closes(&mut conns, Some("standby:5432"), &closes, &left_closed);
+
+    let standby = &conns["standby:5432"];
+    assert_eq!(f2_names(&standby.prepared), ["keep", "s1"]);
+    assert!(standby.stale.is_empty());
+    #[cfg(feature = "pool-modes")]
+    assert!(
+        standby.dirty,
+        "a Close may have been skipped after an error"
+    );
+    let primary = &conns["primary:5432"];
+    assert_eq!(f2_names(&primary.prepared), ["keep"]);
+    assert_eq!(f2_names(&primary.stale), ["s1", "s2"]);
+
+    // A batch that reached no backend treats every connection as "other".
+    let keep = ["keep".to_string()];
+    ProxyServer::note_statement_closes(&mut conns, None, &keep, &keep);
+    assert_eq!(f2_names(&conns["standby:5432"].stale), ["keep"]);
+    assert!(conns["primary:5432"].prepared.is_empty());
+    assert_eq!(f2_names(&conns["primary:5432"].stale), ["keep", "s1", "s2"]);
+}
+
+/// A batch routed to a connection that still holds a statement the session
+/// closed through another connection: the proxy closes it there first. A
+/// Bind then runs the session's current definition (re-prepared from the
+/// registry), and a Parse of the name does not fail with 42P05. The client
+/// sees only the batch's own reply.
+#[tokio::test]
+async fn f2_stale_statement_is_closed_before_the_batch_uses_it() {
+    let current = tr08_parse("s1", "SELECT v FROM t WHERE id = 1");
+    let bind_batch = [tr08_bind("", "s1"), tr08_execute(""), frame(b'S', &[])].concat();
+    let parse_batch = [current.clone(), bind_batch.clone()].concat();
+    // (batch, re-prepare list, defines, frames the backend must see)
+    let cases: [(&[u8], &[&str], &[&str], &[u8]); 2] = [
+        (&bind_batch, &["s1"], &[], b"CHPHBES"),
+        (&parse_batch, &[], &["s1"], b"CHPBES"),
+    ];
+    for (batch, reprepare, defines, want) in cases {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let fake = tokio::spawn(f2_fake_backend(listener, b"SELECT 1\0"));
+        let config = test_config();
+        let server = ProxyServer::new(config.clone()).unwrap();
+        let state = server.state.clone();
+        let session = make_test_session();
+        let (client_raw, mut client_peer) = pair().await;
+        let mut client = ClientStream::Plain(client_raw);
+        let mut conns: HashMap<String, BackendConn> = HashMap::new();
+        let mut bc = BackendConn::new(TcpStream::connect(&addr).await.unwrap());
+        bc.stale.insert("s1".to_string());
+        conns.insert(addr.clone(), bc);
+        let mut registry: HashMap<String, bytes::Bytes> = HashMap::new();
+        registry.insert("s1".to_string(), bytes::Bytes::from(current.clone()));
+        let reprepare: Vec<String> = reprepare.iter().map(|s| s.to_string()).collect();
+        let defines: Vec<String> = defines.iter().map(|s| s.to_string()).collect();
+        let mut fault = None;
+        let (node, _) = ProxyServer::forward_extended_batch(
+            &mut client,
+            batch,
+            None,
+            true,
+            &mut conns,
+            Some(addr.as_str()),
+            &registry,
+            &reprepare,
+            &defines,
+            None,
+            0,
+            &session,
+            &state,
+            &config,
+            &mut fault,
+        )
+        .await
+        .unwrap();
+        assert_eq!(node.as_deref(), Some(addr.as_str()));
+
+        let seen = fake.await.unwrap();
+        assert_eq!(seen.iter().map(|(t, _)| *t).collect::<Vec<_>>(), want);
+        assert_eq!(seen[0].1, b"Ss1\0");
+        assert_eq!(frame(b'P', &seen[2].1), current, "the current definition");
+        let bc = &conns[&addr];
+        assert!(bc.prepared.contains("s1") && bc.stale.is_empty());
+
+        let mut reply = [
+            frame(b'2', &[]),
+            frame(b'C', b"SELECT 1\0"),
+            frame(b'Z', b"I"),
+        ]
+        .concat();
+        if !defines.is_empty() {
+            reply = [frame(b'1', &[]), reply].concat();
+        }
+        let mut got = vec![0u8; reply.len()];
+        client_peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, reply);
+    }
+}
+
+/// Transaction replay onto a connection that still holds a statement the
+/// session closed elsewhere closes it before re-preparing the registry's
+/// definition and re-sending the cycle.
+#[tokio::test]
+async fn f2_replay_closes_a_stale_statement_first() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let fake = tokio::spawn(f2_fake_backend(listener, b"INSERT 0 1\0"));
+    let server = ProxyServer::new(test_config()).unwrap();
+    let state = server.state.clone();
+    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    let mut bc = BackendConn::new(TcpStream::connect(&addr).await.unwrap());
+    bc.stale.insert("ins".to_string());
+    conns.insert(addr.clone(), bc);
+    let parse = tr08_parse("ins", "INSERT INTO t VALUES (1)");
+    let mut registry: HashMap<String, bytes::Bytes> = HashMap::new();
+    registry.insert("ins".to_string(), bytes::Bytes::from(parse.clone()));
+    let cycle = [tr08_bind("", "ins"), tr08_execute(""), frame(b'S', &[])].concat();
+    let entries = vec![StatementLog {
+        sql: "INSERT INTO t VALUES (1)".to_string(),
+        params: Vec::new(),
+        result_checksum: None,
+        executed_at: chrono::Utc::now(),
+        extended: Some(ExtendedBatchLog {
+            frames: bytes::Bytes::from(cycle),
+            unnamed_parse: None,
+            defines: Vec::new(),
+            refs: vec!["ins".to_string()],
+            outside: Vec::new(),
+        }),
+    }];
+    let r =
+        ProxyServer::tr_replay_transaction(&mut conns, &addr, &entries, &registry, &state).await;
+    assert!(r.is_ok());
+    let seen = fake.await.unwrap();
+    assert_eq!(seen.iter().map(|(t, _)| *t).collect::<Vec<_>>(), b"CHPHBES");
+    assert_eq!(seen[0].1, b"Sins\0");
+    assert_eq!(frame(b'P', &seen[2].1), parse);
+    let bc = &conns[&addr];
+    assert!(bc.prepared.contains("ins") && bc.stale.is_empty());
+}
