@@ -1,0 +1,26 @@
+# cache-logical scenario, proxy-a: query cache on, invalidated by this proxy's own
+# writes AND by the database's committed changes from a pgoutput logical slot
+# (C-02 slice 2), so writes through proxy-b, direct writes and trigger side effects
+# do not leave stale cached reads behind.
+listen_address = "127.0.0.1:35710"
+admin_address = "127.0.0.1:35790"
+admin_token = "helios-lab-admin"
+strict_config = true
+
+[health]
+check_interval_secs = 1
+check_timeout_secs = 2
+failure_threshold = 2
+success_threshold = 1
+
+[cache]
+enabled = true
+ttl_secs = 3600
+invalidation_source = "logical"
+logical_dsn = "host=127.0.0.1 port=35701 user=lab dbname=lab"
+logical_feedback_ms = 500
+
+[[nodes]]
+host = "127.0.0.1"
+port = 35701
+role = "primary"

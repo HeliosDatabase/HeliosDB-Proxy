@@ -1,0 +1,132 @@
+# V-02 HA/chaos laboratory: a disposable PostgreSQL 18.4 cluster behind TWO
+# HeliosProxy instances, driven by a ledger client. Run it only through
+# run-lab.sh, which takes the fleet build lock, bounds memory, and always tears
+# the project down.
+#
+#   pg-a     127.0.0.1:35701  primary (synchronous_standby_names = pg_b)
+#   pg-b     127.0.0.1:35702  synchronous physical standby  (the promotion target)
+#   pg-c     127.0.0.1:35703  asynchronous physical standby
+#   proxy-a  127.0.0.1:35710  admin :35790   (LAB_PROXY_A_CONFIG, default proxy-a.toml)
+#   proxy-b  127.0.0.1:35711  admin :35791   (LAB_PROXY_B_CONFIG, default proxy-b.toml)
+#   ledger   bash + psql client
+#
+# Networking: this host cannot create Docker bridge networks (firewalld removed
+# Docker's iptables chains, c9ad6dee52fa), so every service uses the host
+# network and binds 127.0.0.1 only, on the 357xx ports above. Every data
+# directory is tmpfs (no volumes are created).
+name: helios-lab
+
+x-pg: &pg
+  image: postgres:18.4-bookworm
+  network_mode: host
+  tmpfs:
+    - /var/lib/postgresql:rw,size=512m
+  mem_limit: 1g
+  cpus: 1.5
+
+x-proxy: &proxy
+  image: postgres:18.4-bookworm
+  network_mode: host
+  mem_limit: 1g
+  cpus: 1.5
+  entrypoint:
+    - /opt/helios/heliosdb-proxy
+    - --config
+    - /lab/proxy.toml
+    - --log-level
+    - info
+  depends_on:
+    pg-a: {condition: service_healthy}
+    pg-b: {condition: service_healthy}
+    pg-c: {condition: service_healthy}
+
+services:
+  pg-a:
+    <<: *pg
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_USER: lab
+      POSTGRES_DB: lab
+      PGPORT: "35701"
+    command:
+      - postgres
+      - -c
+      - port=35701
+      - -c
+      - listen_addresses=127.0.0.1
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+      - -c
+      - wal_keep_size=256MB
+      - -c
+      - max_connections=200
+      - -c
+      - log_min_messages=warning
+    volumes:
+      - ./primary-init.sh:/docker-entrypoint-initdb.d/10-lab.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 35701 -U lab -d lab"]
+      interval: 1s
+      timeout: 2s
+      retries: 90
+
+  pg-b:
+    <<: *pg
+    environment:
+      PRIMARY_PORT: "35701"
+      PORT: "35702"
+      STANDBY_NAME: pg_b
+    entrypoint: ["bash", "/lab/standby.sh"]
+    volumes:
+      - ./standby.sh:/lab/standby.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 35702 -U lab -d lab"]
+      interval: 1s
+      timeout: 2s
+      retries: 90
+    depends_on:
+      pg-a: {condition: service_healthy}
+
+  pg-c:
+    <<: *pg
+    environment:
+      PRIMARY_PORT: "35701"
+      PORT: "35703"
+      STANDBY_NAME: pg_c
+    entrypoint: ["bash", "/lab/standby.sh"]
+    volumes:
+      - ./standby.sh:/lab/standby.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 35703 -U lab -d lab"]
+      interval: 1s
+      timeout: 2s
+      retries: 90
+    depends_on:
+      pg-a: {condition: service_healthy}
+
+  proxy-a:
+    <<: *proxy
+    volumes:
+      - ${HELIOS_PROXY_BIN:?set HELIOS_PROXY_BIN to a heliosdb-proxy built with postgres-topology}:/opt/helios/heliosdb-proxy:ro
+      - ${LAB_PROXY_A_CONFIG:-./proxy-a.toml}:/lab/proxy.toml:ro
+
+  proxy-b:
+    <<: *proxy
+    volumes:
+      - ${HELIOS_PROXY_BIN:?set HELIOS_PROXY_BIN to a heliosdb-proxy built with postgres-topology}:/opt/helios/heliosdb-proxy:ro
+      - ${LAB_PROXY_B_CONFIG:-./proxy-b.toml}:/lab/proxy.toml:ro
+
+  ledger:
+    image: postgres:18.4-bookworm
+    network_mode: host
+    mem_limit: 512m
+    cpus: 2
+    entrypoint: ["sleep", "infinity"]
+    tmpfs:
+      - /results:rw,size=64m
+    volumes:
+      - ./ledger.sh:/lab/ledger.sh:ro
