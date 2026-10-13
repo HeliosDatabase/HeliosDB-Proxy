@@ -227,6 +227,9 @@ pub(super) struct TrSession {
     /// replaces the earlier one), bounded by `[limits]
     /// tr_max_session_set_statements`.
     pub(super) gucs: Vec<String>,
+    /// Bumped on every change of `gucs`: read offload mirrors the set onto a
+    /// standby connection only when that connection is behind it.
+    pub(super) guc_epoch: u64,
     /// Tracking stopped at the cap — the restore would be incomplete, so a
     /// failover is refused rather than re-homing with partial state.
     pub(super) guc_cap_hit: bool,
@@ -272,6 +275,7 @@ impl TrSession {
             record_tx: matches!(mode, TrMode::Select | TrMode::Transaction),
             track_gucs: mode != TrMode::None,
             gucs: Vec::new(),
+            guc_epoch: 0,
             guc_cap_hit: false,
             pending_tx_gucs: Vec::new(),
             tx_savepoints: Vec::new(),
@@ -1129,6 +1133,7 @@ impl ProxyServer {
 
     /// Apply one deferred transaction op at COMMIT.
     pub(super) fn tr_apply_guc_op(tr: &mut TrSession, op: GucOp, state: &Arc<ServerState>) {
+        tr.guc_epoch += 1;
         match op {
             GucOp::Set(sql) => Self::tr_apply_set(tr, &sql, state),
             GucOp::Reset(name) => Self::tr_apply_reset(tr, &name),
@@ -2579,6 +2584,7 @@ impl ProxyServer {
                             msg,
                             conns,
                             Some(node.as_str()),
+                            &ReadRouting::OFF,
                             session,
                             state,
                             config,
@@ -2601,6 +2607,7 @@ impl ProxyServer {
                             wait_ready,
                             conns,
                             Some(node.as_str()),
+                            &ReadRouting::OFF,
                             registry,
                             reprepare,
                             defines,

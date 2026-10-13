@@ -270,6 +270,9 @@ impl ProxyServer {
             #[cfg(feature = "rate-limiting")]
             rate_limit_key: std::sync::OnceLock::new(),
             startup_slot: parking_lot::Mutex::new(None),
+            reads_pinned: std::sync::atomic::AtomicBool::new(false),
+            read_node: parking_lot::Mutex::new(None),
+            last_write: parking_lot::Mutex::new(None),
         });
 
         // Register the session, then attach an RAII guard that deregisters it on
@@ -801,6 +804,25 @@ impl ProxyServer {
         // SETs, the lost-while-idle backend, the aborted-transaction emulation
         // and the open extended-protocol cycle. See `tr_handle_fault`.
         let mut tr = TrSession::new(session.tr_mode);
+        // Read offload (`[load_balancer] standby_reads`): on when reads may
+        // leave the primary and a standby can serve them. Mirroring the
+        // session's settings onto standby connections needs the SET tracker.
+        let offload_on = config.load_balancer.offloads_reads()
+            && (state.authoritative_topology
+                || config.nodes.iter().any(|n| {
+                    n.enabled && matches!(n.role, NodeRole::Standby | NodeRole::ReadReplica)
+                }));
+        tr.track_gucs |= offload_on;
+        let ryw = Duration::from_millis(config.load_balancer.read_your_writes_ms);
+        // Extended batches under read offload: every statement the in-flight
+        // batch executes is a standby-safe read; a Flush part of it was
+        // already forwarded (a chain stays where it started); this batch
+        // Parsed the unnamed statement; and the standby-safety of named
+        // statements, memoized against the registry's Parse bytes.
+        let mut batch_reads = true;
+        let mut batch_flushed = false;
+        let mut batch_parsed_unnamed = false;
+        let mut stmt_reads: HashMap<String, (bytes::Bytes, bool)> = HashMap::new();
         loop {
             // Read the client's next message directly into the accumulation
             // buffer (no intermediate zeroed scratch, no extra copy). `read_buf`
@@ -1025,6 +1047,19 @@ impl ProxyServer {
                         #[cfg(feature = "wasm-plugins")]
                         let forward_start = std::time::Instant::now();
                         let mut fault: Option<BackendFault> = None;
+                        // Read offload: a statement that leaves connection-local
+                        // state keeps the session's reads on its home node.
+                        if offload_on
+                            && !session
+                                .reads_pinned
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                            && crate::protocol::query_text(&msg.payload)
+                                .is_some_and(Self::pins_reads)
+                        {
+                            session
+                                .reads_pinned
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         let fr = match tr.lost_backend.take() {
                             // The session's backend died while idle: the request
                             // was certainly not delivered anywhere.
@@ -1047,6 +1082,18 @@ impl ProxyServer {
                                     &msg,
                                     &mut conns,
                                     current_node.as_deref(),
+                                    &ReadRouting {
+                                        offload_on,
+                                        may_offload: offload_on
+                                            && !tr.guc_cap_hit
+                                            && !session
+                                                .reads_pinned
+                                                .load(std::sync::atomic::Ordering::Relaxed),
+                                        batch_reads: false,
+                                        gucs: &tr.gucs,
+                                        guc_epoch: tr.guc_epoch,
+                                        read_your_writes: ryw,
+                                    },
                                     session,
                                     state,
                                     config,
@@ -1265,6 +1312,40 @@ impl ProxyServer {
                                         }
                                     }
                                 }
+                                // Read offload: a batch is offloaded only when
+                                // every statement it Parses is a standby-safe
+                                // read; an extended SET/RESET/DISCARD (not
+                                // tracked for mirroring) or a statement that
+                                // leaves connection-local state pins the
+                                // session's reads to its home.
+                                if offload_on {
+                                    let sql = msg
+                                        .payload
+                                        .iter()
+                                        .position(|&b| b == 0)
+                                        .and_then(|end| {
+                                            crate::protocol::query_text(&msg.payload[end + 1..])
+                                        })
+                                        .unwrap_or("");
+                                    if batch_reads
+                                        && !Self::standby_safe_read(sql, &state.tr_read_policy)
+                                    {
+                                        batch_reads = false;
+                                    }
+                                    let head = sql.trim_start();
+                                    if Self::pins_reads(sql)
+                                        || crate::protocol::starts_with_ci(head, "SET")
+                                        || crate::protocol::starts_with_ci(head, "RESET")
+                                        || crate::protocol::starts_with_ci(head, "DISCARD")
+                                    {
+                                        session
+                                            .reads_pinned
+                                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    if unnamed {
+                                        batch_parsed_unnamed = true;
+                                    }
+                                }
                                 // Promotion: park an unnamed Parse that opens a
                                 // fresh batch. Its signature is the payload after
                                 // the empty statement-name NUL (query + param
@@ -1289,6 +1370,19 @@ impl ProxyServer {
                             }
                             MessageType::Bind => {
                                 let stmt_ref = Self::bind_stmt_ref(&msg.payload);
+                                if offload_on && batch_reads {
+                                    batch_reads = match stmt_ref {
+                                        Some(name) => Self::named_standby_read(
+                                            &mut stmt_reads,
+                                            &stmt_registry,
+                                            name,
+                                            &state.tr_read_policy,
+                                        ),
+                                        // The unnamed statement: only this
+                                        // batch's own (classified) Parse.
+                                        None => batch_parsed_unnamed,
+                                    };
+                                }
                                 // Unnamed statement: not tracked in
                                 // batch_refs, but the edge invalidation must
                                 // still see its execution.
@@ -1443,13 +1537,43 @@ impl ProxyServer {
                                             },
                                         )
                                     });
+                                    // A batch with no Parse that executes named
+                                    // statements routes by the first one's SQL,
+                                    // so a prepared write never runs on a
+                                    // standby the session last read from.
+                                    let ref_route_sql = if offload_on
+                                        && pending_route_sql.is_none()
+                                        && !batch_parsed_unnamed
+                                    {
+                                        batch_refs
+                                            .first()
+                                            .and_then(|n| stmt_registry.get(n))
+                                            .and_then(|b| Self::parse_msg_sql(b))
+                                            .map(str::to_string)
+                                    } else {
+                                        None
+                                    };
                                     Self::forward_extended_batch(
                                         stream,
                                         &batch,
-                                        pending_route_sql.as_deref(),
+                                        pending_route_sql.as_deref().or(ref_route_sql.as_deref()),
                                         wait_ready,
                                         &mut conns,
                                         current_node.as_deref(),
+                                        &ReadRouting {
+                                            offload_on,
+                                            may_offload: offload_on
+                                                && !tr.guc_cap_hit
+                                                && !session
+                                                    .reads_pinned
+                                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                            batch_reads: batch_reads
+                                                && wait_ready
+                                                && !batch_flushed,
+                                            gucs: &tr.gucs,
+                                            guc_epoch: tr.guc_epoch,
+                                            read_your_writes: ryw,
+                                        },
                                         &stmt_registry,
                                         &reprepare,
                                         &batch_defines,
@@ -1593,6 +1717,7 @@ impl ProxyServer {
                                 stmt_registry_bytes =
                                     stmt_registry_bytes.saturating_sub(removed.len());
                             }
+                            stmt_reads.remove(name);
                         }
                         // ...and the session's other backend connections may
                         // still hold their own copies (F2).
@@ -1633,10 +1758,15 @@ impl ProxyServer {
                             batch_defines.clear();
                             batch_refs.clear();
                             batch_left_closed.clear();
+                            batch_reads = true;
+                            batch_flushed = false;
+                            batch_parsed_unnamed = false;
                             state
                                 .metrics
                                 .queries_processed
                                 .fetch_add(1, Ordering::Relaxed);
+                        } else if !skip_forward {
+                            batch_flushed = true;
                         }
                     }
 

@@ -220,6 +220,7 @@ pub async fn start_proxy_with(customize: impl FnOnce(&mut ProxyConfig)) -> Optio
             read_strategy: Strategy::RoundRobin,
             read_write_split: false,
             latency_threshold_ms: 500,
+            ..Default::default()
         },
         // Disable optional subsystems that need real configuration
         ..Default::default()
@@ -300,6 +301,7 @@ pub async fn start_proxy_ha() -> Option<HaFixture> {
             read_strategy: Strategy::RoundRobin,
             read_write_split: true,
             latency_threshold_ms: 500,
+            ..Default::default()
         },
         ..Default::default()
     };

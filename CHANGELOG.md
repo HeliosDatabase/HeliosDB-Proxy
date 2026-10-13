@@ -37,6 +37,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Read offload to standbys now works as documented** (behaviour change). With
+  `[load_balancer] read_write_split = true` (the default) a session's reads used to stay on
+  the node the session was on — the primary, from its first statement — so standbys only
+  served reads after a failover or with a `node=` hint. Now a read the proxy can show is
+  side-effect-free (one `SELECT`/`VALUES`/`TABLE`/`WITH` of side-effect-free built-ins
+  and `tr_read_functions`, no `INTO`, no row locks, outside a transaction; for the
+  extended protocol, every statement of the batch) runs on a standby, chosen by the new
+  `[load_balancer] standby_reads`: `"async"` (default) any healthy standby or read
+  replica, `"sync"` only synchronous standbys (new `[[nodes]] synchronous = true`, or
+  Patroni's `sync_standby`), `"primary"` none — the previous behaviour. Every other
+  statement, and everything inside a transaction, runs on the primary. Session `SET`s are
+  mirrored onto the standby connection; temp tables, cursors, SQL `PREPARE`, `LISTEN`,
+  `set_config()`, multi-statement strings and extended-protocol `SET`s keep that
+  session's reads on the primary. After a session's write its reads stay on the primary
+  for `[load_balancer] read_your_writes_ms` (new, default 1000), so it reads back its own
+  writes; other sessions' recent writes can still be missing on an asynchronous standby
+  (bound the lag with `[lag_routing]`, use `"sync"` with `synchronous_commit =
+  remote_apply`, or set `standby_reads = "primary"` to keep the old routing). A
+  `/*helios:route=standby*/` hint now sends the statement to a standby (it only cleared
+  the write flag before).
 - Dependencies: `dashmap` 5 → 6 (6.2.1), `socket2` 0.5 → 0.6 (0.6.5, the line tokio
   already uses), `base64` 0.21 → 0.22 (the version `reqwest` and `hyper-util` use; 0.23
   would add a third copy). Duplicate crate versions in the all-features tree drop from 45

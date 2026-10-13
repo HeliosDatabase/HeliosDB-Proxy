@@ -1,0 +1,506 @@
+//! Read offload to standbys: `[load_balancer] standby_reads` (Sprinter
+//! 6b0487365969).
+use super::*;
+use crate::config::StandbyReads;
+
+/// A primary and two standbys; `pg-s2` replicates synchronously.
+fn offload_config(mode: StandbyReads) -> ProxyConfig {
+    let mut config = ProxyConfig::default();
+    config.add_node("pg-p:5432", "primary").unwrap();
+    config.add_node("pg-s1:5432", "standby").unwrap();
+    config.add_node("pg-s2:5432", "standby").unwrap();
+    config.nodes[2].synchronous = true;
+    config.load_balancer.standby_reads = mode;
+    config
+}
+
+const ON: ReadRouting<'static> = ReadRouting {
+    offload_on: true,
+    may_offload: true,
+    batch_reads: true,
+    gucs: &[],
+    guc_epoch: 0,
+    read_your_writes: Duration::ZERO,
+};
+
+async fn route(
+    server: &ProxyServer,
+    config: &ProxyConfig,
+    session: &Arc<ClientSession>,
+    is_write: bool,
+    current: Option<&str>,
+    read: ReadRoute,
+) -> (String, bool) {
+    ProxyServer::choose_target_node(
+        is_write,
+        None,
+        current,
+        read,
+        session,
+        &server.state,
+        config,
+    )
+    .await
+    .unwrap()
+}
+
+fn set_healthy(server: &ProxyServer, addr: &str, healthy: bool) {
+    let mut health = (*server.state.health.load_full()).clone();
+    health.get_mut(addr).expect("configured node").healthy = healthy;
+    server.state.health.store(Arc::new(health));
+}
+
+#[test]
+fn standby_safe_reads_are_single_side_effect_free_reads() {
+    let policy = TrReadPolicy::default();
+    for (sql, safe) in [
+        ("SELECT * FROM t WHERE id = 1", true),
+        ("select a, b from t order by a", true),
+        ("VALUES (1), (2)", true),
+        ("TABLE t", true),
+        ("WITH x AS (SELECT 1 AS a) SELECT a FROM x", true),
+        ("SELECT * FROM t FOR UPDATE", false),
+        ("SELECT * FROM t FOR NO KEY UPDATE", false),
+        ("SELECT * FROM t FOR SHARE", false),
+        ("SELECT now(), version()", true),
+        ("SELECT inet_server_addr()", true),
+        ("SELECT pg_is_in_recovery()", false),
+        ("SELECT inet_server_port(), PG_IS_IN_RECOVERY()", false),
+        ("SELECT pg_current_wal_lsn()", false),
+        ("SELECT txid_current()", false),
+        ("SELECT nextval('s')", false),
+        ("SELECT my_function(1)", false),
+        ("SELECT * INTO new_t FROM t", false),
+        (
+            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+            false,
+        ),
+        ("SELECT 1; DELETE FROM t", false),
+        ("INSERT INTO t VALUES (1)", false),
+        ("SHOW search_path", false),
+        ("EXPLAIN SELECT 1", false),
+        ("COPY t TO STDOUT", false),
+        ("BEGIN", false),
+        ("SET search_path TO app", false),
+        ("", false),
+    ] {
+        assert_eq!(
+            ProxyServer::standby_safe_read(sql, &policy),
+            safe,
+            "{sql:?}"
+        );
+    }
+}
+
+#[test]
+fn statements_that_leave_connection_state_pin_reads() {
+    for (sql, pins) in [
+        ("CREATE TEMP TABLE x (a int)", true),
+        ("CREATE TEMPORARY TABLE x (a int)", true),
+        ("create local temp table x (a int)", true),
+        ("SELECT * INTO TEMP x FROM t", true),
+        ("DECLARE c CURSOR WITH HOLD FOR SELECT 1", true),
+        ("LISTEN chan", true),
+        ("PREPARE p AS SELECT 1", true),
+        ("LOAD 'auto_explain'", true),
+        ("SELECT set_config('app.x', '1', false)", true),
+        ("SELECT 1; SELECT 2", true),
+        ("PREPARE TRANSACTION 'g1'", false),
+        ("SELECT 1;", false),
+        ("SET search_path TO app", false),
+        ("CREATE TABLE t (a int)", false),
+        ("SELECT * FROM t", false),
+        ("INSERT INTO t VALUES (1)", false),
+    ] {
+        assert_eq!(ProxyServer::pins_reads(sql), pins, "{sql:?}");
+    }
+}
+
+#[test]
+fn the_read_route_follows_the_session_and_the_statement() {
+    let session = make_test_session();
+    assert_eq!(
+        ReadRouting::OFF.route(&session, true, || true),
+        ReadRoute::Stay,
+        "no offload: the session's node, as before"
+    );
+    assert_eq!(ON.route(&session, false, || true), ReadRoute::Offload);
+    assert_eq!(ON.route(&session, false, || false), ReadRoute::Home);
+    assert_eq!(
+        ON.route(&session, true, || false),
+        ReadRoute::Offload,
+        "a route=standby hint offloads what the proxy cannot classify"
+    );
+    let pinned = ReadRouting {
+        may_offload: false,
+        ..ON
+    };
+    assert_eq!(pinned.route(&session, true, || true), ReadRoute::Home);
+    // Read-your-writes: right after the session's write its reads stay home,
+    // unless a hint asks for a standby.
+    let ryw = ReadRouting {
+        read_your_writes: Duration::from_secs(60),
+        ..ON
+    };
+    assert_eq!(ryw.route(&session, false, || true), ReadRoute::Offload);
+    ryw.note_write(&session);
+    assert_eq!(ryw.route(&session, false, || true), ReadRoute::Home);
+    assert_eq!(ryw.route(&session, true, || true), ReadRoute::Offload);
+    assert_eq!(
+        ON.route(&session, false, || true),
+        ReadRoute::Offload,
+        "a zero window never holds reads back"
+    );
+    // A statement the proxy cannot vouch for opens the window too.
+    let fresh = make_test_session();
+    assert_eq!(ryw.route(&fresh, false, || false), ReadRoute::Home);
+    assert_eq!(ryw.route(&fresh, false, || true), ReadRoute::Home);
+    let unhinted = ReadRouting {
+        read_your_writes: Duration::from_millis(1),
+        ..ON
+    };
+    std::thread::sleep(Duration::from_millis(5));
+    assert_eq!(unhinted.route(&session, false, || true), ReadRoute::Offload);
+
+    session
+        .in_transaction
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        ON.route(&session, true, || true),
+        ReadRoute::Stay,
+        "a transaction stays on its node"
+    );
+}
+
+#[tokio::test]
+async fn async_reads_leave_the_primary_and_stick_to_one_standby() {
+    let config = offload_config(StandbyReads::Async);
+    let server = ProxyServer::new(config.clone()).unwrap();
+    let session = make_test_session();
+    let primary = "pg-p:5432";
+
+    // A write goes to the primary.
+    assert_eq!(
+        route(
+            &server,
+            &config,
+            &session,
+            true,
+            Some(primary),
+            ReadRoute::Stay
+        )
+        .await,
+        (primary.to_string(), false)
+    );
+    // An offloadable read leaves it for a standby...
+    let (first, offloaded) = route(
+        &server,
+        &config,
+        &session,
+        false,
+        Some(primary),
+        ReadRoute::Offload,
+    )
+    .await;
+    assert!(offloaded && first != primary, "{first}");
+    // ...and keeps using that standby, also after the session went home.
+    for _ in 0..5 {
+        assert_eq!(
+            route(
+                &server,
+                &config,
+                &session,
+                false,
+                Some(primary),
+                ReadRoute::Offload
+            )
+            .await,
+            (first.clone(), true)
+        );
+    }
+    // A read the primary must serve goes home from the standby.
+    assert_eq!(
+        route(
+            &server,
+            &config,
+            &session,
+            false,
+            Some(first.as_str()),
+            ReadRoute::Home
+        )
+        .await,
+        (primary.to_string(), false)
+    );
+    // Without offload the session stays on its healthy node.
+    assert_eq!(
+        route(
+            &server,
+            &config,
+            &session,
+            false,
+            Some(first.as_str()),
+            ReadRoute::Stay
+        )
+        .await,
+        (first.clone(), false)
+    );
+
+    // The sticky standby fails: the other one takes over.
+    set_healthy(&server, &first, false);
+    let (second, offloaded) = route(
+        &server,
+        &config,
+        &session,
+        false,
+        Some(primary),
+        ReadRoute::Offload,
+    )
+    .await;
+    assert!(
+        offloaded && second != first && second != primary,
+        "{second}"
+    );
+    // No standby left: the primary serves the read.
+    set_healthy(&server, &second, false);
+    assert_eq!(
+        route(
+            &server,
+            &config,
+            &session,
+            false,
+            Some(primary),
+            ReadRoute::Offload
+        )
+        .await,
+        (primary.to_string(), false)
+    );
+}
+
+#[tokio::test]
+async fn sync_reads_use_only_synchronous_standbys() {
+    let mut config = offload_config(StandbyReads::Sync);
+    let server = ProxyServer::new(config.clone()).unwrap();
+    for _ in 0..4 {
+        let session = make_test_session();
+        assert_eq!(
+            route(
+                &server,
+                &config,
+                &session,
+                false,
+                Some("pg-p:5432"),
+                ReadRoute::Offload
+            )
+            .await,
+            ("pg-s2:5432".to_string(), true)
+        );
+    }
+
+    // No synchronous standby: reads stay on the primary.
+    config.nodes[2].synchronous = false;
+    let server = ProxyServer::new(config.clone()).unwrap();
+    let session = make_test_session();
+    assert_eq!(
+        route(
+            &server,
+            &config,
+            &session,
+            false,
+            Some("pg-p:5432"),
+            ReadRoute::Offload
+        )
+        .await,
+        ("pg-p:5432".to_string(), false)
+    );
+
+    // Patroni's sync_standby role counts as synchronous too.
+    let member = |address: &str, role: &str| crate::primary_tracker::TopologyMember {
+        name: address.to_string(),
+        address: address.to_string(),
+        role: role.to_string(),
+        state: "streaming".to_string(),
+        lag_bytes: None,
+    };
+    let members = [
+        member("pg-s1:5432", "sync_standby"),
+        member("pg-s2:5432", "replica"),
+    ];
+    assert!(ProxyServer::is_sync_standby(
+        &config,
+        &members,
+        "pg-s1:5432"
+    ));
+    assert!(!ProxyServer::is_sync_standby(
+        &config,
+        &members,
+        "pg-s2:5432"
+    ));
+}
+
+/// A fake backend for one connection that answers each simple query with
+/// `CommandComplete` + `ReadyForQuery`, or an error for queries containing
+/// `refuse`, and reports the queries it saw once the proxy closes it.
+async fn guc_backend(listener: tokio::net::TcpListener) -> Vec<String> {
+    let (mut sock, _) = listener.accept().await.unwrap();
+    let mut seen = Vec::new();
+    loop {
+        let mut header = [0u8; 5];
+        if sock.read_exact(&mut header).await.is_err() {
+            return seen;
+        }
+        let len = u32::from_be_bytes(header[1..5].try_into().unwrap()) as usize;
+        let mut body = vec![0u8; len - 4];
+        sock.read_exact(&mut body).await.unwrap();
+        assert_eq!(header[0], b'Q');
+        let sql = String::from_utf8_lossy(&body[..body.len() - 1]).to_string();
+        let reply = if sql.contains("refuse") {
+            [
+                idle_frame(b'E', b"SERROR\0C42501\0Mrefused\0\0"),
+                idle_frame(b'Z', b"I"),
+            ]
+            .concat()
+        } else {
+            [idle_frame(b'C', b"SET\0"), idle_frame(b'Z', b"I")].concat()
+        };
+        seen.push(sql);
+        if sock.write_all(&reply).await.is_err() {
+            return seen;
+        }
+    }
+}
+
+/// The standby connection is brought up to the session's tracked `SET`s
+/// once per change (`RESET ALL` first when it carries an older set); a
+/// standby that refuses a `SET` is dropped and the session's reads are
+/// pinned to its home.
+#[tokio::test]
+async fn standby_connections_mirror_the_sessions_settings() {
+    let config = offload_config(StandbyReads::Async);
+    let server = ProxyServer::new(config.clone()).unwrap();
+    let state = server.state.clone();
+    let session = make_test_session();
+    let (client_raw, _client_peer) = pair().await;
+    let mut client = ClientStream::Plain(client_raw);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let fake = tokio::spawn(guc_backend(listener));
+    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    conns.insert(
+        addr.clone(),
+        BackendConn::new(TcpStream::connect(&addr).await.unwrap()),
+    );
+
+    let gucs = vec!["SET search_path TO app".to_string()];
+    let mut reads = ReadRouting {
+        gucs: &gucs,
+        guc_epoch: 1,
+        ..ON
+    };
+    // A fresh connection: the tracked SETs, no RESET ALL.
+    assert!(
+        ProxyServer::mirror_read_gucs(
+            &mut client,
+            &mut conns,
+            &addr,
+            &reads,
+            &session,
+            &state,
+            &config
+        )
+        .await
+    );
+    // Same epoch: nothing to send.
+    assert!(
+        ProxyServer::mirror_read_gucs(
+            &mut client,
+            &mut conns,
+            &addr,
+            &reads,
+            &session,
+            &state,
+            &config
+        )
+        .await
+    );
+    // The session changed its settings: start from the defaults again.
+    let changed = vec![
+        "SET search_path TO other".to_string(),
+        "SET work_mem = '8MB'".to_string(),
+    ];
+    reads.gucs = &changed;
+    reads.guc_epoch = 2;
+    assert!(
+        ProxyServer::mirror_read_gucs(
+            &mut client,
+            &mut conns,
+            &addr,
+            &reads,
+            &session,
+            &state,
+            &config
+        )
+        .await
+    );
+    assert_eq!(conns[&addr].gucs_synced, Some(2));
+
+    // A SET the standby refuses: the connection is dropped, reads pinned.
+    let refused = vec!["SET app.refuse = '1'".to_string()];
+    reads.gucs = &refused;
+    reads.guc_epoch = 3;
+    assert!(
+        !ProxyServer::mirror_read_gucs(
+            &mut client,
+            &mut conns,
+            &addr,
+            &reads,
+            &session,
+            &state,
+            &config
+        )
+        .await
+    );
+    assert!(!conns.contains_key(&addr));
+    assert!(session
+        .reads_pinned
+        .load(std::sync::atomic::Ordering::Relaxed));
+
+    assert_eq!(
+        fake.await.unwrap(),
+        vec![
+            "SET search_path TO app",
+            "RESET ALL",
+            "SET search_path TO other",
+            "SET work_mem = '8MB'",
+            "RESET ALL",
+            "SET app.refuse = '1'",
+        ]
+    );
+}
+
+/// The standby-safety of a named statement follows the registry's current
+/// `Parse`: a redefinition is reclassified, an unknown name never offloads.
+#[test]
+fn named_statements_are_classified_from_the_registry() {
+    let policy = TrReadPolicy::default();
+    let parse = |name: &str, sql: &str| {
+        let mut body = name.as_bytes().to_vec();
+        body.push(0);
+        body.extend_from_slice(sql.as_bytes());
+        body.extend_from_slice(&[0, 0, 0]);
+        bytes::Bytes::from(idle_frame(b'P', &body))
+    };
+    let mut memo = HashMap::new();
+    let mut registry = HashMap::new();
+    registry.insert("s1".to_string(), parse("s1", "SELECT * FROM t"));
+    assert!(ProxyServer::named_standby_read(
+        &mut memo, &registry, "s1", &policy
+    ));
+    registry.insert("s1".to_string(), parse("s1", "UPDATE t SET a = 1"));
+    assert!(!ProxyServer::named_standby_read(
+        &mut memo, &registry, "s1", &policy
+    ));
+    assert!(!ProxyServer::named_standby_read(
+        &mut memo, &registry, "nope", &policy
+    ));
+}

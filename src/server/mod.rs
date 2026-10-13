@@ -63,7 +63,7 @@ use tr::{
 
 mod tr_policy;
 pub use tr_policy::TrReadPolicy;
-use tr_policy::{GucOp, Observation};
+use tr_policy::{GucOp, Observation, STANDBY_UNSAFE_FUNCTIONS};
 #[cfg(test)]
 use tr_policy::{TR_CALL_KEYWORDS, TR_PURE_BUILTINS};
 
@@ -90,6 +90,7 @@ mod client;
 mod auth;
 
 mod backend_conn;
+use backend_conn::{ReadRoute, ReadRouting};
 
 mod relay;
 
@@ -1879,6 +1880,14 @@ impl ProxyServer {
                                 .metrics
                                 .backend_capacity_refusals
                                 .load(Ordering::Relaxed),
+                            reads_offloaded: server_state
+                                .metrics
+                                .reads_offloaded
+                                .load(Ordering::Relaxed),
+                            read_mirror_failures: server_state
+                                .metrics
+                                .read_mirror_failures
+                                .load(Ordering::Relaxed),
                             journal_committed: server_state
                                 .metrics
                                 .journal_committed
@@ -2129,6 +2138,12 @@ impl ProxyServer {
                 .state
                 .metrics
                 .backend_capacity_refusals
+                .load(Ordering::Relaxed),
+            reads_offloaded: self.state.metrics.reads_offloaded.load(Ordering::Relaxed),
+            read_mirror_failures: self
+                .state
+                .metrics
+                .read_mirror_failures
                 .load(Ordering::Relaxed),
             journal_committed: self.state.metrics.journal_committed.load(Ordering::Relaxed),
             journal_rolled_back: self

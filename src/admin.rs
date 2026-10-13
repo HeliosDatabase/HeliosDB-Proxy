@@ -2768,6 +2768,23 @@ impl AdminServer {
         ));
 
         output.push_str(
+            "# HELP heliosdb_proxy_reads_offloaded_total Requests served by a standby under [load_balancer] standby_reads\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_reads_offloaded_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_reads_offloaded_total {}\n",
+            metrics.reads_offloaded
+        ));
+        output.push_str(
+            "# HELP heliosdb_proxy_read_mirror_failures_total Standby connections that could not take the session's settings, so the read went to the primary\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_read_mirror_failures_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_read_mirror_failures_total {}\n",
+            metrics.read_mirror_failures
+        ));
+
+        output.push_str(
             "# HELP heliosdb_proxy_journal_committed_total Transactions the recovery journal recorded as committed (TR-07)\n",
         );
         output.push_str("# TYPE heliosdb_proxy_journal_committed_total counter\n");
@@ -2922,6 +2939,8 @@ impl AdminState {
                 reconnect_attempts: 0,
                 backend_capacity_waits: 0,
                 backend_capacity_refusals: 0,
+                reads_offloaded: 0,
+                read_mirror_failures: 0,
                 journal_committed: 0,
                 journal_rolled_back: 0,
                 journal_statements: 0,
@@ -3864,6 +3883,8 @@ mod tests {
             reconnect_attempts: 0,
             backend_capacity_waits: 0,
             backend_capacity_refusals: 0,
+            reads_offloaded: 0,
+            read_mirror_failures: 0,
             journal_committed: 0,
             journal_rolled_back: 0,
             journal_statements: 0,
@@ -3948,6 +3969,8 @@ mod tests {
             reconnect_attempts: 0,
             backend_capacity_waits: 0,
             backend_capacity_refusals: 0,
+            reads_offloaded: 0,
+            read_mirror_failures: 0,
             journal_committed: 0,
             journal_rolled_back: 0,
             journal_statements: 0,

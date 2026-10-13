@@ -1,22 +1,115 @@
 use super::*;
 
+/// How a request that is neither a write nor hint-forced to a node is routed
+/// (see [`ProxyServer::choose_target_node`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReadRoute {
+    /// Reads are not offloaded, or the session is inside a transaction: stay
+    /// on the session's node (pick a read node only when it has none or it
+    /// is unhealthy).
+    Stay,
+    /// The primary must serve it: go to the session's home node.
+    Home,
+    /// A standby may serve it.
+    Offload,
+}
+
+/// Read-routing inputs the client loop hands to the forward paths.
+pub(super) struct ReadRouting<'a> {
+    /// `[load_balancer]` offloads reads and a standby can serve them.
+    pub(super) offload_on: bool,
+    /// ...and this session may still read from a standby (not pinned).
+    pub(super) may_offload: bool,
+    /// Extended protocol: every statement of the batch is a standby-safe
+    /// read. The simple path classifies its final SQL itself.
+    pub(super) batch_reads: bool,
+    /// The session's tracked `SET`s, mirrored onto a standby connection
+    /// before its next read, and the epoch that names this set.
+    pub(super) gucs: &'a [String],
+    pub(super) guc_epoch: u64,
+    /// `[load_balancer] read_your_writes_ms`.
+    pub(super) read_your_writes: Duration,
+}
+
+impl ReadRouting<'_> {
+    /// No read offload (internal re-execution paths).
+    pub(super) const OFF: ReadRouting<'static> = ReadRouting {
+        offload_on: false,
+        may_offload: false,
+        batch_reads: false,
+        gucs: &[],
+        guc_epoch: 0,
+        read_your_writes: Duration::ZERO,
+    };
+
+    /// The route of a request that is not classified as a write and is not
+    /// forced to a node. `standby_hint`: a `route=standby` hint, which also
+    /// overrides read-your-writes; `standby_safe`: whether the request is a
+    /// read a standby may serve. A request the proxy cannot vouch for
+    /// (`CALL`, `DO`, `EXECUTE`, a function that may write, …) counts as a
+    /// write for read-your-writes.
+    pub(super) fn route(
+        &self,
+        session: &ClientSession,
+        standby_hint: bool,
+        standby_safe: impl FnOnce() -> bool,
+    ) -> ReadRoute {
+        if !self.offload_on
+            || session
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return ReadRoute::Stay;
+        }
+        if !self.may_offload {
+            return ReadRoute::Home;
+        }
+        let safe = standby_safe();
+        if !safe {
+            self.note_write(session);
+        }
+        let wrote_recently = !self.read_your_writes.is_zero()
+            && session
+                .last_write
+                .lock()
+                .is_some_and(|t| t.elapsed() < self.read_your_writes);
+        if standby_hint || (safe && !wrote_recently) {
+            ReadRoute::Offload
+        } else {
+            ReadRoute::Home
+        }
+    }
+
+    /// Note a write (or `SET`, or transaction control) the session sent, for
+    /// read-your-writes. Only while reads are offloaded.
+    pub(super) fn note_write(&self, session: &ClientSession) {
+        if self.offload_on && !self.read_your_writes.is_zero() {
+            *session.last_write.lock() = Some(std::time::Instant::now());
+        }
+    }
+}
+
 impl ProxyServer {
     /// Decide which node a request should be routed to, without doing any
-    /// I/O. Reuses `current_node` when it is healthy and role-compatible
-    /// (sticky session), otherwise selects a fresh primary/read node. The
-    /// returned address is the key into the per-session connection cache.
+    /// I/O. A write goes to the write target (reusing `current_node` when it
+    /// is one); a hint-forced request to its node. Any other request follows
+    /// `read` (see [`ReadRoute`]); with [`ReadRoute::Stay`] it reuses a
+    /// healthy `current_node` (sticky session) as before read offload
+    /// existed. Returns the address — the key into the per-session
+    /// connection cache — and whether it is an offloaded read on a standby.
     pub(super) async fn choose_target_node(
         is_write: bool,
         forced_target: Option<String>,
         current_node: Option<&str>,
+        read: ReadRoute,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,
-    ) -> Result<String> {
+    ) -> Result<(String, bool)> {
         // After a migration cutover, every request stays on the promoted
         // target — never route back to the former primary.
         if let Some(t) = state.cutover.load_full().as_ref() {
-            return Ok(t.addr.clone());
+            return Ok((t.addr.clone(), false));
         }
 
         // Read-your-writes: within the window after a write, a read is pinned to
@@ -27,29 +120,12 @@ impl ProxyServer {
             let last_write = *session.last_write_at.read().await;
             if Self::ryw_pins_primary(last_write, config.lag_routing.ryw_window_ms) {
                 tracing::debug!(target: "helios::routing", "read-your-writes: pinning read to primary");
-                return Self::select_primary_with_timeout(session, state, config).await;
+                return Ok((
+                    Self::select_primary_with_timeout(session, state, config).await?,
+                    false,
+                ));
             }
         }
-
-        let need_switch = if let Some(ref forced) = forced_target {
-            let health = state.health.load_full();
-            let reuse = current_node
-                .map(|c| c == forced && health.get(c).map(|h| h.healthy).unwrap_or(false))
-                .unwrap_or(false);
-            !reuse
-        } else if let Some(current) = current_node {
-            let health = state.health.load_full();
-            let current_healthy = health.get(current).map(|h| h.healthy).unwrap_or(false);
-            if !current_healthy {
-                true
-            } else if is_write {
-                !Self::is_write_target(state, config, current)
-            } else {
-                false
-            }
-        } else {
-            true
-        };
 
         if let Some(forced) = forced_target {
             // Resolve a node *name* to its address; an address is passed
@@ -62,15 +138,161 @@ impl ProxyServer {
                 .find(|n| n.name.as_deref() == Some(forced.as_str()) || n.address() == forced)
                 .map(|n| n.address().to_string())
                 .unwrap_or(forced);
-            Ok(resolved)
-        } else if need_switch {
-            if is_write {
-                Self::select_primary_with_timeout(session, state, config).await
+            return Ok((resolved, false));
+        }
+
+        let healthy = |addr: &str| {
+            state
+                .health
+                .load_full()
+                .get(addr)
+                .map(|h| h.healthy)
+                .unwrap_or(false)
+        };
+        if !is_write {
+            match read {
+                ReadRoute::Stay => {}
+                ReadRoute::Offload => {
+                    let sync_only =
+                        config.load_balancer.standby_reads == crate::config::StandbyReads::Sync;
+                    let sticky = session.read_node.lock().clone();
+                    if let Some(prev) = sticky {
+                        if Self::still_read_target(state, config, &prev, sync_only) {
+                            *session.current_node.write().await = Some(prev.clone());
+                            return Ok((prev, true));
+                        }
+                    }
+                    if let Some(addr) = Self::pick_standby(session, state, config, sync_only).await
+                    {
+                        if !Self::is_write_target(state, config, &addr) {
+                            *session.read_node.lock() = Some(addr.clone());
+                            return Ok((addr, true));
+                        }
+                    }
+                    *session.read_node.lock() = None;
+                    // No standby qualifies right now: the primary serves it.
+                    if let Some(c) = current_node {
+                        if healthy(c) && Self::is_write_target(state, config, c) {
+                            return Ok((c.to_string(), false));
+                        }
+                    }
+                    if let Some(home) = Self::home_node(state, config) {
+                        return Ok((home, false));
+                    }
+                }
+                ReadRoute::Home => {
+                    if let Some(c) = current_node {
+                        if healthy(c) && Self::is_write_target(state, config, c) {
+                            return Ok((c.to_string(), false));
+                        }
+                    }
+                    if let Some(home) = Self::home_node(state, config) {
+                        return Ok((home, false));
+                    }
+                    // No primary right now: behave as without offload, so a
+                    // read can still be served by a standby during an outage.
+                }
+            }
+        }
+
+        let need_switch = if let Some(current) = current_node {
+            if !healthy(current) {
+                true
+            } else if is_write {
+                !Self::is_write_target(state, config, current)
             } else {
-                Self::select_read_node(session, state, config).await
+                false
             }
         } else {
-            Ok(current_node.unwrap().to_string())
+            true
+        };
+        if need_switch {
+            if is_write {
+                Ok((
+                    Self::select_primary_with_timeout(session, state, config).await?,
+                    false,
+                ))
+            } else {
+                Ok((Self::select_read_node(session, state, config).await?, false))
+            }
+        } else {
+            Ok((current_node.unwrap().to_string(), false))
+        }
+    }
+
+    /// An offloaded read is about to run on the standby connection `target`:
+    /// bring that socket's session settings up to the session's tracked
+    /// `SET`s (the primary connection ran them itself) unless it already
+    /// matches `reads.guc_epoch` — `RESET ALL` first if it carries an older
+    /// set, then each tracked `SET`. Only in session pooling: with
+    /// transaction or statement pooling every connection is reset between
+    /// transactions anyway. `false` when the socket could not be brought up
+    /// to date: it is dropped, a backend that refused a `SET` pins the
+    /// session's reads to its home, and the caller routes the read home.
+    pub(super) async fn mirror_read_gucs(
+        client: &mut ClientStream,
+        conns: &mut HashMap<String, BackendConn>,
+        target: &str,
+        reads: &ReadRouting<'_>,
+        session: &ClientSession,
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+    ) -> bool {
+        let Some(bc) = conns.get_mut(target) else {
+            return false;
+        };
+        if bc.gucs_synced == Some(reads.guc_epoch)
+            || config.pool_mode.mode != crate::config::PoolingMode::Session
+        {
+            return true;
+        }
+        if bc.gucs_synced.is_none() && reads.gucs.is_empty() {
+            // A fresh connection already has the session's startup settings.
+            bc.gucs_synced = Some(reads.guc_epoch);
+            return true;
+        }
+        let wt = state.limits.backend_write_timeout;
+        let rt = state.limits.backend_read_timeout;
+        let mf = state.limits.max_backend_frame_bytes;
+        let reset = bc.gucs_synced.is_some();
+        let synced = async {
+            Self::finish_pending_backend_frames(client, bc, state).await?;
+            if reset {
+                Self::tr_run_discard(&mut bc.stream, "RESET ALL", wt, rt, mf, None).await?;
+            }
+            Self::tr_restore_session_state(&mut bc.stream, reads.gucs, wt, rt, mf).await
+        }
+        .await;
+        match synced {
+            Ok(_) => {
+                bc.gucs_synced = Some(reads.guc_epoch);
+                #[cfg(feature = "pool-modes")]
+                if !reads.gucs.is_empty() {
+                    bc.dirty = true;
+                }
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "helios::routing",
+                    node = %target,
+                    error = %e,
+                    "could not mirror the session's settings onto a standby; reading from the primary"
+                );
+                conns.remove(target);
+                state
+                    .metrics
+                    .read_mirror_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                if matches!(e, ProxyError::Network(_)) {
+                    Self::record_backend_failure(state, target, &e.to_string());
+                } else {
+                    session
+                        .reads_pinned
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                false
+            }
         }
     }
 

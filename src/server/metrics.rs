@@ -48,6 +48,11 @@ pub(super) struct ServerMetrics {
     /// Clients (or transaction-mode redials) refused with 53300 because the
     /// backend stayed at `max_connections` for the whole `acquire_timeout`.
     pub(super) backend_capacity_refusals: AtomicU64,
+    /// Requests served by a standby under `[load_balancer] standby_reads`.
+    pub(super) reads_offloaded: AtomicU64,
+    /// Standby connections that could not take the session's settings, so
+    /// the read went to the primary.
+    pub(super) read_mirror_failures: AtomicU64,
     /// TR-07: transactions the recovery journal recorded as committed.
     pub(super) journal_committed: AtomicU64,
     /// TR-07: captured transactions the backend rolled back (or that were
@@ -121,6 +126,10 @@ pub struct ServerMetricsSnapshot {
     pub backend_capacity_waits: u64,
     /// Refusals passed to the client as 53300 after the capacity wait expired.
     pub backend_capacity_refusals: u64,
+    /// Requests served by a standby (read offload).
+    pub reads_offloaded: u64,
+    /// Read-offload setting mirrors that failed (the read went to the primary).
+    pub read_mirror_failures: u64,
     /// TR-07: transactions the recovery journal recorded as committed.
     pub journal_committed: u64,
     /// TR-07: captured transactions the backend rolled back.

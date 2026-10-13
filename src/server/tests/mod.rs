@@ -13,6 +13,7 @@ fn test_config() -> ProxyConfig {
 
 // ---- single-pass statement facts ----
 mod prepared_commit_flush;
+mod read_offload;
 mod startup_terminal;
 mod stmt_facts;
 
@@ -203,6 +204,9 @@ fn make_test_session() -> Arc<ClientSession> {
         #[cfg(feature = "rate-limiting")]
         rate_limit_key: std::sync::OnceLock::new(),
         startup_slot: parking_lot::Mutex::new(None),
+        reads_pinned: std::sync::atomic::AtomicBool::new(false),
+        read_node: parking_lot::Mutex::new(None),
+        last_write: parking_lot::Mutex::new(None),
     })
 }
 

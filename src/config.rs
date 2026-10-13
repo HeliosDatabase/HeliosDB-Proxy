@@ -2452,6 +2452,7 @@ impl ProxyConfig {
             enabled: true,
             name: None,
             max_connections: 0,
+            synchronous: false,
             addr_cache: OnceLock::new(),
         });
 
@@ -3198,8 +3199,17 @@ impl PoolConfig {
 pub struct LoadBalancerConfig {
     /// Routing strategy for read queries
     pub read_strategy: Strategy,
-    /// Enable read/write splitting
+    /// Enable read/write splitting: writes go to the primary and, per
+    /// `standby_reads`, standby-safe reads to standbys. `false` keeps every
+    /// statement on the session's node.
     pub read_write_split: bool,
+    /// Which standbys serve offloaded reads (with `read_write_split`).
+    pub standby_reads: StandbyReads,
+    /// Read-your-writes for offloaded reads: for this many milliseconds after
+    /// a session's write (or `SET`, or transaction end) its reads stay on the
+    /// primary, so it reads back what it just wrote despite replica lag.
+    /// `0` disables. Default 1000.
+    pub read_your_writes_ms: u64,
     /// Latency threshold for unhealthy marking (ms)
     pub latency_threshold_ms: u64,
 }
@@ -3209,9 +3219,37 @@ impl Default for LoadBalancerConfig {
         Self {
             read_strategy: Strategy::RoundRobin,
             read_write_split: true,
+            standby_reads: StandbyReads::default(),
+            read_your_writes_ms: 1000,
             latency_threshold_ms: 100,
         }
     }
+}
+
+impl LoadBalancerConfig {
+    /// Whether reads may leave the primary at all.
+    pub fn offloads_reads(&self) -> bool {
+        self.read_write_split && self.standby_reads != StandbyReads::Primary
+    }
+}
+
+/// `[load_balancer] standby_reads`: where reads outside a transaction run
+/// when `read_write_split` is on. Only statements the proxy can prove are
+/// side-effect-free reads leave the primary; see docs/configuration.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StandbyReads {
+    /// Any healthy standby or read replica, synchronous or asynchronous. A
+    /// read may lag the primary; `[lag_routing]` bounds the lag and adds
+    /// read-your-writes.
+    #[default]
+    Async,
+    /// Only synchronous standbys: `[[nodes]] synchronous = true`, or Patroni's
+    /// `sync_standby` member with `[topology] provider = "patroni"`. With no
+    /// such standby, reads stay on the primary.
+    Sync,
+    /// Reads stay on the primary.
+    Primary,
 }
 
 /// Load balancing strategy
@@ -3318,6 +3356,11 @@ pub struct NodeConfig {
     /// `max_connections` some headroom above this for them and for admins.
     #[serde(default)]
     pub max_connections: usize,
+    /// The standby replicates synchronously (it is in the primary's
+    /// `synchronous_standby_names`). Only such standbys serve reads with
+    /// `[load_balancer] standby_reads = "sync"`. Default `false`.
+    #[serde(default)]
+    pub synchronous: bool,
     /// Lazily-computed `"host:port"` string, cached so the hot query path
     /// (looked up several times per read query — health, circuit-breaker,
     /// lag, and the winning node) doesn't `format!()` a fresh `String` on
@@ -3353,6 +3396,7 @@ impl Default for NodeConfig {
             enabled: false,
             name: None,
             max_connections: 0,
+            synchronous: false,
             addr_cache: OnceLock::new(),
         }
     }
@@ -3862,6 +3906,67 @@ database = "helios"
             first_ptr,
             second.as_ptr(),
             "address() should return the same cached allocation on repeated calls"
+        );
+    }
+
+    /// `[load_balancer] standby_reads` defaults to the documented
+    /// read/write split (reads to any standby); `[[nodes]] synchronous`
+    /// defaults to `false`; `read_write_split = false` or "primary" keeps
+    /// reads on the primary.
+    #[test]
+    fn standby_reads_and_synchronous_parse_with_defaults() {
+        let config = ProxyConfig::default();
+        assert_eq!(config.load_balancer.standby_reads, StandbyReads::Async);
+        assert_eq!(config.load_balancer.read_your_writes_ms, 1000);
+        assert!(config.load_balancer.offloads_reads());
+
+        let parsed: ProxyConfig = toml::from_str(
+            r#"
+            [load_balancer]
+            standby_reads = "sync"
+            read_your_writes_ms = 0
+            [[nodes]]
+            host = "a"
+            port = 5432
+            role = "primary"
+            [[nodes]]
+            host = "b"
+            port = 5432
+            role = "standby"
+            synchronous = true
+            [[nodes]]
+            host = "c"
+            port = 5432
+            role = "standby"
+        "#,
+        )
+        .expect("parse");
+        assert_eq!(parsed.load_balancer.standby_reads, StandbyReads::Sync);
+        assert_eq!(parsed.load_balancer.read_your_writes_ms, 0);
+        assert!(parsed.load_balancer.offloads_reads());
+        assert_eq!(
+            parsed
+                .nodes
+                .iter()
+                .map(|n| n.synchronous)
+                .collect::<Vec<_>>(),
+            vec![false, true, false]
+        );
+
+        for (split, mode, offloads) in [
+            (true, StandbyReads::Primary, false),
+            (false, StandbyReads::Async, false),
+            (true, StandbyReads::Async, true),
+        ] {
+            let lb = LoadBalancerConfig {
+                read_write_split: split,
+                standby_reads: mode,
+                ..Default::default()
+            };
+            assert_eq!(lb.offloads_reads(), offloads, "{split} {mode:?}");
+        }
+        assert!(
+            toml::from_str::<ProxyConfig>("[load_balancer]\nstandby_reads = \"any\"\n").is_err()
         );
     }
 

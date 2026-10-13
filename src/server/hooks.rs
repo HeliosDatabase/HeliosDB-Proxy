@@ -366,7 +366,7 @@ impl ProxyServer {
     pub(super) fn extended_hint_route(
         state: &Arc<ServerState>,
         sql: &str,
-    ) -> Option<(bool, Option<String>)> {
+    ) -> Option<(bool, Option<String>, bool)> {
         let parser = state.hint_parser.as_ref()?;
         let hints = parser.parse(sql);
         if hints.is_empty() {
@@ -375,10 +375,10 @@ impl ProxyServer {
         let stripped = parser.strip(sql);
         let is_write = Self::is_write_query(&stripped);
         match Self::hint_to_override(&hints) {
-            RouteOverride::Primary => Some((true, None)),
-            RouteOverride::Standby => Some((false, None)),
-            RouteOverride::Node(n) => Some((is_write, Some(n))),
-            _ => Some((is_write, None)),
+            RouteOverride::Primary => Some((true, None, false)),
+            RouteOverride::Standby => Some((false, None, true)),
+            RouteOverride::Node(n) => Some((is_write, Some(n), false)),
+            _ => Some((is_write, None, false)),
         }
     }
 

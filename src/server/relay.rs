@@ -18,6 +18,7 @@ impl ProxyServer {
         msg: &Message,
         conns: &mut HashMap<String, BackendConn>,
         current_node: Option<&str>,
+        reads: &ReadRouting<'_>,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,
@@ -71,6 +72,7 @@ impl ProxyServer {
         let (route_override, stripped_msg): (RouteOverride, Option<Message>) =
             (plugin_override, None);
 
+        let standby_hint = matches!(route_override, RouteOverride::Standby);
         let (is_write, forced_target) = match route_override {
             RouteOverride::None => (default_is_write, None),
             RouteOverride::Primary => (true, None),
@@ -331,16 +333,27 @@ impl ProxyServer {
         #[cfg(feature = "query-analytics")]
         let started = std::time::Instant::now();
 
-        let target = Self::choose_target_node(
+        if is_write {
+            reads.note_write(session);
+        }
+        let read_route = if is_write || forced_target.is_some() {
+            ReadRoute::Stay
+        } else {
+            reads.route(session, standby_hint, || {
+                facts.is_standby_read(&state.tr_read_policy)
+            })
+        };
+        let (mut target, offloaded) = Self::choose_target_node(
             is_write,
             forced_target,
             current_node,
+            read_route,
             session,
             state,
             config,
         )
         .await?;
-        tracing::debug!(target: "helios::routing", node = %target, is_write, "routed simple query");
+        tracing::debug!(target: "helios::routing", node = %target, is_write, offloaded, "routed simple query");
 
         // Circuit breaker: fast-fail when the chosen node's circuit is open.
         #[cfg(feature = "circuit-breaker")]
@@ -358,6 +371,36 @@ impl ProxyServer {
             Self::record_backend_failure(state, &target, &e.to_string());
             BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
             return Err(e);
+        }
+        // An offloaded read runs with the session's settings mirrored onto
+        // the standby connection; if that cannot be done, the home serves it.
+        let mut served_by_standby = offloaded;
+        if offloaded
+            && !Self::mirror_read_gucs(client, conns, &target, reads, session, state, config).await
+        {
+            served_by_standby = false;
+            target = Self::choose_target_node(
+                false,
+                None,
+                current_node,
+                ReadRoute::Home,
+                session,
+                state,
+                config,
+            )
+            .await?
+            .0;
+            if let Err(e) = Self::ensure_conn(conns, &target, session, config, state).await {
+                Self::record_backend_failure(state, &target, &e.to_string());
+                BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
+                return Err(e);
+            }
+        }
+        if served_by_standby {
+            state
+                .metrics
+                .reads_offloaded
+                .fetch_add(1, Ordering::Relaxed);
         }
         let backend = conns.get_mut(&target).expect("just ensured");
 
@@ -414,12 +457,14 @@ impl ProxyServer {
 
         #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
         {
+            // A standby's answer may predate a write the caches were just
+            // invalidated for: it is served, never stored.
             #[cfg(feature = "query-cache")]
-            let qc_wants = cache_ctx.is_some() && state.query_cache.is_some();
+            let qc_wants = cache_ctx.is_some() && state.query_cache.is_some() && !served_by_standby;
             #[cfg(not(feature = "query-cache"))]
             let qc_wants = false;
             #[cfg(feature = "edge-proxy")]
-            let edge_wants = edge_ctx.is_some();
+            let edge_wants = edge_ctx.is_some() && !served_by_standby;
             #[cfg(not(feature = "edge-proxy"))]
             let edge_wants = false;
             if (qc_wants || edge_wants) && backend.response_buf.is_empty() {
@@ -624,6 +669,7 @@ impl ProxyServer {
         wait_ready: bool,
         conns: &mut HashMap<String, BackendConn>,
         current_node: Option<&str>,
+        reads: &ReadRouting<'_>,
         registry: &HashMap<String, bytes::Bytes>,
         reprepare: &[String],
         defines: &[String],
@@ -655,29 +701,49 @@ impl ProxyServer {
         #[cfg(feature = "query-analytics")]
         let started = std::time::Instant::now();
 
-        let target = match route_sql {
+        let (mut target, offloaded) = match route_sql {
             Some(sql) => {
                 // Routing-hints, when active, can override the verb-based
                 // target (and recompute the write flag on the stripped SQL).
                 #[cfg(feature = "routing-hints")]
-                let (is_write, forced) = Self::extended_hint_route(state, sql)
-                    .unwrap_or_else(|| (Self::is_write_query(sql), None));
+                let (is_write, forced, standby_hint) = Self::extended_hint_route(state, sql)
+                    .unwrap_or_else(|| (Self::is_write_query(sql), None, false));
                 #[cfg(not(feature = "routing-hints"))]
-                let (is_write, forced): (bool, Option<String>) = (Self::is_write_query(sql), None);
+                let (is_write, forced, standby_hint): (bool, Option<String>, bool) =
+                    (Self::is_write_query(sql), None, false);
                 #[cfg(feature = "lag-routing")]
                 if is_write && config.lag_routing.enabled {
                     *session.last_write_at.write().await = Some(std::time::Instant::now());
                 }
-                Self::choose_target_node(is_write, forced, current_node, session, state, config)
-                    .await?
+                if is_write {
+                    reads.note_write(session);
+                }
+                let read_route = if is_write || forced.is_some() {
+                    ReadRoute::Stay
+                } else {
+                    reads.route(session, standby_hint, || reads.batch_reads)
+                };
+                Self::choose_target_node(
+                    is_write,
+                    forced,
+                    current_node,
+                    read_route,
+                    session,
+                    state,
+                    config,
+                )
+                .await?
             }
             // No Parse in this batch: stay on the prepared-statement /
             // portal connection. Fall back to a read node only if the
             // session has no current connection yet.
-            None => match current_node {
-                Some(c) => c.to_string(),
-                None => Self::select_read_node(session, state, config).await?,
-            },
+            None => (
+                match current_node {
+                    Some(c) => c.to_string(),
+                    None => Self::select_read_node(session, state, config).await?,
+                },
+                false,
+            ),
         };
 
         // Circuit breaker: fast-fail when the chosen node's circuit is open.
@@ -697,6 +763,33 @@ impl ProxyServer {
             Self::record_backend_failure(state, &target, &e.to_string());
             BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
             return Err(e);
+        }
+        // An offloaded batch runs with the session's settings mirrored onto
+        // the standby connection; if that cannot be done, the home serves it.
+        if offloaded
+            && !Self::mirror_read_gucs(client, conns, &target, reads, session, state, config).await
+        {
+            target = Self::choose_target_node(
+                false,
+                None,
+                current_node,
+                ReadRoute::Home,
+                session,
+                state,
+                config,
+            )
+            .await?
+            .0;
+            if let Err(e) = Self::ensure_conn(conns, &target, session, config, state).await {
+                Self::record_backend_failure(state, &target, &e.to_string());
+                BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
+                return Err(e);
+            }
+        } else if offloaded {
+            state
+                .metrics
+                .reads_offloaded
+                .fetch_add(1, Ordering::Relaxed);
         }
         let backend = conns.get_mut(&target).expect("just ensured");
 

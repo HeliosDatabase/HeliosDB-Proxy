@@ -341,6 +341,30 @@ impl ProxyServer {
                 return Ok(node);
             }
         }
+        if let Some(addr) = Self::pick_standby(session, state, config, false).await {
+            return Ok(addr);
+        }
+        // Fall back to primary if no healthy standbys
+        Self::select_node(session, state, config).await
+    }
+
+    /// Pick a node that may serve reads right now — a healthy, enabled
+    /// standby or read replica that is read-eligible (circuit closed, lag
+    /// within `[lag_routing]`) — with `[load_balancer] read_strategy`, and pin
+    /// the session to it. `sync_only` keeps synchronous standbys only. `None`
+    /// when no node qualifies.
+    pub(super) async fn pick_standby(
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+        sync_only: bool,
+    ) -> Option<String> {
+        let members = if sync_only {
+            state.primary_tracker.provider_members()
+        } else {
+            Vec::new()
+        };
+        let sync_ok = |addr: &str| !sync_only || Self::is_sync_standby(config, &members, addr);
 
         // H-01 step 3: under a topology provider the published snapshot names
         // the read set, so a promotion moves reads too (the demoted former
@@ -357,13 +381,14 @@ impl ProxyServer {
                     .iter()
                     .any(|n| n.enabled && n.address() == r.address)
                     && Self::read_eligible(state, config, &r.address, r.lag_bytes)
+                    && sync_ok(&r.address)
                 {
                     candidates.push(&r.address);
                     weights.push(r.weight);
                     latency.push(r.latency_ms);
                 }
             }
-            let picked = Self::pin_read_target(
+            return Self::pin_read_target(
                 session,
                 state,
                 config,
@@ -373,10 +398,6 @@ impl ProxyServer {
                 &latency,
             )
             .await;
-            if let Some(addr) = picked {
-                return Ok(addr);
-            }
-            return Self::select_node(session, state, config).await;
         }
 
         // Get healthy nodes (prefer standbys for reads)
@@ -396,32 +417,104 @@ impl ProxyServer {
                             .get(n.address())
                             .and_then(|h| h.replication_lag_bytes),
                     )
+                    && sync_ok(n.address())
             })
             .collect();
+        let weights: Vec<u32> = healthy_standbys.iter().map(|n| n.weight).collect();
+        let latency: Vec<f64> = healthy_standbys
+            .iter()
+            .map(|n| health.get(n.address()).map(|h| h.latency_ms).unwrap_or(0.0))
+            .collect();
+        Self::pin_read_target(
+            session,
+            state,
+            config,
+            &healthy_standbys,
+            |n| n.address(),
+            &weights,
+            &latency,
+        )
+        .await
+    }
 
-        if !healthy_standbys.is_empty() {
-            let weights: Vec<u32> = healthy_standbys.iter().map(|n| n.weight).collect();
-            let latency: Vec<f64> = healthy_standbys
-                .iter()
-                .map(|n| health.get(n.address()).map(|h| h.latency_ms).unwrap_or(0.0))
-                .collect();
-            let picked = Self::pin_read_target(
-                session,
-                state,
-                config,
-                &healthy_standbys,
-                |n| n.address(),
-                &weights,
-                &latency,
-            )
-            .await;
-            if let Some(addr) = picked {
-                return Ok(addr);
-            }
+    /// Whether `addr` may still serve a session's offloaded reads (the sticky
+    /// read node): the same tests [`Self::pick_standby`] applies, for one node.
+    pub(super) fn still_read_target(
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+        addr: &str,
+        sync_only: bool,
+    ) -> bool {
+        if Self::is_write_target(state, config, addr) {
+            return false;
         }
+        if sync_only
+            && !Self::is_sync_standby(config, &state.primary_tracker.provider_members(), addr)
+        {
+            return false;
+        }
+        if state.authoritative_topology {
+            let snapshot = state.routing.load();
+            return snapshot.replicas.iter().any(|r| {
+                r.address == addr
+                    && config
+                        .nodes
+                        .iter()
+                        .any(|n| n.enabled && n.address() == addr)
+                    && Self::read_eligible(state, config, addr, r.lag_bytes)
+            });
+        }
+        let health = state.health.load_full();
+        let Some(h) = health.get(addr) else {
+            return false;
+        };
+        h.healthy
+            && config.nodes.iter().any(|n| {
+                n.enabled
+                    && n.address() == addr
+                    && (n.role == NodeRole::Standby || n.role == NodeRole::ReadReplica)
+            })
+            && Self::read_eligible(state, config, addr, h.replication_lag_bytes)
+    }
 
-        // Fall back to primary if no healthy standbys
-        Self::select_node(session, state, config).await
+    /// Whether `addr` replicates synchronously: `[[nodes]] synchronous =
+    /// true`, or the provider (Patroni) reports it as `sync_standby`.
+    pub(super) fn is_sync_standby(
+        config: &ProxyConfig,
+        members: &[crate::primary_tracker::TopologyMember],
+        addr: &str,
+    ) -> bool {
+        config
+            .nodes
+            .iter()
+            .any(|n| n.synchronous && n.address() == addr)
+            || members
+                .iter()
+                .any(|m| m.role == "sync_standby" && m.address == addr)
+    }
+
+    /// The session's home for statements the primary must serve, found
+    /// without waiting: the provider's leader while its lease is valid, or
+    /// (static topology) a healthy configured primary. `None` when there is
+    /// none right now.
+    pub(super) fn home_node(state: &ServerState, config: &ProxyConfig) -> Option<String> {
+        if state.authoritative_topology {
+            let snapshot = state.routing.load();
+            return snapshot
+                .write_leader(std::time::Instant::now())
+                .filter(|a| config.nodes.iter().any(|n| n.enabled && n.address() == *a))
+                .map(str::to_string);
+        }
+        let health = state.health.load_full();
+        config
+            .nodes
+            .iter()
+            .find(|n| {
+                n.enabled
+                    && n.role == NodeRole::Primary
+                    && health.get(n.address()).map(|h| h.healthy).unwrap_or(false)
+            })
+            .map(|n| n.address().to_string())
     }
 
     /// Whether a healthy read candidate may serve reads right now: its

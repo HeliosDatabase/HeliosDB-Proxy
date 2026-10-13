@@ -2796,17 +2796,33 @@ async fn writes_follow_the_authoritative_leader_not_the_configured_role() {
     assert!(ProxyServer::is_write_target(state, &config, "pg-b:5432"));
 
     // A session still sitting on the demoted configured primary is moved.
-    let target =
-        ProxyServer::choose_target_node(true, None, Some("pg-a:5432"), &session, state, &config)
-            .await
-            .unwrap();
+    let target = ProxyServer::choose_target_node(
+        true,
+        None,
+        Some("pg-a:5432"),
+        ReadRoute::Stay,
+        &session,
+        state,
+        &config,
+    )
+    .await
+    .unwrap()
+    .0;
     assert_eq!(target, "pg-b:5432");
 
     // A session already on the leader stays put.
-    let target =
-        ProxyServer::choose_target_node(true, None, Some("pg-b:5432"), &session, state, &config)
-            .await
-            .unwrap();
+    let target = ProxyServer::choose_target_node(
+        true,
+        None,
+        Some("pg-b:5432"),
+        ReadRoute::Stay,
+        &session,
+        state,
+        &config,
+    )
+    .await
+    .unwrap()
+    .0;
     assert_eq!(target, "pg-b:5432");
 }
 
@@ -3771,6 +3787,7 @@ async fn f2_stale_statement_is_closed_before_the_batch_uses_it() {
             true,
             &mut conns,
             Some(addr.as_str()),
+            &ReadRouting::OFF,
             &registry,
             &case.reprepare,
             &case.defines,

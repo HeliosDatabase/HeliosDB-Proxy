@@ -176,6 +176,9 @@ write_timeout_secs = 15
 mode = "session"
 [load_balancer]
 read_write_split = true
+# Routing in this check comes only from the node hints (read offload would
+# move the unhinted Bind-only batches by their statement's SQL).
+standby_reads = "primary"
 [routing_hints]
 enabled = true
 [health]

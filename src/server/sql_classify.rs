@@ -371,6 +371,100 @@ impl ProxyServer {
     /// regardless of surrounding whitespace while an identifier substring
     /// (`into_total`) is not. Always compiled: the in-session TR statement
     /// classifier (`tr_classify`) uses it on every build.
+    /// A statement a standby can run with the result the primary would give
+    /// (up to replication lag): one SELECT / VALUES / TABLE / WITH that
+    /// transaction replay classifies as a read — only side-effect-free
+    /// built-ins and `tr_read_functions`, no `INTO`, no data-modifying CTE —
+    /// without a row-locking clause (`FOR UPDATE` / `FOR SHARE` …, which needs
+    /// a writable node) and without a call of a function that answers about
+    /// the primary or fails during recovery ([`STANDBY_UNSAFE_FUNCTIONS`]).
+    /// Everything else is never offloaded.
+    pub(super) fn standby_safe_read(sql: &str, policy: &TrReadPolicy) -> bool {
+        let t = sql.trim_start();
+        let read_lead = Self::starts_with_word_ci(t, "SELECT")
+            || Self::starts_with_word_ci(t, "VALUES")
+            || Self::starts_with_word_ci(t, "TABLE")
+            || Self::starts_with_word_ci(t, "WITH");
+        if !read_lead || Self::tr_classify(sql, policy) != StmtKind::Read {
+            return false;
+        }
+        if Self::contains_word_ci(t, "for")
+            && (Self::contains_word_ci(t, "update") || Self::contains_word_ci(t, "share"))
+        {
+            return false;
+        }
+        let mut primary_bound = false;
+        let scanned = crate::replay_sql::words(t, |w| {
+            if w.call
+                && STANDBY_UNSAFE_FUNCTIONS
+                    .iter()
+                    .any(|f| w.text.eq_ignore_ascii_case(f))
+            {
+                primary_bound = true;
+                return false;
+            }
+            true
+        });
+        scanned.is_ok() && !primary_bound
+    }
+
+    /// Whether the session's named statement `name` is a standby-safe read,
+    /// classified from the registry's canonical `Parse` and memoized. A memo
+    /// entry is trusted only while it still describes the very `Parse` bytes
+    /// the registry holds (a redefinition or a refused-batch undo replaces
+    /// them); an unknown name is not offloaded.
+    pub(super) fn named_standby_read(
+        memo: &mut HashMap<String, (bytes::Bytes, bool)>,
+        registry: &HashMap<String, bytes::Bytes>,
+        name: &str,
+        policy: &TrReadPolicy,
+    ) -> bool {
+        let Some(parse) = registry.get(name) else {
+            return false;
+        };
+        if let Some((seen, safe)) = memo.get(name) {
+            if seen.as_ptr() == parse.as_ptr() && seen.len() == parse.len() {
+                return *safe;
+            }
+        }
+        let safe =
+            Self::parse_msg_sql(parse).is_some_and(|sql| Self::standby_safe_read(sql, policy));
+        memo.insert(name.to_string(), (parse.clone(), safe));
+        safe
+    }
+
+    /// A statement after which the session's reads stay on its home node: it
+    /// leaves state that only the backend connection running it holds and
+    /// that the proxy does not mirror onto standbys — a temporary object
+    /// (`CREATE TEMP …`, `SELECT … INTO`), a cursor, a SQL `PREPARE`,
+    /// `LISTEN`, `LOAD`, a GUC change through `set_config()` — or a
+    /// multi-statement string, whose leading keyword vouches for nothing
+    /// after the first `;`. Session `SET`/`RESET` are not here: they are
+    /// tracked and mirrored.
+    pub(super) fn pins_reads(sql: &str) -> bool {
+        let t = sql.trim();
+        let core = t.strip_suffix(';').unwrap_or(t).trim_end();
+        if core.contains(';') {
+            return true;
+        }
+        let kw = |w: &str| Self::starts_with_word_ci(core, w);
+        if kw("DECLARE") || kw("LISTEN") || kw("LOAD") {
+            return true;
+        }
+        if kw("PREPARE") && !kw("PREPARE TRANSACTION") {
+            return true;
+        }
+        if kw("CREATE")
+            && (Self::contains_word_ci(core, "temp") || Self::contains_word_ci(core, "temporary"))
+        {
+            return true;
+        }
+        if (kw("SELECT") || kw("WITH")) && Self::contains_word_ci(core, "into") {
+            return true;
+        }
+        Self::contains_word_ci(core, "set_config")
+    }
+
     pub(super) fn contains_word_ci(haystack: &str, word: &str) -> bool {
         let hb = haystack.as_bytes();
         let wb = word.as_bytes();

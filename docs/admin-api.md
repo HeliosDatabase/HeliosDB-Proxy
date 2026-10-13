@@ -367,6 +367,8 @@ Besides the counters above, the body carries (P-03):
 | `heliosdb_proxy_journal_apply_seconds` | histogram | — | Applying a response's captured operations to the recovery journal. |
 | `heliosdb_proxy_operator_replay_seconds` | histogram | — | `POST /api/replay` runs. |
 | `heliosdb_proxy_tr_replay_refusals_total` | counter | `reason` = `outcome_unknown`, `not_replayable`, `cap_exceeded`, `diverged`, `deadline`, `backend_unavailable` | Backend faults Transaction Replay did not transparently continue. |
+| `heliosdb_proxy_reads_offloaded_total` | counter | — | Requests served by a standby under `[load_balancer] standby_reads`. |
+| `heliosdb_proxy_read_mirror_failures_total` | counter | — | Standby connections that could not take the session's `SET`s, so the read went to the primary. |
 | `heliosdb_proxy_cache_hits_total` | counter | `tier` = `l1`, `l2`, `l3` | Query cache hits (`[cache] enabled`). |
 | `heliosdb_proxy_cache_misses_total`, `_puts_total`, `_invalidations_total` | counter | — | Query cache misses, stores, invalidation operations. |
 | `heliosdb_proxy_cache_stale_rejected_total` | counter | — | Hits refused because a table they read was written since the fetch. |

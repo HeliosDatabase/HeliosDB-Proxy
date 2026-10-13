@@ -134,6 +134,20 @@ pub struct ClientSession {
     /// The node slot (H-05) of the backend connection opened during startup,
     /// handed to that connection's `BackendConn` once the session starts.
     pub(crate) startup_slot: parking_lot::Mutex<crate::node_slots::Slot>,
+    /// The session's reads stay on its home node (the primary) from now on:
+    /// it created state that only that connection holds (temp tables,
+    /// cursors, SQL `PREPARE`, `LISTEN`, untracked GUC changes), or mirroring
+    /// its tracked `SET`s onto a standby failed. Only consulted while
+    /// `[load_balancer]` offloads reads.
+    pub(crate) reads_pinned: std::sync::atomic::AtomicBool,
+    /// The standby the session's offloaded reads last ran on. Reads keep
+    /// using it while it stays eligible, so one session does not read from
+    /// standbys at different replay positions in turn.
+    pub(crate) read_node: parking_lot::Mutex<Option<String>>,
+    /// When the session last sent a write (or `SET`, or transaction end)
+    /// while reads are offloaded: `[load_balancer] read_your_writes_ms`
+    /// keeps its reads on the primary for that long afterwards.
+    pub(crate) last_write: parking_lot::Mutex<Option<std::time::Instant>>,
 }
 
 /// Transaction state
@@ -234,6 +248,10 @@ pub(super) struct BackendConn {
     /// Named statements the session closed through another connection that
     /// this socket may still hold. Never also in `prepared`.
     pub(super) stale: HashSet<String>,
+    /// The session's tracked-`SET` epoch this socket was last brought up to
+    /// date with (offloaded reads mirror the primary's session GUCs onto a
+    /// standby connection). `None`: never synchronised.
+    pub(super) gucs_synced: Option<u64>,
     /// Signature (query text + parameter-type OIDs) of the *unnamed* prepared
     /// statement currently established on this socket, if any. When the client
     /// re-sends an identical unnamed `Parse`, the proxy can skip forwarding it
@@ -266,6 +284,7 @@ impl BackendConn {
             response_buf: BytesMut::new(),
             prepared: HashSet::new(),
             stale: HashSet::new(),
+            gucs_synced: None,
             unnamed_sig: None,
             #[cfg(feature = "pool-modes")]
             dirty: false,

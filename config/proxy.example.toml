@@ -157,9 +157,17 @@ prepared_statement_mode = "track"
 #   random               — random selection
 read_strategy = "round_robin"
 
-# When true, SELECT queries are routed to standbys and writes to the primary.
-# Disable if your application cannot tolerate any replication lag on reads.
+# When true, writes go to the primary and side-effect-free reads outside a
+# transaction to the standbys chosen by standby_reads. Disable if your
+# application cannot tolerate any replication lag on reads.
 read_write_split = true
+
+# Which standbys serve those reads:
+#   async   — any healthy standby or read replica (may lag the primary)
+#   sync    — only standbys marked `synchronous = true` below (or Patroni's
+#             sync_standby); reads stay on the primary while there is none
+#   primary — reads stay on the primary
+standby_reads = "async"
 
 # If a node's average response time exceeds this threshold (milliseconds)
 # it is temporarily deprioritised for read traffic.
@@ -220,6 +228,7 @@ port = 5432
 role = "standby"
 weight = 100
 enabled = true
+synchronous = false       # true if listed in the primary's synchronous_standby_names
 
 # -----------------------------------------------------------------------------
 # Cache — query result caching (disabled in this starter config)

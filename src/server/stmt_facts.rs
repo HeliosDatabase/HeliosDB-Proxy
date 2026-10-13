@@ -95,6 +95,9 @@ pub(super) struct StmtFacts<'a> {
     /// `is_cacheable_read_sql`: plain, deterministic, single-statement SELECT.
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     pub(super) is_cacheable_read: Option<bool>,
+    /// `standby_safe_read`: a read a standby may serve (only asked while
+    /// reads are offloaded).
+    pub(super) standby_read: Option<bool>,
 }
 
 impl<'a> StmtFacts<'a> {
@@ -110,6 +113,7 @@ impl<'a> StmtFacts<'a> {
             leaves_session_state: None,
             #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
             is_cacheable_read: None,
+            standby_read: None,
         }
     }
 
@@ -186,5 +190,12 @@ impl<'a> StmtFacts<'a> {
             self.sql,
             ProxyServer::is_cacheable_read_sql,
         )
+    }
+
+    /// See [`ProxyServer::standby_safe_read`].
+    pub(super) fn is_standby_read(&mut self, policy: &TrReadPolicy) -> bool {
+        Self::memo(&mut self.standby_read, self.sql, |sql| {
+            ProxyServer::standby_safe_read(sql, policy)
+        })
     }
 }

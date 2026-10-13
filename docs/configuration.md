@@ -361,14 +361,66 @@ test_on_acquire = true
 [load_balancer]
 read_strategy = "round_robin"
 read_write_split = true
+standby_reads = "async"     # "async" | "sync" | "primary"
+read_your_writes_ms = 1000
 latency_threshold_ms = 100
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `read_strategy` | string | `"round_robin"` | Read routing strategy (see below). |
-| `read_write_split` | bool | `true` | Route writes to the primary, reads to standby/replica nodes. |
+| `read_write_split` | bool | `true` | Route writes to the primary and, per `standby_reads`, reads to standby/replica nodes. `false`: every statement stays on the session's node (the primary). |
+| `standby_reads` | string | `"async"` | Which standbys serve reads: `async` — any healthy standby or read replica, which may lag the primary; `sync` — only synchronous standbys (`[[nodes]] synchronous = true`, or Patroni's `sync_standby` member with `[topology] provider = "patroni"`), reads stay on the primary while there is none; `primary` — reads stay on the primary. |
+| `read_your_writes_ms` | u64 | `1000` | For this long after a session sends a write — or `SET`, a transaction statement, or any statement the proxy cannot show is a side-effect-free read (`CALL`, `DO`, a function that may write) — its reads stay on the primary, so it reads back what it just wrote despite replica lag. `0` disables. A `/*helios:route=standby*/` hint overrides it. |
 | `latency_threshold_ms` | u64 | `100` | Latency above which a node is treated as unhealthy for routing. |
+
+### Read offload
+
+With `read_write_split = true` and `standby_reads` other than `primary`, a statement runs on
+a standby only when the proxy can show it is a side-effect-free read:
+
+- one `SELECT`, `VALUES`, `TABLE` or `WITH` statement that transaction replay classifies as a
+  read: every function it calls is a side-effect-free built-in or listed in
+  `tr_read_functions`, it has no `INTO`, and a `WITH` contains no `INSERT`, `UPDATE`,
+  `DELETE` or `MERGE`;
+- without a row-locking clause (`FOR UPDATE`, `FOR SHARE`, …), and without a function that
+  answers about the primary or fails during recovery (`pg_is_in_recovery()`, the WAL-position,
+  replay-status, transaction-id and snapshot functions);
+- outside an explicit transaction. `BEGIN` goes to the primary and the whole transaction
+  stays there;
+- for the extended protocol, every statement the `Sync`-terminated batch executes must
+  qualify (a batch split by `Flush` stays on the primary). A `Bind` of a named statement
+  prepared earlier is classified from that statement's SQL, and is re-prepared on the
+  standby when needed.
+
+Everything else (writes, `SET`, `SHOW`, `COPY`, `EXPLAIN`, functions that may write, a
+`/*helios:route=primary*/` hint) runs on the primary. A `/*helios:route=standby*/` hint
+sends the statement to a standby even when the proxy cannot classify it;
+`/*helios:node=<name>*/` still targets that node.
+
+A session's offloaded reads stay on one standby while it remains eligible (healthy, circuit
+closed, within `[lag_routing] max_lag_bytes`, synchronous for `sync`), so its reads do not
+alternate between standbys at different replay positions. With no eligible standby the
+primary serves the read. A result a standby served is never stored in the query cache or
+the edge cache: it may predate a write the cache was just invalidated for. Counters:
+`heliosdb_proxy_reads_offloaded_total`, `heliosdb_proxy_read_mirror_failures_total`.
+
+**Session state.** Session-level `SET`/`RESET` sent with the simple protocol go to the
+primary and are mirrored onto a standby connection before its next read (`RESET ALL`, then
+the session's settings, once per change; session pooling only, since transaction and
+statement pooling reset connections anyway). A session that creates state only its primary
+connection holds keeps its reads on the primary for the rest of its life: temporary tables
+(`CREATE TEMP …`, `SELECT … INTO`), cursors (`DECLARE`), SQL `PREPARE`, `LISTEN`, `LOAD`,
+`set_config()`, a multi-statement simple query, an extended-protocol `SET`/`RESET`/`DISCARD`,
+more tracked `SET`s than `[limits] tr_max_session_set_statements`, or a `SET` the standby
+refuses.
+
+**Consistency.** A read on an asynchronous standby can miss a write committed just before
+it. `read_your_writes_ms` keeps a session's reads on the primary for a while after its own
+writes; it does not cover other sessions' writes. For stronger guarantees bound the lag with
+`[lag_routing] max_lag_bytes`, or use
+`standby_reads = "sync"` with the primary's `synchronous_commit = remote_apply` (with `on`,
+a synchronous standby has the commit flushed but not necessarily applied yet).
 
 ### Routing Strategies
 
@@ -537,6 +589,7 @@ name = "standby-1"
 | `http_port` | u16 | `8080` | No | HTTP API port on the backend node (SQL API forwarding). |
 | `role` | string | — | Yes | `primary`, `standby`, or `replica`. |
 | `weight` | u32 | — | Yes* | Load-balancing weight. |
+| `synchronous` | bool | `false` | No | The standby replicates synchronously (it is listed in the primary's `synchronous_standby_names`). Only such standbys serve reads with `[load_balancer] standby_reads = "sync"`. |
 | `max_connections` | usize | `0` | No | Most backend connections this proxy keeps to the node at once, in use and parked idle alike (H-05); `0` = unlimited. A full node first gives up one idle pooled connection, then waits up to `[limits] backend_slot_wait_ms`, then refuses the request with SQLSTATE 53300 (the node is not marked unhealthy). Health and topology probes are not counted: keep the backend's own `max_connections` above the sum of every proxy's caps plus probes and admins. |
 | `enabled` | bool | — | Yes* | Whether the node is routable. Toggleable at runtime via the admin API. |
 | `name` | string | *(none)* | No | Human-readable name for logs/metrics/admin. |
@@ -548,7 +601,7 @@ name = "standby-1"
 | Role | Description |
 |------|-------------|
 | `primary` | Read/write node. All writes and transaction-control statements route here. At least one required. |
-| `standby` | Receives reads when `read_write_split` is on. Becomes a write destination only after external promotion and discovery by an authoritative provider, or an operator updates its configured role to `primary`. The proxy does not promote it. |
+| `standby` | Receives side-effect-free reads when `read_write_split` is on (see [Read offload](#read-offload) and `standby_reads`). Becomes a write destination only after external promotion and discovery by an authoritative provider, or an operator updates its configured role to `primary`. The proxy does not promote it. |
 | `replica` | Read-only replica. Not promotable; receives reads only. |
 
 ---
