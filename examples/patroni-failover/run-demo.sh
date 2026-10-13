@@ -14,6 +14,13 @@ PROXY_PID=
 RELAY_PIDS=
 
 cleanup() {
+  local rc=$?
+  if [ "$rc" != 0 ]; then
+    # Keep the members' and etcd's logs of a failed run next to proxy.log.
+    for c in etcd pg-a pg-b; do
+      docker logs --timestamps ${P}-$c >"demo-$c.log" 2>&1 || true
+    done
+  fi
   [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null || true
   for r in $RELAY_PIDS; do kill -CONT "$r" 2>/dev/null; kill "$r" 2>/dev/null || true; done
   rm -f proxy-h02.generated.toml
