@@ -8,7 +8,7 @@ listening on 127.0.0.1 and 127.0.0.2) and its own proxy; uses no existing
 database and no third-party Python packages. The proxy sees the one server as
 two nodes: 127.0.0.1 is the primary and 127.0.0.2 the standby, with
 read_write_split on. A session therefore holds one backend connection per
-address, each with its own prepared statements, and `inet_server_addr()`
+address, each with its own prepared statements, and `host(inet_server_addr())`
 reports which of them ran a statement.
 Usage: python3 tests/integration/prepared_close_routing.py PROXY [--output evidence.json]
 Requires the already available postgres:18.4-bookworm image (never pulls images).
@@ -47,7 +47,7 @@ wire = tr08.wire
 frame = tr08.frame
 SYNC = tr08.SYNC
 PRIMARY, STANDBY = "127.0.0.1", "127.0.0.2"
-WHERE = "SELECT inet_server_addr()::text"
+WHERE = "SELECT host(inet_server_addr())"
 
 
 def query(client, sql):
@@ -85,8 +85,8 @@ def case_replaced(client):
     write(client)
     run_bind(client, "a1", report)
     report["v_after"] = value()
-    report["ok"] = (report["replaced_on"] == [[STANDBY + "/32"]]
-                    and report["bind_rows"] == [[PRIMARY + "/32"]]
+    report["ok"] = (report["replaced_on"] == [[STANDBY]]
+                    and report["bind_rows"] == [[PRIMARY]]
                     and report["bind_sqlstates"] == []
                     and report["v_after"] == report["v_before"])
     return report
@@ -107,7 +107,7 @@ def case_closed(client):
     write(client)
     run_bind(client, "b1", report)
     report["v_after"] = value()
-    report["ok"] = (report["read_on"] == [[STANDBY + "/32"]]
+    report["ok"] = (report["read_on"] == [[STANDBY]]
                     and report["bind_sqlstates"] == ["26000"]
                     and report["v_after"] == report["v_before"])
     return report
@@ -122,7 +122,7 @@ def case_reparsed(client):
                   + tr08.bind("", "c1") + tr08.execute("") + SYNC)
     report["reparse_tags"] = tags(r)
     report["reparse_sqlstates"] = tr08.errors(r)
-    report["ok"] = (report["read_on"] == [[STANDBY + "/32"]]
+    report["ok"] = (report["read_on"] == [[STANDBY]]
                     and report["reparse_sqlstates"] == []
                     and report["reparse_tags"] == ["INSERT 0 1"])
     return report
@@ -135,8 +135,8 @@ def case_replacement(client):
     report["defined_on"] = tr08.rows(r)
     write(client)
     run_bind(client, "d1", report)
-    report["ok"] = (report["defined_on"] == [[STANDBY + "/32"]]
-                    and report["bind_rows"] == [[PRIMARY + "/32"]]
+    report["ok"] = (report["defined_on"] == [[STANDBY]]
+                    and report["bind_rows"] == [[PRIMARY]]
                     and report["bind_sqlstates"] == [])
     return report
 
@@ -195,7 +195,7 @@ role = "standby"
         try:
             # Ready once a read reaches the standby (its health check passed).
             with tr08.startup(address) as probe:
-                if tr08.rows(query(probe, WHERE)) == [[STANDBY + "/32"]]:
+                if tr08.rows(query(probe, WHERE)) == [[STANDBY]]:
                     return proc, log, address
         except (OSError, RuntimeError, EOFError):
             pass

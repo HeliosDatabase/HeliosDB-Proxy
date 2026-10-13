@@ -1626,11 +1626,11 @@ impl ProxyServer {
     /// afterwards. On `target`, the connection that ran the batch, the
     /// `left_closed` names are no longer prepared; that socket is also no
     /// longer provably clean for the conditional reset, since a `Close`
-    /// skipped after an error in the batch leaves its statement defined. Every
-    /// other cached connection may still hold its own copy of a closed name,
-    /// which becomes stale there. `target` is `None` when the batch reached no
-    /// backend: then every connection is "other", which only costs an extra
-    /// `Close` later.
+    /// skipped after an error in the batch leaves its statement defined. A
+    /// name already stale on the target stays stale for the same reason: one
+    /// more `Close` before its next use is cheap. Every other cached
+    /// connection may still hold its own copy of a closed name, which becomes
+    /// stale there. With `target` `None` every connection is "other".
     pub(super) fn note_statement_closes(
         conns: &mut HashMap<String, BackendConn>,
         target: Option<&str>,

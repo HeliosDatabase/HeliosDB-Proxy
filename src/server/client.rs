@@ -1508,7 +1508,13 @@ impl ProxyServer {
                                 },
                             }
                         };
-                        let forwarded = used_node.is_some();
+                        if used_node.is_none() {
+                            // Refused before it reached a backend (rate limit,
+                            // open circuit, failed replacement): as on the
+                            // 25P02 path above, nothing was closed (F2).
+                            batch_closes.clear();
+                            batch_left_closed.clear();
+                        }
                         if let Some(n) = used_node {
                             current_node = Some(n);
                         }
@@ -1592,11 +1598,7 @@ impl ProxyServer {
                         // still hold their own copies (F2).
                         Self::note_statement_closes(
                             &mut conns,
-                            if forwarded {
-                                current_node.as_deref()
-                            } else {
-                                None
-                            },
+                            current_node.as_deref(),
                             &batch_closes,
                             &batch_left_closed,
                         );
