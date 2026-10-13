@@ -24,10 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `poll_interval_secs` is not below `lease_timeout_secs`.
 - Named prepared statements across a session's backend connections (F2). A `Close`
   reaches only the connection its batch is routed to, but the proxy kept listing the
-  name as prepared on the session's other connections. With `read_write_split`, a
-  statement closed and re-Parsed on a standby could still run its old definition when a
-  later `Bind` stayed on the primary, a `Bind` of a closed name ran instead of failing
-  with `26000`, and a new `Parse` of the name failed with `42P05`. Those connections now
+  name as prepared on the session's other connections. When a session's batches reach
+  more than one node (a `/*helios:node=...*/` routing hint, a read re-routed after its
+  node failed), a statement closed and re-Parsed on a standby could still run its old
+  definition when a later `Bind` stayed on the primary, a `Bind` of a closed name ran
+  instead of failing with `26000`, and a new `Parse` of the name failed with `42P05`. Those connections now
   close the name before a batch uses or redefines it (bounded by
   `reprepare_timeout_secs`). Separately, `Close s; Parse s ...` in one batch (the Npgsql
   replacement pattern) dropped `s` from the session's record, so it could not be

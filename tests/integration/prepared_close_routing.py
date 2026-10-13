@@ -6,19 +6,22 @@ tripping over, a statement the client closed.
 Starts and removes its own bounded PostgreSQL Docker container (host network,
 listening on 127.0.0.1 and 127.0.0.2) and its own proxy; uses no existing
 database and no third-party Python packages. The proxy sees the one server as
-two nodes: 127.0.0.1 is the primary and 127.0.0.2 the standby, with
-read_write_split on. A session therefore holds one backend connection per
-address, each with its own prepared statements, and `host(inet_server_addr())`
-reports which of them ran a statement.
+two nodes: 127.0.0.1 is the primary (pg-primary) and 127.0.0.2 the standby
+(pg-standby). A session starts on the primary and a read stays on the node the
+session is on, so the reads below name the standby with a routing hint
+(`/*helios:node=pg-standby*/`, `[routing_hints] enabled = true`); a write
+moves the session back to the primary. The session therefore holds one backend
+connection per address, each with its own prepared statements, and
+`host(inet_server_addr())` reports which of them ran a statement.
 Usage: python3 tests/integration/prepared_close_routing.py PROXY [--output evidence.json]
 Requires the already available postgres:18.4-bookworm image (never pulls images).
 
-Cases (each on a new client connection):
+Cases (each on a new client connection; <SELECT> carries the standby hint):
   replaced     Parse a1 (an UPDATE) on the primary; `Close a1; Parse a1 <SELECT>`
                runs on the standby; after a write, Bind/Execute a1 stays on the
                primary. Expected: the SELECT runs there, the UPDATE never does.
-  closed       Parse b1 (an UPDATE) on the primary; `Close b1` runs on the
-               standby; after a write, Bind/Execute b1 on the primary.
+  closed       Parse b1 (an UPDATE) on the primary; after a hinted read moves
+               the session to the standby, `Close b1` runs there; after a write, Bind/Execute b1 on the primary.
                Expected: 26000 (the client closed b1), the UPDATE never runs.
   reparsed     Parse c1 on the primary; `Close c1` runs on the standby; a new
                `Parse c1 <INSERT>` goes to the primary. Expected: no 42P05.
@@ -47,7 +50,8 @@ wire = tr08.wire
 frame = tr08.frame
 SYNC = tr08.SYNC
 PRIMARY, STANDBY = "127.0.0.1", "127.0.0.2"
-WHERE = "SELECT host(inet_server_addr())"
+# Runs on the standby; once prepared, a Bind of it reports wherever it runs.
+WHERE = "/*helios:node=pg-standby*/ SELECT host(inet_server_addr())"
 
 
 def query(client, sql):
@@ -172,6 +176,8 @@ write_timeout_secs = 15
 mode = "session"
 [load_balancer]
 read_write_split = true
+[routing_hints]
+enabled = true
 [health]
 check_interval_secs = 1
 check_timeout_secs = 1
@@ -181,10 +187,12 @@ success_threshold = 1
 host = "{PRIMARY}"
 port = {pg_port}
 role = "primary"
+name = "pg-primary"
 [[nodes]]
 host = "{STANDBY}"
 port = {pg_port}
 role = "standby"
+name = "pg-standby"
 '''
     (temp / "proxy.toml").write_text(cfg)
     log = (temp / "proxy.log").open("w+")
