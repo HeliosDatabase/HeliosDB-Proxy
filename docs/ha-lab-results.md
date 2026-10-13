@@ -85,8 +85,8 @@ Evidence: `/home/gpc/HDB/sprint/baselines/proxy/stack-20261012/window-M/lab-tip2
 
 | scenario | result | committed / attempted | not_sent | unknown | lost / phantom | write gap |
 |---|---|---|---|---|---|---|
-| promote-under-load | PASS | 2452 / 2454 | 2 | 0 | 0 / 0 | about 3.5 s |
-| stop-old-primary | PASS (no split-brain acknowledgement) | 2367 / 2371 | 4 | 0 | 0 / 0 | about 5 s |
+| promote-under-load | PASS | 2452 / 2454 | 2 | 0 | 0 / 0 | 2.7 s |
+| stop-old-primary | PASS (no split-brain acknowledgement) | 2367 / 2371 | 4 | 0 | 0 / 0 | 5.1 s |
 | edge-resume | PASS, 7/7 checks | | | | | |
 | cache-logical (C-02 slice 2) | PASS | | | | | |
 
