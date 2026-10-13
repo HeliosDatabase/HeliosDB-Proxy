@@ -1,4 +1,4 @@
-//// Side-effect-free functions whose answer is about the primary, or that
+/// Side-effect-free functions whose answer is about the primary, or that
 /// fail during recovery: a read calling one is never offloaded to a standby
 /// (`[load_balancer] standby_reads`). Connection-identity functions such as
 /// `inet_server_addr()` are not here — on a standby they truthfully describe
@@ -22,7 +22,7 @@ pub(super) const STANDBY_UNSAFE_FUNCTIONS: &[&str] = &[
     "txid_current_snapshot",
 ];
 
-// PostgreSQL built-in functions that have no side effects when re-executed
+/// PostgreSQL built-in functions that have no side effects when re-executed
 /// (TR-03). This is the whole basis for calling an interrupted read
 /// re-executable on an unknown outcome: a read calling anything NOT listed here
 /// — a user-defined function, `nextval`, `pg_notify`, `set_config`, advisory

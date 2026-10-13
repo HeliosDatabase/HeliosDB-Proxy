@@ -72,7 +72,9 @@ impl ProxyServer {
         let (route_override, stripped_msg): (RouteOverride, Option<Message>) =
             (plugin_override, None);
 
-        let standby_hint = matches!(route_override, RouteOverride::Standby);
+        // A route=standby hint offloads a statement the proxy cannot classify,
+        // never one it classifies as a write or transaction control.
+        let standby_hint = matches!(route_override, RouteOverride::Standby) && !default_is_write;
         let (is_write, forced_target) = match route_override {
             RouteOverride::None => (default_is_write, None),
             RouteOverride::Primary => (true, None),
@@ -354,6 +356,9 @@ impl ProxyServer {
         )
         .await?;
         tracing::debug!(target: "helios::routing", node = %target, is_write, offloaded, "routed simple query");
+        if offloaded {
+            Self::drop_if_unusable(conns, &target);
+        }
 
         // Circuit breaker: fast-fail when the chosen node's circuit is open.
         #[cfg(feature = "circuit-breaker")]
@@ -374,8 +379,11 @@ impl ProxyServer {
         }
         // An offloaded read runs with the session's settings mirrored onto
         // the standby connection; if that cannot be done, the home serves it.
+        // A connection that once took mirrored settings and now serves as home
+        // (a standby promoted since) is brought up to date the same way.
+        let stale_mirror = !offloaded && Self::mirror_stale(conns, &target, reads);
         let mut served_by_standby = offloaded;
-        if offloaded
+        if (offloaded || stale_mirror)
             && !Self::mirror_read_gucs(client, conns, &target, reads, session, state, config).await
         {
             served_by_standby = false;
@@ -401,6 +409,8 @@ impl ProxyServer {
                 .metrics
                 .reads_offloaded
                 .fetch_add(1, Ordering::Relaxed);
+        } else if stale_mirror {
+            Self::mirror_now_home(conns, &target);
         }
         let backend = conns.get_mut(&target).expect("just ensured");
 
@@ -721,7 +731,14 @@ impl ProxyServer {
                 let read_route = if is_write || forced.is_some() {
                     ReadRoute::Stay
                 } else {
-                    reads.route(session, standby_hint, || reads.batch_reads)
+                    match reads.route(session, standby_hint, || reads.batch_reads) {
+                        // Part of a Flush-split cycle: the rest of it may write,
+                        // so the whole cycle stays on the home node.
+                        ReadRoute::Offload if !reads.batch_whole && !standby_hint => {
+                            ReadRoute::Home
+                        }
+                        route => route,
+                    }
                 };
                 Self::choose_target_node(
                     is_write,
@@ -746,6 +763,10 @@ impl ProxyServer {
             ),
         };
 
+        if offloaded {
+            Self::drop_if_unusable(conns, &target);
+        }
+
         // Circuit breaker: fast-fail when the chosen node's circuit is open.
         #[cfg(feature = "circuit-breaker")]
         if let Some(mut resp) = Self::circuit_fast_fail(state, &target) {
@@ -766,7 +787,10 @@ impl ProxyServer {
         }
         // An offloaded batch runs with the session's settings mirrored onto
         // the standby connection; if that cannot be done, the home serves it.
-        if offloaded
+        // A connection that once took mirrored settings and now serves as home
+        // is brought up to date the same way.
+        let stale_mirror = !offloaded && Self::mirror_stale(conns, &target, reads);
+        if (offloaded || stale_mirror)
             && !Self::mirror_read_gucs(client, conns, &target, reads, session, state, config).await
         {
             target = Self::choose_target_node(
@@ -790,6 +814,8 @@ impl ProxyServer {
                 .metrics
                 .reads_offloaded
                 .fetch_add(1, Ordering::Relaxed);
+        } else if stale_mirror {
+            Self::mirror_now_home(conns, &target);
         }
         let backend = conns.get_mut(&target).expect("just ensured");
 

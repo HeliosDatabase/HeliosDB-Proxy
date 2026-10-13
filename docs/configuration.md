@@ -395,8 +395,8 @@ a standby only when the proxy can show it is a side-effect-free read:
 
 Everything else (writes, `SET`, `SHOW`, `COPY`, `EXPLAIN`, functions that may write, a
 `/*helios:route=primary*/` hint) runs on the primary. A `/*helios:route=standby*/` hint
-sends the statement to a standby even when the proxy cannot classify it;
-`/*helios:node=<name>*/` still targets that node.
+sends a statement the proxy cannot classify to a standby, but never one it classifies as
+a write or transaction control; `/*helios:node=<name>*/` still targets that node.
 
 A session's offloaded reads stay on one standby while it remains eligible (healthy, circuit
 closed, within `[lag_routing] max_lag_bytes`, synchronous for `sync`), so its reads do not
@@ -414,6 +414,12 @@ connection holds keeps its reads on the primary for the rest of its life: tempor
 `set_config()`, a multi-statement simple query, an extended-protocol `SET`/`RESET`/`DISCARD`,
 more tracked `SET`s than `[limits] tr_max_session_set_statements`, or a `SET` the standby
 refuses.
+
+**Connections.** In session pooling a session that has offloaded a read keeps one standby
+connection besides its primary connection for its lifetime: size the standbys'
+`max_connections` (and `[[nodes]] max_connections`) for the session count. The idle
+session's primary connection is the one watched for backend loss; a standby connection
+that died while idle is replaced before its next read.
 
 **Consistency.** A read on an asynchronous standby can miss a write committed just before
 it. `read_your_writes_ms` keeps a session's reads on the primary for a while after its own

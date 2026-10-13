@@ -23,6 +23,9 @@ pub(super) struct ReadRouting<'a> {
     /// Extended protocol: every statement of the batch is a standby-safe
     /// read. The simple path classifies its final SQL itself.
     pub(super) batch_reads: bool,
+    /// Extended protocol: the batch is a whole `Sync`-terminated cycle with
+    /// no `Flush` part forwarded before it; a split cycle stays home.
+    pub(super) batch_whole: bool,
     /// The session's tracked `SET`s, mirrored onto a standby connection
     /// before its next read, and the epoch that names this set.
     pub(super) gucs: &'a [String],
@@ -37,6 +40,7 @@ impl ReadRouting<'_> {
         offload_on: false,
         may_offload: false,
         batch_reads: false,
+        batch_whole: false,
         gucs: &[],
         guc_epoch: 0,
         read_your_writes: Duration::ZERO,
@@ -217,6 +221,65 @@ impl ProxyServer {
             }
         } else {
             Ok((current_node.unwrap().to_string(), false))
+        }
+    }
+
+    /// Read offload: remember where the session's last request that was not
+    /// an offloaded read ran — its home, the socket the idle watch covers.
+    pub(super) fn note_home(
+        home: &mut Option<String>,
+        used: Option<&str>,
+        session: &ClientSession,
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+    ) {
+        let Some(node) = used else {
+            return;
+        };
+        let offloaded = session.read_node.lock().as_deref() == Some(node)
+            && !Self::is_write_target(state, config, node);
+        if !offloaded && home.as_deref() != Some(node) {
+            *home = Some(node.to_string());
+        }
+    }
+
+    /// A standby socket kept for offloaded reads is not watched while the
+    /// session idles on its home. Before reusing it, drop it if the backend
+    /// closed it or sent anything unsolicited (a FATAL before closing): it
+    /// holds nothing the session cannot rebuild, and `ensure_conn` dials anew.
+    pub(super) fn drop_if_unusable(conns: &mut HashMap<String, BackendConn>, target: &str) {
+        let Some(bc) = conns.get_mut(target) else {
+            return;
+        };
+        let mut probe = [0u8; 1];
+        let idle = bc.response_buf.is_empty()
+            && matches!(
+                bc.stream.try_read(&mut probe),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+            );
+        if !idle {
+            conns.remove(target);
+        }
+    }
+
+    /// `target` once took the session's settings by mirroring (a standby the
+    /// session read from) and is behind them, while reads are offloaded.
+    pub(super) fn mirror_stale(
+        conns: &HashMap<String, BackendConn>,
+        target: &str,
+        reads: &ReadRouting<'_>,
+    ) -> bool {
+        reads.offload_on
+            && conns
+                .get(target)
+                .is_some_and(|bc| bc.gucs_synced.is_some_and(|e| e != reads.guc_epoch))
+    }
+
+    /// A once-mirrored connection now serves as the session's home: from here
+    /// on it runs the session's `SET`s itself.
+    pub(super) fn mirror_now_home(conns: &mut HashMap<String, BackendConn>, target: &str) {
+        if let Some(bc) = conns.get_mut(target) {
+            bc.gucs_synced = None;
         }
     }
 

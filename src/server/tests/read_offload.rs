@@ -18,6 +18,7 @@ const ON: ReadRouting<'static> = ReadRouting {
     offload_on: true,
     may_offload: true,
     batch_reads: true,
+    batch_whole: true,
     gucs: &[],
     guc_epoch: 0,
     read_your_writes: Duration::ZERO,
@@ -105,7 +106,17 @@ fn statements_that_leave_connection_state_pin_reads() {
         ("LOAD 'auto_explain'", true),
         ("SELECT set_config('app.x', '1', false)", true),
         ("SELECT 1; SELECT 2", true),
+        ("CREATE OR REPLACE TEMP VIEW v AS SELECT 1", true),
+        ("CREATE GLOBAL TEMPORARY TABLE x (a int)", true),
         ("PREPARE TRANSACTION 'g1'", false),
+        (
+            "WITH x AS (SELECT 1 AS a) INSERT INTO t SELECT a FROM x",
+            false,
+        ),
+        ("SELECT * INTO new_t FROM t", false),
+        ("SELECT * FROM t WHERE note = 'into temp'", false),
+        ("CREATE INDEX i ON t (temp)", false),
+        ("SELECT 'set_config(1)'", false),
         ("SELECT 1;", false),
         ("SET search_path TO app", false),
         ("CREATE TABLE t (a int)", false),
@@ -503,4 +514,84 @@ fn named_statements_are_classified_from_the_registry() {
     assert!(!ProxyServer::named_standby_read(
         &mut memo, &registry, "nope", &policy
     ));
+}
+
+/// An idle standby socket is reused; one whose backend closed is dropped
+/// before the read (the idle watch covers only the home socket).
+#[tokio::test]
+async fn a_closed_standby_socket_is_dropped_before_reuse() {
+    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    let (live, _live_peer) = pair().await;
+    conns.insert("live:5432".to_string(), BackendConn::new(live));
+    ProxyServer::drop_if_unusable(&mut conns, "live:5432");
+    assert!(conns.contains_key("live:5432"));
+
+    let (dead, dead_peer) = pair().await;
+    drop(dead_peer);
+    conns.insert("dead:5432".to_string(), BackendConn::new(dead));
+    // The FIN reaches the reactor asynchronously.
+    for _ in 0..50 {
+        ProxyServer::drop_if_unusable(&mut conns, "dead:5432");
+        if !conns.contains_key("dead:5432") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!conns.contains_key("dead:5432"));
+}
+
+/// The home node follows the session's non-offloaded requests only, and a
+/// once-mirrored socket is re-synchronised only while reads are offloaded.
+#[tokio::test]
+async fn home_tracking_and_stale_mirrors() {
+    let config = offload_config(StandbyReads::Async);
+    let server = ProxyServer::new(config.clone()).unwrap();
+    let session = make_test_session();
+    let mut home = Some("pg-p:5432".to_string());
+    *session.read_node.lock() = Some("pg-s1:5432".to_string());
+    ProxyServer::note_home(
+        &mut home,
+        Some("pg-s1:5432"),
+        &session,
+        &server.state,
+        &config,
+    );
+    assert_eq!(home.as_deref(), Some("pg-p:5432"), "an offloaded read");
+    ProxyServer::note_home(
+        &mut home,
+        Some("pg-s2:5432"),
+        &session,
+        &server.state,
+        &config,
+    );
+    assert_eq!(
+        home.as_deref(),
+        Some("pg-s2:5432"),
+        "a hinted request moves home"
+    );
+
+    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    let (s, _peer) = pair().await;
+    let mut bc = BackendConn::new(s);
+    bc.gucs_synced = Some(1);
+    conns.insert("pg-s1:5432".to_string(), bc);
+    let gucs = vec!["SET search_path TO app".to_string()];
+    let reads = ReadRouting {
+        gucs: &gucs,
+        guc_epoch: 2,
+        ..ON
+    };
+    assert!(ProxyServer::mirror_stale(&conns, "pg-s1:5432", &reads));
+    assert!(!ProxyServer::mirror_stale(
+        &conns,
+        "pg-s1:5432",
+        &ReadRouting::OFF
+    ));
+    let current = ReadRouting {
+        guc_epoch: 1,
+        ..reads
+    };
+    assert!(!ProxyServer::mirror_stale(&conns, "pg-s1:5432", &current));
+    ProxyServer::mirror_now_home(&mut conns, "pg-s1:5432");
+    assert!(!ProxyServer::mirror_stale(&conns, "pg-s1:5432", &reads));
 }

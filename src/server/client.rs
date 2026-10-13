@@ -823,6 +823,13 @@ impl ProxyServer {
         let mut batch_flushed = false;
         let mut batch_parsed_unnamed = false;
         let mut stmt_reads: HashMap<String, (bytes::Bytes, bool)> = HashMap::new();
+        // The batch Binds the unnamed statement; the node holding the client's
+        // unnamed statement (where its last unnamed Parse ran); the session's
+        // home node (where its last non-offloaded request ran), which the idle
+        // watch covers while the session sits on a standby.
+        let mut batch_binds_unnamed = false;
+        let mut unnamed_node: Option<String> = None;
+        let mut home_node: Option<String> = current_node.clone();
         loop {
             // Read the client's next message directly into the accumulation
             // buffer (no intermediate zeroed scratch, no extra copy). `read_buf`
@@ -845,19 +852,35 @@ impl ProxyServer {
             // `None` (the default, `client_idle_timeout_secs = 0`) leaves every
             // read unbounded exactly as before.
             let idle_deadline = Self::client_idle_deadline(state, &buffer, session);
-            // Borrowed, not cloned (Fix S4): the watch target is always the
-            // session's current node, so cloning the node key into a fresh
-            // `String` on every client-message wait was pure hot-path overhead.
+            // Borrowed, not cloned (Fix S4): the watch target is the session's
+            // current node (with read offload, its home node), so cloning the
+            // node key into a fresh `String` on every client-message wait was
+            // pure hot-path overhead.
             let watch_node: Option<&str> = if session
                 .copy_in_progress
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
                 None
+            } else if offload_on {
+                // Read offload: watch the home socket (it holds the session's
+                // state) even while the last request ran on a standby.
+                home_node
+                    .as_deref()
+                    .filter(|node| conns.contains_key(*node))
+                    .or_else(|| {
+                        current_node
+                            .as_deref()
+                            .filter(|node| conns.contains_key(*node))
+                    })
             } else {
                 current_node
                     .as_deref()
                     .filter(|node| conns.contains_key(*node))
             };
+            // Only the home socket's loss is the session's: a standby socket
+            // used for offloaded reads holds nothing the session cannot rebuild,
+            // so its FATAL is not forwarded and its loss is silent.
+            let watching_home = !offload_on || watch_node == home_node.as_deref();
             let n: usize = match Self::read_next_client_message(
                 stream,
                 &mut buffer,
@@ -865,7 +888,7 @@ impl ProxyServer {
                 watch_node,
                 idle_deadline,
                 state,
-                session.tr_mode != TrMode::None,
+                session.tr_mode != TrMode::None || !watching_home,
             )
             .await?
             {
@@ -888,11 +911,11 @@ impl ProxyServer {
             };
             // `read_next_client_message` drops a watched backend connection that
             // died while the session was idle; the session survives and the next
-            // query redials. `watch_node` is a reborrow of `current_node` (see
-            // where it is built above), so a now-missing entry is always the
-            // session's current node — no equality re-check is needed.
-            let watched_backend_gone = watch_node.is_some_and(|node| !conns.contains_key(node));
-            if watched_backend_gone {
+            // query redials.
+            let watched_gone: Option<String> = watch_node
+                .filter(|node| !conns.contains_key(*node))
+                .map(str::to_string);
+            if let Some(gone) = watched_gone {
                 // F3: dropping the dead cached connection is enough only with
                 // `tr_mode = none` outside a transaction (the next query simply
                 // redials, as before). Otherwise the loss must be carried into
@@ -905,17 +928,24 @@ impl ProxyServer {
                 // Recorded here rather than inside `read_next_client_message`
                 // (where O2/S4 moved the watch loop) because the helper is
                 // session-agnostic — it takes no `&ClientSession` and owns no
-                // `TrSession` — and `watched_backend_gone` already reconstructs
-                // the same signal losslessly from `conns`.
-                if session.tr_mode != TrMode::None
-                    || tr.ext_dispatched
-                    || session
-                        .in_transaction
-                        .load(std::sync::atomic::Ordering::Relaxed)
+                // `TrSession` — and the missing `conns` entry reconstructs the
+                // same signal losslessly. A standby socket used only for
+                // offloaded reads is simply forgotten.
+                if watching_home
+                    && (session.tr_mode != TrMode::None
+                        || tr.ext_dispatched
+                        || session
+                            .in_transaction
+                            .load(std::sync::atomic::Ordering::Relaxed))
                 {
-                    tr.lost_backend = watch_node.map(|node| node.to_string());
+                    tr.lost_backend = Some(gone.clone());
                 }
-                current_node = None;
+                if home_node.as_deref() == Some(gone.as_str()) {
+                    home_node = None;
+                }
+                if current_node.as_deref() == Some(gone.as_str()) {
+                    current_node = None;
+                }
             }
 
             if n == 0 {
@@ -1090,6 +1120,7 @@ impl ProxyServer {
                                                 .reads_pinned
                                                 .load(std::sync::atomic::Ordering::Relaxed),
                                         batch_reads: false,
+                                        batch_whole: true,
                                         gucs: &tr.gucs,
                                         guc_epoch: tr.guc_epoch,
                                         read_your_writes: ryw,
@@ -1144,6 +1175,15 @@ impl ProxyServer {
                                 }
                             },
                         };
+                        if offload_on {
+                            Self::note_home(
+                                &mut home_node,
+                                used_node.as_deref(),
+                                session,
+                                state,
+                                config,
+                            );
+                        }
                         if let Some(n) = used_node {
                             current_node = Some(n);
                         }
@@ -1370,6 +1410,9 @@ impl ProxyServer {
                             }
                             MessageType::Bind => {
                                 let stmt_ref = Self::bind_stmt_ref(&msg.payload);
+                                if stmt_ref.is_none() {
+                                    batch_binds_unnamed = true;
+                                }
                                 if offload_on && batch_reads {
                                     batch_reads = match stmt_ref {
                                         Some(name) => Self::named_standby_read(
@@ -1541,6 +1584,14 @@ impl ProxyServer {
                                     // statements routes by the first one's SQL,
                                     // so a prepared write never runs on a
                                     // standby the session last read from.
+                                    // A batch that Binds the unnamed statement
+                                    // without Parsing it runs where that
+                                    // statement lives.
+                                    let unnamed_home = (offload_on
+                                        && batch_binds_unnamed
+                                        && !batch_parsed_unnamed)
+                                        .then(|| unnamed_node.clone())
+                                        .flatten();
                                     let ref_route_sql = if offload_on
                                         && pending_route_sql.is_none()
                                         && !batch_parsed_unnamed
@@ -1553,13 +1604,22 @@ impl ProxyServer {
                                     } else {
                                         None
                                     };
+                                    let (route_sql, route_from) = match unnamed_home.as_deref() {
+                                        Some(node) => (None, Some(node)),
+                                        None => (
+                                            pending_route_sql
+                                                .as_deref()
+                                                .or(ref_route_sql.as_deref()),
+                                            current_node.as_deref(),
+                                        ),
+                                    };
                                     Self::forward_extended_batch(
                                         stream,
                                         &batch,
-                                        pending_route_sql.as_deref().or(ref_route_sql.as_deref()),
+                                        route_sql,
                                         wait_ready,
                                         &mut conns,
-                                        current_node.as_deref(),
+                                        route_from,
                                         &ReadRouting {
                                             offload_on,
                                             may_offload: offload_on
@@ -1567,9 +1627,8 @@ impl ProxyServer {
                                                 && !session
                                                     .reads_pinned
                                                     .load(std::sync::atomic::Ordering::Relaxed),
-                                            batch_reads: batch_reads
-                                                && wait_ready
-                                                && !batch_flushed,
+                                            batch_reads,
+                                            batch_whole: wait_ready && !batch_flushed,
                                             gucs: &tr.gucs,
                                             guc_epoch: tr.guc_epoch,
                                             read_your_writes: ryw,
@@ -1638,6 +1697,20 @@ impl ProxyServer {
                             // 25P02 path above, nothing was closed (F2).
                             batch_closes.clear();
                             batch_left_closed.clear();
+                        }
+                        if offload_on {
+                            Self::note_home(
+                                &mut home_node,
+                                used_node.as_deref(),
+                                session,
+                                state,
+                                config,
+                            );
+                            if batch_parsed_unnamed {
+                                if let Some(n) = used_node.as_ref() {
+                                    unnamed_node = Some(n.clone());
+                                }
+                            }
                         }
                         if let Some(n) = used_node {
                             current_node = Some(n);
@@ -1761,6 +1834,7 @@ impl ProxyServer {
                             batch_reads = true;
                             batch_flushed = false;
                             batch_parsed_unnamed = false;
+                            batch_binds_unnamed = false;
                             state
                                 .metrics
                                 .queries_processed

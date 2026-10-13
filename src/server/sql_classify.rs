@@ -454,15 +454,44 @@ impl ProxyServer {
         if kw("PREPARE") && !kw("PREPARE TRANSACTION") {
             return true;
         }
-        if kw("CREATE")
-            && (Self::contains_word_ci(core, "temp") || Self::contains_word_ci(core, "temporary"))
-        {
+        // Token-exact checks outside literals, comments and quoted names:
+        // `set_config(…)` and `… INTO TEMP[ORARY] …`.
+        let is = |w: &str, k: &str| w.eq_ignore_ascii_case(k);
+        let (mut set_config, mut into_temp, mut after_into) = (false, false, false);
+        let scanned = crate::replay_sql::words(core, |w| {
+            if w.call && is(w.text, "set_config") {
+                set_config = true;
+                return false;
+            }
+            into_temp |= !w.quoted && after_into && (is(w.text, "temp") || is(w.text, "temporary"));
+            after_into = !w.quoted && is(w.text, "into");
+            true
+        });
+        if scanned.is_err() || set_config {
             return true;
         }
-        if (kw("SELECT") || kw("WITH")) && Self::contains_word_ci(core, "into") {
+        if (kw("SELECT") || kw("WITH")) && into_temp {
             return true;
         }
-        Self::contains_word_ci(core, "set_config")
+        // `CREATE [OR REPLACE] [GLOBAL | LOCAL] TEMP[ORARY] …`: leading
+        // keywords only, where no literal can occur.
+        if kw("CREATE") {
+            let mut rest = core.split_whitespace().skip(1).peekable();
+            if rest.peek().is_some_and(|w| is(w, "or")) {
+                rest.next();
+                rest.next(); // REPLACE
+            }
+            if rest
+                .peek()
+                .is_some_and(|w| is(w, "global") || is(w, "local"))
+            {
+                rest.next();
+            }
+            return rest
+                .next()
+                .is_some_and(|w| is(w, "temp") || is(w, "temporary"));
+        }
+        false
     }
 
     pub(super) fn contains_word_ci(haystack: &str, word: &str) -> bool {

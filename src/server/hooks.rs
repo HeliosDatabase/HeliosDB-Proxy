@@ -376,7 +376,8 @@ impl ProxyServer {
         let is_write = Self::is_write_query(&stripped);
         match Self::hint_to_override(&hints) {
             RouteOverride::Primary => Some((true, None, false)),
-            RouteOverride::Standby => Some((false, None, true)),
+            // A standby hint never moves a write or transaction control.
+            RouteOverride::Standby => Some((false, None, !is_write)),
             RouteOverride::Node(n) => Some((is_write, Some(n), false)),
             _ => Some((is_write, None, false)),
         }

@@ -1984,20 +1984,26 @@ impl ProxyServer {
                 Ok(()) => {
                     let bc = conns.get_mut(&node).expect("just ensured");
                     Self::tr_restore_preflight(tr)?;
-                    match tokio::time::timeout_at(
-                        deadline,
-                        Self::tr_restore_session_state(
-                            &mut bc.stream,
-                            &tr.gucs,
-                            state.limits.backend_write_timeout,
-                            state.limits.backend_read_timeout,
-                            state.limits.max_backend_frame_bytes,
-                        ),
-                    )
+                    let (wt, rt, mf) = (
+                        state.limits.backend_write_timeout,
+                        state.limits.backend_read_timeout,
+                        state.limits.max_backend_frame_bytes,
+                    );
+                    // A socket that took mirrored settings for offloaded
+                    // reads may carry an older set: start from its defaults.
+                    let mirrored = bc.gucs_synced.is_some();
+                    match tokio::time::timeout_at(deadline, async {
+                        if mirrored {
+                            Self::tr_run_discard(&mut bc.stream, "RESET ALL", wt, rt, mf, None)
+                                .await?;
+                        }
+                        Self::tr_restore_session_state(&mut bc.stream, &tr.gucs, wt, rt, mf).await
+                    })
                     .await
                     .unwrap_or_else(|_| Err(expired()))
                     {
                         Ok(n) => {
+                            bc.gucs_synced = None;
                             #[cfg(feature = "pool-modes")]
                             if n > 0 {
                                 bc.dirty = true;
