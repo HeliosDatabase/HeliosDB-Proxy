@@ -21,6 +21,7 @@ import hashlib
 import importlib.util
 import json
 import pathlib
+import socket
 import struct
 import subprocess
 import sys
@@ -36,6 +37,35 @@ tr08 = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tr08)
 wire = tr08.wire
 frame = wire.frame
+
+def read_response(client, limit=1000):
+    """Complete frames until ReadyForQuery or close (the shared fault reader
+    stops at 100 frames; this read returns 200 rows). Returns (messages,
+    closed, trailing_bytes, malformed, timed_out) like wire.fault_response."""
+    messages, pending = [], b""
+    while len(messages) < limit:
+        while len(pending) >= 5:
+            size = struct.unpack("!I", pending[1:5])[0]
+            if not 4 <= size <= 1024 * 1024:
+                return messages, False, len(pending), True, False
+            if len(pending) < size + 1:
+                break
+            tag, body = pending[:1], pending[5:size + 1]
+            pending = pending[size + 1:]
+            messages.append((tag, body))
+            if tag == b"Z":
+                return messages, False, len(pending), False, False
+        try:
+            chunk = client.recv(65536)
+        except ConnectionResetError:
+            return messages, True, len(pending), False, False
+        except socket.timeout:
+            return messages, False, len(pending), False, True
+        if not chunk:
+            return messages, True, len(pending), False, False
+        pending += chunk
+    raise ValueError("response exceeded the frame limit")
+
 
 READ = ("SELECT g, repeat('x', 1000), CASE WHEN g = 100 THEN pg_sleep(4) END "
         "FROM generate_series(1, 200) AS g")
@@ -55,7 +85,7 @@ def run_case(binary, hold):
             killer.start()
             client.settimeout(30)
             client.sendall(frame(b"Q", READ.encode() + b"\0"))
-            messages, closed, trailing, malformed, timed_out = wire.fault_response(client)
+            messages, closed, trailing, malformed, timed_out = read_response(client)
             killer.join()
             report.update({
                 "data_rows": sum(tag == b"D" for tag, _ in messages),

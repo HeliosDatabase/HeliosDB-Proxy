@@ -494,6 +494,81 @@ impl ProxyServer {
         Ok(off)
     }
 
+    /// Offset of the first FATAL/PANIC `ErrorResponse` among the complete
+    /// frames `buf[..whole]`, if any. Read while the session is idle, such a
+    /// frame is the backend announcing its own end (`pg_terminate_backend`, a
+    /// fast shutdown, `idle_session_timeout`).
+    pub(super) fn idle_termination_offset(buf: &[u8], whole: usize) -> Option<usize> {
+        let mut off = 0usize;
+        while off + 5 <= whole {
+            let len = u32::from_be_bytes([buf[off + 1], buf[off + 2], buf[off + 3], buf[off + 4]])
+                as usize;
+            let end = (off + 1 + len).min(whole);
+            if buf[off] == b'E' && Self::error_ends_session(&buf[off + 5..end]) {
+                return Some(off);
+            }
+            off = end;
+        }
+        None
+    }
+
+    /// Whether an `ErrorResponse` body's severity (`V`, else `S`) is FATAL or
+    /// PANIC.
+    fn error_ends_session(mut fields: &[u8]) -> bool {
+        let mut severity: Option<&[u8]> = None;
+        while let Some((&code, tail)) = fields.split_first() {
+            if code == 0 {
+                break;
+            }
+            let Some(nul) = memchr::memchr(0, tail) else {
+                break;
+            };
+            let value = &tail[..nul];
+            if code == b'V' {
+                severity = Some(value);
+                break;
+            }
+            if code == b'S' && severity.is_none() {
+                severity = Some(value);
+            }
+            fields = &tail[nul + 1..];
+        }
+        severity.is_some_and(|s| s == b"FATAL" || s == b"PANIC")
+    }
+
+    /// [`Self::forward_buffered_backend_frames`] for the idle watch. With
+    /// `keep_session` (the session's TR re-homes it: `tr_mode != none`),
+    /// frames up to a backend's own FATAL/PANIC are forwarded; that frame and
+    /// everything after it are dropped and `true` reports the backend gone.
+    /// The proxy keeps the client session (it redials, restores the session's
+    /// state and, in a transaction, replays), so the client must not be told
+    /// the session ended: a driver that sees an unsolicited FATAL closes its
+    /// connection. Without `keep_session` nothing is restored, and the FATAL
+    /// is the client's notice that its session state is gone: it is forwarded.
+    async fn forward_idle_backend_frames(
+        stream: &mut ClientStream,
+        buf: &mut BytesMut,
+        state: &Arc<ServerState>,
+        keep_session: bool,
+    ) -> Result<(usize, bool)> {
+        let whole = Self::complete_frame_prefix(buf, state.limits.max_backend_frame_bytes)?;
+        let cut = if keep_session {
+            Self::idle_termination_offset(buf, whole)
+        } else {
+            None
+        };
+        let Some(cut) = cut else {
+            return Ok((
+                Self::forward_buffered_backend_frames(stream, buf, state).await?,
+                false,
+            ));
+        };
+        let mut head = buf.split_to(cut);
+        let sent = Self::forward_buffered_backend_frames(stream, &mut head, state).await?;
+        buf.clear();
+        Ok((sent, true))
+    }
+
     pub(super) async fn read_next_client_message(
         stream: &mut ClientStream,
         buffer: &mut BytesMut,
@@ -501,6 +576,7 @@ impl ProxyServer {
         watch_node: Option<&str>,
         idle_deadline: Option<tokio::time::Instant>,
         state: &Arc<ServerState>,
+        keep_session: bool,
     ) -> Result<ClientRead> {
         let Some(node) = watch_node else {
             return Self::read_client_bytes(stream, buffer, idle_deadline).await;
@@ -522,38 +598,50 @@ impl ProxyServer {
             // Every relay of this socket shares its unpublished frame tail.
             {
                 let bc = conns.get_mut(node).expect("watch_node is in conns");
-                let sent =
-                    Self::forward_buffered_backend_frames(stream, &mut bc.response_buf, state)
-                        .await?;
+                let (sent, ended) = Self::forward_idle_backend_frames(
+                    stream,
+                    &mut bc.response_buf,
+                    state,
+                    keep_session,
+                )
+                .await?;
                 state
                     .metrics
                     .bytes_sent
                     .fetch_add(sent as u64, Ordering::Relaxed);
                 bc.response_buf.reserve(16 * 1024);
-                tokio::select! {
-                    r = stream.read_buf(buffer) => {
-                        client_bytes = Some(r.map_err(|e| {
-                            ProxyError::Network(format!("Read error: {}", e))
-                        })?);
+                if ended {
+                    backend_gone = true;
+                } else {
+                    tokio::select! {
+                        r = stream.read_buf(buffer) => {
+                            client_bytes = Some(r.map_err(|e| {
+                                ProxyError::Network(format!("Read error: {}", e))
+                            })?);
+                        }
+                        _ = &mut idle_wait => return Ok(ClientRead::IdleTimeout),
+                        r = bc.stream.read_buf(&mut bc.response_buf) => match r {
+                            Ok(0) => backend_gone = true,
+                            Ok(_) => {
+                                // Publish only COMPLETE frames. A truncated frame is
+                                // unrecoverable: the client blocks waiting for the
+                                // rest, and nothing may ever be injected after it —
+                                // not an ErrorResponse, and certainly not the rows of
+                                // a re-executed statement, which would be appended to
+                                // whatever the partial frame turns out to be.
+                                let (sent, ended) = Self::forward_idle_backend_frames(stream, &mut bc.response_buf, state, keep_session).await?;
+                                state.metrics.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                                if ended {
+                                    tracing::debug!(node = %node, "backend ended the session while idle (FATAL); dropping cached connection");
+                                    backend_gone = true;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(node = %node, error = %e, "backend read error while idle; dropping cached connection");
+                                backend_gone = true;
+                            }
+                        },
                     }
-                    _ = &mut idle_wait => return Ok(ClientRead::IdleTimeout),
-                    r = bc.stream.read_buf(&mut bc.response_buf) => match r {
-                        Ok(0) => backend_gone = true,
-                        Ok(_) => {
-                            // Publish only COMPLETE frames. A truncated frame is
-                            // unrecoverable: the client blocks waiting for the
-                            // rest, and nothing may ever be injected after it —
-                            // not an ErrorResponse, and certainly not the rows of
-                            // a re-executed statement, which would be appended to
-                            // whatever the partial frame turns out to be.
-                            let sent = Self::forward_buffered_backend_frames(stream, &mut bc.response_buf, state).await?;
-                            state.metrics.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            tracing::debug!(node = %node, error = %e, "backend read error while idle; dropping cached connection");
-                            backend_gone = true;
-                        }
-                    },
                 }
             }
             if backend_gone {
@@ -750,6 +838,7 @@ impl ProxyServer {
                 watch_node,
                 idle_deadline,
                 state,
+                session.tr_mode != TrMode::None,
             )
             .await?
             {

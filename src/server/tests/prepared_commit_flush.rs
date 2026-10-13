@@ -154,6 +154,7 @@ async fn commit_fragment_survives_flush_watch_and_sync_handoffs() {
         Some("a"),
         Some(tokio::time::Instant::now() + Duration::from_millis(100)),
         &server.state,
+        true,
     )
     .await
     .unwrap();
@@ -308,6 +309,7 @@ async fn backend_frame_tail_is_isolated_by_socket_and_dropped_on_loss() {
             Some("b"),
             Some(tokio::time::Instant::now() + Duration::from_millis(100)),
             &server.state,
+            true,
         )
         .await
         .unwrap(),
@@ -330,6 +332,7 @@ async fn backend_frame_tail_is_isolated_by_socket_and_dropped_on_loss() {
             Some("a"),
             Some(tokio::time::Instant::now() + Duration::from_millis(100)),
             &server.state,
+            true,
         )
         .await
         .unwrap(),

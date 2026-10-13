@@ -1583,6 +1583,7 @@ async fn read_next_client_message_times_out_while_watching_the_backend() {
         Some("node-a"),
         Some(deadline),
         &server.state,
+        true,
     )
     .await
     .unwrap();
@@ -1637,6 +1638,7 @@ async fn watch_relay_withholds_partial_backend_frames() {
         Some("node-a"),
         Some(deadline),
         &server.state,
+        true,
     )
     .await
     .unwrap();
@@ -1664,6 +1666,7 @@ async fn watch_relay_withholds_partial_backend_frames() {
         Some("node-a"),
         Some(deadline),
         &server.state,
+        true,
     )
     .await
     .unwrap();
@@ -2217,3 +2220,90 @@ fn anomaly_fingerprint_collapses_literals() {
 // ---- In-session Transaction Replay (tr_mode) ----
 
 mod tr_in_session;
+
+fn idle_frame(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut f = vec![tag];
+    f.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+    f.extend_from_slice(body);
+    f
+}
+
+/// A backend's own FATAL/PANIC ErrorResponse is found by severity (`V`, else
+/// `S`); ordinary errors and other frames are not.
+#[test]
+fn idle_termination_offset_finds_a_backend_fatal() {
+    let status = idle_frame(b'S', b"TimeZone\0UTC\0");
+    let error = idle_frame(b'E', b"SERROR\0VERROR\0C42P01\0Mnope\0\0");
+    let fatal = idle_frame(
+        b'E',
+        b"SFATAL\0VFATAL\0C57P01\0Mterminating connection due to administrator command\0\0",
+    );
+    let panic_s_only = idle_frame(b'E', b"SPANIC\0C XX000\0Mboom\0\0");
+    let localized = idle_frame(b'E', b"SSCHWERWIEGEND\0VFATAL\0C57P01\0Mx\0\0");
+    let at = |frames: &[&[u8]]| {
+        let buf = frames.concat();
+        ProxyServer::idle_termination_offset(&buf, buf.len())
+    };
+    assert_eq!(at(&[&status, &error]), None);
+    assert_eq!(
+        at(&[&status, &error, &fatal]),
+        Some(status.len() + error.len())
+    );
+    assert_eq!(at(&[&panic_s_only]), Some(0));
+    assert_eq!(at(&[&localized]), Some(0));
+}
+
+/// Idle watch: with the session kept by TR, a backend's FATAL is not
+/// forwarded (the client would close its connection) and the connection is
+/// dropped; frames before it still reach the client. With tr_mode = none it
+/// is forwarded as before.
+#[tokio::test]
+async fn idle_watch_keeps_a_backend_fatal_from_a_kept_session() {
+    use tokio::io::AsyncReadExt;
+    let status = idle_frame(b'S', b"TimeZone\0UTC\0");
+    let fatal = idle_frame(b'E', b"SFATAL\0VFATAL\0C57P01\0Mterminating\0\0");
+    for keep_session in [true, false] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut stream = ClientStream::Plain(sock);
+        let blistener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let baddr = blistener.local_addr().unwrap();
+        let backend = TcpStream::connect(baddr).await.unwrap();
+        let (mut peer, _) = blistener.accept().await.unwrap();
+        peer.write_all(&[status.clone(), fatal.clone()].concat())
+            .await
+            .unwrap();
+        let mut conns: HashMap<String, BackendConn> = HashMap::new();
+        conns.insert("node-a".to_string(), BackendConn::new(backend));
+        let server = ProxyServer::new(test_config()).unwrap();
+        let mut buffer = BytesMut::with_capacity(64);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let outcome = ProxyServer::read_next_client_message(
+            &mut stream,
+            &mut buffer,
+            &mut conns,
+            Some("node-a"),
+            Some(deadline),
+            &server.state,
+            keep_session,
+        )
+        .await
+        .unwrap();
+        drop(stream);
+        let mut seen = Vec::new();
+        client.read_to_end(&mut seen).await.unwrap();
+        if keep_session {
+            assert_eq!(outcome, ClientRead::IdleTimeout);
+            assert_eq!(seen, status, "only the frames before the FATAL");
+            assert!(
+                !conns.contains_key("node-a"),
+                "the ended backend is dropped"
+            );
+        } else {
+            assert_eq!(seen, [status.clone(), fatal.clone()].concat());
+        }
+        drop(peer);
+    }
+}

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A backend that ends an idle session (`pg_terminate_backend`, a fast shutdown during a
+  switchover, `idle_session_timeout`) sends a FATAL `ErrorResponse` before it closes.
+  The idle backend-watch forwarded that frame to the client although the proxy keeps the
+  client session and re-homes it, so a driver could close a connection that transaction
+  replay was about to recover. With `tr_mode` other than `none` the frame is now dropped
+  and the backend treated as gone. With `tr_mode = "none"` nothing is restored, so the
+  FATAL still reaches the client as its notice that the session state is lost.
+
 ### Changed
 
 - Dependencies: `dashmap` 5 → 6 (6.2.1), `socket2` 0.5 → 0.6 (the version tokio already
