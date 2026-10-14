@@ -284,6 +284,11 @@ pub(super) struct BackendConn {
     /// `false` on a fresh/reused connection.
     #[cfg(feature = "pool-modes")]
     pub(super) dirty: bool,
+    /// The server reported `in_hot_standby = on` when this socket started
+    /// (PostgreSQL 14+): it was a standby then, and writes on it fail until a
+    /// promotion completes. `false` when not reported (other PG-wire
+    /// backends, pooled sockets).
+    pub(super) hot_standby: bool,
     /// This socket's slot on its node's `max_connections` cap (H-05); `None`
     /// for an uncapped node. Held for its `Drop`: released when the socket is
     /// dropped, or moved into the idle pool with it (`pool-modes`).
@@ -302,6 +307,7 @@ impl BackendConn {
             unnamed_sig: None,
             #[cfg(feature = "pool-modes")]
             dirty: false,
+            hot_standby: false,
             _slot: None,
         }
     }

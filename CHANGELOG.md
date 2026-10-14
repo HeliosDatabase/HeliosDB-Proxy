@@ -184,6 +184,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backend was lost while idle (settings restored, or `08006` when they are unknown), and
   an open transaction is reported lost (`57P01`). Live check:
   `tests/integration/home_move.py`.
+- A transaction-replay re-home during a Patroni switchover could replay onto the new
+  leader before it had left recovery: Patroni takes the leader lock and starts the
+  promotion about 100 ms before PostgreSQL accepts writes, and the replayed `INSERT`
+  failed read-only, so the client got `40001` instead of a transparent failover. A
+  replacement connection whose server reports `in_hot_standby = on` (PostgreSQL 14+) is
+  now dropped and redialed until the promotion has completed, within the recovery
+  deadline (`write_timeout_secs`), without marking the node unhealthy. Backends that do
+  not report `in_hot_standby` are unaffected.
 
 ### Changed
 

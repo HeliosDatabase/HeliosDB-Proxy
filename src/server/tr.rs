@@ -2572,6 +2572,7 @@ impl ProxyServer {
         // The request's responses now come from two backends (and a replay
         // in between): its tally is not whole.
         session.cycle_counted.store(false, Ordering::Relaxed);
+        let pause = Duration::from_millis(100);
         loop {
             let node = Self::select_primary_until(session, state, config, deadline).await?;
             // Routing can retain another node's socket with an unpublished
@@ -2591,6 +2592,27 @@ impl ProxyServer {
             .await
             .unwrap_or_else(|_| Err(expired()))
             {
+                Ok(()) if conns.get(&node).is_some_and(|bc| bc.hot_standby) => {
+                    // The topology already names this node the primary, but its
+                    // server still reports hot standby: a promotion is in
+                    // progress (Patroni takes the leader lock before PostgreSQL
+                    // leaves recovery), and a replayed write would fail
+                    // read-only. Not a fault: redial until the promotion has
+                    // completed, within the recovery deadline.
+                    conns.remove(&node);
+                    tracing::info!(
+                        target: "helios::tr",
+                        node = %node,
+                        "replacement still in hot standby (promotion in progress); waiting"
+                    );
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(ProxyError::Network(format!(
+                            "{node} still in hot standby at the recovery deadline"
+                        )));
+                    }
+                    tokio::time::sleep(pause).await;
+                    continue;
+                }
                 Ok(()) => {
                     let bc = conns.get_mut(&node).expect("just ensured");
                     Self::tr_restore_preflight(tr)?;
@@ -2649,7 +2671,7 @@ impl ProxyServer {
             if tokio::time::Instant::now() >= deadline {
                 return Err(err);
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(pause).await;
         }
     }
 

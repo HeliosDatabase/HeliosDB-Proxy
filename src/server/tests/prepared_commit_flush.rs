@@ -440,6 +440,88 @@ async fn replay_refuses_pending_frame_before_sending_statements() {
     );
 }
 
+/// A re-home onto a node whose server still reports hot standby (Patroni
+/// already named it the leader; its promotion has not finished) redials it
+/// until it reports a primary, instead of replaying writes onto a read-only
+/// session.
+#[tokio::test]
+async fn recovery_waits_for_a_promotion_in_progress() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let mut config = ProxyConfig::default();
+    config.add_node(&address, "primary").unwrap();
+    let server = ProxyServer::new(config.clone()).unwrap();
+    let session = make_test_session();
+    let mut conns = HashMap::new();
+    let serving = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        for standby in ["on", "off"] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let length = socket.read_u32().await.unwrap();
+            let mut startup = vec![0; length as usize - 4];
+            socket.read_exact(&mut startup).await.unwrap();
+            let status = [&b"in_hot_standby\0"[..], standby.as_bytes(), b"\0"].concat();
+            socket
+                .write_all(
+                    &[
+                        frame(b'R', &[0; 4]),
+                        frame(b'S', &status),
+                        frame(b'Z', b"I"),
+                    ]
+                    .concat(),
+                )
+                .await
+                .unwrap();
+            sockets.push(socket);
+        }
+        sockets
+    });
+    let selected = ProxyServer::tr_acquire_replacement(
+        &mut conns,
+        &TrSession::new(TrMode::Session),
+        &session,
+        &server.state,
+        &config,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(selected, address);
+    assert!(!conns[&address].hot_standby);
+    let mut sockets = tokio::time::timeout(Duration::from_secs(2), serving)
+        .await
+        .unwrap()
+        .unwrap();
+    // The standby-era socket was dropped; the healthy node was not demoted.
+    let mut probe = [0; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), sockets[0].read(&mut probe))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert!(server
+        .state
+        .health
+        .load()
+        .get(&address)
+        .is_none_or(|h| h.healthy));
+    assert!(ProxyServer::reports_hot_standby(&frame(
+        b'S',
+        b"in_hot_standby\0on\0"
+    )));
+    assert!(!ProxyServer::reports_hot_standby(
+        &[
+            frame(b'S', b"in_hot_standby\0off\0"),
+            frame(b'S', b"DateStyle\0ISO, MDY\0"),
+            frame(b'Z', b"I"),
+        ]
+        .concat()
+    ));
+    assert!(!ProxyServer::reports_hot_standby(&[b'S', 0, 0]));
+}
+
 #[tokio::test]
 async fn recovery_redials_cached_socket_with_unpublished_tail() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -78,6 +78,10 @@ a provider:
   `08006` when they are unknown. An open transaction is reported lost (`57P01`). Before
   2.1.0 the session's next write moved to a fresh connection without its settings. Live
   check: `tests/integration/home_move.py`.
+- a transaction-replay re-home does not replay onto a leader still finishing its
+  promotion: Patroni takes the leader lock before PostgreSQL leaves recovery, so a
+  replacement connection whose server reports `in_hot_standby = on` is redialed until
+  it reports a primary, within `write_timeout_secs`.
 
 A session keeps reading from its current node while that node stays healthy; the read set
 applies when a session picks a node (for example per transaction under transaction

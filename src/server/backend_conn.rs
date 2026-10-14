@@ -542,7 +542,7 @@ impl ProxyServer {
         let capacity_deadline = tokio::time::Instant::now() + config.pool.acquire_timeout();
         let seed = session.id.as_u128() as u64;
         let mut attempt: u32 = 0;
-        let backend = loop {
+        let (backend, hot_standby) = loop {
             let mut backend =
                 tokio::time::timeout(config.pool.acquire_timeout(), TcpStream::connect(target))
                     .await
@@ -565,7 +565,7 @@ impl ProxyServer {
             )
             .await
             {
-                Ok(_) => break backend,
+                Ok(frames) => break (backend, Self::reports_hot_standby(&frames)),
                 Err(ProxyError::PoolExhausted(msg)) => {
                     if !Self::backend_capacity_backoff(
                         state,
@@ -593,8 +593,27 @@ impl ProxyServer {
             tracing::debug!(target: "helios::pool", node = %target, "dialed fresh backend connection (pool miss)");
         }
         tracing::debug!(node = %target, "opened backend connection");
-        conns.insert(target.to_string(), BackendConn::with_slot(backend, slot));
+        let mut bc = BackendConn::with_slot(backend, slot);
+        bc.hot_standby = hot_standby;
+        conns.insert(target.to_string(), bc);
         Ok(())
+    }
+
+    /// Whether a backend's startup frames (as `complete_backend_auth`
+    /// returns them) carry `ParameterStatus in_hot_standby = on`.
+    pub(super) fn reports_hot_standby(frames: &[u8]) -> bool {
+        let mut at = 0;
+        while let Some(head) = frames.get(at..at + 5) {
+            let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let Some(body) = frames.get(at + 5..at + 1 + len) else {
+                return false;
+            };
+            if head[0] == b'S' && body == b"in_hot_standby\0on\0" {
+                return true;
+            }
+            at += 1 + len;
+        }
+        false
     }
 
     /// Take a slot on `node`'s `max_connections` cap (H-05) before opening a
