@@ -505,11 +505,20 @@ pub fn starts_with_ci(s: &str, prefix: &str) -> bool {
 /// (compared byte-for-byte, never case-folded) — just fewer full-window
 /// comparisons on the common case of a rare first byte.
 pub fn contains_ci(haystack: &str, needle: &str) -> bool {
-    contains_ci_bytes(haystack.as_bytes(), needle)
+    contains_ci_in(haystack.as_bytes(), needle)
 }
 
 /// [`contains_ci`] over raw bytes (no UTF-8 validation needed).
 pub fn contains_ci_bytes(hb: &[u8], needle: &str) -> bool {
+    contains_ci_in(hb, needle)
+}
+
+/// The search behind [`contains_ci`] and [`contains_ci_bytes`]. Always inlined:
+/// `contains_ci` then compiles to its own body and stays small enough to be
+/// inlined into the statement classifiers. One shared out-of-line body was not
+/// inlined there, and those paths ran 30-45 % slower in Criterion.
+#[inline(always)]
+fn contains_ci_in(hb: &[u8], needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
