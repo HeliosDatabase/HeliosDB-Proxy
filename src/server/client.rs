@@ -1783,6 +1783,10 @@ impl ProxyServer {
                         let copying = session
                             .copy_in_progress
                             .load(std::sync::atomic::Ordering::Relaxed);
+                        if copying {
+                            // This cycle's COPY drain is not a simple query's.
+                            tr.copy_query = None;
+                        }
                         if tr.track_gucs {
                             let outcome = ext_set.at_boundary(ExtSetBoundary {
                                 sync: wait_ready,
@@ -1962,6 +1966,8 @@ impl ProxyServer {
                                     session
                                         .copy_in_progress
                                         .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    // The query that started the COPY never drains.
+                                    tr.copy_query = None;
                                     let in_tx = session
                                         .in_transaction
                                         .load(std::sync::atomic::Ordering::Relaxed);
@@ -2065,6 +2071,8 @@ impl ProxyServer {
                                 session
                                     .copy_in_progress
                                     .store(false, std::sync::atomic::Ordering::Relaxed);
+                                // The query that started the COPY never drains.
+                                tr.copy_query = None;
                                 // The COPY aborted — nothing loaded — so discard any
                                 // deferred invalidation stash, else it would later
                                 // fire against an unrelated COPY's drain.

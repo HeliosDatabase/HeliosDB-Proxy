@@ -1728,6 +1728,10 @@ fn default_tr_max_tracked_savepoints() -> usize {
 pub(crate) fn default_tr_max_cycle_statements() -> usize {
     16
 }
+/// Upper bound of `[limits] tr_max_cycle_statements`: reading a failed cycle
+/// replays it once per place the error could have come from, so its cost
+/// grows with the square of the statements read.
+const MAX_TR_CYCLE_STATEMENTS: usize = 256;
 
 /// Upper bound (seconds) for any `[limits]` `*_secs` timeout that feeds a
 /// `Duration`/`Instant`. Each of these is added to a `tokio::time::Instant` at
@@ -2869,10 +2873,10 @@ impl ProxyConfig {
                     "limits.tr_max_tracked_savepoints must be >= 1".to_string(),
                 ));
             }
-            if l.tr_max_cycle_statements == 0 {
-                return Err(ProxyError::Config(
-                    "limits.tr_max_cycle_statements must be >= 1".to_string(),
-                ));
+            if !(1..=MAX_TR_CYCLE_STATEMENTS).contains(&l.tr_max_cycle_statements) {
+                return Err(ProxyError::Config(format!(
+                    "limits.tr_max_cycle_statements must be 1..={MAX_TR_CYCLE_STATEMENTS}"
+                )));
             }
             if l.backend_slot_wait_ms == 0 {
                 return Err(ProxyError::Config(
@@ -4898,6 +4902,10 @@ database = "helios"
         let mut c = base();
         c.limits.tr_max_cycle_statements = 0;
         assert!(c.validate().is_err());
+        c.limits.tr_max_cycle_statements = 257;
+        assert!(c.validate().is_err());
+        c.limits.tr_max_cycle_statements = 256;
+        assert!(c.validate().is_ok());
     }
 
     #[test]

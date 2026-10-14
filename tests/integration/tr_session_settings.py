@@ -22,8 +22,9 @@ settings it tracked. The re-homed session must show exactly what the old one did
                  restored (SET SESSION AUTHORIZATION ends a SET ROLE, and the
                  role set after it must be restored after it).
   call_in_cycle  a SET and a CALL of a procedure that COMMITs in one extended cycle:
-                 PostgreSQL refuses the COMMIT (2D000) and rolls the SET back; the
-                 re-homed session matches.
+                 PostgreSQL refuses the COMMIT (2D000) and rolls the SET back, but the
+                 proxy cannot count on every backend refusing: the SET is unknown and
+                 the re-home is refused with 08006.
   unknown        set_config(..., false) changes a setting the proxy cannot record:
                  the re-home is refused with 08006 instead of continuing without it.
 Exit 1 if any case fails its expectation.
@@ -137,9 +138,10 @@ def case_two_resets(client):
 def case_call_in_cycle(client):
     r = {"call_cycle": cycle(client, "SET application_name = 'rr-call'", "CALL rr_commit()")}
     r["before"] = state(client)
-    r["after"] = kill_and_read(client)
+    tr08.kill_backend(pid(client))
+    r["after_kill"] = query(client, "SELECT 1")[1]
     r["ok"] = (r["call_cycle"] == ["2D000"] and r["before"][2] == ""
-               and r["after"] == r["before"])
+               and r["after_kill"] in (["08006"], ["closed"]))
     return r
 
 

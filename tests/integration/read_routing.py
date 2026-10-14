@@ -37,10 +37,11 @@ Cases (each on a new client connection unless noted):
                  (changes no session setting); two SETs in one cycle; a simple ROLLBACK TO
                  with a comment inside it. Each reads from the standby with exactly the
                  committed setting. A procedure that COMMITs, called after a SET in the
-                 same cycle, fails (2D000) and the SET is rolled back: reads still offload.
-                 set_config(..., false) changes a setting the proxy cannot record: the
+                 same cycle, fails (2D000) and the SET is rolled back; the proxy, which
+                 cannot count on every backend refusing, treats the SET as unknown: the
                  session's reads stay on the primary and
-                 heliosdb_proxy_tr_session_set_untracked_total counts it.
+                 heliosdb_proxy_tr_session_set_untracked_total counts it (once per
+                 session, so a later set_config(..., false) adds nothing).
   role           SET ROLE is mirrored onto the standby, RESET ALL keeps it (as in
                  PostgreSQL), RESET ROLE drops it there too; a SERIALIZABLE default
                  isolation level keeps reads on the primary.
@@ -235,7 +236,7 @@ def case_ext_set_tx(address, admin):
     r["untracked_after"] = metric(admin, "heliosdb_proxy_tr_session_set_untracked_total")
     r["ok"] = (all(r[name].pop("ok") for name in scenarios)
                and r["call_cycle"] == "error ['2D000']"
-               and r["read_after_call"] == [STANDBY, ""]
+               and r["read_after_call"] == [PRIMARY, ""]
                and r["set_config"] == "ok"
                and r["read_after_set_config"] == [PRIMARY, "rr-cfg"]
                and r["untracked_before"] == 0 and r["untracked_after"] == 1)

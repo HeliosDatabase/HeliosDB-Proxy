@@ -282,11 +282,8 @@ pub(super) struct TrSession {
     /// The next simple-query response was synthesized by the proxy (the
     /// aborted-transaction emulation): nothing ran, no setting changed.
     pub(super) skip_settings: bool,
-    /// The current simple query's text, read lossily: it is not UTF-8.
-    pub(super) lossy_query: Option<String>,
-    /// A simple query that yielded for COPY, to read at the drain (`true`:
-    /// read lossily).
-    pub(super) copy_query: Option<(String, bool)>,
+    /// A simple query that yielded for COPY, to read at the drain.
+    pub(super) copy_query: Option<bytes::Bytes>,
 }
 
 impl TrSession {
@@ -312,7 +309,6 @@ impl TrSession {
             tx_portals: HashMap::new(),
             simple_cycle: ExtSetCycle::default(),
             skip_settings: false,
-            lossy_query: None,
             copy_query: None,
         }
     }
@@ -1267,35 +1263,56 @@ impl ProxyServer {
             .into_iter()
             .any(kw)
         };
-        if !set_like && !tx_like() {
-            // `set_config(name, value, false)` changes a session setting the
-            // proxy cannot record. One byte search for an ordinary statement.
-            if !crate::protocol::contains_ci_bytes(sql, "set_config") {
-                return Bound::Other;
+        let set_like_or_tx = set_like || tx_like();
+        let plain = || {
+            if kw("CALL") || kw("DO") {
+                Bound::CommitPoint
+            } else {
+                Bound::Other
             }
-            return match std::str::from_utf8(sql) {
-                Ok(q) if Self::tr_sets_config(q) => Bound::Set(q.to_string()),
-                Ok(_) => Bound::Other,
-                Err(_) => Bound::Unknown,
+        };
+        if !set_like_or_tx && !crate::protocol::contains_ci_bytes(sql, "set_config") {
+            // One comment skip, a few prefix compares, one byte search.
+            return plain();
+        }
+        // Not UTF-8 (a client_encoding such as LATIN1): read the statement's
+        // shape with replacement characters; its text cannot be recorded.
+        let text = String::from_utf8_lossy(sql);
+        let exact = matches!(text, std::borrow::Cow::Borrowed(_));
+        let untrackable = || Bound::Set(String::new());
+        // `set_config(name, value, false)` changes a session setting the
+        // proxy cannot record.
+        let set_config = |q: &str| (!set_like && Self::tr_sets_config(q)).then(untrackable);
+        if !set_like_or_tx {
+            return set_config(&text).unwrap_or_else(plain);
+        }
+        if !set_like {
+            return match Self::tr_tx_verb(&text) {
+                Some(v) => {
+                    // Only savepoint statements need their text (the name).
+                    let keep =
+                        matches!(v, TxVerb::Savepoint | TxVerb::Release | TxVerb::RollbackTo);
+                    Bound::Tx(
+                        v,
+                        if keep {
+                            text.into_owned()
+                        } else {
+                            String::new()
+                        },
+                    )
+                }
+                // `PREPARE p AS SELECT set_config(...)`: a later EXECUTE runs it.
+                None => set_config(&text).unwrap_or(Bound::Other),
             };
         }
-        let Ok(sql) = std::str::from_utf8(sql) else {
-            return Bound::Unknown;
-        };
-        if !set_like {
-            return Self::tr_tx_verb(sql).map_or(Bound::Other, |v| {
-                // Only savepoint statements need their text (the name).
-                let keep = matches!(v, TxVerb::Savepoint | TxVerb::Release | TxVerb::RollbackTo);
-                Bound::Tx(v, if keep { sql.to_string() } else { String::new() })
-            });
-        }
-        if Self::tr_reset_all_op(crate::protocol::skip_leading_comments(sql))
+        if Self::tr_reset_all_op(crate::protocol::skip_leading_comments(&text))
             == Some(GucOp::DiscardAll)
         {
-            return Bound::DiscardAll(sql.to_string());
+            return Bound::DiscardAll(text.into_owned());
         }
-        match Self::tr_session_level(sql) {
-            Some(true) => Bound::Set(sql.to_string()),
+        match Self::tr_session_level(&text) {
+            Some(true) if exact => Bound::Set(text.into_owned()),
+            Some(true) => untrackable(),
             Some(false) => Bound::Other,
             None => Bound::Unknown,
         }
@@ -1305,6 +1322,10 @@ impl ProxyServer {
     /// `is_local` other than the literal `true`: a session-level change the
     /// proxy cannot record.
     pub(super) fn tr_sets_config(sql: &str) -> bool {
+        if sql.contains('\\') {
+            // The two backslash readings may see different calls.
+            return crate::protocol::contains_ci(sql, "set_config");
+        }
         let base = sql.as_ptr() as usize;
         let mut session = false;
         let scanned = crate::replay_sql::words(sql, |w| {
@@ -1322,7 +1343,7 @@ impl ProxyServer {
 
     /// Whether the argument list at the start of `args`, `(name, value,
     /// is_local)`, has the literal `true` as `is_local`. Anything it cannot
-    /// read counts as session-level.
+    /// read (dollar quotes, comments, backslashes) counts as session-level.
     fn tr_set_config_is_local(args: &str) -> bool {
         let b = args.as_bytes();
         let Some(open) = b.iter().position(|&c| c == b'(') else {
@@ -1337,6 +1358,11 @@ impl ProxyServer {
                         i += if b[i] == quote { 2 } else { 1 };
                     }
                 }
+                // A parameter (`$1`) is fine, a dollar quote is not read.
+                b'$' if b.get(i + 1).is_some_and(u8::is_ascii_digit) => {}
+                b'$' | b'\\' => return false,
+                b'-' if b.get(i + 1) == Some(&b'-') => return false,
+                b'/' if b.get(i + 1) == Some(&b'*') => return false,
                 b'(' => depth += 1,
                 b')' if depth > 0 => depth -= 1,
                 b')' => {
@@ -1598,40 +1624,45 @@ impl ProxyServer {
     /// controls it (see `ext_set`), which covers pool resets such as
     /// Npgsql's `SET SESSION AUTHORIZATION DEFAULT;RESET ALL;...`. A query
     /// with no `;` but a trailing one is one statement, read with a few
-    /// prefix compares. `lossy`: the text was not valid UTF-8 and was read
-    /// with replacement characters, so no `SET` in it can be recorded.
+    /// prefix compares. `sql` is the query text, or its bytes when it is not
+    /// UTF-8 (a `client_encoding` such as LATIN1): then no `SET` in it can be
+    /// recorded.
     pub(super) fn tr_simple_settings(
         tr: &mut TrSession,
-        sql: &str,
-        lossy: bool,
+        sql: &[u8],
         b: ExtSetBoundary,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
     ) {
         let mut cycle = std::mem::take(&mut tr.simple_cycle);
         cycle.set_limit(state.limits.tr_max_cycle_statements);
-        let bound = |q: &str| match Self::tr_bound(q.as_bytes()) {
-            Bound::Set(_) | Bound::DiscardAll(_) if lossy => Bound::Unknown,
-            other => other,
-        };
         let mut run = |bound: Bound| {
             cycle.on_bind(b"", bound);
             cycle.on_execute(b"");
         };
-        let core = sql.trim_end();
-        let single = memchr::memchr(b';', core.as_bytes()).is_none_or(|i| i + 1 == core.len());
+        let sql = sql.strip_suffix(&[0]).unwrap_or(sql);
+        let core = sql.trim_ascii_end();
+        let single = memchr::memchr(b';', core).is_none_or(|i| i + 1 == core.len());
         if single {
-            match bound(sql) {
+            match Self::tr_bound(sql) {
                 // PostgreSQL parses the whole query first: one it rejects
                 // ran nothing.
                 Bound::Unknown if b.failed => {}
                 one => run(one),
             }
         } else {
-            match crate::replay_sql::split_statements(sql) {
+            let text = String::from_utf8_lossy(sql);
+            let lossy = matches!(text, std::borrow::Cow::Owned(_));
+            match crate::replay_sql::split_statements(&text) {
                 Ok(statements) => {
                     for statement in statements {
-                        run(bound(statement));
+                        run(match Self::tr_bound(statement.as_bytes()) {
+                            // Read with replacement characters: not restorable.
+                            Bound::Set(q) if lossy && q.contains('\u{FFFD}') => {
+                                Bound::Set(String::new())
+                            }
+                            bound => bound,
+                        });
                     }
                 }
                 Err(crate::replay_sql::Unsplit::Unlexable) if b.failed => {}
@@ -1782,11 +1813,8 @@ impl ProxyServer {
             if tr.track_gucs && extended_kind.is_none() && !std::mem::take(&mut tr.skip_settings) {
                 // A simple query that yielded for COPY: its statements are
                 // read once the COPY drains to ReadyForQuery.
-                tr.copy_query = match (sql, tr.lossy_query.take()) {
-                    (Some(q), _) => Some((q.to_string(), false)),
-                    (None, Some(lossy)) => Some((lossy, true)),
-                    (None, None) => None,
-                };
+                // (Text that is not UTF-8 is stashed by `tr_after_simple`.)
+                tr.copy_query = sql.map(|q| bytes::Bytes::copy_from_slice(q.as_bytes()));
             }
             if tr.record_tx {
                 let mut ts = session.tx_state.write().await;
@@ -1830,12 +1858,9 @@ impl ProxyServer {
                 copying: false,
                 simple: true,
             };
-            match (query, tr.lossy_query.take()) {
-                (Some(q), _) => Self::tr_simple_settings(tr, q, false, b, session, state),
-                (None, Some(lossy)) => {
-                    Self::tr_simple_settings(tr, &lossy, true, b, session, state)
-                }
-                (None, None) => {}
+            // (Text that is not UTF-8 is read by `tr_after_simple`.)
+            if let Some(q) = query {
+                Self::tr_simple_settings(tr, q.as_bytes(), b, session, state);
             }
         }
 
@@ -1948,13 +1973,10 @@ impl ProxyServer {
             session.tr_replay_tainted.store(true, Ordering::Relaxed);
         }
         let sql = crate::protocol::query_text(&msg.payload);
-        if sql.is_none() && tr.track_gucs {
-            // Not UTF-8 (a client_encoding such as LATIN1): read it with
-            // replacement characters, which keeps its statement structure.
-            let raw: &[u8] = &msg.payload;
-            let text = raw.strip_suffix(&[0]).unwrap_or(raw);
-            tr.lossy_query = Some(String::from_utf8_lossy(text).into_owned());
-        }
+        // Not UTF-8 (a client_encoding such as LATIN1): `tr_after_response`
+        // cannot read its settings; they are read below from the raw bytes.
+        let raw = sql.is_none() && tr.track_gucs && !tr.skip_settings;
+        let before = tr.prev_status;
         if !tr.acked.is_empty() && sql.is_none_or(Self::tr_touches_statements) {
             // PREPARE / DEALLOCATE / DISCARD ALL act on named statements
             // behind the protocol's back (TR-08).
@@ -1977,6 +1999,23 @@ impl ProxyServer {
             state,
         )
         .await;
+        if raw {
+            if session.copy_in_progress.load(Ordering::Relaxed) {
+                // Read at the drain, like a UTF-8 query that yielded for COPY.
+                tr.copy_query = Some(bytes::Bytes::copy_from_slice(&msg.payload));
+            } else {
+                let b = ExtSetBoundary {
+                    sync: true,
+                    forwarded: true,
+                    before,
+                    after: tr.prev_status,
+                    failed: session.last_response_error.load(Ordering::Relaxed),
+                    copying: false,
+                    simple: true,
+                };
+                Self::tr_simple_settings(tr, &msg.payload, b, session, state);
+            }
+        }
     }
 
     /// Bookkeeping after an extended-protocol batch. A Flush-terminated batch
@@ -2254,7 +2293,7 @@ impl ProxyServer {
             .last_rfq_status
             .load(std::sync::atomic::Ordering::Relaxed);
         let before = std::mem::replace(&mut tr.prev_status, status);
-        if let Some((query, lossy)) = tr.copy_query.take() {
+        if let Some(query) = tr.copy_query.take() {
             // The simple query that yielded for COPY, read now that its
             // ReadyForQuery is in.
             let b = ExtSetBoundary {
@@ -2268,7 +2307,7 @@ impl ProxyServer {
                 copying: false,
                 simple: true,
             };
-            Self::tr_simple_settings(tr, &query, lossy, b, session, state);
+            Self::tr_simple_settings(tr, &query, b, session, state);
         }
         if status == b'I' {
             // The COPY's statement may have ended the transaction (TR-08).

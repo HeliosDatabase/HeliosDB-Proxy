@@ -74,8 +74,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outcome they agree on. PostgreSQL semantics this follows:
   - `DISCARD ALL` as the first statement of a cycle commits at once.
   - Settings made in a prepared transaction persist, as at `COMMIT`.
-  - A `CALL` or `DO` cannot commit statements that ran before it in the same cycle
-    (PostgreSQL refuses with 2D000).
+  - A transaction a cycle opens and rolls back leaves nothing behind.
+  - `SET`s that ran before a `CALL` or `DO` outside a transaction block in the same
+    cycle are unknown: PostgreSQL refuses transaction control there (2D000), but other
+    PG-wire backends may let the procedure commit or roll them back.
 
   When the cases disagree, or a cycle cannot be read statement by statement, the
   session's settings become unknown (inside an open transaction, once it commits). A

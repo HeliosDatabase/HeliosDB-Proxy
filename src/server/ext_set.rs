@@ -19,10 +19,12 @@
 //! place the error could have come from (a statement that ran and failed,
 //! one whose Parse or Bind failed, a message after the last Execute), keeps
 //! those that end in the transaction status the ReadyForQuery shows, and
-//! uses the outcome they agree on. (A `CALL` or `DO` cannot commit or roll
-//! back statements that ran before it in the same cycle or query:
-//! PostgreSQL refuses transaction control there with 2D000.) When the
-//! possibilities disagree, or the cycle cannot be read
+//! uses the outcome they agree on. A transaction the cycle opens and rolls
+//! back leaves nothing behind. `SET`s that ran before a `CALL` or `DO`
+//! outside a transaction block are unknown: PostgreSQL refuses transaction
+//! control in such a procedure (2D000), but other PG-wire backends may let
+//! it commit or roll them back. When the possibilities disagree, or the
+//! cycle cannot be read
 //! statement by statement (a statement the proxy has no record of, an
 //! Execute of a portal not bound just before it, a cycle still copying, one
 //! abandoned without its Sync), the settings it may have changed are
@@ -53,6 +55,8 @@ pub(super) enum Bound {
     DiscardAll(String),
     /// A transaction-control statement (the SQL is kept for savepoints).
     Tx(TxVerb, String),
+    /// `CALL` or `DO`: a procedure that may control the transaction.
+    CommitPoint,
     /// Anything else.
     Other,
 }
@@ -140,6 +144,7 @@ enum Step {
     Set(String),
     DiscardAll(String),
     Tx(TxVerb, String),
+    CommitPoint,
     /// One or more consecutive other statements.
     Other,
 }
@@ -155,7 +160,7 @@ pub(super) struct ExtSetCycle {
     binds: u32,
     /// The cycle's statements in Bind order (the first `max_steps`).
     steps: Vec<Step>,
-    /// It bound a SET-like or transaction-control statement.
+    /// It bound a SET-like, transaction-control, `CALL` or `DO` statement.
     relevant: bool,
     /// It bound more than `max_steps` statements.
     overflow: bool,
@@ -259,6 +264,7 @@ impl ExtSetCycle {
             Bound::Set(sql) => Step::Set(sql),
             Bound::DiscardAll(sql) => Step::DiscardAll(sql),
             Bound::Tx(verb, sql) => Step::Tx(verb, sql),
+            Bound::CommitPoint => Step::CommitPoint,
         };
         self.relevant |= step != Step::Other;
         if self.steps.len() < self.max_steps {
@@ -336,7 +342,8 @@ impl ExtSetCycle {
             || self.steps.iter().any(|s| {
                 matches!(
                     s,
-                    Step::DiscardAll(_)
+                    Step::CommitPoint
+                        | Step::DiscardAll(_)
                         | Step::Tx(
                             TxVerb::Commit
                                 | TxVerb::Rollback
@@ -534,14 +541,25 @@ impl ExtSetCycle {
     /// with an error, `None` for success), or `None` when it cannot have
     /// happened or does not end in the status the response showed.
     fn run(&self, b: ExtSetBoundary, fail: Option<Failure>) -> Option<Vec<SettingsOp>> {
-        use SettingsOp::{Apply, Defer, End, Savepoint};
+        use SettingsOp::{Apply, Defer, End, Savepoint, Unknown};
         // An explicit transaction block is open; it failed; the SETs of the
-        // cycle's own (implicit) transaction so far.
+        // cycle's own (implicit) transaction so far; nothing has run in that
+        // transaction yet; where the ops of a block the cycle opened start.
         let mut open = b.before != b'I';
         let mut aborted = b.before == b'E';
         let mut implicit: Vec<&str> = Vec::new();
+        let mut fresh = !open;
+        let mut opened_at: Option<usize> = None;
         let mut ops = Vec::new();
         let mut stopped = false;
+        // The block ends: committed (its ops stand) or rolled back. One the
+        // cycle opened leaves nothing behind when it rolls back.
+        let end = |ops: &mut Vec<SettingsOp>, opened_at: &mut Option<usize>, committed: bool| {
+            match opened_at.take() {
+                Some(at) if !committed => ops.truncate(at),
+                _ => ops.push(End(Some(committed))),
+            }
+        };
         for (i, step) in self.steps.iter().enumerate() {
             if fail == Some(Failure { at: i, ran: false }) {
                 stopped = true;
@@ -564,11 +582,18 @@ impl ExtSetCycle {
                 // It would fail ("current transaction is aborted").
                 return None;
             }
+            if *step == Step::CommitPoint && !open && !implicit.is_empty() {
+                // A procedure outside a transaction block may commit or roll
+                // back what ran before it (PostgreSQL refuses, other PG-wire
+                // backends may not).
+                implicit.clear();
+                ops.push(Unknown);
+            }
             if failing {
                 match step {
                     // A failed COMMIT or PREPARE TRANSACTION rolls back.
                     Step::Tx(TxVerb::Commit | TxVerb::Prepare, _) if open && !aborted => {
-                        ops.push(End(Some(false)));
+                        end(&mut ops, &mut opened_at, false);
                         open = false;
                     }
                     // What a failed COMMIT AND CHAIN leaves is not modelled.
@@ -578,14 +603,17 @@ impl ExtSetCycle {
                 break;
             }
             match step {
-                Step::Other => {}
+                Step::Other | Step::CommitPoint => fresh &= open,
                 Step::Set(sql) if open => ops.push(Defer(sql.clone())),
-                Step::Set(sql) => implicit.push(sql),
+                Step::Set(sql) => {
+                    implicit.push(sql);
+                    fresh = false;
+                }
                 Step::DiscardAll(sql) => {
-                    // It refuses to run in a transaction block, and in an
-                    // extended-protocol cycle it must come first; there it
-                    // commits at once.
-                    if open || i > 0 || (b.simple && self.steps.len() > 1) {
+                    // It refuses to run in a transaction block (an implicit
+                    // one included) or after other statements of the same
+                    // transaction; where it runs, it commits at once.
+                    if open || !fresh || (b.simple && self.steps.len() > 1) {
                         return None;
                     }
                     ops.push(Apply(sql.clone()));
@@ -595,24 +623,33 @@ impl ExtSetCycle {
                         if !open {
                             // The block takes in what the cycle ran before.
                             open = true;
+                            opened_at = Some(ops.len());
                             ops.extend(implicit.drain(..).map(|q| Defer(q.to_string())));
                         }
                     }
                     TxVerb::Commit | TxVerb::Rollback | TxVerb::Prepare if open => {
-                        ops.push(End(Some(
-                            matches!(verb, TxVerb::Commit | TxVerb::Prepare) && !aborted,
-                        )));
+                        let committed =
+                            matches!(verb, TxVerb::Commit | TxVerb::Prepare) && !aborted;
+                        end(&mut ops, &mut opened_at, committed);
                         open = false;
                         aborted = false;
+                        fresh = true;
                     }
                     // Outside a block they end the cycle's own transaction
                     // (with a warning).
                     TxVerb::Commit | TxVerb::Prepare => {
                         ops.extend(implicit.drain(..).map(|q| Apply(q.to_string())));
+                        fresh = true;
                     }
-                    TxVerb::Rollback => implicit.clear(),
+                    TxVerb::Rollback => {
+                        implicit.clear();
+                        fresh = true;
+                    }
                     TxVerb::CommitChain | TxVerb::RollbackChain if open => {
-                        ops.push(End(Some(*verb == TxVerb::CommitChain && !aborted)));
+                        let committed = *verb == TxVerb::CommitChain && !aborted;
+                        end(&mut ops, &mut opened_at, committed);
+                        // The chained transaction is one the cycle opened.
+                        opened_at = Some(ops.len());
                         aborted = false;
                     }
                     TxVerb::Savepoint | TxVerb::Release | TxVerb::RollbackTo if open => {

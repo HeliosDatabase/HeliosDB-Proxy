@@ -1588,6 +1588,176 @@ async fn tr_session_authorization_ends_the_role() {
     assert!(tr.gucs.is_empty(), "{:?}", tr.gucs);
 }
 
+/// Simple queries: a transaction the query opens and rolls back, a SQL
+/// function body, `set_config`, text that is not UTF-8, a query that yields
+/// for COPY, and a response the proxy answered itself.
+#[tokio::test]
+async fn tr_simple_query_edge_cases() {
+    let server = ProxyServer::new(test_config()).unwrap();
+    let state = server.state.clone();
+    let session = make_test_session();
+    let mut tr = TrSession::new(TrMode::Session);
+    let tracked = |tr: &TrSession, needle: &str| tr.gucs.iter().any(|g| g.contains(needle));
+    async fn send(
+        tr: &mut TrSession,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        status: u8,
+        failed: bool,
+        msg: Message,
+    ) {
+        ProxyServer::note_ready_for_query(session, status, failed);
+        ProxyServer::tr_after_simple(tr, &msg, session, state).await;
+    }
+    let raw = |bytes: &[u8]| Message {
+        msg_type: crate::protocol::MessageType::Query,
+        payload: bytes::BytesMut::from(bytes),
+    };
+
+    // A whole transaction in one query whose COMMIT failed: nothing changed,
+    // nothing unknown.
+    send(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        true,
+        qmsg("BEGIN; SET search_path TO app; INSERT INTO t VALUES (1); COMMIT"),
+    )
+    .await;
+    assert!(!tr.gucs_unknown && tr.gucs.is_empty(), "{:?}", tr.gucs);
+    // A SQL-standard function body's own `;`s.
+    send(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        qmsg(
+            "SET work_mem = '2MB'; CREATE FUNCTION f() RETURNS int LANGUAGE sql \
+         BEGIN ATOMIC SELECT 1; END",
+        ),
+    )
+    .await;
+    assert!(!tr.gucs_unknown && tracked(&tr, "2MB"), "{:?}", tr.gucs);
+    // set_config: local is fine, session-level cannot be recorded.
+    send(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        qmsg("select set_config('role', 'anon', true)"),
+    )
+    .await;
+    assert!(!tr.gucs_unknown);
+    send(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        qmsg("select set_config('search_path', '', false)"),
+    )
+    .await;
+    assert!(tr.gucs_unknown);
+    send(&mut tr, &session, &state, b'I', false, qmsg("DISCARD ALL")).await;
+    assert!(!tr.gucs_unknown && tr.gucs.is_empty());
+
+    // Not UTF-8 (LATIN1): a SET inside a transaction that rolls back is no
+    // loss; one that applies cannot be recorded.
+    send(&mut tr, &session, &state, b'T', false, qmsg("BEGIN")).await;
+    send(
+        &mut tr,
+        &session,
+        &state,
+        b'T',
+        false,
+        raw(b"SET application_name = 'caf\xe9'\0"),
+    )
+    .await;
+    send(&mut tr, &session, &state, b'I', false, qmsg("ROLLBACK")).await;
+    assert!(!tr.gucs_unknown);
+    send(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        raw(b"SET application_name = 'caf\xe9'\0"),
+    )
+    .await;
+    assert!(tr.gucs_unknown);
+    send(&mut tr, &session, &state, b'I', false, qmsg("DISCARD ALL")).await;
+    // ...while its other statements are read as usual.
+    send(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        raw(b"SELECT 'caf\xe9'; SET work_mem = '4MB'\0"),
+    )
+    .await;
+    assert!(!tr.gucs_unknown && tracked(&tr, "4MB"), "{:?}", tr.gucs);
+    send(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        raw(b"SELECT 1; SET application_name = 'caf\xe9'\0"),
+    )
+    .await;
+    assert!(tr.gucs_unknown);
+    send(&mut tr, &session, &state, b'I', false, qmsg("DISCARD ALL")).await;
+
+    // A query the proxy answered itself (the aborted-transaction emulation)
+    // changed nothing.
+    tr.skip_settings = true;
+    send(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        qmsg("SET work_mem = '1GB'"),
+    )
+    .await;
+    assert!(!tracked(&tr, "1GB"));
+    send(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        qmsg("SET work_mem = '8MB'"),
+    )
+    .await;
+    assert!(tracked(&tr, "8MB"));
+
+    // A query that yields for COPY is read at the drain.
+    session.copy_in_progress.store(true, Ordering::Relaxed);
+    send(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        qmsg("SET work_mem = '16MB'; COPY t FROM STDIN"),
+    )
+    .await;
+    assert!(!tracked(&tr, "16MB"), "not before the drain");
+    session.copy_in_progress.store(false, Ordering::Relaxed);
+    ProxyServer::note_ready_for_query(&session, b'I', false);
+    ProxyServer::tr_after_copy_drain(&mut tr, &session, &state).await;
+    assert!(
+        tracked(&tr, "16MB") && tr.copy_query.is_none(),
+        "{:?}",
+        tr.gucs
+    );
+}
+
 /// Savepoint names are read like PostgreSQL reads them (comments aside,
 /// quoted names whole), and the tracked savepoints are capped by `[limits]
 /// tr_max_tracked_savepoints`.

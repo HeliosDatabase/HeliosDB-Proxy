@@ -87,14 +87,14 @@ pub(crate) enum Unsplit {
 /// split; both backslash readings must agree.
 pub(crate) fn split_statements(sql: &str) -> Result<Vec<&str>, Unsplit> {
     let mut cuts = Vec::new();
-    let plain = scan_with(sql, false, &mut |i| cuts.push(i));
+    let plain = scan_with::<true>(sql, false, &mut |i| cuts.push(i));
     let needs_escaped = match &plain {
         Ok(p) => p.saw_quoted_backslash,
         Err(()) => true,
     };
     if needs_escaped {
         let mut other = Vec::new();
-        let escaped = scan_with(sql, true, &mut |i| other.push(i));
+        let escaped = scan_with::<true>(sql, true, &mut |i| other.push(i));
         match (&plain, escaped) {
             (Err(()), Err(())) => return Err(Unsplit::Unlexable),
             (Ok(_), Ok(_)) if other == cuts => {}
@@ -110,34 +110,29 @@ pub(crate) fn split_statements(sql: &str) -> Result<Vec<&str>, Unsplit> {
         }
         start = end + 1;
     }
-    // A SQL-standard function body (`BEGIN ATOMIC ... END`) has `;`s of its
-    // own that this lexer does not tell apart from statement ends.
-    let mut previous_begin = false;
-    let mut atomic = false;
-    let _ = words(sql, |w| {
-        atomic = previous_begin && !w.quoted && w.text.eq_ignore_ascii_case("ATOMIC");
-        previous_begin = !w.quoted && w.text.eq_ignore_ascii_case("BEGIN");
-        !atomic
-    });
-    if atomic {
-        return Err(Unsplit::Ambiguous);
-    }
     Ok(out)
 }
 
 /// One lexical pass. `backslash_escapes` selects the session reading: when true
 /// a backslash consumes the next byte inside a single-quoted literal.
 fn scan(sql: &str, backslash_escapes: bool) -> Result<Scan<'_>, ()> {
-    scan_with(sql, backslash_escapes, &mut |_| {})
+    scan_with::<false>(sql, backslash_escapes, &mut |_| {})
 }
 
 /// [`scan`], reporting the byte offset of every statement-separating `;`.
-fn scan_with<'a>(
+/// With `ATOMIC`, a `;` inside a SQL-standard function body (`BEGIN ATOMIC
+/// ... END`) does not separate statements, by psql's rule: inside `CREATE
+/// [OR REPLACE] FUNCTION|PROCEDURE`, each `BEGIN` or `CASE` opens a level and
+/// each `END` closes one.
+fn scan_with<'a, const ATOMIC: bool>(
     sql: &'a str,
     backslash_escapes: bool,
     on_semicolon: &mut impl FnMut(usize),
 ) -> Result<Scan<'a>, ()> {
     let b = sql.as_bytes();
+    let mut lead: [&str; 4] = [""; 4];
+    let mut idents = 0usize;
+    let mut begin_depth = 0usize;
     let mut saw_quoted_backslash = false;
     let mut i = 0;
     let mut head = None;
@@ -181,8 +176,13 @@ fn scan_with<'a>(
                 continue;
             }
             b';' => {
+                if ATOMIC && begin_depth > 0 {
+                    i += 1;
+                    continue;
+                }
                 on_semicolon(i);
                 at_start = true;
+                idents = 0;
                 i += 1;
                 continue;
             }
@@ -202,6 +202,23 @@ fn scan_with<'a>(
                 i += 1;
             }
             word = &sql[start..i];
+            if ATOMIC {
+                if let Some(slot) = lead.get_mut(idents) {
+                    *slot = word;
+                }
+                idents += 1;
+                let is = |w: &str, k: &str| w.eq_ignore_ascii_case(k);
+                let routine = |w: &str| is(w, "FUNCTION") || is(w, "PROCEDURE");
+                let in_routine = idents > 1
+                    && is(lead[0], "CREATE")
+                    && (routine(lead[1])
+                        || (is(lead[1], "OR") && is(lead[2], "REPLACE") && routine(lead[3])));
+                if in_routine && (is(word, "BEGIN") || is(word, "CASE")) {
+                    begin_depth += 1;
+                } else if begin_depth > 0 && is(word, "END") {
+                    begin_depth -= 1;
+                }
+            }
         } else if matches!(b[i], b'\'' | b'"') {
             let quote = b[i];
             i += 1;
@@ -452,12 +469,32 @@ mod tests {
             split_statements("SET a = 'C:\\dir'; SET b = 2"),
             Ok(vec!["SET a = 'C:\\dir'", "SET b = 2"])
         );
-        // A SQL-standard function body's own `;`s.
+        // A SQL-standard function body's own `;`s (psql's rule, CASE nested).
         assert_eq!(
             split_statements(
                 "SET a = 1; CREATE FUNCTION f() RETURNS int BEGIN ATOMIC SELECT 1; END; BEGIN"
             ),
-            Err(Unsplit::Ambiguous)
+            Ok(vec![
+                "SET a = 1",
+                "CREATE FUNCTION f() RETURNS int BEGIN ATOMIC SELECT 1; END",
+                "BEGIN"
+            ])
+        );
+        assert_eq!(
+            split_statements(
+                "create or replace procedure p() begin atomic select case when true then 1 end; \
+                 select 2; end; COMMIT"
+            ),
+            Ok(vec![
+                "create or replace procedure p() begin atomic select case when true then 1 end; \
+                 select 2; end",
+                "COMMIT"
+            ])
+        );
+        // Outside a routine definition BEGIN and END are transaction control.
+        assert_eq!(
+            split_statements("BEGIN; SELECT 1; END; SET a = 1"),
+            Ok(vec!["BEGIN", "SELECT 1", "END", "SET a = 1"])
         );
     }
 
