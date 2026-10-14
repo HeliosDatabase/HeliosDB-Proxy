@@ -1,0 +1,59 @@
+# proxy-a for the reconnect-wave drill (H-05): proxy-a.toml plus per-node backend
+# caps, a per-node reconnect limit and per-tenant client caps. Two tenants, named
+# by application_name, share it: "big" (many writing clients) and "small" (a few
+# readers). pg-a is killed under load and pg-b promoted.
+listen_address = "127.0.0.1:27710"
+admin_address = "127.0.0.1:27790"
+admin_token = "helios-lab-admin"
+tr_enabled = true
+tr_mode = "transaction"
+write_timeout_secs = 30
+strict_config = true
+
+[limits]
+max_concurrent_reconnects_per_node = 4
+backend_slot_wait_ms = 10000
+
+# A small committed-history ring fills within seconds, so the proxy's RSS
+# reaches its steady state before pg-a is killed and the drill sees what the
+# failover itself costs.
+[journal]
+max_committed_transactions = 2000
+
+[multi_tenancy]
+enabled = true
+identify_by = "application_name"
+tenants = ["big", "small"]
+max_clients_per_tenant = 64
+tenant_max_clients = { small = 8 }
+
+[health]
+check_interval_secs = 1
+check_timeout_secs = 2
+failure_threshold = 2
+success_threshold = 1
+
+[topology]
+provider = "postgres"
+user = "lab"
+database = "lab"
+poll_interval_secs = 1
+lease_timeout_secs = 5
+
+[[nodes]]
+host = "127.0.0.1"
+port = 27701
+role = "primary"
+max_connections = 70
+
+[[nodes]]
+host = "127.0.0.1"
+port = 27702
+role = "standby"
+max_connections = 70
+
+[[nodes]]
+host = "127.0.0.1"
+port = 27703
+role = "standby"
+max_connections = 70

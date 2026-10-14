@@ -96,6 +96,30 @@ A write through `proxy-b`, a direct write on pg-a, and a trigger's side effect o
 poll interval. Logical source: attached, 4 transactions applied, 0 lag, 0 reconnects, 0
 full invalidations.
 
+## 2026-10-14, reconnect wave (H-05), main 350978a + reconnect limit
+
+Binary `wave2` (sha256 in the evidence), same build features, lab ports 27701-27792.
+Evidence: `/home/gpc/HDB/sprint/baselines/proxy/wave-20261014/lab-reconnect-wave` and
+`lab-wave-control`.
+
+`proxy-a` runs `proxy-wave.toml`. Two tenants drive it through pgbench, named by
+`application_name`: `big` with 48 tpcb-like clients and `small` with 2 select-only
+clients, for 60 s, all with transaction replay on. pg-a is killed at 15.9 s and pg-b
+promoted at 17.9 s.
+
+| run | max reconnects in progress | permit waits / refusals | TR re-homes | big tenant back to ½ throughput | small tenant | proxy RSS before kill → end |
+|---|---|---|---|---|---|---|
+| `max_concurrent_reconnects_per_node = 4` | 4 | 749 / 0 | 47 | 1.1 s after promotion | served every second except the 2 s of the kill and promotion (17-18 s); 0 aborted | 16.5 MiB → 17.3 MiB, flat after |
+| control, limit 1000 | 0 sampled (11 in an earlier run; dials finish within the 250 ms sampling) | 0 / 0 | 47 | 1.2 s | same | 16.3 MiB → 17.2 MiB |
+
+The limit meters the reconnect wave at no cost to recovery time. The big tenant lost 6
+clients (control: 4) to `outcome unknown` errors. Those were in-flight COMMITs at the
+moment pg-a was killed: replay cannot know whether they landed and says so instead of
+guessing. In an earlier run with the default committed-history ring (50,000
+transactions), the proxy's RSS grew about 3 MiB/s until the ring was full and then held
+flat. The drill therefore uses a 2,000-transaction ring, so it measures the failover
+rather than the ring filling.
+
 ## Not covered yet
 
 Network partitions and `tc netem` delay, proxy drain (`SIGUSR2`) and restart, SIGHUP with

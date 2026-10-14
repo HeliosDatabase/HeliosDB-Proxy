@@ -196,7 +196,8 @@ pub struct ProxyLatency {
     pub journal_apply: LatencyHistogram,
     /// Operator-driven `POST /api/replay` runs.
     pub operator_replay: LatencyHistogram,
-    /// Waits for a slot on a node at its `max_connections` cap (H-05).
+    /// Waits for a slot on a node at its `max_connections` cap, or for a
+    /// `max_concurrent_reconnects_per_node` permit (H-05).
     pub backend_slot_wait: LatencyHistogram,
     refusals: [AtomicU64; ReplayRefusal::ALL.len()],
 }
@@ -281,7 +282,7 @@ impl ProxyLatency {
             (
                 &self.backend_slot_wait,
                 "heliosdb_proxy_backend_slot_wait_seconds",
-                "Waits for a slot on a node at its max_connections cap",
+                "Waits for a slot on a node at its max_connections cap or for a reconnect permit",
             ),
         ] {
             hist.snapshot().write_prometheus(out, name, help);

@@ -12,7 +12,7 @@
 #
 # Networking: this host cannot create Docker bridge networks (firewalld removed
 # Docker's iptables chains, c9ad6dee52fa), so every service uses the host
-# network and binds 127.0.0.1 only, on the 357xx ports above. Every data
+# network and binds 127.0.0.1 only, on the 277xx ports above. Every data
 # directory is tmpfs (no volumes are created).
 name: helios-lab
 

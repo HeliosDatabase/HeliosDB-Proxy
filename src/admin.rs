@@ -563,6 +563,9 @@ impl AdminServer {
                     }
                     if let Some(s) = state.node_slots.read().await.as_ref() {
                         map.insert("node_slots".into(), serde_json::to_value(s.stats())?);
+                        if let Some(r) = s.reconnect_stats() {
+                            map.insert("reconnect_slots".into(), serde_json::to_value(r)?);
+                        }
                     }
                     if let Some(s) = state.tenant_slots.read().await.as_ref() {
                         if !s.is_empty() {
@@ -631,6 +634,9 @@ impl AdminServer {
                 }
                 if let Some(s) = state.node_slots.read().await.as_ref() {
                     Self::push_node_slots_prometheus(&mut prometheus, &s.stats());
+                    if let Some(r) = s.reconnect_stats() {
+                        Self::push_reconnect_slots_prometheus(&mut prometheus, &r);
+                    }
                 }
                 if let Some(s) = state.tenant_slots.read().await.as_ref() {
                     Self::push_tenant_slots_prometheus(&mut prometheus, &s.stats());
@@ -2395,6 +2401,42 @@ impl AdminServer {
             for s in stats {
                 let _ = writeln!(output, "{name}{{node=\"{}\"}} {}", s.node, value(s));
             }
+        }
+    }
+
+    /// Append the reconnect limit (H-05). Absent when it is off.
+    fn push_reconnect_slots_prometheus(output: &mut String, r: &crate::node_slots::ReconnectStats) {
+        use std::fmt::Write as _;
+        for (name, kind, help, value) in [
+            (
+                "heliosdb_proxy_backend_reconnects_in_progress",
+                "gauge",
+                "Backend connections being opened on a session's behalf now (all nodes)",
+                r.in_progress as u64,
+            ),
+            (
+                "heliosdb_proxy_backend_reconnect_limit",
+                "gauge",
+                "[limits] max_concurrent_reconnects_per_node",
+                r.limit_per_node as u64,
+            ),
+            (
+                "heliosdb_proxy_backend_reconnect_waits_total",
+                "counter",
+                "Connections that waited for a reconnect permit",
+                r.waits,
+            ),
+            (
+                "heliosdb_proxy_backend_reconnect_refusals_total",
+                "counter",
+                "Requests refused (53300) waiting for a reconnect permit",
+                r.refusals,
+            ),
+        ] {
+            let _ = writeln!(
+                output,
+                "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}"
+            );
         }
     }
 

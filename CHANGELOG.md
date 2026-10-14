@@ -100,6 +100,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `[limits] max_concurrent_reconnects_per_node` (H-05, default 0 = unlimited): the most backend
+  connections the proxy opens at once to one node on a session's behalf (a transaction-replay
+  re-home, a reconnect after a lost backend, a standby connection), from TCP connect through
+  authentication, so a failover's reconnect wave reaches the new primary metered. Over the
+  limit a dial waits up to `backend_slot_wait_ms`, then the request is refused with 53300.
+  Metrics: `heliosdb_proxy_backend_reconnects_in_progress`, `_reconnect_limit`,
+  `_reconnect_waits_total`, `_reconnect_refusals_total`; `/metrics` `reconnect_slots`.
+
 - Paced L2 shed (`[cache] l2_shed_batch`, default 1024, and `l2_shed_pause_us`, default
   2000): the `cache-reclaim` thread now removes write-retired L2 entries in steps with a
   pause between them, instead of removing a whole retired working set at full rate while

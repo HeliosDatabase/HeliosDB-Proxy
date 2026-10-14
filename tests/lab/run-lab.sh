@@ -20,6 +20,16 @@
 #                        pgoutput slot on pg-a. Writes through proxy-b, direct
 #                        writes on pg-a and a trigger's side effect must all
 #                        stop proxy-a serving the old cached value.
+#   reconnect-wave       H-05 acceptance drill: two tenants (application_name)
+#                        drive proxy-a with pgbench, a "big" one with
+#                        WAVE_CLIENTS (48) writing clients and a "small" one
+#                        with WAVE_SMALL (2) readers, for WAVE_SECS (60); pg-a
+#                        is killed and pg-b promoted. Judged: the small tenant
+#                        keeps being served, reconnects in progress stay within
+#                        [limits] max_concurrent_reconnects_per_node, the proxy's
+#                        RSS stays bounded, the big tenant recovers.
+#                        LAB_WAVE_CONFIG replaces proxy-wave.toml (e.g. a
+#                        control run with another reconnect limit).
 #
 # PROXY_BINARY must be built with `postgres-topology` (and runs inside the
 # postgres:18.4-bookworm image, so a glibc build from this host works).
@@ -47,6 +57,8 @@ case "$SCENARIO" in
     export LAB_PROXY_A_CONFIG=./proxy-home.toml LAB_PROXY_B_CONFIG=./proxy-edge.toml ;;
   cache-logical)
     export LAB_PROXY_A_CONFIG=./proxy-cache.toml ;;
+  reconnect-wave)
+    export LAB_PROXY_A_CONFIG="${LAB_WAVE_CONFIG:-./proxy-wave.toml}" ;;
   *) echo "unknown scenario: $SCENARIO" >&2; exit 2 ;;
 esac
 [ -x "$BIN" ] || { echo "not executable: $BIN" >&2; exit 2; }
@@ -55,6 +67,7 @@ if [ "${LAB_LOCKED:-0}" != 1 ]; then
   exec flock "$LOCK" systemd-run --user --scope --collect --quiet \
     -p MemoryMax=24G -p MemorySwapMax=0 \
     env LAB_LOCKED=1 LEDGER_SECS="$LEDGER_SECS" LEDGER_WORKERS="$LEDGER_WORKERS" \
+    WAVE_CLIENTS="${WAVE_CLIENTS:-48}" WAVE_SMALL="${WAVE_SMALL:-2}" WAVE_SECS="${WAVE_SECS:-60}" \
     STEP_TIMEOUT="$STEP_TIMEOUT" LAB_PROXY_A_CONFIG="${LAB_PROXY_A_CONFIG:-./proxy-a.toml}" \
     LAB_PROXY_B_CONFIG="${LAB_PROXY_B_CONFIG:-./proxy-b.toml}" bash "$0" "$BIN" "$SCENARIO" "$OUT"
 fi
@@ -73,6 +86,7 @@ port_of() {
 admin_of() { case "$1" in proxy-a) echo 27790 ;; proxy-b) echo 27791 ;; esac; }
 admin_get() { curl -s -m 5 -H "Authorization: Bearer helios-lab-admin" "http://127.0.0.1:$(admin_of "$1")/$2"; }
 RELAY_PID=
+SAMPLER_PID=
 log() { echo "[$(date -u +%T)] $*" | tee -a "$OUT/driver.log"; }
 # Bound every step. `timeout` cannot run a shell function, so the lab's own
 # helpers (ledger, pg, via) bound themselves and are called directly.
@@ -90,6 +104,7 @@ cleanup() {
   set +e
   log "teardown (exit $rc)"
   [ -n "$RELAY_PID" ] && kill "$RELAY_PID" 2>/dev/null
+  [ -n "$SAMPLER_PID" ] && kill "$SAMPLER_PID" 2>/dev/null
   "${COMPOSE[@]}" logs --no-color --timestamps >"$OUT/compose.log" 2>&1
   "${COMPOSE[@]}" down --remove-orphans --timeout 5 >>"$OUT/driver.log" 2>&1
   local left
@@ -143,6 +158,41 @@ for p in proxy-a proxy-b; do
   done
 done
 log "replication: $(pg pg-a -c "SELECT string_agg(application_name || ':' || sync_state, ',') FROM pg_stat_replication")"
+
+if [ "$SCENARIO" = reconnect-wave ]; then
+  WAVE_CLIENTS="${WAVE_CLIENTS:-48}" WAVE_SMALL="${WAVE_SMALL:-2}" WAVE_SECS="${WAVE_SECS:-60}"
+  step "${COMPOSE[@]}" exec -T ledger pgbench -i -q -s 4 -h 127.0.0.1 -p 27701 -U lab lab >>"$OUT/driver.log" 2>&1
+  pgb() { # TENANT CLIENTS THREADS PGBENCH-ARGS...
+    local tenant=$1 clients=$2 threads=$3; shift 3
+    timeout "$((WAVE_SECS + STEP_TIMEOUT))" "${COMPOSE[@]}" exec -T -e PGAPPNAME="$tenant" ledger \
+      pgbench -h 127.0.0.1 -p 27710 -U lab -n -c "$clients" -j "$threads" -T "$WAVE_SECS" -P 1 "$@" lab
+  }
+  proxy_pid="$(docker inspect -f '{{.State.Pid}}' "$PROJECT-proxy-a-1")"
+  python3 -I "$HERE/wave_sampler.py" "http://127.0.0.1:27790" helios-lab-admin "$proxy_pid" \
+    "$OUT/wave-samples.tsv" "$OUT/wave-stop" 2>>"$OUT/driver.log" &
+  SAMPLER_PID=$!
+  date +%s%3N >"$OUT/wave_start_ms"
+  pgb big "$WAVE_CLIENTS" 4 -b tpcb-like >"$OUT/pgbench-big.log" 2>&1 &
+  BIG_PID=$!
+  pgb small "$WAVE_SMALL" 1 -S >"$OUT/pgbench-small.log" 2>&1 &
+  SMALL_PID=$!
+  sleep 15
+  log "kill -9 pg-a"
+  "${COMPOSE[@]}" kill -s KILL pg-a >>"$OUT/driver.log" 2>&1
+  sleep 2
+  date +%s%3N >"$OUT/promoted_ms"
+  log "promote pg-b: $(pg pg-b -c "SELECT pg_promote(true, 60)")"
+  wait "$BIG_PID" || true
+  wait "$SMALL_PID" || true
+  touch "$OUT/wave-stop"
+  wait "$SAMPLER_PID" || true
+  SAMPLER_PID=
+  admin_get proxy-a metrics/prometheus >"$OUT/metrics-prometheus-proxy-a.prom" 2>&1 || true
+  admin_get proxy-a metrics >"$OUT/metrics-proxy-a.json" 2>&1 || true
+  echo "$WAVE_SECS" >"$OUT/wave_secs"
+  python3 -I "$HERE/verdict.py" "$SCENARIO" "$OUT" | tee "$OUT/verdict.txt"
+  exit "${PIPESTATUS[0]}"
+fi
 
 if [ "$SCENARIO" = cache-logical ]; then
   metrics() { admin_get proxy-a metrics; }

@@ -1605,6 +1605,16 @@ pub struct LimitsToml {
     /// must be > 0. Default 5000.
     #[serde(default = "default_backend_slot_wait_ms")]
     pub backend_slot_wait_ms: u64,
+    /// Most backend connections the proxy opens at once to one node on a
+    /// session's behalf after its startup connection (a transaction-replay
+    /// re-home, a reconnect after a lost backend, a standby connection for
+    /// offloaded reads), from TCP connect through authentication (H-05).
+    /// Meters the reconnect wave a failover sends to the new primary. A dial
+    /// over the limit waits up to `backend_slot_wait_ms`, then the request is
+    /// refused with 53300 (the node is not marked unhealthy). Default 0 =
+    /// unlimited.
+    #[serde(default)]
+    pub max_concurrent_reconnects_per_node: usize,
     /// TR-09: under `tr_mode = "select"` or `"transaction"`, hold the response
     /// of a read the proxy may re-execute in the proxy until its
     /// ReadyForQuery, up to this many bytes. A backend fault before then has
@@ -1723,6 +1733,7 @@ impl Default for LimitsToml {
             tr_max_session_set_statements: default_tr_max_session_set_statements(),
             latency_buckets_ms: crate::metrics_hist::default_latency_buckets_ms(),
             backend_slot_wait_ms: default_backend_slot_wait_ms(),
+            max_concurrent_reconnects_per_node: 0,
             tr_buffer_small_reads_bytes: 0,
         }
     }

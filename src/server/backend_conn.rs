@@ -515,6 +515,9 @@ impl ProxyServer {
         // pool acquire timeout — see `connect_and_authenticate`.
         // H-05: hold a slot on the node's cap for the connection's life.
         let slot = Self::acquire_node_slot(state, target).await?;
+        // H-05: at most `max_concurrent_reconnects_per_node` such dials to one
+        // node at a time, from TCP connect through authentication.
+        let dialing = Self::acquire_reconnect_slot(state, target).await?;
         let capacity_deadline = tokio::time::Instant::now() + config.pool.acquire_timeout();
         let seed = session.id.as_u128() as u64;
         let mut attempt: u32 = 0;
@@ -563,6 +566,7 @@ impl ProxyServer {
                 Err(e) => return Err(e),
             }
         };
+        drop(dialing);
         #[cfg(feature = "pool-modes")]
         if state.backend_pool.is_some() {
             tracing::debug!(target: "helios::pool", node = %target, "dialed fresh backend connection (pool miss)");
@@ -591,6 +595,24 @@ impl ProxyServer {
             state.latency.backend_slot_wait.record(waited);
         }
         Ok(slot)
+    }
+
+    /// A permit to open a connection to `node` on a session's behalf under
+    /// `[limits] max_concurrent_reconnects_per_node` (H-05): waits up to
+    /// `backend_slot_wait_ms`, then fails with `PoolExhausted` (53300).
+    pub(super) async fn acquire_reconnect_slot(
+        state: &ServerState,
+        node: &str,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        let (permit, waited) = state
+            .node_slots
+            .acquire_reconnect(node, state.limits.backend_slot_wait)
+            .await
+            .map_err(|e| ProxyError::PoolExhausted(e.to_string()))?;
+        if let Some(waited) = waited {
+            state.latency.backend_slot_wait.record(waited);
+        }
+        Ok(permit)
     }
 
     fn free_idle_backend(state: &ServerState, node: &str) -> bool {
