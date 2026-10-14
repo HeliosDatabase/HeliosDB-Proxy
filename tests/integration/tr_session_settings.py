@@ -25,6 +25,8 @@ settings it tracked. The re-homed session must show exactly what the old one did
                  PostgreSQL refuses the COMMIT (2D000) and rolls the SET back, but the
                  proxy cannot count on every backend refusing: the SET is unknown and
                  the re-home is refused with 08006.
+  multi_copy     a SET and two COPY FROM STDIN in one simple query: the proxy follows
+                 both COPYs and reads the SET once the query ends; it is restored.
   unknown        set_config(..., false) changes a setting the proxy cannot record:
                  the re-home is refused with 08006 instead of continuing without it.
 Exit 1 if any case fails its expectation.
@@ -145,6 +147,27 @@ def case_call_in_cycle(client):
     return r
 
 
+def case_multi_copy(client):
+    sql = "SET application_name = 'rr-copy'; COPY rr_copy FROM STDIN; COPY rr_copy FROM STDIN"
+    client.sendall(frame(b"Q", sql.encode() + b"\0"))
+    tags = []
+    for _ in range(2):
+        while True:
+            tag, _body = tr08.wire.receive(client)
+            tags.append(tag.decode())
+            if tag == b"G":
+                break
+            if tag in (b"Z", b"E"):
+                raise RuntimeError(f"COPY not started: {tags}")
+        client.sendall(frame(b"d", b"1\n") + frame(b"c"))
+    r = {"frames": tags, "errors": tr08.errors(tr08.wire.drain(client))}
+    r["before"] = state(client)
+    r["after"] = kill_and_read(client)
+    r["ok"] = (tags.count("G") == 2 and r["errors"] == [] and r["before"][2] == "rr-copy"
+               and r["after"] == r["before"])
+    return r
+
+
 def case_unknown(client):
     r = {"set_config": query(client,
                              "SELECT set_config('application_name', 'rr-cfg', false)")[1]}
@@ -169,11 +192,12 @@ def main():
         tr08.pg_query("CREATE ROLE rr_tenant")
         tr08.pg_query("CREATE ROLE rr_tenant_b")
         tr08.pg_query("CREATE SCHEMA rr_schema")
+        tr08.pg_query("CREATE TABLE rr_copy (a int)")
         tr08.pg_query("CREATE PROCEDURE rr_commit() LANGUAGE plpgsql AS $$BEGIN COMMIT; END$$")
         for case, run in [("pool_reset", case_pool_reset), ("batch_set", case_batch_set),
                           ("ext_tx_set", case_ext_tx_set), ("savepoint", case_savepoint),
                           ("two_resets", case_two_resets), ("call_in_cycle", case_call_in_cycle),
-                          ("unknown", case_unknown)]:
+                          ("multi_copy", case_multi_copy), ("unknown", case_unknown)]:
             with tempfile.TemporaryDirectory(prefix="proxy-trset-") as temp:
                 temp = pathlib.Path(temp)
                 proc, log, client = tr08.start_proxy(args.binary, temp, tr08.PG_ADDRESS[1],

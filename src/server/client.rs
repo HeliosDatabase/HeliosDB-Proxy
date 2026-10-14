@@ -1986,6 +1986,12 @@ impl ProxyServer {
                                 }
                                 if is_copy_end {
                                     let node = current_node.clone().unwrap();
+                                    // Cleared before the drain: a query with a
+                                    // second COPY makes the relay set it again
+                                    // when it yields for that one.
+                                    session
+                                        .copy_in_progress
+                                        .store(false, std::sync::atomic::Ordering::Relaxed);
                                     let r = Self::stream_until_ready_buffered(
                                         stream,
                                         &mut b.stream,
@@ -1995,13 +2001,25 @@ impl ProxyServer {
                                         0,
                                     )
                                     .await;
-                                    // Copy has drained back to ReadyForQuery — the
-                                    // session is no longer mid-COPY, so pool release
-                                    // is allowed again.
-                                    session
-                                        .copy_in_progress
-                                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    // Drained back to ReadyForQuery, unless the
+                                    // relay yielded for the next COPY: then the
+                                    // session is still mid-COPY.
+                                    let copying_on = r.is_ok()
+                                        && session
+                                            .copy_in_progress
+                                            .load(std::sync::atomic::Ordering::Relaxed);
+                                    if !copying_on {
+                                        session
+                                            .copy_in_progress
+                                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                     match r {
+                                        Ok(sent) if copying_on => {
+                                            state
+                                                .metrics
+                                                .bytes_sent
+                                                .fetch_add(sent, Ordering::Relaxed);
+                                        }
                                         Ok(sent) => {
                                             Self::tr_after_copy_drain(&mut tr, session, state)
                                                 .await;

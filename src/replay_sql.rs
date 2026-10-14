@@ -58,6 +58,8 @@ struct Scan<'a> {
     ends_tx: bool,
     saw_quoted_backslash: bool,
     statements: usize,
+    /// (`ATOMIC` scans) a function body was still open at the end.
+    unclosed_body: bool,
 }
 
 /// Whether `sql` is at most one statement (a trailing `;` aside) under both
@@ -88,6 +90,10 @@ pub(crate) enum Unsplit {
 pub(crate) fn split_statements(sql: &str) -> Result<Vec<&str>, Unsplit> {
     let mut cuts = Vec::new();
     let plain = scan_with::<true>(sql, false, &mut |i| cuts.push(i));
+    if plain.as_ref().is_ok_and(|p| p.unclosed_body) {
+        // A body this rule never saw end: its `;`s may be statement ends.
+        return Err(Unsplit::Ambiguous);
+    }
     let needs_escaped = match &plain {
         Ok(p) => p.saw_quoted_backslash,
         Err(()) => true,
@@ -120,10 +126,12 @@ fn scan(sql: &str, backslash_escapes: bool) -> Result<Scan<'_>, ()> {
 }
 
 /// [`scan`], reporting the byte offset of every statement-separating `;`.
-/// With `ATOMIC`, a `;` inside a SQL-standard function body (`BEGIN ATOMIC
-/// ... END`) does not separate statements, by psql's rule: inside `CREATE
-/// [OR REPLACE] FUNCTION|PROCEDURE`, each `BEGIN` or `CASE` opens a level and
-/// each `END` closes one.
+/// With `ATOMIC`, a `;` inside a SQL-standard function body does not
+/// separate statements: inside `CREATE [OR REPLACE] FUNCTION|PROCEDURE`,
+/// `BEGIN ATOMIC` (the server's only body form) opens a level, a `CASE`
+/// inside a body opens one more, and `END` closes one; words inside
+/// parentheses (parameters, `RETURNS TABLE` columns, expressions) do not
+/// count, as in psql.
 fn scan_with<'a, const ATOMIC: bool>(
     sql: &'a str,
     backslash_escapes: bool,
@@ -133,6 +141,8 @@ fn scan_with<'a, const ATOMIC: bool>(
     let mut lead: [&str; 4] = [""; 4];
     let mut idents = 0usize;
     let mut begin_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut after_begin = false;
     let mut saw_quoted_backslash = false;
     let mut i = 0;
     let mut head = None;
@@ -183,6 +193,8 @@ fn scan_with<'a, const ATOMIC: bool>(
                 on_semicolon(i);
                 at_start = true;
                 idents = 0;
+                paren_depth = 0;
+                after_begin = false;
                 i += 1;
                 continue;
             }
@@ -202,22 +214,25 @@ fn scan_with<'a, const ATOMIC: bool>(
                 i += 1;
             }
             word = &sql[start..i];
-            if ATOMIC {
+            if ATOMIC && paren_depth == 0 {
                 if let Some(slot) = lead.get_mut(idents) {
                     *slot = word;
                 }
                 idents += 1;
                 let is = |w: &str, k: &str| w.eq_ignore_ascii_case(k);
                 let routine = |w: &str| is(w, "FUNCTION") || is(w, "PROCEDURE");
-                let in_routine = idents > 1
+                let in_routine = idents > 2
                     && is(lead[0], "CREATE")
                     && (routine(lead[1])
                         || (is(lead[1], "OR") && is(lead[2], "REPLACE") && routine(lead[3])));
-                if in_routine && (is(word, "BEGIN") || is(word, "CASE")) {
+                let opens = (in_routine && after_begin && is(word, "ATOMIC"))
+                    || (begin_depth > 0 && is(word, "CASE"));
+                if opens {
                     begin_depth += 1;
                 } else if begin_depth > 0 && is(word, "END") {
                     begin_depth -= 1;
                 }
+                after_begin = in_routine && is(word, "BEGIN");
             }
         } else if matches!(b[i], b'\'' | b'"') {
             let quote = b[i];
@@ -263,6 +278,14 @@ fn scan_with<'a, const ATOMIC: bool>(
                 i += 1;
             }
         } else {
+            if ATOMIC {
+                match b[i] {
+                    b'(' => paren_depth += 1,
+                    b')' => paren_depth = paren_depth.saturating_sub(1),
+                    _ => {}
+                }
+                after_begin = false;
+            }
             i += 1;
         }
         if at_start {
@@ -289,6 +312,7 @@ fn scan_with<'a, const ATOMIC: bool>(
         ends_tx,
         saw_quoted_backslash,
         statements,
+        unclosed_body: begin_depth > 0,
     })
 }
 
@@ -495,6 +519,31 @@ mod tests {
         assert_eq!(
             split_statements("BEGIN; SELECT 1; END; SET a = 1"),
             Ok(vec!["BEGIN", "SELECT 1", "END", "SET a = 1"])
+        );
+        // `begin` as a parameter, column or plain word is no body.
+        assert_eq!(
+            split_statements(
+                "CREATE FUNCTION f(begin date, stop date) RETURNS int LANGUAGE sql \
+                 AS $$SELECT 1$$; SET search_path = app"
+            ),
+            Ok(vec![
+                "CREATE FUNCTION f(begin date, stop date) RETURNS int LANGUAGE sql \
+                 AS $$SELECT 1$$",
+                "SET search_path = app"
+            ])
+        );
+        assert_eq!(
+            split_statements(
+                "CREATE FUNCTION g() RETURNS TABLE(begin timestamptz, \"end\" int) \
+                 LANGUAGE sql AS 'SELECT now(), 1'; SET a = 1"
+            )
+            .map(|v| v.len()),
+            Ok(2)
+        );
+        // A body that never ends: its `;`s cannot be told apart.
+        assert_eq!(
+            split_statements("CREATE FUNCTION h() RETURNS int BEGIN ATOMIC SELECT 1; SET a = 1"),
+            Err(Unsplit::Ambiguous)
         );
     }
 

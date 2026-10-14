@@ -113,6 +113,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   structure still counts, but a `SET` in it makes the settings unknown, since its text
   cannot be restored. The statements of a simple query that yields for COPY are read when
   the COPY ends.
+- A simple query with more than one `COPY ... FROM STDIN` (for example
+  `SET ...; COPY a FROM STDIN; COPY b FROM STDIN`): after the first COPY ended, the
+  proxy marked the session as no longer copying while the server waited for the next
+  COPY's data. It now stays mid-COPY until the query's ReadyForQuery, and the query's
+  settings are read then.
+- `PREPARE p AS ... set_config(..., false)` makes the session's settings unknown when it
+  runs, even inside a transaction that rolls back: the prepared statement survives, and a
+  later `EXECUTE p` changes the setting.
 - Savepoint names in this tracking are read like PostgreSQL reads them:
   - comments inside the statement are skipped;
   - quoted names keep their spaces;

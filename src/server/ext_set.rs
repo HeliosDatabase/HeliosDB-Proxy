@@ -57,6 +57,11 @@ pub(super) enum Bound {
     Tx(TxVerb, String),
     /// `CALL` or `DO`: a procedure that may control the transaction.
     CommitPoint,
+    /// A statement whose effect on settings outlives its transaction and
+    /// cannot be followed (`PREPARE p AS SELECT set_config(..., false)`: the
+    /// prepared statement survives a rollback, and a later `EXECUTE p`
+    /// changes the setting): where it runs, the settings become unknown.
+    Untracked,
     /// Anything else.
     Other,
 }
@@ -145,6 +150,7 @@ enum Step {
     DiscardAll(String),
     Tx(TxVerb, String),
     CommitPoint,
+    Untracked,
     /// One or more consecutive other statements.
     Other,
 }
@@ -265,6 +271,7 @@ impl ExtSetCycle {
             Bound::DiscardAll(sql) => Step::DiscardAll(sql),
             Bound::Tx(verb, sql) => Step::Tx(verb, sql),
             Bound::CommitPoint => Step::CommitPoint,
+            Bound::Untracked => Step::Untracked,
         };
         self.relevant |= step != Step::Other;
         if self.steps.len() < self.max_steps {
@@ -331,7 +338,12 @@ impl ExtSetCycle {
             || self
                 .steps
                 .iter()
-                .any(|s| matches!(s, Step::Set(_) | Step::DiscardAll(_)))
+                .any(|s| matches!(s, Step::Set(_) | Step::DiscardAll(_) | Step::Untracked))
+    }
+
+    /// The cycle bound a statement whose effect no rollback undoes.
+    fn untracked(&self) -> bool {
+        self.steps.contains(&Step::Untracked)
     }
 
     /// The cycle may have ended a transaction (or committed part of an
@@ -370,6 +382,9 @@ impl ExtSetCycle {
     fn abandon(&self, before: u8) -> Vec<SettingsOp> {
         if !self.relevant && !self.unknown && !self.overflow {
             return Vec::new();
+        }
+        if self.untracked() {
+            return vec![SettingsOp::Unknown];
         }
         let (sets, may_end) = (self.sets(), self.may_end());
         if before == b'I' {
@@ -423,6 +438,9 @@ impl ExtSetCycle {
         let open_before = b.before != b'I';
         let open_after = b.after != b'I';
         let (sets, may_end, savepoints) = (self.sets(), self.may_end(), self.savepoints());
+        if self.untracked() {
+            return vec![Unknown];
+        }
         if b.copying {
             // No ReadyForQuery yet: the statuses say nothing, and the drain
             // to it settles a transaction that ended unseen.
@@ -556,7 +574,11 @@ impl ExtSetCycle {
         // cycle opened leaves nothing behind when it rolls back.
         let end = |ops: &mut Vec<SettingsOp>, opened_at: &mut Option<usize>, committed: bool| {
             match opened_at.take() {
-                Some(at) if !committed => ops.truncate(at),
+                Some(at) if !committed => {
+                    // What no rollback undoes stays.
+                    let undone = ops.split_off(at);
+                    ops.extend(undone.into_iter().filter(|op| *op == Unknown));
+                }
                 _ => ops.push(End(Some(committed))),
             }
         };
@@ -604,6 +626,10 @@ impl ExtSetCycle {
             }
             match step {
                 Step::Other | Step::CommitPoint => fresh &= open,
+                Step::Untracked => {
+                    ops.push(Unknown);
+                    fresh &= open;
+                }
                 Step::Set(sql) if open => ops.push(Defer(sql.clone())),
                 Step::Set(sql) => {
                     implicit.push(sql);

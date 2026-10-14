@@ -1663,6 +1663,33 @@ async fn tr_simple_query_edge_cases() {
     assert!(tr.gucs_unknown);
     send(&mut tr, &session, &state, b'I', false, qmsg("DISCARD ALL")).await;
     assert!(!tr.gucs_unknown && tr.gucs.is_empty());
+    // A prepared set_config survives the rollback of its transaction.
+    send(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        qmsg("BEGIN; PREPARE p AS SELECT set_config('a', 'b', false); ROLLBACK"),
+    )
+    .await;
+    assert!(tr.gucs_unknown);
+    send(&mut tr, &session, &state, b'I', false, qmsg("DISCARD ALL")).await;
+    // A `begin` parameter is no function body: the SET after it counts.
+    send(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        qmsg(
+            "CREATE FUNCTION f(begin date) RETURNS int LANGUAGE sql AS $$SELECT 1$$; \
+              SET search_path = app",
+        ),
+    )
+    .await;
+    assert!(tracked(&tr, "search_path = app"), "{:?}", tr.gucs);
+    send(&mut tr, &session, &state, b'I', false, qmsg("DISCARD ALL")).await;
 
     // Not UTF-8 (LATIN1): a SET inside a transaction that rolls back is no
     // loss; one that applies cannot be recorded.
@@ -1699,7 +1726,20 @@ async fn tr_simple_query_edge_cases() {
         raw(b"SELECT 'caf\xe9'; SET work_mem = '4MB'\0"),
     )
     .await;
-    assert!(!tr.gucs_unknown && tracked(&tr, "4MB"), "{:?}", tr.gucs);
+    // (In encodings whose trail bytes can be `;` the lossy split cannot be
+    // trusted where a SET is involved.)
+    assert!(tr.gucs_unknown, "{:?}", tr.gucs);
+    send(&mut tr, &session, &state, b'I', false, qmsg("DISCARD ALL")).await;
+    send(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        raw(b"SELECT 'caf\xe9'; SELECT 2\0"),
+    )
+    .await;
+    assert!(!tr.gucs_unknown);
     send(
         &mut tr,
         &session,

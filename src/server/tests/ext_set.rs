@@ -368,6 +368,22 @@ fn a_transaction_the_cycle_opens_and_rolls_back_leaves_nothing() {
 }
 
 #[test]
+fn a_prepared_set_config_outlives_a_rollback() {
+    let prepared = [tx("BEGIN"), Bound::Untracked, tx("ROLLBACK")];
+    assert_eq!(stmts(&prepared, ok_sync()), ops(vec![Unknown]));
+    // Inside a transaction open before the cycle, at once.
+    assert_eq!(
+        stmts(&[Bound::Untracked], sync(b'T', b'T', false)),
+        ops(vec![Unknown])
+    );
+    // If it never ran, nothing.
+    assert_eq!(
+        stmts(&[Bound::Untracked], sync(b'I', b'I', true)),
+        ops(vec![])
+    );
+}
+
+#[test]
 fn a_simple_query_is_parsed_whole() {
     // An extended cycle can fail at its COMMIT's Bind (still 'E', the
     // savepoint taken) or at the SAVEPOINT; a simple query either ran
@@ -716,7 +732,6 @@ fn bound_statements_are_classified_from_raw_bytes() {
         "SELECT 1, set_config('a', 'b', true), set_config('c', 'd', false)",
         "SELECT set_config('a', $$'$$, false) -- ', true)",
         "SELECT set_config('a', E'x\\'', true)",
-        "PREPARE p AS SELECT set_config('a', 'b', false)",
     ] {
         // Applied, an empty SET is one the proxy cannot record.
         assert_eq!(
@@ -725,6 +740,13 @@ fn bound_statements_are_classified_from_raw_bytes() {
             "{sql}"
         );
     }
+    // A prepared set_config: EXECUTE sets it later, whatever the
+    // transaction does; a non-UTF-8 savepoint name could collide.
+    assert_eq!(
+        ProxyServer::tr_bound(b"PREPARE p AS SELECT set_config('a', 'b', false)"),
+        Bound::Untracked
+    );
+    assert_eq!(ProxyServer::tr_bound(b"SAVEPOINT a\xe9"), Bound::Unknown);
     // A non-UTF-8 session SET: its shape is known, its text is not.
     assert_eq!(
         ProxyServer::tr_bound(b"SET application_name = 'caf\xe9'"),

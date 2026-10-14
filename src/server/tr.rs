@@ -1289,20 +1289,20 @@ impl ProxyServer {
         if !set_like {
             return match Self::tr_tx_verb(&text) {
                 Some(v) => {
-                    // Only savepoint statements need their text (the name).
+                    // Only savepoint statements need their text (the name),
+                    // which replacement characters could make collide.
                     let keep =
                         matches!(v, TxVerb::Savepoint | TxVerb::Release | TxVerb::RollbackTo);
-                    Bound::Tx(
-                        v,
-                        if keep {
-                            text.into_owned()
-                        } else {
-                            String::new()
-                        },
-                    )
+                    match (keep, exact) {
+                        (false, _) => Bound::Tx(v, String::new()),
+                        (true, true) => Bound::Tx(v, text.into_owned()),
+                        (true, false) => Bound::Unknown,
+                    }
                 }
-                // `PREPARE p AS SELECT set_config(...)`: a later EXECUTE runs it.
-                None => set_config(&text).unwrap_or(Bound::Other),
+                // `PREPARE p AS ... set_config(..., false)`: EXECUTE p sets it
+                // later, whatever becomes of this transaction.
+                None if Self::tr_sets_config(&text) => Bound::Untracked,
+                None => Bound::Other,
             };
         }
         if Self::tr_reset_all_op(crate::protocol::skip_leading_comments(&text))
@@ -1654,15 +1654,21 @@ impl ProxyServer {
             let text = String::from_utf8_lossy(sql);
             let lossy = matches!(text, std::borrow::Cow::Owned(_));
             match crate::replay_sql::split_statements(&text) {
+                // Not UTF-8: in multi-byte encodings whose trail bytes can be
+                // `;`, a backslash or part of a dollar tag, the lossy text
+                // may split where the server does not. Only a query whose
+                // every piece is plainly irrelevant is trusted.
+                Ok(statements) if lossy => {
+                    let relevant = statements
+                        .iter()
+                        .any(|q| !matches!(Self::tr_bound(q.as_bytes()), Bound::Other));
+                    if relevant {
+                        run(Bound::Unknown);
+                    }
+                }
                 Ok(statements) => {
                     for statement in statements {
-                        run(match Self::tr_bound(statement.as_bytes()) {
-                            // Read with replacement characters: not restorable.
-                            Bound::Set(q) if lossy && q.contains('\u{FFFD}') => {
-                                Bound::Set(String::new())
-                            }
-                            bound => bound,
-                        });
+                        run(Self::tr_bound(statement.as_bytes()));
                     }
                 }
                 Err(crate::replay_sql::Unsplit::Unlexable) if b.failed => {}
