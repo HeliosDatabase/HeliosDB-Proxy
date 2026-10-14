@@ -574,6 +574,17 @@ enum ClientRead {
     IdleTimeout,
 }
 
+/// What the idle watch needs from the session while it relays backend
+/// frames between client requests.
+#[derive(Clone, Copy)]
+struct IdleWatch<'a> {
+    /// Counts the relayed frames into the request tally.
+    session: &'a ClientSession,
+    /// The session's TR re-homes it: a backend's own FATAL/PANIC is
+    /// dropped, not forwarded (see `forward_idle_backend_frames`).
+    keep_session: bool,
+}
+
 /// SQLSTATE `too_many_connections`: the backend is at `max_connections`.
 const SQLSTATE_TOO_MANY_CONNECTIONS: &str = "53300";
 

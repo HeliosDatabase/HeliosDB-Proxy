@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Session settings across a transaction-replay re-home (tr_mode = "session";
-Sprinter 75c0c5eceac3 and 72494e4aaebf).
+Sprinter 75c0c5eceac3, 72494e4aaebf, 8bd78d5947e5 and 03fb06edf4b8).
 
 Starts and removes its own bounded, loopback-only PostgreSQL Docker container
 and its own proxies; uses no existing database and no third-party Python packages.
@@ -29,6 +29,17 @@ settings it tracked. The re-homed session must show exactly what the old one did
                  both COPYs and reads the SET once the query ends; it is restored.
   unknown        set_config(..., false) changes a setting the proxy cannot record:
                  the re-home is refused with 08006 instead of continuing without it.
+  autosave       pgjdbc autosave=always: [BEGIN, SAVEPOINT, SET], then [SAVEPOINT,
+                 failing INSERT], [ROLLBACK TO SAVEPOINT], [COMMIT], each one extended
+                 cycle. The proxy counts the completions, so it knows the INSERT (not
+                 the SAVEPOINT) failed: the SET is restored, not refused with 08006.
+  pipeline       psycopg-style pipeline in autocommit: an extended SET answered at a
+                 Flush, then a SELECT and the Sync. The Flush output is counted, so
+                 the SET is known to have run: it is restored.
+  ext_copy       COPY FROM STDIN in the extended protocol (Parse/Bind/Execute/Sync,
+                 CopyData, CopyDone, Sync, as libpq and tokio-postgres send it): the
+                 ReadyForQuery answers the second Sync, and the proxy must not wait for
+                 it at CopyDone. The row arrives and a SET from before is restored.
 Exit 1 if any case fails its expectation.
 """
 import argparse
@@ -179,6 +190,61 @@ def case_unknown(client):
     return r
 
 
+def case_autosave(client):
+    r = {"cycles": [cycle(client, "BEGIN", "SAVEPOINT PGJDBC_AUTOSAVE",
+                          "SET application_name = 'rr-autosave'"),
+                    cycle(client, "SAVEPOINT PGJDBC_AUTOSAVE", "INSERT INTO rr_copy VALUES ('x')"),
+                    cycle(client, "ROLLBACK TO SAVEPOINT PGJDBC_AUTOSAVE"),
+                    cycle(client, "COMMIT")]}
+    r["before"] = state(client)
+    r["after"] = kill_and_read(client)
+    r["ok"] = (r["cycles"] == [[], ["22P02"], [], []] and r["before"][2] == "rr-autosave"
+               and r["after"] == r["before"])
+    return r
+
+
+def receive_until(client, tags):
+    """Frames up to and including the first one tagged with one of `tags`."""
+    seen = []
+    while True:
+        tag, body = tr08.wire.receive(client)
+        seen.append((tag, body))
+        if tag in tags:
+            return seen
+
+
+def case_pipeline(client):
+    client.sendall(tr08.parse("", "SET application_name = 'rr-pipe'") + tr08.bind("", "")
+                   + tr08.execute("") + frame(b"H"))
+    first = receive_until(client, (b"C", b"E"))
+    rest = tr08.send(client, tr08.parse("", "SELECT 1") + tr08.bind("", "") + tr08.execute("")
+                     + SYNC)
+    r = {"flush": [tag.decode() for tag, _ in first], "errors": tr08.errors(first + rest)}
+    r["before"] = state(client)
+    r["after"] = kill_and_read(client)
+    r["ok"] = (r["flush"][-1] == "C" and r["errors"] == [] and r["before"][2] == "rr-pipe"
+               and r["after"] == r["before"])
+    return r
+
+
+def case_ext_copy(client):
+    r = {"set": query(client, "SET application_name = 'rr-ext-copy'")[1]}
+    client.sendall(tr08.parse("", "COPY rr_copy FROM STDIN") + tr08.bind("", "")
+                   + tr08.execute("") + SYNC)
+    started = receive_until(client, (b"G", b"Z"))
+    client.sendall(frame(b"d", b"7\n") + frame(b"c") + SYNC)
+    ended = tr08.wire.drain(client)
+    r["frames"] = [tag.decode() for tag, _ in started + ended]
+    r["errors"] = tr08.errors(started + ended)
+    r["copied"] = query(client, "SELECT count(*) FROM rr_copy WHERE a = 7")
+    r["before"] = state(client)
+    r["after"] = kill_and_read(client)
+    r["ok"] = (r["frames"][-3:] == ["G", "C", "Z"] and r["errors"] == []
+               and r["copied"] == ([["1"]], []) and r["before"][2] == "rr-ext-copy"
+               and r["after"] == r["before"])
+    return r
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=lambda p: str(pathlib.Path(p).resolve()))
@@ -197,7 +263,9 @@ def main():
         for case, run in [("pool_reset", case_pool_reset), ("batch_set", case_batch_set),
                           ("ext_tx_set", case_ext_tx_set), ("savepoint", case_savepoint),
                           ("two_resets", case_two_resets), ("call_in_cycle", case_call_in_cycle),
-                          ("multi_copy", case_multi_copy), ("unknown", case_unknown)]:
+                          ("multi_copy", case_multi_copy), ("unknown", case_unknown),
+                          ("autosave", case_autosave), ("pipeline", case_pipeline),
+                          ("ext_copy", case_ext_copy)]:
             with tempfile.TemporaryDirectory(prefix="proxy-trset-") as temp:
                 temp = pathlib.Path(temp)
                 proc, log, client = tr08.start_proxy(args.binary, temp, tr08.PG_ADDRESS[1],

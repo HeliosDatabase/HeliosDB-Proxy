@@ -40,6 +40,15 @@ pub struct ClientSession {
     /// `ErrorResponse` frame. Lets the TR bookkeeping skip recording a
     /// `SET` that the backend rejected.
     pub last_response_error: std::sync::atomic::AtomicBool,
+    /// The current request's statements that completed (CommandComplete,
+    /// EmptyQueryResponse, PortalSuspended) across every response relayed
+    /// for it, Flush output included; whether any of those carried an
+    /// ErrorResponse; and whether the tally is whole (no fault interrupted
+    /// the request). Settings tracking places a failure with it. Reset when a
+    /// request starts and when it ends.
+    pub cycle_completions: std::sync::atomic::AtomicU32,
+    pub cycle_errored: std::sync::atomic::AtomicBool,
+    pub cycle_counted: std::sync::atomic::AtomicBool,
     /// TR-06 observation digest of the most recent fully-relayed response
     /// (RowDescription/DataRow/CommandComplete/EmptyQueryResponse frames),
     /// `0` = none computed. Hashed only while inside an explicit transaction

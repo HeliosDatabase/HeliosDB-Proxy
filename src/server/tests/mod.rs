@@ -21,6 +21,14 @@ mod stmt_facts;
 /// A connected loopback `TcpStream` pair, shared by the relay tests
 /// below that need a real socket (so `try_read_buf`/`WouldBlock`
 /// behaves as it does in production, unlike an in-memory duplex pipe).
+/// The idle watch of `session` (see `read_next_client_message`).
+fn watch(session: &ClientSession, keep_session: bool) -> IdleWatch<'_> {
+    IdleWatch {
+        session,
+        keep_session,
+    }
+}
+
 async fn pair() -> (TcpStream, TcpStream) {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
@@ -179,6 +187,9 @@ fn make_test_session() -> Arc<ClientSession> {
         copy_in_progress: std::sync::atomic::AtomicBool::new(false),
         last_rfq_status: std::sync::atomic::AtomicU8::new(b'I'),
         last_response_error: std::sync::atomic::AtomicBool::new(false),
+        cycle_completions: std::sync::atomic::AtomicU32::new(0),
+        cycle_errored: std::sync::atomic::AtomicBool::new(false),
+        cycle_counted: std::sync::atomic::AtomicBool::new(true),
         last_response_digest: std::sync::atomic::AtomicU64::new(0),
         last_response_unverifiable: std::sync::atomic::AtomicBool::new(false),
         tr_replay_tainted: std::sync::atomic::AtomicBool::new(false),
@@ -1589,7 +1600,7 @@ async fn read_next_client_message_times_out_while_watching_the_backend() {
         Some("node-a"),
         Some(deadline),
         &server.state,
-        true,
+        watch(&make_test_session(), true),
     )
     .await
     .unwrap();
@@ -1644,7 +1655,7 @@ async fn watch_relay_withholds_partial_backend_frames() {
         Some("node-a"),
         Some(deadline),
         &server.state,
-        true,
+        watch(&make_test_session(), true),
     )
     .await
     .unwrap();
@@ -1672,7 +1683,7 @@ async fn watch_relay_withholds_partial_backend_frames() {
         Some("node-a"),
         Some(deadline),
         &server.state,
-        true,
+        watch(&make_test_session(), true),
     )
     .await
     .unwrap();
@@ -2293,7 +2304,7 @@ async fn idle_watch_keeps_a_backend_fatal_from_a_kept_session() {
             Some("node-a"),
             Some(deadline),
             &server.state,
-            keep_session,
+            watch(&make_test_session(), keep_session),
         )
         .await
         .unwrap();

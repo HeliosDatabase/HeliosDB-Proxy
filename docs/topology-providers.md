@@ -71,6 +71,13 @@ a provider:
 - when the leader moves from one node to another, idle pooled backend connections to the
   former leader are closed (a demoted server is typically restarted by its HA manager).
   Losing the leader without a successor (lease expiry, conflict) closes nothing.
+- a session whose home connection to the former leader is still open (a switchover that
+  left the old primary running) leaves it before its next request. Under transaction
+  replay (`tr_mode` other than `none`) it re-homes onto the leader as after losing its
+  backend while idle: its tracked settings are restored, or the re-home is refused with
+  `08006` when they are unknown. An open transaction is reported lost (`57P01`). Before
+  2.1.0 the session's next write moved to a fresh connection without its settings. Live
+  check: `tests/integration/home_move.py`.
 
 A session keeps reading from its current node while that node stays healthy; the read set
 applies when a session picks a node (for example per transaction under transaction

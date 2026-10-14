@@ -94,6 +94,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Such a session keeps its reads on the primary. A failover is refused with `08006` until
   `DISCARD ALL`, rather than re-homing the session without those settings. New counter:
   `tr_session_set_untracked_total`.
+- Failed cycles are read exactly (Sprinter 8bd78d5947e5). The proxy counts the statements
+  of each request that completed (`CommandComplete`, `EmptyQueryResponse`,
+  `PortalSuspended`, output answering a `Flush` included) and notes any error in its
+  responses, so it knows which statement failed instead of considering every position.
+  Common driver patterns that made the settings unknown now stay known:
+  - pgjdbc `autosave=always` with a `SET` in the transaction and a recovered error
+    (`[SAVEPOINT PGJDBC_AUTOSAVE, failing INSERT]`, then `ROLLBACK TO`): the transaction's
+    settings were tainted, and after `COMMIT` a failover was refused until `DISCARD ALL`,
+    which HikariCP never sends;
+  - a psycopg pipeline in autocommit with a `SET` and a mid-pipeline fetch (`Flush`);
+  - a cycle with a Parse, Describe or Close after a `COMMIT` that failed.
+
+  The count is not used when a backend fault or re-home interrupted the request, or when
+  a `[query_rewrite]` rule changed its text.
 - `SET`, `RESET` and `DISCARD ALL` inside a multi-statement simple query are now tracked:
   the query's statements are read in order, like an extended-protocol cycle. Before, only
   a query's first statement was looked at, and a multi-statement query was not tracked
@@ -155,6 +169,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement pattern) dropped `s` from the session's record, so it could not be
   re-prepared on another connection; the record now keeps the new definition. Live
   check: `tests/integration/prepared_close_routing.py`.
+- Extended-protocol `COPY ... FROM STDIN` (Parse/Bind/Execute/Sync, CopyData, CopyDone,
+  Sync, as libpq's `PQexecParams` and tokio-postgres `copy_in` send it) no longer stalls
+  (Sprinter 03fb06edf4b8). PostgreSQL ignores the cycle's Sync during copy-in and answers
+  the Sync the client sends after CopyDone, but the proxy waited for that ReadyForQuery at
+  CopyDone without reading the client's Sync, until the backend read timeout. An extended
+  COPY's end is now relayed and its bookkeeping settled at the client's Sync. Simple-query
+  COPY (psql, pgjdbc, psycopg, asyncpg) is unchanged.
+- A session whose home connection to the former primary was still open when the topology
+  provider moved the leader (a switchover that left the old primary running) sent its next
+  write to a fresh connection on the new leader without its settings, or ran the rest of
+  an open transaction outside it (Sprinter 480d8084f833). It now leaves that connection
+  before its next request: under transaction replay it re-homes like a session whose
+  backend was lost while idle (settings restored, or `08006` when they are unknown), and
+  an open transaction is reported lost (`57P01`). Live check:
+  `tests/integration/home_move.py`.
 
 ### Changed
 

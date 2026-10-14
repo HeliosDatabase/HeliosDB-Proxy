@@ -3632,6 +3632,47 @@ async fn new_session_after_promotion_selects_the_authoritative_leader() {
     );
 }
 
+/// Regression for Sprinter 480d8084f833: a session whose home connection is
+/// still open after the provider moved the leader is re-homed (so replay
+/// restores its settings) instead of drifting to a fresh connection. Without
+/// a valid leader, or under a static topology, nothing moves.
+#[tokio::test]
+async fn a_home_that_lost_the_leadership_is_reported_moved() {
+    let (server, tracker, config) = authoritative_server();
+    let state = &server.state;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    conns.insert(
+        "pg-a:5432".to_string(),
+        BackendConn::new(TcpStream::connect(&addr).await.unwrap()),
+    );
+
+    promote(&server, &tracker, "pg-a:5432");
+    assert_eq!(
+        ProxyServer::home_moved(&conns, Some("pg-a:5432"), state, &config),
+        None
+    );
+    promote(&server, &tracker, "pg-b:5432");
+    assert_eq!(
+        ProxyServer::home_moved(&conns, Some("pg-a:5432"), state, &config).as_deref(),
+        Some("pg-a:5432")
+    );
+    // No open connection there (it already went), or no home: nothing to move.
+    assert_eq!(
+        ProxyServer::home_moved(&HashMap::new(), Some("pg-a:5432"), state, &config),
+        None
+    );
+    assert_eq!(ProxyServer::home_moved(&conns, None, state, &config), None);
+
+    // A static topology keeps the configured roles.
+    let static_server = ProxyServer::new(config.clone()).unwrap();
+    assert_eq!(
+        ProxyServer::home_moved(&conns, Some("pg-b:5432"), &static_server.state, &config),
+        None
+    );
+}
+
 /// The write path must re-route a session whose current node is the
 /// configured primary once the provider has demoted it, and must not route
 /// writes anywhere while the provider has no valid leader.

@@ -242,6 +242,9 @@ impl ProxyServer {
             copy_in_progress: std::sync::atomic::AtomicBool::new(false),
             last_rfq_status: std::sync::atomic::AtomicU8::new(b'I'),
             last_response_error: std::sync::atomic::AtomicBool::new(false),
+            cycle_completions: std::sync::atomic::AtomicU32::new(0),
+            cycle_errored: std::sync::atomic::AtomicBool::new(false),
+            cycle_counted: std::sync::atomic::AtomicBool::new(true),
             last_response_digest: std::sync::atomic::AtomicU64::new(0),
             last_response_unverifiable: std::sync::atomic::AtomicBool::new(false),
             tr_replay_tainted: std::sync::atomic::AtomicBool::new(false),
@@ -539,6 +542,79 @@ impl ProxyServer {
         severity.is_some_and(|s| s == b"FATAL" || s == b"PANIC")
     }
 
+    /// Before a request: when the session's home is no longer the write
+    /// leader (see `home_moved`), drop its connection and forget it as home
+    /// (`nodes`: the home and current node). Under transaction replay, or
+    /// inside a transaction, the session re-homes like one whose home was
+    /// lost while idle (replay restores its settings or refuses; an open
+    /// transaction is reported lost). Otherwise the next connection simply
+    /// goes to the leader, as after any lost backend.
+    fn rehome_if_moved(
+        conns: &mut HashMap<String, BackendConn>,
+        nodes: [&mut Option<String>; 2],
+        offload_on: bool,
+        tr: &mut TrSession,
+        session: &ClientSession,
+        state: &ServerState,
+        config: &ProxyConfig,
+    ) {
+        let [home_node, current_node] = nodes;
+        let watched = if offload_on {
+            home_node.as_deref()
+        } else {
+            current_node.as_deref()
+        };
+        let Some(moved) = Self::home_moved(conns, watched, state, config) else {
+            return;
+        };
+        conns.remove(&moved);
+        tracing::info!(
+            target: "helios::tr",
+            node = %moved,
+            "session home is no longer the write leader: re-homing"
+        );
+        for node in [home_node, current_node] {
+            if node.as_deref() == Some(moved.as_str()) {
+                *node = None;
+            }
+        }
+        if session.tr_mode != TrMode::None
+            || tr.ext_dispatched
+            || session
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            tr.lost_backend = Some(moved);
+        }
+    }
+
+    /// A COPY drained to its ReadyForQuery (`done`: it ended with CopyDone,
+    /// not CopyFail): settle its bookkeeping and, for COPY ... FROM, fire the
+    /// deferred edge invalidation now that its rows are visible.
+    async fn copy_drained(
+        tr: &mut TrSession,
+        done: bool,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+    ) {
+        Self::tr_after_copy_drain(tr, session, state).await;
+        #[cfg(feature = "edge-proxy")]
+        if config.edge.enabled {
+            let stashed = session
+                .pending_edge_copy_tables
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            // CopyFail loaded nothing: the stash is just cleared.
+            if let (Some(tables), true) = (stashed, done) {
+                Self::edge_invalidate_write(state, config, tables).await;
+            }
+        }
+        #[cfg(not(feature = "edge-proxy"))]
+        let _ = (done, config);
+    }
+
     /// [`Self::forward_buffered_backend_frames`] for the idle watch. With
     /// `keep_session` (the session's TR re-homes it: `tr_mode != none`),
     /// frames up to a backend's own FATAL/PANIC are forwarded; that frame and
@@ -552,8 +628,12 @@ impl ProxyServer {
         stream: &mut ClientStream,
         buf: &mut BytesMut,
         state: &Arc<ServerState>,
-        keep_session: bool,
+        watch: IdleWatch<'_>,
     ) -> Result<(usize, bool)> {
+        let IdleWatch {
+            session,
+            keep_session,
+        } = watch;
         let whole = Self::complete_frame_prefix(buf, state.limits.max_backend_frame_bytes)?;
         let cut = if keep_session {
             Self::idle_termination_offset(buf, whole)
@@ -562,12 +642,12 @@ impl ProxyServer {
         };
         let Some(cut) = cut else {
             return Ok((
-                Self::forward_buffered_backend_frames(stream, buf, state).await?,
+                Self::forward_buffered_backend_frames(stream, buf, session, state).await?,
                 false,
             ));
         };
         let mut head = buf.split_to(cut);
-        let sent = Self::forward_buffered_backend_frames(stream, &mut head, state).await?;
+        let sent = Self::forward_buffered_backend_frames(stream, &mut head, session, state).await?;
         buf.clear();
         Ok((sent, true))
     }
@@ -579,7 +659,7 @@ impl ProxyServer {
         watch_node: Option<&str>,
         idle_deadline: Option<tokio::time::Instant>,
         state: &Arc<ServerState>,
-        keep_session: bool,
+        watch: IdleWatch<'_>,
     ) -> Result<ClientRead> {
         let Some(node) = watch_node else {
             return Self::read_client_bytes(stream, buffer, idle_deadline).await;
@@ -601,13 +681,9 @@ impl ProxyServer {
             // Every relay of this socket shares its unpublished frame tail.
             {
                 let bc = conns.get_mut(node).expect("watch_node is in conns");
-                let (sent, ended) = Self::forward_idle_backend_frames(
-                    stream,
-                    &mut bc.response_buf,
-                    state,
-                    keep_session,
-                )
-                .await?;
+                let (sent, ended) =
+                    Self::forward_idle_backend_frames(stream, &mut bc.response_buf, state, watch)
+                        .await?;
                 state
                     .metrics
                     .bytes_sent
@@ -632,7 +708,7 @@ impl ProxyServer {
                                 // not an ErrorResponse, and certainly not the rows of
                                 // a re-executed statement, which would be appended to
                                 // whatever the partial frame turns out to be.
-                                let (sent, ended) = Self::forward_idle_backend_frames(stream, &mut bc.response_buf, state, keep_session).await?;
+                                let (sent, ended) = Self::forward_idle_backend_frames(stream, &mut bc.response_buf, state, watch).await?;
                                 state.metrics.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
                                 if ended {
                                     tracing::debug!(node = %node, "backend ended the session while idle (FATAL); dropping cached connection");
@@ -834,6 +910,11 @@ impl ProxyServer {
         // what the client's unnamed statement is (it outlives the cycle that
         // Parsed it).
         let mut ext_set = ExtSetCycle::with_limit(state.limits.tr_max_cycle_statements);
+        // The client's last request was extended-protocol (so a COPY it
+        // started is too), and such a COPY's end (CopyDone: `true`) waiting
+        // for the client's Sync.
+        let mut ext_copy = false;
+        let mut ext_copy_end: Option<bool> = None;
         let mut unnamed_bound = Bound::Other;
         loop {
             // Read the client's next message directly into the accumulation
@@ -893,7 +974,10 @@ impl ProxyServer {
                 watch_node,
                 idle_deadline,
                 state,
-                session.tr_mode != TrMode::None || !watching_home,
+                IdleWatch {
+                    session,
+                    keep_session: session.tr_mode != TrMode::None || !watching_home,
+                },
             )
             .await?
             {
@@ -986,7 +1070,28 @@ impl ProxyServer {
 
                     // ---- Simple query protocol ----
                     MessageType::Query => {
+                        // A fresh tally for the query's response (see
+                        // `ClientSession::cycle_completions`).
+                        Self::tally_reset(session);
+                        ext_copy = false;
+                        if ext_copy_end.take().is_some() {
+                            // An extended COPY ended without the Sync that
+                            // settles it (libpq and tokio-postgres always send
+                            // one): its completion may precede the query's
+                            // response, and its transaction is not replayable.
+                            session
+                                .cycle_counted
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                            session
+                                .tr_replay_tainted
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         if tr.track_gucs && ext_set.is_open() {
+                            // Output the cycle produced may still precede the
+                            // query's own response.
+                            session
+                                .cycle_counted
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
                             // A Query after a Flush leaves the extended cycle
                             // without its Sync: settle what may have run of it.
                             let outcome = ext_set.interrupt(
@@ -1113,6 +1218,15 @@ impl ProxyServer {
                                 .reads_pinned
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
                         }
+                        Self::rehome_if_moved(
+                            &mut conns,
+                            [&mut home_node, &mut current_node],
+                            offload_on,
+                            &mut tr,
+                            session,
+                            state,
+                            config,
+                        );
                         let fr = match tr.lost_backend.take() {
                             // The session's backend died while idle: the request
                             // was certainly not delivered anywhere.
@@ -1237,6 +1351,17 @@ impl ProxyServer {
                     | MessageType::Describe
                     | MessageType::Execute
                     | MessageType::Close => {
+                        if pending.is_empty() && held_unnamed.is_none() && !tr.ext_dispatched {
+                            // A new cycle: a fresh tally for its responses.
+                            Self::tally_reset(session);
+                            if ext_copy_end.is_some() {
+                                // An extended COPY's completion may still be
+                                // in flight ahead of them.
+                                session
+                                    .cycle_counted
+                                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
                         // Whether this message is appended to `pending`. An
                         // unnamed Parse held aside for promotion is the lone
                         // exception (resolved at the batch boundary).
@@ -1605,6 +1730,15 @@ impl ProxyServer {
                             (None, 0)
                         } else {
                             let mut fault: Option<BackendFault> = None;
+                            Self::rehome_if_moved(
+                                &mut conns,
+                                [&mut home_node, &mut current_node],
+                                offload_on,
+                                &mut tr,
+                                session,
+                                state,
+                                config,
+                            );
                             let fr = match tr.lost_backend.take() {
                                 Some(lost) => {
                                     fault = Some(BackendFault {
@@ -1787,7 +1921,10 @@ impl ProxyServer {
                             // This cycle's COPY drain is not a simple query's.
                             tr.copy_query = None;
                         }
+                        // A COPY that follows is the extended protocol's.
+                        ext_copy = true;
                         if tr.track_gucs {
+                            let (completed, errored) = Self::tally(session);
                             let outcome = ext_set.at_boundary(ExtSetBoundary {
                                 sync: wait_ready,
                                 forwarded,
@@ -1795,8 +1932,10 @@ impl ProxyServer {
                                 after: status_after,
                                 failed: session
                                     .last_response_error
-                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    || errored,
                                 copying,
+                                completed,
                                 simple: false,
                             });
                             let idle_after_sync =
@@ -1836,6 +1975,16 @@ impl ProxyServer {
                             }
                         }
                         held_unnamed = None;
+                        if wait_ready {
+                            if let Some(done) = ext_copy_end.take() {
+                                // This Sync's ReadyForQuery ended the COPY.
+                                if forwarded && !copying {
+                                    Self::copy_drained(&mut tr, done, session, state, config).await;
+                                }
+                            }
+                            // The cycle ended: a fresh tally for the next one.
+                            Self::tally_reset(session);
+                        }
                         // A `Sync` is the extended-protocol transaction/statement
                         // boundary (it yields ReadyForQuery); a `Flush` is not, so
                         // only a Sync triggers a pool release.
@@ -1984,7 +2133,20 @@ impl ProxyServer {
                                     .await;
                                     return Ok(());
                                 }
-                                if is_copy_end {
+                                if is_copy_end && ext_copy {
+                                    // An extended-protocol COPY: the backend
+                                    // ignored the cycle's Sync during copy-in, so
+                                    // the ReadyForQuery answers the client's next
+                                    // Sync (libpq and tokio-postgres send one
+                                    // after CopyDone). Waiting for it here would
+                                    // stall until that Sync, which is not read.
+                                    session
+                                        .copy_in_progress
+                                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    ext_copy = false;
+                                    ext_copy_end =
+                                        Some(matches!(msg.msg_type, MessageType::CopyDone));
+                                } else if is_copy_end {
                                     let node = current_node.clone().unwrap();
                                     // Cleared before the drain: a query with a
                                     // second COPY makes the relay set it again
@@ -2021,33 +2183,18 @@ impl ProxyServer {
                                                 .fetch_add(sent, Ordering::Relaxed);
                                         }
                                         Ok(sent) => {
-                                            Self::tr_after_copy_drain(&mut tr, session, state)
-                                                .await;
+                                            Self::copy_drained(
+                                                &mut tr,
+                                                matches!(msg.msg_type, MessageType::CopyDone),
+                                                session,
+                                                state,
+                                                config,
+                                            )
+                                            .await;
                                             state
                                                 .metrics
                                                 .bytes_sent
                                                 .fetch_add(sent, Ordering::Relaxed);
-                                            // COPY ... FROM rows became visible at
-                                            // this drain: fire the deferred edge
-                                            // invalidation now. CopyFail loaded
-                                            // nothing — just clear the stash.
-                                            #[cfg(feature = "edge-proxy")]
-                                            if config.edge.enabled {
-                                                let stashed = session
-                                                    .pending_edge_copy_tables
-                                                    .lock()
-                                                    .unwrap_or_else(|e| e.into_inner())
-                                                    .take();
-                                                if let Some(tables) = stashed {
-                                                    if matches!(msg.msg_type, MessageType::CopyDone)
-                                                    {
-                                                        Self::edge_invalidate_write(
-                                                            state, config, tables,
-                                                        )
-                                                        .await;
-                                                    }
-                                                }
-                                            }
                                         }
                                         Err(e) => {
                                             conns.remove(&node);
@@ -2107,8 +2254,13 @@ impl ProxyServer {
                                         "COPY aborted: backend connection lost",
                                     );
                                     let _ = stream.write_all(&emsg).await;
-                                    let _ =
-                                        stream.write_all(&Self::create_ready_for_query(b'I')).await;
+                                    // An extended COPY's ReadyForQuery answers
+                                    // the client's next Sync.
+                                    if !std::mem::take(&mut ext_copy) {
+                                        let _ = stream
+                                            .write_all(&Self::create_ready_for_query(b'I'))
+                                            .await;
+                                    }
                                 }
                             }
                         }

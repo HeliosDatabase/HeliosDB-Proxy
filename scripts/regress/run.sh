@@ -133,7 +133,23 @@ if [ "$bigres" = "1000000" ]; then
   if [ "$peak_mb" -lt 60 ]; then ok large_stream "rss ${before_mb}->${peak_mb}MB"; else bad large_stream "rss ${before_mb}->${peak_mb}MB (>60: store-and-forward buffers whole result; Batch B streaming fixes this)"; fi
 else bad large_stream "wrong row count: $bigres (want 1000000)"; fi
 
-# 9. admin health endpoint
+# 9. extended-protocol COPY FROM STDIN: psql's \bind sends the COPY with
+#    Parse/Bind/Execute/Sync, and libpq ends it with CopyDone then Sync (the
+#    backend ignores the first Sync during copy-in). Bounded by `timeout`: a
+#    proxy that waits for ReadyForQuery at CopyDone stalls here (03fb06edf4b8).
+#    SKIP when the backend itself can't run it (direct attempt yields no count).
+printf '%s\n' 'DROP TABLE IF EXISTS _extcopy;' 'CREATE TABLE _extcopy(x int);' \
+  'COPY _extcopy FROM STDIN \bind \g' 1 2 3 '\.' 'SELECT count(*) FROM _extcopy;' \
+  'DROP TABLE _extcopy;' > "$OUT/extcopy.sql"
+xcopy(){ docker run --rm --network host -e PGPASSWORD="$BPASS" -v "$OUT":/w "$IMG" \
+  timeout 20 psql -h "$1" -p "$2" -U "$BUSER" -d "$BDB" -qtA -v ON_ERROR_STOP=1 -f /w/extcopy.sql; }
+dx=$(xcopy $BHOST $BPORT 2>/dev/null | grep -xE '[0-9]+' | tail -1)
+px=$(xcopy $PROXY_HOST $PROXY_PORT 2>"$OUT/extcopy.err" | grep -xE '[0-9]+' | tail -1)
+if [ "$dx" != "3" ]; then skip extended_copy "backend unsupported"
+elif [ "$px" = "3" ]; then ok extended_copy "($px rows)"
+else bad extended_copy "got=[$px] $(tail -1 "$OUT/extcopy.err")"; fi
+
+# 10. admin health endpoint
 hc=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$ADMIN_PORT/health" 2>/dev/null)
 [ "$hc" = "200" ] && ok admin_health || bad admin_health "http=$hc"
 

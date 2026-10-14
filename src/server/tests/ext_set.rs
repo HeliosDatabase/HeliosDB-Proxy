@@ -29,6 +29,7 @@ fn sync(before: u8, after: u8, failed: bool) -> ExtSetBoundary {
         after,
         failed,
         copying: false,
+        completed: None,
         simple: false,
     }
 }
@@ -52,7 +53,16 @@ fn flush(forwarded: bool, before: u8) -> ExtSetBoundary {
         after: before,
         failed: false,
         copying: false,
+        completed: None,
         simple: false,
+    }
+}
+
+/// `b` with the cycle's completion count.
+fn counted(b: ExtSetBoundary, completed: u32) -> ExtSetBoundary {
+    ExtSetBoundary {
+        completed: Some(completed),
+        ..b
     }
 }
 
@@ -490,6 +500,90 @@ fn a_flushed_cycle_considers_an_unseen_error() {
     assert_eq!(
         c.at_boundary(sync(b'T', b'T', false)),
         ops(vec![defer(SET)])
+    );
+}
+
+#[test]
+fn a_counted_cycle_places_the_failure_exactly() {
+    // pgjdbc autosave: [SAVEPOINT, failing INSERT]. Uncounted, the SAVEPOINT
+    // may have failed too, and the savepoints are in doubt.
+    let autosave = [tx("SAVEPOINT PGJDBC_AUTOSAVE"), Bound::Other];
+    assert_eq!(
+        stmts(&autosave, sync(b'T', b'E', true)),
+        ops(vec![Taint {
+            settings: false,
+            savepoints: true
+        }])
+    );
+    // One statement completed: the INSERT failed, the SAVEPOINT stands.
+    assert_eq!(
+        stmts(&autosave, counted(sync(b'T', b'E', true), 1)),
+        ops(vec![savepoint("SAVEPOINT PGJDBC_AUTOSAVE")])
+    );
+    // None did: the SAVEPOINT failed.
+    assert_eq!(
+        stmts(&autosave, counted(sync(b'T', b'E', true), 0)),
+        ops(vec![])
+    );
+    // A Parse after the COMMIT failed: the COMMIT completed first.
+    for (completed, end) in [(1, true), (0, false)] {
+        let mut c = ExtSetCycle::default();
+        run(&mut c, tx("COMMIT"));
+        c.on_other_message();
+        assert_eq!(
+            c.at_boundary(counted(sync(b'T', b'I', true), completed)),
+            ops(vec![End(Some(end))]),
+            "{completed}"
+        );
+    }
+    // Consecutive other statements count one each: three completed means
+    // the second SAVEPOINT failed, not a message after it.
+    assert_eq!(
+        stmts(
+            &[
+                tx("SAVEPOINT a"),
+                Bound::Other,
+                Bound::Other,
+                tx("SAVEPOINT b")
+            ],
+            counted(sync(b'T', b'E', true), 3)
+        ),
+        ops(vec![savepoint("SAVEPOINT a")])
+    );
+    // A simple query is parsed whole: the statement after the completed ones
+    // failed while it ran.
+    assert_eq!(
+        stmts(
+            &[tx("BEGIN"), set(), tx("COMMIT"), set2()],
+            counted(simple_sync(b'I', b'I', true), 3)
+        ),
+        ops(vec![defer(SET), End(Some(true))])
+    );
+}
+
+#[test]
+fn a_counted_flush_output_settles_the_cycle() {
+    // psycopg pipeline: a SET answered at a Flush, then the Sync. With every
+    // response counted, an error at the Flush is no longer unseen.
+    let mut c = ExtSetCycle::default();
+    lone_set(&mut c);
+    assert_eq!(c.at_boundary(flush(true, b'I')), ops(vec![]));
+    assert_eq!(c.at_boundary(counted(ok_sync(), 1)), ops(vec![apply(SET)]));
+    let mut c = ExtSetCycle::default();
+    lone_set(&mut c);
+    assert_eq!(c.at_boundary(flush(true, b'I')), ops(vec![]));
+    assert_eq!(
+        c.at_boundary(counted(sync(b'I', b'I', true), 0)),
+        ops(vec![])
+    );
+    // A count that does not fit the cycle is not trusted.
+    let mut c = ExtSetCycle::default();
+    lone_set(&mut c);
+    assert_eq!(c.at_boundary(flush(true, b'I')), ops(vec![]));
+    assert_eq!(c.at_boundary(counted(ok_sync(), 2)), ops(vec![Unknown]));
+    assert_eq!(
+        stmts(&[set()], counted(sync(b'I', b'I', true), 2)),
+        ops(vec![])
     );
 }
 

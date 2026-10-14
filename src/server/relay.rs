@@ -111,10 +111,14 @@ impl ProxyServer {
         #[cfg(feature = "query-rewriting")]
         if rewritten_msg.is_some() {
             // The recorded client text is not what executes — the enclosing
-            // transaction must not be blindly replayed after a failover.
+            // transaction must not be blindly replayed after a failover, and
+            // the response's completions are not the client text's.
             session
                 .tr_replay_tainted
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            session
+                .cycle_counted
+                .store(false, std::sync::atomic::Ordering::Relaxed);
         }
         #[cfg(feature = "query-rewriting")]
         let forward_msg = rewritten_msg.as_ref().unwrap_or(forward_msg);
@@ -872,7 +876,7 @@ impl ProxyServer {
                     continue;
                 }
                 let closed = async {
-                    Self::finish_pending_backend_frames(client, backend, state).await?;
+                    Self::finish_pending_backend_frames(client, backend, session, state).await?;
                     Self::close_statement(
                         &mut backend.stream,
                         name,
@@ -907,7 +911,7 @@ impl ProxyServer {
             let prepared = async {
                 // Internal ParseComplete reads must start at a frame boundary,
                 // not at a suffix left by a previous Flush/watch read.
-                Self::finish_pending_backend_frames(client, backend, state).await?;
+                Self::finish_pending_backend_frames(client, backend, session, state).await?;
                 Self::reprepare_statement(
                     &mut backend.stream,
                     parse_bytes,
@@ -1268,6 +1272,7 @@ impl ProxyServer {
                     }
                     let frame_total = len + 1;
                     let mtype = rem[0];
+                    Self::tally_frame(session, mtype);
                     consumed += frame_total;
                     if mtype == b'E' {
                         had_error = true;
@@ -1480,6 +1485,7 @@ impl ProxyServer {
                     }
                     let frame_total = len + 1;
                     let mtype = rem[0];
+                    Self::tally_frame(session, mtype);
                     if mtype == b'E' {
                         had_error = true;
                     }
@@ -1626,10 +1632,12 @@ impl ProxyServer {
     pub(super) async fn forward_buffered_backend_frames(
         client: &mut ClientStream,
         buf: &mut BytesMut,
+        session: &ClientSession,
         state: &ServerState,
     ) -> Result<usize> {
         let whole = Self::complete_frame_prefix(buf, state.limits.max_backend_frame_bytes)?;
         if whole > 0 {
+            Self::tally_frames(session, &buf[..whole]);
             Self::observe_prepared_commit_frames(&buf[..whole], state);
             tokio::time::timeout(
                 state.limits.client_write_timeout,
@@ -1649,11 +1657,50 @@ impl ProxyServer {
         Ok(whole)
     }
 
+    /// Count one relayed backend frame into the session's request tally
+    /// (completions and errors; see `ClientSession::cycle_completions`).
+    pub(super) fn tally_frame(session: &ClientSession, tag: u8) {
+        match tag {
+            b'C' | b'I' | b's' => {
+                session.cycle_completions.fetch_add(1, Ordering::Relaxed);
+            }
+            b'E' => session.cycle_errored.store(true, Ordering::Relaxed),
+            _ => {}
+        }
+    }
+
+    /// [`Self::tally_frame`] for each of the whole frames in `frames`.
+    fn tally_frames(session: &ClientSession, frames: &[u8]) {
+        let mut at = 0;
+        while let Some(head) = frames.get(at..at + 5) {
+            Self::tally_frame(session, head[0]);
+            at += 1 + u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+        }
+    }
+
+    /// A request ended (or a new one starts): a fresh tally.
+    pub(super) fn tally_reset(session: &ClientSession) {
+        session.cycle_completions.store(0, Ordering::Relaxed);
+        session.cycle_errored.store(false, Ordering::Relaxed);
+        session.cycle_counted.store(true, Ordering::Relaxed);
+    }
+
+    /// The request's tally: its completions when whole, and whether a
+    /// response for it carried an error (`false` when not whole).
+    pub(super) fn tally(session: &ClientSession) -> (Option<u32>, bool) {
+        let counted = session.cycle_counted.load(Ordering::Relaxed);
+        (
+            counted.then(|| session.cycle_completions.load(Ordering::Relaxed)),
+            counted && session.cycle_errored.load(Ordering::Relaxed),
+        )
+    }
+
     /// Finish a previously buffered frame before an internal backend exchange.
     /// Existing re-prepare timeout bounds the whole drain, including slow drip.
     pub(super) async fn finish_pending_backend_frames(
         client: &mut ClientStream,
         backend: &mut BackendConn,
+        session: &ClientSession,
         state: &ServerState,
     ) -> Result<()> {
         if backend.response_buf.is_empty() {
@@ -1661,9 +1708,13 @@ impl ProxyServer {
         }
         tokio::time::timeout(state.limits.reprepare_timeout, async {
             while !backend.response_buf.is_empty() {
-                let sent =
-                    Self::forward_buffered_backend_frames(client, &mut backend.response_buf, state)
-                        .await?;
+                let sent = Self::forward_buffered_backend_frames(
+                    client,
+                    &mut backend.response_buf,
+                    session,
+                    state,
+                )
+                .await?;
                 state
                     .metrics
                     .bytes_sent
@@ -1710,13 +1761,16 @@ impl ProxyServer {
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
     ) -> std::result::Result<u64, ResponseFailure> {
-        let _ = session;
         let mut sent: u64 = 0;
         let response = async {
             loop {
-                sent +=
-                    Self::forward_buffered_backend_frames(client, &mut backend.response_buf, state)
-                        .await? as u64;
+                sent += Self::forward_buffered_backend_frames(
+                    client,
+                    &mut backend.response_buf,
+                    session,
+                    state,
+                )
+                .await? as u64;
                 backend.response_buf.reserve(16 * 1024);
                 match backend.stream.try_read_buf(&mut backend.response_buf) {
                     Ok(0) => {

@@ -1855,13 +1855,15 @@ impl ProxyServer {
         // --- session GUC tracking (simple protocol; the client loop tracks
         // extended-protocol cycles itself) ---
         if tr.track_gucs && simple && !std::mem::take(&mut tr.skip_settings) {
+            let (completed, errored) = Self::tally(session);
             let b = ExtSetBoundary {
                 sync: true,
                 forwarded: true,
                 before: prev_status,
                 after: status,
-                failed: had_error,
+                failed: had_error || errored,
                 copying: false,
+                completed,
                 simple: true,
             };
             // (Text that is not UTF-8 is read by `tr_after_simple`.)
@@ -2010,17 +2012,23 @@ impl ProxyServer {
                 // Read at the drain, like a UTF-8 query that yielded for COPY.
                 tr.copy_query = Some(bytes::Bytes::copy_from_slice(&msg.payload));
             } else {
+                let (completed, errored) = Self::tally(session);
                 let b = ExtSetBoundary {
                     sync: true,
                     forwarded: true,
                     before,
                     after: tr.prev_status,
-                    failed: session.last_response_error.load(Ordering::Relaxed),
+                    failed: session.last_response_error.load(Ordering::Relaxed) || errored,
                     copying: false,
+                    completed,
                     simple: true,
                 };
                 Self::tr_simple_settings(tr, &msg.payload, b, session, state);
             }
+        }
+        if !session.copy_in_progress.load(Ordering::Relaxed) {
+            // The query's response is in (a COPY's is read at its drain).
+            Self::tally_reset(session);
         }
     }
 
@@ -2302,6 +2310,7 @@ impl ProxyServer {
         if let Some(query) = tr.copy_query.take() {
             // The simple query that yielded for COPY, read now that its
             // ReadyForQuery is in.
+            let (completed, errored) = Self::tally(session);
             let b = ExtSetBoundary {
                 sync: true,
                 forwarded: true,
@@ -2309,12 +2318,15 @@ impl ProxyServer {
                 after: status,
                 failed: session
                     .last_response_error
-                    .load(std::sync::atomic::Ordering::Relaxed),
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    || errored,
                 copying: false,
+                completed,
                 simple: true,
             };
             Self::tr_simple_settings(tr, &query, b, session, state);
         }
+        Self::tally_reset(session);
         if status == b'I' {
             // The COPY's statement may have ended the transaction (TR-08).
             tr.tx_portals.clear();
@@ -2557,6 +2569,9 @@ impl ProxyServer {
         deadline: tokio::time::Instant,
     ) -> Result<String> {
         let expired = || ProxyError::Network("recovery deadline exceeded".to_string());
+        // The request's responses now come from two backends (and a replay
+        // in between): its tally is not whole.
+        session.cycle_counted.store(false, Ordering::Relaxed);
         loop {
             let node = Self::select_primary_until(session, state, config, deadline).await?;
             // Routing can retain another node's socket with an unpublished
@@ -2902,6 +2917,8 @@ impl ProxyServer {
         // auth, session restore, replay — instead of per-phase timeouts that
         // could add up well beyond `write_timeout_secs`.
         let deadline = tokio::time::Instant::now() + config.write_timeout();
+        // What the lost backend ran of the request is not all counted.
+        session.cycle_counted.store(false, Ordering::Relaxed);
         // P-03: fault seen -> replacement connected, and replay duration.
         let fault_seen = std::time::Instant::now();
         let mode = session.tr_mode;

@@ -154,7 +154,7 @@ async fn commit_fragment_survives_flush_watch_and_sync_handoffs() {
         Some("a"),
         Some(tokio::time::Instant::now() + Duration::from_millis(100)),
         &server.state,
-        true,
+        watch(&make_test_session(), true),
     )
     .await
     .unwrap();
@@ -309,7 +309,7 @@ async fn backend_frame_tail_is_isolated_by_socket_and_dropped_on_loss() {
             Some("b"),
             Some(tokio::time::Instant::now() + Duration::from_millis(100)),
             &server.state,
-            true,
+            watch(&make_test_session(), true),
         )
         .await
         .unwrap(),
@@ -332,7 +332,7 @@ async fn backend_frame_tail_is_isolated_by_socket_and_dropped_on_loss() {
             Some("a"),
             Some(tokio::time::Instant::now() + Duration::from_millis(100)),
             &server.state,
-            true,
+            watch(&make_test_session(), true),
         )
         .await
         .unwrap(),
@@ -382,7 +382,12 @@ async fn pending_frame_drain_preserves_internal_reply_boundary() {
     source.write_all(&notice[3..]).await.unwrap();
     tokio::time::timeout(
         Duration::from_secs(2),
-        ProxyServer::finish_pending_backend_frames(&mut client, &mut backend, &server.state),
+        ProxyServer::finish_pending_backend_frames(
+            &mut client,
+            &mut backend,
+            &make_test_session(),
+            &server.state,
+        ),
     )
     .await
     .unwrap()

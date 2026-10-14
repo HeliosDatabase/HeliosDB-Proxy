@@ -248,8 +248,14 @@ statement, pgjdbc `autosave` savepoints and batches. Extended-protocol
 settle deferred settings like simple-protocol ones. Leading comments do not hide a
 statement, and `SET LOCAL` is not a session setting.
 
-When a failed cycle leaves it open which of its statements ran, or a cycle cannot be
-read statement by statement, the session's settings become unknown (inside a
+The proxy counts the statements of each request that completed (`CommandComplete`,
+`EmptyQueryResponse`, `PortalSuspended`, output answering a `Flush` included) and notes
+any error in its responses, so a failed cycle is read exactly: the statement after the
+last one that completed failed. Only when that count is not whole (a backend fault or
+re-home during the request, a `[query_rewrite]` rule that changed its text, or a count
+that does not fit the request) are all the places the error could have come from
+considered. When a failed cycle leaves it open which of its statements ran, or a cycle
+cannot be read statement by statement, the session's settings become unknown (inside a
 transaction, once it commits). Examples: a statement the proxy has no record of, an
 Execute of a portal bound in another cycle, a call of `set_config(..., false)`, a `SET`
 before a `CALL` or `DO` in the same cycle or query, or more statements than

@@ -386,6 +386,27 @@ impl ProxyServer {
                 .is_some_and(|bc| bc.gucs_synced.is_some_and(|e| e != reads.guc_epoch))
     }
 
+    /// Under an authoritative topology, the session's home connection is
+    /// still open but its node is no longer the write leader (a switchover
+    /// left the old primary running). Carrying on would move the session to
+    /// a fresh connection without its settings, or run the rest of an open
+    /// transaction outside it. Returns that node: the caller treats it like a
+    /// home lost while idle, so transaction replay re-homes the session
+    /// (restoring its settings, or refusing when they are unknown).
+    pub(super) fn home_moved(
+        conns: &HashMap<String, BackendConn>,
+        home: Option<&str>,
+        state: &ServerState,
+        config: &ProxyConfig,
+    ) -> Option<String> {
+        if !state.authoritative_topology {
+            return None;
+        }
+        let home = home.filter(|h| conns.contains_key(*h))?;
+        let leader = Self::home_node(state, config)?;
+        (leader != home).then(|| home.to_string())
+    }
+
     /// A once-mirrored connection now serves as the session's home: from here
     /// on it runs the session's `SET`s itself.
     pub(super) fn mirror_now_home(conns: &mut HashMap<String, BackendConn>, target: &str) {
@@ -432,7 +453,7 @@ impl ProxyServer {
         let reset = bc.gucs_synced.is_some();
         let role = bc.gucs_role;
         let synced = async {
-            Self::finish_pending_backend_frames(client, bc, state).await?;
+            Self::finish_pending_backend_frames(client, bc, session, state).await?;
             if reset {
                 Self::tr_reset_mirrored(&mut bc.stream, role, wt, rt, mf).await?;
             }

@@ -108,6 +108,13 @@ pub(super) struct ExtSetBoundary {
     /// The cycle is still copying: its ReadyForQuery has not arrived, so
     /// `after` is stale (Sync only).
     pub(super) copying: bool,
+    /// The cycle's statements that completed (CommandComplete,
+    /// EmptyQueryResponse, PortalSuspended) across every response relayed
+    /// for it, Flush output included, when the proxy saw them all (no fault
+    /// interrupted the cycle). With it, `failed` covers those responses too,
+    /// and a failure is placed exactly: at the statement after the last one
+    /// that completed.
+    pub(super) completed: Option<u32>,
     /// A simple-protocol query rather than an extended-protocol cycle: it is
     /// parsed whole before anything runs.
     pub(super) simple: bool,
@@ -151,8 +158,18 @@ enum Step {
     Tx(TxVerb, String),
     CommitPoint,
     Untracked,
-    /// One or more consecutive other statements.
-    Other,
+    /// This many consecutive other statements.
+    Other(u32),
+}
+
+impl Step {
+    /// The statements the step stands for.
+    fn statements(&self) -> u32 {
+        match self {
+            Step::Other(n) => *n,
+            _ => 1,
+        }
+    }
 }
 
 /// One extended-protocol cycle (Sync to Sync) or simple query, as far as
@@ -265,15 +282,20 @@ impl ExtSetCycle {
                 self.unknown = true;
                 return;
             }
-            Bound::Other if self.steps.last() == Some(&Step::Other) => return,
-            Bound::Other => Step::Other,
+            Bound::Other => {
+                if let Some(Step::Other(n)) = self.steps.last_mut() {
+                    *n += 1;
+                    return;
+                }
+                Step::Other(1)
+            }
             Bound::Set(sql) => Step::Set(sql),
             Bound::DiscardAll(sql) => Step::DiscardAll(sql),
             Bound::Tx(verb, sql) => Step::Tx(verb, sql),
             Bound::CommitPoint => Step::CommitPoint,
             Bound::Untracked => Step::Untracked,
         };
-        self.relevant |= step != Step::Other;
+        self.relevant |= !matches!(step, Step::Other(_));
         if self.steps.len() < self.max_steps {
             self.steps.push(step);
         } else {
@@ -477,6 +499,9 @@ impl ExtSetCycle {
     /// Run the cycle's statements in every way consistent with the
     /// response, and return what they agree on. `None` when no way is.
     fn simulate(&self, b: ExtSetBoundary) -> Option<Vec<SettingsOp>> {
+        if let Some(failures) = self.counted_failures(b) {
+            return self.agree(b, failures);
+        }
         // After a Flush an error may not reach the Sync's response.
         let may_fail = b.failed || self.flushed;
         if !may_fail {
@@ -502,9 +527,57 @@ impl ExtSetCycle {
                 ran: false,
             });
         }
+        let scenarios: Vec<Option<Failure>> = failures
+            .into_iter()
+            .map(Some)
+            .chain((!b.failed).then_some(None))
+            .collect();
+        self.agree(b, scenarios)
+    }
+
+    /// With the completion count: the scenarios it leaves. `None` when the
+    /// count is missing or does not fit the cycle (then every position is
+    /// considered).
+    fn counted_failures(&self, b: ExtSetBoundary) -> Option<Vec<Option<Failure>>> {
+        let completed = b.completed?;
+        let total: u32 = self.steps.iter().map(Step::statements).sum();
+        if !b.failed {
+            // Every statement completed, or the count is off.
+            return (completed == total).then(|| vec![None]);
+        }
+        if completed > total {
+            return None;
+        }
+        // The statement after the last one that completed failed, while it
+        // ran or at its Parse/Bind; past the last one, a later message did.
+        let mut first = 0;
+        for (at, step) in self.steps.iter().enumerate() {
+            let next = first + step.statements();
+            if completed < next {
+                // (A simple query is parsed whole: past its first statement
+                // only a running one fails.)
+                return Some(if matches!(step, Step::Other(_)) || (b.simple && at > 0) {
+                    vec![Some(Failure { at, ran: true })]
+                } else {
+                    vec![
+                        Some(Failure { at, ran: true }),
+                        Some(Failure { at, ran: false }),
+                    ]
+                });
+            }
+            first = next;
+        }
+        Some(vec![Some(Failure {
+            at: self.steps.len(),
+            ran: false,
+        })])
+    }
+
+    /// Run the scenarios and return what they agree on (or, where they part,
+    /// the conservative tail).
+    fn agree(&self, b: ExtSetBoundary, scenarios: Vec<Option<Failure>>) -> Option<Vec<SettingsOp>> {
         let mut outcomes: Vec<Vec<SettingsOp>> = Vec::new();
-        let scenarios = failures.into_iter().map(Some);
-        for fail in scenarios.chain((!b.failed).then_some(None)) {
+        for fail in scenarios {
             if let Some(ops) = self.run(b, fail) {
                 if !outcomes.contains(&ops) {
                     outcomes.push(ops);
@@ -625,7 +698,7 @@ impl ExtSetCycle {
                 break;
             }
             match step {
-                Step::Other | Step::CommitPoint => fresh &= open,
+                Step::Other(_) | Step::CommitPoint => fresh &= open,
                 Step::Untracked => {
                     ops.push(Unknown);
                     fresh &= open;
