@@ -1551,6 +1551,43 @@ async fn tr_simple_queries_are_read_statement_by_statement() {
     assert!(tr.gucs_unknown);
 }
 
+/// PostgreSQL's SET/RESET SESSION AUTHORIZATION also ends a SET ROLE: the
+/// restore set must not bring the role back, and a role set after it must be
+/// restored after it. Two pool resets on one connection, each followed by
+/// another tenant's SET ROLE, used to restore the session authorization last,
+/// switching the role off (the second tenant ran as the pool user).
+#[tokio::test]
+async fn tr_session_authorization_ends_the_role() {
+    let server = ProxyServer::new(test_config()).unwrap();
+    let state = server.state.clone();
+    let session = make_test_session();
+    let mut tr = TrSession::new(TrMode::Session);
+    let reset = "SET SESSION AUTHORIZATION DEFAULT;RESET ALL;CLOSE ALL";
+    for sql in ["SET ROLE tenant_a", reset, "SET ROLE tenant_b"] {
+        ProxyServer::note_ready_for_query(&session, b'I', false);
+        ProxyServer::tr_after_simple(&mut tr, &qmsg(sql), &session, &state).await;
+    }
+    assert_eq!(
+        tr.gucs,
+        vec!["SET SESSION AUTHORIZATION DEFAULT", "SET ROLE tenant_b"]
+    );
+    for sql in [reset, "SET ROLE tenant_c"] {
+        ProxyServer::tr_after_simple(&mut tr, &qmsg(sql), &session, &state).await;
+    }
+    assert_eq!(
+        tr.gucs,
+        vec!["SET SESSION AUTHORIZATION DEFAULT", "SET ROLE tenant_c"]
+    );
+    ProxyServer::tr_after_simple(
+        &mut tr,
+        &qmsg("RESET SESSION AUTHORIZATION"),
+        &session,
+        &state,
+    )
+    .await;
+    assert!(tr.gucs.is_empty(), "{:?}", tr.gucs);
+}
+
 /// Savepoint names are read like PostgreSQL reads them (comments aside,
 /// quoted names whole), and the tracked savepoints are capped by `[limits]
 /// tr_max_tracked_savepoints`.
@@ -1702,7 +1739,8 @@ async fn tr_recorder_tracks_gucs_behind_leading_comments() {
 }
 
 /// PostgreSQL's `RESET ALL` keeps the role and the session authorization;
-/// `DISCARD ALL` resets them too. Both always fit under the cap.
+/// `DISCARD ALL` resets them too. Both always fit under the cap. (The role is
+/// set after the session authorization, which would otherwise end it.)
 #[tokio::test]
 async fn tr_recorder_reset_all_keeps_the_role() {
     let mut config = test_config();
@@ -1722,8 +1760,8 @@ async fn tr_recorder_reset_all_keeps_the_role() {
     }
     for sql in [
         "SET work_mem = '64MB'",
-        "SET ROLE tenant_a",
         "SET SESSION AUTHORIZATION app",
+        "SET ROLE tenant_a",
     ] {
         step(&mut tr, &session, &state, sql).await;
     }
@@ -1731,8 +1769,8 @@ async fn tr_recorder_reset_all_keeps_the_role() {
         tr.gucs,
         vec![
             "SET work_mem = '64MB'",
-            "SET ROLE tenant_a",
-            "SET SESSION AUTHORIZATION app"
+            "SET SESSION AUTHORIZATION app",
+            "SET ROLE tenant_a"
         ],
         "the role and the session authorization fit past the cap"
     );
@@ -1744,7 +1782,7 @@ async fn tr_recorder_reset_all_keeps_the_role() {
     step(&mut tr, &session, &state, "RESET ALL").await;
     assert_eq!(
         tr.gucs,
-        vec!["SET ROLE tenant_a", "SET SESSION AUTHORIZATION app"]
+        vec!["SET SESSION AUTHORIZATION app", "SET ROLE tenant_a"]
     );
     assert!(!tr.guc_cap_hit);
 

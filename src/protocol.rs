@@ -505,10 +505,14 @@ pub fn starts_with_ci(s: &str, prefix: &str) -> bool {
 /// (compared byte-for-byte, never case-folded) — just fewer full-window
 /// comparisons on the common case of a rare first byte.
 pub fn contains_ci(haystack: &str, needle: &str) -> bool {
+    contains_ci_bytes(haystack.as_bytes(), needle)
+}
+
+/// [`contains_ci`] over raw bytes (no UTF-8 validation needed).
+pub fn contains_ci_bytes(hb: &[u8], needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
-    let hb = haystack.as_bytes();
     let nb = needle.as_bytes();
     if hb.len() < nb.len() {
         return false;

@@ -110,6 +110,18 @@ pub(crate) fn split_statements(sql: &str) -> Result<Vec<&str>, Unsplit> {
         }
         start = end + 1;
     }
+    // A SQL-standard function body (`BEGIN ATOMIC ... END`) has `;`s of its
+    // own that this lexer does not tell apart from statement ends.
+    let mut previous_begin = false;
+    let mut atomic = false;
+    let _ = words(sql, |w| {
+        atomic = previous_begin && !w.quoted && w.text.eq_ignore_ascii_case("ATOMIC");
+        previous_begin = !w.quoted && w.text.eq_ignore_ascii_case("BEGIN");
+        !atomic
+    });
+    if atomic {
+        return Err(Unsplit::Ambiguous);
+    }
     Ok(out)
 }
 
@@ -439,6 +451,13 @@ mod tests {
         assert_eq!(
             split_statements("SET a = 'C:\\dir'; SET b = 2"),
             Ok(vec!["SET a = 'C:\\dir'", "SET b = 2"])
+        );
+        // A SQL-standard function body's own `;`s.
+        assert_eq!(
+            split_statements(
+                "SET a = 1; CREATE FUNCTION f() RETURNS int BEGIN ATOMIC SELECT 1; END; BEGIN"
+            ),
+            Err(Unsplit::Ambiguous)
         );
     }
 

@@ -65,19 +65,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     failover re-homed the session without it.
   - With `tr_mode = session` (the default), an extended-protocol cycle did not advance the
     transaction status this tracking compares against.
-- For a cycle that failed, the proxy considers every statement the error could have come
-  from:
-  - including an error answering a Flush, which never reaches the Sync's response;
-  - including a `CALL` or `DO` that commits before failing.
+- For a cycle that failed, the proxy considers every place the error could have come from:
+  - a statement that ran and failed, or one whose Parse or Bind failed;
+  - a Parse, Describe or Close after the last Execute;
+  - an error answering a Flush, which never reaches the Sync's response.
 
   It keeps the cases that end in the transaction status the server reports, and uses the
-  outcome they agree on. When they disagree, or a cycle cannot be read statement by
-  statement, the session's settings become unknown (inside an open transaction, once it
-  commits). A cycle cannot be read statement by statement when it has:
+  outcome they agree on. PostgreSQL semantics this follows:
+  - `DISCARD ALL` as the first statement of a cycle commits at once.
+  - Settings made in a prepared transaction persist, as at `COMMIT`.
+  - A `CALL` or `DO` cannot commit statements that ran before it in the same cycle
+    (PostgreSQL refuses with 2D000).
+
+  When the cases disagree, or a cycle cannot be read statement by statement, the
+  session's settings become unknown (inside an open transaction, once it commits). A
+  cycle cannot be read statement by statement when it has:
   - a statement the proxy has no record of;
   - an Execute of a portal not bound just before it;
   - a COPY still running;
-  - a simple Query arriving before its Sync.
+  - a simple Query arriving before its Sync;
+  - more statements than the new `[limits] tr_max_cycle_statements` (default 16).
+
+  A statement calling `set_config(..., false)` (or with an `is_local` the proxy cannot
+  read) also makes them unknown, once it commits: the proxy cannot record what it set.
 
   Such a session keeps its reads on the primary. A failover is refused with `08006` until
   `DISCARD ALL`, rather than re-homing the session without those settings. New counter:
@@ -93,6 +103,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   settings unknown. Simple-protocol `COMMIT AND CHAIN` and `ROLLBACK AND CHAIN` now
   settle deferred settings. A transaction that ends on a statement that cannot have ended
   it leaves them unknown instead of dropping them.
+- `SET SESSION AUTHORIZATION` and `RESET SESSION AUTHORIZATION` now also end a tracked
+  `SET ROLE`, as in PostgreSQL. A `SET ROLE` that follows is restored after them: two
+  pool resets on one connection, each followed by another tenant's `SET ROLE`, no longer
+  restore the role switched off. A simple query that is not valid UTF-8 (for example
+  under `client_encoding` LATIN1) is read with replacement characters: its statement
+  structure still counts, but a `SET` in it makes the settings unknown, since its text
+  cannot be restored. The statements of a simple query that yields for COPY are read when
+  the COPY ends.
 - Savepoint names in this tracking are read like PostgreSQL reads them:
   - comments inside the statement are skipped;
   - quoted names keep their spaces;

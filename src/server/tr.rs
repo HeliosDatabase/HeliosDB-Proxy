@@ -279,6 +279,14 @@ pub(super) struct TrSession {
     pub(super) tx_portals: HashMap<String, StmtKind>,
     /// The cycle a simple-protocol query is read as (kept for its buffers).
     pub(super) simple_cycle: ExtSetCycle,
+    /// The next simple-query response was synthesized by the proxy (the
+    /// aborted-transaction emulation): nothing ran, no setting changed.
+    pub(super) skip_settings: bool,
+    /// The current simple query's text, read lossily: it is not UTF-8.
+    pub(super) lossy_query: Option<String>,
+    /// A simple query that yielded for COPY, to read at the drain (`true`:
+    /// read lossily).
+    pub(super) copy_query: Option<(String, bool)>,
 }
 
 impl TrSession {
@@ -303,6 +311,9 @@ impl TrSession {
             acked: HashMap::new(),
             tx_portals: HashMap::new(),
             simple_cycle: ExtSetCycle::default(),
+            skip_settings: false,
+            lossy_query: None,
+            copy_query: None,
         }
     }
 }
@@ -1196,6 +1207,11 @@ impl ProxyServer {
     /// earlier statement in place, or append it honouring the cap.
     pub(super) fn tr_apply_set(tr: &mut TrSession, sql: &str, state: &Arc<ServerState>) {
         let name = Self::tr_guc_name(sql);
+        if name.as_deref() == Some("session_authorization") {
+            // PostgreSQL's SET SESSION AUTHORIZATION also ends a SET ROLE;
+            // a later SET ROLE is then appended after it, in restore order.
+            Self::tr_apply_reset(tr, "role");
+        }
         if let Some(name) = name.as_deref() {
             if let Some(slot) = tr
                 .gucs
@@ -1209,10 +1225,14 @@ impl ProxyServer {
         Self::tr_push_guc(tr, sql, state);
     }
 
-    /// Apply a `RESET <name>` to the committed restore set.
+    /// Apply a `RESET <name>` to the committed restore set. `RESET SESSION
+    /// AUTHORIZATION` also ends a `SET ROLE`.
     pub(super) fn tr_apply_reset(tr: &mut TrSession, name: &str) {
-        tr.gucs
-            .retain(|g| Self::tr_guc_name(g).as_deref() != Some(name));
+        let role_too = name == "session_authorization";
+        tr.gucs.retain(|g| {
+            let n = Self::tr_guc_name(g);
+            n.as_deref() != Some(name) && !(role_too && n.as_deref() == Some("role"))
+        });
     }
 
     /// Whether a statement, after any leading comments, is a `SET`, `RESET`
@@ -1224,9 +1244,10 @@ impl ProxyServer {
             || crate::protocol::leads_with_keyword(sql, "DISCARD")
     }
 
-    /// How a statement an extended-protocol cycle binds bears on the
-    /// session's settings (see `ext_set`): for an ordinary statement, one
-    /// comment skip and a few prefix compares (per-`Bind` cost).
+    /// How a statement an extended-protocol cycle binds (or a simple query
+    /// runs) bears on the session's settings (see `ext_set`): for an
+    /// ordinary statement, one comment skip, a few prefix compares and one
+    /// byte search for `set_config` (per-`Bind` cost).
     pub(super) fn tr_bound(sql: &[u8]) -> Bound {
         let head = crate::protocol::skip_leading_comments_bytes(sql);
         let kw = |k: &str| crate::protocol::leads_with_keyword(head, k);
@@ -1247,23 +1268,93 @@ impl ProxyServer {
             .any(kw)
         };
         if !set_like && !tx_like() {
-            return if kw("CALL") || kw("DO") {
-                Bound::CommitPoint
-            } else {
-                Bound::Other
+            // `set_config(name, value, false)` changes a session setting the
+            // proxy cannot record. One byte search for an ordinary statement.
+            if !crate::protocol::contains_ci_bytes(sql, "set_config") {
+                return Bound::Other;
+            }
+            return match std::str::from_utf8(sql) {
+                Ok(q) if Self::tr_sets_config(q) => Bound::Set(q.to_string()),
+                Ok(_) => Bound::Other,
+                Err(_) => Bound::Unknown,
             };
         }
         let Ok(sql) = std::str::from_utf8(sql) else {
             return Bound::Unknown;
         };
         if !set_like {
-            return Self::tr_tx_verb(sql).map_or(Bound::Other, |v| Bound::Tx(v, sql.to_string()));
+            return Self::tr_tx_verb(sql).map_or(Bound::Other, |v| {
+                // Only savepoint statements need their text (the name).
+                let keep = matches!(v, TxVerb::Savepoint | TxVerb::Release | TxVerb::RollbackTo);
+                Bound::Tx(v, if keep { sql.to_string() } else { String::new() })
+            });
+        }
+        if Self::tr_reset_all_op(crate::protocol::skip_leading_comments(sql))
+            == Some(GucOp::DiscardAll)
+        {
+            return Bound::DiscardAll(sql.to_string());
         }
         match Self::tr_session_level(sql) {
             Some(true) => Bound::Set(sql.to_string()),
             Some(false) => Bound::Other,
             None => Bound::Unknown,
         }
+    }
+
+    /// Whether `sql` calls `set_config(name, value, is_local)` with an
+    /// `is_local` other than the literal `true`: a session-level change the
+    /// proxy cannot record.
+    pub(super) fn tr_sets_config(sql: &str) -> bool {
+        let base = sql.as_ptr() as usize;
+        let mut session = false;
+        let scanned = crate::replay_sql::words(sql, |w| {
+            if w.call && !w.quoted && w.text.eq_ignore_ascii_case("set_config") {
+                let end = w.text.as_ptr() as usize - base + w.text.len();
+                if !Self::tr_set_config_is_local(&sql[end..]) {
+                    session = true;
+                    return false;
+                }
+            }
+            true
+        });
+        session || scanned.is_err()
+    }
+
+    /// Whether the argument list at the start of `args`, `(name, value,
+    /// is_local)`, has the literal `true` as `is_local`. Anything it cannot
+    /// read counts as session-level.
+    fn tr_set_config_is_local(args: &str) -> bool {
+        let b = args.as_bytes();
+        let Some(open) = b.iter().position(|&c| c == b'(') else {
+            return false;
+        };
+        let (mut depth, mut commas, mut start, mut i) = (0usize, 0usize, open + 1, open + 1);
+        while i < b.len() {
+            match b[i] {
+                quote @ (b'\'' | b'"') => {
+                    i += 1;
+                    while i < b.len() && !(b[i] == quote && b.get(i + 1) != Some(&quote)) {
+                        i += if b[i] == quote { 2 } else { 1 };
+                    }
+                }
+                b'(' => depth += 1,
+                b')' if depth > 0 => depth -= 1,
+                b')' => {
+                    let third = args[start..i].trim();
+                    return commas == 2
+                        && ["true", "'true'", "'t'"]
+                            .iter()
+                            .any(|t| third.eq_ignore_ascii_case(t));
+                }
+                b',' if depth == 0 => {
+                    commas += 1;
+                    start = i + 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        false
     }
 
     /// Whether a SET-like statement changes the session's settings: a `SET`
@@ -1505,52 +1596,53 @@ impl ProxyServer {
     /// statements are read in order like an extended-protocol cycle: a
     /// multi-statement query runs in one implicit transaction unless it
     /// controls it (see `ext_set`), which covers pool resets such as
-    /// Npgsql's `SET SESSION AUTHORIZATION DEFAULT;RESET ALL;...`. Without a
-    /// `;` the query is one statement, read with a few prefix compares.
+    /// Npgsql's `SET SESSION AUTHORIZATION DEFAULT;RESET ALL;...`. A query
+    /// with no `;` but a trailing one is one statement, read with a few
+    /// prefix compares. `lossy`: the text was not valid UTF-8 and was read
+    /// with replacement characters, so no `SET` in it can be recorded.
     pub(super) fn tr_simple_settings(
         tr: &mut TrSession,
         sql: &str,
-        before: u8,
-        after: u8,
-        failed: bool,
+        lossy: bool,
+        b: ExtSetBoundary,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
     ) {
         let mut cycle = std::mem::take(&mut tr.simple_cycle);
+        cycle.set_limit(state.limits.tr_max_cycle_statements);
+        let bound = |q: &str| match Self::tr_bound(q.as_bytes()) {
+            Bound::Set(_) | Bound::DiscardAll(_) if lossy => Bound::Unknown,
+            other => other,
+        };
         let mut run = |bound: Bound| {
             cycle.on_bind(b"", bound);
             cycle.on_execute(b"");
         };
-        if memchr::memchr(b';', sql.as_bytes()).is_none() {
-            match Self::tr_bound(sql.as_bytes()) {
-                // PostgreSQL parses the whole query first: one that does not
-                // lex ran nothing.
-                Bound::Unknown if failed => {}
-                bound => run(bound),
+        let core = sql.trim_end();
+        let single = memchr::memchr(b';', core.as_bytes()).is_none_or(|i| i + 1 == core.len());
+        if single {
+            match bound(sql) {
+                // PostgreSQL parses the whole query first: one it rejects
+                // ran nothing.
+                Bound::Unknown if b.failed => {}
+                one => run(one),
             }
         } else {
             match crate::replay_sql::split_statements(sql) {
                 Ok(statements) => {
                     for statement in statements {
-                        run(Self::tr_bound(statement.as_bytes()));
+                        run(bound(statement));
                     }
                 }
-                Err(crate::replay_sql::Unsplit::Unlexable) if failed => {}
+                Err(crate::replay_sql::Unsplit::Unlexable) if b.failed => {}
                 // Which statements ran depends on the session's reading of
                 // backslashes (or on a lexer disagreement): anything did.
                 Err(_) => run(Bound::Unknown),
             }
         }
-        let outcome = cycle.at_boundary(ExtSetBoundary {
-            sync: true,
-            forwarded: true,
-            before,
-            after,
-            failed,
-            copying: false,
-        });
+        let outcome = cycle.at_boundary(b);
         tr.simple_cycle = cycle;
-        Self::tr_ext_set_outcome(tr, outcome, after == b'I', session, state);
+        Self::tr_ext_set_outcome(tr, outcome, b.after == b'I', session, state);
     }
 
     /// Apply what an extended-protocol cycle (or a multi-statement query) did
@@ -1616,9 +1708,9 @@ impl ProxyServer {
     pub(super) fn tr_restore_preflight(tr: &TrSession) -> Result<()> {
         if tr.gucs_unknown {
             return Err(ProxyError::Protocol(
-                "the session changed settings in a way the proxy cannot follow (an \
-                 extended-protocol SET it could not read); the session state cannot be \
-                 restored on a replacement backend"
+                "the session changed settings in a way the proxy cannot follow (see \
+                 tr_session_set_untracked_total); the session state cannot be restored \
+                 on a replacement backend"
                     .to_string(),
             ));
         }
@@ -1665,8 +1757,10 @@ impl ProxyServer {
     /// and enables GUC tracking here (the client loop tracks extended-protocol
     /// SETs and transaction ends itself, see `ext_set`).
     ///
-    /// Hot-path cost outside a transaction: a few prefix compares, no
-    /// allocation, no lock.
+    /// Hot-path cost outside a transaction for a one-statement simple query
+    /// that is not a `SET` or transaction control: a few prefix compares and
+    /// one byte search, no allocation, no lock. A multi-statement query is
+    /// lexed once (see `tr_simple_settings`).
     pub(super) async fn tr_after_response(
         tr: &mut TrSession,
         sql: Option<&str>,
@@ -1685,6 +1779,15 @@ impl ProxyServer {
             .copy_in_progress
             .load(std::sync::atomic::Ordering::Relaxed)
         {
+            if tr.track_gucs && extended_kind.is_none() && !std::mem::take(&mut tr.skip_settings) {
+                // A simple query that yielded for COPY: its statements are
+                // read once the COPY drains to ReadyForQuery.
+                tr.copy_query = match (sql, tr.lossy_query.take()) {
+                    (Some(q), _) => Some((q.to_string(), false)),
+                    (None, Some(lossy)) => Some((lossy, true)),
+                    (None, None) => None,
+                };
+            }
             if tr.record_tx {
                 let mut ts = session.tx_state.write().await;
                 if tr.prev_status != b'I' || ts.in_transaction {
@@ -1706,6 +1809,7 @@ impl ProxyServer {
         tr.prev_status = status;
         let now_in_tx = status != b'I';
         let was_in_tx = prev_status != b'I';
+        let query = sql;
         let sql = sql.unwrap_or("");
         // Classify lazily: only needed inside a transaction or for a SET.
         let simple = extended_kind.is_none();
@@ -1716,8 +1820,23 @@ impl ProxyServer {
 
         // --- session GUC tracking (simple protocol; the client loop tracks
         // extended-protocol cycles itself) ---
-        if tr.track_gucs && simple {
-            Self::tr_simple_settings(tr, sql, prev_status, status, had_error, session, state);
+        if tr.track_gucs && simple && !std::mem::take(&mut tr.skip_settings) {
+            let b = ExtSetBoundary {
+                sync: true,
+                forwarded: true,
+                before: prev_status,
+                after: status,
+                failed: had_error,
+                copying: false,
+                simple: true,
+            };
+            match (query, tr.lossy_query.take()) {
+                (Some(q), _) => Self::tr_simple_settings(tr, q, false, b, session, state),
+                (None, Some(lossy)) => {
+                    Self::tr_simple_settings(tr, &lossy, true, b, session, state)
+                }
+                (None, None) => {}
+            }
         }
 
         // --- explicit-transaction statement recording ---
@@ -1829,6 +1948,13 @@ impl ProxyServer {
             session.tr_replay_tainted.store(true, Ordering::Relaxed);
         }
         let sql = crate::protocol::query_text(&msg.payload);
+        if sql.is_none() && tr.track_gucs {
+            // Not UTF-8 (a client_encoding such as LATIN1): read it with
+            // replacement characters, which keeps its statement structure.
+            let raw: &[u8] = &msg.payload;
+            let text = raw.strip_suffix(&[0]).unwrap_or(raw);
+            tr.lossy_query = Some(String::from_utf8_lossy(text).into_owned());
+        }
         if !tr.acked.is_empty() && sql.is_none_or(Self::tr_touches_statements) {
             // PREPARE / DEALLOCATE / DISCARD ALL act on named statements
             // behind the protocol's back (TR-08).
@@ -2127,7 +2253,23 @@ impl ProxyServer {
         let status = session
             .last_rfq_status
             .load(std::sync::atomic::Ordering::Relaxed);
-        tr.prev_status = status;
+        let before = std::mem::replace(&mut tr.prev_status, status);
+        if let Some((query, lossy)) = tr.copy_query.take() {
+            // The simple query that yielded for COPY, read now that its
+            // ReadyForQuery is in.
+            let b = ExtSetBoundary {
+                sync: true,
+                forwarded: true,
+                before,
+                after: status,
+                failed: session
+                    .last_response_error
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                copying: false,
+                simple: true,
+            };
+            Self::tr_simple_settings(tr, &query, lossy, b, session, state);
+        }
         if status == b'I' {
             // The COPY's statement may have ended the transaction (TR-08).
             tr.tx_portals.clear();

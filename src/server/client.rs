@@ -833,7 +833,7 @@ impl ProxyServer {
         // Extended-protocol SET tracking (`ext_set`): the open cycle, and
         // what the client's unnamed statement is (it outlives the cycle that
         // Parsed it).
-        let mut ext_set = ExtSetCycle::default();
+        let mut ext_set = ExtSetCycle::with_limit(state.limits.tr_max_cycle_statements);
         let mut unnamed_bound = Bound::Other;
         loop {
             // Read the client's next message directly into the accumulation
@@ -989,19 +989,17 @@ impl ProxyServer {
                         if tr.track_gucs && ext_set.is_open() {
                             // A Query after a Flush leaves the extended cycle
                             // without its Sync: settle what may have run of it.
-                            let ops = ext_set.interrupt(
+                            let outcome = ext_set.interrupt(
                                 session
                                     .last_rfq_status
                                     .load(std::sync::atomic::Ordering::Relaxed),
                             );
-                            if !ops.is_empty() {
-                                Self::tr_ext_set_outcome(
-                                    &mut tr,
-                                    ExtSetOutcome { pin: false, ops },
-                                    false,
-                                    session,
-                                    state,
-                                );
+                            if Self::tr_ext_set_outcome(&mut tr, outcome, false, session, state)
+                                && offload_on
+                            {
+                                session
+                                    .reads_pinned
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                         // Anomaly detector — record every Query message before
@@ -1083,6 +1081,8 @@ impl ProxyServer {
                             stream.write_all(&resp).await.map_err(|e| {
                                 ProxyError::Network(format!("Client write error: {}", e))
                             })?;
+                            // Nothing reached a backend: no setting changed.
+                            tr.skip_settings = true;
                             Self::tr_after_simple(&mut tr, &msg, session, state).await;
                             tr.ext_dispatched = false;
                             state
@@ -1486,6 +1486,9 @@ impl ProxyServer {
                                 }
                             }
                             MessageType::Describe => {
+                                if tr.track_gucs {
+                                    ext_set.on_other_message();
+                                }
                                 if let Some(name) = Self::stmt_kind_name(&msg.payload) {
                                     Self::remember_batch_name(
                                         &mut batch_refs,
@@ -1498,6 +1501,9 @@ impl ProxyServer {
                                 ext_set.on_execute(Self::leading_cstring(&msg.payload));
                             }
                             MessageType::Close => {
+                                if tr.track_gucs {
+                                    ext_set.on_other_message();
+                                }
                                 if let Some(name) = Self::stmt_kind_name(&msg.payload) {
                                     Self::remember_batch_name(
                                         &mut batch_closes,
@@ -1787,6 +1793,7 @@ impl ProxyServer {
                                     .last_response_error
                                     .load(std::sync::atomic::Ordering::Relaxed),
                                 copying,
+                                simple: false,
                             });
                             let idle_after_sync =
                                 wait_ready && forwarded && !copying && status_after == b'I';

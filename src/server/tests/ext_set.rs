@@ -29,6 +29,7 @@ fn sync(before: u8, after: u8, failed: bool) -> ExtSetBoundary {
         after,
         failed,
         copying: false,
+        simple: false,
     }
 }
 
@@ -44,6 +45,7 @@ fn flush(forwarded: bool, before: u8) -> ExtSetBoundary {
         after: before,
         failed: false,
         copying: false,
+        simple: false,
     }
 }
 
@@ -230,10 +232,11 @@ fn transaction_control_settles_deferred_settings() {
             vec![End(Some(false))],
         ),
         (
+            // Settings made in a prepared transaction persist, as at COMMIT.
             "prepare transaction",
             &["PREPARE TRANSACTION 'x'"],
             sync(b'T', b'I', false),
-            vec![End(None)],
+            vec![End(Some(true))],
         ),
         (
             "savepoint",
@@ -310,26 +313,49 @@ fn transaction_control_settles_deferred_settings() {
 }
 
 #[test]
-fn a_procedure_may_commit_part_of_a_failed_cycle() {
-    // CALL or DO outside a transaction block can COMMIT the SET before it;
-    // a later error leaves the proxy unable to tell.
-    for cp in [tx("CALL p()"), tx("DO $$BEGIN COMMIT; END$$")] {
-        assert_eq!(cp, Bound::CommitPoint);
-        assert_eq!(
-            stmts(&[set(), cp.clone(), Bound::Other], sync(b'I', b'I', true)),
-            ops(vec![Unknown])
-        );
-        // Without an error everything committed anyway.
-        assert_eq!(
-            stmts(&[set(), cp.clone(), Bound::Other], ok_sync()),
-            ops(vec![apply(SET)])
-        );
-        // Inside a transaction block a procedure cannot commit.
-        assert_eq!(
-            stmts(&[set(), cp, Bound::Other], sync(b'T', b'E', true)),
-            ops(vec![])
-        );
+fn a_call_is_an_ordinary_statement() {
+    // PostgreSQL refuses transaction control in a procedure called after
+    // other statements of the cycle (2D000): it cannot commit or roll back
+    // what ran before it.
+    for call in [&b"CALL p()"[..], b"/* t */ DO $$BEGIN COMMIT; END$$"] {
+        assert_eq!(ProxyServer::tr_bound(call), Bound::Other);
     }
+    let set_call_fail = [set(), Bound::Other, Bound::Other];
+    assert_eq!(stmts(&set_call_fail, sync(b'I', b'I', true)), ops(vec![]));
+    assert_eq!(stmts(&set_call_fail, ok_sync()), ops(vec![apply(SET)]));
+}
+
+#[test]
+fn discard_all_commits_at_once_and_only_first() {
+    let discard = || ProxyServer::tr_bound(b"DISCARD ALL");
+    assert_eq!(discard(), Bound::DiscardAll("DISCARD ALL".into()));
+    assert_eq!(
+        stmts(&[discard()], ok_sync()),
+        ops(vec![apply("DISCARD ALL")])
+    );
+    // First in the cycle it committed before a later error could undo it,
+    // unless it was the statement that failed: the proxy cannot tell.
+    assert_eq!(
+        stmts(&[discard(), Bound::Other], sync(b'I', b'I', true)),
+        ops(vec![Unknown])
+    );
+    // Inside a transaction block it fails.
+    assert_eq!(stmts(&[discard()], sync(b'T', b'E', true)), ops(vec![]));
+}
+
+#[test]
+fn an_error_after_the_last_statement_is_considered() {
+    // A Parse or Describe after the COMMIT's Execute can fail after the
+    // COMMIT succeeded, or the COMMIT itself failed.
+    let mut c = ExtSetCycle::default();
+    run(&mut c, tx("COMMIT"));
+    c.on_other_message();
+    assert_eq!(c.at_boundary(sync(b'T', b'I', true)), ops(vec![End(None)]));
+    // Without such a message only the COMMIT can have failed.
+    assert_eq!(
+        stmts(&[tx("COMMIT")], sync(b'T', b'I', true)),
+        ops(vec![End(Some(false))])
+    );
 }
 
 #[test]
@@ -468,20 +494,24 @@ fn an_interrupted_cycle_settles_conservatively() {
     lone_set(&mut c);
     assert_eq!(c.at_boundary(flush(true, b'T')), ops(vec![]));
     assert!(c.is_open());
+    // The unnamed SET's Parse may not have run either: the pin stays.
     assert_eq!(
         c.interrupt(b'T'),
-        vec![Taint {
-            settings: true,
-            savepoints: false
-        }]
+        ExtSetOutcome {
+            pin: true,
+            ops: vec![Taint {
+                settings: true,
+                savepoints: false
+            }]
+        }
     );
     assert!(!c.is_open());
     run(&mut c, tx("COMMIT"));
-    assert_eq!(c.interrupt(b'T'), vec![End(None)]);
+    assert_eq!(c.interrupt(b'T'), ops(vec![End(None)]));
     run(&mut c, set());
-    assert_eq!(c.interrupt(b'I'), vec![Unknown]);
+    assert_eq!(c.interrupt(b'I'), ops(vec![Unknown]));
     run(&mut c, Bound::Other);
-    assert_eq!(c.interrupt(b'I'), vec![]);
+    assert_eq!(c.interrupt(b'I'), ops(vec![]));
 }
 
 #[test]
@@ -528,7 +558,6 @@ fn bound_statements_are_classified_from_raw_bytes() {
         (&b"SET a = 1"[..], Some(None)),
         (b"SET x = 'a;b'", Some(None)),
         (b"/* c */ RESET ALL", Some(None)),
-        (b"DISCARD ALL", Some(None)),
         (
             b"SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY",
             Some(None),
@@ -556,7 +585,11 @@ fn bound_statements_are_classified_from_raw_bytes() {
         let text = String::from_utf8_lossy(sql).to_string();
         match expected {
             Some(None) => assert_eq!(got, Bound::Set(text.clone()), "{text}"),
-            Some(Some(v)) => assert_eq!(got, Bound::Tx(v, text.clone()), "{text}"),
+            Some(Some(v)) => {
+                let keep = matches!(v, Savepoint | Release | RollbackTo);
+                let kept = if keep { text.clone() } else { String::new() };
+                assert_eq!(got, Bound::Tx(v, kept), "{text}")
+            }
             None => unreachable!(),
         }
     }
@@ -574,7 +607,11 @@ fn bound_statements_are_classified_from_raw_bytes() {
         b"SELECT 1",
         b"BEGINNING",
         b"/* COMMIT */ SELECT 1",
-        b"CALLS",
+        b"CALL p()",
+        b"SELECT set_config('request.jwt.claims', $1, true)",
+        b"select set_config ( 'a' , f(1, 2) , TRUE )",
+        b"SELECT set_config('a', 'b', 't')",
+        b"SELECT 'set_config(1, 2, false)'",
     ] {
         assert_eq!(
             ProxyServer::tr_bound(sql),
@@ -583,10 +620,22 @@ fn bound_statements_are_classified_from_raw_bytes() {
             String::from_utf8_lossy(sql)
         );
     }
-    assert_eq!(ProxyServer::tr_bound(b"call p()"), Bound::CommitPoint);
+    // set_config(..., false) or an is_local the proxy cannot read: a
+    // session-level change it cannot record.
+    for sql in [
+        "SELECT set_config('search_path', '', false)",
+        "SELECT set_config('a', 'x,y', is_local)",
+        "SELECT 1, set_config('a', 'b', true), set_config('c', 'd', false)",
+    ] {
+        assert_eq!(
+            ProxyServer::tr_bound(sql.as_bytes()),
+            Bound::Set(sql.into()),
+            "{sql}"
+        );
+    }
     assert_eq!(
-        ProxyServer::tr_bound(b"/* t */ DO $$ BEGIN END $$"),
-        Bound::CommitPoint
+        ProxyServer::tr_bound(b"DISCARD ALL"),
+        Bound::DiscardAll("DISCARD ALL".into())
     );
     // Not UTF-8: nothing the proxy can record.
     assert_eq!(ProxyServer::tr_bound(b"COMMIT /* \xff */"), Bound::Unknown);

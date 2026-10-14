@@ -18,9 +18,14 @@ settings it tracked. The re-homed session must show exactly what the old one did
   ext_tx_set     an extended-protocol SET inside an extended BEGIN/COMMIT is restored.
   savepoint      BEGIN; SAVEPOINT s; SET; ROLLBACK /* undo */ TO s; COMMIT: the
                  undone SET is not restored.
-  unknown        a cycle where a procedure commits a SET before an error leaves the
-                 session's settings unknown: the re-home is refused with 08006
-                 instead of continuing without them.
+  two_resets     SET ROLE, a pool reset, another tenant's SET ROLE: that role is
+                 restored (SET SESSION AUTHORIZATION ends a SET ROLE, and the
+                 role set after it must be restored after it).
+  call_in_cycle  a SET and a CALL of a procedure that COMMITs in one extended cycle:
+                 PostgreSQL refuses the COMMIT (2D000) and rolls the SET back; the
+                 re-homed session matches.
+  unknown        set_config(..., false) changes a setting the proxy cannot record:
+                 the re-home is refused with 08006 instead of continuing without it.
 Exit 1 if any case fails its expectation.
 """
 import argparse
@@ -119,13 +124,33 @@ def case_savepoint(client):
     return r
 
 
+def case_two_resets(client):
+    reset = "SET SESSION AUTHORIZATION DEFAULT;RESET ALL;CLOSE ALL"
+    r = {"steps": [query(client, sql)[1] for sql in (
+        "SET ROLE rr_tenant", reset, "SET ROLE rr_tenant_b", reset, "SET ROLE rr_tenant")]}
+    r["before"] = state(client)
+    r["after"] = kill_and_read(client)
+    r["ok"] = r["before"][0] == "rr_tenant" and r["after"] == r["before"]
+    return r
+
+
+def case_call_in_cycle(client):
+    r = {"call_cycle": cycle(client, "SET application_name = 'rr-call'", "CALL rr_commit()")}
+    r["before"] = state(client)
+    r["after"] = kill_and_read(client)
+    r["ok"] = (r["call_cycle"] == ["2D000"] and r["before"][2] == ""
+               and r["after"] == r["before"])
+    return r
+
+
 def case_unknown(client):
-    r = {"call_cycle": cycle(client, "SET application_name = 'rr-call'", "CALL rr_commit()",
-                             "SELECT 1/0")}
+    r = {"set_config": query(client,
+                             "SELECT set_config('application_name', 'rr-cfg', false)")[1]}
     r["before"] = state(client)
     tr08.kill_backend(pid(client))
     r["after_kill"] = query(client, "SELECT 1")[1]
-    r["ok"] = len(r["call_cycle"]) == 1 and r["after_kill"] in (["08006"], ["closed"])
+    r["ok"] = (r["set_config"] == [] and r["before"][2] == "rr-cfg"
+               and r["after_kill"] in (["08006"], ["closed"]))
     return r
 
 
@@ -140,10 +165,12 @@ def main():
     try:
         version = tr08.start_postgres(name)
         tr08.pg_query("CREATE ROLE rr_tenant")
+        tr08.pg_query("CREATE ROLE rr_tenant_b")
         tr08.pg_query("CREATE SCHEMA rr_schema")
         tr08.pg_query("CREATE PROCEDURE rr_commit() LANGUAGE plpgsql AS $$BEGIN COMMIT; END$$")
         for case, run in [("pool_reset", case_pool_reset), ("batch_set", case_batch_set),
                           ("ext_tx_set", case_ext_tx_set), ("savepoint", case_savepoint),
+                          ("two_resets", case_two_resets), ("call_in_cycle", case_call_in_cycle),
                           ("unknown", case_unknown)]:
             with tempfile.TemporaryDirectory(prefix="proxy-trset-") as temp:
                 temp = pathlib.Path(temp)

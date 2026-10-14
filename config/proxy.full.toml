@@ -206,6 +206,8 @@ write_timeout_secs = 30
 #                                        # over the cap a failover is refused (08006)
 # tr_max_tracked_savepoints = 1024      # savepoints per transaction whose position among
 #                                        # deferred SETs is tracked for ROLLBACK TO
+# tr_max_cycle_statements = 16          # statements of an extended cycle or multi-statement
+#                                        # query read one by one for SET tracking
 # tr_buffer_small_reads_bytes = 0       # TR-09: hold a re-executable read's response until
 #                                        # ReadyForQuery (up to this many bytes) so a fault
 #                                        # before then retries it; 0 = stream (off)

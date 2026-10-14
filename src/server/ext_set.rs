@@ -1,48 +1,58 @@
-//! Extended-protocol `SET` tracking (Sprinter d3a4c04c28be, 75c0c5eceac3).
+//! Session-settings tracking for extended-protocol cycles and
+//! multi-statement queries (Sprinter d3a4c04c28be, 75c0c5eceac3,
+//! 72494e4aaebf).
 //!
 //! JDBC, Npgsql and tokio-postgres send a `SET` as its own extended-protocol
 //! cycle: Parse, Bind, Execute, Sync. JDBC with autocommit off puts the
 //! transaction's `BEGIN` in front of its first statement, in the same cycle,
-//! and its `autosave` puts a `SAVEPOINT` there. The cycle's session-level
-//! `SET`s and transaction-control statements are read in order, the way
-//! PostgreSQL runs them: statements up to a Sync share one transaction unless
-//! they control it. Outside an explicit transaction a `SET` applies when that
-//! transaction commits; inside one it is deferred to the transaction's end.
-//! `COMMIT`, `ROLLBACK`, savepoints and their chained and prepared forms
-//! settle deferred settings the way the simple protocol does, whichever
+//! and its `autosave` puts a `SAVEPOINT` there; pools reset a connection with
+//! one multi-statement simple query. The statements of a cycle (or of such a
+//! query) are read in order, the way PostgreSQL runs them: they share one
+//! transaction unless they control it. Outside an explicit transaction a
+//! session-level `SET` applies when that transaction commits; inside one it
+//! is deferred to the transaction's end. `COMMIT`, `ROLLBACK`, savepoints and
+//! their chained and prepared forms settle deferred settings, whichever
 //! protocol deferred them. Offloaded reads mirror the result, and
 //! transaction replay restores it.
 //!
 //! When the cycle failed, the proxy cannot see where. It considers every
-//! statement the error could have come from, keeps those that end in the
-//! transaction status the ReadyForQuery shows, and uses the outcome they
-//! agree on. A `CALL` or `DO` outside a transaction may commit part of the
-//! cycle, and either case counts. When they disagree, or the cycle cannot be
-//! read statement by statement (a statement the proxy has no record of, an
-//! Execute of a portal not bound just before it, a cycle still copying), the
-//! settings it may have changed are unknown. Inside a transaction that stays
-//! open, that taints the transaction: if it commits, the session's settings
-//! become unknown. Otherwise they become unknown at once. A session with
-//! unknown settings keeps its reads home, and transaction replay refuses to
-//! re-home it rather than restore part of its state.
+//! place the error could have come from (a statement that ran and failed,
+//! one whose Parse or Bind failed, a message after the last Execute), keeps
+//! those that end in the transaction status the ReadyForQuery shows, and
+//! uses the outcome they agree on. (A `CALL` or `DO` cannot commit or roll
+//! back statements that ran before it in the same cycle or query:
+//! PostgreSQL refuses transaction control there with 2D000.) When the
+//! possibilities disagree, or the cycle cannot be read
+//! statement by statement (a statement the proxy has no record of, an
+//! Execute of a portal not bound just before it, a cycle still copying, one
+//! abandoned without its Sync), the settings it may have changed are
+//! unknown. Inside a transaction that stays open, that taints the
+//! transaction: if it commits, the session's settings become unknown.
+//! Otherwise they become unknown at once. A session with unknown settings
+//! keeps its reads home, and transaction replay refuses to re-home it rather
+//! than restore part of its state.
 //!
 //! Separately, a cycle after which the proxy's record of the session's
 //! prepared statements may no longer match the backend's keeps the
 //! session's reads home.
 
-/// What a Bind bound, as far as session settings are concerned.
+/// What a Bind bound (or a statement of a simple query is), as far as
+/// session settings are concerned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Bound {
     /// A statement the proxy has no record of.
     Unknown,
-    /// A session-level `SET`, `RESET` or `DISCARD ALL` (not `SET LOCAL`,
-    /// `SET TRANSACTION`, `SET CONSTRAINTS` or another `DISCARD`, whose
-    /// effects end with the transaction or are not settings).
+    /// A session-level `SET` or `RESET` (not `SET LOCAL`, `SET TRANSACTION`,
+    /// `SET CONSTRAINTS` or a `DISCARD` other than `DISCARD ALL`, whose
+    /// effects end with the transaction or are not settings), or a statement
+    /// calling `set_config(..., false)`, whose effect the proxy cannot
+    /// record (applied, it makes the settings unknown).
     Set(String),
-    /// A transaction-control statement.
+    /// `DISCARD ALL`: it cannot run inside a transaction block, and as the
+    /// first statement of an extended-protocol cycle it commits at once.
+    DiscardAll(String),
+    /// A transaction-control statement (the SQL is kept for savepoints).
     Tx(TxVerb, String),
-    /// `CALL` or `DO`: outside a transaction block the procedure may commit.
-    CommitPoint,
     /// Anything else.
     Other,
 }
@@ -60,7 +70,7 @@ pub(super) enum TxVerb {
     CommitChain,
     /// `ROLLBACK AND CHAIN`.
     RollbackChain,
-    /// `PREPARE TRANSACTION`.
+    /// `PREPARE TRANSACTION`: settings it made persist, as at COMMIT.
     Prepare,
     /// `SAVEPOINT`.
     Savepoint,
@@ -89,6 +99,9 @@ pub(super) struct ExtSetBoundary {
     /// The cycle is still copying: its ReadyForQuery has not arrived, so
     /// `after` is stale (Sync only).
     pub(super) copying: bool,
+    /// A simple-protocol query rather than an extended-protocol cycle: it is
+    /// parsed whole before anything runs.
+    pub(super) simple: bool,
 }
 
 /// What a cycle boundary means for the session.
@@ -125,32 +138,26 @@ pub(super) enum SettingsOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Step {
     Set(String),
+    DiscardAll(String),
     Tx(TxVerb, String),
-    CommitPoint,
     /// One or more consecutive other statements.
     Other,
 }
 
-/// The statements a cycle remembers (consecutive other statements count
-/// once); a cycle with more is one the proxy does not read statement by
-/// statement. It bounds the work and memory per cycle; past it the proxy is
-/// only more conservative.
-const MAX_STEPS: usize = 16;
-
-/// `CALL`s and `DO`s a cycle is read with: each may or may not commit, so
-/// the outcomes considered double with each one.
-const MAX_COMMIT_POINTS: usize = 4;
-
-/// One extended-protocol cycle (Sync to Sync), as far as settings are
-/// concerned.
-#[derive(Debug, Default)]
+/// One extended-protocol cycle (Sync to Sync) or simple query, as far as
+/// settings are concerned.
+#[derive(Debug)]
 pub(super) struct ExtSetCycle {
+    /// `[limits] tr_max_cycle_statements`: the statements a cycle remembers
+    /// (consecutive other statements count once). A cycle with more is not
+    /// read statement by statement.
+    max_steps: usize,
     binds: u32,
-    /// The cycle's statements in Bind order (the first `MAX_STEPS`).
+    /// The cycle's statements in Bind order (the first `max_steps`).
     steps: Vec<Step>,
-    /// It bound a SET-like, transaction-control, `CALL` or `DO` statement.
+    /// It bound a SET-like or transaction-control statement.
     relevant: bool,
-    /// It bound more than `MAX_STEPS` statements.
+    /// It bound more than `max_steps` statements.
     overflow: bool,
     /// It bound a statement the proxy has no record of.
     unknown: bool,
@@ -160,6 +167,9 @@ pub(super) struct ExtSetCycle {
     awaiting_execute: bool,
     /// An Execute that did not run, once, the portal bound just before it.
     unpaired: bool,
+    /// A Parse, Describe or Close came after the last Execute: an error can
+    /// follow every statement of the cycle.
+    tail: bool,
     /// The cycle Parsed a named statement that is SET-like or replaced one:
     /// if the Parse failed (the backend keeps the old definition) or never
     /// reached the backend, the proxy's record of it is wrong.
@@ -172,19 +182,50 @@ pub(super) struct ExtSetCycle {
     flushed: bool,
 }
 
-/// One way the cycle may have run: the step that failed (with, for a
-/// `CALL`/`DO`, whether it committed first), and which `CALL`s and `DO`s
-/// committed.
-#[derive(Clone, Copy)]
-struct Scenario {
-    fail: Option<(usize, bool)>,
-    commits: u32,
+impl Default for ExtSetCycle {
+    fn default() -> Self {
+        Self::with_limit(crate::config::default_tr_max_cycle_statements())
+    }
+}
+
+/// Where a scenario's cycle stopped with an error: before step `at` ran
+/// (`ran == false`: its Parse or Bind failed, or `at` is past the last step)
+/// or while it ran.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Failure {
+    at: usize,
+    ran: bool,
 }
 
 impl ExtSetCycle {
+    /// A cycle reading at most `max_steps` statements one by one.
+    pub(super) fn with_limit(max_steps: usize) -> Self {
+        Self {
+            max_steps,
+            binds: 0,
+            steps: Vec::new(),
+            relevant: false,
+            overflow: false,
+            unknown: false,
+            portal: Vec::new(),
+            awaiting_execute: false,
+            unpaired: false,
+            tail: false,
+            named_set_parsed: false,
+            unnamed_set_parsed: false,
+            flushed: false,
+        }
+    }
+
+    /// Change the limit on statements read one by one.
+    pub(super) fn set_limit(&mut self, max_steps: usize) {
+        self.max_steps = max_steps;
+    }
+
     /// A Parse: `named` statement or the unnamed one; `set_like` its new
     /// SQL; `replaced_set_like` the definition it replaces.
     pub(super) fn on_parse(&mut self, named: bool, set_like: bool, replaced_set_like: bool) {
+        self.tail = true;
         if set_like || replaced_set_like {
             if named {
                 self.named_set_parsed = true;
@@ -192,6 +233,11 @@ impl ExtSetCycle {
                 self.unnamed_set_parsed = true;
             }
         }
+    }
+
+    /// A Describe or Close: it can fail after the cycle's last Execute.
+    pub(super) fn on_other_message(&mut self) {
+        self.tail = true;
     }
 
     /// A Bind of `portal` to `bound`.
@@ -211,11 +257,11 @@ impl ExtSetCycle {
             Bound::Other if self.steps.last() == Some(&Step::Other) => return,
             Bound::Other => Step::Other,
             Bound::Set(sql) => Step::Set(sql),
+            Bound::DiscardAll(sql) => Step::DiscardAll(sql),
             Bound::Tx(verb, sql) => Step::Tx(verb, sql),
-            Bound::CommitPoint => Step::CommitPoint,
         };
         self.relevant |= step != Step::Other;
-        if self.steps.len() < MAX_STEPS {
+        if self.steps.len() < self.max_steps {
             self.steps.push(step);
         } else {
             self.overflow = true;
@@ -228,6 +274,7 @@ impl ExtSetCycle {
             self.unpaired = true;
         }
         self.awaiting_execute = false;
+        self.tail = false;
     }
 
     /// A cycle is open: something was bound or flushed since the last Sync.
@@ -263,14 +310,22 @@ impl ExtSetCycle {
     /// The client left the cycle without a Sync (a simple Query after a
     /// Flush, or after extended messages it never synced): what ran of it
     /// can no longer be told apart.
-    pub(super) fn interrupt(&mut self, before: u8) -> Vec<SettingsOp> {
-        let ops = self.abandon(before);
+    pub(super) fn interrupt(&mut self, before: u8) -> ExtSetOutcome {
+        let outcome = ExtSetOutcome {
+            pin: self.named_set_parsed || self.unnamed_set_parsed,
+            ops: self.abandon(before),
+        };
         self.reset();
-        ops
+        outcome
     }
 
     fn sets(&self) -> bool {
-        self.unknown || self.overflow || self.steps.iter().any(|s| matches!(s, Step::Set(_)))
+        self.unknown
+            || self.overflow
+            || self
+                .steps
+                .iter()
+                .any(|s| matches!(s, Step::Set(_) | Step::DiscardAll(_)))
     }
 
     /// The cycle may have ended a transaction (or committed part of an
@@ -281,7 +336,7 @@ impl ExtSetCycle {
             || self.steps.iter().any(|s| {
                 matches!(
                     s,
-                    Step::CommitPoint
+                    Step::DiscardAll(_)
                         | Step::Tx(
                             TxVerb::Commit
                                 | TxVerb::Rollback
@@ -397,51 +452,37 @@ impl ExtSetCycle {
     /// Run the cycle's statements in every way consistent with the
     /// response, and return what they agree on. `None` when no way is.
     fn simulate(&self, b: ExtSetBoundary) -> Option<Vec<SettingsOp>> {
-        let commit_points = self
-            .steps
-            .iter()
-            .filter(|s| matches!(s, Step::CommitPoint))
-            .count();
-        if commit_points > MAX_COMMIT_POINTS {
-            return None;
-        }
         // After a Flush an error may not reach the Sync's response.
-        let may_succeed = !b.failed;
         let may_fail = b.failed || self.flushed;
+        if !may_fail {
+            return self.run(b, None);
+        }
+        let mut failures = Vec::new();
+        for (at, step) in self.steps.iter().enumerate() {
+            // A simple query is parsed whole: either nothing ran, or a
+            // statement failed while it ran.
+            if !b.simple || at == 0 {
+                failures.push(Failure { at, ran: false });
+            }
+            if !matches!(
+                step,
+                Step::Tx(TxVerb::Begin | TxVerb::Rollback | TxVerb::RollbackChain, _)
+            ) {
+                failures.push(Failure { at, ran: true });
+            }
+        }
+        if self.tail && !b.simple {
+            failures.push(Failure {
+                at: self.steps.len(),
+                ran: false,
+            });
+        }
         let mut outcomes: Vec<Vec<SettingsOp>> = Vec::new();
-        let mut consider = |s: Scenario| {
-            if let Some(ops) = self.run(b, s) {
+        let scenarios = failures.into_iter().map(Some);
+        for fail in scenarios.chain((!b.failed).then_some(None)) {
+            if let Some(ops) = self.run(b, fail) {
                 if !outcomes.contains(&ops) {
                     outcomes.push(ops);
-                }
-            }
-        };
-        for commits in 0..(1u32 << commit_points) {
-            if may_succeed {
-                consider(Scenario {
-                    fail: None,
-                    commits,
-                });
-            }
-            if may_fail {
-                for (i, step) in self.steps.iter().enumerate() {
-                    if matches!(
-                        step,
-                        Step::Tx(TxVerb::Begin | TxVerb::Rollback | TxVerb::RollbackChain, _)
-                    ) {
-                        // These do not fail once bound.
-                        continue;
-                    }
-                    consider(Scenario {
-                        fail: Some((i, false)),
-                        commits,
-                    });
-                    if *step == Step::CommitPoint {
-                        consider(Scenario {
-                            fail: Some((i, true)),
-                            commits,
-                        });
-                    }
                 }
             }
         }
@@ -489,9 +530,10 @@ impl ExtSetCycle {
         Some(ops)
     }
 
-    /// The settings operations of one scenario, or `None` when it cannot
-    /// have happened or does not end in the status the response showed.
-    fn run(&self, b: ExtSetBoundary, s: Scenario) -> Option<Vec<SettingsOp>> {
+    /// The settings operations of one scenario (`fail`: where it stopped
+    /// with an error, `None` for success), or `None` when it cannot have
+    /// happened or does not end in the status the response showed.
+    fn run(&self, b: ExtSetBoundary, fail: Option<Failure>) -> Option<Vec<SettingsOp>> {
         use SettingsOp::{Apply, Defer, End, Savepoint};
         // An explicit transaction block is open; it failed; the SETs of the
         // cycle's own (implicit) transaction so far.
@@ -499,9 +541,13 @@ impl ExtSetCycle {
         let mut aborted = b.before == b'E';
         let mut implicit: Vec<&str> = Vec::new();
         let mut ops = Vec::new();
-        let mut commit_point = 0;
+        let mut stopped = false;
         for (i, step) in self.steps.iter().enumerate() {
-            let failing = s.fail.map(|(f, _)| f) == Some(i);
+            if fail == Some(Failure { at: i, ran: false }) {
+                stopped = true;
+                break;
+            }
+            let failing = fail == Some(Failure { at: i, ran: true });
             let runs_when_aborted = matches!(
                 step,
                 Step::Tx(
@@ -509,6 +555,7 @@ impl ExtSetCycle {
                         | TxVerb::Rollback
                         | TxVerb::CommitChain
                         | TxVerb::RollbackChain
+                        | TxVerb::Prepare
                         | TxVerb::RollbackTo,
                     _
                 )
@@ -526,26 +573,23 @@ impl ExtSetCycle {
                     }
                     // What a failed COMMIT AND CHAIN leaves is not modelled.
                     Step::Tx(TxVerb::CommitChain, _) => return None,
-                    _ if open => aborted = true,
-                    // A procedure that committed before it failed.
-                    Step::CommitPoint if s.fail == Some((i, true)) => {
-                        ops.extend(implicit.drain(..).map(|q| Apply(q.to_string())));
-                    }
-                    _ => implicit.clear(),
+                    _ => stopped = true,
                 }
-                // PostgreSQL skips the rest of the cycle.
                 break;
             }
             match step {
                 Step::Other => {}
-                Step::CommitPoint => {
-                    if !open && s.commits & (1 << commit_point) != 0 {
-                        ops.extend(implicit.drain(..).map(|q| Apply(q.to_string())));
-                    }
-                    commit_point += 1;
-                }
                 Step::Set(sql) if open => ops.push(Defer(sql.clone())),
                 Step::Set(sql) => implicit.push(sql),
+                Step::DiscardAll(sql) => {
+                    // It refuses to run in a transaction block, and in an
+                    // extended-protocol cycle it must come first; there it
+                    // commits at once.
+                    if open || i > 0 || (b.simple && self.steps.len() > 1) {
+                        return None;
+                    }
+                    ops.push(Apply(sql.clone()));
+                }
                 Step::Tx(verb, sql) => match verb {
                     TxVerb::Begin => {
                         if !open {
@@ -555,15 +599,15 @@ impl ExtSetCycle {
                         }
                     }
                     TxVerb::Commit | TxVerb::Rollback | TxVerb::Prepare if open => {
-                        ops.push(match verb {
-                            TxVerb::Commit if !aborted => End(Some(true)),
-                            TxVerb::Prepare => End(None),
-                            _ => End(Some(false)),
-                        });
+                        ops.push(End(Some(
+                            matches!(verb, TxVerb::Commit | TxVerb::Prepare) && !aborted,
+                        )));
                         open = false;
                         aborted = false;
                     }
-                    TxVerb::Commit => {
+                    // Outside a block they end the cycle's own transaction
+                    // (with a warning).
+                    TxVerb::Commit | TxVerb::Prepare => {
                         ops.extend(implicit.drain(..).map(|q| Apply(q.to_string())));
                     }
                     TxVerb::Rollback => implicit.clear(),
@@ -579,6 +623,22 @@ impl ExtSetCycle {
                     // unlexable statement always is.
                     _ => return None,
                 },
+            }
+        }
+        if fail
+            == Some(Failure {
+                at: self.steps.len(),
+                ran: false,
+            })
+        {
+            stopped = true;
+        }
+        if stopped {
+            // The error aborts the transaction in progress.
+            if open {
+                aborted = true;
+            } else {
+                implicit.clear();
             }
         }
         if !open {
@@ -608,6 +668,7 @@ impl ExtSetCycle {
         self.portal.clear();
         self.awaiting_execute = false;
         self.unpaired = false;
+        self.tail = false;
         self.named_set_parsed = false;
         self.unnamed_set_parsed = false;
         self.flushed = false;

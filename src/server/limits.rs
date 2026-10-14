@@ -53,6 +53,8 @@ pub(super) struct ResolvedLimits {
     pub(super) tr_max_session_set_statements: usize,
     /// In-session TR: cap on tracked savepoints per transaction.
     pub(super) tr_max_tracked_savepoints: usize,
+    /// In-session TR / read offload: statements of a cycle read one by one.
+    pub(super) tr_max_cycle_statements: usize,
     /// Wait for a backend slot on a node at its `max_connections` (H-05).
     pub(super) backend_slot_wait: Duration,
     /// TR-09: bytes of a re-executable read's response held until its
@@ -107,6 +109,7 @@ impl ResolvedLimits {
             tr_max_replay_bytes: l.tr_max_replay_bytes,
             tr_max_session_set_statements: l.tr_max_session_set_statements,
             tr_max_tracked_savepoints: l.tr_max_tracked_savepoints,
+            tr_max_cycle_statements: l.tr_max_cycle_statements,
             backend_slot_wait: Duration::from_millis(l.backend_slot_wait_ms),
             tr_buffer_small_reads: l.tr_buffer_small_reads_bytes,
         }

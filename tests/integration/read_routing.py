@@ -36,10 +36,11 @@ Cases (each on a new client connection unless noted):
                  autosave (a SAVEPOINT in front of each statement); a SET LOCAL batch
                  (changes no session setting); two SETs in one cycle; a simple ROLLBACK TO
                  with a comment inside it. Each reads from the standby with exactly the
-                 committed setting. A cycle where a procedure commits before an error
-                 (CALL that COMMITs, then 1/0) makes the session's settings unknown: its
-                 reads stay on the primary and heliosdb_proxy_tr_session_set_untracked_total
-                 counts it.
+                 committed setting. A procedure that COMMITs, called after a SET in the
+                 same cycle, fails (2D000) and the SET is rolled back: reads still offload.
+                 set_config(..., false) changes a setting the proxy cannot record: the
+                 session's reads stay on the primary and
+                 heliosdb_proxy_tr_session_set_untracked_total counts it.
   role           SET ROLE is mirrored onto the standby, RESET ALL keeps it (as in
                  PostgreSQL), RESET ROLE drops it there too; a SERIALIZABLE default
                  isolation level keeps reads on the primary.
@@ -221,16 +222,22 @@ def case_ext_set_tx(address, admin):
     r["untracked_before"] = metric(admin, "heliosdb_proxy_tr_session_set_untracked_total")
     with tr08.startup(address) as c:
         query(c, "SET application_name = ''")
-        # The procedure's COMMIT keeps the SET; the error ends the cycle.
-        r["call_cycle"] = cycle(c, app("rr-call"), "CALL rr_commit()", "SELECT 1/0")
+        # PostgreSQL refuses the procedure's COMMIT here and rolls back the SET.
+        r["call_cycle"] = cycle(c, app("rr-call"), "CALL rr_commit()")
         time.sleep(RYW_WAIT)
         res = tr08.rows(query(c, probe))
         r["read_after_call"] = res[0] if res else None
+        r["set_config"] = cycle(c, "SELECT set_config('application_name', 'rr-cfg', false)")
+        time.sleep(RYW_WAIT)
+        res = tr08.rows(query(c, probe))
+        r["read_after_set_config"] = res[0] if res else None
     time.sleep(METRICS_SYNC)
     r["untracked_after"] = metric(admin, "heliosdb_proxy_tr_session_set_untracked_total")
     r["ok"] = (all(r[name].pop("ok") for name in scenarios)
-               and r["call_cycle"].startswith("error")
-               and (r["read_after_call"] or [None])[0] == PRIMARY
+               and r["call_cycle"] == "error ['2D000']"
+               and r["read_after_call"] == [STANDBY, ""]
+               and r["set_config"] == "ok"
+               and r["read_after_set_config"] == [PRIMARY, "rr-cfg"]
                and r["untracked_before"] == 0 and r["untracked_after"] == 1)
     return r
 
