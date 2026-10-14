@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-10-15
+
+Read offload to standbys now works as documented and is on by default. Session settings
+(`SET`, `RESET`, `DISCARD ALL`, `SET ROLE`) are tracked statement by statement on both wire
+protocols, so offloaded reads and transaction-replay re-homes carry them, and a failover
+that cannot restore them exactly is refused instead of continuing without them. A Patroni
+leader counts only while it holds the DCS leader lock, under a lease no longer than
+Patroni's own, and a session whose home stops being the leader is re-homed. Reconnect
+waves, backend connections per node and client sessions per tenant can be capped; the
+query cache can follow logical replication; transaction replay covers prepared statements
+and portals from earlier cycles.
+
+### Upgrade notes (behaviour changes)
+
+- **Reads go to standbys by default.** With `[load_balancer] read_write_split = true` (the
+  default), a side-effect-free read outside a transaction now runs on a standby
+  (`standby_reads = "async"`); a session reads its own writes from the primary for
+  `read_your_writes_ms` (1000). `standby_reads = "primary"` keeps the 2.0 routing.
+  Standbys that require a password need `[auth] mode = "scram"` with an `auth_file`
+  (otherwise those reads fall back to the primary). See Changed below.
+- **A failover can refuse a session with `08006`** when the proxy cannot restore its
+  settings exactly (`set_config(..., false)`, a cycle it cannot read statement by
+  statement, more distinct variables than `[limits] tr_max_session_set_statements`) until
+  the session sends `DISCARD ALL`, instead of re-homing it without them.
+- **Reconnects are metered:** `[limits] max_concurrent_reconnects_per_node = 16` by
+  default (0 = unlimited, the 2.0 behaviour).
+- **Patroni:** `[topology] patroni_confirm_leader_lock = true` by default (the leader's own
+  REST API must answer `GET /primary` with 200), and startup rejects a
+  `lease_timeout_secs` that is not below `patroni_ttl_secs - patroni_loop_wait_secs`
+  (defaults 30 and 10): set those to the cluster's Patroni values.
+- **An empty `admin_token`** (config file or `--admin-token`) is a startup error.
+- **Gateways** (HTTP SQL, GraphQL, MCP) now apply `[rate_limit]`, `[query_rewrite]` and
+  `[circuit_breaker]`.
+- **Library API** (crates that use `heliosdb-proxy` as a library): `JournalOp` gains a
+  `PreparedCommitted` variant, so exhaustive matches must handle it; `L2Config`
+  (`shed_batch`, `shed_pause`), `ServerMetricsSnapshot` (`admission_queue_depth`),
+  `ExtendedBatchLog` (`outside`) and `TransactionState` (`replay_cap_exceeded`) gain
+  public fields, so struct literals must set them. The daemon's config, CLI, wire
+  protocol and admin API stay compatible.
+- **Dependencies:** `dashmap` 6, `socket2` 0.6, `base64` 0.22. A crate that builds this one
+  against its own lock file needs `cargo update -p dashmap -p socket2 -p base64`.
+
 ### Fixed
 
 - Read offload and transaction replay now see a statement behind comments, such as
