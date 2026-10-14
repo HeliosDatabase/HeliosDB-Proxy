@@ -37,6 +37,16 @@ class Authority:
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
+                # A member's own REST API (api_url) answers GET /primary with
+                # 200 only while it holds the leader lock (H-02).
+                if self.path.startswith("/m/") and self.path.endswith("/primary"):
+                    port = int(self.path.split("/")[2])
+                    leader = any(m["port"] == port and m["role"] == "leader"
+                                 for m in authority.members)
+                    self.send_response(200 if leader else 503)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 if self.path != "/cluster":
                     self.send_error(404)
                     return
@@ -55,8 +65,10 @@ class Authority:
         self.thread.start()
 
     def leaders(self, *backends):
+        api = f"http://127.0.0.1:{self.server.server_port}/m"
         self.members = [dict(host="127.0.0.1", port=b.port, role="leader",
-                             state="running", timeline=index + 1)
+                             state="running", timeline=index + 1,
+                             api_url=f"{api}/{b.port}/patroni")
                         for index, b in enumerate(backends)]
 
     def close(self):
