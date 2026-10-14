@@ -428,6 +428,66 @@ pub fn query_text(payload: &[u8]) -> Option<&str> {
     std::str::from_utf8(&payload[..end]).ok()
 }
 
+/// Skip leading whitespace and SQL comments (`-- …` and `/* … */`, which
+/// nest in PostgreSQL). Whitespace and line ends are PostgreSQL's: ASCII
+/// space, tab, `\n`, `\r`, form feed and vertical tab; a `--` comment ends
+/// at `\n` or `\r`. An unterminated comment leaves nothing.
+pub fn skip_leading_comments(s: &str) -> &str {
+    let rest = skip_leading_comments_bytes(s.as_bytes());
+    // `rest` starts at the beginning, after ASCII whitespace or after an
+    // ASCII comment delimiter: always a char boundary.
+    &s[s.len() - rest.len()..]
+}
+
+/// [`skip_leading_comments`] over raw bytes (no UTF-8 validation needed:
+/// every delimiter is ASCII).
+pub fn skip_leading_comments_bytes(mut b: &[u8]) -> &[u8] {
+    loop {
+        while let Some((c, rest)) = b.split_first() {
+            if matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b) {
+                b = rest;
+            } else {
+                break;
+            }
+        }
+        if let Some(rest) = b.strip_prefix(b"--") {
+            b = rest
+                .iter()
+                .position(|&c| c == b'\n' || c == b'\r')
+                .map_or(&[][..], |i| &rest[i + 1..]);
+        } else if b.starts_with(b"/*") {
+            let (mut depth, mut i) = (0usize, 0usize);
+            while depth > 0 || i == 0 {
+                match b.get(i..i + 2) {
+                    Some(b"/*") => {
+                        depth += 1;
+                        i += 2;
+                    }
+                    Some(b"*/") => {
+                        depth -= 1;
+                        i += 2;
+                    }
+                    Some(_) => i += 1,
+                    None => return &[],
+                }
+            }
+            b = &b[i..];
+        } else {
+            return b;
+        }
+    }
+}
+
+/// Whether `b`, after leading comments, starts with the keyword `word`
+/// (ASCII case-insensitive, followed by a non-identifier byte or the end).
+pub fn leads_with_keyword(b: &[u8], word: &str) -> bool {
+    let b = skip_leading_comments_bytes(b);
+    b.len() >= word.len()
+        && b[..word.len()].eq_ignore_ascii_case(word.as_bytes())
+        && b.get(word.len())
+            .is_none_or(|&c| !(c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80))
+}
+
 /// Case-insensitive ASCII prefix test without allocating an
 /// uppercased copy of the haystack.
 pub fn starts_with_ci(s: &str, prefix: &str) -> bool {
@@ -1189,5 +1249,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn skip_leading_comments_skips_line_block_and_nested_comments() {
+        for (sql, rest) in [
+            ("SET a = 1", "SET a = 1"),
+            ("  \n\tSET a = 1", "SET a = 1"),
+            ("/* app=x */ SET a = 1", "SET a = 1"),
+            ("-- note\nSET a = 1", "SET a = 1"),
+            ("/* a */ -- b\n /* c */SET a = 1", "SET a = 1"),
+            (
+                "/* outer /* inner */ still a comment */ SET a = 1",
+                "SET a = 1",
+            ),
+            ("/**/SELECT 1", "SELECT 1"),
+            ("/*/ */SELECT 1", "SELECT 1"),
+            ("SELECT 1 /* trailing */", "SELECT 1 /* trailing */"),
+            ("/* unterminated SET a = 1", ""),
+            ("/* outer /* inner */ SET a = 1", ""),
+            ("-- no newline", ""),
+            ("/*", ""),
+            ("/* é */ SET a = 1", "SET a = 1"),
+            ("-- note\rSET a = 1", "SET a = 1"),
+            ("-- note\r\nSET a = 1", "SET a = 1"),
+            ("\x0b\x0cSET a = 1", "SET a = 1"),
+            ("\u{a0}SET a = 1", "\u{a0}SET a = 1"),
+        ] {
+            assert_eq!(skip_leading_comments(sql), rest, "{sql:?}");
+            assert_eq!(skip_leading_comments_bytes(sql.as_bytes()), rest.as_bytes());
+        }
+    }
+
+    #[test]
+    fn leads_with_keyword_needs_a_word_boundary() {
+        assert!(leads_with_keyword(b"/* app */ set a = 1", "SET"));
+        assert!(leads_with_keyword(b"RESET ALL", "RESET"));
+        assert!(leads_with_keyword(b"DISCARD", "DISCARD"));
+        assert!(!leads_with_keyword(b"SETTINGS", "SET"));
+        assert!(!leads_with_keyword(b"SET_x", "SET"));
+        assert!(!leads_with_keyword("SET\u{e9}".as_bytes(), "SET"));
+        assert!(!leads_with_keyword(b"SELECT 'SET'", "SET"));
+        assert!(!leads_with_keyword(b"-- SET\rSELECT 1", "SET"));
     }
 }

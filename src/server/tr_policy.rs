@@ -447,8 +447,12 @@ pub(super) enum GucOp {
     Set(String),
     /// `RESET <name>`: forget the variable.
     Reset(String),
-    /// `RESET ALL` / `DISCARD ALL`: forget every variable.
+    /// `RESET ALL`: forget every variable except `role` and
+    /// `session_authorization`, which PostgreSQL's `RESET ALL` leaves alone.
     ResetAll,
+    /// `DISCARD ALL`: forget every variable, role and session authorization
+    /// included.
+    DiscardAll,
 }
 
 /// TR-06: a bounded, order-sensitive digest of the frames a client observed

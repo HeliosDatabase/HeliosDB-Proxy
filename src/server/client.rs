@@ -830,6 +830,11 @@ impl ProxyServer {
         let mut batch_binds_unnamed = false;
         let mut unnamed_node: Option<String> = None;
         let mut home_node: Option<String> = current_node.clone();
+        // Extended-protocol SET tracking (`ext_set`): the open cycle, and the
+        // client's unnamed statement when that is SET-like (it outlives the
+        // cycle that Parsed it).
+        let mut ext_set = ExtSetCycle::default();
+        let mut unnamed_set: Option<String> = None;
         loop {
             // Read the client's next message directly into the accumulation
             // buffer (no intermediate zeroed scratch, no extra copy). `read_buf`
@@ -1116,6 +1121,7 @@ impl ProxyServer {
                                         offload_on,
                                         may_offload: offload_on
                                             && !tr.guc_cap_hit
+                                            && !tr.serializable_default
                                             && !session
                                                 .reads_pinned
                                                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -1224,6 +1230,25 @@ impl ProxyServer {
                                 // borrow the query (2nd cstring) for routing.
                                 let name = Self::parse_stmt_name(&msg.payload);
                                 let unnamed = name.is_empty();
+                                if tr.track_gucs {
+                                    let sql = Self::parse_payload_sql_bytes(&msg.payload);
+                                    let set_like = sql.is_some_and(Self::tr_is_set_like_bytes);
+                                    let replaced = if unnamed {
+                                        unnamed_set.is_some()
+                                    } else {
+                                        stmt_registry
+                                            .get(name)
+                                            .and_then(|b| Self::parse_msg_sql_bytes(b))
+                                            .is_some_and(Self::tr_is_set_like_bytes)
+                                    };
+                                    ext_set.on_parse(!unnamed, set_like, replaced);
+                                    if unnamed {
+                                        unnamed_set = sql
+                                            .filter(|_| set_like)
+                                            .and_then(|q| std::str::from_utf8(q).ok())
+                                            .map(str::to_string);
+                                    }
+                                }
                                 if !unnamed {
                                     let name = name.to_string();
                                     let existed = stmt_registry.contains_key(&name);
@@ -1354,10 +1379,9 @@ impl ProxyServer {
                                 }
                                 // Read offload: a batch is offloaded only when
                                 // every statement it Parses is a standby-safe
-                                // read; an extended SET/RESET/DISCARD (not
-                                // tracked for mirroring) or a statement that
-                                // leaves connection-local state pins the
-                                // session's reads to its home.
+                                // read; a statement that leaves connection-local
+                                // state pins the session's reads to its home
+                                // (SET/RESET/DISCARD are decided at the Sync).
                                 if offload_on {
                                     let sql = msg
                                         .payload
@@ -1372,12 +1396,7 @@ impl ProxyServer {
                                     {
                                         batch_reads = false;
                                     }
-                                    let head = sql.trim_start();
-                                    if Self::pins_reads(sql)
-                                        || crate::protocol::starts_with_ci(head, "SET")
-                                        || crate::protocol::starts_with_ci(head, "RESET")
-                                        || crate::protocol::starts_with_ci(head, "DISCARD")
-                                    {
+                                    if Self::pins_reads(sql) {
                                         session
                                             .reads_pinned
                                             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1412,6 +1431,23 @@ impl ProxyServer {
                                 let stmt_ref = Self::bind_stmt_ref(&msg.payload);
                                 if stmt_ref.is_none() {
                                     batch_binds_unnamed = true;
+                                }
+                                if tr.track_gucs {
+                                    // SET-like / other known / unknown statement.
+                                    let bound = match stmt_ref {
+                                        Some(name) => stmt_registry.get(name).and_then(|b| {
+                                            match Self::parse_msg_sql_bytes(b) {
+                                                Some(q) if Self::tr_is_set_like_bytes(q) => {
+                                                    std::str::from_utf8(q)
+                                                        .ok()
+                                                        .map(|q| Some(q.to_string()))
+                                                }
+                                                _ => Some(None),
+                                            }
+                                        }),
+                                        None => Some(unnamed_set.clone()),
+                                    };
+                                    ext_set.on_bind(Self::leading_cstring(&msg.payload), bound);
                                 }
                                 if offload_on && batch_reads {
                                     batch_reads = match stmt_ref {
@@ -1450,6 +1486,9 @@ impl ProxyServer {
                                     );
                                 }
                             }
+                            MessageType::Execute if tr.track_gucs => {
+                                ext_set.on_execute(Self::leading_cstring(&msg.payload));
+                            }
                             MessageType::Close => {
                                 if let Some(name) = Self::stmt_kind_name(&msg.payload) {
                                     Self::remember_batch_name(
@@ -1474,6 +1513,9 @@ impl ProxyServer {
                     // ---- Extended batch boundary ----
                     MessageType::Sync | MessageType::Flush => {
                         let wait_ready = msg.msg_type == MessageType::Sync;
+                        let status_before = session
+                            .last_rfq_status
+                            .load(std::sync::atomic::Ordering::Relaxed);
                         msg.encode_into(&mut pending);
                         let batch = pending.split().freeze();
                         // Re-prepare any named statement this batch references
@@ -1624,6 +1666,7 @@ impl ProxyServer {
                                             offload_on,
                                             may_offload: offload_on
                                                 && !tr.guc_cap_hit
+                                                && !tr.serializable_default
                                                 && !session
                                                     .reads_pinned
                                                     .load(std::sync::atomic::Ordering::Relaxed),
@@ -1712,8 +1755,38 @@ impl ProxyServer {
                                 }
                             }
                         }
+                        let forwarded = used_node.is_some() && !skip_forward;
                         if let Some(n) = used_node {
                             current_node = Some(n);
+                        }
+                        // Extended-protocol SET (JDBC, Npgsql and tokio-postgres
+                        // send `SET` this way): a lone one is tracked like the
+                        // simple protocol; any other cycle that binds one keeps
+                        // the session's reads home (see `ext_set`).
+                        if tr.track_gucs {
+                            let decision = ext_set.at_boundary(ExtSetBoundary {
+                                sync: wait_ready,
+                                forwarded,
+                                idle_before: status_before == b'I',
+                                idle_after: session
+                                    .last_rfq_status
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    == b'I',
+                                failed: session
+                                    .last_response_error
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                            });
+                            match decision {
+                                ExtSetDecision::Track(sql) => {
+                                    if let Some(op) = Self::tr_guc_op(&sql) {
+                                        Self::tr_apply_guc_op(&mut tr, op, state);
+                                    }
+                                }
+                                ExtSetDecision::Pin if offload_on => session
+                                    .reads_pinned
+                                    .store(true, std::sync::atomic::Ordering::Relaxed),
+                                _ => {}
+                            }
                         }
                         if !skip_forward {
                             Self::tr_after_extended(

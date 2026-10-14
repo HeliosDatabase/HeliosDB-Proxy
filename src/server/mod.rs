@@ -92,6 +92,9 @@ mod auth;
 mod backend_conn;
 use backend_conn::{OffloadRefusals, ReadRoute, ReadRouting};
 
+mod ext_set;
+use ext_set::{ExtSetBoundary, ExtSetCycle, ExtSetDecision};
+
 mod relay;
 
 mod sql_classify;

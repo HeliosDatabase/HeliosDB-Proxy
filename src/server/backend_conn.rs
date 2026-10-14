@@ -391,6 +391,7 @@ impl ProxyServer {
     pub(super) fn mirror_now_home(conns: &mut HashMap<String, BackendConn>, target: &str) {
         if let Some(bc) = conns.get_mut(target) {
             bc.gucs_synced = None;
+            bc.gucs_role = false;
         }
     }
 
@@ -429,10 +430,11 @@ impl ProxyServer {
         let rt = state.limits.backend_read_timeout;
         let mf = state.limits.max_backend_frame_bytes;
         let reset = bc.gucs_synced.is_some();
+        let role = bc.gucs_role;
         let synced = async {
             Self::finish_pending_backend_frames(client, bc, state).await?;
             if reset {
-                Self::tr_run_discard(&mut bc.stream, "RESET ALL", wt, rt, mf, None).await?;
+                Self::tr_reset_mirrored(&mut bc.stream, role, wt, rt, mf).await?;
             }
             Self::tr_restore_session_state(&mut bc.stream, reads.gucs, wt, rt, mf).await
         }
@@ -440,6 +442,7 @@ impl ProxyServer {
         match synced {
             Ok(_) => {
                 bc.gucs_synced = Some(reads.guc_epoch);
+                bc.gucs_role = Self::tr_sets_role(reads.gucs);
                 #[cfg(feature = "pool-modes")]
                 if !reads.gucs.is_empty() {
                     bc.dirty = true;

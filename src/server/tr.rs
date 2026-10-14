@@ -233,6 +233,9 @@ pub(super) struct TrSession {
     /// Tracking stopped at the cap — the restore would be incomplete, so a
     /// failover is refused rather than re-homing with partial state.
     pub(super) guc_cap_hit: bool,
+    /// The tracked set makes SERIALIZABLE the session's default isolation
+    /// level: a standby refuses such reads, so they are not offloaded.
+    pub(super) serializable_default: bool,
     /// GUC operations issued inside the current explicit transaction, applied
     /// to `gucs` in order only if the transaction COMMITs. PostgreSQL rolls
     /// `SET`/`RESET`/`RESET ALL` back with the transaction, so must we.
@@ -277,6 +280,7 @@ impl TrSession {
             gucs: Vec::new(),
             guc_epoch: 0,
             guc_cap_hit: false,
+            serializable_default: false,
             pending_tx_gucs: Vec::new(),
             tx_savepoints: Vec::new(),
             lost_backend: None,
@@ -341,7 +345,7 @@ impl ProxyServer {
                 && (Self::contains_word_ci(t, "serializable")
                     || Self::contains_word_ci(t, "repeatable"))
         };
-        let head = sql.trim_start();
+        let head = crate::protocol::skip_leading_comments(sql);
         let opens = crate::protocol::starts_with_ci(head, "BEGIN")
             || crate::protocol::starts_with_ci(head, "START");
         if opens && strict(sql) {
@@ -356,7 +360,7 @@ impl ProxyServer {
         if opens && !Self::contains_word_ci(sql, "isolation") {
             // Inherits the session default.
             return gucs.iter().any(|g| {
-                Self::tr_guc_name(g).as_deref() == Some("default_transaction_isolation")
+                Self::tr_sets_default_isolation(g)
                     && (Self::contains_word_ci(g, "serializable")
                         || Self::contains_word_ci(g, "repeatable"))
             });
@@ -627,27 +631,17 @@ impl ProxyServer {
     /// accepts: `ROLLBACK`/`ABORT`/`COMMIT`/`END` (optionally `WORK`/
     /// `TRANSACTION`) — not `ROLLBACK TO`, not `* PREPARED`, not `AND CHAIN`.
     pub(super) fn tr_ends_transaction(sql: &str) -> bool {
-        let t = sql.trim();
-        let core = t.strip_suffix(';').unwrap_or(t).trim_end();
-        if core.contains(';') {
-            return false;
-        }
-        let mut words = core.split_ascii_whitespace();
-        let Some(first) = words.next() else {
+        let Some(w) = Self::tr_lead_words(sql, 3) else {
             return false;
         };
-        let first_ok = ["ROLLBACK", "ABORT", "COMMIT", "END"]
-            .iter()
-            .any(|w| first.eq_ignore_ascii_case(w));
-        if !first_ok {
+        let kw = |i: usize, k: &str| Self::tr_word_is(sql, &w, i, k);
+        if !(kw(0, "ROLLBACK") || kw(0, "ABORT") || kw(0, "COMMIT") || kw(0, "END")) {
             return false;
         }
-        match words.next() {
-            None => true,
-            Some(w) => {
-                (w.eq_ignore_ascii_case("WORK") || w.eq_ignore_ascii_case("TRANSACTION"))
-                    && words.next().is_none()
-            }
+        match w.len() {
+            1 => true,
+            2 => kw(1, "WORK") || kw(1, "TRANSACTION"),
+            _ => false,
         }
     }
 
@@ -660,24 +654,74 @@ impl ProxyServer {
         if core.contains(';') {
             return false;
         }
-        if Self::starts_with_word_ci(core, "RESET") {
+        let Some(w) = Self::tr_lead_words(core, 2) else {
+            return false;
+        };
+        let kw = |i: usize, k: &str| Self::tr_word_is(core, &w, i, k);
+        if kw(0, "RESET") {
             return true;
         }
-        if !Self::starts_with_word_ci(core, "SET") {
-            return false;
-        }
-        let rest = core[3..].trim_start();
-        !(Self::starts_with_word_ci(rest, "LOCAL")
-            || Self::starts_with_word_ci(rest, "TRANSACTION")
-            || Self::starts_with_word_ci(rest, "CONSTRAINTS"))
+        kw(0, "SET") && !(kw(1, "LOCAL") || kw(1, "TRANSACTION") || kw(1, "CONSTRAINTS"))
     }
 
-    /// `RESET ALL` / `DISCARD ALL` wipe every tracked session GUC.
-    pub(super) fn tr_resets_all(sql: &str) -> bool {
-        let t = sql.trim();
-        let core = t.strip_suffix(';').unwrap_or(t).trim_end();
-        (Self::starts_with_word_ci(core, "RESET") || Self::starts_with_word_ci(core, "DISCARD"))
-            && Self::contains_word_ci(core, "all")
+    /// `RESET ALL` or `DISCARD ALL` (exactly those two words, comments aside).
+    pub(super) fn tr_reset_all_op(sql: &str) -> Option<GucOp> {
+        let w = Self::tr_lead_words(sql, 3)?;
+        let kw = |i: usize, k: &str| Self::tr_word_is(sql, &w, i, k);
+        if w.len() != 2 || !kw(1, "ALL") {
+            None
+        } else if kw(0, "RESET") {
+            Some(GucOp::ResetAll)
+        } else if kw(0, "DISCARD") {
+            Some(GucOp::DiscardAll)
+        } else {
+            None
+        }
+    }
+
+    /// The first `n` words of `sql` outside comments, string literals,
+    /// dollar quotes and the like, as (byte offset, length, quoted) — quoted
+    /// identifiers keep their quotes. `None` when the text does not lex (an
+    /// unterminated literal or comment, which PostgreSQL rejects).
+    pub(super) fn tr_lead_words(sql: &str, n: usize) -> Option<Vec<(usize, usize, bool)>> {
+        let base = sql.as_ptr() as usize;
+        let mut out = Vec::with_capacity(n);
+        crate::replay_sql::words(sql, |w| {
+            out.push((w.text.as_ptr() as usize - base, w.text.len(), w.quoted));
+            out.len() < n
+        })
+        .ok()?;
+        Some(out)
+    }
+
+    /// Whether word `i` of `words` (from [`Self::tr_lead_words`] over `sql`)
+    /// is the unquoted keyword `k`.
+    pub(super) fn tr_word_is(sql: &str, words: &[(usize, usize, bool)], i: usize, k: &str) -> bool {
+        words
+            .get(i)
+            .is_some_and(|&(at, len, quoted)| !quoted && sql[at..at + len].eq_ignore_ascii_case(k))
+    }
+
+    /// The query bytes of a `Parse` payload (name cstring, query cstring,
+    /// parameter types), without UTF-8 validation.
+    pub(super) fn parse_payload_sql_bytes(payload: &[u8]) -> Option<&[u8]> {
+        let name_end = payload.iter().position(|&b| b == 0)?;
+        let q = &payload[name_end + 1..];
+        Some(&q[..q.iter().position(|&b| b == 0)?])
+    }
+
+    /// [`Self::parse_payload_sql_bytes`] of an encoded `Parse` message.
+    pub(super) fn parse_msg_sql_bytes(parse_bytes: &[u8]) -> Option<&[u8]> {
+        Self::parse_payload_sql_bytes(parse_bytes.get(5..)?)
+    }
+
+    /// The leading cstring of a message payload (the portal of a `Bind` or
+    /// an `Execute`), without its NUL.
+    pub(super) fn leading_cstring(payload: &[u8]) -> &[u8] {
+        &payload[..payload
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(payload.len())]
     }
 
     /// SQL text of an encoded `Parse` message (5-byte header, name cstring,
@@ -1064,48 +1108,85 @@ impl ProxyServer {
     /// `role`. `SET SESSION CHARACTERISTICS` has no single GUC and keys on the
     /// whole phrase.
     pub(super) fn tr_guc_name(sql: &str) -> Option<String> {
-        let t = sql.trim();
-        let core = t.strip_suffix(';').unwrap_or(t).trim_end();
-        let mut words = core.split_whitespace().peekable();
-        let verb = words.next()?;
-        if !(verb.eq_ignore_ascii_case("SET") || verb.eq_ignore_ascii_case("RESET")) {
+        let w = Self::tr_lead_words(sql, 4)?;
+        let kw = |i: usize, k: &str| Self::tr_word_is(sql, &w, i, k);
+        if !(kw(0, "SET") || kw(0, "RESET")) {
             return None;
         }
-        if words
-            .peek()
-            .is_some_and(|w| w.eq_ignore_ascii_case("SESSION"))
-        {
-            words.next();
-            if words
-                .peek()
-                .is_some_and(|w| w.eq_ignore_ascii_case("AUTHORIZATION"))
-            {
+        let mut i = 1;
+        if kw(1, "SESSION") {
+            if kw(2, "AUTHORIZATION") {
                 return Some("session_authorization".to_string());
             }
-            if words
-                .peek()
-                .is_some_and(|w| w.eq_ignore_ascii_case("CHARACTERISTICS"))
-            {
+            if kw(2, "CHARACTERISTICS") {
                 return Some("session characteristics".to_string());
             }
+            i = 2;
         }
-        let first = words.next()?;
-        let name = match first.to_ascii_lowercase().as_str() {
-            "time" if words.peek().is_some_and(|w| w.eq_ignore_ascii_case("ZONE")) => {
-                "timezone".to_string()
+        let special = [
+            ("SCHEMA", "search_path"),
+            ("NAMES", "client_encoding"),
+            ("SEED", "seed"),
+            ("ROLE", "role"),
+        ];
+        if kw(i, "TIME") && kw(i + 1, "ZONE") {
+            return Some("timezone".to_string());
+        }
+        if let Some((_, name)) = special.iter().find(|(k, _)| kw(i, k)) {
+            return Some(name.to_string());
+        }
+        // The (possibly dotted) name as written, up to whitespace, `=`, a
+        // comment or a literal.
+        let &(at, _, _) = w.get(i)?;
+        let tail = &sql[at..];
+        let mut end = tail.len();
+        for (j, c) in tail.char_indices() {
+            if c.is_whitespace()
+                || matches!(c, '=' | ';' | '\'')
+                || tail[j..].starts_with("/*")
+                || tail[j..].starts_with("--")
+            {
+                end = j;
+                break;
             }
-            "schema" => "search_path".to_string(),
-            "names" => "client_encoding".to_string(),
-            "seed" => "seed".to_string(),
-            "role" => "role".to_string(),
-            other => other
-                .split(|c: char| c == '=' || c.is_whitespace())
-                .next()
-                .unwrap_or(other)
-                .trim_matches('"')
-                .to_string(),
-        };
+        }
+        let name = tail[..end]
+            .to_ascii_lowercase()
+            .trim_matches('"')
+            .to_string();
         (!name.is_empty() && name != "all").then_some(name)
+    }
+
+    /// Whether a tracked `SET` sets the default isolation level
+    /// (`default_transaction_isolation` or `SET SESSION CHARACTERISTICS`).
+    pub(super) fn tr_sets_default_isolation(sql: &str) -> bool {
+        matches!(
+            Self::tr_guc_name(sql).as_deref(),
+            Some("default_transaction_isolation" | "session characteristics")
+        )
+    }
+
+    /// Whether the tracked set makes SERIALIZABLE the default isolation
+    /// level. PostgreSQL refuses such a session's reads on a hot standby
+    /// ("cannot use serializable mode in a hot standby").
+    pub(super) fn tr_serializable_default(gucs: &[String]) -> bool {
+        gucs.iter().any(|g| {
+            Self::tr_sets_default_isolation(g) && Self::contains_word_ci(g, "serializable")
+        })
+    }
+
+    /// Whether a `SET` changes the current role or the session
+    /// authorization, which PostgreSQL's `RESET ALL` does not reset.
+    pub(super) fn tr_is_role_set(sql: &str) -> bool {
+        matches!(
+            Self::tr_guc_name(sql).as_deref(),
+            Some("role" | "session_authorization")
+        )
+    }
+
+    /// Whether a tracked set changes the role or the session authorization.
+    pub(super) fn tr_sets_role(gucs: &[String]) -> bool {
+        gucs.iter().any(|g| Self::tr_is_role_set(g))
     }
 
     /// Apply a `SET` to the committed restore set: replace the variable's
@@ -1131,6 +1212,37 @@ impl ProxyServer {
             .retain(|g| Self::tr_guc_name(g).as_deref() != Some(name));
     }
 
+    /// Whether `sql`, after any leading comments, is a `SET`, `RESET` or
+    /// `DISCARD`.
+    pub(super) fn tr_is_set_like(sql: &str) -> bool {
+        Self::tr_is_set_like_bytes(sql.as_bytes())
+    }
+
+    /// [`Self::tr_is_set_like`] over raw statement bytes: a prefix test, no
+    /// UTF-8 validation (per-`Bind` cost).
+    pub(super) fn tr_is_set_like_bytes(sql: &[u8]) -> bool {
+        crate::protocol::leads_with_keyword(sql, "SET")
+            || crate::protocol::leads_with_keyword(sql, "RESET")
+            || crate::protocol::leads_with_keyword(sql, "DISCARD")
+    }
+
+    /// The session-GUC effect of `sql`, which may carry comments: `RESET
+    /// ALL` / `DISCARD ALL`; a session `SET` or `RESET` of one variable, kept
+    /// without its leading comments. `None` for anything else (`SET LOCAL`,
+    /// `SET TRANSACTION`, other `DISCARD`s, several statements).
+    pub(super) fn tr_guc_op(sql: &str) -> Option<GucOp> {
+        let core = crate::protocol::skip_leading_comments(sql);
+        if let Some(op) = Self::tr_reset_all_op(core) {
+            Some(op)
+        } else if !Self::tr_is_session_set(core) {
+            None
+        } else if Self::starts_with_word_ci(core, "RESET") {
+            Self::tr_guc_name(core).map(GucOp::Reset)
+        } else {
+            Some(GucOp::Set(core.to_string()))
+        }
+    }
+
     /// Apply one deferred transaction op at COMMIT.
     pub(super) fn tr_apply_guc_op(tr: &mut TrSession, op: GucOp, state: &Arc<ServerState>) {
         tr.guc_epoch += 1;
@@ -1138,10 +1250,17 @@ impl ProxyServer {
             GucOp::Set(sql) => Self::tr_apply_set(tr, &sql, state),
             GucOp::Reset(name) => Self::tr_apply_reset(tr, &name),
             GucOp::ResetAll => {
+                // PostgreSQL's RESET ALL keeps the role and the session
+                // authorization (never dropped at the cap, so it is lifted).
+                tr.gucs.retain(|g| Self::tr_is_role_set(g));
+                tr.guc_cap_hit = false;
+            }
+            GucOp::DiscardAll => {
                 tr.gucs.clear();
                 tr.guc_cap_hit = false;
             }
         }
+        tr.serializable_default = Self::tr_serializable_default(&tr.gucs);
     }
 
     /// `SAVEPOINT s` / `RELEASE [SAVEPOINT] s` / `ROLLBACK TO [SAVEPOINT] s`
@@ -1209,12 +1328,15 @@ impl ProxyServer {
         Ok(())
     }
 
-    /// Append one tracked session `SET`, honouring the cap.
+    /// Append one tracked session `SET`, honouring the cap. The role and the
+    /// session authorization are one slot each and always fit: `RESET ALL`
+    /// keeps them, so it could not lift the cap if one had been dropped.
     pub(super) fn tr_push_guc(tr: &mut TrSession, sql: &str, state: &Arc<ServerState>) {
-        if tr.guc_cap_hit {
+        let role = Self::tr_is_role_set(sql);
+        if tr.guc_cap_hit && !role {
             return;
         }
-        if tr.gucs.len() >= state.limits.tr_max_session_set_statements {
+        if tr.gucs.len() >= state.limits.tr_max_session_set_statements && !role {
             tr.guc_cap_hit = true;
             state
                 .metrics
@@ -1236,7 +1358,8 @@ impl ProxyServer {
     /// the replay record and is only invoked while inside an explicit
     /// transaction in `select`/`transaction` mode. `extended_kind` supplies
     /// the whole cycle's safety classification; None denotes simple protocol
-    /// and enables GUC tracking (extended SETs are not tracked).
+    /// and enables GUC tracking here (the client loop tracks a lone
+    /// extended-protocol SET itself, see `ext_set`).
     ///
     /// Hot-path cost outside a transaction: a few prefix compares, no
     /// allocation, no lock.
@@ -1287,27 +1410,14 @@ impl ProxyServer {
             *kind_cache.get_or_insert_with(|| Self::tr_classify(sql, &state.tr_read_policy))
         };
 
-        // --- session GUC tracking (simple protocol only) ---
+        // --- session GUC tracking (simple protocol; the client loop tracks a
+        // lone extended-protocol SET itself) ---
         if tr.track_gucs && simple {
-            let is_set_like = crate::protocol::starts_with_ci(sql.trim_start(), "SET")
-                || crate::protocol::starts_with_ci(sql.trim_start(), "RESET")
-                || crate::protocol::starts_with_ci(sql.trim_start(), "DISCARD");
-            if is_set_like && !had_error {
+            if Self::tr_is_set_like(sql) && !had_error {
                 // Inside a transaction every GUC change is deferred: PostgreSQL
                 // rolls SET/RESET/RESET ALL back with the transaction, so the
                 // restore set must not learn them until COMMIT.
-                let op = if Self::tr_resets_all(sql) {
-                    Some(GucOp::ResetAll)
-                } else if Self::tr_is_session_set(sql) {
-                    if crate::protocol::starts_with_ci(sql.trim_start(), "RESET") {
-                        Self::tr_guc_name(sql).map(GucOp::Reset)
-                    } else {
-                        Some(GucOp::Set(sql.to_string()))
-                    }
-                } else {
-                    None
-                };
-                if let Some(op) = op {
+                if let Some(op) = Self::tr_guc_op(sql) {
                     if now_in_tx {
                         tr.pending_tx_gucs.push(op);
                     } else {
@@ -1315,12 +1425,12 @@ impl ProxyServer {
                     }
                 }
             } else if now_in_tx && !had_error {
-                let head = sql.trim_start();
+                let head = crate::protocol::skip_leading_comments(sql);
                 if crate::protocol::starts_with_ci(head, "SAVEPOINT")
                     || crate::protocol::starts_with_ci(head, "RELEASE")
                     || crate::protocol::starts_with_ci(head, "ROLLBACK")
                 {
-                    Self::tr_note_savepoint(tr, sql);
+                    Self::tr_note_savepoint(tr, head);
                 }
             }
             if was_in_tx && !now_in_tx {
@@ -1947,6 +2057,35 @@ impl ProxyServer {
         Ok(gucs.len())
     }
 
+    /// Bring a socket that took mirrored settings back to its defaults:
+    /// `RESET ALL`, plus `RESET SESSION AUTHORIZATION` and `RESET ROLE` when
+    /// the mirrored set changed them (`RESET ALL` leaves both in place).
+    pub(super) async fn tr_reset_mirrored<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+        backend: &mut S,
+        role: bool,
+        write_timeout: Duration,
+        read_timeout: Duration,
+        max_frame_bytes: usize,
+    ) -> Result<()> {
+        let resets: &[&str] = if role {
+            &["RESET ALL", "RESET SESSION AUTHORIZATION", "RESET ROLE"]
+        } else {
+            &["RESET ALL"]
+        };
+        for sql in resets {
+            Self::tr_run_discard(
+                backend,
+                sql,
+                write_timeout,
+                read_timeout,
+                max_frame_bytes,
+                None,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Re-home the session: wait for a healthy primary (bounded by
     /// `write_timeout_secs`), dial it (startup params re-sent by
     /// `ensure_conn`), restore the tracked session GUCs, and make it the
@@ -1992,10 +2131,10 @@ impl ProxyServer {
                     // A socket that took mirrored settings for offloaded
                     // reads may carry an older set: start from its defaults.
                     let mirrored = bc.gucs_synced.is_some();
+                    let role = bc.gucs_role;
                     match tokio::time::timeout_at(deadline, async {
                         if mirrored {
-                            Self::tr_run_discard(&mut bc.stream, "RESET ALL", wt, rt, mf, None)
-                                .await?;
+                            Self::tr_reset_mirrored(&mut bc.stream, role, wt, rt, mf).await?;
                         }
                         Self::tr_restore_session_state(&mut bc.stream, &tr.gucs, wt, rt, mf).await
                     })
@@ -2004,6 +2143,7 @@ impl ProxyServer {
                     {
                         Ok(n) => {
                             bc.gucs_synced = None;
+                            bc.gucs_role = false;
                             #[cfg(feature = "pool-modes")]
                             if n > 0 {
                                 bc.dirty = true;

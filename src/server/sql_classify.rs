@@ -380,12 +380,12 @@ impl ProxyServer {
     /// the primary or fails during recovery ([`STANDBY_UNSAFE_FUNCTIONS`]).
     /// Everything else is never offloaded.
     pub(super) fn standby_safe_read(sql: &str, policy: &TrReadPolicy) -> bool {
-        let t = sql.trim_start();
+        let t = crate::protocol::skip_leading_comments(sql);
         let read_lead = Self::starts_with_word_ci(t, "SELECT")
             || Self::starts_with_word_ci(t, "VALUES")
             || Self::starts_with_word_ci(t, "TABLE")
             || Self::starts_with_word_ci(t, "WITH");
-        if !read_lead || Self::tr_classify(sql, policy) != StmtKind::Read {
+        if !read_lead || Self::tr_classify(t, policy) != StmtKind::Read {
             return false;
         }
         if Self::contains_word_ci(t, "for")
@@ -440,9 +440,10 @@ impl ProxyServer {
     /// `LISTEN`, `LOAD`, a GUC change through `set_config()` — or a
     /// multi-statement string, whose leading keyword vouches for nothing
     /// after the first `;`. Session `SET`/`RESET` are not here: they are
-    /// tracked and mirrored.
+    /// tracked and mirrored. Leading comments (sqlcommenter tags) do not hide
+    /// the statement.
     pub(super) fn pins_reads(sql: &str) -> bool {
-        let t = sql.trim();
+        let t = crate::protocol::skip_leading_comments(sql).trim_end();
         let core = t.strip_suffix(';').unwrap_or(t).trim_end();
         if core.contains(';') {
             return true;

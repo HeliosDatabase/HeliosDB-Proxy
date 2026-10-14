@@ -84,6 +84,15 @@ fn standby_safe_reads_are_single_side_effect_free_reads() {
         ("BEGIN", false),
         ("SET search_path TO app", false),
         ("", false),
+        // Leading comments (sqlcommenter tags) do not hide the statement.
+        ("/* app=shop,route=x */ SELECT * FROM t", true),
+        ("-- note\nSELECT 1", true),
+        ("/* a /* nested */ b */ SELECT 1", true),
+        ("/* SELECT */ DELETE FROM t", false),
+        ("-- SELECT\nINSERT INTO t VALUES (1)", false),
+        ("/* app=shop */ SELECT * FROM t FOR UPDATE", false),
+        ("/* app=shop */ SELECT nextval('s')", false),
+        ("/* unterminated SELECT 1", false),
     ] {
         assert_eq!(
             ProxyServer::standby_safe_read(sql, &policy),
@@ -122,6 +131,15 @@ fn statements_that_leave_connection_state_pin_reads() {
         ("CREATE TABLE t (a int)", false),
         ("SELECT * FROM t", false),
         ("INSERT INTO t VALUES (1)", false),
+        ("/* app=shop */ CREATE TEMP TABLE x (a int)", true),
+        ("-- note\nDECLARE c CURSOR FOR SELECT 1", true),
+        ("/* a /* nested */ b */ LISTEN chan", true),
+        (
+            "/* app=shop */ SELECT set_config('app.x', '1', false)",
+            true,
+        ),
+        ("/* a; b */ SELECT * FROM t", false),
+        ("/* app=shop */ SET search_path TO app", false),
     ] {
         assert_eq!(ProxyServer::pins_reads(sql), pins, "{sql:?}");
     }

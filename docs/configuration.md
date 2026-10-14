@@ -239,8 +239,11 @@ inside a transaction are deferred to commit. Variables are keyed by name, so
 repeating a `SET` reuses its slot; the cap `tr_max_session_set_statements` counts
 **distinct variables**, and exceeding it refuses the failover with `08006` rather
 than re-homing a session with incomplete state. It covers simple-protocol
-statements only — extended-protocol `SET`s as sent by JDBC, SQL-level `PREPARE`,
-session temp tables and cursors are not restored.
+statements, and an extended-protocol `SET`/`RESET`/`DISCARD ALL` sent alone outside a
+transaction (one Bind and Execute in the cycle, the way JDBC, Npgsql and tokio-postgres
+send a `SET`); leading comments do not hide a statement. An extended-protocol `SET`
+inside a transaction or batched with other statements, SQL-level `PREPARE`, session
+temp tables and cursors are not restored.
 
 **Backend credentials.** Re-homing a session means opening a *fresh* backend
 connection. In pass-through auth mode the proxy never sees the client's
@@ -405,15 +408,21 @@ primary serves the read. A result a standby served is never stored in the query 
 the edge cache: it may predate a write the cache was just invalidated for. Counters:
 `heliosdb_proxy_reads_offloaded_total`, `heliosdb_proxy_read_mirror_failures_total`.
 
-**Session state.** Session-level `SET`/`RESET` sent with the simple protocol go to the
-primary and are mirrored onto a standby connection before its next read (`RESET ALL`, then
-the session's settings, once per change; session pooling only, since transaction and
-statement pooling reset connections anyway). A session that creates state only its primary
-connection holds keeps its reads on the primary for the rest of its life: temporary tables
-(`CREATE TEMP …`, `SELECT … INTO`), cursors (`DECLARE`), SQL `PREPARE`, `LISTEN`, `LOAD`,
-`set_config()`, a multi-statement simple query, an extended-protocol `SET`/`RESET`/`DISCARD`,
-more tracked `SET`s than `[limits] tr_max_session_set_statements`, or a `SET` the standby
-refuses.
+**Session state.** Session-level `SET`/`RESET` go to the primary and are mirrored onto a
+standby connection before its next read (`RESET ALL`, then the session's settings, once per
+change; session pooling only, since transaction and statement pooling reset connections
+anyway). That covers the simple protocol and an extended-protocol `SET`/`RESET`/`DISCARD`
+sent alone outside a transaction, as JDBC, Npgsql and tokio-postgres send one. Comments,
+such as sqlcommenter tags, do not hide a statement from this tracking or from read
+classification. `RESET ALL` keeps `SET ROLE` and `SET SESSION AUTHORIZATION`, as in
+PostgreSQL; `DISCARD ALL` resets them. While the session's default isolation level is
+SERIALIZABLE its reads stay on the primary (a hot standby refuses them). A session that
+creates state only its primary connection holds keeps its reads on the primary for the
+rest of its life: temporary tables (`CREATE TEMP …`, `SELECT … INTO`), cursors
+(`DECLARE`), SQL `PREPARE`, `LISTEN`, `LOAD`, `set_config()`, a multi-statement simple
+query, an extended-protocol `SET`/`RESET`/`DISCARD` inside a transaction, batched with
+other statements or split by a Flush, more tracked `SET`s than
+`[limits] tr_max_session_set_statements`, or a `SET` the standby refuses.
 
 **Authentication.** A standby connection is opened by the proxy itself. With the default
 pass-through auth (`[auth] mode = "passthrough"`) the proxy holds no password for that, so a
@@ -1536,8 +1545,9 @@ published nothing to the client before the fault.
 
 ### Session state across a failover (TR-04)
 
-`SET`/`RESET` issued through the simple query protocol are tracked per session and
-replayed, in order, onto the replacement backend when the session re-homes. The
+`SET`/`RESET` issued through the simple query protocol, or alone through the extended
+protocol outside a transaction, are tracked per session and replayed, in order, onto the
+replacement backend when the session re-homes. The
 tracking is transactional, mirroring PostgreSQL: a `SET` inside an explicit
 transaction takes effect for restore only when that transaction commits; `ROLLBACK`
 discards it; `ROLLBACK TO SAVEPOINT` discards the `SET`s made after the savepoint
@@ -1545,8 +1555,10 @@ discards it; `ROLLBACK TO SAVEPOINT` discards the `SET`s made after the savepoin
 transaction are likewise deferred until commit. `SET LOCAL`, `SET TRANSACTION` and
 `SET CONSTRAINTS` are transaction-scoped and never tracked. Variables are identified
 by name (`SET TIME ZONE` is `timezone`, `SET SCHEMA` is `search_path`, `SET NAMES`
-is `client_encoding`), so repeated `SET`s of one variable cost one slot. Extended-
-protocol `SET`s, `SQL PREPARE`, temporary tables and cursors are not restored.
+is `client_encoding`), so repeated `SET`s of one variable cost one slot; the role and the
+session authorization always fit, because `RESET ALL` keeps them (as in PostgreSQL) while
+`DISCARD ALL` resets them. Extended-protocol `SET`s inside a transaction or batched with
+other statements, `SQL PREPARE`, temporary tables and cursors are not restored.
 
 ### Replay verification and the recovery deadline (TR-06)
 

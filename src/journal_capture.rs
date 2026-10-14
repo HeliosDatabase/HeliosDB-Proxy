@@ -103,26 +103,6 @@ impl StmtKind {
     }
 }
 
-/// Skip leading whitespace and SQL comments (`-- …` and `/* … */`).
-fn skip_leading_comments(mut s: &str) -> &str {
-    loop {
-        s = s.trim_start();
-        if let Some(rest) = s.strip_prefix("--") {
-            s = match rest.find('\n') {
-                Some(i) => &rest[i + 1..],
-                None => "",
-            };
-        } else if let Some(rest) = s.strip_prefix("/*") {
-            s = match rest.find("*/") {
-                Some(i) => &rest[i + 2..],
-                None => "",
-            };
-        } else {
-            return s;
-        }
-    }
-}
-
 /// The first SQL word (ASCII letters/digits/underscore) and the remainder.
 fn first_word(s: &str) -> (&str, &str) {
     let end = s
@@ -149,7 +129,7 @@ fn savepoint_name(rest: &str) -> String {
 
 /// Classify one statement (no interior `;`).
 fn classify_single(sql: &str) -> StmtKind {
-    let s = skip_leading_comments(sql);
+    let s = crate::protocol::skip_leading_comments(sql);
     let (w, rest) = first_word(s);
     let (w2, rest2) = first_word(rest.trim_start());
     let upper = |kw: &str| word_eq(w, kw);

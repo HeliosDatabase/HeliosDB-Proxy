@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Read offload and transaction replay now see a statement behind comments, such as
+  sqlcommenter tags (`/* app=shop */ SET search_path TO tenant1`). Such a `SET` was
+  neither tracked nor did it keep the session's reads on the primary, so offloaded reads
+  ran with the default settings, for example another tenant's `search_path`. A tagged
+  `CREATE TEMP`, `DECLARE` or `LISTEN` did not pin the session either, a tagged
+  `SAVEPOINT` was not seen by the transactional `SET` tracking, and `RESET x /* all */`
+  was taken for `RESET ALL`. Comments nest and a `--` comment ends at a line feed or
+  carriage return, as in PostgreSQL. Tagged reads now offload like untagged ones. Under
+  the aborted-transaction emulation after a failover, a tagged `ROLLBACK` is now accepted.
+- `RESET ALL` no longer forgets a tracked `SET ROLE` or `SET SESSION AUTHORIZATION`:
+  PostgreSQL's `RESET ALL` leaves both in place, so after `SET ROLE tenant_a; RESET ALL`
+  offloaded reads and a transaction-replay re-home ran as the session user instead of
+  `tenant_a`. `DISCARD ALL` still resets them. A standby connection that took a mirrored
+  role is reset with `RESET SESSION AUTHORIZATION` and `RESET ROLE` as well, so `RESET ROLE`
+  reaches it too. The role and the session authorization always fit under
+  `[limits] tr_max_session_set_statements`.
+- Reads are no longer offloaded while the session's default isolation level is
+  SERIALIZABLE (`default_transaction_isolation` or `SET SESSION CHARACTERISTICS`): a hot
+  standby refuses them ("cannot use serializable mode in a hot standby").
+- An extended-protocol `SET`/`RESET`/`DISCARD ALL` sent alone outside a transaction (one
+  Bind and one Execute of the same portal in the cycle, the way JDBC, Npgsql and
+  tokio-postgres send a `SET`) is now tracked like a simple-protocol one. It is mirrored
+  onto standby connections, so such sessions keep offloading reads instead of being
+  pinned to the primary after their first `SET`, and transaction replay restores it on a
+  replacement backend; it now counts toward `tr_max_session_set_statements`, and a
+  replacement backend that rejects it aborts the re-home like any tracked `SET`. Inside a
+  transaction, batched with other statements or split by a Flush, it keeps the session's
+  reads on the primary and is not restored; so does a cycle after which the proxy cannot
+  be sure which prepared statements the backend holds.
 - A backend that ends an idle session (`pg_terminate_backend`, a fast shutdown during a
   switchover, `idle_session_timeout`) sends a FATAL `ErrorResponse` before it closes.
   The idle backend-watch forwarded that frame to the client although the proxy keeps the

@@ -25,6 +25,13 @@ Cases (each on a new client connection unless noted):
   sync_none      standby_reads = "sync", standby not marked synchronous: primary.
   sync           standby_reads = "sync", [[nodes]] synchronous = true: standby.
   split_off      read_write_split = false: primary.
+  ext_set        a SET sent with the extended protocol (Parse/Bind/Execute/Sync, as JDBC
+                 sends it) and a SET behind a sqlcommenter tag are mirrored onto the
+                 standby (a tagged read offloads too); an extended SET inside a
+                 transaction keeps the session's reads on the primary.
+  role           SET ROLE is mirrored onto the standby, RESET ALL keeps it (as in
+                 PostgreSQL), RESET ROLE drops it there too; a SERIALIZABLE default
+                 isolation level keeps reads on the primary.
   scram_login    pass-through auth and a login the standby wants a password for (a
                  scram-sha-256 pg_hba row for user rr_pw, connecting with psql from the
                  container): its reads fall back to the primary without an error, a later
@@ -135,6 +142,50 @@ def case_expect(expected):
     return run
 
 
+def case_ext_set(address, _admin):
+    probe = "SELECT host(inet_server_addr()), current_setting('application_name')"
+    r = {}
+    with tr08.startup(address) as c:
+        r["ext_set"] = extended(c, "", "SET application_name = 'rr-ext'")
+        time.sleep(RYW_WAIT)
+        res = tr08.rows(query(c, probe))
+        r["ext_set_mirrored"] = res[0] if res else None
+        query(c, "/* app=rr */ SET application_name = 'rr-tagged'")
+        time.sleep(RYW_WAIT)
+        res = tr08.rows(query(c, "/* app=rr */ " + probe))
+        r["tagged_set_mirrored"] = res[0] if res else None
+        query(c, "BEGIN")
+        r["ext_set_in_tx"] = extended(c, "", "SET application_name = 'rr-in-tx'")
+        query(c, "COMMIT")
+        time.sleep(RYW_WAIT)
+        r["read_after_tx_set"] = where(c)
+    r["ok"] = (r["ext_set"] == "no rows" and r["ext_set_mirrored"] == [STANDBY, "rr-ext"]
+               and r["tagged_set_mirrored"] == [STANDBY, "rr-tagged"]
+               and r["read_after_tx_set"] == PRIMARY)
+    return r
+
+
+def case_role(address, _admin):
+    probe = "SELECT host(inet_server_addr()), current_user"
+    r = {}
+    with tr08.startup(address) as c:
+        for step, sql in [("after_set_role", "SET ROLE rr_tenant"),
+                          ("after_reset_all", "RESET ALL"),
+                          ("after_reset_role", "RESET ROLE")]:
+            query(c, sql)
+            time.sleep(RYW_WAIT)
+            res = tr08.rows(query(c, probe))
+            r[step] = res[0] if res else None
+        query(c, "SET default_transaction_isolation = 'serializable'")
+        time.sleep(RYW_WAIT)
+        r["serializable_read"] = where(c)
+    r["ok"] = (r["after_set_role"] == [STANDBY, "rr_tenant"]
+               and r["after_reset_all"] == [STANDBY, "rr_tenant"]
+               and r["after_reset_role"] == [STANDBY, "audit"]
+               and r["serializable_read"] == PRIMARY)
+    return r
+
+
 def psql_rr_pw(name, address, *sqls):
     """Run `sqls` in one psql session (SCRAM login rr_pw) through the proxy."""
     cmd = ["docker", "exec", "--env", f"PGPASSWORD={RR_PW_PASSWORD}", name, "psql", "-X", "-At",
@@ -232,12 +283,15 @@ def main():
         ("sync_none", 'standby_reads = "sync"', "", case_expect(PRIMARY)),
         ("sync", 'standby_reads = "sync"', "synchronous = true", case_expect(STANDBY)),
         ("split_off", "read_write_split = false", "", case_expect(PRIMARY)),
+        ("ext_set", "", "", case_ext_set),
+        ("role", "", "", case_role),
         ("scram_login", "", "", case_scram_login(name)),
     ]
     try:
         version = f2.start_postgres(name, tr08.PG_ADDRESS[1])
         tr08.pg_query("CREATE TABLE rr_t (a int)")
         tr08.pg_query(f"CREATE ROLE rr_pw LOGIN PASSWORD '{RR_PW_PASSWORD}'")
+        tr08.pg_query("CREATE ROLE rr_tenant")
         subprocess.run(["docker", "exec", name, "sh", "-c",
                         'sed -i "1i host all rr_pw all scram-sha-256" "$PGDATA/pg_hba.conf"'],
                        check=True, capture_output=True, timeout=20)

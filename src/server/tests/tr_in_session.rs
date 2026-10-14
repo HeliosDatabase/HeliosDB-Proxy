@@ -333,6 +333,9 @@ fn tr_ends_transaction_recognises_single_statement_ends_only() {
         "COMMIT WORK",
         "END TRANSACTION",
         " Rollback Work ; ",
+        "/* app=shop */ ROLLBACK",
+        "ROLLBACK /* app=shop */",
+        "-- note\rCOMMIT",
     ] {
         assert!(f(s), "{s}");
     }
@@ -345,6 +348,8 @@ fn tr_ends_transaction_recognises_single_statement_ends_only() {
         "SELECT 1",
         "",
         "ENDING",
+        "/* ROLLBACK */ SELECT 1",
+        "ROLLBACK /* x */ TO SAVEPOINT a",
     ] {
         assert!(!f(s), "{s}");
     }
@@ -364,11 +369,17 @@ fn tr_session_set_tracking_filters() {
     assert!(!set("SET a = 1; SET b = 2"));
     assert!(!set("SELECT set_config('a','b',false)"));
     assert!(!set("SETTINGS"));
-    let all = ProxyServer::tr_resets_all;
-    assert!(all("RESET ALL"));
-    assert!(all("discard all;"));
-    assert!(!all("RESET application_name"));
-    assert!(!all("DISCARD PLANS"));
+    assert!(set("SET search_path TO app /* app=shop */"));
+    assert!(!set("SET /* x */ LOCAL work_mem = 1"));
+    let all = ProxyServer::tr_reset_all_op;
+    assert_eq!(all("RESET ALL"), Some(GucOp::ResetAll));
+    assert_eq!(all("discard all;"), Some(GucOp::DiscardAll));
+    assert_eq!(all("RESET /* c */ ALL /* d */"), Some(GucOp::ResetAll));
+    assert_eq!(all("RESET application_name"), None);
+    assert_eq!(all("DISCARD PLANS"), None);
+    // A comment that says "all" is not ALL.
+    assert_eq!(all("RESET work_mem /* all */"), None);
+    assert_eq!(all("DISCARD PLANS -- all"), None);
 }
 
 #[test]
@@ -1200,8 +1211,217 @@ async fn tr_recorder_session_gucs_are_transactional_and_savepoint_scoped() {
 }
 
 #[test]
+fn tr_guc_op_sees_through_leading_comments() {
+    let op = ProxyServer::tr_guc_op;
+    assert_eq!(
+        op("/* app=shop */ SET search_path TO tenant1"),
+        Some(GucOp::Set("SET search_path TO tenant1".to_string()))
+    );
+    assert_eq!(
+        op("-- note\n  set work_mem = '64MB';"),
+        Some(GucOp::Set("set work_mem = '64MB';".to_string()))
+    );
+    assert_eq!(
+        op("/* a /* nested */ b */ RESET work_mem"),
+        Some(GucOp::Reset("work_mem".to_string()))
+    );
+    assert_eq!(op("/* x */ RESET ALL"), Some(GucOp::ResetAll));
+    assert_eq!(op("DISCARD ALL"), Some(GucOp::DiscardAll));
+    assert_eq!(
+        op("RESET /* c */ search_path"),
+        Some(GucOp::Reset("search_path".to_string()))
+    );
+    assert_eq!(
+        op("RESET work_mem /* all */"),
+        Some(GucOp::Reset("work_mem".to_string()))
+    );
+    assert_eq!(
+        op("-- t\rSET search_path TO t2"),
+        Some(GucOp::Set("SET search_path TO t2".to_string()))
+    );
+    for none in [
+        "SET LOCAL work_mem = '1MB'",
+        "/* x */ SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "DISCARD PLANS",
+        "SET a = 1; SET b = 2",
+        "SELECT 1",
+        "/* unterminated SET a = 1",
+    ] {
+        assert_eq!(op(none), None, "{none:?}");
+    }
+    let like = ProxyServer::tr_is_set_like;
+    assert!(like("/* app=shop */ set search_path TO x"));
+    assert!(like("-- c\nDISCARD ALL"));
+    assert!(!like("SELECT 'SET a = 1'"));
+    assert!(!like("SETTINGS"));
+}
+
+/// sqlcommenter tags every statement with a leading comment: the tracker
+/// must still see the SETs, RESETs and savepoints behind it, or offloaded
+/// reads (and a TR re-home) would run with the default settings.
+#[tokio::test]
+async fn tr_recorder_tracks_gucs_behind_leading_comments() {
+    let server = ProxyServer::new(test_config()).unwrap();
+    let state = server.state.clone();
+    let session = make_test_session();
+    let mut tr = TrSession::new(TrMode::Session);
+    async fn step(
+        tr: &mut TrSession,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        status: u8,
+        sql: &str,
+    ) {
+        ProxyServer::note_ready_for_query(session, status, false);
+        ProxyServer::tr_after_simple(tr, &qmsg(sql), session, state).await;
+    }
+    let s = (&session, &state);
+    step(
+        &mut tr,
+        s.0,
+        s.1,
+        b'I',
+        "/* app=shop */ SET search_path TO tenant1",
+    )
+    .await;
+    step(
+        &mut tr,
+        s.0,
+        s.1,
+        b'I',
+        "/* a */ -- b\n SET work_mem = '64MB'",
+    )
+    .await;
+    assert_eq!(
+        tr.gucs,
+        vec!["SET search_path TO tenant1", "SET work_mem = '64MB'"]
+    );
+    let epoch = tr.guc_epoch;
+    step(&mut tr, s.0, s.1, b'I', "/* app=shop */ RESET work_mem").await;
+    assert_eq!(tr.gucs, vec!["SET search_path TO tenant1"]);
+    assert!(tr.guc_epoch > epoch);
+
+    // A savepoint behind a comment still scopes the SETs made after it.
+    step(&mut tr, s.0, s.1, b'T', "BEGIN").await;
+    step(&mut tr, s.0, s.1, b'T', "/* c */ SAVEPOINT s1").await;
+    step(
+        &mut tr,
+        s.0,
+        s.1,
+        b'T',
+        "/* c */ SET search_path TO tenant2",
+    )
+    .await;
+    step(&mut tr, s.0, s.1, b'T', "/* c */ ROLLBACK TO SAVEPOINT s1").await;
+    step(&mut tr, s.0, s.1, b'I', "COMMIT").await;
+    assert_eq!(tr.gucs, vec!["SET search_path TO tenant1"]);
+
+    step(&mut tr, s.0, s.1, b'I', "/* app=shop */ RESET ALL").await;
+    assert!(tr.gucs.is_empty());
+}
+
+/// PostgreSQL's `RESET ALL` keeps the role and the session authorization;
+/// `DISCARD ALL` resets them too. Both always fit under the cap.
+#[tokio::test]
+async fn tr_recorder_reset_all_keeps_the_role() {
+    let mut config = test_config();
+    config.limits.tr_max_session_set_statements = 1;
+    let server = ProxyServer::new(config).unwrap();
+    let state = server.state.clone();
+    let session = make_test_session();
+    let mut tr = TrSession::new(TrMode::Session);
+    async fn step(
+        tr: &mut TrSession,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        sql: &str,
+    ) {
+        ProxyServer::note_ready_for_query(session, b'I', false);
+        ProxyServer::tr_after_simple(tr, &qmsg(sql), session, state).await;
+    }
+    for sql in [
+        "SET work_mem = '64MB'",
+        "SET ROLE tenant_a",
+        "SET SESSION AUTHORIZATION app",
+    ] {
+        step(&mut tr, &session, &state, sql).await;
+    }
+    assert_eq!(
+        tr.gucs,
+        vec![
+            "SET work_mem = '64MB'",
+            "SET ROLE tenant_a",
+            "SET SESSION AUTHORIZATION app"
+        ],
+        "the role and the session authorization fit past the cap"
+    );
+    assert!(!tr.guc_cap_hit);
+    step(&mut tr, &session, &state, "SET search_path TO x").await;
+    assert!(tr.guc_cap_hit);
+    assert!(ProxyServer::tr_sets_role(&tr.gucs));
+
+    step(&mut tr, &session, &state, "RESET ALL").await;
+    assert_eq!(
+        tr.gucs,
+        vec!["SET ROLE tenant_a", "SET SESSION AUTHORIZATION app"]
+    );
+    assert!(!tr.guc_cap_hit);
+
+    step(&mut tr, &session, &state, "RESET ROLE").await;
+    assert_eq!(tr.gucs, vec!["SET SESSION AUTHORIZATION app"]);
+
+    step(&mut tr, &session, &state, "DISCARD ALL").await;
+    assert!(tr.gucs.is_empty());
+}
+
+/// A SERIALIZABLE default isolation level (either spelling) is flagged: a hot
+/// standby refuses such reads, so they stay on the primary.
+#[tokio::test]
+async fn tr_recorder_flags_a_serializable_default() {
+    let server = ProxyServer::new(test_config()).unwrap();
+    let state = server.state.clone();
+    let session = make_test_session();
+    let mut tr = TrSession::new(TrMode::Session);
+    for (sql, serializable) in [
+        ("SET default_transaction_isolation = 'serializable'", true),
+        (
+            "SET default_transaction_isolation = 'read committed'",
+            false,
+        ),
+        (
+            "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            true,
+        ),
+        ("RESET ALL", false),
+        (
+            "/* jdbc */ SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            true,
+        ),
+        ("DISCARD ALL", false),
+    ] {
+        ProxyServer::note_ready_for_query(&session, b'I', false);
+        ProxyServer::tr_after_simple(&mut tr, &qmsg(sql), &session, &state).await;
+        assert_eq!(tr.serializable_default, serializable, "{sql}");
+    }
+}
+
+#[test]
 fn tr_guc_name_identifies_the_variable() {
     let n = |sql: &str| ProxyServer::tr_guc_name(sql);
+    assert_eq!(
+        n("RESET /* c */ search_path").as_deref(),
+        Some("search_path")
+    );
+    assert_eq!(n("SET app.tenant = 'a'").as_deref(), Some("app.tenant"));
+    assert_eq!(
+        n("SET app.tenant/* c */= 'a'").as_deref(),
+        Some("app.tenant")
+    );
+    assert_eq!(
+        n("SET search_path TO app /* sqlcommenter='x' */").as_deref(),
+        Some("search_path")
+    );
+    assert_eq!(n("SET /* c */ ROLE x").as_deref(), Some("role"));
     assert_eq!(
         n("SET application_name = 'x'").as_deref(),
         Some("application_name")

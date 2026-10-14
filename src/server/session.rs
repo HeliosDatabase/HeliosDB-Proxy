@@ -252,6 +252,10 @@ pub(super) struct BackendConn {
     /// date with (offloaded reads mirror the primary's session GUCs onto a
     /// standby connection). `None`: never synchronised.
     pub(super) gucs_synced: Option<u64>,
+    /// The mirrored set this socket took changed the role or the session
+    /// authorization, which `RESET ALL` leaves in place: resetting the socket
+    /// then also needs `RESET SESSION AUTHORIZATION` and `RESET ROLE`.
+    pub(super) gucs_role: bool,
     /// Signature (query text + parameter-type OIDs) of the *unnamed* prepared
     /// statement currently established on this socket, if any. When the client
     /// re-sends an identical unnamed `Parse`, the proxy can skip forwarding it
@@ -285,6 +289,7 @@ impl BackendConn {
             prepared: HashSet::new(),
             stale: HashSet::new(),
             gucs_synced: None,
+            gucs_role: false,
             unnamed_sig: None,
             #[cfg(feature = "pool-modes")]
             dirty: false,
