@@ -830,11 +830,11 @@ impl ProxyServer {
         let mut batch_binds_unnamed = false;
         let mut unnamed_node: Option<String> = None;
         let mut home_node: Option<String> = current_node.clone();
-        // Extended-protocol SET tracking (`ext_set`): the open cycle, and the
-        // client's unnamed statement when that is SET-like (it outlives the
-        // cycle that Parsed it).
+        // Extended-protocol SET tracking (`ext_set`): the open cycle, and
+        // what the client's unnamed statement is (it outlives the cycle that
+        // Parsed it).
         let mut ext_set = ExtSetCycle::default();
-        let mut unnamed_set: Option<String> = None;
+        let mut unnamed_bound = Bound::Other;
         loop {
             // Read the client's next message directly into the accumulation
             // buffer (no intermediate zeroed scratch, no extra copy). `read_buf`
@@ -986,6 +986,24 @@ impl ProxyServer {
 
                     // ---- Simple query protocol ----
                     MessageType::Query => {
+                        if tr.track_gucs && ext_set.is_open() {
+                            // A Query after a Flush leaves the extended cycle
+                            // without its Sync: settle what may have run of it.
+                            let ops = ext_set.interrupt(
+                                session
+                                    .last_rfq_status
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                            );
+                            if !ops.is_empty() {
+                                Self::tr_ext_set_outcome(
+                                    &mut tr,
+                                    ExtSetOutcome { pin: false, ops },
+                                    false,
+                                    session,
+                                    state,
+                                );
+                            }
+                        }
                         // Anomaly detector — record every Query message before
                         // the plugin hook so a detection lands in the audit
                         // trail even if a plugin later blocks.
@@ -1234,7 +1252,7 @@ impl ProxyServer {
                                     let sql = Self::parse_payload_sql_bytes(&msg.payload);
                                     let set_like = sql.is_some_and(Self::tr_is_set_like_bytes);
                                     let replaced = if unnamed {
-                                        unnamed_set.is_some()
+                                        matches!(unnamed_bound, Bound::Set(_) | Bound::Unknown)
                                     } else {
                                         stmt_registry
                                             .get(name)
@@ -1243,10 +1261,7 @@ impl ProxyServer {
                                     };
                                     ext_set.on_parse(!unnamed, set_like, replaced);
                                     if unnamed {
-                                        unnamed_set = sql
-                                            .filter(|_| set_like)
-                                            .and_then(|q| std::str::from_utf8(q).ok())
-                                            .map(str::to_string);
+                                        unnamed_bound = sql.map_or(Bound::Unknown, Self::tr_bound);
                                     }
                                 }
                                 if !unnamed {
@@ -1433,19 +1448,12 @@ impl ProxyServer {
                                     batch_binds_unnamed = true;
                                 }
                                 if tr.track_gucs {
-                                    // SET-like / other known / unknown statement.
                                     let bound = match stmt_ref {
-                                        Some(name) => stmt_registry.get(name).and_then(|b| {
-                                            match Self::parse_msg_sql_bytes(b) {
-                                                Some(q) if Self::tr_is_set_like_bytes(q) => {
-                                                    std::str::from_utf8(q)
-                                                        .ok()
-                                                        .map(|q| Some(q.to_string()))
-                                                }
-                                                _ => Some(None),
-                                            }
-                                        }),
-                                        None => Some(unnamed_set.clone()),
+                                        Some(name) => stmt_registry
+                                            .get(name)
+                                            .and_then(|b| Self::parse_msg_sql_bytes(b))
+                                            .map_or(Bound::Unknown, Self::tr_bound),
+                                        None => unnamed_bound.clone(),
                                     };
                                     ext_set.on_bind(Self::leading_cstring(&msg.payload), bound);
                                 }
@@ -1759,33 +1767,40 @@ impl ProxyServer {
                         if let Some(n) = used_node {
                             current_node = Some(n);
                         }
-                        // Extended-protocol SET (JDBC, Npgsql and tokio-postgres
-                        // send `SET` this way): a lone one is tracked like the
-                        // simple protocol; any other cycle that binds one keeps
-                        // the session's reads home (see `ext_set`).
+                        // Extended-protocol SETs (JDBC, Npgsql and tokio-postgres
+                        // send `SET` this way) and transaction ends, tracked
+                        // like the simple protocol's where the cycle can be
+                        // read statement by statement (see `ext_set`).
+                        let status_after = session
+                            .last_rfq_status
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let copying = session
+                            .copy_in_progress
+                            .load(std::sync::atomic::Ordering::Relaxed);
                         if tr.track_gucs {
-                            let decision = ext_set.at_boundary(ExtSetBoundary {
+                            let outcome = ext_set.at_boundary(ExtSetBoundary {
                                 sync: wait_ready,
                                 forwarded,
-                                idle_before: status_before == b'I',
-                                idle_after: session
-                                    .last_rfq_status
-                                    .load(std::sync::atomic::Ordering::Relaxed)
-                                    == b'I',
+                                before: status_before,
+                                after: status_after,
                                 failed: session
                                     .last_response_error
                                     .load(std::sync::atomic::Ordering::Relaxed),
+                                copying,
                             });
-                            match decision {
-                                ExtSetDecision::Track(sql) => {
-                                    if let Some(op) = Self::tr_guc_op(&sql) {
-                                        Self::tr_apply_guc_op(&mut tr, op, state);
-                                    }
-                                }
-                                ExtSetDecision::Pin if offload_on => session
+                            let idle_after_sync =
+                                wait_ready && forwarded && !copying && status_after == b'I';
+                            if Self::tr_ext_set_outcome(
+                                &mut tr,
+                                outcome,
+                                idle_after_sync,
+                                session,
+                                state,
+                            ) && offload_on
+                            {
+                                session
                                     .reads_pinned
-                                    .store(true, std::sync::atomic::Ordering::Relaxed),
-                                _ => {}
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                         if !skip_forward {
@@ -1803,6 +1818,11 @@ impl ProxyServer {
                             )
                             .await;
                             tr.ext_dispatched = !wait_ready;
+                            if wait_ready && forwarded && !copying {
+                                // The status baseline the simple protocol's
+                                // tracking compares against, in every TR mode.
+                                tr.prev_status = status_after;
+                            }
                         }
                         held_unnamed = None;
                         // A `Sync` is the extended-protocol transaction/statement
@@ -1970,7 +1990,8 @@ impl ProxyServer {
                                         .store(false, std::sync::atomic::Ordering::Relaxed);
                                     match r {
                                         Ok(sent) => {
-                                            Self::tr_after_copy_drain(&mut tr, session).await;
+                                            Self::tr_after_copy_drain(&mut tr, session, state)
+                                                .await;
                                             state
                                                 .metrics
                                                 .bytes_sent

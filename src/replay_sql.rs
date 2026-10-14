@@ -57,6 +57,18 @@ struct Scan<'a> {
     may_commit: bool,
     ends_tx: bool,
     saw_quoted_backslash: bool,
+    statements: usize,
+}
+
+/// Whether `sql` is at most one statement (a trailing `;` aside) under both
+/// backslash readings; `false` when it does not lex. Semicolons inside
+/// literals, quoted identifiers, dollar quotes and comments do not count.
+pub(crate) fn single_statement(sql: &str) -> bool {
+    let Ok(plain) = scan(sql, false) else {
+        return false;
+    };
+    plain.statements <= 1
+        && (!plain.saw_quoted_backslash || scan(sql, true).is_ok_and(|e| e.statements <= 1))
 }
 
 /// One lexical pass. `backslash_escapes` selects the session reading: when true
@@ -195,6 +207,7 @@ fn scan(sql: &str, backslash_escapes: bool) -> Result<Scan<'_>, ()> {
         may_commit: may_commit || (ends_tx && statements > 1),
         ends_tx,
         saw_quoted_backslash,
+        statements,
     })
 }
 
@@ -344,6 +357,26 @@ pub(crate) fn words(sql: &str, mut f: impl FnMut(Word<'_>) -> bool) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_statement_ignores_quoted_semicolons() {
+        for (sql, single) in [
+            ("SET search_path TO 'a;b'", true),
+            ("SET application_name = $$x;y$$", true),
+            ("SET a = 1 /* ; */", true),
+            ("SET a = 1;", true),
+            ("SET a = 1; ", true),
+            ("SET a = 1; SELECT 1", false),
+            ("RESET ALL;CLOSE ALL", false),
+            ("SET \"x;y\".z = 1", true),
+            // Ambiguous backslash: one reading sees a second statement.
+            ("SET a = 'x\\'; SET b = 2; --'", false),
+            // Does not lex.
+            ("SET a = 'open", false),
+        ] {
+            assert_eq!(single_statement(sql), single, "{sql}");
+        }
+    }
 
     #[test]
     fn recognizes_transaction_boundaries_outside_quotes() {

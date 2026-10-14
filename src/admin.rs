@@ -2895,6 +2895,11 @@ impl AdminServer {
                 "Sessions whose SET tracking stopped at limits.tr_max_session_set_statements",
                 tr.session_set_cap_exceeded,
             ),
+            (
+                "tr_session_set_untracked_total",
+                "Sessions whose settings changed in a way the proxy could not follow (reads kept home, failover refused)",
+                tr.session_set_untracked,
+            ),
         ] {
             output.push_str(&format!("# HELP heliosdb_proxy_{name} {help}\n"));
             output.push_str(&format!("# TYPE heliosdb_proxy_{name} counter\n"));
@@ -3256,6 +3261,8 @@ struct MetricsResponse {
     tr_replay_cap_exceeded_total: u64,
     /// Sessions whose SET tracking hit `[limits] tr_max_session_set_statements`.
     tr_session_set_cap_exceeded_total: u64,
+    /// Sessions whose settings changed in a way the proxy could not follow.
+    tr_session_set_untracked_total: u64,
     /// TR-07 recovery journal: transactions recorded as committed.
     journal_committed_total: u64,
     /// TR-07 recovery journal: captured transactions the backend rolled back.
@@ -3283,6 +3290,7 @@ impl From<ServerMetricsSnapshot> for MetricsResponse {
             tr_unknown_outcome_errors_total: m.tr.unknown_outcome_errors,
             tr_replay_cap_exceeded_total: m.tr.replay_cap_exceeded,
             tr_session_set_cap_exceeded_total: m.tr.session_set_cap_exceeded,
+            tr_session_set_untracked_total: m.tr.session_set_untracked,
             journal_committed_total: m.journal_committed,
             journal_rolled_back_total: m.journal_rolled_back,
             journal_statements_total: m.journal_statements,
@@ -3969,6 +3977,7 @@ mod tests {
                 unknown_outcome_errors: 2,
                 replay_cap_exceeded: 3,
                 session_set_cap_exceeded: 8,
+                session_set_untracked: 7,
             },
         };
 
@@ -3987,6 +3996,7 @@ mod tests {
         assert!(output.contains("heliosdb_proxy_tr_unknown_outcome_errors_total 2"));
         assert!(output.contains("heliosdb_proxy_tr_replay_cap_exceeded_total 3"));
         assert!(output.contains("heliosdb_proxy_tr_session_set_cap_exceeded_total 8"));
+        assert!(output.contains("heliosdb_proxy_tr_session_set_untracked_total 7"));
         // P-03: admission/reconnect counters are scrapeable.
         assert!(output.contains("heliosdb_proxy_admission_waited_total 0"));
         assert!(output.contains("heliosdb_proxy_admission_timeout_total 0"));

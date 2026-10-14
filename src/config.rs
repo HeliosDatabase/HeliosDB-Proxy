@@ -1591,6 +1591,15 @@ pub struct LimitsToml {
     /// with `08006` instead of re-homing with incomplete state (TR-04).
     #[serde(default = "default_tr_max_session_set_statements")]
     pub tr_max_session_set_statements: usize,
+    /// Cap on the savepoints of one transaction whose position among the
+    /// transaction's deferred `SET`s is tracked, so `ROLLBACK TO SAVEPOINT`
+    /// undoes the right ones. Past it the records start over; a later
+    /// `ROLLBACK TO` one that was dropped makes the transaction's settings
+    /// unknown. Default 1024: a JDBC `autosave` transaction of that many
+    /// statements loses nothing, at about 72 KiB per session at most (a
+    /// savepoint name is at most 63 bytes).
+    #[serde(default = "default_tr_max_tracked_savepoints")]
+    pub tr_max_tracked_savepoints: usize,
     /// Upper bounds, in milliseconds, of the buckets of every latency
     /// histogram on `/metrics/prometheus` (failover reconnect, replay,
     /// admission wait, journal apply, operator replay): 1 to 32 values,
@@ -1703,6 +1712,9 @@ fn default_tr_max_replay_bytes() -> usize {
 fn default_tr_max_session_set_statements() -> usize {
     256
 }
+fn default_tr_max_tracked_savepoints() -> usize {
+    1024
+}
 
 /// Upper bound (seconds) for any `[limits]` `*_secs` timeout that feeds a
 /// `Duration`/`Instant`. Each of these is added to a `tokio::time::Instant` at
@@ -1737,6 +1749,7 @@ impl Default for LimitsToml {
             tr_max_replay_statements: default_tr_max_replay_statements(),
             tr_max_replay_bytes: default_tr_max_replay_bytes(),
             tr_max_session_set_statements: default_tr_max_session_set_statements(),
+            tr_max_tracked_savepoints: default_tr_max_tracked_savepoints(),
             latency_buckets_ms: crate::metrics_hist::default_latency_buckets_ms(),
             backend_slot_wait_ms: default_backend_slot_wait_ms(),
             max_concurrent_reconnects_per_node: default_max_concurrent_reconnects_per_node(),
@@ -2835,6 +2848,11 @@ impl ProxyConfig {
             if l.tr_max_session_set_statements == 0 {
                 return Err(ProxyError::Config(
                     "limits.tr_max_session_set_statements must be >= 1".to_string(),
+                ));
+            }
+            if l.tr_max_tracked_savepoints == 0 {
+                return Err(ProxyError::Config(
+                    "limits.tr_max_tracked_savepoints must be >= 1".to_string(),
                 ));
             }
             if l.backend_slot_wait_ms == 0 {
@@ -4587,6 +4605,7 @@ database = "helios"
         assert_eq!(l.tr_max_replay_statements, 1000);
         assert_eq!(l.tr_max_replay_bytes, 4 * 1024 * 1024);
         assert_eq!(l.tr_max_session_set_statements, 256);
+        assert_eq!(l.tr_max_tracked_savepoints, 1024);
         // And the field on a default ProxyConfig matches.
         assert_eq!(
             ProxyConfig::default().limits.max_prepared_bytes,
@@ -4851,6 +4870,10 @@ database = "helios"
         let mut c = base();
         c.limits.tr_max_session_set_statements = 0;
         assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.tr_max_tracked_savepoints = 0;
+        assert!(c.validate().is_err());
     }
 
     #[test]
@@ -4958,6 +4981,7 @@ database = "helios"
         assert_eq!(limits.tr_max_replay_bytes, 1024);
         // Untouched key keeps its default.
         assert_eq!(limits.tr_max_session_set_statements, 256);
+        assert_eq!(limits.tr_max_tracked_savepoints, 1024);
     }
 
     #[test]

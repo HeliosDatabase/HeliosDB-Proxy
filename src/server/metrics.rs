@@ -84,6 +84,9 @@ pub(super) struct TrMetrics {
     /// Sessions whose `SET` tracking stopped at
     /// `[limits] tr_max_session_set_statements`.
     pub(super) session_set_cap_exceeded: AtomicU64,
+    /// Sessions whose settings changed in a way the proxy could not follow
+    /// (an extended-protocol SET it could not read).
+    pub(super) session_set_untracked: AtomicU64,
 }
 
 impl TrMetrics {
@@ -96,6 +99,7 @@ impl TrMetrics {
             unknown_outcome_errors: self.unknown_outcome_errors.load(Ordering::Relaxed),
             replay_cap_exceeded: self.replay_cap_exceeded.load(Ordering::Relaxed),
             session_set_cap_exceeded: self.session_set_cap_exceeded.load(Ordering::Relaxed),
+            session_set_untracked: self.session_set_untracked.load(Ordering::Relaxed),
         }
     }
 }
@@ -159,6 +163,8 @@ pub struct TrMetricsSnapshot {
     pub replay_cap_exceeded: u64,
     /// Sessions whose `SET` tracking hit `[limits] tr_max_session_set_statements`.
     pub session_set_cap_exceeded: u64,
+    /// Sessions whose settings changed in a way the proxy could not follow.
+    pub session_set_untracked: u64,
 }
 
 /// Pool mode statistics snapshot (when pool-modes feature is enabled)

@@ -93,7 +93,7 @@ mod backend_conn;
 use backend_conn::{OffloadRefusals, ReadRoute, ReadRouting};
 
 mod ext_set;
-use ext_set::{ExtSetBoundary, ExtSetCycle, ExtSetDecision};
+use ext_set::{Bound, ExtSetBoundary, ExtSetCycle, ExtSetOutcome, SettingsOp, TxVerb};
 
 mod relay;
 

@@ -1210,6 +1210,226 @@ async fn tr_recorder_session_gucs_are_transactional_and_savepoint_scoped() {
     assert!(tr.gucs.is_empty());
 }
 
+/// 75c0c5eceac3: extended-protocol cycles settle deferred settings,
+/// whichever protocol deferred them; a cycle the proxy cannot read makes the
+/// session's settings unknown, which keeps its reads home and refuses its
+/// failover until `DISCARD ALL`.
+#[tokio::test]
+async fn tr_extended_cycles_settle_deferred_settings() {
+    let server = ProxyServer::new(test_config()).unwrap();
+    let state = server.state.clone();
+    let session = make_test_session();
+    let mut tr = TrSession::new(TrMode::Session);
+    let ext = |tr: &mut TrSession, op: Option<SettingsOp>, idle_after_sync: bool| {
+        ProxyServer::tr_ext_set_outcome(
+            tr,
+            ExtSetOutcome {
+                pin: false,
+                ops: op.into_iter().collect(),
+            },
+            idle_after_sync,
+            &session,
+            &state,
+        )
+    };
+    let untracked = || {
+        state
+            .metrics
+            .tr
+            .session_set_untracked
+            .load(Ordering::Relaxed)
+    };
+    async fn simple(
+        tr: &mut TrSession,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        status: u8,
+        sql: &str,
+    ) {
+        ProxyServer::note_ready_for_query(session, status, false);
+        ProxyServer::tr_after_simple(tr, &qmsg(sql), session, state).await;
+    }
+    let app = |v: &str| format!("SET application_name = '{v}'");
+
+    // Mixed protocol: a simple-protocol SET inside a transaction that an
+    // extended-protocol COMMIT ends is promoted...
+    simple(&mut tr, &session, &state, b'T', "BEGIN").await;
+    simple(&mut tr, &session, &state, b'T', &app("mixed")).await;
+    assert_eq!(tr.pending_tx_gucs.len(), 1);
+    ProxyServer::note_ready_for_query(&session, b'I', false);
+    assert!(!ext(&mut tr, Some(SettingsOp::End(Some(true))), true));
+    tr.prev_status = b'I'; // the client loop's baseline after the cycle
+    assert_eq!(tr.gucs, vec![app("mixed")]);
+    assert!(!ProxyServer::tr_tx_settings_open(&tr));
+    // ...and one an extended-protocol ROLLBACK ends is dropped.
+    simple(&mut tr, &session, &state, b'T', "BEGIN").await;
+    simple(&mut tr, &session, &state, b'T', &app("dropped")).await;
+    ProxyServer::note_ready_for_query(&session, b'I', false);
+    ext(&mut tr, Some(SettingsOp::End(Some(false))), true);
+    tr.prev_status = b'I';
+    assert_eq!(tr.gucs, vec![app("mixed")]);
+    assert!(!ProxyServer::tr_tx_settings_open(&tr));
+
+    // Extended-protocol SETs and savepoints inside a transaction, ended by
+    // a simple-protocol COMMIT: ROLLBACK WORK TO undoes the later SET.
+    simple(&mut tr, &session, &state, b'T', "BEGIN").await;
+    ext(&mut tr, Some(SettingsOp::Defer(app("kept"))), false);
+    ext(
+        &mut tr,
+        Some(SettingsOp::Savepoint("SAVEPOINT s".into())),
+        false,
+    );
+    ext(
+        &mut tr,
+        Some(SettingsOp::Defer("/* tag */ SET work_mem = '1MB'".into())),
+        false,
+    );
+    ext(
+        &mut tr,
+        Some(SettingsOp::Savepoint("ROLLBACK WORK TO SAVEPOINT s".into())),
+        false,
+    );
+    assert_eq!(tr.pending_tx_gucs, vec![GucOp::Set(app("kept"))]);
+    tr.prev_status = b'T';
+    simple(&mut tr, &session, &state, b'I', "COMMIT").await;
+    assert_eq!(tr.gucs, vec![app("kept")]);
+    assert!(!tr.gucs_unknown && untracked() == 0);
+
+    // A tainted transaction that rolls back leaves the settings known...
+    simple(&mut tr, &session, &state, b'T', "BEGIN").await;
+    ext(
+        &mut tr,
+        Some(SettingsOp::Taint {
+            settings: true,
+            savepoints: false,
+        }),
+        false,
+    );
+    simple(&mut tr, &session, &state, b'I', "ROLLBACK").await;
+    assert!(!tr.gucs_unknown && ProxyServer::tr_restore_preflight(&tr).is_ok());
+    // ...one that commits does not: reads stay home, the failover is refused.
+    simple(&mut tr, &session, &state, b'T', "BEGIN").await;
+    ext(
+        &mut tr,
+        Some(SettingsOp::Taint {
+            settings: true,
+            savepoints: false,
+        }),
+        false,
+    );
+    assert!(!session.reads_pinned.load(Ordering::Relaxed));
+    simple(&mut tr, &session, &state, b'I', "COMMIT").await;
+    assert!(tr.gucs_unknown);
+    assert!(session.reads_pinned.load(Ordering::Relaxed));
+    assert_eq!(untracked(), 1);
+    let refused = ProxyServer::tr_restore_preflight(&tr).unwrap_err();
+    assert!(refused.to_string().contains("cannot follow"), "{refused}");
+    // Unknown again: counted once per session.
+    ext(&mut tr, Some(SettingsOp::Unknown), true);
+    assert_eq!(untracked(), 1);
+    // DISCARD ALL resets every setting: known again.
+    ext(&mut tr, Some(SettingsOp::Apply("DISCARD ALL".into())), true);
+    assert!(!tr.gucs_unknown && tr.gucs.is_empty());
+    assert!(ProxyServer::tr_restore_preflight(&tr).is_ok());
+
+    // A ROLLBACK TO a savepoint the proxy has no record of undid an unknown
+    // share of the deferred SETs.
+    simple(&mut tr, &session, &state, b'T', "BEGIN").await;
+    ext(&mut tr, Some(SettingsOp::Defer(app("maybe"))), false);
+    ext(
+        &mut tr,
+        Some(SettingsOp::Savepoint("ROLLBACK TO unseen".into())),
+        false,
+    );
+    assert!(tr.tx_gucs_unknown);
+    ProxyServer::note_ready_for_query(&session, b'I', false);
+    ext(&mut tr, Some(SettingsOp::End(Some(true))), true);
+    tr.prev_status = b'I';
+    assert!(tr.gucs_unknown);
+    ext(&mut tr, Some(SettingsOp::Apply("DISCARD ALL".into())), true);
+
+    // Unseen savepoints with deferred SETs pending taint the transaction;
+    // without any they only forget the savepoints.
+    simple(&mut tr, &session, &state, b'T', "BEGIN").await;
+    ext(
+        &mut tr,
+        Some(SettingsOp::Savepoint("SAVEPOINT a".into())),
+        false,
+    );
+    let lost = Some(SettingsOp::Taint {
+        settings: false,
+        savepoints: true,
+    });
+    ext(&mut tr, lost, false);
+    assert!(tr.tx_savepoints.is_empty() && !tr.tx_gucs_unknown);
+    ext(&mut tr, Some(SettingsOp::Defer(app("x"))), false);
+    ext(
+        &mut tr,
+        Some(SettingsOp::Taint {
+            settings: false,
+            savepoints: true,
+        }),
+        false,
+    );
+    assert!(tr.tx_gucs_unknown);
+    simple(&mut tr, &session, &state, b'I', "ROLLBACK").await;
+    assert!(!tr.gucs_unknown);
+
+    // The transaction ended where no cycle showed it end: an idle
+    // ReadyForQuery with deferred SETs still pending settles them as
+    // unknown, after an extended cycle or a simple statement alike.
+    simple(&mut tr, &session, &state, b'T', "BEGIN").await;
+    simple(&mut tr, &session, &state, b'T', &app("lost")).await;
+    ProxyServer::note_ready_for_query(&session, b'I', false);
+    ext(&mut tr, None, true);
+    assert!(tr.gucs_unknown && !ProxyServer::tr_tx_settings_open(&tr));
+    ext(&mut tr, Some(SettingsOp::Apply("DISCARD ALL".into())), true);
+    tr.prev_status = b'I';
+    tr.pending_tx_gucs.push(GucOp::Set(app("stale")));
+    simple(&mut tr, &session, &state, b'I', "SELECT 1").await;
+    assert!(tr.gucs_unknown && tr.pending_tx_gucs.is_empty());
+}
+
+/// Savepoint names are read like PostgreSQL reads them (comments aside,
+/// quoted names whole), and the tracked savepoints are capped by `[limits]
+/// tr_max_tracked_savepoints`.
+#[test]
+fn tr_savepoint_names_are_lexed_and_capped() {
+    let set = |v: &str| GucOp::Set(format!("SET application_name = '{v}'"));
+    let note = ProxyServer::tr_note_savepoint;
+    let mut tr = TrSession::new(TrMode::Session);
+    // A comment inside ROLLBACK TO.
+    tr.pending_tx_gucs = vec![set("a")];
+    note(&mut tr, "SAVEPOINT s", 8);
+    tr.pending_tx_gucs.push(set("b"));
+    note(&mut tr, "ROLLBACK /* undo */ TO s", 8);
+    assert_eq!(tr.pending_tx_gucs, vec![set("a")]);
+    // Quoted names with spaces are whole names.
+    let mut tr = TrSession::new(TrMode::Session);
+    note(&mut tr, "SAVEPOINT \"my a\"", 8);
+    tr.pending_tx_gucs.push(set("x"));
+    note(&mut tr, "SAVEPOINT \"my b\"", 8);
+    note(&mut tr, "ROLLBACK WORK TO \"my a\"", 8);
+    assert!(tr.pending_tx_gucs.is_empty(), "x came after \"my a\"");
+    // A savepoint the proxy has no record of, with SETs pending.
+    tr.pending_tx_gucs.push(set("y"));
+    note(&mut tr, "ROLLBACK TRANSACTION TO SAVEPOINT nowhere", 8);
+    assert!(tr.tx_gucs_unknown);
+    // Past the cap the records start over; a ROLLBACK TO a dropped one
+    // makes the transaction's settings unknown.
+    let mut tr = TrSession::new(TrMode::Session);
+    for n in ["a", "b", "c"] {
+        note(&mut tr, &format!("SAVEPOINT {n}"), 2);
+        tr.pending_tx_gucs.push(set(n));
+    }
+    assert_eq!(tr.tx_savepoints.len(), 1);
+    note(&mut tr, "ROLLBACK TO c", 2);
+    assert_eq!(tr.pending_tx_gucs, vec![set("a"), set("b")]);
+    assert!(!tr.tx_gucs_unknown);
+    note(&mut tr, "ROLLBACK TO a", 2);
+    assert!(tr.tx_gucs_unknown);
+}
+
 #[test]
 fn tr_guc_op_sees_through_leading_comments() {
     let op = ProxyServer::tr_guc_op;
@@ -3871,7 +4091,7 @@ async fn tr08_copy_cycles_acknowledge_nothing_and_end_portals() {
         .store(false, std::sync::atomic::Ordering::Relaxed);
     tr.tx_portals.insert("cur".to_string(), StmtKind::Read);
     ProxyServer::note_ready_for_query(&session, b'I', false);
-    ProxyServer::tr_after_copy_drain(&mut tr, &session).await;
+    ProxyServer::tr_after_copy_drain(&mut tr, &session, &state).await;
     assert!(tr.tx_portals.is_empty());
 }
 

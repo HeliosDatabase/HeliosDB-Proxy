@@ -27,8 +27,19 @@ Cases (each on a new client connection unless noted):
   split_off      read_write_split = false: primary.
   ext_set        a SET sent with the extended protocol (Parse/Bind/Execute/Sync, as JDBC
                  sends it) and a SET behind a sqlcommenter tag are mirrored onto the
-                 standby (a tagged read offloads too); an extended SET inside a
-                 transaction keeps the session's reads on the primary.
+                 standby (a tagged read offloads too); so is an extended SET inside a
+                 transaction once a simple COMMIT ends it.
+  ext_set_tx     transactions in the extended protocol, one session each (75c0c5eceac3):
+                 JDBC's BEGIN + SET cycle then an extended COMMIT; a simple BEGIN and SET
+                 ended by an extended COMMIT (mixed protocol); an extended ROLLBACK drops
+                 the SET; an extended ROLLBACK TO SAVEPOINT undoes the later SET; pgjdbc
+                 autosave (a SAVEPOINT in front of each statement); a SET LOCAL batch
+                 (changes no session setting); two SETs in one cycle; a simple ROLLBACK TO
+                 with a comment inside it. Each reads from the standby with exactly the
+                 committed setting. A cycle where a procedure commits before an error
+                 (CALL that COMMITs, then 1/0) makes the session's settings unknown: its
+                 reads stay on the primary and heliosdb_proxy_tr_session_set_untracked_total
+                 counts it.
   role           SET ROLE is mirrored onto the standby, RESET ALL keeps it (as in
                  PostgreSQL), RESET ROLE drops it there too; a SERIALIZABLE default
                  isolation level keeps reads on the primary.
@@ -142,6 +153,14 @@ def case_expect(expected):
     return run
 
 
+def cycle(client, *sqls):
+    """One extended-protocol cycle (Sync to Sync) running each statement in turn on the
+    unnamed statement and portal."""
+    msgs = b"".join(tr08.parse("", sql) + tr08.bind("", "") + tr08.execute("") for sql in sqls)
+    errs = tr08.errors(tr08.send(client, msgs + SYNC))
+    return f"error {errs}" if errs else "ok"
+
+
 def case_ext_set(address, _admin):
     probe = "SELECT host(inet_server_addr()), current_setting('application_name')"
     r = {}
@@ -158,10 +177,61 @@ def case_ext_set(address, _admin):
         r["ext_set_in_tx"] = extended(c, "", "SET application_name = 'rr-in-tx'")
         query(c, "COMMIT")
         time.sleep(RYW_WAIT)
-        r["read_after_tx_set"] = where(c)
+        res = tr08.rows(query(c, probe))
+        r["read_after_tx_set"] = res[0] if res else None
     r["ok"] = (r["ext_set"] == "no rows" and r["ext_set_mirrored"] == [STANDBY, "rr-ext"]
                and r["tagged_set_mirrored"] == [STANDBY, "rr-tagged"]
-               and r["read_after_tx_set"] == PRIMARY)
+               and r["read_after_tx_set"] == [STANDBY, "rr-in-tx"])
+    return r
+
+
+def case_ext_set_tx(address, admin):
+    probe = "SELECT host(inet_server_addr()), current_setting('application_name')"
+    app = "SET application_name = '{}'".format
+    scenarios = {
+        # JDBC with autocommit off: BEGIN in front of the first statement.
+        "jdbc_begin_set": ([["BEGIN", app("rr-jdbc")], ["COMMIT"]], "rr-jdbc"),
+        # A driver mixing the protocols: simple BEGIN and SET, extended COMMIT.
+        "mixed_commit": (["BEGIN", app("rr-mixed"), ["COMMIT"]], "rr-mixed"),
+        "ext_rollback": ([["BEGIN"], [app("rr-rolled-back")], ["ROLLBACK"]], ""),
+        "ext_savepoint": ([["BEGIN"], [app("rr-kept")], ["SAVEPOINT s"], [app("rr-undone")],
+                           ["ROLLBACK TO SAVEPOINT s"], ["COMMIT"]], "rr-kept"),
+        "jdbc_autosave": ([["BEGIN", "SAVEPOINT PGJDBC_AUTOSAVE", app("rr-autosave")],
+                           ["SAVEPOINT PGJDBC_AUTOSAVE", "SELECT 1"], ["COMMIT"]], "rr-autosave"),
+        "set_local_batch": ([["BEGIN", "SET LOCAL application_name = 'rr-local'", "SELECT 1"],
+                             ["COMMIT"]], ""),
+        "two_sets_one_cycle": ([[app("rr-a"), app("rr-b")]], "rr-b"),
+        "comment_in_rollback_to": (["BEGIN", "SAVEPOINT s", app("rr-comment-undone"),
+                                    "ROLLBACK /* undo */ TO s", "COMMIT"], ""),
+    }
+    r = {}
+    for name, (steps, expected) in scenarios.items():
+        with tr08.startup(address) as c:
+            query(c, "SET application_name = ''")
+            time.sleep(RYW_WAIT)
+            # A list is one extended cycle, a string one simple query.
+            done = [cycle(c, *step) if isinstance(step, list) else
+                    ("ok" if not tr08.errors(query(c, step)) else "error") for step in steps]
+            time.sleep(RYW_WAIT)
+            res = tr08.rows(query(c, probe))
+            r[name] = {"steps": done, "read": res[0] if res else None}
+            r[name]["ok"] = (all(d == "ok" for d in done)
+                             and r[name]["read"] == [STANDBY, expected])
+    time.sleep(METRICS_SYNC)
+    r["untracked_before"] = metric(admin, "heliosdb_proxy_tr_session_set_untracked_total")
+    with tr08.startup(address) as c:
+        query(c, "SET application_name = ''")
+        # The procedure's COMMIT keeps the SET; the error ends the cycle.
+        r["call_cycle"] = cycle(c, app("rr-call"), "CALL rr_commit()", "SELECT 1/0")
+        time.sleep(RYW_WAIT)
+        res = tr08.rows(query(c, probe))
+        r["read_after_call"] = res[0] if res else None
+    time.sleep(METRICS_SYNC)
+    r["untracked_after"] = metric(admin, "heliosdb_proxy_tr_session_set_untracked_total")
+    r["ok"] = (all(r[name].pop("ok") for name in scenarios)
+               and r["call_cycle"].startswith("error")
+               and (r["read_after_call"] or [None])[0] == PRIMARY
+               and r["untracked_before"] == 0 and r["untracked_after"] == 1)
     return r
 
 
@@ -284,6 +354,7 @@ def main():
         ("sync", 'standby_reads = "sync"', "synchronous = true", case_expect(STANDBY)),
         ("split_off", "read_write_split = false", "", case_expect(PRIMARY)),
         ("ext_set", "", "", case_ext_set),
+        ("ext_set_tx", "", "", case_ext_set_tx),
         ("role", "", "", case_role),
         ("scram_login", "", "", case_scram_login(name)),
     ]
@@ -292,6 +363,7 @@ def main():
         tr08.pg_query("CREATE TABLE rr_t (a int)")
         tr08.pg_query(f"CREATE ROLE rr_pw LOGIN PASSWORD '{RR_PW_PASSWORD}'")
         tr08.pg_query("CREATE ROLE rr_tenant")
+        tr08.pg_query("CREATE PROCEDURE rr_commit() LANGUAGE plpgsql AS $$BEGIN COMMIT; END$$")
         subprocess.run(["docker", "exec", name, "sh", "-c",
                         'sed -i "1i host all rr_pw all scram-sha-256" "$PGDATA/pg_hba.conf"'],
                        check=True, capture_output=True, timeout=20)

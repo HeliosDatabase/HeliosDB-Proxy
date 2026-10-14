@@ -243,6 +243,13 @@ pub(super) struct TrSession {
     /// Open savepoints of the current transaction: (name, length of
     /// `pending_tx_gucs` when it was taken). `ROLLBACK TO` truncates to it.
     pub(super) tx_savepoints: Vec<(String, usize)>,
+    /// The current transaction may have changed settings the proxy could
+    /// not follow (see `ext_set`): if it commits, `gucs_unknown`.
+    pub(super) tx_gucs_unknown: bool,
+    /// The session's settings may differ from `gucs` in ways the proxy
+    /// could not follow: its reads stay home and a failover is refused
+    /// rather than restoring part of its state. `DISCARD ALL` clears it.
+    pub(super) gucs_unknown: bool,
     /// The session's backend socket died while idle: the next request is a
     /// not-delivered fault against this node.
     pub(super) lost_backend: Option<String>,
@@ -283,6 +290,8 @@ impl TrSession {
             serializable_default: false,
             pending_tx_gucs: Vec::new(),
             tx_savepoints: Vec::new(),
+            tx_gucs_unknown: false,
+            gucs_unknown: false,
             lost_backend: None,
             tx_aborted: false,
             prev_status: b'I',
@@ -651,7 +660,7 @@ impl ProxyServer {
     pub(super) fn tr_is_session_set(sql: &str) -> bool {
         let t = sql.trim();
         let core = t.strip_suffix(';').unwrap_or(t).trim_end();
-        if core.contains(';') {
+        if !crate::replay_sql::single_statement(core) {
             return false;
         }
         let Some(w) = Self::tr_lead_words(core, 2) else {
@@ -1226,6 +1235,109 @@ impl ProxyServer {
             || crate::protocol::leads_with_keyword(sql, "DISCARD")
     }
 
+    /// How a statement an extended-protocol cycle binds bears on the
+    /// session's settings (see `ext_set`): for an ordinary statement, one
+    /// comment skip and a few prefix compares (per-`Bind` cost).
+    pub(super) fn tr_bound(sql: &[u8]) -> Bound {
+        let head = crate::protocol::skip_leading_comments_bytes(sql);
+        let kw = |k: &str| crate::protocol::leads_with_keyword(head, k);
+        let set_like = kw("SET") || kw("RESET") || kw("DISCARD");
+        let tx_like = || {
+            [
+                "BEGIN",
+                "START",
+                "COMMIT",
+                "END",
+                "ROLLBACK",
+                "ABORT",
+                "SAVEPOINT",
+                "RELEASE",
+                "PREPARE",
+            ]
+            .into_iter()
+            .any(kw)
+        };
+        if !set_like && !tx_like() {
+            return if kw("CALL") || kw("DO") {
+                Bound::CommitPoint
+            } else {
+                Bound::Other
+            };
+        }
+        let Ok(sql) = std::str::from_utf8(sql) else {
+            return Bound::Unknown;
+        };
+        if !set_like {
+            return Self::tr_tx_verb(sql).map_or(Bound::Other, |v| Bound::Tx(v, sql.to_string()));
+        }
+        match Self::tr_session_level(sql) {
+            Some(true) => Bound::Set(sql.to_string()),
+            Some(false) => Bound::Other,
+            None => Bound::Unknown,
+        }
+    }
+
+    /// Whether a SET-like statement changes the session's settings: a `SET`
+    /// other than `SET LOCAL` / `SET TRANSACTION` / `SET CONSTRAINTS`, a
+    /// `RESET`, or `DISCARD ALL` (other `DISCARD`s change no setting).
+    /// `None` when it does not lex.
+    pub(super) fn tr_session_level(sql: &str) -> Option<bool> {
+        let w = Self::tr_lead_words(sql, 2)?;
+        let kw = |i: usize, k: &str| Self::tr_word_is(sql, &w, i, k);
+        Some(if kw(0, "RESET") {
+            true
+        } else if kw(0, "DISCARD") {
+            kw(1, "ALL")
+        } else {
+            kw(0, "SET") && !(kw(1, "LOCAL") || kw(1, "TRANSACTION") || kw(1, "CONSTRAINTS"))
+        })
+    }
+
+    /// The transaction-control verb of `sql` (comments aside), if it is a
+    /// transaction-control statement of this session's transaction (`COMMIT
+    /// PREPARED` and `ROLLBACK PREPARED` are not).
+    pub(super) fn tr_tx_verb(sql: &str) -> Option<TxVerb> {
+        let Some(w) = Self::tr_lead_words(sql, 6) else {
+            // PostgreSQL rejects what does not lex; read nothing into it.
+            return Some(TxVerb::Opaque);
+        };
+        let kw = |i: usize, k: &str| Self::tr_word_is(sql, &w, i, k);
+        // `... AND CHAIN` starts the next transaction at once.
+        let chained = (1..w.len()).any(|i| kw(i, "CHAIN") && !kw(i - 1, "NO"));
+        if kw(0, "BEGIN") || (kw(0, "START") && kw(1, "TRANSACTION")) {
+            Some(TxVerb::Begin)
+        } else if kw(0, "SAVEPOINT") {
+            Some(TxVerb::Savepoint)
+        } else if kw(0, "RELEASE") {
+            Some(TxVerb::Release)
+        } else if kw(0, "COMMIT") || kw(0, "END") {
+            (!kw(1, "PREPARED")).then_some(if chained {
+                TxVerb::CommitChain
+            } else {
+                TxVerb::Commit
+            })
+        } else if kw(0, "ROLLBACK") || kw(0, "ABORT") {
+            let to = if kw(1, "WORK") || kw(1, "TRANSACTION") {
+                2
+            } else {
+                1
+            };
+            Some(if kw(1, "PREPARED") {
+                return None;
+            } else if kw(to, "TO") {
+                TxVerb::RollbackTo
+            } else if chained {
+                TxVerb::RollbackChain
+            } else {
+                TxVerb::Rollback
+            })
+        } else if kw(0, "PREPARE") && kw(1, "TRANSACTION") {
+            Some(TxVerb::Prepare)
+        } else {
+            None
+        }
+    }
+
     /// The session-GUC effect of `sql`, which may carry comments: `RESET
     /// ALL` / `DISCARD ALL`; a session `SET` or `RESET` of one variable, kept
     /// without its leading comments. `None` for anything else (`SET LOCAL`,
@@ -1258,66 +1370,217 @@ impl ProxyServer {
             GucOp::DiscardAll => {
                 tr.gucs.clear();
                 tr.guc_cap_hit = false;
+                tr.gucs_unknown = false;
             }
         }
         tr.serializable_default = Self::tr_serializable_default(&tr.gucs);
     }
 
-    /// `SAVEPOINT s` / `RELEASE [SAVEPOINT] s` / `ROLLBACK TO [SAVEPOINT] s`
-    /// bookkeeping for deferred GUC ops. Unquoted names fold to lowercase.
-    pub(super) fn tr_note_savepoint(tr: &mut TrSession, sql: &str) {
-        let t = sql.trim();
-        let core = t.strip_suffix(';').unwrap_or(t).trim_end();
-        let mut w = core.split_whitespace();
-        let Some(verb) = w.next() else { return };
-        let fold = |n: &str| -> String {
-            if let Some(q) = n.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
-                q.replace("\"\"", "\"")
-            } else {
-                n.to_ascii_lowercase()
+    /// `SAVEPOINT s` / `RELEASE [SAVEPOINT] s` / `ROLLBACK [WORK |
+    /// TRANSACTION] TO [SAVEPOINT] s` bookkeeping for deferred GUC ops, for a
+    /// statement that succeeded. Names are read like PostgreSQL reads them:
+    /// comments aside, unquoted names fold to lowercase, quoted ones keep
+    /// their case. At most `cap` savepoints are tracked; past it the records
+    /// start over. A `ROLLBACK TO` a savepoint the proxy has no record of
+    /// undid an unknown share of the deferred ops: the transaction's
+    /// settings become unknown.
+    pub(super) fn tr_note_savepoint(tr: &mut TrSession, sql: &str, cap: usize) {
+        let unknown_rollback = |tr: &mut TrSession| {
+            if !tr.pending_tx_gucs.is_empty() {
+                tr.tx_gucs_unknown = true;
             }
         };
-        if verb.eq_ignore_ascii_case("SAVEPOINT") {
-            if let Some(name) = w.next() {
-                tr.tx_savepoints
-                    .push((fold(name), tr.pending_tx_gucs.len()));
+        let Some(w) = Self::tr_lead_words(sql, 6) else {
+            unknown_rollback(tr);
+            return;
+        };
+        let kw = |i: usize, k: &str| Self::tr_word_is(sql, &w, i, k);
+        let name = |i: usize| {
+            w.get(i).map(|&(at, len, quoted)| {
+                let t = &sql[at..at + len];
+                if quoted {
+                    t[1..t.len() - 1].replace("\"\"", "\"")
+                } else {
+                    t.to_ascii_lowercase()
+                }
+            })
+        };
+        // The noise word `SAVEPOINT`, unless it is the name itself.
+        let skip_noise = |i: usize| {
+            if kw(i, "SAVEPOINT") && w.len() > i + 1 {
+                i + 1
+            } else {
+                i
             }
-        } else if verb.eq_ignore_ascii_case("RELEASE") {
-            let mut name = w.next();
-            if name.is_some_and(|n| n.eq_ignore_ascii_case("SAVEPOINT")) {
-                name = w.next();
+        };
+        if kw(0, "SAVEPOINT") {
+            if let Some(n) = name(1) {
+                if tr.tx_savepoints.len() >= cap {
+                    // A ROLLBACK TO a dropped record finds none.
+                    tr.tx_savepoints.clear();
+                }
+                tr.tx_savepoints.push((n, tr.pending_tx_gucs.len()));
             }
-            if let Some(name) = name.map(fold) {
+        } else if kw(0, "RELEASE") {
+            if let Some(n) = name(skip_noise(1)) {
                 // Release destroys the savepoint and every later one; the ops
                 // made since stay part of the transaction.
-                if let Some(i) = tr.tx_savepoints.iter().rposition(|(n, _)| *n == name) {
+                if let Some(i) = tr.tx_savepoints.iter().rposition(|(s, _)| *s == n) {
                     tr.tx_savepoints.truncate(i);
                 }
             }
-        } else if verb.eq_ignore_ascii_case("ROLLBACK") {
-            if !w.next().is_some_and(|n| n.eq_ignore_ascii_case("TO")) {
+        } else if kw(0, "ROLLBACK") {
+            let to = if kw(1, "WORK") || kw(1, "TRANSACTION") {
+                2
+            } else {
+                1
+            };
+            if !kw(to, "TO") {
                 return;
             }
-            let mut name = w.next();
-            if name.is_some_and(|n| n.eq_ignore_ascii_case("SAVEPOINT")) {
-                name = w.next();
-            }
-            if let Some(name) = name.map(fold) {
+            let found = name(skip_noise(to + 1))
+                .and_then(|n| tr.tx_savepoints.iter().rposition(|(s, _)| *s == n));
+            match found {
                 // Undo the ops made after the savepoint; the savepoint itself
                 // survives, later ones are destroyed.
-                if let Some(i) = tr.tx_savepoints.iter().rposition(|(n, _)| *n == name) {
+                Some(i) => {
                     let len = tr.tx_savepoints[i].1;
                     tr.pending_tx_gucs.truncate(len);
                     tr.tx_savepoints.truncate(i + 1);
                 }
+                None => unknown_rollback(tr),
             }
         }
+    }
+
+    /// Deferred settings bookkeeping of a transaction is still open.
+    pub(super) fn tr_tx_settings_open(tr: &TrSession) -> bool {
+        tr.tx_gucs_unknown || !tr.pending_tx_gucs.is_empty() || !tr.tx_savepoints.is_empty()
+    }
+
+    /// The open transaction ended: committed (`Some(true)`), rolled back
+    /// (`Some(false)`), or with an outcome the proxy cannot tell (`None`).
+    /// Its deferred settings apply only if it committed.
+    pub(super) fn tr_settle_tx(
+        tr: &mut TrSession,
+        committed: Option<bool>,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+    ) {
+        let pending = std::mem::take(&mut tr.pending_tx_gucs);
+        let tainted = std::mem::take(&mut tr.tx_gucs_unknown);
+        tr.tx_savepoints.clear();
+        match committed {
+            Some(true) => {
+                for op in pending {
+                    Self::tr_apply_guc_op(tr, op, state);
+                }
+                if tainted {
+                    Self::tr_gucs_unknown(tr, session, state);
+                }
+            }
+            Some(false) => {}
+            None => {
+                if tainted || !pending.is_empty() {
+                    Self::tr_gucs_unknown(tr, session, state);
+                }
+            }
+        }
+    }
+
+    /// The session's settings may now differ from the tracked set in ways
+    /// the proxy could not follow: keep its reads home and refuse a
+    /// failover rather than restore part of its state.
+    pub(super) fn tr_gucs_unknown(
+        tr: &mut TrSession,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+    ) {
+        session.reads_pinned.store(true, Ordering::Relaxed);
+        if !tr.gucs_unknown {
+            tr.gucs_unknown = true;
+            state
+                .metrics
+                .tr
+                .session_set_untracked
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                target: "helios::tr",
+                "in-session TR: the session changed settings in a way the proxy cannot follow; \
+                 its reads stay on its home node and a failover will be refused"
+            );
+        }
+    }
+
+    /// Apply what an extended-protocol cycle (or a multi-statement query) did
+    /// to the session's settings (see `ext_set`). `idle_after_sync`: the
+    /// cycle reached a backend and ended in an idle ReadyForQuery. Returns
+    /// whether the proxy's record of the session's prepared statements calls
+    /// for keeping its reads home.
+    pub(super) fn tr_ext_set_outcome(
+        tr: &mut TrSession,
+        outcome: ExtSetOutcome,
+        idle_after_sync: bool,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+    ) -> bool {
+        for op in outcome.ops {
+            match op {
+                SettingsOp::Apply(sql) => match Self::tr_guc_op(&sql) {
+                    Some(op) => Self::tr_apply_guc_op(tr, op, state),
+                    // A session-level SET the proxy cannot record.
+                    None => Self::tr_gucs_unknown(tr, session, state),
+                },
+                SettingsOp::Defer(sql) => match Self::tr_guc_op(&sql) {
+                    Some(op) => tr.pending_tx_gucs.push(op),
+                    None => tr.tx_gucs_unknown = true,
+                },
+                SettingsOp::Savepoint(sql) => Self::tr_note_savepoint(
+                    tr,
+                    crate::protocol::skip_leading_comments(&sql),
+                    state.limits.tr_max_tracked_savepoints,
+                ),
+                SettingsOp::End(committed) => Self::tr_settle_tx(tr, committed, session, state),
+                SettingsOp::Taint {
+                    settings,
+                    savepoints,
+                } => {
+                    // Unseen savepoint statements may have undone deferred
+                    // ops (ROLLBACK TO) and leave later ones unmatched.
+                    if settings || (savepoints && !tr.pending_tx_gucs.is_empty()) {
+                        tr.tx_gucs_unknown = true;
+                    }
+                    if savepoints {
+                        tr.tx_savepoints.clear();
+                    }
+                }
+                SettingsOp::Unknown => {
+                    tr.pending_tx_gucs.clear();
+                    tr.tx_savepoints.clear();
+                    tr.tx_gucs_unknown = false;
+                    Self::tr_gucs_unknown(tr, session, state);
+                }
+            }
+        }
+        if idle_after_sync && Self::tr_tx_settings_open(tr) {
+            // The transaction ended where the cycle did not show it end.
+            Self::tr_settle_tx(tr, None, session, state);
+        }
+        outcome.pin
     }
 
     /// Before re-homing: an incomplete restore set is not something to hand
     /// the client silently. Refuse the failover instead (surfaces as `08006`
     /// "session state could not be restored").
     pub(super) fn tr_restore_preflight(tr: &TrSession) -> Result<()> {
+        if tr.gucs_unknown {
+            return Err(ProxyError::Protocol(
+                "the session changed settings in a way the proxy cannot follow (an \
+                 extended-protocol SET it could not read); the session state cannot be \
+                 restored on a replacement backend"
+                    .to_string(),
+            ));
+        }
         if tr.guc_cap_hit {
             return Err(ProxyError::Protocol(
                 "session SET tracking exceeded [limits] tr_max_session_set_statements; \
@@ -1358,8 +1621,8 @@ impl ProxyServer {
     /// the replay record and is only invoked while inside an explicit
     /// transaction in `select`/`transaction` mode. `extended_kind` supplies
     /// the whole cycle's safety classification; None denotes simple protocol
-    /// and enables GUC tracking here (the client loop tracks a lone
-    /// extended-protocol SET itself, see `ext_set`).
+    /// and enables GUC tracking here (the client loop tracks extended-protocol
+    /// SETs and transaction ends itself, see `ext_set`).
     ///
     /// Hot-path cost outside a transaction: a few prefix compares, no
     /// allocation, no lock.
@@ -1410,8 +1673,8 @@ impl ProxyServer {
             *kind_cache.get_or_insert_with(|| Self::tr_classify(sql, &state.tr_read_policy))
         };
 
-        // --- session GUC tracking (simple protocol; the client loop tracks a
-        // lone extended-protocol SET itself) ---
+        // --- session GUC tracking (simple protocol; the client loop tracks
+        // extended-protocol cycles itself) ---
         if tr.track_gucs && simple {
             if Self::tr_is_set_like(sql) && !had_error {
                 // Inside a transaction every GUC change is deferred: PostgreSQL
@@ -1430,7 +1693,7 @@ impl ProxyServer {
                     || crate::protocol::starts_with_ci(head, "RELEASE")
                     || crate::protocol::starts_with_ci(head, "ROLLBACK")
                 {
-                    Self::tr_note_savepoint(tr, head);
+                    Self::tr_note_savepoint(tr, head, state.limits.tr_max_tracked_savepoints);
                 }
             }
             if was_in_tx && !now_in_tx {
@@ -1446,15 +1709,10 @@ impl ProxyServer {
                     && !had_error
                     && kind(&mut kind_cache) == StmtKind::Commit
                     && Self::tr_commits_session_state(sql);
-                if committed {
-                    let pending = std::mem::take(&mut tr.pending_tx_gucs);
-                    for op in pending {
-                        Self::tr_apply_guc_op(tr, op, state);
-                    }
-                } else {
-                    tr.pending_tx_gucs.clear();
-                }
-                tr.tx_savepoints.clear();
+                Self::tr_settle_tx(tr, Some(committed), session, state);
+            } else if !now_in_tx && Self::tr_tx_settings_open(tr) {
+                // The transaction ended where the proxy did not see it end.
+                Self::tr_settle_tx(tr, None, session, state);
             }
         }
 
@@ -1857,7 +2115,11 @@ impl ProxyServer {
     /// drained to `ReadyForQuery`: refresh the status baseline and, if the
     /// COPY ran inside an explicit transaction, mark it non-replayable (its
     /// data stream is not recorded).
-    pub(super) async fn tr_after_copy_drain(tr: &mut TrSession, session: &Arc<ClientSession>) {
+    pub(super) async fn tr_after_copy_drain(
+        tr: &mut TrSession,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+    ) {
         let status = session
             .last_rfq_status
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -1865,6 +2127,9 @@ impl ProxyServer {
         if status == b'I' {
             // The COPY's statement may have ended the transaction (TR-08).
             tr.tx_portals.clear();
+            if Self::tr_tx_settings_open(tr) {
+                Self::tr_settle_tx(tr, None, session, state);
+            }
         }
         if !tr.record_tx {
             return;
@@ -2869,6 +3134,7 @@ impl ProxyServer {
         Self::tr_clear_tx(session).await;
         tr.pending_tx_gucs.clear();
         tr.tx_savepoints.clear();
+        tr.tx_gucs_unknown = false;
         // The response the client just saw ended with ErrorResponse + RFQ.
         Self::note_ready_for_query(session, if in_tx { b'E' } else { b'I' }, true);
         Self::journal_discard(session, if in_tx { b'E' } else { b'I' });

@@ -34,10 +34,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   onto standby connections, so such sessions keep offloading reads instead of being
   pinned to the primary after their first `SET`, and transaction replay restores it on a
   replacement backend; it now counts toward `tr_max_session_set_statements`, and a
-  replacement backend that rejects it aborts the re-home like any tracked `SET`. Inside a
-  transaction, batched with other statements or split by a Flush, it keeps the session's
-  reads on the primary and is not restored; so does a cycle after which the proxy cannot
-  be sure which prepared statements the backend holds.
+  replacement backend that rejects it aborts the re-home like any tracked `SET`. A cycle
+  after which the proxy cannot be sure which prepared statements the backend holds keeps
+  the session's reads on the primary.
+- Extended-protocol cycles (Parse/Bind/Execute up to a Sync) are now read statement by
+  statement, the way PostgreSQL runs them. Statements up to a Sync share one transaction
+  unless they control it.
+  - Session-level `SET`, `RESET` and `DISCARD ALL` apply when that transaction commits.
+  - Inside an explicit transaction they are deferred to its end, applied if it commits,
+    dropped if it rolls back, and undone by `ROLLBACK TO SAVEPOINT`, as in the simple
+    protocol.
+  - `COMMIT`, `ROLLBACK`, their `AND CHAIN` forms, `PREPARE TRANSACTION`, `SAVEPOINT`,
+    `RELEASE` and `ROLLBACK TO` settle the deferred settings, whichever protocol
+    deferred them.
+
+  Covered patterns:
+  - Spring or Hibernate on JDBC with autocommit off (`BEGIN` sent in front of a
+    transaction's first statement).
+  - pgjdbc `autosave` (a `SAVEPOINT` in front of each statement).
+  - Batches of several statements.
+  - `SET LOCAL`, now recognised as no session setting.
+
+  Such sessions keep offloading reads, and transaction replay restores their `SET`s.
+
+  What was wrong before:
+  - An extended-protocol `SET` inside a transaction or batched with other statements kept
+    the session's reads on the primary and was never restored.
+  - A simple-protocol `SET` inside a transaction that an extended-protocol `COMMIT` ended
+    (drivers that mix the two) stayed pending. Offloaded reads ran without it, and a
+    failover re-homed the session without it.
+  - With `tr_mode = session` (the default), an extended-protocol cycle did not advance the
+    transaction status this tracking compares against.
+- For a cycle that failed, the proxy considers every statement the error could have come
+  from:
+  - including an error answering a Flush, which never reaches the Sync's response;
+  - including a `CALL` or `DO` that commits before failing.
+
+  It keeps the cases that end in the transaction status the server reports, and uses the
+  outcome they agree on. When they disagree, or a cycle cannot be read statement by
+  statement, the session's settings become unknown (inside an open transaction, once it
+  commits). A cycle cannot be read statement by statement when it has:
+  - a statement the proxy has no record of;
+  - an Execute of a portal not bound just before it;
+  - a COPY still running;
+  - a simple Query arriving before its Sync.
+
+  Such a session keeps its reads on the primary. A failover is refused with `08006` until
+  `DISCARD ALL`, rather than re-homing the session without those settings. New counter:
+  `tr_session_set_untracked_total`.
+- Savepoint names in this tracking are read like PostgreSQL reads them:
+  - comments inside the statement are skipped;
+  - quoted names keep their spaces;
+  - `ROLLBACK WORK TO` and `ROLLBACK TRANSACTION TO` count as `ROLLBACK TO`.
+
+  A `ROLLBACK TO` a savepoint the proxy has no record of, while `SET`s are deferred, makes
+  them unknown. The tracked savepoints per transaction are capped by the new
+  `[limits] tr_max_tracked_savepoints` (default 1024). A `SET` whose value contains a
+  quoted `;` is now tracked.
 - A backend that ends an idle session (`pg_terminate_backend`, a fast shutdown during a
   switchover, `idle_session_timeout`) sends a FATAL `ErrorResponse` before it closes.
   The idle backend-watch forwarded that frame to the client although the proxy keeps the

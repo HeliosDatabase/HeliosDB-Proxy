@@ -239,11 +239,20 @@ inside a transaction are deferred to commit. Variables are keyed by name, so
 repeating a `SET` reuses its slot; the cap `tr_max_session_set_statements` counts
 **distinct variables**, and exceeding it refuses the failover with `08006` rather
 than re-homing a session with incomplete state. It covers simple-protocol
-statements, and an extended-protocol `SET`/`RESET`/`DISCARD ALL` sent alone outside a
-transaction (one Bind and Execute in the cycle, the way JDBC, Npgsql and tokio-postgres
-send a `SET`); leading comments do not hide a statement. An extended-protocol `SET`
-inside a transaction or batched with other statements, SQL-level `PREPARE`, session
-temp tables and cursors are not restored.
+statements and extended-protocol cycles. A cycle's statements are read in order, the
+way PostgreSQL runs them up to a Sync: a JDBC `BEGIN` in front of a transaction's first
+statement, pgjdbc `autosave` savepoints and batches are all covered. Extended-protocol
+`COMMIT`/`ROLLBACK`/`SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (and the `AND CHAIN` forms)
+settle deferred settings like simple-protocol ones. Leading comments do not hide a
+statement, and `SET LOCAL` is not a session setting.
+
+When a failed cycle leaves it open which of its statements ran, or a cycle cannot be
+read statement by statement, the session's settings become unknown (inside a
+transaction, once it commits). Examples: a statement the proxy has no record of, an
+Execute of a portal bound in another cycle, a `CALL` that commits before a later error.
+A failover is then refused with `08006` (`tr_session_set_untracked_total`) until
+`DISCARD ALL`. At most `tr_max_tracked_savepoints` savepoints per transaction are
+tracked. SQL-level `PREPARE`, session temp tables and cursors are not restored.
 
 **Backend credentials.** Re-homing a session means opening a *fresh* backend
 connection. In pass-through auth mode the proxy never sees the client's
@@ -260,7 +269,8 @@ former "scram mode needs a trust backend" restriction on the first connection).
 Counters on `/metrics` and `/metrics/prometheus`: `tr_failovers_total`,
 `tr_statements_reexecuted_total`, `tr_transactions_replayed_total`,
 `tr_replay_failures_total`, `tr_unknown_outcome_errors_total`,
-`tr_replay_cap_exceeded_total`, `tr_session_set_cap_exceeded_total`.
+`tr_replay_cap_exceeded_total`, `tr_session_set_cap_exceeded_total`,
+`tr_session_set_untracked_total`.
 
 ---
 
@@ -411,8 +421,9 @@ the edge cache: it may predate a write the cache was just invalidated for. Count
 **Session state.** Session-level `SET`/`RESET` go to the primary and are mirrored onto a
 standby connection before its next read (`RESET ALL`, then the session's settings, once per
 change; session pooling only, since transaction and statement pooling reset connections
-anyway). That covers the simple protocol and an extended-protocol `SET`/`RESET`/`DISCARD`
-sent alone outside a transaction, as JDBC, Npgsql and tokio-postgres send one. Comments,
+anyway). That covers the simple protocol and extended-protocol `SET`/`RESET`/`DISCARD
+ALL`, alone or batched, as JDBC, Npgsql and tokio-postgres send them; inside a
+transaction a `SET` applies when the transaction commits, in either protocol. Comments,
 such as sqlcommenter tags, do not hide a statement from this tracking or from read
 classification. `RESET ALL` keeps `SET ROLE` and `SET SESSION AUTHORIZATION`, as in
 PostgreSQL; `DISCARD ALL` resets them. While the session's default isolation level is
@@ -420,8 +431,8 @@ SERIALIZABLE its reads stay on the primary (a hot standby refuses them). A sessi
 creates state only its primary connection holds keeps its reads on the primary for the
 rest of its life: temporary tables (`CREATE TEMP …`, `SELECT … INTO`), cursors
 (`DECLARE`), SQL `PREPARE`, `LISTEN`, `LOAD`, `set_config()`, a multi-statement simple
-query, an extended-protocol `SET`/`RESET`/`DISCARD` inside a transaction, batched with
-other statements or split by a Flush, more tracked `SET`s than
+query, an extended-protocol cycle whose settings the proxy cannot tell (see Transaction
+Replay Modes above), more tracked `SET`s than
 `[limits] tr_max_session_set_statements`, or a `SET` the standby refuses.
 
 **Authentication.** A standby connection is opened by the proxy itself. With the default
@@ -855,6 +866,7 @@ gateway_pool_max_idle = 16
 tr_max_replay_statements = 1000
 tr_max_replay_bytes = 4194304
 tr_max_session_set_statements = 256
+tr_max_tracked_savepoints = 1024
 latency_buckets_ms = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]
 tr_buffer_small_reads_bytes = 0
 ```
@@ -887,6 +899,7 @@ tr_buffer_small_reads_bytes = 0
 | `latency_buckets_ms` | list of numbers | `[1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]` | Bucket upper bounds, in milliseconds, of every latency histogram on `/metrics` and `/metrics/prometheus` (failover reconnect, transaction replay, admission wait, journal apply, operator replay). 1 to 32 values, strictly increasing, each at least `0.001`; an implicit `+Inf` bucket follows. Applied at startup. |
 | `tr_buffer_small_reads_bytes` | usize | `0` | In-session TR (`tr_mode = select\|transaction`, TR-09): hold the response of a read the proxy may re-execute until its `ReadyForQuery`, up to this many bytes, so a backend fault before then has shown the client nothing and the read is retried transparently instead of the session being closed. A response that outgrows the bound is published at that point and streams on as usual. Costs the client its time to first row (the whole held response arrives at once) and up to this many bytes per session. `0` = off (stream every response). Applied at startup. |
 | `tr_max_session_set_statements` | usize | `256` | In-session TR (`tr_mode != none`): cap on DISTINCT session variables whose latest `SET` is replayed onto the replacement backend (a later `SET` of the same variable replaces the earlier one; `RESET name` removes it; `DISCARD ALL` clears all; `RESET ALL` clears all but `SET ROLE` / `SET SESSION AUTHORIZATION`, which it keeps as PostgreSQL does and which are tracked even past the cap). Over the cap tracking stops (`tr_session_set_cap_exceeded_total`) and a subsequent failover is refused with `08006` rather than re-homing the session with incomplete state. |
+| `tr_max_tracked_savepoints` | usize | `1024` | In-session TR and read offload: cap on the savepoints of one transaction whose position among its deferred `SET`s is tracked, so `ROLLBACK TO SAVEPOINT` undoes the right ones (simple or extended protocol). Past the cap the records start over; a later `ROLLBACK TO` one that was dropped while `SET`s were deferred makes the session's settings unknown once the transaction commits (reads stay home, a failover is refused with `08006`). 1024 covers a JDBC `autosave` transaction of that many statements, at most about 72 KiB per session. Must be ≥ 1. Applied at startup. |
 
 ---
 

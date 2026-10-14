@@ -516,9 +516,10 @@ after the savepoint — and replays the resulting state onto the replacement bac
 is refused (`08006`) rather than completed with incomplete state.
 
 Not restored: named `PREPARE`d statements, cursor positions, session temp tables and
-advisory locks. An extended-protocol `SET` is tracked only when sent alone outside a
-transaction (as JDBC, Npgsql and tokio-postgres send one); inside a transaction or batched
-with other statements it is not. The
+advisory locks. Extended-protocol `SET`s are tracked inside and outside transactions,
+alone or batched, by reading each cycle's statements in order. When a failed cycle
+leaves it open which of them ran, the session's settings become unknown, and its
+failover is refused (`08006`) rather than completed without them, until `DISCARD ALL`. The
 library modules `src/cursor_restore.rs` and `src/session_migrate.rs` implement
 parts of this but remain unwired from the recovery path. Applications depending on that
 state surviving a failover still need application-level coordination.
