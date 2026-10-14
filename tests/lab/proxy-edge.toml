@@ -1,8 +1,8 @@
 # edge-resume scenario, proxy-b: an EDGE of proxy-a. Serves reads from its own cache,
 # forwards misses and writes to the home's PG-wire listener, and drops cached entries
 # on the home's invalidation stream (resuming it with a cursor after a drop, C-03).
-listen_address = "127.0.0.1:35711"
-admin_address = "127.0.0.1:35791"
+listen_address = "127.0.0.1:27711"
+admin_address = "127.0.0.1:27791"
 admin_token = "helios-lab-admin"
 strict_config = true
 
@@ -15,7 +15,7 @@ success_threshold = 1
 [edge]
 enabled = true
 role = "edge"
-home_url = "http://127.0.0.1:35792"   # relay to the home's admin port 35790
+home_url = "http://127.0.0.1:27792"   # relay to the home's admin port 27790
 auth_token = "helios-lab-admin"
 allow_insecure_home_url = true   # loopback only
 default_ttl_secs = 600
@@ -24,5 +24,5 @@ region = "lab"
 
 [[nodes]]
 host = "127.0.0.1"
-port = 35710
+port = 27710
 role = "primary"

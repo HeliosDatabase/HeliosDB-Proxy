@@ -6,9 +6,9 @@ compares those outcomes with the final database. Results of recorded runs:
 [docs/ha-lab-results.md](../../docs/ha-lab-results.md).
 
 ```
-ledger --+--> proxy-a :35710 --+--> pg-a :35701  primary (synchronous_standby_names = pg_b)
-         +--> proxy-b :35711 --+--> pg-b :35702  synchronous standby  (promotion target)
-                               +--> pg-c :35703  asynchronous standby
+ledger --+--> proxy-a :27710 --+--> pg-a :27701  primary (synchronous_standby_names = pg_b)
+         +--> proxy-b :27711 --+--> pg-b :27702  synchronous standby  (promotion target)
+                               +--> pg-c :27703  asynchronous standby
 ```
 
 Both proxies run the same topology config (`proxy-a.toml`, `proxy-b.toml`; they differ
@@ -27,8 +27,10 @@ The binary must be built with `postgres-topology`, for example
 the `postgres:18.4-bookworm` image, so a glibc build from the host runs as is.
 
 Every container uses the **host network** and binds 127.0.0.1 only: PostgreSQL on
-35701-35703, the proxies on 35710/35711 with admin APIs on 35790/35791, and the edge
-drill's relay on 35792. This host cannot create Docker bridge networks and its published
+27701-27703, the proxies on 27710/27711 with admin APIs on 27790/27791, and the edge
+drill's relay on 27792, all below the Linux ephemeral port range (32768-60999) so that no
+outgoing connection on the host can hold one of them (the lab used 357xx until a relay
+collided with one, 2026-10-13). This host cannot create Docker bridge networks and its published
 ports do not work, so the lab does not use either. A run refuses to start while any of
 these ports is in use.
 
@@ -37,7 +39,7 @@ these ports is in use.
 | `promote-under-load` | The ledger runs through both proxies; after 10 s `pg-a` is killed (`SIGKILL`) and `pg-b` promoted. |
 | `stop-old-primary` | After 10 s `pg-a` is frozen (`docker compose pause`, every process stopped) and `pg-b` promoted; 15 s later `pg-a` returns **unfenced** and still writable while the ledger runs; it is stopped (fenced) at the end. |
 | `cache-logical` | C-02 slice 2, no ledger: `proxy-a` caches reads with `[cache] invalidation_source = "logical"` (`proxy-cache.toml`; pg-a runs `wal_level = logical` and has the publication). A write through `proxy-b`, a direct write on `pg-a`, and a trigger's side effect on another table must each stop `proxy-a` serving the old cached value within the poll interval. Needs a binary with that feature. |
-| `edge-resume` | C-03 drill, no ledger: `proxy-a` runs as an `[edge]` home (`proxy-home.toml`), `proxy-b` as its edge (`proxy-edge.toml`). The edge reaches the home's admin API through a TCP relay (`scripts/regress/tcp-relay.py`, 35792 → 35790). The edge's cache is warmed, the relay is killed (the edge's invalidation stream drops at once) while a write goes through the home, then restarted: expected **warm** resume (missed invalidation replayed, the cached entry of another table kept; edge invalidation is per table). Then the home is restarted: expected **gap** (the edge flushes). |
+| `edge-resume` | C-03 drill, no ledger: `proxy-a` runs as an `[edge]` home (`proxy-home.toml`), `proxy-b` as its edge (`proxy-edge.toml`). The edge reaches the home's admin API through a TCP relay (`scripts/regress/tcp-relay.py`, 27792 → 27790). The edge's cache is warmed, the relay is killed (the edge's invalidation stream drops at once) while a write goes through the home, then restarted: expected **warm** resume (missed invalidation replayed, the cached entry of another table kept; edge invalidation is per table). Then the home is restarted: expected **gap** (the edge flushes). |
 
 Tunables (environment): `LEDGER_SECS` (default 60), `LEDGER_WORKERS` (4; even workers
 use `proxy-a`, odd ones `proxy-b`), `STEP_TIMEOUT` (180 s per step).

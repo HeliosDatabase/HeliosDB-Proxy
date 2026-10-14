@@ -27,8 +27,8 @@ PSQL=(psql -X -q -At -U lab -d lab -v ON_ERROR_STOP=1 -v VERBOSITY=sqlstate)
 at() {
   local port
   case "$1" in
-    proxy-a) port=35710 ;; proxy-b) port=35711 ;;
-    pg-a) port=35701 ;; pg-b) port=35702 ;; pg-c) port=35703 ;;
+    proxy-a) port=27710 ;; proxy-b) port=27711 ;;
+    pg-a) port=27701 ;; pg-b) port=27702 ;; pg-c) port=27703 ;;
     *) echo "unknown lab endpoint $1" >&2; return 1 ;;
   esac
   AT=(-h 127.0.0.1 -p "$port")

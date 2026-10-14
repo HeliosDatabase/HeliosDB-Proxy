@@ -1,8 +1,8 @@
 # proxy-b: one of two identically configured lab proxies. The proxy never promotes:
 # the lab driver promotes pg-b with pg_promote(), and [topology] provider = "postgres"
 # follows whichever node is not in recovery, without a proxy.toml edit.
-listen_address = "127.0.0.1:35711"
-admin_address = "127.0.0.1:35791"
+listen_address = "127.0.0.1:27711"
+admin_address = "127.0.0.1:27791"
 admin_token = "helios-lab-admin"
 tr_enabled = true
 tr_mode = "transaction"
@@ -24,15 +24,15 @@ lease_timeout_secs = 5
 
 [[nodes]]
 host = "127.0.0.1"
-port = 35701
+port = 27701
 role = "primary"
 
 [[nodes]]
 host = "127.0.0.1"
-port = 35702
+port = 27702
 role = "standby"
 
 [[nodes]]
 host = "127.0.0.1"
-port = 35703
+port = 27703
 role = "standby"

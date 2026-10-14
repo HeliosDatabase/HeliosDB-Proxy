@@ -2,8 +2,8 @@
 # writes AND by the database's committed changes from a pgoutput logical slot
 # (C-02 slice 2), so writes through proxy-b, direct writes and trigger side effects
 # do not leave stale cached reads behind.
-listen_address = "127.0.0.1:35710"
-admin_address = "127.0.0.1:35790"
+listen_address = "127.0.0.1:27710"
+admin_address = "127.0.0.1:27790"
 admin_token = "helios-lab-admin"
 strict_config = true
 
@@ -17,10 +17,10 @@ success_threshold = 1
 enabled = true
 ttl_secs = 3600
 invalidation_source = "logical"
-logical_dsn = "host=127.0.0.1 port=35701 user=lab dbname=lab"
+logical_dsn = "host=127.0.0.1 port=27701 user=lab dbname=lab"
 logical_feedback_ms = 500
 
 [[nodes]]
 host = "127.0.0.1"
-port = 35701
+port = 27701
 role = "primary"

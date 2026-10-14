@@ -28,7 +28,7 @@
 # systemd scope; every step has a timeout; the EXIT trap always removes the
 # `helios-lab` compose project. Only objects carrying that project's label are
 # touched, and no volumes exist (data lives on tmpfs). Never `down -v`.
-# Networking: host network, 127.0.0.1 only, ports 35701-35792 (this host cannot
+# Networking: host network, 127.0.0.1 only, ports 27701-27792 (this host cannot
 # create Docker bridge networks); the run refuses to start if one is taken.
 set -euo pipefail
 
@@ -63,14 +63,14 @@ export HELIOS_PROXY_BIN="$BIN"
 PROJECT=helios-lab
 COMPOSE=(docker compose -p "$PROJECT" -f "$HERE/lab.yml")
 mkdir -p "$OUT"
-LAB_PORTS="35701 35702 35703 35710 35711 35790 35791 35792"
+LAB_PORTS="27701 27702 27703 27710 27711 27790 27791 27792"
 port_of() {
   case "$1" in
-    pg-a) echo 35701 ;; pg-b) echo 35702 ;; pg-c) echo 35703 ;;
-    proxy-a) echo 35710 ;; proxy-b) echo 35711 ;;
+    pg-a) echo 27701 ;; pg-b) echo 27702 ;; pg-c) echo 27703 ;;
+    proxy-a) echo 27710 ;; proxy-b) echo 27711 ;;
   esac
 }
-admin_of() { case "$1" in proxy-a) echo 35790 ;; proxy-b) echo 35791 ;; esac; }
+admin_of() { case "$1" in proxy-a) echo 27790 ;; proxy-b) echo 27791 ;; esac; }
 admin_get() { curl -s -m 5 -H "Authorization: Bearer helios-lab-admin" "http://127.0.0.1:$(admin_of "$1")/$2"; }
 RELAY_PID=
 log() { echo "[$(date -u +%T)] $*" | tee -a "$OUT/driver.log"; }
@@ -117,8 +117,16 @@ trap cleanup EXIT
 sha256sum "$BIN" | tee "$OUT/binary.sha256"
 log "scenario $SCENARIO, ledger ${LEDGER_SECS}s x ${LEDGER_WORKERS} workers"
 start_relay() { # the edge's path to its home's admin API (edge-resume)
-  python3 -I "$HERE/../../scripts/regress/tcp-relay.py" 35792 127.0.0.1 35790 >>"$OUT/relay.log" 2>&1 &
+  python3 -I "$HERE/../../scripts/regress/tcp-relay.py" 27792 127.0.0.1 27790 >>"$OUT/relay.log" 2>&1 &
   RELAY_PID=$!
+  # A relay that cannot listen must fail the run here, not as a missing edge
+  # subscription later.
+  for _ in $(seq 1 50); do
+    ss -ltnH 2>/dev/null | grep -q "127.0.0.1:27792 " && return 0
+    kill -0 "$RELAY_PID" 2>/dev/null || { log "relay could not listen on 127.0.0.1:27792 (relay.log)"; exit 1; }
+    sleep 0.1
+  done
+  log "relay did not listen on 127.0.0.1:27792 within 5 s"; exit 1
 }
 [ "$SCENARIO" = edge-resume ] && start_relay
 lab_start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"

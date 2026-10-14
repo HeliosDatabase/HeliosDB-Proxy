@@ -1,8 +1,8 @@
 # edge-resume scenario, proxy-a: the edge HOME. Authoritative for writes, publishes
 # invalidations on GET /api/edge/subscribe (admin port, token-gated). The edge reaches
-# that port through a killable relay (127.0.0.1:35792 -> 35790) the driver controls.
-listen_address = "127.0.0.1:35710"
-admin_address = "127.0.0.1:35790"
+# that port through a killable relay (127.0.0.1:27792 -> 27790) the driver controls.
+listen_address = "127.0.0.1:27710"
+admin_address = "127.0.0.1:27790"
 admin_token = "helios-lab-admin"
 strict_config = true
 
@@ -25,15 +25,15 @@ role = "home"
 
 [[nodes]]
 host = "127.0.0.1"
-port = 35701
+port = 27701
 role = "primary"
 
 [[nodes]]
 host = "127.0.0.1"
-port = 35702
+port = 27702
 role = "standby"
 
 [[nodes]]
 host = "127.0.0.1"
-port = 35703
+port = 27703
 role = "standby"

@@ -3,11 +3,11 @@
 # run-lab.sh, which takes the fleet build lock, bounds memory, and always tears
 # the project down.
 #
-#   pg-a     127.0.0.1:35701  primary (synchronous_standby_names = pg_b)
-#   pg-b     127.0.0.1:35702  synchronous physical standby  (the promotion target)
-#   pg-c     127.0.0.1:35703  asynchronous physical standby
-#   proxy-a  127.0.0.1:35710  admin :35790   (LAB_PROXY_A_CONFIG, default proxy-a.toml)
-#   proxy-b  127.0.0.1:35711  admin :35791   (LAB_PROXY_B_CONFIG, default proxy-b.toml)
+#   pg-a     127.0.0.1:27701  primary (synchronous_standby_names = pg_b)
+#   pg-b     127.0.0.1:27702  synchronous physical standby  (the promotion target)
+#   pg-c     127.0.0.1:27703  asynchronous physical standby
+#   proxy-a  127.0.0.1:27710  admin :27790   (LAB_PROXY_A_CONFIG, default proxy-a.toml)
+#   proxy-b  127.0.0.1:27711  admin :27791   (LAB_PROXY_B_CONFIG, default proxy-b.toml)
 #   ledger   bash + psql client
 #
 # Networking: this host cannot create Docker bridge networks (firewalld removed
@@ -47,11 +47,11 @@ services:
       POSTGRES_HOST_AUTH_METHOD: trust
       POSTGRES_USER: lab
       POSTGRES_DB: lab
-      PGPORT: "35701"
+      PGPORT: "27701"
     command:
       - postgres
       - -c
-      - port=35701
+      - port=27701
       - -c
       - listen_addresses=127.0.0.1
       - -c
@@ -69,7 +69,7 @@ services:
     volumes:
       - ./primary-init.sh:/docker-entrypoint-initdb.d/10-lab.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 35701 -U lab -d lab"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 27701 -U lab -d lab"]
       interval: 1s
       timeout: 2s
       retries: 90
@@ -77,14 +77,14 @@ services:
   pg-b:
     <<: *pg
     environment:
-      PRIMARY_PORT: "35701"
-      PORT: "35702"
+      PRIMARY_PORT: "27701"
+      PORT: "27702"
       STANDBY_NAME: pg_b
     entrypoint: ["bash", "/lab/standby.sh"]
     volumes:
       - ./standby.sh:/lab/standby.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 35702 -U lab -d lab"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 27702 -U lab -d lab"]
       interval: 1s
       timeout: 2s
       retries: 90
@@ -94,14 +94,14 @@ services:
   pg-c:
     <<: *pg
     environment:
-      PRIMARY_PORT: "35701"
-      PORT: "35703"
+      PRIMARY_PORT: "27701"
+      PORT: "27703"
       STANDBY_NAME: pg_c
     entrypoint: ["bash", "/lab/standby.sh"]
     volumes:
       - ./standby.sh:/lab/standby.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 35703 -U lab -d lab"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 27703 -U lab -d lab"]
       interval: 1s
       timeout: 2s
       retries: 90
