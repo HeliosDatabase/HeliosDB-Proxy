@@ -239,9 +239,11 @@ inside a transaction are deferred to commit. Variables are keyed by name, so
 repeating a `SET` reuses its slot; the cap `tr_max_session_set_statements` counts
 **distinct variables**, and exceeding it refuses the failover with `08006` rather
 than re-homing a session with incomplete state. It covers simple-protocol
-statements and extended-protocol cycles. A cycle's statements are read in order, the
-way PostgreSQL runs them up to a Sync: a JDBC `BEGIN` in front of a transaction's first
-statement, pgjdbc `autosave` savepoints and batches are all covered. Extended-protocol
+queries and extended-protocol cycles. A multi-statement query's or a cycle's
+statements are read in order, the way PostgreSQL runs them in one implicit
+transaction. That covers a pool reset such as `SET SESSION AUTHORIZATION
+DEFAULT;RESET ALL;...`, a JDBC `BEGIN` in front of a transaction's first
+statement, pgjdbc `autosave` savepoints and batches. Extended-protocol
 `COMMIT`/`ROLLBACK`/`SAVEPOINT`/`RELEASE`/`ROLLBACK TO` (and the `AND CHAIN` forms)
 settle deferred settings like simple-protocol ones. Leading comments do not hide a
 statement, and `SET LOCAL` is not a session setting.

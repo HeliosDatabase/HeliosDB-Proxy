@@ -277,6 +277,8 @@ pub(super) struct TrSession {
     /// with the kind of the statement bound. Replaying the binding cycle
     /// recreates the portal; cleared when the transaction ends.
     pub(super) tx_portals: HashMap<String, StmtKind>,
+    /// The cycle a simple-protocol query is read as (kept for its buffers).
+    pub(super) simple_cycle: ExtSetCycle,
 }
 
 impl TrSession {
@@ -300,6 +302,7 @@ impl TrSession {
             ext_dispatched: false,
             acked: HashMap::new(),
             tx_portals: HashMap::new(),
+            simple_cycle: ExtSetCycle::default(),
         }
     }
 }
@@ -492,18 +495,6 @@ impl ProxyServer {
                 .unwrap_or(true)
     }
 
-    /// Classify one client statement for in-session TR (see `StmtKind`).
-    /// Conservative by construction: anything not positively recognised as a
-    /// read or as idempotent control is treated as a possible write.
-    /// Whether `sql` durably commits the transaction it ends, so SETs issued
-    /// inside that transaction survive. Distinct from `StmtKind::Commit`, which
-    /// answers the wider replay-safety question.
-    pub(super) fn tr_commits_session_state(sql: &str) -> bool {
-        crate::replay_sql::boundaries(sql)
-            .map(|b| b.may_commit && !b.ends_tx)
-            .unwrap_or(false)
-    }
-
     /// TR-03: can this read-shaped statement be re-executed on an unknown
     /// outcome? Only if every syntactic function call is a PostgreSQL built-in
     /// known to be side-effect-free (or operator-listed), no quoted identifier
@@ -525,6 +516,9 @@ impl ProxyServer {
         scanned.is_ok() && ok
     }
 
+    /// Classify one client statement for in-session TR (see `StmtKind`).
+    /// Conservative by construction: anything not positively recognised as a
+    /// read or as idempotent control is treated as a possible write.
     pub(super) fn tr_classify(sql: &str, policy: &TrReadPolicy) -> StmtKind {
         let Ok(boundaries) = crate::replay_sql::boundaries(sql) else {
             // The session's lexical rules or malformed input make commit
@@ -1221,14 +1215,9 @@ impl ProxyServer {
             .retain(|g| Self::tr_guc_name(g).as_deref() != Some(name));
     }
 
-    /// Whether `sql`, after any leading comments, is a `SET`, `RESET` or
-    /// `DISCARD`.
-    pub(super) fn tr_is_set_like(sql: &str) -> bool {
-        Self::tr_is_set_like_bytes(sql.as_bytes())
-    }
-
-    /// [`Self::tr_is_set_like`] over raw statement bytes: a prefix test, no
-    /// UTF-8 validation (per-`Bind` cost).
+    /// Whether a statement, after any leading comments, is a `SET`, `RESET`
+    /// or `DISCARD`: a prefix test over raw bytes, no UTF-8 validation
+    /// (per-`Parse` cost).
     pub(super) fn tr_is_set_like_bytes(sql: &[u8]) -> bool {
         crate::protocol::leads_with_keyword(sql, "SET")
             || crate::protocol::leads_with_keyword(sql, "RESET")
@@ -1512,6 +1501,58 @@ impl ProxyServer {
         }
     }
 
+    /// What a simple-protocol query did to the session's settings. Its
+    /// statements are read in order like an extended-protocol cycle: a
+    /// multi-statement query runs in one implicit transaction unless it
+    /// controls it (see `ext_set`), which covers pool resets such as
+    /// Npgsql's `SET SESSION AUTHORIZATION DEFAULT;RESET ALL;...`. Without a
+    /// `;` the query is one statement, read with a few prefix compares.
+    pub(super) fn tr_simple_settings(
+        tr: &mut TrSession,
+        sql: &str,
+        before: u8,
+        after: u8,
+        failed: bool,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+    ) {
+        let mut cycle = std::mem::take(&mut tr.simple_cycle);
+        let mut run = |bound: Bound| {
+            cycle.on_bind(b"", bound);
+            cycle.on_execute(b"");
+        };
+        if memchr::memchr(b';', sql.as_bytes()).is_none() {
+            match Self::tr_bound(sql.as_bytes()) {
+                // PostgreSQL parses the whole query first: one that does not
+                // lex ran nothing.
+                Bound::Unknown if failed => {}
+                bound => run(bound),
+            }
+        } else {
+            match crate::replay_sql::split_statements(sql) {
+                Ok(statements) => {
+                    for statement in statements {
+                        run(Self::tr_bound(statement.as_bytes()));
+                    }
+                }
+                Err(crate::replay_sql::Unsplit::Unlexable) if failed => {}
+                // Which statements ran depends on the session's reading of
+                // backslashes (or on a lexer disagreement): anything did.
+                Err(_) => run(Bound::Unknown),
+            }
+        }
+        let outcome = cycle.at_boundary(ExtSetBoundary {
+            sync: true,
+            forwarded: true,
+            before,
+            after,
+            failed,
+            copying: false,
+        });
+        tr.simple_cycle = cycle;
+        Self::tr_ext_set_outcome(tr, outcome, after == b'I', session, state);
+    }
+
     /// Apply what an extended-protocol cycle (or a multi-statement query) did
     /// to the session's settings (see `ext_set`). `idle_after_sync`: the
     /// cycle reached a backend and ended in an idle ReadyForQuery. Returns
@@ -1676,44 +1717,7 @@ impl ProxyServer {
         // --- session GUC tracking (simple protocol; the client loop tracks
         // extended-protocol cycles itself) ---
         if tr.track_gucs && simple {
-            if Self::tr_is_set_like(sql) && !had_error {
-                // Inside a transaction every GUC change is deferred: PostgreSQL
-                // rolls SET/RESET/RESET ALL back with the transaction, so the
-                // restore set must not learn them until COMMIT.
-                if let Some(op) = Self::tr_guc_op(sql) {
-                    if now_in_tx {
-                        tr.pending_tx_gucs.push(op);
-                    } else {
-                        Self::tr_apply_guc_op(tr, op, state);
-                    }
-                }
-            } else if now_in_tx && !had_error {
-                let head = crate::protocol::skip_leading_comments(sql);
-                if crate::protocol::starts_with_ci(head, "SAVEPOINT")
-                    || crate::protocol::starts_with_ci(head, "RELEASE")
-                    || crate::protocol::starts_with_ci(head, "ROLLBACK")
-                {
-                    Self::tr_note_savepoint(tr, head, state.limits.tr_max_tracked_savepoints);
-                }
-            }
-            if was_in_tx && !now_in_tx {
-                // Transaction ended: SETs made inside it persist only if it
-                // committed (a failed transaction's COMMIT is a ROLLBACK).
-                // `StmtKind::Commit` is the replay-safety classification: it is
-                // deliberately wide and also covers `ROLLBACK; <DML>`, where the
-                // trailing DML commits in autocommit but the transaction's own
-                // session state was DISCARDED. Promoting that transaction's SETs
-                // would restore settings the database never kept, so the durable
-                // commit is confirmed against the statement itself.
-                let committed = prev_status == b'T'
-                    && !had_error
-                    && kind(&mut kind_cache) == StmtKind::Commit
-                    && Self::tr_commits_session_state(sql);
-                Self::tr_settle_tx(tr, Some(committed), session, state);
-            } else if !now_in_tx && Self::tr_tx_settings_open(tr) {
-                // The transaction ended where the proxy did not see it end.
-                Self::tr_settle_tx(tr, None, session, state);
-            }
+            Self::tr_simple_settings(tr, sql, prev_status, status, had_error, session, state);
         }
 
         // --- explicit-transaction statement recording ---

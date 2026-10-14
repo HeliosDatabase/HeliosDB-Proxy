@@ -1390,6 +1390,167 @@ async fn tr_extended_cycles_settle_deferred_settings() {
     assert!(tr.gucs_unknown && tr.pending_tx_gucs.is_empty());
 }
 
+/// 72494e4aaebf: a multi-statement simple query is read statement by
+/// statement, like an extended-protocol cycle: a pool reset forgets the
+/// previous user's settings, a failed batch changes nothing, a chained COMMIT
+/// applies the transaction's SETs.
+#[tokio::test]
+async fn tr_simple_queries_are_read_statement_by_statement() {
+    let server = ProxyServer::new(test_config()).unwrap();
+    let state = server.state.clone();
+    let session = make_test_session();
+    let mut tr = TrSession::new(TrMode::Session);
+    async fn step(
+        tr: &mut TrSession,
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        status: u8,
+        failed: bool,
+        sql: &str,
+    ) {
+        ProxyServer::note_ready_for_query(session, status, failed);
+        ProxyServer::tr_after_simple(tr, &qmsg(sql), session, state).await;
+    }
+    let tracked = |tr: &TrSession, needle: &str| tr.gucs.iter().any(|g| g.contains(needle));
+    let search_path = "SET search_path TO tenant_a";
+
+    // Npgsql's pool reset when it keeps prepared statements.
+    step(&mut tr, &session, &state, b'I', false, search_path).await;
+    step(&mut tr, &session, &state, b'I', false, "SET ROLE tenant_a").await;
+    step(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        "SET SESSION AUTHORIZATION DEFAULT;RESET ALL;CLOSE ALL;UNLISTEN *;\
+         SELECT pg_advisory_unlock_all();DISCARD SEQUENCES;DISCARD TEMP",
+    )
+    .await;
+    assert!(!tracked(&tr, "search_path"), "{:?}", tr.gucs);
+    assert!(
+        tracked(&tr, "SESSION AUTHORIZATION DEFAULT"),
+        "{:?}",
+        tr.gucs
+    );
+    assert!(!tr.gucs_unknown);
+    // asyncpg's.
+    step(&mut tr, &session, &state, b'I', false, search_path).await;
+    step(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        "SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL;",
+    )
+    .await;
+    assert!(!tracked(&tr, "search_path"), "{:?}", tr.gucs);
+    // A SET batched with a read; a quoted ';' is part of a value.
+    step(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        "SET work_mem = '8MB'; SELECT 1",
+    )
+    .await;
+    step(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        "SET application_name = 'a;b'",
+    )
+    .await;
+    assert!(
+        tracked(&tr, "8MB") && tracked(&tr, "'a;b'"),
+        "{:?}",
+        tr.gucs
+    );
+    // A failed batch: its implicit transaction rolled back with the SET.
+    step(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        true,
+        "SET work_mem = '64MB'; SELECT 1/0",
+    )
+    .await;
+    assert!(
+        tracked(&tr, "8MB") && !tracked(&tr, "64MB"),
+        "{:?}",
+        tr.gucs
+    );
+    // A batch that is a whole transaction.
+    step(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        "BEGIN; SET work_mem = '32MB'; COMMIT",
+    )
+    .await;
+    assert!(tracked(&tr, "32MB"), "{:?}", tr.gucs);
+    // COMMIT AND CHAIN applies; the chained transaction's ROLLBACK keeps it.
+    step(&mut tr, &session, &state, b'T', false, "BEGIN").await;
+    step(
+        &mut tr,
+        &session,
+        &state,
+        b'T',
+        false,
+        "SET statement_timeout = '5s'",
+    )
+    .await;
+    step(&mut tr, &session, &state, b'T', false, "COMMIT AND CHAIN").await;
+    step(&mut tr, &session, &state, b'I', false, "ROLLBACK").await;
+    assert!(tracked(&tr, "statement_timeout"), "{:?}", tr.gucs);
+    // A transaction that ended on a statement no reading explains: unknown.
+    step(&mut tr, &session, &state, b'T', false, "BEGIN").await;
+    step(
+        &mut tr,
+        &session,
+        &state,
+        b'T',
+        false,
+        "SET lock_timeout = '1s'",
+    )
+    .await;
+    step(&mut tr, &session, &state, b'I', false, "SELECT 1").await;
+    assert!(tr.gucs_unknown);
+    step(&mut tr, &session, &state, b'I', false, "DISCARD ALL").await;
+    assert!(!tr.gucs_unknown && tr.gucs.is_empty());
+    // A query that does not lex ran nothing...
+    step(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        true,
+        "SET a = 'open; SELECT 1",
+    )
+    .await;
+    step(&mut tr, &session, &state, b'I', true, "SET a = 'open").await;
+    assert!(!tr.gucs_unknown && tr.gucs.is_empty());
+    // ...but one whose statements depend on the session's backslash reading
+    // may have run any of them.
+    step(
+        &mut tr,
+        &session,
+        &state,
+        b'I',
+        false,
+        "SET application_name = 'x\\'; SET work_mem = '1MB'; --'",
+    )
+    .await;
+    assert!(tr.gucs_unknown);
+}
+
 /// Savepoint names are read like PostgreSQL reads them (comments aside,
 /// quoted names whole), and the tracked savepoints are capped by `[limits]
 /// tr_max_tracked_savepoints`.
@@ -1469,7 +1630,7 @@ fn tr_guc_op_sees_through_leading_comments() {
     ] {
         assert_eq!(op(none), None, "{none:?}");
     }
-    let like = ProxyServer::tr_is_set_like;
+    let like = |sql: &str| ProxyServer::tr_is_set_like_bytes(sql.as_bytes());
     assert!(like("/* app=shop */ set search_path TO x"));
     assert!(like("-- c\nDISCARD ALL"));
     assert!(!like("SELECT 'SET a = 1'"));
@@ -2273,6 +2434,7 @@ async fn tr_recorder_mode_gating() {
         .await;
     assert!(session.tx_state.read().await.statements.is_empty());
     ProxyServer::note_ready_for_query(&session, b'I', false);
+    ProxyServer::tr_after_simple(&mut tr, &qmsg("COMMIT"), &session, &state).await;
     ProxyServer::tr_after_simple(&mut tr, &qmsg("SET a = 1"), &session, &state).await;
     assert_eq!(tr.gucs, vec!["SET a = 1"]);
 

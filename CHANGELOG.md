@@ -82,6 +82,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Such a session keeps its reads on the primary. A failover is refused with `08006` until
   `DISCARD ALL`, rather than re-homing the session without those settings. New counter:
   `tr_session_set_untracked_total`.
+- `SET`, `RESET` and `DISCARD ALL` inside a multi-statement simple query are now tracked:
+  the query's statements are read in order, like an extended-protocol cycle. Before, only
+  a query's first statement was looked at, and a multi-statement query was not tracked
+  at all. So after a connection pool's reset query (Npgsql's
+  `SET SESSION AUTHORIZATION DEFAULT;RESET ALL;...`, asyncpg's `...;RESET ALL;`) the proxy
+  still held the previous logical user's settings, `SET ROLE` included, and a
+  transaction-replay re-home restored them onto the connection now serving someone else.
+  A query whose statement boundaries depend on `standard_conforming_strings` makes the
+  settings unknown. Simple-protocol `COMMIT AND CHAIN` and `ROLLBACK AND CHAIN` now
+  settle deferred settings. A transaction that ends on a statement that cannot have ended
+  it leaves them unknown instead of dropping them.
 - Savepoint names in this tracking are read like PostgreSQL reads them:
   - comments inside the statement are skipped;
   - quoted names keep their spaces;

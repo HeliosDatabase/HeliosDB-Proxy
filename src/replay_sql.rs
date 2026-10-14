@@ -71,9 +71,60 @@ pub(crate) fn single_statement(sql: &str) -> bool {
         && (!plain.saw_quoted_backslash || scan(sql, true).is_ok_and(|e| e.statements <= 1))
 }
 
+/// Why [`split_statements`] could not split a query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unsplit {
+    /// It lexes under neither backslash reading: PostgreSQL rejects it.
+    Unlexable,
+    /// The two readings disagree on where its statements are: which ran
+    /// depends on the session's `standard_conforming_strings`.
+    Ambiguous,
+}
+
+/// The statements of a multi-statement query, in order, without their `;`
+/// and surrounding whitespace (empty statements are dropped). Semicolons
+/// inside literals, quoted identifiers, dollar quotes and comments do not
+/// split; both backslash readings must agree.
+pub(crate) fn split_statements(sql: &str) -> Result<Vec<&str>, Unsplit> {
+    let mut cuts = Vec::new();
+    let plain = scan_with(sql, false, &mut |i| cuts.push(i));
+    let needs_escaped = match &plain {
+        Ok(p) => p.saw_quoted_backslash,
+        Err(()) => true,
+    };
+    if needs_escaped {
+        let mut other = Vec::new();
+        let escaped = scan_with(sql, true, &mut |i| other.push(i));
+        match (&plain, escaped) {
+            (Err(()), Err(())) => return Err(Unsplit::Unlexable),
+            (Ok(_), Ok(_)) if other == cuts => {}
+            _ => return Err(Unsplit::Ambiguous),
+        }
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    for end in cuts.into_iter().chain(std::iter::once(sql.len())) {
+        let stmt = sql[start..end].trim();
+        if !crate::protocol::skip_leading_comments(stmt).is_empty() {
+            out.push(stmt);
+        }
+        start = end + 1;
+    }
+    Ok(out)
+}
+
 /// One lexical pass. `backslash_escapes` selects the session reading: when true
 /// a backslash consumes the next byte inside a single-quoted literal.
 fn scan(sql: &str, backslash_escapes: bool) -> Result<Scan<'_>, ()> {
+    scan_with(sql, backslash_escapes, &mut |_| {})
+}
+
+/// [`scan`], reporting the byte offset of every statement-separating `;`.
+fn scan_with<'a>(
+    sql: &'a str,
+    backslash_escapes: bool,
+    on_semicolon: &mut impl FnMut(usize),
+) -> Result<Scan<'a>, ()> {
     let b = sql.as_bytes();
     let mut saw_quoted_backslash = false;
     let mut i = 0;
@@ -118,6 +169,7 @@ fn scan(sql: &str, backslash_escapes: bool) -> Result<Scan<'_>, ()> {
                 continue;
             }
             b';' => {
+                on_semicolon(i);
                 at_start = true;
                 i += 1;
                 continue;
@@ -357,6 +409,38 @@ pub(crate) fn words(sql: &str, mut f: impl FnMut(Word<'_>) -> bool) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_statements_follows_the_lexer() {
+        assert_eq!(
+            split_statements("SET SESSION AUTHORIZATION DEFAULT;RESET ALL;CLOSE ALL;UNLISTEN *;"),
+            Ok(vec![
+                "SET SESSION AUTHORIZATION DEFAULT",
+                "RESET ALL",
+                "CLOSE ALL",
+                "UNLISTEN *"
+            ])
+        );
+        assert_eq!(
+            split_statements("SET a = 'x;y' ; /* ; */ SELECT $$;$$ ;;  -- tail ;"),
+            Ok(vec!["SET a = 'x;y'", "/* ; */ SELECT $$;$$"])
+        );
+        assert_eq!(split_statements("SELECT 1"), Ok(vec!["SELECT 1"]));
+        assert_eq!(split_statements(" ; "), Ok(vec![]));
+        assert_eq!(
+            split_statements("SET a = 'open; SELECT 1"),
+            Err(Unsplit::Unlexable)
+        );
+        assert_eq!(
+            split_statements("SET a = 'x\\'; SET b = 2; --'"),
+            Err(Unsplit::Ambiguous)
+        );
+        // A backslash both readings agree on.
+        assert_eq!(
+            split_statements("SET a = 'C:\\dir'; SET b = 2"),
+            Ok(vec!["SET a = 'C:\\dir'", "SET b = 2"])
+        );
+    }
 
     #[test]
     fn single_statement_ignores_quoted_semicolons() {
