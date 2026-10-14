@@ -11,7 +11,7 @@ The proxies never promote anything. The driver plays the HA manager, promoting p
 `pg_promote()`. `[topology] provider = "postgres"` lets both proxies follow whichever node
 is not in recovery, with no config edit and no restart.
 
-## 2026-10-13, local main (cf78f8a)
+## 2026-10-13, local main (7218448)
 
 Binary sha256 `605d3ac6…1cfc08` (`--features all-features,postgres-topology`, release).
 Host gpc001ca, every container on the host network, 127.0.0.1 ports 35701-35792. Evidence:
@@ -75,9 +75,9 @@ the home, and the relay is restarted. Then the home is restarted.
 
 The first run failed the "kept other entries" check: the drill's other entry was in the
 same table as the missed write, and edge invalidation is per table, so dropping it was
-correct. The drill now uses a second table (46f6a11).
+correct. The drill now uses a second table (11ffcad).
 
-## 2026-10-13, 2026-10-12 stack tip (0020dd3)
+## 2026-10-13, 2026-10-12 stack tip (bfa7e2b)
 
 The local branch stack: routing snapshot, P-03, H-02, C-02 slice 2, H-06, H-05, TR-08,
 TR-09, L2 shed pacing and the dependency bump. Binary `tip3`, same build features.
@@ -96,7 +96,7 @@ A write through `proxy-b`, a direct write on pg-a, and a trigger's side effect o
 poll interval. Logical source: attached, 4 transactions applied, 0 lag, 0 reconnects, 0
 full invalidations.
 
-## 2026-10-14, reconnect wave (H-05), main 350978a + reconnect limit
+## 2026-10-14, reconnect wave (H-05), main 24416af + reconnect limit
 
 Binary `wave2` (sha256 in the evidence), same build features, lab ports 27701-27792.
 Evidence: `/home/gpc/HDB/sprint/baselines/proxy/wave-20261014/lab-reconnect-wave` and
@@ -119,6 +119,23 @@ guessing. In an earlier run with the default committed-history ring (50,000
 transactions), the proxy's RSS grew about 3 MiB/s until the ring was full and then held
 flat. The drill therefore uses a 2,000-transaction ring, so it measures the failover
 rather than the ring filling.
+
+## 2026-10-14, reconnect wave at the default limit (16), main 0c73797
+
+Binary `rdef2` (sha256 in the evidence), same drill. Evidence:
+`/home/gpc/HDB/sprint/baselines/proxy/rdef2-20261014/lab-reconnect-wave` and
+`lab-wave-default`. `max_concurrent_reconnects_per_node` now defaults to 16. The drill
+reads the new `heliosdb_proxy_backend_reconnects_peak` gauge, the most connections
+opened at once to one node, instead of sampling the in-progress gauge every 250 ms:
+dials finish within one sample, so the sampled maximum was 0 in both runs.
+
+| run | peak reconnects to one node | permit waits / refusals | TR re-homes | big tenant back to ½ throughput | small tenant | proxy RSS before kill → end |
+|---|---|---|---|---|---|---|
+| `max_concurrent_reconnects_per_node = 4` | 4 | 618 / 0 | 45 | 1.2 s after promotion | 0 aborted, served outside the kill and promotion seconds | 15.8 MiB → 16.5 MiB |
+| default, 16 | 16 | 48 / 0 | 47 | 1.1 s | same | 15.9 MiB → 16.5 MiB |
+
+The default limit is reached by a 48-client wave and holds it at 16 without refusals or a
+slower recovery.
 
 ## Not covered yet
 

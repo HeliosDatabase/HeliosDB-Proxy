@@ -21,7 +21,7 @@ stay under 3%.
 
 L2 file-cache TTL repair (sprinter `21cc434afb5c`). Host **gpc001ca**, rustc **1.99.0**,
 `--features all-features`, governor `performance`, one fleet-lock acquisition, 24 GiB/no-swap
-scope. Base: `82d044c` with the candidate's `benches/cache.rs` and the same gate scripts, so
+scope. Base: `16d6ba8` with the candidate's `benches/cache.rs` and the same gate scripts, so
 both arms run the same 120 cases. Gate: `scripts/bench-gate.sh`, whole-arm mode, 3 rounds
 AB/BA/AB, thresholds unchanged. Evidence:
 `/home/gpc/HDB/sprint/baselines/proxy/l2-ttl-20261004/criterion-r3layout-full-r7-output/`;

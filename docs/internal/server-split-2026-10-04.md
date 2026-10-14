@@ -8,8 +8,8 @@ source references and changelog; historical reports retain their original paths.
 
 ## Source and evidence
 
-- Baseline: `721e0d4be65a759f6002163da75d04bf391d91f7`.
-- Tested refactor: `0e7ee896a180c8002851ce869dd5ac287ef4c571`.
+- Baseline: `3dc10e0a6ae34d67c131f1c66f665442de392ce3`.
+- Tested refactor: `7669531db26ccc0b6084456506c1589cc60944a2`.
 - Candidate worktree: `/home/gpc/HDB/Proxy-wt-server-split-20261002`.
 - Baseline worktree: `/home/gpc/HDB/Proxy-base-server-split-20261002`.
 - Evidence root: `/home/gpc/HDB/sprint/baselines/proxy/server-split-20261002`.
