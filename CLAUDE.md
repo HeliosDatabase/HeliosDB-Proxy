@@ -19,7 +19,9 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
 - Live regression battery: `BK=pg scripts/regress/run.sh <proxy-binary>` (or `BK=nano`).
   Needs Docker for the psql/pgbench client tooling AND an already-running backend — the
   script does not start one (BK=pg expects PG 18.4 at `127.0.0.1:25433`, user `bench`;
-  BK=nano expects Nano at `100.64.0.2:54320`)
+  BK=nano expects Nano at `100.64.0.2:54320`). `REGRESS_BACKEND=host:port:user:password:db`
+  points it at a disposable backend instead (e.g. a host-network `postgres:18.4-bookworm`
+  container you start and remove yourself)
 - MSRV: `cargo check --locked --features msrv-features` on Rust 1.86
 
 ## Quality Gates (mandatory — every change must pass ALL before commit/merge)

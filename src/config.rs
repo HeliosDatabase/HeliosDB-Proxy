@@ -1611,9 +1611,11 @@ pub struct LimitsToml {
     /// offloaded reads), from TCP connect through authentication (H-05).
     /// Meters the reconnect wave a failover sends to the new primary. A dial
     /// over the limit waits up to `backend_slot_wait_ms`, then the request is
-    /// refused with 53300 (the node is not marked unhealthy). Default 0 =
-    /// unlimited.
-    #[serde(default)]
+    /// refused with 53300 (the node is not marked unhealthy); a
+    /// transaction-replay re-home keeps retrying until its recovery deadline.
+    /// A wave of N such connections takes about N x (connect + auth time) /
+    /// the limit. Default 16; 0 = unlimited.
+    #[serde(default = "default_max_concurrent_reconnects_per_node")]
     pub max_concurrent_reconnects_per_node: usize,
     /// TR-09: under `tr_mode = "select"` or `"transaction"`, hold the response
     /// of a read the proxy may re-execute in the proxy until its
@@ -1629,6 +1631,10 @@ pub struct LimitsToml {
 
 fn default_backend_slot_wait_ms() -> u64 {
     5000
+}
+
+fn default_max_concurrent_reconnects_per_node() -> usize {
+    16
 }
 
 fn default_max_cancel_keys() -> usize {
@@ -1733,7 +1739,7 @@ impl Default for LimitsToml {
             tr_max_session_set_statements: default_tr_max_session_set_statements(),
             latency_buckets_ms: crate::metrics_hist::default_latency_buckets_ms(),
             backend_slot_wait_ms: default_backend_slot_wait_ms(),
-            max_concurrent_reconnects_per_node: 0,
+            max_concurrent_reconnects_per_node: default_max_concurrent_reconnects_per_node(),
             tr_buffer_small_reads_bytes: 0,
         }
     }
@@ -4853,8 +4859,18 @@ database = "helios"
         let c: ProxyConfig = toml::from_str(toml).expect("parse");
         assert_eq!(c.nodes[0].max_connections, 40);
         assert_eq!(c.limits.backend_slot_wait_ms, 250);
+        assert_eq!(
+            c.limits.max_concurrent_reconnects_per_node, 16,
+            "an absent key takes the default"
+        );
         assert!(c.validate().is_ok());
         assert_eq!(LimitsToml::default().backend_slot_wait_ms, 5000);
+        assert_eq!(LimitsToml::default().max_concurrent_reconnects_per_node, 16);
+        let off: ProxyConfig = toml::from_str(
+            "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n\n[limits]\nmax_concurrent_reconnects_per_node = 0\n",
+        )
+        .expect("parse");
+        assert_eq!(off.limits.max_concurrent_reconnects_per_node, 0);
         assert_eq!(
             NodeConfig::default().max_connections,
             0,

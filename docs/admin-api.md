@@ -380,7 +380,7 @@ Besides the counters above, the body carries (P-03):
 | `heliosdb_proxy_gateway_pool_idle` | gauge | `gateway` | Idle pooled gateway backend connections. |
 | `heliosdb_proxy_node_backend_connections`, `_connection_limit` | gauge | `node` | Backend connections held (in use or parked) to a node with `[[nodes]] max_connections`, and that limit (H-05). Only capped nodes appear. |
 | `heliosdb_proxy_node_backend_slot_waits_total`, `_slot_refusals_total` | counter | `node` | New backend connections that waited for a slot, and those refused with 53300 at the cap. |
-| `heliosdb_proxy_backend_reconnects_in_progress`, `_reconnect_limit` | gauge | — | Backend connections being opened on a session's behalf right now (all nodes), and `[limits] max_concurrent_reconnects_per_node` (H-05). Only when that limit is set. |
+| `heliosdb_proxy_backend_reconnects_in_progress`, `_reconnects_peak`, `_reconnect_limit` | gauge | — | Backend connections being opened on a session's behalf right now (all nodes), the most opened at once to one node since startup (never above the limit), and `[limits] max_concurrent_reconnects_per_node` (H-05). Absent when the limit is `0`. |
 | `heliosdb_proxy_backend_reconnect_waits_total`, `_reconnect_refusals_total` | counter | — | Such connections that waited for a permit, and requests refused with 53300 waiting for one. |
 | `heliosdb_proxy_backend_slot_wait_seconds` | histogram | — | How long the waits for a node slot or a reconnect permit took. |
 

@@ -11,11 +11,11 @@
 //! backend connections the proxy is opening at once on a session's behalf
 //! (a transaction-replay re-home, a reconnect after a lost backend, a standby
 //! connection), from TCP connect through authentication. It meters the
-//! reconnect wave a failover sends to the new primary. `0` (the default)
+//! reconnect wave a failover sends to the new primary. Default 16; `0`
 //! takes no permit at all.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -75,6 +75,9 @@ pub struct NodeSlots {
     reconnecting: dashmap::DashMap<String, Arc<Semaphore>>,
     reconnect_waits: AtomicU64,
     reconnect_refusals: AtomicU64,
+    /// Most reconnects one node had in progress at once, as each dial got its
+    /// permit.
+    reconnect_peak: AtomicUsize,
 }
 
 /// What `/metrics` reports for the reconnect limit.
@@ -82,6 +85,8 @@ pub struct NodeSlots {
 pub struct ReconnectStats {
     pub limit_per_node: usize,
     pub in_progress: usize,
+    /// Most connections being opened at once to one node since startup.
+    pub peak_per_node: usize,
     pub waits: u64,
     pub refusals: u64,
 }
@@ -149,12 +154,16 @@ impl NodeSlots {
                 .clone(),
         };
         if let Ok(p) = sem.clone().try_acquire_owned() {
+            self.note_reconnect_peak(&sem);
             return Ok((Some(p), None));
         }
         self.reconnect_waits.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
-        match tokio::time::timeout(wait, sem.acquire_owned()).await {
-            Ok(Ok(p)) => Ok((Some(p), Some(started.elapsed()))),
+        match tokio::time::timeout(wait, sem.clone().acquire_owned()).await {
+            Ok(Ok(p)) => {
+                self.note_reconnect_peak(&sem);
+                Ok((Some(p), Some(started.elapsed())))
+            }
             _ => {
                 self.reconnect_refusals.fetch_add(1, Ordering::Relaxed);
                 Err(ReconnectTimeout {
@@ -163,6 +172,12 @@ impl NodeSlots {
                 })
             }
         }
+    }
+
+    fn note_reconnect_peak(&self, sem: &Semaphore) {
+        let in_progress = self.reconnect_limit - sem.available_permits().min(self.reconnect_limit);
+        self.reconnect_peak
+            .fetch_max(in_progress, Ordering::Relaxed);
     }
 
     /// The reconnect limit's state; `None` when it is off.
@@ -176,6 +191,7 @@ impl NodeSlots {
                     self.reconnect_limit - e.value().available_permits().min(self.reconnect_limit)
                 })
                 .sum(),
+            peak_per_node: self.reconnect_peak.load(Ordering::Relaxed),
             waits: self.reconnect_waits.load(Ordering::Relaxed),
             refusals: self.reconnect_refusals.load(Ordering::Relaxed),
         })
@@ -251,6 +267,15 @@ mod tests {
     async fn reconnects_are_bounded_per_node_when_configured() {
         let mut config = ProxyConfig::default();
         config.add_node("db:5432", "primary").unwrap();
+        assert_eq!(config.limits.max_concurrent_reconnects_per_node, 16);
+        assert_eq!(
+            NodeSlots::from_config(&config)
+                .reconnect_stats()
+                .map(|r| r.limit_per_node),
+            Some(16),
+            "on by default"
+        );
+        config.limits.max_concurrent_reconnects_per_node = 0;
         let off = NodeSlots::from_config(&config);
         let (p, w) = off
             .acquire_reconnect("db:5432", Duration::from_millis(1))
@@ -265,6 +290,7 @@ mod tests {
         let a = slots.acquire_reconnect("db:5432", wait).await.unwrap().0;
         let b = slots.acquire_reconnect("db:5432", wait).await.unwrap().0;
         assert!(a.is_some() && b.is_some());
+        assert_eq!(slots.reconnect_stats().unwrap().peak_per_node, 2);
         // Another node (e.g. one a reload added) has its own permits.
         assert!(slots
             .acquire_reconnect("new:5432", wait)
@@ -294,12 +320,14 @@ mod tests {
             Some(ReconnectStats {
                 limit_per_node: 2,
                 in_progress: 2,
+                peak_per_node: 2,
                 waits: 2,
                 refusals: 1,
             })
         );
         drop((b, c));
-        assert_eq!(slots.reconnect_stats().unwrap().in_progress, 0);
+        let idle = slots.reconnect_stats().unwrap();
+        assert_eq!((idle.in_progress, idle.peak_per_node), (0, 2));
     }
 
     #[tokio::test]

@@ -9,6 +9,8 @@
 # Usage:
 #   BK=pg   ./run.sh /path/to/heliosdb-proxy            # PostgreSQL 18.4
 #   BK=nano ./run.sh /path/to/heliosdb-proxy            # HeliosDB-Nano
+#   REGRESS_BACKEND=127.0.0.1:35645:bench:benchpass:benchdb BK=pg ./run.sh BIN
+#                                    # a disposable backend, not the shared one
 #
 # Client tooling (psql/pgbench 18.4) runs from the local postgres docker
 # image over --network host so it can reach proxy + both backends.
@@ -31,6 +33,14 @@ esac
 CFG="${CFG_OVERRIDE:-$CFG}"
 
 OUT="${OUT:-/tmp/regress-$BK}"; mkdir -p "$OUT"
+# A disposable backend instead of the shared one:
+# REGRESS_BACKEND=host:port:user:password:database. The config's node host and
+# port are rewritten to match (into $OUT/proxy-backend.toml).
+if [ -n "${REGRESS_BACKEND:-}" ]; then
+  IFS=: read -r BHOST BPORT BUSER BPASS BDB <<<"$REGRESS_BACKEND"
+  sed -E "s/^host = \".*\"/host = \"$BHOST\"/; s/^port = [0-9]+/port = $BPORT/" "$CFG" >"$OUT/proxy-backend.toml"
+  CFG="$OUT/proxy-backend.toml"
+fi
 PASS=0; FAIL=0; SKIP=0; RESULTS=()
 note(){ printf '  %s\n' "$*"; }
 ok(){   PASS=$((PASS+1)); RESULTS+=("PASS $1"); printf '  \033[32mPASS\033[0m %s %s\n' "$1" "${2:-}"; }

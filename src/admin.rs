@@ -2415,6 +2415,12 @@ impl AdminServer {
                 r.in_progress as u64,
             ),
             (
+                "heliosdb_proxy_backend_reconnects_peak",
+                "gauge",
+                "Most backend connections being opened at once to one node since startup",
+                r.peak_per_node as u64,
+            ),
+            (
                 "heliosdb_proxy_backend_reconnect_limit",
                 "gauge",
                 "[limits] max_concurrent_reconnects_per_node",
@@ -3679,6 +3685,31 @@ mod tests {
         assert!(out.contains("# TYPE heliosdb_proxy_tenant_client_limit gauge"));
         assert!(out.contains("heliosdb_proxy_tenant_admission_queue_depth{tenant="));
         assert!(out.contains("} 5\n"), "{out}");
+    }
+
+    #[test]
+    fn reconnect_limit_metrics_carry_the_peak() {
+        let mut out = String::new();
+        AdminServer::push_reconnect_slots_prometheus(
+            &mut out,
+            &crate::node_slots::ReconnectStats {
+                limit_per_node: 16,
+                in_progress: 3,
+                peak_per_node: 16,
+                waits: 59,
+                refusals: 0,
+            },
+        );
+        for line in [
+            "heliosdb_proxy_backend_reconnects_in_progress 3\n",
+            "# TYPE heliosdb_proxy_backend_reconnects_peak gauge\n",
+            "heliosdb_proxy_backend_reconnects_peak 16\n",
+            "heliosdb_proxy_backend_reconnect_limit 16\n",
+            "heliosdb_proxy_backend_reconnect_waits_total 59\n",
+            "heliosdb_proxy_backend_reconnect_refusals_total 0\n",
+        ] {
+            assert!(out.contains(line), "{line} missing from {out}");
+        }
     }
 
     #[tokio::test]

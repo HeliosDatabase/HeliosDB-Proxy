@@ -20,8 +20,10 @@ reconnect-wave (H-05) instead:
   small_tenant_no_aborts     no small-tenant client was aborted
   big_tenant_recovers        the big tenant reaches half its pre-kill throughput
                              within 30 s of the promotion
-  reconnects_within_limit    backend reconnects in progress never exceeded
-                             max_concurrent_reconnects_per_node x nodes
+  reconnects_within_limit    the most reconnects one node had in progress at once
+                             (heliosdb_proxy_backend_reconnects_peak) is above 0
+                             (the wave went through the limit) and at most
+                             max_concurrent_reconnects_per_node
   rss_bounded                proxy RSS at the end is within 64 MiB of before the kill
   rss_flat_after_failover    from RECOVER_S after the promotion to the end the
                              proxy's RSS varies by less than 16 MiB
@@ -57,8 +59,11 @@ def reconnect_wave(out):
             samples.append(dict(zip(("ms", "in_progress", "waits", "refusals", "failovers",
                                      "rss_kib"), map(int, line.split("\t")))))
     prom = json.loads(out.joinpath("metrics-prometheus-proxy-a.prom").read_text())["text"]
-    limit = next((int(float(line.split()[1])) for line in prom.splitlines()
-                  if line.startswith("heliosdb_proxy_backend_reconnect_limit ")), 0)
+    def gauge(name):
+        return next((int(float(line.split()[1])) for line in prom.splitlines()
+                     if line.startswith(name + " ")), 0)
+    limit = gauge("heliosdb_proxy_backend_reconnect_limit")
+    peak = gauge("heliosdb_proxy_backend_reconnects_peak")
     rss_before = max((s["rss_kib"] for s in samples if s["ms"] < promoted - 2000), default=-1)
     rss_end = samples[-1]["rss_kib"] if samples else -1
     max_in_progress = max((s["in_progress"] for s in samples), default=-1)
@@ -69,7 +74,7 @@ def reconnect_wave(out):
         ("small_tenant_served", all(small.get(t, 0) > 0 for t in before + after)),
         ("small_tenant_no_aborts", aborted["small"] == 0),
         ("big_tenant_recovers", recovery is not None and recovery <= 30),
-        ("reconnects_within_limit", limit > 0 and 0 <= max_in_progress <= limit * 3),
+        ("reconnects_within_limit", limit > 0 and 0 < peak <= limit),
         ("rss_bounded", rss_before > 0 and rss_end - rss_before <= 64 * 1024),
         ("rss_flat_after_failover", len(late) > 1 and max(late) - min(late) < 16 * 1024),
     ]
@@ -80,7 +85,8 @@ def reconnect_wave(out):
         "big_zero_tps_seconds": [t for t in range(1, secs) if big.get(t, 0) == 0],
         "aborted_clients": aborted,
         "reconnect_limit_per_node": limit,
-        "max_reconnects_in_progress": max_in_progress,
+        "peak_reconnects_per_node": peak,
+        "max_reconnects_in_progress_sampled": max_in_progress,
         "reconnect_waits": last.get("waits"), "reconnect_refusals": last.get("refusals"),
         "tr_failovers": last.get("failovers"),
         "rss_kib_before_kill": rss_before, "rss_kib_end": rss_end,
