@@ -10,6 +10,12 @@
 #                        (docker pause = SIGSTOP of every process), pg-b
 #                        promoted, then pg-a returns unfenced while the ledger
 #                        runs; it is fenced (stopped) later.
+#   chaos-force-leader   b251750f1d54 drill: ledger through both proxies; pg-a
+#                        is held out through each proxy's POST /api/chaos
+#                        force_unhealthy (no process touched: the leader is
+#                        dropped at once and writes wait), then pg-b is
+#                        promoted while pg-a stays up unfenced; the overrides
+#                        are reset at the end and pg-a fenced (stopped).
 #   edge-resume          C-03 drill: proxy-a is an edge home, proxy-b its edge,
 #                        subscribed through a killable relay. The relay is cut
 #                        while a write goes through the home, then restored
@@ -52,7 +58,7 @@ LEDGER_WORKERS="${LEDGER_WORKERS:-4}"
 STEP_TIMEOUT="${STEP_TIMEOUT:-180}"
 
 case "$SCENARIO" in
-  promote-under-load | stop-old-primary) ;;
+  promote-under-load | stop-old-primary | chaos-force-leader) ;;
   edge-resume)
     export LAB_PROXY_A_CONFIG=./proxy-home.toml LAB_PROXY_B_CONFIG=./proxy-edge.toml ;;
   cache-logical)
@@ -85,6 +91,7 @@ port_of() {
 }
 admin_of() { case "$1" in proxy-a) echo 27790 ;; proxy-b) echo 27791 ;; esac; }
 admin_get() { curl -s -m 5 -H "Authorization: Bearer helios-lab-admin" "http://127.0.0.1:$(admin_of "$1")/$2"; }
+admin_post() { curl -s -m 5 -X POST -H "Authorization: Bearer helios-lab-admin" -H "Content-Type: application/json" -d "$3" "http://127.0.0.1:$(admin_of "$1")/$2"; }
 RELAY_PID=
 SAMPLER_PID=
 log() { echo "[$(date -u +%T)] $*" | tee -a "$OUT/driver.log"; }
@@ -307,6 +314,19 @@ stop-old-primary)
   sleep 15
   log "pg-a in_recovery=$(pg pg-a -c "SELECT pg_is_in_recovery()"), pg-b in_recovery=$(pg pg-b -c "SELECT pg_is_in_recovery()")"
   ;;
+chaos-force-leader)
+  for p in proxy-a proxy-b; do
+    log "$p: force_unhealthy pg-a -> $(admin_post "$p" api/chaos '{"action":"force_unhealthy","target_node":"127.0.0.1:27701"}')"
+    admin_get "$p" topology >"$OUT/topology-forced-$p.json" 2>&1 || true
+    admin_get "$p" nodes >"$OUT/nodes-forced-$p.json" 2>&1 || true
+  done
+  log "proxy-a topology after the override: $(cat "$OUT/topology-forced-proxy-a.json")"
+  sleep 2
+  date +%s%3N >"$OUT/promoted_ms"
+  log "promote pg-b: $(pg pg-b -c "SELECT pg_promote(true, 60)")"
+  sleep 15
+  log "pg-a in_recovery=$(pg pg-a -c "SELECT pg_is_in_recovery()"), pg-b in_recovery=$(pg pg-b -c "SELECT pg_is_in_recovery()")"
+  ;;
 esac
 
 wait "$LEDGER_PID" || true
@@ -316,8 +336,14 @@ for p in proxy-a proxy-b; do
   admin_get "$p" metrics/prometheus >"$OUT/metrics-prometheus-$p.prom" 2>&1 || true
 done
 
-if [ "$SCENARIO" = stop-old-primary ]; then
+if [ "$SCENARIO" = stop-old-primary ] || [ "$SCENARIO" = chaos-force-leader ]; then
   step ledger check pg-b pg-a >"$OUT/check.json" 2>&1 || true
+  if [ "$SCENARIO" = chaos-force-leader ]; then
+    for p in proxy-a proxy-b; do
+      admin_get "$p" api/chaos >"$OUT/chaos-$p.json" 2>&1 || true
+      log "$p: chaos reset -> $(admin_post "$p" api/chaos '{"action":"reset"}')"
+    done
+  fi
   log "fence pg-a (stop)"
   "${COMPOSE[@]}" stop --timeout 5 pg-a >>"$OUT/driver.log" 2>&1
 else

@@ -137,6 +137,35 @@ dials finish within one sample, so the sampled maximum was 0 in both runs.
 The default limit is reached by a 48-client wave and holds it at 16 without refusals or a
 slower recovery.
 
+## 2026-10-21, admin node controls (b251750f1d54), branch fix/admin-node-controls-20261020 (4a5a975)
+
+`POST /api/chaos force_unhealthy` and `POST /nodes/{addr}/disable` now reach routing (before
+this fix they only changed the admin API's display copy). Binary sha256 `bf8cf1ac…9f539b`
+(`--features all-features,postgres-topology`, release). Evidence:
+`/home/gpc/HDB/sprint/baselines/proxy/b251750f1d54-20261020/ha-lab-*`.
+
+| scenario | result | committed / attempted | not_sent | unknown | lost / phantom | write gap |
+|---|---|---|---|---|---|---|
+| chaos-force-leader (new) | PASS (no split-brain acknowledgement) | 2137 / 2137 | 0 | 0 | 0 / 0 | 9.4 s |
+| promote-under-load | PASS | 2403 / 2405 | 2 | 0 | 0 / 0 | 3.6 s |
+| stop-old-primary | PASS (no split-brain acknowledgement) | 2359 / 2363 | 4 | 0 | 0 / 0 | 5.1 s |
+| reconnect-wave (H-05) | PASS, 6/6 checks | | | | | |
+| cache-logical (C-02 slice 2) | PASS, 6/6 checks | | | | | |
+| edge-resume (C-03) | PASS, 7/7 checks | | | | | |
+
+**chaos-force-leader:** 10 s into the ledger run, pg-a is held out through each proxy's
+`POST /api/chaos force_unhealthy`; no process is touched. Both proxies answered
+`{"applied":"force_unhealthy"}` and, read back in the same second, `/topology` named no
+primary (`currentPrimary: null`, the provider's authority still valid) and `/nodes` showed
+pg-a `healthy: false` with `override.kind = "force_unhealthy"`. Writes waited. pg-b was
+promoted 2 s later while pg-a stayed up, unfenced and writable, for the rest of the run;
+`[topology] provider = "postgres"` then saw two nodes not in recovery and chose pg-b once
+its post-promotion checkpoint raised its timeline, which is why the write gap (9.4 s) is
+longer than after a kill (3.6 s): the ledger's writes were held, not failed, and every one
+of the 2137 transfers committed (863 through proxy-a and 845 through proxy-b after the
+promotion). pg-a holds no acknowledged transfer pg-b lacks. `reset` on each proxy cleared
+the override (`restored: ["127.0.0.1:27701"]`) and pg-a was stopped (fenced) at the end.
+
 ## Not covered yet
 
 Network partitions and `tc netem` delay, proxy drain (`SIGUSR2`) and restart, SIGHUP with

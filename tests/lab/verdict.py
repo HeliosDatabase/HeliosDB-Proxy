@@ -8,9 +8,12 @@ Properties (every scenario):
   no_phantom_write       no transfer the client saw fail (ERROR / not sent) is present
   writes_resume_<proxy>  both proxies committed transfers that started after the
                          promotion (writes followed the new primary, no config edit)
-stop-old-primary also:
-  no_split_brain_ack     the returned, unfenced former primary holds no
-                         acknowledged transfer the new primary lacks
+stop-old-primary and chaos-force-leader also:
+  no_split_brain_ack     the returned (or never stopped), unfenced former primary
+                         holds no acknowledged transfer the new primary lacks
+chaos-force-leader also:
+  override_dropped_leader_<proxy>  right after POST /api/chaos force_unhealthy,
+                         that proxy's /topology named no primary
 edge-resume (C-03) instead: warm resume after a network cut replays the missed
 invalidation and keeps the rest of the cache; a home restart flushes the edge.
 reconnect-wave (H-05) instead:
@@ -169,9 +172,13 @@ def main(scenario, out):
         ("writes_resume_proxy-a", after.get("proxy-a", 0) > 0),
         ("writes_resume_proxy-b", after.get("proxy-b", 0) > 0),
     ]
-    if scenario == "stop-old-primary":
+    if scenario in ("stop-old-primary", "chaos-force-leader"):
         other = next((d for d in docs if "other_node" in d), {})
         checks.append(("no_split_brain_ack", other.get("acknowledged_only_on_other") == 0))
+    if scenario == "chaos-force-leader":
+        for proxy in ("proxy-a", "proxy-b"):
+            forced = json.loads(out.joinpath(f"topology-forced-{proxy}.json").read_text())
+            checks.append((f"override_dropped_leader_{proxy}", forced.get("currentPrimary") is None))
     for name, ok in checks:
         print(f"{name:24} {'ok' if ok else 'FAILED'}")
     print(json.dumps({"committed_after_promotion": after, **main_doc}))
