@@ -189,6 +189,11 @@ pub struct ConfigSnapshot {
     pub pool_min_connections: usize,
     pub pool_max_connections: usize,
     pub nodes: Vec<NodeSnapshot>,
+    /// Keys the loaded config file carried that the proxy does not know
+    /// (each warned at load; refused under `strict_config`). Follows a
+    /// SIGHUP reload. Empty when the config came from CLI flags.
+    #[serde(default)]
+    pub ignored_config_keys: Vec<String>,
 }
 
 /// Node configuration snapshot
@@ -538,7 +543,15 @@ impl AdminServer {
 
             // Health endpoints (z-suffixed aliases are token-exempt probe paths)
             ("GET", "/health") | ("GET", "/healthz") => {
-                let health = HealthResponse { status: "ok" };
+                let health = HealthResponse {
+                    status: "ok",
+                    ignored_config_keys: state
+                        .config_snapshot
+                        .read()
+                        .await
+                        .ignored_config_keys
+                        .len(),
+                };
                 Ok((200, serde_json::to_value(health)?))
             }
             ("GET", "/health/ready") | ("GET", "/readyz") => {
@@ -617,6 +630,10 @@ impl AdminServer {
             ("GET", "/metrics/prometheus") => {
                 let metrics = state.metrics.read().await.clone();
                 let mut prometheus = Self::format_prometheus_metrics(&metrics);
+                Self::push_config_prometheus(
+                    &mut prometheus,
+                    state.config_snapshot.read().await.ignored_config_keys.len(),
+                );
                 if let Some(t) = state.primary_tracker.read().await.as_ref() {
                     if t.has_provider() {
                         Self::push_topology_prometheus(
@@ -2406,6 +2423,19 @@ impl AdminServer {
     /// Append the topology provider's counters (H-01) to a Prometheus body.
     /// Only emitted when a provider backs the tracker: a static topology
     /// has no provider to disagree with itself.
+    /// Unknown keys the loaded config carried (ab502f27cbe2): a gauge so a
+    /// monitor sees a typo'd key without reading the startup log.
+    fn push_config_prometheus(output: &mut String, ignored_keys: usize) {
+        output.push_str(
+            "# HELP heliosdb_proxy_config_ignored_keys Keys in the loaded config file that the proxy does not know (warned and ignored; see GET /config).\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_config_ignored_keys gauge\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_config_ignored_keys {}\n",
+            ignored_keys
+        ));
+    }
+
     fn push_topology_prometheus(output: &mut String, conflicting_primaries_total: u64) {
         output.push_str(
             "# HELP heliosdb_proxy_topology_conflicting_primaries_total Provider polls that found more than one node claiming write authority\n",
@@ -3054,6 +3084,7 @@ impl AdminState {
             }),
             active_sessions: RwLock::new(0),
             config_snapshot: RwLock::new(ConfigSnapshot {
+                ignored_config_keys: Vec::new(),
                 listen_address: String::new(),
                 admin_address: String::new(),
                 tr_enabled: false,
@@ -3275,6 +3306,8 @@ struct SqlResponse {
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
+    /// How many unknown keys the loaded config carried (see `/config`).
+    ignored_config_keys: usize,
 }
 
 #[derive(Serialize)]
@@ -3867,6 +3900,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ignored_config_keys_are_reported_on_config_health_and_prometheus() {
+        let state = Arc::new(AdminState::new());
+        let (_, before) = AdminServer::route_request("GET", "/health", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(before["ignored_config_keys"], 0);
+        state.config_snapshot.write().await.ignored_config_keys = vec![
+            "pool_mode.validation_query".to_string(),
+            "rate_limit.global_qps".to_string(),
+        ];
+        let (status, config) = AdminServer::route_request("GET", "/config", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(
+            config["ignored_config_keys"],
+            serde_json::json!(["pool_mode.validation_query", "rate_limit.global_qps"])
+        );
+        let (_, health) = AdminServer::route_request("GET", "/health", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["ignored_config_keys"], 2);
+        let (_, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
+            .await
+            .unwrap();
+        let text = body["text"].as_str().unwrap();
+        assert!(
+            text.contains("# TYPE heliosdb_proxy_config_ignored_keys gauge"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\nheliosdb_proxy_config_ignored_keys 2\n"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_healthz_alias_matches_health() {
         let state = Arc::new(AdminState::new());
         let (status, body) = AdminServer::route_request("GET", "/health", None, &state)
@@ -3879,7 +3950,10 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(alias_status, 200);
         assert_eq!(body, alias_body);
-        assert_eq!(alias_body, serde_json::json!({ "status": "ok" }));
+        assert_eq!(
+            alias_body,
+            serde_json::json!({ "status": "ok", "ignored_config_keys": 0 })
+        );
     }
 
     #[tokio::test]

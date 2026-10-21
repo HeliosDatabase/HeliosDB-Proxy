@@ -199,6 +199,12 @@ pub struct ProxyConfig {
     /// warn-and-continue behaviour.
     #[serde(default)]
     pub strict_config: bool,
+    /// Dotted paths of the keys the loaded file carried that `ProxyConfig`
+    /// does not know (warned at load, refused under `strict_config`). Kept
+    /// so `/config`, `/health` and `/metrics/prometheus` report them after
+    /// startup (ab502f27cbe2). Not a config key itself.
+    #[serde(skip)]
+    pub ignored_keys: Vec<String>,
     /// Enable TR (Transaction Replay)
     pub tr_enabled: bool,
     /// TR mode
@@ -2069,6 +2075,7 @@ impl Default for ProxyConfig {
             admin_token: None,
             admin_allow_insecure: false,
             strict_config: false,
+            ignored_keys: Vec::new(),
             tr_enabled: true,
             tr_mode: TrMode::Session,
             tr_read_functions: Vec::new(),
@@ -2390,6 +2397,174 @@ fn deserialize_reporting_ignored_paths(text: &str) -> Result<(ProxyConfig, Vec<S
     Ok((config, ignored))
 }
 
+/// Keys operators reach for that `ProxyConfig` never had, or had under another
+/// name, with where their intent lives (ab502f27cbe2). Matched on the full
+/// dotted path before any edit-distance guess.
+const IGNORED_KEY_ALIASES: &[(&str, &str)] = &[
+    (
+        "rate_limit.global_qps",
+        "did you mean 'rate_limit.default_qps'?",
+    ),
+    (
+        "rate_limit.global_burst",
+        "did you mean 'rate_limit.default_burst'?",
+    ),
+    (
+        "pool_mode.validation_query",
+        "there is no validation query: [pool] test_on_acquire checks a pooled socket is alive \
+         before handing it out, and [health] check_query probes nodes",
+    ),
+    (
+        "pool_mode.queue_timeout_secs",
+        "did you mean 'pool_mode.acquire_timeout_secs'?",
+    ),
+    (
+        "logging",
+        "there is no [logging] section: use --log-level and --json-logs",
+    ),
+    (
+        "metrics",
+        "there is no [metrics] section: /metrics and /metrics/prometheus are always on",
+    ),
+    (
+        "routing",
+        "there is no [routing] section: see [load_balancer], [routing_hints] and [lag_routing]",
+    ),
+    ("lag", "did you mean [lag_routing]?"),
+    ("rewriter", "did you mean [query_rewrite]?"),
+    ("graphql", "did you mean [graphql_gateway]?"),
+    ("tenants", "did you mean [multi_tenancy]?"),
+    ("schema_routes", "did you mean [schema_routing]?"),
+    (
+        "auth.jwt",
+        "there is no JWT auth: [auth] mode is \"passthrough\" or \"scram\"",
+    ),
+    (
+        "cache.l1",
+        "there is no [cache.l1]: the cache's keys are flat under [cache]",
+    ),
+];
+
+/// Keys a serialised default `ProxyConfig` does not show (optional fields
+/// that serialise as absent, and `[[nodes]]` entries, which default to none)
+/// so a typo next to them still gets a suggestion.
+const KNOWN_KEYS_NOT_IN_DEFAULT: &[&str] = &[
+    "admin_token",
+    "health.user",
+    "health.password",
+    "health.database",
+    "topology.password",
+    "auth.auth_file",
+    "auto_promote.promote_url",
+    "nodes.host",
+    "nodes.port",
+    "nodes.http_port",
+    "nodes.role",
+    "nodes.weight",
+    "nodes.enabled",
+    "nodes.name",
+    "nodes.max_connections",
+    "nodes.synchronous",
+];
+
+/// Every dotted key path `ProxyConfig` knows, taken from a serialised default
+/// config plus [`KNOWN_KEYS_NOT_IN_DEFAULT`]. Array elements are addressed
+/// without their index (`nodes.host`), as [`ignored_key_hint`] normalises.
+pub fn known_config_keys() -> std::collections::BTreeSet<String> {
+    fn walk(prefix: &str, value: &toml::Value, out: &mut std::collections::BTreeSet<String>) {
+        match value {
+            toml::Value::Table(table) => {
+                for (key, child) in table {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    out.insert(path.clone());
+                    walk(&path, child, out);
+                }
+            }
+            toml::Value::Array(items) => {
+                for item in items {
+                    walk(prefix, item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut known = std::collections::BTreeSet::new();
+    if let Ok(value) = toml::Value::try_from(ProxyConfig::default()) {
+        walk("", &value, &mut known);
+    }
+    known.extend(KNOWN_KEYS_NOT_IN_DEFAULT.iter().map(|k| k.to_string()));
+    known
+}
+
+/// Levenshtein distance between two ASCII-ish keys.
+fn key_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// The hint for an unknown key `path`: a known alias, else the closest known
+/// key of the same section when the typo is small (distance at most
+/// `max(2, len / 3)`), else nothing. Array indexes in the path are ignored
+/// when matching and kept in the suggestion (`nodes.0.hots` -> `nodes.0.host`).
+pub fn ignored_key_hint(path: &str, known: &std::collections::BTreeSet<String>) -> Option<String> {
+    let normalised: Vec<&str> = path
+        .split('.')
+        .filter(|seg| !seg.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    let normalised_path = normalised.join(".");
+    if let Some((_, hint)) = IGNORED_KEY_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == normalised_path)
+    {
+        return Some((*hint).to_string());
+    }
+    let (section, last) = normalised.split_at(normalised.len().checked_sub(1)?);
+    let last = last[0];
+    let section = section.join(".");
+    let budget = (last.len() / 3).max(2);
+    let best = known
+        .iter()
+        .filter_map(|candidate| {
+            let (cand_section, cand_last) = match candidate.rsplit_once('.') {
+                Some((s, l)) => (s, l),
+                None => ("", candidate.as_str()),
+            };
+            (cand_section == section && cand_last != last)
+                .then(|| (key_distance(last, cand_last), cand_last))
+        })
+        .filter(|(distance, _)| *distance <= budget)
+        .min()?;
+    // Keep the operator's own prefix (array indexes included) in the suggestion.
+    let mut suggested: Vec<&str> = path.split('.').collect();
+    *suggested.last_mut()? = best.1;
+    Some(format!("did you mean '{}'?", suggested.join(".")))
+}
+
+/// The warning logged for one unknown key.
+pub fn describe_ignored_key(path: &str, known: &std::collections::BTreeSet<String>) -> String {
+    match ignored_key_hint(path, known) {
+        Some(hint) => {
+            format!("unknown config key '{path}' ignored (not part of ProxyConfig); {hint}")
+        }
+        None => format!("unknown config key '{path}' ignored (not part of ProxyConfig)"),
+    }
+}
+
 impl ProxyConfig {
     /// Get write timeout as Duration
     pub fn write_timeout(&self) -> Duration {
@@ -2427,7 +2602,7 @@ impl ProxyConfig {
         // no `:-default` fallback.
         let contents = substitute_env(&raw)?;
 
-        let (config, ignored) = deserialize_reporting_ignored_paths(&contents)?;
+        let (mut config, ignored) = deserialize_reporting_ignored_paths(&contents)?;
 
         // An ignored HA section can falsely promise automatic database promotion.
         // Reject it even in permissive mode: health checks cannot fence a primary
@@ -2450,18 +2625,27 @@ impl ProxyConfig {
         // deserialization already ignores unknown fields and pre-existing
         // configs with such keys keep loading. `strict_config = true` upgrades
         // this to a hard startup failure.
+        // Each unknown key names the key it most likely meant (a known
+        // rename, or the closest key of the same section), in the warning
+        // and in the strict_config error alike (ab502f27cbe2).
+        let known = known_config_keys();
         if config.strict_config && !ignored.is_empty() {
+            let listed: Vec<String> = ignored
+                .iter()
+                .map(|path| match ignored_key_hint(path, &known) {
+                    Some(hint) => format!("{path} ({hint})"),
+                    None => path.clone(),
+                })
+                .collect();
             return Err(ProxyError::Config(format!(
                 "strict_config: unknown config keys: {}",
-                ignored.join(", ")
+                listed.join(", ")
             )));
         }
         for path in &ignored {
-            tracing::warn!(
-                "unknown config key '{}' ignored (not part of ProxyConfig)",
-                path
-            );
+            tracing::warn!("{}", describe_ignored_key(path, &known));
         }
+        config.ignored_keys = ignored;
 
         config.validate()?;
 
@@ -3653,6 +3837,117 @@ mod tests {
         let bad: ProxyConfig = toml::from_str(&format!("{base}globex = 1\n")).unwrap();
         let err = bad.validate().unwrap_err().to_string();
         assert!(err.contains("tenant_max_clients names \"globex\""), "{err}");
+    }
+
+    #[test]
+    fn ignored_key_hints_name_the_intended_key() {
+        let known = known_config_keys();
+        assert!(
+            known.contains("rate_limit.default_qps"),
+            "default config keys are known"
+        );
+        assert!(
+            known.contains("nodes.host"),
+            "node keys are known without an index"
+        );
+        let hint = |path: &str| ignored_key_hint(path, &known);
+        // Known renames and never-existed keys, by alias.
+        assert_eq!(
+            hint("rate_limit.global_qps").as_deref(),
+            Some("did you mean 'rate_limit.default_qps'?")
+        );
+        assert_eq!(
+            hint("rate_limit.global_burst").as_deref(),
+            Some("did you mean 'rate_limit.default_burst'?")
+        );
+        assert!(
+            hint("pool_mode.validation_query")
+                .unwrap()
+                .contains("test_on_acquire"),
+            "{:?}",
+            hint("pool_mode.validation_query")
+        );
+        assert!(hint("logging").unwrap().contains("--log-level"));
+        // Small typos next to a known key of the same section.
+        assert_eq!(
+            hint("cache.enabed").as_deref(),
+            Some("did you mean 'cache.enabled'?")
+        );
+        assert_eq!(
+            hint("journal.fsyncc").as_deref(),
+            Some("did you mean 'journal.fsync'?")
+        );
+        assert_eq!(
+            hint("nodes.0.hots").as_deref(),
+            Some("did you mean 'nodes.0.host'?")
+        );
+        assert_eq!(
+            hint("strict_confg").as_deref(),
+            Some("did you mean 'strict_config'?")
+        );
+        // Garbage gets no guess, and a key of another section is not offered.
+        assert_eq!(hint("nonsense_top_level"), None);
+        assert_eq!(hint("cache.default_qps"), None);
+        assert_eq!(
+            describe_ignored_key("nonsense_top_level", &known),
+            "unknown config key 'nonsense_top_level' ignored (not part of ProxyConfig)"
+        );
+        assert_eq!(
+            describe_ignored_key("rate_limit.global_qps", &known),
+            "unknown config key 'rate_limit.global_qps' ignored (not part of ProxyConfig); \
+             did you mean 'rate_limit.default_qps'?"
+        );
+    }
+
+    #[test]
+    fn strict_config_error_and_loaded_config_carry_the_ignored_keys() {
+        let src =
+            std::fs::read_to_string("config/proxy.example.toml").expect("example config present");
+        let stamp = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        // The example config has no `[rate_limit]` table, so one can be
+        // appended with the field report's wrong key names.
+        assert!(
+            !src.contains("\n[rate_limit]"),
+            "example config grew a [rate_limit] table; rewrite it instead"
+        );
+        let with_typos =
+            format!("{src}\n[rate_limit]\nenabled = false\nglobal_qps = 1\nglobal_burst = 1\n");
+
+        let strict = format!("strict_config = true\n{with_typos}");
+        let path = std::env::temp_dir().join(format!("helios-hint-strict-{stamp}.toml"));
+        std::fs::write(&path, strict).unwrap();
+        let err = ProxyConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            err.contains("rate_limit.global_qps (did you mean 'rate_limit.default_qps'?)")
+                && err
+                    .contains("rate_limit.global_burst (did you mean 'rate_limit.default_burst'?)"),
+            "{err}"
+        );
+
+        let path = std::env::temp_dir().join(format!("helios-hint-lax-{stamp}.toml"));
+        std::fs::write(&path, with_typos).unwrap();
+        let config = ProxyConfig::from_file(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            config.ignored_keys,
+            vec![
+                "rate_limit.global_burst".to_string(),
+                "rate_limit.global_qps".to_string()
+            ]
+        );
+        // The list is not a config key: it never round-trips into a file.
+        let text = toml::to_string(&config).unwrap();
+        assert!(!text.contains("ignored_keys"), "{text}");
     }
 
     #[test]

@@ -750,6 +750,11 @@ impl ProxyServer {
                     crate::config::PreparedStatementMode::Named => PoolPreparedStatementMode::Named,
                 },
                 test_on_acquire: config.pool.test_on_acquire,
+                // Library-only fields: the manager never runs a validation
+                // query (test_on_acquire is a socket liveness check) and does
+                // not queue acquisitions, so these are not proxy.toml keys.
+                // A `[pool_mode] validation_query` in a file is reported as
+                // unknown with that explanation (ab502f27cbe2).
                 validation_query: "SELECT 1".to_string(),
                 queue_timeout_secs: 30,
                 max_queue_size: 0,
@@ -1722,6 +1727,7 @@ impl ProxyServer {
                     tr_mode: format!("{:?}", config.effective_tr_mode()),
                     pool_min_connections: config.pool.min_connections,
                     pool_max_connections: config.pool.max_connections,
+                    ignored_config_keys: config.ignored_keys.clone(),
                     nodes: config
                         .nodes
                         .iter()
@@ -1859,6 +1865,16 @@ impl ProxyServer {
                         let health = server_state.health.load_full();
                         let mut admin_health = admin_state_sync.node_health.write().await;
                         *admin_health = (*health).clone();
+                    }
+
+                    // The unknown keys the live config carries follow a SIGHUP
+                    // reload into /config, /health and the Prometheus gauge.
+                    {
+                        let live = server_state.live_config.load();
+                        let mut snapshot = admin_state_sync.config_snapshot.write().await;
+                        if snapshot.ignored_config_keys != live.ignored_keys {
+                            snapshot.ignored_config_keys = live.ignored_keys.clone();
+                        }
                     }
 
                     // Sync metrics

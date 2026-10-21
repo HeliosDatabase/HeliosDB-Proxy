@@ -449,7 +449,7 @@ Per-node connection pool statistics (active/idle/pending, lifetime created/close
 
 ### GET /config
 
-Returns a snapshot of the running configuration (secrets such as `admin_token` and TLS material that serialize as `None` are omitted).
+Returns a snapshot of the running configuration (secrets such as `admin_token` and TLS material that serialize as `None` are omitted). `ignored_config_keys` lists the keys the loaded file carried that the proxy does not know (each was warned at load with the key it most likely meant; `strict_config = true` refuses them); it follows a SIGHUP reload. `GET /health` reports their count as `ignored_config_keys` and `/metrics/prometheus` the gauge `heliosdb_proxy_config_ignored_keys`, so a monitor can alert on a policy that silently runs at its defaults.
 
 ---
 

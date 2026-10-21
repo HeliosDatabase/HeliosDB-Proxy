@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Unknown config keys name the key they most likely meant**, in the startup warning
+  and in the `strict_config` error: a known rename or never-existed key
+  (`rate_limit.global_qps` -> `default_qps`, `pool_mode.validation_query` -> there is
+  none, `[pool] test_on_acquire` is a socket check), else the closest key of the same
+  section for a small typo (`cache.enabed` -> `cache.enabled`). The ignored keys stay
+  reported after startup: `GET /config` lists `ignored_config_keys`, `GET /health` adds
+  their count, `/metrics/prometheus` adds the gauge
+  `heliosdb_proxy_config_ignored_keys`; all follow a SIGHUP reload. Field report
+  2026-10-16 (Sprinter ab502f27cbe2): a `[rate_limit]` policy written with the wrong
+  key names ran at the defaults with only a startup warning to show for it. Library:
+  `config::known_config_keys`, `config::ignored_key_hint`,
+  `config::describe_ignored_key`, `ProxyConfig::ignored_keys`,
+  `ConfigSnapshot::ignored_config_keys`.
+
 ### Fixed
 
 - **Admin node controls reach routing.** `POST /api/chaos force_unhealthy` and

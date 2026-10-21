@@ -125,8 +125,28 @@ dotted path:
 
 ```
 WARN unknown config key '<key>' ignored (not part of ProxyConfig)
-WARN unknown config key 'cache.l1_max_byts' ignored (not part of ProxyConfig)
+WARN unknown config key 'cache.enabed' ignored (not part of ProxyConfig); did you mean 'cache.enabled'?
+WARN unknown config key 'rate_limit.global_qps' ignored (not part of ProxyConfig); did you mean 'rate_limit.default_qps'?
 ```
+
+Each warning names the key most likely meant: a known rename or never-existed key
+(table below), else the closest key of the same section when the typo is small. The
+same hint appears in the `strict_config` error. The list of ignored keys also stays
+available after startup, so a monitor can catch a policy that silently ran at its
+defaults: `GET /config` returns `ignored_config_keys`, `GET /health` returns their
+count, and `/metrics/prometheus` exposes the gauge `heliosdb_proxy_config_ignored_keys`
+(all follow a SIGHUP reload).
+
+Renamed or non-existent keys operators reach for:
+
+| Written | Reality |
+|---|---|
+| `[rate_limit] global_qps`, `global_burst` | `default_qps`, `default_burst` (per bucket, see `key_by`). With the wrong names the limiter runs at its defaults, 1000 qps / burst 2000. |
+| `[pool_mode] validation_query` | Never a key. `[pool] test_on_acquire` checks that a pooled socket is alive before handing it out (no query); `[health] check_query` probes nodes. |
+| `[pool_mode] queue_timeout_secs`, `max_queue_size` | Never keys: the pool does not queue acquisitions; `acquire_timeout_secs` bounds the wait. |
+| `[ha]` | Rejected (below). |
+| `[logging]`, `[metrics]` | `--log-level` / `--json-logs`; `/metrics` and `/metrics/prometheus` are always on. |
+| `[routing]`, `[lag]`, `[rewriter]`, `[graphql]`, `[[tenants]]`, `[[schema_routes]]`, `[auth.jwt]`, `[cache.l1]` | `[load_balancer]` / `[routing_hints]` / `[lag_routing]`, `[query_rewrite]`, `[graphql_gateway]`, `[multi_tenancy]`, `[schema_routing]`, `[auth] mode`, flat `[cache]` keys. |
 
 This makes silent doc-drift and typos visible without breaking pre-existing configs.
 Historical example blocks such as `[logging]`, `[metrics]`, `[routing]`,
@@ -821,6 +841,10 @@ key_by = "user"
 | `default_burst` | u32 | `2000` | Token-bucket depth (burst) per bucket. |
 | `max_concurrent` | u32 | `0` | Max concurrent in-flight queries per bucket (0 = engine default). |
 | `key_by` | string | `"user"` | Bucket key: `user`, `client_ip`, `database`, `global`. |
+
+> The keys are `default_qps` / `default_burst`. A file that says `global_qps` /
+> `global_burst` loads with a warning naming the right key and the limiter runs at its
+> defaults; `strict_config = true` refuses it instead.
 
 ---
 
