@@ -115,6 +115,8 @@ mod promotion;
 
 mod snapshot;
 
+mod node_control;
+
 mod cache_source;
 
 mod gateway;
@@ -361,6 +363,10 @@ struct ServerState {
     routing: Arc<crate::routing_snapshot::RoutingView>,
     /// H-05: per-node backend connection caps (`[[nodes]] max_connections`).
     node_slots: Arc<crate::node_slots::NodeSlots>,
+    /// Operator overrides on node eligibility (`/nodes/{addr}/disable`,
+    /// `/api/chaos force_unhealthy`): applied by every health publication
+    /// and by the routing snapshot (Sprinter b251750f1d54).
+    node_overrides: Arc<crate::node_overrides::NodeOverrides>,
     /// H-05: per-tenant client caps (`[multi_tenancy] max_clients_per_tenant`
     /// / `tenant_max_clients`); empty without the `multi-tenancy` feature.
     tenant_slots: Arc<crate::tenant_slots::TenantSlots>,
@@ -1075,6 +1081,7 @@ impl ProxyServer {
             )),
             gateway_pools,
             node_slots: Arc::new(crate::node_slots::NodeSlots::from_config(&config)),
+            node_overrides: Arc::new(crate::node_overrides::NodeOverrides::new()),
             #[cfg(feature = "multi-tenancy")]
             tenant_slots: Arc::new(crate::tenant_slots::TenantSlots::from_config(&config)),
             #[cfg(not(feature = "multi-tenancy"))]
@@ -1345,7 +1352,9 @@ impl ProxyServer {
         }
         for gone in current.keys().filter(|k| !next.contains_key(*k)) {
             tracing::info!(node = %gone, "SIGHUP: node removed from config");
+            state.node_overrides.clear(gone);
         }
+        Self::apply_node_overrides(&state.node_overrides, &mut next);
         state.health.store(Arc::new(next));
         Self::publish_routing(state);
     }
@@ -1699,6 +1708,9 @@ impl ProxyServer {
             }
             admin_state.with_routing_view(state.routing.clone()).await;
             admin_state.with_promoter(state.promoter.clone()).await;
+            admin_state
+                .with_node_control(Self::node_control_for(&state))
+                .await;
 
             // Initialize config snapshot
             {

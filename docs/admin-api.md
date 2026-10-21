@@ -229,6 +229,20 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/nodes
     "last_error": null,
     "latency_ms": 0.5,
     "replication_lag_bytes": null
+  },
+  {
+    "address": "db-replica-1.internal:5432",
+    "healthy": false,
+    "last_check": "2026-07-08T10:15:30.123Z",
+    "failure_count": 0,
+    "last_error": null,
+    "latency_ms": 0.6,
+    "replication_lag_bytes": 0,
+    "override": {
+      "kind": "disabled",
+      "since": "2026-07-08T10:12:00Z",
+      "note": "disabled via POST /nodes/{addr}/disable"
+    }
   }
 ]
 ```
@@ -242,6 +256,7 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/nodes
 | `last_error` | string \| null | Error from the most recent failed health check. |
 | `latency_ms` | f64 | Round-trip latency of the most recent successful check. |
 | `replication_lag_bytes` | u64 \| null | Replication lag in bytes (standby/replica only). |
+| `override` | object | Present while an operator override holds the node out of routing: `kind` (`disabled` from `POST /nodes/{addr}/disable`, `force_unhealthy` from `POST /api/chaos`), `since` (RFC 3339), `note`. `healthy` is `false` for as long as it is present. |
 
 ### GET /nodes/{address}
 
@@ -254,7 +269,16 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 ### POST /nodes/{address}/enable — POST /nodes/{address}/disable
 
-Enable re-admits a node into routing; disable removes it (new queries stop routing to it; in-flight work is allowed to finish). Useful for draining a **single backend** for maintenance.
+Disable holds a node out of routing on this proxy instance: it publishes as unhealthy and
+counts as `enabled = false` from the moment the request returns (`/nodes`, `/topology` and the
+next query all see it), whatever its health probes say, until it is enabled again. New queries
+stop routing to it; a session whose connection is on the node moves at its next request, as
+after any lost backend (an open transaction is reported lost, see `tr_mode`). Useful for
+draining a **single backend** for maintenance. Enable clears the override, including a chaos
+fault from `POST /api/chaos`; the node is routed to again at once when its probe counters
+already prove it (no failure in progress, `success_threshold` consecutive passes), otherwise
+when its next probe passes. Overrides are per proxy instance, live in memory only, and do
+not survive a restart; `404` when the address is not a configured node.
 
 ```bash
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
@@ -280,8 +304,9 @@ the provider's current leader. Promotion and fencing belong to the database or
 external HA manager; see [topology providers](topology-providers.md). In-session
 recovery is governed by `tr_mode`; setting the master switch `tr_enabled = false`
 disables both write journaling and in-session replay (effective mode `none`).
-There is **no `/failover` endpoint.** The chaos API changes health overrides; it
-does not change database roles or make a standby writable.
+There is **no `/failover` endpoint.** The chaos API holds nodes out of routing on this
+proxy instance; it does not change database roles or make a standby writable, and it never
+starts an `[auto_promote]` promotion (the promoter probes the databases itself).
 
 ### GET /api/chaos
 
@@ -294,6 +319,19 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/api/chaos
 ### POST /api/chaos
 
 Inject or clear a controlled fault. Supported actions: `force_unhealthy`, `restore`, `reset`.
+
+`force_unhealthy` takes effect before the request returns: the node publishes as unhealthy and
+counts as `enabled = false` for routing, so `/nodes` shows `healthy: false` with an `override`
+of kind `force_unhealthy`, `/topology` no longer names it, and no new query is routed to it;
+its health probes keep running but cannot re-admit it. With a static topology, writes move to
+the next healthy configured `primary` if there is one, otherwise they wait and fail closed
+with `08006` after `write_timeout_secs`. Under an authoritative provider (Patroni, postgres)
+forcing the leader stops writes through this proxy the same way until the override is cleared
+or the provider names another leader; forcing a replica removes it from the read set.
+`restore` clears one override, `reset` clears every `force_unhealthy` override and leaves
+operational `disable`s alone; a restored node is routed to again at once when its probe
+counters already prove it, otherwise when its next probe passes. `404` for an address that is
+not a configured node.
 
 ```bash
 # Force the primary unhealthy (does not promote a standby)
@@ -736,10 +774,12 @@ curl -X POST -H "$AUTH" "http://localhost:9090/nodes/$NODE/enable"
 ### Simulate primary unavailability
 
 In static mode, with no other healthy configured primary, this drill makes
-`currentPrimary` null and writes fail after `write_timeout_secs`. Restore the
-override when done. To test successful failover, separately arrange a fenced
-database promotion and configure an authoritative provider to observe it. A
-chaos health override does not override that provider's leader authority.
+`currentPrimary` null at once and writes fail with `08006` after `write_timeout_secs`;
+with a second configured `primary` that is healthy, writes move to it. Under an
+authoritative provider the forced leader is dropped from routing and writes wait the
+same way; the proxy does not promote. Restore the override when done. To test a
+successful failover, separately arrange a fenced database promotion and let the
+provider report it.
 
 ```bash
 AUTH="Authorization: Bearer $ADMIN_TOKEN"

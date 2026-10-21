@@ -8,6 +8,7 @@ use crate::anomaly::AnomalyDetector;
 use crate::config::{NodeConfig, NodeRole, ProxyConfig};
 #[cfg(feature = "edge-proxy")]
 use crate::edge::{EdgeCache, EdgeRegistry, InvalidationEvent};
+use crate::node_overrides::{NodeControl, NodeOverride, OverrideKind};
 #[cfg(feature = "wasm-plugins")]
 use crate::plugins::PluginManager;
 use crate::replay::{CommittedHistoryRequest, ReplayEngine, TimeTravelRequest};
@@ -116,6 +117,11 @@ pub struct AdminState {
     /// state. Lets the UI distinguish "operationally disabled" from
     /// "chaos-injected fault" and lets `Reset` restore everything.
     pub chaos_overrides: RwLock<HashMap<String, ChaosOverride>>,
+    /// The server's node-eligibility control (Sprinter b251750f1d54).
+    /// Attached by the daemon at startup; `/nodes/{addr}/enable|disable`
+    /// and `/api/chaos` then change health and routing, not only this
+    /// display copy.
+    pub node_control: RwLock<Option<Arc<dyn NodeControl>>>,
     /// Anomaly detector — same Arc the server populates from the
     /// query path. /api/anomalies polls this for the recent-events
     /// ring buffer.
@@ -658,36 +664,51 @@ impl AdminServer {
 
             // Node management
             ("GET", "/nodes") => {
+                let overrides = Self::node_overrides(state).await;
                 let health = state.node_health.read().await;
                 let nodes: Vec<NodeHealthResponse> = health
                     .values()
-                    .map(|h| NodeHealthResponse::from(h.clone()))
+                    .map(|h| NodeHealthResponse::from(h.clone()).with_override(&overrides))
                     .collect();
                 Ok((200, serde_json::to_value(nodes)?))
             }
             ("GET", path) if path.starts_with("/nodes/") => {
                 let node_addr = path.trim_start_matches("/nodes/");
+                let overrides = Self::node_overrides(state).await;
                 let health = state.node_health.read().await;
                 match health.get(node_addr) {
                     Some(h) => Ok((
                         200,
-                        serde_json::to_value(NodeHealthResponse::from(h.clone()))?,
+                        serde_json::to_value(
+                            NodeHealthResponse::from(h.clone()).with_override(&overrides),
+                        )?,
                     )),
                     None => Ok((404, serde_json::json!({ "error": "Node not found" }))),
                 }
             }
+            // Enable clears any override on the node (an operational disable
+            // or a chaos fault); disable holds it out of routing.
             ("POST", path) if path.starts_with("/nodes/") && path.ends_with("/enable") => {
                 let node_addr = path
                     .trim_start_matches("/nodes/")
                     .trim_end_matches("/enable");
-                Self::set_node_enabled(state, node_addr, true).await?;
+                if let Err(e) = Self::apply_node_override(state, node_addr, None).await {
+                    return Ok((404, serde_json::json!({ "error": e.to_string() })));
+                }
+                state.chaos_overrides.write().await.remove(node_addr);
                 Ok((200, serde_json::json!({ "status": "enabled" })))
             }
             ("POST", path) if path.starts_with("/nodes/") && path.ends_with("/disable") => {
                 let node_addr = path
                     .trim_start_matches("/nodes/")
                     .trim_end_matches("/disable");
-                Self::set_node_enabled(state, node_addr, false).await?;
+                let held = NodeOverride::now(
+                    OverrideKind::Disabled,
+                    "disabled via POST /nodes/{addr}/disable",
+                );
+                if let Err(e) = Self::apply_node_override(state, node_addr, Some(held)).await {
+                    return Ok((404, serde_json::json!({ "error": e.to_string() })));
+                }
                 Ok((200, serde_json::json!({ "status": "disabled" })))
             }
 
@@ -1320,19 +1341,35 @@ impl AdminServer {
         health.values().any(|h| h.healthy)
     }
 
-    /// Set node enabled status
-    async fn set_node_enabled(
+    /// Apply an override to `node_addr` (or clear it with `None`): through
+    /// the server's control when one is attached, so the change reaches
+    /// health and routing before this returns, and always on the admin
+    /// display copy. Without a control (library use) only the copy changes.
+    async fn apply_node_override(
         state: &Arc<AdminState>,
         node_addr: &str,
-        enabled: bool,
+        override_: Option<NodeOverride>,
     ) -> Result<()> {
+        let control = state.node_control.read().await.clone();
+        let (healthy, validated) = match control {
+            Some(control) => (control.set_override(node_addr, override_)?, true),
+            None => (override_.is_none(), false),
+        };
         let mut health = state.node_health.write().await;
+        match health.get_mut(node_addr) {
+            Some(node_health) => node_health.healthy = healthy,
+            // The server validated the node; its copy here may lag one sync.
+            None if validated => {}
+            None => return Err(ProxyError::Config(format!("Node not found: {}", node_addr))),
+        }
+        Ok(())
+    }
 
-        if let Some(node_health) = health.get_mut(node_addr) {
-            node_health.healthy = enabled;
-            Ok(())
-        } else {
-            Err(ProxyError::Config(format!("Node not found: {}", node_addr)))
+    /// The server's current node overrides (empty without a control).
+    async fn node_overrides(state: &Arc<AdminState>) -> HashMap<String, NodeOverride> {
+        match state.node_control.read().await.as_ref() {
+            Some(control) => control.overrides(),
+            None => HashMap::new(),
         }
     }
 
@@ -2042,7 +2079,11 @@ impl AdminServer {
         };
         match action {
             ChaosAction::ForceUnhealthy { target_node } => {
-                if let Err(e) = Self::set_node_enabled(state, &target_node, false).await {
+                let fault = NodeOverride::now(
+                    OverrideKind::ForceUnhealthy,
+                    "forced unhealthy via chaos endpoint",
+                );
+                if let Err(e) = Self::apply_node_override(state, &target_node, Some(fault)).await {
                     return Ok((404, serde_json::json!({ "error": e.to_string() })));
                 }
                 state.chaos_overrides.write().await.insert(
@@ -2062,7 +2103,7 @@ impl AdminServer {
                 ))
             }
             ChaosAction::Restore { target_node } => {
-                if let Err(e) = Self::set_node_enabled(state, &target_node, true).await {
+                if let Err(e) = Self::apply_node_override(state, &target_node, None).await {
                     return Ok((404, serde_json::json!({ "error": e.to_string() })));
                 }
                 state.chaos_overrides.write().await.remove(&target_node);
@@ -2074,11 +2115,23 @@ impl AdminServer {
                 ))
             }
             ChaosAction::Reset => {
-                let overrides: Vec<String> =
-                    state.chaos_overrides.read().await.keys().cloned().collect();
+                // Every chaos fault the server holds (plus any this copy
+                // still lists); an operational disable is left alone.
+                let mut overrides: Vec<String> = Self::node_overrides(state)
+                    .await
+                    .into_iter()
+                    .filter(|(_, o)| o.kind == OverrideKind::ForceUnhealthy)
+                    .map(|(addr, _)| addr)
+                    .collect();
+                for addr in state.chaos_overrides.read().await.keys() {
+                    if !overrides.contains(addr) {
+                        overrides.push(addr.clone());
+                    }
+                }
+                overrides.sort();
                 let mut restored = Vec::with_capacity(overrides.len());
                 for addr in overrides {
-                    let _ = Self::set_node_enabled(state, &addr, true).await;
+                    let _ = Self::apply_node_override(state, &addr, None).await;
                     restored.push(addr);
                 }
                 state.chaos_overrides.write().await.clear();
@@ -3029,6 +3082,7 @@ impl AdminState {
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: RwLock::new(None),
             chaos_overrides: RwLock::new(HashMap::new()),
+            node_control: RwLock::new(None),
             #[cfg(feature = "anomaly-detection")]
             anomaly_detector: RwLock::new(None),
             #[cfg(feature = "query-analytics")]
@@ -3133,6 +3187,12 @@ impl AdminState {
     /// Attach the per-node connection caps so `/metrics` reports them (H-05).
     pub async fn with_node_slots(&self, slots: Arc<crate::node_slots::NodeSlots>) {
         *self.node_slots.write().await = Some(slots);
+    }
+
+    /// Attach the server's node-eligibility control so the node and chaos
+    /// endpoints reach health and routing. Wired by the daemon at startup.
+    pub async fn with_node_control(&self, control: Arc<dyn NodeControl>) {
+        *self.node_control.write().await = Some(control);
     }
 
     /// Attach the per-tenant client caps (H-05) so `/metrics` reports them.
@@ -3310,6 +3370,17 @@ struct NodeHealthResponse {
     /// When the lag byte count was sampled (H-04); `None` when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     lag_sampled_at: Option<String>,
+    /// The operator override holding the node out of routing, if any
+    /// (`kind`: `disabled` | `force_unhealthy`, `since`, `note`).
+    #[serde(rename = "override", skip_serializing_if = "Option::is_none")]
+    override_: Option<NodeOverride>,
+}
+
+impl NodeHealthResponse {
+    fn with_override(mut self, overrides: &HashMap<String, NodeOverride>) -> Self {
+        self.override_ = overrides.get(&self.address).cloned();
+        self
+    }
 }
 
 impl From<NodeHealth> for NodeHealthResponse {
@@ -3323,6 +3394,7 @@ impl From<NodeHealth> for NodeHealthResponse {
             latency_ms: h.latency_ms,
             replication_lag_bytes: h.replication_lag_bytes,
             lag_sampled_at: h.lag_sampled_at.map(|t| t.to_rfc3339()),
+            override_: None,
         }
     }
 }
@@ -4863,6 +4935,186 @@ mod tests {
             .await
             .expect("handler returns Ok");
         assert_eq!(status, 400);
+    }
+
+    // ---- node controls reach the server (Sprinter b251750f1d54) ----
+
+    fn seeded_node(addr: &str) -> NodeHealth {
+        NodeHealth {
+            address: addr.to_string(),
+            healthy: true,
+            last_check: chrono::Utc::now(),
+            failure_count: 0,
+            last_error: None,
+            latency_ms: 1.0,
+            replication_lag_bytes: None,
+            success_count: 0,
+            lag_sampled_at: None,
+        }
+    }
+
+    /// A fake server control: validates addresses, records every call and
+    /// holds the override map the way the daemon's does.
+    struct FakeControl {
+        known: Vec<String>,
+        calls: parking_lot::Mutex<Vec<(String, Option<OverrideKind>)>>,
+        map: crate::node_overrides::NodeOverrides,
+    }
+
+    impl FakeControl {
+        fn calls(&self) -> Vec<(String, Option<OverrideKind>)> {
+            self.calls.lock().clone()
+        }
+    }
+
+    impl NodeControl for FakeControl {
+        fn set_override(&self, addr: &str, override_: Option<NodeOverride>) -> Result<bool> {
+            if !self.known.iter().any(|k| k == addr) {
+                return Err(ProxyError::Config(format!("Node not found: {}", addr)));
+            }
+            self.calls
+                .lock()
+                .push((addr.to_string(), override_.as_ref().map(|o| o.kind)));
+            Ok(match override_ {
+                Some(o) => {
+                    self.map.set(addr, o);
+                    false
+                }
+                None => {
+                    self.map.clear(addr);
+                    true
+                }
+            })
+        }
+
+        fn overrides(&self) -> HashMap<String, NodeOverride> {
+            self.map.snapshot()
+        }
+    }
+
+    async fn controlled_state(addrs: &[&str]) -> (Arc<AdminState>, Arc<FakeControl>) {
+        let state = Arc::new(AdminState::new());
+        for addr in addrs {
+            state
+                .node_health
+                .write()
+                .await
+                .insert(addr.to_string(), seeded_node(addr));
+        }
+        let control = Arc::new(FakeControl {
+            known: addrs.iter().map(|a| a.to_string()).collect(),
+            calls: Default::default(),
+            map: Default::default(),
+        });
+        state.with_node_control(control.clone()).await;
+        (state, control)
+    }
+
+    async fn route(
+        state: &Arc<AdminState>,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> (u16, serde_json::Value) {
+        AdminServer::route_request(method, path, body, state)
+            .await
+            .expect("handler returns Ok")
+    }
+
+    #[tokio::test]
+    async fn node_disable_and_enable_reach_the_server_control() {
+        let (state, control) = controlled_state(&["a:5432"]).await;
+        let (status, body) = route(&state, "POST", "/nodes/a:5432/disable", None).await;
+        assert_eq!((status, body["status"].as_str()), (200, Some("disabled")));
+        assert_eq!(
+            control.calls(),
+            vec![("a:5432".to_string(), Some(OverrideKind::Disabled))]
+        );
+        assert!(!state.node_health.read().await["a:5432"].healthy);
+
+        let (_, nodes) = route(&state, "GET", "/nodes", None).await;
+        let entry = &nodes.as_array().unwrap()[0];
+        assert_eq!(entry["override"]["kind"], "disabled");
+        assert_eq!(entry["healthy"], false);
+        let (_, one) = route(&state, "GET", "/nodes/a:5432", None).await;
+        assert_eq!(one["override"]["kind"], "disabled");
+
+        let (status, body) = route(&state, "POST", "/nodes/a:5432/enable", None).await;
+        assert_eq!((status, body["status"].as_str()), (200, Some("enabled")));
+        assert_eq!(
+            control.calls().last().unwrap(),
+            &("a:5432".to_string(), None)
+        );
+        assert!(state.node_health.read().await["a:5432"].healthy);
+        let (_, nodes) = route(&state, "GET", "/nodes", None).await;
+        assert!(nodes.as_array().unwrap()[0].get("override").is_none());
+    }
+
+    #[tokio::test]
+    async fn chaos_force_and_restore_reach_the_control_and_enable_clears_a_fault() {
+        let (state, control) = controlled_state(&["a:5432"]).await;
+        let force = r#"{"action":"force_unhealthy","target_node":"a:5432"}"#;
+        let (status, _) = route(&state, "POST", "/api/chaos", Some(force)).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            control.calls(),
+            vec![("a:5432".to_string(), Some(OverrideKind::ForceUnhealthy))]
+        );
+        assert!(!state.node_health.read().await["a:5432"].healthy);
+        let (_, listed) = route(&state, "GET", "/api/chaos", None).await;
+        assert!(listed.get("a:5432").is_some());
+
+        let restore = r#"{"action":"restore","target_node":"a:5432"}"#;
+        let (status, _) = route(&state, "POST", "/api/chaos", Some(restore)).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            control.calls().last().unwrap(),
+            &("a:5432".to_string(), None)
+        );
+        assert!(state.node_health.read().await["a:5432"].healthy);
+        assert!(control.overrides().is_empty());
+
+        // /enable clears a chaos fault too, including this copy's listing.
+        route(&state, "POST", "/api/chaos", Some(force)).await;
+        let (status, _) = route(&state, "POST", "/nodes/a:5432/enable", None).await;
+        assert_eq!(status, 200);
+        assert!(control.overrides().is_empty());
+        let (_, listed) = route(&state, "GET", "/api/chaos", None).await;
+        assert_eq!(listed, serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn chaos_reset_clears_faults_but_not_an_operational_disable() {
+        let (state, control) = controlled_state(&["a:5432", "b:5432", "s:5432"]).await;
+        route(&state, "POST", "/nodes/s:5432/disable", None).await;
+        for addr in ["a:5432", "b:5432"] {
+            let body = format!(r#"{{"action":"force_unhealthy","target_node":"{addr}"}}"#);
+            route(&state, "POST", "/api/chaos", Some(&body)).await;
+        }
+        let (status, body) =
+            route(&state, "POST", "/api/chaos", Some(r#"{"action":"reset"}"#)).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["restored"], serde_json::json!(["a:5432", "b:5432"]));
+        let left = control.overrides();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left["s:5432"].kind, OverrideKind::Disabled);
+        assert!(!state.node_health.read().await["s:5432"].healthy);
+        assert!(state.node_health.read().await["a:5432"].healthy);
+        assert!(state.chaos_overrides.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn node_controls_404_when_the_server_does_not_know_the_node() {
+        let (state, control) = controlled_state(&["a:5432"]).await;
+        let (status, body) = route(&state, "POST", "/nodes/zz:1/disable", None).await;
+        assert_eq!(status, 404, "{body}");
+        let (status, _) = route(&state, "POST", "/nodes/zz:1/enable", None).await;
+        assert_eq!(status, 404);
+        let force = r#"{"action":"force_unhealthy","target_node":"zz:1"}"#;
+        let (status, _) = route(&state, "POST", "/api/chaos", Some(force)).await;
+        assert_eq!(status, 404);
+        assert!(control.calls().is_empty());
+        assert!(state.chaos_overrides.read().await.is_empty());
     }
 
     #[tokio::test]

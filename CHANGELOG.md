@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Admin node controls reach routing.** `POST /api/chaos force_unhealthy` and
+  `POST /nodes/{addr}/disable` only flipped the admin API's display copy of node health,
+  which the server overwrote within a second, so neither ever took a node out of routing
+  (field report 2026-10-16, finding F; Sprinter b251750f1d54). Both now set a per-node
+  override the server owns and republish health and routing before the request returns:
+  the node publishes as unhealthy and counts as `enabled = false` (`/nodes` shows the
+  `override`, `/topology` drops it, no new query is routed to it, a session on it moves at
+  its next request), probes cannot re-admit it, and a forced provider leader makes writes
+  fail closed. `restore`, `reset` and `/enable` clear overrides; `reset` leaves operational
+  disables alone. A cleared node is routed to again at once when its probe counters already
+  prove it, otherwise when its next probe passes. Overrides are per proxy instance and do
+  not survive a restart; the proxy still never promotes. Library: `node_overrides` module
+  (`NodeOverrides`, `NodeOverride`, `OverrideKind`, trait `NodeControl`),
+  `ProxyServer::node_control()`, `AdminState::with_node_control()`.
+
 ## [2.1.0] - 2026-10-15
 
 Read offload to standbys now works as documented and is on by default. Session settings

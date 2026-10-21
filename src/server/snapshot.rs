@@ -19,7 +19,9 @@ impl ProxyServer {
                 NodeFacts {
                     address: n.address(),
                     role: n.role,
-                    enabled: n.enabled,
+                    // An operator override holds the node out as if it were
+                    // not enabled; under a provider that also drops the leader.
+                    enabled: n.enabled && !state.node_overrides.is_overridden(n.address()),
                     healthy: h.map(|h| h.healthy).unwrap_or(false),
                     weight: n.weight,
                     latency_ms: h.map(|h| h.latency_ms).unwrap_or(0.0),

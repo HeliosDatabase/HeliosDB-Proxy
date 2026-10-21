@@ -133,6 +133,7 @@ impl ProxyServer {
                 node_health.last_check = chrono::Utc::now();
             }
         }
+        Self::apply_node_overrides(&state.node_overrides, &mut next);
         state.health.store(Arc::new(next));
         Self::publish_routing(state);
     }

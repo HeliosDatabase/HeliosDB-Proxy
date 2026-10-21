@@ -13,6 +13,7 @@ fn test_config() -> ProxyConfig {
 
 // ---- single-pass statement facts ----
 mod ext_set;
+mod node_overrides;
 mod prepared_commit_flush;
 mod read_offload;
 mod startup_terminal;
@@ -455,6 +456,7 @@ async fn test_apply_authenticate_hook_with_manager_no_plugins_defers() {
         routing: Arc::new(crate::routing_snapshot::RoutingView::new(false)),
         gateway_pools: Arc::new(crate::gateway_pool::GatewayPools::new(1)),
         node_slots: Arc::new(crate::node_slots::NodeSlots::default()),
+        node_overrides: Arc::new(crate::node_overrides::NodeOverrides::new()),
         tenant_slots: Arc::new(crate::tenant_slots::TenantSlots::default()),
         latency: Arc::new(crate::metrics_hist::ProxyLatency::new(
             &crate::metrics_hist::default_latency_buckets_ms(),
