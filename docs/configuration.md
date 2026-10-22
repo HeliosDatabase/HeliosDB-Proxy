@@ -676,6 +676,12 @@ name = "standby-1"
 ## TLS (`[tls]`)
 
 Optional TLS termination for client connections. Omit the whole section to disable.
+A `SIGHUP` reloads this section and the files it names: to rotate the certificate,
+replace `cert_path` / `key_path` on disk and send `SIGHUP`; every new connection then
+handshakes with the new certificate, established sessions keep the one they started
+with, and a certificate or key that fails to load keeps the running TLS configuration
+(logged as an error) rather than dropping to plaintext. Enabling or disabling the
+section on reload takes effect for new connections the same way.
 
 ```toml
 [tls]

@@ -331,7 +331,9 @@ struct ServerState {
     cancel_order: Arc<parking_lot::Mutex<std::collections::VecDeque<(u32, u32)>>>,
     /// Client-facing TLS acceptor, built from `[tls]` config when enabled.
     /// `None` => the proxy rejects SSLRequests with `N` (plaintext only).
-    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    /// Swapped by a SIGHUP reload (certificate rotation): every new
+    /// connection loads the current one; established sessions keep theirs.
+    tls_acceptor: arc_swap::ArcSwapOption<tokio_rustls::TlsAcceptor>,
     /// Proxy-terminated SCRAM auth state. `Some` when `[auth] mode = "scram"`:
     /// the proxy authenticates clients itself against this user list instead
     /// of relaying their credentials to the backend.
@@ -791,21 +793,14 @@ impl ProxyServer {
         // Build the client TLS acceptor if [tls] is configured + enabled.
         // A bad cert/key is fatal at startup (fail fast, don't silently
         // fall back to plaintext for a deployment that asked for TLS).
-        let tls_acceptor = match config.tls.as_ref() {
-            Some(tls) if tls.enabled => match build_tls_acceptor(tls) {
-                Ok(acc) => {
-                    tracing::info!(
-                        mtls = tls.require_client_cert,
-                        "client TLS termination enabled"
-                    );
-                    Some(acc)
-                }
-                Err(e) => {
-                    return Err(ProxyError::Config(format!("TLS init failed: {}", e)));
-                }
-            },
-            _ => None,
-        };
+        let tls_acceptor = Self::client_tls_acceptor(&config)
+            .map_err(|e| ProxyError::Config(format!("TLS init failed: {}", e)))?;
+        if tls_acceptor.is_some() {
+            tracing::info!(
+                mtls = config.tls.as_ref().is_some_and(|t| t.require_client_cert),
+                "client TLS termination enabled"
+            );
+        }
 
         // Load the SCRAM auth_file when proxy-terminated auth is requested.
         // Misconfiguration is fatal at startup (fail fast).
@@ -1074,7 +1069,7 @@ impl ProxyServer {
             metrics: ServerMetrics::default(),
             cancel_map: Arc::new(DashMap::new()),
             cancel_order: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
-            tls_acceptor,
+            tls_acceptor: arc_swap::ArcSwapOption::from(tls_acceptor.map(Arc::new)),
             auth_file,
             mirror,
             cutover: Arc::new(ArcSwap::from_pointee(None)),
@@ -1312,6 +1307,9 @@ impl ProxyServer {
         // Standbys that refused password-less logins get another try: their
         // auth may have changed along with the config.
         self.state.offload_refusals.clear();
+        // Certificate rotation: a changed cert/key on disk is picked up here
+        // even when the [tls] section itself is unchanged.
+        Self::reload_client_tls(&self.state, &new_config);
         self.state.live_config.store(Arc::new(new_config));
         tracing::info!(
             nodes,
@@ -1319,6 +1317,51 @@ impl ProxyServer {
             pool_max,
             "SIGHUP: configuration reloaded — applies to new connections"
         );
+    }
+
+    /// The client TLS acceptor `config` asks for: `Some` when `[tls]` is
+    /// enabled and its certificate and key load, `None` when TLS is off.
+    fn client_tls_acceptor(
+        config: &ProxyConfig,
+    ) -> std::result::Result<Option<tokio_rustls::TlsAcceptor>, String> {
+        match config.tls.as_ref() {
+            Some(tls) if tls.enabled => build_tls_acceptor(tls).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// Apply `[tls]` from a reloaded config (certificate rotation, or
+    /// switching TLS on or off): new connections use the rebuilt acceptor
+    /// at once, established sessions keep the one they handshook with. A
+    /// certificate or key that fails to load keeps the running acceptor so
+    /// a bad rotation never drops a deployment to plaintext. Returns whether
+    /// the acceptor changed.
+    fn reload_client_tls(state: &ServerState, config: &ProxyConfig) -> bool {
+        match Self::client_tls_acceptor(config) {
+            Ok(next) => {
+                let had = state.tls_acceptor.load().is_some();
+                let has = next.is_some();
+                state.tls_acceptor.store(next.map(Arc::new));
+                match (had, has) {
+                    (true, true) => tracing::info!(
+                        "SIGHUP: client TLS certificate reloaded — new connections use it"
+                    ),
+                    (false, true) => tracing::info!("SIGHUP: client TLS termination enabled"),
+                    (true, false) => tracing::warn!(
+                        "SIGHUP: client TLS termination disabled — new connections are plaintext"
+                    ),
+                    (false, false) => {}
+                }
+                had || has
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "SIGHUP: [tls] certificate or key failed to load — keeping the running TLS configuration"
+                );
+                false
+            }
+        }
     }
 
     /// Rebuild the health map for `config`'s node set: surviving nodes keep

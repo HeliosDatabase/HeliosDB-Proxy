@@ -48,7 +48,7 @@ impl ProxyServer {
         };
 
         match first {
-            StartupMessage::SSLRequest => match state.tls_acceptor.as_ref() {
+            StartupMessage::SSLRequest => match state.tls_acceptor.load_full() {
                 Some(acceptor) => {
                     tcp.write_all(b"S")
                         .await

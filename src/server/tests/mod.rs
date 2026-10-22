@@ -18,6 +18,7 @@ mod prepared_commit_flush;
 mod read_offload;
 mod startup_terminal;
 mod stmt_facts;
+mod tls_reload;
 
 /// A connected loopback `TcpStream` pair, shared by the relay tests
 /// below that need a real socket (so `try_read_buf`/`WouldBlock`
@@ -446,7 +447,7 @@ async fn test_apply_authenticate_hook_with_manager_no_plugins_defers() {
         metrics: ServerMetrics::default(),
         cancel_map: Arc::new(DashMap::new()),
         cancel_order: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
-        tls_acceptor: None,
+        tls_acceptor: arc_swap::ArcSwapOption::from(None),
         auth_file: None,
         mirror: None,
         cutover: Arc::new(ArcSwap::from_pointee(None)),
