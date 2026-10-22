@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Client TLS follows a SIGHUP reload.** `[tls]` and the files it names are reloaded with
+  the configuration: replace the certificate and key on disk and send `SIGHUP` to rotate
+  them. New connections handshake with the new certificate, established sessions keep
+  theirs, a certificate or key that fails to load keeps the running TLS configuration
+  (logged as an error) instead of dropping to plaintext, and the section can be switched
+  on or off the same way. Before this a rotation needed the `SIGUSR2` drain and a restart.
+- **Five more chaos verbs in the HA lab and the Patroni demo** (Sprinter 967e1db11c29):
+  lab scenarios `drain-restart` (`SIGUSR2` drain and restart of a proxy under the
+  ledger), `stale-sighup` (an unparsable file is refused, a stale one is applied while
+  writes go on) and `tls-rotation`; demo modes `dcs` (loss of one, then two, of a
+  three-member etcd under load) and `delay` (latency on the proxy's Patroni control path
+  below and above `patroni_request_timeout_ms`). `scripts/regress/tcp-relay.py` gained a
+  `--control FILE` with `delay_ms` and `drop` for the latter. The demo's etcd is now three
+  members.
 - **Nano physical-pair drill.** `scripts/regress/nano-pair-drill.py` runs the proxy
   (`scripts/regress/proxy-nano-pair.toml`: `[topology] provider = "postgres"`,
   `[health] check_query = "SELECT heliosdb_require_ready()"`, lag routing in Nano sequence

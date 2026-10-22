@@ -300,6 +300,122 @@ def control_partition(relay_pids):
     sys.exit(0 if outcome["pass"] else 1)
 
 
+PATRONI_TTL = 15  # patroni.yml ttl
+REQUEST_TIMEOUT = 2  # proxy.toml patroni_request_timeout_ms default
+
+
+def member_running(name):
+    out = subprocess.run(["docker", "inspect", "-f", "{{.State.Status}}", f"hp-patroni-demo-{name}"],
+                         capture_output=True, text=True)
+    return out.stdout.strip() == "running"
+
+
+def dcs_loss():
+    """Stop one etcd member (quorum kept: 2 of 3), then a second (quorum lost: Patroni can no
+    longer hold the leader key and demotes; the proxy's lease lapses and it fails closed),
+    then start both again. Nothing the client saw commit may be missing on the final
+    leader; writes must flow while one member is down and again after the heal; once the
+    quorum has been lost for a ttl plus the proxy's lease, no write completes until the
+    heal."""
+    def drill():
+        time.sleep(5)
+        t_one = time.time()
+        subprocess.run(["docker", "stop", "-t", "5", "hp-patroni-demo-etcd1"], check=True, capture_output=True)
+        time.sleep(20)
+        t_two = time.time()
+        subprocess.run(["docker", "stop", "-t", "5", "hp-patroni-demo-etcd2"], check=True, capture_output=True)
+        time.sleep(PATRONI_TTL + LEASE_SECS + 15)
+        t_heal = time.time()
+        for m in ("etcd2", "etcd1"):
+            subprocess.run(["docker", "start", f"hp-patroni-demo-{m}"], check=True, capture_output=True)
+        try:
+            wait_leader("", timeout=120)
+        except SystemExit:
+            pass
+        time.sleep(25)
+        return {"t_one": t_one, "t_two": t_two, "t_heal": t_heal}
+    marks, writes, topo = with_load(drill)
+    lead = leader()
+    on_leader = ids_on(lead) or set() if lead else set()
+    committed = [w for w in writes if w["outcome"] == "committed"]
+    quorum_lost_from = marks["t_two"] + PATRONI_TTL + LEASE_SECS + 2
+    outcome = {
+        "mode": "dcs-loss", "leader_after": lead,
+        "etcd_members_running_after": [m for m in ("etcd1", "etcd2", "etcd3") if member_running(m)],
+        "writes": {o: sum(w["outcome"] == o for w in writes) for o in ("committed", "error", "unknown")},
+        "committed_with_one_member_down": sum(marks["t_one"] < w["t0"] < marks["t_two"] for w in committed),
+        "topology_without_leader_with_one_member_down": len(
+            [s for s in topo if marks["t_one"] + 2 < s.get("t", 0) < marks["t_two"] and s.get("leader") is None]),
+        "completed_after_quorum_loss_before_heal": [w["id"] for w in committed
+                                                   if w["t0"] > quorum_lost_from and w["t1"] < marks["t_heal"]],
+        "topology_without_leader_after_quorum_loss": len(
+            [s for s in topo if quorum_lost_from < s.get("t", 0) < marks["t_heal"] and s.get("leader") is None]),
+        "committed_after_heal": sum(w["t0"] > marks["t_heal"] for w in committed),
+        "acknowledged_missing_on_leader": [w["id"] for w in committed if w["id"] not in on_leader],
+        "errors_seen": sorted({w.get("code") or "conn" for w in writes if w["outcome"] != "committed"}),
+    }
+    outcome["pass"] = (lead is not None
+                       and outcome["committed_with_one_member_down"] > 0
+                       and outcome["topology_without_leader_with_one_member_down"] == 0
+                       and not outcome["completed_after_quorum_loss_before_heal"]
+                       and outcome["topology_without_leader_after_quorum_loss"] > 0
+                       and outcome["committed_after_heal"] > 0
+                       and not outcome["acknowledged_missing_on_leader"])
+    print(json.dumps(outcome, indent=2, default=str))
+    sys.exit(0 if outcome["pass"] else 1)
+
+
+def control_delay(control_file):
+    """Add latency to the relays that carry the proxy's Patroni polls. The relay delays each
+    chunk in both directions, so a delay of D is a round trip of about 2D: 0.4 s (round trip
+    0.8 s, inside patroni_request_timeout_ms = 2 s) must change nothing; 5 s (every request
+    times out) must lapse the lease so the proxy has no write target and no write that started
+    after the lapse completes until the latency is removed; writes resume after it. (1 s, a
+    round trip at the timeout, makes the lease flap: measured 2026-10-22, see
+    docs/ha-lab-results.md.)"""
+    def set_delay(ms):
+        with open(control_file, "w", encoding="utf-8") as handle:
+            handle.write(f"delay_ms={ms}\n")
+    def drill():
+        time.sleep(5)
+        t_slow = time.time()
+        set_delay(400)
+        time.sleep(20)
+        t_stall = time.time()
+        set_delay(5000)
+        time.sleep(LEASE_SECS + REQUEST_TIMEOUT + 15)
+        t_heal = time.time()
+        set_delay(0)
+        time.sleep(20)
+        return {"t_slow": t_slow, "t_stall": t_stall, "t_heal": t_heal}
+    marks, writes, topo = with_load(drill)
+    lead = leader()
+    on_leader = ids_on(lead) or set()
+    committed = [w for w in writes if w["outcome"] == "committed"]
+    lapsed_from = marks["t_stall"] + LEASE_SECS + REQUEST_TIMEOUT + 2
+    outcome = {
+        "mode": "control-delay", "leader": lead,
+        "writes": {o: sum(w["outcome"] == o for w in writes) for o in ("committed", "error", "unknown")},
+        "committed_under_0_4s_delay": sum(marks["t_slow"] + 2 < w["t0"] < marks["t_stall"] for w in committed),
+        "topology_without_leader_under_0_4s_delay": len(
+            [s for s in topo if marks["t_slow"] + 2 < s.get("t", 0) < marks["t_stall"] and s.get("leader") is None]),
+        "completed_after_lapse_while_delayed": [w["id"] for w in committed
+                                               if w["t0"] > lapsed_from and w["t1"] < marks["t_heal"]],
+        "topology_without_leader_while_delayed": len(
+            [s for s in topo if lapsed_from < s.get("t", 0) < marks["t_heal"] and s.get("leader") is None]),
+        "committed_after_heal": sum(w["t0"] > marks["t_heal"] + 2 for w in committed),
+        "acknowledged_missing_on_leader": [w["id"] for w in committed if w["id"] not in on_leader],
+    }
+    outcome["pass"] = (outcome["committed_under_0_4s_delay"] > 0
+                       and outcome["topology_without_leader_under_0_4s_delay"] == 0
+                       and not outcome["completed_after_lapse_while_delayed"]
+                       and outcome["topology_without_leader_while_delayed"] > 0
+                       and outcome["committed_after_heal"] > 0
+                       and not outcome["acknowledged_missing_on_leader"])
+    print(json.dumps(outcome, indent=2, default=str))
+    sys.exit(0 if outcome["pass"] else 1)
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "switchover"
     if mode == "new-session":
@@ -308,5 +424,9 @@ if __name__ == "__main__":
         lock_drill()
     elif mode == "control-partition":
         control_partition(sys.argv[2:])
+    elif mode == "dcs-loss":
+        dcs_loss()
+    elif mode == "control-delay":
+        control_delay(sys.argv[2])
     else:
         main(mode)

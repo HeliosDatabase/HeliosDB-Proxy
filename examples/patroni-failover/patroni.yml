@@ -2,7 +2,7 @@
 # (see docker-compose.yml). Demo only: loopback trust authentication, throwaway data.
 scope: hp-demo
 etcd3:
-  hosts: 127.0.0.1:35620
+  hosts: 127.0.0.1:35620,127.0.0.1:35622,127.0.0.1:35624
 bootstrap:
   dcs:
     ttl: 15

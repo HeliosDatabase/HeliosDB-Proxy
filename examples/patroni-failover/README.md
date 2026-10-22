@@ -13,8 +13,8 @@ cd examples/patroni-failover
 ```
 
 Needs Docker with Compose, `python3` with `psycopg2`, and `curl`. It builds a small Patroni image
-(`hp-patroni-demo:local`, PostgreSQL 18.4 + `pip install patroni[etcd3]`), starts etcd and two members on
-loopback ports 35601-35621, starts the proxy on 35600 (admin 35690) and runs three scenarios. Everything it
+(`hp-patroni-demo:local`, PostgreSQL 18.4 + `pip install patroni[etcd3]`), starts a three-member etcd and two
+members on loopback ports 35601-35625, starts the proxy on 35600 (admin 35690) and runs three scenarios. Everything it
 creates is named `hp-patroni-demo-*` and is removed when the script exits (exact names; it never uses
 `down -v` and never touches other containers). Demo only: loopback `trust` authentication.
 
@@ -33,6 +33,26 @@ load (three writers, one fresh session per `INSERT`, plus a `/topology` sampler)
   untouched). Passes when, once the lease (8 s) has run out, the proxy has no write target
   and no write that started after that completes before the heal, and writes resume after
   it with nothing acknowledged missing.
+
+### DCS and control-path drills (`./run-demo.sh <binary> dcs`, `./run-demo.sh <binary> delay`)
+
+Same cluster and load as the H-02 drills:
+
+- `dcs`: `etcd1` is stopped (two of three members remain: quorum kept), 20 s later `etcd2`
+  (quorum lost: Patroni cannot renew the leader key and demotes after `ttl`; the proxy's
+  lease lapses), then both are started again. Passes when writes flowed with one member
+  down and the proxy never lost its write target then, no write that started once the
+  quorum had been lost for `ttl` plus the lease completed before the heal, the proxy had
+  no write target during that time, writes resumed after the heal, and nothing
+  acknowledged is missing on the final leader.
+- `delay`: the relays carrying the proxy's Patroni polls get latency through their
+  control file (`tcp-relay.py --control`; the relay delays each chunk both ways, so a
+  delay of D is a round trip of about 2D): 0.4 s for 20 s (round trip 0.8 s, inside
+  `patroni_request_timeout_ms` = 2 s: no effect expected), then 5 s (every request times
+  out: the lease lapses and writes wait), then none. Passes when writes flowed and
+  the write target never vanished under the 0.4 s delay, no write that started after the
+  lapse completed under the 5 s delay, the proxy had no write target then, writes resumed
+  after the heal, and nothing acknowledged is missing on the leader.
 
 ## What `demo.py` does
 

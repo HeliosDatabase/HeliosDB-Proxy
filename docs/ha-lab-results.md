@@ -166,9 +166,71 @@ of the 2137 transfers committed (863 through proxy-a and 845 through proxy-b aft
 promotion). pg-a holds no acknowledged transfer pg-b lacks. `reset` on each proxy cleared
 the override (`restored: ["127.0.0.1:27701"]`) and pg-a was stopped (fenced) at the end.
 
+## 2026-10-22, remaining chaos verbs (Sprinter 967e1db11c29), branch feat/lab-chaos-verbs-20261022
+
+Binary labverbs-heliosdb-proxy (sha256 `d9269655…9248a8`, `--features all-features,postgres-topology`,
+release), main c85b0bf plus the reloadable client TLS acceptor. Evidence:
+`/home/gpc/HDB/sprint/baselines/proxy/lab-verbs-20261022/ha-lab-*`.
+
+| scenario | result | committed / attempted | not_sent | unknown | lost / phantom | proxy-a write gap |
+|---|---|---|---|---|---|---|
+| drain-restart (new) | PASS, 7/7 | 2525 / 2548 | 23 | 0 | 0 / 0 | 0.1 s |
+| stale-sighup (new) | PASS, 7/7 | 2558 / 2558 | 0 | 0 | 0 / 0 | 0.07 s |
+| tls-rotation (new) | PASS, 6/6 | 2435 / 2435 | 0 | 0 | 0 / 0 | 0.1 s |
+
+**drain-restart:** 10 s into the ledger run proxy-a received `SIGUSR2`. It closed its listener,
+let the in-flight sessions finish and exited 531 ms later (`drain complete` in its log); the
+driver started it again and it served 911 ms after exiting. The ledger workers on proxy-a saw 23
+refused connections in that window (`not_sent`, never `unknown`: a drain finishes what is in
+flight) and committed again at once; proxy-b was untouched. No cluster change: the check ran
+against pg-a.
+
+**stale-sighup:** proxy-a read a copy of its config the driver rewrote. First `SIGHUP` with a
+file that does not parse: refused (`SIGHUP reload failed to parse — keeping current config`),
+`/nodes` kept 3 nodes. Then `SIGHUP` with a stale file that predates pg-c: applied
+(`SIGHUP: node removed from config`), `/nodes` dropped to 2, the provider's leader stayed pg-a
+and every one of the 2558 transfers committed through both proxies.
+
+**tls-rotation:** proxy-a terminated client TLS (`proxy-a-tls.toml`); the ledger's `psql`
+negotiated it with its default `sslmode=prefer`. A new self-signed certificate was written over
+the old files and `SIGHUP` sent: the fingerprint a new client saw changed from the old
+certificate's to the new file's (`SIGHUP: client TLS certificate reloaded`), established
+sessions kept going, and all 2435 transfers committed. Before this change the acceptor was
+built once at startup, so a rotation needed the `SIGUSR2` drain and a restart.
+
+### Patroni demo, same day (`examples/patroni-failover`, three-member etcd)
+
+Evidence: `/home/gpc/HDB/sprint/baselines/proxy/lab-verbs-20261022/patroni-*.log`.
+
+**`dcs` (DCS member loss): PASS.** Under three writers (one fresh session per `INSERT`) and
+a `/topology` sampler: `etcd1` stopped, 20 s later `etcd2` (quorum lost), 38 s later both
+started again. With one member down 241 writes committed and the proxy never lost its write
+target; once the quorum had been lost for Patroni's `ttl` (15 s) plus the proxy's lease
+(8 s), no write completed until the heal (28 samples without a write target, writes refused
+with `08006` or a dropped connection), and 262 committed after it. Patroni re-elected
+`pg-b`; nothing the client saw commit is missing on it.
+
+**`delay` (control-path latency), 1 s: lease flaps.** The relay delays each chunk in both
+directions, so 1 s is a round trip of about 2 s, exactly `patroni_request_timeout_ms` (2 s).
+Polls then timed out intermittently and the proxy's lease lapsed and returned repeatedly: 25
+of the samples in that phase had no write target, while 61 writes still committed whenever
+the lease was valid; the 5 s phase and the heal behaved as expected (no write completed after
+the lapse, 200 committed after the heal, nothing acknowledged missing). This is the designed
+fail-closed behaviour, not a defect: a control path whose round trip sits at the request
+timeout is indistinguishable from a partition. Operators with a slow Patroni REST path should
+raise `patroni_request_timeout_ms` (and keep `lease_timeout_secs` below Patroni's `ttl` minus
+`loop_wait`). The drill's benign phase was recalibrated to 0.4 s (round trip 0.8 s).
+
+**`delay`, recalibrated (0.4 s then 5 s): PASS.** Under the 0.4 s delay (round trip 0.8 s)
+200 writes committed and the write target never vanished; under 5 s every poll timed out, the
+lease lapsed (26 samples without a write target) and no write that started after the lapse
+completed before the latency was removed; 200 committed after the heal; nothing acknowledged
+is missing on the leader. 566 writes in all, 0 errors, 0 unknown.
+
 ## Not covered yet
 
-Network partitions and `tc netem` delay, proxy drain (`SIGUSR2`) and restart, SIGHUP with
-a stale config, TLS rotation, and loss of a DCS member. The Patroni example
-(`examples/patroni-failover`) drills the Patroni leader lock and a frozen control path
-(H-02).
+Kernel-level network faults (`tc netem` delay and loss, `iptables` partitions): this host
+cannot create Docker bridge networks, so every lab container shares the host network
+namespace and such tooling would hit the host itself. Control-path delay and black-holing
+are covered in user space instead (`scripts/regress/tcp-relay.py --control`, the Patroni
+demo's `delay` mode and the H-02 `control-partition` drill); data-path partitions are not.

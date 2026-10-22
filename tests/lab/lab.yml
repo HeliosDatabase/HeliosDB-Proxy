@@ -113,6 +113,8 @@ services:
     volumes:
       - ${HELIOS_PROXY_BIN:?set HELIOS_PROXY_BIN to a heliosdb-proxy built with postgres-topology}:/opt/helios/heliosdb-proxy:ro
       - ${LAB_PROXY_A_CONFIG:-./proxy-a.toml}:/lab/proxy.toml:ro
+      # tls-rotation: the driver's certificate directory (any directory otherwise)
+      - ${LAB_TLS_DIR:-./}:/lab/tls:ro
 
   proxy-b:
     <<: *proxy

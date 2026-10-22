@@ -16,6 +16,19 @@
 #                        dropped at once and writes wait), then pg-b is
 #                        promoted while pg-a stays up unfenced; the overrides
 #                        are reset at the end and pg-a fenced (stopped).
+#   drain-restart        ledger through both proxies; proxy-a gets SIGUSR2 (graceful
+#                        drain: listener closed, in-flight sessions finish, process
+#                        exits) and is started again; writes through it must resume
+#                        with no unknown outcome and no cluster change.
+#   stale-sighup         ledger through both proxies; proxy-a is sent SIGHUP twice:
+#                        first with a file that does not parse (the reload must be
+#                        refused and the running config kept), then with a stale
+#                        file that predates pg-c (it must be applied: pg-c leaves
+#                        /nodes) while writes keep flowing to the provider's leader.
+#   tls-rotation         proxy-a terminates client TLS (proxy-a-tls.toml); the ledger's
+#                        psql connects with sslmode=prefer. A new certificate is written
+#                        over the old files and SIGHUP sent: new connections must show
+#                        the new fingerprint, the ledger must not notice.
 #   edge-resume          C-03 drill: proxy-a is an edge home, proxy-b its edge,
 #                        subscribed through a killable relay. The relay is cut
 #                        while a write goes through the home, then restored
@@ -58,7 +71,19 @@ LEDGER_WORKERS="${LEDGER_WORKERS:-4}"
 STEP_TIMEOUT="${STEP_TIMEOUT:-180}"
 
 case "$SCENARIO" in
-  promote-under-load | stop-old-primary | chaos-force-leader) ;;
+  promote-under-load | stop-old-primary | chaos-force-leader | drain-restart) ;;
+  stale-sighup)
+    # proxy-a reads a copy the driver can rewrite between SIGHUPs.
+    mkdir -p "$OUT"
+    cp "$HERE/proxy-a.toml" "$OUT/proxy-a-live.toml"
+    export LAB_PROXY_A_CONFIG="$OUT/proxy-a-live.toml" ;;
+  tls-rotation)
+    mkdir -p "$OUT/tls"
+    (umask 077; openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=lab-proxy-a \
+       -keyout "$OUT/tls/server.key" -out "$OUT/tls/server.crt" >/dev/null 2>&1) \
+      || { echo "openssl could not create the lab certificate" >&2; exit 2; }
+    chmod 644 "$OUT/tls/server.key" "$OUT/tls/server.crt"
+    export LAB_PROXY_A_CONFIG=./proxy-a-tls.toml LAB_TLS_DIR="$OUT/tls" ;;
   edge-resume)
     export LAB_PROXY_A_CONFIG=./proxy-home.toml LAB_PROXY_B_CONFIG=./proxy-edge.toml ;;
   cache-logical)
@@ -75,6 +100,7 @@ if [ "${LAB_LOCKED:-0}" != 1 ]; then
     env LAB_LOCKED=1 LEDGER_SECS="$LEDGER_SECS" LEDGER_WORKERS="$LEDGER_WORKERS" \
     WAVE_CLIENTS="${WAVE_CLIENTS:-48}" WAVE_SMALL="${WAVE_SMALL:-2}" WAVE_SECS="${WAVE_SECS:-60}" \
     STEP_TIMEOUT="$STEP_TIMEOUT" LAB_PROXY_A_CONFIG="${LAB_PROXY_A_CONFIG:-./proxy-a.toml}" \
+    LAB_TLS_DIR="${LAB_TLS_DIR:-./}" \
     LAB_PROXY_B_CONFIG="${LAB_PROXY_B_CONFIG:-./proxy-b.toml}" bash "$0" "$BIN" "$SCENARIO" "$OUT"
 fi
 
@@ -95,6 +121,12 @@ admin_post() { curl -s -m 5 -X POST -H "Authorization: Bearer helios-lab-admin" 
 RELAY_PID=
 SAMPLER_PID=
 log() { echo "[$(date -u +%T)] $*" | tee -a "$OUT/driver.log"; }
+# The SHA-256 fingerprint of the certificate proxy-a presents to a new client.
+tls_fingerprint() {
+  openssl s_client -connect 127.0.0.1:27710 -starttls postgres </dev/null 2>/dev/null \
+    | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//'
+}
+proxy_container_state() { docker inspect -f '{{.State.Status}}' "$PROJECT-$1-1" 2>/dev/null || echo missing; }
 # Bound every step. `timeout` cannot run a shell function, so the lab's own
 # helpers (ledger, pg, via) bound themselves and are called directly.
 step() {
@@ -327,6 +359,52 @@ chaos-force-leader)
   sleep 15
   log "pg-a in_recovery=$(pg pg-a -c "SELECT pg_is_in_recovery()"), pg-b in_recovery=$(pg pg-b -c "SELECT pg_is_in_recovery()")"
   ;;
+drain-restart)
+  log "SIGUSR2 proxy-a: graceful drain (listener closed, in-flight sessions finish, then exit)"
+  date +%s%3N >"$OUT/drained_ms"
+  "${COMPOSE[@]}" kill -s USR2 proxy-a >>"$OUT/driver.log" 2>&1
+  for _ in $(seq 1 240); do
+    [ "$(proxy_container_state proxy-a)" = exited ] && break
+    sleep 0.5
+  done
+  date +%s%3N >"$OUT/exited_ms"
+  log "proxy-a after the drain: $(proxy_container_state proxy-a) ($(( ($(cat "$OUT/exited_ms") - $(cat "$OUT/drained_ms")) )) ms)"
+  log "start proxy-a again"
+  "${COMPOSE[@]}" up -d --no-deps proxy-a >>"$OUT/driver.log" 2>&1
+  for _ in $(seq 1 120); do via proxy-a "SELECT 1" >/dev/null 2>&1 && break; sleep 0.5; done
+  date +%s%3N >"$OUT/promoted_ms"   # the instant writes through proxy-a may resume
+  log "proxy-a serving again ($(( ($(cat "$OUT/promoted_ms") - $(cat "$OUT/exited_ms")) )) ms after it exited)"
+  ;;
+stale-sighup)
+  log "SIGHUP proxy-a with a file that does not parse: the reload must be refused"
+  printf 'listen_address = "127.0.0.1:27710"\n[this is not toml\n' >"$OUT/proxy-a-live.toml"
+  "${COMPOSE[@]}" kill -s HUP proxy-a >>"$OUT/driver.log" 2>&1
+  sleep 3
+  admin_get proxy-a nodes >"$OUT/nodes-after-broken-reload.json" 2>&1 || true
+  log "SIGHUP proxy-a with a stale file that predates pg-c: pg-c must leave /nodes, writes must go on"
+  sed '/^\[\[nodes\]\]$/{N;N;N;/port = 27703/d}' "$HERE/proxy-a.toml" >"$OUT/proxy-a-live.toml"
+  grep -q 27703 "$OUT/proxy-a-live.toml" && { log "stale file still names pg-c"; exit 1; }
+  "${COMPOSE[@]}" kill -s HUP proxy-a >>"$OUT/driver.log" 2>&1
+  sleep 3
+  admin_get proxy-a nodes >"$OUT/nodes-after-stale-reload.json" 2>&1 || true
+  admin_get proxy-a topology >"$OUT/topology-after-stale-reload.json" 2>&1 || true
+  date +%s%3N >"$OUT/promoted_ms"   # no promotion: the instant after the second reload
+  ;;
+tls-rotation)
+  before="$(tls_fingerprint)"
+  log "proxy-a presents $before; writing a new certificate over the old files, then SIGHUP"
+  (umask 077; openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=lab-proxy-a-rotated \
+     -keyout "$OUT/tls/server.key" -out "$OUT/tls/server.crt" >/dev/null 2>&1)
+  chmod 644 "$OUT/tls/server.key" "$OUT/tls/server.crt"
+  file="$(openssl x509 -in "$OUT/tls/server.crt" -noout -fingerprint -sha256 | sed 's/^.*=//')"
+  date +%s%3N >"$OUT/rotated_ms"
+  "${COMPOSE[@]}" kill -s HUP proxy-a >>"$OUT/driver.log" 2>&1
+  sleep 2
+  after="$(tls_fingerprint)"
+  log "after SIGHUP proxy-a presents $after (new file: $file)"
+  printf '{"before":"%s","after":"%s","file":"%s"}\n' "$before" "$after" "$file" >"$OUT/tls-fingerprints.json"
+  date +%s%3N >"$OUT/promoted_ms"   # no promotion: the instant after the rotation
+  ;;
 esac
 
 wait "$LEDGER_PID" || true
@@ -336,6 +414,12 @@ for p in proxy-a proxy-b; do
   admin_get "$p" metrics/prometheus >"$OUT/metrics-prometheus-$p.prom" 2>&1 || true
 done
 
+# The node the ledger is checked against: pg-b after a promotion, pg-a when the
+# scenario never promotes (a standby refuses the check's temp table with 25006).
+case "$SCENARIO" in
+  drain-restart | stale-sighup | tls-rotation) CHECK_HOST=pg-a ;;
+  *) CHECK_HOST=pg-b ;;
+esac
 if [ "$SCENARIO" = stop-old-primary ] || [ "$SCENARIO" = chaos-force-leader ]; then
   step ledger check pg-b pg-a >"$OUT/check.json" 2>&1 || true
   if [ "$SCENARIO" = chaos-force-leader ]; then
@@ -347,9 +431,11 @@ if [ "$SCENARIO" = stop-old-primary ] || [ "$SCENARIO" = chaos-force-leader ]; t
   log "fence pg-a (stop)"
   "${COMPOSE[@]}" stop --timeout 5 pg-a >>"$OUT/driver.log" 2>&1
 else
-  step ledger check pg-b >"$OUT/check.json" 2>&1 || true
+  step ledger check "$CHECK_HOST" >"$OUT/check.json" 2>&1 || true
 fi
 "${COMPOSE[@]}" exec -T ledger cat /results/outcomes.tsv >"$OUT/outcomes.tsv" 2>/dev/null || true
 cat "$OUT/check.json" | tee -a "$OUT/driver.log"
+# proxy-a's log for the verdicts that read it (compose.log is written at teardown).
+"${COMPOSE[@]}" logs --no-color --timestamps proxy-a >"$OUT/proxy-a.log" 2>&1 || true
 
 python3 -I "$HERE/verdict.py" "$SCENARIO" "$OUT" | tee "$OUT/verdict.txt"

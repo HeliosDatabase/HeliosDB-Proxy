@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# Disposable end-to-end demo: Patroni (etcd + 2 members) elects/promotes, HeliosProxy follows.
-# Usage: ./run-demo.sh /path/to/heliosdb-proxy [h02]   (binary built with --features all-features,postgres-topology)
+# Disposable end-to-end demo: Patroni (3-member etcd + 2 members) elects/promotes, HeliosProxy follows.
+# Usage: ./run-demo.sh /path/to/heliosdb-proxy [h02|dcs|delay]   (binary built with --features all-features,postgres-topology)
 #   default: switchover, new session after promotion, stopped-leader failover
 #   h02:     leader-lock drill (frozen leader) and control-plane partition drill
+#   dcs:     DCS member loss under load: one etcd member stopped (quorum kept), then a second
+#            (quorum lost: Patroni demotes, the proxy fails closed), then both return
+#   delay:   control-path latency under load: the proxy's Patroni polls go through relays
+#            delayed 0.4 s (round trip 0.8 s, below the request timeout: no effect) then
+#            5 s (above it: the lease lapses and writes wait), then healed
 # Needs: docker compose, python3 + psycopg2, curl. Creates ONLY resources named hp-patroni-demo-*
 # and removes exactly those on exit (no `down -v`, no filters by image).
 set -euo pipefail
@@ -17,14 +22,14 @@ cleanup() {
   local rc=$?
   if [ "$rc" != 0 ]; then
     # Keep the members' and etcd's logs of a failed run next to proxy.log.
-    for c in etcd pg-a pg-b; do
+    for c in etcd1 etcd2 etcd3 pg-a pg-b; do
       docker logs --timestamps ${P}-$c >"demo-$c.log" 2>&1 || true
     done
   fi
   [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null || true
   for r in $RELAY_PIDS; do kill -CONT "$r" 2>/dev/null; kill "$r" 2>/dev/null || true; done
-  rm -f proxy-h02.generated.toml
-  docker rm -f ${P}-etcd ${P}-pg-a ${P}-pg-b >/dev/null 2>&1 || true
+  rm -f proxy-h02.generated.toml relay-control.generated
+  docker rm -f ${P}-etcd1 ${P}-etcd2 ${P}-etcd3 ${P}-pg-a ${P}-pg-b >/dev/null 2>&1 || true
   docker volume rm ${P}-pg-a-data ${P}-pg-b-data >/dev/null 2>&1 || true
   docker rmi ${P}:local >/dev/null 2>&1 || true
 }
@@ -64,6 +69,29 @@ if [ "$MODE" = h02 ]; then
   echo "=== H-02 drill 2: the proxy's Patroni control path is cut for 25 s (relays frozen) ==="
   python3 demo.py control-partition $RELAY_PIDS || rc=1
   exit $rc
+fi
+
+if [ "$MODE" = dcs ]; then
+  "$BIN" --config proxy.toml >proxy.log 2>&1 & PROXY_PID=$!
+  wait_for 30 "curl -s http://127.0.0.1:35690/topology | grep -q authoritative"
+  echo "=== DCS drill: etcd1 stopped (quorum kept), then etcd2 (quorum lost), then both return ==="
+  python3 demo.py dcs-loss
+  exit $?
+fi
+
+if [ "$MODE" = delay ]; then
+  # Relays as in h02, but with a control file the drill rewrites to add latency.
+  : >relay-control.generated
+  python3 ../../scripts/regress/tcp-relay.py 35631 127.0.0.1 35611 --control relay-control.generated & RELAY_PIDS="$!"
+  python3 ../../scripts/regress/tcp-relay.py 35632 127.0.0.1 35612 --control relay-control.generated & RELAY_PIDS="$RELAY_PIDS $!"
+  sed 's#"http://127.0.0.1:35611", "http://127.0.0.1:35612"#"http://127.0.0.1:35631", "http://127.0.0.1:35632"#' \
+    proxy.toml >proxy-h02.generated.toml
+  grep -q 35631 proxy-h02.generated.toml
+  "$BIN" --config proxy-h02.generated.toml >proxy.log 2>&1 & PROXY_PID=$!
+  wait_for 30 "curl -s http://127.0.0.1:35690/topology | grep -q authoritative"
+  echo "=== control-path delay drill: 0.4 s (round trip below the request timeout), then 5 s (above it), then healed ==="
+  python3 demo.py control-delay relay-control.generated
+  exit $?
 fi
 
 "$BIN" --config proxy.toml >proxy.log 2>&1 & PROXY_PID=$!

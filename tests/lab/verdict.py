@@ -14,6 +14,17 @@ stop-old-primary and chaos-force-leader also:
 chaos-force-leader also:
   override_dropped_leader_<proxy>  right after POST /api/chaos force_unhealthy,
                          that proxy's /topology named no primary
+drain-restart also (promoted_ms = the instant proxy-a served again):
+  drain_completed        proxy-a logged the drain as complete and exited
+  drain_no_unknown       no transfer through proxy-a ended `unknown` (a drain finishes
+                         in-flight work; new connections are refused, never cut)
+stale-sighup also (promoted_ms = the instant after the second reload):
+  broken_reload_refused  the unparsable file was refused and /nodes kept 3 nodes
+  stale_reload_applied   the stale file was applied: /nodes dropped to 2 and the
+                         provider's leader stayed pg-a
+tls-rotation also (promoted_ms = the instant after the rotation):
+  certificate_rotated    the fingerprint a new client sees changed with SIGHUP and
+                         equals the new file's
 edge-resume (C-03) instead: warm resume after a network cut replays the missed
 invalidation and keeps the rest of the cache; a home restart flushes the edge.
 reconnect-wave (H-05) instead:
@@ -179,6 +190,27 @@ def main(scenario, out):
         for proxy in ("proxy-a", "proxy-b"):
             forced = json.loads(out.joinpath(f"topology-forced-{proxy}.json").read_text())
             checks.append((f"override_dropped_leader_{proxy}", forced.get("currentPrimary") is None))
+    if scenario == "drain-restart":
+        compose = out.joinpath("proxy-a.log").read_text(errors="replace")
+        drained = [l for l in compose.splitlines() if "proxy-a" in l and "drain complete" in l]
+        unknown_a = sum(1 for line in out.joinpath("outcomes.tsv").read_text().splitlines()
+                        if line.split("\t")[1] == "unknown" and line.split("\t")[3] == "proxy-a")
+        checks.append(("drain_completed", bool(drained) and out.joinpath("exited_ms").exists()))
+        checks.append(("drain_no_unknown", unknown_a == 0))
+    if scenario == "stale-sighup":
+        compose = out.joinpath("proxy-a.log").read_text(errors="replace")
+        refused = any("proxy-a" in l and "SIGHUP reload failed to parse" in l for l in compose.splitlines())
+        after_broken = json.loads(out.joinpath("nodes-after-broken-reload.json").read_text())
+        after_stale = json.loads(out.joinpath("nodes-after-stale-reload.json").read_text())
+        topo = json.loads(out.joinpath("topology-after-stale-reload.json").read_text())
+        checks.append(("broken_reload_refused", refused and len(after_broken) == 3))
+        checks.append(("stale_reload_applied", len(after_stale) == 2
+                       and all(n["address"] != "127.0.0.1:27703" for n in after_stale)
+                       and topo.get("currentPrimary") == "127.0.0.1:27701"))
+    if scenario == "tls-rotation":
+        fp = json.loads(out.joinpath("tls-fingerprints.json").read_text())
+        checks.append(("certificate_rotated", bool(fp["before"]) and bool(fp["after"])
+                       and fp["before"] != fp["after"] and fp["after"] == fp["file"]))
     for name, ok in checks:
         print(f"{name:24} {'ok' if ok else 'FAILED'}")
     print(json.dumps({"committed_after_promotion": after, **main_doc}))

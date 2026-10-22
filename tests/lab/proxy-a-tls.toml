@@ -1,0 +1,44 @@
+# proxy-a with client TLS termination (tls-rotation scenario). Same routing as
+# proxy-a.toml; the driver generates the certificate and key under LAB_TLS_DIR
+# (mounted at /lab/tls) and rotates them with SIGHUP.
+listen_address = "127.0.0.1:27710"
+admin_address = "127.0.0.1:27790"
+admin_token = "helios-lab-admin"
+tr_enabled = true
+tr_mode = "transaction"
+write_timeout_secs = 30
+strict_config = true
+
+[health]
+check_interval_secs = 1
+check_timeout_secs = 2
+failure_threshold = 2
+success_threshold = 1
+
+[topology]
+provider = "postgres"
+user = "lab"
+database = "lab"
+poll_interval_secs = 1
+lease_timeout_secs = 5
+
+[[nodes]]
+host = "127.0.0.1"
+port = 27701
+role = "primary"
+
+[[nodes]]
+host = "127.0.0.1"
+port = 27702
+role = "standby"
+
+[[nodes]]
+host = "127.0.0.1"
+port = 27703
+role = "standby"
+
+[tls]
+enabled = true
+cert_path = "/lab/tls/server.crt"
+key_path = "/lab/tls/server.key"
+require_client_cert = false
