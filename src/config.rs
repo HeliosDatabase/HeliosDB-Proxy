@@ -2443,6 +2443,37 @@ const IGNORED_KEY_ALIASES: &[(&str, &str)] = &[
         "cache.l1",
         "there is no [cache.l1]: the cache's keys are flat under [cache]",
     ),
+    // Sections and keys the website's heliosproxy.toml sample showed that never
+    // existed (Sprinter 18b23fd60e82).
+    (
+        "ai_cache",
+        "there is no [ai_cache] section: the semantic/AI cache tiers are library code the daemon \
+         does not configure; the query cache is [cache] (enabled, ttl_secs, max_result_bytes, ...)",
+    ),
+    (
+        "cache.query",
+        "there is no [cache.query]: the query cache's keys are flat under [cache], and there is no \
+         exclude_patterns: only SELECT, VALUES, TABLE and WITH reads are ever cached, while INSERT, \
+         UPDATE and DELETE invalidate",
+    ),
+    ("tenancy", "did you mean [multi_tenancy]?"),
+    (
+        "transparent_write_routing",
+        "there is no [transparent_write_routing]: writes always go to the primary (tr_mode, \
+         write_timeout_secs, [load_balancer] read_write_split)",
+    ),
+    ("upgrade", "there is no [upgrade] section: the upgrade orchestrator is a library module"),
+    ("auth.enabled", "there is no auth.enabled: [auth] mode is \"passthrough\" or \"scram\""),
+    ("auth.api_key", "there is no API-key auth: [auth] mode is \"passthrough\" or \"scram\""),
+    ("auth.ldap", "there is no [auth.ldap]: [auth] mode is \"passthrough\" or \"scram\""),
+    ("rate_limit.global_connections", "did you mean 'rate_limit.max_concurrent'?"),
+    (
+        "rate_limit.tenant",
+        "there is no [[rate_limit.tenant]]: limits apply per bucket, key_by = user | client_ip | \
+         database | global",
+    ),
+    ("circuit_breaker.reset_timeout", "did you mean 'circuit_breaker.open_secs'?"),
+    ("circuit_breaker.half_open_requests", "did you mean 'circuit_breaker.success_threshold'?"),
 ];
 
 /// Keys a serialised default `ProxyConfig` does not show (optional fields
@@ -3948,6 +3979,150 @@ mod tests {
         // The list is not a config key: it never round-trips into a file.
         let text = toml::to_string(&config).unwrap();
         assert!(!text.contains("ignored_keys"), "{text}");
+    }
+
+    /// The sections heliosdb.com's heliosproxy.toml sample showed on 2026-10-22
+    /// that `ProxyConfig` never had (Sprinter 18b23fd60e82), minus `[[plugins]]`
+    /// (tested below: an array where a table is expected is a parse error, not
+    /// an ignored key). Every one must be reported, with the hint that names
+    /// where its intent lives, and the real keys next to them must still load.
+    const WEBSITE_SAMPLE_20261022: &str = r#"
+[pool_mode]
+mode = "transaction"
+max_pool_size = 100
+min_idle = 10
+reset_query = "DISCARD ALL"
+[limits]
+max_client_connections = 500
+[journal]
+dir = "/var/lib/heliosproxy/journal"
+[ai_cache]
+enabled = true
+conversation_context_ttl = "30m"
+conversation_context_size = "512MB"
+rag_chunk_cache_size = "2GB"
+rag_chunk_ttl = "1h"
+semantic_cache_enabled = true
+similarity_threshold = 0.92
+[cache.query]
+enabled = true
+max_result_size = "10MB"
+exclude_patterns = ["INSERT", "UPDATE", "DELETE"]
+[routing]
+schema_aware = true
+[routing.workload]
+enabled = true
+[circuit_breaker]
+enabled = true
+failure_threshold = 5
+reset_timeout = "30s"
+half_open_requests = 3
+[auth]
+enabled = true
+[auth.jwt]
+enabled = true
+issuer = "https://issuer.example"
+[auth.api_key]
+enabled = true
+header = "X-API-Key"
+[auth.ldap]
+enabled = true
+server = "ldap://ldap.example"
+[tenancy]
+enabled = true
+tenant_header = "X-Tenant"
+[[tenancy.tenant]]
+id = "acme"
+[rate_limit]
+enabled = true
+global_qps = 10000
+global_connections = 1000
+[[rate_limit.tenant]]
+id = "acme"
+qps = 100
+[transparent_write_routing]
+enabled = true
+sync_mode = "async"
+[transparent_write_routing.pool]
+max_connections = 10
+[upgrade]
+enabled = true
+[[upgrade.stages]]
+name = "shadow"
+[[nodes]]
+host = "127.0.0.1"
+port = 5432
+role = "primary"
+"#;
+
+    #[test]
+    fn website_sample_sections_are_reported_with_hints() {
+        let (config, ignored) =
+            deserialize_reporting_ignored_paths(WEBSITE_SAMPLE_20261022).unwrap();
+        assert_eq!(
+            ignored,
+            [
+                "ai_cache",
+                "auth.api_key",
+                "auth.enabled",
+                "auth.jwt",
+                "auth.ldap",
+                "cache.query",
+                "circuit_breaker.half_open_requests",
+                "circuit_breaker.reset_timeout",
+                "rate_limit.global_connections",
+                "rate_limit.global_qps",
+                "rate_limit.tenant",
+                "routing",
+                "tenancy",
+                "transparent_write_routing",
+                "upgrade",
+            ]
+            .map(str::to_string)
+        );
+        // The real keys next to them loaded.
+        assert_eq!(config.pool_mode.max_pool_size, 100);
+        assert_eq!(config.limits.max_client_connections, 500);
+        assert_eq!(config.journal.dir, "/var/lib/heliosproxy/journal");
+        assert!(config.circuit_breaker.enabled && config.rate_limit.enabled);
+        // Every unknown one carries a hint naming where its intent lives.
+        let known = known_config_keys();
+        let expect = [
+            ("ai_cache", "[cache]"),
+            ("cache.query", "exclude_patterns"),
+            ("tenancy", "[multi_tenancy]"),
+            ("transparent_write_routing", "primary"),
+            ("upgrade", "library"),
+            ("auth.enabled", "passthrough"),
+            ("auth.jwt", "passthrough"),
+            ("auth.api_key", "passthrough"),
+            ("auth.ldap", "passthrough"),
+            ("rate_limit.global_qps", "rate_limit.default_qps"),
+            ("rate_limit.global_connections", "rate_limit.max_concurrent"),
+            ("rate_limit.tenant", "key_by"),
+            ("circuit_breaker.reset_timeout", "circuit_breaker.open_secs"),
+            (
+                "circuit_breaker.half_open_requests",
+                "circuit_breaker.success_threshold",
+            ),
+            ("routing", "[load_balancer]"),
+        ];
+        for (path, needle) in expect {
+            let hint = ignored_key_hint(path, &known).unwrap_or_default();
+            assert!(hint.contains(needle), "{path}: {hint:?} lacks {needle:?}");
+        }
+    }
+
+    #[test]
+    fn website_sample_plugins_array_is_a_parse_error() {
+        // `[[plugins]]` (an array of tables) where `[plugins]` (one table) is
+        // expected cannot be ignored: the whole file is refused.
+        let text = "[[plugins]]\nname = \"audit\"\nsource = \"audit.wasm\"\n\
+                    [[nodes]]\nhost = \"127.0.0.1\"\nrole = \"primary\"\n";
+        let err = deserialize_reporting_ignored_paths(text)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("plugins"), "{err}");
     }
 
     #[test]

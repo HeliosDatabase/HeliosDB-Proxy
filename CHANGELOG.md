@@ -45,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `config::known_config_keys`, `config::ignored_key_hint`,
   `config::describe_ignored_key`, `ProxyConfig::ignored_keys`,
   `ConfigSnapshot::ignored_config_keys`.
+- **Hints for the sections the website sample showed that never existed** (Sprinter
+  18b23fd60e82): `[ai_cache]`, `[cache.query]`, `[tenancy]`, `[transparent_write_routing]`,
+  `[upgrade]`, `[auth] enabled` / `[auth.api_key]` / `[auth.ldap]`, `[[rate_limit.tenant]]`,
+  `rate_limit.global_connections`, `circuit_breaker.reset_timeout` / `half_open_requests`,
+  each pointing at the real key; a pinned test loads that sample and expects exactly those
+  unknown keys. `docs/configuration.md` gains the rows and a note under `[cache]` that the
+  daemon runs the L1 + L2 query cache only, with no semantic tier or exclusion patterns.
 
 ### Fixed
 

@@ -147,6 +147,14 @@ Renamed or non-existent keys operators reach for:
 | `[ha]` | Rejected (below). |
 | `[logging]`, `[metrics]` | `--log-level` / `--json-logs`; `/metrics` and `/metrics/prometheus` are always on. |
 | `[routing]`, `[lag]`, `[rewriter]`, `[graphql]`, `[[tenants]]`, `[[schema_routes]]`, `[auth.jwt]`, `[cache.l1]` | `[load_balancer]` / `[routing_hints]` / `[lag_routing]`, `[query_rewrite]`, `[graphql_gateway]`, `[multi_tenancy]`, `[schema_routing]`, `[auth] mode`, flat `[cache]` keys. |
+| `[ai_cache]` (`semantic_cache_enabled`, `similarity_threshold`, `rag_chunk_cache_size`, …) | Never a section. The semantic (L3) and AI cache tiers exist as library code (`cache::L3Config`, `distribcache`) that the daemon does not configure or enable; the query cache the daemon runs is L1 + L2 under `[cache]`. |
+| `[cache.query]` (`max_result_size`, `exclude_patterns`) | `[cache]` with `max_result_bytes`. There is no exclusion pattern: only `SELECT`, `VALUES`, `TABLE` and `WITH … SELECT` reads without locking clauses are ever cached; `INSERT`, `UPDATE`, `DELETE` (and DDL) invalidate. |
+| `[tenancy]`, `[[tenancy.tenant]]` | `[multi_tenancy]` (`identify_by`, `tenant_column`, `tenant_tables`, `tenants`, `max_clients_per_tenant`, `tenant_max_clients`). |
+| `[rate_limit] global_connections`, `[[rate_limit.tenant]]` | `max_concurrent`; limits apply per bucket (`key_by`), there are no per-tenant rate-limit tables. |
+| `[circuit_breaker] reset_timeout`, `half_open_requests` | `open_secs`, `success_threshold`. |
+| `[auth] enabled`, `[auth.api_key]`, `[auth.ldap]` | `[auth] mode = "passthrough" \| "scram"` plus `auth_file`; admission rules are `[[hba]]`. |
+| `[transparent_write_routing]`, `[upgrade]`, `[[upgrade.stages]]` | Never sections: writes always go to the primary (`tr_mode`, `write_timeout_secs`, `[load_balancer] read_write_split`); the upgrade orchestrator is a library module. |
+| `[[plugins]]` (array of `name`, `source`, `hooks`, `verify_with`) | `[plugins]` is one table (`enabled`, `plugin_dir`, `trust_root`, limits); an array where a table is expected is a parse error, not an ignored key. |
 
 This makes silent doc-drift and typos visible without breaking pre-existing configs.
 Historical example blocks such as `[logging]`, `[metrics]`, `[routing]`,
@@ -703,6 +711,12 @@ require_client_cert = false
 ---
 
 ## Query Cache (`[cache]`)
+
+The cache the daemon runs is the L1 (hot) + L2 (warm) query-result cache below. There is
+no semantic/AI cache key and no exclusion-pattern key in `proxy.toml`: the library's L3
+semantic tier (`cache::L3Config`, embedding-based) is not configured or enabled by the
+daemon, and only `SELECT`, `VALUES`, `TABLE` and `WITH … SELECT` reads without locking
+clauses are cached while writes and DDL invalidate (see the renamed-keys table above).
 
 In-process query-result cache. Only active with the `query-cache` feature and
 `enabled = true`.
