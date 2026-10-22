@@ -3,10 +3,11 @@
 
 Usage: python3 scripts/regress/nano-pair-drill.py --nano-binary PATH --fixture PATH
           --proxy-binary PATH [--dir DIR] [--load-rate N] [--output evidence.json]
-          [--fixture-arg ARG ...]
+          [--fixture-arg=ARG ...]
 
 `--fixture` is Nano's scripts/regress/nano-physical-pair.sh (branch feat/physical-standby);
-every `--fixture-arg` (for example `--tls`, Nano P2.2) is passed to each of its invocations.
+every `--fixture-arg=ARG` (written with `=`, since ARG itself starts with dashes: for example
+`--fixture-arg=--tls`, Nano P2.2) is passed to each of its invocations.
 The pair listens on 127.0.0.1:27721/27722 (replication 27741, HTTP 27751/27752); the
 proxy uses scripts/regress/proxy-nano-pair.toml (27730, admin 27731) with
 write_timeout_secs lowered to 5 so the fail-closed cases settle quickly. Needs only
@@ -222,7 +223,8 @@ def main():
     parser.add_argument("--load-duration", type=int, default=8)
     parser.add_argument("--output")
     parser.add_argument("--fixture-arg", action="append", default=[],
-                        help="extra option passed to every fixture invocation (repeatable)")
+                        help="extra option passed to every fixture invocation, written with "
+                             "'=' (e.g. --fixture-arg=--tls); repeatable")
     args = parser.parse_args()
 
     workdir = pathlib.Path(args.dir) if args.dir else pathlib.Path(tempfile.mkdtemp(prefix="nano-pair-drill-"))
