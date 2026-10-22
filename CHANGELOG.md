@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Nano physical-pair drill.** `scripts/regress/nano-pair-drill.py` runs the proxy
+  (`scripts/regress/proxy-nano-pair.toml`: `[topology] provider = "postgres"`,
+  `[health] check_query = "SELECT heliosdb_require_ready()"`, lag routing in Nano sequence
+  units) in front of HeliosDB-Nano's physical primary + standby fixture and checks startup,
+  read offload, the chaos overrides, SIGKILL and restart of either side, and a sustained
+  load. First run against Nano P2.1 (d9d49e90): 8/8.
+
 ### Changed
 
 - **Unknown config keys name the key they most likely meant**, in the startup warning

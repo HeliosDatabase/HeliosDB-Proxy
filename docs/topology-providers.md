@@ -180,7 +180,15 @@ For PostgreSQL with an external manager that promotes and fences database nodes:
 For HeliosDB-Nano, verify that the selected discovery mechanism is actually
 supported by that deployment. PG-wire compatibility alone does not establish
 support for PostgreSQL role/timeline probes or the PostgreSQL `pg_promote`
-command. Use Nano's supported promotion and fencing procedure; with static
+command. Nano's physical standbys (branch `feat/physical-standby`, P1 and later)
+answer every probe the `postgres` provider and the health checker send
+(`pg_is_in_recovery()`, the two WAL-position functions as HI/LO text of Nano's
+physical sequence, `pg_control_checkpoint().timeline_id`, `in_hot_standby`), raise
+SQLSTATE 55000 from `heliosdb_require_ready()` while a standby is not ready, and
+are exercised by `scripts/regress/nano-pair-drill.py` with
+`scripts/regress/proxy-nano-pair.toml` against Nano's
+`scripts/regress/nano-physical-pair.sh` (startup, read offload, chaos overrides,
+SIGKILL and restart of either side, load). Use Nano's supported promotion and fencing procedure; with static
 topology, update proxy roles after the database role change succeeds. Fixing
 replication connectivity is a prerequisite to a meaningful replicated failover
 test, and the proxy cannot repair the replica's replication stream.

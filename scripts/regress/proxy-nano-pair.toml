@@ -1,0 +1,78 @@
+# Regression harness — HeliosDB-Nano physical primary + standby pair
+# (Nano repo: scripts/regress/nano-physical-pair.sh, P1/P2.1 acceptance).
+# Nano listens on 127.0.0.1:27721 (primary) and 27722 (standby); this proxy on
+# 27730 with its admin API on 27731, outside the 27701-27792 range tests/lab owns.
+# Driver: scripts/regress/nano-pair-drill.py.
+#
+# Everything the proxy depends on from Nano (PG-wire port only):
+#   SELECT heliosdb_require_ready()            -> t, or SQLSTATE 55000 when not ready
+#   SELECT pg_is_in_recovery()                 -> t/f, exactly one row, one column
+#   SELECT pg_current_wal_lsn()::text          -> HI/LO hex of the physical sequence (primary)
+#   SELECT pg_last_wal_replay_lsn()::text      -> HI/LO hex of the applied cursor (standby)
+#   SELECT timeline_id::bigint FROM pg_control_checkpoint()  -> epoch
+#   ParameterStatus in_hot_standby = on|off at session start
+listen_address = "127.0.0.1:27730"
+admin_address = "127.0.0.1:27731"
+tr_enabled = true
+tr_mode = "session"
+write_timeout_secs = 30
+
+[pool]
+min_connections = 2
+max_connections = 50
+idle_timeout_secs = 300
+max_lifetime_secs = 1800
+acquire_timeout_secs = 5
+test_on_acquire = true
+
+[load_balancer]
+read_strategy = "round_robin"
+read_write_split = true
+standby_reads = "async"
+read_your_writes_ms = 1000
+
+# Credentialed probe: check_query is pass/fail on ErrorResponse, so the 55000 raised
+# by heliosdb_require_ready() takes a not-ready standby out of the read set after
+# failure_threshold probes. Thresholds are 1 so drills settle in ~2-4 s
+# (check_timeout_secs must stay below check_interval_secs or startup warns).
+[health]
+check_interval_secs = 2
+check_timeout_secs = 1
+failure_threshold = 1
+success_threshold = 1
+check_query = "SELECT heliosdb_require_ready()"
+user = "postgres"
+password = "postgres"
+database = "postgres"
+
+# Lag is (pg_current_wal_lsn - pg_last_wal_replay_lsn) in Nano sequence units
+# (one per written key). 30000 = 30 s at the 1000 ops/s the fixture sustains;
+# re-derive from the ops/s the fixture prints. require_known_lag drops a standby
+# whose replay probe stops answering.
+[lag_routing]
+enabled = true
+ryw_window_ms = 500
+max_lag_bytes = 30000
+require_known_lag = true
+
+# Role discovery from pg_is_in_recovery(); a promotion (Nano P5) shows up as the
+# node whose timeline_id is strictly higher.
+[topology]
+provider = "postgres"
+poll_interval_secs = 1
+lease_timeout_secs = 5
+user = "postgres"
+password = "postgres"
+database = "postgres"
+
+[[nodes]]
+host = "127.0.0.1"
+port = 27721
+role = "primary"
+name = "nano-a"
+
+[[nodes]]
+host = "127.0.0.1"
+port = 27722
+role = "standby"
+name = "nano-b"
