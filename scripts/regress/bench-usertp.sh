@@ -15,6 +15,8 @@
 # Usage:  ./bench-usertp.sh /path/to/heliosdb-proxy [label]
 # Env:    CLIENTS="1 16 64"  DUR=10  MODES="direct session transaction"
 #         OUT=/tmp/bench-usertp  CKPT_BEFORE_WRITE=1  WARMUP_SECS=8
+#         PGBENCH_PROTOCOL=simple|extended|prepared (pgbench -M for the measured
+#         cells; unset = pgbench default, simple)
 #
 # The script starts its own proxy per mode (Session / Transaction pool configs
 # are generated next to this script's conventions). It does NOT start the
@@ -36,6 +38,12 @@ OUT="${OUT:-/tmp/bench-usertp}"; mkdir -p "$OUT"
 [ -n "${PGOPTIONS:-}" ] && echo "PGOPTIONS=$PGOPTIONS"
 # TR_ENABLED=false / EXTRA_TOML=$'[journal]\nmax_committed_transactions = 1' isolate one subsystem's cost.
 [ -n "${TR_ENABLED:-}${EXTRA_TOML:-}" ] && echo "TR_ENABLED=${TR_ENABLED:-true} EXTRA_TOML=${EXTRA_TOML:-}"
+# PGBENCH_PROTOCOL=extended|prepared runs the measured cells over the extended
+# query protocol (Parse/Bind/Execute/Sync; prepared parses each statement once
+# per connection), so they go through the proxy's extended-protocol relay. The
+# warm-up pgbench and the psql probes stay simple.
+case "${PGBENCH_PROTOCOL:-}" in ""|simple|extended|prepared) ;; *) echo "FATAL: PGBENCH_PROTOCOL must be simple, extended or prepared" >&2; exit 2;; esac
+[ -n "${PGBENCH_PROTOCOL:-}" ] && echo "PGBENCH_PROTOCOL=$PGBENCH_PROTOCOL"
 RUNS_JSON="$OUT/$LABEL-results.json"
 PROXYPID=""
 
@@ -156,7 +164,8 @@ run_pgbench(){
   local host=$1 port=$2 clients=$3 dur=$4 log=$5; shift 5
   local out
   out=$(pgv pgbench -h "$host" -p "$port" -U "$BUSER" -d "$BDB" -n \
-        -c "$clients" -j 4 -T "$dur" -l --log-prefix="/w/$(basename "$log")" "$@" 2>&1)
+        -c "$clients" -j 4 -T "$dur" -l --log-prefix="/w/$(basename "$log")" \
+        ${PGBENCH_PROTOCOL:+-M "$PGBENCH_PROTOCOL"} "$@" 2>&1)
   local tps failed
   tps=$(printf '%s' "$out" | grep -oE 'tps = [0-9.]+' | head -1 | grep -oE '[0-9.]+')
   failed=$(printf '%s' "$out" | grep -oE 'number of failed transactions: [0-9]+' | grep -oE '[0-9]+$')
@@ -202,7 +211,7 @@ RESULTS=()
 
 record(){
   local mode=$1 clients=$2 kind=$3 tps=$4 failed=$5 p=$6 rss=$7 cpu=$8 frow=$9 ckpts=${10}
-  RESULTS+=("{\"mode\":\"$mode\",\"clients\":$clients,\"workload\":\"$kind\",\"tps\":$tps,\"failed_txns\":$failed,\"latency_ms\":[$p],\"rss_kb\":${rss:-0},\"cpu_percent\":${cpu:-0},\"first_row_ms\":${frow:-0},\"checkpoints\":${ckpts:--1}}")
+  RESULTS+=("{\"mode\":\"$mode\",\"clients\":$clients,\"workload\":\"$kind\",\"protocol\":\"${PGBENCH_PROTOCOL:-simple}\",\"tps\":$tps,\"failed_txns\":$failed,\"latency_ms\":[$p],\"rss_kb\":${rss:-0},\"cpu_percent\":${cpu:-0},\"first_row_ms\":${frow:-0},\"checkpoints\":${ckpts:--1}}")
 }
 
 for mode in $MODES; do

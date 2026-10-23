@@ -16,6 +16,13 @@ silently calling that "n/a" is exactly the kind of miss this harness exists
 to catch (Criterion missed the 2026-09-21 TR-07 async-lock convoy; see
 CLAUDE.md gate 3).
 
+The first stdout line names the pgbench query protocol(s) each side ran
+("pgbench protocol: base=<p> cand=<p>", from each result row's "protocol";
+rows older than PGBENCH_PROTOCOL count as "simple"); the summary records them
+as protocol_base / protocol_cand. Sides that ran different protocols are
+compared anyway, with a warning: that comparison measures the protocol, not
+the binary.
+
 Exit code: 1 if any proxy-mode (mode != "direct") committed_write cell
 regresses beyond BUDGET_PCT (default 3%) in TPS or p99, medians over passes;
 0 otherwise (a gate with nothing ungated to check — e.g. every committed_write
@@ -97,15 +104,32 @@ def delta(b, c):
     return (c - b) / b * 100, "ok"
 
 
-base_runs, cand_runs = agg(load(BASE)), agg(load(CAND))
+def protocols(runs):
+    """The pgbench query protocols the rows of `runs` ran (bench-usertp.sh's
+    PGBENCH_PROTOCOL); a row without one predates the knob and ran simple."""
+    return sorted({r.get("protocol", "simple") for run in runs for r in run})
+
+
+base_loaded, cand_loaded = load(BASE), load(CAND)
+base_runs, cand_runs = agg(base_loaded), agg(cand_loaded)
+protocol_base, protocol_cand = protocols(base_loaded), protocols(cand_loaded)
 
 cells = []
 warnings = []
+if protocol_base != protocol_cand:
+    warnings.append(
+        f"WARN: base ran pgbench protocol {protocol_base}, cand ran {protocol_cand}; "
+        f"the deltas compare protocols, not binaries"
+    )
 tps_deltas, p99_deltas = [], []
 gated_failures = []
 
 fmt = lambda v, w: (f"{v:{w}.1f}" if isinstance(v, (int, float)) else f"{'n/a':>{w}s}")
 
+print(
+    f"pgbench protocol: base={','.join(protocol_base) or 'none'} "
+    f"cand={','.join(protocol_cand) or 'none'}"
+)
 print(
     f"{'mode':12s} {'cl':>3s} {'workload':14s} {'tps base':>10s} {'tps cand':>10s} {'d%':>7s} "
     f"{'p99 base':>9s} {'p99 cand':>9s} {'d%':>7s} {'frow base':>9s} {'frow cand':>9s} "
@@ -230,6 +254,8 @@ summary = {
     "base_label": BASE,
     "cand_label": CAND,
     "budget_pct": BUDGET_PCT,
+    "protocol_base": protocol_base,
+    "protocol_cand": protocol_cand,
     "cells": cells,
     "gated_failures": gated_failures,
     "aggregate_proxy_modes": {

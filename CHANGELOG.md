@@ -84,6 +84,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RouteOverride::{Primary, Standby, Node}` under `wasm-plugins` or `routing-hints`. No
   behaviour change. The 16 remaining suppressions are on public API and wait for the next
   major release.
+- **`scripts/regress/bench-usertp.sh` and `scripts/perf-gate-userpath.sh`:
+  `PGBENCH_PROTOCOL`.** `PGBENCH_PROTOCOL=extended|prepared` runs the measured pgbench
+  cells in that query protocol (`-M`), so the user-path gate measures the
+  extended-protocol relay (`forward_extended_batch`). Unset keeps the simple protocol and
+  today's command lines; any other value exits 2 before any heavy step. The harness runs
+  `tr_mode = "session"`, so TR recording returns early in these cells. Each result row
+  records its `protocol`, `compare-usertp.py` prints the protocols compared (and warns
+  when they differ), and `perf-gate-userpath.sh` archives its settings in
+  `<label>-env.txt`. `scripts/tests/compare_usertp_test.py` covers the comparator in CI.
 
 ## [2.1.0] - 2026-10-15
 

@@ -187,6 +187,9 @@ across concurrent tasks. It needs a live PostgreSQL backend and Docker for the
 pgbench client image, and, per `CLAUDE.md`'s Resource Constraints, explicit
 owner approval for each run. Criterion still gates every change for
 microbenchmark regressions; this gate is in addition to it, not instead of it.
+pgbench runs the simple query protocol by default; for a change to the
+extended-protocol path, also run it with `PGBENCH_PROTOCOL=prepared` (or
+`extended`) under its own label.
 
 1. Move `## [Unreleased]` in `CHANGELOG.md` to the new version and date; bump
    `version` in `Cargo.toml`.

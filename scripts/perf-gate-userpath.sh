@@ -19,6 +19,9 @@
 #   PASSES         interleaved base/cand pass count     (default 3)
 #   MODES          proxy pool modes to test             (default "session transaction")
 #   PGOPTIONS      passed through to pgbench            (default "-c synchronous_commit=off")
+#   PGBENCH_PROTOCOL  pgbench query protocol, -M (simple|extended|prepared;
+#                  default unset = simple). extended/prepared measure the
+#                  extended-protocol relay; use a distinct label per protocol
 #   BUDGET_PCT     regression budget, TPS and p99        (default 3.0, see compare-usertp.py)
 #   BASELINE_ROOT  where labelled runs are archived      (default /home/gpc/HDB/sprint/baselines/proxy)
 #   OUT            this run's archive dir                (default $BASELINE_ROOT/$LABEL/usertp)
@@ -63,6 +66,8 @@ DUR="${DUR:-12}"
 PASSES="${PASSES:-3}"
 MODES="${MODES:-session transaction}"
 PGOPTIONS="${PGOPTIONS:--c synchronous_commit=off}"
+PGBENCH_PROTOCOL="${PGBENCH_PROTOCOL:-}"
+case "$PGBENCH_PROTOCOL" in ""|simple|extended|prepared) ;; *) echo "FATAL: PGBENCH_PROTOCOL must be simple, extended or prepared" >&2; exit 2;; esac
 BUDGET_PCT="${BUDGET_PCT:-3.0}"
 BASELINE_ROOT="${BASELINE_ROOT:-/home/gpc/HDB/sprint/baselines/proxy}"
 OUT="${OUT:-$BASELINE_ROOT/$LABEL/usertp}"
@@ -80,6 +85,21 @@ if [ "$NO_LOCK" != 1 ]; then
 fi
 
 mkdir -p "$OUT"
+# The settings this run measured, archived next to its results.
+{
+  echo "label=$LABEL"
+  echo "base_bin=$BASE_BIN"
+  echo "base_sha256=$(sha256sum "$BASE_BIN" | cut -d' ' -f1)"
+  echo "cand_bin=$CAND_BIN"
+  echo "cand_sha256=$(sha256sum "$CAND_BIN" | cut -d' ' -f1)"
+  echo "CLIENTS=$CLIENTS"
+  echo "DUR=$DUR"
+  echo "PASSES=$PASSES"
+  echo "MODES=$MODES"
+  echo "PGOPTIONS=$PGOPTIONS"
+  echo "PGBENCH_PROTOCOL=${PGBENCH_PROTOCOL:-simple}"
+  echo "BUDGET_PCT=$BUDGET_PCT"
+} > "$OUT/$LABEL-env.txt"
 
 pg(){ docker run --rm --network host -e PGPASSWORD="$BPASS" "$IMG" "$@"; }
 # fleet lock OUTSIDE, memory bound INSIDE — both mandatory on this host (see
@@ -113,10 +133,10 @@ run_pass(){
   # invoked via `bash` rather than relying on the file's executable bit —
   # scripts/regress/bench-usertp.sh is tracked without +x in git.
   heavy env OUT="$OUT" CLIENTS="$CLIENTS" DUR="$DUR" MODES="$MODES" PGOPTIONS="$PGOPTIONS" \
-    bash "$HERE/regress/bench-usertp.sh" "$bin" "$plabel"
+    PGBENCH_PROTOCOL="$PGBENCH_PROTOCOL" bash "$HERE/regress/bench-usertp.sh" "$bin" "$plabel"
 }
 
-echo "== perf-gate-userpath($LABEL): $PASSES interleaved pass(es), CLIENTS=\"$CLIENTS\" DUR=$DUR MODES=\"$MODES\" =="
+echo "== perf-gate-userpath($LABEL): $PASSES interleaved pass(es), CLIENTS=\"$CLIENTS\" DUR=$DUR MODES=\"$MODES\" PGBENCH_PROTOCOL=${PGBENCH_PROTOCOL:-simple} =="
 for p in $(seq 1 "$PASSES"); do
   run_pass "$BASE_BIN" base "$p"
   run_pass "$CAND_BIN" cand "$p"
