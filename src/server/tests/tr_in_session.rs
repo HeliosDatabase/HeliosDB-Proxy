@@ -423,6 +423,23 @@ fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
     f
 }
 
+/// An `ExtBatch` from the pieces `tr_after_extended` used to take loose.
+fn ext_batch<'a>(
+    batch: &'a bytes::Bytes,
+    unnamed: Option<&'a (bytes::Bytes, bytes::Bytes)>,
+    route_sql: Option<&'a str>,
+    wait_ready: bool,
+    defines: &'a [String],
+) -> ExtBatch<'a> {
+    ExtBatch {
+        batch,
+        route_sql,
+        wait_ready,
+        defines,
+        unnamed,
+    }
+}
+
 #[test]
 fn tr_commit_classification_guards_every_query_statement() {
     for sql in [
@@ -2742,11 +2759,13 @@ async fn tr_recorder_extended_cycle_accumulates_until_sync() {
     );
     ProxyServer::tr_after_extended(
         &mut tr,
-        &flush_batch,
-        Some(&unnamed),
-        Some("INSERT INTO t VALUES ($1)"),
-        false,
-        &[],
+        ext_batch(
+            &flush_batch,
+            Some(&unnamed),
+            Some("INSERT INTO t VALUES ($1)"),
+            false,
+            &[],
+        ),
         &[],
         &registry,
         &session,
@@ -2757,11 +2776,7 @@ async fn tr_recorder_extended_cycle_accumulates_until_sync() {
     assert_eq!(session.tx_state.read().await.statements.len(), 1);
     ProxyServer::tr_after_extended(
         &mut tr,
-        &sync_batch,
-        None,
-        None,
-        true,
-        &["s1".to_string()],
+        ext_batch(&sync_batch, None, None, true, &["s1".to_string()]),
         &["s1".to_string()],
         &registry,
         &session,
@@ -2830,11 +2845,13 @@ async fn tr_recorder_preserves_later_held_parse_positions() {
             expected.extend_from_slice(&frames);
             ProxyServer::tr_after_extended(
                 &mut tr,
-                &bytes::Bytes::from(frames),
-                held.as_ref(),
-                Some(sql),
-                index == 2,
-                &[],
+                ext_batch(
+                    &bytes::Bytes::from(frames),
+                    held.as_ref(),
+                    Some(sql),
+                    index == 2,
+                    &[],
+                ),
                 &[],
                 &registry,
                 &session,
@@ -2873,11 +2890,7 @@ async fn tr_recorder_bounds_open_flush_cycle_before_sync() {
         for _ in 0..32 {
             ProxyServer::tr_after_extended(
                 &mut tr,
-                &batch,
-                None,
-                None,
-                false,
-                &[],
+                ext_batch(&batch, None, None, false, &[]),
                 &[],
                 &HashMap::new(),
                 &session,
@@ -2922,11 +2935,7 @@ async fn tr_recorder_retains_begin_before_first_sync_or_refuses_incomplete_histo
         ProxyServer::note_ready_for_query(&session, b'I', false);
         ProxyServer::tr_after_extended(
             &mut tr,
-            &flush,
-            Some(&held),
-            Some("BEGIN"),
-            false,
-            &[],
+            ext_batch(&flush, Some(&held), Some("BEGIN"), false, &[]),
             &[],
             &HashMap::new(),
             &session,
@@ -2940,11 +2949,7 @@ async fn tr_recorder_retains_begin_before_first_sync_or_refuses_incomplete_histo
         } else {
             ProxyServer::tr_after_extended(
                 &mut tr,
-                &sync,
-                None,
-                None,
-                true,
-                &[],
+                ext_batch(&sync, None, None, true, &[]),
                 &[],
                 &HashMap::new(),
                 &session,
@@ -2980,11 +2985,13 @@ async fn tr_recorder_idle_flush_cap_does_not_taint_next_transaction() {
     for _ in 0..16 {
         ProxyServer::tr_after_extended(
             &mut tr,
-            &bytes::Bytes::from(frame(b'H', &[])),
-            None,
-            None,
-            false,
-            &[],
+            ext_batch(
+                &bytes::Bytes::from(frame(b'H', &[])),
+                None,
+                None,
+                false,
+                &[],
+            ),
             &[],
             &HashMap::new(),
             &session,
@@ -2995,11 +3002,7 @@ async fn tr_recorder_idle_flush_cap_does_not_taint_next_transaction() {
     assert!(tr.ext_cycle_dropped);
     ProxyServer::tr_after_extended(
         &mut tr,
-        &bytes::Bytes::from(frame(b'S', &[])),
-        None,
-        None,
-        true,
-        &[],
+        ext_batch(&bytes::Bytes::from(frame(b'S', &[])), None, None, true, &[]),
         &[],
         &HashMap::new(),
         &session,
@@ -4228,11 +4231,13 @@ async fn tr08_recorder_snapshots_statements_from_earlier_cycles() {
     let prepare = bytes::Bytes::from([ins.clone(), frame(b'S', &[])].concat());
     ProxyServer::tr_after_extended(
         &mut tr,
-        &prepare,
-        None,
-        Some("INSERT INTO t VALUES ($1)"),
-        true,
-        &["ins".to_string()],
+        ext_batch(
+            &prepare,
+            None,
+            Some("INSERT INTO t VALUES ($1)"),
+            true,
+            &["ins".to_string()],
+        ),
         &[],
         &registry,
         &session,
@@ -4246,11 +4251,7 @@ async fn tr08_recorder_snapshots_statements_from_earlier_cycles() {
     let chunk = bytes::Bytes::from([late.clone(), frame(b'H', &[])].concat());
     ProxyServer::tr_after_extended(
         &mut tr,
-        &chunk,
-        None,
-        Some("SELECT 2"),
-        false,
-        &["late".to_string()],
+        ext_batch(&chunk, None, Some("SELECT 2"), false, &["late".to_string()]),
         &[],
         &registry,
         &session,
@@ -4259,11 +4260,7 @@ async fn tr08_recorder_snapshots_statements_from_earlier_cycles() {
     .await;
     ProxyServer::tr_after_extended(
         &mut tr,
-        &sync(),
-        None,
-        None,
-        true,
-        &[],
+        ext_batch(&sync(), None, None, true, &[]),
         &[],
         &registry,
         &session,
@@ -4286,11 +4283,7 @@ async fn tr08_recorder_snapshots_statements_from_earlier_cycles() {
     );
     ProxyServer::tr_after_extended(
         &mut tr,
-        &use_ins,
-        None,
-        None,
-        true,
-        &[],
+        ext_batch(&use_ins, None, None, true, &[]),
         &["ins".to_string()],
         &registry,
         &session,
@@ -4321,11 +4314,7 @@ async fn tr08_recorder_snapshots_statements_from_earlier_cycles() {
         bytes::Bytes::from([tr08_bind("", "late"), tr08_execute(""), frame(b'S', &[])].concat());
     ProxyServer::tr_after_extended(
         &mut tr,
-        &use_late,
-        None,
-        None,
-        true,
-        &[],
+        ext_batch(&use_late, None, None, true, &[]),
         &["late".to_string()],
         &registry,
         &session,
@@ -4522,11 +4511,7 @@ async fn tr08_copy_cycles_acknowledge_nothing_and_end_portals() {
     let batch = bytes::Bytes::from([s2.clone(), frame(b'S', &[])].concat());
     ProxyServer::tr_after_extended(
         &mut tr,
-        &batch,
-        None,
-        Some("SELECT 2"),
-        true,
-        &["s2".to_string()],
+        ext_batch(&batch, None, Some("SELECT 2"), true, &["s2".to_string()]),
         &[],
         &registry,
         &session,
@@ -4634,7 +4619,7 @@ async fn f2_stale_statement_is_closed_before_the_batch_uses_it() {
     let bind_batch = [tr08_bind("", "s1"), tr08_execute(""), frame(b'S', &[])].concat();
     let parse_batch = [current.clone(), bind_batch.clone()].concat();
     struct Case {
-        batch: Vec<u8>,
+        batch: bytes::Bytes,
         reprepare: Vec<String>,
         defines: Vec<String>,
         /// Frame types the backend must see, in order.
@@ -4642,13 +4627,13 @@ async fn f2_stale_statement_is_closed_before_the_batch_uses_it() {
     }
     let cases = [
         Case {
-            batch: bind_batch,
+            batch: bytes::Bytes::from(bind_batch),
             reprepare: vec!["s1".to_string()],
             defines: Vec::new(),
             want: b"CHPHBES",
         },
         Case {
-            batch: parse_batch,
+            batch: bytes::Bytes::from(parse_batch),
             reprepare: Vec::new(),
             defines: vec!["s1".to_string()],
             want: b"CHPBES",
@@ -4672,22 +4657,26 @@ async fn f2_stale_statement_is_closed_before_the_batch_uses_it() {
         registry.insert("s1".to_string(), bytes::Bytes::from(current.clone()));
         let mut fault = None;
         let (node, _) = ProxyServer::forward_extended_batch(
-            &mut client,
-            &case.batch,
-            None,
-            true,
-            &mut conns,
-            Some(addr.as_str()),
-            &ReadRouting::OFF,
-            &registry,
+            ForwardCtx {
+                client: &mut client,
+                conns: &mut conns,
+                current_node: Some(addr.as_str()),
+                reads: &ReadRouting::OFF,
+                session: &session,
+                state: &state,
+                config: &config,
+                fault: &mut fault,
+            },
+            ExtBatch {
+                batch: &case.batch,
+                route_sql: None,
+                wait_ready: true,
+                defines: &case.defines,
+                unnamed: None,
+            },
             &case.reprepare,
-            &case.defines,
-            None,
+            &registry,
             0,
-            &session,
-            &state,
-            &config,
-            &mut fault,
         )
         .await
         .unwrap();

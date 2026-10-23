@@ -70,6 +70,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`NodeOverrides`, `NodeOverride`, `OverrideKind`, trait `NodeControl`),
   `ProxyServer::node_control()`, `AdminState::with_node_control()`.
 
+### Development
+
+- **No lint suppressions left in `src/server/`** (Sprinter 7603358c5da2). The forward
+  paths take a `ForwardCtx` (client stream, connection cache, current node, read routing,
+  session/state/config, fault slot). The extended path takes an `ExtBatch` (batch frames,
+  routing SQL, Sync/Flush, defined statements, held unnamed Parse), which
+  `InFlight::Extended` and TR recording also carry. The TR fault path takes a
+  `TrRecovery`. Parameter counts: `forward_extended_batch` 16→5, `forward_simple_query`
+  9→2, `tr_handle_fault` 10→3, `tr_after_extended` 10→6. The plugin- and hint-only
+  routing variants are compiled only where something builds them:
+  `PreQueryAction::{Block, Cached}` and `RouteOverride::Block` under `wasm-plugins`;
+  `RouteOverride::{Primary, Standby, Node}` under `wasm-plugins` or `routing-hints`. No
+  behaviour change. The 16 remaining suppressions are on public API and wait for the next
+  major release.
+
 ## [2.1.0] - 2026-10-15
 
 Read offload to standbys now works as documented and is on by default. Session settings

@@ -1249,28 +1249,30 @@ impl ProxyServer {
                             }
                             None => {
                                 Self::forward_simple_query(
-                                    stream,
-                                    &msg,
-                                    &mut conns,
-                                    current_node.as_deref(),
-                                    &ReadRouting {
-                                        offload_on,
-                                        may_offload: offload_on
-                                            && !tr.guc_cap_hit
-                                            && !tr.serializable_default
-                                            && !session
-                                                .reads_pinned
-                                                .load(std::sync::atomic::Ordering::Relaxed),
-                                        batch_reads: false,
-                                        batch_whole: true,
-                                        gucs: &tr.gucs,
-                                        guc_epoch: tr.guc_epoch,
-                                        read_your_writes: ryw,
+                                    ForwardCtx {
+                                        client: stream,
+                                        conns: &mut conns,
+                                        current_node: current_node.as_deref(),
+                                        reads: &ReadRouting {
+                                            offload_on,
+                                            may_offload: offload_on
+                                                && !tr.guc_cap_hit
+                                                && !tr.serializable_default
+                                                && !session
+                                                    .reads_pinned
+                                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                            batch_reads: false,
+                                            batch_whole: true,
+                                            gucs: &tr.gucs,
+                                            guc_epoch: tr.guc_epoch,
+                                            read_your_writes: ryw,
+                                        },
+                                        session,
+                                        state,
+                                        config,
+                                        fault: &mut fault,
                                     },
-                                    session,
-                                    state,
-                                    config,
-                                    &mut fault,
+                                    &msg,
                                 )
                                 .await
                             }
@@ -1288,16 +1290,18 @@ impl ProxyServer {
                             Err(e) => match fault.take() {
                                 Some(f) => {
                                     match Self::tr_handle_fault(
-                                        stream,
-                                        &mut conns,
-                                        &mut current_node,
+                                        TrRecovery {
+                                            client: stream,
+                                            conns: &mut conns,
+                                            current_node: &mut current_node,
+                                            tr: &mut tr,
+                                            registry: &stmt_registry,
+                                            session,
+                                            state,
+                                            config,
+                                        },
                                         f,
                                         InFlight::Simple(&msg),
-                                        &mut tr,
-                                        &stmt_registry,
-                                        session,
-                                        state,
-                                        config,
                                     )
                                     .await?
                                     {
@@ -1808,35 +1812,39 @@ impl ProxyServer {
                                         ),
                                     };
                                     Self::forward_extended_batch(
-                                        stream,
-                                        &batch,
-                                        route_sql,
-                                        wait_ready,
-                                        &mut conns,
-                                        route_from,
-                                        &ReadRouting {
-                                            offload_on,
-                                            may_offload: offload_on
-                                                && !tr.guc_cap_hit
-                                                && !tr.serializable_default
-                                                && !session
-                                                    .reads_pinned
-                                                    .load(std::sync::atomic::Ordering::Relaxed),
-                                            batch_reads,
-                                            batch_whole: wait_ready && !batch_flushed,
-                                            gucs: &tr.gucs,
-                                            guc_epoch: tr.guc_epoch,
-                                            read_your_writes: ryw,
+                                        ForwardCtx {
+                                            client: stream,
+                                            conns: &mut conns,
+                                            current_node: route_from,
+                                            reads: &ReadRouting {
+                                                offload_on,
+                                                may_offload: offload_on
+                                                    && !tr.guc_cap_hit
+                                                    && !tr.serializable_default
+                                                    && !session
+                                                        .reads_pinned
+                                                        .load(std::sync::atomic::Ordering::Relaxed),
+                                                batch_reads,
+                                                batch_whole: wait_ready && !batch_flushed,
+                                                gucs: &tr.gucs,
+                                                guc_epoch: tr.guc_epoch,
+                                                read_your_writes: ryw,
+                                            },
+                                            session,
+                                            state,
+                                            config,
+                                            fault: &mut fault,
                                         },
-                                        &stmt_registry,
+                                        ExtBatch {
+                                            batch: &batch,
+                                            route_sql,
+                                            wait_ready,
+                                            defines: &batch_defines,
+                                            unnamed: held_unnamed.as_ref(),
+                                        },
                                         &reprepare,
-                                        &batch_defines,
-                                        held_unnamed.as_ref(),
+                                        &stmt_registry,
                                         hold,
-                                        session,
-                                        state,
-                                        config,
-                                        &mut fault,
                                     )
                                     .await
                                 }
@@ -1846,23 +1854,27 @@ impl ProxyServer {
                                 Err(e) => match fault.take() {
                                     Some(f) => {
                                         match Self::tr_handle_fault(
-                                            stream,
-                                            &mut conns,
-                                            &mut current_node,
+                                            TrRecovery {
+                                                client: stream,
+                                                conns: &mut conns,
+                                                current_node: &mut current_node,
+                                                tr: &mut tr,
+                                                registry: &stmt_registry,
+                                                session,
+                                                state,
+                                                config,
+                                            },
                                             f,
                                             InFlight::Extended {
-                                                batch: &batch,
-                                                route_sql: pending_route_sql.as_deref(),
-                                                wait_ready,
+                                                ext: ExtBatch {
+                                                    batch: &batch,
+                                                    route_sql: pending_route_sql.as_deref(),
+                                                    wait_ready,
+                                                    defines: &batch_defines,
+                                                    unnamed: held_unnamed.as_ref(),
+                                                },
                                                 reprepare: &reprepare,
-                                                defines: &batch_defines,
-                                                unnamed: held_unnamed.as_ref(),
                                             },
-                                            &mut tr,
-                                            &stmt_registry,
-                                            session,
-                                            state,
-                                            config,
                                         )
                                         .await?
                                         {
@@ -1960,11 +1972,13 @@ impl ProxyServer {
                         if !skip_forward {
                             Self::tr_after_extended(
                                 &mut tr,
-                                &batch,
-                                held_unnamed.as_ref(),
-                                pending_route_sql.as_deref(),
-                                wait_ready,
-                                &batch_defines,
+                                ExtBatch {
+                                    batch: &batch,
+                                    route_sql: pending_route_sql.as_deref(),
+                                    wait_ready,
+                                    defines: &batch_defines,
+                                    unnamed: held_unnamed.as_ref(),
+                                },
                                 &batch_refs,
                                 &stmt_registry,
                                 session,

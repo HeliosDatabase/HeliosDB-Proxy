@@ -93,6 +93,26 @@ impl ReadRouting<'_> {
     }
 }
 
+/// What a forward path (`forward_simple_query`, `forward_extended_batch`)
+/// works with besides the request. Passed by value and destructured on entry,
+/// so the bodies keep the locals separate parameters gave them.
+pub(super) struct ForwardCtx<'a> {
+    pub(super) client: &'a mut ClientStream,
+    /// The session's per-node backend connections.
+    pub(super) conns: &'a mut HashMap<String, BackendConn>,
+    /// The node the request stays on unless routing moves it: the session's
+    /// current node, the node holding the unnamed statement a Parse-less batch
+    /// binds, or the replacement node on a TR re-execution.
+    pub(super) current_node: Option<&'a str>,
+    pub(super) reads: &'a ReadRouting<'a>,
+    pub(super) session: &'a Arc<ClientSession>,
+    pub(super) state: &'a Arc<ServerState>,
+    pub(super) config: &'a ProxyConfig,
+    /// Filled on a backend fault (failed node, delivery phase); a client-side
+    /// error leaves it untouched.
+    pub(super) fault: &'a mut Option<BackendFault>,
+}
+
 /// Read offload under pass-through auth: the standbys that refused a login
 /// the proxy opened without a password, per (user, database) — `pg_hba.conf`
 /// decides per user and database, so a refusal says nothing about other

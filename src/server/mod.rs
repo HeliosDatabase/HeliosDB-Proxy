@@ -57,8 +57,8 @@ mod tr;
 #[cfg(test)]
 use tr::{AckedStmt, CycleScan, ReplayFailure, TrAction};
 use tr::{
-    BackendFault, FaultPhase, InFlight, PriorCycles, ResponseFailure, ResponseProgress, StmtKind,
-    TrSession,
+    BackendFault, ExtBatch, FaultPhase, InFlight, PriorCycles, ResponseFailure, ResponseProgress,
+    StmtKind, TrRecovery, TrSession,
 };
 
 mod tr_policy;
@@ -90,7 +90,7 @@ mod client;
 mod auth;
 
 mod backend_conn;
-use backend_conn::{OffloadRefusals, ReadRoute, ReadRouting};
+use backend_conn::{ForwardCtx, OffloadRefusals, ReadRoute, ReadRouting};
 
 mod ext_set;
 use ext_set::{Bound, ExtSetBoundary, ExtSetCycle, ExtSetOutcome, SettingsOp, TxVerb};

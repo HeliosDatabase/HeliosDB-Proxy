@@ -148,17 +148,49 @@ pub(super) enum TrAction {
     ReplayThenReexecute,
 }
 
+/// An extended-protocol batch as the client loop accumulated it, borrowed:
+/// what forwarding, TR recording and TR re-execution read.
+#[derive(Clone, Copy)]
+pub(super) struct ExtBatch<'a> {
+    /// The frames up to and including the Sync/Flush. `Bytes`, so TR
+    /// recording keeps it without a copy (`tr_after_extended`).
+    pub(super) batch: &'a bytes::Bytes,
+    /// The SQL the batch routes or records by: the forward call passes the
+    /// routing SQL `client_loop` computed for it; recording and re-execution
+    /// pass the batch's first Parse SQL.
+    pub(super) route_sql: Option<&'a str>,
+    /// Sync-terminated (else Flush).
+    pub(super) wait_ready: bool,
+    /// Named statements the batch's own Parses define.
+    pub(super) defines: &'a [String],
+    /// The held unnamed Parse and its signature.
+    pub(super) unnamed: Option<&'a (bytes::Bytes, bytes::Bytes)>,
+}
+
 /// The request a fault interrupted, borrowed so it can be re-executed.
 pub(super) enum InFlight<'a> {
     Simple(&'a Message),
     Extended {
-        batch: &'a [u8],
-        route_sql: Option<&'a str>,
-        wait_ready: bool,
+        ext: ExtBatch<'a>,
+        /// Named statements to re-prepare on the replacement connection
+        /// (`forward_extended_batch`'s `reprepare`).
         reprepare: &'a [String],
-        defines: &'a [String],
-        unnamed: Option<&'a (bytes::Bytes, bytes::Bytes)>,
     },
+}
+
+/// The client loop's state a TR recovery (`tr_handle_fault`) works on. Holds
+/// `&mut tr`, so it never carries a `ReadRouting` (which borrows `tr.gucs`).
+pub(super) struct TrRecovery<'a> {
+    pub(super) client: &'a mut ClientStream,
+    pub(super) conns: &'a mut HashMap<String, BackendConn>,
+    /// Written by the recovery (the replacement node, or `None`).
+    pub(super) current_node: &'a mut Option<String>,
+    pub(super) tr: &'a mut TrSession,
+    /// The session's statement registry (replay and re-prepare read it).
+    pub(super) registry: &'a HashMap<String, bytes::Bytes>,
+    pub(super) session: &'a Arc<ClientSession>,
+    pub(super) state: &'a Arc<ServerState>,
+    pub(super) config: &'a ProxyConfig,
 }
 
 /// Why a transaction replay failed.
@@ -2035,19 +2067,21 @@ impl ProxyServer {
     /// Bookkeeping after an extended-protocol batch. A Flush-terminated batch
     /// is accumulated into the open cycle; the Sync-terminated batch closes
     /// the cycle and records it as one replay entry.
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn tr_after_extended(
         tr: &mut TrSession,
-        batch: &bytes::Bytes,
-        unnamed: Option<&(bytes::Bytes, bytes::Bytes)>,
-        route_sql: Option<&str>,
-        wait_ready: bool,
-        defines: &[String],
+        ext: ExtBatch<'_>,
         refs: &[String],
         registry: &HashMap<String, bytes::Bytes>,
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
     ) {
+        let ExtBatch {
+            batch,
+            route_sql,
+            wait_ready,
+            defines,
+            unnamed,
+        } = ext;
         if !tr.record_tx {
             return;
         }
@@ -2922,19 +2956,21 @@ impl ProxyServer {
     /// `Ok(Some(forward_result))` when the session continues (the request was
     /// re-executed or answered with an error), `Ok(None)` when the client
     /// connection must be closed, `Err` only when the CLIENT socket failed.
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn tr_handle_fault(
-        client: &mut ClientStream,
-        conns: &mut HashMap<String, BackendConn>,
-        current_node: &mut Option<String>,
+        rec: TrRecovery<'_>,
         mut fault: BackendFault,
         inflight: InFlight<'_>,
-        tr: &mut TrSession,
-        registry: &HashMap<String, bytes::Bytes>,
-        session: &Arc<ClientSession>,
-        state: &Arc<ServerState>,
-        config: &ProxyConfig,
     ) -> Result<Option<(Option<String>, u64)>> {
+        let TrRecovery {
+            client,
+            conns,
+            current_node,
+            tr,
+            registry,
+            session,
+            state,
+            config,
+        } = rec;
         // TR-06: ONE deadline for the whole recovery — primary wait, connect and
         // auth, session restore, replay — instead of per-phase timeouts that
         // could add up well beyond `write_timeout_secs`.
@@ -2958,9 +2994,13 @@ impl ProxyServer {
                 true,
             ),
             InFlight::Extended {
-                batch,
-                wait_ready,
-                unnamed,
+                ext:
+                    ExtBatch {
+                        batch,
+                        wait_ready,
+                        unnamed,
+                        ..
+                    },
                 ..
             } => (
                 // TR-08: a Bind of a statement an earlier cycle prepared is
@@ -3218,46 +3258,25 @@ impl ProxyServer {
                     .fetch_add(1, Ordering::Relaxed);
                 *current_node = Some(node.clone());
                 let mut second: Option<BackendFault> = None;
+                let fwd = ForwardCtx {
+                    client,
+                    conns,
+                    current_node: Some(node.as_str()),
+                    reads: &ReadRouting::OFF,
+                    session,
+                    state,
+                    config,
+                    fault: &mut second,
+                };
                 let r = match inflight {
-                    InFlight::Simple(msg) => {
-                        Self::forward_simple_query(
-                            client,
-                            msg,
-                            conns,
-                            Some(node.as_str()),
-                            &ReadRouting::OFF,
-                            session,
-                            state,
-                            config,
-                            &mut second,
-                        )
-                        .await
-                    }
-                    InFlight::Extended {
-                        batch,
-                        route_sql,
-                        wait_ready,
-                        reprepare,
-                        defines,
-                        unnamed,
-                    } => {
+                    InFlight::Simple(msg) => Self::forward_simple_query(fwd, msg).await,
+                    InFlight::Extended { ext, reprepare } => {
                         Self::forward_extended_batch(
-                            client,
-                            batch,
-                            route_sql,
-                            wait_ready,
-                            conns,
-                            Some(node.as_str()),
-                            &ReadRouting::OFF,
-                            registry,
+                            fwd,
+                            ext,
                             reprepare,
-                            defines,
-                            unnamed,
+                            registry,
                             Self::tr_hold_bytes(session, state, || kind),
-                            session,
-                            state,
-                            config,
-                            &mut second,
                         )
                         .await
                     }

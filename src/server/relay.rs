@@ -8,22 +8,24 @@ impl ProxyServer {
     /// request was short-circuited (plugin block) without touching a backend.
     ///
     /// On a backend fault the broken connection is dropped, the node is
-    /// demoted, `fault` is filled with the failed node and whether the
+    /// demoted, `fwd.fault` is filled with the failed node and whether the
     /// statement had already been delivered, and `Err` is returned so the
     /// caller can run the `tr_mode` recovery. A client-side error leaves
-    /// `fault` untouched.
-    #[allow(clippy::too_many_arguments)]
+    /// `fwd.fault` untouched.
     pub(super) async fn forward_simple_query(
-        client: &mut ClientStream,
+        fwd: ForwardCtx<'_>,
         msg: &Message,
-        conns: &mut HashMap<String, BackendConn>,
-        current_node: Option<&str>,
-        reads: &ReadRouting<'_>,
-        session: &Arc<ClientSession>,
-        state: &Arc<ServerState>,
-        config: &ProxyConfig,
-        fault: &mut Option<BackendFault>,
     ) -> Result<(Option<String>, u64)> {
+        let ForwardCtx {
+            client,
+            conns,
+            current_node,
+            reads,
+            session,
+            state,
+            config,
+            fault,
+        } = fwd;
         // Rate-limit gate: deny before any backend selection.
         #[cfg(feature = "rate-limiting")]
         if let Some(mut resp) = Self::rate_limit_check(session, state, config).await {
@@ -689,37 +691,47 @@ impl ProxyServer {
 
     /// Forward an accumulated extended-protocol batch (Parse/Bind/Describe/
     /// Execute/Close terminated by Sync or Flush) and stream the response.
-    /// Routing is taken from `route_sql` (the first Parse's SQL); when it is
-    /// `None` (a re-Bind/Execute of a named prepared statement) the request
-    /// stays on the connection the statement was prepared on — no switch.
+    /// Routing is taken from `ext.route_sql`, the routing SQL `client_loop`
+    /// computed: the first Parse's SQL, or under read offload the registered
+    /// SQL of the first named statement a Parse-less batch executes. When it
+    /// is `None` the batch runs on `fwd.current_node` with no switch — the
+    /// statement's connection, or under read offload the unnamed statement's
+    /// home — and picks a read node only when the session has none yet.
     ///
     /// `reprepare` lists named statements this batch references but does not
     /// itself define; any that the chosen connection has not seen are
     /// re-prepared from `registry` (their original `Parse`) before the batch is
     /// sent, so a named statement survives a backend switch/redial (Batch F.4).
-    /// `defines` are the named statements this batch's own `Parse`s create —
-    /// recorded against the connection once it accepts the batch.
+    /// `ext.defines` are the named statements this batch's own `Parse`s
+    /// create — recorded against the connection once it accepts the batch.
+    /// `hold` is the TR-09 small-read hold budget (`tr_hold_bytes`), 0 = stream.
     ///
-    /// `fault` is filled on a backend fault exactly like `forward_simple_query`.
-    #[allow(clippy::too_many_arguments)]
+    /// `fwd.fault` is filled on a backend fault exactly like
+    /// `forward_simple_query`.
     pub(super) async fn forward_extended_batch(
-        client: &mut ClientStream,
-        batch: &[u8],
-        route_sql: Option<&str>,
-        wait_ready: bool,
-        conns: &mut HashMap<String, BackendConn>,
-        current_node: Option<&str>,
-        reads: &ReadRouting<'_>,
-        registry: &HashMap<String, bytes::Bytes>,
+        fwd: ForwardCtx<'_>,
+        ext: ExtBatch<'_>,
         reprepare: &[String],
-        defines: &[String],
-        unnamed: Option<&(bytes::Bytes, bytes::Bytes)>,
+        registry: &HashMap<String, bytes::Bytes>,
         hold: usize,
-        session: &Arc<ClientSession>,
-        state: &Arc<ServerState>,
-        config: &ProxyConfig,
-        fault: &mut Option<BackendFault>,
     ) -> Result<(Option<String>, u64)> {
+        let ForwardCtx {
+            client,
+            conns,
+            current_node,
+            reads,
+            session,
+            state,
+            config,
+            fault,
+        } = fwd;
+        let ExtBatch {
+            batch,
+            route_sql,
+            wait_ready,
+            defines,
+            unnamed,
+        } = ext;
         // Rate-limit gate. The terminating ReadyForQuery is only appended when
         // the batch carried a Sync (`wait_ready`); a Flush-terminated batch
         // expects an ErrorResponse with no ReadyForQuery.
