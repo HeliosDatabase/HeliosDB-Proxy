@@ -4,9 +4,11 @@
 //! message through the existing `crate::protocol` types so we keep a
 //! single wire-protocol implementation in the crate.
 //!
-//! The code path here is distinct from `ProxyServer::route_and_forward`,
-//! which *forwards* client frames. That path remains zero-copy;
-//! this path is for **internal TR management** queries (health check,
+//! The code path here is distinct from the client data path
+//! (`ProxyServer::forward_simple_query` / `forward_extended_batch` in
+//! `src/server/relay.rs`), which relays client frames over the session's
+//! own backend connections. This path originates SQL on its own
+//! connections for **internal TR management** queries (health check,
 //! `pg_is_in_recovery()`, `pg_promote()`, WAL-position probes, failover
 //! replay, session-state restoration).
 

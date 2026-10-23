@@ -125,6 +125,7 @@ impl ProxyServer {
     /// Send the client a `Block`-outcome response: an error frame plus
     /// `ReadyForQuery` so the client's state machine returns to idle and
     /// the next query can be accepted.
+    #[cfg(feature = "wasm-plugins")]
     pub(super) async fn send_block_response(
         stream: &mut ClientStream,
         reason: &str,

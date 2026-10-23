@@ -48,6 +48,7 @@ impl ProxyServer {
         let plugin_override = Self::apply_route_hook(msg, state, session);
 
         // Block short-circuits before any backend selection.
+        #[cfg(feature = "wasm-plugins")]
         if let RouteOverride::Block(reason) = plugin_override {
             let mut response = Vec::with_capacity(64 + reason.len());
             response.extend_from_slice(&Self::create_error_response(
@@ -74,14 +75,18 @@ impl ProxyServer {
 
         // A route=standby hint offloads a statement the proxy cannot classify,
         // never one it classifies as a write or transaction control.
-        let standby_hint = matches!(route_override, RouteOverride::Standby) && !default_is_write;
-        let (is_write, forced_target) = match route_override {
-            RouteOverride::None => (default_is_write, None),
-            RouteOverride::Primary => (true, None),
-            RouteOverride::Standby => (false, None),
-            RouteOverride::Node(name) => (default_is_write, Some(name)),
-            RouteOverride::Block(_) => unreachable!("handled above"),
-        };
+        let (is_write, forced_target, standby_hint): (bool, Option<String>, bool) =
+            match route_override {
+                RouteOverride::None => (default_is_write, None, false),
+                #[cfg(any(feature = "wasm-plugins", feature = "routing-hints"))]
+                RouteOverride::Primary => (true, None, false),
+                #[cfg(any(feature = "wasm-plugins", feature = "routing-hints"))]
+                RouteOverride::Standby => (false, None, !default_is_write),
+                #[cfg(any(feature = "wasm-plugins", feature = "routing-hints"))]
+                RouteOverride::Node(name) => (default_is_write, Some(name), false),
+                #[cfg(feature = "wasm-plugins")]
+                RouteOverride::Block(_) => unreachable!("handled above"),
+            };
 
         // Read-your-writes: stamp the session on a write so subsequent reads
         // pin to the primary for the configured window.

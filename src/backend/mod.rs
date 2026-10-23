@@ -1,11 +1,15 @@
 //! Backend PostgreSQL client used by TR-management code paths.
 //!
-//! `ProxyServer::route_and_forward` still forwards client frames to
-//! backends without ever parsing or originating SQL — that zero-copy
-//! path remains untouched. This module is the *other* direction: the
-//! proxy itself acts as a PG client for internal management queries
-//! (health checks, `pg_is_in_recovery()`, `pg_promote()`, WAL-position
-//! probes, failover replay, session-state restoration).
+//! The client data path (`ProxyServer::forward_simple_query` /
+//! `forward_extended_batch` in `src/server/relay.rs`) relays the client's
+//! own frames over the session's backend connections. A simple `Query` is
+//! re-encoded, and rebuilt when hint stripping, query rewriting or a tenant
+//! filter changes its SQL. The path also sends its own protocol
+//! housekeeping, such as mirrored `SET`s on a standby connection and
+//! out-of-band `Parse`/`Close` for re-prepare. This module is the *other*
+//! direction: the proxy itself acts as a PG client for internal management
+//! queries (health checks, `pg_is_in_recovery()`, `pg_promote()`,
+//! WAL-position probes, failover replay, session-state restoration).
 //!
 //! Design goals:
 //!

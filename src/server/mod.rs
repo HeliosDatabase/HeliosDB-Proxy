@@ -526,49 +526,59 @@ pub(crate) fn bind_reuseport(addr: &str) -> Result<TcpListener> {
         .map_err(|e| ProxyError::Network(format!("from_std listener: {}", e)))
 }
 
-/// Disposition produced by the pre-query plugin hook stage.
-///
-/// When the `wasm-plugins` feature is off, only `Forward` is ever produced —
-/// the hook dispatch is compiled out entirely and the variant list exists
-/// purely for pattern-match symmetry.
+/// What the pre-query plugin hook decided for a simple `Query`
+/// (`apply_pre_query_hook`). Without the `wasm-plugins` feature the hook is
+/// compiled out and `Forward` is the only variant.
 #[derive(Debug)]
-#[allow(dead_code)] // Block/Cached only constructed under wasm-plugins
 enum PreQueryAction {
-    /// Send the message to the backend as usual.
+    /// Send the message to the backend (possibly rewritten by the hook).
     Forward,
-    /// A plugin blocked the query. The caller sends an error + ReadyForQuery
-    /// to the client and skips backend forwarding.
+    /// A plugin blocked the query: `client_loop` answers with
+    /// `send_block_response` (ErrorResponse 42000 + ReadyForQuery) and skips
+    /// backend forwarding.
+    #[cfg(feature = "wasm-plugins")]
     Block(String),
-    /// A plugin returned a cached response. Not yet wired — response
-    /// synthesis from raw bytes requires building a full protocol reply
-    /// (RowDescription + DataRow(s) + CommandComplete + ReadyForQuery),
-    /// which is the next step of T0-a. For now the caller falls back to
-    /// `Forward` and logs a warning.
+    /// A plugin returned a cached result (JSON rows): `client_loop` answers
+    /// with `synthesise_cached_response`, and forwards the query (with a
+    /// warning) only when the payload cannot be synthesised.
+    #[cfg(feature = "wasm-plugins")]
     Cached(Vec<u8>),
 }
 
-/// Override produced by the Route plugin hook. Consumed by `route_and_forward`
-/// when deciding which backend to talk to.
-///
-/// As with `PreQueryAction`, only `None` is ever produced when the
-/// `wasm-plugins` feature is off.
+/// Routing override for a statement, from the Route plugin hook
+/// (`apply_route_hook`: simple `Query` only, `wasm-plugins`) or a SQL-comment
+/// hint (`hint_to_override`, `routing-hints`). `forward_simple_query` applies
+/// it (a hint wins over the plugin, see `resolve_simple_route`), and
+/// `extended_hint_route` applies a hint's override to an extended batch. A
+/// migration cutover overrides `None`, `Primary`, `Standby` and `Node`
+/// (`choose_target_node`); a plugin `Block` is answered before any routing,
+/// so a cutover never overrides it. Without either feature `None` is the
+/// only variant.
 #[derive(Debug)]
-#[allow(dead_code)] // Primary/Standby/Node/Block only constructed under wasm-plugins
 enum RouteOverride {
     /// No override — use the default SQL-verb-based routing.
     None,
-    /// Force the write path (use `select_primary_with_timeout`).
+    /// Route as a write (`is_write = true`): the write target, as
+    /// `choose_target_node` picks it for any write.
+    #[cfg(any(feature = "wasm-plugins", feature = "routing-hints"))]
     Primary,
-    /// Force the read path (use `select_read_node`).
+    /// Route as a read (`is_write = false`) through the normal read path.
+    /// Under read offload a statement the proxy cannot classify may go to a
+    /// standby (`standby_hint`); one it classifies as a write or transaction
+    /// control is never offloaded.
+    #[cfg(any(feature = "wasm-plugins", feature = "routing-hints"))]
     Standby,
-    /// Use this exact node address. Takes precedence over the is_write
-    /// heuristic; the proxy will still verify the node is healthy before
-    /// connecting (via the normal switch-vs-reuse flow).
+    /// Use this node, by configured name or address. Wins over the write
+    /// heuristic, read-your-writes and schema routing; only a migration
+    /// cutover wins over it. Not health-checked by `choose_target_node`: a
+    /// node that is down fails at connect (or on an open circuit) like any
+    /// other target.
+    #[cfg(any(feature = "wasm-plugins", feature = "routing-hints"))]
     Node(String),
-    /// Reject the query: write a PG ErrorResponse + ReadyForQuery to
-    /// the client and skip the forward. Carries the reason the plugin
-    /// supplied. Takes precedence over every other field — the proxy
-    /// short-circuits before any backend selection.
+    /// Reject the query (Route plugin only): write a PG ErrorResponse +
+    /// ReadyForQuery to the client and skip the forward. Carries the plugin's
+    /// reason. Checked before hint resolution and any backend selection.
+    #[cfg(feature = "wasm-plugins")]
     Block(String),
 }
 

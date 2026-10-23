@@ -1116,7 +1116,11 @@ impl ProxyServer {
                         // Plugin pre-query hook — may rewrite the SQL, block,
                         // or return a cached response.
                         let (msg, action) = Self::apply_pre_query_hook(msg, state, session);
+                        // Without wasm-plugins the hook can only forward.
+                        #[cfg(not(feature = "wasm-plugins"))]
+                        let PreQueryAction::Forward = action;
 
+                        #[cfg(feature = "wasm-plugins")]
                         if let PreQueryAction::Block(reason) = &action {
                             tracing::info!(reason = %reason, "pre-query plugin blocked query");
                             Self::send_block_response(stream, reason, state).await?;

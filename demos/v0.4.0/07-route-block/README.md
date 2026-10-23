@@ -49,7 +49,7 @@ See `18-residency-router/` for the fully-runnable instance.
 
 - ABI: `heliosdb-proxy-plugins/abi/src/lib.rs::RouteResult::Block`
   variant + the wire-format `{ "action": "block", "reason": "..." }`.
-- Proxy plumbing: `src/server.rs::route_and_forward` — Block
+- Proxy plumbing: `src/server/relay.rs::forward_simple_query` — Block
   short-circuits before backend selection, synthesises
   `ErrorResponse` + `ReadyForQuery`.
 - Plugin user: `residency-router/src/lib.rs::route` returns
