@@ -274,8 +274,9 @@ pub struct L3Config {
     /// Cosine similarity threshold for cache hits
     pub similarity_threshold: f32,
 
-    /// Maximum entries in semantic cache, and maximum remembered column-name
-    /// embeddings
+    /// Maximum entries in semantic cache (all its shards together), and
+    /// maximum remembered column-name embeddings. Also sets the shard count:
+    /// `max_entries / 32` rounded down to a power of two, 1 to 64.
     pub max_entries: usize,
 
     /// Maximum entries for one statement shape that differ only in their

@@ -46,8 +46,8 @@ at transaction end.
 
 ## 2026-10-23 — query-cache, edge-fingerprint, semantic-tier and exclusion cases (91c4af7cc20e) — values pending
 
-Fourteen new `benches/cache.rs` cases for the `[cache]` semantic tier / exclusions / C-07
-fingerprint work. They were added in two commits so the A/B measures what changed:
+Fifteen new `benches/cache.rs` cases for the `[cache]` semantic tier / exclusions / C-07
+fingerprint work. They were added in three commits so the A/B measures what changed:
 
 - **Group A — A/B against the base.** Commit `bench(cache): query-cache and edge
   fingerprint cases` uses only APIs that exist on the base `a6344f4` (the tenant-budgets
@@ -63,6 +63,11 @@ fingerprint work. They were added in two commits so the A/B measures what change
   comment marker and one regex pass.
 - **Group B — candidate only.** Commit `bench(cache): L3 and exclusion cases` adds cases
   for code that does not exist on the base; `bench-gate.sh` reports them as NEW.
+  Commit `perf(cache): shard the semantic tier's store; build slots outside the lock`
+  adds `cache/l3/store_lookup_contended_8` (NEW against `a6344f4` too). It uses only the
+  tier's public API (`L3SemanticCache::new` / `get` / `put` / `len`), which the commit
+  before it (`3916aa8`, one tier-wide store lock) already has, so `3916aa8` plus this
+  `benches/cache.rs` is the base that measures the sharding itself.
 
 | Benchmark | Group | What one iteration does | Base ns | Candidate ns |
 |---|---|---|---:|---:|
@@ -77,6 +82,7 @@ fingerprint work. They were added in two commits so the A/B measures what change
 | `cache/l3/lookup_exact_5000` | B | `L3SemanticCache::get` of a paraphrase, exact canonical hit among 5000 entries | — | pending |
 | `cache/l3/lookup_approx_16` | B | an approximate hit scoring 16 variants (384-dim embeddings from an in-bench stub, remembered before timing) | — | pending |
 | `cache/l3/store_full_5000` | B | `L3SemanticCache::put` into a full tier (FIFO eviction every call) | — | pending |
+| `cache/l3/store_lookup_contended_8` | B | 8 threads at once, each a miss (`L3SemanticCache::get`) then a `put` of a key of its own into a full 5000-entry tier (eviction every store); wall time per round of all 8, from a barrier after thread start-up (values pending the lead's gate run) | — | pending |
 | `cache/excl/scan_3_names_1k` | B | `sql_text::TableExclusions::matches` on a ~1 KiB read naming none of 3 tables | — | pending |
 | `cache/excl/scan_1100_names_1k` | B | the same scan with 1100 names (one Aho-Corasick pass; the per-name memmem scan it replaced grew linearly) | — | pending |
 | `cache/excl/catalog_time_travel_scan_1k` | B | `sql_text::names_system_catalog` + `sql_text::uncacheable_text` on the same read with a trailing hint comment (the relay's per-read system-catalog, time-travel-comment and backend-ambiguous-text refusal scans, rounds 5 and 6) | — | pending |

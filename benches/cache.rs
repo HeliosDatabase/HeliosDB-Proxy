@@ -6,8 +6,8 @@
 //! write; `cache/edge/*` the edge-cache key the relay computes for every
 //! cacheable read when `[edge]` is on, and the edge invalidation's table set.
 //! `cache/l3/*` measure the semantic tier through its public API (canonical
-//! form included) and `cache/excl/*` the relay's `[cache] exclude_tables`
-//! scan.
+//! form included; `store_lookup_contended_8` with eight threads at once) and
+//! `cache/excl/*` the relay's `[cache] exclude_tables` scan.
 
 use criterion::{criterion_group, criterion_main, Criterion};
 #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
@@ -290,15 +290,23 @@ fn embedding_stub(dim: usize) -> String {
     url
 }
 
+/// Threads of `cache/l3/store_lookup_contended_8`.
+#[cfg(feature = "query-cache")]
+const CONTENDED_THREADS: usize = 8;
+
 /// The semantic tier through its public API (normalization and canonical
 /// form on every call): an exact hit among 5000 entries, an approximate hit
 /// scoring 16 variants of one statement shape (embeddings from an in-bench
-/// stub, remembered before timing), and a store into a full tier (FIFO
-/// eviction on every call).
+/// stub, remembered before timing), a store into a full tier (FIFO
+/// eviction on every call), and `CONTENDED_THREADS` threads at once each
+/// missing and then storing keys of their own against a full tier (the miss
+/// path of hinted reads of distinct keys, which a tier-wide lock serialised).
 #[cfg(feature = "query-cache")]
 fn bench_semantic_cache(c: &mut Criterion) {
     use bytes::Bytes;
     use heliosdb_proxy::cache::{CacheContext, CachedResult, L3Config, L3SemanticCache};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
     use std::time::Duration;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -389,6 +397,62 @@ fn bench_semantic_cache(c: &mut Criterion) {
             rt.block_on(full.put(black_box(&sql), &ctx, result.clone()))
         })
     });
+
+    // One iteration: every thread misses and then stores one key of its own
+    // (never stored before, so every store evicts), all at once; the time is
+    // the wall time from a common start (a barrier, after the threads and
+    // their runtimes are up) until the last thread is done, per round.
+    let contended = Arc::new(L3SemanticCache::new(L3Config {
+        enabled: true,
+        similarity_threshold: 1.0,
+        ..L3Config::default()
+    }));
+    rt.block_on(async {
+        for i in 0..5000 {
+            contended
+                .put(
+                    &format!("SELECT val FROM kv WHERE id = {i}"),
+                    &ctx,
+                    result.clone(),
+                )
+                .await;
+        }
+    });
+    assert_eq!(contended.len(), 5000);
+    let next_id = AtomicU64::new(5000);
+    group.bench_function("store_lookup_contended_8", |b| {
+        b.iter_custom(|iters| {
+            let start = Arc::new(Barrier::new(CONTENDED_THREADS + 1));
+            let workers: Vec<_> = (0..CONTENDED_THREADS)
+                .map(|_| {
+                    let first = next_id.fetch_add(iters, Ordering::Relaxed);
+                    let (cache, start) = (contended.clone(), start.clone());
+                    let (ctx, result) = (ctx.clone(), result.clone());
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .build()
+                            .unwrap();
+                        start.wait();
+                        for id in first..first + iters {
+                            let sql = format!("SELECT val FROM kv WHERE id = {id}");
+                            rt.block_on(async {
+                                assert!(cache.get(black_box(&sql), &ctx).await.is_none());
+                                cache.put(black_box(&sql), &ctx, result.clone()).await;
+                            });
+                        }
+                    })
+                })
+                .collect();
+            start.wait();
+            let began = std::time::Instant::now();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            began.elapsed()
+        })
+    });
+    // Concurrent stores may evict one more than needed each: at most full.
+    assert!(contended.len() <= 5000);
     group.finish();
 }
 

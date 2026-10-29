@@ -157,8 +157,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   embed_errors_total, embed_skipped_total, embed_seconds, approximate_hits_total,
   ineligible_total, too_large_total, entries, embeddings}`; a result whose entry alone
   exceeds `semantic_max_bytes` stays out of the tier (counted; startup warns when the
-  budget is below `max_result_bytes`). Under `strict_config` a build without
-  `query-cache` refuses `cache.semantic_enabled`.
+  budget is below `max_result_bytes`). The entries are sharded by statement shape and
+  session (`semantic_max_entries / 32` rounded down to a power of two, 1 to 64): a lookup
+  or store locks only its shard and builds what it stores before taking the lock, while
+  `semantic_max_entries` and `semantic_max_bytes` bound the whole tier (eviction is
+  oldest-first within a shard, approximate across shards). Under `strict_config` a build
+  without `query-cache` refuses `cache.semantic_enabled`.
 - **Table exclusions and per-table TTLs.** `[cache] exclude_tables` and `[[cache.tables]]`
   (`name` and exactly one of `ttl_secs` or `exclude = true`). An excluded read is neither
   looked up, captured nor stored by either result cache (the query cache and `[edge]`),

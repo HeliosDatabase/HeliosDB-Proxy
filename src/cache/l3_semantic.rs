@@ -39,16 +39,35 @@
 //! kept: approximate matching pauses until the entries shrink). A failing
 //! endpoint is left alone for `embedding_retry_after`, then probed by
 //! exactly one call at a time; exact hits are unaffected meanwhile.
+//!
+//! The entries are split into shards by bucket (statement shape and session
+//! context; `shard_count`: up to `MAX_STORE_SHARDS`, and at least
+//! `MIN_ENTRIES_PER_SHARD` of `max_entries` per shard). A lookup or a
+//! store locks only its bucket's shard, and a store builds everything it
+//! files before taking that lock and frees what it replaced or evicted after
+//! releasing it, so stores and lookups of different shards never wait on
+//! each other. `max_entries` and `max_bytes` bound the whole tier (counted
+//! across the shards): a store that takes the tier over either evicts the
+//! oldest entries of its own shard, and only while that shard holds nothing
+//! older than the entry it just filed, the oldest of the following shards in
+//! turn (one lock at a time). Eviction is therefore oldest-inserted first
+//! within a shard, and only approximately across the tier: an entry can
+//! outlive an older one of a shard that received fewer stores. The bounds
+//! hold whenever no store is in progress; while stores run concurrently,
+//! each can hold the tier one entry over them (or evict one more than
+//! needed) for the moment it takes. The column-name memo's lock is taken by
+//! a store only when the approximate part is on (or the memo holds names
+//! that the entries' growth leaves no room for).
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashSet;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use tokio::sync::Semaphore;
 
 use super::canonical::{self, Canonical};
@@ -69,6 +88,37 @@ const PROBE_TEXT: &str = "heliosdb proxy semantic cache probe";
 /// MEMO_SHARE_DIVISOR` (a quarter) of the byte budget, and only what the
 /// entries leave of it: approximate matching can never starve the entries.
 const MEMO_SHARE_DIVISOR: usize = 4;
+/// Most shards the entries are split into. A lookup or a store locks only
+/// its bucket's shard, so with `W` sessions storing at once (the miss path of
+/// hinted reads of distinct keys: one store per read) any two share a lock
+/// with a chance of about one in this many, where one lock made all `W` wait
+/// in turn. 64 covers the tokio workers of hosts up to 64 cores; a shard
+/// costs a lock, an empty map and an empty queue when unused.
+const MAX_STORE_SHARDS: usize = 64;
+/// Entries of `max_entries` each shard is sized for at least: a tier with
+/// fewer than [`MAX_STORE_SHARDS`] times this many gets fewer shards (one
+/// below twice this). A shard's oldest entry then stands for the tier's
+/// oldest well enough, and a store rarely finds its shard holding nothing
+/// older to evict (which sends it to the other shards). The default 5000
+/// entries make 64 shards of about 78.
+const MIN_ENTRIES_PER_SHARD: usize = 32;
+
+/// Shards for a tier of `max_entries`: `max_entries /`
+/// [`MIN_ENTRIES_PER_SHARD`] rounded down to a power of two, from 1 to
+/// [`MAX_STORE_SHARDS`].
+fn shard_count(max_entries: usize) -> usize {
+    let n = (max_entries / MIN_ENTRIES_PER_SHARD).clamp(1, MAX_STORE_SHARDS);
+    1 << n.ilog2()
+}
+
+/// Add `add` to `counter` and take `sub` from it, in one step.
+fn shift(counter: &AtomicUsize, add: usize, sub: usize) {
+    if add >= sub {
+        counter.fetch_add(add - sub, Ordering::AcqRel);
+    } else {
+        counter.fetch_sub(sub - add, Ordering::AcqRel);
+    }
+}
 
 /// The embedding endpoint as the tier last saw it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -158,13 +208,20 @@ impl std::fmt::Debug for L3SemanticCache {
 
 struct Inner {
     config: L3Config,
-    store: RwLock<Store>,
-    /// Column-name embeddings, least recently used first.
-    memo: Mutex<lru::LruCache<String, Arc<[f32]>>>,
+    /// The entries: bucket `key` lives in `shards[key & shard_mask]`
+    /// ([`shard_count`] of them, a power of two).
+    shards: Box<[RwLock<Shard>]>,
+    shard_mask: usize,
+    /// Column-name embeddings, least recently used first. Read-locked to
+    /// see which names are remembered; write-locked to fetch one (which
+    /// marks it used), remember one or trim.
+    memo: RwLock<lru::LruCache<String, Arc<[f32]>>>,
     /// Bytes and names the memo holds (read without its lock).
     memo_bytes: AtomicUsize,
     memo_len: AtomicUsize,
-    /// Bytes and count of the entries (mirrors of the store's, lock-free).
+    /// Bytes and count of the entries of all shards together, which
+    /// `max_bytes` and `max_entries` bound. A shard changes them by exactly
+    /// its own changes, under its lock, so they are always the shards' sums.
     entry_bytes: AtomicUsize,
     entry_count: AtomicUsize,
     client: EmbeddingClient,
@@ -212,15 +269,74 @@ impl Slot {
     }
 }
 
+/// One shard of the entries: the buckets whose key it holds, and their
+/// insertion order.
 #[derive(Default)]
-struct Store {
+struct Shard {
     /// Slots by bucket (statement shape + context), oldest first.
     buckets: HashMap<u64, Vec<Slot>>,
     /// Insertion order for eviction, cleaned lazily: (bucket, seq).
     fifo: VecDeque<(u64, u64)>,
     next_seq: u64,
+    /// This shard's entries and their bytes.
     len: usize,
     bytes: usize,
+}
+
+impl Shard {
+    /// Move this shard's oldest slot into `dead` and return its charge, or
+    /// `None` when it holds no slot other than `keep` (the seq of the slot
+    /// the caller just filed, the shard's newest).
+    fn evict_oldest(&mut self, keep: Option<u64>, dead: &mut Vec<Slot>) -> Option<usize> {
+        while let Some(&(key, seq)) = self.fifo.front() {
+            if keep == Some(seq) {
+                return None;
+            }
+            self.fifo.pop_front();
+            let Some(bucket) = self.buckets.get_mut(&key) else {
+                continue;
+            };
+            let Some(at) = bucket.iter().position(|s| s.seq == seq) else {
+                continue;
+            };
+            let slot = bucket.remove(at);
+            if bucket.is_empty() {
+                self.buckets.remove(&key);
+            }
+            self.len -= 1;
+            self.bytes -= slot.charge;
+            let charge = slot.charge;
+            dead.push(slot);
+            return Some(charge);
+        }
+        None
+    }
+
+    /// Drop the queue's references to slots already gone once they
+    /// outnumber the live ones.
+    fn compact_fifo(&mut self) {
+        if self.fifo.len() > 2 * self.len + 1 {
+            let Shard { buckets, fifo, .. } = self;
+            fifo.retain(|(key, seq)| {
+                buckets
+                    .get(key)
+                    .is_some_and(|b| b.iter().any(|s| s.seq == *seq))
+            });
+        }
+    }
+}
+
+/// Move the slots of `bucket` that `doomed` picks into `dead`, keeping the
+/// others in order; linear in the bucket's length.
+fn take_where(bucket: &mut Vec<Slot>, dead: &mut Vec<Slot>, mut doomed: impl FnMut(&Slot) -> bool) {
+    let mut kept = 0;
+    for at in 0..bucket.len() {
+        if !doomed(&bucket[at]) {
+            bucket.swap(kept, at);
+            kept += 1;
+        }
+    }
+    dead.extend(bucket.drain(kept..));
 }
 
 /// Endpoint state, epoch and retry lease.
@@ -450,35 +566,55 @@ impl Inner {
         self.config.similarity_threshold < 1.0
     }
 
-    /// Evict oldest-inserted entries while `over` holds. Publishes the
-    /// entries' count and bytes. The slot a store just pushed is the newest,
-    /// so it goes last.
-    fn evict_while(&self, store: &mut Store, over: impl Fn(&Store) -> bool) {
-        while over(store) {
-            let Some((key, seq)) = store.fifo.pop_front() else {
+    /// The index of the shard holding bucket `key`.
+    fn shard_index(&self, key: u64) -> usize {
+        // Truncation on a 32-bit target keeps the low bits, all the mask reads.
+        key as usize & self.shard_mask
+    }
+
+    /// The tier's entries exceed `max_entries`, or `max_bytes` (when set).
+    fn over_bounds(&self) -> bool {
+        self.entry_count.load(Ordering::Acquire) > self.config.max_entries
+            || (self.config.max_bytes > 0
+                && self.entry_bytes.load(Ordering::Acquire) > self.config.max_bytes)
+    }
+
+    /// Record that a shard took `slots` and `bytes` out (the caller holds
+    /// its lock and has already subtracted them from the shard's own).
+    fn forget(&self, slots: usize, bytes: usize) {
+        shift(&self.entry_count, 0, slots);
+        shift(&self.entry_bytes, 0, bytes);
+    }
+
+    /// Evict `shard`'s oldest entries into `dead` while the tier is over a
+    /// bound, never the slot `keep`. `false` when it is still over and the
+    /// shard holds nothing else. The caller holds the shard's lock. The
+    /// bounds are the tier's (every shard's entries together): entries are
+    /// evicted only while they alone exceed the byte budget, so never for
+    /// the memo.
+    fn evict_from(&self, shard: &mut Shard, keep: Option<u64>, dead: &mut Vec<Slot>) -> bool {
+        let mut settled = true;
+        while self.over_bounds() {
+            let Some(charge) = shard.evict_oldest(keep, dead) else {
+                settled = false;
                 break;
             };
-            if let Some(bucket) = store.buckets.get_mut(&key) {
-                if let Some(at) = bucket.iter().position(|s| s.seq == seq) {
-                    let slot = bucket.remove(at);
-                    store.len -= 1;
-                    store.bytes -= slot.charge;
-                }
-                if bucket.is_empty() {
-                    store.buckets.remove(&key);
-                }
-            }
+            self.forget(1, charge);
         }
-        if store.fifo.len() > 2 * store.len + 1 {
-            let Store { buckets, fifo, .. } = store;
-            fifo.retain(|(key, seq)| {
-                buckets
-                    .get(key)
-                    .is_some_and(|b| b.iter().any(|s| s.seq == *seq))
-            });
-        }
-        self.entry_bytes.store(store.bytes, Ordering::Release);
-        self.entry_count.store(store.len, Ordering::Relaxed);
+        shard.compact_fifo();
+        settled
+    }
+
+    /// The memo holds more names than `max_entries`, or more bytes than the
+    /// entries leave it ([`Self::memo_room`]): it must be trimmed. Read
+    /// without its lock; see [`Self::memoize`] for the fence that pairs a
+    /// store's growth of the entries with a memoize's growth of the memo.
+    fn memo_over_room(&self) -> bool {
+        let names = self.memo_len.load(Ordering::Relaxed);
+        names > 0
+            && (names > self.config.max_entries
+                || self.memo_bytes.load(Ordering::Relaxed)
+                    > self.memo_room(self.entry_bytes.load(Ordering::Acquire)))
     }
 
     /// Bytes the remembered embeddings may take next to `entry_bytes` of
@@ -525,10 +661,14 @@ impl Inner {
     }
 
     /// Remember a column name's embedding within the memo's bounds; never
-    /// touches an entry. A store that runs meanwhile trims the memo again
-    /// under the same lock, with the entries' published bytes.
+    /// touches an entry. A store does not take the memo lock unless the memo
+    /// is over its room ([`Self::memo_over_room`]), read after the store
+    /// published the entries' growth and a `SeqCst` fence; this publishes the
+    /// memo's growth, fences, then reads the entries' bytes again. Of a store
+    /// and a memoize running at once, at least one therefore sees the other's
+    /// growth and trims (store buffering is ruled out by the two fences).
     fn memoize(&self, name: String, v: Arc<[f32]>) {
-        let mut memo = self.memo.lock();
+        let mut memo = self.memo.write();
         let mut memo_bytes = self.memo_bytes.load(Ordering::Relaxed) + memo_charge(&name, &v);
         if let Some((old_name, old)) = memo.push(name, v) {
             memo_bytes -= memo_charge(&old_name, &old);
@@ -538,6 +678,17 @@ impl Inner {
             memo_bytes,
             self.entry_bytes.load(Ordering::Acquire),
         );
+        loop {
+            fence(Ordering::SeqCst);
+            if !self.memo_over_room() {
+                break;
+            }
+            self.trim_memo(
+                &mut memo,
+                self.memo_bytes.load(Ordering::Relaxed),
+                self.entry_bytes.load(Ordering::Acquire),
+            );
+        }
     }
 
     /// One embedding call tagged `epoch`; the result is remembered when
@@ -600,11 +751,13 @@ impl L3SemanticCache {
                 .clamp(1, Semaphore::MAX_PERMITS),
         ));
         let health = Health::new(config.embedding_retry_after);
+        let shards = shard_count(config.max_entries);
         Self {
             inner: Arc::new(Inner {
                 config,
-                store: RwLock::new(Store::default()),
-                memo: Mutex::new(lru::LruCache::unbounded()),
+                shards: (0..shards).map(|_| RwLock::new(Shard::default())).collect(),
+                shard_mask: shards - 1,
+                memo: RwLock::new(lru::LruCache::unbounded()),
                 memo_bytes: AtomicUsize::new(0),
                 memo_len: AtomicUsize::new(0),
                 entry_bytes: AtomicUsize::new(0),
@@ -662,8 +815,8 @@ impl L3SemanticCache {
         let mut exact = None;
         let mut candidates: Vec<(Vec<Option<String>>, CachedResult)> = Vec::new();
         {
-            let store = inner.store.read();
-            for slot in store.buckets.get(&key).into_iter().flatten().rev() {
+            let shard = inner.shards[inner.shard_index(key)].read();
+            for slot in shard.buckets.get(&key).into_iter().flatten().rev() {
                 if !slot.matches(c, ctx) {
                     continue;
                 }
@@ -750,7 +903,7 @@ impl L3SemanticCache {
         names.sort_unstable();
         names.dedup();
         let embeddings: Vec<Option<Arc<[f32]>>> = {
-            let mut memo = inner.memo.lock();
+            let mut memo = inner.memo.write();
             names.iter().map(|n| memo.get(*n).cloned()).collect()
         };
         let embedding = |name: &str| {
@@ -820,46 +973,55 @@ impl L3SemanticCache {
         best.map(|(_, at)| at)
     }
 
-    /// Drop the expired and retired slots of one bucket, unless its lock is
-    /// contended (the next lookup or store tries again).
+    /// Drop the expired and retired slots of one bucket, unless its shard's
+    /// lock is contended (the next lookup or store tries again). They are
+    /// freed after the lock is released.
     fn purge_bucket(&self, key: u64, now: Instant, is_current: &dyn Fn(&CachedResult) -> bool) {
-        let Some(mut guard) = self.inner.store.try_write() else {
-            return;
-        };
-        let store = &mut *guard;
-        let Some(bucket) = store.buckets.get_mut(&key) else {
-            return;
-        };
-        let mut freed = 0;
-        let mut removed = 0;
-        bucket.retain(|s| {
-            let alive = !expired(&s.result, now) && is_current(&s.result);
-            if !alive {
-                freed += s.charge;
-                removed += 1;
+        let inner = &self.inner;
+        let mut dead = Vec::new();
+        {
+            let Some(mut guard) = inner.shards[inner.shard_index(key)].try_write() else {
+                return;
+            };
+            let shard = &mut *guard;
+            let Some(bucket) = shard.buckets.get_mut(&key) else {
+                return;
+            };
+            take_where(bucket, &mut dead, |s| {
+                expired(&s.result, now) || !is_current(&s.result)
+            });
+            if bucket.is_empty() {
+                shard.buckets.remove(&key);
             }
-            alive
-        });
-        if bucket.is_empty() {
-            store.buckets.remove(&key);
+            let freed: usize = dead.iter().map(|s| s.charge).sum();
+            shard.len -= dead.len();
+            shard.bytes -= freed;
+            shard.compact_fifo();
+            inner.forget(dead.len(), freed);
         }
-        store.len -= removed;
-        store.bytes -= freed;
-        self.inner.entry_bytes.store(store.bytes, Ordering::Relaxed);
-        self.inner.entry_count.store(store.len, Ordering::Relaxed);
+        drop(dead);
     }
 
     /// Store `result` for `c` in context `ctx`. Synchronous, no I/O: the
     /// bucket's expired, retired (`is_current` false) and same-select slots
     /// are replaced, a full bucket (`max_variants`) drops its oldest, and
-    /// the tier evicts oldest-inserted entries to `max_entries`. Within
-    /// `max_bytes` the remembered embeddings yield first (least recently used
-    /// first); entries are evicted only while they alone exceed it, so never
-    /// to make room for embeddings. An entry that alone exceeds `max_bytes`
-    /// could never be kept: it is not stored (counted in `too_large`), and
-    /// nothing is evicted or trimmed for it. The entry's TTL is capped at
-    /// `ttl`. In an approximable statement (threshold below 1.0), its column
-    /// names without an embedding are embedded in the background.
+    /// while the tier is over `max_entries` (or its entries alone over
+    /// `max_bytes`) the oldest-inserted entries of the bucket's shard are
+    /// evicted, then (only when that shard holds nothing older than the new
+    /// entry) those of the following shards in turn. Within `max_bytes` the
+    /// remembered embeddings yield first (least recently used first);
+    /// entries are evicted only while they alone exceed it, so never to make
+    /// room for embeddings. An entry that alone exceeds `max_bytes` could
+    /// never be kept: it is not stored (counted in `too_large`), and nothing
+    /// is evicted or trimmed for it. The entry's TTL is capped at `ttl`. In
+    /// an approximable statement (threshold below 1.0), its column names
+    /// without an embedding are embedded in the background.
+    ///
+    /// The entry is built (all its strings copied, its bytes counted) before
+    /// any lock is taken; under the shard's lock the store only files it and
+    /// keeps the bucket and eviction books; what it replaced or evicted is
+    /// freed after the lock is released. The memo's lock is taken only when
+    /// it can matter ([`Self::after_store`]).
     pub(crate) fn store(
         &self,
         c: &Canonical,
@@ -889,84 +1051,105 @@ impl L3SemanticCache {
             inner.counters.too_large.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        {
-            let mut guard = inner.store.write();
-            let store = &mut *guard;
-            let seq = store.next_seq;
-            store.next_seq += 1;
-            let bucket = store.buckets.entry(key).or_default();
-            let mut freed = 0;
-            let mut removed = 0;
-            bucket.retain(|s| {
-                let replace = s.matches(c, ctx)
-                    && (expired(&s.result, now) || !is_current(&s.result) || s.select == c.select);
-                if replace {
-                    freed += s.charge;
-                    removed += 1;
-                }
-                !replace
+        let slot = Slot {
+            seq: 0,
+            database: ctx.database.clone(),
+            user: ctx.user.clone(),
+            branch: ctx.branch.clone(),
+            shape: c.shape.clone(),
+            select: c.select.clone(),
+            columns: c.columns.clone(),
+            result,
+            charge,
+        };
+        let home = inner.shard_index(key);
+        let mut dead: Vec<Slot> = Vec::new();
+        let settled = {
+            let mut guard = inner.shards[home].write();
+            let shard = &mut *guard;
+            let seq = shard.next_seq;
+            shard.next_seq += 1;
+            let bucket = shard.buckets.entry(key).or_default();
+            take_where(bucket, &mut dead, |s| {
+                s.matches(c, ctx)
+                    && (expired(&s.result, now) || !is_current(&s.result) || s.select == c.select)
             });
             if bucket.len() >= inner.config.max_variants.max(1) {
-                let oldest = bucket.remove(0);
-                freed += oldest.charge;
-                removed += 1;
+                dead.push(bucket.remove(0));
             }
-            bucket.push(Slot {
-                seq,
-                database: ctx.database.clone(),
-                user: ctx.user.clone(),
-                branch: ctx.branch.clone(),
-                shape: c.shape.clone(),
-                select: c.select.clone(),
-                columns: c.columns.clone(),
-                result,
-                charge,
-            });
-            store.fifo.push_back((key, seq));
-            store.len = store.len + 1 - removed;
-            store.bytes = store.bytes + charge - freed;
-            let max_entries = inner.config.max_entries;
-            inner.evict_while(store, |s| s.len > max_entries);
-            // Entries are evicted only when they alone exceed the byte
-            // budget, so never for the memo.
-            let max_bytes = inner.config.max_bytes;
-            inner.evict_while(store, |s| max_bytes > 0 && s.bytes > max_bytes);
+            bucket.push(Slot { seq, ..slot });
+            shard.fifo.push_back((key, seq));
+            let freed: usize = dead.iter().map(|s| s.charge).sum();
+            shard.len = shard.len + 1 - dead.len();
+            shard.bytes = shard.bytes + charge - freed;
+            shift(&inner.entry_count, 1, dead.len());
+            shift(&inner.entry_bytes, charge, freed);
+            inner.evict_from(shard, Some(seq), &mut dead)
+        };
+        if !settled {
+            // The home shard holds nothing older than the new entry: the
+            // following shards give their oldest, one lock at a time (none
+            // is held here, so no two stores can wait on each other).
+            for step in 1..inner.shards.len() {
+                if !inner.over_bounds() {
+                    break;
+                }
+                let mut other = inner.shards[(home + step) & inner.shard_mask].write();
+                inner.evict_from(&mut other, None, &mut dead);
+            }
         }
-        // Within the byte budget the embeddings yield first: the memo is
-        // trimmed to what the entries (as published) leave. Under its own
-        // lock, after the store's is released: a lookup holding the memo lock
-        // never stalls a store that holds the store lock, and through it
-        // every other session's lookup.
-        let unknown: Vec<String> = {
-            let mut memo = inner.memo.lock();
+        drop(dead);
+        self.after_store(c);
+    }
+
+    /// The memo's part of a store of `c`, after the shard's lock is released
+    /// (a lookup holding the memo lock never stalls a store that holds a
+    /// shard's lock, and through it every lookup of that shard). Within the
+    /// byte budget the embeddings yield first: the memo is trimmed to what
+    /// the entries leave, and in an approximable statement (threshold below
+    /// 1.0) the column names without an embedding are scheduled. Nothing of
+    /// that can matter while the approximate part is off and the memo is
+    /// empty (it only fills while the part is on): then no fence and no lock.
+    /// Otherwise the write lock only when the memo is over its room (checked
+    /// after a fence that pairs with [`Inner::memoize`]'s), and the read lock
+    /// only to see which of an approximable statement's names it lacks.
+    fn after_store(&self, c: &Canonical) {
+        let inner = &self.inner;
+        if !inner.approximate_on() && inner.memo_len.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        fence(Ordering::SeqCst);
+        if inner.memo_over_room() {
+            let mut memo = inner.memo.write();
             inner.trim_memo(
                 &mut memo,
                 inner.memo_bytes.load(Ordering::Relaxed),
                 inner.entry_bytes.load(Ordering::Acquire),
             );
-            if c.approximable && inner.approximate_on() {
-                let names: Vec<&str> = c.columns.iter().flatten().map(String::as_str).collect();
-                let mut unknown: Vec<String> = names
-                    .iter()
-                    .filter(|n| !memo.contains(**n))
-                    .map(|n| n.to_string())
-                    .collect();
-                unknown.sort();
-                unknown.dedup();
-                // The statement's names are matched together: fetched only
-                // when they all fit in the memo ([`MemoPlan`]).
-                if !unknown.is_empty() && !inner.memo_plan().reserve(&names) {
-                    inner
-                        .counters
-                        .skipped
-                        .fetch_add(unknown.len() as u64, Ordering::Relaxed);
-                    unknown.clear();
-                }
-                unknown
-            } else {
-                Vec::new()
-            }
+        }
+        if !(c.approximable && inner.approximate_on()) {
+            return;
+        }
+        let names: Vec<&str> = c.columns.iter().flatten().map(String::as_str).collect();
+        let mut unknown: Vec<String> = {
+            let memo = inner.memo.read();
+            names
+                .iter()
+                .filter(|n| !memo.contains(**n))
+                .map(|n| n.to_string())
+                .collect()
         };
+        unknown.sort();
+        unknown.dedup();
+        // The statement's names are matched together: fetched only when
+        // they all fit in the memo ([`MemoPlan`]).
+        if !unknown.is_empty() && !inner.memo_plan().reserve(&names) {
+            inner
+                .counters
+                .skipped
+                .fetch_add(unknown.len() as u64, Ordering::Relaxed);
+            unknown.clear();
+        }
         if !unknown.is_empty() {
             self.schedule_embed(unknown);
         }
@@ -992,7 +1175,7 @@ impl L3SemanticCache {
         let room = inner.memo_room(inner.entry_bytes.load(Ordering::Acquire));
         for name in names {
             if room < memo_charge_for(&name, inner.config.embedding_dim)
-                || inner.memo.lock().contains(&name)
+                || inner.memo.read().contains(&name)
                 || !inner.in_flight.insert(name.clone())
             {
                 skip();
@@ -1107,16 +1290,21 @@ impl L3SemanticCache {
         )
     }
 
-    /// Clear all entries and remembered embeddings
+    /// Clear all entries and remembered embeddings. Each shard is emptied
+    /// under its own lock (and taken off the tier's totals with it), and
+    /// freed after that lock is released.
     pub async fn clear(&self) {
         let inner = &self.inner;
-        {
-            let mut store = inner.store.write();
-            *store = Store::default();
-            inner.entry_bytes.store(0, Ordering::Relaxed);
-            inner.entry_count.store(0, Ordering::Relaxed);
+        for shard in inner.shards.iter() {
+            let old = {
+                let mut guard = shard.write();
+                let old = std::mem::take(&mut *guard);
+                inner.forget(old.len, old.bytes);
+                old
+            };
+            drop(old);
         }
-        let mut memo = inner.memo.lock();
+        let mut memo = inner.memo.write();
         memo.clear();
         inner.memo_bytes.store(0, Ordering::Relaxed);
         inner.memo_len.store(0, Ordering::Relaxed);
@@ -2172,7 +2360,7 @@ mod tests {
         assert_eq!((h.entries, h.embeddings), (6, 2), "{h:?}");
         assert!(inner.memo_bytes.load(Ordering::Relaxed) <= budget / MEMO_SHARE_DIVISOR);
         {
-            let memo = inner.memo.lock();
+            let memo = inner.memo.read();
             assert!(memo.contains("c05") && memo.contains("c04"));
         }
 
@@ -2199,7 +2387,10 @@ mod tests {
         let h = cache.health();
         assert_eq!((h.entries, h.embeddings), (7, 0), "{h:?}");
         assert!(cache.retained_bytes() <= budget);
-        // Entries alone over the budget: the oldest go.
+        // Entries alone over the budget: entries go (oldest first within
+        // each shard; across the tier's shards the order is approximate), so
+        // the big one (which with the new one exceeds the budget) must, and
+        // the new one stays.
         let result = CachedResult::new(
             Bytes::from(vec![b'x'; budget / 2]),
             1,
@@ -2210,7 +2401,8 @@ mod tests {
         let sql = "SELECT huge FROM t8 WHERE id = 1";
         cache.store(&canon(sql), &ctx(), result, &|_| true);
         assert!(look(&cache, sql).is_some());
-        assert!(look(&cache, "SELECT c00 FROM t0 WHERE id = 1").is_none());
+        assert!(look(&cache, "SELECT big FROM t9 WHERE id = 1").is_none());
+        assert!(cache.len() < 8, "{}", cache.len());
         assert!(cache.retained_bytes() <= budget);
         assert_eq!(cache.health().too_large, 0);
     }
@@ -2370,7 +2562,7 @@ mod tests {
             .inner
             .memo_room(cache.inner.entry_bytes.load(Ordering::Relaxed));
         assert!(one <= room && room < 2 * one, "{room} vs {one}");
-        eventually("alt embedded", || cache.inner.memo.lock().contains("alt")).await;
+        eventually("alt embedded", || cache.inner.memo.read().contains("alt")).await;
         assert_eq!(fake.requests(), 2);
         assert_eq!(cache.health().embeddings, 1, "val made room for alt");
         let skipped = cache.health().embed_skipped;
@@ -2385,7 +2577,7 @@ mod tests {
         assert_eq!((h.embed_requests, h.embeddings), (2, 1), "{h:?}");
         assert_eq!(h.embed_skipped, skipped + 20, "{h:?}");
         assert_eq!(h.approximate_hits, 0);
-        assert!(cache.inner.memo.lock().contains("alt"));
+        assert!(cache.inner.memo.read().contains("alt"));
         assert_eq!(cache.len(), 2, "no entry was evicted");
 
         // Room for both: each name fetched once more (the clear dropped
@@ -2431,18 +2623,18 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(fake.requests(), 2, "the failed call, then val");
         assert_eq!(fake.last_prompt(), "val");
-        assert!(cache.inner.memo.lock().contains("val"));
+        assert!(cache.inner.memo.read().contains("val"));
         assert_eq!(cache.health().embeddings, 1);
     }
 
-    /// A store never waits on the memo lock while it holds the store lock.
+    /// A store never waits on the memo lock while it holds a shard's lock.
     /// A lookup scoring candidates holds the memo lock; a concurrent store
     /// used to park on it inside its store write lock, and through it every
     /// other session's lookup (exact hits included) blocked its worker.
     #[test]
     fn a_store_waiting_on_the_memo_never_holds_the_store_lock() {
         let cache = Arc::new(L3SemanticCache::new(config(&closed_endpoint(), 0.9)));
-        let memo = cache.inner.memo.lock();
+        let memo = cache.inner.memo.write();
         let storing = {
             let cache = cache.clone();
             std::thread::spawn(move || put(&cache, "SELECT val FROM kv WHERE id = 1", "r"))
@@ -2454,7 +2646,7 @@ mod tests {
         }
         // The entry is in; the store now waits on the memo lock.
         let free = loop {
-            if cache.inner.store.try_read().is_some() {
+            if cache.inner.shards.iter().all(|s| s.try_read().is_some()) {
                 break true;
             }
             if Instant::now() > deadline {
@@ -2512,8 +2704,8 @@ mod tests {
                 .memoize(format!("n{i}"), Arc::from(vec![1.0f32; 64]));
         }
         assert_eq!(cache.health().embeddings, 3);
-        assert!(!cache.inner.memo.lock().contains("n0"));
-        assert!(cache.inner.memo.lock().contains("n4"));
+        assert!(!cache.inner.memo.read().contains("n0"));
+        assert!(cache.inner.memo.read().contains("n4"));
     }
 
     #[test]
@@ -2578,5 +2770,451 @@ mod tests {
         assert_eq!((stats.entry_count, stats.total_accesses), (1, 1));
         cache.clear().await;
         assert!(cache.is_empty());
+    }
+
+    // ------------------------------------------------------------ shards
+
+    /// A tier of `max_entries` without a byte budget, exact matches only.
+    fn sharded(max_entries: usize) -> L3SemanticCache {
+        L3SemanticCache::new(L3Config {
+            max_entries,
+            max_bytes: 0,
+            ..config(&closed_endpoint(), 1.0)
+        })
+    }
+
+    /// The shard the bucket of `sql` (in [`ctx`]) lives in.
+    fn shard_of(cache: &L3SemanticCache, sql: &str) -> usize {
+        cache.inner.shard_index(bucket_key(&canon(sql), &ctx()))
+    }
+
+    /// The first `n` of `statement(0)`, `statement(1)`, ... whose bucket
+    /// lives in `shard`.
+    fn pick(
+        cache: &L3SemanticCache,
+        shard: usize,
+        n: usize,
+        statement: impl Fn(usize) -> String,
+    ) -> Vec<String> {
+        (0..)
+            .map(statement)
+            .filter(|sql| shard_of(cache, sql) == shard)
+            .take(n)
+            .collect()
+    }
+
+    /// The first `n` statements `SELECT v FROM {table} WHERE id = <k>` whose
+    /// bucket lives in `shard`.
+    fn in_shard(cache: &L3SemanticCache, table: &str, shard: usize, n: usize) -> Vec<String> {
+        pick(cache, shard, n, |k| {
+            format!("SELECT v FROM {table} WHERE id = {k}")
+        })
+    }
+
+    /// Each shard's (entries, bytes), checked against its slots: every
+    /// bucket is in the shard its key picks, none is empty or over
+    /// `max_variants`, every slot is in its shard's queue; and the tier's
+    /// totals are the sums.
+    fn books(cache: &L3SemanticCache) -> Vec<(usize, usize)> {
+        let inner = &cache.inner;
+        let per: Vec<(usize, usize)> = inner
+            .shards
+            .iter()
+            .enumerate()
+            .map(|(at, shard)| {
+                let shard = shard.read();
+                let (mut len, mut bytes) = (0, 0);
+                for (key, bucket) in &shard.buckets {
+                    assert_eq!(inner.shard_index(*key), at);
+                    assert!(!bucket.is_empty() && bucket.len() <= inner.config.max_variants);
+                    for slot in bucket {
+                        assert!(shard.fifo.contains(&(*key, slot.seq)), "shard {at}");
+                        len += 1;
+                        bytes += slot.charge;
+                    }
+                }
+                assert_eq!((shard.len, shard.bytes), (len, bytes), "shard {at}");
+                (len, bytes)
+            })
+            .collect();
+        assert_eq!(per.iter().map(|p| p.0).sum::<usize>(), cache.len());
+        assert_eq!(
+            per.iter().map(|p| p.1).sum::<usize>(),
+            inner.entry_bytes.load(Ordering::Relaxed)
+        );
+        per
+    }
+
+    /// Each shard's entries.
+    fn lens(cache: &L3SemanticCache) -> Vec<usize> {
+        books(cache).into_iter().map(|(len, _)| len).collect()
+    }
+
+    /// A result of `n` bytes.
+    fn sized(n: usize) -> CachedResult {
+        CachedResult::new(
+            Bytes::from(vec![b'x'; n]),
+            1,
+            Duration::from_secs(60),
+            vec!["test".to_string()],
+            Duration::from_millis(5),
+        )
+    }
+
+    /// The shard count follows `max_entries`: at least
+    /// `MIN_ENTRIES_PER_SHARD` of it per shard, a power of two, at most
+    /// `MAX_STORE_SHARDS`. A small tier is one shard (an exact FIFO).
+    #[test]
+    fn the_shard_count_follows_max_entries() {
+        for (max_entries, shards) in [
+            (0, 1),
+            (1, 1),
+            (63, 1),
+            (64, 2),
+            (127, 2),
+            (128, 4),
+            (1000, 16),
+            (2047, 32),
+            (2048, 64),
+            (5000, 64),
+            (usize::MAX, 64),
+        ] {
+            assert_eq!(shard_count(max_entries), shards, "{max_entries}");
+        }
+        let cache = sharded(5000);
+        assert_eq!((cache.inner.shards.len(), cache.inner.shard_mask), (64, 63));
+        assert_eq!(sharded(3).inner.shards.len(), 1);
+    }
+
+    /// `max_entries` bounds the whole tier, not each shard: a store over it
+    /// evicts the oldest entry of its own shard, and when its shard holds
+    /// nothing older than the new entry, the oldest of the following shards.
+    #[test]
+    fn the_entry_bound_holds_across_shards() {
+        let cache = sharded(128);
+        assert_eq!(cache.inner.shards.len(), 4);
+        let zero = in_shard(&cache, "t", 0, 129);
+        for sql in &zero[..128] {
+            put(&cache, sql, "r");
+        }
+        assert_eq!(lens(&cache), [128, 0, 0, 0]);
+        // Shard 1 holds nothing older than its new entry: shard 0 gives its
+        // oldest.
+        let one = in_shard(&cache, "u", 1, 1).remove(0);
+        put(&cache, &one, "new");
+        assert_eq!(lens(&cache), [127, 1, 0, 0]);
+        assert_eq!(look(&cache, &one), Some((Bytes::from("new"), false)));
+        assert_eq!(look(&cache, &zero[0]), None);
+        assert!(look(&cache, &zero[1]).is_some());
+        // A store into shard 0 evicts shard 0's oldest, not another shard's.
+        put(&cache, &zero[128], "r");
+        assert_eq!(lens(&cache), [127, 1, 0, 0]);
+        assert_eq!(look(&cache, &zero[1]), None);
+        assert!(look(&cache, &one).is_some());
+        // Stores into every shard: the bound holds after each.
+        for k in 0..600 {
+            put(&cache, &format!("SELECT w FROM x WHERE id = {k}"), "r");
+            assert_eq!(cache.len(), 128, "{k}");
+            if k % 50 == 0 {
+                books(&cache);
+            }
+        }
+        books(&cache);
+    }
+
+    /// `max_bytes` bounds the whole tier's entries the same way: a store
+    /// whose shard holds nothing older takes the room of the oldest entries
+    /// of the following shards, in turn.
+    #[test]
+    fn the_byte_bound_holds_across_shards() {
+        // Statements of one length: entries of one charge.
+        let statement = |k: usize| format!("SELECT v FROM t WHERE id = {}", 1000 + k);
+        let probe = sharded(128);
+        put(&probe, &statement(0), "r");
+        let one = probe.inner.entry_bytes.load(Ordering::Relaxed);
+        let cache = L3SemanticCache::new(L3Config {
+            max_entries: 128,
+            max_bytes: 10 * one,
+            ..config(&closed_endpoint(), 1.0)
+        });
+        assert_eq!(cache.inner.shards.len(), 4);
+        let bytes = || cache.inner.entry_bytes.load(Ordering::Relaxed);
+        let zero = pick(&cache, 0, 10, statement);
+        for sql in &zero {
+            put(&cache, sql, "r");
+        }
+        assert_eq!(bytes(), 10 * one);
+        let first = pick(&cache, 1, 1, statement).remove(0);
+        put(&cache, &first, "r");
+        assert_eq!(bytes(), 10 * one);
+        assert_eq!(lens(&cache), [9, 1, 0, 0]);
+        assert_eq!(look(&cache, &zero[0]), None);
+        // Four entries' worth in shard 2: shard 3 is empty, so shard 0 gives
+        // its four oldest; shard 1 is not reached.
+        let large = pick(&cache, 2, 1, statement).remove(0);
+        put(&cache, &large, &"x".repeat(3 * one));
+        assert!(bytes() <= 10 * one, "{} > {}", bytes(), 10 * one);
+        assert_eq!(lens(&cache), [5, 1, 1, 0]);
+        assert!(look(&cache, &large).is_some());
+        assert_eq!(look(&cache, &zero[4]), None);
+        assert!(look(&cache, &zero[5]).is_some());
+        // Stores of every size into every shard: the bound holds after each.
+        for k in 0..400 {
+            put(&cache, &statement(1000 + k), &"x".repeat(k % 5 * one));
+            assert!(bytes() <= 10 * one, "{k}: {} > {}", bytes(), 10 * one);
+            if k % 50 == 0 {
+                books(&cache);
+            }
+        }
+        books(&cache);
+        assert_eq!(cache.health().too_large, 0);
+    }
+
+    /// Within a shard eviction is oldest-inserted first, and a store evicts
+    /// from its own shard while it holds older entries: the tier's order is
+    /// only approximately FIFO (the entries of a shard that receives no
+    /// stores outlive newer ones of another).
+    #[test]
+    fn eviction_is_oldest_first_within_a_shard() {
+        let cache = sharded(128);
+        let zero = in_shard(&cache, "t", 0, 74);
+        let one = in_shard(&cache, "t", 1, 64);
+        // Shard 1's entries first: older than all of shard 0's.
+        for sql in &one {
+            put(&cache, sql, "1");
+        }
+        for sql in &zero[..64] {
+            put(&cache, sql, "0");
+        }
+        assert_eq!(lens(&cache), [64, 64, 0, 0]);
+        for k in 0..10 {
+            put(&cache, &zero[64 + k], "0");
+            assert_eq!(look(&cache, &zero[k]), None, "{k}");
+            assert!(look(&cache, &zero[k + 1]).is_some(), "{k}");
+        }
+        assert_eq!(lens(&cache), [64, 64, 0, 0]);
+        assert!(one.iter().all(|sql| look(&cache, sql).is_some()));
+    }
+
+    /// A purge drops the retired and expired slots of its bucket from its
+    /// shard and from the tier's totals; the other shards are untouched.
+    #[test]
+    fn a_purge_frees_its_slots_and_the_tier_totals() {
+        let cache = sharded(128);
+        let zero = in_shard(&cache, "t", 0, 1).remove(0);
+        let one = in_shard(&cache, "t", 1, 2);
+        put(&cache, &zero, "kept");
+        let mut retired = create_result("retired");
+        retired.generation = 7;
+        cache.store(&canon(&one[0]), &ctx(), retired, &|_| true);
+        let mut short = create_result("short");
+        short.ttl = Duration::ZERO;
+        short.cached_at = Instant::now() - Duration::from_millis(5);
+        cache.store(&canon(&one[1]), &ctx(), short, &|_| true);
+        let kept = books(&cache)[0].1;
+        assert_eq!(lens(&cache), [1, 2, 0, 0]);
+        assert!(matches!(
+            cache.lookup(&canon(&one[0]), &ctx(), &|r| r.generation != 7),
+            SemanticLookup::Stale
+        ));
+        assert!(matches!(
+            cache.lookup(&canon(&one[1]), &ctx(), &|_| true),
+            SemanticLookup::Miss
+        ));
+        assert_eq!(books(&cache), [(1, kept), (0, 0), (0, 0), (0, 0)]);
+        assert_eq!(cache.retained_bytes(), kept);
+        assert_eq!(look(&cache, &zero), Some((Bytes::from("kept"), false)));
+    }
+
+    /// `max_variants` bounds every bucket, whichever shard holds it: a full
+    /// bucket replaces its oldest variant.
+    #[test]
+    fn max_variants_bounds_every_bucket_of_every_shard() {
+        let cache = L3SemanticCache::new(L3Config {
+            max_entries: 128,
+            max_variants: 2,
+            max_bytes: 0,
+            ..config(&closed_endpoint(), 1.0)
+        });
+        // One shape per shard: the bucket of `SELECT <column> FROM t WHERE id
+        // = k` does not depend on the column.
+        let shapes: Vec<String> = (0..4)
+            .map(|shard| in_shard(&cache, "t", shard, 1).remove(0))
+            .collect();
+        let variant =
+            |sql: &str, column: &str| sql.replacen("SELECT v", &format!("SELECT {column}"), 1);
+        for sql in &shapes {
+            for column in ["a", "b", "c"] {
+                put(&cache, &variant(sql, column), column);
+            }
+        }
+        assert_eq!(lens(&cache), [2, 2, 2, 2]);
+        for sql in &shapes {
+            assert_eq!(look(&cache, &variant(sql, "a")), None);
+            assert_eq!(
+                look(&cache, &variant(sql, "b")),
+                Some((Bytes::from("b"), false))
+            );
+            assert_eq!(
+                look(&cache, &variant(sql, "c")),
+                Some((Bytes::from("c"), false))
+            );
+        }
+    }
+
+    /// Several threads storing (new keys, replacements, variants, retired and
+    /// oversized results) and looking up (hits, misses, retired entries,
+    /// which are purged) at once, each on keys of its own: afterwards every
+    /// shard's books match its slots, the tier's totals are their sums, both
+    /// bounds hold, and the hit and too-large counters equal what the threads
+    /// saw; at no moment did the tier hold more than one entry (and one
+    /// entry's bytes) over a bound per thread.
+    #[test]
+    fn concurrent_stores_and_lookups_keep_the_books_and_the_bounds() {
+        const THREADS: usize = 8;
+        const KEYS: usize = 100;
+        const ROUNDS: usize = 3000;
+        const UNIT: usize = 64;
+        let max_entries = 256;
+        // The largest entry: the longest statement with the largest result.
+        let max_charge = {
+            let probe = sharded(max_entries);
+            let sql = format!("SELECT a FROM s{} WHERE id = {}", THREADS - 1, KEYS - 1);
+            probe.store(&canon(&sql), &ctx(), sized(3 * UNIT), &|_| true);
+            probe.inner.entry_bytes.load(Ordering::Relaxed)
+        };
+        let max_bytes = 200 * max_charge;
+        let cache = Arc::new(L3SemanticCache::new(L3Config {
+            max_entries,
+            max_variants: 2,
+            max_bytes,
+            ..config(&closed_endpoint(), 1.0)
+        }));
+        assert_eq!(cache.inner.shards.len(), 8);
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (cache, stop) = (cache.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut peak = (0, 0);
+                while !stop.load(Ordering::Acquire) {
+                    peak.0 = cache.len().max(peak.0);
+                    peak.1 = cache.inner.entry_bytes.load(Ordering::Relaxed).max(peak.1);
+                    std::thread::yield_now();
+                }
+                peak
+            })
+        };
+        let workers: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let cache = cache.clone();
+                std::thread::spawn(move || {
+                    // This thread's keys (a table of its own): KEYS shapes,
+                    // three variants of each.
+                    let forms: Vec<Canonical> = (0..KEYS)
+                        .flat_map(|k| {
+                            ["a", "b", "c"].map(|column| {
+                                canon(&format!("SELECT {column} FROM s{t} WHERE id = {k}"))
+                            })
+                        })
+                        .collect();
+                    let (mut hits, mut too_large) = (0u64, 0u64);
+                    let hit =
+                        |l: SemanticLookup| u64::from(matches!(l, SemanticLookup::Hit { .. }));
+                    for round in 0..ROUNDS {
+                        // Five rounds per form (store, replace, look up, look up
+                        // with half retired, store again), then the next form.
+                        let c = &forms[(round / 5 * 13 + t) % forms.len()];
+                        let generation = round as u64;
+                        match round % 5 {
+                            0 | 1 => {
+                                let mut r = sized(round % 4 * UNIT);
+                                r.generation = generation;
+                                cache.store(c, &ctx(), r, &|_| true);
+                            }
+                            2 => hits += hit(cache.lookup(c, &ctx(), &|_| true)),
+                            3 => hits += hit(cache.lookup(c, &ctx(), &|r| r.generation % 3 != 0)),
+                            _ => {
+                                let oversized = round % 50 == 4;
+                                let mut r = sized(if oversized { max_bytes + 1 } else { UNIT });
+                                r.generation = generation;
+                                too_large += u64::from(oversized);
+                                cache.store(c, &ctx(), r, &|old| old.generation % 2 == 0);
+                            }
+                        }
+                    }
+                    (hits, too_large)
+                })
+            })
+            .collect();
+        let (hits, too_large) = workers
+            .into_iter()
+            .map(|w| w.join().unwrap())
+            .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        stop.store(true, Ordering::Release);
+        let (peak_len, peak_bytes) = watcher.join().unwrap();
+        books(&cache);
+        let bytes = cache.inner.entry_bytes.load(Ordering::Relaxed);
+        assert!(cache.len() <= max_entries, "{}", cache.len());
+        assert!(bytes <= max_bytes, "{bytes} > {max_bytes}");
+        assert!(peak_len <= max_entries + THREADS, "{peak_len}");
+        assert!(
+            peak_bytes <= max_bytes + THREADS * max_charge,
+            "{peak_bytes} > {max_bytes} + {THREADS} x {max_charge}"
+        );
+        let h = cache.health();
+        assert!(hits > 0 && too_large > 0 && !cache.is_empty());
+        assert_eq!(cache.stats().total_accesses, hits);
+        assert_eq!(h.too_large, too_large);
+        assert_eq!((h.approximate_hits, h.embeddings), (0, 0));
+        assert_eq!(h.entries as usize, cache.len());
+    }
+
+    /// Whether `put(sql)` on another thread completes within 5 s while this
+    /// thread holds `guard` (a lock of the memo); the guard is then released.
+    fn store_completes_while<G>(cache: &Arc<L3SemanticCache>, sql: &'static str, guard: G) -> bool {
+        let done = Arc::new(AtomicBool::new(false));
+        let storing = {
+            let (cache, done) = (cache.clone(), done.clone());
+            std::thread::spawn(move || {
+                put(&cache, sql, "r");
+                done.store(true, Ordering::Release);
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let completed = done.load(Ordering::Acquire);
+        drop(guard);
+        storing.join().unwrap();
+        completed
+    }
+
+    /// With the approximate part off (threshold 1.0) the memo stays empty,
+    /// and a store never takes its lock. Every store used to lock it to trim
+    /// it: a second tier-wide lock on the miss path of every hinted read.
+    #[test]
+    fn a_store_takes_no_memo_lock_while_approximation_is_off() {
+        let cache = Arc::new(L3SemanticCache::new(config(&closed_endpoint(), 1.0)));
+        let guard = cache.inner.memo.write();
+        let sql = "SELECT val FROM kv WHERE id = 1";
+        assert!(store_completes_while(&cache, sql, guard));
+        assert!(look(&cache, sql).is_some());
+    }
+
+    /// With the approximate part on, a store whose entry leaves the memo its
+    /// room only reads the memo (for the names it lacks); it write-locks it
+    /// only to trim it.
+    #[test]
+    fn a_store_only_reads_the_memo_while_it_has_room() {
+        let cache = Arc::new(L3SemanticCache::new(config(&closed_endpoint(), 0.9)));
+        cache
+            .inner
+            .memoize("val".to_string(), Arc::from(vec![0.5f32; 64]));
+        let guard = cache.inner.memo.read();
+        let sql = "SELECT val FROM kv WHERE id = 1";
+        assert!(store_completes_while(&cache, sql, guard));
+        assert!(look(&cache, sql).is_some());
+        assert_eq!(cache.health().embeddings, 1);
     }
 }

@@ -1530,9 +1530,11 @@ pub struct CacheToml {
     /// it needs `semantic_match = "canonical"` (substitution works on the
     /// canonical form).
     pub semantic_similarity_threshold: f64,
-    /// Maximum semantic entries, and maximum remembered column-name
-    /// embeddings. Entries are evicted oldest-inserted first. Must be >= 1.
-    /// Default 5000.
+    /// Maximum semantic entries (the whole tier), and maximum remembered
+    /// column-name embeddings. Entries are evicted oldest-inserted first
+    /// within each of the tier's shards (`semantic_max_entries / 32` rounded
+    /// down to a power of two, 1 to 64), so only approximately in insertion
+    /// order across the tier. Must be >= 1. Default 5000.
     pub semantic_max_entries: usize,
     /// Maximum entries kept for one statement shape that differ only in
     /// their bare select-list columns; a full shape replaces its oldest. This

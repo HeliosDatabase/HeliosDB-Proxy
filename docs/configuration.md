@@ -867,9 +867,9 @@ ttl_secs = 10
 | `semantic_enabled` | bool | `false` | Turn on the L3 semantic tier (with `enabled = true`; alone it only logs a warning). Used only by statements that carry `/*helios:cache=semantic*/` (also `semantic`, `cache=l3`, `cache=vector`), after L1 and L2 miss, and only by single-table SELECTs of its [grammar](#semantic-tier-l3); any other statement uses L1/L2. Under `strict_config`, a build without `query-cache` refuses it. |
 | `semantic_match` | string | `"verbatim"` | How the semantic tier matches a read. `"verbatim"`: an entry stored for the same statement text as the backend receives it, hint comments included (still only statements of the [grammar](#semantic-tier-l3)); sound on every backend. `"canonical"`: the canonical form (hint comments, whitespace, keyword case, `!=`/`<>`, the relation alias and `AS` fold; names keep their case), **PostgreSQL semantics only**: once a backend reports a HeliosDB `server_version` the tier neither stores nor serves (counted in `semantic_ineligible`) and one warning names this key and the node. Any other value is a startup error. |
 | `semantic_similarity_threshold` | f64 | `1.0` | `1.0`: exact matches only; the embedding endpoint is **never contacted**. Below 1.0 (only with `semantic_match = "canonical"`; with `"verbatim"` a startup error names both keys), a bare select-list column of a statement without `DISTINCT` or `GROUP BY` may be served from an entry listing another column at the same position whose name embeds at or above this cosine (an approximate hit). **Caution: such a hit returns the values of a different column at that position** (the stored statement's rows, never other rows), under the stored column's name. Must be finite, > 0 and ≤ 1. |
-| `semantic_max_entries` | usize | `5000` | Maximum semantic entries, and remembered column-name embeddings; entries are evicted oldest-inserted first. ≥ 1. |
+| `semantic_max_entries` | usize | `5000` | Maximum semantic entries (the whole tier), and remembered column-name embeddings; entries are evicted oldest-inserted first within each of the tier's shards, so only approximately in insertion order across the tier ([bounds and eviction](#semantic-tier-l3)). It also sets the shard count: `semantic_max_entries / 32` rounded down to a power of two, 1 to 64 (64 at the default). ≥ 1. |
 | `semantic_max_variants` | usize | `16` | Maximum entries of one statement shape that differ only in their bare select-list columns (a full shape replaces its oldest). Bounds the cost of a lookup. 1–1024. |
-| `semantic_max_bytes` | usize | `67108864` | Byte budget for semantic entries plus remembered embeddings. Embeddings take at most a quarter of it and yield first (least recently used first); entries are evicted oldest first only while they alone exceed it, never to make room for embeddings. A result whose entry alone exceeds it (the result plus the entry's statement and bookkeeping) is not stored in the tier — it uses L1/L2 only, nothing is evicted for it, and it is counted in `semantic_too_large`; startup logs a warning when this is below `max_result_bytes`. `0` = no byte budget (`semantic_max_entries` still applies to both). |
+| `semantic_max_bytes` | usize | `67108864` | Byte budget for semantic entries plus remembered embeddings. Embeddings take at most a quarter of it and yield first (least recently used first); entries are evicted oldest first (within a shard, as for `semantic_max_entries`) only while they alone exceed it, never to make room for embeddings. A result whose entry alone exceeds it (the result plus the entry's statement and bookkeeping) is not stored in the tier — it uses L1/L2 only, nothing is evicted for it, and it is counted in `semantic_too_large`; startup logs a warning when this is below `max_result_bytes`. `0` = no byte budget (`semantic_max_entries` still applies to both). |
 | `semantic_ttl_secs` | u64 | `3600` | Upper bound on a semantic entry's lifetime: min(hint TTL, table TTL or `ttl_secs`, this). ≥ 1. |
 | `semantic_embedding_endpoint` | string | `"http://localhost:11434"` | Base URL of an Ollama-compatible embedding service (`POST {url}/api/embeddings` with `{"model","prompt"}`). http or https with a host, no user, password, query or fragment, no leading or trailing whitespace and no control characters; a trailing `/` is ignored; system HTTP proxies are not used. It only ever receives column names, in the background. |
 | `semantic_embedding_model` | string | `"all-minilm"` | Model name sent with each request. Non-empty, no control characters. |
@@ -1181,6 +1181,22 @@ it once (only when the threshold is below 1.0). Watch
 **Ollama** unloads an idle model; a cold load can exceed `semantic_embedding_timeout_ms`
 and mark the endpoint down for a retry window. Set `OLLAMA_KEEP_ALIVE` (e.g. `-1`) on the
 Ollama server, or raise the timeout.
+
+**Bounds and eviction.** The tier's entries are split into shards by statement shape and
+session context (`semantic_max_entries / 32` rounded down to a power of two, from 1 to 64;
+64 at the default 5000 entries, about 78 each). A lookup or a store locks only its own
+shard, and a store copies and sizes everything it keeps before it takes that lock, so
+hinted reads of different statements do not wait on each other (the miss path of a
+random-key workload stores on every read). `semantic_max_entries` and
+`semantic_max_bytes` bound the **whole tier**: a store that takes it over either bound
+evicts the oldest entries of its own shard, and only when that shard holds nothing older
+than the new entry the oldest of the following shards, in turn. Eviction is therefore
+oldest-inserted first within a shard and only approximately across the tier: an entry
+can outlive an older one of a shard that received fewer stores (a tier below 64 entries
+is one shard, an exact FIFO). The bounds hold whenever no store is in progress; while
+stores run concurrently each can hold the tier one entry over them (or evict one more than
+needed) for the moment it takes. With `semantic_similarity_threshold` at 1.0 a store never
+touches the embedding memo.
 
 Other limits: simple query protocol only; a standby-served result is never stored, so
 with read offload (`[load_balancer] standby_reads`) hinted reads that a standby serves
