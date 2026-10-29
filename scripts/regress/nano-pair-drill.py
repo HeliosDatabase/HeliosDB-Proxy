@@ -30,6 +30,14 @@ Cases:
                  lag ceiling (nodes sampled every 0.5 s)
   kill_primary   SIGKILL the primary: the leader is dropped, writes fail closed; the
                  restarted primary is the leader again and the standby survived
+  promote        (a fixture with `--promote standby`, Nano P5.1) a transaction is left open
+                 on the primary, the standby is promoted with the fence: the proxy's leader
+                 moves to the standby's address (higher timeline, the fenced node failing
+                 heliosdb_require_ready()), writes land there, the fenced node leaves the
+                 read set and refuses a direct write (25006), and the open transaction's
+                 next statement fails while its uncommitted row never appears. Last case:
+                 the pair stays promoted. Without the fixture action it is SKIPPED (listed
+                 under `skipped`, never counted as a pass).
 Exit 1 if any case fails its expectation.
 """
 import argparse
@@ -89,7 +97,12 @@ class Client:
         self.sock.sendall(b"Q" + struct.pack("!I", len(payload) + 4) + payload)
         rows, errors, tags = [], [], []
         while True:
-            tag, body = recv_message(self.sock)
+            try:
+                tag, body = recv_message(self.sock)
+            except ConnectionError:
+                if not errors:  # a FATAL before the close still names its SQLSTATE
+                    raise
+                break
             tags.append(tag.decode())
             if tag == b"D":
                 ncols = struct.unpack("!H", body[:2])[0]
@@ -123,13 +136,15 @@ class Client:
 
 
 def write(sql):
-    client = Client(PROXY_PORT)
+    client = None
     try:
+        client = Client(PROXY_PORT)  # a refused startup is a result too, never an exception
         return client.query(sql)
     except (ConnectionError, OSError, RuntimeError) as error:
         return {"rows": [], "errors": [{"M": str(error)}], "tags": "", "sqlstate": "connection"}
     finally:
-        client.close()
+        if client is not None:
+            client.close()
 
 
 # ---------------------------------------------------------------- admin API
@@ -366,6 +381,44 @@ def main():
               {"leader_dropped": dropped, "write_while_down": refused, "standby_while_primary_down": standby_alive,
                "fixture_restart": restarted, "leader_after_restart": back, "write_after_restart": resumed,
                "standby_after": standby_after})
+
+        # ---- promote (fixture action from Nano P5.1)
+        if "--promote" not in pathlib.Path(args.fixture).read_text():
+            report.setdefault("skipped", []).append("promote")
+            print("  SKIP promote: the fixture has no --promote action (Nano before P5.1)")
+        else:
+            pinned = Client(PROXY_PORT)
+            opened = [pinned.query("BEGIN"), pinned.query("INSERT INTO drill VALUES (6, 'six')")]
+            promoted = fixture.run("--promote", "standby")
+            moved = wait_for(lambda: primary() == STANDBY and node(STANDBY)["healthy"] and primary(), 60)
+            try:
+                after_fence = pinned.query("INSERT INTO drill VALUES (7, 'seven')")
+            except (ConnectionError, OSError, RuntimeError) as error:
+                after_fence = {"rows": [], "errors": [{"M": str(error)}], "tags": "", "sqlstate": "connection"}
+            pinned.close()
+            landed = write("INSERT INTO drill VALUES (8, 'eight')")
+            time.sleep(1.5)
+            new_row = write("SELECT count(*) FROM drill WHERE id = 8")
+            lost_rows = write("SELECT count(*) FROM drill WHERE id IN (6, 7)")
+            fenced = wait_for(lambda: node(PRIMARY)["healthy"] is False and PRIMARY not in replicas()
+                              and node(PRIMARY), 30)
+            try:
+                direct = Client(int(PRIMARY.rsplit(":", 1)[1]))
+                direct_write = direct.query("INSERT INTO drill VALUES (9, 'nine')")
+                direct.close()
+            except (ConnectionError, OSError, RuntimeError) as error:
+                direct_write = {"errors": [{"M": str(error)}], "sqlstate": "connection"}
+            epochs = (promoted or {}).get("nodes")
+            check(cases, "promote",
+                  all(not o["errors"] for o in opened) and moved == STANDBY
+                  and after_fence["sqlstate"] is not None and not landed["errors"]
+                  and new_row["rows"] == [["1"]] and lost_rows["rows"] == [["0"]]
+                  and bool(fenced) and direct_write["sqlstate"] == "25006",
+                  {"open_transaction": opened, "fixture_promote": promoted, "epochs": epochs,
+                   "leader_after_promote": moved, "open_transaction_after_fence": after_fence,
+                   "write_after_promote": landed, "row_after_promote": new_row,
+                   "uncommitted_rows_visible": lost_rows, "fenced_node": fenced,
+                   "direct_write_on_fenced_node": direct_write})
     except Exception as error:  # noqa: BLE001 - the report must say what broke
         cases["exception"] = {"ok": False, "error": repr(error)}
         print(f"  FAIL exception: {error!r}")

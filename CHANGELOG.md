@@ -101,7 +101,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[health] check_query = "SELECT heliosdb_require_ready()"`, lag routing in Nano sequence
   units) in front of HeliosDB-Nano's physical primary + standby fixture and checks startup,
   read offload, the chaos overrides, SIGKILL and restart of either side, and a sustained
-  load. First run against Nano P2.1 (d9d49e90): 8/8.
+  load. First run against Nano P2.1 (d9d49e90): 8/8. A ninth case, `promote`, runs when the
+  fixture has `--promote standby` (Nano P5.1): a transaction left open on the primary, a
+  fenced promotion of the standby, the leader moving to it, the fenced node leaving the read
+  set, and the open transaction failing without its row appearing; older fixtures skip it.
 - **Semantic cache tier (L3) in `[cache]`** (Sprinter 91c4af7cc20e): `semantic_enabled`,
   `semantic_match` (default `"verbatim"`), `semantic_similarity_threshold` (default `1.0`;
   below it needs `semantic_match = "canonical"`, else a startup error names both keys),
