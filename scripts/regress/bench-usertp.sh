@@ -19,6 +19,18 @@
 #         cells; unset = pgbench default, simple)
 #         TR_MODE=session (the proxy's tr_mode; `transaction` exercises the
 #         in-session replay recording, e.g. [multi_tenancy] replay budgets)
+#         EXTRA_TOML=$'[cache]\nenabled = true'   appended verbatim to the generated
+#             proxy config (after [[nodes]]: start it with a [section] header)
+#         READ_SCRIPT=/path/read.sql   a pgbench script for the read cells instead of
+#             the built-in select-only (-S); copied into $OUT and run as -f /w/<name>
+#             with -s <scale>, the scale read once from the backend's pgbench_branches
+#             (pgbench detects it only for its built-in scripts: a custom one would see
+#             :scale = 1 and read a tenth of the accounts -S reads at scale 10).
+#             E.g. a hinted point read for the semantic cache tier, the same key space
+#             as -S:
+#               \set aid random(1, 100000 * :scale)
+#               SELECT abalance FROM pgbench_accounts WHERE aid = :aid /*helios:cache=semantic*/;
+#             (pgbench's default simple protocol is the one the query cache serves.)
 #
 # Each proxy mode's GET /metrics JSON is saved, at the end of its cells, as
 # $OUT/$LABEL-<mode>-metrics.json (e.g. to check `tenant_budgets`).
@@ -50,10 +62,31 @@ OUT="${OUT:-/tmp/bench-usertp}"; mkdir -p "$OUT"
 # warm-up pgbench and the psql probes stay simple.
 case "${PGBENCH_PROTOCOL:-}" in ""|simple|extended|prepared) ;; *) echo "FATAL: PGBENCH_PROTOCOL must be simple, extended or prepared" >&2; exit 2;; esac
 [ -n "${PGBENCH_PROTOCOL:-}" ] && echo "PGBENCH_PROTOCOL=$PGBENCH_PROTOCOL"
+case "${PGBENCH_PROTOCOL:-simple}" in simple) ;; *)
+  [ -n "${READ_SCRIPT:-}" ] && echo "WARN: READ_SCRIPT with PGBENCH_PROTOCOL=$PGBENCH_PROTOCOL measures the extended read path, which the query cache does not serve" >&2;;
+esac
 RUNS_JSON="$OUT/$LABEL-results.json"
 PROXYPID=""
 
 pg(){ docker run --rm --network host -e PGPASSWORD="$BPASS" "$IMG" "$@"; }
+
+# Read cells run the built-in select-only script unless READ_SCRIPT names one.
+# A custom script gets the scale the built-in one detects (pgbench sets :scale
+# from pgbench_branches for its built-in scripts only, 1 otherwise), so both
+# arms of a comparison read the same key space.
+READ_ARGS=(-S)
+if [ -n "${READ_SCRIPT:-}" ]; then
+  [ -r "$READ_SCRIPT" ] || { echo "READ_SCRIPT=$READ_SCRIPT is not readable" >&2; exit 2; }
+  SCALE=$(pg psql -h "$PGHOST" -p "$PGPORT" -U "$BUSER" -d "$BDB" -qAtc \
+    "select count(*) from pgbench_branches" 2>/dev/null | tr -d '[:space:]')
+  case "$SCALE" in
+    ''|*[!0-9]*|0) echo "READ_SCRIPT: could not read the scale from pgbench_branches (got '$SCALE')" >&2; exit 2 ;;
+  esac
+  cp "$READ_SCRIPT" "$OUT/$(basename "$READ_SCRIPT")"
+  READ_ARGS=(-s "$SCALE" -f "/w/$(basename "$READ_SCRIPT")")
+  echo "READ_SCRIPT=$READ_SCRIPT scale=$SCALE"
+fi
+
 # pgbench runs in a container: mount $OUT so its -l log lands on the host.
 # PGOPTIONS (e.g. "-c synchronous_commit=off") is passed through to pgbench so the
 # write path can be measured CPU-bound instead of fsync-bound when the backend's
@@ -234,7 +267,7 @@ for mode in $MODES; do
     # tails are the read-path SLA.
     readlog="$OUT/$LABEL-$mode-read-$clients.log"
     c0=$(checkpoints_started)
-    read_out=$(run_pgbench "$host" "$port" "$clients" "$DUR" "$readlog" -S)
+    read_out=$(run_pgbench "$host" "$port" "$clients" "$DUR" "$readlog" "${READ_ARGS[@]}")
     read_ckpts=$(ckpt_delta "$c0" "$(checkpoints_started)")
     read_tps=${read_out%% *}; read_failed=${read_out##* }
     read_p=$(percentiles "$readlog")

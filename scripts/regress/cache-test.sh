@@ -9,7 +9,12 @@
 #   2. mutate v directly on the backend;
 #   3. proxy read returns the STALE cached value (cache hit, no backend trip);
 #   4. a write THROUGH the proxy invalidates the table's cache;
-#   5. the next proxy read returns the fresh value.
+#   5. the next proxy read returns the fresh value;
+#   6. after another direct write, the same read with a trailing multi-key hint
+#      comment carrying cache=skip returns the NEW value (base-failing: the cache's
+#      hint parser read `cache_ttl=60,cache=skip` as one key and served the
+#      cached row). No route=primary next to it: with [routing_hints] on that
+#      alone makes the read a write that bypasses the cache.
 #
 # Usage:  ./cache-test.sh /path/to/heliosdb-proxy  (binary built with the
 # `query-cache` feature).
@@ -69,7 +74,14 @@ pP -tAc "update cache_probe set v = 3" >/dev/null 2>&1
 r3=$(pP -tAc "select v from cache_probe" 2>/dev/null | tr -d '[:space:]')
 [ "$r3" = "3" ] && ok write_invalidates_cache "($r3)" || bad write_invalidates_cache "got=$r3 (want 3)"
 
-# 6. the proxy logged at least one cache hit.
+# 6. cache=skip inside a comma-separated hint comment bypasses the cache. The
+#    plain read above stored v=3; v becomes 4 behind the proxy's back.
+pD -tAc "update cache_probe set v = 4" >/dev/null 2>&1
+r4=$(pP -tAc "select v from cache_probe /*helios:cache_ttl=60,cache=skip*/" 2>/dev/null | tr -d '[:space:]')
+[ "$r4" = "4" ] && ok skip_hint_in_key_list "($r4)" \
+  || bad skip_hint_in_key_list "got=$r4 (want 4: the cache=skip hint was not honoured)"
+
+# 7. the proxy logged at least one cache hit.
 grep -qi 'cache hit' "$LOG" && ok cache_hit_logged || bad cache_hit_logged "no 'cache hit' in proxy log"
 
 echo "== query-cache: PASS=$PASS FAIL=$FAIL =="

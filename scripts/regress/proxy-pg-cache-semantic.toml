@@ -1,0 +1,56 @@
+# Regression harness — single-node PG 18.4 with the query-result cache, its
+# semantic tier (L3) and a table exclusion, for scripts/regress/cache-semantic-drill.py.
+# The embedding endpoint is scripts/regress/embed-stub.py on loopback. semantic_match
+# and the similarity threshold are left at their defaults ("verbatim"; 1.0, the
+# endpoint never contacted), which the drill's phase 0 runs; its later phases add
+# semantic_match = "canonical", and semantic_similarity_threshold = 0.92 for the
+# approximate, hung-endpoint and recovery steps.
+listen_address = "127.0.0.1:6432"
+admin_address  = "127.0.0.1:9099"
+strict_config = true
+tr_enabled = false
+tr_mode    = "none"
+write_timeout_secs = 30
+
+[pool]
+min_connections = 1
+max_connections = 20
+idle_timeout_secs = 300
+max_lifetime_secs = 1800
+acquire_timeout_secs = 5
+test_on_acquire = true
+
+[load_balancer]
+read_strategy = "round_robin"
+read_write_split = false
+latency_threshold_ms = 100
+
+[health]
+check_interval_secs = 30
+check_timeout_secs = 3
+failure_threshold = 3
+success_threshold = 2
+check_query = "SELECT 1"
+
+# A leading /*helios:cache=...*/ hint reaches the cache through the strip.
+[routing_hints]
+enabled = true
+strip_hints = true
+
+[cache]
+enabled = true
+ttl_secs = 300
+max_result_bytes = 1048576
+semantic_enabled = true
+semantic_embedding_endpoint = "http://127.0.0.1:${HELIOS_EMBED_STUB_PORT:-18434}"
+semantic_embedding_timeout_ms = 500
+semantic_embedding_retry_secs = 3
+exclude_tables = ["secret"]
+
+[[nodes]]
+host = "127.0.0.1"
+port = 25433
+role = "primary"
+weight = 100
+enabled = true
+name = "pg-primary"
