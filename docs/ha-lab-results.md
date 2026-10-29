@@ -227,6 +227,32 @@ lease lapsed (26 samples without a write target) and no write that started after
 completed before the latency was removed; 200 committed after the heal; nothing acknowledged
 is missing on the leader. 566 writes in all, 0 errors, 0 unknown.
 
+## 2026-10-29, reconnect wave with a heavy tenant (ac858d61400b), branch feat/tenant-budgets-20261023
+
+Binary `heliosdb-proxy-tenant-a6344f4-topo` (sha256 `4af41997…ddb43`, `--features
+all-features,postgres-topology`, release). Evidence:
+`/home/gpc/HDB/sprint/baselines/proxy/ac858d61400b-20261023/live/lab-reconnect-wave-2`
+(candidate config) and `lab-reconnect-wave-control` (main's `proxy-wave.toml` through
+`LAB_WAVE_CONFIG`, no heavy tenant). A third tenant, `heavy`, runs 6 clients of
+transactions with four 64 KiB statements against its active-query cap (2, 10 s wait) and
+replay-byte budget (300000).
+
+| run | checks | peak reconnects to one node | permit waits / refusals | TR re-homes | big tenant back to ½ throughput | small tenant | proxy RSS before kill → end |
+|---|---|---|---|---|---|---|---|
+| heavy tenant | PASS, 11/11 | 4 | 1142 / 0 | 52 | 1.3 s | 0 aborted, served outside 17-19 s (kill 15.0 s, promotion 19.7 s) | 17.7 MiB → 17.3 MiB |
+| control, main's config | PASS, 6/6 | 4 | 957 / 0 | 48 | 1.9 s | 0 aborted, served outside 17-20 s | 16.2 MiB → 16.9 MiB |
+
+Heavy tenant: at most 2 active queries sampled (its cap), 352 waits and 0 refusals at the
+cap; replay bytes peaked at 262243 of 300000, 177 statements marked non-replayable by the
+budget, 0 bytes held at the end. The base binary refuses the candidate's
+`proxy-wave.toml` at startup (`strict_config: unknown config keys:
+multi_tenancy.active_query_wait_ms, …`).
+
+A first candidate run failed `small_tenant_served` (10/11) because the verdict placed the
+kill 2 s before the promotion while `docker compose kill` itself took about 8 s on the
+loaded host, so the "served before the kill" window covered the outage. The driver now
+records `kill_ms` before issuing the kill (commit 3f44407) and the rerun above uses it.
+
 ## Not covered yet
 
 Kernel-level network faults (`tc netem` delay and loss, `iptables` partitions): this host
