@@ -46,9 +46,16 @@
 #                        is killed and pg-b promoted. Judged: the small tenant
 #                        keeps being served, reconnects in progress stay within
 #                        [limits] max_concurrent_reconnects_per_node, the proxy's
-#                        RSS stays bounded, the big tenant recovers.
+#                        RSS stays bounded, the big tenant recovers. A
+#                        "heavy" tenant (ac858d61400b) runs WAVE_HEAVY (6)
+#                        clients of 4 x 64 KiB-statement transactions against
+#                        its active-query cap (2) and replay-byte budget
+#                        (300000): judged within both, both engaged, and its
+#                        replay bytes returned at the end.
 #                        LAB_WAVE_CONFIG replaces proxy-wave.toml (e.g. a
-#                        control run with another reconnect limit).
+#                        control run with another reconnect limit); then
+#                        WAVE_HEAVY defaults to 0 (no heavy tenant, no heavy
+#                        checks) since the control config has no such tenant.
 #
 # PROXY_BINARY must be built with `postgres-topology` (and runs inside the
 # postgres:18.4-bookworm image, so a glibc build from this host works).
@@ -94,11 +101,16 @@ case "$SCENARIO" in
 esac
 [ -x "$BIN" ] || { echo "not executable: $BIN" >&2; exit 2; }
 
+# reconnect-wave: the heavy tenant's clients; a control config (LAB_WAVE_CONFIG)
+# has no heavy tenant unless asked for.
+WAVE_HEAVY="${WAVE_HEAVY:-$([ -n "${LAB_WAVE_CONFIG:-}" ] && echo 0 || echo 6)}"
+
 if [ "${LAB_LOCKED:-0}" != 1 ]; then
   exec flock "$LOCK" systemd-run --user --scope --collect --quiet \
     -p MemoryMax=24G -p MemorySwapMax=0 \
     env LAB_LOCKED=1 LEDGER_SECS="$LEDGER_SECS" LEDGER_WORKERS="$LEDGER_WORKERS" \
     WAVE_CLIENTS="${WAVE_CLIENTS:-48}" WAVE_SMALL="${WAVE_SMALL:-2}" WAVE_SECS="${WAVE_SECS:-60}" \
+    WAVE_HEAVY="$WAVE_HEAVY" \
     STEP_TIMEOUT="$STEP_TIMEOUT" LAB_PROXY_A_CONFIG="${LAB_PROXY_A_CONFIG:-./proxy-a.toml}" \
     LAB_TLS_DIR="${LAB_TLS_DIR:-./}" \
     LAB_PROXY_B_CONFIG="${LAB_PROXY_B_CONFIG:-./proxy-b.toml}" bash "$0" "$BIN" "$SCENARIO" "$OUT"
@@ -206,6 +218,15 @@ if [ "$SCENARIO" = reconnect-wave ]; then
     timeout "$((WAVE_SECS + STEP_TIMEOUT))" "${COMPOSE[@]}" exec -T -e PGAPPNAME="$tenant" ledger \
       pgbench -h 127.0.0.1 -p 27710 -U lab -n -c "$clients" -j "$threads" -T "$WAVE_SECS" -P 1 "$@" lab
   }
+  # The heavy tenant's transaction: the large statements first, so each one
+  # holds ~262 kB of replay history for ~0.3 s and the other permit holder's
+  # statements overflow the tenant's 300000-byte budget.
+  if [ "$WAVE_HEAVY" -gt 0 ]; then
+    lit=$(head -c 65536 /dev/zero | tr '\0' x)
+    { echo "BEGIN;"; for _ in 1 2 3 4; do echo "SELECT length('$lit');"; done
+      echo "SELECT pg_sleep(0.3);"; echo "END;"; } \
+      | "${COMPOSE[@]}" exec -T ledger sh -c 'cat >/results/wave-heavy.sql'
+  fi
   proxy_pid="$(docker inspect -f '{{.State.Pid}}' "$PROJECT-proxy-a-1")"
   python3 -I "$HERE/wave_sampler.py" "http://127.0.0.1:27790" helios-lab-admin "$proxy_pid" \
     "$OUT/wave-samples.tsv" "$OUT/wave-stop" 2>>"$OUT/driver.log" &
@@ -215,6 +236,11 @@ if [ "$SCENARIO" = reconnect-wave ]; then
   BIG_PID=$!
   pgb small "$WAVE_SMALL" 1 -S >"$OUT/pgbench-small.log" 2>&1 &
   SMALL_PID=$!
+  HEAVY_PID=
+  if [ "$WAVE_HEAVY" -gt 0 ]; then
+    pgb heavy "$WAVE_HEAVY" 1 -f /results/wave-heavy.sql >"$OUT/pgbench-heavy.log" 2>&1 &
+    HEAVY_PID=$!
+  fi
   sleep 15
   log "kill -9 pg-a"
   "${COMPOSE[@]}" kill -s KILL pg-a >>"$OUT/driver.log" 2>&1
@@ -223,6 +249,7 @@ if [ "$SCENARIO" = reconnect-wave ]; then
   log "promote pg-b: $(pg pg-b -c "SELECT pg_promote(true, 60)")"
   wait "$BIG_PID" || true
   wait "$SMALL_PID" || true
+  [ -n "${HEAVY_PID:-}" ] && { wait "$HEAVY_PID" || true; }
   touch "$OUT/wave-stop"
   wait "$SAMPLER_PID" || true
   SAMPLER_PID=

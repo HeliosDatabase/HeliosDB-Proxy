@@ -33,6 +33,10 @@ identify_by = "application_name"
 tenant_column = "tid"
 tenant_tables = ["mt_data"]
 tenants = ["acme", "globex"]
+# ac858d61400b: globex may run one request (or transaction) at a time; a
+# second waits 300 ms for the permit, then is refused with 53300.
+active_query_wait_ms = 300
+tenant_max_active_queries = { globex = 1 }
 
 [[nodes]]
 host = "127.0.0.1"

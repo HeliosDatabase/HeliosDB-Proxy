@@ -1,7 +1,8 @@
 # proxy-a for the reconnect-wave drill (H-05): proxy-a.toml plus per-node backend
-# caps, a per-node reconnect limit and per-tenant client caps. Two tenants, named
-# by application_name, share it: "big" (many writing clients) and "small" (a few
-# readers). pg-a is killed under load and pg-b promoted.
+# caps, a per-node reconnect limit and per-tenant client caps. Three tenants, named
+# by application_name, share it: "big" (many writing clients), "small" (a few
+# readers) and "heavy" (large transactions against its request budgets,
+# ac858d61400b). pg-a is killed under load and pg-b promoted.
 listen_address = "127.0.0.1:27710"
 admin_address = "127.0.0.1:27790"
 admin_token = "helios-lab-admin"
@@ -23,9 +24,15 @@ max_committed_transactions = 2000
 [multi_tenancy]
 enabled = true
 identify_by = "application_name"
-tenants = ["big", "small"]
+tenants = ["big", "small", "heavy"]
 max_clients_per_tenant = 64
-tenant_max_clients = { small = 8 }
+tenant_max_clients = { small = 8, heavy = 8 }
+# ac858d61400b: "heavy" runs transactions of four 64 KiB statements, at most two
+# at once, with 300000 bytes of replay history across its sessions: one
+# transaction (~262 kB) fits, any overlap with another's statement does not.
+tenant_max_active_queries = { heavy = 2 }
+active_query_wait_ms = 10000
+tenant_max_replay_bytes = { heavy = 300000 }
 
 [health]
 check_interval_secs = 1

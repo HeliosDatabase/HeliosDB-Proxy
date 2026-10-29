@@ -22,6 +22,10 @@
 #   PGBENCH_PROTOCOL  pgbench query protocol, -M (simple|extended|prepared;
 #                  default unset = simple). extended/prepared measure the
 #                  extended-protocol relay; use a distinct label per protocol
+#   TR_MODE        the proxies' tr_mode                  (default unset = session;
+#                  `transaction` exercises the in-session replay recording)
+#   EXTRA_TOML     TOML appended to both proxies' config  (default empty; e.g. a
+#                  `[multi_tenancy]` section for a capped run, both arms alike)
 #   BUDGET_PCT     regression budget, TPS and p99        (default 3.0, see compare-usertp.py)
 #   BASELINE_ROOT  where labelled runs are archived      (default /home/gpc/HDB/sprint/baselines/proxy)
 #   OUT            this run's archive dir                (default $BASELINE_ROOT/$LABEL/usertp)
@@ -98,6 +102,8 @@ mkdir -p "$OUT"
   echo "MODES=$MODES"
   echo "PGOPTIONS=$PGOPTIONS"
   echo "PGBENCH_PROTOCOL=${PGBENCH_PROTOCOL:-simple}"
+  echo "TR_MODE=${TR_MODE:-session}"
+  printf 'EXTRA_TOML=%q\n' "${EXTRA_TOML:-}"
   echo "BUDGET_PCT=$BUDGET_PCT"
 } > "$OUT/$LABEL-env.txt"
 
@@ -133,7 +139,8 @@ run_pass(){
   # invoked via `bash` rather than relying on the file's executable bit —
   # scripts/regress/bench-usertp.sh is tracked without +x in git.
   heavy env OUT="$OUT" CLIENTS="$CLIENTS" DUR="$DUR" MODES="$MODES" PGOPTIONS="$PGOPTIONS" \
-    PGBENCH_PROTOCOL="$PGBENCH_PROTOCOL" bash "$HERE/regress/bench-usertp.sh" "$bin" "$plabel"
+    PGBENCH_PROTOCOL="$PGBENCH_PROTOCOL" TR_MODE="${TR_MODE:-}" EXTRA_TOML="${EXTRA_TOML:-}" \
+    bash "$HERE/regress/bench-usertp.sh" "$bin" "$plabel"
 }
 
 echo "== perf-gate-userpath($LABEL): $PASSES interleaved pass(es), CLIENTS=\"$CLIENTS\" DUR=$DUR MODES=\"$MODES\" PGBENCH_PROTOCOL=${PGBENCH_PROTOCOL:-simple} =="

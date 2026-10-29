@@ -17,6 +17,11 @@
 #         OUT=/tmp/bench-usertp  CKPT_BEFORE_WRITE=1  WARMUP_SECS=8
 #         PGBENCH_PROTOCOL=simple|extended|prepared (pgbench -M for the measured
 #         cells; unset = pgbench default, simple)
+#         TR_MODE=session (the proxy's tr_mode; `transaction` exercises the
+#         in-session replay recording, e.g. [multi_tenancy] replay budgets)
+#
+# Each proxy mode's GET /metrics JSON is saved, at the end of its cells, as
+# $OUT/$LABEL-<mode>-metrics.json (e.g. to check `tenant_budgets`).
 #
 # The script starts its own proxy per mode (Session / Transaction pool configs
 # are generated next to this script's conventions). It does NOT start the
@@ -38,6 +43,7 @@ OUT="${OUT:-/tmp/bench-usertp}"; mkdir -p "$OUT"
 [ -n "${PGOPTIONS:-}" ] && echo "PGOPTIONS=$PGOPTIONS"
 # TR_ENABLED=false / EXTRA_TOML=$'[journal]\nmax_committed_transactions = 1' isolate one subsystem's cost.
 [ -n "${TR_ENABLED:-}${EXTRA_TOML:-}" ] && echo "TR_ENABLED=${TR_ENABLED:-true} EXTRA_TOML=${EXTRA_TOML:-}"
+[ -n "${TR_MODE:-}" ] && echo "TR_MODE=$TR_MODE"
 # PGBENCH_PROTOCOL=extended|prepared runs the measured cells over the extended
 # query protocol (Parse/Bind/Execute/Sync; prepared parses each statement once
 # per connection), so they go through the proxy's extended-protocol relay. The
@@ -95,7 +101,7 @@ write_proxy_config(){
 listen_address = "127.0.0.1:$PXPORT"
 admin_address  = "$ADMIN"
 tr_enabled     = ${TR_ENABLED:-true}
-tr_mode        = "session"
+tr_mode        = "${TR_MODE:-session}"
 write_timeout_secs = 30
 
 [pool]
@@ -252,6 +258,7 @@ for mode in $MODES; do
   if [ "$mode" != "direct" ]; then
     log="$OUT/$LABEL-$mode.log"
     unknown=$(curl -sS --max-time 3 "http://$ADMIN/metrics" 2>/dev/null \
+      | tee "$OUT/$LABEL-$mode-metrics.json" \
       | python3 -c 'import json,sys
 try:
     m=json.load(sys.stdin); print(m.get("tr_unknown_outcome_errors_total", m.get("tr",{}).get("unknown_outcome_errors",0)))

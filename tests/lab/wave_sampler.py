@@ -3,7 +3,9 @@
 
 Usage: wave_sampler.py ADMIN_URL TOKEN PROXY_PID OUT_TSV STOP_FILE
 Writes one line per 250 ms: epoch_ms, backend reconnects in progress, reconnect
-waits, reconnect refusals, TR failovers, proxy RSS (KiB). Standard library only.
+waits, reconnect refusals, TR failovers, proxy RSS (KiB), and the "heavy" tenant's
+active-query permits and replay bytes (ac858d61400b; -1 when the series is absent).
+Standard library only.
 """
 import json, pathlib, sys, time, urllib.request
 
@@ -12,6 +14,8 @@ METRICS = {
     "heliosdb_proxy_backend_reconnect_waits_total": "waits",
     "heliosdb_proxy_backend_reconnect_refusals_total": "refusals",
     "heliosdb_proxy_tr_failovers_total": "failovers",
+    'heliosdb_proxy_tenant_active_queries{tenant="heavy"}': "heavy_active",
+    'heliosdb_proxy_tenant_replay_bytes{tenant="heavy"}': "heavy_replay",
 }
 
 
@@ -38,12 +42,14 @@ def rss_kib(pid):
 def main(url, token, pid, out, stop):
     stop = pathlib.Path(stop)
     with open(out, "w") as f:
-        f.write("ms\tin_progress\twaits\trefusals\tfailovers\trss_kib\n")
+        f.write("ms\tin_progress\twaits\trefusals\tfailovers\trss_kib"
+                "\theavy_active\theavy_replay\n")
         while not stop.exists():
             try:
                 m = scrape(url, token)
-                row = [int(time.time() * 1000)] + [m.get(k, -1) for k in
+                row = ([int(time.time() * 1000)] + [m.get(k, -1) for k in
                        ("in_progress", "waits", "refusals", "failovers")] + [rss_kib(pid)]
+                       + [m.get(k, -1) for k in ("heavy_active", "heavy_replay")])
                 f.write("\t".join(map(str, row)) + "\n")
                 f.flush()
             except Exception as e:  # keep sampling through a slow scrape

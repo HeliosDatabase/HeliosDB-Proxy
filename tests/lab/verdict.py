@@ -41,6 +41,15 @@ reconnect-wave (H-05) instead:
   rss_bounded                proxy RSS at the end is within 64 MiB of before the kill
   rss_flat_after_failover    from RECOVER_S after the promotion to the end the
                              proxy's RSS varies by less than 16 MiB
+  with a heavy tenant (pgbench-heavy.log, WAVE_HEAVY > 0; ac858d61400b) also:
+  heavy_queries_within_cap   the heavy tenant's sampled active-query permits
+                             peaked above 0 and at most its active-query limit
+  heavy_cap_engaged          some heavy request waited at the cap
+  heavy_replay_within_budget its sampled replay bytes peaked above one 64 KiB
+                             statement and at most its replay-byte budget
+  heavy_replay_budget_engaged the budget marked some transaction non-replayable
+  heavy_replay_released      the final scrape shows 0 replay bytes held
+  (heavy aborts are reported, not judged: pgbench aborts a client on 53300/57P01)
 """
 import json, pathlib, re, sys
 
@@ -61,8 +70,10 @@ def reconnect_wave(out):
     prom_s = (promoted - start) / 1000
     big = tps_series(out.joinpath("pgbench-big.log"))
     small = tps_series(out.joinpath("pgbench-small.log"))
+    heavy_log = out.joinpath("pgbench-heavy.log")
+    tenants = ("big", "small", "heavy") if heavy_log.exists() else ("big", "small")
     aborted = {t: len(re.findall(r"aborted", out.joinpath(f"pgbench-{t}.log").read_text()))
-               for t in ("big", "small")}
+               for t in tenants}
     before = list(range(2, int(kill_s) - 1))
     after = list(range(int(prom_s) + RECOVER_S, secs))
     pre_big = sum(big.get(t, 0) for t in before) / max(len(before), 1)
@@ -71,11 +82,16 @@ def reconnect_wave(out):
     for line in out.joinpath("wave-samples.tsv").read_text().splitlines():
         if line[:1].isdigit():
             samples.append(dict(zip(("ms", "in_progress", "waits", "refusals", "failovers",
-                                     "rss_kib"), map(int, line.split("\t")))))
+                                     "rss_kib", "heavy_active", "heavy_replay"),
+                                    map(int, line.split("\t")))))
     prom = json.loads(out.joinpath("metrics-prometheus-proxy-a.prom").read_text())["text"]
-    def gauge(name):
+    def gauge_opt(name):
         return next((int(float(line.split()[1])) for line in prom.splitlines()
-                     if line.startswith(name + " ")), 0)
+                     if line.startswith(name + " ")), None)
+
+    def gauge(name):
+        value = gauge_opt(name)
+        return 0 if value is None else value
     limit = gauge("heliosdb_proxy_backend_reconnect_limit")
     peak = gauge("heliosdb_proxy_backend_reconnects_peak")
     rss_before = max((s["rss_kib"] for s in samples if s["ms"] < promoted - 2000), default=-1)
@@ -92,7 +108,35 @@ def reconnect_wave(out):
         ("rss_bounded", rss_before > 0 and rss_end - rss_before <= 64 * 1024),
         ("rss_flat_after_failover", len(late) > 1 and max(late) - min(late) < 16 * 1024),
     ]
-    return checks, {
+    heavy = {}
+    if heavy_log.exists():
+        def tenant(name):
+            return gauge_opt(name + '{tenant="heavy"}')
+        active = max((s.get("heavy_active", -1) for s in samples), default=-1)
+        replay = max((s.get("heavy_replay", -1) for s in samples), default=-1)
+        query_limit = tenant("heliosdb_proxy_tenant_active_query_limit")
+        byte_limit = tenant("heliosdb_proxy_tenant_replay_byte_limit")
+        waits = tenant("heliosdb_proxy_tenant_query_waits_total")
+        refusals = tenant("heliosdb_proxy_tenant_replay_budget_refusals_total")
+        final_replay = tenant("heliosdb_proxy_tenant_replay_bytes")
+        checks += [
+            ("heavy_queries_within_cap",
+             query_limit is not None and 0 < active <= query_limit),
+            ("heavy_cap_engaged", (waits or 0) > 0),
+            ("heavy_replay_within_budget",
+             byte_limit is not None and 65536 < replay <= byte_limit),
+            ("heavy_replay_budget_engaged", (refusals or 0) > 0),
+            ("heavy_replay_released", final_replay == 0),
+        ]
+        heavy = {
+            "heavy_tps": round(sum(tps_series(heavy_log).values()) / max(secs, 1), 1),
+            "heavy_max_active_sampled": active, "heavy_active_query_limit": query_limit,
+            "heavy_query_waits": waits,
+            "heavy_query_refusals": tenant("heliosdb_proxy_tenant_query_refusals_total"),
+            "heavy_max_replay_bytes_sampled": replay, "heavy_replay_byte_limit": byte_limit,
+            "heavy_replay_budget_refusals": refusals, "heavy_final_replay_bytes": final_replay,
+        }
+    return checks, {**heavy, **{
         "pre_kill_big_tps": round(pre_big, 1),
         "big_recovery_s": None if recovery is None else round(recovery, 1),
         "small_zero_tps_seconds": [t for t in range(1, secs) if small.get(t, 0) == 0],
@@ -107,7 +151,7 @@ def reconnect_wave(out):
         "rss_kib_late_min_max": [min(late, default=-1), max(late, default=-1)],
         "journal_committed_total": journal.get("journal_committed_total"),
         "kill_s": round(kill_s, 1), "promotion_s": round(prom_s, 1),
-    }
+    }}
 
 
 
