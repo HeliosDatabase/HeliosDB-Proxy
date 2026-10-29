@@ -439,7 +439,13 @@ async fn standby_connections_mirror_the_sessions_settings() {
         )
         .await
     );
-    // Same epoch: nothing to send.
+    // The socket holds an unnamed statement (and a stale one is noted).
+    {
+        let bc = conns.get_mut(&addr).unwrap();
+        bc.unnamed_sig = Some(bytes::Bytes::from_static(b"select 1\0\0\0"));
+        bc.unnamed_stale = UnnamedStale::STATEMENT;
+    }
+    // Same epoch: nothing to send, the unnamed statement stays.
     assert!(
         ProxyServer::mirror_read_gucs(
             &mut client,
@@ -452,6 +458,7 @@ async fn standby_connections_mirror_the_sessions_settings() {
         )
         .await
     );
+    assert!(conns[&addr].unnamed_sig.is_some());
     // The session changed its settings: start from the defaults again.
     let changed = vec![
         "SET search_path TO other".to_string(),
@@ -472,6 +479,10 @@ async fn standby_connections_mirror_the_sessions_settings() {
         .await
     );
     assert_eq!(conns[&addr].gucs_synced, Some(2));
+    // Those simple Queries destroyed the unnamed statement: an identical
+    // unnamed Parse must reach the standby again.
+    assert_eq!(conns[&addr].unnamed_sig, None);
+    assert_eq!(conns[&addr].unnamed_stale, UnnamedStale::default());
 
     // A SET the standby refuses: the connection is dropped, reads pinned.
     let refused = vec!["SET app.refuse = '1'".to_string()];

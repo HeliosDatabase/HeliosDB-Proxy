@@ -149,8 +149,8 @@ Renamed or non-existent keys operators reach for:
 | `[routing]`, `[lag]`, `[rewriter]`, `[graphql]`, `[[tenants]]`, `[[schema_routes]]`, `[auth.jwt]`, `[cache.l1]` | `[load_balancer]` / `[routing_hints]` / `[lag_routing]`, `[query_rewrite]`, `[graphql_gateway]`, `[multi_tenancy]`, `[schema_routing]`, `[auth] mode`, flat `[cache]` keys. |
 | `[ai_cache]` (`semantic_cache_enabled`, `similarity_threshold`, `rag_chunk_cache_size`, …) | Never a section. The semantic (L3) and AI cache tiers exist as library code (`cache::L3Config`, `distribcache`) that the daemon does not configure or enable; the query cache the daemon runs is L1 + L2 under `[cache]`. |
 | `[cache.query]` (`max_result_size`, `exclude_patterns`) | `[cache]` with `max_result_bytes`. There is no exclusion pattern: only `SELECT`, `VALUES`, `TABLE` and `WITH … SELECT` reads without locking clauses are ever cached; `INSERT`, `UPDATE`, `DELETE` (and DDL) invalidate. |
-| `[tenancy]`, `[[tenancy.tenant]]` | `[multi_tenancy]` (`identify_by`, `tenant_column`, `tenant_tables`, `tenants`, `max_clients_per_tenant`, `tenant_max_clients`). |
-| `[rate_limit] global_connections`, `[[rate_limit.tenant]]` | `max_concurrent`; limits apply per bucket (`key_by`), there are no per-tenant rate-limit tables. |
+| `[tenancy]`, `[[tenancy.tenant]]` | `[multi_tenancy]` (`identify_by`, `tenant_column`, `tenant_tables`, `tenants`, `max_clients_per_tenant`, `tenant_max_clients`, `max_active_queries_per_tenant`, `tenant_max_active_queries`, `active_query_wait_ms`, `idle_permit_timeout_ms`, `max_replay_bytes_per_tenant`, `tenant_max_replay_bytes`). |
+| `[rate_limit] global_connections`, `[[rate_limit.tenant]]` | Rate limits apply per bucket (`key_by`); there are no per-tenant rate-limit tables. Per-tenant concurrency is `[multi_tenancy] max_active_queries_per_tenant`. |
 | `[circuit_breaker] reset_timeout`, `half_open_requests` | `open_secs`, `success_threshold`. |
 | `[auth] enabled`, `[auth.api_key]`, `[auth.ldap]` | `[auth] mode = "passthrough" \| "scram"` plus `auth_file`; admission rules are `[[hba]]`. |
 | `[transparent_write_routing]`, `[upgrade]`, `[[upgrade.stages]]` | Never sections: writes always go to the primary (`tr_mode`, `write_timeout_secs`, `[load_balancer] read_write_split`); the upgrade orchestrator is a library module. |
@@ -253,7 +253,8 @@ is never retried; `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` are ordinary replayed
 statements; a `COPY` in progress at the fault → `08006` and the connection is
 closed. A transaction is marked non-replayable (so `transaction` degrades to
 `session` for it) when it exceeds `[limits] tr_max_replay_statements` /
-`tr_max_replay_bytes`, enters the failed state, contains a `COPY`, or one of
+`tr_max_replay_bytes` or its tenant's `[multi_tenancy]` replay-byte budget,
+enters the failed state, contains a `COPY`, or one of
 its statements was transformed by query-rewrite / multi-tenancy, runs at
 `SERIALIZABLE` or `REPEATABLE READ` (explicitly, via `SET TRANSACTION`, or
 inherited from a tracked `default_transaction_isolation` — no replay can
@@ -444,7 +445,17 @@ a standby only when the proxy can show it is a side-effect-free read:
 - for the extended protocol, every statement the `Sync`-terminated batch executes must
   qualify (a batch split by `Flush` stays on the primary). A `Bind` of a named statement
   prepared earlier is classified from that statement's SQL, and is re-prepared on the
-  standby when needed.
+  standby when needed;
+- not part of a cycle a backend already holds open. Everything the client sends after a
+  `Flush` forwarded part of a cycle, or after an extended-protocol `COPY` ended, up to and
+  including the `Sync` or `Query` that settles it, goes to the connection holding that
+  cycle, whatever a hint, read offload or the node's health would pick for a new request:
+  only that backend can finish the cycle. If that connection is gone, the request fails
+  like any statement whose backend failed (`tr_mode`), with an unknown outcome: part of
+  its cycle ran there, so it is never re-run alone on a replacement connection. After a
+  `Flush`-forwarded part the session closes; a `Sync` or `Query` continuing an ended
+  extended `COPY` (whose rows died uncommitted with the connection) gets `08007` and the
+  session goes on (`tr_mode = none`: `57P01`, and the session closes).
 
 Everything else (writes, `SET`, `SHOW`, `COPY`, `EXPLAIN`, functions that may write, a
 `/*helios:route=primary*/` hint) runs on the primary. A `/*helios:route=standby*/` hint
@@ -859,12 +870,47 @@ key_by = "user"
 | `enabled` | bool | `false` | Enforce rate limits. |
 | `default_qps` | u32 | `1000` | Sustained queries/sec per bucket. |
 | `default_burst` | u32 | `2000` | Token-bucket depth (burst) per bucket. |
-| `max_concurrent` | u32 | `0` | Max concurrent in-flight queries per bucket (0 = engine default). |
+| `max_concurrent` | u32 | `0` | Not enforced: nothing on the data path checks it (see `[multi_tenancy] max_active_queries_per_tenant` for a per-tenant concurrency cap). |
 | `key_by` | string | `"user"` | Bucket key: `user`, `client_ip`, `database`, `global`. |
 
 > The keys are `default_qps` / `default_burst`. A file that says `global_qps` /
 > `global_burst` loads with a warning naming the right key and the limiter runs at its
 > defaults; `strict_config = true` refuses it instead.
+
+A refused statement (53400) never reaches the backend. Inside a transaction its
+`ReadyForQuery` reports the transaction's real status (`T`, or `E` in a failed one), and unlike an error from
+PostgreSQL the refusal does not abort the transaction: the backend transaction stays open,
+so a `COMMIT` sent after it commits the statements that ran before the refused one. A
+client that carries on after an error inside a transaction (a psql script without
+`ON_ERROR_STOP`, an application that logs the error and continues) must roll back itself.
+The circuit breaker's fast-fail and a plugin `Block` behave the same way.
+
+A message that continues an extended-protocol cycle the backend already holds open —
+anything the client sends after a `Flush` forwarded part of the cycle (more
+`Bind`/`Execute`/`Flush` batches of a pipeline, up to the `Sync`), or after an
+extended-protocol `COPY` ended, and the `Sync` or `Query` that settles it — is never
+refused, by the limiter or by an open circuit, and never answered from the query or edge
+cache: it belongs to a request admitted at the cycle's first forwarded batch, and only the
+backend's own reply settles the cycle. (A refusal there would tell the client that the
+cycle failed while the backend kept it open, to skip the next cycle or to commit the
+flushed part with it.) Such a message is still charged: one that runs statements of its
+own (a batch with an `Execute`, or a `Query`) takes a token like any request, and with the
+bucket empty it waits for the token to refill (the limiter's retry delay, at most 5 s,
+the same cap as any backpressure sleep) instead of being refused, then runs. A client
+pipelining `Execute`s behind `Flush`es without a `Sync` therefore runs at the bucket's
+rate. A `Sync`, `Flush`, `Describe` or `Close` alone runs no statement and costs nothing.
+A bare `Flush` with no extended cycle open never reaches the limiter (or an open circuit)
+at all: the proxy consumes it, as PostgreSQL answers nothing to one, so it is never
+refused and never discards the request the client sends after it.
+
+A refused `Flush`-terminated batch that starts an extended cycle is that cycle's error. As
+PostgreSQL does after an error, everything the client sends after it up to the `Sync`
+(more `Bind`/`Execute`/`Flush` batches, a `Query`) is discarded and never reaches the
+backend, even once the bucket has refilled, so no later part of the cycle runs, or is
+committed by the `Sync`, behind the error; the `Sync` is answered with `ReadyForQuery`
+(the transaction's status) and is not charged. An open circuit's fast-fail of such a batch,
+and the error a failover answers one with when it does not re-run it, end the cycle the
+same way.
 
 ---
 
@@ -887,6 +933,16 @@ success_threshold = 3
 | `failure_threshold` | u32 | `5` | Consecutive failures that open a node's circuit. |
 | `open_secs` | u64 | `10` | How long a circuit stays open before a half-open probe. |
 | `success_threshold` | u32 | `3` | Successful probes required to close a half-open circuit. |
+
+A fast-fail (08006 `circuit open for node ...`) never reaches the backend. Inside a
+transaction it reports the transaction's status (`T`) and does not abort the transaction: a
+later `COMMIT` commits the statements before it (see Rate Limiting above). A message that
+continues a cycle a node already holds open (anything after a `Flush` forwarded part of the
+cycle up to its `Sync`, see Rate Limiting above) is never fast-failed, executing batches of
+a `Flush`-chained pipeline included: it goes to that node's connection, whose reply or
+failure settles the cycle. The circuit applies again from the next request. A fast-fail of
+a `Flush`-terminated batch that starts a cycle discards the rest of that cycle up to its
+`Sync` (see Rate Limiting above).
 
 ---
 
@@ -911,6 +967,7 @@ max_prepared_bytes = 67108864
 max_pending_bytes = 67108864
 max_backend_frame_bytes = 104857600
 backend_response_timeout_secs = 0
+backend_cancel_timeout_ms = 5000
 tr_max_observation_bytes = 1048576
 max_total_idle_backend_conns = 8192
 pool_reap_interval_secs = 30
@@ -918,6 +975,7 @@ replay_deadline_secs = 300
 max_client_connections = 0
 client_idle_timeout_secs = 0
 client_admission_wait_secs = 0
+client_tcp_keepalive_secs = 60
 gateway_pool_max_idle = 16
 tr_max_replay_statements = 1000
 tr_max_replay_bytes = 4194304
@@ -941,6 +999,7 @@ tr_buffer_small_reads_bytes = 0
 | `max_pending_bytes` | usize | `67108864` | Per-session cap on the un-flushed extended-protocol `pending` buffer (64 MiB). |
 | `max_backend_frame_bytes` | usize | `104857600` | Cap on the declared length of one backend response frame on every streaming relay; a header above it or below the 4-byte minimum closes the backend as malformed (100 MiB, the frontend message cap). Bounds a frame, not a result set. |
 | `backend_response_timeout_secs` | u64 | `0` | Whole-response deadline for one backend response on the streaming relays, first read to `ReadyForQuery`. `backend_read_timeout_secs` re-arms per read and cannot catch a slow drip inside one response; this can. `0` disables (prior behaviour). |
+| `backend_cancel_timeout_ms` | u64 | `5000` | Bound on sending one CancelRequest to a backend: the TCP connect, the request, and the backend closing that connection once it has signalled the statement (as libpq's `PQcancel` waits for it). Covers a client's CancelRequest forwarded to the backend running its statement, and the one the proxy sends itself before it drops a backend connection on which a request it delivered may still be running: a `backend_read_timeout_secs` or `backend_response_timeout_secs` expiry, a client gone mid-response, another fault that leaves the socket open, or a session that ends (client gone, `Terminate`, an idle timeout) with an extended cycle a `Flush` dispatched, or an extended COPY's end, still open there. PostgreSQL notices a closed client socket only when it next writes to it (`client_connection_check_interval` is off by default), so without the cancel such a statement runs on with its locks for its whole duration, and outside `[multi_tenancy] max_active_queries_per_tenant`, whose permit the session returns only after the cancel was sent. The cancel stops the statement only on a backend that implements CancelRequest (PostgreSQL; PgBouncer forwards it); one that does not (HeliosDB-Nano ignores it) runs the statement to completion. Only a session whose tenant has an active-query cap waits for that cancel (up to this bound, after the fault was recorded against the node); every other session (no `[multi_tenancy]`, an unknown tenant, or one without an active-query cap) sends it in the background, so its failover, re-execution or next message never waits for a backend host that does not answer. A backend that already closed or reset the connection gets none; one that does not close the cancel connection in time is assumed to have taken the request. Must be 1..=31536000000 (1 year). Applied at startup. |
 | `tr_max_observation_bytes` | usize | `1048576` | In-session TR: response bytes hashed per recorded statement into an observation digest, re-verified when the transaction is replayed; divergence rolls the replay back with `40001`. A response over the cap has no verifiable digest, so its transaction becomes non-replayable. |
 | `max_total_idle_backend_conns` | usize | `8192` | Global ceiling on idle backend-pool connections across all `(node,user,db)` identities. Only consumed with the `pool-modes` feature; parsed-and-ignored otherwise. |
 | `pool_reap_interval_secs` | u64 | `30` | How often the idle-connection reaper runs. |
@@ -948,6 +1007,7 @@ tr_buffer_small_reads_bytes = 0
 | `max_client_connections` | usize | `0` | Ceiling on concurrently-served client connections on the PG-wire listener. `0` = unlimited. Excess connections are refused with SQLSTATE 53300 (see `client_admission_wait_secs`). Applied at startup; a SIGHUP change is ignored with a warning. |
 | `client_idle_timeout_secs` | u64 | `0` | Close an authenticated idle session after this many seconds. `0` = wait forever (historical behaviour). Applied at startup. |
 | `client_admission_wait_secs` | u64 | `0` | Bounded fair-admission queue (H-05): when `max_client_connections` is reached, a new connection waits up to this many seconds for a permit before being refused with 53300. `0` refuses immediately. Health/admin traffic is unaffected (health probes hold no client slot; admin is a separate listener). Applied at startup. |
+| `client_tcp_keepalive_secs` | u64 | `60` | TCP keepalive on every accepted PG-wire client socket: after this many seconds without traffic from the client the kernel probes it, repeating the probe at the same interval (Linux, macOS, FreeBSD, NetBSD, Android, Windows; elsewhere the OS's interval), and once the OS's probe count (`net.ipv4.tcp_keepalive_probes`, 9 on Linux) goes unanswered the connection fails. A client that vanished without a FIN or RST (a NAT or load-balancer flow dropped, a client host frozen or powered off) then ends its session, about ten times this long after its last traffic, and what the session held returns: its `[multi_tenancy]` active-query permit (an idle transaction, advisory locks, a stalled COPY), its client slot, its backend connections. A live client's kernel answers the probes, so they never end an idle session, and they keep idle flows open through NAT and load balancers whose idle timeout is longer than this value. Unlike the keys above it has no compiled-in predecessor: before it the proxy enabled no keepalive, and such a session waited on its client until the proxy restarted; `0` restores that. Must be ≤ 32767 (the largest keepalive time and interval Linux accepts). Applied at startup; a SIGHUP change is ignored with a warning. |
 | `gateway_pool_max_idle` | usize | `16` | Idle authenticated backend connections kept per identity by each non-PG-wire gateway (HTTP SQL, MCP, GraphQL) for reuse (H-06). `0` disables pooling (each gateway request dials, the pre-H-06 behaviour). Gateways have separate pools so a session policy (e.g. MCP read-only) cannot leak across interfaces. Applied at startup. |
 | `tr_max_replay_statements` | usize | `1000` | In-session TR (`tr_mode = select\|transaction`): cap on statements recorded per explicit transaction for failover replay. Over the cap the transaction is marked non-replayable (`transaction` degrades to `session` for it; `tr_replay_cap_exceeded_total`). |
 | `tr_max_replay_bytes` | usize | `4194304` | In-session TR: cap on bytes (statement text / raw extended-protocol frames) recorded per explicit transaction (4 MiB). Same degradation as above. |
@@ -1101,8 +1161,12 @@ Each `[[query_rewrite.rules]]` entry (first matching transformation is applied):
 
 ## Multi-Tenancy (`[multi_tenancy]`)
 
-Per-tenant row isolation via injected predicates. Only active with the `multi-tenancy`
-feature and `enabled = true`.
+Per-tenant row isolation via injected predicates, per-tenant client caps, and per-tenant
+request budgets. Only active with the `multi-tenancy` feature and `enabled = true` (a build
+without the feature logs a startup warning; under `strict_config` it is a startup error).
+
+The whole section is applied at startup; a SIGHUP that changes it logs a warning and keeps
+the running settings. Change caps with a restart or the SIGUSR2 handoff.
 
 ```toml
 [multi_tenancy]
@@ -1112,20 +1176,33 @@ tenant_column = "tenant_id"
 tenant_tables = ["orders", "invoices"]
 tenants = ["acme", "globex"]
 max_clients_per_tenant = 50
+max_active_queries_per_tenant = 20
+active_query_wait_ms = 5000
+idle_permit_timeout_ms = 60000
+max_replay_bytes_per_tenant = 67108864
 
 [multi_tenancy.tenant_max_clients]
 acme = 200
+
+[multi_tenancy.tenant_max_active_queries]
+acme = 50
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Enforce per-tenant row isolation. |
+| `enabled` | bool | `false` | Enable multi-tenancy: per-tenant row isolation (with `tenants` / `tenant_tables`) and the per-tenant client caps and request budgets below. Needs the `multi-tenancy` feature. |
 | `identify_by` | string | `"application_name"` | Connection attribute naming the tenant: a startup parameter name (e.g. `application_name`, `user`) or the literal `database`. |
 | `tenant_column` | string | `"tenant_id"` | The row-level tenant column injected into queries. |
 | `tenant_tables` | array | `[]` | Tables that get the tenant filter injected; others pass through. |
 | `tenants` | array | `[]` | Known tenant ids. |
-| `max_clients_per_tenant` | usize | `0` | Most client sessions one known tenant may hold on this proxy at once (H-05). The tenant is read from the startup packet (`identify_by`; `database` falls back to `user` as PostgreSQL does). A tenant at its cap waits up to `[limits] client_admission_wait_secs` for one of its own sessions to end, then is refused with SQLSTATE 53300 naming the tenant; other tenants are not affected. The tenant slot is taken before the process-wide `[limits] max_client_connections` slot, so connections queued at their tenant's cap never hold process-wide capacity. Sessions naming no known tenant count only against `max_client_connections`. To guarantee a small tenant its share, keep the sum of tenant caps at or below `max_client_connections`. `0` = no per-tenant cap. Applied at startup. |
-| `tenant_max_clients` | table | `{}` | Per-tenant overrides of `max_clients_per_tenant` (`0` = no cap for that tenant). Every key must be in `tenants` (startup error otherwise). |
+| `max_clients_per_tenant` | usize | `0` | Most client sessions one known tenant may hold on this proxy at once (H-05). The tenant is read from the startup packet (`identify_by`; `database` falls back to `user` as PostgreSQL does). A tenant at its cap waits up to `[limits] client_admission_wait_secs` for one of its own sessions to end, then is refused with SQLSTATE 53300 naming the tenant; other tenants are not affected. The tenant slot is taken before the process-wide `[limits] max_client_connections` slot, so connections queued at their tenant's cap never hold process-wide capacity. Sessions naming no known tenant count only against `max_client_connections`. To guarantee a small tenant its share, keep the sum of tenant caps at or below `max_client_connections`. `0` = no per-tenant cap. Must be ≤ `Semaphore::MAX_PERMITS`. |
+| `tenant_max_clients` | table | `{}` | Per-tenant overrides of `max_clients_per_tenant` (`0` = no cap for that tenant). Every key must be in `tenants` (startup error otherwise); each value ≤ `Semaphore::MAX_PERMITS`. |
+| `max_active_queries_per_tenant` | usize | `0` | Most requests one known tenant may have in progress through this proxy at once, on PG-wire sessions (the HTTP, MCP and GraphQL gateways are not covered). A request — a simple `Query`, or an extended cycle from its first `Parse`/`Bind`/`Describe`/`Execute`/`Close` to its `Sync` — that starts while its session is idle takes one of the tenant's permits and holds it until the session is idle again: an explicit transaction holds one permit from `BEGIN` to its end and its statements are never refused, a partly received extended cycle (or one a `Query` interrupts) keeps it, and under session pooling a session holding session-level advisory locks (which outlive `ReadyForQuery`; a statement takes them when its text names `pg_advisory_lock`, `pg_advisory_lock_shared`, `pg_try_advisory_lock` or `pg_try_advisory_lock_shared` as a whole word, in any case and anywhere in it, string literals and comments included, so a `DO` block's body counts, while other text containing `advisory_lock`, such as a table `job_advisory_locks` or a literal `'advisory_lock'`, does not) keeps it until a simple-protocol `pg_advisory_unlock_all()` (a call outside string literals and comments, in a statement without a backslash) or `DISCARD ALL` succeeds on the backend connection that took them, or until that connection ends (one that never reaches it, refused by the rate limiter, an open circuit or a plugin or answered from a cache, released nothing and keeps the permit held; a lock statement is seen at its `Parse` and at each `Bind` of a named statement that takes one, and counts once its request reaches a backend: one a failover answers with an error without re-running it took none; the same unlock statements over the extended protocol do not clear it, so a session that uses only the extended protocol keeps its permit until it ends: bound it with `idle_permit_timeout_ms`). Locks end with their backend connection: when it is lost, or the session moves to a replacement after a failover, they no longer keep the permit. A connection lost while its session idles returns the permit at once, without waiting for the client's next message (unless a transaction, or a cycle the client is still in, keeps it: the client's next request replays a lost transaction where its `tr_mode` allows, and is told it was lost otherwise); a session moved during a request returns it at that request's end. So a session idle inside a transaction keeps its permit for as long as its client stays connected, also after the backend ended that transaction (`idle_in_transaction_session_timeout`, `pg_terminate_backend`): bound such sessions with `idle_permit_timeout_ms`. A client that vanishes without closing its connection is detected by `[limits] client_tcp_keepalive_secs` (on by default), and its session then ends and returns the permit. With keepalive off, such a session keeps its permit until the proxy restarts unless a timeout ends it: `idle_permit_timeout_ms` ends only an idle permit holder (inside a transaction, holding advisory locks), `[limits] client_idle_timeout_secs` also one in the middle of an extended cycle (after a `Flush`, owing its `Sync`), and nothing ends one in a stalled `COPY FROM STDIN` or with a message partly received; a warning says so at startup when keepalive is off and a tenant has an active-query cap. A lock statement a transaction replay runs again on the replacement keeps it there. At the cap a request waits in FIFO order up to `active_query_wait_ms`, then is refused with SQLSTATE 53300 `too many active queries for tenant "X" (limit N)`; the session stays usable. On the simple protocol the refusal is followed by `ReadyForQuery`; on the extended protocol the error is sent at once and everything up to `Sync` is discarded (Flush and Query included), as PostgreSQL does after an error; the backend never sees a refused request. A CancelRequest for a waiting session ends the wait with 57014 `canceling statement due to user request` (a key that several live sessions were relayed, from a backend that issues colliding BackendKeyData, ends no wait, since the cancel may come from a session running a statement: it is forwarded to the backend as before); a client that disconnects while waiting abandons its request. A message that continues a cycle a backend holds open (after a `Flush`, or the end of an extended-protocol `COPY`, up to the `Sync` or `Query` that settles it) goes to the connection holding that cycle and is never refused by the rate limiter (which paces it) or an open circuit nor answered from a cache (see `[rate_limit]`), so that backend's reply settles the cycle and the permit returns then. Only a plugin `Block` of such a `Query` leaves the cycle open on the backend: the session keeps its permit (and, under transaction/statement pooling, its backend connection) until a later request reaches the backend and settles it, and meanwhile counts as an idle permit holder (`idle_permit_timeout_ms`). When that connection is lost meanwhile, the cycle dies with it (the backend rolls it back) and the permit returns at once; the client's next request is answered as after any loss of an open cycle. A message other than COPY data that arrives while a `COPY ... FROM STDIN` is in copy-in ends that COPY (PostgreSQL fails it, 08P01, without running the message) and goes to the COPY's connection the same way; that backend's ReadyForQuery ends the session's COPY and leaves it idle (its permit returns), and a plugin `Block` of such a `Query` leaves the COPY open there and the session an idle permit holder. When the connection holding a cycle its client is still in (and may be waiting on: the rest of a `Flush`-dispatched cycle's results, which only the idle backend watch relays, or the answer to an extended `COPY`'s end) is lost while the session waits for that client, the session ends at once with FATAL 08006 `backend ... connection lost while an extended-protocol cycle was open on it (its outcome is unknown)`, and its permit returns: no backend will answer that client. A session that ends with a cycle still open on its backend (its client gone, a `Terminate`, an idle or idle-permit timeout) closes that connection, never resets or parks it, so the backend rolls the cycle back; it first sends that backend a CancelRequest, so on a backend that implements one (PostgreSQL; PgBouncer forwards it) a flushed `Execute` (or the end of an extended COPY) still running there stops before the permit returns. Likewise, a statement the relay abandons while its backend may still run it (silent past `[limits] backend_read_timeout_secs`, past `backend_response_timeout_secs`, or its client gone mid-response) gets a CancelRequest on its connection (bounded by `[limits] backend_cancel_timeout_ms`) before the connection closes and the permit returns, so on such a backend it does not run on outside the cap (only a capped session waits for that cancel). A backend that does not implement CancelRequest (HeliosDB-Nano ignores it) runs such a statement to completion, outside the cap, after its permit returned. With read offload, while a cycle its client is still in is open on a standby (a `route=standby` or `node=` hint sent it there), the session watches that standby's connection rather than its home's, so the rest of the cycle's results reach the waiting client and the loss of that connection ends the session as above. Under transaction/statement pooling a waiting or refused session first parks its idle backend connections, so it holds no backend connection while it waits; the cap does not bound backend connections otherwise. Query-cache and edge-cache hits, rate-limit refusals and the in-request primary wait of a failover all count as active. A single-statement simple-protocol `COMMIT PREPARED` / `ROLLBACK PREPARED` runs without a permit (it can only release locks that permit holders wait on); 2PC through the extended protocol and locks taken inside functions or by an SQL `EXECUTE` of a `PREPARE`d statement are not seen, so set `lock_timeout` as the backstop for lock-wait/permit-wait cycles. A `FunctionCall` message is not gated. `0` = no cap. Must be ≤ `Semaphore::MAX_PERMITS`. |
+| `tenant_max_active_queries` | table | `{}` | Per-tenant overrides of `max_active_queries_per_tenant` (`0` = no cap for that tenant). Every key must be in `tenants`; each value ≤ `Semaphore::MAX_PERMITS`. |
+| `active_query_wait_ms` | u64 | `5000` | How long a request waits for one of its tenant's active-query permits before it is refused with 53300. `0` = refuse at once. Must be ≤ 31536000000 (1 year). |
+| `idle_permit_timeout_ms` | u64 | `0` | A session that sits idle (waiting for its client) while holding one of its tenant's active-query permits — inside a transaction, or holding session-level advisory locks — is terminated after this long: FATAL 25P03 `terminating connection due to idle-in-transaction timeout` inside a transaction, 57P05 otherwise. The permit returns. A session whose `Query` a plugin blocked while its backend held an extended cycle, or a COPY in copy-in, open (see `max_active_queries_per_tenant`) is idle too: it has been answered `ReadyForQuery`. A bare `Flush` with no extended cycle open, or sent after such a blocked `Query`, has nothing to flush for its client (PostgreSQL answers nothing to an idle one): the proxy consumes it (in every session, capped or not), so it never makes an idle session look busy, and nothing refuses it. Never applies to a session without a permit, nor to one in the middle of an extended cycle (after a `Flush`, before the `Sync` the client still owes, also when that `Flush` was answered with an error before reaching a backend, such as a rate-limit or open-circuit refusal or the error a failover answers it with when it does not re-run it; `[limits] client_idle_timeout_secs` bounds that); when `[limits] client_idle_timeout_secs` is also armed, the earlier deadline wins. A stalled `COPY FROM STDIN` is not idle (both idle timeouts are disarmed during COPY), so it holds its permit (and, under transaction or statement pooling, its backend connection) until its client sends the rest of the COPY or closes its socket. A client host that vanishes without a FIN or RST is detected by `[limits] client_tcp_keepalive_secs` (on by default, about ten times its value after the client's last traffic), which ends the session and returns the permit; with keepalive off it is never detected. During copy-in the proxy reads only the client, so a backend that ends the COPY (or is terminated with `pg_terminate_backend`) goes unnoticed while the client stays connected: only that client, or restarting the proxy, ends such a session; size the cap with headroom for it. `0` = never. Must be ≤ 31536000000 (1 year). |
+| `max_replay_bytes_per_tenant` | usize | `0` | Most transaction-replay bytes (`[limits] tr_max_replay_bytes`'s measure: statement text and raw extended-protocol frames) all sessions of one known tenant may hold at once. Applies to sessions whose `tr_mode` is `select` or `transaction` (`tr_mode` follows a SIGHUP for new sessions; a warning is logged at startup when no recording mode is configured, and on a SIGHUP that changes it). A `select`-mode transaction with writes is never replayed, so it is not charged, and a `Flush` chunk that may write is not checked against the budget either (its write is recorded only at the cycle's `Sync`). The statement whose recording would take the tenant over marks its transaction non-replayable, the same degradation as `tr_max_replay_bytes` (P-03 refusal reason `cap_exceeded`; `heliosdb_proxy_tr_replay_cap_exceeded_total` keeps counting only the `[limits]` caps, and a transaction one of them degrades is not counted as a tenant refusal as well). Inside a transaction, chunks of an open Flush-terminated cycle are checked against the budget and charged when the `Sync` records the cycle; an autocommit chunk holds no budget bytes (a cycle that opens a transaction is charged, or refused, at its `Sync`). The bytes return at transaction end and at session end. `0` = no budget. |
+| `tenant_max_replay_bytes` | table | `{}` | Per-tenant overrides of `max_replay_bytes_per_tenant` (`0` = no budget for that tenant). Every key must be in `tenants`. |
 
 `/metrics` reports `tenant_slots` (`tenant`, `limit`, `in_use`, `waiting`, `waits`,
 `refusals`) for capped tenants; Prometheus has `heliosdb_proxy_tenant_clients`,
@@ -1135,6 +1212,26 @@ acme = 200
 `heliosdb_proxy_admission_queue_depth` (all connections waiting for admission now).
 The caps bound client sessions; with session pooling that also bounds a tenant's backend
 connections, while transaction pooling shares backend connections across tenants.
+
+For tenants with a request budget, `/metrics` reports `tenant_budgets` (`tenant`,
+`query_limit`, `queries_active`, `queries_idle`, `queries_waiting`, `queries_admitted`,
+`query_waits`, `query_refusals`, `query_wait_cancels`, `idle_permit_timeouts`,
+`replay_byte_limit`, `replay_bytes`, `replay_refusals`). Prometheus has, labelled by
+`tenant`, for tenants with an active-query cap: `heliosdb_proxy_tenant_active_queries`,
+`heliosdb_proxy_tenant_active_query_limit`, `heliosdb_proxy_tenant_active_queries_idle`
+(permit holders idle in a transaction, holding locks, or behind a plugin-blocked `Query` that left
+an extended cycle open), `heliosdb_proxy_tenant_query_queue_depth`,
+`heliosdb_proxy_tenant_queries_admitted_total`, `heliosdb_proxy_tenant_query_waits_total`,
+`heliosdb_proxy_tenant_query_refusals_total`, `heliosdb_proxy_tenant_query_wait_cancels_total`
+and `heliosdb_proxy_tenant_idle_permit_timeouts_total`; for tenants with a replay-byte
+budget: `heliosdb_proxy_tenant_replay_bytes`, `heliosdb_proxy_tenant_replay_byte_limit`
+and `heliosdb_proxy_tenant_replay_budget_refusals_total`. The histogram
+`heliosdb_proxy_tenant_query_wait_seconds` records the wait of every request that waited
+for a permit, however the wait ended (admitted, refused with 53300 at its end, cancelled, or
+abandoned by its client). It is one series for all tenants, with no `tenant` label: its
+count matches the sum of `heliosdb_proxy_tenant_query_waits_total` over all tenants, and its
+buckets mix every tenant's waits, so it cannot show one tenant's wait latency (the
+per-tenant counters show which tenants wait).
 
 ---
 
@@ -1235,6 +1332,10 @@ kv_max_total_bytes = 67108864
 | `kv_max_plugins` | usize | `256` | Max distinct plugin KV namespaces that may exist at once; `0` = unlimited. Bounds how many `<plugin>` namespaces `PUT /admin/kv/<plugin>/<key>` can create, so a token-holder cannot exhaust memory by writing to unboundedly-many namespace names. Writing to an already-present namespace never trips the cap; deleting a namespace's last key frees its slot. |
 | `kv_max_total_bytes` | usize | `67108864` (64 MiB) | Max TOTAL retained bytes across ALL plugin KV namespaces (each entry's key + value bytes plus each live namespace's name bytes); `0` = unlimited. The single backstop that bounds the whole KV footprint regardless of the per-axis product `kv_max_plugins × kv_max_keys_per_plugin × kv_max_value_bytes` (which can otherwise reach tens of GiB), so a token-holding `PUT /admin/kv/<plugin>/<key>` caller cannot drive the proxy to an OOM. A write past this cap is rejected (`kv_set` returns `-1`; the admin endpoint returns `413`). |
 | `trust_root` | string | *(none)* | Ed25519 trust-root directory. When set, every `.wasm` requires a sidecar `.sig` verifying against a `*.pub` in this directory; when omitted, signatures are not checked. |
+
+A statement a plugin blocks (42000) never reaches the backend. Inside a transaction the
+reply reports the transaction's status (`T`) and does not abort the transaction: a later
+`COMMIT` commits the statements before it (see Rate Limiting above).
 
 ---
 

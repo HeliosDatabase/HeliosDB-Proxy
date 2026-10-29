@@ -241,6 +241,103 @@ fn bench_pool_metrics(c: &mut Criterion) {
     group.finish();
 }
 
+/// Per-tenant request budgets (ac858d61400b): the active-query permit a
+/// capped tenant's request takes and returns (one CAS, then the release
+/// through the semaphore's waiter mutex), the FIFO handoff when requests wait
+/// at the cap, and the replay-byte charge each recorded statement makes.
+fn bench_tenant_budget(c: &mut Criterion) {
+    use heliosdb_proxy::config::ProxyConfig;
+    use heliosdb_proxy::metrics_hist::{default_latency_buckets_ms, LatencyHistogram};
+    use heliosdb_proxy::tenant_slots::{TenantBudget, TenantCharge, TenantSlots};
+    use std::sync::Arc;
+
+    let slots_of = |query_cap: usize| {
+        let mut config = ProxyConfig::default();
+        config.multi_tenancy.enabled = true;
+        config.multi_tenancy.tenants = vec!["t".to_string()];
+        config.multi_tenancy.max_active_queries_per_tenant = query_cap;
+        config.multi_tenancy.max_replay_bytes_per_tenant = 1 << 30;
+        TenantSlots::from_config(&config)
+    };
+    let budget_in =
+        |slots: &TenantSlots| Arc::clone(slots.budget("t").expect("tenant t has a budget"));
+    let mut group = c.benchmark_group("tenant_budget");
+
+    let wide = budget_in(&slots_of(1024));
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("query_permit/acquire_release", |b| {
+        b.iter(|| drop(black_box(wide.try_acquire_query())));
+    });
+
+    // 8 tasks share a cap of 4 on one thread: the first 4 take a permit and
+    // hold it across a yield, so the other 4 find the cap full, queue (FIFO)
+    // and are each handed a permit by a release, the path a saturated tenant
+    // takes; each wait is recorded in the wait histogram, as the proxy does.
+    // That every iteration queues exactly 4 is checked outside the timing.
+    const TASKS: usize = 8;
+    const CAP: usize = 4;
+    async fn handoff(budget: &Arc<TenantBudget>, waits: &Arc<LatencyHistogram>) {
+        let tasks: Vec<_> = (0..TASKS)
+            .map(|_| {
+                let budget = Arc::clone(budget);
+                let waits = Arc::clone(waits);
+                tokio::spawn(async move {
+                    let permit = budget
+                        .wait_query(&waits)
+                        .await
+                        .expect("admitted within the wait");
+                    tokio::task::yield_now().await;
+                    drop(permit);
+                })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+    }
+    let narrow_slots = slots_of(CAP);
+    let narrow = budget_in(&narrow_slots);
+    let waits = Arc::new(LatencyHistogram::new(&default_latency_buckets_ms()));
+    let one_thread = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    group.throughput(Throughput::Elements(TASKS as u64));
+    group.bench_function("query_permit/handoff_8x4", |b| {
+        b.to_async(&one_thread).iter_custom(|iters| {
+            let (slots, budget, waits) = (&narrow_slots, &narrow, &waits);
+            async move {
+                let queued = || slots.budget_stats()[0].query_waits;
+                let (before, recorded) = (queued(), waits.snapshot().count());
+                let start = std::time::Instant::now();
+                for _ in 0..iters {
+                    handoff(budget, waits).await;
+                }
+                let elapsed = start.elapsed();
+                let expected = (TASKS - CAP) as u64 * iters;
+                assert_eq!(queued() - before, expected, "waits queued at the cap");
+                assert_eq!(
+                    waits.snapshot().count() - recorded,
+                    expected,
+                    "waits recorded"
+                );
+                elapsed
+            }
+        });
+    });
+
+    let charge = TenantCharge::new(Arc::clone(&wide));
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("replay_charge/reserve_settle", |b| {
+        b.iter(|| {
+            charge.replay_reserve(black_box(4096));
+            charge.replay_settle(0);
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_pool_creation,
@@ -250,5 +347,6 @@ criterion_group!(
     bench_acquire_release_contention,
     bench_node_endpoint,
     bench_pool_metrics,
+    bench_tenant_budget,
 );
 criterion_main!(benches);

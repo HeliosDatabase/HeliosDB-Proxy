@@ -590,6 +590,12 @@ impl AdminServer {
                         if !s.is_empty() {
                             map.insert("tenant_slots".into(), serde_json::to_value(s.stats())?);
                         }
+                        if s.has_budgets() {
+                            map.insert(
+                                "tenant_budgets".into(),
+                                serde_json::to_value(s.budget_stats())?,
+                            );
+                        }
                     }
                     if let Some(p) = state.gateway_pools.read().await.as_ref() {
                         let pools: serde_json::Map<String, serde_json::Value> = p
@@ -663,6 +669,7 @@ impl AdminServer {
                 }
                 if let Some(s) = state.tenant_slots.read().await.as_ref() {
                     Self::push_tenant_slots_prometheus(&mut prometheus, &s.stats());
+                    Self::push_tenant_budgets_prometheus(&mut prometheus, &s.budget_stats());
                 }
                 #[cfg(feature = "query-cache")]
                 if let Some(c) = state.query_cache.read().await.as_ref() {
@@ -2575,12 +2582,118 @@ impl AdminServer {
         ] {
             let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} {kind}");
             for s in stats {
-                let tenant = s
-                    .tenant
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('\n', "\\n");
+                let tenant = Self::tenant_label(&s.tenant);
                 let _ = writeln!(output, "{name}{{tenant=\"{tenant}\"}} {}", value(s));
+            }
+        }
+    }
+
+    /// A tenant id as a Prometheus label value (text-format escaping).
+    fn tenant_label(tenant: &str) -> String {
+        tenant
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    }
+
+    /// Append the per-tenant request budgets (ac858d61400b), labelled by
+    /// tenant id like the client caps: the active-query series for tenants
+    /// with an active-query cap, the replay series for tenants with a
+    /// replay-byte budget. Absent when no tenant has either.
+    fn push_tenant_budgets_prometheus(
+        output: &mut String,
+        stats: &[crate::tenant_slots::TenantBudgetStats],
+    ) {
+        use std::fmt::Write as _;
+        type Value = fn(&crate::tenant_slots::TenantBudgetStats) -> u64;
+        let queries: Vec<_> = stats.iter().filter(|s| s.query_limit > 0).collect();
+        let replay: Vec<_> = stats.iter().filter(|s| s.replay_byte_limit > 0).collect();
+        let query_series: [(&str, &str, &str, Value); 9] = [
+            (
+                "heliosdb_proxy_tenant_active_queries",
+                "gauge",
+                "Active-query permits the tenant holds now (requests in progress, open transactions)",
+                |s| s.queries_active as u64,
+            ),
+            (
+                "heliosdb_proxy_tenant_active_query_limit",
+                "gauge",
+                "The tenant's active-query cap ([multi_tenancy] max_active_queries_per_tenant / tenant_max_active_queries)",
+                |s| s.query_limit as u64,
+            ),
+            (
+                "heliosdb_proxy_tenant_active_queries_idle",
+                "gauge",
+                "Permit holders of the tenant idle now (in a transaction, holding session-level advisory locks, or behind a plugin-blocked Query that left an extended cycle open)",
+                |s| s.queries_idle as u64,
+            ),
+            (
+                "heliosdb_proxy_tenant_query_queue_depth",
+                "gauge",
+                "Requests of the tenant waiting for an active-query permit now",
+                |s| s.queries_waiting as u64,
+            ),
+            (
+                "heliosdb_proxy_tenant_queries_admitted_total",
+                "counter",
+                "Requests of the tenant that took an active-query permit",
+                |s| s.queries_admitted,
+            ),
+            (
+                "heliosdb_proxy_tenant_query_waits_total",
+                "counter",
+                "Requests of the tenant that had to wait at its active-query cap",
+                |s| s.query_waits,
+            ),
+            (
+                "heliosdb_proxy_tenant_query_refusals_total",
+                "counter",
+                "Requests of the tenant refused (53300) at its active-query cap",
+                |s| s.query_refusals,
+            ),
+            (
+                "heliosdb_proxy_tenant_query_wait_cancels_total",
+                "counter",
+                "Active-query waits of the tenant ended by a CancelRequest or a client disconnect",
+                |s| s.query_wait_cancels,
+            ),
+            (
+                "heliosdb_proxy_tenant_idle_permit_timeouts_total",
+                "counter",
+                "Sessions of the tenant terminated idle while holding a permit ([multi_tenancy] idle_permit_timeout_ms)",
+                |s| s.idle_permit_timeouts,
+            ),
+        ];
+        let replay_series: [(&str, &str, &str, Value); 3] = [
+            (
+                "heliosdb_proxy_tenant_replay_bytes",
+                "gauge",
+                "Transaction-replay bytes the tenant's sessions hold now",
+                |s| s.replay_bytes as u64,
+            ),
+            (
+                "heliosdb_proxy_tenant_replay_byte_limit",
+                "gauge",
+                "The tenant's replay-byte budget ([multi_tenancy] max_replay_bytes_per_tenant / tenant_max_replay_bytes)",
+                |s| s.replay_byte_limit as u64,
+            ),
+            (
+                "heliosdb_proxy_tenant_replay_budget_refusals_total",
+                "counter",
+                "Transactions of the tenant marked non-replayable by its replay-byte budget",
+                |s| s.replay_refusals,
+            ),
+        ];
+        for (rows, series) in [(&queries, &query_series[..]), (&replay, &replay_series[..])] {
+            if rows.is_empty() {
+                continue;
+            }
+            for (name, kind, help, value) in series {
+                let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} {kind}");
+                for s in rows {
+                    let tenant = Self::tenant_label(&s.tenant);
+                    let _ = writeln!(output, "{name}{{tenant=\"{tenant}\"}} {}", value(s));
+                }
             }
         }
     }
@@ -3798,6 +3911,140 @@ mod tests {
         assert!(out.contains("# TYPE heliosdb_proxy_tenant_client_limit gauge"));
         assert!(out.contains("heliosdb_proxy_tenant_admission_queue_depth{tenant="));
         assert!(out.contains("} 5\n"), "{out}");
+    }
+
+    fn budget_row(
+        tenant: &str,
+        query_limit: usize,
+        replay_limit: usize,
+    ) -> crate::tenant_slots::TenantBudgetStats {
+        crate::tenant_slots::TenantBudgetStats {
+            tenant: tenant.into(),
+            query_limit,
+            queries_active: 2,
+            queries_idle: 1,
+            queries_waiting: 3,
+            queries_admitted: 40,
+            query_waits: 5,
+            query_refusals: 6,
+            query_wait_cancels: 7,
+            idle_permit_timeouts: 8,
+            replay_byte_limit: replay_limit,
+            replay_bytes: 900,
+            replay_refusals: 9,
+        }
+    }
+
+    #[test]
+    fn tenant_budget_metrics_are_labelled_and_split_by_budget() {
+        let mut out = String::new();
+        AdminServer::push_tenant_budgets_prometheus(&mut out, &[]);
+        assert!(out.is_empty(), "no budget, no series");
+        let names = |out: &str| {
+            out.lines()
+                .filter_map(|l| l.strip_prefix("# TYPE "))
+                .map(|l| l.split(' ').next().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // A query-only tenant: exactly the nine active-query series.
+        AdminServer::push_tenant_budgets_prometheus(&mut out, &[budget_row("a\"b\\c", 4, 0)]);
+        assert_eq!(
+            names(&out),
+            [
+                "heliosdb_proxy_tenant_active_queries",
+                "heliosdb_proxy_tenant_active_query_limit",
+                "heliosdb_proxy_tenant_active_queries_idle",
+                "heliosdb_proxy_tenant_query_queue_depth",
+                "heliosdb_proxy_tenant_queries_admitted_total",
+                "heliosdb_proxy_tenant_query_waits_total",
+                "heliosdb_proxy_tenant_query_refusals_total",
+                "heliosdb_proxy_tenant_query_wait_cancels_total",
+                "heliosdb_proxy_tenant_idle_permit_timeouts_total",
+            ]
+        );
+        assert!(
+            out.contains("heliosdb_proxy_tenant_active_queries{tenant=\"a\\\"b\\\\c\"} 2\n"),
+            "{out}"
+        );
+        assert!(out.contains("# TYPE heliosdb_proxy_tenant_active_query_limit gauge"));
+        assert!(
+            out.contains("heliosdb_proxy_tenant_active_query_limit{tenant=\"a\\\"b\\\\c\"} 4\n")
+        );
+        // The idle gauge's HELP names every reason a holder counts as idle.
+        assert!(out.contains(
+            "# HELP heliosdb_proxy_tenant_active_queries_idle Permit holders of the tenant idle \
+             now (in a transaction, holding session-level advisory locks, or behind a \
+             plugin-blocked Query that left an extended cycle open)\n"
+        ));
+        assert!(out.contains(
+            "heliosdb_proxy_tenant_idle_permit_timeouts_total{tenant=\"a\\\"b\\\\c\"} 8\n"
+        ));
+
+        // A replay-only tenant: exactly the three replay series.
+        let mut out = String::new();
+        AdminServer::push_tenant_budgets_prometheus(&mut out, &[budget_row("r", 0, 1000)]);
+        assert_eq!(
+            names(&out),
+            [
+                "heliosdb_proxy_tenant_replay_bytes",
+                "heliosdb_proxy_tenant_replay_byte_limit",
+                "heliosdb_proxy_tenant_replay_budget_refusals_total",
+            ]
+        );
+        assert!(out.contains("heliosdb_proxy_tenant_replay_bytes{tenant=\"r\"} 900\n"));
+        assert!(out.contains("# TYPE heliosdb_proxy_tenant_replay_budget_refusals_total counter"));
+
+        // Mixed rows: each tenant only in the series its budget covers.
+        let mut out = String::new();
+        AdminServer::push_tenant_budgets_prometheus(
+            &mut out,
+            &[budget_row("q", 4, 0), budget_row("r", 0, 1000)],
+        );
+        assert_eq!(names(&out).len(), 12);
+        assert!(!out.contains("heliosdb_proxy_tenant_replay_bytes{tenant=\"q\"}"));
+        assert!(!out.contains("heliosdb_proxy_tenant_active_queries{tenant=\"r\"}"));
+    }
+
+    #[tokio::test]
+    async fn metrics_json_carries_tenant_budgets_only_when_configured() {
+        let state = Arc::new(AdminState::new());
+        let mut config = crate::config::ProxyConfig::default();
+        config.multi_tenancy.enabled = true;
+        config.multi_tenancy.tenants = vec!["acme".into()];
+        config.multi_tenancy.max_clients_per_tenant = 3;
+        state
+            .with_tenant_slots(Arc::new(crate::tenant_slots::TenantSlots::from_config(
+                &config,
+            )))
+            .await;
+        let (_, json) = AdminServer::route_request("GET", "/metrics", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(json["tenant_slots"][0]["tenant"], "acme");
+        assert!(json.get("tenant_budgets").is_none(), "{json}");
+
+        config.multi_tenancy.max_active_queries_per_tenant = 2;
+        config.multi_tenancy.max_replay_bytes_per_tenant = 1000;
+        state
+            .with_tenant_slots(Arc::new(crate::tenant_slots::TenantSlots::from_config(
+                &config,
+            )))
+            .await;
+        let (_, json) = AdminServer::route_request("GET", "/metrics", None, &state)
+            .await
+            .unwrap();
+        let row = &json["tenant_budgets"][0];
+        assert_eq!(row["tenant"], "acme");
+        assert_eq!(row["query_limit"], 2);
+        assert_eq!(row["replay_byte_limit"], 1000);
+        assert_eq!(row["queries_active"], 0);
+        let (_, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
+            .await
+            .unwrap();
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("heliosdb_proxy_tenant_active_query_limit{tenant=\"acme\"} 2\n"));
+        assert!(text.contains("heliosdb_proxy_tenant_replay_byte_limit{tenant=\"acme\"} 1000\n"));
     }
 
     #[test]

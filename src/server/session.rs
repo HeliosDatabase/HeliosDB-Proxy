@@ -28,7 +28,9 @@ pub struct ClientSession {
     /// seen yet, so Transaction/Statement pool release must be suppressed while
     /// it is set — otherwise the connection would be reset (`DISCARD ALL`) and
     /// parked in the middle of a copy, aborting it and hanging the client.
-    /// Cleared once the COPY drains to ReadyForQuery.
+    /// Cleared once the COPY drains to ReadyForQuery, and at any
+    /// ReadyForQuery the backend relays (one that ended copy-in at a message
+    /// other than CopyData/CopyDone/CopyFail: `note_copy_left`).
     pub copy_in_progress: std::sync::atomic::AtomicBool,
     /// Status byte of the most recent `ReadyForQuery` relayed to the client
     /// (`b'I'` idle, `b'T'` in transaction, `b'E'` failed transaction).
@@ -157,6 +159,96 @@ pub struct ClientSession {
     /// while reads are offloaded: `[load_balancer] read_your_writes_ms`
     /// keeps its reads on the primary for that long afterwards.
     pub(crate) last_write: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// ac858d61400b: the session's tenant request budgets, set once at
+    /// admission and only for a tenant with one. Its Drop returns the replay
+    /// bytes still charged.
+    pub(crate) tenant_charge: std::sync::OnceLock<crate::tenant_slots::TenantCharge>,
+    /// The BackendKeyData (pid, secret) relayed to this client at startup, so
+    /// a CancelRequest can end a wait at its tenant's active-query cap. Set
+    /// together with `TenantSlots::session_key_relayed`; the `SessionGuard`
+    /// ends that at the session's end. It is also the startup backend
+    /// connection's own (`BackendConn::backend_key`).
+    pub(crate) cancel_key: std::sync::OnceLock<(u32, u32)>,
+}
+
+impl ClientSession {
+    /// The session's tenant request budgets, if its tenant has any.
+    pub(crate) fn tenant_budget(&self) -> Option<&crate::tenant_slots::TenantBudget> {
+        self.tenant_charge
+            .get()
+            .map(crate::tenant_slots::TenantCharge::budget)
+    }
+
+    /// Whether the session's tenant has an active-query cap, so the session
+    /// holds one of its permits while a request runs.
+    pub(crate) fn tenant_query_capped(&self) -> bool {
+        self.tenant_budget()
+            .is_some_and(crate::tenant_slots::TenantBudget::has_query_cap)
+    }
+
+    /// The session's charge, only when its tenant has a replay-byte budget.
+    fn tenant_replay(&self) -> Option<&crate::tenant_slots::TenantCharge> {
+        self.tenant_charge
+            .get()
+            .filter(|c| c.budget().has_replay_budget())
+    }
+
+    /// The replay bytes of `ts` charged to the tenant: a `select`-mode
+    /// transaction with writes is never replayed, so it is charged nothing.
+    fn tenant_chargeable(&self, ts: &TransactionState, bytes: usize) -> usize {
+        if self.tr_mode == TrMode::Select && ts.has_writes {
+            0
+        } else {
+            bytes
+        }
+    }
+
+    /// Charge the tenant up to `retained` replay bytes for `ts`; `false`
+    /// when that would take the tenant over its budget.
+    pub(crate) fn tenant_replay_reserve(&self, ts: &TransactionState, retained: usize) -> bool {
+        self.tenant_replay()
+            .is_none_or(|c| c.replay_reserve(self.tenant_chargeable(ts, retained)))
+    }
+
+    /// Whether `projected` replay bytes for `ts` would fit the tenant's
+    /// budget (a check only: the Flush projection); a `false` is counted as
+    /// a tenant refusal. `writes_unrecorded` tells whether the part not yet
+    /// recorded (the Flush chunks the Sync will record) may write. It may
+    /// scan the open cycle, so it is asked last: only when the projection
+    /// does not fit, in `select` mode, for a transaction with no recorded
+    /// write. One that writes is charged nothing there, so such a projection
+    /// fits (and is no refusal).
+    pub(crate) fn tenant_replay_fits(
+        &self,
+        ts: &TransactionState,
+        projected: usize,
+        writes_unrecorded: impl FnOnce() -> bool,
+    ) -> bool {
+        let Some(c) = self.tenant_replay() else {
+            return true;
+        };
+        if c.replay_room(self.tenant_chargeable(ts, projected))
+            || (self.tr_mode == TrMode::Select && !ts.has_writes && writes_unrecorded())
+        {
+            return true;
+        }
+        c.note_replay_refusal();
+        false
+    }
+
+    /// Set the tenant charge to the chargeable `ts.replay_bytes`.
+    pub(crate) fn tenant_replay_settle(&self, ts: &TransactionState) {
+        if let Some(c) = self.tenant_replay() {
+            c.replay_settle(self.tenant_chargeable(ts, ts.replay_bytes));
+        }
+    }
+
+    /// Return every replay byte the session holds to its tenant.
+    pub(crate) fn tenant_replay_release(&self) {
+        if let Some(c) = self.tenant_replay() {
+            c.replay_settle(0);
+        }
+    }
 }
 
 /// Transaction state
@@ -188,7 +280,8 @@ pub struct TransactionState {
     /// degrades to `session` behaviour for it.
     pub non_replayable: bool,
     /// `non_replayable` because the transaction outgrew `[limits]
-    /// tr_max_replay_statements` / `tr_max_replay_bytes` (P-03 refusal reason).
+    /// tr_max_replay_statements` / `tr_max_replay_bytes`, or its tenant's
+    /// `[multi_tenancy]` replay-byte budget (P-03 refusal reason).
     pub replay_cap_exceeded: bool,
 }
 
@@ -271,6 +364,10 @@ pub(super) struct BackendConn {
     /// (the backend's unnamed statement already holds that SQL) and synthesize
     /// the `ParseComplete` locally — the unnamed-Parse promotion (Batch H).
     pub(super) unnamed_sig: Option<bytes::Bytes>,
+    /// The unnamed statement and portal this socket may still hold although
+    /// the session's were destroyed without it (see [`UnnamedStale`]). Never
+    /// set on a fresh or pooled connection.
+    pub(super) unnamed_stale: UnnamedStale,
     /// Whether a simple-query statement forwarded on this socket may have left
     /// session-level state behind (a `SET`, temp table, `LISTEN`, advisory
     /// lock, …). Used only by the conditional-reset optimisation
@@ -289,6 +386,24 @@ pub(super) struct BackendConn {
     /// promotion completes. `false` when not reported (other PG-wire
     /// backends, pooled sockets).
     pub(super) hot_standby: bool,
+    /// ac858d61400b: a statement that takes a session-level advisory lock
+    /// ran on this socket (`takes_session_lock`, see `note_session_locks`), and no
+    /// `pg_advisory_unlock_all()` or `DISCARD ALL` has succeeded on it since.
+    /// PostgreSQL keeps such locks after ReadyForQuery 'I', so under session
+    /// pooling a capped session keeps its tenant's active-query permit while
+    /// any of its cached sockets is marked. The locks end with the backend
+    /// session, so the mark goes with the socket: a connection that is lost,
+    /// or dropped for a replacement, no longer pins the permit. Read only for
+    /// capped tenants under session pooling; `false` on a fresh or pooled
+    /// connection.
+    pub(super) session_locks: bool,
+    /// The BackendKeyData (process id, secret key) the backend behind this
+    /// socket reported at its startup (the session's startup connection, a
+    /// fresh dial, or one leased from the pool, which keeps it while the
+    /// socket is parked). The proxy cancels with it what it abandons on the
+    /// socket while the backend may still be running it (`abandon_conn`).
+    /// `None` when the backend sent none.
+    pub(super) backend_key: Option<(u32, u32)>,
     /// This socket's slot on its node's `max_connections` cap (H-05); `None`
     /// for an uncapped node. Held for its `Drop`: released when the socket is
     /// dropped, or moved into the idle pool with it (`pool-modes`).
@@ -305,9 +420,12 @@ impl BackendConn {
             gucs_synced: None,
             gucs_role: false,
             unnamed_sig: None,
+            unnamed_stale: UnnamedStale::default(),
             #[cfg(feature = "pool-modes")]
             dirty: false,
             hot_standby: false,
+            session_locks: false,
+            backend_key: None,
             _slot: None,
         }
     }
@@ -318,6 +436,54 @@ impl BackendConn {
             _slot: slot,
             ..Self::new(stream)
         }
+    }
+
+    /// A simple Query reached this socket (the client's, or one the proxy
+    /// runs itself: mirrored or restored settings, a replayed statement):
+    /// the backend destroyed its unnamed statement and portal.
+    pub(super) fn unnamed_destroyed(&mut self) {
+        self.unnamed_sig = None;
+        self.unnamed_stale = UnnamedStale::default();
+    }
+}
+
+/// Which unnamed objects a backend socket may still hold after the session's
+/// were destroyed without it. PostgreSQL destroys the unnamed statement at
+/// every simple `Query` and every unnamed `Parse` before it runs or parses
+/// anything, so even one that fails leaves none, and the unnamed portal at
+/// every simple `Query` (it outlives its cycle only inside a transaction
+/// block). A request the proxy refuses or answers without that socket (the
+/// rate limiter, an open circuit, the tenant's active-query cap or a cancel
+/// of its wait, a cache or plugin answer, the aborted-transaction emulation),
+/// or a Query another of the session's sockets runs, leaves the older ones
+/// in place there: a later Bind or Describe of the unnamed statement, or an
+/// Execute of the unnamed portal, with no Parse or Bind of its own would run
+/// them where PostgreSQL answers 26000 or 34000. They are closed before a
+/// batch could use them (`forward_extended_batch`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct UnnamedStale {
+    pub(super) statement: bool,
+    pub(super) portal: bool,
+}
+
+impl UnnamedStale {
+    /// What an unnamed `Parse` destroys.
+    pub(super) const STATEMENT: Self = Self {
+        statement: true,
+        portal: false,
+    };
+
+    /// What a simple `Query` destroys, the session in a transaction block
+    /// (`in_block`) or not.
+    pub(super) fn query(in_block: bool) -> Self {
+        Self {
+            statement: true,
+            portal: in_block,
+        }
+    }
+
+    pub(super) fn any(self) -> bool {
+        self.statement || self.portal
     }
 }
 
@@ -344,7 +510,13 @@ pub(super) struct SessionGuard {
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        self.state.sessions.remove(&self.session_id);
+        if let Some((_, session)) = self.state.sessions.remove(&self.session_id) {
+            // The BackendKeyData relayed to it no longer names this session
+            // for a CancelRequest that may end a tenant active-query wait.
+            if let Some(key) = session.cancel_key.get() {
+                self.state.tenant_slots.session_key_ended(*key);
+            }
+        }
         self.state
             .metrics
             .connections_closed

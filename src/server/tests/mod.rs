@@ -177,6 +177,11 @@ async fn test_node_health_initialization() {
 
 /// Build a minimal `ClientSession` for plugin-hook unit tests.
 fn make_test_session() -> Arc<ClientSession> {
+    make_test_session_mode(crate::config::TrMode::default())
+}
+
+/// [`make_test_session`] for a session whose `tr_mode` is `tr_mode`.
+fn make_test_session_mode(tr_mode: crate::config::TrMode) -> Arc<ClientSession> {
     let id = Uuid::new_v4();
     let client_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     Arc::new(ClientSession {
@@ -204,7 +209,7 @@ fn make_test_session() -> Arc<ClientSession> {
         tx_state: RwLock::new(TransactionState::default()),
         variables: RwLock::new(HashMap::new()),
         created_at: chrono::Utc::now(),
-        tr_mode: crate::config::TrMode::default(),
+        tr_mode,
         #[cfg(feature = "lag-routing")]
         last_write_at: RwLock::new(None),
         #[cfg(feature = "pool-modes")]
@@ -221,6 +226,8 @@ fn make_test_session() -> Arc<ClientSession> {
         reads_pinned: std::sync::atomic::AtomicBool::new(false),
         read_node: parking_lot::Mutex::new(None),
         last_write: parking_lot::Mutex::new(None),
+        tenant_charge: std::sync::OnceLock::new(),
+        cancel_key: std::sync::OnceLock::new(),
     })
 }
 
@@ -664,6 +671,7 @@ async fn refused_simple_reply(
             state,
             config,
             fault: &mut fault,
+            continues_cycle: None,
         },
         &msg,
     )
@@ -1041,6 +1049,8 @@ mod query_rewriting;
 
 #[cfg(feature = "multi-tenancy")]
 mod multi_tenancy;
+#[cfg(feature = "multi-tenancy")]
+mod tenant_budgets;
 
 // ---- TR: the journal records statements the replay engine reads ----
 
@@ -1482,6 +1492,96 @@ async fn cancel_request_is_admitted_while_the_cap_is_saturated() {
         state.metrics.connections_rejected.load(Ordering::Relaxed),
         0,
         "a cancel request is not a rejection"
+    );
+}
+
+/// `[limits] client_tcp_keepalive_secs` (ac858d61400b): `handle_client`
+/// enables TCP keepalive on the client socket it serves, probing after that
+/// many idle seconds and at that interval, so a client that vanished without
+/// a FIN or RST fails the session's pending read and the session ends,
+/// returning what it held (a tenant permit, a client slot). Without it such
+/// a session waited on its dead client until the proxy restarted. `0` leaves
+/// the socket as accepted (no keepalive).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn handle_client_enables_the_configured_tcp_keepalive() {
+    use std::os::fd::AsFd;
+    let default = crate::config::LimitsToml::default().client_tcp_keepalive_secs;
+    for secs in [default, 7, 0] {
+        let mut config = test_config();
+        config.limits.client_tcp_keepalive_secs = secs;
+        let server = ProxyServer::new(config.clone()).unwrap();
+        let (proxy, mut client) = pair().await;
+        // The same socket through a descriptor of its own, which outlives
+        // the session's.
+        let probe = socket2::Socket::from(proxy.as_fd().try_clone_to_owned().unwrap());
+        assert!(
+            !probe.keepalive().unwrap(),
+            "{secs}: an accepted socket has none"
+        );
+        let peer = proxy.peer_addr().unwrap();
+        let task = tokio::spawn(ProxyServer::handle_client(
+            proxy,
+            peer,
+            server.state.clone(),
+            Arc::new(config),
+            server.shutdown_tx.clone(),
+        ));
+        // A CancelRequest for an unknown key: the session ends at once (the
+        // probe's descriptor keeps the socket open, so the client sees no
+        // EOF; the session's end is its task's).
+        client.write_all(&cancel_bytes(42, 43)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the session ends")
+            .unwrap()
+            .unwrap();
+        drop(client);
+        assert_eq!(probe.keepalive().unwrap(), secs > 0, "{secs}");
+        if secs > 0 {
+            let every = Duration::from_secs(secs);
+            assert_eq!(probe.tcp_keepalive_time().unwrap(), every);
+            assert_eq!(probe.tcp_keepalive_interval().unwrap(), every);
+        }
+    }
+}
+
+/// ac858d61400b: `[limits] client_tcp_keepalive_secs` is read once at
+/// startup (`state.limits`), so a SIGHUP that changes it is warned about and
+/// the running value kept, like the other client-side `[limits]` keys: the
+/// published config never advertises a keepalive that is not in effect,
+/// while the rest of the reload applies.
+#[tokio::test]
+async fn a_sighup_keeps_the_running_client_tcp_keepalive() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proxy.toml");
+    let nodes = "[[nodes]]\nhost = \"db\"\nport = 5432\nrole = \"primary\"\n";
+    std::fs::write(
+        &path,
+        format!("{nodes}[limits]\nclient_tcp_keepalive_secs = 0\n"),
+    )
+    .unwrap();
+    let config = ProxyConfig::from_file(path.to_str().unwrap()).unwrap();
+    let server = ProxyServer::new(config)
+        .unwrap()
+        .with_config_path(Some(path.to_string_lossy().into_owned()));
+    assert_eq!(server.state.limits.client_tcp_keepalive, None);
+
+    std::fs::write(
+        &path,
+        format!("[pool]\nmax_connections = 77\n{nodes}[limits]\nclient_tcp_keepalive_secs = 60\n"),
+    )
+    .unwrap();
+    server.reload_config().await;
+    let live = server.state.live_config.load_full();
+    assert_eq!(
+        live.limits.client_tcp_keepalive_secs, 0,
+        "the running value is kept"
+    );
+    assert_eq!(server.state.limits.client_tcp_keepalive, None);
+    assert_eq!(
+        live.pool.max_connections, 77,
+        "the rest of the reload applies"
     );
 }
 
@@ -2370,7 +2470,8 @@ async fn idle_watch_keeps_a_backend_fatal_from_a_kept_session() {
         let mut seen = Vec::new();
         client.read_to_end(&mut seen).await.unwrap();
         if keep_session {
-            assert_eq!(outcome, ClientRead::IdleTimeout);
+            // The wait ends at the loss, before the idle deadline.
+            assert_eq!(outcome, ClientRead::BackendGone);
             assert_eq!(seen, status, "only the frames before the FATAL");
             assert!(
                 !conns.contains_key("node-a"),

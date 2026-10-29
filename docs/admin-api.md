@@ -404,7 +404,7 @@ Besides the counters above, the body carries (P-03):
 | `heliosdb_proxy_admission_wait_seconds` | histogram | — | Time a client waited for a slot at `[limits] max_client_connections` (only connections that had to wait). |
 | `heliosdb_proxy_journal_apply_seconds` | histogram | — | Applying a response's captured operations to the recovery journal. |
 | `heliosdb_proxy_operator_replay_seconds` | histogram | — | `POST /api/replay` runs. |
-| `heliosdb_proxy_tr_replay_refusals_total` | counter | `reason` = `outcome_unknown`, `not_replayable`, `cap_exceeded`, `diverged`, `deadline`, `backend_unavailable` | Backend faults Transaction Replay did not transparently continue. |
+| `heliosdb_proxy_tr_replay_refusals_total` | counter | `reason` = `outcome_unknown`, `not_replayable`, `cap_exceeded`, `diverged`, `deadline`, `backend_unavailable` | Backend faults Transaction Replay did not transparently continue. `cap_exceeded` covers transactions over the `[limits] tr_max_replay_*` caps and over their tenant's `[multi_tenancy]` replay-byte budget; `heliosdb_proxy_tr_replay_cap_exceeded_total` counts only the `[limits]` caps. |
 | `heliosdb_proxy_reads_offloaded_total` | counter | — | Requests served by a standby under `[load_balancer] standby_reads`. |
 | `heliosdb_proxy_read_mirror_failures_total` | counter | — | Offloaded reads served by the primary because the standby connection could not be opened (for example a standby that wants a password pass-through auth does not hold) or could not take the session's `SET`s. |
 | `heliosdb_proxy_cache_hits_total` | counter | `tier` = `l1`, `l2`, `l3` | Query cache hits (`[cache] enabled`). |
@@ -421,11 +421,23 @@ Besides the counters above, the body carries (P-03):
 | `heliosdb_proxy_backend_reconnects_in_progress`, `_reconnects_peak`, `_reconnect_limit` | gauge | — | Backend connections being opened on a session's behalf right now (all nodes), the most opened at once to one node since startup (never above the limit), and `[limits] max_concurrent_reconnects_per_node` (H-05). Absent when the limit is `0`. |
 | `heliosdb_proxy_backend_reconnect_waits_total`, `_reconnect_refusals_total` | counter | — | Such connections that waited for a permit, and requests refused with 53300 waiting for one. |
 | `heliosdb_proxy_backend_slot_wait_seconds` | histogram | — | How long the waits for a node slot or a reconnect permit took. |
+| `heliosdb_proxy_tenant_clients`, `_client_limit` | gauge | `tenant` | Client sessions a tenant with a client cap holds on this proxy, and the cap (`[multi_tenancy] max_clients_per_tenant` / `tenant_max_clients`, H-05). Only capped tenants appear. |
+| `heliosdb_proxy_tenant_admission_queue_depth` | gauge | `tenant` | Client connections of the tenant waiting for one of its slots now. |
+| `heliosdb_proxy_tenant_admission_waits_total`, `_admission_refusals_total` | counter | `tenant` | Client connections of the tenant that waited at its cap, and those refused with 53300. |
+| `heliosdb_proxy_tenant_active_queries`, `_active_query_limit` | gauge | `tenant` | Active-query permits the tenant holds now (requests in progress, open transactions), and its cap (`[multi_tenancy] max_active_queries_per_tenant` / `tenant_max_active_queries`). Only tenants with an active-query cap appear in this and the next five rows. |
+| `heliosdb_proxy_tenant_active_queries_idle` | gauge | `tenant` | Permit holders idle now (in a transaction, holding session-level advisory locks, or behind a plugin-blocked `Query` that left an extended cycle open): "busy" versus "pinned". |
+| `heliosdb_proxy_tenant_query_queue_depth` | gauge | `tenant` | Requests of the tenant waiting for a permit now. |
+| `heliosdb_proxy_tenant_queries_admitted_total`, `_query_waits_total`, `_query_refusals_total` | counter | `tenant` | Requests that took a permit, that had to wait for one, and that were refused with 53300. |
+| `heliosdb_proxy_tenant_query_wait_cancels_total` | counter | `tenant` | Waits ended by a CancelRequest (57014) or a client disconnect. |
+| `heliosdb_proxy_tenant_idle_permit_timeouts_total` | counter | `tenant` | Sessions terminated by `[multi_tenancy] idle_permit_timeout_ms`. |
+| `heliosdb_proxy_tenant_replay_bytes`, `_replay_byte_limit` | gauge | `tenant` | Transaction-replay bytes the tenant's sessions hold now, and its budget (`[multi_tenancy] max_replay_bytes_per_tenant` / `tenant_max_replay_bytes`). Only tenants with a replay-byte budget appear in this and the next row. |
+| `heliosdb_proxy_tenant_replay_budget_refusals_total` | counter | `tenant` | Transactions marked non-replayable by the tenant's replay-byte budget. |
+| `heliosdb_proxy_tenant_query_wait_seconds` | histogram | — | How long requests waited for a tenant active-query permit (only requests that waited; every wait, whether it ended admitted, refused, cancelled or abandoned). One series for all tenants, not labelled by tenant: its `_count` is the sum of `heliosdb_proxy_tenant_query_waits_total` over all tenants. |
 
 Histogram buckets are `[limits] latency_buckets_ms`, exported in seconds as `_bucket{le="…"}`,
 `_sum` and `_count`. `GET /metrics` carries the same data as JSON under `latency`
 (`bounds_us`, cumulative counts, `sum_us`, `count`, and `tr_replay_refusals`),
-`gateway_pools`, `query_cache` and `edge_cache`.
+`gateway_pools`, `query_cache`, `edge_cache`, `tenant_slots` and `tenant_budgets`.
 
 > This is not directly scrapable as raw Prometheus text — the payload is JSON with the exposition string in `text`, so a scraper must unwrap the `text` field. This endpoint is served unconditionally; there is no separate build flag that changes its format (the `observability` feature only pulls in the `prometheus`/`opentelemetry` crates and wires no exporter — see the feature-flags reference).
 

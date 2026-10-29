@@ -17,6 +17,32 @@ stay under 3%.
   candidate's CI does not overlap the baseline CI (Criterion's own change report says
   "regressed" / "improved" / "within noise").
 
+## 2026-10-23 — tenant request budgets (3 new cases, values pending)
+
+Per-tenant active-query and replay-byte budgets (sprinter `ac858d61400b`). Three new cases
+in `benches/pooling.rs` (`bench_tenant_budget`), `--features all-features`, built from
+`TenantSlots::from_config` with tenant `t`, `max_active_queries_per_tenant = 1024` (4 for
+the handoff case) and `max_replay_bytes_per_tenant = 1 << 30`. They are NEW in
+`scripts/bench-gate.sh` (no base arm). The values below are recorded from the candidate arm
+of the gate run (`ac858-crit`, host gpc001ca, rustc 1.99.0) by whoever runs it; the
+implementing session ran no Criterion measurement.
+
+| Benchmark | Metric | Value | Date | Host | Features | Commit |
+|---|---|---:|---|---|---|---|
+| `tenant_budget/query_permit/acquire_release` | median ns | pending | — | gpc001ca | `all-features` | — |
+| `tenant_budget/query_permit/handoff_8x4` | median ns (8 admissions, 4 of them queued + handed off) | pending | — | gpc001ca | `all-features` | — |
+| `tenant_budget/replay_charge/reserve_settle` | median ns | pending | — | gpc001ca | `all-features` | — |
+
+`acquire_release` is the capped request's fast path (one CAS, then the release through the
+semaphore's waiter mutex); `handoff_8x4` is the FIFO handoff a saturated tenant takes: on
+a current-thread runtime, 8 tasks share a cap of 4, the first 4 hold their permit across a
+yield, so the other 4 queue in the semaphore and are each handed a permit by a release,
+each wait recorded in the wait histogram as the proxy records it (the bench asserts,
+outside the timing, exactly 4 queued and recorded waits per iteration; the first version
+of this case let every task take a permit at once, so nothing queued, and its numbers do
+not compare); `reserve_settle` is the per-statement replay charge (one CAS) and the credit
+at transaction end.
+
 ## 2026-10-07 — L2 cache baseline (2 new cases) and the L2 file-cache TTL gate
 
 L2 file-cache TTL repair (sprinter `21cc434afb5c`). Host **gpc001ca**, rustc **1.99.0**,

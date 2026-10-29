@@ -111,6 +111,52 @@ pub(super) struct ForwardCtx<'a> {
     /// Filled on a backend fault (failed node, delivery phase); a client-side
     /// error leaves it untouched.
     pub(super) fault: &'a mut Option<BackendFault>,
+    /// The request continues a cycle a backend connection already holds open
+    /// (a Flush dispatched part of it, or an extended COPY awaits its Sync):
+    /// part of a request admitted already, it is neither refused (rate limit,
+    /// open circuit) nor answered from a cache, nor routed anywhere but that
+    /// connection, any of which would leave the cycle open behind a reply its
+    /// backend never gave. `None`: a new request.
+    pub(super) continues_cycle: Option<OpenCycle<'a>>,
+}
+
+/// The cycle a backend connection holds open, as the request continuing it
+/// sees it (see [`ForwardCtx::continues_cycle`]).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct OpenCycle<'a> {
+    /// The node whose connection holds the cycle. The request goes there
+    /// whatever routing would pick (read offload, a hint, an unhealthy or
+    /// disabled node): that connection's reply, or its failure, settles the
+    /// cycle. With that connection gone the request is a fault on it.
+    pub(super) node: &'a str,
+    /// The request runs statements of its own (an `Execute`, a `Query`): the
+    /// rate limiter charges it like any request, but paces it instead of
+    /// refusing it (`rate_limit_pace`). A batch that runs none (a bare
+    /// `Sync` or `Flush`, a `Close`) is not charged.
+    pub(super) runs: bool,
+}
+
+impl OpenCycle<'_> {
+    /// The connection holding the cycle is gone (its backend died, or the
+    /// session dropped it): the request continuing the cycle is a fault on
+    /// that node, never sent to a fresh connection that knows nothing of the
+    /// cycle. Part of the cycle may already have run there, so its outcome
+    /// is unknown.
+    pub(super) fn lost(
+        &self,
+        conns: &HashMap<String, BackendConn>,
+        fault: &mut Option<BackendFault>,
+    ) -> Option<ProxyError> {
+        if conns.contains_key(self.node) {
+            return None;
+        }
+        let e = ProxyError::Connection(format!(
+            "the backend connection holding the open extended-protocol cycle on {} is gone",
+            self.node
+        ));
+        BackendFault::set(fault, self.node, FaultPhase::OutcomeUnknown, &e);
+        Some(e)
+    }
 }
 
 /// Read offload under pass-through auth: the standbys that refused a login
@@ -482,6 +528,9 @@ impl ProxyServer {
         .await;
         match synced {
             Ok(_) => {
+                // Sent as simple Queries (a `RESET ALL`, or settings on a
+                // fresh connection: never nothing).
+                bc.unnamed_destroyed();
                 bc.gucs_synced = Some(reads.guc_epoch);
                 bc.gucs_role = Self::tr_sets_role(reads.gucs);
                 #[cfg(feature = "pool-modes")]
@@ -497,7 +546,6 @@ impl ProxyServer {
                     error = %e,
                     "could not mirror the session's settings onto a standby; reading from the primary"
                 );
-                conns.remove(target);
                 state
                     .metrics
                     .read_mirror_failures
@@ -509,6 +557,7 @@ impl ProxyServer {
                         .reads_pinned
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                Self::abandon_conn(conns, target, session, state).await;
                 false
             }
         }
@@ -536,13 +585,15 @@ impl ProxyServer {
         #[cfg(feature = "pool-modes")]
         if let Some(pool) = state.backend_pool.as_ref() {
             let key = Self::pool_key_for(target, session).await;
-            if let Some((stream, slot)) = pool.checkout_with_slot(&key) {
+            if let Some((stream, slot, backend_key)) = pool.checkout_keyed(&key) {
                 tracing::info!(
                     target: "helios::pool",
                     node = %target,
                     "reused pooled backend connection"
                 );
-                conns.insert(target.to_string(), BackendConn::with_slot(stream, slot));
+                let mut bc = BackendConn::with_slot(stream, slot);
+                bc.backend_key = backend_key;
+                conns.insert(target.to_string(), bc);
                 return Ok(());
             }
         }
@@ -562,7 +613,7 @@ impl ProxyServer {
         let capacity_deadline = tokio::time::Instant::now() + config.pool.acquire_timeout();
         let seed = session.id.as_u128() as u64;
         let mut attempt: u32 = 0;
-        let (backend, hot_standby) = loop {
+        let (backend, hot_standby, backend_key) = loop {
             let mut backend =
                 tokio::time::timeout(config.pool.acquire_timeout(), TcpStream::connect(target))
                     .await
@@ -585,7 +636,13 @@ impl ProxyServer {
             )
             .await
             {
-                Ok(frames) => break (backend, Self::reports_hot_standby(&frames)),
+                Ok(frames) => {
+                    break (
+                        backend,
+                        Self::reports_hot_standby(&frames),
+                        Self::backend_key_data(&frames),
+                    )
+                }
                 Err(ProxyError::PoolExhausted(msg)) => {
                     if !Self::backend_capacity_backoff(
                         state,
@@ -615,8 +672,148 @@ impl ProxyServer {
         tracing::debug!(node = %target, "opened backend connection");
         let mut bc = BackendConn::with_slot(backend, slot);
         bc.hot_standby = hot_standby;
+        bc.backend_key = backend_key;
         conns.insert(target.to_string(), bc);
         Ok(())
+    }
+
+    /// The BackendKeyData (process id, secret key) in a backend's startup
+    /// frames (as `complete_backend_auth` returns them), if it sent one.
+    pub(super) fn backend_key_data(frames: &[u8]) -> Option<(u32, u32)> {
+        let mut at = 0;
+        while let Some(head) = frames.get(at..at + 5) {
+            let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let body = frames.get(at + 5..at + 1 + len)?;
+            if head[0] == b'K' && body.len() >= 8 {
+                return Some((
+                    u32::from_be_bytes([body[0], body[1], body[2], body[3]]),
+                    u32::from_be_bytes([body[4], body[5], body[6], body[7]]),
+                ));
+            }
+            at += 1 + len;
+        }
+        None
+    }
+
+    /// Whether the backend behind `bc` may still be running what the proxy
+    /// sent it: its socket is not observed closed. A backend that ended its
+    /// session (exited, or was killed) closed or reset the socket; one that
+    /// is still executing, waiting on a lock, or unreachable without a reset
+    /// looks open. Reads at most one byte, so only on a socket being dropped.
+    pub(super) fn backend_may_be_running(bc: &BackendConn) -> bool {
+        let mut probe = [0u8; 1];
+        match bc.stream.try_read(&mut probe) {
+            Ok(0) => false,
+            Ok(_) => true,
+            Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
+        }
+    }
+
+    /// Drop the session's connection to `node` after a fault on it (or its
+    /// client going away) while a request the proxy delivered on it may
+    /// still be running there, cancelling that request first.
+    ///
+    /// Closing the socket alone does not stop it: PostgreSQL notices a
+    /// closed client socket only when it next writes to it (or every
+    /// `client_connection_check_interval`, off by default), so a statement
+    /// silent past `[limits] backend_read_timeout_secs`, one waiting on a
+    /// lock, or a `Flush`-dispatched `Execute` whose client vanished, runs on
+    /// with its CPU, I/O and locks for its whole duration, outside the
+    /// tenant active-query cap whose permit the session then returns
+    /// (ac858d61400b). So the backend gets a CancelRequest with the
+    /// connection's BackendKeyData ([`Self::cancel_abandoned`]); only a
+    /// backend that implements CancelRequest stops the statement
+    /// (HeliosDB-Nano ignores one: there it runs to completion). A backend
+    /// that already closed or reset the socket, or a connection without a
+    /// key, gets none. Callers record the fault first: a cancel this waits
+    /// for never delays the node's demotion.
+    pub(super) async fn abandon_conn(
+        conns: &mut HashMap<String, BackendConn>,
+        node: &str,
+        session: &ClientSession,
+        state: &ServerState,
+    ) {
+        if let Some(bc) = conns.remove(node) {
+            Self::cancel_abandoned(bc, node, session, state).await;
+        }
+    }
+
+    /// Drop `node`'s connection after a fault before anything of the
+    /// request reached it (`FaultPhase::NotDelivered`): only a cycle the
+    /// backend holds open, which the request continues (`open_cycle`: a
+    /// `Flush`-dispatched `Execute`, a COPY), can be running there, and is
+    /// cancelled ([`Self::abandon_conn`]); otherwise the backend is idle (or
+    /// waits for the rest of a frame) and the socket is just closed.
+    pub(super) async fn drop_undelivered(
+        conns: &mut HashMap<String, BackendConn>,
+        node: &str,
+        open_cycle: bool,
+        session: &ClientSession,
+        state: &ServerState,
+    ) {
+        if open_cycle {
+            Self::abandon_conn(conns, node, session, state).await;
+        } else {
+            conns.remove(node);
+        }
+    }
+
+    /// [`Self::abandon_conn`] for a connection already taken out of the
+    /// session's map: the CancelRequest, if its backend may still be running
+    /// something, then the socket's close (it stays open until the request
+    /// was sent, so its backend keeps the process id the key names).
+    ///
+    /// Awaited, bounded by `[limits] backend_cancel_timeout_ms`, only when
+    /// it guards a tenant active-query permit (the session's tenant has an
+    /// active-query cap): the permit then returns only after the cancel was
+    /// sent. Every other session sends it from a task of its own, so its
+    /// fault path (failover, re-execution) or its next message never waits
+    /// for a backend host that does not answer, as before the cancel existed.
+    pub(super) async fn cancel_abandoned(
+        bc: BackendConn,
+        node: &str,
+        session: &ClientSession,
+        state: &ServerState,
+    ) {
+        let Some((pid, key)) = bc.backend_key else {
+            return;
+        };
+        if !Self::backend_may_be_running(&bc) {
+            return;
+        }
+        let timeout = state.limits.backend_cancel_timeout;
+        if session.tenant_query_capped() {
+            Self::cancel_then_close(bc, node, (pid, key), timeout).await;
+        } else {
+            let node = node.to_string();
+            tokio::spawn(async move {
+                Self::cancel_then_close(bc, &node, (pid, key), timeout).await;
+            });
+        }
+    }
+
+    /// Send `bc`'s backend the CancelRequest for `(pid, key)`, then close
+    /// `bc` (dropped here). The request goes to the address `bc` is open to:
+    /// the key names a process of that server alone, and `node` is resolved
+    /// afresh on every dial, so a name with several addresses, or one that
+    /// changed since `bc` connected, can lead to another server, which
+    /// ignores the key while the statement runs on. `node` is dialled only
+    /// when the socket no longer reports its peer.
+    async fn cancel_then_close(bc: BackendConn, node: &str, key: (u32, u32), timeout: Duration) {
+        let peer = bc.stream.peer_addr().ok();
+        let sent = match peer {
+            Some(peer) => Self::send_cancel_request(peer, key.0, key.1, timeout).await,
+            None => Self::send_cancel_request(node, key.0, key.1, timeout).await,
+        };
+        if sent {
+            tracing::info!(
+                node = %node,
+                peer = ?peer,
+                pid = key.0,
+                "sent a CancelRequest for the request abandoned on a backend connection before closing it"
+            );
+        }
+        drop(bc);
     }
 
     /// Whether a backend's startup frames (as `complete_backend_auth`
@@ -864,12 +1061,16 @@ impl ProxyServer {
         // autocommit workloads. Any of these three signals forces the full
         // reset. Extended-protocol traffic always has `prepared`/`unnamed_sig`
         // set (or `dirty`, after a Close), so it is never clean-skipped
-        // (conservative by construction).
-        let clean =
-            !bc.dirty && bc.prepared.is_empty() && bc.stale.is_empty() && bc.unnamed_sig.is_none();
+        // (conservative by construction). Nor is an unnamed statement or
+        // portal the session no longer has (`unnamed_stale`).
+        let clean = !bc.dirty
+            && bc.prepared.is_empty()
+            && bc.stale.is_empty()
+            && bc.unnamed_sig.is_none()
+            && !bc.unnamed_stale.any();
         if config.pool_mode.skip_clean_reset && clean {
             let key = Self::pool_key_for(node, session).await;
-            if pool.checkin_with_slot(&key, bc.stream, bc._slot) {
+            if pool.checkin_keyed(&key, bc.stream, bc._slot, bc.backend_key) {
                 pool.note_reset_skipped();
                 tracing::debug!(target: "helios::pool", node = %node, "parked clean backend connection (reset skipped)");
             }
@@ -886,10 +1087,13 @@ impl ProxyServer {
         .is_ok()
         {
             let key = Self::pool_key_for(node, session).await;
-            if pool.checkin_with_slot(&key, bc.stream, bc._slot) {
+            if pool.checkin_keyed(&key, bc.stream, bc._slot, bc.backend_key) {
                 tracing::debug!(target: "helios::pool", node = %node, "parked backend connection for reuse");
             }
+            return;
         }
-        // On reset failure the connection is dropped here (closed).
+        // On reset failure the connection is dropped here (closed), the
+        // reset cancelled first if it may still be running.
+        Self::cancel_abandoned(bc, node, session, state).await;
     }
 }

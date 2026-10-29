@@ -9,6 +9,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-tenant active-query and replay-byte budgets** (H-05 follow-up, Sprinter
+  ac858d61400b; `multi-tenancy` feature). New `[multi_tenancy]` keys:
+  `max_active_queries_per_tenant` (default 0 = no cap) with `tenant_max_active_queries`
+  overrides, `active_query_wait_ms` (default 5000), `idle_permit_timeout_ms` (default 0 =
+  off), and `max_replay_bytes_per_tenant` (default 0 = no budget) with
+  `tenant_max_replay_bytes` overrides. A PG-wire request that starts while its session is
+  idle takes one of its tenant's permits and holds it until the session is idle again (an
+  explicit transaction holds one permit from `BEGIN` to its end; under session pooling, so
+  does a session holding session-level advisory locks (taken by a statement naming
+  `pg_advisory_lock[_shared]` or `pg_try_advisory_lock[_shared]` as a whole word, literals
+  and comments included; a table such as `job_advisory_locks` takes none), until a simple-protocol
+  `pg_advisory_unlock_all()` or `DISCARD ALL` succeeds on the backend connection that took
+  them or that connection ends: one refused before it releases nothing, a lock statement a
+  failover answers without re-running it takes none, and the extended protocol never clears
+  it, so a session that uses only the extended protocol keeps its permit until it ends or
+  loses that connection; one lost while the session idles returns the permit at once, not at
+  the client's next message).
+  At the cap a request waits FIFO,
+  then is refused with 53300 `too many active queries for tenant "X" (limit N)`; the
+  session stays usable, and a refused extended cycle is discarded up to its `Sync`. A
+  CancelRequest during the wait answers 57014 `canceling statement due to user request`
+  (a key that several live sessions were relayed, from a backend that issues colliding
+  BackendKeyData, ends no wait and is forwarded to the backend as before), and under transaction/statement pooling a waiting session parks its idle backend
+  connections first. A single-statement simple `COMMIT PREPARED` / `ROLLBACK PREPARED` is
+  exempt. `idle_permit_timeout_ms` terminates a session idle while holding a permit (FATAL
+  25P03 in a transaction, 57P05 otherwise). The replay budget bounds the transaction-replay
+  bytes all sessions of a tenant hold (`tr_mode` `select`/`transaction`); the statement
+  that would exceed it marks its transaction non-replayable like `[limits]
+  tr_max_replay_bytes`. A request the proxy abandons while its backend may still run it
+  (silent past `[limits] backend_read_timeout_secs` or `backend_response_timeout_secs`, its
+  client gone mid-response, or a session that ends with a `Flush`-dispatched `Execute` or an
+  extended COPY's end open) now gets a CancelRequest there first: the backend connection keeps the
+  BackendKeyData its backend reported (also while parked in the pool), and the proxy sends
+  that backend a CancelRequest, bounded by the new `[limits] backend_cancel_timeout_ms`
+  (default 5000, which also bounds a forwarded client CancelRequest, now including the
+  backend's close), before the connection closes and the session's permit returns. Before
+  this, such a statement ran on outside the cap until it next wrote to its closed socket.
+  That cancel, and a client's forwarded CancelRequest, go to the address the backend
+  connection is open to (the node's `host:port` is dialled only when that is unknown), so
+  a node name with several addresses, or one a failover moved, no longer sends them to a
+  server that ignores the key. The cancel stops the statement only on a backend that
+  implements CancelRequest (PostgreSQL; PgBouncer forwards it): HeliosDB-Nano ignores one,
+  so there such a statement still runs to completion outside the cap.
+  Only a session whose tenant has an active-query cap waits for that cancel (after the
+  fault is recorded against the node); every other session sends it in the background, so
+  its failover latency is unchanged. Library: `pool::backend_pool::BackendKey`,
+  `BackendIdlePool::{checkin_keyed, checkout_keyed}`; `LimitsToml` gains the public field
+  `backend_cancel_timeout_ms` (default 5000), so struct literals without
+  `..Default::default()` must set it; `metrics_hist::ProxyLatency` gains
+  `tenant_query_wait`. Metrics: `tenant_budgets` in `GET /metrics`, twelve
+  `heliosdb_proxy_tenant_*` series labelled by tenant and the
+  `heliosdb_proxy_tenant_query_wait_seconds` histogram (one series for all tenants). The reconnect-wave lab drill runs a
+  heavy tenant against both budgets. Library: `tenant_slots::{TenantBudget, TenantCharge,
+  QueryHold, QueryWait, TenantBudgetStats, TenantQueryRefusal}`, `TenantSlots::{budget,
+  budget_of, budget_stats, has_budgets, has_replay_budgets, register_query_wait,
+  unregister_query_wait, cancel_query_wait, session_key_relayed, session_key_ended}`, `MultiTenancyToml::{active_query_cap,
+  replay_byte_cap}` and the new public `MultiTenancyToml` fields (struct literals without
+  `..Default::default()` no longer compile).
+- **TCP keepalive on client sockets** (`[limits] client_tcp_keepalive_secs`, default 60;
+  0 = off). Every accepted PG-wire client socket now probes its peer after that many idle
+  seconds, at the same interval, so a client that vanished without a FIN or RST (a NAT or
+  load-balancer flow dropped, a host frozen or powered off) ends its session once the OS's
+  probe count goes unanswered, and what the session held returns: a `[multi_tenancy]`
+  active-query permit (an idle transaction, advisory locks, a stalled COPY), its client
+  slot, its backend connections. Before this the proxy enabled no keepalive, and such a
+  session waited on its dead client until the proxy restarted. With keepalive off, a tenant
+  active-query cap now logs a warning at startup: `idle_permit_timeout_ms` ends only an idle
+  permit holder (in a transaction, holding advisory locks), `client_idle_timeout_secs` also
+  a client mid-cycle (after a `Flush`), and nothing ends a session in a stalled COPY or
+  with a message partly received. Read at startup; a SIGHUP change is ignored with a
+  warning.
+  `LimitsToml` gains the public field `client_tcp_keepalive_secs` (struct literals without
+  `..Default::default()` must set it) and `config::MAX_TCP_KEEPALIVE_SECS` (32767).
 - **Client TLS follows a SIGHUP reload.** `[tls]` and the files it names are reloaded with
   the configuration: replace the certificate and key on disk and send `SIGHUP` to rotate
   them. New connections handshake with the new certificate, established sessions keep
@@ -55,6 +128,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Synthesized refusals report the backend's transaction status.** Rate-limit, circuit
+  fast-fail, plugin-block and wasm-cached replies inside a transaction ended in
+  ReadyForQuery 'I' while the backend transaction stayed open; they now report its real
+  status ('T' or 'E'). As before, such a refusal does not abort the transaction the way a
+  PostgreSQL error does: a `COMMIT` sent after it commits the statements that ran before
+  the refused one, so a client that continues after the error must roll back itself
+  (documented under `[rate_limit]`, `[circuit_breaker]` and `[plugins]`). A transaction end
+  refused this way while the session emulates a transaction a failover aborted reports 'E'
+  and keeps the emulation (later statements get 25P02, never autocommit).
+- **The unnamed statement and portal follow PostgreSQL's lifetime.** PostgreSQL destroys
+  the unnamed prepared statement at every simple Query and before it parses an unnamed
+  `Parse` (so even one that fails leaves none), and the unnamed portal at every simple
+  Query. A request the proxy refused or answered without the backend (the rate limiter,
+  circuit fast-fail, the tenant active-query cap or a cancel of its wait, a query- or
+  edge-cache hit, a plugin answer, the aborted-transaction emulation), or a Query another
+  of the session's connections ran, left the older ones on the backend connection: a later
+  `Bind` or `Describe` of the unnamed statement, or `Execute` of the unnamed portal, with
+  no `Parse` or `Bind` of its own (for example a pipelined prepare-only cycle, then its
+  execution) ran the older statement with the new parameters where PostgreSQL answers
+  26000 or 34000. The proxy now closes them on that connection before such a batch (one
+  extra round trip, only then). Conversely the unnamed-`Parse` promotion
+  (`optimize_unnamed_parse`, on by default) skipped an unnamed `Parse` identical to the one
+  before a simple Query the backend ran, or before settings the proxy itself mirrored or
+  restored on that connection, so its `Bind` failed 26000 where PostgreSQL runs it (the
+  same parameterized statement on either side of a simple `BEGIN`, say). Residual: a Query
+  a plugin `Block` refuses while a `Flush`-dispatched cycle stays open leaves that cycle's
+  own later batches unchecked until it settles.
+- **A message continuing an open extended cycle is no longer refused or sent elsewhere.**
+  Anything after a Flush-dispatched part of an extended cycle (further `Bind`/`Execute`/
+  `Flush` batches, the `Sync`, or a Query), or after an extended `COPY` ended, could be
+  refused before it reached the backend (rate limit, circuit fast-fail), answered from the
+  query or edge cache, or routed to another node (read offload, a routing hint, the node
+  marked unhealthy or disabled meanwhile). The client was told the cycle failed (or
+  finished) while the backend kept it open: a flushed chunk that had failed made the backend
+  skip the next cycle (the client got a bare ReadyForQuery), one that had succeeded was
+  committed by the next cycle's Sync after the client saw an error, under
+  transaction/statement pooling the connection was reset and parked mid-cycle, and a write
+  with its row locks stayed uncommitted on the primary while the session (and its tenant
+  permit) moved on. Such a message now belongs to the request admitted at the cycle's first
+  forwarded batch: it goes to the connection holding the cycle (a fault on that node when
+  the connection is gone), is never refused nor answered from a cache, and that backend's
+  reply settles the cycle. The rate limiter still charges one that runs statements (a batch
+  with an `Execute`, or a Query): with the bucket empty it waits for the token, at most 5 s,
+  instead of being refused, so a `Flush`-chained pipeline runs at the bucket's rate. Only a
+  plugin `Block` of such a Query still leaves the cycle open; the session then keeps its
+  connection and tenant permit until a later request settles it (or that connection is
+  lost: the permit returns at once, the cycle having died with it), and counts as an idle
+  permit holder meanwhile (`idle_permit_timeout_ms` bounds it; a bare `Flush` sent then is
+  consumed, as at idle). A session that ends with a cycle still open on its backend (its
+  client gone after a `Flush` or an extended `COPY`'s end, an idle or idle-permit timeout)
+  closes that connection, so the backend rolls the cycle back, instead of resetting it
+  mid-cycle (which committed the unsynced work, or waited out the reset's drain timeout
+  with the tenant permit held) and parking it. A `Sync` (or a Query in its
+  place) continuing an extended `COPY` whose connection was lost before it (the backend
+  died while the session was idle, or the session moved to a new write leader) is answered
+  `08007` in every `tr_mode` but `none`, instead of being re-run alone on a replacement
+  connection, whose bare ReadyForQuery told the client the COPY had completed while its rows
+  died uncommitted. A `Flush` sent there gets that `08007`, and the `Sync` after it a
+  ReadyForQuery that leaves the session idle: its tenant permit returns and, under
+  transaction/statement pooling, its replacement connection is parked.
+- **A `Flush`-dispatched cycle a routing hint sent to a standby is relayed.** With read
+  offload, a pipelining client's extended cycle that a `route=standby` (or `node=`) hint
+  sent to a standby while the session's home stayed on the primary (libpq
+  `PQsendFlushRequest`, a psycopg 3 pipeline) never got the rest of its results: the idle
+  backend watch covered only the home connection, so they sat in the standby's socket
+  while the proxy waited for the client and the client for them, and a capped tenant's
+  session held its active-query permit until the client gave up. While a cycle its client
+  is still in is open, the watch now covers the connection holding it, wherever routing
+  sent it, and that connection's loss ends the session with 08006 as on the home node.
+- **A stray CopyData, CopyDone or CopyFail outside a COPY is ignored**, as PostgreSQL
+  ignores it (pgx, for one, sends CopyDone after a COPY that failed or was refused at once).
+  On the simple protocol the session waited for a ReadyForQuery that never came; after an
+  extended-protocol request it was taken for the end of an extended COPY, which let a
+  following bare Flush dispatch a cycle (and a capped tenant's session run requests and
+  open transactions) without an active-query permit; and a session holding no backend
+  connection (idle under transaction/statement pooling) answered it with an unsolicited
+  `57000 COPY aborted: backend connection lost` and ReadyForQuery, which put every later
+  reply on that connection one query behind. A COPY whose connection was lost before its
+  end is still answered 57000 at its CopyDone or CopyFail.
+- **A message that ends a COPY in copy-in leaves the session idle again.** PostgreSQL ends
+  copy-in at any message other than CopyData, CopyDone and CopyFail (and the Flush and
+  Sync it ignores there): it fails the COPY (08P01) without running that message, and
+  answers ReadyForQuery (a COPY a Query started) or skips to the Sync that does. The proxy
+  relayed that ReadyForQuery but still took the session for one mid-COPY until it ended,
+  so for the rest of the session its tenant permit (and, under transaction/statement
+  pooling, its backend connection) stayed pinned, its idle backend watch and both idle
+  timeouts stayed off, and `idle_permit_timeout_ms` never applied. A backend's
+  ReadyForQuery now ends the session's COPY. Such a message also goes to the COPY's own
+  connection, like one continuing an open extended cycle (never refused, answered from a
+  cache, or routed elsewhere: read offload sent a read to a standby, whose ReadyForQuery
+  ended no COPY on the primary); one a plugin `Block`s leaves the COPY open there and the
+  session an idle permit holder, which `idle_permit_timeout_ms` bounds.
+- **A session whose backend died while its client waited inside an extended cycle no
+  longer hangs.** When the connection holding a cycle its client was still in died while
+  the session waited for that client (`pg_terminate_backend`, a crash, a failover), the
+  client could be waiting for answers no backend would give: the rest of a
+  `Flush`-dispatched cycle's results (a libpq or psycopg pipeline, which only the idle
+  backend watch relays), or the answer to an extended `COPY`'s end. Under a recording
+  `tr_mode` the backend's FATAL was dropped (the session survives other losses), with
+  `tr_mode = none` a crash sent none, and the proxy then waited for the client in turn
+  with the tenant permit held, which `idle_permit_timeout_ms` does not cover; two such
+  sessions could take a tenant's last permits for good. Such a session now ends at once
+  with FATAL 08006 `backend ... connection lost while an extended-protocol cycle was open
+  on it (its outcome is unknown)`, and its permit returns. A client whose COPY end was
+  answered still gets 08007 at the `Sync` it owes and goes on.
+- **A cycle refused at a `Flush` batch is discarded up to its `Sync`.** A `Flush`-terminated
+  batch that started an extended cycle and was refused before it reached any backend (an
+  empty rate-limit bucket, an open circuit, the error a failover answers it with when it
+  does not re-run it) got its ErrorResponse, but what the client pipelined after it was
+  taken for a new request: once the bucket refilled or the circuit closed, a later
+  `Bind`/`Execute` ran and the cycle's `Sync` committed it although the client had been
+  told the cycle failed (a libpq pipeline or an asyncpg `executemany` committed partly),
+  and each refused chunk got an error of its own. As PostgreSQL skips to the `Sync` after
+  an error, the rest of such a cycle (a `Query` included) is now discarded, and its `Sync`
+  is answered with ReadyForQuery reporting the backend's status, without being charged,
+  and returns the cycle's tenant permit. A bare `Flush` with no extended cycle open is
+  consumed in every session, as PostgreSQL answers nothing to one: it runs nothing, so a
+  rate limit, an open circuit or a lost backend's recovery never refuses it (which would
+  discard a simple `Query` sent after it, and hang a client that never sends a `Sync`),
+  and it never makes the next request look like part of a cycle.
+- **A SIGHUP that changed `[multi_tenancy]` was silently ignored**; it now logs a warning
+  and keeps the running section (it is applied at startup only).
+- **A tenant cap above `Semaphore::MAX_PERMITS` panicked at startup**; it is now a config
+  error.
+- **`[multi_tenancy] enabled = true` in a build without the `multi-tenancy` feature** now
+  logs a startup warning.
 - **Admin node controls reach routing.** `POST /api/chaos force_unhealthy` and
   `POST /nodes/{addr}/disable` only flipped the admin API's display copy of node health,
   which the server overwrote within a second, so neither ever took a node out of routing

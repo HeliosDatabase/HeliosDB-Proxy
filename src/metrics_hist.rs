@@ -199,6 +199,10 @@ pub struct ProxyLatency {
     /// Waits for a slot on a node at its `max_connections` cap, or for a
     /// `max_concurrent_reconnects_per_node` permit (H-05).
     pub backend_slot_wait: LatencyHistogram,
+    /// Request waits for one of the tenant's active-query permits at its
+    /// `[multi_tenancy]` cap (ac858d61400b); only requests that waited, every
+    /// wait however it ended (admitted, refused, cancelled, abandoned).
+    pub tenant_query_wait: LatencyHistogram,
     refusals: [AtomicU64; ReplayRefusal::ALL.len()],
 }
 
@@ -211,6 +215,7 @@ impl ProxyLatency {
             journal_apply: LatencyHistogram::new(bounds_ms),
             operator_replay: LatencyHistogram::new(bounds_ms),
             backend_slot_wait: LatencyHistogram::new(bounds_ms),
+            tenant_query_wait: LatencyHistogram::new(bounds_ms),
             refusals: Default::default(),
         }
     }
@@ -246,6 +251,7 @@ impl ProxyLatency {
             "journal_apply": hist(&self.journal_apply),
             "operator_replay": hist(&self.operator_replay),
             "backend_slot_wait": hist(&self.backend_slot_wait),
+            "tenant_query_wait": hist(&self.tenant_query_wait),
             "tr_replay_refusals": refusals,
         })
     }
@@ -283,6 +289,11 @@ impl ProxyLatency {
                 &self.backend_slot_wait,
                 "heliosdb_proxy_backend_slot_wait_seconds",
                 "Waits for a slot on a node at its max_connections cap or for a reconnect permit",
+            ),
+            (
+                &self.tenant_query_wait,
+                "heliosdb_proxy_tenant_query_wait_seconds",
+                "Request wait for a tenant active-query permit, all tenants together, admitted or not (only requests that waited)",
             ),
         ] {
             hist.snapshot().write_prometheus(out, name, help);
@@ -387,6 +398,8 @@ mod tests {
             "admission_wait",
             "journal_apply",
             "operator_replay",
+            "backend_slot_wait",
+            "tenant_query_wait",
         ] {
             assert!(out.contains(&format!("# TYPE heliosdb_proxy_{name}_seconds histogram\n")));
         }

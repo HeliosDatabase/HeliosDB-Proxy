@@ -73,7 +73,7 @@ use frames::RelayLimits;
 use frames::{backend_frame_len, read_budget, validate_backend_frame_len};
 
 mod session;
-use session::{BackendConn, SessionGuard};
+use session::{BackendConn, SessionGuard, UnnamedStale};
 pub use session::{ClientSession, ExtendedBatchLog, StatementLog, TransactionState};
 
 mod stmt_facts;
@@ -90,7 +90,7 @@ mod client;
 mod auth;
 
 mod backend_conn;
-use backend_conn::{ForwardCtx, OffloadRefusals, ReadRoute, ReadRouting};
+use backend_conn::{ForwardCtx, OffloadRefusals, OpenCycle, ReadRoute, ReadRouting};
 
 mod ext_set;
 use ext_set::{Bound, ExtSetBoundary, ExtSetCycle, ExtSetOutcome, SettingsOp, TxVerb};
@@ -279,6 +279,18 @@ pub(crate) fn parse_pg_lsn(text: &str) -> Option<u64> {
     Some((hi << 32) | (lo & 0xffff_ffff))
 }
 
+/// Where a client's CancelRequest for a BackendKeyData goes
+/// (`ServerState::cancel_map`): the address the backend connection that
+/// issued the key is open to (`peer`), as the key names a process of that
+/// server alone, while the node's `host:port` is resolved afresh on every
+/// dial and can lead elsewhere (several addresses, a name moved since).
+/// `node` is dialled only when the connection did not report its peer.
+#[derive(Debug, Clone)]
+struct CancelTarget {
+    node: String,
+    peer: Option<SocketAddr>,
+}
+
 /// Server runtime state
 struct ServerState {
     /// Operational limits/timeouts resolved from `[limits]` config at startup.
@@ -320,11 +332,11 @@ struct ServerState {
     /// Metrics
     metrics: ServerMetrics,
     /// Query-cancellation routing. Maps the BackendKeyData (pid, secret)
-    /// the backend handed to the client onto the backend address that
-    /// issued it, so a later out-of-band CancelRequest (which arrives on a
-    /// fresh connection) can be forwarded to the right backend instead of
-    /// being dropped. Bounded; best-effort.
-    cancel_map: Arc<DashMap<(u32, u32), String>>,
+    /// the backend handed to the client onto the backend that issued it, so
+    /// a later out-of-band CancelRequest (which arrives on a fresh
+    /// connection) can be forwarded to the right backend instead of being
+    /// dropped. Bounded; best-effort.
+    cancel_map: Arc<DashMap<(u32, u32), CancelTarget>>,
     /// Insertion order of `cancel_map` keys, so an overflow evicts the OLDEST
     /// entries (FIFO) instead of clearing the whole map — a busy proxy no
     /// longer loses every in-flight cancel registration at once.
@@ -590,6 +602,10 @@ enum ClientRead {
     /// The `[limits] client_idle_timeout_secs` deadline expired while the
     /// session sat idle between statements.
     IdleTimeout,
+    /// The watched backend connection ended while the session sat idle: its
+    /// entry is gone from `conns` and nothing of the client was read. The
+    /// caller settles what died with it, then waits on the client again.
+    BackendGone,
 }
 
 /// What the idle watch needs from the session while it relays backend
@@ -1069,6 +1085,12 @@ impl ProxyServer {
         let gateway_pools = Arc::new(crate::gateway_pool::GatewayPools::new(
             resolved_limits.gateway_pool_max_idle,
         ));
+        #[cfg(not(feature = "multi-tenancy"))]
+        if config.multi_tenancy.enabled {
+            tracing::warn!(
+                "[multi_tenancy] enabled = true but this build lacks the `multi-tenancy` feature: row isolation, tenant client caps and request budgets are inactive"
+            );
+        }
         let state = Arc::new(ServerState {
             limits: resolved_limits,
             client_slots,
@@ -1275,14 +1297,43 @@ impl ProxyServer {
             );
             new_config.edge = old.edge.clone();
         }
+        // [multi_tenancy] is built once at startup (tenant manager, client
+        // caps, request budgets): warn and keep the running section, like
+        // [edge].
+        if new_config.multi_tenancy != old.multi_tenancy {
+            tracing::warn!(
+                old = ?old.multi_tenancy,
+                new = ?new_config.multi_tenancy,
+                "[multi_tenancy] changed on SIGHUP but is applied at startup only — keeping the running settings (restart, or a SIGUSR2 handoff, to apply)"
+            );
+            new_config.multi_tenancy = old.multi_tenancy.clone();
+        }
+        // tr_mode follows a reload for new sessions; the tenant replay-byte
+        // budgets apply only to sessions that record their transactions.
+        let records = |m: TrMode| matches!(m, TrMode::Select | TrMode::Transaction);
+        if self.state.tenant_slots.has_replay_budgets()
+            && records(new_config.effective_tr_mode()) != records(old.effective_tr_mode())
+        {
+            tracing::warn!(
+                old = ?old.effective_tr_mode(),
+                new = ?new_config.effective_tr_mode(),
+                "tr_mode changed on SIGHUP: [multi_tenancy] replay-byte budgets {} for new sessions",
+                if records(new_config.effective_tr_mode()) {
+                    "now apply"
+                } else {
+                    "no longer apply"
+                }
+            );
+        }
         // `[limits]` is resolved once at startup into `state.limits` (and, for
         // max_client_connections, into the already-sized `client_slots`
         // semaphore whose outstanding permits could not be revoked anyway), so
-        // a reload cannot apply it. Warn on the two opt-in stability bounds
+        // a reload cannot apply it. Warn on the client-side stability bounds
         // rather than let an operator believe a SIGHUP armed them.
         if new_config.limits.max_client_connections != old.limits.max_client_connections
             || new_config.limits.client_idle_timeout_secs != old.limits.client_idle_timeout_secs
             || new_config.limits.client_admission_wait_secs != old.limits.client_admission_wait_secs
+            || new_config.limits.client_tcp_keepalive_secs != old.limits.client_tcp_keepalive_secs
         {
             tracing::warn!(
                 old_max_client_connections = old.limits.max_client_connections,
@@ -1291,7 +1342,9 @@ impl ProxyServer {
                 new_client_idle_timeout_secs = new_config.limits.client_idle_timeout_secs,
                 old_client_admission_wait_secs = old.limits.client_admission_wait_secs,
                 new_client_admission_wait_secs = new_config.limits.client_admission_wait_secs,
-                "[limits] max_client_connections / client_idle_timeout_secs / client_admission_wait_secs changed on SIGHUP but are applied at startup only — keeping the running values (restart to apply)"
+                old_client_tcp_keepalive_secs = old.limits.client_tcp_keepalive_secs,
+                new_client_tcp_keepalive_secs = new_config.limits.client_tcp_keepalive_secs,
+                "[limits] max_client_connections / client_idle_timeout_secs / client_admission_wait_secs / client_tcp_keepalive_secs changed on SIGHUP but are applied at startup only — keeping the running values (restart to apply)"
             );
             // Keep the published config truthful: `/config` must not advertise
             // a cap/idle timeout that is not the one in effect (same treatment
@@ -1299,6 +1352,7 @@ impl ProxyServer {
             new_config.limits.max_client_connections = old.limits.max_client_connections;
             new_config.limits.client_idle_timeout_secs = old.limits.client_idle_timeout_secs;
             new_config.limits.client_admission_wait_secs = old.limits.client_admission_wait_secs;
+            new_config.limits.client_tcp_keepalive_secs = old.limits.client_tcp_keepalive_secs;
         }
         if new_config.listen_address != old.listen_address {
             tracing::warn!(old = %old.listen_address, new = %new_config.listen_address,

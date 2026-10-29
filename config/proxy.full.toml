@@ -152,6 +152,14 @@ write_timeout_secs = 30
 # first byte to ReadyForQuery). backend_read_timeout_secs re-arms per read, so it
 # cannot catch a backend dripping bytes inside one response; this can. 0 = off.
 # backend_response_timeout_secs = 0
+# Bound (milliseconds) on sending one CancelRequest to a backend (connect,
+# request, the backend closing that connection): a client's CancelRequest, and
+# the one the proxy sends a backend still running a request it abandons (a
+# read/response timeout, a client gone mid-response, a session that ends with
+# a Flush-dispatched cycle open) before it closes that connection. Only a
+# session whose tenant has an active-query cap waits for that cancel; others
+# send it in the background.
+# backend_cancel_timeout_ms = 5000
 # # Global ceiling on idle connections parked in the data-path backend pool
 # # across ALL (node,user,db) identities (pool-modes feature only).
 # max_total_idle_backend_conns = 8192
@@ -188,6 +196,14 @@ write_timeout_secs = 30
 # # being refused with 53300. 0 (default) refuses immediately. Read once at
 # # startup.
 # client_admission_wait_secs = 0
+# # TCP keepalive on every accepted client socket: probes after this many
+# # seconds without client traffic, repeated at the same interval; once the
+# # OS's probe count goes unanswered (9 on Linux) the connection fails, so a
+# # client that vanished without a FIN or RST (a dropped NAT flow, a frozen
+# # host) ends its session and returns what it held (a tenant active-query
+# # permit, a client slot). 0 = off (no keepalive, as before this key). Max
+# # 32767. Read once at startup.
+# client_tcp_keepalive_secs = 60
 # # Idle authenticated backend connections kept per identity by each
 # # non-PG-wire gateway (HTTP SQL, MCP, GraphQL) for reuse (H-06). 0 disables
 # # pooling (each request dials). Gateways pool separately.

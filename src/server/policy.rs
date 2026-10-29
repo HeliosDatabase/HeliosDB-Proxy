@@ -1,5 +1,11 @@
 use super::*;
 
+/// The longest a rate-limit backpressure sleep lasts (a `Throttled` or
+/// `Queued` verdict, or the pacing of a message that continues an open cycle),
+/// so a misconfiguration can't pin a connection task indefinitely.
+#[cfg(feature = "rate-limiting")]
+const RATE_LIMIT_MAX_SLEEP: Duration = Duration::from_secs(5);
+
 impl ProxyServer {
     /// Derive the rate-limit bucket key for a session per the configured
     /// keying dimension, memoizing it on the session.
@@ -81,9 +87,7 @@ impl ProxyServer {
                 None
             }
             RateLimitResult::Throttled(d) | RateLimitResult::Queued(d) => {
-                // Cap the backpressure sleep so a misconfiguration can't pin a
-                // connection task indefinitely.
-                tokio::time::sleep(d.min(Duration::from_secs(5))).await;
+                tokio::time::sleep(d.min(RATE_LIMIT_MAX_SLEEP)).await;
                 None
             }
             RateLimitResult::Denied(exc) => {
@@ -94,6 +98,47 @@ impl ProxyServer {
                     exc.retry_after.as_millis()
                 );
                 Some(Self::create_error_response("53400", &msg))
+            }
+        }
+    }
+
+    /// Charge a message that continues a cycle a backend connection holds
+    /// open and runs statements of its own (`OpenCycle::runs`: an `Execute`
+    /// after a `Flush`, a `Query`). It belongs to a request admitted already,
+    /// so it is never refused: an error there would leave the cycle open on
+    /// the backend, to be committed by the next `Sync` behind the client's
+    /// back. It still takes its token like any request: with the bucket empty
+    /// it waits until one refills (the limiter's `retry_after`, at most
+    /// `RATE_LIMIT_MAX_SLEEP`), takes it unless another request of the bucket
+    /// took it first, and runs. A client that pipelines `Execute`s behind
+    /// `Flush`es and never sends a `Sync` runs at the bucket's rate.
+    #[cfg(feature = "rate-limiting")]
+    pub(super) async fn rate_limit_pace(
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+    ) {
+        use crate::rate_limit::RateLimitResult;
+        let Some(limiter) = state.rate_limiter.as_ref() else {
+            return;
+        };
+        let key = Self::rate_limit_key(session, config).await;
+        let key = key.as_ref();
+        match limiter.check_cached(key, 1) {
+            RateLimitResult::Allowed => {}
+            RateLimitResult::Warned(msg) => {
+                tracing::warn!(key = %key, reason = %msg, "rate limit warning");
+            }
+            RateLimitResult::Throttled(d) | RateLimitResult::Queued(d) => {
+                tokio::time::sleep(d.min(RATE_LIMIT_MAX_SLEEP)).await;
+            }
+            RateLimitResult::Denied(exc) => {
+                tracing::debug!(
+                    key = %key,
+                    "rate limit exceeded by a message continuing an open cycle; pacing it"
+                );
+                tokio::time::sleep(exc.retry_after.min(RATE_LIMIT_MAX_SLEEP)).await;
+                let _ = limiter.check_cached(key, 1);
             }
         }
     }

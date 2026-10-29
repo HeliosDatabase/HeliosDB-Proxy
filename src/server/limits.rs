@@ -42,6 +42,9 @@ pub(super) struct ResolvedLimits {
     /// Bounded admission wait for the `max_client_connections` cap (H-05).
     /// `None` when `client_admission_wait_secs = 0` (refuse immediately).
     pub(super) client_admission_wait: Option<Duration>,
+    /// TCP keepalive idle time and probe interval on accepted client
+    /// sockets; `None` when `client_tcp_keepalive_secs = 0` (off).
+    pub(super) client_tcp_keepalive: Option<Duration>,
     /// Idle authenticated clients kept per backend identity by the non-PG-wire
     /// gateways (H-06).
     pub(super) gateway_pool_max_idle: usize,
@@ -57,6 +60,9 @@ pub(super) struct ResolvedLimits {
     pub(super) tr_max_cycle_statements: usize,
     /// Wait for a backend slot on a node at its `max_connections` (H-05).
     pub(super) backend_slot_wait: Duration,
+    /// Bound on sending one CancelRequest to a backend (connect, request,
+    /// the backend's close). `[limits] backend_cancel_timeout_ms`.
+    pub(super) backend_cancel_timeout: Duration,
     /// TR-09: bytes of a re-executable read's response held until its
     /// ReadyForQuery; 0 = off.
     pub(super) tr_buffer_small_reads: usize,
@@ -104,6 +110,10 @@ impl ResolvedLimits {
                 0 => None,
                 secs => Some(Duration::from_secs(secs)),
             },
+            client_tcp_keepalive: match l.client_tcp_keepalive_secs {
+                0 => None,
+                secs => Some(Duration::from_secs(secs)),
+            },
             gateway_pool_max_idle: l.gateway_pool_max_idle,
             tr_max_replay_statements: l.tr_max_replay_statements,
             tr_max_replay_bytes: l.tr_max_replay_bytes,
@@ -111,6 +121,7 @@ impl ResolvedLimits {
             tr_max_tracked_savepoints: l.tr_max_tracked_savepoints,
             tr_max_cycle_statements: l.tr_max_cycle_statements,
             backend_slot_wait: Duration::from_millis(l.backend_slot_wait_ms),
+            backend_cancel_timeout: Duration::from_millis(l.backend_cancel_timeout_ms),
             tr_buffer_small_reads: l.tr_buffer_small_reads_bytes,
         }
     }

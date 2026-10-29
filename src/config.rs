@@ -1224,10 +1224,12 @@ pub struct SchemaRoutingToml {
 /// Multi-tenancy configuration (always present). Converted to a
 /// `multi_tenancy::TenantManager` at startup; only active when the
 /// `multi-tenancy` feature is compiled in AND `enabled = true`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MultiTenancyToml {
-    /// Enforce per-tenant row isolation. Default `false`.
+    /// Enable multi-tenancy: per-tenant row isolation (with
+    /// `tenants`/`tenant_tables`) and the per-tenant client caps and request
+    /// budgets below. Needs the `multi-tenancy` feature. Default `false`.
     pub enabled: bool,
     /// Which connection attribute names the tenant: a startup parameter name
     /// (e.g. `application_name`, `user`) or the literal `database`.
@@ -1248,8 +1250,43 @@ pub struct MultiTenancyToml {
     /// max_client_connections`. Default 0 = no per-tenant cap.
     pub max_clients_per_tenant: usize,
     /// Per-tenant overrides of `max_clients_per_tenant` (`0` = no cap for that
-    /// tenant). Every key must be in `tenants`.
+    /// tenant). Every key must be in `tenants`; each value <=
+    /// `Semaphore::MAX_PERMITS`.
     pub tenant_max_clients: std::collections::BTreeMap<String, usize>,
+    /// Most requests one known tenant may have in progress through this proxy
+    /// at once (ac858d61400b, PG-wire sessions; needs the `multi-tenancy`
+    /// feature). A request (a simple Query, or an extended cycle from its
+    /// first message to Sync) that starts while its session is idle takes one
+    /// of the tenant's permits and holds it until its session is idle again:
+    /// an explicit transaction holds one permit from BEGIN to its end, and so
+    /// does a session holding session-level advisory locks (session pooling).
+    /// At the cap a request waits up to `active_query_wait_ms` (FIFO), then is
+    /// refused with 53300; the session stays usable. Default 0 = no cap.
+    pub max_active_queries_per_tenant: usize,
+    /// Per-tenant overrides of `max_active_queries_per_tenant` (`0` = no cap
+    /// for that tenant). Every key must be in `tenants`; each value <=
+    /// `Semaphore::MAX_PERMITS`.
+    pub tenant_max_active_queries: std::collections::BTreeMap<String, usize>,
+    /// How long a request waits for one of its tenant's active-query permits,
+    /// in milliseconds, before it is refused with 53300. 0 = refuse at once.
+    /// Default 5000.
+    pub active_query_wait_ms: u64,
+    /// A session that sits idle (waiting for its client) while holding one of
+    /// its tenant's active-query permits — inside a transaction, or holding
+    /// session-level advisory locks — is terminated after this many
+    /// milliseconds (FATAL 25P03 in a transaction, 57P05 otherwise),
+    /// returning the permit. Default 0 = never.
+    pub idle_permit_timeout_ms: u64,
+    /// Most transaction-replay bytes (`[limits] tr_max_replay_bytes`'s
+    /// measure) all sessions of one known tenant may hold at once
+    /// (ac858d61400b). Applies to sessions whose `tr_mode` is `select` or
+    /// `transaction`. The statement that would take the tenant over marks its
+    /// transaction non-replayable, like `tr_max_replay_bytes`. Default 0 = no
+    /// budget.
+    pub max_replay_bytes_per_tenant: usize,
+    /// Per-tenant overrides of `max_replay_bytes_per_tenant` (`0` = none for
+    /// that tenant). Every key must be in `tenants`.
+    pub tenant_max_replay_bytes: std::collections::BTreeMap<String, usize>,
 }
 
 impl Default for MultiTenancyToml {
@@ -1262,6 +1299,12 @@ impl Default for MultiTenancyToml {
             tenants: Vec::new(),
             max_clients_per_tenant: 0,
             tenant_max_clients: std::collections::BTreeMap::new(),
+            max_active_queries_per_tenant: 0,
+            tenant_max_active_queries: std::collections::BTreeMap::new(),
+            active_query_wait_ms: 5000,
+            idle_permit_timeout_ms: 0,
+            max_replay_bytes_per_tenant: 0,
+            tenant_max_replay_bytes: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -1274,6 +1317,26 @@ impl MultiTenancyToml {
             .get(tenant)
             .copied()
             .unwrap_or(self.max_clients_per_tenant)
+    }
+
+    /// The active-query cap of a known tenant (ac858d61400b): its
+    /// `tenant_max_active_queries` override, else
+    /// `max_active_queries_per_tenant`; 0 = none.
+    pub fn active_query_cap(&self, tenant: &str) -> usize {
+        self.tenant_max_active_queries
+            .get(tenant)
+            .copied()
+            .unwrap_or(self.max_active_queries_per_tenant)
+    }
+
+    /// The replay-byte budget of a known tenant (ac858d61400b): its
+    /// `tenant_max_replay_bytes` override, else `max_replay_bytes_per_tenant`;
+    /// 0 = none.
+    pub fn replay_byte_cap(&self, tenant: &str) -> usize {
+        self.tenant_max_replay_bytes
+            .get(tenant)
+            .copied()
+            .unwrap_or(self.max_replay_bytes_per_tenant)
     }
 }
 
@@ -1569,6 +1632,24 @@ pub struct LimitsToml {
     /// client slot and the admin API is a separate listener.
     #[serde(default = "default_client_admission_wait_secs")]
     pub client_admission_wait_secs: u64,
+    /// TCP keepalive (seconds) on every accepted PG-wire client socket
+    /// (ac858d61400b): after this long without traffic from the client the
+    /// kernel probes it, repeating the probe at this interval (on platforms
+    /// that let it be set; the OS's interval elsewhere), and once the OS's
+    /// probe count (`net.ipv4.tcp_keepalive_probes`, 9 on Linux) goes
+    /// unanswered the connection fails. A client that vanished without a FIN
+    /// or RST (a NAT or load-balancer flow dropped, a host frozen or powered
+    /// off) then ends its session, about ten times this long after its last
+    /// traffic, and what the session held returns: its tenant active-query
+    /// permit (an idle transaction, advisory locks, a stalled COPY), its
+    /// client slot, its backend connections. A live client's kernel answers
+    /// the probes, so an idle session is never ended by them, and they keep
+    /// middlebox flows alive. Default 60; 0 = off (before this key the proxy
+    /// enabled no keepalive, and such a session waited on its client until
+    /// the proxy restarted). Must be <= [`MAX_TCP_KEEPALIVE_SECS`]. Read once
+    /// at startup; a SIGHUP change is ignored with a warning.
+    #[serde(default = "default_client_tcp_keepalive_secs")]
+    pub client_tcp_keepalive_secs: u64,
     /// How many authenticated idle backend clients the non-PG-wire gateways
     /// (HTTP SQL, MCP, GraphQL) keep per backend identity for reuse (H-06).
     /// 0 disables pooling (every gateway request dials, the pre-H-06
@@ -1642,6 +1723,19 @@ pub struct LimitsToml {
     /// the limit. Default 16; 0 = unlimited.
     #[serde(default = "default_max_concurrent_reconnects_per_node")]
     pub max_concurrent_reconnects_per_node: usize,
+    /// Bound, in milliseconds, on sending one CancelRequest to a backend: the
+    /// TCP connect, the request, and the backend closing that connection
+    /// once it has signalled the statement (as libpq waits for it). Covers a
+    /// client's CancelRequest forwarded to the backend running its statement,
+    /// and the one the proxy sends a backend running a request it abandons
+    /// (a `backend_read_timeout_secs` or `backend_response_timeout_secs`
+    /// expiry, a client gone mid-response, a session that ends with a
+    /// Flush-dispatched cycle or an extended COPY's end still open there),
+    /// before the session's tenant active-query permit returns. Must be
+    /// 1..=31536000000 (1 year). Default 5000 (the forward's prior connect
+    /// bound).
+    #[serde(default = "default_backend_cancel_timeout_ms")]
+    pub backend_cancel_timeout_ms: u64,
     /// TR-09: under `tr_mode = "select"` or `"transaction"`, hold the response
     /// of a read the proxy may re-execute in the proxy until its
     /// ReadyForQuery, up to this many bytes. A backend fault before then has
@@ -1660,6 +1754,14 @@ fn default_backend_slot_wait_ms() -> u64 {
 
 fn default_max_concurrent_reconnects_per_node() -> usize {
     16
+}
+
+fn default_backend_cancel_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_client_tcp_keepalive_secs() -> u64 {
+    60
 }
 
 fn default_max_cancel_keys() -> usize {
@@ -1747,6 +1849,12 @@ const MAX_TR_CYCLE_STATEMENTS: usize = 256;
 /// the overflow boundary, so [`ProxyConfig::validate`] rejects anything larger.
 const MAX_LIMIT_SECS: u64 = 31_536_000; // 1 year
 
+/// Upper bound of `[limits] client_tcp_keepalive_secs`: Linux refuses a
+/// keepalive idle time or probe interval above 32767 seconds
+/// (`MAX_TCP_KEEPIDLE`, `MAX_TCP_KEEPINTVL`), so a larger value could never be
+/// applied to a socket.
+pub const MAX_TCP_KEEPALIVE_SECS: u64 = 32_767;
+
 impl Default for LimitsToml {
     fn default() -> Self {
         Self {
@@ -1768,6 +1876,7 @@ impl Default for LimitsToml {
             max_client_connections: default_max_client_connections(),
             client_idle_timeout_secs: default_client_idle_timeout_secs(),
             client_admission_wait_secs: default_client_admission_wait_secs(),
+            client_tcp_keepalive_secs: default_client_tcp_keepalive_secs(),
             gateway_pool_max_idle: default_gateway_pool_max_idle(),
             tr_max_replay_statements: default_tr_max_replay_statements(),
             tr_max_replay_bytes: default_tr_max_replay_bytes(),
@@ -1777,6 +1886,7 @@ impl Default for LimitsToml {
             latency_buckets_ms: crate::metrics_hist::default_latency_buckets_ms(),
             backend_slot_wait_ms: default_backend_slot_wait_ms(),
             max_concurrent_reconnects_per_node: default_max_concurrent_reconnects_per_node(),
+            backend_cancel_timeout_ms: default_backend_cancel_timeout_ms(),
             tr_buffer_small_reads_bytes: 0,
         }
     }
@@ -2020,7 +2130,9 @@ pub struct RateLimitToml {
     pub default_qps: u32,
     /// Burst capacity (token-bucket depth) per bucket.
     pub default_burst: u32,
-    /// Max concurrent in-flight queries per bucket (0 = use the engine default).
+    /// Not enforced: nothing on the data path checks it. Kept so configs that
+    /// set it still load; per-tenant concurrency is `[multi_tenancy]
+    /// max_active_queries_per_tenant`.
     pub max_concurrent: u32,
     /// What each bucket is keyed on.
     pub key_by: RateLimitKeyBy,
@@ -2466,7 +2578,11 @@ const IGNORED_KEY_ALIASES: &[(&str, &str)] = &[
     ("auth.enabled", "there is no auth.enabled: [auth] mode is \"passthrough\" or \"scram\""),
     ("auth.api_key", "there is no API-key auth: [auth] mode is \"passthrough\" or \"scram\""),
     ("auth.ldap", "there is no [auth.ldap]: [auth] mode is \"passthrough\" or \"scram\""),
-    ("rate_limit.global_connections", "did you mean 'rate_limit.max_concurrent'?"),
+    (
+        "rate_limit.global_connections",
+        "there is no global connection cap here: per-tenant concurrency is [multi_tenancy] \
+         max_active_queries_per_tenant, and 'rate_limit.max_concurrent' is not enforced",
+    ),
     (
         "rate_limit.tenant",
         "there is no [[rate_limit.tenant]]: limits apply per bucket, key_by = user | client_ip | \
@@ -2737,16 +2853,57 @@ impl ProxyConfig {
             return Err(ProxyError::Config("No primary node configured".to_string()));
         }
 
-        // `[multi_tenancy]` admission caps (H-05) name configured tenants.
-        if let Some(unknown) = self
-            .multi_tenancy
-            .tenant_max_clients
-            .keys()
-            .find(|k| !self.multi_tenancy.tenants.contains(k))
-        {
-            return Err(ProxyError::Config(format!(
-                "multi_tenancy.tenant_max_clients names {unknown:?}, which is not in multi_tenancy.tenants"
-            )));
+        // `[multi_tenancy]` admission caps (H-05) and request budgets
+        // (ac858d61400b) name configured tenants.
+        let mt = &self.multi_tenancy;
+        for (key, overrides) in [
+            ("tenant_max_clients", &mt.tenant_max_clients),
+            ("tenant_max_active_queries", &mt.tenant_max_active_queries),
+            ("tenant_max_replay_bytes", &mt.tenant_max_replay_bytes),
+        ] {
+            if let Some(unknown) = overrides.keys().find(|k| !mt.tenants.contains(k)) {
+                return Err(ProxyError::Config(format!(
+                    "multi_tenancy.{key} names {unknown:?}, which is not in multi_tenancy.tenants"
+                )));
+            }
+        }
+        // Each tenant cap builds a tokio semaphore, which panics above
+        // `Semaphore::MAX_PERMITS`.
+        let max_permits = tokio::sync::Semaphore::MAX_PERMITS;
+        for (key, cap) in [
+            ("max_clients_per_tenant", mt.max_clients_per_tenant),
+            (
+                "max_active_queries_per_tenant",
+                mt.max_active_queries_per_tenant,
+            ),
+        ]
+        .into_iter()
+        .chain(
+            mt.tenant_max_clients
+                .values()
+                .map(|v| ("tenant_max_clients", *v)),
+        )
+        .chain(
+            mt.tenant_max_active_queries
+                .values()
+                .map(|v| ("tenant_max_active_queries", *v)),
+        ) {
+            if cap > max_permits {
+                return Err(ProxyError::Config(format!(
+                    "multi_tenancy.{key} must be <= {max_permits}"
+                )));
+            }
+        }
+        for (key, ms) in [
+            ("active_query_wait_ms", mt.active_query_wait_ms),
+            ("idle_permit_timeout_ms", mt.idle_permit_timeout_ms),
+        ] {
+            if ms > MAX_LIMIT_SECS * 1000 {
+                return Err(ProxyError::Config(format!(
+                    "multi_tenancy.{key} must be <= {} (1 year)",
+                    MAX_LIMIT_SECS * 1000
+                )));
+            }
         }
 
         // `[topology]` (H-01): the provider is authoritative for the write
@@ -3097,6 +3254,17 @@ impl ProxyConfig {
                 return Err(ProxyError::Config(
                     "limits.backend_slot_wait_ms must be >= 1".to_string(),
                 ));
+            }
+            if !(1..=MAX_LIMIT_SECS * 1000).contains(&l.backend_cancel_timeout_ms) {
+                return Err(ProxyError::Config(format!(
+                    "limits.backend_cancel_timeout_ms must be 1..={} (1 year)",
+                    MAX_LIMIT_SECS * 1000
+                )));
+            }
+            if l.client_tcp_keepalive_secs > MAX_TCP_KEEPALIVE_SECS {
+                return Err(ProxyError::Config(format!(
+                    "limits.client_tcp_keepalive_secs must be 0..={MAX_TCP_KEEPALIVE_SECS} (0 = off)"
+                )));
             }
             if let Err(e) = crate::metrics_hist::validate_buckets_ms(&l.latency_buckets_ms) {
                 return Err(ProxyError::Config(format!(
@@ -3871,6 +4039,96 @@ mod tests {
     }
 
     #[test]
+    fn tenant_budgets_parse_validate_and_name_known_tenants() {
+        let base = "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n[multi_tenancy]\nenabled = true\ntenants = [\"acme\", \"tiny\"]\n";
+        // Defaults: no cap, no budget, a 5 s wait, no idle-permit timeout.
+        let d: ProxyConfig = toml::from_str(base).unwrap();
+        d.validate().unwrap();
+        let mt = &d.multi_tenancy;
+        assert_eq!(
+            (
+                mt.active_query_cap("acme"),
+                mt.active_query_wait_ms,
+                mt.idle_permit_timeout_ms,
+                mt.replay_byte_cap("acme"),
+            ),
+            (0, 5000, 0, 0)
+        );
+        let ok: ProxyConfig = toml::from_str(&format!(
+            "{base}max_active_queries_per_tenant = 20\nactive_query_wait_ms = 300\n\
+             idle_permit_timeout_ms = 60000\nmax_replay_bytes_per_tenant = 1000\n\
+             [multi_tenancy.tenant_max_active_queries]\nacme = 50\ntiny = 0\n\
+             [multi_tenancy.tenant_max_replay_bytes]\ntiny = 7\n"
+        ))
+        .unwrap();
+        ok.validate().unwrap();
+        let mt = &ok.multi_tenancy;
+        assert_eq!(mt.active_query_cap("acme"), 50);
+        assert_eq!(mt.active_query_cap("tiny"), 0);
+        assert_eq!(mt.active_query_cap("other"), 20);
+        assert_eq!(mt.replay_byte_cap("acme"), 1000);
+        assert_eq!(mt.replay_byte_cap("tiny"), 7);
+        assert_eq!(
+            (mt.active_query_wait_ms, mt.idle_permit_timeout_ms),
+            (300, 60000)
+        );
+
+        // Overrides must name configured tenants; the message names the key.
+        for key in ["tenant_max_active_queries", "tenant_max_replay_bytes"] {
+            let bad: ProxyConfig =
+                toml::from_str(&format!("{base}[multi_tenancy.{key}]\nglobex = 1\n")).unwrap();
+            let err = bad.validate().unwrap_err().to_string();
+            assert!(err.contains(&format!("{key} names \"globex\"")), "{err}");
+        }
+        // Caps above Semaphore::MAX_PERMITS would panic Semaphore::new.
+        let over = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        for (setting, key) in [
+            (
+                format!("max_clients_per_tenant = {over}\n"),
+                "max_clients_per_tenant",
+            ),
+            (
+                format!("max_active_queries_per_tenant = {over}\n"),
+                "max_active_queries_per_tenant",
+            ),
+            (
+                format!("[multi_tenancy.tenant_max_clients]\nacme = {over}\n"),
+                "tenant_max_clients",
+            ),
+            (
+                format!("[multi_tenancy.tenant_max_active_queries]\nacme = {over}\n"),
+                "tenant_max_active_queries",
+            ),
+        ] {
+            let bad: ProxyConfig = toml::from_str(&format!("{base}{setting}")).unwrap();
+            let err = bad.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("multi_tenancy.{key} must be <=")),
+                "{err}"
+            );
+        }
+        let at_max: ProxyConfig = toml::from_str(&format!(
+            "{base}max_active_queries_per_tenant = {}\n",
+            tokio::sync::Semaphore::MAX_PERMITS
+        ))
+        .unwrap();
+        at_max.validate().unwrap();
+        // Waits and timeouts are bounded by one year.
+        for key in ["active_query_wait_ms", "idle_permit_timeout_ms"] {
+            let year: ProxyConfig =
+                toml::from_str(&format!("{base}{key} = {}\n", MAX_LIMIT_SECS * 1000)).unwrap();
+            year.validate().unwrap();
+            let bad: ProxyConfig =
+                toml::from_str(&format!("{base}{key} = {}\n", MAX_LIMIT_SECS * 1000 + 1)).unwrap();
+            let err = bad.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("multi_tenancy.{key} must be <=")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
     fn ignored_key_hints_name_the_intended_key() {
         let known = known_config_keys();
         assert!(
@@ -4098,7 +4356,11 @@ role = "primary"
             ("auth.api_key", "passthrough"),
             ("auth.ldap", "passthrough"),
             ("rate_limit.global_qps", "rate_limit.default_qps"),
-            ("rate_limit.global_connections", "rate_limit.max_concurrent"),
+            (
+                "rate_limit.global_connections",
+                "[multi_tenancy] max_active_queries_per_tenant",
+            ),
+            ("rate_limit.global_connections", "not enforced"),
             ("rate_limit.tenant", "key_by"),
             ("circuit_breaker.reset_timeout", "circuit_breaker.open_secs"),
             (
@@ -5408,6 +5670,56 @@ database = "helios"
             .unwrap_err()
             .to_string()
             .contains("backend_slot_wait_ms"));
+    }
+
+    /// ac858d61400b: `[limits] backend_cancel_timeout_ms` bounds every
+    /// CancelRequest the proxy sends a backend; 0 (which would never send
+    /// one) and anything past a year are refused.
+    #[test]
+    fn backend_cancel_timeout_parses_and_validates() {
+        assert_eq!(LimitsToml::default().backend_cancel_timeout_ms, 5000);
+        let mut c: ProxyConfig = toml::from_str(
+            "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n\n[limits]\nbackend_cancel_timeout_ms = 250\n",
+        )
+        .expect("parse");
+        assert_eq!(c.limits.backend_cancel_timeout_ms, 250);
+        assert!(c.validate().is_ok());
+        for bad in [0, MAX_LIMIT_SECS * 1000 + 1] {
+            c.limits.backend_cancel_timeout_ms = bad;
+            assert!(
+                c.validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("limits.backend_cancel_timeout_ms"),
+                "{bad}"
+            );
+        }
+        c.limits.backend_cancel_timeout_ms = MAX_LIMIT_SECS * 1000;
+        assert!(c.validate().is_ok());
+    }
+
+    /// ac858d61400b: `[limits] client_tcp_keepalive_secs` enables TCP
+    /// keepalive on client sockets by default; 0 turns it off, and a value
+    /// no socket accepts is refused.
+    #[test]
+    fn client_tcp_keepalive_parses_and_validates() {
+        assert_eq!(LimitsToml::default().client_tcp_keepalive_secs, 60);
+        let mut c: ProxyConfig = toml::from_str(
+            "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n\n[limits]\nclient_tcp_keepalive_secs = 15\n",
+        )
+        .expect("parse");
+        assert_eq!(c.limits.client_tcp_keepalive_secs, 15);
+        assert!(c.validate().is_ok());
+        for ok in [0, MAX_TCP_KEEPALIVE_SECS] {
+            c.limits.client_tcp_keepalive_secs = ok;
+            assert!(c.validate().is_ok(), "{ok}");
+        }
+        c.limits.client_tcp_keepalive_secs = MAX_TCP_KEEPALIVE_SECS + 1;
+        assert!(c
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("limits.client_tcp_keepalive_secs"));
     }
 
     #[test]

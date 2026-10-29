@@ -336,7 +336,7 @@ async fn backend_frame_tail_is_isolated_by_socket_and_dropped_on_loss() {
         )
         .await
         .unwrap(),
-        ClientRead::IdleTimeout
+        ClientRead::BackendGone
     );
     assert!(
         !conns.contains_key("a"),
@@ -570,4 +570,54 @@ async fn recovery_redials_cached_socket_with_unpublished_tail() {
             .unwrap(),
         0
     );
+}
+
+/// A cached socket the recovery reuses gets its mirrored settings reset
+/// with simple Queries, which destroy its unnamed statement and portal: the
+/// proxy forgets them, so the unnamed-Parse promotion never skips a Parse the
+/// backend no longer holds.
+#[tokio::test]
+async fn a_restore_on_a_reused_socket_forgets_its_unnamed_statement() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let mut config = ProxyConfig::default();
+    config.add_node(&address, "primary").unwrap();
+    let server = ProxyServer::new(config.clone()).unwrap();
+    let session = make_test_session();
+    let cached = TcpStream::connect(&address).await.unwrap();
+    let (mut peer, _) = listener.accept().await.unwrap();
+    let mut bc = BackendConn::new(cached);
+    bc.gucs_synced = Some(1);
+    bc.unnamed_sig = Some(bytes::Bytes::from_static(b"select 1\0\0\0"));
+    bc.unnamed_stale = UnnamedStale::STATEMENT;
+    let mut conns = HashMap::from([(address.clone(), bc)]);
+    let serving = tokio::spawn(async move {
+        let mut header = [0u8; 5];
+        peer.read_exact(&mut header).await.unwrap();
+        let len = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+        let mut body = vec![0u8; len - 4];
+        peer.read_exact(&mut body).await.unwrap();
+        peer.write_all(&[frame(b'C', b"RESET\0"), frame(b'Z', b"I")].concat())
+            .await
+            .unwrap();
+        (header[0], String::from_utf8_lossy(&body).into_owned(), peer)
+    });
+    let selected = ProxyServer::tr_acquire_replacement(
+        &mut conns,
+        &TrSession::new(TrMode::Session),
+        &session,
+        &server.state,
+        &config,
+        tokio::time::Instant::now() + Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(selected, address);
+    let (tag, sql, _peer) = tokio::time::timeout(Duration::from_secs(2), serving)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((tag, sql.as_str()), (b'Q', "RESET ALL\0"));
+    assert_eq!(conns[&address].unnamed_sig, None);
+    assert_eq!(conns[&address].unnamed_stale, UnnamedStale::default());
 }

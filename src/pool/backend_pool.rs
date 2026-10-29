@@ -41,12 +41,27 @@ pub fn pool_key(node: &str, user: &str, database: &str) -> String {
     format!("{}\0{}\0{}", node, user, database)
 }
 
+/// The BackendKeyData (process id, secret key) the backend behind a
+/// connection reported at its startup: what a CancelRequest for a statement
+/// running on that connection names. `None` when the backend sent none.
+pub type BackendKey = Option<(u32, u32)>;
+
+/// One parked connection.
+struct Parked {
+    stream: TcpStream,
+    parked_at: Instant,
+    /// The connection's node slot (H-05), kept while it is parked.
+    slot: crate::node_slots::Slot,
+    /// Handed back with the connection, so the borrower can cancel a
+    /// statement it abandons on it.
+    key: BackendKey,
+}
+
 /// A bounded set of idle, authenticated backend connections, partitioned by
 /// connection identity. Cheap to clone-share behind an `Arc`.
 pub struct BackendIdlePool {
-    /// identity-key -> stack of (idle authenticated stream, park time, the
-    /// connection's node slot (H-05), kept while it is parked).
-    idle: DashMap<String, Vec<(TcpStream, Instant, crate::node_slots::Slot)>>,
+    /// identity-key -> stack of parked connections (newest last).
+    idle: DashMap<String, Vec<Parked>>,
     /// Hard cap on idle connections parked per identity key.
     max_idle_per_key: usize,
     /// Hard cap on idle connections parked across ALL identities — bounds total
@@ -117,12 +132,28 @@ impl BackendIdlePool {
     /// [`Self::checkout`], also handing back the connection's node slot
     /// (H-05) so it stays held while the connection is in use.
     pub fn checkout_with_slot(&self, key: &str) -> Option<(TcpStream, crate::node_slots::Slot)> {
+        self.checkout_keyed(key)
+            .map(|(stream, slot, _backend_key)| (stream, slot))
+    }
+
+    /// [`Self::checkout_with_slot`], also handing back the BackendKeyData
+    /// the connection was parked with ([`Self::checkin_keyed`]).
+    pub fn checkout_keyed(
+        &self,
+        key: &str,
+    ) -> Option<(TcpStream, crate::node_slots::Slot, BackendKey)> {
         let mut guard = self.idle.get_mut(key)?;
-        while let Some((stream, _parked_at, slot)) = guard.pop() {
+        while let Some(Parked {
+            stream,
+            slot,
+            key: backend_key,
+            ..
+        }) = guard.pop()
+        {
             self.total_idle.fetch_sub(1, Ordering::Relaxed);
             if Self::probe_alive(&stream) {
                 self.reuses.fetch_add(1, Ordering::Relaxed);
-                return Some((stream, slot));
+                return Some((stream, slot, backend_key));
             }
             // Peer closed (or desynced) while idle — drop it and try the next.
             self.stale_evicted.fetch_add(1, Ordering::Relaxed);
@@ -146,6 +177,18 @@ impl BackendIdlePool {
         stream: TcpStream,
         slot: crate::node_slots::Slot,
     ) -> bool {
+        self.checkin_keyed(key, stream, slot, None)
+    }
+
+    /// [`Self::checkin_with_slot`] keeping the connection's BackendKeyData
+    /// (`backend_key`) with it, for [`Self::checkout_keyed`] to hand back.
+    pub fn checkin_keyed(
+        &self,
+        key: &str,
+        stream: TcpStream,
+        slot: crate::node_slots::Slot,
+        backend_key: BackendKey,
+    ) -> bool {
         // Global ceiling first — bounds total FDs across all identities. Reserve
         // the slot atomically (fetch_add, inspect the prior value) rather than
         // load-then-act: a plain load outside the lock lets N concurrent
@@ -164,7 +207,12 @@ impl BackendIdlePool {
             self.over_capacity.fetch_add(1, Ordering::Relaxed);
             return false; // `stream` dropped here → socket closed.
         }
-        entry.push((stream, Instant::now(), slot));
+        entry.push(Parked {
+            stream,
+            parked_at: Instant::now(),
+            slot,
+            key: backend_key,
+        });
         self.parked.fetch_add(1, Ordering::Relaxed);
         true
     }
@@ -180,7 +228,7 @@ impl BackendIdlePool {
             let before = entry.value().len();
             entry
                 .value_mut()
-                .retain(|(_, parked_at, _)| parked_at.elapsed() < max_age);
+                .retain(|p| p.parked_at.elapsed() < max_age);
             reaped += before - entry.value().len();
         }
         if reaped > 0 {
@@ -250,8 +298,7 @@ impl BackendIdlePool {
                 continue;
             }
             // Oldest first: index 0 was parked earliest (checkin pushes).
-            let (stream, _parked_at, slot) = entry.value_mut().remove(0);
-            drop((stream, slot));
+            drop(entry.value_mut().remove(0));
             self.total_idle.fetch_sub(1, Ordering::Relaxed);
             self.capacity_evictions.fetch_add(1, Ordering::Relaxed);
             return true;
@@ -400,6 +447,29 @@ mod tests {
         assert_eq!(sem.available_permits(), 1, "still held while in use");
         drop(slot);
         assert_eq!(sem.available_permits(), 2);
+    }
+
+    /// ac858d61400b: a parked connection keeps the BackendKeyData of the
+    /// backend behind it, so the session that borrows it next can cancel a
+    /// statement it abandons there; one parked without a key has none.
+    #[tokio::test]
+    async fn parked_connections_keep_their_backend_key() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pool = BackendIdlePool::new(4, 1000);
+        let key = pool_key("db:5432", "u", "d");
+        let (c1, _s1) = live_pair(&listener).await;
+        let (c2, _s2) = live_pair(&listener).await;
+        let keyed_addr = c1.local_addr().unwrap();
+        assert!(pool.checkin_keyed(&key, c1, None, Some((7, 1007))));
+        assert!(pool.checkin_with_slot(&key, c2, None));
+
+        // Newest first: the one parked without a key, then the keyed one.
+        let (_, _, none) = pool.checkout_keyed(&key).expect("parked");
+        assert_eq!(none, None);
+        let (stream, _, backend_key) = pool.checkout_keyed(&key).expect("parked");
+        assert_eq!(stream.local_addr().unwrap(), keyed_addr);
+        assert_eq!(backend_key, Some((7, 1007)));
+        assert!(pool.checkout_keyed(&key).is_none());
     }
 
     #[test]

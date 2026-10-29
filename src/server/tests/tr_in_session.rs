@@ -1020,10 +1020,11 @@ async fn tr_replay_transaction_replays_in_order_and_reports_rejections() {
     let server = ProxyServer::new(test_config()).unwrap();
     let state = server.state.clone();
     let mut conns: HashMap<String, BackendConn> = HashMap::new();
-    conns.insert(
-        addr.clone(),
-        BackendConn::new(TcpStream::connect(&addr).await.unwrap()),
-    );
+    let mut bc = BackendConn::new(TcpStream::connect(&addr).await.unwrap());
+    // A socket the session kept, holding an unnamed statement.
+    bc.unnamed_sig = Some(bytes::Bytes::from_static(b"select 1\0\0\0"));
+    bc.unnamed_stale = UnnamedStale::STATEMENT;
+    conns.insert(addr.clone(), bc);
     let registry: HashMap<String, bytes::Bytes> = HashMap::new();
     let entries = vec![
         simple_log("BEGIN"),
@@ -1037,6 +1038,9 @@ async fn tr_replay_transaction_replays_in_order_and_reports_rejections() {
         *seen.lock().unwrap(),
         vec!["BEGIN", "INSERT INTO t VALUES (1)", "SAVEPOINT a"]
     );
+    // The replayed simple Queries destroyed it.
+    assert_eq!(conns[&addr].unnamed_sig, None);
+    assert_eq!(conns[&addr].unnamed_stale, UnnamedStale::default());
     // A rejected statement stops the replay with a Statement failure.
     let entries = vec![
         simple_log("BEGIN"),
@@ -2916,6 +2920,483 @@ async fn tr_recorder_bounds_open_flush_cycle_before_sync() {
     }
 }
 
+/// Tenant replay budgets (ac858d61400b): `TenantSlots` with tenant "t" and a
+/// `max_replay_bytes_per_tenant` of `budget`, and a session of it in
+/// `tr_mode` carrying its charge.
+fn tenant_replay_slots(budget: usize) -> crate::tenant_slots::TenantSlots {
+    let mut config = test_config();
+    config.tr_mode = TrMode::Transaction;
+    config.multi_tenancy.enabled = true;
+    config.multi_tenancy.tenants = vec!["t".into()];
+    config.multi_tenancy.max_replay_bytes_per_tenant = budget;
+    crate::tenant_slots::TenantSlots::from_config(&config)
+}
+
+fn tenant_session(slots: &crate::tenant_slots::TenantSlots, tr_mode: TrMode) -> Arc<ClientSession> {
+    let session = make_test_session_mode(tr_mode);
+    let budget = Arc::clone(slots.budget("t").unwrap());
+    assert!(session
+        .tenant_charge
+        .set(crate::tenant_slots::TenantCharge::new(budget))
+        .is_ok());
+    session
+}
+
+/// A simple `SELECT` of exactly `n` bytes.
+fn sized_select(n: usize) -> String {
+    let sql = format!("SELECT '{}'", "x".repeat(n - 9));
+    assert_eq!(sql.len(), n);
+    sql
+}
+
+/// The tenant's replay bytes in use and its replay refusals.
+fn tenant_replay(slots: &crate::tenant_slots::TenantSlots) -> (usize, u64) {
+    let s = &slots.budget_stats()[0];
+    (s.replay_bytes, s.replay_refusals)
+}
+
+#[tokio::test]
+async fn tr_recorder_charges_and_returns_the_tenant_replay_budget() {
+    let server = ProxyServer::new(test_config()).unwrap();
+    let state = server.state.clone();
+    let slots = tenant_replay_slots(64);
+    let a = tenant_session(&slots, TrMode::Transaction);
+    let b = tenant_session(&slots, TrMode::Transaction);
+    let (mut tr_a, mut tr_b) = (
+        TrSession::new(TrMode::Transaction),
+        TrSession::new(TrMode::Transaction),
+    );
+
+    // A: BEGIN + a 40-byte statement, all charged to the tenant.
+    ProxyServer::note_ready_for_query(&a, b'T', false);
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg("BEGIN"), &a, &state).await;
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg(&sized_select(40)), &a, &state).await;
+    let a_bytes = a.tx_state.read().await.replay_bytes;
+    assert_eq!(a_bytes, 45);
+    assert_eq!(tenant_replay(&slots), (45, 0));
+
+    // B: BEGIN fits (50); its 20-byte statement would take the tenant to 70.
+    ProxyServer::note_ready_for_query(&b, b'T', false);
+    ProxyServer::tr_after_simple(&mut tr_b, &qmsg("BEGIN"), &b, &state).await;
+    assert_eq!(tenant_replay(&slots), (50, 0));
+    ProxyServer::tr_after_simple(&mut tr_b, &qmsg(&sized_select(20)), &b, &state).await;
+    {
+        let ts = b.tx_state.read().await;
+        assert!(ts.non_replayable && ts.replay_cap_exceeded);
+        assert!(ts.statements.is_empty() && ts.replay_bytes == 0);
+    }
+    // B's bytes went back; the refusal is the tenant's, not [limits]'.
+    assert_eq!(tenant_replay(&slots), (45, 1));
+    assert_eq!(
+        state.metrics.tr.replay_cap_exceeded.load(Ordering::Relaxed),
+        0
+    );
+    // Later statements of B's transaction are not refused again.
+    ProxyServer::tr_after_simple(&mut tr_b, &qmsg("SELECT 1"), &b, &state).await;
+    assert_eq!(tenant_replay(&slots), (45, 1));
+    // A keeps recording within the budget.
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg("SELECT 1"), &a, &state).await;
+    assert_eq!(tenant_replay(&slots), (53, 1));
+    assert!(!a.tx_state.read().await.non_replayable);
+
+    // Transaction end returns the bytes.
+    ProxyServer::note_ready_for_query(&a, b'I', false);
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg("COMMIT"), &a, &state).await;
+    ProxyServer::note_ready_for_query(&b, b'I', false);
+    ProxyServer::tr_after_simple(&mut tr_b, &qmsg("COMMIT"), &b, &state).await;
+    assert_eq!(tenant_replay(&slots), (0, 1));
+
+    // tr_clear_tx (a transaction lost with its backend) returns them too.
+    ProxyServer::note_ready_for_query(&a, b'T', false);
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg("BEGIN"), &a, &state).await;
+    assert_eq!(tenant_replay(&slots).0, 5);
+    ProxyServer::tr_clear_tx(&a).await;
+    assert_eq!(tenant_replay(&slots).0, 0);
+
+    // A session that ends mid-transaction returns its bytes when dropped.
+    ProxyServer::note_ready_for_query(&b, b'T', false);
+    ProxyServer::tr_after_simple(&mut tr_b, &qmsg("BEGIN"), &b, &state).await;
+    ProxyServer::tr_after_simple(&mut tr_b, &qmsg(&sized_select(30)), &b, &state).await;
+    assert_eq!(tenant_replay(&slots).0, 35);
+    drop(b);
+    assert_eq!(tenant_replay(&slots).0, 0);
+}
+
+/// A COPY inside a transaction makes it non-replayable (its data stream is
+/// not recorded), so the session's replay charge returns to its tenant when
+/// the COPY starts, not at the transaction's end: another session of the
+/// tenant fits meanwhile. The COPY's drain to ReadyForQuery settles the
+/// charge at 0 whatever the session still held, in the transaction ('T') or
+/// after it ('I').
+#[tokio::test]
+async fn tr_an_in_transaction_copy_returns_the_tenant_replay_budget() {
+    let server = ProxyServer::new(test_config()).unwrap();
+    let state = server.state.clone();
+    let slots = tenant_replay_slots(64);
+    let a = tenant_session(&slots, TrMode::Transaction);
+    let b = tenant_session(&slots, TrMode::Transaction);
+    let (mut tr_a, mut tr_b) = (
+        TrSession::new(TrMode::Transaction),
+        TrSession::new(TrMode::Transaction),
+    );
+    // A: BEGIN + a 40-byte statement, charged to the tenant.
+    ProxyServer::note_ready_for_query(&a, b'T', false);
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg("BEGIN"), &a, &state).await;
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg(&sized_select(40)), &a, &state).await;
+    assert_eq!(tenant_replay(&slots), (45, 0));
+
+    // A's COPY yields for client data: nothing of A's stays charged.
+    a.copy_in_progress.store(true, Ordering::Relaxed);
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg("COPY t FROM STDIN"), &a, &state).await;
+    {
+        let ts = a.tx_state.read().await;
+        assert!(ts.non_replayable && ts.statements.is_empty());
+        assert_eq!(ts.replay_bytes, 0);
+    }
+    assert_eq!(tenant_replay(&slots), (0, 0));
+
+    // B's transaction of the same size fits while A copies (next to A's 45
+    // bytes it would not).
+    ProxyServer::note_ready_for_query(&b, b'T', false);
+    ProxyServer::tr_after_simple(&mut tr_b, &qmsg("BEGIN"), &b, &state).await;
+    ProxyServer::tr_after_simple(&mut tr_b, &qmsg(&sized_select(40)), &b, &state).await;
+    assert!(!b.tx_state.read().await.non_replayable);
+    assert_eq!(tenant_replay(&slots), (45, 0));
+
+    // The COPY drains inside A's transaction: A is still charged nothing,
+    // nor are its later statements.
+    a.copy_in_progress.store(false, Ordering::Relaxed);
+    ProxyServer::note_ready_for_query(&a, b'T', false);
+    ProxyServer::tr_after_copy_drain(&mut tr_a, &a, &state).await;
+    assert!(a.tx_state.read().await.non_replayable);
+    assert_eq!(tenant_replay(&slots), (45, 0));
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg("SELECT 1"), &a, &state).await;
+    assert_eq!(tenant_replay(&slots), (45, 0));
+    ProxyServer::note_ready_for_query(&a, b'I', false);
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg("COMMIT"), &a, &state).await;
+    assert_eq!(tenant_replay(&slots), (45, 0));
+
+    // A drain settles the charge at 0 whatever the session still held (B's
+    // 45 bytes here): in its transaction, which it leaves non-replayable ...
+    ProxyServer::note_ready_for_query(&b, b'T', false);
+    ProxyServer::tr_after_copy_drain(&mut tr_b, &b, &state).await;
+    {
+        let ts = b.tx_state.read().await;
+        assert!(ts.in_transaction && ts.non_replayable && ts.statements.is_empty());
+    }
+    assert_eq!(tenant_replay(&slots), (0, 0));
+    // ... or after it.
+    ProxyServer::note_ready_for_query(&a, b'T', false);
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg("BEGIN"), &a, &state).await;
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg(&sized_select(40)), &a, &state).await;
+    assert_eq!(tenant_replay(&slots), (45, 0));
+    ProxyServer::note_ready_for_query(&a, b'I', false);
+    ProxyServer::tr_after_copy_drain(&mut tr_a, &a, &state).await;
+    assert!(!a.tx_state.read().await.in_transaction);
+    assert_eq!(tenant_replay(&slots), (0, 0));
+}
+
+#[tokio::test]
+async fn tr_select_mode_write_transactions_are_not_charged() {
+    let server = ProxyServer::new(test_config()).unwrap();
+    let state = server.state.clone();
+    let slots = tenant_replay_slots(16);
+    let w = tenant_session(&slots, TrMode::Select);
+    let r = tenant_session(&slots, TrMode::Select);
+    let (mut tr_w, mut tr_r) = (
+        TrSession::new(TrMode::Select),
+        TrSession::new(TrMode::Select),
+    );
+
+    // A write transaction is recorded as before but never charged: select
+    // mode cannot replay it.
+    ProxyServer::note_ready_for_query(&w, b'T', false);
+    ProxyServer::tr_after_simple(&mut tr_w, &qmsg("BEGIN"), &w, &state).await;
+    ProxyServer::tr_after_simple(&mut tr_w, &qmsg("INSERT INTO t VALUES (1)"), &w, &state).await;
+    ProxyServer::tr_after_simple(&mut tr_w, &qmsg(&sized_select(40)), &w, &state).await;
+    {
+        let ts = w.tx_state.read().await;
+        assert!(ts.has_writes && ts.statements.len() == 3);
+        // Not refused by the tenant budget: the P-03 reason stays
+        // not_replayable, never cap_exceeded.
+        assert!(!ts.non_replayable && !ts.replay_cap_exceeded);
+    }
+    assert_eq!(tenant_replay(&slots), (0, 0));
+
+    // A concurrent read-only transaction of the tenant fits the small budget.
+    ProxyServer::note_ready_for_query(&r, b'T', false);
+    ProxyServer::tr_after_simple(&mut tr_r, &qmsg("BEGIN"), &r, &state).await;
+    ProxyServer::tr_after_simple(&mut tr_r, &qmsg("SELECT 1"), &r, &state).await;
+    assert!(!r.tx_state.read().await.non_replayable);
+    assert_eq!(tenant_replay(&slots), (13, 0));
+}
+
+#[tokio::test]
+async fn tr_recorder_checks_open_flush_cycles_against_the_tenant_budget() {
+    let server = ProxyServer::new(test_config()).unwrap();
+    let state = server.state.clone();
+    let slots = tenant_replay_slots(64);
+    let a = tenant_session(&slots, TrMode::Transaction);
+    let b = tenant_session(&slots, TrMode::Transaction);
+    let (mut tr_a, mut tr_b) = (
+        TrSession::new(TrMode::Transaction),
+        TrSession::new(TrMode::Transaction),
+    );
+    // Another session of the tenant holds 40 bytes.
+    ProxyServer::note_ready_for_query(&a, b'T', false);
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg("BEGIN"), &a, &state).await;
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg(&sized_select(35)), &a, &state).await;
+    assert_eq!(tenant_replay(&slots), (40, 0));
+
+    ProxyServer::note_ready_for_query(&b, b'T', false);
+    ProxyServer::tr_after_simple(&mut tr_b, &qmsg("BEGIN"), &b, &state).await;
+    let batch = bytes::Bytes::from(frame(b'H', &[]));
+    for _ in 0..32 {
+        ProxyServer::tr_after_extended(
+            &mut tr_b,
+            ext_batch(&batch, None, None, false, &[]),
+            &[],
+            &HashMap::new(),
+            &b,
+            &state,
+        )
+        .await;
+        // Flush chunks are checked, not charged: the tenant never holds more
+        // than its budget, retained chunks included.
+        let retained = tr_b.ext_cycle.as_ref().map_or(0, |c| c.frames.len());
+        assert!(tenant_replay(&slots).0 + retained <= 64);
+    }
+    assert!(tr_b.ext_cycle.is_none(), "the open cycle was dropped");
+    {
+        let ts = b.tx_state.read().await;
+        assert!(ts.non_replayable && ts.replay_cap_exceeded);
+        assert!(ts.statements.is_empty() && ts.replay_bytes == 0);
+    }
+    // Counted once; B's bytes returned; [limits]' counter untouched.
+    assert_eq!(tenant_replay(&slots), (40, 1));
+    assert_eq!(
+        state.metrics.tr.replay_cap_exceeded.load(Ordering::Relaxed),
+        0
+    );
+}
+
+/// An autocommit Flush chunk holds no tenant bytes: a tenant budget other
+/// sessions fill never drops it, so its Sync keeps every statement the
+/// session had acknowledged (TR-08) and no tenant refusal is counted.
+#[tokio::test]
+async fn tr_an_autocommit_flush_cycle_ignores_a_saturated_tenant_budget() {
+    let server = ProxyServer::new(test_config()).unwrap();
+    let state = server.state.clone();
+    let slots = tenant_replay_slots(64);
+    let a = tenant_session(&slots, TrMode::Transaction);
+    let c = tenant_session(&slots, TrMode::Transaction);
+    let (mut tr_a, mut tr_c) = (
+        TrSession::new(TrMode::Transaction),
+        TrSession::new(TrMode::Transaction),
+    );
+    // Another session of the tenant holds 40 of its 64 bytes.
+    ProxyServer::note_ready_for_query(&a, b'T', false);
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg("BEGIN"), &a, &state).await;
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg(&sized_select(35)), &a, &state).await;
+    assert_eq!(tenant_replay(&slots), (40, 0));
+
+    // C, in autocommit, prepares "ins" in its own cycle: acknowledged.
+    let ins = tr08_parse("ins", "INSERT INTO t VALUES ($1)");
+    let late = tr08_parse("late", "SELECT 'a statement prepared by a Flush'");
+    let mut registry: HashMap<String, bytes::Bytes> = HashMap::new();
+    registry.insert("ins".to_string(), bytes::Bytes::from(ins.clone()));
+    registry.insert("late".to_string(), bytes::Bytes::from(late.clone()));
+    ProxyServer::note_ready_for_query(&c, b'I', false);
+    let prepare = bytes::Bytes::from([ins, frame(b'S', &[])].concat());
+    ProxyServer::tr_after_extended(
+        &mut tr_c,
+        ext_batch(&prepare, None, None, true, &["ins".to_string()]),
+        &[],
+        &registry,
+        &c,
+        &state,
+    )
+    .await;
+    assert!(tr_c.acked.contains_key("ins"));
+
+    // A Flush chunk bigger than the budget's room, then its Sync.
+    let chunk = bytes::Bytes::from([late, frame(b'H', &[])].concat());
+    assert!(40 + chunk.len() > 64);
+    ProxyServer::tr_after_extended(
+        &mut tr_c,
+        ext_batch(&chunk, None, None, false, &["late".to_string()]),
+        &[],
+        &registry,
+        &c,
+        &state,
+    )
+    .await;
+    assert!(tr_c.ext_cycle.is_some(), "the chunk is retained");
+    assert!(!tr_c.ext_cycle_dropped);
+    let sync = bytes::Bytes::from(frame(b'S', &[]));
+    ProxyServer::tr_after_extended(
+        &mut tr_c,
+        ext_batch(&sync, None, None, true, &[]),
+        &[],
+        &registry,
+        &c,
+        &state,
+    )
+    .await;
+    assert!(
+        tr_c.acked.contains_key("ins"),
+        "the acknowledged statement survives"
+    );
+    assert!(!c.tx_state.read().await.non_replayable);
+    assert_eq!(tenant_replay(&slots), (40, 0), "no tenant refusal");
+}
+
+/// A Flush chunk that takes its transaction over a `[limits]` replay cap is
+/// degraded by that cap alone: the tenant budget it would also exceed is not
+/// checked, so the one degradation counts once, in
+/// `tr_replay_cap_exceeded_total`, never as a tenant refusal too.
+#[tokio::test]
+async fn tr_a_limits_cap_overflow_at_a_flush_is_not_also_a_tenant_refusal() {
+    let mut config = test_config();
+    config.limits.tr_max_replay_bytes = 64;
+    let server = ProxyServer::new(config).unwrap();
+    let state = server.state.clone();
+    let slots = tenant_replay_slots(64);
+    let a = tenant_session(&slots, TrMode::Transaction);
+    let b = tenant_session(&slots, TrMode::Transaction);
+    let (mut tr_a, mut tr_b) = (
+        TrSession::new(TrMode::Transaction),
+        TrSession::new(TrMode::Transaction),
+    );
+    // Another session of the tenant holds 40 of its 64 bytes.
+    ProxyServer::note_ready_for_query(&a, b'T', false);
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg("BEGIN"), &a, &state).await;
+    ProxyServer::tr_after_simple(&mut tr_a, &qmsg(&sized_select(35)), &a, &state).await;
+    ProxyServer::note_ready_for_query(&b, b'T', false);
+    ProxyServer::tr_after_simple(&mut tr_b, &qmsg("BEGIN"), &b, &state).await;
+    assert_eq!(tenant_replay(&slots), (45, 0));
+
+    // B's chunk is over both the [limits] cap and the tenant's room.
+    let chunk = bytes::Bytes::from(
+        [
+            tr08_parse("", &sized_select(60)),
+            tr08_bind("", ""),
+            tr08_execute(""),
+            frame(b'H', &[]),
+        ]
+        .concat(),
+    );
+    assert!(5 + chunk.len() > 64 && 40 + 5 + chunk.len() > 64);
+    ProxyServer::tr_after_extended(
+        &mut tr_b,
+        ext_batch(&chunk, None, None, false, &[]),
+        &[],
+        &HashMap::new(),
+        &b,
+        &state,
+    )
+    .await;
+    assert!(tr_b.ext_cycle.is_none() && tr_b.ext_cycle_dropped);
+    {
+        let ts = b.tx_state.read().await;
+        assert!(ts.non_replayable && ts.replay_cap_exceeded);
+    }
+    // B's bytes returned; only the [limits] counter moved.
+    assert_eq!(tenant_replay(&slots), (40, 0));
+    assert_eq!(
+        state.metrics.tr.replay_cap_exceeded.load(Ordering::Relaxed),
+        1
+    );
+}
+
+/// One Flush-terminated chunk of an extended cycle, through the recorder.
+async fn tr_flush_chunk(
+    tr: &mut TrSession,
+    chunk: &bytes::Bytes,
+    session: &Arc<ClientSession>,
+    state: &Arc<ServerState>,
+) {
+    ProxyServer::tr_after_extended(
+        tr,
+        ext_batch(chunk, None, None, false, &[]),
+        &[],
+        &HashMap::new(),
+        session,
+        state,
+    )
+    .await;
+}
+
+/// `select` mode's write exemption at the Flush projection: the "may
+/// write" question, which scans the whole retained cycle, is asked only when
+/// the tenant budget does not fit, a projection it lets through is no
+/// refusal, and its answer is kept for the rest of the cycle, so a long
+/// Flush pipeline is not rescanned at every chunk.
+#[tokio::test]
+async fn tr_select_mode_scans_an_open_flush_cycle_only_over_budget_and_once() {
+    let server = ProxyServer::new(test_config()).unwrap();
+    let state = server.state.clone();
+    let slots = tenant_replay_slots(256);
+    let x = tenant_session(&slots, TrMode::Select);
+    let y = tenant_session(&slots, TrMode::Select);
+    let (mut tr_x, mut tr_y) = (
+        TrSession::new(TrMode::Select),
+        TrSession::new(TrMode::Select),
+    );
+
+    // The check itself: the question is not asked while the projection fits,
+    // and a projection it lets through is not counted.
+    let ts = TransactionState::default();
+    assert!(y.tenant_replay_fits(&ts, 256, || panic!("asked although it fits")));
+    assert!(y.tenant_replay_fits(&ts, 257, || true));
+    assert_eq!(tenant_replay(&slots), (0, 0));
+    assert!(!y.tenant_replay_fits(&ts, 257, || false));
+    assert_eq!(tenant_replay(&slots), (0, 1));
+
+    // Y's read-only transaction; its first chunk, a write, fits: not scanned.
+    ProxyServer::note_ready_for_query(&y, b'T', false);
+    ProxyServer::tr_after_simple(&mut tr_y, &qmsg("BEGIN"), &y, &state).await;
+    let chunk = |sql: &str| {
+        bytes::Bytes::from(
+            [
+                tr08_parse("", sql),
+                tr08_bind("", ""),
+                tr08_execute(""),
+                frame(b'H', &[]),
+            ]
+            .concat(),
+        )
+    };
+    let write = chunk("INSERT INTO t VALUES (1)");
+    let read = chunk(&sized_select(20));
+    tr_flush_chunk(&mut tr_y, &write, &y, &state).await;
+    assert!(!tr_y.ext_cycle.as_ref().unwrap().may_write, "not scanned");
+
+    // X takes most of the budget: Y's next chunk does not fit, so the cycle
+    // is scanned, found to write, let through and remembered as a write.
+    ProxyServer::note_ready_for_query(&x, b'T', false);
+    ProxyServer::tr_after_simple(&mut tr_x, &qmsg("BEGIN"), &x, &state).await;
+    ProxyServer::tr_after_simple(&mut tr_x, &qmsg(&sized_select(150)), &x, &state).await;
+    assert_eq!(tenant_replay(&slots), (160, 1));
+    assert!(155 + 5 + write.len() + read.len() > 256);
+    tr_flush_chunk(&mut tr_y, &read, &y, &state).await;
+    assert!(
+        tr_y.ext_cycle.as_ref().unwrap().may_write,
+        "scanned: it writes"
+    );
+    assert_eq!(tenant_replay(&slots), (160, 1), "no new refusal");
+
+    // The answer stands for the rest of the cycle: a later chunk is let
+    // through on it, without a rescan (the retained frames are swapped for
+    // read-only ones here, which a rescan would refuse).
+    tr_y.ext_cycle.as_mut().unwrap().frames = bytes::BytesMut::from(&read[..]);
+    assert!(155 + 5 + 2 * read.len() > 256);
+    tr_flush_chunk(&mut tr_y, &read, &y, &state).await;
+    assert!(tr_y.ext_cycle.is_some());
+    assert!(!y.tx_state.read().await.non_replayable);
+    assert_eq!(tenant_replay(&slots), (160, 1), "no refusal");
+}
+
 #[tokio::test]
 async fn tr_recorder_retains_begin_before_first_sync_or_refuses_incomplete_history() {
     for (cap, simple_end) in [(4096, false), (1, false), (4096, true)] {
@@ -3211,6 +3692,7 @@ async fn passthrough_auth_holds_back_a_capacity_refusal() {
     let r = ProxyServer::proxy_authentication(
         &mut client,
         &mut backend,
+        &make_test_session(),
         &server.state,
         "127.0.0.1:5432",
         &mut false,
@@ -3245,6 +3727,7 @@ async fn passthrough_auth_relays_errors_and_reports_their_sqlstate() {
         let r = ProxyServer::proxy_authentication(
             &mut client,
             &mut backend,
+            &make_test_session(),
             &server.state,
             "127.0.0.1:5432",
             &mut false,
@@ -3275,15 +3758,21 @@ async fn passthrough_auth_relays_a_successful_startup_unchanged() {
     bytes.extend(frame(b'K', &[0, 0, 0, 7, 0, 0, 0, 9]));
     bytes.extend(frame(b'Z', b"I"));
     backend_peer.write_all(&bytes).await.unwrap();
+    let session = make_test_session();
     ProxyServer::proxy_authentication(
         &mut client,
         &mut backend,
+        &session,
         &server.state,
         "127.0.0.1:5432",
         &mut false,
     )
     .await
     .expect("startup completes");
+    // The key the client was given is the session's (a cancel of a tenant
+    // active-query wait names it).
+    assert_eq!(session.cancel_key.get(), Some(&(7, 9)));
+    assert!(server.state.cancel_map.contains_key(&(7, 9)));
     drop(client);
     let mut got = Vec::new();
     client_peer.read_to_end(&mut got).await.unwrap();
@@ -4666,6 +5155,7 @@ async fn f2_stale_statement_is_closed_before_the_batch_uses_it() {
                 state: &state,
                 config: &config,
                 fault: &mut fault,
+                continues_cycle: None,
             },
             ExtBatch {
                 batch: &case.batch,

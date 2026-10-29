@@ -540,24 +540,11 @@ impl ProxyServer {
             };
             *session.backend_credential.write().await = credential;
             // Register the cancel key from the BackendKeyData frame.
-            let mut off = 0usize;
-            while off + 5 <= post_auth.len() {
-                let len = u32::from_be_bytes([
-                    post_auth[off + 1],
-                    post_auth[off + 2],
-                    post_auth[off + 3],
-                    post_auth[off + 4],
-                ]) as usize;
-                if len < 4 || off + 1 + len > post_auth.len() {
-                    break;
+            if let Some((pid, key)) = Self::backend_key_data(&post_auth) {
+                Self::register_cancel_key(state, pid, key, node_addr, backend.peer_addr().ok());
+                if session.cancel_key.set((pid, key)).is_ok() {
+                    state.tenant_slots.session_key_relayed((pid, key));
                 }
-                if post_auth[off] == b'K' && len + 1 >= 13 {
-                    let f = &post_auth[off..off + 1 + len];
-                    let pid = u32::from_be_bytes([f[5], f[6], f[7], f[8]]);
-                    let key = u32::from_be_bytes([f[9], f[10], f[11], f[12]]);
-                    Self::register_cancel_key(state, pid, key, node_addr);
-                }
-                off += 1 + len;
             }
             let mut to_client = Vec::with_capacity(9 + post_auth.len());
             to_client.extend_from_slice(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]); // AuthenticationOk
@@ -574,6 +561,7 @@ impl ProxyServer {
             Self::proxy_authentication(
                 client_stream,
                 backend,
+                session,
                 state,
                 node_addr,
                 error_response_started,
@@ -663,12 +651,15 @@ impl ProxyServer {
     // resolved once at startup into `ServerState::limits` (`ResolvedLimits`).
     // Defaults are byte-for-byte the prior constants; see that struct.
 
-    /// Record the backend that owns a BackendKeyData (pid, secret) pair.
+    /// Record the backend that owns a BackendKeyData (pid, secret) pair:
+    /// its node, and `peer`, the address of the connection that issued it
+    /// (see [`CancelTarget`]).
     pub(super) fn register_cancel_key(
         state: &Arc<ServerState>,
         pid: u32,
         key: u32,
         node_addr: &str,
+        peer: Option<SocketAddr>,
     ) {
         // FIFO-evict the oldest registrations when at capacity, rather than
         // dropping all of them. Evict a small batch so we don't churn the lock
@@ -690,40 +681,110 @@ impl ProxyServer {
             }
             order.push_back((pid, key));
         }
-        state.cancel_map.insert((pid, key), node_addr.to_string());
+        state.cancel_map.insert(
+            (pid, key),
+            CancelTarget {
+                node: node_addr.to_string(),
+                peer,
+            },
+        );
     }
 
     /// Forward a client CancelRequest to the backend that issued the
-    /// matching BackendKeyData. Best-effort: unknown keys are ignored.
+    /// matching BackendKeyData, at the address its connection was open to
+    /// (its node's name is dialled only when that address is unknown; see
+    /// [`CancelTarget`]). Best-effort: unknown keys are ignored. A
+    /// session waiting at its tenant's active-query cap (ac858d61400b) has
+    /// nothing running on a backend: the cancel ends that wait instead. A key
+    /// several live sessions were relayed (a backend that issues colliding
+    /// keys) is ambiguous, as the sender may be one running a statement: it
+    /// ends no wait and is forwarded as before.
     pub(super) async fn forward_cancel_request(state: &Arc<ServerState>, pid: u32, key: u32) {
-        let Some(addr) = state.cancel_map.get(&(pid, key)).map(|e| e.clone()) else {
+        if state.tenant_slots.cancel_query_wait(pid, key) {
+            tracing::debug!(
+                target: "helios::tenant",
+                pid,
+                "cancel request ended a tenant active-query wait"
+            );
+            // The statement never reached a backend.
+            return;
+        }
+        let Some(target) = state.cancel_map.get(&(pid, key)).map(|e| e.clone()) else {
             tracing::debug!(pid, "cancel request for unknown key; ignoring");
             return;
         };
+        let timeout = state.limits.backend_cancel_timeout;
+        match target.peer {
+            Some(peer) => Self::send_cancel_request(peer, pid, key, timeout).await,
+            None => Self::send_cancel_request(target.node.as_str(), pid, key, timeout).await,
+        };
+    }
+
+    /// Send the backend at `addr` (a node's `host:port`, or the very
+    /// address a backend connection is open to) a CancelRequest for the
+    /// BackendKeyData `(pid, key)`, and wait for it to close that connection,
+    /// which PostgreSQL does once it has signalled the backend running the
+    /// statement (libpq's `PQcancel` waits for the same). Our side of the
+    /// connection is shut down after the request, so a backend that reads
+    /// to the end of its input closes too. All of it within `timeout`
+    /// (`[limits] backend_cancel_timeout_ms`). Best-effort: `false` (logged)
+    /// when the request could not be sent; a backend that took it but did
+    /// not close in time still counts as sent.
+    pub(super) async fn send_cancel_request<A>(
+        addr: A,
+        pid: u32,
+        key: u32,
+        timeout: Duration,
+    ) -> bool
+    where
+        A: tokio::net::ToSocketAddrs + std::fmt::Display + Copy,
+    {
         // CancelRequest: int32 len(16) + int32 code(80877102) + pid + key.
         let mut msg = BytesMut::with_capacity(16);
         msg.put_u32(16);
         msg.put_u32(80877102);
         msg.put_u32(pid);
         msg.put_u32(key);
-        match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr)).await {
-            Ok(Ok(mut conn)) => {
-                let _ = conn.set_nodelay(true);
-                if let Err(e) = conn.write_all(&msg).await {
-                    tracing::warn!(node = %addr, error = %e, "failed to forward CancelRequest");
-                }
-                // PG closes the connection after handling a CancelRequest.
+        let mut written = false;
+        let sent = tokio::time::timeout(timeout, async {
+            let mut conn = TcpStream::connect(addr).await?;
+            let _ = conn.set_nodelay(true);
+            conn.write_all(&msg).await?;
+            written = true;
+            let _ = conn.shutdown().await;
+            let mut rest = [0u8; 64];
+            while conn.read(&mut rest).await? > 0 {}
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+        match sent {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) if written => {
+                tracing::debug!(node = %addr, error = %e, "CancelRequest sent; the backend reset its connection");
+                true
             }
-            other => {
-                tracing::warn!(node = %addr, ?other, "could not connect to forward CancelRequest")
+            Ok(Err(e)) => {
+                tracing::warn!(node = %addr, error = %e, "could not send a CancelRequest");
+                false
+            }
+            Err(_) if written => {
+                tracing::debug!(node = %addr, "CancelRequest sent; the backend did not close its connection in time");
+                true
+            }
+            Err(_) => {
+                tracing::warn!(node = %addr, ?timeout, "could not send a CancelRequest in time");
+                false
             }
         }
     }
 
-    /// Proxy authentication messages between client and backend
+    /// Proxy authentication messages between client and backend. The
+    /// BackendKeyData relayed to the client is registered for cancel routing
+    /// and kept on `session` (its tenant active-query wait).
     pub(super) async fn proxy_authentication(
         client_stream: &mut ClientStream,
         backend_stream: &mut TcpStream,
+        session: &ClientSession,
         state: &Arc<ServerState>,
         node_addr: &str,
         error_response_started: &mut bool,
@@ -751,6 +812,9 @@ impl ProxyServer {
         // arrives as the very first frame and is held back, so the caller can
         // free idle capacity and redial without the client seeing it.
         let mut relayed_any = false;
+        // The server this connection is open to, which a cancel of the key
+        // it issues must reach (see `CancelTarget`).
+        let peer = backend_stream.peer_addr().ok();
 
         loop {
             tokio::select! {
@@ -832,7 +896,10 @@ impl ProxyServer {
                                 let key = u32::from_be_bytes([
                                     frame[9], frame[10], frame[11], frame[12],
                                 ]);
-                                Self::register_cancel_key(state, pid, key, node_addr);
+                                Self::register_cancel_key(state, pid, key, node_addr, peer);
+                                if session.cancel_key.set((pid, key)).is_ok() {
+                                    state.tenant_slots.session_key_relayed((pid, key));
+                                }
                             }
                             // ReadyForQuery: authentication + startup complete.
                             b'Z' => {

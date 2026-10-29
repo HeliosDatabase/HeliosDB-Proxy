@@ -25,10 +25,26 @@ impl ProxyServer {
             state,
             config,
             fault,
+            continues_cycle,
         } = fwd;
-        // Rate-limit gate: deny before any backend selection.
+        // Without the limiter nothing charges a continuation.
+        #[cfg(not(feature = "rate-limiting"))]
+        let _ = continues_cycle.map(|cycle| cycle.runs);
+        // Rate-limit gate: deny before any backend selection (never a query
+        // that continues a cycle the backend holds open: it belongs to a
+        // request admitted already, and is paced instead).
         #[cfg(feature = "rate-limiting")]
-        if let Some(mut resp) = Self::rate_limit_check(session, state, config).await {
+        let limited = match continues_cycle {
+            None => Self::rate_limit_check(session, state, config).await,
+            Some(cycle) => {
+                if cycle.runs {
+                    Self::rate_limit_pace(session, state, config).await;
+                }
+                None
+            }
+        };
+        #[cfg(feature = "rate-limiting")]
+        if let Some(mut resp) = limited {
             // Nothing reached the backend: its status is the last one relayed
             // ('T'/'E' inside a transaction that stays open there).
             resp.extend_from_slice(&Self::create_ready_for_query(
@@ -217,8 +233,11 @@ impl ProxyServer {
                 .edge_ineligible
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        // Neither cache answers (nor stores) a query that continues a cycle
+        // the backend holds open: only the backend's reply settles it.
         #[cfg(feature = "edge-proxy")]
         let edge_ctx: Option<(crate::edge::CacheKey, Vec<String>, u64, u64)> = if is_write
+            || continues_cycle.is_some()
             || !config.edge.enabled
             || session
                 .edge_ineligible
@@ -303,27 +322,28 @@ impl ProxyServer {
         // store below (`put_prepared`), so a miss+store normalizes the SQL
         // once instead of twice.
         #[cfg(feature = "query-cache")]
-        let cache_ctx: Option<(crate::cache::CacheContext, crate::cache::QueryPrep)> = if is_write {
-            None
-        } else if let Some(qc) = state.query_cache.as_ref() {
-            let sql = facts.sql();
-            match Self::cacheable_read_ctx(session, facts.is_cacheable_read()).await {
-                Some(ctx) => {
-                    let (lookup, prep) = qc.get_with_prep(sql, &ctx).await;
-                    if let crate::cache::CacheLookup::Hit { result, level } = lookup {
-                        tracing::debug!(target: "helios::cache", level = %level, "cache hit");
-                        client.write_all(&result.data).await.map_err(|e| {
-                            ProxyError::Network(format!("Client write error: {}", e))
-                        })?;
-                        return Ok((None, result.data.len() as u64));
+        let cache_ctx: Option<(crate::cache::CacheContext, crate::cache::QueryPrep)> =
+            if is_write || continues_cycle.is_some() {
+                None
+            } else if let Some(qc) = state.query_cache.as_ref() {
+                let sql = facts.sql();
+                match Self::cacheable_read_ctx(session, facts.is_cacheable_read()).await {
+                    Some(ctx) => {
+                        let (lookup, prep) = qc.get_with_prep(sql, &ctx).await;
+                        if let crate::cache::CacheLookup::Hit { result, level } = lookup {
+                            tracing::debug!(target: "helios::cache", level = %level, "cache hit");
+                            client.write_all(&result.data).await.map_err(|e| {
+                                ProxyError::Network(format!("Client write error: {}", e))
+                            })?;
+                            return Ok((None, result.data.len() as u64));
+                        }
+                        Some((ctx, prep))
                     }
-                    Some((ctx, prep))
+                    None => None,
                 }
-                None => None,
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         // Schema/workload routing: pin an analytical (OLAP) read to the
         // configured analytics node, unless something already forced a target.
@@ -355,31 +375,52 @@ impl ProxyServer {
         if is_write {
             reads.note_write(session);
         }
-        let read_route = if is_write || forced_target.is_some() {
-            ReadRoute::Stay
-        } else {
-            reads.route(session, standby_hint, || {
-                facts.is_standby_read(&state.tr_read_policy)
-            })
+        // A query continuing an open cycle goes to the connection holding it
+        // (only that backend's reply settles the cycle), wherever routing
+        // would send a new one.
+        let (mut target, mut offloaded) = match continues_cycle {
+            Some(cycle) => {
+                if let Some(e) = cycle.lost(conns, fault) {
+                    return Err(e);
+                }
+                (cycle.node.to_string(), false)
+            }
+            None => {
+                let read_route = if is_write || forced_target.is_some() {
+                    ReadRoute::Stay
+                } else {
+                    reads.route(session, standby_hint, || {
+                        facts.is_standby_read(&state.tr_read_policy)
+                    })
+                };
+                Self::choose_target_node(
+                    is_write,
+                    forced_target,
+                    current_node,
+                    read_route,
+                    session,
+                    state,
+                    config,
+                )
+                .await?
+            }
         };
-        let (mut target, mut offloaded) = Self::choose_target_node(
-            is_write,
-            forced_target,
-            current_node,
-            read_route,
-            session,
-            state,
-            config,
-        )
-        .await?;
         tracing::debug!(target: "helios::routing", node = %target, is_write, offloaded, "routed simple query");
         if offloaded {
             Self::drop_if_unusable(conns, &target);
         }
 
-        // Circuit breaker: fast-fail when the chosen node's circuit is open.
+        // Circuit breaker: fast-fail when the chosen node's circuit is open
+        // (not a query continuing a cycle that node holds open: its reply,
+        // or its failure, settles that cycle).
         #[cfg(feature = "circuit-breaker")]
-        if let Some(mut resp) = Self::circuit_fast_fail(state, &target) {
+        let fast_fail = if continues_cycle.is_some() {
+            None
+        } else {
+            Self::circuit_fast_fail(state, &target)
+        };
+        #[cfg(feature = "circuit-breaker")]
+        if let Some(mut resp) = fast_fail {
             resp.extend_from_slice(&Self::create_ready_for_query(
                 session.last_rfq_status.load(Ordering::Relaxed),
             ));
@@ -420,8 +461,11 @@ impl ProxyServer {
         // An offloaded read runs with the session's settings mirrored onto
         // the standby connection; if that cannot be done, the home serves it.
         // A connection that once took mirrored settings and now serves as home
-        // (a standby promoted since) is brought up to date the same way.
-        let stale_mirror = !offloaded && Self::mirror_stale(conns, &target, reads);
+        // (a standby promoted since) is brought up to date the same way, but
+        // never in the middle of a cycle it holds open (a SET there would end
+        // that cycle).
+        let stale_mirror =
+            !offloaded && continues_cycle.is_none() && Self::mirror_stale(conns, &target, reads);
         let mut served_by_standby = offloaded;
         if (offloaded || stale_mirror)
             && !Self::mirror_read_gucs(client, conns, &target, reads, session, state, config).await
@@ -466,6 +510,10 @@ impl ProxyServer {
             backend.dirty = true;
         }
 
+        // The Query destroys whatever unnamed statement and portal the socket
+        // holds (a failed write drops the socket): an identical unnamed Parse
+        // after it must reach the backend again.
+        backend.unnamed_destroyed();
         let backend_err = match tokio::time::timeout(
             state.limits.backend_write_timeout,
             backend.stream.write_all(&forward_msg.encode()),
@@ -478,9 +526,9 @@ impl ProxyServer {
         };
         if let Some(msg) = backend_err {
             let e = ProxyError::Network(msg);
-            conns.remove(&target);
             Self::record_backend_failure(state, &target, &e.to_string());
             BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
+            Self::drop_undelivered(conns, &target, continues_cycle.is_some(), session, state).await;
             return Err(e);
         }
 
@@ -606,9 +654,9 @@ impl ProxyServer {
                         Ok((Some(target), sent))
                     }
                     Err(e) => {
-                        conns.remove(&target);
                         Self::record_backend_failure(state, &target, &e.to_string());
                         BackendFault::set_response(fault, &target, &e);
+                        Self::abandon_conn(conns, &target, session, state).await;
                         Err(e.error)
                     }
                 };
@@ -677,9 +725,9 @@ impl ProxyServer {
             }
             Err(e) => {
                 // Drop the broken connection so the next use redials.
-                conns.remove(&target);
                 Self::record_backend_failure(state, &target, &e.to_string());
                 BackendFault::set_response(fault, &target, &e);
+                Self::abandon_conn(conns, &target, session, state).await;
                 #[cfg(feature = "query-analytics")]
                 if let Some(sql) = analytics_sql.as_deref() {
                     Self::record_analytics(
@@ -732,6 +780,7 @@ impl ProxyServer {
             state,
             config,
             fault,
+            continues_cycle,
         } = fwd;
         let ExtBatch {
             batch,
@@ -742,9 +791,23 @@ impl ProxyServer {
         } = ext;
         // Rate-limit gate. The terminating ReadyForQuery is only appended when
         // the batch carried a Sync (`wait_ready`); a Flush-terminated batch
-        // expects an ErrorResponse with no ReadyForQuery.
+        // expects an ErrorResponse with no ReadyForQuery. A batch continuing
+        // a cycle the backend holds open is part of a request admitted
+        // already: refusing it would tell the client its cycle failed while
+        // the backend keeps it open (and a later Sync commits it), so one
+        // that executes anything is paced instead.
         #[cfg(feature = "rate-limiting")]
-        if let Some(mut resp) = Self::rate_limit_check(session, state, config).await {
+        let limited = match continues_cycle {
+            None => Self::rate_limit_check(session, state, config).await,
+            Some(cycle) => {
+                if cycle.runs {
+                    Self::rate_limit_pace(session, state, config).await;
+                }
+                None
+            }
+        };
+        #[cfg(feature = "rate-limiting")]
+        if let Some(mut resp) = limited {
             if wait_ready {
                 resp.extend_from_slice(&Self::create_ready_for_query(
                     session.last_rfq_status.load(Ordering::Relaxed),
@@ -763,6 +826,17 @@ impl ProxyServer {
         #[cfg(feature = "query-analytics")]
         let started = std::time::Instant::now();
 
+        // A batch continuing an open cycle goes to the connection holding it,
+        // wherever routing would send a new one.
+        let pinned = match continues_cycle {
+            Some(cycle) => {
+                if let Some(e) = cycle.lost(conns, fault) {
+                    return Err(e);
+                }
+                Some(cycle.node)
+            }
+            None => None,
+        };
         let (mut target, mut offloaded) = match route_sql {
             Some(sql) => {
                 // Routing-hints, when active, can override the verb-based
@@ -780,34 +854,38 @@ impl ProxyServer {
                 if is_write {
                     reads.note_write(session);
                 }
-                let read_route = if is_write || forced.is_some() {
-                    ReadRoute::Stay
+                if let Some(node) = pinned {
+                    (node.to_string(), false)
                 } else {
-                    match reads.route(session, standby_hint, || reads.batch_reads) {
-                        // Part of a Flush-split cycle: the rest of it may write,
-                        // so the whole cycle stays on the home node.
-                        ReadRoute::Offload if !reads.batch_whole && !standby_hint => {
-                            ReadRoute::Home
+                    let read_route = if is_write || forced.is_some() {
+                        ReadRoute::Stay
+                    } else {
+                        match reads.route(session, standby_hint, || reads.batch_reads) {
+                            // Part of a Flush-split cycle: the rest of it may write,
+                            // so the whole cycle stays on the home node.
+                            ReadRoute::Offload if !reads.batch_whole && !standby_hint => {
+                                ReadRoute::Home
+                            }
+                            route => route,
                         }
-                        route => route,
-                    }
-                };
-                Self::choose_target_node(
-                    is_write,
-                    forced,
-                    current_node,
-                    read_route,
-                    session,
-                    state,
-                    config,
-                )
-                .await?
+                    };
+                    Self::choose_target_node(
+                        is_write,
+                        forced,
+                        current_node,
+                        read_route,
+                        session,
+                        state,
+                        config,
+                    )
+                    .await?
+                }
             }
-            // No Parse in this batch: stay on the prepared-statement /
-            // portal connection. Fall back to a read node only if the
-            // session has no current connection yet.
+            // No Parse in this batch: stay on the open cycle's, else the
+            // prepared-statement / portal connection. Fall back to a read
+            // node only if the session has no current connection yet.
             None => (
-                match current_node {
+                match pinned.or(current_node) {
                     Some(c) => c.to_string(),
                     None => Self::select_read_node(session, state, config).await?,
                 },
@@ -819,9 +897,17 @@ impl ProxyServer {
             Self::drop_if_unusable(conns, &target);
         }
 
-        // Circuit breaker: fast-fail when the chosen node's circuit is open.
+        // Circuit breaker: fast-fail when the chosen node's circuit is open
+        // (not a batch continuing a cycle that node holds open: its reply, or
+        // its failure, settles that cycle).
         #[cfg(feature = "circuit-breaker")]
-        if let Some(mut resp) = Self::circuit_fast_fail(state, &target) {
+        let fast_fail = if continues_cycle.is_some() {
+            None
+        } else {
+            Self::circuit_fast_fail(state, &target)
+        };
+        #[cfg(feature = "circuit-breaker")]
+        if let Some(mut resp) = fast_fail {
             if wait_ready {
                 resp.extend_from_slice(&Self::create_ready_for_query(
                     session.last_rfq_status.load(Ordering::Relaxed),
@@ -863,8 +949,10 @@ impl ProxyServer {
         // An offloaded batch runs with the session's settings mirrored onto
         // the standby connection; if that cannot be done, the home serves it.
         // A connection that once took mirrored settings and now serves as home
-        // is brought up to date the same way.
-        let stale_mirror = !offloaded && Self::mirror_stale(conns, &target, reads);
+        // is brought up to date the same way, but never in the middle of a
+        // cycle it holds open.
+        let stale_mirror =
+            !offloaded && continues_cycle.is_none() && Self::mirror_stale(conns, &target, reads);
         if (offloaded || stale_mirror)
             && !Self::mirror_read_gucs(client, conns, &target, reads, session, state, config).await
         {
@@ -916,11 +1004,18 @@ impl ProxyServer {
                 }
                 .await;
                 if let Err(e) = closed {
-                    conns.remove(&target);
                     if matches!(e, ProxyError::Network(_)) {
                         Self::record_backend_failure(state, &target, &e.to_string());
                         BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
                     }
+                    Self::drop_undelivered(
+                        conns,
+                        &target,
+                        continues_cycle.is_some(),
+                        session,
+                        state,
+                    )
+                    .await;
                     return Err(e);
                 }
             }
@@ -955,7 +1050,6 @@ impl ProxyServer {
                     backend.prepared.insert(name.clone());
                 }
                 Err(e) => {
-                    conns.remove(&target);
                     // A socket-level failure here is a backend fault (the batch
                     // was never sent); a backend *rejecting* the re-prepare is
                     // a protocol-level problem and is propagated as before.
@@ -963,7 +1057,65 @@ impl ProxyServer {
                         Self::record_backend_failure(state, &target, &e.to_string());
                         BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
                     }
+                    Self::drop_undelivered(
+                        conns,
+                        &target,
+                        continues_cycle.is_some(),
+                        session,
+                        state,
+                    )
+                    .await;
                     return Err(e);
+                }
+            }
+        }
+
+        // An unnamed statement or portal the session no longer has (see
+        // `UnnamedStale`) is closed before a batch that could use it, so the
+        // backend answers such a use as PostgreSQL would (26000, 34000), as it
+        // answers an F2 stale name. Only at a cycle start: a backend skipping
+        // to the Sync after an error in an open cycle would never answer an
+        // out-of-band Close, so a cycle a Flush opens is cleared first.
+        if continues_cycle.is_none() && backend.unnamed_stale.any() {
+            match Self::unnamed_stale_after(
+                batch,
+                unnamed.is_some(),
+                wait_ready,
+                backend.unnamed_stale,
+            ) {
+                Ok(left) => backend.unnamed_stale = left,
+                Err(stale) => {
+                    let closed = async {
+                        Self::finish_pending_backend_frames(client, backend, session, state)
+                            .await?;
+                        Self::close_unnamed(
+                            &mut backend.stream,
+                            stale,
+                            state.limits.reprepare_timeout,
+                            state.limits.max_backend_frame_bytes,
+                        )
+                        .await
+                    }
+                    .await;
+                    if let Err(e) = closed {
+                        if matches!(e, ProxyError::Network(_)) {
+                            Self::record_backend_failure(state, &target, &e.to_string());
+                            BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
+                        }
+                        Self::drop_undelivered(
+                            conns,
+                            &target,
+                            continues_cycle.is_some(),
+                            session,
+                            state,
+                        )
+                        .await;
+                        return Err(e);
+                    }
+                    backend.unnamed_stale = UnnamedStale::default();
+                    if stale.statement {
+                        backend.unnamed_sig = None;
+                    }
                 }
             }
         }
@@ -989,9 +1141,16 @@ impl ProxyServer {
                 .and_then(|r| {
                     r.map_err(|e| ProxyError::Network(format!("Backend write error: {}", e)))
                 }) {
-                    conns.remove(&target);
                     Self::record_backend_failure(state, &target, &e.to_string());
                     BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
+                    Self::drop_undelivered(
+                        conns,
+                        &target,
+                        continues_cycle.is_some(),
+                        session,
+                        state,
+                    )
+                    .await;
                     return Err(e);
                 }
                 new_unnamed_sig = Some(sig.clone());
@@ -1005,9 +1164,9 @@ impl ProxyServer {
         )
         .await
         {
-            conns.remove(&target);
             Self::record_backend_failure(state, &target, &e.to_string());
             BackendFault::set(fault, &target, phase, &e);
+            Self::abandon_conn(conns, &target, session, state).await;
             return Err(e);
         }
 
@@ -1020,7 +1179,7 @@ impl ProxyServer {
                 .await
                 .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))
             {
-                conns.remove(&target);
+                Self::abandon_conn(conns, &target, session, state).await;
                 return Err(e);
             }
             injected = 5;
@@ -1066,10 +1225,10 @@ impl ProxyServer {
                 Ok((Some(target), sent + injected))
             }
             Err(mut e) => {
-                conns.remove(&target);
                 Self::record_backend_failure(state, &target, &e.to_string());
                 e.progress.bytes += injected;
                 BackendFault::set_response(fault, &target, &e);
+                Self::abandon_conn(conns, &target, session, state).await;
                 #[cfg(feature = "query-analytics")]
                 if let Some(sql) = analytics_sql.as_deref() {
                     Self::record_analytics(
@@ -1127,9 +1286,15 @@ impl ProxyServer {
 
     /// Append a statement-kind `Close` of `name` to `wire`.
     pub(super) fn push_close_statement(wire: &mut Vec<u8>, name: &str) {
+        Self::push_close(wire, b'S', name);
+    }
+
+    /// Append a `Close` of `name` to `wire`: `kind` `S` (statement) or `P`
+    /// (portal).
+    fn push_close(wire: &mut Vec<u8>, kind: u8, name: &str) {
         wire.push(b'C');
         wire.extend_from_slice(&((4 + 1 + name.len() + 1) as u32).to_be_bytes());
-        wire.push(b'S');
+        wire.push(kind);
         wire.extend_from_slice(name.as_bytes());
         wire.push(0);
     }
@@ -1164,6 +1329,108 @@ impl ProxyServer {
                 other as char
             ))),
         }
+    }
+
+    /// What stays of `stale` (see [`UnnamedStale`]) once `batch` reaches its
+    /// socket at the start of a cycle, or `Err` with what must be closed before
+    /// it. A first message that is an unnamed `Parse` (`held_parse`: the one
+    /// the promotion held aside leads the batch) replaces the statement, even
+    /// when it fails. Any other use of a stale object counts, a later unnamed
+    /// Parse or Bind to the unnamed portal included (an error before it skips
+    /// the rest of the cycle, so it may never run). A Flush-terminated batch
+    /// (`!wait_ready`) leaves the cycle open, and its later batches are not
+    /// checked: whatever is still stale is closed before it.
+    pub(super) fn unnamed_stale_after(
+        batch: &[u8],
+        held_parse: bool,
+        wait_ready: bool,
+        mut stale: UnnamedStale,
+    ) -> std::result::Result<UnnamedStale, UnnamedStale> {
+        if held_parse {
+            stale.statement = false;
+        }
+        let mut lead = !held_parse;
+        let mut at = 0;
+        while let Some(head) = batch.get(at..at + 5) {
+            let len = (u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize).max(4);
+            let body = batch.get(at + 5..at + 1 + len).unwrap_or_default();
+            let unnamed = body.first() == Some(&0);
+            let uses = match head[0] {
+                b'P' if unnamed && lead => {
+                    stale.statement = false;
+                    false
+                }
+                b'P' => unnamed && stale.statement,
+                b'B' => {
+                    (unnamed && stale.portal)
+                        || (stale.statement && Self::bind_stmt_ref(body).is_none())
+                }
+                b'E' => unnamed && stale.portal,
+                b'D' | b'C' => match body {
+                    [b'S', 0, ..] => stale.statement,
+                    [b'P', 0, ..] => stale.portal,
+                    _ => false,
+                },
+                _ => false,
+            };
+            if uses {
+                return Err(stale);
+            }
+            lead = false;
+            at += 1 + len;
+        }
+        if !wait_ready && stale.any() {
+            return Err(stale);
+        }
+        Ok(stale)
+    }
+
+    /// Close the unnamed statement and/or portal (`which`) out of band:
+    /// `Close` + `Flush`, consuming each `CloseComplete`. PostgreSQL does not
+    /// treat closing one it does not hold as an error. Bounded by `timeout`,
+    /// like [`Self::close_statement`].
+    pub(super) async fn close_unnamed<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+        backend: &mut S,
+        which: UnnamedStale,
+        timeout: Duration,
+        max_frame_bytes: usize,
+    ) -> Result<()> {
+        let mut wire = Vec::with_capacity(19);
+        let mut replies = 0;
+        if which.statement {
+            Self::push_close(&mut wire, b'S', "");
+            replies += 1;
+        }
+        if which.portal {
+            Self::push_close(&mut wire, b'P', "");
+            replies += 1;
+        }
+        wire.extend_from_slice(&[b'H', 0, 0, 0, 4]);
+        tokio::time::timeout(timeout, backend.write_all(&wire))
+            .await
+            .map_err(|_| ProxyError::Network("unnamed close write timeout".to_string()))?
+            .map_err(|e| ProxyError::Network(format!("unnamed close write error: {}", e)))?;
+        for _ in 0..replies {
+            let mtype =
+                tokio::time::timeout(timeout, Self::read_one_frame_type(backend, max_frame_bytes))
+                    .await
+                    .map_err(|_| ProxyError::Network("unnamed close read timeout".to_string()))??;
+            match mtype {
+                b'3' => {} // CloseComplete
+                b'E' => {
+                    return Err(ProxyError::Protocol(
+                        "unnamed close rejected by backend".to_string(),
+                    ))
+                }
+                other => {
+                    return Err(ProxyError::Protocol(format!(
+                        "unexpected unnamed close reply: {}",
+                        other as char
+                    )))
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Read exactly one backend message frame (5-byte header + body) and return
@@ -1371,6 +1638,7 @@ impl ProxyServer {
 
                 if let Some(status) = ready_status {
                     Self::note_ready_for_query(session, status, had_error);
+                    Self::note_copy_left(session);
                     Self::note_observation(session, observation.as_ref());
                     let observed = early.or_else(|| {
                         outcome
@@ -1591,6 +1859,7 @@ impl ProxyServer {
 
                 if let Some(status) = ready_status {
                     Self::note_ready_for_query(session, status, had_error);
+                    Self::note_copy_left(session);
                     Self::note_observation(session, observation.as_ref());
                     let cacheable = !had_error && status == b'I' && !saw_async && !oversize;
                     return Ok((sent, captured, cacheable, row_count));
@@ -1684,6 +1953,22 @@ impl ProxyServer {
             )));
         }
         Ok(whole)
+    }
+
+    /// A backend relayed ReadyForQuery: its connection is not in copy-in.
+    /// PostgreSQL ends copy-in at any message other than CopyData, CopyDone
+    /// and CopyFail (and the Flush and Sync it ignores there): it fails the
+    /// COPY (08P01) without running that message, then answers ReadyForQuery
+    /// (a COPY a Query started) or skips to the Sync that does (one an
+    /// Execute started). A request arriving in copy-in goes only to the
+    /// COPY's own connection (`OpenCycle`), so this is that connection's
+    /// answer, and `copy_in_progress` no longer pins the session's tenant
+    /// permit and pooled connection, nor disarms its idle timeouts and watch,
+    /// for the rest of the session.
+    fn note_copy_left(session: &ClientSession) {
+        if session.copy_in_progress.load(Ordering::Relaxed) {
+            session.copy_in_progress.store(false, Ordering::Relaxed);
+        }
     }
 
     /// Count one relayed backend frame into the session's request tally

@@ -186,6 +186,12 @@ pub(super) struct TrRecovery<'a> {
     /// Written by the recovery (the replacement node, or `None`).
     pub(super) current_node: &'a mut Option<String>,
     pub(super) tr: &'a mut TrSession,
+    /// The node whose connection holds the session's open extended cycle
+    /// (read only while one is open: `tr.ext_dispatched`,
+    /// `tr.ext_copy_end`). It can differ from the faulted node: a hint
+    /// holds the cycle on a standby while the session's home moves, or dies
+    /// idle.
+    pub(super) cycle_node: Option<&'a str>,
     /// The session's statement registry (replay and re-prepare read it).
     pub(super) registry: &'a HashMap<String, bytes::Bytes>,
     pub(super) session: &'a Arc<ClientSession>,
@@ -211,6 +217,11 @@ pub(super) struct TrExtCycle {
     pub(super) defines: Vec<String>,
     pub(super) refs: Vec<String>,
     pub(super) route_sql: Option<String>,
+    /// The frames retained so far may write (ac858d61400b): `select` mode's
+    /// tenant replay check found so. A cycle's classification only grows as
+    /// frames are added, so this holds for the rest of the cycle and later
+    /// chunks are not rescanned.
+    pub(super) may_write: bool,
 }
 
 /// TR-08: a named statement the backend acknowledged — the batch that
@@ -298,6 +309,18 @@ pub(super) struct TrSession {
     pub(super) ext_cycle_dropped: bool,
     /// A Flush has dispatched part of the current cycle, regardless of TR mode.
     pub(super) ext_dispatched: bool,
+    /// The last fault recovery (`tr_handle_fault`) sent the request on to a
+    /// replacement backend (re-execution). `false` when it answered the
+    /// request with an error instead: nothing of it reached a backend then,
+    /// so it opens no cycle there although the session now uses the
+    /// replacement.
+    pub(super) fault_resent: bool,
+    /// An extended-protocol COPY ended (CopyDone: `Some(true)`, CopyFail:
+    /// `Some(false)`) and its cycle awaits the client's Sync, regardless of
+    /// TR mode: until then the backend holds the COPY's implicit transaction
+    /// open, so a request continuing it is part of an open cycle (the
+    /// recovery never runs it alone on a replacement connection).
+    pub(super) ext_copy_end: Option<bool>,
     /// TR-08: the session's acknowledged named statements. A later cycle that
     /// `Bind`s one is classified (and replayed) from here instead of being
     /// refused as opaque. A name an errored batch `Parse`d or `Close`d, or any
@@ -337,6 +360,8 @@ impl TrSession {
             ext_cycle: None,
             ext_cycle_dropped: false,
             ext_dispatched: false,
+            fault_resent: false,
+            ext_copy_end: None,
             acked: HashMap::new(),
             tx_portals: HashMap::new(),
             simple_cycle: ExtSetCycle::default(),
@@ -1861,6 +1886,7 @@ impl ProxyServer {
                     ts.non_replayable = true;
                     ts.statements = Vec::new();
                     ts.replay_bytes = 0;
+                    session.tenant_replay_release();
                 }
             }
             return;
@@ -1916,86 +1942,103 @@ impl ProxyServer {
             return;
         }
         let mut ts = session.tx_state.write().await;
-        if !now_in_tx {
-            // Transaction over (COMMIT/ROLLBACK/implicit): release the record.
-            *ts = TransactionState::default();
-            return;
-        }
-        if !was_in_tx {
-            // Idle -> InTx: this statement opened the transaction.
-            *ts = TransactionState::default();
-            ts.in_transaction = true;
-            ts.tx_id = Some(Uuid::new_v4());
-            ts.read_only = true;
-        }
-        let k = kind(&mut kind_cache);
-        if !matches!(k, StmtKind::Read | StmtKind::Control) {
-            ts.has_writes = true;
-            ts.read_only = false;
-        }
-        let tainted = session
-            .tr_replay_tainted
-            .swap(false, std::sync::atomic::Ordering::Relaxed);
-        if status == b'E' || tainted || k == StmtKind::Commit {
-            // A failed transaction can only be rolled back; a transformed
-            // statement's recorded text is not what executed.
-            ts.non_replayable = true;
-        }
-        if ts.non_replayable {
-            if !ts.statements.is_empty() {
+        // Every exit leaves the tenant charge equal to the chargeable
+        // `replay_bytes` (ac858d61400b): the settle below covers each reset
+        // and the growth.
+        'record: {
+            if !now_in_tx {
+                // Transaction over (COMMIT/ROLLBACK/implicit): release the record.
+                *ts = TransactionState::default();
+                break 'record;
+            }
+            if !was_in_tx {
+                // Idle -> InTx: this statement opened the transaction.
+                *ts = TransactionState::default();
+                ts.in_transaction = true;
+                ts.tx_id = Some(Uuid::new_v4());
+                ts.read_only = true;
+            }
+            let k = kind(&mut kind_cache);
+            if !matches!(k, StmtKind::Read | StmtKind::Control) {
+                ts.has_writes = true;
+                ts.read_only = false;
+            }
+            let tainted = session
+                .tr_replay_tainted
+                .swap(false, std::sync::atomic::Ordering::Relaxed);
+            if status == b'E' || tainted || k == StmtKind::Commit {
+                // A failed transaction can only be rolled back; a transformed
+                // statement's recorded text is not what executed.
+                ts.non_replayable = true;
+            }
+            if ts.non_replayable {
+                if !ts.statements.is_empty() {
+                    ts.statements = Vec::new();
+                    ts.replay_bytes = 0;
+                }
+                break 'record;
+            }
+            let over_session = ts.statements.len() >= state.limits.tr_max_replay_statements
+                || ts.replay_bytes.saturating_add(entry_bytes) > state.limits.tr_max_replay_bytes;
+            // ac858d61400b: the tenant's replay-byte budget, shared by all its
+            // sessions, is reserved before the statement is retained (one CAS).
+            if over_session
+                || !session.tenant_replay_reserve(&ts, ts.replay_bytes.saturating_add(entry_bytes))
+            {
+                ts.non_replayable = true;
+                ts.replay_cap_exceeded = true;
                 ts.statements = Vec::new();
                 ts.replay_bytes = 0;
+                if over_session {
+                    state
+                        .metrics
+                        .tr
+                        .replay_cap_exceeded
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        target: "helios::tr",
+                        "transaction exceeded [limits] tr_max_replay_statements/bytes; marked non-replayable"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "helios::tr",
+                        "transaction exceeded its tenant's [multi_tenancy] replay-byte budget; marked non-replayable"
+                    );
+                }
+                break 'record;
             }
-            return;
-        }
-        if ts.statements.len() >= state.limits.tr_max_replay_statements
-            || ts.replay_bytes.saturating_add(entry_bytes) > state.limits.tr_max_replay_bytes
-        {
-            ts.non_replayable = true;
-            ts.replay_cap_exceeded = true;
-            ts.statements = Vec::new();
-            ts.replay_bytes = 0;
-            state
-                .metrics
-                .tr
-                .replay_cap_exceeded
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                target: "helios::tr",
-                "transaction exceeded [limits] tr_max_replay_statements/bytes; marked non-replayable"
-            );
-            return;
-        }
-        // TR-06: a statement executed inside the transaction must carry a
-        // verifiable observation, or the transaction cannot be replayed.
-        let mut logged = entry();
-        if prev_status == b'T' {
-            if session
-                .last_response_unverifiable
-                .swap(false, std::sync::atomic::Ordering::Relaxed)
-            {
+            // TR-06: a statement executed inside the transaction must carry a
+            // verifiable observation, or the transaction cannot be replayed.
+            let mut logged = entry();
+            if prev_status == b'T' {
+                if session
+                    .last_response_unverifiable
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    ts.non_replayable = true;
+                    ts.statements = Vec::new();
+                    ts.replay_bytes = 0;
+                    tracing::debug!(
+                        target: "helios::tr",
+                        "response exceeded [limits] tr_max_observation_bytes; transaction marked non-replayable"
+                    );
+                    break 'record;
+                }
+                let d = session
+                    .last_response_digest
+                    .swap(0, std::sync::atomic::Ordering::Relaxed);
+                logged.result_checksum = (d != 0).then_some(d);
+            }
+            if !sql.is_empty() && Self::tr_snapshot_sensitive(sql, &tr.gucs) {
                 ts.non_replayable = true;
                 ts.statements = Vec::new();
                 ts.replay_bytes = 0;
-                tracing::debug!(
-                    target: "helios::tr",
-                    "response exceeded [limits] tr_max_observation_bytes; transaction marked non-replayable"
-                );
-                return;
+                break 'record;
             }
-            let d = session
-                .last_response_digest
-                .swap(0, std::sync::atomic::Ordering::Relaxed);
-            logged.result_checksum = (d != 0).then_some(d);
+            ts.statements.push(logged);
+            ts.replay_bytes += entry_bytes;
         }
-        if !sql.is_empty() && Self::tr_snapshot_sensitive(sql, &tr.gucs) {
-            ts.non_replayable = true;
-            ts.statements = Vec::new();
-            ts.replay_bytes = 0;
-            return;
-        }
-        ts.statements.push(logged);
-        ts.replay_bytes += entry_bytes;
+        session.tenant_replay_settle(&ts);
     }
 
     /// Bookkeeping after a simple-query response.
@@ -2129,7 +2172,9 @@ impl ProxyServer {
             }
             tr.ext_cycle = None;
             if std::mem::take(&mut tr.ext_cycle_dropped) {
-                *session.tx_state.write().await = TransactionState::default();
+                let mut ts = session.tx_state.write().await;
+                *ts = TransactionState::default();
+                session.tenant_replay_release();
             }
             return;
         }
@@ -2138,6 +2183,8 @@ impl ProxyServer {
             // Apply the replay budget before retaining each chunk, rather
             // than only when the completed cycle becomes a history entry.
             let mut ts = session.tx_state.write().await;
+            // The retained frames plus this chunk may write (`may_write`).
+            let mut cycle_writes = false;
             let retained = tr.ext_cycle.as_ref().map_or(0, |c| {
                 c.frames
                     .len()
@@ -2148,19 +2195,75 @@ impl ProxyServer {
                 .saturating_add(retained)
                 .saturating_add(batch.len())
                 .saturating_add(unnamed.map_or(0, |(p, _)| p.len()));
-            if !ts.non_replayable
-                && (projected > state.limits.tr_max_replay_bytes
-                    || ts.statements.len() >= state.limits.tr_max_replay_statements)
-            {
-                ts.non_replayable = true;
-                ts.replay_cap_exceeded = true;
-                ts.statements = Vec::new();
-                ts.replay_bytes = 0;
-                state
-                    .metrics
-                    .tr
-                    .replay_cap_exceeded
-                    .fetch_add(1, Ordering::Relaxed);
+            if !ts.non_replayable {
+                let over_session = projected > state.limits.tr_max_replay_bytes
+                    || ts.statements.len() >= state.limits.tr_max_replay_statements;
+                // The tenant budget is checked here and charged when the Sync
+                // records the cycle (ac858d61400b). Only inside a transaction:
+                // an autocommit chunk holds no tenant bytes, and dropping it
+                // would forget every acknowledged statement at its Sync. A
+                // chunk that opens a transaction is charged (or refused) by
+                // the Sync's strict reserve. In `select` mode a transaction
+                // with writes is never replayed and is charged nothing, but
+                // `has_writes` is set only when the Sync records the cycle: a
+                // chunk that may write is classified here as its Sync will
+                // classify the cycle, and is never refused by the budget.
+                // That scan reads the whole retained cycle, so it runs only
+                // when the budget check fails, and its "may write" is kept
+                // for the rest of the cycle. A transaction the `[limits]` cap
+                // already made non-replayable is not checked (nor counted as
+                // a tenant refusal).
+                let tenant_over = !over_session
+                    && in_tx_context
+                    && !session.tenant_replay_fits(&ts, projected, || {
+                        if tr.ext_cycle.as_ref().is_some_and(|c| c.may_write) {
+                            cycle_writes = true;
+                            return true;
+                        }
+                        let prior = Some(PriorCycles {
+                            statements: &tr.acked,
+                            portals: &tr.tx_portals,
+                            registry: None,
+                        });
+                        let kind = match &tr.ext_cycle {
+                            Some(c) => Self::tr_extended_cycle_scan(
+                                &[
+                                    &c.frames,
+                                    unnamed.map_or(&[][..], |(p, _)| p.as_ref()),
+                                    batch,
+                                ],
+                                c.unnamed_parse.as_deref(),
+                                state.limits.max_prepared_statements,
+                                &state.tr_read_policy,
+                                prior,
+                                None,
+                            ),
+                            None => Self::tr_extended_cycle_scan(
+                                &[batch],
+                                unnamed.map(|(p, _)| p.as_ref()),
+                                state.limits.max_prepared_statements,
+                                &state.tr_read_policy,
+                                prior,
+                                None,
+                            ),
+                        };
+                        cycle_writes = !matches!(kind, StmtKind::Read | StmtKind::Control);
+                        cycle_writes
+                    });
+                if over_session || tenant_over {
+                    ts.non_replayable = true;
+                    ts.replay_cap_exceeded = true;
+                    ts.statements = Vec::new();
+                    ts.replay_bytes = 0;
+                    session.tenant_replay_release();
+                    if over_session {
+                        state
+                            .metrics
+                            .tr
+                            .replay_cap_exceeded
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
             if ts.non_replayable {
                 tr.ext_cycle = None;
@@ -2175,7 +2278,9 @@ impl ProxyServer {
                 defines: Vec::new(),
                 refs: Vec::new(),
                 route_sql: None,
+                may_write: false,
             });
+            cycle.may_write |= cycle_writes;
             if let Some((p, _)) = unnamed {
                 if first_chunk {
                     cycle.unnamed_parse = Some(p.clone());
@@ -2382,6 +2487,7 @@ impl ProxyServer {
             ts.statements = Vec::new();
             ts.replay_bytes = 0;
         }
+        session.tenant_replay_release();
     }
 
     /// Build `CommandComplete(tag)`.
@@ -2612,13 +2718,17 @@ impl ProxyServer {
             // Routing can retain another node's socket with an unpublished
             // Flush/watch tail. Internal restore reads require a fresh frame
             // boundary; discard that socket rather than consume its suffix as
-            // the reply to a restore statement.
+            // the reply to a restore statement (cancelling what that cycle
+            // may still be running there).
             if conns
                 .get(&node)
                 .is_some_and(|bc| !bc.response_buf.is_empty())
             {
-                conns.remove(&node);
+                Self::abandon_conn(conns, &node, session, state).await;
             }
+            // A restore that failed on the socket: the connection is dropped
+            // (its restore statement cancelled) once the fault is recorded.
+            let mut restore_failed = false;
             let err = match tokio::time::timeout_at(
                 deadline,
                 Self::ensure_conn(conns, &node, session, config, state),
@@ -2669,6 +2779,11 @@ impl ProxyServer {
                     .unwrap_or_else(|_| Err(expired()))
                     {
                         Ok(n) => {
+                            // Simple Queries reached a socket the session
+                            // kept (a cached one may be reused here).
+                            if mirrored || n > 0 {
+                                bc.unnamed_destroyed();
+                            }
                             bc.gucs_synced = None;
                             bc.gucs_role = false;
                             #[cfg(feature = "pool-modes")]
@@ -2690,7 +2805,7 @@ impl ProxyServer {
                             return Err(e);
                         }
                         Err(e) => {
-                            conns.remove(&node);
+                            restore_failed = true;
                             e
                         }
                     }
@@ -2702,11 +2817,41 @@ impl ProxyServer {
                 Err(e) => e,
             };
             Self::record_backend_failure(state, &node, &err.to_string());
+            if restore_failed {
+                Self::abandon_conn(conns, &node, session, state).await;
+            }
             if tokio::time::Instant::now() >= deadline {
                 return Err(err);
             }
             tokio::time::sleep(pause).await;
         }
+    }
+
+    /// Whether replaying `entries` may take a session-level advisory lock on
+    /// the replacement ([`Self::takes_session_lock`]):
+    /// such a lock outlives the replayed transaction's end, a ROLLBACK
+    /// included. A text scan of everything the replay sends — each simple
+    /// statement, each cycle's frames and held-aside unnamed `Parse`, and the
+    /// `Parse`s it redefines or re-prepares — so a literal can match too
+    /// (conservative).
+    pub(super) fn tr_replay_takes_session_lock(
+        entries: &[StatementLog],
+        registry: &HashMap<String, bytes::Bytes>,
+    ) -> bool {
+        let locks = Self::takes_session_lock;
+        entries.iter().any(|st| match &st.extended {
+            None => locks(st.sql.as_bytes()),
+            Some(ext) => {
+                locks(&ext.frames)
+                    || ext.unnamed_parse.as_deref().is_some_and(locks)
+                    || ext.outside.iter().any(|(_, p)| locks(p))
+                    || ext
+                        .refs
+                        .iter()
+                        .filter_map(|name| registry.get(name))
+                        .any(|p| locks(p))
+            }
+        })
     }
 
     /// Replay a recorded explicit transaction on `node`'s connection,
@@ -2736,24 +2881,28 @@ impl ProxyServer {
         let total = entries.len();
         for (i, st) in entries.iter().enumerate() {
             let status = match &st.extended {
-                None => Self::tr_run_discard(
-                    &mut bc.stream,
-                    &st.sql,
-                    wt,
-                    rt,
-                    mf,
-                    st.result_checksum.map(|d| (d, ob)),
-                )
-                .await
-                .map_err(|e| match e {
-                    ProxyError::Protocol(_) => ReplayFailure::Statement(format!(
-                        "statement {}/{} rejected: {}",
-                        i + 1,
-                        total,
-                        Self::tr_short_sql(&st.sql)
-                    )),
-                    other => ReplayFailure::Backend(other),
-                })?,
+                None => {
+                    // A simple Query, even one the backend rejects.
+                    bc.unnamed_destroyed();
+                    Self::tr_run_discard(
+                        &mut bc.stream,
+                        &st.sql,
+                        wt,
+                        rt,
+                        mf,
+                        st.result_checksum.map(|d| (d, ob)),
+                    )
+                    .await
+                    .map_err(|e| match e {
+                        ProxyError::Protocol(_) => ReplayFailure::Statement(format!(
+                            "statement {}/{} rejected: {}",
+                            i + 1,
+                            total,
+                            Self::tr_short_sql(&st.sql)
+                        )),
+                        other => ReplayFailure::Backend(other),
+                    })?
+                }
                 Some(ext) => {
                     // F2: names the session closed through another
                     // connection may still be defined on this one.
@@ -2929,7 +3078,9 @@ impl ProxyServer {
 
     /// Drop the session's recorded transaction (it died with the backend).
     pub(super) async fn tr_clear_tx(session: &Arc<ClientSession>) {
-        *session.tx_state.write().await = TransactionState::default();
+        let mut ts = session.tx_state.write().await;
+        *ts = TransactionState::default();
+        session.tenant_replay_release();
     }
 
     /// Routing found no healthy node within `write_timeout_secs`: tell the
@@ -2954,8 +3105,9 @@ impl ProxyServer {
 
     /// Execute the in-session TR recovery for a backend fault. Returns
     /// `Ok(Some(forward_result))` when the session continues (the request was
-    /// re-executed or answered with an error), `Ok(None)` when the client
-    /// connection must be closed, `Err` only when the CLIENT socket failed.
+    /// re-executed or answered with an error: `tr.fault_resent` tells which),
+    /// `Ok(None)` when the client connection must be closed, `Err` only when
+    /// the CLIENT socket failed.
     pub(super) async fn tr_handle_fault(
         rec: TrRecovery<'_>,
         mut fault: BackendFault,
@@ -2966,11 +3118,14 @@ impl ProxyServer {
             conns,
             current_node,
             tr,
+            cycle_node,
             registry,
             session,
             state,
             config,
         } = rec;
+        // Set only by a re-execution that reached the replacement.
+        tr.fault_resent = false;
         // TR-06: ONE deadline for the whole recovery — primary wait, connect and
         // auth, session restore, replay — instead of per-phase timeouts that
         // could add up well beyond `write_timeout_secs`.
@@ -3020,6 +3175,19 @@ impl ProxyServer {
                 *wait_ready,
             ),
         };
+        // The request continues an extended COPY that ended without its Sync
+        // (`ext_copy_end`): the COPY's rows sit in the lost connection's open
+        // implicit transaction, which this Sync (or a Query in its place)
+        // would have committed. Part of the cycle ran there and died
+        // uncommitted, so the request is a write whose outcome is unknown,
+        // never re-run alone on a replacement connection (whose bare
+        // ReadyForQuery would tell the client its COPY completed).
+        let copy_open = tr.ext_copy_end.is_some();
+        let kind = if copy_open && kind != StmtKind::Commit {
+            StmtKind::Write
+        } else {
+            kind
+        };
         fault.kind = Some(kind);
         let (tx_has_writes, tx_replayable, tx_cap_exceeded) = {
             let ts = session.tx_state.read().await;
@@ -3036,9 +3204,10 @@ impl ProxyServer {
             ReplayRefusal::NotReplayable
         };
         let prior_flush = tr.ext_dispatched;
-        if prior_flush {
+        if prior_flush || copy_open {
             // The current chunk may be unsent, but earlier Executes in this
-            // cycle may already have run (or even committed).
+            // cycle may already have run (or even committed), and an ended
+            // extended COPY has run.
             fault.phase = FaultPhase::OutcomeUnknown;
         }
         let mut action = if copying {
@@ -3075,6 +3244,19 @@ impl ProxyServer {
             action = ?action,
             "backend fault on a live session"
         );
+        // ac858d61400b: the recovery forgets the session's open cycle, and
+        // nothing of it is continued, whatever it decides. On the faulted
+        // node that cycle's connection is already gone, but the fault can be
+        // another node's: a session's home that moved, or died idle, while a
+        // hint held the cycle on a standby. What the cycle dispatched may
+        // still run on its own connection, so it is cancelled and closed
+        // here, while the session still holds its tenant permit. Once
+        // forgotten, the session's end (`cancel_open_cycle`) no longer sees
+        // it, and would drop that connection unannounced, its statement
+        // running on outside the cap until it next writes.
+        if prior_flush || copy_open {
+            Self::abandon_cycle_conn(conns, cycle_node, session, state).await;
+        }
         let phase_desc = match fault.phase {
             FaultPhase::NotDelivered => "before the statement was delivered",
             FaultPhase::OutcomeUnknown => "while the statement was in flight (outcome unknown)",
@@ -3188,6 +3370,19 @@ impl ProxyServer {
                         )))
                     });
                     state.latency.tr_replay.record(replay_started.elapsed());
+                    // ac858d61400b: a session-level advisory lock the
+                    // transaction took is held again by the replacement, even
+                    // after a divergence's ROLLBACK, so the session keeps its
+                    // tenant permit while it keeps that connection (see
+                    // `session_locks_held`). A replacement the replay lost is
+                    // dropped below, and its mark with it.
+                    if session.tenant_budget().is_some_and(|b| b.has_query_cap())
+                        && Self::tr_replay_takes_session_lock(&entries, registry)
+                    {
+                        if let Some(bc) = conns.get_mut(&node) {
+                            bc.session_locks = true;
+                        }
+                    }
                     match replayed {
                         Ok(()) => {
                             state
@@ -3221,6 +3416,7 @@ impl ProxyServer {
                                 ReplayFailure::Statement(d) => {
                                     // Leave the new backend clean.
                                     if let Some(bc) = conns.get_mut(&node) {
+                                        bc.unnamed_destroyed();
                                         let _ = Self::tr_run_discard(
                                             &mut bc.stream,
                                             "ROLLBACK",
@@ -3234,8 +3430,8 @@ impl ProxyServer {
                                     d
                                 }
                                 ReplayFailure::Backend(e) => {
-                                    conns.remove(&node);
                                     Self::record_backend_failure(state, &node, &e.to_string());
+                                    Self::abandon_conn(conns, &node, session, state).await;
                                     format!("replacement backend {} failed: {}", node, e)
                                 }
                             };
@@ -3267,6 +3463,9 @@ impl ProxyServer {
                     state,
                     config,
                     fault: &mut second,
+                    // The cycle the failed backend held died with it: the
+                    // re-execution is checked like any request.
+                    continues_cycle: None,
                 };
                 let r = match inflight {
                     InFlight::Simple(msg) => Self::forward_simple_query(fwd, msg).await,
@@ -3282,7 +3481,12 @@ impl ProxyServer {
                     }
                 };
                 match r {
-                    Ok(v) => Ok(Some(v)),
+                    Ok(v) => {
+                        // Refused before the replacement (rate limit, open
+                        // circuit), it reached no backend either.
+                        tr.fault_resent = v.0.is_some();
+                        Ok(Some(v))
+                    }
                     Err(e) => {
                         let Some(f2) = second else {
                             // Client-side failure: nothing left to do.

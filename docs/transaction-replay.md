@@ -153,7 +153,10 @@ tr_max_observation_bytes`, default 1 MiB). Autocommit traffic records nothing.
 the outcome is *not delivered*, recovery is safe. If the outcome is *unknown* — the
 statement may have committed — it is never re-executed; the client receives `08007` with
 instructions to verify. Once any part of a response has reached the client, the session is
-closed rather than have a second result appended to the first.
+closed rather than have a second result appended to the first. A request that continues an
+extended-protocol cycle the lost backend held open (anything after a `Flush` forwarded part
+of it, or after an extended `COPY` ended, up to its `Sync`) has an unknown outcome as well:
+part of its cycle ran there, so it is never re-run alone on the replacement connection.
 
 **Holding small reads (opt-in, TR-09).** Responses stream: the first rows reach the
 client while the backend is still producing the rest, so a backend that dies mid-result

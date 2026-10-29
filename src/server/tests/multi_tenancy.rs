@@ -105,3 +105,39 @@ async fn tenant_admission_caps_each_tenant_separately() {
             .is_some()
     );
 }
+
+/// ac858d61400b: `[multi_tenancy]` is built once at startup, so a SIGHUP that
+/// changes it warns and keeps the running section (the published config
+/// stays truthful), while the rest of the reload applies.
+#[tokio::test]
+async fn a_sighup_keeps_the_running_multi_tenancy_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proxy.toml");
+    let boot = "[[nodes]]\nhost = \"db\"\nport = 5432\nrole = \"primary\"\n\
+                [multi_tenancy]\nenabled = true\ntenants = [\"acme\"]\n\
+                max_active_queries_per_tenant = 2\n";
+    std::fs::write(&path, boot).unwrap();
+    let config = ProxyConfig::from_file(path.to_str().unwrap()).unwrap();
+    let running = config.multi_tenancy.clone();
+    let server = ProxyServer::new(config)
+        .unwrap()
+        .with_config_path(Some(path.to_string_lossy().into_owned()));
+
+    std::fs::write(
+        &path,
+        format!(
+            "[pool]\nmax_connections = 77\n{boot}\
+             [multi_tenancy.tenant_max_active_queries]\nacme = 9\n"
+        ),
+    )
+    .unwrap();
+    server.reload_config().await;
+    let live = server.state.live_config.load_full();
+    assert_eq!(live.multi_tenancy, running, "the running section is kept");
+    assert_eq!(
+        live.pool.max_connections, 77,
+        "the rest of the reload applies"
+    );
+    let acme = &server.state.tenant_slots.budget_stats()[0];
+    assert_eq!((acme.tenant.as_str(), acme.query_limit), ("acme", 2));
+}
