@@ -133,9 +133,9 @@ Three-tier query result cache:
 
 - **L1 (Hot):** In-process hash map with LRU eviction. Microsecond access.
 - **L2 (Warm):** Larger shared cache with normalized query fingerprinting. Sub-millisecond access.
-- **L3 (Semantic):** Semantic similarity matching for near-duplicate queries.
+- **L3 (Semantic):** opt-in, through `[cache] semantic_enabled` and a per-statement `/*helios:cache=semantic*/` hint. It accepts only single-table SELECTs of one small grammar (an allow-list; anything else uses L1/L2) and, by default (`semantic_match = "verbatim"`), serves only the same statement text, hint comments included, which is sound on every backend. With `semantic_match = "canonical"` (PostgreSQL semantics only; it turns itself off once a backend reports a HeliosDB `server_version`) it serves canonical-form matches (hint comments, keyword case, the table alias and which alias a qualifier uses do not matter; whether a column is qualified does, since `t.f` may call a function `f(t)`, and so does the case of every name, which HeliosDB-Lite does not fold and HeliosDB-Nano reports as written in output labels; any other comment makes a statement ineligible; literals, operators, the relation, ordering as written and limits must be identical), plus optional column substitution by name similarity when `semantic_similarity_threshold` is below its 1.0 default (only column names are embedded, in the background). Neither mode needs an embedding service at threshold 1.0. No tier caches a read naming a system catalog (`pg_*`, `information_schema`, or any Unicode-escaped `U&"…"` identifier) or one whose comment holds `AS OF` / `VERSIONS BETWEEN`; on HeliosDB-Nano, list its live `helios_*` / `heliosdb_*` system views in `exclude_tables`. See `docs/configuration.md`, "Semantic tier (L3)".
 
-Supports TTL-based expiration, table-based invalidation on writes, and cache bypass via SQL hints.
+Supports TTL-based expiration (per table with `[[cache.tables]] ttl_secs`), commit-aware table-generation invalidation on writes, table exclusions that also bind `[edge]` (`exclude_tables`), and cache control via SQL-comment hints (`cache=skip`, `cache_ttl`, `cache=semantic`).
 
 ### `routing-hints` -- Query Routing Hints
 
@@ -292,7 +292,7 @@ Routes queries based on table-level metadata:
 
 > **Caveat (verify before relying on it):** `distribcache` is a **library-only module**. It is compiled behind `#[cfg(feature = "distribcache")]` in `src/lib.rs` but is **not** referenced anywhere outside its own module (grep for `distribcache::` outside `src/distribcache/` returns nothing), and there is **no `[distribcache]` section in `ProxyConfig`** -- `proxy.toml` cannot configure or activate it. Enabling the feature makes the module available to code linking the crate as a library; it does **not** turn on a turnkey distributed proxy cache on the data path. For an operator-facing result cache, use `query-cache` (and `edge-proxy` for cross-region invalidation).
 
-The module itself implements multi-tier intelligent caching (L1 in-process / L2 shared / L3 external Redis-compatible), workload classification, an access heatmap, and AI-specific strategies (embedding prefetch, conversation-context caching).
+The module itself implements multi-tier caching (L1 and L2 in-process maps; L3 a custom TCP peer mesh — not Redis and not Redis-compatible), workload classification, an access heatmap, and AI-specific caches (conversation context, tool results, RAG chunks). There is no embedding prefetch: its prefetcher works on query-fingerprint patterns. The daemon's semantic result tier is the query cache's L3, configured by `[cache] semantic_*` — not this module.
 
 ### `anomaly-detection` -- Anomaly Detection
 

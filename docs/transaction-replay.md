@@ -477,8 +477,19 @@ The journal records what the backend confirmed: completed data-changing statemen
 their outcomes, real transaction boundaries, savepoint structure, bound parameter values
 and a proxy-observed commit order. It does **not** record reads (so a read with side
 effects — `nextval`, `set_config`, a volatile function — is not reproduced), the data of
-a `COPY … FROM STDIN`, or the effect of an `EXECUTE` of a session-scoped prepared
-statement; those mark the transaction incomplete and committed-history replay refuses it.
+a `COPY … FROM STDIN`, the effect of an `EXECUTE` of a session-scoped prepared
+statement, a statement whose first word holds a non-ASCII character other than a space
+(HeliosDB-Lite matches keywords upper-cased the Unicode way and runs `ınsert ınto kv …`,
+with a dotless `ı`, as an INSERT), or (in builds with a result cache, `query-cache` or
+`edge-proxy`) a statement whose leading comment PostgreSQL and HeliosDB-Nano/Lite end in
+different places (`/* a /* b */ UPDATE …`, which one of them runs and the other rejects;
+`/* it's */ UPDATE t SET v = 'a; DELETE FROM b; --'`, where HeliosDB-Lite's
+statement splitter, which knows no comments, takes the quote for the start of a literal
+and runs the DELETE); those mark the transaction incomplete and committed-history replay
+refuses it. A leading comment holding a `;` or a `$`, or leaving a quote open, counts only
+when a `;` other than the final one follows it; one whose quotes all close (a
+sqlcommenter tag such as `/*controller='posts',action='index'*/`) leaves the statement
+journaled and replayed by its first word.
 Sequence values, `now()`, `random()` and other non-deterministic expressions inside a
 journaled statement produce fresh values on replay — replay re-executes SQL, it does not
 copy rows.

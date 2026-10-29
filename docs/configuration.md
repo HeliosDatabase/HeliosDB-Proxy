@@ -147,8 +147,11 @@ Renamed or non-existent keys operators reach for:
 | `[ha]` | Rejected (below). |
 | `[logging]`, `[metrics]` | `--log-level` / `--json-logs`; `/metrics` and `/metrics/prometheus` are always on. |
 | `[routing]`, `[lag]`, `[rewriter]`, `[graphql]`, `[[tenants]]`, `[[schema_routes]]`, `[auth.jwt]`, `[cache.l1]` | `[load_balancer]` / `[routing_hints]` / `[lag_routing]`, `[query_rewrite]`, `[graphql_gateway]`, `[multi_tenancy]`, `[schema_routing]`, `[auth] mode`, flat `[cache]` keys. |
-| `[ai_cache]` (`semantic_cache_enabled`, `similarity_threshold`, `rag_chunk_cache_size`, …) | Never a section. The semantic (L3) and AI cache tiers exist as library code (`cache::L3Config`, `distribcache`) that the daemon does not configure or enable; the query cache the daemon runs is L1 + L2 under `[cache]`. |
-| `[cache.query]` (`max_result_size`, `exclude_patterns`) | `[cache]` with `max_result_bytes`. There is no exclusion pattern: only `SELECT`, `VALUES`, `TABLE` and `WITH … SELECT` reads without locking clauses are ever cached; `INSERT`, `UPDATE`, `DELETE` (and DDL) invalidate. |
+| `[ai_cache]` (`semantic_cache_enabled`, `similarity_threshold`, `rag_chunk_cache_size`, …) | Never a section. The semantic tier is configured under `[cache]`: `semantic_enabled` (was `semantic_cache_enabled`) and `semantic_similarity_threshold` (was `similarity_threshold`), used by statements that carry `/*helios:cache=semantic*/` ([Semantic tier](#semantic-tier-l3)). There are no conversation or RAG-chunk caches: the proxy caches SQL results (`distribcache` is a library module the daemon does not configure). |
+| `[cache.query]` (`max_result_size`, `exclude_patterns`) | `[cache]` with `max_result_bytes`. There is no exclusion pattern: only single-statement `SELECT` reads are cached and writes always invalidate; keep a table out of the cache with `[cache] exclude_tables` or `[[cache.tables]] exclude = true`. |
+| `[cache.semantic]`, `[cache.l3]`, `[cache] similarity_threshold`, `semantic_cache_enabled` | The semantic keys are flat under `[cache]`: `semantic_enabled`, `semantic_similarity_threshold`, `semantic_*`. |
+| `[cache] exclude_patterns`, `excluded_tables` | `exclude_tables` (whole table names; writes are never cached). |
+| `[[cache.tables]] ttl`, `table`, `exclude_columns`; `[cache] exclude_columns` | `ttl_secs`, `name`. `exclude_columns` is **refused at load** in any spelling under `[cache]` (flat, per table, as a table, or inside any other table such as `[cache.query]` or `[cache.l3]`, at any depth and in any case), even without `strict_config`: column-level exclusion cannot be enforced (a `SELECT *`, a view or a function hides which columns a read returns); set `exclude = true` for the table, or list it in `exclude_tables`. |
 | `[tenancy]`, `[[tenancy.tenant]]` | `[multi_tenancy]` (`identify_by`, `tenant_column`, `tenant_tables`, `tenants`, `max_clients_per_tenant`, `tenant_max_clients`, `max_active_queries_per_tenant`, `tenant_max_active_queries`, `active_query_wait_ms`, `idle_permit_timeout_ms`, `max_replay_bytes_per_tenant`, `tenant_max_replay_bytes`). |
 | `[rate_limit] global_connections`, `[[rate_limit.tenant]]` | Rate limits apply per bucket (`key_by`); there are no per-tenant rate-limit tables. Per-tenant concurrency is `[multi_tenancy] max_active_queries_per_tenant`. |
 | `[circuit_breaker] reset_timeout`, `half_open_requests` | `open_secs`, `success_threshold`. |
@@ -723,27 +726,133 @@ require_client_cert = false
 
 ## Query Cache (`[cache]`)
 
-The cache the daemon runs is the L1 (hot) + L2 (warm) query-result cache below. There is
-no semantic/AI cache key and no exclusion-pattern key in `proxy.toml`: the library's L3
-semantic tier (`cache::L3Config`, embedding-based) is not configured or enabled by the
-daemon, and only `SELECT`, `VALUES`, `TABLE` and `WITH … SELECT` reads without locking
-clauses are cached while writes and DDL invalidate (see the renamed-keys table above).
-
 In-process query-result cache. Only active with the `query-cache` feature and
-`enabled = true`.
+`enabled = true`. Two tiers are always on: L1 (hot; per connection, keyed by the exact
+text) and L2 (warm; shared, keyed by the statement's fingerprint — comments and
+whitespace removed, literals kept in order, every word kept as written: HeliosDB-Nano
+labels an output column as written, so `SELECT Name …` and `SELECT name …` return
+different column names and never share an entry, and in a `client_encoding` such as SJIS
+or BIG5 a letter byte can belong to a multi-byte character). Where HeliosDB-Nano reads a
+statement otherwise than PostgreSQL, the fingerprint keeps the text as written: every
+space and comment of a statement whose `AS OF` / `VERSIONS BETWEEN`, `SECURITY DEFINER` / `SECURITY INVOKER` or
+`AS IDENTITY (…)` rewrite depends on them (`SELECT v AS of FROM t` loses its `FROM t`
+there, `SELECT v AS  of FROM t` does not; `FROM xsecurity definer` reads the table `x`,
+`FROM xsecurity  definer` the table `xsecurity`), of one with a string literal, dollar
+quote, quoted identifier or comment holding one of those texts (HeliosDB-Nano's planner
+and HeliosDB-Lite search the raw statement for `AS OF` and cut the clause up to a keyword
+spelled with one space; `/* was offline */` holds `AS OF`), and of one naming a catalog
+HeliosDB-Nano answers by matching the raw text (any `pg_…` or `information_schema` text:
+its `pg_settings` and `pg_tables` read `name IN ('x')` and `name IN  ('x')`
+differently). Whitespace is PostgreSQL 16's: `\v` included. **On a HeliosDB backend
+the L2 key keeps every run of whitespace and every comment of every statement** (only
+literal values are folded, and a dollar quote keeps its delimiters, so two texts share a
+key only when they differ in literals alone), and so does the `[edge]` key: once a backend connection's startup reports a
+`server_version` naming HeliosDB (HeliosDB-Nano sends `16.0 (HeliosDB Nano x.y.z)`,
+HeliosDB-Lite `17.0 (HeliosDB-Lite 2.0)`), a process-wide sticky flag switches both keys
+and retires every entry stored before; it is logged once. Those engines read comments,
+spacing and case before they parse: HeliosDB-Lite's `SIMILAR TO` and `COLLATE` rewrites
+take a quote inside a comment for the start of a literal, HeliosDB-Nano's point-lookup
+fast path declines any statement holding a comment and looks its table up as written
+while its planner folds the name, and its empty-projection rewrite matches `select from `
+with single spaces only. The flag is set before the connection answers its first read,
+so no entry from such a backend is keyed the PostgreSQL way. The L3 semantic tier is
+opt-in, per key and per statement ([below](#semantic-tier-l3)).
+
+What is cached: single-statement reads that **start with** `SELECT` (a leading comment
+makes a read uncacheable; see [Cache hints](#cache-hints) for leading hints), outside an
+explicit transaction, without `FOR UPDATE`/`FOR SHARE`, `SELECT … INTO` or volatile
+functions (`now()`, `random()`, `nextval()`, `set_config()`, …). `VALUES`, `TABLE` and
+`WITH … SELECT` are not cached. Writes and DDL invalidate. Only the **simple query
+protocol** is served from or stored in the cache: extended-protocol reads (prepared
+statements; asyncpg; psycopg 3 with parameters) always reach the backend. A result a
+standby served is never stored.
+
+Never looked up, captured or stored by **any tier** (L1, L2, L3 and `[edge]`):
+
+- a read that may name a **system catalog** relation: a word starting with `pg_` or
+  `information_schema`, in any case, anywhere in the text — the schema `pg_catalog`, an
+  unqualified `pg_settings` or `pg_stat_activity`, `'pg_class'::regclass`, a quoted
+  `"pg_class"`, a comment mentioning one, one after a Unicode space (U+00A0, U+3000),
+  which HeliosDB-Nano and HeliosDB-Lite read as whitespace — and any read with a
+  Unicode-escaped quoted identifier (`U&"…"`, which can spell `pg_settings` without its
+  bytes: `U&"\0070g_settings"`). Fail-closed: a function such as `pg_backend_pid()` or
+  a column named `pg_x` only costs the hit. Such reads depend on
+  the session (`pg_settings` reflects `SET`), change with DDL no write through the proxy
+  announces, and HeliosDB-Nano answers several from a router that matches the raw text.
+  Counted in `heliosdb_proxy_cache_catalog_skipped_total`. **HeliosDB-Nano's own live
+  system views** are not PostgreSQL catalogs and are not recognised:
+  `helios_topology`, `helios_ha_status`, `helios_node_aliases`, `helios_sync_status`,
+  `helios_query_history`, `helios_table_memory_stats`, `helios_transaction_stats`,
+  `heliosdb_config`, `heliosdb_compression_stats`, `heliosdb_compression_events`,
+  `heliosdb_pattern_stats`, `heliosdb_art_indexes`, `heliosdb_simd_capabilities`. No write
+  through the proxy changes them (a failover or the engine does), so a cached read of
+  one would be served stale until its TTL: on HeliosDB-Nano, list the ones your clients
+  read in `exclude_tables`. Nor are its code-graph and knowledge-graph tables, which the
+  engine fills itself and reads under two names (`_hdb_code_symbols` and
+  `_hdb_code.symbols`): list the names of both spellings, `_hdb_code_symbols` and
+  `symbols` ([Exclusions and per-table TTL](#exclusions-and-per-table-ttl)), and expect a
+  write through one spelling not to retire a cached read through the other;
+- a read with a **comment holding `AS OF` or `VERSIONS BETWEEN`**, with any run of
+  whitespace between the words, in any ASCII case (`/* as  of now */`, `-- was offline`):
+  the keys leave comments out, while HeliosDB-Nano and HeliosDB-Lite read a time-travel
+  clause in one (Lite cuts it out of the raw text across the end of the comment). Counted
+  in `heliosdb_proxy_cache_time_travel_skipped_total`;
+- a read whose text **PostgreSQL and HeliosDB-Nano/Lite read differently**: a backslash
+  right before a quote in a plain `'…'` literal (`'C:\'`, `E'\''`: the server's
+  `standard_conforming_strings`, which the proxy does not track, ends it in different
+  places), a nested `/*` in a block comment (PostgreSQL nests them, HeliosDB-Nano ends
+  one at its first `*/`), a `--` comment ended by a lone `\r` (PostgreSQL ends it there,
+  HeliosDB-Nano at `\n`), a dollar quote holding a quote or a comment marker
+  (HeliosDB-Nano strips comments without knowing dollar quotes), a `$` where
+  HeliosDB-Nano and HeliosDB-Lite open a dollar quote and PostgreSQL does not (inside a
+  name, `a$$` or `a$b$`, or before a tag starting with a digit, `$1$`: PostgreSQL reads
+  a name or a parameter) or the reverse (a tag holding a non-ASCII byte, `$é$`, which
+  HeliosDB-Nano's statement splitter does not know), a comment holding a `;` or a `$`, or
+  leaving a quote open (`-- it's`: a `'` or `"` that no later one of its kind closes
+  inside the comment), when a `;` other than the text's final one comes after its start
+  (HeliosDB-Lite's statement splitter knows no comments: it runs the DELETE of
+  `SELECT v FROM a -- ; DELETE FROM b` and of `SELECT 1 -- it's` newline
+  `, 'a; DELETE FROM b; --'`; a comment whose quotes all close, such as a sqlcommenter tag
+  `/*controller='users',action='index'*/`, leaves it where PostgreSQL is), an
+  unterminated literal, identifier or comment, or a quoted literal where the table
+  extraction reads a table name (below): `SELECT v FROM public.'kv'` (or `FROM 'kv'`)
+  reads `kv` on HeliosDB-Nano and HeliosDB-Lite, whose parser takes a `'…'` string
+  there for a name, and fails on PostgreSQL. The proxy does not tell a function's `FROM`
+  from a table's, so a literal right after `FROM` inside a function call counts too
+  (`substring(s FROM 'x')`, `EXTRACT(year FROM '2024-01-01'::date)`,
+  `trim(BOTH FROM ' x ')`; a column or a `$n` parameter there does not), and neither
+  the `FROM` of `IS [NOT] DISTINCT FROM` (HeliosDB-Nano and HeliosDB-Lite may take `is`
+  for a column and `DISTINCT` for its alias: `SELECT kv.is DISTINCT FROM 'kv'` reads
+  `kv`), so a literal after it counts too (`WHERE status IS DISTINCT FROM 'done'`); so
+  does one right after a number running into a word, which they read as a number and a
+  word (`SELECT 1from 'kv'` reads `kv`). Such text is rare, and the proxy does not try to read it every way: it is
+  never cached, counted in
+  `heliosdb_proxy_cache_ambiguous_text_skipped_total` (JSON `cache_ambiguous_skipped`),
+  and as a write it invalidates the whole cache (below).
 
 ```toml
 [cache]
 enabled = true
 ttl_secs = 300
 max_result_bytes = 1048576
+# keep these tables out of both result caches (this one and [edge])
+exclude_tables = ["payroll"]
+# opt-in semantic tier; "verbatim" = the same statement text only
+semantic_enabled = false
+semantic_match = "verbatim"
+semantic_similarity_threshold = 1.0
+
+[[cache.tables]]
+name = "fx_rates"
+ttl_secs = 10
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Serve read SELECT results from the L1/L2 cache. |
-| `ttl_secs` | u64 | `300` | Time-to-live for cached results. |
+| `ttl_secs` | u64 | `300` | Time-to-live for cached results. A client `cache_ttl` hint can only shorten it; a `[[cache.tables]]` TTL can shorten or lengthen it (below). |
 | `max_result_bytes` | usize | `1048576` | Largest single result to cache; larger results bypass. |
+| `max_cacheable_response_bytes` | usize | `4194304` | Ceiling on the response the proxy buffers while streaming a cacheable read to the client, shared by this cache and `[edge]`; past it the capture is dropped (the client still receives everything) and `heliosdb_proxy_cache_capture_oversize_total` counts it. Applies even with `enabled = false` while `[edge]` caches reads. Must be ≥ 1. |
 | `invalidation_source` | string | `"proxy"` | `proxy`: only writes through this proxy invalidate (below). `logical`: also every committed change decoded from a `pgoutput` logical replication slot on the primary — writes from other proxies, direct connections, triggers and cron jobs (C-02 slice 2). |
 | `logical_dsn` | string | `""` | *(logical)* libpq-style `host=... port=... user=... password=... dbname=...` of a role with `REPLICATION` on the primary; its own connection, separate from data-path credentials. Required for `logical`. |
 | `logical_slot` | string | `"heliosdb_proxy_cache"` | *(logical)* Slot name; created with the `pgoutput` plugin if missing. Lower-case identifier. **One slot per proxy instance**: reading a slot consumes its changes, so two proxies sharing one would each see only part of them. |
@@ -753,6 +862,29 @@ max_result_bytes = 1048576
 | `logical_max_slot_lag_bytes` | u64 | `1073741824` | *(logical)* A slot lagging more than this behind the primary's WAL invalidates the whole cache and logs an error (an unread slot also retains WAL on the primary). |
 | `l2_shed_batch` | usize | `1024` | When L2 is full and writes have retired entries, one eviction pass sheds them on the `cache-reclaim` thread, this many per step (`0` = all at once). |
 | `l2_shed_pause_us` | u64 | `2000` | Pause between those steps, microseconds (`0` = none). After a write retires a whole working set (10^5-10^6 entries) the shed then contends with concurrent readers at a lower rate, for longer, instead of at full rate for 3-5 s. |
+| `exclude_tables` | list of strings | `[]` | Tables whose reads neither result cache (this one and `[edge]`) looks up, captures or stores. Bare identifiers (`[a-z_][a-z0-9_]*`, case-insensitive, at most 63 bytes, no schema or quotes). On HeliosDB-Nano, list its live system views that clients read (`helios_ha_status`, `helios_topology`, …, above). See [Exclusions and per-table TTL](#exclusions-and-per-table-ttl). |
+| `[[cache.tables]]` `name`, `ttl_secs`, `exclude` | table array | none | Per-table settings: `name` (required, same rule, unique) and exactly one of `ttl_secs` (≥ 1) or `exclude = true` (same as listing the table in `exclude_tables`). `exclude_columns` is refused at load, here or flat under `[cache]`. |
+| `semantic_enabled` | bool | `false` | Turn on the L3 semantic tier (with `enabled = true`; alone it only logs a warning). Used only by statements that carry `/*helios:cache=semantic*/` (also `semantic`, `cache=l3`, `cache=vector`), after L1 and L2 miss, and only by single-table SELECTs of its [grammar](#semantic-tier-l3); any other statement uses L1/L2. Under `strict_config`, a build without `query-cache` refuses it. |
+| `semantic_match` | string | `"verbatim"` | How the semantic tier matches a read. `"verbatim"`: an entry stored for the same statement text as the backend receives it, hint comments included (still only statements of the [grammar](#semantic-tier-l3)); sound on every backend. `"canonical"`: the canonical form (hint comments, whitespace, keyword case, `!=`/`<>`, the relation alias and `AS` fold; names keep their case), **PostgreSQL semantics only**: once a backend reports a HeliosDB `server_version` the tier neither stores nor serves (counted in `semantic_ineligible`) and one warning names this key and the node. Any other value is a startup error. |
+| `semantic_similarity_threshold` | f64 | `1.0` | `1.0`: exact matches only; the embedding endpoint is **never contacted**. Below 1.0 (only with `semantic_match = "canonical"`; with `"verbatim"` a startup error names both keys), a bare select-list column of a statement without `DISTINCT` or `GROUP BY` may be served from an entry listing another column at the same position whose name embeds at or above this cosine (an approximate hit). **Caution: such a hit returns the values of a different column at that position** (the stored statement's rows, never other rows), under the stored column's name. Must be finite, > 0 and ≤ 1. |
+| `semantic_max_entries` | usize | `5000` | Maximum semantic entries, and remembered column-name embeddings; entries are evicted oldest-inserted first. ≥ 1. |
+| `semantic_max_variants` | usize | `16` | Maximum entries of one statement shape that differ only in their bare select-list columns (a full shape replaces its oldest). Bounds the cost of a lookup. 1–1024. |
+| `semantic_max_bytes` | usize | `67108864` | Byte budget for semantic entries plus remembered embeddings. Embeddings take at most a quarter of it and yield first (least recently used first); entries are evicted oldest first only while they alone exceed it, never to make room for embeddings. A result whose entry alone exceeds it (the result plus the entry's statement and bookkeeping) is not stored in the tier — it uses L1/L2 only, nothing is evicted for it, and it is counted in `semantic_too_large`; startup logs a warning when this is below `max_result_bytes`. `0` = no byte budget (`semantic_max_entries` still applies to both). |
+| `semantic_ttl_secs` | u64 | `3600` | Upper bound on a semantic entry's lifetime: min(hint TTL, table TTL or `ttl_secs`, this). ≥ 1. |
+| `semantic_embedding_endpoint` | string | `"http://localhost:11434"` | Base URL of an Ollama-compatible embedding service (`POST {url}/api/embeddings` with `{"model","prompt"}`). http or https with a host, no user, password, query or fragment, no leading or trailing whitespace and no control characters; a trailing `/` is ignored; system HTTP proxies are not used. It only ever receives column names, in the background. |
+| `semantic_embedding_model` | string | `"all-minilm"` | Model name sent with each request. Non-empty, no control characters. |
+| `semantic_embedding_dim` | usize | `384` | Expected embedding length. A response of another length, or larger than `dim × 32 + 4096` bytes, is an endpoint failure (it is never padded). 1–65536. |
+| `semantic_embedding_timeout_ms` | u64 | `5000` | Total time limit (DNS, connect, body) of one background embedding call; it bounds how long a permit is held, reads never wait on it. 1–60000. |
+| `semantic_embedding_concurrency` | usize | `4` | Background embedding calls in flight at most. When none is free the call is skipped (`semantic_embed_skipped`), nothing waits. 1–256. |
+| `semantic_embedding_retry_secs` | u64 | `30` | After an endpoint failure (error, timeout, non-2xx, bad JSON, wrong dimension, oversized body) no embedding call is made for this long; then exactly one call probes the endpoint. Exact canonical hits continue meanwhile. 1–86400. |
+| `semantic_max_statement_bytes` | usize | `16384` | Longest statement the semantic tier's grammar is parsed for. A longer one is not parsed at all (parsing takes about a hundred times the statement's size, transiently): it never uses the tier (counted in `semantic_ineligible` when hinted) and a `[[cache.tables]]` TTL longer than `ttl_secs` never applies to it (a shorter one still does). Applies whether or not the tier is enabled. Range 1..=1048576 (1 MiB): a statement at the bound parses in about 100 MiB on the connection's task, so the bound stays far below `[limits] max_pending_bytes`. |
+
+Every key is validated at startup whether or not its tier is enabled, and an error names
+the key. **`[cache]` is applied at startup only:** a SIGHUP that changes it keeps the
+running section and logs a warning (restart to apply) — except
+`max_cacheable_response_bytes`, which every read takes from the reloaded config, on
+connections opened before the reload too (both the capture ceiling and the `[edge]`
+cache's per-entry ceiling; entries already stored stay).
 
 **Invalidation is commit-aware on both protocols (C-02).** Every cached result records
 the write generation of the tables it read, taken before its backend fetch, and every
@@ -774,7 +906,77 @@ feeds the transaction journal), on the simple and the extended protocol alike:
   TRANSACTION` and `ROLLBACK PREPARED` do not publish changes;
 - a result whose tables were written while it was being fetched is not stored;
 - a write whose tables cannot be read from its text — DDL, `TRUNCATE`, `COPY`,
-  `EXECUTE`, `CALL`, `DO` — invalidates the whole cache.
+  `EXECUTE`, `CALL`, `DO`, a `MERGE` other than PostgreSQL's `MERGE INTO`
+  (HeliosDB-Nano's `MERGE [DATABASE] BRANCH src INTO dst` changes every table of the
+  branch it merges into; `[edge]` flushes on it too), an `INSERT` without `INTO`
+  (HeliosDB-Nano and HeliosDB-Lite accept `INSERT orders SELECT …` and write `orders`;
+  `[edge]` flushes on it too), a write whose text PostgreSQL and HeliosDB-Nano/Lite read
+  differently (the backend-ambiguous text listed above, anywhere in the statement: after
+  a leading `-- v2` and a lone `\r`, PostgreSQL runs the `CREATE OR REPLACE VIEW …`
+  HeliosDB-Nano reads as a comment; `[edge]` flushes on it too), a statement, read or
+  write, whose first word follows a leading comment the backends end in different places
+  (`/* purge /tmp/* entries */ DELETE FROM sessions …` is an unterminated comment for
+  PostgreSQL and a DELETE for HeliosDB-Nano: the capture journals it as a statement it
+  cannot reproduce, so committed-history replay refuses its transaction; `[edge]`
+  flushes on it too), a statement whose first word holds a non-ASCII character other
+  than a space (HeliosDB-Lite matches keywords upper-cased the Unicode way and runs
+  `ınsert ınto kv …`, with a dotless `ı`, as an INSERT: the capture journals it as a
+  statement it cannot reproduce; `[edge]` flushes on it too), a write naming, where the
+  table extraction reads a table name — after `FROM`, `JOIN`, `INTO`, `UPDATE`, `TABLE`,
+  `COPY`, `INSERT` or `ONLY` (or a `(` after one), or after the dot of a name there, but
+  not after the `FROM` of `IS [NOT] DISTINCT FROM`, which starts an expression — a
+  quoted identifier (`INSERT INTO "app_book" …`, as Django and Rails write every name;
+  `UPDATE s."t" …`; a `FROM "t"` in a subquery counts too, since a data-modifying CTE's
+  `DELETE FROM "t"` reads the same) or a name with a `$` or a non-ASCII character
+  other than a space (`t$x`, `café`), which the table extraction cannot read whole, a
+  quoted literal where it reads the name of a table the write may change — after
+  `UPDATE`, `INTO`, `TABLE`, `COPY`, `INSERT`, `ONLY` or `JOIN`, after a number running
+  into a word (`1into`, which HeliosDB-Nano and HeliosDB-Lite read as `1` and `INTO`),
+  or after any `FROM` once a `DELETE` came before it (`UPDATE public.'kv' …`, a write of
+  `kv` on HeliosDB-Nano and HeliosDB-Lite; `DELETE x FROM 'kv' …`, which they run as a
+  delete from `kv`, ignoring the names between), a Unicode-escaped identifier (`U&"t"`)
+  anywhere, or anywhere a non-ASCII word whose upper case (the Unicode way) is one of
+  the keywords of sqlparser 0.53, which HeliosDB-Lite then reads as that keyword
+  (`ınsert ınto kv` in a CTE, `ſet`, `ﬁlter` with a `ﬁ` ligature), or, for a word
+  starting with a digit, any ASCII text (`1ınsert` is `1` and `INSERT` there)
+  (`[edge]` flushes on all of these too; a quoted or non-ASCII column,
+  conflict target or alias, as in `UPDATE accounts SET "lastLogin" = now() …`,
+  `UPDATE kunden SET größe = 3 …` or `UPDATE kunden SET straße = 'x' …`, and a literal
+  value name no table and leave the write's tables read: so does a literal after any
+  other `FROM` in a write without a `DELETE`, a table the write only reads, as in
+  `UPDATE t SET s = substring(s FROM 'x')`, and one after the `FROM` of
+  `IS [NOT] DISTINCT FROM` in any write, as in
+  `UPDATE jobs SET status = 'done' WHERE … AND status IS DISTINCT FROM 'done'`), an `UPDATE` with
+  sqlparser's conflict clause or an `INSERT` with Hive's `LOCAL` after `INTO`
+  (`UPDATE OR IGNORE kv …`, `UPDATE REPLACE kv …`, `INSERT INTO LOCAL kv …`, which
+  HeliosDB-Nano and HeliosDB-Lite run as writes of `kv`; a table really named `replace`
+  or `local` after those keywords counts too; `[edge]` flushes on them as well), and a
+  write of more than one statement (`UPDATE a …; TRUNCATE b`; `[edge]` flushes on it
+  too) — invalidates the whole cache. Statement boundaries are the proxy lexer's: a `;`
+  outside literals, quoted identifiers, dollar quotes and comments. A `;` inside one
+  ends nothing and no literal's or comment's text is read as SQL, so
+  `UPDATE posts SET body = 'Hi; do you know?' WHERE id = 1` retires only `posts`.
+  An `INSERT` names its table whether or not `INTO`
+  follows (`OR REPLACE`, `REPLACE` and `OVERWRITE` are skipped), and a Unicode space
+  (U+00A0, U+3000, …) before a keyword or around a dotted name's dot separates words,
+  as HeliosDB-Nano and HeliosDB-Lite read it;
+- a simple-query string, read or write, with a `;` inside backend-ambiguous text
+  (above) may run a statement the proxy's capture
+  does not see (`SELECT E'\'' ; UPDATE b …` runs the UPDATE with
+  `standard_conforming_strings` on; HeliosDB-Nano runs the DELETE of
+  `SELECT 1 /* a /* b */ ; DELETE FROM b */` and of `SELECT 1 AS a$$ -- $$; DELETE FROM
+  b`, HeliosDB-Lite the UPDATE of `SELECT 1 -- ; UPDATE b SET v = 2`): it invalidates
+  the whole cache before its `ReadyForQuery` reaches the client, and again at the commit
+  when it leaves a transaction open, counted in
+  `heliosdb_proxy_cache_unseen_write_invalidations_total` (JSON
+  `unseen_write_invalidations`). Nothing else does: a `;` inside a plain literal or a
+  quoted identifier invalidates nothing, nor does a comment holding a quote with no `;`
+  after it (`SELECT * FROM products WHERE name ILIKE '%a;b%' /*controller='search'*/`)
+  or whose quotes all close (`/*application='app'*/ UPDATE t SET note = 'a;b' …` retires
+  only `t`), and a `$`, a backslash or a comment marker alone is no ambiguity. The capture splits a
+  string as PostgreSQL does: a `$` that continues an identifier is part of it
+  (`SELECT 1 AS a$b$ ; UPDATE b …` is the write it is), a dollar tag may hold non-ASCII
+  bytes and never starts with a digit, and a `--` comment ends at a lone `\r`.
 
 Not covered with `invalidation_source = "proxy"` (the default): writes that do not pass
 through this proxy (another proxy, a direct connection, a trigger or function writing a
@@ -801,13 +1003,293 @@ pg_drop_replication_slot('heliosdb_proxy_cache')`) when you turn the source off.
 Status: `/metrics` (`query_cache.logical_source`) and
 `heliosdb_proxy_cache_logical_*` on `/metrics/prometheus`.
 
-**Cache identity is the SQL, the database, the user and the branch — not session state.**
-Two sessions of the same user that differ only in `SET ROLE`, `search_path`, or a custom
-setting read by row-level-security policies (for example `app.tenant_id` set per request
-on a shared connection user) can be served each other's cached result. Leave the cache
-off for workloads whose results depend on such session state. The proxy's own
-`[multi_tenancy]` filtering is safe: it rewrites the SQL per tenant before the cache
-lookup. (Tracked as audit item C-06.)
+**Cache identity is the SQL, the database and the user — not session state.** This holds
+for L1, L2 and L3 alike (the daemon never sets a branch). Two sessions of the same user
+that differ only in `SET ROLE`, `search_path`, or a custom setting read by
+row-level-security policies (for example `app.tenant_id` set per request on a shared
+connection user) can be served each other's cached result. Leave the cache off for
+workloads whose results depend on such session state. The proxy's own `[multi_tenancy]`
+filtering rewrites the SQL per tenant before the cache lookup, so tenants do not share
+entries, provided the filter lands in the statement: write cache hints as block comments
+(see "Cache hints" below). (Tracked as audit item C-06.)
+
+### Semantic tier (L3)
+
+Opt-in twice: `semantic_enabled = true` turns the tier on, and only reads that carry a
+`cache=semantic` hint use it, after L1 and L2 miss. The tier accepts only statements of
+one small grammar — an allow-list, not a list of refused shapes. **A statement outside it
+simply uses L1/L2** (exact text, and the fingerprint with literals in place); it is counted
+in `semantic_ineligible`, never an error. The accepted statements read one table:
+
+```text
+SELECT [ALL | DISTINCT] <select list> FROM <relation> [WHERE <condition>]
+  [GROUP BY <column>, …] [ORDER BY <column> [ASC | DESC] [NULLS FIRST | LAST], …]
+  [LIMIT <digits>] [OFFSET <digits>] [;]
+```
+
+- **select list**: `*`, or items that are each a column or one of `count(*)`,
+  `count|sum|min|max|avg([DISTINCT] <column>)`, with an optional output alias
+  (`[AS] <name>`);
+- **relation**: `<table>` or `<schema>.<table>`, with an optional alias (`[AS] <alias>`);
+- **column**: `<name>` or `<qualifier>.<name>`, where the qualifier is the relation's
+  alias (or, without an alias, the table's own name);
+- **condition**: comparisons joined by `AND`/`OR`, each optionally preceded by `NOT`, in
+  parentheses as needed; a comparison is `<column> <op> <literal or column>` (`=`, `<>`,
+  `!=`, `<`, `<=`, `>`, `>=`), `<column> IS [NOT] NULL|TRUE|FALSE`, `<column> [NOT] IN
+  (<literal>, …)`, `<column> [NOT] BETWEEN <literal> AND <literal>`, or `<column> [NOT]
+  LIKE|ILIKE '<pattern>'`;
+- **literal**: a number (`42`, `-1.5`, `.5`, `1e3`; no `_` separators), a plain `'…'`
+  string (no `E`/`B`/`X`/`U&`/`N` prefix, no backslash), `TRUE`, `FALSE`, `NULL`;
+- **names**: unquoted, ASCII (a name with a non-ASCII byte is refused: the proxy does not
+  know the session's `client_encoding`, in which case folding could change a multi-byte
+  character), at most 63 bytes, and not a PostgreSQL reserved word or a word of this
+  grammar (`count`, `first`, `nulls`, …); a qualifier is spelled exactly like the alias
+  (or the table) in case too;
+- **comments**: only `helios:` hints made of words and `key=value` pieces
+  (`/*helios:cache=semantic,cache_ttl=30*/`); any other comment makes the statement
+  ineligible;
+- **length**: at most `semantic_max_statement_bytes` (16 KiB by default); a longer
+  statement is not parsed.
+
+Refused, among others: quoted identifiers, `::` casts, any function other than the five
+aggregates, `CASE`, arithmetic and string operators, `$n` parameters, dollar quotes,
+prefixed strings, subqueries, joins and comma lists in `FROM`, `ONLY`, `TABLESAMPLE`,
+`LATERAL`, `UNION`/`INTERSECT`/`EXCEPT`, `HAVING`, `WINDOW`, `FETCH`, `FOR UPDATE`/`SHARE`,
+`GROUP BY ALL`/`DISTINCT`, ordinals in `ORDER BY`/`GROUP BY` (`ORDER BY 1`), `COLLATE`,
+`OPERATOR(…)`, three-part names (`s.t.c`), a column named like the table or its alias
+(PostgreSQL reads that as the whole row), an unqualified `GROUP BY` or `ORDER BY` name
+equal to an output alias (in any case), a qualifier spelled otherwise than the alias or
+the table (`SELECT T.id FROM kv t`), and a relation the table extraction did not find (a
+write could not invalidate it). Also refused, because HeliosDB-Nano refuses or rewrites
+them while their canonical form is that of a statement it runs: a relation alias without
+`AS` that its SQL parser reserves (`FROM kv sort`; `sort`, `view`, `set`, `start`,
+`format`, `global`, `partition`, `top`, `explain`, … — with `AS` any name works), the
+names `exists`, `interval`, `struct`, `trim` and `top` (it cannot read `trim.val`), a
+comment it ends elsewhere than PostgreSQL (a nested block comment, a `--` comment a lone
+`\r` ends), and a statement one of its spacing-exact text rewrites may fire on: its
+`AS OF` / `VERSIONS BETWEEN` rewrite, its removal of the first `SECURITY DEFINER` /
+`SECURITY INVOKER` (`FROM xsecurity definer` reads the table `x` there) and its removal of
+the list after `AS IDENTITY`. That is two words that end in `as` and start with `of` or
+`identity`, end in `versions` and start with `between`, or end in `security` and start
+with `definer` or `invoker`, or a string literal holding `AS OF`, `VERSIONS BETWEEN`,
+`SECURITY DEFINER`, `SECURITY INVOKER` or `AS IDENTITY` in any case. A statement naming
+a catalog it emulates — any `pg_…` or `information_schema` text, a table such as
+`pg_settings`, `pg_tables` or `pg_catalog.pg_class`, or that text in a literal — is
+refused (and a read naming a system catalog is cached by no tier at all, above): it answers those from a router that matches the raw text, spacing included
+(`WHERE name='work_mem'` keeps every `pg_settings` row, `WHERE name = 'work_mem'` one;
+`tablename='kv'` answers `pg_tables` with eight columns, `tablename = 'kv'` with five).
+And a comment other than a plain hint is refused because HeliosDB-Nano and
+HeliosDB-Lite read comments as text: Nano's planner searches the raw statement for
+`AS OF` (`/* was offline */` holds it, and the statement fails), Lite cuts an `AS OF`
+clause out of the raw text across the end of a comment (`-- as of now`, a newline,
+`WHERE id = 1` loses its `WHERE`), and Lite's `SIMILAR TO` and `COLLATE` rewrites track
+quotes without knowing comments (a quote in one flips what they take for a literal).
+
+**How a read matches an entry is `semantic_match`**; neither mode needs an embedding
+service.
+
+- **`"verbatim"` (the default)**: the entry stored for the same statement text as the
+  backend receives it, byte for byte, hint comments included (removing a hint would glue
+  the words around it — `FROM t/*helios:…*/x` reads the table `t` aliased `x`, `FROM tx`
+  another table — and HeliosDB-Nano reads a statement with a comment through another
+  path than the same text without one). Case, whitespace, aliases, literals and the
+  hint's own text all count. The grammar above still decides eligibility, so every
+  entry reads one relation that writes retire exactly. Approximate substitution is not
+  available (a threshold below 1.0 is a startup error). Sound on every backend.
+- **`"canonical"` (PostgreSQL semantics only)**: the canonical form below. HeliosDB-Nano
+  and HeliosDB-Lite re-read the raw text, so statements PostgreSQL reads alike may read
+  differently there (an alias decides between Nano's point-lookup fast path and its
+  planner, which fold names differently; Lite's `SIMILAR TO` rewrite reads `dissimilar
+  tolerance` and `dissimilar  tolerance` differently). Once a backend connection's
+  startup reports a HeliosDB `server_version`, the tier neither stores nor serves (every
+  hinted read counts in `semantic_ineligible` and uses L1/L2), every entry stored before
+  is retired, and one warning per process names `cache.semantic_match` and the node.
+
+With `"canonical"`, a read is served from an entry with the same **canonical form**. Hint
+comments, whitespace, keyword case, `!=` vs `<>`, the relation's alias and `AS` in
+`FROM`, and which alias a qualifier uses do not matter:
+`select val from kv where id = 1` and `SELECT val FROM kv AS t WHERE id = 1` are one
+entry, and so are `SELECT t.val FROM kv AS t WHERE t.id = 1` and
+`SELECT kv.val FROM kv WHERE kv.id = 1`. **Names keep their case**: the table, its
+schema, every column and every output alias is compared as written. PostgreSQL folds
+unquoted names, but HeliosDB-Lite never does (`Orders` and `orders` are two tables
+there, `Name` and `name` two columns), HeliosDB-Nano's point lookups find a table as
+written, and Nano reports an output column's label (its alias, or else its column's
+name) as written in the RowDescription. So `SELECT val FROM KV …` and
+`SELECT val FROM kv …`, `SELECT VAL …` and `SELECT val …`, or `… AS Total` and
+`… AS total` never serve each other exactly; case variants only cost hit rate (an
+aggregate is labelled by its function's name, which every backend folds: `COUNT(*)` and
+`count(*)` are one entry). Below a threshold of 1.0 a bare column spelled in another
+case is at most an approximate hit, with the stored label (see below).
+**Whether a column is qualified does matter**:
+PostgreSQL reads `t.f` as the column `f` when the table has one and otherwise as the
+function call `f(t)` (attribute notation, the "computed field" pattern), while a bare `f`
+is then an error, so `t.val` and `val` are never one entry. Everything else is kept as
+written: the relation with its schema, the output aliases and a select-list `AS`, every
+literal in place, parentheses, `ASC`/`DESC`/`NULLS` (no defaults filled in), `LIMIT` and
+`OFFSET`. `id = 1` and `id = 2`, `<` and `>`, `ASC` and `DESC`, `s1.kv` and `s2.kv` never
+share an entry. **`ORDER BY` and `GROUP BY` keys are compared as written**, never by what
+they resolve to, since backends resolve a lone name differently: PostgreSQL sorts
+`SELECT price_eur AS price FROM items ORDER BY price` by the output column `price`
+(`price_eur`), HeliosDB-Nano by the table's own `price` column. Such a statement, a lone
+`ORDER BY` or `GROUP BY` name equal to an output alias, is refused (it uses L1/L2);
+`ORDER BY price_eur` and `ORDER BY items.price` are accepted, and `ORDER BY a` and
+`ORDER BY t.a` are never one entry.
+
+**Approximate column substitution** (only with `semantic_match = "canonical"` and
+`semantic_similarity_threshold` below 1.0). In a statement without `DISTINCT` (in the select list or an aggregate) and without
+`GROUP BY`, an unqualified select-list column without an output alias may be served from
+an entry that lists another unqualified column at the same position, when the two column
+names' embeddings have a cosine at or above the threshold,
+position by position (names are compared as written: a column in another case is
+another name, matched only through its embedding). A qualified column (`t.f`) is never substituted: it may
+be the function call `f(t)`, which can return another number of rows (a set-returning
+function) or fail where the stored column did not. Aggregates are always
+compared exactly. The client then receives the **stored** statement's rows — the same
+rows by construction — with the **stored column's values and name** in its
+RowDescription. That is the only way the tier is approximate; approximate hits are counted
+in `semantic_approximate_hits`. `1.0` (the default) switches it off entirely.
+
+**What leaves the proxy.** Only the column names of stored results are sent to the
+embedding endpoint, in clear text over http (use https, or keep the endpoint on
+loopback), never literals, operators or table names. A name is embedded once a statement
+listing it has returned a result and been stored; a lookup never sends the names its own
+statement lists, which no backend has answered yet. So an approximate hit needs a stored
+statement for each of the two names (the client's column is embedded after its first
+miss, or after any other stored row that lists it). Embeddings are computed in the
+background, at most
+`semantic_embedding_concurrency` at a time, once per name in flight, and remembered in a
+bounded LRU (at most `semantic_max_entries` names, and at most a quarter of
+`semantic_max_bytes`, which the entries take first: an embedding never evicts an entry);
+no lookup or store waits on the endpoint. A name is sent only when the memo has room for
+every name it must be remembered with (a stored statement's columns; for a lookup, which
+only fetches a stored entry's name it lacks, both names of each column it would
+substitute, next to those of newer candidates): else it could not be kept, or would
+evict the one it is compared with. While the entries leave the
+memo too little room, no such name is sent (counted in `semantic_embed_skipped`):
+**approximate matching pauses until the entries shrink**
+(they expire, or writes retire them), while exact canonical hits continue. Size
+`semantic_max_bytes` for the entries plus the embeddings you want remembered. A failure (error, timeout, non-2xx,
+bad JSON, wrong dimension, oversized body) marks the endpoint down: no call is made for
+`semantic_embedding_retry_secs`, then exactly one call at a time probes it (a probe that
+outlasts the window keeps every other call off until it ends). Exact canonical hits
+continue while it is down; only approximate matching pauses. At startup the daemon probes
+it once (only when the threshold is below 1.0). Watch
+`heliosdb_proxy_cache_semantic_endpoint_state`, `…_embed_errors_total` and
+`…_embed_seconds` ([Admin API](admin-api.md)).
+
+**Ollama** unloads an idle model; a cold load can exceed `semantic_embedding_timeout_ms`
+and mark the endpoint down for a retry window. Set `OLLAMA_KEEP_ALIVE` (e.g. `-1`) on the
+Ollama server, or raise the timeout.
+
+Other limits: simple query protocol only; a standby-served result is never stored, so
+with read offload (`[load_balancer] standby_reads`) hinted reads that a standby serves
+never fill the tier; and HeliosDB-Nano through 4.41 answers a statement that starts with
+a block comment with no rows — leading hints therefore only work through the
+`[routing_hints]` strip, which forwards the statement without the comment.
+
+### Exclusions and per-table TTL
+
+`exclude_tables` and `[[cache.tables]] exclude = true` are enforced in the relay, ahead
+of **both** result caches (this one and `[edge]`): a cacheable read that names an
+excluded table is neither looked up, captured nor stored, and counts once in
+`heliosdb_proxy_cache_excluded_total`. The check is **fail-closed**: it searches the raw
+statement text, comments and literals included, for each name as a whole identifier
+(case-insensitive), so `public.payroll`, `"Payroll"`, `FROM a, payroll` and
+`FROM/**/payroll` are all caught. It is one pass over the statement whatever the number
+of names: its cost grows with the statement's length, not with the length of the list. PostgreSQL truncates an identifier longer than 63 bytes
+(clipping a multi-byte character), so a name of 60 bytes or more is also matched as the
+start of a longer identifier. A name next to a character other than an ASCII letter
+or digit, `_`, `$` or a letter (a Unicode space, U+00A0 or U+3000, which HeliosDB-Nano
+and HeliosDB-Lite read as whitespace) is a whole identifier: `FROM`, a U+00A0 and
+`payroll` is caught, `payrollé` is not. It also over-excludes: a column, an alias, a literal, a
+comment or a keyword with the same name excludes the read too (a table named like an
+unreserved keyword, `values` or `name`, matches every use of that keyword), and so does
+any Unicode-escaped quoted identifier (`U&"…"`, which can spell a name without its
+bytes). A PostgreSQL reserved or type/function-name keyword (`order`, `user`, `left`,
+`table`, …) is **refused as a name at load**, in `exclude_tables` and `[[cache.tables]]`
+alike: a table so named is only ever written quoted (`"order"`) or after a schema, while
+the scan would match the keyword in nearly every statement (`ORDER BY`), excluding almost
+every read or giving it that table's TTL. **Views and functions**
+over an excluded table are not detected: list them as well. So are **partitions and
+inheritance children**: a read of a parent returns its children's rows, and a read of a
+child its parent's data, without naming the other; list the parent and every partition
+or child. A `[[cache.tables]]` `ttl_secs` entry for a table that `exclude_tables` lists is
+refused at load. **HeliosDB-Nano's `_hdb_code_<t>` and `_hdb_graph_<t>` tables** (its
+code graph and knowledge graph, written by the engine itself, never by a statement
+through the proxy) are also read as `_hdb_code.<t>` and `_hdb_graph.<t>`, the spelling
+its `pg_tables` lists: a name may only be listed bare, and the scan matches whole
+identifiers, so excluding such a table, or giving it a shorter TTL, takes both its
+storage name and the bare `<t>` (`exclude_tables = ["_hdb_code_symbols", "symbols"]`;
+the bare name also matches user tables called `symbols`).
+
+`[[cache.tables]] ttl_secs` sets a table's TTL. A read of several tables uses the
+shortest of their TTLs (`ttl_secs` for tables without one). A table TTL **longer** than
+`ttl_secs` applies only to a read of the [semantic tier's grammar](#semantic-tier-l3)
+(one relation, which the table extraction found, spelled in lower case like the
+configured name — `FROM Orders` is another table than `orders` on a backend that does not
+fold names — and none of the shapes it refuses, such as a lone `ORDER BY` name equal to
+an output alias, a comment other than a hint, or a `pg_…` catalog) without a qualified column (`t.f` may
+call a function `f(t)` that reads other tables) — whether or not the read is hinted for
+the tier, and whether or not the tier is on; any other read (a join, a comma list, a
+subquery, a quoted or function relation, a qualified column, a statement over
+`semantic_max_statement_bytes`, …) is capped at `ttl_secs`. That check is syntactic: it
+sees that the statement names one relation, not what that relation reads. **Writes that
+reach a table without naming it do not retire its entries** with
+`invalidation_source = "proxy"` (the default): a write to a partition or an inheritance
+child (a read of the parent returns its rows), a foreign key's `ON DELETE`/`ON UPDATE`
+`CASCADE`/`SET NULL`/`SET DEFAULT`, a trigger, or a **function called from a `SELECT`**
+(`SELECT place_order(42, 3)`, as RPC-style applications write), which the proxy treats
+as a read and never invalidates on. Likewise a **view** (a security-barrier
+view, or a relation a rule rewrites, alike) returns rows that change with writes to its
+base tables, and a table with a **row-level security policy** that reads other tables
+(`USING (EXISTS (SELECT 1 FROM acl …))`) returns rows that change with writes to those;
+a read of either never names them. Such cached reads are served until their TTL ends, so
+never give such a table or view a longer TTL (with `"logical"`, cascades, triggers and a
+function's writes are decoded as changes of the table itself, so give a table written
+through functions a longer TTL only with `invalidation_source = "logical"`; but a
+partition's change still names the partition, or with `publish_via_partition_root` the
+root, never both, and a view's or a policy's tables only ever name themselves). A shorter TTL on a table does not reach a
+view over it either: give the view its own `[[cache.tables]]` entry, as exclusions list
+views too. A **shorter** table TTL holds fail-closed: for a
+read outside that grammar the statement text is also scanned, the way exclusions are,
+and every configured name it mentions anywhere (as a whole identifier, comments and
+literals included, a name of 60 bytes or more also as the start of a longer identifier,
+which PostgreSQL truncates to 63 bytes) applies its TTL; a Unicode-escaped identifier
+(`U&"…"`) applies the shortest. L1 admits TTLs up to the longest configured. A table name
+applies to that table in every schema. A client `cache_ttl` hint can only shorten the
+result. **Table TTLs bind `[edge]` too**, as a cap: an edge entry lives
+`[edge] default_ttl_secs`, or less when its read names a table whose `ttl_secs` is
+shorter (found by the same fail-closed text scan, comments and literals included): then
+that table's TTL. A longer table TTL never extends an edge entry. This holds whether or
+not `[cache]` itself is enabled.
+
+### Cache hints
+
+Hints are SQL block comments `/*helios:key=value,…*/`, read only outside string literals
+and quoted identifiers; one comment may carry several, comma-separated
+(`/*helios:cache=semantic,cache_ttl=60*/`), also together with routing hints. **Do not put
+cache hints next to `route=primary` or `consistency=strong`**: with `[routing_hints]` on,
+those make the proxy treat the read as a write — it runs on the primary and bypasses
+every cache tier, neither looked up nor stored. A result a standby serves
+(`route=standby`) is never stored either. The parser
+also reads a `-- helios:key=value` line comment, but do not use that form with
+`[multi_tenancy]`: a line comment runs to the end of the line, so it also comments out
+the tenant filter the proxy appends to a SELECT without `WHERE`. The cache acts on:
+
+| Hint | Effect |
+|---|---|
+| `cache=skip` (also `bypass`, `none`, `no`, `off`, `false`, `disable`) | Neither look up nor store this read. `bypass` and `none` are the routing parser's words for it too, which strips them (below). |
+| `cache_ttl=N` / `ttl=N` (seconds, or `500ms`, `5m`, `1h`, `1d`) | A shorter TTL for this result; a longer one is capped at the configured TTL. It also bounds what the read is served: an entry older than `N` (stored by an unhinted read, or under a longer hint) is a miss on every tier, and the result is fetched and stored with the shorter TTL. A zero TTL (`0`, `0ms`) means "always fresh" and acts as `cache=skip` (nothing looked up, captured or stored, so the entry unhinted reads share stays). A value too large or unparsable is ignored. |
+| `cache=semantic` (also `semantic`, `cache=l3`, `cache=vector`) | Use the semantic tier (with `semantic_enabled`). |
+
+`cache_tables`, `cache_refresh` and `cache=l1|l2|all` are parsed and have no effect.
+Placement: a hint **after** the statement always works (`SELECT … /*helios:cache=skip*/`).
+A **leading** hint works when `[routing_hints] enabled` (with the default `strip_hints`)
+and the key is one the routing parser knows (`cache=…`, `cache_ttl=<seconds>`): the
+strip forwards the statement without the comment, and the cache reads the hints from the
+client's own text. Any other leading comment keeps the read uncacheable. `[edge]` ignores
+cache hints.
 
 ---
 
@@ -1553,7 +2035,7 @@ edge_id = "edge-a"
 | `home_url` | string | `""` | *(edge)* Home proxy admin base URL the edge subscribes to. Required for `role = "edge"`. |
 | `auth_token` | string | `""` | *(edge)* Home admin bearer for the invalidation subscription. When set, `home_url` must be `https://` unless `allow_insecure_home_url = true`. |
 | `allow_insecure_home_url` | bool | `false` | *(edge)* Allow presenting `auth_token` to a plain-http `home_url` (private links only). |
-| `default_ttl_secs` | u64 | `60` | Default TTL for cache entries when the home supplies none. Must be ≥ 1 when edge is enabled. |
+| `default_ttl_secs` | u64 | `60` | Default TTL for cache entries when the home supplies none. Must be ≥ 1 when edge is enabled. A shorter `[[cache.tables]] ttl_secs` of a table the read names caps it ([Exclusions and per-table TTL](#exclusions-and-per-table-ttl)). |
 | `max_entries` | usize | `10000` | Cache entries before LRU eviction. |
 | `max_total_bytes` | usize | `268435456` | Aggregate retained-payload budget (C-01): response bodies plus per-entry overhead. On insert the cache evicts LRU entries until the retained payload fits. `0` disables the budget (entry count x per-entry ceiling then bounds memory). |
 | `max_edges` | usize | `32` | *(home)* Maximum simultaneously-registered edges. |
@@ -1565,6 +2047,41 @@ edge_id = "edge-a"
 An `edge`-role proxy also requires at least one `[[nodes]]` entry pointing at the home's
 PG-wire listener (its data plane), and cannot be combined with `[cache] enabled = true`
 (the query-result cache does not receive edge invalidations).
+
+A write through the home invalidates the edge entries of the tables its text names (the
+query cache's table extraction, [C-02](#query-cache-cache)), or every entry when its
+scope is unknown: DDL, `REFRESH MATERIALIZED VIEW`, `COMMENT`, `SECURITY LABEL`,
+`IMPORT FOREIGN SCHEMA`, `REASSIGN OWNED`, `EXECUTE`, `CALL` and `DO` (a view, a function
+or a `TRUNCATE … CASCADE` changes reads its text does not name), a `MERGE` other than
+`MERGE INTO`, an `INSERT` without `INTO`, a write naming a quoted identifier or a name
+with a `$` or a non-ASCII character where a table name is read (or a `U&"…"` one
+anywhere) or a quoted literal where the name of a table it may write is read (a literal
+after the `FROM` of an `UPDATE`, of a subquery or of a function in a write without a
+`DELETE`, after `COPY t FROM`, or after `IS DISTINCT FROM` names no written table:
+`COPY kv FROM '/tmp/kv.csv'` flushes `kv` on `[edge]`, while the query cache
+invalidates everything on any `COPY`; after a `DELETE` any `FROM` counts, since
+`DELETE x FROM 'kv'` deletes from `kv`), backend-ambiguous text and a string of more than one statement holding a write
+or a statement not known to change no rows. Such a string is read one statement at a
+time, split where the proxy's lexer finds a `;` outside literals, quoted identifiers and
+comments: a string of reads (`SELECT`, `VALUES`, `TABLE`, `SHOW`, a `WITH` without a
+data-modifying verb, an `EXPLAIN` without `ANALYZE`) and bare `BEGIN`, `START`,
+`SAVEPOINT`, `RELEASE` and `ROLLBACK` alone (`SELECT a FROM t1; SELECT b FROM t2`)
+invalidates nothing; any other statement in it (`REFRESH MATERIALIZED VIEW a;
+REFRESH MATERIALIZED VIEW b`, a `LOCK`) flushes every entry, and so does a string the
+backends may split differently (a `;` inside backend-ambiguous text). A string the lexer
+finds one statement in is read as that statement, however many `;` its literals and
+quoted identifiers hold (`COPY t TO STDOUT (DELIMITER ';')` and `NOTIFY c, 'a;b'`
+invalidate nothing). An
+`EXPLAIN ANALYZE`, which runs the statement it explains, invalidates the tables its text
+names. A
+simple-protocol statement is read from its first word past its leading comments
+(`/* job */ UPDATE …` and `MERGE INTO … USING …` are writes), and one whose leading
+comment the backends end in different places, or whose first word holds a non-ASCII
+character other than a space (HeliosDB-Lite reads `ınsert` as `INSERT`), counts as a
+write of unknown scope (so does a data-modifying CTE verb HeliosDB-Lite reads upper-cased
+the Unicode way). A `WITH` statement is a write when a word outside its literals, quoted
+identifiers and comments is `INSERT`, `UPDATE`, `DELETE` or `MERGE`:
+`WITH r AS (SELECT … WHERE op = 'delete') SELECT …` is a read.
 
 ---
 

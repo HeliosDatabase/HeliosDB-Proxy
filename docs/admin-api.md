@@ -411,7 +411,19 @@ Besides the counters above, the body carries (P-03):
 | `heliosdb_proxy_cache_misses_total`, `_puts_total`, `_invalidations_total` | counter | — | Query cache misses, stores, invalidation operations. |
 | `heliosdb_proxy_cache_stale_rejected_total` | counter | — | Hits refused because a table they read was written since the fetch. |
 | `heliosdb_proxy_cache_fills_raced_total` | counter | — | Fills not stored because a write raced their backend fetch. |
-| `heliosdb_proxy_cache_retained_bytes` | gauge | `tier` | Bytes the query cache retains per tier (L1 includes per-entry overhead). |
+| `heliosdb_proxy_cache_unseen_write_invalidations_total` | counter | — | Whole-cache invalidations for a simple-query string with a `;` inside text PostgreSQL and HeliosDB-Nano/Lite read differently, which may end a statement the proxy's journal capture does not see; see [Query Cache](configuration.md#query-cache-cache). |
+| `heliosdb_proxy_cache_retained_bytes` | gauge | `tier` | Bytes the query cache retains per tier (L1 includes per-entry overhead; L3 counts entries plus remembered embeddings). |
+| `heliosdb_proxy_cache_excluded_total` | counter | — | Cacheable reads neither result cache looked up or stored because they name a table of `[cache] exclude_tables` / `[[cache.tables]] exclude = true` (always emitted). |
+| `heliosdb_proxy_cache_catalog_skipped_total` | counter | — | Cacheable reads no result cache tier (L1, L2, L3, `[edge]`) looked up or stored because they may name a system catalog relation: a word starting with `pg_` or `information_schema`, anywhere in the text, or a Unicode-escaped quoted identifier (`U&"…"`, which can spell one without its bytes) (always emitted; see [Query Cache](configuration.md#query-cache-cache)). |
+| `heliosdb_proxy_cache_time_travel_skipped_total` | counter | — | Cacheable reads no result cache tier looked up or stored because a comment holds `AS OF` or `VERSIONS BETWEEN` (any whitespace between the words; always emitted). |
+| `heliosdb_proxy_cache_ambiguous_text_skipped_total` | counter | — | Cacheable reads no result cache tier looked up or stored because PostgreSQL and HeliosDB-Nano/Lite may read their text differently: a backslash before a quote in a `'…'` literal, a nested `/*`, a `--` comment ended by a lone `\r`, a dollar quote holding a quote or a comment marker, a `$` where HeliosDB-Nano and HeliosDB-Lite open a dollar quote and PostgreSQL does not (`a$$`, `a$b$`, `$1$`) or the reverse (a non-ASCII tag, `$é$`), a comment holding `;` or `$` or leaving a quote open (`-- it's`) before a later `;` (HeliosDB-Lite's splitter knows no comments; a comment whose quotes all close, such as a sqlcommenter tag, does not count), an unterminated token (always emitted; the full list is in [Query Cache](configuration.md#query-cache-cache)). |
+| `heliosdb_proxy_cache_semantic_endpoint_state` | gauge | `state` = `unknown`, `up`, `down` | 1 on the semantic tier's embedding-endpoint state, 0 on the others. `unknown` until a call completes (at `semantic_similarity_threshold = 1.0` it is never called). The semantic series appear only when the tier is on. |
+| `heliosdb_proxy_cache_semantic_embed_requests_total`, `_embed_errors_total`, `_embed_skipped_total` | counter | — | Column-name embedding calls made (background and startup probe), failed (error, timeout, non-2xx, bad JSON, wrong dimension, oversized body), and not made (already known or in flight, no memo room while the entries hold `semantic_max_bytes`, no permit free, endpoint down inside its retry window). |
+| `heliosdb_proxy_cache_semantic_embed_seconds` | summary | — | Time spent in embedding calls (`_sum`, `_count`). No read waits on them. |
+| `heliosdb_proxy_cache_semantic_approximate_hits_total` | counter | — | Semantic hits that served a similar column at the same position (a subset of `cache_hits_total{tier="l3"}`). |
+| `heliosdb_proxy_cache_semantic_ineligible_total` | counter | — | Reads hinted `cache=semantic` that are outside the semantic tier's grammar, or that a `semantic_match = "canonical"` tier refused because a backend reported a HeliosDB `server_version` (they use L1/L2 only; see [Semantic tier](configuration.md#semantic-tier-l3)). |
+| `heliosdb_proxy_cache_semantic_too_large_total` | counter | — | Results not stored in the semantic tier because their entry alone exceeds `[cache] semantic_max_bytes` (they use L1/L2 only; nothing is evicted for them). |
+| `heliosdb_proxy_cache_semantic_entries`, `_embeddings` | gauge | — | Semantic entries retained, and column-name embeddings remembered. |
 | `heliosdb_proxy_edge_cache_retained_bytes` | gauge | — | Bytes the edge cache retains (`edge-proxy` builds). |
 | `heliosdb_proxy_edge_gap_flushes_total` | counter | — | Edge cache flushes after an invalidation-stream gap (C-03). |
 | `heliosdb_proxy_gateway_pool_reuses_total`, `_misses_total`, `_discards_total` | counter | `gateway` = `mcp`, `http`, `graphql` | Gateway backend checkouts that reused a pooled connection, dialed a fresh one, or dropped one instead of pooling it (H-06). |
@@ -438,6 +450,11 @@ Histogram buckets are `[limits] latency_buckets_ms`, exported in seconds as `_bu
 `_sum` and `_count`. `GET /metrics` carries the same data as JSON under `latency`
 (`bounds_us`, cumulative counts, `sum_us`, `count`, and `tr_replay_refusals`),
 `gateway_pools`, `query_cache`, `edge_cache`, `tenant_slots` and `tenant_budgets`.
+`query_cache.semantic` is the semantic tier's state (`endpoint`, `embed_requests`,
+`embed_errors`, `embed_skipped`, `embed_seconds_sum`, `embed_seconds_count`,
+`approximate_hits`, `ineligible`, `too_large`, `entries`, `embeddings`), `null` when the
+tier is off; the server counters carry `cache_excluded`, `cache_catalog_skipped`,
+`cache_time_travel_skipped` and `cache_ambiguous_skipped`.
 
 > This is not directly scrapable as raw Prometheus text — the payload is JSON with the exposition string in `text`, so a scraper must unwrap the `text` field. This endpoint is served unconditionally; there is no separate build flag that changes its format (the `observability` feature only pulls in the `prometheus`/`opentelemetry` crates and wires no exporter — see the feature-flags reference).
 
@@ -575,8 +592,14 @@ Body fields: `from` / `to` (RFC 3339), `target_host`, `target_port`, optional
 
 Committed-history replay never leaves a partial transaction on the target: a transaction
 the journal could not capture completely (a `COPY … FROM STDIN`, an `EXECUTE` of a
-session-scoped prepared statement, a statement over `[journal] max_statement_bytes`, a
-per-transaction cap) is refused before it starts. `last_commit_seq` in the response is the
+session-scoped prepared statement, in builds with a result cache (`query-cache` or
+`edge-proxy`) a statement whose leading comment the backends end in
+different places (`/* a /* b */ …`, or `/* it's */ …` before a later `;`, which
+HeliosDB-Lite's comment-blind splitter reads as the start of a literal; a leading
+sqlcommenter tag whose quotes all close is no such comment), a statement whose first word
+holds a non-ASCII character other than a space (HeliosDB-Lite runs `ınsert …` as an
+INSERT), a statement over `[journal] max_statement_bytes`, a per-transaction cap) is
+refused before it starts. `last_commit_seq` in the response is the
 resume point for the next call.
 
 ```json

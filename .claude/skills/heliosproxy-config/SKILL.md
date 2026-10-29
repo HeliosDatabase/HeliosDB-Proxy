@@ -36,7 +36,7 @@ blocks you need.
 | `[anomaly]`       | rate spike / SQLi / auth-burst thresholds | feat: `anomaly-detection` |
 | `[edge]`          | mode = home / edge, registry | feat: `edge-proxy` |
 | `[multi_tenancy]` | per-tenant pools and quotas | feat: `multi-tenancy` |
-| `[query_cache]`   | L1/L2/L3 cache tiers | feat: `query-cache` |
+| `[cache]`         | L1/L2 cache, opt-in L3 `semantic_*`, `exclude_tables`, `[[cache.tables]]` | feat: `query-cache` |
 | `[rate_limit]`    | token bucket / sliding window | feat: `rate-limiting` |
 
 ## Recipes

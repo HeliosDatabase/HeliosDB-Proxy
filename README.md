@@ -183,7 +183,7 @@ The four core jobs above are the product; everything below is optional. HeliosPr
 
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
-| **Query Cache** | `query-cache` | Three-tier result cache (L1 hot / L2 warm / L3 semantic) with TTL-based expiration, pattern-based invalidation, and normalized query fingerprinting. (`distribcache` is a separate, experimental in-tree library module for distributed cache tiers — it is not wired into this proxy cache path; see the feature-flags table) |
+| **Query Cache** | `query-cache` | Result cache (L1 hot / L2 warm / opt-in L3 semantic: `[cache] semantic_enabled` + `/*helios:cache=semantic*/`) with TTL-based expiration (per table too), commit-aware table-generation invalidation, table exclusions, and normalized query fingerprinting. (`distribcache` is a separate, experimental in-tree library module for distributed cache tiers — it is not wired into this proxy cache path; see the feature-flags table) |
 | **Query Routing** | `routing-hints` | Hint-based routing via SQL comments (`/*helios:route=primary*/`) and automatic classification of read vs. write queries |
 | **Lag-Aware Routing** | `lag-routing` | Routes reads to replicas within an acceptable replication lag threshold, with read-your-writes (RYW) session consistency guarantees |
 | **Query Rewriter** | `query-rewriting` | Rule-based SQL transformation engine — rewrite, redirect, or annotate queries before they reach the backend |
