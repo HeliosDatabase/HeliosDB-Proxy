@@ -327,8 +327,9 @@ pub struct ProxyConfig {
     /// enforced when the `lag-routing` feature is compiled in.
     #[serde(default)]
     pub lag_routing: LagRoutingToml,
-    /// Query-result cache (L1 hot / L2 warm). Disabled by default. Only active
-    /// when the `query-cache` feature is compiled in.
+    /// Query-result cache (L1 hot / L2 warm / opt-in L3 semantic) and the
+    /// table exclusions both result caches honour. Disabled by default. Only
+    /// active when the `query-cache` feature is compiled in.
     #[serde(default)]
     pub cache: CacheToml,
     /// SQL query rewriting (rules engine). Disabled by default. Only active
@@ -1382,10 +1383,48 @@ pub enum CacheInvalidationSource {
     Logical,
 }
 
+/// How the semantic tier (L3) matches a statement (`[cache] semantic_match`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticMatch {
+    /// The statement text exactly as the backend receives it (hint comments
+    /// included): a hit needs the same text, still of the tier's grammar.
+    /// Sound on every backend.
+    #[default]
+    Verbatim,
+    /// The canonical form (keyword case, whitespace, hint comments, the
+    /// relation alias and `AS` folded), which assumes PostgreSQL semantics.
+    /// Off (nothing stored or served) once a backend reports a HeliosDB
+    /// `server_version`.
+    Canonical,
+}
+
+impl SemanticMatch {
+    /// The `semantic_match` value as written in `proxy.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SemanticMatch::Verbatim => "verbatim",
+            SemanticMatch::Canonical => "canonical",
+        }
+    }
+}
+
+/// Upper bound of `[cache] semantic_max_statement_bytes` (1 MiB): the
+/// semantic tier's grammar parse that key bounds takes about a hundred times
+/// the statement's size, transiently, on the connection's task, and it also
+/// runs for unhinted reads where a `[[cache.tables]]` TTL exceeds
+/// `ttl_secs`. A statement at the bound costs about 100 MiB; a higher one
+/// would let one client statement take gigabytes.
+pub const SEMANTIC_MAX_STATEMENT_BYTES_CEILING: usize = 1 << 20;
+
 /// Query-result cache configuration (TOML-friendly, always present). Converted
-/// to `crate::cache::CacheConfig` at startup and only active when the
-/// `query-cache` feature is compiled in AND `enabled = true`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// to `crate::cache::CacheConfig` at startup (L1 hot / L2 warm, and the L3
+/// semantic tier when `semantic_enabled`) and only active when the
+/// `query-cache` feature is compiled in AND `enabled = true`. Applied at
+/// startup only: a SIGHUP keeps the running section (with a warning), except
+/// `max_cacheable_response_bytes`, which every read takes from the live
+/// config (the `[edge]` cache's per-entry ceiling follows it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CacheToml {
     /// Serve read SELECT results from an in-process L1/L2 cache. Default `false`.
@@ -1448,6 +1487,601 @@ pub struct CacheToml {
     /// contend with concurrent readers at full rate for its whole duration.
     /// Default 2000.
     pub l2_shed_pause_us: u64,
+    /// Turn on the semantic tier (L3) when `enabled = true`. Only
+    /// simple-protocol reads whose cache hints carry `cache=semantic` (also
+    /// `semantic`, `cache=l3`, `cache=vector`) use it, only after L1 and L2
+    /// miss, and only single-table SELECTs of its grammar (an allow-list:
+    /// columns and `count`/`sum`/`min`/`max`/`avg`, one relation,
+    /// `AND`/`OR`/`NOT` comparisons with literals, `IS`, `IN`, `BETWEEN`,
+    /// `LIKE`/`ILIKE`, `GROUP BY`/`ORDER BY` on columns, `LIMIT`/`OFFSET`);
+    /// any other statement uses L1/L2 only. How a read matches an entry is
+    /// `semantic_match`. That needs no embedding endpoint. Put the hint
+    /// after the statement, or enable `[routing_hints]` (with `strip_hints`)
+    /// for a leading one. Without `enabled` it only logs a warning. Default
+    /// `false`.
+    pub semantic_enabled: bool,
+    /// How the semantic tier matches a read: `"verbatim"` (default) serves
+    /// only an entry stored for the same statement text as the backend
+    /// receives it (hint comments included), still of the tier's grammar;
+    /// `"canonical"` (PostgreSQL semantics only) serves an entry with the
+    /// same canonical form: hint comments, whitespace, keyword case, `!=` /
+    /// `<>`, the relation's alias and `AS` in FROM, and which alias a column
+    /// qualifier uses do not matter; names keep their case (relation, schema,
+    /// columns, output labels, `ORDER BY` / `GROUP BY` keys), a qualifier
+    /// must be spelled exactly like the alias (or, without one, the
+    /// relation), whether a column is qualified matters (`t.f` may call the
+    /// function `f(t)`), and any other comment makes the statement
+    /// ineligible; literals, operators, the relation with its schema,
+    /// ordering as written and limits must be identical. HeliosDB-Nano and
+    /// HeliosDB-Lite re-read the raw text, so once a backend reports a
+    /// HeliosDB `server_version` the canonical tier neither stores nor
+    /// serves (counted in `semantic_ineligible`, one warning). A
+    /// `semantic_similarity_threshold` below `1.0` needs `"canonical"`.
+    pub semantic_match: SemanticMatch,
+    /// Minimum cosine similarity of the embeddings of two column names for a
+    /// bare select-list column (in a statement without `DISTINCT` or
+    /// `GROUP BY`) to be served from an entry
+    /// that lists the other column at the same position (an approximate hit,
+    /// counted in `semantic_approximate_hits`). CAUTION: below `1.0` such a
+    /// hit returns the values of a DIFFERENT column at that position (the
+    /// stored statement's rows, never other rows), under the stored column's
+    /// name. Default `1.0`: exact canonical matches only, and the embedding
+    /// endpoint is never contacted. Must be finite, > 0 and <= 1; below `1.0`
+    /// it needs `semantic_match = "canonical"` (substitution works on the
+    /// canonical form).
+    pub semantic_similarity_threshold: f64,
+    /// Maximum semantic entries, and maximum remembered column-name
+    /// embeddings. Entries are evicted oldest-inserted first. Must be >= 1.
+    /// Default 5000.
+    pub semantic_max_entries: usize,
+    /// Maximum entries kept for one statement shape that differ only in
+    /// their bare select-list columns; a full shape replaces its oldest. This
+    /// bounds the cost of one lookup. Range 1..=1024. Default 16.
+    pub semantic_max_variants: usize,
+    /// Byte budget for semantic entries plus remembered embeddings. The
+    /// embeddings take at most a quarter of it and yield first (least
+    /// recently used first); entries are evicted oldest first only while they
+    /// alone exceed it, never to make room for embeddings. A result whose
+    /// entry alone exceeds it is not stored in the tier (counted in
+    /// `semantic_too_large`; startup warns when it is below
+    /// `max_result_bytes`). `0` means no byte budget (`semantic_max_entries`
+    /// still bounds both). Default 64 MiB.
+    pub semantic_max_bytes: usize,
+    /// Upper bound on a semantic entry's lifetime, seconds: its TTL is
+    /// min(hint TTL, table TTL or `ttl_secs`, this). Must be >= 1. Default
+    /// 3600.
+    pub semantic_ttl_secs: u64,
+    /// Base URL of an Ollama-compatible embedding service; requests go to
+    /// `POST {url}/api/embeddings` with `{"model", "prompt"}`. Must be http
+    /// or https with a host, and no user, password, query or fragment, no
+    /// leading or trailing whitespace and no control characters; a
+    /// trailing `/` is ignored and system HTTP proxies are not used. It only
+    /// ever receives the column names of stored results (in clear text over
+    /// http), in the background, never on a client's read path. Default
+    /// `http://localhost:11434`.
+    pub semantic_embedding_endpoint: String,
+    /// Embedding model name sent with each request. Must be non-empty, with
+    /// no control characters. Default `all-minilm`.
+    pub semantic_embedding_model: String,
+    /// Expected embedding length. A response of another length, or larger
+    /// than `dim * 32 + 4096` bytes, counts as an endpoint failure (it is no
+    /// longer padded). Range 1..=65536. Default 384.
+    pub semantic_embedding_dim: usize,
+    /// Total time limit (DNS, connect, body) of one background embedding
+    /// call, milliseconds. It bounds how long a permit is held; reads never
+    /// wait on it. Range 1..=60000. Default 5000.
+    pub semantic_embedding_timeout_ms: u64,
+    /// Maximum background embedding calls in flight. When none is free the
+    /// call is skipped (counted in `semantic_embed_skipped`); nothing waits.
+    /// Range 1..=256. Default 4.
+    pub semantic_embedding_concurrency: usize,
+    /// After an endpoint failure (error, timeout, non-2xx, bad JSON, wrong
+    /// dimension, oversized body), no embedding call is made for this many
+    /// seconds; then exactly one call probes the endpoint. Exact canonical
+    /// hits continue meanwhile. Range 1..=86400. Default 30.
+    pub semantic_embedding_retry_secs: u64,
+    /// Longest statement, in bytes, that the semantic tier's grammar is
+    /// parsed for. A longer one is not parsed at all (the tokens and the
+    /// parse take about a hundred times the text, transiently): it never uses
+    /// the semantic tier (counted as ineligible when hinted), and a
+    /// `[[cache.tables]]` TTL longer than `ttl_secs` never applies to it (a
+    /// shorter one still does, through the text scan). Applies whether or
+    /// not the tier is enabled. Range 1..=1048576
+    /// ([`SEMANTIC_MAX_STATEMENT_BYTES_CEILING`]: a statement at the bound
+    /// parses in about 100 MiB). Default 16384.
+    pub semantic_max_statement_bytes: usize,
+    /// Tables whose reads neither result cache (this one and `[edge]`)
+    /// looks up, captures or stores. Bare identifiers (`[a-z_][a-z0-9_]*`,
+    /// case-insensitive, at most 63 bytes, no schema or quotes), matched as
+    /// whole identifiers anywhere in the statement text, comments and
+    /// literals included (fail-closed): a schema-qualified, quoted or
+    /// comma-joined use is caught, and a column, alias or literal of the same
+    /// name also excludes the read, as does any Unicode-escaped quoted
+    /// identifier (`U&"…"`, which can spell a name without its bytes). A name
+    /// of 60 bytes or more also matches the start of a longer identifier
+    /// (PostgreSQL truncates identifiers to 63 bytes). Views and functions
+    /// over these tables must be listed too, and so must the partitions or
+    /// inheritance children of a listed table and its parent (a read of one
+    /// returns the other's rows without naming it). Counted in
+    /// `heliosdb_proxy_cache_excluded_total`. Default empty.
+    pub exclude_tables: Vec<String>,
+    /// Per-table settings (`[[cache.tables]]`). Kept last: TOML writes
+    /// arrays of tables after plain values.
+    pub tables: Vec<CacheTableToml>,
+}
+
+/// One `[[cache.tables]]` entry: exactly one of `ttl_secs` or
+/// `exclude = true`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheTableToml {
+    /// The table: a bare identifier as in `cache.exclude_tables`, unique
+    /// among the entries (case-insensitively). It applies to the table of
+    /// that name in every schema.
+    pub name: String,
+    /// TTL of reads of this table, seconds (>= 1). It may be longer than
+    /// `cache.ttl_secs`, and then applies only to a single-table read of the
+    /// semantic tier's grammar without a qualified column (`t.f` may call a
+    /// function `f(t)` reading other tables), hinted or not; a shorter one
+    /// also holds for a read the table extraction did not fully recognise
+    /// whose text names the table (fail-closed, like `exclude_tables`). A
+    /// read of several tables uses the shortest. The single-table check is
+    /// syntactic: writes that reach the table without naming it (to a
+    /// partition or inheritance child, through a foreign key's cascade, from
+    /// a trigger, from a function called from a `SELECT` (which the proxy
+    /// treats as a read and never invalidates on), or, for a view or a table
+    /// whose row-level security policy reads other tables, to those tables)
+    /// do not retire its reads with statement-based invalidation: do not give
+    /// such a table or view a longer TTL (a table written through functions
+    /// only with `invalidation_source = "logical"`, which decodes those
+    /// writes). With `[edge]` on, a TTL shorter than `[edge]
+    /// default_ttl_secs` also caps the edge entry of a read whose text names
+    /// the table (the same fail-closed scan); a longer one never extends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+    /// Never cache reads of this table (same as listing it in
+    /// `cache.exclude_tables`).
+    #[serde(default)]
+    pub exclude: bool,
+}
+
+/// The form a `[cache]` table name is matched in: ASCII-lower-cased (the
+/// normalizer's table names are lower-case and unquoted).
+pub(crate) fn cache_table_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+/// Whether `name` is a bare table identifier `[a-z_][a-z0-9_]*` (after ASCII
+/// lower-casing) of at most 63 bytes.
+fn plain_cache_table_name(name: &str) -> bool {
+    let mut bytes = name.bytes().map(|b| b.to_ascii_lowercase());
+    name.len() <= 63
+        && matches!(bytes.next(), Some(b'a'..=b'z' | b'_'))
+        && bytes.all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+}
+
+/// PostgreSQL's reserved and type/function-name keywords (`RESERVED_KEYWORD`
+/// and `TYPE_FUNC_NAME_KEYWORD`), lower-case and sorted. Neither is a table
+/// name unquoted: a table so named is only ever written quoted (`"order"`)
+/// or after a schema (`public.order`), while the word itself is in nearly
+/// every statement (`ORDER BY`, `LEFT JOIN`, `user`). So a `[cache]` table
+/// name may not be one (the fail-closed name scans would match the keyword),
+/// and the semantic tier's grammar never reads one as an identifier.
+pub(crate) const POSTGRES_RESERVED_WORDS: &[&str] = &[
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "authorization",
+    "binary",
+    "both",
+    "case",
+    "cast",
+    "check",
+    "collate",
+    "collation",
+    "column",
+    "concurrently",
+    "constraint",
+    "create",
+    "cross",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_schema",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "false",
+    "fetch",
+    "for",
+    "foreign",
+    "freeze",
+    "from",
+    "full",
+    "grant",
+    "group",
+    "having",
+    "ilike",
+    "in",
+    "initially",
+    "inner",
+    "intersect",
+    "into",
+    "is",
+    "isnull",
+    "join",
+    "lateral",
+    "leading",
+    "left",
+    "like",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "natural",
+    "not",
+    "notnull",
+    "null",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "outer",
+    "overlaps",
+    "placing",
+    "primary",
+    "references",
+    "returning",
+    "right",
+    "select",
+    "session_user",
+    "similar",
+    "some",
+    "symmetric",
+    "system_user",
+    "table",
+    "tablesample",
+    "then",
+    "to",
+    "trailing",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "variadic",
+    "verbose",
+    "when",
+    "where",
+    "window",
+    "with",
+];
+
+/// Why the `[cache]` table name `name`, given as `what`, is refused, if it
+/// is: not a bare identifier, or a PostgreSQL reserved word.
+fn cache_table_name_error(what: &str, name: &str) -> Option<String> {
+    if !plain_cache_table_name(name) {
+        return Some(format!(
+            "{what} {name:?} must be a bare table name ([a-z_][a-z0-9_]*, at most 63 bytes, \
+             no schema or quotes)"
+        ));
+    }
+    POSTGRES_RESERVED_WORDS
+        .binary_search(&cache_table_name(name).as_str())
+        .is_ok()
+        .then(|| {
+            format!(
+                "{what} {name:?} is a PostgreSQL reserved word: a table of that name is \
+                 only ever written quoted, while the fail-closed table-name scan would \
+                 match the keyword itself in nearly every statement (excluding, or giving \
+                 that TTL to, almost every read)"
+            )
+        })
+}
+
+impl CacheToml {
+    /// The tables neither result cache may serve: `exclude_tables` and the
+    /// `[[cache.tables]]` entries with `exclude = true`, lower-cased, sorted
+    /// and de-duplicated.
+    pub fn excluded_table_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .exclude_tables
+            .iter()
+            .map(|n| cache_table_name(n))
+            .chain(
+                self.tables
+                    .iter()
+                    .filter(|t| t.exclude)
+                    .map(|t| cache_table_name(&t.name)),
+            )
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Validate the `semantic_*`, `exclude_tables` and `[[cache.tables]]`
+    /// keys. Unconditional — the defaults are valid and a key that is set
+    /// must be valid whether or not the tier is enabled — and every error
+    /// names its key.
+    pub fn validate_semantic_and_tables(&self) -> Result<()> {
+        let bad = |msg: String| Err(ProxyError::Config(msg));
+        let t = self.semantic_similarity_threshold;
+        if !(t.is_finite() && t > 0.0 && t <= 1.0) {
+            return bad(format!(
+                "cache.semantic_similarity_threshold must be finite, > 0 and <= 1, got {t}"
+            ));
+        }
+        if t < 1.0 && self.semantic_match == SemanticMatch::Verbatim {
+            return bad(format!(
+                "cache.semantic_similarity_threshold = {t} needs cache.semantic_match = \
+                 \"canonical\" (approximate column substitution works on the canonical form; \
+                 cache.semantic_match is \"verbatim\")"
+            ));
+        }
+        for (key, value, lo, hi) in [
+            (
+                "cache.semantic_max_entries",
+                self.semantic_max_entries as u64,
+                1,
+                u64::MAX,
+            ),
+            (
+                "cache.semantic_max_variants",
+                self.semantic_max_variants as u64,
+                1,
+                1024,
+            ),
+            (
+                "cache.semantic_ttl_secs",
+                self.semantic_ttl_secs,
+                1,
+                u64::MAX,
+            ),
+            (
+                "cache.semantic_embedding_dim",
+                self.semantic_embedding_dim as u64,
+                1,
+                65536,
+            ),
+            (
+                "cache.semantic_embedding_timeout_ms",
+                self.semantic_embedding_timeout_ms,
+                1,
+                60_000,
+            ),
+            (
+                "cache.semantic_embedding_concurrency",
+                self.semantic_embedding_concurrency as u64,
+                1,
+                256,
+            ),
+            (
+                "cache.semantic_embedding_retry_secs",
+                self.semantic_embedding_retry_secs,
+                1,
+                86_400,
+            ),
+            (
+                "cache.semantic_max_statement_bytes",
+                self.semantic_max_statement_bytes as u64,
+                1,
+                SEMANTIC_MAX_STATEMENT_BYTES_CEILING as u64,
+            ),
+        ] {
+            if !(lo..=hi).contains(&value) {
+                return if hi == u64::MAX {
+                    bad(format!("{key} must be >= {lo}, got {value}"))
+                } else {
+                    bad(format!("{key} must be in {lo}..={hi}, got {value}"))
+                };
+            }
+        }
+        let endpoint = &self.semantic_embedding_endpoint;
+        // The URL parser drops leading and trailing spaces and control
+        // characters (and tabs and newlines anywhere), while the client sends
+        // the string as written (`{endpoint}/api/embeddings`): a trailing
+        // space would pass here and then sit in the middle of every request
+        // URL.
+        if endpoint.trim() != endpoint || endpoint.chars().any(char::is_control) {
+            return bad(format!(
+                "cache.semantic_embedding_endpoint {endpoint:?} must not have leading or \
+                 trailing whitespace or contain control characters"
+            ));
+        }
+        let url = match reqwest::Url::parse(endpoint) {
+            Ok(url) => url,
+            Err(e) => {
+                return bad(format!(
+                    "cache.semantic_embedding_endpoint {endpoint:?} is not a URL: {e}"
+                ))
+            }
+        };
+        if !matches!(url.scheme(), "http" | "https") {
+            return bad(format!(
+                "cache.semantic_embedding_endpoint {endpoint:?} must be an http or https URL"
+            ));
+        }
+        if url.host_str().is_none_or(str::is_empty) {
+            return bad(format!(
+                "cache.semantic_embedding_endpoint {endpoint:?} must name a host"
+            ));
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return bad(format!(
+                "cache.semantic_embedding_endpoint {endpoint:?} must not carry a user or password"
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return bad(format!(
+                "cache.semantic_embedding_endpoint {endpoint:?} must not carry a query or fragment"
+            ));
+        }
+        let model = &self.semantic_embedding_model;
+        if model.is_empty() || model.chars().any(char::is_control) {
+            return bad(format!(
+                "cache.semantic_embedding_model must be non-empty without control characters, got {model:?}"
+            ));
+        }
+        for name in &self.exclude_tables {
+            if let Some(error) = cache_table_name_error("cache.exclude_tables entry", name) {
+                return bad(error);
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for table in &self.tables {
+            let name = &table.name;
+            if let Some(error) = cache_table_name_error("cache.tables name", name) {
+                return bad(error);
+            }
+            if !seen.insert(cache_table_name(name)) {
+                return bad(format!(
+                    "cache.tables names {name:?} twice (names are case-insensitive)"
+                ));
+            }
+            match (table.ttl_secs, table.exclude) {
+                (Some(0), _) => {
+                    return bad(format!("cache.tables {name:?}: ttl_secs must be >= 1"));
+                }
+                (None, false) => {
+                    return bad(format!(
+                        "cache.tables {name:?} has no effect: set ttl_secs or exclude = true"
+                    ));
+                }
+                (Some(_), true) => {
+                    return bad(format!(
+                        "cache.tables {name:?} sets both ttl_secs and exclude = true: \
+                         an excluded table is never cached"
+                    ));
+                }
+                (Some(_), false)
+                    if self
+                        .exclude_tables
+                        .iter()
+                        .any(|x| cache_table_name(x) == cache_table_name(name)) =>
+                {
+                    return bad(format!(
+                        "cache.tables {name:?} sets ttl_secs but cache.exclude_tables lists it: \
+                         an excluded table is never cached"
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if self.semantic_enabled && !self.enabled {
+            tracing::warn!(
+                "cache.semantic_enabled = true has no effect while cache.enabled = false"
+            );
+        }
+        if let Some(warning) = self.semantic_budget_warning() {
+            tracing::warn!("{warning}");
+        }
+        Ok(())
+    }
+
+    /// The startup warning for a semantic byte budget below
+    /// `max_result_bytes`: a cacheable result whose entry alone exceeds
+    /// `semantic_max_bytes` is never stored in the semantic tier (it would
+    /// evict every entry and then itself). `None` when the tier is off or
+    /// the budget is `0` (none) or at least `max_result_bytes`.
+    pub fn semantic_budget_warning(&self) -> Option<String> {
+        (self.enabled
+            && self.semantic_enabled
+            && self.semantic_max_bytes > 0
+            && self.semantic_max_bytes < self.max_result_bytes)
+            .then(|| {
+                format!(
+                    "cache.semantic_max_bytes = {} is below cache.max_result_bytes = {}: a result \
+                     whose semantic entry alone exceeds semantic_max_bytes is cached in L1/L2 \
+                     only (counted in semantic_too_large)",
+                    self.semantic_max_bytes, self.max_result_bytes
+                )
+            })
+    }
+}
+
+#[cfg(feature = "query-cache")]
+impl CacheToml {
+    /// Build the runtime cache config from the parsed `[cache]` section:
+    /// L1/L2 TTLs and sizes, the L3 semantic tier from the `semantic_*`
+    /// keys, and per-table TTLs from `[[cache.tables]]`. L1 clamps every
+    /// entry to its own TTL, so it is the longest TTL any table may get.
+    /// Exclusions are not part of it: the relay enforces them, for both
+    /// result caches.
+    pub fn to_cache_config(&self) -> crate::cache::CacheConfig {
+        use crate::cache::config::TableCacheConfig;
+        use crate::cache::{CacheConfig, L1Config, L2Config, L3Config};
+        let ttl = Duration::from_secs(self.ttl_secs);
+        let table_configs: std::collections::HashMap<String, TableCacheConfig> = self
+            .tables
+            .iter()
+            .filter_map(|t| {
+                t.ttl_secs.map(|secs| {
+                    (
+                        cache_table_name(&t.name),
+                        TableCacheConfig {
+                            ttl: Duration::from_secs(secs),
+                            ..Default::default()
+                        },
+                    )
+                })
+            })
+            .collect();
+        let longest = table_configs
+            .values()
+            .map(|c| c.ttl)
+            .fold(ttl, Duration::max);
+        CacheConfig {
+            enabled: self.enabled,
+            default_ttl: ttl,
+            max_result_size: self.max_result_bytes,
+            l1: L1Config {
+                ttl: longest,
+                ..Default::default()
+            },
+            l2: L2Config {
+                ttl,
+                shed_batch: self.l2_shed_batch,
+                shed_pause: Duration::from_micros(self.l2_shed_pause_us),
+                ..Default::default()
+            },
+            l3: L3Config {
+                enabled: self.enabled && self.semantic_enabled,
+                semantic_match: self.semantic_match,
+                similarity_threshold: self.semantic_similarity_threshold as f32,
+                max_entries: self.semantic_max_entries,
+                max_variants: self.semantic_max_variants,
+                max_bytes: self.semantic_max_bytes,
+                ttl: Duration::from_secs(self.semantic_ttl_secs),
+                embedding_endpoint: self
+                    .semantic_embedding_endpoint
+                    .trim_end_matches('/')
+                    .to_string(),
+                embedding_model: self.semantic_embedding_model.clone(),
+                embedding_dim: self.semantic_embedding_dim,
+                embedding_timeout: Duration::from_millis(self.semantic_embedding_timeout_ms),
+                embedding_concurrency: self.semantic_embedding_concurrency,
+                embedding_retry_after: Duration::from_secs(self.semantic_embedding_retry_secs),
+                max_statement_bytes: self.semantic_max_statement_bytes,
+            },
+            table_configs,
+            excluded_tables: Vec::new(),
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for CacheToml {
@@ -1466,6 +2100,22 @@ impl Default for CacheToml {
             logical_max_slot_lag_bytes: 1024 * 1024 * 1024,
             l2_shed_batch: 1024,
             l2_shed_pause_us: 2000,
+            semantic_enabled: false,
+            semantic_match: SemanticMatch::Verbatim,
+            semantic_similarity_threshold: 1.0,
+            semantic_max_entries: 5000,
+            semantic_max_variants: 16,
+            semantic_max_bytes: 64 * 1024 * 1024,
+            semantic_ttl_secs: 3600,
+            semantic_embedding_endpoint: "http://localhost:11434".to_string(),
+            semantic_embedding_model: "all-minilm".to_string(),
+            semantic_embedding_dim: 384,
+            semantic_embedding_timeout_ms: 5000,
+            semantic_embedding_concurrency: 4,
+            semantic_embedding_retry_secs: 30,
+            semantic_max_statement_bytes: 16 * 1024,
+            exclude_tables: Vec::new(),
+            tables: Vec::new(),
         }
     }
 }
@@ -2553,20 +3203,59 @@ const IGNORED_KEY_ALIASES: &[(&str, &str)] = &[
     ),
     (
         "cache.l1",
-        "there is no [cache.l1]: the cache's keys are flat under [cache]",
+        "there is no [cache.l1]: the cache's keys are flat under [cache] (per-table settings are \
+         [[cache.tables]])",
+    ),
+    (
+        "cache.similarity_threshold",
+        "did you mean 'cache.semantic_similarity_threshold'?",
+    ),
+    (
+        "cache.semantic_cache_enabled",
+        "did you mean 'cache.semantic_enabled'?",
+    ),
+    (
+        "cache.exclude_patterns",
+        "there is no exclude_patterns: writes are never cached; keep a table out with \
+         cache.exclude_tables",
+    ),
+    (
+        "cache.semantic",
+        "there is no [cache.semantic]: the semantic keys are flat under [cache] (semantic_enabled, \
+         semantic_similarity_threshold, ...)",
+    ),
+    (
+        "cache.l3",
+        "there is no [cache.l3]: the semantic keys are flat under [cache] (semantic_enabled, \
+         semantic_similarity_threshold, ...)",
+    ),
+    ("cache.tables.ttl", "did you mean 'ttl_secs'?"),
+    ("cache.tables.table", "did you mean 'name'?"),
+    (
+        "cache.tables.exclude_columns",
+        "column-level exclusion is not supported: set exclude = true for the table",
+    ),
+    (
+        "cache.exclude_columns",
+        "column-level exclusion is not supported: set exclude = true for the table (or list it \
+         in cache.exclude_tables)",
     ),
     // Sections and keys the website's heliosproxy.toml sample showed that never
     // existed (Sprinter 18b23fd60e82).
     (
         "ai_cache",
-        "there is no [ai_cache] section: the semantic/AI cache tiers are library code the daemon \
-         does not configure; the query cache is [cache] (enabled, ttl_secs, max_result_bytes, ...)",
+        "there is no [ai_cache] section: the semantic tier is under [cache] — \
+         cache.semantic_enabled (was semantic_cache_enabled) and \
+         cache.semantic_similarity_threshold (was similarity_threshold), used by statements that \
+         carry /*helios:cache=semantic*/; conversation and RAG caches are not provided (the proxy \
+         caches SQL results)",
     ),
     (
         "cache.query",
-        "there is no [cache.query]: the query cache's keys are flat under [cache], and there is no \
-         exclude_patterns: only SELECT, VALUES, TABLE and WITH reads are ever cached, while INSERT, \
-         UPDATE and DELETE invalidate",
+        "there is no [cache.query]: the keys are flat under [cache] (max_result_size is \
+         max_result_bytes); there is no exclude_patterns: only single-statement SELECT reads are \
+         cached and writes always invalidate; keep a table out of the cache with \
+         cache.exclude_tables",
     ),
     ("tenancy", "did you mean [multi_tenancy]?"),
     (
@@ -2612,6 +3301,9 @@ const KNOWN_KEYS_NOT_IN_DEFAULT: &[&str] = &[
     "nodes.name",
     "nodes.max_connections",
     "nodes.synchronous",
+    "cache.tables.name",
+    "cache.tables.ttl_secs",
+    "cache.tables.exclude",
 ];
 
 /// Every dotted key path `ProxyConfig` knows, taken from a serialised default
@@ -2664,16 +3356,60 @@ fn key_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// The dotted path of the first `exclude_columns` key (any case) at any
+/// depth under `[cache]` in the TOML `text`, which asks the cache for
+/// column-level exclusion: `cache.exclude_columns`,
+/// `cache.tables.0.exclude_columns`, `cache.query.exclude_columns`, ….
+/// Read from the document itself, not from the keys `serde_ignored` reports:
+/// that reports an unknown table under `[cache]` (`[cache.query]`,
+/// `[cache.l3]`) as one path and never visits the keys inside it.
+fn column_exclusion_key(text: &str) -> Option<String> {
+    let document: toml::Table = toml::from_str(text).ok()?;
+    let mut pending: Vec<(String, &toml::Value)> =
+        vec![("cache".to_string(), document.get("cache")?)];
+    while let Some((path, value)) = pending.pop() {
+        match value {
+            toml::Value::Table(table) => {
+                for (key, value) in table {
+                    let path = format!("{path}.{key}");
+                    if key.eq_ignore_ascii_case("exclude_columns") {
+                        return Some(path);
+                    }
+                    pending.push((path, value));
+                }
+            }
+            toml::Value::Array(items) => pending.extend(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, item)| (format!("{path}.{i}"), item)),
+            ),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `path` without its array indexes (`nodes.0.host` -> `nodes.host`), the
+/// form [`IGNORED_KEY_ALIASES`] and the known keys use.
+fn normalise_key_path(path: &str) -> String {
+    path.split('.')
+        .filter(|seg| !seg.chars().all(|c| c.is_ascii_digit()))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 /// The hint for an unknown key `path`: a known alias, else the closest known
 /// key of the same section when the typo is small (distance at most
 /// `max(2, len / 3)`), else nothing. Array indexes in the path are ignored
 /// when matching and kept in the suggestion (`nodes.0.hots` -> `nodes.0.host`).
 pub fn ignored_key_hint(path: &str, known: &std::collections::BTreeSet<String>) -> Option<String> {
-    let normalised: Vec<&str> = path
-        .split('.')
-        .filter(|seg| !seg.chars().all(|c| c.is_ascii_digit()))
-        .collect();
-    let normalised_path = normalised.join(".");
+    let normalised_path = normalise_key_path(path);
+    let normalised: Vec<&str> = if normalised_path.is_empty() {
+        Vec::new()
+    } else {
+        normalised_path.split('.').collect()
+    };
     if let Some((_, hint)) = IGNORED_KEY_ALIASES
         .iter()
         .find(|(alias, _)| *alias == normalised_path)
@@ -2754,6 +3490,19 @@ impl ProxyConfig {
         // An ignored HA section can falsely promise automatic database promotion.
         // Reject it even in permissive mode: health checks cannot fence a primary
         // or make a read-only standby writable.
+        // Column-level cache exclusion cannot be enforced (a `SELECT *`, a
+        // view or a function hides which columns a statement returns), so a
+        // config asking for it must not load as if it were honoured, in any
+        // spelling under [cache] (flat, per table, a table of its own, or
+        // inside any other table under [cache], known or not).
+        if let Some(path) = column_exclusion_key(&contents) {
+            return Err(ProxyError::Config(format!(
+                "{path}: column-level exclusion is not supported (a SELECT *, a view or a \
+                 function hides which columns a read returns); keep the whole table out of \
+                 the cache with cache.exclude_tables or exclude = true in its \
+                 [[cache.tables]] entry"
+            )));
+        }
         if ignored.iter().any(|path| path == "ha") {
             return Err(ProxyError::Config(
                 "[ha] is not supported: HeliosProxy does not automatically promote databases unless the opt-in \
@@ -3071,6 +3820,7 @@ impl ProxyConfig {
                 "cache.max_cacheable_response_bytes must be >= 1".to_string(),
             ));
         }
+        self.cache.validate_semantic_and_tables()?;
 
         // Refuse to expose the admin API beyond loopback without a token. The
         // admin surface runs privileged operations (arbitrary SQL via
@@ -3925,13 +4675,16 @@ mod tests {
         config.add_node("localhost:5432", "primary").unwrap();
         config.strict_config = true;
         config.cache.enabled = true;
+        config.cache.semantic_enabled = true;
         let result = config.validate();
         if cfg!(feature = "query-cache") {
             assert!(result.is_ok(), "a compiled feature must pass strict mode");
         } else {
             let err = result.unwrap_err().to_string();
             assert!(
-                err.contains("strict_config") && err.contains("cache.enabled"),
+                err.contains("strict_config")
+                    && err.contains("cache.enabled")
+                    && err.contains("cache.semantic_enabled"),
                 "{err}"
             );
         }
@@ -4023,6 +4776,28 @@ mod tests {
              REGRESS_CONFIG_IGNORED_KEY_ALLOWLIST with a reason):\n{}",
             unexpected.join("\n")
         );
+    }
+
+    /// The semantic-cache drill's config loads through the real path (env
+    /// substitution, strict_config, validation), with the tier on at the
+    /// exact-only default threshold.
+    #[cfg(all(feature = "query-cache", feature = "routing-hints"))]
+    #[test]
+    fn regress_semantic_config_validates() {
+        let path = format!(
+            "{}/scripts/regress/proxy-pg-cache-semantic.toml",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let config = ProxyConfig::from_file(&path).unwrap();
+        assert!(config.strict_config && config.cache.enabled && config.cache.semantic_enabled);
+        assert_eq!(config.cache.semantic_match, SemanticMatch::Verbatim);
+        assert_eq!(config.cache.semantic_similarity_threshold, 1.0);
+        assert!(config
+            .cache
+            .semantic_embedding_endpoint
+            .starts_with("http://127.0.0.1:"));
+        assert_eq!(config.cache.exclude_tables, ["secret"]);
+        assert!(config.routing_hints.enabled && config.routing_hints.strip_hints);
     }
 
     #[test]
@@ -4347,7 +5122,9 @@ role = "primary"
         let known = known_config_keys();
         let expect = [
             ("ai_cache", "[cache]"),
+            ("ai_cache", "cache.semantic_enabled"),
             ("cache.query", "exclude_patterns"),
+            ("cache.query", "exclude_tables"),
             ("tenancy", "[multi_tenancy]"),
             ("transparent_write_routing", "primary"),
             ("upgrade", "library"),
@@ -5987,6 +6764,555 @@ database = "helios"
         assert_eq!(parsed.max_cacheable_response_bytes, 4 * 1024 * 1024);
         let parsed: CacheToml = toml::from_str("max_cacheable_response_bytes = 8192\n").unwrap();
         assert_eq!(parsed.max_cacheable_response_bytes, 8192);
+    }
+
+    const CACHE_KEYS_TOML: &str = r#"
+enabled = true
+semantic_enabled = true
+semantic_match = "canonical"
+semantic_similarity_threshold = 0.9
+semantic_max_entries = 77
+semantic_max_variants = 3
+semantic_max_bytes = 4096
+semantic_ttl_secs = 120
+semantic_embedding_endpoint = "https://embed.example:8443/v1/"
+semantic_embedding_model = "nomic-embed-text"
+semantic_embedding_dim = 768
+semantic_embedding_timeout_ms = 250
+semantic_embedding_concurrency = 2
+semantic_embedding_retry_secs = 9
+semantic_max_statement_bytes = 2048
+exclude_tables = ["Secret", "audit_log", "secret"]
+
+[[tables]]
+name = "Orders"
+ttl_secs = 3600
+
+[[tables]]
+name = "prices"
+ttl_secs = 10
+
+[[tables]]
+name = "payroll"
+exclude = true
+"#;
+
+    #[test]
+    fn cache_semantic_and_table_keys_round_trip() {
+        let d = CacheToml::default();
+        assert!(!d.semantic_enabled);
+        assert_eq!(d.semantic_match, SemanticMatch::Verbatim);
+        assert_eq!(d.semantic_similarity_threshold, 1.0);
+        assert_eq!(d.semantic_max_entries, 5000);
+        assert_eq!(d.semantic_max_variants, 16);
+        assert_eq!(d.semantic_max_bytes, 64 * 1024 * 1024);
+        assert_eq!(d.semantic_ttl_secs, 3600);
+        assert_eq!(d.semantic_embedding_endpoint, "http://localhost:11434");
+        assert_eq!(d.semantic_embedding_model, "all-minilm");
+        assert_eq!(d.semantic_embedding_dim, 384);
+        assert_eq!(d.semantic_embedding_timeout_ms, 5000);
+        assert_eq!(d.semantic_embedding_concurrency, 4);
+        assert_eq!(d.semantic_embedding_retry_secs, 30);
+        assert_eq!(d.semantic_max_statement_bytes, 16 * 1024);
+        assert!(d.exclude_tables.is_empty() && d.tables.is_empty());
+        assert!(d.validate_semantic_and_tables().is_ok());
+
+        let text = format!("[cache]{CACHE_KEYS_TOML}").replace("[[tables]]", "[[cache.tables]]");
+        let (config, ignored) = deserialize_reporting_ignored_paths(&format!(
+            "{text}\n[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n"
+        ))
+        .unwrap();
+        assert!(ignored.is_empty(), "{ignored:?}");
+        let c = &config.cache;
+        assert!(c.semantic_enabled);
+        assert_eq!(c.semantic_match, SemanticMatch::Canonical);
+        assert_eq!(c.semantic_similarity_threshold, 0.9);
+        assert_eq!(c.semantic_max_entries, 77);
+        assert_eq!(c.semantic_max_variants, 3);
+        assert_eq!(c.semantic_max_bytes, 4096);
+        assert_eq!(c.semantic_ttl_secs, 120);
+        assert_eq!(
+            c.semantic_embedding_endpoint,
+            "https://embed.example:8443/v1/"
+        );
+        assert_eq!(c.semantic_embedding_model, "nomic-embed-text");
+        assert_eq!(c.semantic_embedding_dim, 768);
+        assert_eq!(c.semantic_embedding_timeout_ms, 250);
+        assert_eq!(c.semantic_embedding_concurrency, 2);
+        assert_eq!(c.semantic_embedding_retry_secs, 9);
+        assert_eq!(c.semantic_max_statement_bytes, 2048);
+        assert_eq!(c.tables.len(), 3);
+        assert_eq!(c.tables[0].ttl_secs, Some(3600));
+        assert!(c.tables[2].exclude && c.tables[2].ttl_secs.is_none());
+        assert_eq!(c.excluded_table_names(), ["audit_log", "payroll", "secret"]);
+        config.validate().unwrap();
+        // The section serialises back (arrays of tables last) and re-reads
+        // to the same value.
+        let back: CacheToml = toml::from_str(&toml::to_string(c).unwrap()).unwrap();
+        assert_eq!(&back, c);
+        // A missing name is a parse error, not an ignored key.
+        assert!(toml::from_str::<CacheToml>("[[tables]]\nttl_secs = 5\n").is_err());
+    }
+
+    #[cfg(feature = "query-cache")]
+    #[test]
+    fn cache_toml_defaults_match_l3_config() {
+        let t = CacheToml::default();
+        let l3 = crate::cache::L3Config::default();
+        assert_eq!(t.semantic_enabled, l3.enabled);
+        assert_eq!(t.semantic_max_entries, l3.max_entries);
+        assert_eq!(t.semantic_max_variants, l3.max_variants);
+        assert_eq!(t.semantic_max_bytes, l3.max_bytes);
+        assert_eq!(Duration::from_secs(t.semantic_ttl_secs), l3.ttl);
+        assert_eq!(t.semantic_embedding_endpoint, l3.embedding_endpoint);
+        assert_eq!(t.semantic_embedding_model, l3.embedding_model);
+        assert_eq!(t.semantic_embedding_dim, l3.embedding_dim);
+        assert_eq!(
+            Duration::from_millis(t.semantic_embedding_timeout_ms),
+            l3.embedding_timeout
+        );
+        assert_eq!(t.semantic_embedding_concurrency, l3.embedding_concurrency);
+        assert_eq!(
+            Duration::from_secs(t.semantic_embedding_retry_secs),
+            l3.embedding_retry_after
+        );
+        assert_eq!(t.semantic_max_statement_bytes, l3.max_statement_bytes);
+        // The deliberate differences: the daemon matches the statement text
+        // (verbatim) and serves exact matches only unless the operator opts
+        // into the canonical form and lowers the threshold, while the library
+        // keeps the canonical form and its 0.92.
+        assert_eq!(t.semantic_similarity_threshold, 1.0);
+        assert_eq!(l3.similarity_threshold, 0.92);
+        assert_eq!(t.semantic_match, SemanticMatch::Verbatim);
+        assert_eq!(l3.semantic_match, SemanticMatch::Canonical);
+        assert_eq!(
+            t.to_cache_config().l3.semantic_match,
+            SemanticMatch::Verbatim
+        );
+    }
+
+    /// `[cache] semantic_match` (R5-1): `verbatim` by default, `canonical`
+    /// accepted; an unknown value is a parse error naming the key, and a
+    /// threshold below 1.0 needs `canonical` (an error naming both keys).
+    #[test]
+    fn semantic_match_parses_and_validates() {
+        let node = "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n";
+        let parse =
+            |cache: &str| deserialize_reporting_ignored_paths(&format!("[cache]\n{cache}\n{node}"));
+        let (config, ignored) = parse("semantic_match = \"canonical\"").unwrap();
+        assert!(ignored.is_empty(), "{ignored:?}");
+        assert_eq!(config.cache.semantic_match, SemanticMatch::Canonical);
+        let (config, _) = parse("semantic_match = \"verbatim\"").unwrap();
+        assert_eq!(config.cache.semantic_match, SemanticMatch::Verbatim);
+        let err = parse("semantic_match = \"fuzzy\"").unwrap_err().to_string();
+        assert!(err.contains("semantic_match"), "{err}");
+        assert!(known_config_keys().contains("cache.semantic_match"));
+
+        let mut c = CacheToml {
+            semantic_similarity_threshold: 0.92,
+            ..CacheToml::default()
+        };
+        let err = c.validate_semantic_and_tables().unwrap_err().to_string();
+        assert!(
+            err.contains("cache.semantic_similarity_threshold")
+                && err.contains("cache.semantic_match"),
+            "{err}"
+        );
+        c.semantic_match = SemanticMatch::Canonical;
+        assert!(c.validate_semantic_and_tables().is_ok());
+        assert_eq!(SemanticMatch::Canonical.as_str(), "canonical");
+        assert_eq!(SemanticMatch::Verbatim.as_str(), "verbatim");
+    }
+
+    #[cfg(feature = "query-cache")]
+    #[test]
+    fn to_cache_config_maps_every_key() {
+        let c: CacheToml = toml::from_str(CACHE_KEYS_TOML).unwrap();
+        let cc = c.to_cache_config();
+        assert!(cc.enabled);
+        assert_eq!(cc.default_ttl, Duration::from_secs(c.ttl_secs));
+        assert_eq!(cc.max_result_size, c.max_result_bytes);
+        assert_eq!(cc.l2.ttl, Duration::from_secs(c.ttl_secs));
+        assert_eq!(cc.l2.shed_batch, c.l2_shed_batch);
+        assert_eq!(cc.l2.shed_pause, Duration::from_micros(c.l2_shed_pause_us));
+        // L1 clamps every entry to its TTL: the longest any table gets.
+        assert_eq!(cc.l1.ttl, Duration::from_secs(3600));
+        let l3 = &cc.l3;
+        assert!(l3.enabled);
+        assert_eq!(l3.semantic_match, SemanticMatch::Canonical);
+        assert_eq!(l3.similarity_threshold, 0.9);
+        assert_eq!(l3.max_entries, 77);
+        assert_eq!(l3.max_variants, 3);
+        assert_eq!(l3.max_bytes, 4096);
+        assert_eq!(l3.ttl, Duration::from_secs(120));
+        assert_eq!(l3.embedding_endpoint, "https://embed.example:8443/v1");
+        assert_eq!(l3.embedding_model, "nomic-embed-text");
+        assert_eq!(l3.embedding_dim, 768);
+        assert_eq!(l3.embedding_timeout, Duration::from_millis(250));
+        assert_eq!(l3.embedding_concurrency, 2);
+        assert_eq!(l3.embedding_retry_after, Duration::from_secs(9));
+        assert_eq!(l3.max_statement_bytes, 2048);
+        let mut keys: Vec<&String> = cc.table_configs.keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["orders", "prices"]);
+        assert_eq!(cc.table_configs["prices"].ttl, Duration::from_secs(10));
+        assert!(
+            cc.excluded_tables.is_empty(),
+            "exclusions are relay-enforced"
+        );
+        cc.validate().unwrap();
+        // The tier is only built with the cache itself.
+        let off = CacheToml {
+            enabled: false,
+            ..c.clone()
+        };
+        assert!(!off.to_cache_config().l3.enabled);
+        // Without table TTLs, L1 keeps ttl_secs.
+        assert_eq!(
+            CacheToml::default().to_cache_config().l1.ttl,
+            Duration::from_secs(300)
+        );
+        CacheToml::default().to_cache_config().validate().unwrap();
+    }
+
+    #[test]
+    fn cache_semantic_validation_names_the_key() {
+        type Breaker = fn(&mut CacheToml);
+        let cases: Vec<(&str, Breaker)> = vec![
+            ("cache.semantic_similarity_threshold", |c| {
+                c.semantic_similarity_threshold = f64::NAN
+            }),
+            ("cache.semantic_similarity_threshold", |c| {
+                c.semantic_similarity_threshold = 0.0
+            }),
+            ("cache.semantic_similarity_threshold", |c| {
+                c.semantic_similarity_threshold = 1.5
+            }),
+            ("cache.semantic_max_entries", |c| c.semantic_max_entries = 0),
+            ("cache.semantic_max_variants", |c| {
+                c.semantic_max_variants = 0
+            }),
+            ("cache.semantic_max_variants", |c| {
+                c.semantic_max_variants = 1025
+            }),
+            ("cache.semantic_ttl_secs", |c| c.semantic_ttl_secs = 0),
+            ("cache.semantic_embedding_endpoint", |c| {
+                c.semantic_embedding_endpoint = "ftp://x".into()
+            }),
+            ("cache.semantic_embedding_endpoint", |c| {
+                c.semantic_embedding_endpoint = "http://u:p@h".into()
+            }),
+            ("cache.semantic_embedding_endpoint", |c| {
+                c.semantic_embedding_endpoint = "http://h/?q".into()
+            }),
+            ("cache.semantic_embedding_endpoint", |c| {
+                c.semantic_embedding_endpoint = "http://h/#f".into()
+            }),
+            ("cache.semantic_embedding_endpoint", |c| {
+                c.semantic_embedding_endpoint = "not a url".into()
+            }),
+            // The URL parser drops these; the client would send them.
+            ("cache.semantic_embedding_endpoint", |c| {
+                c.semantic_embedding_endpoint = "http://ollama:11434 ".into()
+            }),
+            ("cache.semantic_embedding_endpoint", |c| {
+                c.semantic_embedding_endpoint = " http://ollama:11434".into()
+            }),
+            ("cache.semantic_embedding_endpoint", |c| {
+                c.semantic_embedding_endpoint = "http://h/v1\n".into()
+            }),
+            ("cache.semantic_embedding_endpoint", |c| {
+                c.semantic_embedding_endpoint = "http://oll\tama:11434".into()
+            }),
+            ("cache.semantic_embedding_model", |c| {
+                c.semantic_embedding_model = String::new()
+            }),
+            ("cache.semantic_embedding_model", |c| {
+                c.semantic_embedding_model = "a\nb".into()
+            }),
+            ("cache.semantic_embedding_dim", |c| {
+                c.semantic_embedding_dim = 0
+            }),
+            ("cache.semantic_embedding_timeout_ms", |c| {
+                c.semantic_embedding_timeout_ms = 0
+            }),
+            ("cache.semantic_embedding_timeout_ms", |c| {
+                c.semantic_embedding_timeout_ms = 60_001
+            }),
+            ("cache.semantic_embedding_concurrency", |c| {
+                c.semantic_embedding_concurrency = 0
+            }),
+            ("cache.semantic_embedding_concurrency", |c| {
+                c.semantic_embedding_concurrency = 257
+            }),
+            ("cache.semantic_embedding_retry_secs", |c| {
+                c.semantic_embedding_retry_secs = 0
+            }),
+            ("cache.semantic_max_statement_bytes", |c| {
+                c.semantic_max_statement_bytes = 0
+            }),
+            // The parse it bounds takes about a hundred times the statement:
+            // a bound matching `limits.max_pending_bytes` (64 MiB) would let
+            // one statement take gigabytes.
+            ("cache.semantic_max_statement_bytes", |c| {
+                c.semantic_max_statement_bytes = SEMANTIC_MAX_STATEMENT_BYTES_CEILING + 1
+            }),
+            ("cache.semantic_max_statement_bytes", |c| {
+                c.semantic_max_statement_bytes = 64 * 1024 * 1024
+            }),
+        ];
+        for semantic in [false, true] {
+            for (key, brk) in &cases {
+                let mut config = ProxyConfig::default();
+                config.add_node("localhost:5432", "primary").unwrap();
+                config.cache.enabled = true;
+                config.cache.semantic_enabled = semantic;
+                brk(&mut config.cache);
+                let err = config.validate().unwrap_err().to_string();
+                assert!(err.contains(key), "semantic={semantic}: {err} lacks {key}");
+            }
+        }
+        // The ceiling itself is accepted.
+        let mut config = ProxyConfig::default();
+        config.add_node("localhost:5432", "primary").unwrap();
+        config.cache.enabled = true;
+        config.cache.semantic_max_statement_bytes = SEMANTIC_MAX_STATEMENT_BYTES_CEILING;
+        config.validate().unwrap();
+        // Without the cache, semantic_enabled only warns.
+        let mut config = ProxyConfig::default();
+        config.add_node("localhost:5432", "primary").unwrap();
+        config.cache.semantic_enabled = true;
+        config.validate().unwrap();
+        // A byte budget below max_result_bytes only warns: a result whose
+        // entry alone exceeds it stays out of the tier.
+        assert_eq!(config.cache.semantic_budget_warning(), None, "cache off");
+        config.cache.enabled = true;
+        assert_eq!(config.cache.semantic_budget_warning(), None, "defaults");
+        config.cache.semantic_max_bytes = config.cache.max_result_bytes - 1;
+        let warning = config.cache.semantic_budget_warning().unwrap();
+        assert!(warning.contains("cache.semantic_max_bytes"), "{warning}");
+        assert!(warning.contains("semantic_too_large"), "{warning}");
+        config.validate().unwrap();
+        config.cache.semantic_max_bytes = 0;
+        assert_eq!(config.cache.semantic_budget_warning(), None, "no budget");
+        config.cache.semantic_max_bytes = config.cache.max_result_bytes;
+        assert_eq!(config.cache.semantic_budget_warning(), None, "equal");
+        config.cache.semantic_max_bytes = 1;
+        config.cache.semantic_enabled = false;
+        assert_eq!(config.cache.semantic_budget_warning(), None, "tier off");
+        // Accepted edge values.
+        let mut config = ProxyConfig::default();
+        config.add_node("localhost:5432", "primary").unwrap();
+        config.cache.semantic_match = SemanticMatch::Canonical;
+        config.cache.semantic_similarity_threshold = 0.5;
+        config.cache.semantic_embedding_endpoint = "https://[::1]:11434/".into();
+        config.cache.semantic_max_bytes = 0;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn cache_tables_validation() {
+        let check = |tables: &str, excludes: &str| {
+            let text = format!(
+                "[cache]\nexclude_tables = [{excludes}]\n{tables}\n\
+                 [[nodes]]\nhost = \"db\"\nrole = \"primary\"\n"
+            );
+            let config: ProxyConfig = toml::from_str(&text).unwrap();
+            config.validate().map_err(|e| e.to_string())
+        };
+        assert!(check("[[cache.tables]]\nname = \"a\"\nttl_secs = 5\n", "\"b\"").is_ok());
+        for (tables, needle) in [
+            (
+                "[[cache.tables]]\nname = \"Orders\"\nttl_secs = 5\n\
+                 [[cache.tables]]\nname = \"orders\"\nexclude = true\n",
+                "twice",
+            ),
+            (
+                "[[cache.tables]]\nname = \"public.orders\"\nttl_secs = 5\n",
+                "bare table name",
+            ),
+            (
+                "[[cache.tables]]\nname = '\"x\"'\nttl_secs = 5\n",
+                "bare table name",
+            ),
+            (
+                "[[cache.tables]]\nname = \"my$t\"\nttl_secs = 5\n",
+                "bare table name",
+            ),
+            (
+                "[[cache.tables]]\nname = \"\"\nttl_secs = 5\n",
+                "bare table name",
+            ),
+            (
+                "[[cache.tables]]\nname = \"a\"\nttl_secs = 0\n",
+                "ttl_secs must be >= 1",
+            ),
+            ("[[cache.tables]]\nname = \"a\"\n", "no effect"),
+            (
+                "[[cache.tables]]\nname = \"a\"\nttl_secs = 5\nexclude = true\n",
+                "never cached",
+            ),
+        ] {
+            let err = check(tables, "").unwrap_err();
+            assert!(
+                err.contains("cache.tables") && err.contains(needle),
+                "{err}"
+            );
+        }
+        // The same contradiction split across exclude_tables and a TTL entry
+        // (names compared case-insensitively).
+        let err = check(
+            "[[cache.tables]]\nname = \"Orders\"\nttl_secs = 5\n",
+            "\"orders\"",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("cache.tables")
+                && err.contains("cache.exclude_tables")
+                && err.contains("never cached"),
+            "{err}"
+        );
+        // An exclude entry for a listed table is only redundant.
+        assert!(check(
+            "[[cache.tables]]\nname = \"orders\"\nexclude = true\n",
+            "\"ORDERS\""
+        )
+        .is_ok());
+        let long = "x".repeat(64);
+        for bad in [
+            "\"public.t\"",
+            "\"t-1\"",
+            "\"1t\"",
+            "\"\"",
+            &format!("\"{long}\""),
+        ] {
+            let err = check("", bad).unwrap_err();
+            assert!(err.contains("cache.exclude_tables"), "{bad}: {err}");
+        }
+        assert!(check("", &format!("\"{}\"", "x".repeat(63))).is_ok());
+        // A reserved word is only ever a quoted table name, and the scans
+        // would match the keyword in every `ORDER BY`, `LEFT JOIN`, ...
+        for word in ["order", "ORDER", "user", "left", "table", "similar"] {
+            let err = check("", &format!("\"{word}\"")).unwrap_err();
+            assert!(
+                err.contains("cache.exclude_tables") && err.contains("reserved word"),
+                "{word}: {err}"
+            );
+            let err = check(
+                &format!("[[cache.tables]]\nname = \"{word}\"\nttl_secs = 5\n"),
+                "",
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("cache.tables") && err.contains("reserved word"),
+                "{word}: {err}"
+            );
+        }
+        // Unreserved keywords and words that only start like one are names.
+        for name in ["orders", "users", "values", "name", "order_items"] {
+            assert!(check("", &format!("\"{name}\"")).is_ok(), "{name}");
+        }
+        // The list is sorted (it is binary-searched) and lower-case.
+        assert!(POSTGRES_RESERVED_WORDS
+            .windows(2)
+            .all(|w| w[0] < w[1] && w[1] == w[1].to_ascii_lowercase()));
+    }
+
+    #[test]
+    fn exclude_columns_is_refused_at_load() {
+        let load = |cache: &str| {
+            let path = std::env::temp_dir().join(format!(
+                "helios-exclude-columns-{}-{}.toml",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::write(
+                &path,
+                format!("{cache}[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n"),
+            )
+            .unwrap();
+            let loaded = ProxyConfig::from_file(path.to_str().unwrap());
+            let _ = std::fs::remove_file(&path);
+            loaded
+        };
+        for (cache, key) in [
+            (
+                "[cache]\nenabled = true\n[[cache.tables]]\nname = \"users\"\nexclude = true\n\
+                 exclude_columns = [\"ssn\"]\n",
+                "cache.tables.0.exclude_columns",
+            ),
+            // The flat spelling the [cache] docs and hints point to.
+            (
+                "[cache]\nenabled = true\nexclude_columns = [\"users.ssn\"]\n",
+                "cache.exclude_columns",
+            ),
+            (
+                "[cache]\nenabled = true\n[cache.exclude_columns]\nusers = [\"ssn\"]\n",
+                "cache.exclude_columns",
+            ),
+            // Inside an unknown table under [cache] (the website sample's
+            // `[cache.query]`, or `[cache.l3]`), which serde_ignored reports
+            // as one path without its keys, at any depth and in any case.
+            (
+                "[cache]\nenabled = true\n[cache.query]\nexclude_columns = [\"users.ssn\"]\n",
+                "cache.query.exclude_columns",
+            ),
+            (
+                "[cache]\nenabled = true\n[cache.l3]\nExclude_Columns = [\"users.ssn\"]\n",
+                "cache.l3.Exclude_Columns",
+            ),
+            (
+                "[cache]\nenabled = true\n[cache.semantic.rules]\nexclude_columns = [\"ssn\"]\n",
+                "cache.semantic.rules.exclude_columns",
+            ),
+            (
+                "[cache]\nenabled = true\n[[cache.rules]]\nname = \"x\"\n\
+                 [[cache.rules]]\nexclude_columns = [\"ssn\"]\n",
+                "cache.rules.1.exclude_columns",
+            ),
+        ] {
+            let err = load(cache).unwrap_err().to_string();
+            assert!(
+                err.contains(key) && err.contains("exclude = true"),
+                "{cache}: {err}"
+            );
+        }
+        // Another section's key of that name is only an ignored key, and so
+        // is another key under [cache].
+        assert!(load("[edge]\nexclude_columns = [\"ssn\"]\n").is_ok());
+        assert!(load("[cache]\n[cache.query]\nexclude_tables = [\"t\"]\n").is_ok());
+        assert_eq!(
+            column_exclusion_key("[edge]\nexclude_columns = 1\n[cache]\nexclude_tables = []\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn website_and_library_cache_names_hint_the_new_keys() {
+        let known = known_config_keys();
+        for (path, needle) in [
+            (
+                "cache.similarity_threshold",
+                "cache.semantic_similarity_threshold",
+            ),
+            ("cache.semantic_cache_enabled", "cache.semantic_enabled"),
+            ("cache.exclude_patterns", "cache.exclude_tables"),
+            ("cache.semantic", "semantic_enabled"),
+            ("cache.l3", "semantic_enabled"),
+            ("cache.l1", "[[cache.tables]]"),
+            ("cache.tables.0.ttl", "ttl_secs"),
+            ("cache.tables.0.table", "name"),
+            ("cache.tables.0.exclude_columns", "exclude = true"),
+            ("cache.exclude_columns", "exclude = true"),
+            ("cache.excluded_tables", "cache.exclude_tables"),
+            ("cache.tables.0.ttl_sec", "cache.tables.0.ttl_secs"),
+        ] {
+            let hint = ignored_key_hint(path, &known).unwrap_or_default();
+            assert!(hint.contains(needle), "{path}: {hint:?} lacks {needle:?}");
+        }
     }
 
     #[cfg(all(feature = "edge-proxy", feature = "query-cache"))]

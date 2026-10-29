@@ -49,6 +49,10 @@ pub struct CacheMetrics {
     /// backend fetch (C-02).
     fills_raced: AtomicU64,
 
+    /// Whole-cache invalidations for a simple-query string a backend may
+    /// split into a statement the journal capture does not see.
+    unseen_write_invalidations: AtomicU64,
+
     /// Creation time
     created_at: Instant,
 }
@@ -165,6 +169,7 @@ impl CacheMetrics {
             size_exceeded: AtomicU64::new(0),
             stale_rejected: AtomicU64::new(0),
             fills_raced: AtomicU64::new(0),
+            unseen_write_invalidations: AtomicU64::new(0),
             created_at: Instant::now(),
         }
     }
@@ -212,6 +217,17 @@ impl CacheMetrics {
     /// Fills dropped because a write raced the fetch.
     pub fn fills_raced(&self) -> u64 {
         self.fills_raced.load(Ordering::Relaxed)
+    }
+
+    /// A whole-cache invalidation for a statement the capture cannot see.
+    pub fn record_unseen_write_invalidation(&self) {
+        self.unseen_write_invalidations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whole-cache invalidations for statements the capture cannot see.
+    pub fn unseen_write_invalidations(&self) -> u64 {
+        self.unseen_write_invalidations.load(Ordering::Relaxed)
     }
 
     pub fn record_invalidation(&self, table_count: usize) {

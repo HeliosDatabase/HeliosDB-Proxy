@@ -231,6 +231,25 @@ impl ProxyServer {
         outcome: crate::journal_capture::ResponseOutcome,
     ) -> Option<ObservedCycle> {
         let armed = session.journal_armed.swap(false, Ordering::Relaxed);
+        // A statement the capture cannot see may have written anything
+        // (`cache_unseen_write`): every cached result is retired before the
+        // client has the answer, and a transaction it leaves open retires
+        // everything again at its commit.
+        #[cfg(feature = "query-cache")]
+        if session.cache_unseen_write.load(Ordering::Relaxed)
+            && session.cache_unseen_write.swap(false, Ordering::Relaxed)
+        {
+            if let Some(qc) = state.query_cache.as_ref() {
+                qc.invalidate_all_for_unseen_write();
+                if outcome.status != b'I' {
+                    session
+                        .tx_cache_stage
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .unknown = true;
+                }
+            }
+        }
         // Fast path: an idle autocommit response with nothing registered and
         // no transaction being captured changes nothing.
         if !armed && outcome.status == b'I' && !session.journal_open.load(Ordering::Relaxed) {
@@ -400,6 +419,8 @@ impl ProxyServer {
     /// registered for the cycle reached the backend.
     pub(super) fn journal_discard(session: &ClientSession, status: u8) {
         session.journal_armed.store(false, Ordering::Relaxed);
+        #[cfg(feature = "query-cache")]
+        session.cache_unseen_write.store(false, Ordering::Relaxed);
         let mut cap = session.journal.lock().unwrap_or_else(|e| e.into_inner());
         cap.discard(status);
         // Keep the relay's fast path off until a deferred rollback has been

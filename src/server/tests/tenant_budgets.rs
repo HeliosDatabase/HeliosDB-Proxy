@@ -2455,6 +2455,29 @@ async fn a_query_continuing_a_flushed_cycle_is_not_answered_from_the_cache() {
     );
 }
 
+/// The cache's refusal checks run only outside an open cycle: a query
+/// continuing a flushed cycle is not classified, so naming a catalog relation
+/// there counts no catalog skip, while the same read at idle counts one.
+#[cfg(feature = "query-cache")]
+#[tokio::test]
+async fn a_query_continuing_a_flushed_cycle_counts_no_cache_skip() {
+    let h = Harness::new(0, None, |c| c.cache.enabled = true).await;
+    let mut a = h.connect("acme").await;
+    let sql = "select relname from pg_class";
+    let skipped = || {
+        h.state
+            .metrics
+            .cache_catalog_skipped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    assert_served(&a.query(sql).await, b'I');
+    assert_eq!(skipped(), 1, "a catalog read at idle is counted");
+    a.send(&[cycle("select 1"), flush()].concat()).await;
+    assert_eq!(tags(&a.frames(3).await), b"12C");
+    assert_served(&a.query(sql).await, b'I');
+    assert_eq!(skipped(), 1, "the continuing query was not classified");
+}
+
 /// A session that ends with an extended cycle still open on its backend
 /// connection, its client gone after a Flush dispatched part of the cycle
 /// (whose chunk succeeded, or failed and left the backend skipping to the

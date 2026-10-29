@@ -1,5 +1,25 @@
 use super::*;
 
+/// The first words of a statement known to change no rows, in a
+/// multi-statement string ([`ProxyServer::edge_statement_changes_nothing`]):
+/// a read (`WITH` and `EXPLAIN` once
+/// [`ProxyServer::is_edge_dml_sql`] found no data-modifying verb and no
+/// `ANALYZE` in them) or bare transaction control.
+#[cfg(feature = "edge-proxy")]
+const EDGE_QUIET_LEADS: &[&str] = &[
+    "SELECT",
+    "VALUES",
+    "TABLE",
+    "SHOW",
+    "WITH",
+    "EXPLAIN",
+    "BEGIN",
+    "START",
+    "SAVEPOINT",
+    "RELEASE",
+    "ROLLBACK",
+];
+
 impl ProxyServer {
     pub(super) fn is_write_query(sql: &str) -> bool {
         use crate::protocol::starts_with_ci;
@@ -50,11 +70,38 @@ impl ProxyServer {
     ///   exempt (its flush closes the invalidate-at-statement vs
     ///   commit-visibility window for in-transaction writes), nor is SET
     ///   (the flush is the interim mitigation for GUC-sensitive results).
-    /// - A multi-statement string (interior `;`) may hide a trailing write
-    ///   behind a read-classified lead — always invalidate (the fingerprint
-    ///   extracts tables from every sub-statement; over-invalidation only).
+    /// - A string of more than one statement is read one statement at a
+    ///   time, split where the caches' lexer finds a `;` outside literals,
+    ///   quoted identifiers and comments (`sql_text::statements`, R6-2): it
+    ///   invalidates when any statement does (a trailing write behind a
+    ///   read-classified lead included; `fingerprint::write_tables` then
+    ///   gives the every-entry set) and when any statement is not one known
+    ///   to change no rows ([`Self::edge_statement_changes_nothing`]: a
+    ///   read or bare transaction control), so a statement this classifier
+    ///   does not list as a write still flushes there, as every
+    ///   multi-statement string used to. A string of reads and bare
+    ///   transaction control invalidates nothing (`SELECT a FROM t1; SELECT b
+    ///   FROM t2` used to flush every edge entry). One the backends may split
+    ///   differently (a backend-ambiguous rest) may hold anything: it
+    ///   invalidates. So does one a routing hint or a plugin sent to the
+    ///   primary as a write (`is_write` where the first word reads no write).
+    ///   A string the lexer finds one statement in, its `;` inside a literal,
+    ///   a quoted identifier or a comment (`COPY t TO STDOUT (DELIMITER
+    ///   ';')`, `NOTIFY c, 'a;b'`), is read as that one statement, as it is
+    ///   without the `;`: it used to flush whenever that statement was not a
+    ///   read.
     /// - `COPY ... FROM` loads rows but is not classified `is_write` (it
     ///   must not be re-routed); catch it here for invalidation.
+    /// - The statement is read from its first word past leading comments
+    ///   (`sql_text::lead`, the lexer the caches share), so
+    ///   `/* job */ UPDATE …` and `-- v2` newline `CREATE OR REPLACE VIEW …`
+    ///   are writes, and a `MERGE` (`MERGE INTO … USING …`, HeliosDB-Nano's
+    ///   `MERGE BRANCH src INTO dst`) is one too ([`Self::is_edge_dml_sql`]).
+    ///   When the backends may end a leading comment in different places
+    ///   (`Lead::Rest`), or the first word holds a non-ASCII character other
+    ///   than a space (HeliosDB-Lite reads `ınsert` as `INSERT`:
+    ///   `journal_capture::first_word_not_ascii`), the statement may be
+    ///   anything: a write of unknown scope.
     ///
     /// `multi_stmt` is `StmtFacts::has_interior_semicolon` for the same SQL —
     /// passed in rather than re-scanned (`stmt_has_interior_semicolon` is the
@@ -65,30 +112,76 @@ impl ProxyServer {
         sql: &str,
         multi_stmt: bool,
     ) -> bool {
-        use crate::protocol::starts_with_ci;
         let t = sql.trim();
         let core = t.strip_suffix(';').unwrap_or(t).trim_end();
-        if !multi_stmt
-            && (starts_with_ci(core, "BEGIN")
-                || starts_with_ci(core, "START")
-                || starts_with_ci(core, "SAVEPOINT")
-                || starts_with_ci(core, "RELEASE")
-                || starts_with_ci(core, "ROLLBACK"))
+        if !multi_stmt {
+            return Self::edge_statement_needs_invalidation(is_write, core);
+        }
+        let Some(statements) = crate::sql_text::statements(core) else {
+            return true;
+        };
+        if statements.len() < 2 {
+            return Self::edge_statement_needs_invalidation(
+                is_write,
+                statements.first().copied().unwrap_or(core),
+            );
+        }
+        (is_write && !Self::is_write_query(sql))
+            || statements.into_iter().any(|statement| {
+                Self::edge_statement_needs_invalidation(false, statement)
+                    || !Self::edge_statement_changes_nothing(statement)
+            })
+    }
+
+    /// Whether the one statement `statement` (of a multi-statement string,
+    /// past [`Self::edge_statement_needs_invalidation`]) is known to change
+    /// no rows: its first word past leading comments is one of
+    /// [`EDGE_QUIET_LEADS`], a read or bare transaction control. Any other
+    /// statement may write (`REFRESH MATERIALIZED VIEW`, a statement a
+    /// backend adds), so its string flushes every edge entry.
+    #[cfg(feature = "edge-proxy")]
+    fn edge_statement_changes_nothing(statement: &str) -> bool {
+        crate::sql_text::statement_start(statement).is_some_and(|lead| {
+            EDGE_QUIET_LEADS
+                .iter()
+                .any(|word| crate::sql_text::starts_with_keyword(lead, word))
+        })
+    }
+
+    /// [`Self::edge_write_needs_invalidation`] for the one statement `core`
+    /// (without its trailing `;`), `is_write` its routing class.
+    #[cfg(feature = "edge-proxy")]
+    fn edge_statement_needs_invalidation(is_write: bool, core: &str) -> bool {
+        use crate::protocol::starts_with_ci;
+        let lead = match crate::sql_text::lead(core) {
+            crate::sql_text::Lead::Start(start) => start,
+            crate::sql_text::Lead::Rest => return true,
+            crate::sql_text::Lead::Nothing => core,
+        };
+        if crate::journal_capture::first_word_not_ascii(lead) {
+            return true;
+        }
+        if starts_with_ci(lead, "BEGIN")
+            || starts_with_ci(lead, "START")
+            || starts_with_ci(lead, "SAVEPOINT")
+            || starts_with_ci(lead, "RELEASE")
+            || starts_with_ci(lead, "ROLLBACK")
         {
             return false;
         }
         is_write
-            || multi_stmt
-            || Self::is_edge_copy_write_sql(core)
-            || Self::is_edge_procedural_sql(core)
-            || Self::is_edge_txn_end_sql(core)
+            || Self::is_write_query(lead)
+            || Self::is_edge_dml_sql(lead)
+            || Self::is_edge_copy_write_sql(lead)
+            || Self::is_edge_procedural_sql(lead)
+            || Self::is_edge_txn_end_sql(lead)
     }
 
     /// Does the simple-query string carry more than one statement? A `;`
     /// before the optional trailing one means a leading-keyword check cannot
     /// vouch for what follows. (A `;` inside a string literal also trips this —
     /// conservative, and only ever costs an extra invalidation/reset.)
-    #[cfg(feature = "edge-proxy")]
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     pub(super) fn stmt_has_interior_semicolon(sql: &str) -> bool {
         let t = sql.trim();
         let core = t.strip_suffix(';').unwrap_or(t).trim_end();
@@ -154,12 +247,37 @@ impl ProxyServer {
     /// `is_write_query` — that routing classifier counts BEGIN/COMMIT/SET as
     /// writes, and their empty table set would full-flush the fleet on every
     /// transaction commit. WITH-prefixed statements are checked for
-    /// data-modifying CTE verbs by word (false positives over-invalidate
-    /// only).
+    /// data-modifying CTE verbs among the words the caches' lexer reads
+    /// outside literals, quoted identifiers and comments
+    /// (`sql_text::may_hold_keyword`: `WITH r AS (SELECT … WHERE op =
+    /// 'delete') …` is a read, and used to flush its tables on every run),
+    /// upper-cased the Unicode way when a word is not ASCII, as
+    /// HeliosDB-Lite matches keywords (`ınsert` is `INSERT` there); text the
+    /// backends may read differently (a backend-ambiguous rest) may hold
+    /// one. The verb
+    /// is the first word past leading comments (`sql_text::lead`); a leading
+    /// comment the backends may end in different places (`Lead::Rest`)
+    /// hides it, and a first word holding a non-ASCII character other than a
+    /// space (`journal_capture::first_word_not_ascii`) cannot be read as
+    /// Lite reads it: either makes the statement DML of unknown scope. Every
+    /// verb the journal capture counts as a write but `CALL` and `DO`
+    /// ([`Self::is_edge_procedural_sql`]) is here (`REFRESH MATERIALIZED
+    /// VIEW`, `COMMENT`, `SECURITY LABEL`, `IMPORT FOREIGN SCHEMA` and
+    /// `REASSIGN OWNED` included, whose scope `fingerprint::write_tables`
+    /// does not know), and so is an `EXPLAIN` holding `ANALYZE` (or
+    /// `ANALYSE`) outside its literals and comments, which runs the
+    /// statement it explains.
     #[cfg(feature = "edge-proxy")]
     pub(super) fn is_edge_dml_sql(sql: &str) -> bool {
         use crate::protocol::starts_with_ci;
-        let t = sql.trim_start();
+        let t = match crate::sql_text::lead(sql) {
+            crate::sql_text::Lead::Start(start) => start,
+            crate::sql_text::Lead::Rest => return true,
+            crate::sql_text::Lead::Nothing => return false,
+        };
+        if crate::journal_capture::first_word_not_ascii(t) {
+            return true;
+        }
         if starts_with_ci(t, "INSERT")
             || starts_with_ci(t, "UPDATE")
             || starts_with_ci(t, "DELETE")
@@ -170,6 +288,11 @@ impl ProxyServer {
             || starts_with_ci(t, "TRUNCATE")
             || starts_with_ci(t, "GRANT")
             || starts_with_ci(t, "REVOKE")
+            || starts_with_ci(t, "REFRESH")
+            || starts_with_ci(t, "COMMENT")
+            || starts_with_ci(t, "SECURITY")
+            || starts_with_ci(t, "IMPORT")
+            || starts_with_ci(t, "REASSIGN")
         {
             return true;
         }
@@ -177,10 +300,10 @@ impl ProxyServer {
             return Self::contains_word_ci(t, "from");
         }
         if starts_with_ci(t, "WITH") {
-            return Self::contains_word_ci(t, "insert")
-                || Self::contains_word_ci(t, "update")
-                || Self::contains_word_ci(t, "delete")
-                || Self::contains_word_ci(t, "merge");
+            return crate::sql_text::may_hold_keyword(t, &["INSERT", "UPDATE", "DELETE", "MERGE"]);
+        }
+        if starts_with_ci(t, "EXPLAIN") {
+            return crate::sql_text::may_hold_keyword(t, &["ANALYZE", "ANALYSE"]);
         }
         false
     }

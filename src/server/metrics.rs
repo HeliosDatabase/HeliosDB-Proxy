@@ -29,6 +29,19 @@ pub(super) struct ServerMetrics {
     /// receives every byte) — either the workload returns huge result sets or
     /// the ceiling is set too low.
     pub(super) cache_capture_oversize: AtomicU64,
+    /// Cacheable reads neither result cache looked up or stored because they
+    /// name a table of `[cache] exclude_tables` / `[[cache.tables]]
+    /// exclude = true`.
+    pub(super) cache_excluded: AtomicU64,
+    /// Cacheable reads no result cache tier looked up or stored because they
+    /// may name a system catalog relation (`pg_*`, `information_schema`).
+    pub(super) cache_catalog_skipped: AtomicU64,
+    /// Cacheable reads no result cache tier looked up or stored because a
+    /// comment of theirs holds `AS OF` / `VERSIONS BETWEEN`.
+    pub(super) cache_time_travel_skipped: AtomicU64,
+    /// Cacheable reads no result cache tier looked up or stored because
+    /// their text is backend-ambiguous (`sql_text::UncacheableText`).
+    pub(super) cache_ambiguous_skipped: AtomicU64,
     /// P-03: client admissions that had to wait for a permit at the
     /// `max_client_connections` cap (the bounded H-05 queue bit).
     pub(super) admission_waited: AtomicU64,
@@ -119,6 +132,18 @@ pub struct ServerMetricsSnapshot {
     /// Cacheable reads whose response outgrew
     /// `[cache] max_cacheable_response_bytes` and were therefore not cached.
     pub cache_capture_oversize: u64,
+    /// Cacheable reads kept out of both result caches by
+    /// `[cache] exclude_tables`.
+    pub cache_excluded: u64,
+    /// Cacheable reads kept out of every result cache tier because they may
+    /// name a system catalog relation (`pg_*`, `information_schema`).
+    pub cache_catalog_skipped: u64,
+    /// Cacheable reads kept out of every result cache tier because a comment
+    /// holds a time-travel clause (`AS OF`, `VERSIONS BETWEEN`).
+    pub cache_time_travel_skipped: u64,
+    /// Cacheable reads kept out of every result cache tier because
+    /// PostgreSQL and HeliosDB-Nano/Lite may read their text differently.
+    pub cache_ambiguous_skipped: u64,
     /// P-03: admissions that waited on the bounded cap queue (H-05).
     pub admission_waited: u64,
     /// P-03: admissions whose bounded wait expired (subset of rejections).

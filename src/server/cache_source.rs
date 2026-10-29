@@ -49,4 +49,17 @@ impl ProxyServer {
         let shutdown = self.shutdown_tx.subscribe();
         Ok(Some(tokio::spawn(source.run(cache, shutdown))))
     }
+
+    /// Probe the semantic tier's embedding endpoint once in the background
+    /// when the tier is on and may contact it (threshold below 1.0), so its
+    /// state and dimension are logged at startup and show on `/metrics`. No
+    /// read waits on it.
+    #[cfg(feature = "query-cache")]
+    pub(super) fn spawn_semantic_probe(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let l3 = self.state.query_cache.as_ref()?.semantic_cache()?.clone();
+        if self.config.cache.semantic_similarity_threshold >= 1.0 {
+            return None;
+        }
+        Some(tokio::spawn(async move { l3.probe().await }))
+    }
 }

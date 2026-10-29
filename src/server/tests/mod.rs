@@ -203,6 +203,8 @@ fn make_test_session_mode(tr_mode: crate::config::TrMode) -> Arc<ClientSession> 
         backend_credential: RwLock::new(None),
         #[cfg(feature = "query-cache")]
         tx_cache_stage: std::sync::Mutex::new(TxCacheStage::default()),
+        #[cfg(feature = "query-cache")]
+        cache_unseen_write: std::sync::atomic::AtomicBool::new(false),
         journal: std::sync::Mutex::new(crate::journal_capture::SessionCapture::default()),
         journal_armed: std::sync::atomic::AtomicBool::new(false),
         journal_open: std::sync::atomic::AtomicBool::new(false),
@@ -487,6 +489,10 @@ async fn test_apply_authenticate_hook_with_manager_no_plugins_defers() {
         analytics: None,
         #[cfg(feature = "query-cache")]
         query_cache: None,
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        table_exclusions: None,
+        #[cfg(feature = "edge-proxy")]
+        edge_table_ttls: None,
         #[cfg(feature = "query-rewriting")]
         rewriter: None,
         #[cfg(feature = "multi-tenancy")]
@@ -513,6 +519,8 @@ async fn test_apply_authenticate_hook_with_manager_no_plugins_defers() {
             edge_defaults.max_edges,
             std::time::Duration::from_secs(edge_defaults.liveness_window_secs),
         )),
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        heliosdb_backend: std::sync::atomic::AtomicBool::new(false),
     });
 
     let mut params = HashMap::new();

@@ -21,11 +21,15 @@ pub(crate) struct Boundaries<'a> {
     pub ends_tx: bool,
 }
 
-fn ident_start(b: u8) -> bool {
+/// A byte that can start an unquoted identifier or keyword: an ASCII letter,
+/// `_`, or any byte of a multi-byte UTF-8 character.
+pub(crate) fn ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_' || b >= 0x80
 }
 
-fn ident_cont(b: u8) -> bool {
+/// A byte that can continue an unquoted identifier: [`ident_start`], an ASCII
+/// digit, or `$`.
+pub(crate) fn ident_cont(b: u8) -> bool {
     ident_start(b) || b.is_ascii_digit() || b == b'$'
 }
 

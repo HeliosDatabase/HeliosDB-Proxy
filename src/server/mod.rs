@@ -418,10 +418,23 @@ struct ServerState {
     /// forwarded query is recorded (fingerprint, latency, slow-query log).
     #[cfg(feature = "query-analytics")]
     analytics: Option<Arc<crate::analytics::QueryAnalytics>>,
-    /// Query-result cache (L1 hot / L2 warm). `Some` when `[cache] enabled`.
-    /// Read SELECTs are served from it; writes invalidate referenced tables.
+    /// Query-result cache (L1 hot / L2 warm / opt-in L3 semantic). `Some`
+    /// when `[cache] enabled`. Read SELECTs are served from it; writes
+    /// invalidate referenced tables.
     #[cfg(feature = "query-cache")]
     query_cache: Option<Arc<crate::cache::QueryCache>>,
+    /// Tables neither result cache may serve or store (`[cache]
+    /// exclude_tables` and `[[cache.tables]] exclude = true`), checked by the
+    /// relay ahead of both. `None` when the list is empty or neither
+    /// `[cache]` nor `[edge]` is enabled. Built once at startup.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    table_exclusions: Option<Arc<crate::sql_text::TableExclusions>>,
+    /// The `[[cache.tables]]` TTLs shorter than `[edge] default_ttl_secs`:
+    /// an edge entry lives at most as long as the shortest of them its read
+    /// names (fail-closed scan). `None` when `[edge]` is off or no table TTL
+    /// is that short. Built once at startup.
+    #[cfg(feature = "edge-proxy")]
+    edge_table_ttls: Option<Arc<crate::sql_text::ShorterTtls>>,
     /// SQL query rewriter. `Some` when `[query_rewrite] enabled` with rules.
     /// Rewrites the query SQL on the path before forwarding.
     #[cfg(feature = "query-rewriting")]
@@ -466,6 +479,14 @@ struct ServerState {
     edge_cache: Arc<crate::edge::EdgeCache>,
     #[cfg(feature = "edge-proxy")]
     edge_registry: Arc<crate::edge::EdgeRegistry>,
+    /// Sticky: a backend connection's startup reported a HeliosDB
+    /// `server_version` (`ProxyServer::note_parameter_status`), whose
+    /// engines read comments, whitespace and case before parsing. The edge
+    /// cache keys reads by their text as written from then on (the query
+    /// cache keeps its own flag, set just before this one by every such
+    /// startup).
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    heliosdb_backend: std::sync::atomic::AtomicBool,
 }
 
 /// Node health status
@@ -934,29 +955,77 @@ impl ProxyServer {
         #[cfg(feature = "query-cache")]
         let query_cache = if config.cache.enabled {
             let c = &config.cache;
+            let table_ttls = c.tables.iter().filter(|t| t.ttl_secs.is_some()).count();
             tracing::info!(
                 ttl_secs = c.ttl_secs,
                 max_result_bytes = c.max_result_bytes,
-                "query cache enabled (L1 hot + L2 warm)"
+                semantic = c.semantic_enabled,
+                exclude_tables = c.excluded_table_names().len(),
+                table_ttls,
+                "query cache enabled (L1 hot + L2 warm{})",
+                if c.semantic_enabled {
+                    " + L3 semantic"
+                } else {
+                    ""
+                }
             );
-            let ttl = Duration::from_secs(c.ttl_secs);
-            let cc = crate::cache::CacheConfig {
-                enabled: true,
-                default_ttl: ttl,
-                max_result_size: c.max_result_bytes,
-                l1: crate::cache::L1Config {
-                    ttl,
-                    ..Default::default()
-                },
-                l2: crate::cache::L2Config {
-                    ttl,
-                    shed_batch: c.l2_shed_batch,
-                    shed_pause: Duration::from_micros(c.l2_shed_pause_us),
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            Some(Arc::new(crate::cache::QueryCache::new(cc)))
+            if c.semantic_enabled {
+                let endpoint_host = reqwest::Url::parse(&c.semantic_embedding_endpoint)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_string))
+                    .unwrap_or_default();
+                tracing::info!(
+                    semantic_match = c.semantic_match.as_str(),
+                    endpoint_host = %endpoint_host,
+                    model = %c.semantic_embedding_model,
+                    dim = c.semantic_embedding_dim,
+                    threshold = c.semantic_similarity_threshold,
+                    "semantic cache tier on: only statements carrying /*helios:cache=semantic*/ \
+                     use it; {}",
+                    match c.semantic_match {
+                        crate::config::SemanticMatch::Verbatim => {
+                            "matches by the statement text as received (the embedding endpoint \
+                             is not contacted)"
+                        }
+                        crate::config::SemanticMatch::Canonical
+                            if c.semantic_similarity_threshold < 1.0 =>
+                        {
+                            "canonical form (PostgreSQL semantics; off once a backend reports \
+                             HeliosDB); column-name embeddings are computed off the read path"
+                        }
+                        crate::config::SemanticMatch::Canonical => {
+                            "exact canonical matches only (PostgreSQL semantics; off once a \
+                             backend reports HeliosDB; the embedding endpoint is not contacted)"
+                        }
+                    }
+                );
+            }
+            Some(Arc::new(crate::cache::QueryCache::new(c.to_cache_config())))
+        } else {
+            None
+        };
+
+        // Table exclusions bind both result caches; only built when one runs.
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        let table_exclusions = {
+            let names = config.cache.excluded_table_names();
+            let caching = (cfg!(feature = "query-cache") && config.cache.enabled)
+                || (cfg!(feature = "edge-proxy") && config.edge.enabled);
+            (caching && !names.is_empty())
+                .then(|| Arc::new(crate::sql_text::TableExclusions::new(names)))
+        };
+        // Table TTLs bind the edge cache too, as a cap: an edge entry never
+        // outlives a shorter `[[cache.tables]]` TTL of a table its read names.
+        #[cfg(feature = "edge-proxy")]
+        let edge_table_ttls = if config.edge.enabled {
+            crate::sql_text::ShorterTtls::new(
+                config.cache.tables.iter().filter_map(|t| {
+                    t.ttl_secs
+                        .map(|secs| (t.name.as_str(), std::time::Duration::from_secs(secs)))
+                }),
+                config.edge.default_ttl(),
+            )
+            .map(Arc::new)
         } else {
             None
         };
@@ -1148,6 +1217,10 @@ impl ProxyServer {
             analytics,
             #[cfg(feature = "query-cache")]
             query_cache,
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            table_exclusions,
+            #[cfg(feature = "edge-proxy")]
+            edge_table_ttls,
             #[cfg(feature = "query-rewriting")]
             rewriter,
             #[cfg(feature = "multi-tenancy")]
@@ -1181,6 +1254,8 @@ impl ProxyServer {
                 config.edge.max_edges,
                 std::time::Duration::from_secs(config.edge.liveness_window_secs),
             )),
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            heliosdb_backend: std::sync::atomic::AtomicBool::new(false),
         });
         Self::publish_routing(&state);
 
@@ -1325,6 +1400,24 @@ impl ProxyServer {
                 }
             );
         }
+        // [cache] builds the query cache (tiers, TTLs, the semantic tier and
+        // its embedding client), the logical source and the table exclusions
+        // once at startup, so a reload cannot apply it: carry the running
+        // section forward. max_cacheable_response_bytes is the exception —
+        // every cacheable read takes it from the live config (and the [edge]
+        // cache's per-entry ceiling follows it, below).
+        let mut incoming = new_config.cache.clone();
+        incoming.max_cacheable_response_bytes = old.cache.max_cacheable_response_bytes;
+        if incoming != old.cache {
+            tracing::warn!(
+                "[cache] configuration changed on SIGHUP but is applied at startup only — \
+                 keeping the running cache settings (restart to apply); \
+                 max_cacheable_response_bytes is applied"
+            );
+            let max_cacheable = new_config.cache.max_cacheable_response_bytes;
+            new_config.cache = old.cache.clone();
+            new_config.cache.max_cacheable_response_bytes = max_cacheable;
+        }
         // `[limits]` is resolved once at startup into `state.limits` (and, for
         // max_client_connections, into the already-sized `client_slots`
         // semaphore whose outstanding permits could not be revoked anyway), so
@@ -1374,6 +1467,14 @@ impl ProxyServer {
         // Certificate rotation: a changed cert/key on disk is picked up here
         // even when the [tls] section itself is unchanged.
         Self::reload_client_tls(&self.state, &new_config);
+        // The relay's capture takes max_cacheable_response_bytes from the
+        // live config; the [edge] cache's per-entry ceiling follows it, or a
+        // response between the old and the new value would be buffered and
+        // then refused as oversize.
+        #[cfg(feature = "edge-proxy")]
+        self.state
+            .edge_cache
+            .set_max_entry_bytes(new_config.cache.max_cacheable_response_bytes);
         self.state.live_config.store(Arc::new(new_config));
         tracing::info!(
             nodes,
@@ -1508,6 +1609,8 @@ impl ProxyServer {
         let routing_task = self.spawn_routing_refresher();
         #[cfg(feature = "query-cache")]
         let cache_source_task = self.spawn_cache_logical_source().await?;
+        #[cfg(feature = "query-cache")]
+        let _semantic_probe = self.spawn_semantic_probe();
         let pool_task = self.spawn_pool_manager();
         // H-01: authoritative topology loop. Only spawned when a provider is
         // configured; static configs keep the historical routing path. Two
@@ -2013,6 +2116,22 @@ impl ProxyServer {
                                 .metrics
                                 .cache_capture_oversize
                                 .load(Ordering::Relaxed),
+                            cache_excluded: server_state
+                                .metrics
+                                .cache_excluded
+                                .load(Ordering::Relaxed),
+                            cache_catalog_skipped: server_state
+                                .metrics
+                                .cache_catalog_skipped
+                                .load(Ordering::Relaxed),
+                            cache_time_travel_skipped: server_state
+                                .metrics
+                                .cache_time_travel_skipped
+                                .load(Ordering::Relaxed),
+                            cache_ambiguous_skipped: server_state
+                                .metrics
+                                .cache_ambiguous_skipped
+                                .load(Ordering::Relaxed),
                             admission_waited: server_state
                                 .metrics
                                 .admission_waited
@@ -2269,6 +2388,22 @@ impl ProxyServer {
                 .state
                 .metrics
                 .cache_capture_oversize
+                .load(Ordering::Relaxed),
+            cache_excluded: self.state.metrics.cache_excluded.load(Ordering::Relaxed),
+            cache_catalog_skipped: self
+                .state
+                .metrics
+                .cache_catalog_skipped
+                .load(Ordering::Relaxed),
+            cache_time_travel_skipped: self
+                .state
+                .metrics
+                .cache_time_travel_skipped
+                .load(Ordering::Relaxed),
+            cache_ambiguous_skipped: self
+                .state
+                .metrics
+                .cache_ambiguous_skipped
                 .load(Ordering::Relaxed),
             admission_waited: self.state.metrics.admission_waited.load(Ordering::Relaxed),
             admission_timeouts: self

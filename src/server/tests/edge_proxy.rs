@@ -46,6 +46,158 @@ fn compound_txn_strings_still_invalidate() {
     assert!(!ewni(false, "SELECT v FROM t"));
 }
 
+/// R6-2: a string of more than one statement is read one statement at a
+/// time, split at the lexer's `;`. A string of reads (and bare transaction
+/// control) invalidates nothing: it used to flush every edge entry, since
+/// `write_tables` gives no table set for more than one statement. One with a
+/// write, or with text the backends may split differently, invalidates.
+#[test]
+fn multi_statement_reads_do_not_invalidate() {
+    for sql in [
+        "SELECT a FROM t1; SELECT b FROM t2",
+        "SELECT a FROM t1; SELECT b FROM t2;",
+        "SELECT 'a;b' FROM t",
+        "/* x */ SELECT 1; -- y\nSELECT 2",
+        "BEGIN; SELECT a FROM t; ROLLBACK",
+    ] {
+        assert!(!ewni(false, sql), "{sql:?}");
+    }
+    assert!(!ewni(true, "BEGIN; SELECT a FROM t; ROLLBACK"));
+    for sql in [
+        "SELECT a FROM t1; UPDATE t2 SET v = 1",
+        "SELECT a FROM t1; /* job */ DELETE FROM t2",
+        "SELECT a FROM t1; MERGE BRANCH fix INTO main",
+        "SELECT a FROM t1; COMMIT",
+        "SELECT a FROM t1; SET search_path TO b",
+        "SELECT a FROM t1; \u{131}nsert \u{131}nto kv VALUES (1)",
+        "SELECT E'\\'' ; UPDATE b SET v = 2",
+        "SELECT 1 -- ; \n; SELECT 2",
+    ] {
+        assert!(ewni(false, sql), "{sql:?}");
+    }
+    // A string a routing hint or a plugin sent to the primary as a write
+    // keeps its flush.
+    assert!(ewni(true, "SELECT a FROM t1; SELECT b FROM t2"));
+}
+
+/// A statement this classifier does not list as a write, in a string of
+/// more than one, flushes every edge entry: every such string used to, and
+/// reading it one statement at a time left `REFRESH MATERIALIZED VIEW a;
+/// REFRESH MATERIALIZED VIEW b` (or a `LOCK`, or any statement a backend
+/// adds) flushing nothing. Only reads and bare transaction control are known
+/// to change no rows.
+#[test]
+fn multi_statement_strings_flush_on_any_statement_not_known_quiet() {
+    for sql in [
+        "REFRESH MATERIALIZED VIEW mv_sales; REFRESH MATERIALIZED VIEW mv_users",
+        "SELECT 1; REFRESH MATERIALIZED VIEW CONCURRENTLY mv",
+        "SELECT 1; EXPLAIN ANALYZE UPDATE t SET v = 2",
+        "SELECT 1; LOCK TABLE t IN EXCLUSIVE MODE",
+        "SELECT 1; CHECKPOINT",
+        "SELECT 1; (SELECT 2)",
+        "SELECT 1; selection()",
+    ] {
+        assert!(ewni(false, sql), "{sql:?}");
+    }
+    for sql in [
+        "SELECT 1; VALUES (1); TABLE t; SHOW search_path",
+        "WITH x AS (SELECT 1) SELECT * FROM x; EXPLAIN SELECT * FROM t",
+        "START TRANSACTION; SELECT 1; SAVEPOINT a; RELEASE a; ROLLBACK",
+    ] {
+        assert!(!ewni(false, sql), "{sql:?}");
+    }
+}
+
+/// R6-2: a `;` inside a literal or a quoted identifier ends no statement, so
+/// a string holding one statement is read as that statement, as it is
+/// without the `;`. The raw `;` used to send it down the multi-statement
+/// rule, where any statement but a read flushes: a CSV export with
+/// `DELIMITER ';'` flushed its table on every edge, a `NOTIFY` whose payload
+/// held a `;` every edge entry.
+#[test]
+fn a_semicolon_inside_a_literal_ends_no_statement() {
+    for sql in [
+        "COPY t TO STDOUT (FORMAT csv, DELIMITER ';')",
+        "NOTIFY jobs, 'id=1;type=x'",
+        "DECLARE c CURSOR FOR SELECT * FROM t WHERE s = 'a;b'",
+        "LISTEN \"a;b\";",
+    ] {
+        assert!(ProxyServer::stmt_has_interior_semicolon(sql), "{sql:?}");
+        assert!(!ewni(false, sql), "{sql:?}");
+    }
+    for sql in [
+        "COPY t FROM STDIN (FORMAT csv, DELIMITER ';')",
+        "UPDATE t SET s = 'a;b'",
+        "NOTIFY jobs, 'a;b'; NOTIFY jobs, 'c'",
+        "SELECT 'a;b'; REFRESH MATERIALIZED VIEW mv",
+    ] {
+        assert!(ewni(false, sql), "{sql:?}");
+    }
+    // One a routing hint or a plugin sent to the primary as a write keeps
+    // its flush.
+    assert!(ewni(true, "NOTIFY jobs, 'a;b'"));
+}
+
+/// The verbs the journal capture counts as writes, and an `EXPLAIN` that
+/// runs what it explains, invalidate on their own too, on both protocols
+/// (the extended one memoizes `is_edge_dml_sql`): `REFRESH MATERIALIZED
+/// VIEW mv` left `SELECT * FROM mv` served until its TTL.
+#[test]
+fn refresh_and_explain_analyze_invalidate() {
+    for sql in [
+        "REFRESH MATERIALIZED VIEW mv",
+        "/* nightly */ refresh materialized view concurrently mv",
+        "COMMENT ON TABLE t IS 'x'",
+        "SECURITY LABEL ON TABLE t IS 'secret'",
+        "IMPORT FOREIGN SCHEMA s FROM SERVER f INTO public",
+        "REASSIGN OWNED BY a TO b",
+        "EXPLAIN ANALYZE DELETE FROM t",
+        "EXPLAIN (ANALYSE, BUFFERS) UPDATE t SET v = 2",
+    ] {
+        assert!(ProxyServer::is_edge_dml_sql(sql), "{sql:?}");
+        assert!(ewni(false, sql), "{sql:?}");
+    }
+    for sql in [
+        "EXPLAIN SELECT * FROM t",
+        "EXPLAIN UPDATE t SET v = 'analyze'",
+        "EXPLAIN SELECT 1 -- analyze",
+    ] {
+        assert!(!ProxyServer::is_edge_dml_sql(sql), "{sql:?}");
+        assert!(!ewni(false, sql), "{sql:?}");
+    }
+    assert!(crate::edge::fingerprint::write_tables("REFRESH MATERIALIZED VIEW mv").is_empty());
+    assert_eq!(
+        crate::edge::fingerprint::write_tables("EXPLAIN ANALYZE DELETE FROM t"),
+        ["t"]
+    );
+}
+
+/// A `WITH` read is no data-modifying CTE because a literal, a comment or a
+/// quoted identifier holds a verb's text: each used to flush its tables on
+/// every run (`[edge]`, both protocols). Backend-ambiguous text may hold a
+/// verb.
+#[test]
+fn verbs_in_literals_and_comments_are_no_cte_writes() {
+    for sql in [
+        "WITH recent AS (SELECT id, op FROM audit_log WHERE op = 'delete') \
+         SELECT count(*) FROM recent",
+        "WITH recent AS (SELECT id FROM audit_log) -- update nightly\n\
+         SELECT count(*) FROM recent",
+        "WITH recent AS (SELECT \"update\" FROM audit_log) SELECT * FROM recent",
+    ] {
+        assert!(!ProxyServer::is_edge_dml_sql(sql), "{sql:?}");
+        assert!(!ewni(false, sql), "{sql:?}");
+    }
+    for sql in [
+        "WITH d AS (DELETE FROM t WHERE op = 'x' RETURNING id) SELECT * FROM d",
+        "WITH d AS (SELECT 1) INSERT INTO t SELECT * FROM d",
+        "WITH d AS (SELECT 'C:\\' AS p) SELECT * FROM d",
+    ] {
+        assert!(ProxyServer::is_edge_dml_sql(sql), "{sql:?}");
+        assert!(ewni(false, sql), "{sql:?}");
+    }
+}
+
 #[test]
 fn copy_from_counts_as_write() {
     assert!(ewni(false, "COPY t FROM STDIN"));
@@ -110,6 +262,72 @@ fn procedural_and_txn_end_trigger_invalidation() {
             !ewni(false, sql),
             "{sql:?} must stay exempt on the simple path"
         );
+    }
+}
+
+/// The simple-protocol write check reads the first word past leading
+/// comments (the routing classifier does not), knows `MERGE` (PostgreSQL's
+/// `MERGE INTO … USING …`, HeliosDB-Nano's `MERGE BRANCH`), and takes a
+/// statement whose leading comment the backends end in different places
+/// for a write of unknown scope. Each of these used to invalidate nothing.
+#[test]
+fn merge_and_writes_behind_comments_invalidate() {
+    for sql in [
+        "MERGE BRANCH fix INTO main",
+        "MERGE INTO kv USING src ON true WHEN MATCHED THEN DELETE",
+        "/* job */ UPDATE kv SET v = 2",
+        "-- v2\nCREATE OR REPLACE VIEW v AS SELECT 1",
+        "/* x */ SET search_path TO b",
+        "/* x */ COMMIT",
+        "/* a /* b */ SELECT 1",
+        "-- x\rSELECT 1\nDELETE FROM kv",
+    ] {
+        assert!(ewni(false, sql), "{sql:?}");
+    }
+    for sql in [
+        "/* x */ BEGIN",
+        "/* x */ SELECT v FROM kv",
+        "-- c\r\nSELECT 1",
+    ] {
+        assert!(!ewni(false, sql), "{sql:?}");
+    }
+    assert!(ProxyServer::is_edge_dml_sql(
+        "/* job */ UPDATE kv SET v = 2"
+    ));
+    assert!(ProxyServer::is_edge_dml_sql(
+        "-- x\rSELECT 1\nDELETE FROM kv"
+    ));
+    assert!(!ProxyServer::is_edge_dml_sql("/* x */ SELECT v FROM kv"));
+}
+
+/// HeliosDB-Lite matches a keyword upper-cased the Unicode way
+/// (`ınsert ınto kv …`, a dotless `ı`, is an INSERT there). The edge check
+/// read the first word as ASCII and flushed neither on it nor on such a
+/// data-modifying CTE verb, so the cached reads of `kv` stayed served.
+#[test]
+fn a_keyword_lite_upper_cases_is_a_write_of_unknown_scope() {
+    for sql in [
+        "\u{131}nsert \u{131}nto kv values (5)",
+        "/* c */ in\u{17f}ert into kv values (5)",
+        "\u{131}nsert \u{131}nto kv values (5);",
+    ] {
+        assert!(ewni(false, sql), "{sql:?}");
+        assert!(ProxyServer::is_edge_dml_sql(sql), "{sql:?}");
+        assert!(
+            crate::edge::fingerprint::write_tables(sql).is_empty(),
+            "{sql:?}"
+        );
+    }
+    let cte = "WITH c AS (SELECT 1) \u{131}nsert \u{131}nto kv SELECT * FROM c";
+    assert!(ProxyServer::is_edge_dml_sql(cte));
+    assert!(crate::edge::fingerprint::write_tables(cte).is_empty());
+    // Non-ASCII text elsewhere is no verb.
+    for sql in [
+        "WITH c AS (SELECT 'caf\u{e9}') SELECT * FROM c",
+        "SELECT '\u{131}nsert' FROM kv",
+    ] {
+        assert!(!ProxyServer::is_edge_dml_sql(sql), "{sql:?}");
+        assert!(!ewni(false, sql), "{sql:?}");
     }
 }
 
@@ -204,4 +422,47 @@ fn extended_batch_tables_union_and_wildcard() {
         ProxyServer::edge_extended_batch_tables(&["ghost".to_string()], false, &named, &None),
         None
     );
+}
+
+/// `[cache] max_cacheable_response_bytes` is the `[cache]` key a SIGHUP
+/// applies, and the relay's capture takes it from the live config: the
+/// `[edge]` cache's per-entry ceiling follows it, so a response between the
+/// old and the new value is stored instead of buffered and then refused as
+/// oversize.
+#[tokio::test]
+async fn a_sighup_reload_moves_the_edge_entry_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proxy.toml");
+    let nodes = "[[nodes]]\nhost = \"pg-p\"\nport = 5432\nrole = \"primary\"\n";
+    let config_with =
+        |bytes: usize| format!("[cache]\nmax_cacheable_response_bytes = {bytes}\n{nodes}");
+    std::fs::write(&path, config_with(16)).unwrap();
+    let path = path.to_string_lossy().into_owned();
+    let config = crate::config::ProxyConfig::from_file(&path).unwrap();
+    let server = ProxyServer::new(config)
+        .unwrap()
+        .with_config_path(Some(path.clone()));
+    let entry = || crate::edge::CacheEntry {
+        version: 1,
+        response_bytes: bytes::Bytes::from_static(&[b'x'; 24]),
+        tables: vec!["t".to_string()],
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
+    };
+    let key = || crate::edge::CacheKey::new("SELECT v FROM t", "p");
+    let edge = &server.state.edge_cache;
+    assert!(!edge.insert_if_fresh(key(), entry()), "24 bytes > 16");
+
+    std::fs::write(&path, config_with(32)).unwrap();
+    server.reload_config().await;
+    assert_eq!(
+        server
+            .state
+            .live_config
+            .load()
+            .cache
+            .max_cacheable_response_bytes,
+        32
+    );
+    assert!(edge.insert_if_fresh(key(), entry()), "24 bytes <= 32");
+    assert_eq!(edge.stats().oversize_rejected, 1);
 }

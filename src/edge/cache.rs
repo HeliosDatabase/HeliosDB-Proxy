@@ -45,7 +45,7 @@ use bytes::Bytes;
 use lru::LruCache;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -175,8 +175,9 @@ struct EdgeCacheInner {
     oversize_rejected: AtomicU64,
     /// Per-entry body ceiling (`[cache] max_cacheable_response_bytes`).
     /// `max_entries` bounds the entry COUNT only, so without this one
-    /// giant entry blows the whole memory budget on its own.
-    max_entry_bytes: usize,
+    /// giant entry blows the whole memory budget on its own. A SIGHUP reload
+    /// moves it with the capture ceiling ([`EdgeCache::set_max_entry_bytes`]).
+    max_entry_bytes: AtomicUsize,
     /// Aggregate retained-byte budget (C-01). `usize::MAX` = disabled.
     max_total_bytes: usize,
     /// Count of gap flushes (C-03).
@@ -254,7 +255,7 @@ impl EdgeCache {
                 invalidations: AtomicU64::new(0),
                 evictions: AtomicU64::new(0),
                 oversize_rejected: AtomicU64::new(0),
-                max_entry_bytes,
+                max_entry_bytes: AtomicUsize::new(max_entry_bytes),
                 max_total_bytes,
                 gap_flushes: AtomicU64::new(0),
             }),
@@ -266,6 +267,17 @@ impl EdgeCache {
     /// index is rebuilt consistently by every mutation path).
     fn lock(&self) -> MutexGuard<'_, MapState> {
         self.inner.map.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Move the per-entry body ceiling (`[cache]
+    /// max_cacheable_response_bytes` after a SIGHUP reload, which the relay's
+    /// capture follows at once): later stores are checked against it, while
+    /// entries already stored stay until they expire, are evicted or are
+    /// invalidated.
+    pub fn set_max_entry_bytes(&self, max_entry_bytes: usize) {
+        self.inner
+            .max_entry_bytes
+            .store(max_entry_bytes, Ordering::Relaxed);
     }
 
     /// This process's per-boot epoch (home role: stamped into every
@@ -400,7 +412,7 @@ impl EdgeCache {
     /// the data path is the first line of defence; this is the one that
     /// holds for any other caller.
     fn oversize(&self, entry: &CacheEntry) -> bool {
-        if entry.response_bytes.len() > self.inner.max_entry_bytes {
+        if entry.response_bytes.len() > self.inner.max_entry_bytes.load(Ordering::Relaxed) {
             self.inner.oversize_rejected.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -1101,6 +1113,24 @@ mod tests {
         );
         assert!(unbounded.get(&CacheKey::new("big", "p")).is_some());
         assert_eq!(unbounded.stats().oversize_rejected, 0);
+    }
+
+    /// A SIGHUP that changes `[cache] max_cacheable_response_bytes` moves the
+    /// capture ceiling at once; the per-entry ceiling follows, so a capture
+    /// within the new one is stored instead of refused as oversize.
+    #[test]
+    fn the_entry_ceiling_moves_with_a_reload() {
+        let c = EdgeCache::with_limits(10, 16);
+        let body = entry(1, &[b'x'; 24], &["users"], Duration::from_secs(60));
+        assert!(!c.insert_if_fresh(CacheKey::new("a", "p"), body.clone()));
+        c.set_max_entry_bytes(32);
+        assert!(c.insert_if_fresh(CacheKey::new("a", "p"), body.clone()));
+        assert!(c.get(&CacheKey::new("a", "p")).is_some());
+        // Lowered again: later stores are refused, the stored one stays.
+        c.set_max_entry_bytes(16);
+        assert!(!c.insert_if_fresh(CacheKey::new("b", "p"), body));
+        assert!(c.get(&CacheKey::new("a", "p")).is_some());
+        assert_eq!(c.stats().oversize_rejected, 2);
     }
 
     #[test]

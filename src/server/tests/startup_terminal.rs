@@ -323,6 +323,50 @@ async fn startup_capacity_retry_can_succeed_without_publishing_refusal() {
     );
 }
 
+/// The pass-through startup relay notes the backend's `server_version`: a
+/// HeliosDB one sets the result caches' sticky flag (their keys keep the
+/// text as written, a canonical semantic tier turns off) before the session
+/// runs anything; PostgreSQL's leaves it unset.
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+#[tokio::test]
+async fn startup_notes_a_heliosdb_server_version() {
+    for (version, heliosdb) in [
+        (&b"18.4"[..], false),
+        (&b"16.0 (HeliosDB Nano 4.41.0)"[..], true),
+        (&b"17.0 (HeliosDB-Lite 2.0)"[..], true),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut parameter = b"server_version\0".to_vec();
+        parameter.extend_from_slice(version);
+        parameter.push(0);
+        let mut success = auth_request(0, b"");
+        success.extend(wire_frame(b'S', &parameter));
+        success.extend(wire_frame(b'K', &[0, 0, 0, 7, 0, 0, 0, 9]));
+        success.extend(wire_frame(b'Z', b"I"));
+        let backend = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_startup(&mut stream).await;
+            stream.write_all(&success).await.unwrap();
+            let _ = through_eof(&mut stream).await;
+        });
+        let (mut client, handler, state) = frontend(config_for(address)).await;
+        for _ in 0..4 {
+            read_frame(&mut client).await;
+        }
+        assert_eq!(
+            state.heliosdb_backend.load(Ordering::Acquire),
+            heliosdb,
+            "{}",
+            String::from_utf8_lossy(version)
+        );
+        client.write_all(&wire_frame(b'X', b"")).await.unwrap();
+        assert!(through_eof(&mut client).await.is_empty());
+        finish(handler).await.unwrap();
+        finish(backend).await;
+    }
+}
+
 #[tokio::test]
 async fn startup_hba_rejection_remains_one_terminal_error() {
     let mut config = config_for("127.0.0.1:0".parse().unwrap());

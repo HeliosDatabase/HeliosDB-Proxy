@@ -1006,6 +1006,8 @@ impl ProxyServer {
             backend_credential: RwLock::new(None),
             #[cfg(feature = "query-cache")]
             tx_cache_stage: std::sync::Mutex::new(TxCacheStage::default()),
+            #[cfg(feature = "query-cache")]
+            cache_unseen_write: std::sync::atomic::AtomicBool::new(false),
             journal: std::sync::Mutex::new(crate::journal_capture::SessionCapture::new(
                 config.journal.max_statement_bytes,
             )),
@@ -2846,7 +2848,7 @@ impl ProxyServer {
                                                 );
                                             }
                                             let meta = if Self::is_edge_dml_sql(q) {
-                                                Some(crate::edge::fingerprint::tables_only(q))
+                                                Some(crate::edge::fingerprint::write_tables(q))
                                             } else if Self::is_edge_procedural_sql(q)
                                                 || Self::is_edge_txn_end_sql(q)
                                             {

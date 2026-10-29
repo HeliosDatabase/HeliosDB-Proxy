@@ -2750,7 +2750,9 @@ impl AdminServer {
             "invalidations": s.invalidations,
             "stale_rejected": cache.stale_rejected(),
             "fills_raced": cache.fills_raced(),
+            "unseen_write_invalidations": cache.unseen_write_invalidations(),
             "retained_bytes": cache.retained_bytes(),
+            "semantic": cache.semantic_health(),
             "logical_source": cache.logical_stats().map(|l| {
                 use std::sync::atomic::Ordering::Relaxed;
                 serde_json::json!({
@@ -2806,6 +2808,11 @@ impl AdminServer {
                 "Fills not stored because a write raced their backend fetch",
                 cache.fills_raced(),
             ),
+            (
+                "heliosdb_proxy_cache_unseen_write_invalidations_total",
+                "Whole-cache invalidations for a simple-query string a backend may split into a statement the journal capture does not see",
+                cache.unseen_write_invalidations(),
+            ),
         ] {
             let _ = writeln!(
                 output,
@@ -2823,6 +2830,85 @@ impl AdminServer {
              heliosdb_proxy_cache_retained_bytes{{tier=\"l3\"}} {}",
             retained.l1, retained.l2, retained.l3
         );
+        if let Some(h) = cache.semantic_health() {
+            let _ = writeln!(
+                output,
+                "# HELP heliosdb_proxy_cache_semantic_endpoint_state 1 on the embedding endpoint's current state (semantic tier)\n\
+                 # TYPE heliosdb_proxy_cache_semantic_endpoint_state gauge"
+            );
+            for state in [
+                crate::cache::EndpointState::Unknown,
+                crate::cache::EndpointState::Up,
+                crate::cache::EndpointState::Down,
+            ] {
+                let _ = writeln!(
+                    output,
+                    "heliosdb_proxy_cache_semantic_endpoint_state{{state=\"{}\"}} {}",
+                    state.as_str(),
+                    u8::from(h.endpoint == state)
+                );
+            }
+            for (name, kind, help, value) in [
+                (
+                    "heliosdb_proxy_cache_semantic_embed_requests_total",
+                    "counter",
+                    "Column-name embedding calls the semantic tier made (background and probe)",
+                    h.embed_requests,
+                ),
+                (
+                    "heliosdb_proxy_cache_semantic_embed_errors_total",
+                    "counter",
+                    "Embedding calls that failed (error, timeout, non-2xx, bad JSON, wrong dimension, oversized body)",
+                    h.embed_errors,
+                ),
+                (
+                    "heliosdb_proxy_cache_semantic_embed_skipped_total",
+                    "counter",
+                    "Embeddings not requested: already known or in flight, no memo room while entries hold the byte budget, no permit free, or the endpoint is down",
+                    h.embed_skipped,
+                ),
+                (
+                    "heliosdb_proxy_cache_semantic_approximate_hits_total",
+                    "counter",
+                    "Semantic hits that served a similar column at the same position (subset of the l3 hits)",
+                    h.approximate_hits,
+                ),
+                (
+                    "heliosdb_proxy_cache_semantic_ineligible_total",
+                    "counter",
+                    "Reads hinted cache=semantic outside the tier's grammar, left to L1/L2",
+                    h.ineligible,
+                ),
+                (
+                    "heliosdb_proxy_cache_semantic_too_large_total",
+                    "counter",
+                    "Results not stored in the semantic tier because their entry alone exceeds semantic_max_bytes, left to L1/L2",
+                    h.too_large,
+                ),
+                (
+                    "heliosdb_proxy_cache_semantic_entries",
+                    "gauge",
+                    "Entries the semantic tier retains",
+                    h.entries,
+                ),
+                (
+                    "heliosdb_proxy_cache_semantic_embeddings",
+                    "gauge",
+                    "Column-name embeddings the semantic tier remembers",
+                    h.embeddings,
+                ),
+            ] {
+                let _ = writeln!(output, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}");
+            }
+            let _ = writeln!(
+                output,
+                "# HELP heliosdb_proxy_cache_semantic_embed_seconds Time spent in embedding calls\n\
+                 # TYPE heliosdb_proxy_cache_semantic_embed_seconds summary\n\
+                 heliosdb_proxy_cache_semantic_embed_seconds_sum {}\n\
+                 heliosdb_proxy_cache_semantic_embed_seconds_count {}",
+                h.embed_seconds_sum, h.embed_seconds_count
+            );
+        }
         if let Some(l) = cache.logical_stats() {
             use std::sync::atomic::Ordering::Relaxed;
             for (name, kind, help, value) in [
@@ -2949,12 +3035,48 @@ impl AdminServer {
         ));
 
         output.push_str(
-            "# HELP heliosdb_proxy_cache_capture_oversize_total Cacheable reads not cached              because the response exceeded cache.max_cacheable_response_bytes\n",
+            "# HELP heliosdb_proxy_cache_capture_oversize_total Cacheable reads not cached because the response exceeded cache.max_cacheable_response_bytes\n",
         );
         output.push_str("# TYPE heliosdb_proxy_cache_capture_oversize_total counter\n");
         output.push_str(&format!(
             "heliosdb_proxy_cache_capture_oversize_total {}\n",
             metrics.cache_capture_oversize
+        ));
+
+        output.push_str(
+            "# HELP heliosdb_proxy_cache_excluded_total Cacheable reads neither result cache looked up or stored because they name a table of cache.exclude_tables\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_cache_excluded_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_cache_excluded_total {}\n",
+            metrics.cache_excluded
+        ));
+
+        output.push_str(
+            "# HELP heliosdb_proxy_cache_catalog_skipped_total Cacheable reads no result cache tier looked up or stored because they may name a system catalog relation (pg_*, information_schema)\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_cache_catalog_skipped_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_cache_catalog_skipped_total {}\n",
+            metrics.cache_catalog_skipped
+        ));
+
+        output.push_str(
+            "# HELP heliosdb_proxy_cache_time_travel_skipped_total Cacheable reads no result cache tier looked up or stored because a comment holds AS OF or VERSIONS BETWEEN\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_cache_time_travel_skipped_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_cache_time_travel_skipped_total {}\n",
+            metrics.cache_time_travel_skipped
+        ));
+
+        output.push_str(
+            "# HELP heliosdb_proxy_cache_ambiguous_text_skipped_total Cacheable reads no result cache tier looked up or stored because PostgreSQL and HeliosDB-Nano/Lite may read their text differently\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_cache_ambiguous_text_skipped_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_cache_ambiguous_text_skipped_total {}\n",
+            metrics.cache_ambiguous_skipped
         ));
 
         output.push_str(
@@ -3182,6 +3304,10 @@ impl AdminState {
                 bytes_sent: 0,
                 failovers: 0,
                 cache_capture_oversize: 0,
+                cache_excluded: 0,
+                cache_catalog_skipped: 0,
+                cache_time_travel_skipped: 0,
+                cache_ambiguous_skipped: 0,
                 admission_waited: 0,
                 admission_timeouts: 0,
                 admission_queue_depth: 0,
@@ -3452,6 +3578,18 @@ struct MetricsResponse {
     /// Cacheable reads whose response outgrew
     /// `[cache] max_cacheable_response_bytes` and were therefore not cached.
     cache_capture_oversize: u64,
+    /// Cacheable reads kept out of both result caches by
+    /// `[cache] exclude_tables`.
+    cache_excluded: u64,
+    /// Cacheable reads kept out of every result cache tier because they may
+    /// name a system catalog relation (`pg_*`, `information_schema`).
+    cache_catalog_skipped: u64,
+    /// Cacheable reads kept out of every result cache tier because a comment
+    /// holds `AS OF` / `VERSIONS BETWEEN`.
+    cache_time_travel_skipped: u64,
+    /// Cacheable reads kept out of every result cache tier because their
+    /// text is backend-ambiguous.
+    cache_ambiguous_skipped: u64,
     /// In-session Transaction Replay (`tr_mode`): sessions re-homed onto a
     /// replacement backend after a backend fault.
     tr_failovers_total: u64,
@@ -3489,6 +3627,10 @@ impl From<ServerMetricsSnapshot> for MetricsResponse {
             bytes_sent: m.bytes_sent,
             failovers: m.failovers,
             cache_capture_oversize: m.cache_capture_oversize,
+            cache_excluded: m.cache_excluded,
+            cache_catalog_skipped: m.cache_catalog_skipped,
+            cache_time_travel_skipped: m.cache_time_travel_skipped,
+            cache_ambiguous_skipped: m.cache_ambiguous_skipped,
             tr_failovers_total: m.tr.failovers,
             tr_statements_reexecuted_total: m.tr.statements_reexecuted,
             tr_transactions_replayed_total: m.tr.transactions_replayed,
@@ -4351,6 +4493,10 @@ mod tests {
             bytes_sent: 100000,
             failovers: 2,
             cache_capture_oversize: 7,
+            cache_excluded: 11,
+            cache_catalog_skipped: 13,
+            cache_time_travel_skipped: 17,
+            cache_ambiguous_skipped: 19,
             admission_waited: 0,
             admission_timeouts: 0,
             admission_queue_depth: 0,
@@ -4380,6 +4526,10 @@ mod tests {
         assert!(output.contains("heliosdb_proxy_failovers_total 2"));
         // O1: the capture byte-cap counter is scrapeable.
         assert!(output.contains("heliosdb_proxy_cache_capture_oversize_total 7"));
+        assert!(output.contains("heliosdb_proxy_cache_excluded_total 11"));
+        assert!(output.contains("heliosdb_proxy_cache_catalog_skipped_total 13"));
+        assert!(output.contains("heliosdb_proxy_cache_time_travel_skipped_total 17"));
+        assert!(output.contains("heliosdb_proxy_cache_ambiguous_text_skipped_total 19"));
         assert!(output.contains("heliosdb_proxy_connections_rejected_total 7"));
         // F3: in-session Transaction Replay counters are scrapeable.
         assert!(output.contains("heliosdb_proxy_tr_failovers_total 4"));
@@ -4439,6 +4589,10 @@ mod tests {
             bytes_sent: 20000,
             failovers: 1,
             cache_capture_oversize: 3,
+            cache_excluded: 5,
+            cache_catalog_skipped: 6,
+            cache_time_travel_skipped: 8,
+            cache_ambiguous_skipped: 4,
             admission_waited: 0,
             admission_timeouts: 0,
             admission_queue_depth: 0,
@@ -4459,6 +4613,10 @@ mod tests {
         let response = MetricsResponse::from(snapshot);
         assert_eq!(response.connections_active, 70);
         assert_eq!(response.cache_capture_oversize, 3);
+        assert_eq!(response.cache_excluded, 5);
+        assert_eq!(response.cache_catalog_skipped, 6);
+        assert_eq!(response.cache_time_travel_skipped, 8);
+        assert_eq!(response.cache_ambiguous_skipped, 4);
         assert_eq!(response.tr_transactions_replayed_total, 9);
         assert_eq!(response.tr_failovers_total, 0);
     }
@@ -4599,14 +4757,75 @@ mod tests {
             "heliosdb_proxy_cache_misses_total 0",
             "heliosdb_proxy_cache_stale_rejected_total 0",
             "heliosdb_proxy_cache_fills_raced_total 0",
+            "heliosdb_proxy_cache_unseen_write_invalidations_total 0",
             "heliosdb_proxy_cache_retained_bytes{tier=\"l3\"} 0",
         ] {
             assert!(text.contains(line), "missing {line}");
         }
+        assert!(text.contains("heliosdb_proxy_cache_excluded_total 0"));
+        assert!(text.contains("heliosdb_proxy_cache_catalog_skipped_total 0"));
+        assert!(text.contains("heliosdb_proxy_cache_time_travel_skipped_total 0"));
+        assert!(text.contains("heliosdb_proxy_cache_ambiguous_text_skipped_total 0"));
+        assert!(
+            !text.contains("heliosdb_proxy_cache_semantic_"),
+            "no semantic series without the tier"
+        );
         let (_, json) = AdminServer::route_request("GET", "/metrics", None, &state)
             .await
             .unwrap();
         assert_eq!(json["query_cache"]["retained_bytes"]["l1"], 0);
+        assert_eq!(json["query_cache"]["unseen_write_invalidations"], 0);
+        assert!(json["query_cache"]["semantic"].is_null());
+    }
+
+    /// With the semantic tier on and its endpoint down (closed port), the
+    /// probe's failure shows on both metrics surfaces.
+    #[cfg(feature = "query-cache")]
+    #[tokio::test]
+    async fn semantic_series_on_metrics() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let cache = Arc::new(crate::cache::QueryCache::new(crate::cache::CacheConfig {
+            l3: crate::cache::L3Config {
+                enabled: true,
+                similarity_threshold: 0.9,
+                embedding_endpoint: endpoint,
+                embedding_timeout: std::time::Duration::from_millis(500),
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        cache.semantic_cache().unwrap().probe().await;
+        let state = Arc::new(AdminState::new());
+        state.with_query_cache(cache).await;
+        let (_, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
+            .await
+            .unwrap();
+        let text = body["text"].as_str().unwrap();
+        for line in [
+            "heliosdb_proxy_cache_semantic_endpoint_state{state=\"unknown\"} 0",
+            "heliosdb_proxy_cache_semantic_endpoint_state{state=\"up\"} 0",
+            "heliosdb_proxy_cache_semantic_endpoint_state{state=\"down\"} 1",
+            "heliosdb_proxy_cache_semantic_embed_requests_total 1",
+            "heliosdb_proxy_cache_semantic_embed_errors_total 1",
+            "heliosdb_proxy_cache_semantic_embed_skipped_total 0",
+            "heliosdb_proxy_cache_semantic_approximate_hits_total 0",
+            "heliosdb_proxy_cache_semantic_ineligible_total 0",
+            "heliosdb_proxy_cache_semantic_too_large_total 0",
+            "heliosdb_proxy_cache_semantic_entries 0",
+            "heliosdb_proxy_cache_semantic_embeddings 0",
+            "heliosdb_proxy_cache_semantic_embed_seconds_count 1",
+            "# TYPE heliosdb_proxy_cache_semantic_embed_seconds summary",
+        ] {
+            assert!(text.contains(line), "missing {line}:\n{text}");
+        }
+        let (_, json) = AdminServer::route_request("GET", "/metrics", None, &state)
+            .await
+            .unwrap();
+        let semantic = &json["query_cache"]["semantic"];
+        assert_eq!(semantic["endpoint"], "down");
+        assert_eq!(semantic["embed_errors"], 1);
     }
 
     #[tokio::test]

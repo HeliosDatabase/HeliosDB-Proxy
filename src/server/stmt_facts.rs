@@ -87,7 +87,7 @@ pub(super) struct StmtFacts<'a> {
     /// A `;` before the (optional) trailing one — i.e. the simple-query string
     /// carries more than one statement, so no leading-keyword classification
     /// can vouch for what follows.
-    #[cfg(feature = "edge-proxy")]
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     pub(super) has_interior_semicolon: Option<bool>,
     /// `stmt_leaves_session_state`: not provably session-neutral.
     #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
@@ -107,7 +107,7 @@ impl<'a> StmtFacts<'a> {
         Self {
             sql,
             is_write: None,
-            #[cfg(feature = "edge-proxy")]
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
             has_interior_semicolon: None,
             #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
             leaves_session_state: None,
@@ -163,7 +163,7 @@ impl<'a> StmtFacts<'a> {
     }
 
     /// See [`ProxyServer::stmt_has_interior_semicolon`].
-    #[cfg(feature = "edge-proxy")]
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     pub(super) fn has_interior_semicolon(&mut self) -> bool {
         Self::memo(
             &mut self.has_interior_semicolon,

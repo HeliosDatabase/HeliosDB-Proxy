@@ -357,6 +357,71 @@ impl ProxyServer {
         !VOLATILE.iter().any(|v| lower.contains(v))
     }
 
+    /// Whether a result cache would look up a cacheable read of `session`
+    /// outside an explicit transaction: the query cache runs, or the edge
+    /// cache is on and the session is still eligible for it. The relay's
+    /// refusal scans ([`Self::cache_refuses`]) and their counters run only
+    /// then.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) fn result_cache_consulted(
+        session: &ClientSession,
+        state: &ServerState,
+        config: &ProxyConfig,
+    ) -> bool {
+        #[cfg(feature = "query-cache")]
+        let query_cache = state.query_cache.is_some();
+        #[cfg(not(feature = "query-cache"))]
+        let query_cache = {
+            let _ = state;
+            false
+        };
+        #[cfg(feature = "edge-proxy")]
+        let edge = config.edge.enabled
+            && !session
+                .edge_ineligible
+                .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "edge-proxy"))]
+        let edge = {
+            let _ = (session, config);
+            false
+        };
+        query_cache || edge
+    }
+
+    /// Whether neither result cache may look up, capture or store the
+    /// cacheable read `sql` (the forwarded text), in any tier (L1, L2, L3,
+    /// `[edge]`), counting why: it names a system catalog relation
+    /// (`sql_text::names_system_catalog`: session-dependent, changed by DDL
+    /// no write announces, answered by raw-text matching on HeliosDB-Nano), a
+    /// comment of it holds a time-travel clause (the keys leave comments
+    /// out, HeliosDB-Nano and HeliosDB-Lite read it), its text is
+    /// backend-ambiguous (PostgreSQL and HeliosDB-Nano/Lite may read
+    /// different statements: `sql_text::uncacheable_text`), or it names a
+    /// table of `[cache] exclude_tables`. The caller runs it only for a read
+    /// a cache would look up.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) fn cache_refuses(state: &ServerState, sql: &str) -> bool {
+        use crate::sql_text::UncacheableText;
+        let counter = if crate::sql_text::names_system_catalog(sql.as_bytes()) {
+            &state.metrics.cache_catalog_skipped
+        } else if let Some(why) = crate::sql_text::uncacheable_text(sql) {
+            match why {
+                UncacheableText::TimeTravelComment => &state.metrics.cache_time_travel_skipped,
+                UncacheableText::AmbiguousText => &state.metrics.cache_ambiguous_skipped,
+            }
+        } else if state
+            .table_exclusions
+            .as_deref()
+            .is_some_and(|exclusions| exclusions.matches(sql))
+        {
+            &state.metrics.cache_excluded
+        } else {
+            return false;
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
     /// Decide whether a read query is safe to serve from / store in the cache,
     /// and build its `CacheContext`. Returns `None` for anything not a plain,
     /// deterministic, non-transactional SELECT.

@@ -1,5 +1,10 @@
 use super::*;
 
+/// What a backend's `server_version` contains when it is HeliosDB-Nano or
+/// HeliosDB-Lite (compared ASCII case-insensitively).
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+const HELIOSDB_VERSION_MARK: &[u8] = b"HeliosDB";
+
 /// How a request that is neither a write nor hint-forced to a node is routed
 /// (see [`ProxyServer::choose_target_node`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -637,11 +642,12 @@ impl ProxyServer {
             .await
             {
                 Ok(frames) => {
+                    Self::note_backend_startup(state, target, &frames);
                     break (
                         backend,
                         Self::reports_hot_standby(&frames),
                         Self::backend_key_data(&frames),
-                    )
+                    );
                 }
                 Err(ProxyError::PoolExhausted(msg)) => {
                     if !Self::backend_capacity_backoff(
@@ -831,6 +837,93 @@ impl ProxyServer {
             at += 1 + len;
         }
         false
+    }
+
+    /// Note every `ParameterStatus` of a backend connection's startup frames
+    /// (as `complete_backend_auth` returns them):
+    /// [`Self::note_parameter_status`].
+    pub(super) fn note_backend_startup(state: &ServerState, node: &str, frames: &[u8]) {
+        let mut at = 0;
+        while let Some(head) = frames.get(at..at + 5) {
+            let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let Some(frame) = frames.get(at..at + 1 + len) else {
+                return;
+            };
+            if head[0] == b'S' {
+                Self::note_parameter_status(state, node, frame);
+            }
+            at += 1 + len;
+        }
+    }
+
+    /// Note one backend `ParameterStatus` frame (tag and length included) a
+    /// connection's startup sent. A `server_version` naming HeliosDB (Nano
+    /// sends `16.0 (HeliosDB Nano x.y.z)`, Lite `17.0 (HeliosDB-Lite 2.0)`;
+    /// matched ASCII case-insensitively) sets the process-wide sticky flag
+    /// before the connection answers any read, so every cached result from
+    /// such a backend is keyed accordingly: the result caches key reads by
+    /// their text as written (whitespace and comments included) from then on,
+    /// and a semantic tier with `[cache] semantic_match = "canonical"`
+    /// (PostgreSQL semantics) neither stores nor serves, with one warning per
+    /// process naming the key and the node. Entries stored before are
+    /// retired.
+    pub(super) fn note_parameter_status(state: &ServerState, node: &str, frame: &[u8]) {
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        {
+            let mut parts = frame.get(5..).unwrap_or_default().split(|&b| b == 0);
+            let (Some(name), Some(value)) = (parts.next(), parts.next()) else {
+                return;
+            };
+            if name != b"server_version"
+                || !value
+                    .windows(HELIOSDB_VERSION_MARK.len())
+                    .any(|w| w.eq_ignore_ascii_case(HELIOSDB_VERSION_MARK))
+            {
+                return;
+            }
+            // The query cache's own flag first, for every such startup (an
+            // idempotent swap): a second HeliosDB connection that finds the
+            // server-wide flag already set, while its first setter has not
+            // reached this point yet, must not answer reads with the cache
+            // still keying the PostgreSQL way (collapsed L2 keys, a
+            // canonical semantic tier).
+            #[cfg(feature = "query-cache")]
+            if let Some(qc) = state.query_cache.as_ref() {
+                qc.note_heliosdb_backend();
+            }
+            if state
+                .heliosdb_backend
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                return;
+            }
+            let version = String::from_utf8_lossy(value);
+            #[cfg(feature = "query-cache")]
+            if let Some(qc) = state.query_cache.as_ref() {
+                let l3 = &qc.config().l3;
+                if l3.enabled && l3.semantic_match == crate::config::SemanticMatch::Canonical {
+                    tracing::warn!(
+                        node = %node,
+                        server_version = %version,
+                        "cache.semantic_match = \"canonical\" assumes PostgreSQL semantics, but \
+                         backend {node} reports a HeliosDB server_version ({version}), whose \
+                         engines re-read the raw statement text: the semantic tier neither \
+                         stores nor serves from now on (hinted reads count in \
+                         semantic_ineligible); set cache.semantic_match = \"verbatim\""
+                    );
+                }
+            }
+            #[cfg(feature = "edge-proxy")]
+            state.edge_cache.flush_all();
+            tracing::info!(
+                node = %node,
+                server_version = %version,
+                "backend reports a HeliosDB server_version: the result caches key reads by \
+                 their text as written (whitespace and comments included) from now on"
+            );
+        }
+        #[cfg(not(any(feature = "query-cache", feature = "edge-proxy")))]
+        let _ = (state, node, frame);
     }
 
     /// Take a slot on `node`'s `max_connections` cap (H-05) before opening a

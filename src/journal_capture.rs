@@ -84,7 +84,12 @@ pub enum StmtKind {
     Copy,
     /// `EXECUTE name`: a session-scoped prepared statement the journal
     /// cannot reproduce on another connection. Journaled and marks the
-    /// transaction incomplete.
+    /// transaction incomplete. So is a statement whose first word holds a
+    /// non-ASCII character other than a space ([`first_word_not_ascii`]:
+    /// HeliosDB-Lite reads `ınsert` as `INSERT`) and (in builds with a result
+    /// cache) one whose first word lies behind text PostgreSQL and
+    /// HeliosDB-Nano/Lite read differently (`sql_text::leading_rest`): what
+    /// it does depends on the backend.
     Opaque,
 }
 
@@ -95,9 +100,10 @@ impl StmtKind {
     fn incomplete_reason(&self) -> Option<&'static str> {
         match self {
             StmtKind::Copy => Some("COPY ... FROM data is not captured by the journal"),
-            StmtKind::Opaque => {
-                Some("EXECUTE of a session-scoped prepared statement cannot be reproduced")
-            }
+            StmtKind::Opaque => Some(
+                "EXECUTE of a session-scoped prepared statement, or a statement the backends \
+                 read differently, cannot be reproduced",
+            ),
             _ => None,
         }
     }
@@ -116,6 +122,19 @@ fn word_eq(word: &str, kw: &str) -> bool {
     word.len() == kw.len() && word.eq_ignore_ascii_case(kw)
 }
 
+/// Whether the first word of `s` (a statement from its first word) holds a
+/// character that is neither ASCII nor a (Unicode) space. HeliosDB-Lite
+/// (sqlparser) matches a keyword upper-cased the Unicode way, so
+/// `ınsert ınto kv …` (a dotless `ı`, as a Turkish-locale `toLowerCase()`
+/// writes it) is an INSERT there, while the proxy reads keywords as ASCII:
+/// what such a statement is, is unknown.
+pub(crate) fn first_word_not_ascii(s: &str) -> bool {
+    let (_, rest) = first_word(s);
+    rest.chars()
+        .next()
+        .is_some_and(|c| !c.is_ascii() && !c.is_whitespace())
+}
+
 /// Savepoint name: the next identifier, optionally quoted, after `rest`.
 fn savepoint_name(rest: &str) -> String {
     let rest = rest.trim_start();
@@ -127,9 +146,39 @@ fn savepoint_name(rest: &str) -> String {
     w.to_string()
 }
 
+/// `sql` past its leading whitespace and comments, a Unicode space (U+00A0,
+/// U+3000, …) included: HeliosDB-Nano and HeliosDB-Lite read one as
+/// whitespace and run the statement after it (`\u{a0}UPDATE kv …` writes
+/// `kv` there), while PostgreSQL fails such a statement.
+fn statement_body(sql: &str) -> &str {
+    let mut s = crate::protocol::skip_leading_comments(sql);
+    loop {
+        let rest = s.trim_start_matches(char::is_whitespace);
+        if rest.len() == s.len() {
+            return s;
+        }
+        s = crate::protocol::skip_leading_comments(rest);
+    }
+}
+
 /// Classify one statement (no interior `;`).
 fn classify_single(sql: &str) -> StmtKind {
-    let s = crate::protocol::skip_leading_comments(sql);
+    // The result caches' lexer reads the leading comments first (R6-3): when
+    // the backends may end one in different places, the first word below is
+    // PostgreSQL's reading only (`/* purge /tmp/* entries */ DELETE FROM s`
+    // is an unterminated comment there and a DELETE on HeliosDB-Nano), so
+    // the statement is one the journal cannot reproduce, and its C-02 scope
+    // is unknown (everything is invalidated).
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    if crate::sql_text::leading_rest(sql) {
+        return StmtKind::Opaque;
+    }
+    let s = statement_body(sql);
+    // A first word the proxy cannot read as HeliosDB-Lite does: a statement
+    // the journal cannot reproduce, of unknown scope.
+    if first_word_not_ascii(s) {
+        return StmtKind::Opaque;
+    }
     let (w, rest) = first_word(s);
     let (w2, rest2) = first_word(rest.trim_start());
     let upper = |kw: &str| word_eq(w, kw);
@@ -203,10 +252,18 @@ fn classify_single(sql: &str) -> StmtKind {
         };
     }
     if upper("WITH") {
-        return if contains_ci(s, "INSERT")
-            || contains_ci(s, "UPDATE")
-            || contains_ci(s, "DELETE")
-            || contains_ci(s, "MERGE")
+        // Upper-cased the Unicode way when it is not ASCII, as HeliosDB-Lite
+        // matches keywords: `ınsert` (a dotless `ı`) holds `INSERT` then.
+        let upper_text;
+        let text = if s.is_ascii() {
+            s
+        } else {
+            upper_text = s.to_uppercase();
+            upper_text.as_str()
+        };
+        return if ["INSERT", "UPDATE", "DELETE", "MERGE"]
+            .iter()
+            .any(|kw| contains_ci(text, kw))
         {
             StmtKind::Write
         } else {
@@ -224,8 +281,10 @@ fn classify_single(sql: &str) -> StmtKind {
 }
 
 /// Split a simple-query string into statements on `;` outside quotes,
-/// dollar-quoted strings and comments. Returns the string itself when it
-/// holds a single statement.
+/// dollar-quoted strings and comments (a `--` comment ends at `\n` or `\r`,
+/// as PostgreSQL ends it; HeliosDB-Nano runs on to `\n`, so this splits at
+/// least where either does). Returns the string itself when it holds a
+/// single statement.
 pub fn split_statements(sql: &str) -> Vec<&str> {
     let b = sql.as_bytes();
     let mut out = Vec::new();
@@ -247,8 +306,10 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
                     i += 1;
                 }
             }
+            // PostgreSQL ends a `--` comment at `\n` or `\r`: in
+            // `SELECT 1 -- x\r; DELETE FROM b` it runs the DELETE.
             b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
-                while i < b.len() && b[i] != b'\n' {
+                while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
                     i += 1;
                 }
             }
@@ -259,17 +320,27 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
                 }
                 i += 1;
             }
-            b'$' => {
-                // $tag$ ... $tag$
+            // `$tag$ … $tag$`, with PostgreSQL's tag rule: empty, or a letter,
+            // `_` or a non-ASCII byte, then those or digits (`$é$` is a tag,
+            // `$1$` is not). A `$` that continues an identifier (`a$b$`,
+            // `a$$`) opens nothing: PostgreSQL's lexer reads it as part of the
+            // name, and `SELECT 1 AS a$$ ; UPDATE b …` runs the UPDATE. Where
+            // HeliosDB-Nano or HeliosDB-Lite open one otherwise, the result
+            // caches' lexer reads backend-ambiguous text instead.
+            b'$' if i == 0 || !crate::replay_sql::ident_cont(b[i - 1]) => {
                 let tag_end = b[i + 1..]
                     .iter()
                     .position(|&c| c == b'$')
                     .map(|p| i + 1 + p);
                 if let Some(te) = tag_end {
                     let tag = &b[i..=te];
-                    if tag[1..tag.len() - 1]
-                        .iter()
-                        .all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                    let inner = &tag[1..tag.len() - 1];
+                    if inner
+                        .first()
+                        .is_none_or(|&c| crate::replay_sql::ident_start(c))
+                        && inner
+                            .iter()
+                            .all(|&c| crate::replay_sql::ident_start(c) || c.is_ascii_digit())
                     {
                         let mut j = te + 1;
                         let mut closed = false;
@@ -1233,6 +1304,53 @@ mod tests {
         assert_eq!(classify("VACUUM t").0, StmtKind::Read);
         assert_eq!(classify("CALL p()").0, StmtKind::Write);
         assert_eq!(classify("").0, StmtKind::Read);
+        // HeliosDB-Nano and HeliosDB-Lite read a Unicode space as
+        // whitespace: the write after one is a write there.
+        assert_eq!(classify("\u{a0}UPDATE kv SET v = 2").0, StmtKind::Write);
+        assert_eq!(
+            classify("\u{3000}/* c */\u{a0}INSERT INTO kv VALUES (1)").0,
+            StmtKind::Write
+        );
+        assert_eq!(
+            classify("\u{a0}COMMIT"),
+            (StmtKind::Control(Control::Commit), false)
+        );
+        // A first word holding another non-ASCII character is unknown
+        // (every backend rejects this one).
+        assert_eq!(classify("\u{e9}UPDATE kv SET v = 2").0, StmtKind::Opaque);
+    }
+
+    /// HeliosDB-Lite (sqlparser) matches a keyword upper-cased the Unicode
+    /// way: `ınsert ınto kv …` (a dotless `ı`, which a Turkish-locale
+    /// `toLowerCase()` writes) inserts there, and `ſ` (long s) is `S`. The
+    /// capture read the first word as ASCII letters (none) and classified the
+    /// write a read: nothing was journaled and no cache was invalidated. Such
+    /// a first word is a statement of unknown scope now, and a
+    /// data-modifying CTE verb is found upper-cased.
+    #[test]
+    fn a_keyword_lite_upper_cases_is_not_read_as_ascii() {
+        for sql in [
+            "\u{131}nsert \u{131}nto kv values (5)",
+            "in\u{17f}ert into kv values (5)",
+            "  /* c */ DELETE FROM kv; \u{131}nsert \u{131}nto kv values (5)",
+            "\u{17f}elect 1; DELETE FROM kv",
+        ] {
+            assert_eq!(classify(sql).0, StmtKind::Opaque, "{sql:?}");
+        }
+        assert_eq!(
+            classify("WITH c AS (SELECT 1) \u{131}nsert \u{131}nto kv SELECT * FROM c").0,
+            StmtKind::Write
+        );
+        // Non-ASCII text elsewhere, and a Unicode space, change nothing.
+        assert_eq!(
+            classify("WITH c AS (SELECT 'caf\u{e9}') SELECT * FROM c").0,
+            StmtKind::Read
+        );
+        assert_eq!(classify("SELECT '\u{131}nsert' FROM t").0, StmtKind::Read);
+        assert_eq!(
+            classify("UPDATE\u{a0}kv SET v = 'caf\u{e9}'").0,
+            StmtKind::Write
+        );
     }
 
     #[test]
@@ -1250,12 +1368,113 @@ mod tests {
             split_statements("select 1 -- ; not\n; select 2 /* ; */"),
             vec!["select 1 -- ; not", "select 2 /* ; */"]
         );
+        // PostgreSQL ends a `--` comment at a lone `\r` and runs the rest.
+        assert_eq!(
+            split_statements("SELECT 1 -- note\r; DELETE FROM b"),
+            vec!["SELECT 1 -- note", "DELETE FROM b"]
+        );
+        assert_eq!(
+            classify("SELECT 1 -- note\r; DELETE FROM b"),
+            (StmtKind::Write, true)
+        );
+        // A `$` that continues an identifier opens no dollar quote: the
+        // UPDATE after `a$b$` / `a$$` runs there.
+        assert_eq!(
+            split_statements("SELECT 1 AS a$b$ ; UPDATE b SET v = 2"),
+            vec!["SELECT 1 AS a$b$", "UPDATE b SET v = 2"]
+        );
+        assert_eq!(
+            classify("SELECT 1 AS a$$ ; UPDATE b SET v = 2; SELECT 1 AS c$$"),
+            (StmtKind::Write, true)
+        );
+        assert_eq!(
+            split_statements("SELECT $$a;b$$, $q$c;d$q$; SELECT 2"),
+            vec!["SELECT $$a;b$$, $q$c;d$q$", "SELECT 2"]
+        );
         assert_eq!(
             classify("begin; insert into t values (1); commit"),
             (StmtKind::Write, true)
         );
         assert_eq!(classify("begin; commit"), (StmtKind::Read, true));
         assert_eq!(classify("select 1; select 2"), (StmtKind::Read, true));
+        // PostgreSQL's dollar tags: empty, or a letter, `_` or a non-ASCII
+        // byte, then those or digits. A `$$` inside a `$\u{e9}$` literal used
+        // to open a quote of its own that swallowed the `;`, and a `$1$` one
+        // that swallowed everything after it.
+        assert_eq!(
+            split_statements("SELECT $\u{e9}$ $$ $\u{e9}$; DELETE FROM b"),
+            vec!["SELECT $\u{e9}$ $$ $\u{e9}$", "DELETE FROM b"]
+        );
+        assert_eq!(
+            classify("SELECT $\u{e9}$ $$ $\u{e9}$; DELETE FROM b"),
+            (StmtKind::Write, true)
+        );
+        assert_eq!(
+            split_statements("SELECT $\u{e9}$;$\u{e9}$; UPDATE b SET v = 2"),
+            vec!["SELECT $\u{e9}$;$\u{e9}$", "UPDATE b SET v = 2"]
+        );
+        assert_eq!(
+            split_statements("SELECT $1$ ; DELETE FROM b"),
+            vec!["SELECT $1$", "DELETE FROM b"]
+        );
+        assert_eq!(
+            split_statements("SELECT $_1$;$_1$; SELECT 2"),
+            vec!["SELECT $_1$;$_1$", "SELECT 2"]
+        );
+    }
+
+    /// R6-3 in the capture: a statement whose first word lies behind a
+    /// leading comment PostgreSQL and HeliosDB-Nano end in different places
+    /// is one the journal cannot reproduce, whatever PostgreSQL's reading of
+    /// it (a read, or nothing at all: an unterminated nested comment). It was
+    /// classified by that reading, so a write HeliosDB-Nano ran was never
+    /// registered and no cache was invalidated.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    #[test]
+    fn a_leading_comment_the_backends_end_apart_is_opaque() {
+        for sql in [
+            "/* a /* b */ UPDATE kv SET v = 2 WHERE id = 1",
+            "-- c\rSELECT 1\nUPDATE kv SET v = 2 WHERE id = 1",
+            "/* /* */ UPDATE b SET val = 'new' WHERE id = 1 -- */ SELECT 1",
+            "/* purge /tmp/* entries */ DELETE FROM sessions WHERE expired",
+            "-- x\rSELECT ' -- \nDELETE FROM kv -- '",
+        ] {
+            assert_eq!(classify(sql), (StmtKind::Opaque, false), "{sql:?}");
+        }
+        for sql in [
+            "SELECT 1; /* a /* b */ DELETE FROM kv",
+            "SELECT 1; /* x /* y */ DELETE FROM kv -- */ SELECT 2",
+        ] {
+            assert_eq!(classify(sql), (StmtKind::Opaque, true), "{sql:?}");
+        }
+        // Comments every backend ends alike leave the first word known.
+        assert_eq!(classify("/* a */ UPDATE kv SET v = 2").0, StmtKind::Write);
+        assert_eq!(classify("-- c\r\nSELECT 1").0, StmtKind::Read);
+        assert_eq!(classify("SELECT 1 /* /* */").0, StmtKind::Read);
+        // HeliosDB-Lite's splitter, which knows no comments, also leaves a
+        // comment whose quotes all close where PostgreSQL does (sqlcommenter
+        // tags): a `;` in a later literal ends nothing. Such a read used to
+        // be journaled as a statement the journal cannot reproduce (its
+        // transaction refused by committed-history replay).
+        let tag = "/*controller='posts',action='index'*/";
+        assert_eq!(
+            classify(&format!(
+                "{tag} SELECT * FROM posts WHERE body = 'Tom &amp; Jerry'"
+            )),
+            (StmtKind::Read, false)
+        );
+        assert_eq!(
+            classify(&format!(
+                "{tag} INSERT INTO posts (body) VALUES ('Tom &amp; Jerry')"
+            )),
+            (StmtKind::Write, false)
+        );
+        // A quote it leaves open moves its boundaries: `DELETE FROM b` is a
+        // statement of its own there.
+        assert_eq!(
+            classify("/* it's */ UPDATE t SET v = 'a; DELETE FROM b; --'"),
+            (StmtKind::Opaque, false)
+        );
     }
 
     #[test]

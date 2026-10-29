@@ -211,6 +211,15 @@ impl ProxyServer {
             }
         }
 
+        // Whether the edge key below keeps whitespace and comments (a
+        // HeliosDB backend was seen). Taken before forwarding: if the flag
+        // is set meanwhile (this session's first backend dialed for the
+        // read), the entry keyed the other way is not stored.
+        #[cfg(feature = "edge-proxy")]
+        let edge_verbatim = state
+            .heliosdb_backend
+            .load(std::sync::atomic::Ordering::Acquire);
+
         // Edge cache: independent of the query-cache below — when both are
         // enabled the edge lookup runs first, so an edge hit returns before
         // the query-cache is consulted. On a miss the read's stamp/epoch is
@@ -233,12 +242,40 @@ impl ProxyServer {
                 .edge_ineligible
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+
         // Neither cache answers (nor stores) a query that continues a cycle
         // the backend holds open: only the backend's reply settles it.
+        //
+        // Reads no tier of either result cache may look up, capture or
+        // store (`cache_refuses`): one naming a system catalog relation, one
+        // whose comment holds a time-travel clause, and one naming a table of
+        // `[cache] exclude_tables`. Fail-closed scans of the forwarded text
+        // (comments and literals included), only when one of the caches
+        // would look the read up: a cacheable read outside an explicit
+        // transaction and outside an open cycle, with the query cache
+        // running or the edge cache on for this session. The cheap checks
+        // come first, so with neither cache running the statement is never
+        // classified (the facts' laziness contract).
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        let cache_refused = !is_write
+            && continues_cycle.is_none()
+            && !session
+                .in_transaction
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && Self::result_cache_consulted(session, state, config)
+            && facts.is_cacheable_read()
+            && Self::cache_refuses(state, facts.sql());
         #[cfg(feature = "edge-proxy")]
-        let edge_ctx: Option<(crate::edge::CacheKey, Vec<String>, u64, u64)> = if is_write
+        let edge_ctx: Option<(
+            crate::edge::CacheKey,
+            Vec<String>,
+            u64,
+            u64,
+            std::time::Duration,
+        )> = if is_write
             || continues_cycle.is_some()
             || !config.edge.enabled
+            || cache_refused
             || session
                 .edge_ineligible
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -272,7 +309,13 @@ impl ProxyServer {
                     rest.sort();
                     (database, user, rest)
                 };
-                let fp = crate::edge::fingerprint::analyze(sql, &database, &user, &session_vars);
+                let fp = crate::edge::fingerprint::analyze_with(
+                    sql,
+                    &database,
+                    &user,
+                    &session_vars,
+                    edge_verbatim,
+                );
                 // A read with no extractable tables could never be dropped by
                 // a table-targeted invalidation — never cache it (coherence
                 // rule).
@@ -309,7 +352,15 @@ impl ProxyServer {
                         } else {
                             (state.edge_cache.next_version(), 0)
                         };
-                    Some((key, fp.tables, read_version, inval_epoch))
+                    // A shorter `[[cache.tables]]` TTL of a table the read
+                    // names caps the entry (fail-closed text scan).
+                    let default_ttl = config.edge.default_ttl();
+                    let ttl = state
+                        .edge_table_ttls
+                        .as_ref()
+                        .and_then(|t| t.min_in(sql))
+                        .map_or(default_ttl, |t| t.min(default_ttl));
+                    Some((key, fp.tables, read_version, inval_epoch, ttl))
                 }
             } else {
                 None
@@ -320,16 +371,24 @@ impl ProxyServer {
         // backend round-trip; on a miss we keep the context to store the result.
         // The lookup's hint parse + normalization are carried over to the
         // store below (`put_prepared`), so a miss+store normalizes the SQL
-        // once instead of twice.
+        // once instead of twice. A `cache=skip` read keeps no context, so no
+        // capture is armed for it.
         #[cfg(feature = "query-cache")]
         let cache_ctx: Option<(crate::cache::CacheContext, crate::cache::QueryPrep)> =
-            if is_write || continues_cycle.is_some() {
+            if is_write || continues_cycle.is_some() || cache_refused {
                 None
             } else if let Some(qc) = state.query_cache.as_ref() {
                 let sql = facts.sql();
                 match Self::cacheable_read_ctx(session, facts.is_cacheable_read()).await {
                     Some(ctx) => {
-                        let (lookup, prep) = qc.get_with_prep(sql, &ctx).await;
+                        // [routing_hints] strip_hints, a rewrite or the tenant
+                        // transform may have removed the client's cache hints
+                        // from the forwarded text: read them from the client's
+                        // own text as well.
+                        let client_sql = (!std::ptr::eq(forward_msg, msg))
+                            .then(|| crate::protocol::query_text(&msg.payload))
+                            .flatten();
+                        let (lookup, prep) = qc.get_with_prep_hinted(sql, client_sql, &ctx).await;
                         if let crate::cache::CacheLookup::Hit { result, level } = lookup {
                             tracing::debug!(target: "helios::cache", level = %level, "cache hit");
                             client.write_all(&result.data).await.map_err(|e| {
@@ -337,7 +396,7 @@ impl ProxyServer {
                             })?;
                             return Ok((None, result.data.len() as u64));
                         }
-                        Some((ctx, prep))
+                        prep.storable().then_some((ctx, prep))
                     }
                     None => None,
                 }
@@ -552,6 +611,26 @@ impl ProxyServer {
                 Self::journal_register_simple(session, sql);
             }
         }
+        // C-02 for what the capture cannot see: a `;` in a backend-ambiguous
+        // rest (`sql_text::ambiguous_rest`: after an `E'\''` literal, a nested
+        // block comment, a `--` comment a lone `\r` ends, a `$` HeliosDB-Nano
+        // opens a dollar quote at inside a name, a comment HeliosDB-Lite
+        // splits in) may end a statement for a backend where the capture
+        // reads none (`SELECT E'\'' ; UPDATE b …`, `SELECT 1 AS a$$ -- $$;
+        // DELETE FROM b`). Read or write, its `ReadyForQuery` invalidates
+        // everything (`journal_observe_sync`). Nothing else sets the signal:
+        // a `;` inside a plain literal ends no statement, a final `;` has
+        // none after it, and a statement whose first word lies behind such
+        // text is journaled as one of unknown scope by the capture itself.
+        #[cfg(feature = "query-cache")]
+        if state.query_cache.is_some()
+            && facts.has_interior_semicolon()
+            && crate::sql_text::ambiguous_rest(facts.sql()).is_some_and(|rest| rest.contains(';'))
+        {
+            session
+                .cache_unseen_write
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
 
         #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
         {
@@ -566,6 +645,10 @@ impl ProxyServer {
             #[cfg(not(feature = "edge-proxy"))]
             let edge_wants = false;
             if (qc_wants || edge_wants) && backend.response_buf.is_empty() {
+                // From the live config, not the session's snapshot: a SIGHUP
+                // moves this ceiling for every connection at once, like the
+                // [edge] cache's per-entry one.
+                let max_capture = state.live_config.load().cache.max_cacheable_response_bytes;
                 return match Self::stream_until_ready_capture_buffered(
                     client,
                     &mut backend.stream,
@@ -575,7 +658,7 @@ impl ProxyServer {
                         hold_bytes: hold,
                         ..state.limits.relay()
                     },
-                    config.cache.max_cacheable_response_bytes,
+                    max_capture,
                     &state.metrics,
                 )
                 .await
@@ -595,14 +678,17 @@ impl ProxyServer {
                         // role gates on the version hwm; edge role on the
                         // invalidation-epoch snapshot taken before forwarding.
                         #[cfg(feature = "edge-proxy")]
-                        if let Some((key, tables, read_version, inval_epoch)) = edge_ctx {
-                            if cacheable && !body.is_empty() {
+                        if let Some((key, tables, read_version, inval_epoch, ttl)) = edge_ctx {
+                            let keyed_as_now = edge_verbatim
+                                || !state
+                                    .heliosdb_backend
+                                    .load(std::sync::atomic::Ordering::Acquire);
+                            if cacheable && !body.is_empty() && keyed_as_now {
                                 let entry = crate::edge::CacheEntry {
                                     version: read_version,
                                     response_bytes: body.clone(),
                                     tables,
-                                    expires_at: std::time::Instant::now()
-                                        + config.edge.default_ttl(),
+                                    expires_at: std::time::Instant::now() + ttl,
                                 };
                                 let stored = if config.edge.role == crate::edge::EdgeRole::Edge {
                                     state.edge_cache.insert_if_epoch(key, entry, inval_epoch)
@@ -681,9 +767,10 @@ impl ProxyServer {
                 // both protocols, before the ReadyForQuery reached the client.
                 // Edge cache: drop local entries for the touched tables and
                 // (home role only) fan the invalidation out to every
-                // registered edge over SSE. Also fires for SELECT-leading
-                // multi-statement strings (the trailing write would otherwise
-                // invalidate nothing); bare transaction-control statements
+                // registered edge over SSE. Also fires for a multi-statement
+                // string with a write behind a SELECT lead (the trailing write
+                // would otherwise invalidate nothing), never for one of reads
+                // alone; bare transaction-control statements
                 // (BEGIN/START/SAVEPOINT/RELEASE/ROLLBACK) change no rows and
                 // are exempted — but COMMIT and SET keep their conservative
                 // full flush. A `COPY ... FROM` is deferred to its CopyDone
@@ -696,13 +783,13 @@ impl ProxyServer {
                         sql,
                         facts.has_interior_semicolon(),
                     ) {
-                        // `tables_only` skips the fingerprint/params-hash work
+                        // `write_tables` skips the fingerprint/params-hash work
                         // (discarded here) — a bulk INSERT must not pay full-
                         // buffer regex rewrites on the forward path. An EMPTY
                         // table set invalidates everything at or below the
-                        // version — an unparseable write must not leave stale
-                        // entries behind (coherence rule).
-                        let tables = crate::edge::fingerprint::tables_only(sql);
+                        // version — an unparseable write (or a branch MERGE)
+                        // must not leave stale entries behind (coherence rule).
+                        let tables = crate::edge::fingerprint::write_tables(sql);
                         if session
                             .copy_in_progress
                             .load(std::sync::atomic::Ordering::Relaxed)

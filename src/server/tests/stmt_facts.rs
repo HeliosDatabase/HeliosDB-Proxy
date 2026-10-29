@@ -166,7 +166,7 @@ fn each_fact_is_classified_at_most_once() {
         let _ = f.is_cacheable_read();
         assert_eq!(stmt_fact_classifications() - before, 1);
     }
-    #[cfg(feature = "edge-proxy")]
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     {
         let before = stmt_fact_classifications();
         let _ = f.has_interior_semicolon();

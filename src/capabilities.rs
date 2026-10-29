@@ -160,7 +160,10 @@ pub fn manifest(config: &ProxyConfig) -> Vec<Capability> {
             cfg!(feature = "distribcache"),
             false,
             false,
-            Some("library-only; not wired into the daemon"),
+            Some(
+                "library-only; not wired into the daemon (the daemon's semantic tier is [cache] \
+                 semantic_*)",
+            ),
         ),
         c(
             "postgres-topology",
@@ -205,10 +208,15 @@ pub fn manifest(config: &ProxyConfig) -> Vec<Capability> {
 /// config key path whose promise the binary cannot keep.
 pub fn unavailable_enabled(config: &ProxyConfig) -> Vec<&'static str> {
     // (config key path, enabled now, compiled into this build)
-    let checks: [(&'static str, bool, bool); 16] = [
+    let checks: [(&'static str, bool, bool); 17] = [
         (
             "cache.enabled",
             config.cache.enabled,
+            cfg!(feature = "query-cache"),
+        ),
+        (
+            "cache.semantic_enabled",
+            config.cache.enabled && config.cache.semantic_enabled,
             cfg!(feature = "query-cache"),
         ),
         (
@@ -333,5 +341,15 @@ mod tests {
         } else {
             assert!(unavailable.contains(&"cache.enabled"));
         }
+        // The semantic tier is promised only with the cache itself.
+        assert!(!unavailable.contains(&"cache.semantic_enabled"));
+        config.cache.semantic_enabled = true;
+        let unavailable = unavailable_enabled(&config);
+        assert_eq!(
+            unavailable.contains(&"cache.semantic_enabled"),
+            !cfg!(feature = "query-cache")
+        );
+        config.cache.enabled = false;
+        assert!(!unavailable_enabled(&config).contains(&"cache.semantic_enabled"));
     }
 }

@@ -81,6 +81,13 @@ pub struct ClientSession {
     /// on rollback and at session end.
     #[cfg(feature = "query-cache")]
     pub(crate) tx_cache_stage: std::sync::Mutex<TxCacheStage>,
+    /// The simple-query string in flight may run a statement the journal
+    /// capture does not see (a `;` in its backend-ambiguous rest,
+    /// `sql_text::ambiguous_rest`): the next `ReadyForQuery` invalidates every
+    /// cached result before it reaches the client (C-02), and inside a
+    /// transaction the commit does again.
+    #[cfg(feature = "query-cache")]
+    pub(crate) cache_unseen_write: std::sync::atomic::AtomicBool,
     /// TR-07 recovery-journal capture: the per-session state machine that
     /// turns registered statements + observed backend responses into
     /// committed transactions (`journal_capture`). Locked briefly on the

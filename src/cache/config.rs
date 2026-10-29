@@ -30,10 +30,12 @@ pub struct CacheConfig {
     /// Maximum result size to cache (bytes)
     pub max_result_size: usize,
 
-    /// Table-specific configurations
+    /// Table-specific configurations. `QueryCache` reads only their `ttl`
+    /// (keys are lower-case, unqualified table names).
     pub table_configs: HashMap<String, TableCacheConfig>,
 
-    /// Excluded tables (never cache)
+    /// Excluded tables. Not read by `QueryCache`: the daemon enforces
+    /// `[cache] exclude_tables` in the relay, ahead of both result caches.
     pub excluded_tables: Vec<String>,
 }
 
@@ -124,8 +126,47 @@ impl CacheConfig {
             return Err("L2 cache size cannot be 0 when enabled".to_string());
         }
 
-        if self.l3.similarity_threshold < 0.0 || self.l3.similarity_threshold > 1.0 {
-            return Err("L3 similarity threshold must be between 0.0 and 1.0".to_string());
+        let t = self.l3.similarity_threshold;
+        if !(t > 0.0 && t <= 1.0) {
+            return Err("L3 similarity threshold must be > 0.0 and <= 1.0".to_string());
+        }
+        if t < 1.0 && self.l3.semantic_match == crate::config::SemanticMatch::Verbatim {
+            return Err(
+                "L3 similarity threshold below 1.0 needs semantic_match = Canonical".to_string(),
+            );
+        }
+
+        // The grammar parse it bounds runs whether or not the tier is enabled
+        // (a per-table TTL longer than the default) and takes about a hundred
+        // times the statement.
+        if self.l3.max_statement_bytes > crate::config::SEMANTIC_MAX_STATEMENT_BYTES_CEILING {
+            return Err(format!(
+                "L3 max_statement_bytes must be at most {}",
+                crate::config::SEMANTIC_MAX_STATEMENT_BYTES_CEILING
+            ));
+        }
+
+        if self.l3.enabled {
+            let l3 = &self.l3;
+            for (name, zero) in [
+                ("max_entries", l3.max_entries == 0),
+                ("max_variants", l3.max_variants == 0),
+                ("embedding_dim", l3.embedding_dim == 0),
+                ("ttl", l3.ttl.is_zero()),
+                ("embedding_timeout", l3.embedding_timeout.is_zero()),
+                ("embedding_retry_after", l3.embedding_retry_after.is_zero()),
+                ("max_statement_bytes", l3.max_statement_bytes == 0),
+            ] {
+                if zero {
+                    return Err(format!("L3 {name} cannot be 0 when enabled"));
+                }
+            }
+            if !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&l3.embedding_concurrency) {
+                return Err(format!(
+                    "L3 embedding_concurrency must be in 1..={}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                ));
+            }
         }
 
         Ok(())
@@ -222,14 +263,30 @@ pub struct L3Config {
     /// Enable L3 semantic cache
     pub enabled: bool,
 
+    /// How a statement matches an entry: its canonical form (the library
+    /// default, which the approximate part needs) or its exact text
+    /// (`[cache] semantic_match`, which defaults to `Verbatim` in the
+    /// daemon). The canonical form assumes PostgreSQL semantics: once
+    /// `QueryCache::note_heliosdb_backend` ran, the tier neither stores nor
+    /// serves it.
+    pub semantic_match: crate::config::SemanticMatch,
+
     /// Cosine similarity threshold for cache hits
     pub similarity_threshold: f32,
 
-    /// Maximum entries in semantic cache
+    /// Maximum entries in semantic cache, and maximum remembered column-name
+    /// embeddings
     pub max_entries: usize,
 
-    /// Aggregate byte budget for retained entries and embeddings (C-01).
-    /// `0` means unbounded (entry count still applies). Default 64 MiB.
+    /// Maximum entries for one statement shape that differ only in their
+    /// bare select-list columns (a full shape replaces its oldest). Bounds
+    /// the work of one lookup. Default 16.
+    pub max_variants: usize,
+
+    /// Aggregate byte budget for retained entries plus remembered
+    /// embeddings (C-01). Embeddings take at most a quarter of it and yield
+    /// to entries, which they never evict. `0` means unbounded (entry count
+    /// still applies, to both). Default 64 MiB.
     pub max_bytes: usize,
 
     /// Time-to-live for semantic cache entries
@@ -243,19 +300,47 @@ pub struct L3Config {
 
     /// Embedding dimension
     pub embedding_dim: usize,
+
+    /// Total time limit of one embedding call (was a fixed 30 s). Calls run
+    /// in the background; a lookup never waits on one. Default 5 s.
+    pub embedding_timeout: Duration,
+
+    /// Embedding calls in flight at most (was a fixed 10). A call that finds
+    /// none free is skipped, never queued. Default 4.
+    pub embedding_concurrency: usize,
+
+    /// After an endpoint failure, no embedding call is made for this long;
+    /// then one call probes the endpoint. Default 30 s.
+    pub embedding_retry_after: Duration,
+
+    /// Longest statement the tier's grammar is parsed for, in bytes. A
+    /// longer one is not tokenized (the tokens and the parse take about a
+    /// hundred times the text): it is outside the grammar, so it never uses
+    /// the tier, and its relations count as incomplete for a per-table TTL
+    /// longer than the default. The query cache applies it whether or not
+    /// the tier is enabled. At most
+    /// [`crate::config::SEMANTIC_MAX_STATEMENT_BYTES_CEILING`] (1 MiB).
+    /// Default 16 KiB.
+    pub max_statement_bytes: usize,
 }
 
 impl Default for L3Config {
     fn default() -> Self {
         Self {
-            enabled: false, // Disabled by default (requires Ollama)
+            enabled: false, // Disabled by default
+            semantic_match: crate::config::SemanticMatch::Canonical,
             similarity_threshold: 0.92,
             max_entries: 5000,
+            max_variants: 16,
             max_bytes: 64 * 1024 * 1024,
             ttl: Duration::from_secs(3600),
             embedding_endpoint: "http://localhost:11434".to_string(),
             embedding_model: "all-minilm".to_string(),
             embedding_dim: 384, // all-MiniLM-L6-v2 dimension
+            embedding_timeout: Duration::from_secs(5),
+            embedding_concurrency: 4,
+            embedding_retry_after: Duration::from_secs(30),
+            max_statement_bytes: 16 * 1024,
         }
     }
 }
@@ -289,10 +374,12 @@ pub struct TableCacheConfig {
     /// Time-to-live for this table
     pub ttl: Duration,
 
-    /// Exclude this table from caching
+    /// Exclude this table from caching. Not read by `QueryCache`: the daemon
+    /// enforces `[cache] exclude_tables` in the relay.
     pub exclude: bool,
 
-    /// Columns to exclude from cached results
+    /// Columns to exclude from cached results. Not read by `QueryCache`;
+    /// column-level exclusion is not offered by the daemon.
     pub exclude_columns: Vec<String>,
 }
 
@@ -356,6 +443,61 @@ mod tests {
         let mut invalid2 = CacheConfig::default();
         invalid2.l3.similarity_threshold = 1.5;
         assert!(invalid2.validate().is_err());
+    }
+
+    #[test]
+    fn validation_rejects_bad_l3_values() {
+        for t in [f32::NAN, 0.0, 1.5, -0.1] {
+            let mut c = CacheConfig::default();
+            c.l3.similarity_threshold = t;
+            assert!(c.validate().is_err(), "threshold {t}");
+        }
+        let mut one = CacheConfig::default();
+        one.l3.similarity_threshold = 1.0;
+        assert!(one.validate().is_ok());
+        let enabled = || {
+            let mut c = CacheConfig::default();
+            c.l3.enabled = true;
+            c
+        };
+        assert!(enabled().validate().is_ok());
+        let breakers: [fn(&mut L3Config); 9] = [
+            |l3| l3.max_entries = 0,
+            |l3| l3.max_variants = 0,
+            |l3| l3.embedding_dim = 0,
+            |l3| l3.ttl = Duration::ZERO,
+            |l3| l3.embedding_timeout = Duration::ZERO,
+            |l3| l3.embedding_retry_after = Duration::ZERO,
+            |l3| l3.max_statement_bytes = 0,
+            |l3| l3.embedding_concurrency = 0,
+            |l3| l3.embedding_concurrency = tokio::sync::Semaphore::MAX_PERMITS + 1,
+        ];
+        for (i, brk) in breakers.iter().enumerate() {
+            let mut c = enabled();
+            brk(&mut c.l3);
+            assert!(c.validate().is_err(), "breaker {i}");
+            // Off, the tier's sizes are not checked.
+            c.l3.enabled = false;
+            assert!(c.validate().is_ok(), "breaker {i} while disabled");
+        }
+        // The statement bound has a ceiling, on or off: the parse it bounds
+        // runs for per-table TTLs too.
+        for on in [true, false] {
+            let mut c = enabled();
+            c.l3.enabled = on;
+            c.l3.max_statement_bytes = crate::config::SEMANTIC_MAX_STATEMENT_BYTES_CEILING;
+            assert!(c.validate().is_ok(), "at the ceiling, enabled={on}");
+            c.l3.max_statement_bytes += 1;
+            let err = c.validate().unwrap_err();
+            assert!(err.contains("max_statement_bytes"), "{err}");
+        }
+        assert!(CacheConfig::ai_workload().validate().is_ok());
+        // Approximate substitution works on the canonical form only.
+        let mut verbatim = CacheConfig::default();
+        verbatim.l3.semantic_match = crate::config::SemanticMatch::Verbatim;
+        assert!(verbatim.validate().is_err(), "0.92 with verbatim");
+        verbatim.l3.similarity_threshold = 1.0;
+        assert!(verbatim.validate().is_ok());
     }
 
     #[test]

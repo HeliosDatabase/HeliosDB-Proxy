@@ -273,7 +273,9 @@ impl L2Entry {
     }
 }
 
-/// Entry in the L3 semantic cache
+/// Entry of the former embedding-per-statement L3 design. No longer used by
+/// `L3SemanticCache` (which keys entries by canonical form and embeds only
+/// column names); kept for library compatibility.
 #[derive(Debug, Clone)]
 pub struct L3Entry {
     /// The cached result

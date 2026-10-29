@@ -539,6 +539,7 @@ impl ProxyServer {
                 }
             };
             *session.backend_credential.write().await = credential;
+            Self::note_backend_startup(state, node_addr, &post_auth);
             // Register the cancel key from the BackendKeyData frame.
             if let Some((pid, key)) = Self::backend_key_data(&post_auth) {
                 Self::register_cancel_key(state, pid, key, node_addr, backend.peer_addr().ok());
@@ -901,6 +902,9 @@ impl ProxyServer {
                                     state.tenant_slots.session_key_relayed((pid, key));
                                 }
                             }
+                            // ParameterStatus: a HeliosDB backend changes how
+                            // the result caches key reads.
+                            b'S' => Self::note_parameter_status(state, node_addr, &frame),
                             // ReadyForQuery: authentication + startup complete.
                             b'Z' => {
                                 outcome = Some(Ok(()));
