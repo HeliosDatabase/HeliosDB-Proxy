@@ -243,6 +243,9 @@ if [ "$SCENARIO" = reconnect-wave ]; then
   fi
   sleep 15
   log "kill -9 pg-a"
+  # Timed before the kill is issued: `docker compose kill` can take seconds on a
+  # loaded host, and the verdict's "served before the kill" window ends here.
+  date +%s%3N >"$OUT/kill_ms"
   "${COMPOSE[@]}" kill -s KILL pg-a >>"$OUT/driver.log" 2>&1
   sleep 2
   date +%s%3N >"$OUT/promoted_ms"

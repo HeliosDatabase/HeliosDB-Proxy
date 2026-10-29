@@ -66,7 +66,11 @@ def reconnect_wave(out):
     start = int(out.joinpath("wave_start_ms").read_text())
     promoted = int(out.joinpath("promoted_ms").read_text())
     secs = int(out.joinpath("wave_secs").read_text())
-    kill_s = (promoted - start) / 1000 - 2  # the kill came 2 s before the promotion
+    kill_file = out.joinpath("kill_ms")
+    if kill_file.exists():  # recorded just before the kill was issued
+        kill_s = (int(kill_file.read_text()) - start) / 1000
+    else:  # older evidence: the kill came at least 2 s before the promotion
+        kill_s = (promoted - start) / 1000 - 2
     prom_s = (promoted - start) / 1000
     big = tps_series(out.joinpath("pgbench-big.log"))
     small = tps_series(out.joinpath("pgbench-small.log"))
