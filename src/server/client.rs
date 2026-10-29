@@ -1123,7 +1123,15 @@ impl ProxyServer {
                         #[cfg(feature = "wasm-plugins")]
                         if let PreQueryAction::Block(reason) = &action {
                             tracing::info!(reason = %reason, "pre-query plugin blocked query");
-                            Self::send_block_response(stream, reason, state).await?;
+                            Self::send_block_response(
+                                stream,
+                                reason,
+                                session
+                                    .last_rfq_status
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                state,
+                            )
+                            .await?;
                             state
                                 .metrics
                                 .queries_processed
@@ -1133,7 +1141,12 @@ impl ProxyServer {
 
                         #[cfg(feature = "wasm-plugins")]
                         if let PreQueryAction::Cached(bytes) = &action {
-                            match Self::synthesise_cached_response(bytes) {
+                            match Self::synthesise_cached_response(
+                                bytes,
+                                session
+                                    .last_rfq_status
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                            ) {
                                 Ok(reply) => {
                                     stream.write_all(&reply).await.map_err(|e| {
                                         ProxyError::Network(format!("Write error: {}", e))
@@ -1678,6 +1691,8 @@ impl ProxyServer {
                         // backend; anything else is refused with 25P02. A bare
                         // Sync just yields the failed-transaction ReadyForQuery.
                         let mut skip_forward = false;
+                        // The transaction end the emulation lets through.
+                        let mut aborted_end = false;
                         if tr.tx_aborted {
                             let ends = pending_route_sql
                                 .as_deref()
@@ -1685,6 +1700,7 @@ impl ProxyServer {
                                 .unwrap_or(false);
                             if ends {
                                 tr.tx_aborted = false;
+                                aborted_end = true;
                             } else {
                                 skip_forward = true;
                                 let bare_sync = batch.len() == 5 && batch[0] == b'S';
@@ -1904,6 +1920,19 @@ impl ProxyServer {
                             // 25P02 path above, nothing was closed (F2).
                             batch_closes.clear();
                             batch_left_closed.clear();
+                            // A transaction end the emulation let through was
+                            // refused with the failed-transaction status: the
+                            // client is still in its failed transaction, so
+                            // the emulation goes on (later statements get
+                            // 25P02, never autocommit on the new backend).
+                            if aborted_end
+                                && session
+                                    .last_rfq_status
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    == b'E'
+                            {
+                                tr.tx_aborted = true;
+                            }
                         }
                         if offload_on {
                             Self::note_home(

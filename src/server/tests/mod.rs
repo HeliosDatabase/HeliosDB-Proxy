@@ -361,7 +361,7 @@ fn test_synthesise_cached_response_roundtrip() {
                 ["2", null]
             ]
         }"#;
-    let reply = ProxyServer::synthesise_cached_response(payload).expect("synthesis");
+    let reply = ProxyServer::synthesise_cached_response(payload, b'I').expect("synthesis");
 
     // Walk the concatenation frame-by-frame via length prefixes.
     // Each PG message: tag(1) + length(4, big-endian, includes self) + payload.
@@ -379,6 +379,9 @@ fn test_synthesise_cached_response_roundtrip() {
 
     // Spot-check the final ReadyForQuery payload is 'I' (idle).
     assert_eq!(*reply.last().unwrap(), b'I');
+    // Inside a transaction the reply reports the backend's real status.
+    let in_tx = ProxyServer::synthesise_cached_response(payload, b'T').expect("synthesis");
+    assert_eq!(*in_tx.last().unwrap(), b'T');
 }
 
 /// Row width mismatch between columns and row data is rejected so
@@ -390,7 +393,7 @@ fn test_synthesise_cached_response_rejects_row_width_mismatch() {
             "columns": [{"name": "id", "oid": 23}, {"name": "name", "oid": 25}],
             "rows": [["1", "alice", "extra"]]
         }"#;
-    let result = ProxyServer::synthesise_cached_response(payload);
+    let result = ProxyServer::synthesise_cached_response(payload, b'I');
     assert!(matches!(result, Err(ProxyError::Protocol(_))));
 }
 
@@ -401,7 +404,7 @@ fn test_synthesise_cached_response_rejects_row_width_mismatch() {
 #[test]
 fn test_synthesise_cached_response_rejects_empty_columns() {
     let payload = br#"{ "columns": [], "rows": [] }"#;
-    let result = ProxyServer::synthesise_cached_response(payload);
+    let result = ProxyServer::synthesise_cached_response(payload, b'I');
     assert!(matches!(result, Err(ProxyError::Protocol(_))));
 }
 
@@ -411,7 +414,7 @@ fn test_synthesise_cached_response_rejects_empty_columns() {
 #[test]
 fn test_synthesise_cached_response_rejects_bad_json() {
     let payload = b"not json at all";
-    let result = ProxyServer::synthesise_cached_response(payload);
+    let result = ProxyServer::synthesise_cached_response(payload, b'I');
     assert!(matches!(result, Err(ProxyError::Protocol(_))));
 }
 
@@ -632,6 +635,58 @@ mod routing_hints;
 
 #[cfg(feature = "rate-limiting")]
 mod rate_limiting;
+
+/// Run `sql` through `forward_simple_query` for `session`, which has no
+/// backend connection, and return what the client received. The request
+/// must be answered without reaching a backend (a refusal).
+#[cfg(any(feature = "rate-limiting", feature = "circuit-breaker"))]
+async fn refused_simple_reply(
+    state: &Arc<ServerState>,
+    config: &ProxyConfig,
+    session: &Arc<ClientSession>,
+    sql: &str,
+) -> Vec<u8> {
+    let (proxy_side, mut peer) = pair().await;
+    let mut client = ClientStream::Plain(proxy_side);
+    let mut conns: HashMap<String, BackendConn> = HashMap::new();
+    let mut fault: Option<BackendFault> = None;
+    let msg = crate::protocol::QueryMessage {
+        query: sql.to_string(),
+    }
+    .encode();
+    let (used, sent) = ProxyServer::forward_simple_query(
+        ForwardCtx {
+            client: &mut client,
+            conns: &mut conns,
+            current_node: None,
+            reads: &ReadRouting::OFF,
+            session,
+            state,
+            config,
+            fault: &mut fault,
+        },
+        &msg,
+    )
+    .await
+    .expect("a refusal is answered, not an error");
+    assert!(used.is_none(), "the request must not reach a backend");
+    assert!(fault.is_none() && conns.is_empty());
+    let mut reply = vec![0u8; sent as usize];
+    peer.read_exact(&mut reply).await.unwrap();
+    reply
+}
+
+/// The ReadyForQuery that ends `reply`, as its status byte.
+#[cfg(any(feature = "rate-limiting", feature = "circuit-breaker"))]
+fn trailing_rfq_status(reply: &[u8]) -> u8 {
+    let rfq = &reply[reply.len() - 6..];
+    assert_eq!(
+        &rfq[..5],
+        &[b'Z', 0, 0, 0, 5],
+        "reply must end in ReadyForQuery"
+    );
+    rfq[5]
+}
 
 // ---- circuit-breaker: open-after-threshold contract the gate relies on ----
 

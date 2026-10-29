@@ -82,13 +82,17 @@ impl ProxyServer {
     ///
     /// ```text
     /// RowDescription (T) + DataRow (D) × N + CommandComplete (C: "SELECT N")
-    ///                    + ReadyForQuery (Z: idle)
+    ///                    + ReadyForQuery (Z: status)
     /// ```
+    ///
+    /// `status` is the backend's real transaction status (the last one
+    /// relayed): the reply never touched the backend, so it reports the
+    /// status the backend is still in.
     ///
     /// Returns an error on malformed JSON; the caller falls back to
     /// backend forwarding.
     #[cfg(feature = "wasm-plugins")]
-    pub(super) fn synthesise_cached_response(bytes: &[u8]) -> Result<Vec<u8>> {
+    pub(super) fn synthesise_cached_response(bytes: &[u8], status: u8) -> Result<Vec<u8>> {
         use serde::Deserialize;
 
         #[derive(Deserialize)]
@@ -167,8 +171,8 @@ impl ProxyServer {
         cc.put_u8(0);
         reply.extend_from_slice(&Message::new(MessageType::CommandComplete, cc).encode());
 
-        // ReadyForQuery (tag 'Z', status 'I' idle)
-        reply.extend_from_slice(&Self::create_ready_for_query(b'I'));
+        // ReadyForQuery (tag 'Z', the backend's status)
+        reply.extend_from_slice(&Self::create_ready_for_query(status));
 
         Ok(reply)
     }

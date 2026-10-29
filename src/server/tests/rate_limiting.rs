@@ -139,3 +139,37 @@ fn distinct_keys_have_independent_buckets() {
         RateLimitResult::Allowed
     ));
 }
+
+/// A rate-limited statement never reached the backend, so a transaction open
+/// there stays open: inside it the refusal's ReadyForQuery reports the
+/// backend's real status ('T'), never 'I'. In autocommit it is still 'I'.
+#[tokio::test]
+async fn a_rate_limited_statement_inside_a_transaction_reports_status_t() {
+    use std::sync::atomic::Ordering;
+
+    let mut config = super::test_config();
+    config.rate_limit.enabled = true;
+    config.rate_limit.default_qps = 1;
+    config.rate_limit.default_burst = 1;
+    let server = super::ProxyServer::new(config.clone()).unwrap();
+    let state = server.state.clone();
+    let session = super::make_test_session();
+    // Spend the bucket's only token: the next statements are refused.
+    assert!(
+        super::ProxyServer::rate_limit_check(&session, &state, &config)
+            .await
+            .is_none()
+    );
+    for status in *b"TEI" {
+        session.last_rfq_status.store(status, Ordering::Relaxed);
+        session
+            .in_transaction
+            .store(status != b'I', Ordering::Relaxed);
+        let reply =
+            super::refused_simple_reply(&state, &config, &session, "INSERT INTO t VALUES (1)")
+                .await;
+        assert_eq!(reply[0], b'E', "the refusal is an ErrorResponse");
+        assert!(reply.windows(7).any(|w| w == b"C53400\0"));
+        assert_eq!(super::trailing_rfq_status(&reply), status);
+    }
+}

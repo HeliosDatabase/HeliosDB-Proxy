@@ -29,7 +29,11 @@ impl ProxyServer {
         // Rate-limit gate: deny before any backend selection.
         #[cfg(feature = "rate-limiting")]
         if let Some(mut resp) = Self::rate_limit_check(session, state, config).await {
-            resp.extend_from_slice(&Self::create_ready_for_query(b'I'));
+            // Nothing reached the backend: its status is the last one relayed
+            // ('T'/'E' inside a transaction that stays open there).
+            resp.extend_from_slice(&Self::create_ready_for_query(
+                session.last_rfq_status.load(Ordering::Relaxed),
+            ));
             client
                 .write_all(&resp)
                 .await
@@ -57,7 +61,9 @@ impl ProxyServer {
                 "42000",
                 &format!("Query blocked by route plugin: {}", reason),
             ));
-            response.extend_from_slice(&Self::create_ready_for_query(b'I'));
+            response.extend_from_slice(&Self::create_ready_for_query(
+                session.last_rfq_status.load(Ordering::Relaxed),
+            ));
             client
                 .write_all(&response)
                 .await
@@ -374,7 +380,9 @@ impl ProxyServer {
         // Circuit breaker: fast-fail when the chosen node's circuit is open.
         #[cfg(feature = "circuit-breaker")]
         if let Some(mut resp) = Self::circuit_fast_fail(state, &target) {
-            resp.extend_from_slice(&Self::create_ready_for_query(b'I'));
+            resp.extend_from_slice(&Self::create_ready_for_query(
+                session.last_rfq_status.load(Ordering::Relaxed),
+            ));
             client
                 .write_all(&resp)
                 .await
@@ -738,7 +746,9 @@ impl ProxyServer {
         #[cfg(feature = "rate-limiting")]
         if let Some(mut resp) = Self::rate_limit_check(session, state, config).await {
             if wait_ready {
-                resp.extend_from_slice(&Self::create_ready_for_query(b'I'));
+                resp.extend_from_slice(&Self::create_ready_for_query(
+                    session.last_rfq_status.load(Ordering::Relaxed),
+                ));
             }
             client
                 .write_all(&resp)
@@ -813,7 +823,9 @@ impl ProxyServer {
         #[cfg(feature = "circuit-breaker")]
         if let Some(mut resp) = Self::circuit_fast_fail(state, &target) {
             if wait_ready {
-                resp.extend_from_slice(&Self::create_ready_for_query(b'I'));
+                resp.extend_from_slice(&Self::create_ready_for_query(
+                    session.last_rfq_status.load(Ordering::Relaxed),
+                ));
             }
             client
                 .write_all(&resp)

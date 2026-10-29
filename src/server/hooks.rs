@@ -123,12 +123,15 @@ impl ProxyServer {
     }
 
     /// Send the client a `Block`-outcome response: an error frame plus
-    /// `ReadyForQuery` so the client's state machine returns to idle and
-    /// the next query can be accepted.
+    /// `ReadyForQuery` so the client's state machine is ready for its next
+    /// query. `status` is the backend's real transaction status (the last
+    /// one relayed): the block never reached the backend, so a transaction
+    /// open there stays open, and the client must not be told 'I'.
     #[cfg(feature = "wasm-plugins")]
     pub(super) async fn send_block_response(
         stream: &mut ClientStream,
         reason: &str,
+        status: u8,
         state: &Arc<ServerState>,
     ) -> Result<()> {
         let err =
@@ -137,7 +140,7 @@ impl ProxyServer {
             .write_all(&err)
             .await
             .map_err(|e| ProxyError::Network(format!("Write error: {}", e)))?;
-        let rfq = Self::create_ready_for_query(b'I');
+        let rfq = Self::create_ready_for_query(status);
         stream
             .write_all(&rfq)
             .await
