@@ -1072,6 +1072,54 @@ async fn a_query_refused_in_a_transaction_leaves_no_unnamed_portal() {
     assert_eq!((seen[4].text.as_str(), seen[5].text.as_str()), ("S", "P"));
 }
 
+/// Under transaction pooling with `skip_clean_reset`, a connection that holds
+/// an unnamed statement is reset before it is parked, with or without the
+/// unnamed-Parse promotion that records it: parked as clean, the next session
+/// leasing it could Bind that statement without a Parse of its own and run
+/// it with its own parameters.
+#[cfg(feature = "pool-modes")]
+#[tokio::test]
+async fn a_connection_holding_an_unnamed_statement_is_never_parked_unreset() {
+    for promote in [false, true] {
+        let h = Harness::new(0, None, |c| {
+            transaction_pooling(c, true);
+            c.pool_mode.skip_clean_reset = true;
+            c.optimize_unnamed_parse = promote;
+        })
+        .await;
+        let mut a = h.connect("acme").await;
+        a.send(&[cycle("delete from t where id = $1"), sync()].concat())
+            .await;
+        assert_eq!(tags(&a.until_ready().await), b"12CZ", "promotion {promote}");
+        let ran_on = h
+            .backend
+            .log()
+            .iter()
+            .find(|s| s.tag == b'P')
+            .map(|s| s.conn)
+            .expect("the cycle reached a backend");
+        let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
+        while !h
+            .backend
+            .frames_of(ran_on)
+            .iter()
+            .any(|s| s.tag == RESET_ANSWERED)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "promotion {promote}: parked unreset: {:?}",
+                h.backend.frames_of(ran_on)
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The connection the pool hands out next holds no unnamed statement.
+        a.send(&[bind(""), execute(), sync()].concat()).await;
+        let reply = a.until_ready().await;
+        assert_eq!(tags(&reply), b"EZ", "promotion {promote}: {reply:?}");
+        assert_eq!(sqlstate(&reply[0]), "26000", "promotion {promote}");
+    }
+}
+
 #[tokio::test]
 async fn a_partly_received_cycle_keeps_its_permit_across_a_query() {
     let h = Harness::new(0, None, |_| {}).await;

@@ -155,6 +155,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same parameterized statement on either side of a simple `BEGIN`, say). Residual: a Query
   a plugin `Block` refuses while a `Flush`-dispatched cycle stays open leaves that cycle's
   own later batches unchecked until it settles.
+- **A pooled connection holding an unnamed statement is reset before it is parked.** With
+  `[pool_mode] skip_clean_reset = true` and `optimize_unnamed_parse = false` (neither is
+  the default), a transaction- or statement-pooled connection whose requests had only
+  Parsed the unnamed statement (no named one, no `SET`, no `Close`) counted as clean and
+  was parked without `reset_query`, as was one whose unnamed `Parse` did not lead its
+  batch with the promotion on. The next session leasing it (same node, user, database
+  and identity parameters) could `Bind` that statement without a `Parse` of its own and
+  run it with its own parameters, where PostgreSQL answers 26000. Such a connection is
+  now reset.
 - **A message continuing an open extended cycle is no longer refused or sent elsewhere.**
   Anything after a Flush-dispatched part of an extended cycle (further `Bind`/`Execute`/
   `Flush` batches, the `Sync`, or a Query), or after an extended `COPY` ended, could be

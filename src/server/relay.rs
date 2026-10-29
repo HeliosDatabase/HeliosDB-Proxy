@@ -1169,6 +1169,18 @@ impl ProxyServer {
             Self::abandon_conn(conns, &target, session, state).await;
             return Err(e);
         }
+        // Conditional reset (`skip_clean_reset`): the socket may now hold an
+        // unnamed statement the promotion did not record (it is off, or the
+        // Parse did not lead the batch). Parked without its reset, the next
+        // session leasing it could Bind that statement without a Parse.
+        #[cfg(feature = "pool-modes")]
+        if config.pool_mode.skip_clean_reset
+            && !backend.dirty
+            && unnamed.is_none()
+            && Self::batch_parses_unnamed(batch)
+        {
+            backend.dirty = true;
+        }
 
         // The client expects `ParseComplete` first; the backend won't send one
         // for a skipped Parse, so emit it here before relaying the response.
@@ -1383,6 +1395,19 @@ impl ProxyServer {
             return Err(stale);
         }
         Ok(stale)
+    }
+
+    /// `batch` has an unnamed `Parse`.
+    #[cfg(feature = "pool-modes")]
+    pub(super) fn batch_parses_unnamed(batch: &[u8]) -> bool {
+        let mut at = 0;
+        while let Some(head) = batch.get(at..at + 6) {
+            if head[0] == b'P' && head[5] == 0 {
+                return true;
+            }
+            at += 1 + (u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize).max(4);
+        }
+        false
     }
 
     /// Close the unnamed statement and/or portal (`which`) out of band:

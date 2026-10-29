@@ -1060,9 +1060,10 @@ impl ProxyServer {
         // round-trip, removing a backend RTT from the critical path for clean
         // autocommit workloads. Any of these three signals forces the full
         // reset. Extended-protocol traffic always has `prepared`/`unnamed_sig`
-        // set (or `dirty`, after a Close), so it is never clean-skipped
-        // (conservative by construction). Nor is an unnamed statement or
-        // portal the session no longer has (`unnamed_stale`).
+        // set (or `dirty`, after a Close or an unnamed Parse the promotion did
+        // not record), so it is never clean-skipped (conservative by
+        // construction). Nor is an unnamed statement or portal the session no
+        // longer has (`unnamed_stale`).
         let clean = !bc.dirty
             && bc.prepared.is_empty()
             && bc.stale.is_empty()
