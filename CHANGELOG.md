@@ -199,7 +199,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `REGRESS_NANO_BACKEND`) on HeliosDB-Nano; its approximate-refusal corpus (threshold
   0.92, the two column names embedded synonyms) fails when a whole-row reference, a
   qualified column (attribute notation), or a `DISTINCT` or `GROUP BY` statement is
-  filled approximately, next to a control pair that must be;
+  filled approximately, next to a control pair that must be; a pair meant to read
+  differently that the backend now answers alike (Nano P4 sorts by an output alias like
+  PostgreSQL) is reported as premise gone (listed under `premise_gone`, never a pass)
+  when the backend served it with its own result, and still fails when any tier did;
   `scripts/regress/bench-usertp.sh` takes a `READ_SCRIPT` pgbench script for its read
   cells (run with the scale read from `pgbench_branches`, which pgbench detects for its
   built-in scripts only, so `:scale` covers the accounts `-S` reads).

@@ -69,8 +69,13 @@ its default 1.0 (exact canonical matches only):
                       (a case or comment variant: same rows on PostgreSQL, but names and
                       comments are kept); a pair marked `different` must
                       also discriminate on this backend (A returns rows and B's direct
-                      outcome differs from A's), or it covers nothing and FAILs as a corpus
-                      defect. The pairs are every wrong-row pair the review rounds found
+                      outcome differs from A's), or it covers nothing: when B then came
+                      from the backend (no tier's hits grew) with the backend's own
+                      result, the pair is PREMISE-GONE (printed, listed under
+                      `premise_gone` in the evidence, never counted as a pass, not a
+                      failure: the backend answers A and B alike now); if any tier
+                      served B, or B through the proxy differs from the direct result,
+                      it FAILs. The pairs are every wrong-row pair the review rounds found
                       against the earlier canonicalizers that PostgreSQL tells apart at
                       threshold 1.0 (a schema equal to the alias or the table's own name,
                       `1.e3` vs `1. e3`, a table-name qualifier under an alias, ...; the
@@ -136,12 +141,18 @@ turn itself off: it neither stores nor serves.
                       columns, `tablename = 't'` five). Each `different` pair reads
                       alike on PostgreSQL, so it must discriminate here; a `distinct`
                       pair (A and B one text in two spellings) must also be served by no
-                      tier; the `unmatched` pairs (paraphrases on PostgreSQL) must not be
+                      tier. A `different` or `distinct` pair a newer Nano answers like
+                      PostgreSQL (`order_by_alias_named_like_input` on Nano P4, which
+                      sorts by the output alias) is PREMISE-GONE as above when B came
+                      from the backend with its own result, and FAILs when any tier
+                      served B or B through the proxy differs from the direct result;
+                      the `unmatched` pairs (paraphrases on PostgreSQL) must not be
                       L3 hits. `alias_fast_path` is the canonical form's own class: an
                       alias decides between Nano's point-lookup fast path (the table as
                       written, the quoted "L3dn_NN") and its planner (folded, l3dn_NN).
-Writes results (and /metrics snapshots) to --output (default DIR/cache-semantic-drill.json).
-Exit 1 if any case fails.
+Writes results (and /metrics snapshots, the `premise_gone` pairs and the `skipped`
+phases) to --output (default DIR/cache-semantic-drill.json). Exit 1 if any case fails (a
+PREMISE-GONE pair is neither a pass nor a failure).
 """
 import argparse
 import json
@@ -194,7 +205,9 @@ HUNG_READ_BOUND_SECS = 0.25
 # `paraphrase` pair must be an L3 hit with the backend's own result; a `different` pair
 # reads other rows, other column names, or fails on the backend, and must never be served
 # from A's entry (it may be an L3 hit only with exactly the backend's result). A
-# `different` pair must also discriminate (A returns rows, B's direct outcome differs).
+# `different` pair must also discriminate (A returns rows, B's direct outcome differs);
+# one that no longer does is reported as premise gone, not passed, when B came from the
+# backend with the backend's result (run_corpus).
 # Not in the corpus because PostgreSQL 16+ answers both sides alike, so they could never
 # fail: `TREAT(n AS s.amount)` vs `TREAT(n AS amount)` (both 42883), `x.n precision` vs
 # `n precision` (PRECISION needs AS: both 42601), `GROUP BY ALL f` vs `GROUP BY f`, and
@@ -616,6 +629,7 @@ class Drill:
         self.output = pathlib.Path(args.output) if args.output else self.dir / "cache-semantic-drill.json"
         self.results = []
         self.skipped = []
+        self.premise_gone = []
         self.snapshots = {}
         self.proxy = None
         self.stub = None
@@ -819,6 +833,13 @@ class Drill:
     def case(self, name, ok, **detail):
         self.results.append({"case": name, "pass": bool(ok), "detail": detail})
         print(f"{'PASS' if ok else 'FAIL'} {name} {json.dumps(detail, default=str)}", flush=True)
+
+    def premise(self, name, **detail):
+        """A pair that can no longer show a wrong row on this backend (it answers A and B
+        alike now, or A returns no rows) and whose B came from the backend with the
+        backend's own result: listed under `premise_gone`, never counted as a pass."""
+        self.premise_gone.append({"case": name, "detail": detail})
+        print(f"PREMISE-GONE {name} {json.dumps(detail, default=str)}", flush=True)
 
     # ------------------------------------------------------------ fixture
     def reset_tables(self):
@@ -1101,9 +1122,7 @@ class Drill:
                 # Nothing writes between the two calls: whichever tier served B (or
                 # none), it must return what the backend returns.
                 ok = same and discriminating
-            self.case(
-                f"{label}/{name}",
-                ok,
+            detail = dict(
                 kind=kind,
                 l3_hit=hit,
                 served_by=served_by or ["backend"],
@@ -1114,6 +1133,17 @@ class Drill:
                 b_through_proxy=through,
                 b_direct=direct,
             )
+            if kind in ("different", "distinct") and not discriminating:
+                # The backend no longer tells A and B apart (e.g. Nano P4 sorts
+                # order_by_alias_named_like_input by the output alias, as PostgreSQL
+                # does), or A returns no rows: serving A's entry for B could not be
+                # seen. Not a failure when B came from the backend with its own result,
+                # and never a pass; any tier serving B, or another outcome, still FAILs.
+                if same and not served_by:
+                    reason = "a_and_b_alike" if stored == direct else "a_returned_no_rows"
+                    self.premise(f"{label}/{name}", reason=reason, **detail)
+                    continue
+            self.case(f"{label}/{name}", ok, **detail)
 
     # ------------------------------------------------------------ phase 2
     def approximate_sequence(self):
@@ -1342,12 +1372,15 @@ def main():
         "results": drill.results,
         "failed": failed,
         "skipped": drill.skipped,
+        "premise_gone": drill.premise_gone,
         "error": error,
         "snapshots": drill.snapshots,
         "dir": str(drill.dir),
     }
     drill.output.write_text(json.dumps(evidence, indent=2, default=str))
     skipped = f", skipped: {', '.join(drill.skipped)}" if drill.skipped else ""
+    if drill.premise_gone:
+        skipped += f", premise gone: {', '.join(p['case'] for p in drill.premise_gone)}"
     print(f"== cache-semantic drill: {len(drill.results) - len(failed)} passed, "
           f"{len(failed)} failed{', error' if error else ''}{skipped}; evidence {drill.output} ==")
     sys.exit(1 if failed or error else 0)
