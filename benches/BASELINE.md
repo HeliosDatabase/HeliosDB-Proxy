@@ -44,52 +44,64 @@ of this case let every task take a permit at once, so nothing queued, and its nu
 not compare); `reserve_settle` is the per-statement replay charge (one CAS) and the credit
 at transaction end.
 
-## 2026-10-23 — query-cache, edge-fingerprint, semantic-tier and exclusion cases (91c4af7cc20e) — values pending
+## 2026-10-29 — query-cache, edge-fingerprint, semantic-tier and exclusion cases (91c4af7cc20e)
 
 Fifteen new `benches/cache.rs` cases for the `[cache]` semantic tier / exclusions / C-07
 fingerprint work. They were added in three commits so the A/B measures what changed:
 
 - **Group A — A/B against the base.** Commit `bench(cache): query-cache and edge
-  fingerprint cases` uses only APIs that exist on the base `a6344f4` (the tenant-budgets
-  tip this item is rebased onto; built on main `e210276`), so the base tree for
-  `scripts/bench-gate.sh` is `a6344f4` plus that commit. These cases cover the code the
-  item rewrites on every cacheable read: the quote-aware fingerprint scanner (one pass
+  fingerprint cases` (`ccc7ca4`) uses only APIs that exist on the tenant-budgets tip
+  `ec3734d` this item is built on, so the base tree for `scripts/bench-gate.sh` is
+  `ccc7ca4` (`ec3734d` plus that commit). These five cases cover the code the item
+  rewrites on every cacheable read: the quote-aware fingerprint scanner (one pass
   replacing up to five regex passes; runs on every L1 miss) and the `helios:` hint parser
-  (a memchr fast path replacing two regex scans); and on every journaled write, before
-  its `ReadyForQuery` reaches the client: `QueryCache::write_tables`, which no longer
-  calls the fingerprint scanner but runs one full pass of the lexer
-  (`sql_text::single_statement`) over the statement, up to `[journal]
-  max_statement_bytes` (1 MiB by default), where main had a borrowed fast path without a
-  comment marker and one regex pass.
+  (a memchr fast path replacing two regex scans).
 - **Group B — candidate only.** Commit `bench(cache): L3 and exclusion cases` adds cases
-  for code that does not exist on the base; `bench-gate.sh` reports them as NEW.
-  Commit `perf(cache): shard the semantic tier's store; build slots outside the lock`
-  adds `cache/l3/store_lookup_contended_8` (NEW against `a6344f4` too). It uses only the
-  tier's public API (`L3SemanticCache::new` / `get` / `put` / `len`), which the commit
-  before it (`3916aa8`, one tier-wide store lock) already has, so `3916aa8` plus this
-  `benches/cache.rs` is the base that measures the sharding itself.
+  the base tree does not declare; `bench-gate.sh` reports them as NEW. Commit
+  `perf(cache): shard the semantic tier's store; build slots outside the lock` adds
+  `cache/l3/store_lookup_contended_8`. The `write_tables` cases time the call every
+  journaled write makes before its `ReadyForQuery` reaches the client while a result
+  cache runs: `QueryCache::write_tables` no longer calls the fingerprint scanner but runs
+  one full pass of the lexer (`sql_text::single_statement`) over the statement, up to
+  `[journal] max_statement_bytes` (1 MiB by default), where main had a borrowed fast path
+  without a comment marker and one regex pass. Their A/B is a scratch bench of four
+  statements compiled against both trees (3 interleaved rounds, evidence
+  `91c4af7cc20e-20261023/wt-ab/`): 1.7–2.5x the base per write, +0.6 to +1.4 µs
+  (`update_accounts` 890 → 1546 ns, `insert_history` 935 → 2295 ns in round 1).
+
+Values: gate run `cache91c4-crit2-20261029` (base `ccc7ca4`, candidate `ad264fc`; host
+gpc001ca, governor performance, toolchain rustc 1.95.0 as bench-gate ran it, 3 interleaved
+rounds), each the median of the three round medians. The gate's verdict (FAIL on
+separated regressions of body-identical timed code, layout class; mean +0.04 %) and its
+attribution are in `91c4af7cc20e-20261023/GATE-RECORD.md`.
 
 | Benchmark | Group | What one iteration does | Base ns | Candidate ns |
 |---|---|---|---:|---:|
-| `cache/query/l1_hit_1k` | A | `QueryCache::get`, L1 hit, 1 KiB result | pending | pending |
-| `cache/query/l2_hit_1k` | A | `QueryCache::get` without a connection: normalize + L2 hit | pending | pending |
-| `cache/query/hinted_l2_hit_1k` | A | the same with a trailing `/*helios:cache_ttl=60*/` | pending | pending |
-| `cache/query/miss_store_1k` | A | a miss (another database) + a replacing store, 4096 rotating literals | pending | pending |
-| `cache/query/write_tables_short` | A | `QueryCache::write_tables` of a ~70-byte `UPDATE` with two literals | pending | pending |
-| `cache/query/write_tables_insert_1m` | A | `QueryCache::write_tables` of a 1 MiB multi-row `INSERT INTO events … VALUES (…),(…)…` | pending | pending |
-| `cache/edge/fingerprint_short` | A (`edge-proxy`) | `edge::fingerprint::analyze` of a ~100-byte read with a comment and two literals | pending | pending |
-| `cache/edge/write_tables_insert_1m` | B (`edge-proxy`) | `edge::fingerprint::write_tables` (the edge invalidation's table set; new on this branch, main used `tables_only`) of the same 1 MiB `INSERT` | — | pending |
-| `cache/l3/lookup_exact_5000` | B | `L3SemanticCache::get` of a paraphrase, exact canonical hit among 5000 entries | — | pending |
-| `cache/l3/lookup_approx_16` | B | an approximate hit scoring 16 variants (384-dim embeddings from an in-bench stub, remembered before timing) | — | pending |
-| `cache/l3/store_full_5000` | B | `L3SemanticCache::put` into a full tier (FIFO eviction every call) | — | pending |
-| `cache/l3/store_lookup_contended_8` | B | 8 threads at once, each a miss (`L3SemanticCache::get`) then a `put` of a key of its own into a full 5000-entry tier (eviction every store); wall time per round of all 8, from a barrier after thread start-up (values pending the lead's gate run) | — | pending |
-| `cache/excl/scan_3_names_1k` | B | `sql_text::TableExclusions::matches` on a ~1 KiB read naming none of 3 tables | — | pending |
-| `cache/excl/scan_1100_names_1k` | B | the same scan with 1100 names (one Aho-Corasick pass; the per-name memmem scan it replaced grew linearly) | — | pending |
-| `cache/excl/catalog_time_travel_scan_1k` | B | `sql_text::names_system_catalog` + `sql_text::uncacheable_text` on the same read with a trailing hint comment (the relay's per-read system-catalog, time-travel-comment and backend-ambiguous-text refusal scans, rounds 5 and 6) | — | pending |
+| `cache/query/l1_hit_1k` | A | `QueryCache::get`, L1 hit, 1 KiB result | 608.6 | 519.3 |
+| `cache/query/l2_hit_1k` | A | `QueryCache::get` without a connection: normalize + L2 hit | 3757.0 | 2589.7 |
+| `cache/query/hinted_l2_hit_1k` | A | the same with a trailing `/*helios:cache_ttl=60*/` | 4804.0 | 3834.2 |
+| `cache/query/miss_store_1k` | A | a miss (another database) + a replacing store, 4096 rotating literals | 9400.7 | 5442.2 |
+| `cache/edge/fingerprint_short` | A (`edge-proxy`) | `edge::fingerprint::analyze` of a ~100-byte read with a comment and two literals | 3303.8 | 2694.8 |
+| `cache/query/write_tables_short` | B | `QueryCache::write_tables` of a ~70-byte `UPDATE` with two literals | — | 1736.7 |
+| `cache/query/write_tables_insert_1m` | B | `QueryCache::write_tables` of a 1 MiB multi-row `INSERT INTO events … VALUES (…),(…)…` | — | 5279175 |
+| `cache/edge/write_tables_insert_1m` | B (`edge-proxy`) | `edge::fingerprint::write_tables` (the edge invalidation's table set; new on this branch, main used `tables_only`) of the same 1 MiB `INSERT` | — | 5142830 |
+| `cache/l3/lookup_exact_5000` | B | `L3SemanticCache::get` of a paraphrase, exact canonical hit among 5000 entries | — | 4184.9 |
+| `cache/l3/lookup_approx_16` | B | an approximate hit scoring 16 variants (384-dim embeddings from an in-bench stub, remembered before timing) | — | 20761.5 |
+| `cache/l3/store_full_5000` | B | `L3SemanticCache::put` into a full tier (FIFO eviction every call) | — | 4912.9 |
+| `cache/l3/store_lookup_contended_8` | B | 8 threads at once, each a miss (`L3SemanticCache::get`) then a `put` of a key of its own into a full 5000-entry tier (eviction every store); wall time per round of all 8, from a barrier after thread start-up | — | 27775.8 |
+| `cache/excl/scan_3_names_1k` | B | `sql_text::TableExclusions::matches` on a ~1 KiB read naming none of 3 tables | — | 1724.9 |
+| `cache/excl/scan_1100_names_1k` | B | the same scan with 1100 names (one Aho-Corasick pass; the per-name memmem scan it replaced grew linearly) | — | 130.1 |
+| `cache/excl/catalog_time_travel_scan_1k` | B | `sql_text::names_system_catalog` + `sql_text::uncacheable_text` on the same read with a trailing hint comment (the relay's per-read system-catalog, time-travel-comment and backend-ambiguous-text refusal scans) | — | 7852.4 |
 
-The implementer could not run Criterion (lead-only on this host); the lead's
-`scripts/bench-gate.sh <base = a6344f4 + bench commit> <candidate> <label>` run (default
-`BENCHES`, which include `cache`) fills the numbers in and records the verdict here.
+The `cache/l3/*` cases go through the tier's public API, so each includes the query
+normalizer and the canonical form; gdb stack samples of `store_full_5000` and
+`lookup_exact_5000` put about 70–85 % of a call there (the canonical parse alone about
+40–55 %), the store's own filing and eviction about 20 % and the lookup itself a few
+percent (`91c4af7cc20e-20261023/l3-profile/`). In the proxy a hinted read is normalized
+once for L1/L2 and parsed once for both its lookup and its store. With 3 names the
+exclusion scan is slower than with 1100: the automaton for three case-insensitive names
+gets a weaker prefilter on this text (about 1.7 ns per byte), the 1100-name one a packed
+searcher that skips the digits.
 
 ## 2026-10-07 — L2 cache baseline (2 new cases) and the L2 file-cache TTL gate
 

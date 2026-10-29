@@ -161,8 +161,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session (`semantic_max_entries / 32` rounded down to a power of two, 1 to 64): a lookup
   or store locks only its shard and builds what it stores before taking the lock, while
   `semantic_max_entries` and `semantic_max_bytes` bound the whole tier (eviction is
-  oldest-first within a shard, approximate across shards). Under `strict_config` a build
-  without `query-cache` refuses `cache.semantic_enabled`.
+  oldest-first within a shard, approximate across shards). A hinted read that misses pays
+  the tier's parse, lookup and store (about 3 µs single-threaded); on random-key reads that
+  never repeat, hinted reads ran 5-10 % below unhinted ones (docs/configuration.md, "Cost of
+  a hinted miss"): hint the reads that repeat. Under `strict_config` a build without
+  `query-cache` refuses `cache.semantic_enabled`.
 - **Table exclusions and per-table TTLs.** `[cache] exclude_tables` and `[[cache.tables]]`
   (`name` and exactly one of `ttl_secs` or `exclude = true`). An excluded read is neither
   looked up, captured nor stored by either result cache (the query cache and `[edge]`),

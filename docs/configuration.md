@@ -1198,6 +1198,19 @@ stores run concurrently each can hold the tier one entry over them (or evict one
 needed) for the moment it takes. With `semantic_similarity_threshold` at 1.0 a store never
 touches the embedding memo.
 
+**Cost of a hinted miss.** A hinted read that L1 and L2 miss is parsed once for the
+tier's grammar, looked up, and stored in the tier when the backend's result arrives, on
+top of the L1/L2 miss path. In the single-threaded `cache/l3/*` cases of
+`benches/BASELINE.md` that work is about 3 µs for a short point read, most of it the
+parse; with 8 threads missing and storing at once, a round takes about three times one
+thread's lookup and store (`store_lookup_contended_8`). A hit saves a backend round trip,
+so the hint pays off on reads that repeat or are paraphrased; on reads that never repeat
+it is only overhead. End to end, on pgbench point reads of random keys, where every hinted
+read missed and stored (2026-10-29: 16 and 64 clients, session and transaction pooling,
+`semantic_match = "canonical"`, threshold 0.92), hinted reads ran 5–10 % fewer per second
+than the same reads unhinted, and the concurrent writes stayed within the harness's noise.
+Hint the reads that repeat, not every read.
+
 Other limits: simple query protocol only; a standby-served result is never stored, so
 with read offload (`[load_balancer] standby_reads`) hinted reads that a standby serves
 never fill the tier; and HeliosDB-Nano through 4.41 answers a statement that starts with
