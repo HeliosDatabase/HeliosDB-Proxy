@@ -44,6 +44,47 @@ of this case let every task take a permit at once, so nothing queued, and its nu
 not compare); `reserve_settle` is the per-statement replay charge (one CAS) and the credit
 at transaction end.
 
+## 2026-10-23 — query-cache, edge-fingerprint, semantic-tier and exclusion cases (91c4af7cc20e) — values pending
+
+Fourteen new `benches/cache.rs` cases for the `[cache]` semantic tier / exclusions / C-07
+fingerprint work. They were added in two commits so the A/B measures what changed:
+
+- **Group A — A/B against the base.** Commit `bench(cache): query-cache and edge
+  fingerprint cases` uses only APIs that exist on the base `a6344f4` (the tenant-budgets
+  tip this item is rebased onto; built on main `e210276`), so the base tree for
+  `scripts/bench-gate.sh` is `a6344f4` plus that commit. These cases cover the code the
+  item rewrites on every cacheable read: the quote-aware fingerprint scanner (one pass
+  replacing up to five regex passes; runs on every L1 miss) and the `helios:` hint parser
+  (a memchr fast path replacing two regex scans); and on every journaled write, before
+  its `ReadyForQuery` reaches the client: `QueryCache::write_tables`, which no longer
+  calls the fingerprint scanner but runs one full pass of the lexer
+  (`sql_text::single_statement`) over the statement, up to `[journal]
+  max_statement_bytes` (1 MiB by default), where main had a borrowed fast path without a
+  comment marker and one regex pass.
+- **Group B — candidate only.** Commit `bench(cache): L3 and exclusion cases` adds cases
+  for code that does not exist on the base; `bench-gate.sh` reports them as NEW.
+
+| Benchmark | Group | What one iteration does | Base ns | Candidate ns |
+|---|---|---|---:|---:|
+| `cache/query/l1_hit_1k` | A | `QueryCache::get`, L1 hit, 1 KiB result | pending | pending |
+| `cache/query/l2_hit_1k` | A | `QueryCache::get` without a connection: normalize + L2 hit | pending | pending |
+| `cache/query/hinted_l2_hit_1k` | A | the same with a trailing `/*helios:cache_ttl=60*/` | pending | pending |
+| `cache/query/miss_store_1k` | A | a miss (another database) + a replacing store, 4096 rotating literals | pending | pending |
+| `cache/query/write_tables_short` | A | `QueryCache::write_tables` of a ~70-byte `UPDATE` with two literals | pending | pending |
+| `cache/query/write_tables_insert_1m` | A | `QueryCache::write_tables` of a 1 MiB multi-row `INSERT INTO events … VALUES (…),(…)…` | pending | pending |
+| `cache/edge/fingerprint_short` | A (`edge-proxy`) | `edge::fingerprint::analyze` of a ~100-byte read with a comment and two literals | pending | pending |
+| `cache/edge/write_tables_insert_1m` | B (`edge-proxy`) | `edge::fingerprint::write_tables` (the edge invalidation's table set; new on this branch, main used `tables_only`) of the same 1 MiB `INSERT` | — | pending |
+| `cache/l3/lookup_exact_5000` | B | `L3SemanticCache::get` of a paraphrase, exact canonical hit among 5000 entries | — | pending |
+| `cache/l3/lookup_approx_16` | B | an approximate hit scoring 16 variants (384-dim embeddings from an in-bench stub, remembered before timing) | — | pending |
+| `cache/l3/store_full_5000` | B | `L3SemanticCache::put` into a full tier (FIFO eviction every call) | — | pending |
+| `cache/excl/scan_3_names_1k` | B | `sql_text::TableExclusions::matches` on a ~1 KiB read naming none of 3 tables | — | pending |
+| `cache/excl/scan_1100_names_1k` | B | the same scan with 1100 names (one Aho-Corasick pass; the per-name memmem scan it replaced grew linearly) | — | pending |
+| `cache/excl/catalog_time_travel_scan_1k` | B | `sql_text::names_system_catalog` + `sql_text::uncacheable_text` on the same read with a trailing hint comment (the relay's per-read system-catalog, time-travel-comment and backend-ambiguous-text refusal scans, rounds 5 and 6) | — | pending |
+
+The implementer could not run Criterion (lead-only on this host); the lead's
+`scripts/bench-gate.sh <base = a6344f4 + bench commit> <candidate> <label>` run (default
+`BENCHES`, which include `cache`) fills the numbers in and records the verdict here.
+
 ## 2026-10-07 — L2 cache baseline (2 new cases) and the L2 file-cache TTL gate
 
 L2 file-cache TTL repair (sprinter `21cc434afb5c`). Host **gpc001ca**, rustc **1.99.0**,
