@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-10-30
+
+Tenants can be capped on the requests they run at once and on the bytes their sessions hold
+for transaction replay. Client sockets get TCP keepalive, and client TLS certificates rotate
+on SIGHUP. The query cache gains an opt-in semantic tier (statements of one small SELECT
+grammar matched exactly or by canonical form, never by embedding similarity of the SQL),
+table exclusions and per-table TTLs; its keys and invalidation now read literals, comments
+and the places where PostgreSQL and HeliosDB-Nano/Lite read a statement differently, so
+statements that return different rows no longer share an entry (C-07), and text the
+backends read differently is never cached. Admin node controls reach routing, and unknown
+config keys name the key they most likely meant.
+
+### Upgrade notes (behaviour changes)
+
+- **TCP keepalive on every client socket:** `[limits] client_tcp_keepalive_secs = 60` by
+  default, so a client that vanished without a FIN or RST ends its session after the OS's
+  probes go unanswered. `0` keeps the 2.1 behaviour (no keepalive).
+- **Refusals inside a transaction report its status:** a rate-limit, circuit fast-fail,
+  plugin-block or wasm-cached reply now ends in ReadyForQuery `T` or `E`, not `I`.
+- **`[cache]` is read at startup only:** a SIGHUP that changes it keeps the running section
+  with a warning (except `max_cacheable_response_bytes`). A `cache_ttl` hint can only
+  shorten a TTL, and `cache_ttl=0` skips the cache.
+- **Query-cache keys changed:** fingerprints keep words as written (case variants are
+  separate entries), and reads of system catalogs, statements with a time-travel clause in
+  a comment and statements PostgreSQL and HeliosDB-Nano/Lite read differently are never
+  cached; a multi-statement write or a write with such text invalidates the whole cache.
+  Case-variant spellings of one statement now miss each other.
+- **`exclude_columns` under `[cache]` is a startup error**, with or without
+  `strict_config`: column-level exclusion cannot be enforced.
+- **Library API** (crates that use `heliosdb-proxy` as a library): see Changed below —
+  `L3Config`, `CacheToml`, `LimitsToml` and `ServerMetricsSnapshot` gain public fields
+  (struct literals must set them), `L3Config`'s embedding timeout and concurrency defaults
+  change from 30 s / 10 to 5 s / 4, and `QueryNormalizer` fingerprints are no longer
+  upper-cased (HeliosDB-Lite's cache tests that expect upper-cased fingerprints must
+  change). The daemon's CLI, wire protocol and admin API stay compatible.
+- **Dependencies:** `aho-corasick` 1 is a direct dependency; a crate that builds this one
+  against its own lock file needs `cargo update -p heliosdb-proxy`.
+
 ### Added
 
 - **Per-tenant active-query and replay-byte budgets** (H-05 follow-up, Sprinter

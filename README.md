@@ -106,7 +106,7 @@ Sources: [1] [PgBouncer features](https://www.pgbouncer.org/features.html) · [2
 
 ## Status & guarantees
 
-**Verification status (2026-10-15, 2.1.0):** the [September 2026 audit](docs/internal/audit-2026-09/README.md)
+**Verification status (2026-10-30, 2.2.0):** the [September 2026 audit](docs/internal/audit-2026-09/README.md)
 found reproducible Transaction Replay safety defects; all of them are fixed as of
 1.7.0, verified against live PostgreSQL, and replay now checks its own work — a
 replayed statement whose results diverge from what the client already saw is rolled
@@ -115,7 +115,9 @@ makes query-cache invalidation commit-aware on both wire protocols and every tie
 adds Patroni as a write authority with conflicting primaries failing closed. 2.1.0
 offloads reads to standbys, tracks session settings across both wire protocols so
 offloaded reads and failover re-homes carry them (or refuse with `08006`), and bounds the
-Patroni authority lease by Patroni's own. The query
+Patroni authority lease by Patroni's own. 2.2.0 caps tenants' concurrent requests and
+replay bytes, adds an opt-in semantic cache tier, table exclusions and per-table TTLs, and
+keys the caches so that statements returning different rows never share an entry. The query
 cache stays opt-in: its identity does not yet include session state (`SET ROLE`,
 `search_path`, tenant settings), see docs/configuration.md. The audit also records
 advertised library capabilities that are not wired into the daemon. Consult it and the
