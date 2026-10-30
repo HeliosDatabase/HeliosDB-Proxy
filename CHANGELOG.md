@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Development
+
+- **Nano pair drill: online promotion.** `scripts/regress/nano-pair-drill.py
+  --promote-mode online` / `online-nowait` promote the running standby with
+  `SELECT pg_promote(true, 60)` / `pg_promote(false, 60)` on its own PG port (HeliosDB-Nano
+  P5.2) instead of the fixture's offline `--promote standby`: the call answers `t`,
+  `pg_promote` on the primary and a second call answer 55000, a session held on the
+  standby gets FATAL 57P01, and the promoted node's timeline is above the fenced node's;
+  then the same proxy-side checks. First run against Nano P5.2 (869df830, fixture
+  445d9c67): every mode 9/9, plain and TLS.
+
 ## [2.2.0] - 2026-10-30
 
 Tenants can be capped on the requests they run at once and on the bytes their sessions hold

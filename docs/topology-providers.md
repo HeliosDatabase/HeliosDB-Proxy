@@ -191,7 +191,9 @@ are exercised by `scripts/regress/nano-pair-drill.py` with
 SIGKILL and restart of either side, load, and, with Nano P5.1's `--promote standby`, a
 fenced promotion: the fenced old primary still answers `pg_is_in_recovery()` false but stays
 on timeline 1 while the promoted node is on 2, and it fails `heliosdb_require_ready()`, so the
-proxy follows the promoted node). Use Nano's supported promotion and fencing procedure; with static
+proxy follows the promoted node; with `--promote-mode online` or `online-nowait`, the same
+promotion done online by `SELECT pg_promote(wait, 60)` on the running standby, Nano P5.2, whose
+sessions get FATAL 57P01 and redial). Use Nano's supported promotion and fencing procedure; with static
 topology, update proxy roles after the database role change succeeds. Fixing
 replication connectivity is a prerequisite to a meaningful replicated failover
 test, and the proxy cannot repair the replica's replication stream.

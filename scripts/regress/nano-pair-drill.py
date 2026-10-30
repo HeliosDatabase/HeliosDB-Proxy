@@ -3,7 +3,7 @@
 
 Usage: python3 scripts/regress/nano-pair-drill.py --nano-binary PATH --fixture PATH
           --proxy-binary PATH [--dir DIR] [--load-rate N] [--output evidence.json]
-          [--fixture-arg=ARG ...]
+          [--fixture-arg=ARG ...] [--promote-mode fixture|online|online-nowait]
 
 `--fixture` is Nano's scripts/regress/nano-physical-pair.sh (branch feat/physical-standby);
 every `--fixture-arg=ARG` (written with `=`, since ARG itself starts with dashes: for example
@@ -38,6 +38,16 @@ Cases:
                  next statement fails while its uncommitted row never appears. Last case:
                  the pair stays promoted. Without the fixture action it is SKIPPED (listed
                  under `skipped`, never counted as a pass).
+  promote_online (--promote-mode online, Nano P5.2) the same, but the standby is promoted
+                 while it runs: `SELECT pg_promote(true, 60)` on its own PG port answers `t`
+                 once it serves as the primary. Before it, `pg_promote` on the primary is
+                 refused (55000); a session held on the standby gets FATAL 57P01; a fresh
+                 connection to the promoted node answers pg_is_in_recovery() = f, and its
+                 timeline is above the fenced node's. Then every check of `promote`.
+  promote_online_nowait (--promote-mode online-nowait) the same with
+                 `pg_promote(false, 60)`, which answers `t` at once while the promotion runs
+                 in the background; `pg_promote(false, 0)` before it is refused (22023, no
+                 promotion starts) and a second call right after it answers 55000.
 Exit 1 if any case fails its expectation.
 """
 import argparse
@@ -59,6 +69,8 @@ PRIMARY = "127.0.0.1:27721"
 STANDBY = "127.0.0.1:27722"
 PROXY_PORT = 27730
 ADMIN = 27731
+PRIMARY_PORT = int(PRIMARY.rsplit(":", 1)[1])
+STANDBY_PORT = int(STANDBY.rsplit(":", 1)[1])
 
 
 # ---------------------------------------------------------------- PG-wire client
@@ -145,6 +157,69 @@ def write(sql):
     finally:
         if client is not None:
             client.close()
+
+
+def direct(port, sql):
+    """One statement on a Nano node's own PG port, bypassing the proxy; a refused
+    startup or a dropped connection is a result too."""
+    client = None
+    try:
+        client = Client(port)
+        return client.query(sql)
+    except (ConnectionError, OSError, RuntimeError) as error:
+        return {"rows": [], "errors": [{"M": str(error)}], "tags": "", "sqlstate": "connection"}
+    finally:
+        if client is not None:
+            client.close()
+
+
+def pending_error(client, timeout):
+    """The ErrorResponse the server sends on an idle session (a FATAL before it
+    closes it), or what happened instead."""
+    client.sock.settimeout(timeout)
+    try:
+        tag, body = recv_message(client.sock)
+    except socket.timeout:
+        return {"sqlstate": None, "message": f"nothing within {timeout} s"}
+    except (ConnectionError, OSError) as error:
+        return {"sqlstate": "connection", "message": str(error)}
+    if tag != b"E":
+        return {"sqlstate": None, "message": f"unexpected message {tag!r}"}
+    fields = {chr(part[0]): part[1:].decode(errors="replace") for part in body.split(b"\0") if part}
+    return {"sqlstate": fields.get("C"), "severity": fields.get("S"), "message": fields.get("M")}
+
+
+def promote_online(wait):
+    """Spec P5.2: promote the running standby with `SELECT pg_promote(wait, 60)` on its own
+    PG port. Returns whether the node-side expectations held, and what was seen."""
+    seen = {"on_primary": direct(PRIMARY_PORT, "SELECT pg_promote(true, 5)")}
+    if not wait:
+        seen["zero_wait_seconds"] = direct(STANDBY_PORT, "SELECT pg_promote(false, 0)")
+    held = Client(STANDBY_PORT)
+    seen["held_before"] = held.query("SELECT 1")
+    started = time.monotonic()
+    seen["call"] = direct(STANDBY_PORT, f"SELECT pg_promote({'true' if wait else 'false'}, 60)")
+    seen["call_s"] = round(time.monotonic() - started, 2)
+    if not wait:
+        seen["second_call"] = direct(STANDBY_PORT, "SELECT pg_promote(false, 60)")
+    seen["held_session"] = pending_error(held, 60)
+    held.close()
+    seen["recovery_after"] = wait_for(
+        lambda: (r := direct(STANDBY_PORT, "SELECT pg_is_in_recovery()"))["rows"] == [["f"]] and r, 60)
+    timeline = "SELECT timeline_id FROM pg_control_checkpoint()"
+    seen["timelines"] = {"promoted": direct(STANDBY_PORT, timeline)["rows"],
+                         "fenced": direct(PRIMARY_PORT, timeline)["rows"]}
+    try:
+        timelines_ok = int(seen["timelines"]["promoted"][0][0]) > int(seen["timelines"]["fenced"][0][0])
+    except (IndexError, TypeError, ValueError):
+        timelines_ok = False
+    ok = (seen["on_primary"]["sqlstate"] == "55000" and not seen["held_before"]["errors"]
+          and seen["call"]["rows"] == [["t"]]
+          and (wait or (seen["zero_wait_seconds"]["sqlstate"] == "22023" and seen["call_s"] < 2
+                        and seen["second_call"]["sqlstate"] == "55000"))
+          and seen["held_session"]["sqlstate"] == "57P01"
+          and bool(seen["recovery_after"]) and timelines_ok)
+    return ok, seen
 
 
 # ---------------------------------------------------------------- admin API
@@ -240,6 +315,9 @@ def main():
     parser.add_argument("--fixture-arg", action="append", default=[],
                         help="extra option passed to every fixture invocation, written with "
                              "'=' (e.g. --fixture-arg=--tls); repeatable")
+    parser.add_argument("--promote-mode", choices=["fixture", "online", "online-nowait"], default="fixture",
+                        help="how the last case promotes the standby: the fixture's --promote (Nano P5.1, "
+                             "offline) or SELECT pg_promote on the running standby (Nano P5.2)")
     args = parser.parse_args()
 
     workdir = pathlib.Path(args.dir) if args.dir else pathlib.Path(tempfile.mkdtemp(prefix="nano-pair-drill-"))
@@ -249,7 +327,8 @@ def main():
               "nano_sha256": hashlib.sha256(pathlib.Path(args.nano_binary).read_bytes()).hexdigest(),
               "proxy_binary": args.proxy_binary,
               "proxy_sha256": hashlib.sha256(pathlib.Path(args.proxy_binary).read_bytes()).hexdigest(),
-              "dir": str(workdir), "fixture_args": args.fixture_arg, "cases": {}}
+              "dir": str(workdir), "fixture_args": args.fixture_arg, "promote_mode": args.promote_mode,
+              "cases": {}}
     cases = report["cases"]
     print(f"nano pair drill: nano {report['nano_sha256'][:12]} proxy {report['proxy_sha256'][:12]} dir {workdir}")
 
@@ -382,14 +461,19 @@ def main():
                "fixture_restart": restarted, "leader_after_restart": back, "write_after_restart": resumed,
                "standby_after": standby_after})
 
-        # ---- promote (fixture action from Nano P5.1)
-        if "--promote" not in pathlib.Path(args.fixture).read_text():
+        # ---- promote (the fixture's offline action, Nano P5.1; or pg_promote online, P5.2)
+        case = {"fixture": "promote", "online": "promote_online",
+                "online-nowait": "promote_online_nowait"}[args.promote_mode]
+        if args.promote_mode == "fixture" and "--promote" not in pathlib.Path(args.fixture).read_text():
             report.setdefault("skipped", []).append("promote")
             print("  SKIP promote: the fixture has no --promote action (Nano before P5.1)")
         else:
             pinned = Client(PROXY_PORT)
             opened = [pinned.query("BEGIN"), pinned.query("INSERT INTO drill VALUES (6, 'six')")]
-            promoted = fixture.run("--promote", "standby")
+            if args.promote_mode == "fixture":
+                node_side_ok, promoted = True, fixture.run("--promote", "standby")
+            else:
+                node_side_ok, promoted = promote_online(args.promote_mode == "online")
             moved = wait_for(lambda: primary() == STANDBY and node(STANDBY)["healthy"] and primary(), 60)
             try:
                 after_fence = pinned.query("INSERT INTO drill VALUES (7, 'seven')")
@@ -402,19 +486,14 @@ def main():
             lost_rows = write("SELECT count(*) FROM drill WHERE id IN (6, 7)")
             fenced = wait_for(lambda: node(PRIMARY)["healthy"] is False and PRIMARY not in replicas()
                               and node(PRIMARY), 30)
-            try:
-                direct = Client(int(PRIMARY.rsplit(":", 1)[1]))
-                direct_write = direct.query("INSERT INTO drill VALUES (9, 'nine')")
-                direct.close()
-            except (ConnectionError, OSError, RuntimeError) as error:
-                direct_write = {"errors": [{"M": str(error)}], "sqlstate": "connection"}
-            epochs = (promoted or {}).get("nodes")
-            check(cases, "promote",
-                  all(not o["errors"] for o in opened) and moved == STANDBY
+            direct_write = direct(PRIMARY_PORT, "INSERT INTO drill VALUES (9, 'nine')")
+            epochs = (promoted or {}).get("nodes") if args.promote_mode == "fixture" else promoted.get("timelines")
+            check(cases, case,
+                  node_side_ok and all(not o["errors"] for o in opened) and moved == STANDBY
                   and after_fence["sqlstate"] is not None and not landed["errors"]
                   and new_row["rows"] == [["1"]] and lost_rows["rows"] == [["0"]]
                   and bool(fenced) and direct_write["sqlstate"] == "25006",
-                  {"open_transaction": opened, "fixture_promote": promoted, "epochs": epochs,
+                  {"open_transaction": opened, "promotion": promoted, "epochs": epochs,
                    "leader_after_promote": moved, "open_transaction_after_fence": after_fence,
                    "write_after_promote": landed, "row_after_promote": new_row,
                    "uncommitted_rows_visible": lost_rows, "fenced_node": fenced,
