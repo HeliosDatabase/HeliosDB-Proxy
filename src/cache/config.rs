@@ -48,6 +48,9 @@ pub struct CacheConfig {
     /// the entry due takes it over. Default 5 s; non-zero when refresh-ahead
     /// is on.
     pub refresh_ahead_claim_timeout: Duration,
+
+    /// Per-table heatmap (`[cache] heatmap_*`); off by default.
+    pub heatmap: super::heatmap::HeatmapConfig,
 }
 
 impl Default for CacheConfig {
@@ -64,6 +67,7 @@ impl Default for CacheConfig {
             excluded_tables: Vec::new(),
             refresh_ahead_ratio: 0.0,
             refresh_ahead_claim_timeout: Duration::from_secs(5),
+            heatmap: super::heatmap::HeatmapConfig::default(),
         }
     }
 }
@@ -203,6 +207,8 @@ impl CacheConfig {
                 ));
             }
         }
+
+        self.heatmap.validate()?;
 
         Ok(())
     }
@@ -521,6 +527,20 @@ mod tests {
         }
         zstd.l2.zstd_level = 20;
         assert!(zstd.validate().is_err());
+    }
+
+    /// The heatmap is off by default, and an enabled one with a zero bucket
+    /// length is refused (it would divide by zero).
+    #[test]
+    fn validation_checks_an_enabled_heatmap() {
+        let mut c = CacheConfig::default();
+        assert!(!c.heatmap.enabled);
+        c.heatmap.bucket_secs = 0;
+        assert!(c.validate().is_ok(), "off: not checked");
+        c.heatmap.enabled = true;
+        assert!(c.validate().unwrap_err().contains("bucket_secs"));
+        c.heatmap.bucket_secs = 300;
+        assert!(c.validate().is_ok());
     }
 
     #[test]

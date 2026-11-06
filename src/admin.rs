@@ -815,6 +815,20 @@ impl AdminServer {
                 ))
             }
 
+            // Query-cache heatmap: per-table counters over the window, plus
+            // recommendations naming real [cache] keys.
+            #[cfg(feature = "query-cache")]
+            ("GET", p) if p == "/api/cache/heatmap" || p.starts_with("/api/cache/heatmap?") => {
+                Self::handle_cache_heatmap(state).await
+            }
+            #[cfg(not(feature = "query-cache"))]
+            ("GET", p) if p == "/api/cache/heatmap" || p.starts_with("/api/cache/heatmap?") => {
+                Ok((
+                    503,
+                    serde_json::json!({ "error": "query-cache feature not compiled in" }),
+                ))
+            }
+
             // Edge mode (T3.2). Stats panel for the home; the home's
             // registered edges + cache stats; and a manual
             // invalidation endpoint for ops drills. (The live SSE
@@ -2737,6 +2751,30 @@ impl AdminServer {
                 let _ = writeln!(output, "{name}{{gateway=\"{gateway}\"}} {}", value(pool));
             }
         }
+    }
+
+    /// `GET /api/cache/heatmap`: the cache heatmap's window (per-table
+    /// counters, hottest first, and recommendations). 200 with
+    /// `{"enabled": false, "reason": …}` while the query cache or its
+    /// heatmap is off.
+    #[cfg(feature = "query-cache")]
+    async fn handle_cache_heatmap(state: &Arc<AdminState>) -> Result<(u16, serde_json::Value)> {
+        let off = |reason: &str| {
+            Ok((
+                200,
+                serde_json::json!({ "enabled": false, "reason": reason }),
+            ))
+        };
+        let Some(cache) = state.query_cache.read().await.clone() else {
+            return off("the query cache is off ([cache] enabled = false)");
+        };
+        let Some(snapshot) = cache.heatmap_snapshot() else {
+            return off("the cache heatmap is off ([cache] heatmap_enabled = false)");
+        };
+        let mut body = serde_json::to_value(&snapshot)
+            .map_err(|e| ProxyError::Internal(format!("heatmap: {e}")))?;
+        body["enabled"] = serde_json::Value::Bool(true);
+        Ok((200, body))
     }
 
     /// The query cache's counters and retained bytes for `GET /metrics`.
@@ -4932,6 +4970,134 @@ mod tests {
             .unwrap();
         assert_eq!(json["query_cache"]["refresh_hint"], 1);
         assert_eq!(json["query_cache"]["refresh_ahead"]["claims"], 0);
+    }
+
+    /// A query cache with the heatmap on, one table stored, hit and written.
+    #[cfg(feature = "query-cache")]
+    async fn heatmap_cache() -> Arc<crate::cache::QueryCache> {
+        let cache = Arc::new(crate::cache::QueryCache::new(crate::cache::CacheConfig {
+            heatmap: crate::cache::HeatmapConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let ctx = crate::cache::CacheContext::default();
+        let sql = "SELECT v FROM orders WHERE id = 1";
+        cache
+            .put(
+                sql,
+                &ctx,
+                bytes::Bytes::from_static(b"rows"),
+                1,
+                std::time::Duration::ZERO,
+            )
+            .await;
+        assert!(matches!(
+            cache.get(sql, &ctx).await,
+            crate::cache::CacheLookup::Hit { .. }
+        ));
+        cache.mark_written(&["orders".to_string()]);
+        cache
+    }
+
+    /// `GET /api/cache/heatmap` answers 200 `{"enabled": false}` with the
+    /// reason while the cache or its heatmap is off, and the window's JSON
+    /// (every documented field) while it is on.
+    #[cfg(feature = "query-cache")]
+    #[tokio::test]
+    async fn cache_heatmap_endpoint_reports_off_states_and_the_window() {
+        let get = |state: Arc<AdminState>| async move {
+            AdminServer::route_request("GET", "/api/cache/heatmap", None, &state)
+                .await
+                .unwrap()
+        };
+        let state = Arc::new(AdminState::new());
+        let (status, body) = get(state.clone()).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enabled"], false);
+        assert!(body["reason"].as_str().unwrap().contains("[cache] enabled"));
+
+        state
+            .with_query_cache(Arc::new(crate::cache::QueryCache::new(
+                crate::cache::CacheConfig::default(),
+            )))
+            .await;
+        let (status, body) = get(state.clone()).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enabled"], false);
+        assert!(body["reason"].as_str().unwrap().contains("heatmap_enabled"));
+
+        state.with_query_cache(heatmap_cache().await).await;
+        let (status, body) = get(state.clone()).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["window_secs"], 86_400);
+        assert_eq!(body["bucket_secs"], 300);
+        assert_eq!(body["buckets"], 288);
+        assert_eq!(body["max_tables"], 1024);
+        assert_eq!(body["min_samples"], 100);
+        assert_eq!(body["tables_tracked"], 1);
+        assert_eq!(body["overflow"], 0);
+        assert_eq!(body["untracked_misses"], 0);
+        assert_eq!(body["invalidate_all"], 0);
+        assert!(body["recommendations"].as_array().unwrap().is_empty());
+        let tables = body["tables"].as_array().unwrap();
+        assert_eq!(tables.len(), 1);
+        let t = &tables[0];
+        assert_eq!(t["table"], "orders");
+        assert_eq!(t["hits"], 1);
+        assert_eq!(t["misses"], 0);
+        assert_eq!(t["expired"], 0);
+        assert_eq!(t["stores"], 1);
+        assert_eq!(t["stored_bytes"], 4);
+        assert_eq!(t["invalidations"], 1);
+        assert_eq!(t["stale_rejected"], 0);
+        assert_eq!(t["fills_raced"], 0);
+        assert_eq!(t["hit_ratio"], 1.0);
+        assert_eq!(t["temperature"], "hot");
+        assert!(t["last_access_secs_ago"].as_u64().is_some());
+        assert!(t.get("retained_bytes").is_none(), "not reported");
+        // A query string is accepted (and ignored).
+        let (status, _) = AdminServer::route_request("GET", "/api/cache/heatmap?x=1", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+    }
+
+    /// `GET /api/cache/heatmap` is behind the admin bearer token like every
+    /// other `/api/*` route: 401 without it, the window with it.
+    #[cfg(feature = "query-cache")]
+    #[tokio::test]
+    async fn cache_heatmap_endpoint_needs_the_admin_token() {
+        let state = Arc::new(AdminState::new());
+        state.with_query_cache(heatmap_cache().await).await;
+        state.with_auth_token(Some("s3cret".to_string())).await;
+        let request = |state: Arc<AdminState>, auth: &'static str| async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, peer) = listener.accept().await.unwrap();
+                let _ = AdminServer::handle_connection(stream, peer, state).await;
+            });
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            client
+                .write_all(format!("GET /api/cache/heatmap HTTP/1.1\r\n{auth}\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            server.await.unwrap();
+            String::from_utf8_lossy(&response).into_owned()
+        };
+        let denied = request(state.clone(), "").await;
+        assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
+        assert!(!denied.contains("orders"), "{denied}");
+        let wrong = request(state.clone(), "Authorization: Bearer nope\r\n").await;
+        assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
+        let allowed = request(state, "Authorization: Bearer s3cret\r\n").await;
+        assert!(allowed.starts_with("HTTP/1.1 200"), "{allowed}");
+        assert!(allowed.contains("\"table\":\"orders\""), "{allowed}");
     }
 
     /// With the semantic tier on and its endpoint down (closed port), the

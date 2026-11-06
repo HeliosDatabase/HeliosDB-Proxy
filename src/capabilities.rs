@@ -208,7 +208,7 @@ pub fn manifest(config: &ProxyConfig) -> Vec<Capability> {
 /// config key path whose promise the binary cannot keep.
 pub fn unavailable_enabled(config: &ProxyConfig) -> Vec<&'static str> {
     // (config key path, enabled now, compiled into this build)
-    let checks: [(&'static str, bool, bool); 19] = [
+    let checks: [(&'static str, bool, bool); 20] = [
         (
             "cache.enabled",
             config.cache.enabled,
@@ -228,6 +228,11 @@ pub fn unavailable_enabled(config: &ProxyConfig) -> Vec<&'static str> {
         (
             "cache.refresh_ahead_ratio",
             config.cache.enabled && config.cache.refresh_ahead_ratio > 0.0,
+            cfg!(feature = "query-cache"),
+        ),
+        (
+            "cache.heatmap_enabled",
+            config.cache.enabled && config.cache.heatmap_enabled,
             cfg!(feature = "query-cache"),
         ),
         (
@@ -378,6 +383,15 @@ mod tests {
         config.cache.enabled = true;
         assert_eq!(
             unavailable_enabled(&config).contains(&"cache.refresh_ahead_ratio"),
+            !cfg!(feature = "query-cache")
+        );
+        config.cache.enabled = false;
+        // So is the heatmap.
+        config.cache.heatmap_enabled = true;
+        assert!(!unavailable_enabled(&config).contains(&"cache.heatmap_enabled"));
+        config.cache.enabled = true;
+        assert_eq!(
+            unavailable_enabled(&config).contains(&"cache.heatmap_enabled"),
             !cfg!(feature = "query-cache")
         );
     }

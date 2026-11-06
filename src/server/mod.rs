@@ -1002,6 +1002,14 @@ impl ProxyServer {
                     }
                 );
             }
+            if c.heatmap_enabled {
+                tracing::info!(
+                    bucket_secs = c.heatmap_bucket_secs,
+                    buckets = c.heatmap_buckets,
+                    max_tables = c.heatmap_max_tables,
+                    "cache heatmap on: GET /api/cache/heatmap"
+                );
+            }
             Some(Arc::new(crate::cache::QueryCache::new(c.to_cache_config())))
         } else {
             None

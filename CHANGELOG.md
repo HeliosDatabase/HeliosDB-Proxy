@@ -76,6 +76,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Criterion: `cache/l2/compress_{lz4,zstd}_{4k,64k,1m}`,
   `cache/l2/hit_{lz4,zstd}_{4k,64k,1m}` and the control `cache/l2/hit_none_64k`, on
   DataRow payloads.
+- **Query-cache heatmap with recommendations** (distribcache merge P2). With
+  `[cache] heatmap_enabled = true` the cache counts, per table and per time bucket
+  (`heatmap_bucket_secs = 300` × `heatmap_buckets = 288`, a 24 h window), hits, misses
+  (and of those, expired L2 entries), stores and their bytes, C-02 write invalidations,
+  stale rejections and raced fills. `GET /api/cache/heatmap` (token-gated like every
+  `/api/*` route) lists the tables hottest first with hit ratio, temperature and last
+  access, and recommends `cache.exclude_tables` for a table with more invalidations than
+  hits, or a higher `[[cache.tables]] ttl_secs` when most of its misses found the entry
+  expired, once it has `heatmap_min_samples = 100` reads in the window. The table set is
+  bounded by `heatmap_max_tables = 1024` (samples beyond it count in `overflow`; idle
+  tables make room once per bucket). Recording takes no lock (per-table atomic rings, a
+  copy-on-write table set); off (the default), each cache access pays one branch. A
+  `[cache.heatmap]` table gets a hint naming the flat keys. Per-table retained bytes are
+  not reported (the cache keeps no per-table byte count). Library API: `CacheConfig`
+  gains `heatmap` (`cache::HeatmapConfig`) and `CacheToml` the five keys (struct
+  literals must set them); new `QueryCache::heatmap_snapshot` and
+  `L2WarmCache::get_noting_expiry`. Criterion cases
+  `cache/heatmap/record_hit_{off,on,contended_8}`.
 
 ### Fixed
 

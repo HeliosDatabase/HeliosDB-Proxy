@@ -10,8 +10,9 @@
 //! `refresh_ahead_ratio` on); `cache/edge/*` the edge-cache key the relay computes for every
 //! cacheable read when `[edge]` is on, and the edge invalidation's table set.
 //! `cache/l3/*` measure the semantic tier through its public API (canonical
-//! form included; `store_lookup_contended_8` with eight threads at once) and
-//! `cache/excl/*` the relay's `[cache] exclude_tables` scan.
+//! form included; `store_lookup_contended_8` with eight threads at once),
+//! `cache/excl/*` the relay's `[cache] exclude_tables` scan, and
+//! `cache/heatmap/*` what the `[cache] heatmap_enabled` heatmap adds to a hit.
 
 use criterion::{criterion_group, criterion_main, Criterion};
 #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
@@ -635,12 +636,76 @@ fn bench_exclusions(c: &mut Criterion) {
 #[cfg(not(any(feature = "query-cache", feature = "edge-proxy")))]
 fn bench_exclusions(_c: &mut Criterion) {}
 
+/// What the heatmap adds to every cache hit: `QueryCache` records one on
+/// the tables of the served entry (one table here), with the lookup's own
+/// start time (no clock read for it). `record_hit_off` is the default
+/// (`heatmap_enabled = false`: one branch), `record_hit_on` the record into
+/// the table's current bucket, and `record_hit_contended_8`
+/// `CONTENDED_THREADS` threads recording hits of that one table at once (the
+/// worst case: one hot table, one slot), timed per round from a common start
+/// until the last thread is done.
+#[cfg(feature = "query-cache")]
+fn bench_heatmap(c: &mut Criterion) {
+    use heliosdb_proxy::cache::{HeatRecorder, HeatmapConfig};
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+    let tables = vec!["accounts".to_string()];
+    let off = HeatRecorder::new(&HeatmapConfig::default());
+    assert!(off.heatmap().is_none());
+    let config = HeatmapConfig {
+        enabled: true,
+        ..HeatmapConfig::default()
+    };
+    let on = Arc::new(HeatRecorder::new(&config));
+    let at = Instant::now();
+    // Track the table (its first record copies the table set) before timing.
+    on.record_hit(&tables, at);
+
+    let mut group = c.benchmark_group("cache/heatmap");
+    group.sample_size(50);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
+    group.bench_function("record_hit_off", |b| {
+        b.iter(|| off.record_hit(black_box(&tables), black_box(at)))
+    });
+    group.bench_function("record_hit_on", |b| {
+        b.iter(|| on.record_hit(black_box(&tables), black_box(at)))
+    });
+    group.bench_function("record_hit_contended_8", |b| {
+        b.iter_custom(|iters| {
+            let start = Arc::new(Barrier::new(CONTENDED_THREADS + 1));
+            let workers: Vec<_> = (0..CONTENDED_THREADS)
+                .map(|_| {
+                    let (on, start, tables) = (on.clone(), start.clone(), tables.clone());
+                    std::thread::spawn(move || {
+                        start.wait();
+                        for _ in 0..iters {
+                            on.record_hit(black_box(&tables), black_box(at));
+                        }
+                    })
+                })
+                .collect();
+            start.wait();
+            let began = Instant::now();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            began.elapsed()
+        })
+    });
+    group.finish();
+}
+
+#[cfg(not(feature = "query-cache"))]
+fn bench_heatmap(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_l2_cache,
     bench_query_cache,
     bench_edge_fingerprint,
     bench_semantic_cache,
-    bench_exclusions
+    bench_exclusions,
+    bench_heatmap
 );
 criterion_main!(benches);

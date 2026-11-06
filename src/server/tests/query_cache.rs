@@ -1082,7 +1082,8 @@ async fn a_sighup_reload_keeps_the_running_cache_section() {
         format!(
             "[cache]\nenabled = true\nmax_cacheable_response_bytes = 8192\n\
              semantic_enabled = true\nexclude_tables = [\"secret\"]\nttl_secs = 9\n\
-             l1_max_entries = 7\nl2_max_bytes = 1048576\nl2_compression = \"zstd\"\n{nodes}"
+             l1_max_entries = 7\nl2_max_bytes = 1048576\nl2_compression = \"zstd\"\n\
+             heatmap_enabled = true\nheatmap_bucket_secs = 60\n{nodes}"
         ),
     )
     .unwrap();
@@ -1105,6 +1106,11 @@ async fn a_sighup_reload_keeps_the_running_cache_section() {
         ),
         "sizes and compression are startup-only too"
     );
+    // The heatmap keys are kept too, and the running cache keeps no heatmap.
+    assert!(!live.cache.heatmap_enabled);
+    assert_eq!(live.cache.heatmap_bucket_secs, running.heatmap_bucket_secs);
+    let qc = server.state.query_cache.as_ref().expect("cache on");
+    assert!(qc.heatmap_snapshot().is_none());
 
     // Only max_cacheable_response_bytes changed: applied, no section kept.
     std::fs::write(
@@ -1116,6 +1122,39 @@ async fn a_sighup_reload_keeps_the_running_cache_section() {
     let live = server.state.live_config.load_full();
     assert_eq!(live.cache.max_cacheable_response_bytes, 1024);
     assert_eq!(live.cache.ttl_secs, running.ttl_secs);
+}
+
+/// The heatmap sees what the relay does: the first read of a table misses
+/// (untracked: nothing of it stored yet) and is stored, the repeat is a hit,
+/// a write through the proxy is its invalidation (C-02), and the next read
+/// is refused on L1 and L2, misses and is stored again.
+#[tokio::test]
+async fn the_heatmap_counts_reads_and_writes_through_the_relay() {
+    const READ: &str = "SELECT v FROM t WHERE id = 1";
+    let (mut relay, backend) = Relay::start(|c| c.cache.heatmap_enabled = true, &[], 3).await;
+    relay.answered_by_backend(READ).await;
+    let (node, _) = relay.query(READ).await;
+    assert_eq!(node, None, "served from the cache");
+    relay
+        .answered_by_backend("UPDATE t SET v = 2 WHERE id = 1")
+        .await;
+    relay.answered_by_backend(READ).await;
+    let s = relay.cache().heatmap_snapshot().expect("heatmap on");
+    assert_eq!(s.untracked_misses, 1, "{s:?}");
+    let t = s.tables.iter().find(|t| t.table == "t").expect("t tracked");
+    assert_eq!(
+        (
+            t.hits,
+            t.misses,
+            t.stores,
+            t.invalidations,
+            t.stale_rejected
+        ),
+        (1, 1, 2, 1, 2),
+        "{t:?}"
+    );
+    drop(relay);
+    assert_eq!(backend.await.unwrap().len(), 3);
 }
 
 /// The capture ceiling comes from the live config: a SIGHUP that lowers

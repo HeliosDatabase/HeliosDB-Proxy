@@ -57,6 +57,7 @@
 pub(crate) mod canonical;
 pub mod codec;
 pub mod config;
+pub mod heatmap;
 pub mod hints;
 pub mod invalidation;
 pub mod l1_hot;
@@ -71,6 +72,10 @@ pub mod result;
 // Re-exports
 pub use codec::{L2Codec, L2Payload};
 pub use config::{CacheConfig, L1Config, L2Config, L3Config, StorageBackend};
+pub use heatmap::{
+    CacheHeatmap, HeatRecorder, HeatmapConfig, HeatmapSnapshot, Recommendation, TableHeatSnapshot,
+    Temperature,
+};
 pub use hints::{parse_cache_hints, CacheHint};
 pub use invalidation::{InvalidationManager, InvalidationMode};
 pub use l1_hot::L1HotCache;
@@ -323,6 +328,10 @@ pub struct QueryCache {
     /// Refresh-ahead (`refresh_ahead_ratio` in (0, 1), with L2): claims of
     /// refills in flight. `None` when off: the lookup then pays one branch.
     refresh_ahead: Option<Arc<refresh::RefreshAhead>>,
+
+    /// The per-table heatmap (`[cache] heatmap_enabled`); with it off,
+    /// every record below is one branch.
+    heat: HeatRecorder,
 }
 
 /// A job for the `cache-reclaim` thread.
@@ -407,6 +416,7 @@ impl QueryCache {
             } else {
                 None
             },
+            heat: HeatRecorder::new(&config.heatmap),
         }
     }
 
@@ -646,9 +656,10 @@ impl QueryCache {
                     Some(result) if self.is_current(&result) => {
                         young_enough(&result).then_some(result)
                     }
-                    Some(_) => {
+                    Some(stale) => {
                         l1.remove(query);
                         self.metrics.record_stale_rejected();
+                        self.heat.record_stale_rejected(&stale.tables, start);
                         None
                     }
                     None => None,
@@ -658,6 +669,7 @@ impl QueryCache {
                         Some(ra) if ra.due(&result, start) => l1_due = Some(result),
                         _ => {
                             self.metrics.record_hit(CacheLevel::L1Hot, start.elapsed());
+                            self.heat.record_hit(&result.tables, start);
                             return (
                                 CacheLookup::Hit {
                                     result,
@@ -686,13 +698,16 @@ impl QueryCache {
         let normalized = self.normalizer.normalize_with(query, keyed_verbatim);
         let cache_key = CacheKey::new(&normalized, context);
 
-        // L2: Check warm cache (normalized match)
+        // L2: Check warm cache (normalized match). Whether the entry was
+        // there but past its TTL is the heatmap's `expired`.
+        let mut expired = false;
         if let Some(ref l2) = self.l2_cache {
-            let hit = match l2.get(&cache_key).await {
+            let hit = match l2.get_noting_expiry(&cache_key, &mut expired).await {
                 Some(result) if self.is_current(&result) => young_enough(&result).then_some(result),
-                Some(_) => {
+                Some(stale) => {
                     l2.remove(&cache_key).await;
                     self.metrics.record_stale_rejected();
+                    self.heat.record_stale_rejected(&stale.tables, start);
                     None
                 }
                 None => None,
@@ -717,12 +732,14 @@ impl QueryCache {
                             // Its own L1 copy, past the refresh point while
                             // another reader refills the entry.
                             self.metrics.record_hit(level, start.elapsed());
+                            self.heat.record_hit(&result.tables, start);
                             return (CacheLookup::Hit { result, level }, prep);
                         }
                         RefreshPick::Claimed(claim) => {
                             // The claimant is a miss on every tier (L3 too):
                             // its result refills the entry.
                             self.metrics.record_miss(start.elapsed());
+                            self.heat.record_miss(&normalized.tables, expired, start);
                             let prep = self.miss_prep(
                                 hints,
                                 normalized,
@@ -764,6 +781,7 @@ impl QueryCache {
                                 );
                                 self.metrics
                                     .record_hit(CacheLevel::L3Semantic, start.elapsed());
+                                self.heat.record_hit(&result.tables, start);
                                 return (
                                     CacheLookup::Hit {
                                         result,
@@ -780,7 +798,9 @@ impl QueryCache {
                                 );
                             }
                             l3_semantic::SemanticLookup::Stale => {
-                                self.metrics.record_stale_rejected()
+                                self.metrics.record_stale_rejected();
+                                // The tier's single relation: the statement's.
+                                self.heat.record_stale_rejected(&normalized.tables, start);
                             }
                             l3_semantic::SemanticLookup::Miss => {}
                         }
@@ -791,6 +811,7 @@ impl QueryCache {
         }
 
         self.metrics.record_miss(start.elapsed());
+        self.heat.record_miss(&normalized.tables, expired, start);
         let prep = self.miss_prep(hints, normalized, keyed_verbatim, semantic, None);
         (CacheLookup::Miss, prep)
     }
@@ -829,6 +850,7 @@ impl QueryCache {
         prep: QueryPrep,
     ) -> (CacheLookup, QueryPrep) {
         self.metrics.record_hit(CacheLevel::L2Warm, start.elapsed());
+        self.heat.record_hit(&result.tables, start);
 
         // Promote to L1 (raw: L2 returned the payload decompressed)
         if self.config.l1.enabled {
@@ -1039,6 +1061,7 @@ impl QueryCache {
         let generation = prep.generation.unwrap_or(current);
         if generation != current || self.heliosdb_backend() != keyed_verbatim {
             self.metrics.record_fill_raced();
+            self.heat.record_fill_raced(&normalized.tables);
             return false;
         }
 
@@ -1082,6 +1105,9 @@ impl QueryCache {
                 self.invalidator.register(&cache_key, table);
             }
         }
+
+        self.heat
+            .record_store(&normalized.tables, result.data.len(), result.cached_at);
 
         // Store in L3 (semantic) if hint enabled, by the form above; never a
         // canonical form once a HeliosDB backend was seen (checked now: the
@@ -1130,6 +1156,7 @@ impl QueryCache {
     /// from here on no tier (L1/L2/L3) serves, and no in-flight fetch stores,
     /// a result that read these tables before this point.
     pub fn mark_written(&self, tables: &[String]) {
+        self.heat.record_invalidation(tables);
         for table in tables {
             // Runs before the write's ReadyForQuery: a known table (the common
             // case) is bumped in place without allocating its name again.
@@ -1189,6 +1216,7 @@ impl QueryCache {
         self.global_generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.metrics.record_invalidation(0);
+        self.heat.record_invalidate_all();
     }
 
     /// The tables a write statement touches, or `None` when they cannot be
@@ -1316,6 +1344,20 @@ impl QueryCache {
     /// Get configuration
     pub fn config(&self) -> &CacheConfig {
         &self.config
+    }
+
+    /// The heatmap's window now (`GET /api/cache/heatmap`), when
+    /// `heatmap.enabled`; its recommendations quote the configured TTLs.
+    pub fn heatmap_snapshot(&self) -> Option<HeatmapSnapshot> {
+        let map = self.heat.heatmap()?;
+        let table = |t: &str| self.config.table_configs.get(t).map(|c| c.ttl);
+        Some(map.snapshot(
+            Instant::now(),
+            &heatmap::TtlView {
+                default: self.config.default_ttl,
+                table: &table,
+            },
+        ))
     }
 
     /// The semantic tier, when `l3.enabled`.
@@ -3169,5 +3211,161 @@ mod tests {
             0,
             "nothing compressed by default"
         );
+    }
+
+    /// A cache with the heatmap on (`min_samples` reads before a
+    /// recommendation).
+    fn heatmap_cache(config: CacheConfig, min_samples: u64) -> QueryCache {
+        QueryCache::new(CacheConfig {
+            heatmap: HeatmapConfig {
+                enabled: true,
+                min_samples,
+                ..Default::default()
+            },
+            ..config
+        })
+    }
+
+    fn heat_row(cache: &QueryCache, table: &str) -> TableHeatSnapshot {
+        cache
+            .heatmap_snapshot()
+            .expect("heatmap on")
+            .tables
+            .into_iter()
+            .find(|t| t.table == table)
+            .unwrap_or_else(|| panic!("{table} not listed"))
+    }
+
+    /// Every lookup outcome lands on the right tables: a store and each
+    /// tier's hit on the entry's tables (both of a join), a miss on the
+    /// statement's tables once tracked (before its first store a table's
+    /// miss is untracked), a write on its tables and the refusals it causes
+    /// (L1 and L2 each), a raced fill, and a whole-cache invalidation.
+    #[tokio::test]
+    async fn heatmap_attributes_each_event_to_its_tables() {
+        let cache = heatmap_cache(CacheConfig::default(), 100);
+        let q = "SELECT v FROM accounts WHERE id = 1";
+        fill(&cache, q, 1, b"v=1").await;
+        assert!(is_hit(&cache, q, 1).await, "L1");
+        assert!(is_hit(&cache, q, 2).await, "L2");
+        let join = "SELECT a.v, u.name FROM accounts a JOIN users u ON u.id = a.id";
+        fill(&cache, join, 1, b"j").await;
+        assert!(is_hit(&cache, join, 1).await);
+        let s = cache.heatmap_snapshot().unwrap();
+        assert_eq!(s.untracked_misses, 2, "accounts' first miss, users' first");
+        assert_eq!(s.tables_tracked, 2);
+        let a = heat_row(&cache, "accounts");
+        assert_eq!(
+            (a.hits, a.misses, a.stores, a.stored_bytes),
+            (3, 1, 2, 4),
+            "{a:?}"
+        );
+        let u = heat_row(&cache, "users");
+        assert_eq!((u.hits, u.misses, u.stores), (1, 0, 1), "{u:?}");
+
+        cache.mark_written(&["accounts".to_string()]);
+        assert!(!is_hit(&cache, q, 1).await);
+        let a = heat_row(&cache, "accounts");
+        assert_eq!(
+            (a.invalidations, a.stale_rejected, a.misses),
+            (1, 2, 2),
+            "{a:?}"
+        );
+
+        let (lookup, prep) = cache.get_with_prep(q, &ctx(3)).await;
+        assert!(matches!(lookup, CacheLookup::Miss));
+        cache.mark_written(&["accounts".to_string()]);
+        cache
+            .put_prepared(
+                q,
+                &ctx(3),
+                &prep,
+                Bytes::from_static(b"old"),
+                1,
+                Duration::ZERO,
+            )
+            .await;
+        let a = heat_row(&cache, "accounts");
+        assert_eq!(
+            (a.misses, a.invalidations, a.fills_raced, a.stores),
+            (3, 2, 1, 2),
+            "{a:?}"
+        );
+        assert_eq!(heat_row(&cache, "users").invalidations, 0);
+        cache.invalidate_all();
+        assert_eq!(cache.heatmap_snapshot().unwrap().invalidate_all, 1);
+    }
+
+    /// A miss that found its L2 entry past its TTL counts as expired (aged in
+    /// place, no sleep); an absent entry does not. The recommendation to
+    /// raise the table's TTL quotes its `[[cache.tables]]` TTL, and fires
+    /// only while expiries are most of the misses.
+    #[tokio::test]
+    async fn heatmap_counts_an_expired_entry_and_recommends_a_longer_ttl() {
+        let mut config = CacheConfig::default();
+        config.table_configs.insert(
+            "prices".to_string(),
+            config::TableCacheConfig {
+                ttl: Duration::from_secs(1),
+                ..Default::default()
+            },
+        );
+        let cache = heatmap_cache(config, 1);
+        let q = "SELECT v FROM prices WHERE id = 1";
+        fill(&cache, q, 1, b"p").await;
+        let l2 = cache.l2_cache.clone().expect("L2 on by default");
+        let key = CacheKey::new(&cache.normalizer.normalize_with(q, false), &ctx(2));
+        let mut aged = l2.get(&key).await.expect("stored");
+        assert_eq!(aged.ttl, Duration::from_secs(1), "the table's TTL");
+        aged.cached_at = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("monotonic clock past 2 s");
+        l2.put(key, aged).await;
+        assert!(!is_hit(&cache, q, 2).await, "expired");
+        let p = heat_row(&cache, "prices");
+        assert_eq!((p.misses, p.expired), (1, 1), "{p:?}");
+        let s = cache.heatmap_snapshot().unwrap();
+        assert_eq!(s.recommendations.len(), 1, "{s:?}");
+        let r = &s.recommendations[0];
+        assert_eq!((r.key, r.action), ("cache.tables.ttl_secs", "raise"));
+        assert!(r.reason.contains("[[cache.tables]] ttl_secs = 1"), "{r:?}");
+
+        assert!(!is_hit(&cache, "SELECT v FROM prices WHERE id = 2", 2).await);
+        let p = heat_row(&cache, "prices");
+        assert_eq!((p.misses, p.expired), (2, 1), "absent is no expiry");
+        assert!(cache.heatmap_snapshot().unwrap().recommendations.is_empty());
+    }
+
+    /// With L2 compression, a decompressed L2 hit counts on the entry's
+    /// tables like any hit, and `stored_bytes` is the raw size.
+    #[tokio::test]
+    async fn heatmap_counts_a_compressed_l2_hit() {
+        for compression in CODECS {
+            let cache = heatmap_cache(compressed_config(compression), 100);
+            let data = codec::data_rows(64 * 1024);
+            let q = "SELECT id, name, status FROM accounts WHERE region = 'eu'";
+            fill_with(&cache, q, 1, data.clone()).await;
+            assert!(cache.compression_saved_bytes() > 0, "{compression:?}");
+            let (hit, level) = hit_of(&cache, q, 2).await.unwrap();
+            assert_eq!((hit, level), (data.clone(), CacheLevel::L2Warm));
+            let a = heat_row(&cache, "accounts");
+            assert_eq!(
+                (a.hits, a.misses, a.expired, a.stores, a.stored_bytes),
+                (1, 0, 0, 1, data.len() as u64),
+                "{compression:?}: {a:?}"
+            );
+        }
+    }
+
+    /// With the heatmap off (the default) there is no heatmap to read.
+    #[tokio::test]
+    async fn heatmap_off_keeps_no_heatmap() {
+        let cache = QueryCache::new(CacheConfig::default());
+        fill(&cache, "SELECT v FROM t WHERE id = 1", 1, b"v").await;
+        assert!(is_hit(&cache, "SELECT v FROM t WHERE id = 1", 2).await);
+        cache.mark_written(&["t".to_string()]);
+        cache.invalidate_all();
+        assert!(cache.heat.heatmap().is_none());
+        assert!(cache.heatmap_snapshot().is_none());
     }
 }

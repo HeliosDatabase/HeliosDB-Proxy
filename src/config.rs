@@ -1462,6 +1462,12 @@ pub const SEMANTIC_MAX_STATEMENT_BYTES_CEILING: usize = 1 << 20;
 /// held longer only delays the takeover of a lost claimant.
 pub const REFRESH_AHEAD_CLAIM_TIMEOUT_MS_CEILING: u64 = 3_600_000;
 
+/// Upper bound of `[cache] heatmap_buckets × heatmap_max_tables`: every table
+/// the heatmap tracks holds one 72-byte slot per bucket, so this caps it at
+/// 288 MiB (the defaults, 288 × 1024, take about 20 MiB with 1024 tables
+/// tracked; a table's slots are allocated when it is first seen).
+pub const CACHE_HEATMAP_MAX_SLOTS: usize = 1 << 22;
+
 /// Query-result cache configuration (TOML-friendly, always present). Converted
 /// to `crate::cache::CacheConfig` at startup (L1 hot / L2 warm, and the L3
 /// semantic tier when `semantic_enabled`) and only active when the
@@ -1676,6 +1682,26 @@ pub struct CacheToml {
     /// lost task) is taken over by the next read that finds the entry due,
     /// so it never blocks refreshes. Range 1..=3600000. Default 5000.
     pub refresh_ahead_claim_timeout_ms: u64,
+    /// Keep a per-table heatmap of the cache (hits, misses, expiries,
+    /// stores, write invalidations, stale and raced fills, in time buckets)
+    /// with recommendations, served at `GET /api/cache/heatmap`. Needs
+    /// `enabled`. Off: every cache access pays one branch. Default `false`.
+    pub heatmap_enabled: bool,
+    /// Length of one heatmap bucket, seconds. Range 1..=86400. Default 300.
+    pub heatmap_bucket_secs: u64,
+    /// Buckets the heatmap keeps; the window is `heatmap_bucket_secs ×
+    /// heatmap_buckets`. Each tracked table holds this many 72-byte slots.
+    /// At least 1, and `heatmap_buckets × heatmap_max_tables` at most
+    /// [`CACHE_HEATMAP_MAX_SLOTS`] (288 MiB). Default 288 (24 h of 5-minute
+    /// buckets).
+    pub heatmap_buckets: usize,
+    /// Tables the heatmap tracks at most; samples of others count in its
+    /// `overflow`, and once per bucket a full set drops the tables with
+    /// nothing left in the window. >= 1. Default 1024.
+    pub heatmap_max_tables: usize,
+    /// Reads (hits + misses) a table needs in the window before the heatmap
+    /// recommends anything for it. >= 1. Default 100.
+    pub heatmap_min_samples: u64,
     /// Tables whose reads neither result cache (this one and `[edge]`)
     /// looks up, captures or stores. Bare identifiers (`[a-z_][a-z0-9_]*`,
     /// case-insensitive, at most 63 bytes, no schema or quotes), matched as
@@ -1858,7 +1884,7 @@ pub(crate) const POSTGRES_RESERVED_WORDS: &[&str] = &[
 
 /// Why the `[cache]` table name `name`, given as `what`, is refused, if it
 /// is: not a bare identifier, or a PostgreSQL reserved word.
-fn cache_table_name_error(what: &str, name: &str) -> Option<String> {
+pub(crate) fn cache_table_name_error(what: &str, name: &str) -> Option<String> {
     if !plain_cache_table_name(name) {
         return Some(format!(
             "{what} {name:?} must be a bare table name ([a-z_][a-z0-9_]*, at most 63 bytes, \
@@ -2147,6 +2173,61 @@ impl CacheToml {
         Ok(())
     }
 
+    /// Validate the `heatmap_*` keys. Unconditional, like
+    /// [`Self::validate_semantic_and_tables`]: every error names its key.
+    pub fn validate_heatmap(&self) -> Result<()> {
+        let bad = |msg: String| Err(ProxyError::Config(msg));
+        for (key, value, lo, hi) in [
+            (
+                "cache.heatmap_bucket_secs",
+                self.heatmap_bucket_secs,
+                1,
+                86_400,
+            ),
+            (
+                "cache.heatmap_buckets",
+                self.heatmap_buckets as u64,
+                1,
+                u64::MAX,
+            ),
+            (
+                "cache.heatmap_max_tables",
+                self.heatmap_max_tables as u64,
+                1,
+                u64::MAX,
+            ),
+            (
+                "cache.heatmap_min_samples",
+                self.heatmap_min_samples,
+                1,
+                u64::MAX,
+            ),
+        ] {
+            if !(lo..=hi).contains(&value) {
+                return if hi == u64::MAX {
+                    bad(format!("{key} must be >= {lo}, got {value}"))
+                } else {
+                    bad(format!("{key} must be in {lo}..={hi}, got {value}"))
+                };
+            }
+        }
+        let slots = self.heatmap_buckets.saturating_mul(self.heatmap_max_tables);
+        let cap = CACHE_HEATMAP_MAX_SLOTS;
+        if slots > cap {
+            return bad(format!(
+                "cache.heatmap_buckets x cache.heatmap_max_tables must be at most {cap} \
+                 (each tracked table holds one 72-byte slot per bucket), got {} x {} = {slots}",
+                self.heatmap_buckets, self.heatmap_max_tables
+            ));
+        }
+        if self.heatmap_enabled && !self.enabled {
+            tracing::warn!(
+                "cache.heatmap_enabled = true has no effect while cache.enabled = false"
+            );
+        }
+        Ok(())
+    }
+
     /// The startup warning for a semantic byte budget below
     /// `max_result_bytes`: a cacheable result whose entry alone exceeds
     /// `semantic_max_bytes` is never stored in the semantic tier (it would
@@ -2242,6 +2323,13 @@ impl CacheToml {
             excluded_tables: Vec::new(),
             refresh_ahead_ratio: self.refresh_ahead_ratio,
             refresh_ahead_claim_timeout: Duration::from_millis(self.refresh_ahead_claim_timeout_ms),
+            heatmap: crate::cache::HeatmapConfig {
+                enabled: self.enabled && self.heatmap_enabled,
+                bucket_secs: self.heatmap_bucket_secs,
+                buckets: self.heatmap_buckets,
+                max_tables: self.heatmap_max_tables,
+                min_samples: self.heatmap_min_samples,
+            },
             ..Default::default()
         }
     }
@@ -2285,6 +2373,11 @@ impl Default for CacheToml {
             semantic_max_statement_bytes: 16 * 1024,
             refresh_ahead_ratio: 0.0,
             refresh_ahead_claim_timeout_ms: 5000,
+            heatmap_enabled: false,
+            heatmap_bucket_secs: 300,
+            heatmap_buckets: 288,
+            heatmap_max_tables: 1024,
+            heatmap_min_samples: 100,
             exclude_tables: Vec::new(),
             tables: Vec::new(),
         }
@@ -3419,6 +3512,11 @@ const IGNORED_KEY_ALIASES: &[(&str, &str)] = &[
         "there is no [cache.l3]: the semantic keys are flat under [cache] (semantic_enabled, \
          semantic_similarity_threshold, ...)",
     ),
+    (
+        "cache.heatmap",
+        "there is no [cache.heatmap]: the heatmap keys are flat under [cache] (heatmap_enabled, \
+         heatmap_bucket_secs, heatmap_buckets, heatmap_max_tables, heatmap_min_samples)",
+    ),
     ("cache.tables.ttl", "did you mean 'ttl_secs'?"),
     ("cache.tables.table", "did you mean 'name'?"),
     (
@@ -4013,6 +4111,7 @@ impl ProxyConfig {
         self.cache.validate_sizes_and_compression()?;
         self.cache.validate_semantic_and_tables()?;
         self.cache.validate_refresh_ahead()?;
+        self.cache.validate_heatmap()?;
 
         // Refuse to expose the admin API beyond loopback without a token. The
         // admin surface runs privileged operations (arbitrary SQL via
@@ -6982,6 +7081,11 @@ semantic_embedding_retry_secs = 9
 semantic_max_statement_bytes = 2048
 refresh_ahead_ratio = 0.8
 refresh_ahead_claim_timeout_ms = 1500
+heatmap_enabled = true
+heatmap_bucket_secs = 60
+heatmap_buckets = 30
+heatmap_max_tables = 50
+heatmap_min_samples = 7
 exclude_tables = ["Secret", "audit_log", "secret"]
 
 [[tables]]
@@ -7016,9 +7120,15 @@ exclude = true
         assert_eq!(d.semantic_max_statement_bytes, 16 * 1024);
         assert_eq!(d.refresh_ahead_ratio, 0.0);
         assert_eq!(d.refresh_ahead_claim_timeout_ms, 5000);
+        assert!(!d.heatmap_enabled);
+        assert_eq!(d.heatmap_bucket_secs, 300);
+        assert_eq!(d.heatmap_buckets, 288);
+        assert_eq!(d.heatmap_max_tables, 1024);
+        assert_eq!(d.heatmap_min_samples, 100);
         assert!(d.exclude_tables.is_empty() && d.tables.is_empty());
         assert!(d.validate_semantic_and_tables().is_ok());
         assert!(d.validate_refresh_ahead().is_ok());
+        assert!(d.validate_heatmap().is_ok());
 
         let text = format!("[cache]{CACHE_KEYS_TOML}").replace("[[tables]]", "[[cache.tables]]");
         let (config, ignored) = deserialize_reporting_ignored_paths(&format!(
@@ -7046,6 +7156,11 @@ exclude = true
         assert_eq!(c.semantic_max_statement_bytes, 2048);
         assert_eq!(c.refresh_ahead_ratio, 0.8);
         assert_eq!(c.refresh_ahead_claim_timeout_ms, 1500);
+        assert!(c.heatmap_enabled);
+        assert_eq!(c.heatmap_bucket_secs, 60);
+        assert_eq!(c.heatmap_buckets, 30);
+        assert_eq!(c.heatmap_max_tables, 50);
+        assert_eq!(c.heatmap_min_samples, 7);
         assert_eq!(c.tables.len(), 3);
         assert_eq!(c.tables[0].ttl_secs, Some(3600));
         assert!(c.tables[2].exclude && c.tables[2].ttl_secs.is_none());
@@ -7338,13 +7453,29 @@ exclude = true
             cc.excluded_tables.is_empty(),
             "exclusions are relay-enforced"
         );
+        assert_eq!(
+            cc.heatmap,
+            crate::cache::HeatmapConfig {
+                enabled: true,
+                bucket_secs: 60,
+                buckets: 30,
+                max_tables: 50,
+                min_samples: 7,
+            }
+        );
         cc.validate().unwrap();
-        // The tier is only built with the cache itself.
+        // The tier and the heatmap are only built with the cache itself.
         let off = CacheToml {
             enabled: false,
             ..c.clone()
         };
         assert!(!off.to_cache_config().l3.enabled);
+        assert!(!off.to_cache_config().heatmap.enabled);
+        // The defaults map to the runtime defaults (off).
+        assert_eq!(
+            CacheToml::default().to_cache_config().heatmap,
+            crate::cache::HeatmapConfig::default()
+        );
         // Without table TTLs, L1 keeps ttl_secs.
         assert_eq!(
             CacheToml::default().to_cache_config().l1.ttl,
@@ -7420,6 +7551,67 @@ exclude = true
         assert_eq!(config.cache.refresh_ahead_claim_timeout_ms, 250);
         assert!(known_config_keys().contains("cache.refresh_ahead_ratio"));
         assert!(known_config_keys().contains("cache.refresh_ahead_claim_timeout_ms"));
+    }
+
+    /// Every `heatmap_*` range error names its key (the product bound names
+    /// both); the bounds themselves are accepted, the keys are known, and a
+    /// `[cache.heatmap]` table gets a hint.
+    #[test]
+    fn cache_heatmap_validation_names_the_key() {
+        type Breaker = fn(&mut CacheToml);
+        let cases: Vec<(&str, Breaker)> = vec![
+            ("cache.heatmap_bucket_secs", |c| c.heatmap_bucket_secs = 0),
+            ("cache.heatmap_bucket_secs", |c| {
+                c.heatmap_bucket_secs = 86_401
+            }),
+            ("cache.heatmap_buckets", |c| c.heatmap_buckets = 0),
+            ("cache.heatmap_max_tables", |c| c.heatmap_max_tables = 0),
+            ("cache.heatmap_min_samples", |c| c.heatmap_min_samples = 0),
+            ("cache.heatmap_buckets x cache.heatmap_max_tables", |c| {
+                c.heatmap_buckets = CACHE_HEATMAP_MAX_SLOTS / 1024 + 1
+            }),
+            ("cache.heatmap_buckets x cache.heatmap_max_tables", |c| {
+                c.heatmap_max_tables = usize::MAX
+            }),
+        ];
+        // Checked whether or not the heatmap (or the cache) is on.
+        for (enabled, heatmap) in [(false, false), (true, false), (true, true)] {
+            for (key, brk) in &cases {
+                let mut config = ProxyConfig::default();
+                config.add_node("localhost:5432", "primary").unwrap();
+                config.cache.enabled = enabled;
+                config.cache.heatmap_enabled = heatmap;
+                brk(&mut config.cache);
+                let err = config.validate().unwrap_err().to_string();
+                assert!(err.contains(key), "{enabled}/{heatmap}: {err} lacks {key}");
+            }
+        }
+        let mut config = ProxyConfig::default();
+        config.add_node("localhost:5432", "primary").unwrap();
+        config.cache.enabled = true;
+        config.cache.heatmap_enabled = true;
+        config.cache.heatmap_bucket_secs = 86_400;
+        config.cache.heatmap_buckets = CACHE_HEATMAP_MAX_SLOTS / 1024;
+        config.validate().unwrap();
+        config.cache.heatmap_buckets = 1;
+        config.cache.heatmap_max_tables = CACHE_HEATMAP_MAX_SLOTS;
+        config.validate().unwrap();
+        // Without the cache, heatmap_enabled only warns.
+        config.cache.enabled = false;
+        config.validate().unwrap();
+
+        let known = known_config_keys();
+        for key in [
+            "cache.heatmap_enabled",
+            "cache.heatmap_bucket_secs",
+            "cache.heatmap_buckets",
+            "cache.heatmap_max_tables",
+            "cache.heatmap_min_samples",
+        ] {
+            assert!(known.contains(key), "{key}");
+        }
+        let hint = ignored_key_hint("cache.heatmap", &known).unwrap();
+        assert!(hint.contains("heatmap_enabled"), "{hint}");
     }
 
     #[test]

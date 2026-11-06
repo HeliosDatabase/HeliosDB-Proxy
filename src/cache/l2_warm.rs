@@ -142,6 +142,17 @@ impl L2WarmCache {
 
     /// Look up a cache key
     pub async fn get(&self, key: &CacheKey) -> Option<CachedResult> {
+        self.get_noting_expiry(key, &mut false).await
+    }
+
+    /// [`Self::get`], also setting `expired` when the key's in-memory entry
+    /// was found past its TTL (and removed). An expired mmap entry reads as
+    /// absent.
+    pub async fn get_noting_expiry(
+        &self,
+        key: &CacheKey,
+        expired: &mut bool,
+    ) -> Option<CachedResult> {
         if !self.config.enabled {
             return None;
         }
@@ -153,6 +164,7 @@ impl L2WarmCache {
         let found = match self.memory_entries.get_mut(&hash) {
             Some(mut entry) => {
                 if entry.is_expired() {
+                    *expired = true;
                     drop(entry);
                     if let Some((_, old)) = self.memory_entries.remove(&hash) {
                         self.release(&old);
@@ -976,6 +988,59 @@ mod tests {
         assert!(cache.is_empty());
         assert!(cache.get(&key).await.is_none()); // Disk cannot resurrect it.
         assert!(cache.is_empty());
+    }
+
+    /// `get_noting_expiry` tells an entry found past its TTL (removed) from
+    /// an absent or a live one; `get` serves exactly what it serves.
+    #[tokio::test]
+    async fn get_noting_expiry_flags_only_an_expired_entry() {
+        let cache = L2WarmCache::new(L2Config::default());
+        let (live, old) = (create_key(1), create_key(2));
+        cache.put(live.clone(), create_result("live")).await;
+        let mut aged = create_result("aged");
+        aged.cached_at = Instant::now() - Duration::from_secs(120);
+        cache.put(old.clone(), aged).await;
+
+        let mut expired = false;
+        assert!(cache.get_noting_expiry(&live, &mut expired).await.is_some());
+        assert!(!expired);
+        assert!(cache
+            .get_noting_expiry(&create_key(3), &mut expired)
+            .await
+            .is_none());
+        assert!(!expired, "absent is not expired");
+        assert!(cache.get_noting_expiry(&old, &mut expired).await.is_none());
+        assert!(expired);
+        let mut again = false;
+        assert!(cache.get_noting_expiry(&old, &mut again).await.is_none());
+        assert!(!again, "the expired entry was removed by the lookup");
+        assert!(cache.get(&live).await.is_some());
+    }
+
+    /// A compressed entry whose blob does not decode is dropped and misses,
+    /// but it was not past its TTL: no expiry (the heatmap's `expired`), and
+    /// none on a decoded compressed hit either.
+    #[tokio::test]
+    async fn a_corrupt_compressed_entry_is_no_expiry() {
+        let cache = codec_cache(CacheCompression::Lz4, 64 * 1024 * 1024);
+        let (good, bad) = (create_key(7), create_key(8));
+        let rows = rows_result(64 * 1024);
+        cache.put(good.clone(), rows.clone()).await;
+        cache.put(bad.clone(), rows.clone()).await;
+        {
+            let mut entry = cache.memory_entries.get_mut(&bad.hash_value()).unwrap();
+            assert!(entry.raw_len.is_some(), "stored compressed");
+            let mut blob = entry.result.data.to_vec();
+            blob[0] = 0xff;
+            entry.result.data = Bytes::from(blob);
+        }
+        let mut expired = false;
+        let hit = cache.get_noting_expiry(&good, &mut expired).await;
+        assert_eq!(hit.map(|r| r.data), Some(rows.data), "decoded");
+        assert!(!expired);
+        assert!(cache.get_noting_expiry(&bad, &mut expired).await.is_none());
+        assert!(!expired, "a corrupt entry is not an expired one");
+        assert_eq!(cache.len(), 1, "the corrupt entry was dropped");
     }
 
     #[tokio::test]

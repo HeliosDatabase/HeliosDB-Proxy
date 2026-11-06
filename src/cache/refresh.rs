@@ -488,6 +488,59 @@ mod lookup_tests {
         cache.refresh_ahead.as_ref().expect("refresh-ahead on")
     }
 
+    /// The heatmap sees every refresh-ahead path: the claimant's read is a
+    /// miss on the statement's tables (not an expiry), the readers served
+    /// their own due L1 copy or the shared entry while the claim is held are
+    /// hits, and so is the refill served from L2 afterwards.
+    #[tokio::test]
+    async fn the_heatmap_counts_refresh_ahead_claims_and_serves() {
+        let cache = QueryCache::new(CacheConfig {
+            heatmap: crate::cache::HeatmapConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..config(0.5)
+        });
+        // Another statement of the table stored: `kv` is tracked.
+        cache
+            .put(
+                "SELECT v FROM kv WHERE id = 2",
+                &ctx(9),
+                Bytes::from_static(b"two"),
+                1,
+                Duration::ZERO,
+            )
+            .await;
+        store_aged(&cache, SQL, &[1, 2], DUE, b"old").await;
+        let now = Instant::now();
+        let (claimed, prep) = lookup_at(&cache, SQL, 1, now).await;
+        assert!(matches!(claimed, CacheLookup::Miss), "the claimant");
+        assert_eq!(
+            served(&lookup_at(&cache, SQL, 2, now).await.0),
+            Some((&b"old"[..], CacheLevel::L1Hot)),
+            "its own due L1 copy while the claim is held"
+        );
+        assert_eq!(
+            served(&lookup_at(&cache, SQL, 3, now).await.0),
+            Some((&b"old"[..], CacheLevel::L2Warm)),
+            "the shared entry while the claim is held"
+        );
+        store(&cache, SQL, 1, &prep, b"new").await;
+        assert_eq!(
+            served(&lookup_at(&cache, SQL, 2, Instant::now()).await.0),
+            Some((&b"new"[..], CacheLevel::L2Warm)),
+            "the refill, picked up from L2"
+        );
+        let s = cache.heatmap_snapshot().expect("heatmap on");
+        assert_eq!(s.untracked_misses, 0, "{s:?}");
+        let kv = s.tables.iter().find(|t| t.table == "kv").expect("kv");
+        assert_eq!(
+            (kv.hits, kv.misses, kv.expired, kv.stores),
+            (3, 1, 0, 2),
+            "{kv:?}"
+        );
+    }
+
     #[tokio::test]
     async fn off_by_default_and_without_l2() {
         assert!(QueryCache::new(CacheConfig::default())

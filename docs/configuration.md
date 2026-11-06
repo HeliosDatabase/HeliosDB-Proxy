@@ -891,6 +891,11 @@ ttl_secs = 10
 | `semantic_max_statement_bytes` | usize | `16384` | Longest statement the semantic tier's grammar is parsed for. A longer one is not parsed at all (parsing takes about a hundred times the statement's size, transiently): it never uses the tier (counted in `semantic_ineligible` when hinted) and a `[[cache.tables]]` TTL longer than `ttl_secs` never applies to it (a shorter one still does). Applies whether or not the tier is enabled. Range 1..=1048576 (1 MiB): a statement at the bound parses in about 100 MiB on the connection's task, so the bound stays far below `[limits] max_pending_bytes`. |
 | `refresh_ahead_ratio` | f64 | `0.0` | Refresh-ahead ([below](#refresh-ahead)): once a shared (L2) entry's age reaches this fraction of its TTL, exactly one read of it is treated as a miss and refills it on its own backend connection, while every other read is still served the entry until the refill lands or the TTL ends. What it buys: no expiry stampede on hot keys, and no latency cliff at expiry. What it costs: one extra backend read per hot entry per TTL (refilled every ratio × TTL instead of every TTL). `0` = off (the lookup pays one branch); otherwise in (0, 1), e.g. `0.8`. Validated whether or not the cache is enabled; with `enabled = false` it only logs a warning. |
 | `refresh_ahead_claim_timeout_ms` | u64 | `5000` | How long a refresh-ahead claim holds: a claimant whose refill has neither been stored nor failed by then (a slow statement, a lost task) is taken over by the next read that finds the entry due, so a lost claimant never blocks refreshes (counted as abandoned). 1–3600000. |
+| `heatmap_enabled` | bool | `false` | Keep a per-table [heatmap](#cache-heatmap) of the cache (hits, misses, expiries, stores, write invalidations, stale and raced fills, in time buckets) with recommendations, served at `GET /api/cache/heatmap`. Needs `enabled = true` (alone it only logs a warning). Off, every cache access pays one branch. Under `strict_config`, a build without `query-cache` refuses it. |
+| `heatmap_bucket_secs` | u64 | `300` | Length of one heatmap bucket, seconds. 1–86400. |
+| `heatmap_buckets` | usize | `288` | Buckets kept; the window is `heatmap_bucket_secs × heatmap_buckets` (24 h by default). Each tracked table holds one 72-byte slot per bucket (about 20 KiB per table at the default), allocated when the table is first seen. ≥ 1, and `heatmap_buckets × heatmap_max_tables` at most 4194304 (288 MiB). |
+| `heatmap_max_tables` | usize | `1024` | Tables tracked at most (about 20 MiB at the defaults with all of them tracked). Samples of another table count in `overflow`; once per bucket a full set drops the tables with nothing left in the window. ≥ 1. |
+| `heatmap_min_samples` | u64 | `100` | Reads (hits + misses) a table needs in the window before any recommendation is made for it. ≥ 1. |
 
 Every key is validated at startup whether or not its tier is enabled, and an error names
 the key. **`[cache]` is applied at startup only:** a SIGHUP that changes it keeps the
@@ -1349,6 +1354,52 @@ refreshes; its refill is still stored if it arrives. Claims are counted in
 `heliosdb_proxy_cache_refresh_ahead_claims_total` (each is also a miss); JSON
 `query_cache.refresh_ahead` on `/metrics`. `[cache]` is read at startup, so a new ratio
 takes a restart.
+
+### Cache heatmap
+
+With `heatmap_enabled = true` (and `enabled = true`) the cache counts, per table and per
+time bucket, what happens to the reads and writes it sees; `GET /api/cache/heatmap`
+([admin API](admin-api.md#get-apicacheheatmap)) sums the buckets inside the window
+(`heatmap_bucket_secs × heatmap_buckets`) and lists the tables hottest first. The table
+names are the ones C-02 invalidation uses (lower-case, unqualified: `public.orders` and
+`orders` are one table). Per table:
+
+| Field | What it counts in the window |
+|-------|------------------------------|
+| `hits` | Hits on any tier (L1, L2, L3), counted on every table of the served entry (a join's hit counts for each of its tables). A compressed L2 entry counts once decoded; an L1 copy served past its refresh point while another read refills it ([refresh-ahead](#refresh-ahead)) is a hit too. |
+| `misses` | Lookups that went to the backend, on the statement's tables (already extracted by the lookup; the heatmap adds no parse). A table's misses count once it is tracked: before its first hit, store, write or refusal they count in `untracked_misses`, so reads of tables that do not exist cannot fill the set. A read that claims a [refresh-ahead](#refresh-ahead) refill is a miss (never `expired`); a `cache_refresh` read is not one (it looks nothing up, as for `heliosdb_proxy_cache_misses_total`), but its store counts. An L2 entry that does not decompress is a miss, not `expired`. |
+| `expired` | Of `misses`: the L2 entry was there but past its TTL. |
+| `stores`, `stored_bytes` | Results stored, and their size before any L2 compression (not what is retained now: the cache keeps no per-table byte count, so `retained_bytes` is not reported). |
+| `invalidations` | C-02 write marks of the table: one per autocommit write cycle or committed transaction that wrote it through this proxy, and with `invalidation_source = "logical"` one per decoded transaction too (a write through the proxy then counts twice). Whole-cache invalidations (writes of unknown scope) count once in the top-level `invalidate_all`. |
+| `stale_rejected` | Entries refused because the table was written since their fetch, per tier (a read whose L1 and L2 entries were both retired counts 2), like `heliosdb_proxy_cache_stale_rejected_total`. |
+| `fills_raced` | Results not stored because a write to the table raced their fetch. |
+| `hit_ratio` | `hits / (hits + misses)`; `null` without a read. |
+| `temperature` | `hot`, `warm`, `cold` or `frozen`: the quartile of the table's reads among the tables read in the window (top quartile hot); a table with no read is `frozen`. |
+| `last_access_secs_ago` | Seconds since its last hit or miss (`null` if it never had one). |
+
+**Recommendations** are derived from those counters only, for a table with at least
+`heatmap_min_samples` reads in the window whose name the `[cache]` table keys accept, at
+most one per table:
+
+- **`cache.exclude_tables`, `add`** — more `invalidations` than `hits`: writes retire its
+  entries faster than reads reuse them, so caching it costs a capture and a store per
+  fill and serves little.
+- **`cache.tables.ttl_secs`, `raise`** (a `[[cache.tables]]` entry for the table) — more
+  of its misses were `expired` than not: entries outlive every write but not their TTL.
+  The reason quotes the TTL in force; a TTL longer than `ttl_secs` applies only to
+  single-table reads of the [semantic grammar](#semantic-tier-l3) (see
+  [Exclusions and per-table TTL](#exclusions-and-per-table-ttl)). Not made when the
+  churn rule applies.
+
+No "lower the TTL" recommendation is made: a stale rejection is a write the proxy saw,
+which C-02 already handles whatever the TTL, and writes the proxy does not see (the TTL's
+real job) show in no counter.
+
+Recording takes no lock: each tracked table owns its ring of atomic counters, the table
+set is replaced copy-on-write when a table is first seen, and the first record of a new
+bucket resets the slot it reuses without making other recorders wait (a sample landing
+during those few stores is dropped). `overflow` counts samples of tables the full set
+could not take since startup.
 
 ### Cache hints
 

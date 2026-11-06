@@ -107,6 +107,7 @@ Auth column: **token** = requires bearer token when `admin_token` is set; **open
 | `DELETE` | `/admin/kv/{plugin}/{key}` | Delete a plugin KV value (idempotent 200) | `wasm-plugins` | token |
 | `GET` | `/anomalies` | Anomaly-detector recent events (`?limit=N`) | `anomaly-detection` | token |
 | `GET` | `/analytics`, `/api/analytics` | Top queries + slow-query log (`?limit=N`) | `query-analytics` | token |
+| `GET` | `/api/cache/heatmap` | Per-table query-cache heatmap + recommendations (`{"enabled":false}` while off) | `query-cache` | token |
 | `GET` | `/api/chaos` | Read current chaos overrides | — | token |
 | `POST` | `/api/chaos` | Inject/clear a fault (`force_unhealthy`/`restore`/`reset`) | — | token |
 | `POST` | `/api/replay` | Replay a journal window against a target backend (503 when `tr_enabled = false`) | *(default build)* | token |
@@ -576,6 +577,54 @@ Top queries by call count plus the slow-query log. Optional `?limit=N` (default 
 
 ```bash
 curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:9090/api/analytics?limit=50"
+```
+
+### GET /api/cache/heatmap
+
+The query cache's per-table heatmap over its window (`[cache] heatmap_bucket_secs ×
+heatmap_buckets`, 24 h by default), hottest table first, with recommendations that each
+name a real config key (`key` is its dotted path). What every field counts, and the
+rules behind the recommendations, are in
+[configuration.md → Cache heatmap](configuration.md#cache-heatmap). A table with nothing
+left in the window is not listed (`tables_tracked` still counts it until a full set drops
+it). Per-table retained bytes are not reported: the cache keeps no per-table byte count
+(`stored_bytes` is what was stored in the window).
+
+While the query cache (`[cache] enabled`) or its heatmap (`[cache] heatmap_enabled`) is
+off the answer is **`200 {"enabled": false, "reason": "…"}`**, never 404, so a dashboard
+can poll it either way. **`503` unless built with `--features query-cache`.**
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/api/cache/heatmap
+```
+
+```json
+{
+  "enabled": true,
+  "window_secs": 86400,
+  "bucket_secs": 300,
+  "buckets": 288,
+  "max_tables": 1024,
+  "min_samples": 100,
+  "tables_tracked": 2,
+  "overflow": 0,
+  "untracked_misses": 2,
+  "invalidate_all": 0,
+  "tables": [
+    { "table": "fx_rates", "hits": 840, "misses": 410, "expired": 362, "stores": 410,
+      "stored_bytes": 98400, "invalidations": 0, "stale_rejected": 0, "fills_raced": 0,
+      "hit_ratio": 0.672, "temperature": "hot", "last_access_secs_ago": 3 },
+    { "table": "orders", "hits": 61, "misses": 380, "expired": 4, "stores": 352,
+      "stored_bytes": 1441792, "invalidations": 377, "stale_rejected": 290, "fills_raced": 28,
+      "hit_ratio": 0.1383, "temperature": "cold", "last_access_secs_ago": 0 }
+  ],
+  "recommendations": [
+    { "table": "fx_rates", "key": "cache.tables.ttl_secs", "action": "raise",
+      "reason": "362 of its 410 misses in the last 86400 s found the entry expired (its [[cache.tables]] ttl_secs = 10): a longer TTL would have served them unless a write retired them first" },
+    { "table": "orders", "key": "cache.exclude_tables", "action": "add",
+      "reason": "377 invalidations against 61 hits in the last 86400 s: writes retire its entries faster than reads reuse them" }
+  ]
+}
 ```
 
 ---

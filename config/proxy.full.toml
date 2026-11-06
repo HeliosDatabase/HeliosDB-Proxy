@@ -487,6 +487,17 @@ semantic_max_statement_bytes = 16384
 # next read that finds the entry due (1..=3600000 ms).
 # refresh_ahead_claim_timeout_ms = 5000
 
+# Per-table heatmap of this cache (hits, misses, expiries, stores, write
+# invalidations, stale and raced fills, in time buckets) with recommendations
+# naming a [cache] key, at GET /api/cache/heatmap (admin API). Off by default;
+# off, each cache access pays one branch. Each tracked table holds one 72-byte
+# slot per bucket (~20 MiB with 1024 tables at the defaults).
+heatmap_enabled = false
+heatmap_bucket_secs = 300   # 1..=86400
+heatmap_buckets = 288       # window = bucket_secs x buckets (24 h)
+heatmap_max_tables = 1024   # more: counted in `overflow`; buckets x max_tables <= 4194304
+heatmap_min_samples = 100   # reads in the window before a recommendation
+
 # Per-table settings: exactly one of ttl_secs or exclude = true. A ttl_secs longer
 # than ttl_secs above applies only to single-table reads of the semantic grammar
 # without qualified columns; a shorter one holds for every read that names the
