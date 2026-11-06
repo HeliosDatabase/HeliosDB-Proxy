@@ -887,8 +887,11 @@ impl ProxyServer {
                 enabled: true,
                 default_qps: rl.default_qps,
                 default_burst: rl.default_burst,
-                default_concurrency: crate::rate_limit::RateLimitConfig::default()
-                    .default_concurrency,
+                default_concurrency: if rl.max_concurrent > 0 {
+                    rl.max_concurrent
+                } else {
+                    crate::rate_limit::RateLimitConfig::default().default_concurrency
+                },
                 max_in_flight: rl.max_concurrent,
                 ..Default::default()
             };

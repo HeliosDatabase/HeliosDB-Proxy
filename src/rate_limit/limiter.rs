@@ -12,6 +12,7 @@ use arc_swap::ArcSwap;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
+use super::concurrency::ConcurrencyLimiter;
 use super::config::{ExceededAction, PriorityLevel, RateLimitConfig};
 use super::cost_estimator::QueryCostEstimator;
 use super::metrics::RateLimitMetrics;
@@ -314,6 +315,9 @@ pub struct RateLimiter {
     /// Sliding window limiters (rolling counts)
     sliding_windows: DashMap<LimiterKey, SlidingWindow>,
 
+    /// Concurrency limiters (active query count) used by `check_concurrency`.
+    concurrency: DashMap<LimiterKey, Arc<ConcurrencyLimiter>>,
+
     /// Requests in flight per bucket (`[rate_limit] max_concurrent`).
     in_flight: Arc<InFlightMap>,
 
@@ -334,6 +338,7 @@ impl RateLimiter {
             config: ArcSwap::from_pointee(config),
             token_buckets: DashMap::new(),
             sliding_windows: DashMap::new(),
+            concurrency: DashMap::new(),
             in_flight: Arc::new(InFlightMap::new()),
             cost_estimator: QueryCostEstimator::new(),
             metrics: Arc::new(RateLimitMetrics::new()),
@@ -347,6 +352,7 @@ impl RateLimiter {
             config: ArcSwap::from_pointee(config),
             token_buckets: DashMap::new(),
             sliding_windows: DashMap::new(),
+            concurrency: DashMap::new(),
             in_flight: Arc::new(InFlightMap::new()),
             cost_estimator: estimator,
             metrics: Arc::new(RateLimitMetrics::new()),
@@ -433,6 +439,53 @@ impl RateLimiter {
         RateLimitResult::Allowed
     }
 
+    /// Check and acquire concurrency slot (library-level limiter). The daemon
+    /// enforces `[rate_limit] max_concurrent` through the in-flight permit
+    /// (`try_acquire_in_flight`), not through this method.
+    pub fn check_concurrency(
+        &self,
+        key: &LimiterKey,
+    ) -> Result<Arc<ConcurrencyLimiter>, RateLimitExceeded> {
+        let config = self.config.load();
+
+        if !config.enabled {
+            // Return a dummy limiter that allows everything
+            return Ok(Arc::new(ConcurrencyLimiter::new(u32::MAX)));
+        }
+
+        let max = config.effective_concurrency(key, PriorityLevel::Normal);
+
+        // Hit path first: an existing limiter is looked up with `get_mut`
+        // (still the DashMap shard *write* guard, so the key is only cloned
+        // when a new bucket actually has to be inserted) rather than `get`
+        // (a read guard). See `check_token_bucket` for why the write guard
+        // matters: DashMap's `entry()` and `get_mut()` take the same shard
+        // write lock, so this preserves the mutual exclusion `entry()` gave
+        // us between two threads racing to insert the same fresh key.
+        let limiter = match self.concurrency.get_mut(key) {
+            Some(existing) => Arc::clone(existing.value()),
+            None => self
+                .concurrency
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(ConcurrencyLimiter::new(max)))
+                .clone(),
+        };
+
+        // Check if would exceed
+        if limiter.at_capacity() {
+            return Err(RateLimitExceeded {
+                key: key.clone(),
+                limit_type: LimitType::Concurrency,
+                current: limiter.active_count() as u64,
+                limit: max as u64,
+                retry_after: Duration::from_millis(100), // Estimate
+                message: "Concurrency limit exceeded".to_string(),
+            });
+        }
+
+        Ok(limiter)
+    }
+
     /// Whether `[rate_limit] max_concurrent` is enforced (a cap above 0).
     pub fn in_flight_enforced(&self) -> bool {
         self.config.load().max_in_flight > 0
@@ -517,6 +570,9 @@ impl RateLimiter {
         if let Some(window) = self.sliding_windows.get(key) {
             window.reset();
         }
+        if let Some(limiter) = self.concurrency.get(key) {
+            limiter.reset_stats();
+        }
         self.metrics.reset_key(key);
     }
 
@@ -537,6 +593,17 @@ impl RateLimiter {
             stats.insert("window_max".to_string(), window.max_events() as u64);
         }
 
+        if let Some(limiter) = self.concurrency.get(key) {
+            stats.insert(
+                "active_concurrent".to_string(),
+                limiter.active_count() as u64,
+            );
+            stats.insert(
+                "max_concurrent".to_string(),
+                limiter.max_concurrent() as u64,
+            );
+            stats.insert("queued".to_string(), limiter.queue_length() as u64);
+        }
         let max_in_flight = self.config.load().max_in_flight;
         if max_in_flight > 0 {
             stats.insert(
@@ -703,6 +770,7 @@ impl std::fmt::Debug for RateLimiter {
             .field("enabled", &self.config.load().enabled)
             .field("token_buckets", &self.token_buckets.len())
             .field("sliding_windows", &self.sliding_windows.len())
+            .field("concurrency_limiters", &self.concurrency.len())
             .field("in_flight_buckets", &self.in_flight.len())
             .field("uptime", &self.uptime())
             .finish()
@@ -928,6 +996,20 @@ mod tests {
         limiter.update_config(new_config);
 
         assert_eq!(limiter.config().default_qps, 200);
+    }
+
+    #[test]
+    fn test_concurrency_check() {
+        let config = RateLimitConfig::builder().default_concurrency(10).build();
+        let limiter = RateLimiter::new(config);
+
+        let key = LimiterKey::User("test".to_string());
+
+        let result = limiter.check_concurrency(&key);
+        assert!(result.is_ok());
+
+        let conc_limiter = result.unwrap();
+        assert_eq!(conc_limiter.max_concurrent(), 10);
     }
 
     fn in_flight_limiter(max_in_flight: u32) -> RateLimiter {
