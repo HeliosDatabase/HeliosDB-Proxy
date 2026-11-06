@@ -256,6 +256,20 @@ impl GraphqlGateway {
             .await;
         }
 
+        // `[multi_tenancy]` active-query cap: the tenant's permit is held for
+        // the request and returned on every path when it drops.
+        let _query_permit = match policy.admit_tenant_query(tenant.as_ref()).await {
+            Ok(p) => p,
+            Err(denied) => {
+                return Self::respond(
+                    &mut writer,
+                    denied.http_status(),
+                    &json!({"errors":[{"message": denied.to_string()}]}),
+                )
+                .await
+            }
+        };
+
         let mut context = crate::graphql::ExecutionContext::default();
         if let Some(t) = tenant {
             context
@@ -560,6 +574,71 @@ mod tests {
             client.read_to_end(&mut buf).await.unwrap();
             let resp = String::from_utf8(buf).unwrap();
             assert!(resp.starts_with(line), "{status}: {resp}");
+        }
+    }
+
+    /// POST one GraphQL query as the tenant named by `header` (offline engine).
+    #[cfg(feature = "multi-tenancy")]
+    async fn post_query_as(
+        policy: crate::gateway_policy::SharedGatewayPolicy,
+        header: &str,
+    ) -> String {
+        let (mut client, server) = tcp_pair().await;
+        let cfg = Arc::new(GraphqlGatewayConfig::default());
+        let task = tokio::spawn(GraphqlGateway::handle_with(
+            server,
+            None,
+            cfg,
+            offline_engine(),
+            admission(4),
+            policy,
+        ));
+        let body = br#"{"query":"{ __typename }"}"#;
+        let req = format!(
+            "POST /graphql HTTP/1.1\r\n{header}Content-Length: {}\r\n\r\n",
+            body.len()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        client.write_all(body).await.unwrap();
+        let resp = read_all(&mut client).await;
+        task.await.unwrap().unwrap();
+        resp
+    }
+
+    /// `[multi_tenancy]` active-query cap on GraphQL: while a tenant's permit
+    /// is held, its request is refused with 429 and a GraphQL error; another
+    /// tenant is unaffected; once the permit is returned the tenant's requests
+    /// are served again.
+    #[cfg(feature = "multi-tenancy")]
+    #[tokio::test]
+    async fn a_tenant_at_its_active_query_cap_is_refused_with_429() {
+        let policy = Arc::new(crate::gateway_policy::capped_tenancy_policy(
+            "X-Helios-Tenant",
+        ));
+        let in_flight = policy
+            .admit_tenant_query(Some(&crate::gateway_policy::GatewayTenant("acme".into())))
+            .await
+            .unwrap();
+        assert!(in_flight.is_some());
+
+        let refused = post_query_as(policy.clone(), "X-Helios-Tenant: acme\r\n").await;
+        assert_eq!(
+            status_line(&refused),
+            "HTTP/1.1 429 Too Many Requests",
+            "{refused}"
+        );
+        assert!(
+            refused.contains("too many active queries for tenant"),
+            "{refused}"
+        );
+
+        let other = post_query_as(policy.clone(), "X-Helios-Tenant: globex\r\n").await;
+        assert_eq!(status_line(&other), "HTTP/1.1 200 OK", "{other}");
+
+        drop(in_flight);
+        for _ in 0..2 {
+            let resp = post_query_as(policy.clone(), "X-Helios-Tenant: acme\r\n").await;
+            assert_eq!(status_line(&resp), "HTTP/1.1 200 OK", "{resp}");
         }
     }
 }

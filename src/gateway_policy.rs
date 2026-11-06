@@ -18,7 +18,13 @@
 //!   every statement, like the PG-wire listener does for a session; a request
 //!   without a known tenant is refused (403). A gateway without a
 //!   `tenant_header` has no per-request identity, and the daemon refuses that
-//!   combination under `strict_config` (warns otherwise).
+//!   combination under `strict_config` (warns otherwise);
+//! - `[multi_tenancy]` active-query caps: a request of a tenant at its
+//!   `max_active_queries_per_tenant` cap waits up to `active_query_wait_ms`
+//!   for the tenant's permit (the PG-wire path's permit, the same semaphore)
+//!   and is refused (429) when it does not get one. Only the SQL-running part
+//!   of a request holds the permit. `max_clients_per_tenant` does not apply to
+//!   these stateless requests: it counts PG-wire sessions only.
 
 use std::borrow::Cow;
 use std::net::IpAddr;
@@ -44,6 +50,9 @@ pub enum PolicyDenied {
     /// `[multi_tenancy]` is on and the statement touches a tenant table in a
     /// shape its row filter cannot cover; it is not forwarded.
     TenantStatement { reason: String },
+    /// The tenant is at its `max_active_queries_per_tenant` cap and the
+    /// request got no permit within `active_query_wait_ms`.
+    TenantQueryLimit { message: String },
 }
 
 impl PolicyDenied {
@@ -53,6 +62,7 @@ impl PolicyDenied {
             PolicyDenied::RateLimited { .. } => 429,
             PolicyDenied::CircuitOpen { .. } => 503,
             PolicyDenied::Tenant { .. } | PolicyDenied::TenantStatement { .. } => 403,
+            PolicyDenied::TenantQueryLimit { .. } => 429,
         }
     }
 }
@@ -75,6 +85,7 @@ impl std::fmt::Display for PolicyDenied {
             }
             PolicyDenied::Tenant { reason } => write!(f, "tenant required: {reason}"),
             PolicyDenied::TenantStatement { reason } => write!(f, "{reason}"),
+            PolicyDenied::TenantQueryLimit { message } => write!(f, "{message}"),
         }
     }
 }
@@ -102,6 +113,12 @@ pub struct GatewayPolicy {
     /// The tenant manager and the request header naming the tenant.
     #[cfg(feature = "multi-tenancy")]
     tenancy: Option<(Arc<crate::multi_tenancy::TenantManager>, String)>,
+    /// The daemon's tenant budgets (the PG-wire active-query permits) and the
+    /// latency histograms their waits are recorded into.
+    #[cfg(feature = "multi-tenancy")]
+    tenant_slots: Option<Arc<crate::tenant_slots::TenantSlots>>,
+    #[cfg(feature = "multi-tenancy")]
+    tenant_waits: Option<Arc<crate::metrics_hist::ProxyLatency>>,
     #[cfg(feature = "rate-limiting")]
     rate_limiter: Option<(
         Arc<crate::rate_limit::RateLimiter>,
@@ -149,6 +166,52 @@ impl GatewayPolicy {
     ) -> Self {
         self.tenancy = Some((manager, header));
         self
+    }
+
+    /// Share the daemon's tenant budgets, so a request of a tenant with an
+    /// active-query cap takes that tenant's permit (see
+    /// [`Self::admit_tenant_query`]). `waits` is the histogram the PG-wire
+    /// path records its active-query waits into.
+    #[cfg(feature = "multi-tenancy")]
+    pub fn with_tenant_slots(
+        mut self,
+        slots: Arc<crate::tenant_slots::TenantSlots>,
+        waits: Arc<crate::metrics_hist::ProxyLatency>,
+    ) -> Self {
+        self.tenant_slots = Some(slots);
+        self.tenant_waits = Some(waits);
+        self
+    }
+
+    /// The active-query permit a request of `tenant` holds while it runs SQL.
+    ///
+    /// `Ok(None)` when the tenant has no active-query cap (or the request acts
+    /// for no tenant). Otherwise the request waits FIFO for the tenant's permit
+    /// up to `active_query_wait_ms` (the same wait as the PG-wire path) and is
+    /// refused with [`PolicyDenied::TenantQueryLimit`] when it gets none. The
+    /// permit is an RAII guard: dropping it, on every path, returns it.
+    pub async fn admit_tenant_query(
+        &self,
+        tenant: Option<&GatewayTenant>,
+    ) -> Result<Option<tokio::sync::SemaphorePermit<'_>>, PolicyDenied> {
+        #[cfg(feature = "multi-tenancy")]
+        if let (Some(slots), Some(waits), Some(t)) =
+            (&self.tenant_slots, &self.tenant_waits, tenant)
+        {
+            if let Some(budget) = slots.budget(&t.0).filter(|b| b.has_query_cap()) {
+                return match budget.wait_query(&waits.tenant_query_wait).await {
+                    Ok((permit, _waited)) => {
+                        budget.note_query_admitted();
+                        Ok(Some(permit))
+                    }
+                    Err(refusal) => Err(PolicyDenied::TenantQueryLimit {
+                        message: refusal.to_string(),
+                    }),
+                };
+            }
+        }
+        let _ = tenant;
+        Ok(None)
     }
 
     /// The tenant a request acts for, read with `header` (a lookup by header
@@ -309,6 +372,43 @@ impl std::fmt::Debug for GatewayPolicy {
 /// A policy shared by a gateway's tasks.
 pub type SharedGatewayPolicy = Arc<GatewayPolicy>;
 
+/// A policy for the gateway tests: tenants `acme` and `globex` behind
+/// `header`, each with an active-query cap of 1 that refuses at once (no
+/// wait), and `free` with no cap.
+#[cfg(all(test, feature = "multi-tenancy"))]
+pub(crate) fn capped_tenancy_policy(header: &str) -> GatewayPolicy {
+    use crate::multi_tenancy::{
+        IsolationStrategy, MultiTenancyConfig, TenantConfig, TenantId, TenantManagerBuilder,
+    };
+    let mut config = crate::config::ProxyConfig::default();
+    config.multi_tenancy.enabled = true;
+    config.multi_tenancy.tenants = vec!["acme".into(), "globex".into(), "free".into()];
+    config.multi_tenancy.max_active_queries_per_tenant = 1;
+    config
+        .multi_tenancy
+        .tenant_max_active_queries
+        .insert("free".into(), 0);
+    config.multi_tenancy.active_query_wait_ms = 0;
+    let tm = TenantManagerBuilder::new()
+        .config(MultiTenancyConfig {
+            enabled: true,
+            ..Default::default()
+        })
+        .build();
+    for t in ["acme", "globex", "free"] {
+        tm.register_tenant(TenantConfig::new(
+            TenantId::new(t),
+            IsolationStrategy::row("public", "tid"),
+        ));
+    }
+    GatewayPolicy::default()
+        .with_tenancy(Arc::new(tm), header.to_string())
+        .with_tenant_slots(
+            Arc::new(crate::tenant_slots::TenantSlots::from_config(&config)),
+            Arc::new(crate::metrics_hist::ProxyLatency::new(&[1.0, 10.0])),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +559,41 @@ mod tests {
         );
         let p = GatewayPolicy::default().with_rewriter(Arc::new(rw));
         assert_eq!(p.rewrite("SELECT * FROM old_t"), "SELECT * FROM new_t");
+    }
+
+    #[cfg(feature = "multi-tenancy")]
+    #[tokio::test]
+    async fn a_tenant_at_its_query_cap_is_refused_until_its_permit_returns() {
+        let p = capped_tenancy_policy("x-helios-tenant");
+        let acme = GatewayTenant("acme".into());
+        let globex = GatewayTenant("globex".into());
+        let free = GatewayTenant("free".into());
+        // The permit an in-flight request holds.
+        let held = p.admit_tenant_query(Some(&acme)).await.unwrap();
+        assert!(held.is_some());
+        let refused = p.admit_tenant_query(Some(&acme)).await.unwrap_err();
+        assert_eq!(refused.http_status(), 429);
+        assert!(
+            refused
+                .to_string()
+                .contains("too many active queries for tenant \"acme\" (limit 1)"),
+            "{refused}"
+        );
+        // Another tenant is unaffected, and so is an uncapped tenant.
+        assert!(p.admit_tenant_query(Some(&globex)).await.unwrap().is_some());
+        assert!(p.admit_tenant_query(Some(&free)).await.unwrap().is_none());
+        // No tenant (no tenant_header on the gateway): no permit.
+        assert!(p.admit_tenant_query(None).await.unwrap().is_none());
+        // Returned on drop: the tenant's next request is admitted.
+        drop(held);
+        assert!(p.admit_tenant_query(Some(&acme)).await.unwrap().is_some());
+    }
+
+    #[cfg(feature = "multi-tenancy")]
+    #[tokio::test]
+    async fn a_policy_without_tenant_slots_admits_every_request() {
+        let p = GatewayPolicy::default();
+        let acme = GatewayTenant("acme".into());
+        assert!(p.admit_tenant_query(Some(&acme)).await.unwrap().is_none());
     }
 }

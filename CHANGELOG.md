@@ -180,6 +180,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefixes of user-defined volatile functions that also make both result caches refuse a
   read. Validated at startup; restart to change. Sprinter 87c5caf119f8.
 
+- **Per-tenant active-query caps apply to the HTTP, MCP and GraphQL gateways.**
+  `[multi_tenancy] max_active_queries_per_tenant` (and its per-tenant override and
+  `active_query_wait_ms`) bounded only PG-wire sessions. A gateway request of a tenant
+  named by `tenant_header` now takes that tenant's active-query permit, the same permit
+  the PG-wire path takes: it waits up to `active_query_wait_ms` and is refused when the
+  tenant is still at its cap (HTTP 429, MCP tool error, GraphQL 429 with an error). The
+  permit is released when the request ends, however it ends. `max_clients_per_tenant`
+  does not apply to stateless gateway requests (it counts PG-wire sessions only).
+  Sprinter 1d73ba306c92.
 ### Security
 
 - **Routing hints are read only from comments outside literals.** With

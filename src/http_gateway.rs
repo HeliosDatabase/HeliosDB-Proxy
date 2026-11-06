@@ -204,6 +204,19 @@ impl HttpGateway {
             .await;
         }
 
+        // `[multi_tenancy]` active-query cap: the tenant's permit is held for
+        // the request and returned on every path when it drops.
+        let _query_permit = match policy.admit_tenant_query(tenant.as_ref()).await {
+            Ok(p) => p,
+            Err(denied) => {
+                return Self::respond(
+                    &mut writer,
+                    denied.http_status(),
+                    &json!({"error": denied.to_string()}),
+                )
+                .await
+            }
+        };
         match Self::run_sql(&cfg, &pool, &policy, tenant.as_ref(), sql, &params).await {
             Ok(qr) => {
                 let body = neon_result(&qr, array_mode);
@@ -619,5 +632,85 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
         assert!(resp.contains("Retry-After: 1\r\n"));
         assert!(resp.contains("too many concurrent /sql requests"));
+    }
+
+    /// A port nothing listens on: where a gateway test's admitted request
+    /// goes, failing at connect after it has taken its tenant permit.
+    #[cfg(feature = "multi-tenancy")]
+    async fn closed_port() -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    #[cfg(feature = "multi-tenancy")]
+    async fn post_sql_as(policy: SharedGatewayPolicy, port: u16, header: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        let cfg = HttpGatewayConfig {
+            backend_port: port,
+            ..HttpGatewayConfig::default()
+        };
+        let pool: SharedBackendPool = Arc::new(crate::gateway_pool::BackendClientPool::new(0));
+        let task = tokio::spawn(HttpGateway::handle(
+            server,
+            peer,
+            Arc::new(cfg),
+            pool,
+            Arc::new(tokio::sync::Semaphore::new(4)),
+            policy,
+        ));
+        let body = br#"{"query":"select 1"}"#;
+        let req = format!(
+            "POST /sql HTTP/1.1\r\n{header}Content-Length: {}\r\n\r\n",
+            body.len()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        client.write_all(body).await.unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        task.await.unwrap().unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// `[multi_tenancy]` active-query cap on /sql: while a tenant's permit is
+    /// held by an in-flight request, another request of that tenant is
+    /// refused with 429; another tenant is unaffected; once the permit is
+    /// returned the tenant's requests run again, including after a request
+    /// that failed at the backend (the permit is released on every path).
+    #[cfg(feature = "multi-tenancy")]
+    #[tokio::test]
+    async fn handle_caps_a_tenant_at_its_active_query_limit() {
+        let policy = Arc::new(crate::gateway_policy::capped_tenancy_policy(
+            "X-Helios-Tenant",
+        ));
+        let port = closed_port().await;
+        let in_flight = policy
+            .admit_tenant_query(Some(&crate::gateway_policy::GatewayTenant("acme".into())))
+            .await
+            .unwrap();
+        assert!(in_flight.is_some());
+
+        let refused = post_sql_as(policy.clone(), port, "X-Helios-Tenant: acme\r\n").await;
+        assert!(
+            refused.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("too many active queries for tenant"),
+            "{refused}"
+        );
+
+        let other = post_sql_as(policy.clone(), port, "X-Helios-Tenant: globex\r\n").await;
+        assert!(!other.starts_with("HTTP/1.1 429"), "{other}");
+        assert!(!other.contains("too many active queries"), "{other}");
+
+        drop(in_flight);
+        for _ in 0..2 {
+            let resp = post_sql_as(policy.clone(), port, "X-Helios-Tenant: acme\r\n").await;
+            assert!(!resp.starts_with("HTTP/1.1 429"), "{resp}");
+            assert!(!resp.contains("too many active queries"), "{resp}");
+        }
     }
 }

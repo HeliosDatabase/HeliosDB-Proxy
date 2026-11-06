@@ -578,6 +578,12 @@ impl McpServer {
             .tenant_sql(&rewritten, gateway.tenant)
             .map_err(|denied| denied.to_string())?;
         let sql = filtered.as_ref();
+        // `[multi_tenancy]` active-query cap: held until this call's result
+        // is built, released on every path.
+        let _query_permit = policy
+            .admit_tenant_query(gateway.tenant)
+            .await
+            .map_err(|denied| denied.to_string())?;
         let bcfg = BackendConfig {
             host: cfg.backend_host.clone(),
             port: cfg.backend_port,
@@ -1538,5 +1544,83 @@ mod tests {
             text.contains("the row and byte limit was reached"),
             "{text}"
         );
+    }
+
+    /// A port nothing listens on (the backend an admitted call dials).
+    #[cfg(feature = "multi-tenancy")]
+    async fn closed_port() -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    /// `[multi_tenancy]` active-query cap on the `query` tool: while the
+    /// tenant's permit is held, its call is refused in-band (isError, the
+    /// tool-error shape); another tenant is unaffected; once the permit is
+    /// returned the call reaches the backend again.
+    #[cfg(feature = "multi-tenancy")]
+    #[tokio::test]
+    async fn a_query_tool_call_is_refused_at_the_tenant_active_query_cap() {
+        use crate::gateway_policy::GatewayTenant;
+        let policy = crate::gateway_policy::capped_tenancy_policy("X-Helios-Tenant");
+        let acme = GatewayTenant("acme".into());
+        let globex = GatewayTenant("globex".into());
+        let cfg = McpConfig {
+            backend_port: closed_port().await,
+            ..McpConfig::default()
+        };
+        let pool: crate::gateway_pool::SharedBackendPool =
+            Arc::new(crate::gateway_pool::BackendClientPool::new(0));
+        let admission = tokio::sync::Semaphore::new(4);
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "query", "arguments": { "sql": "SELECT 1" } }
+        })
+        .to_string();
+        let text_of = |v: &Value| -> (bool, String) {
+            (
+                v["result"]["isError"].as_bool().unwrap_or(false),
+                v["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        };
+
+        let in_flight = policy.admit_tenant_query(Some(&acme)).await.unwrap();
+        assert!(in_flight.is_some());
+        let gw = Gateway {
+            pool: &pool,
+            policy: &policy,
+            peer: None,
+            tenant: Some(&acme),
+        };
+        let refused = McpServer::dispatch_with(&body, &cfg, None, &gw, &admission)
+            .await
+            .unwrap();
+        let (is_error, text) = text_of(&refused);
+        assert!(is_error, "{refused}");
+        assert!(
+            text.contains("too many active queries for tenant \"acme\""),
+            "{text}"
+        );
+
+        let gw_other = Gateway {
+            pool: &pool,
+            policy: &policy,
+            peer: None,
+            tenant: Some(&globex),
+        };
+        let other = McpServer::dispatch_with(&body, &cfg, None, &gw_other, &admission)
+            .await
+            .unwrap();
+        let (_, text) = text_of(&other);
+        assert!(!text.contains("too many active queries"), "{text}");
+
+        drop(in_flight);
+        let allowed = McpServer::dispatch_with(&body, &cfg, None, &gw, &admission)
+            .await
+            .unwrap();
+        let (_, text) = text_of(&allowed);
+        assert!(text.contains("backend connect"), "{text}");
     }
 }

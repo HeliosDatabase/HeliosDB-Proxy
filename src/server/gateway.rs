@@ -23,6 +23,11 @@ impl ProxyServer {
             Some(cb) => policy.with_circuit_breaker(cb.clone()),
             None => policy,
         };
+        // `[multi_tenancy]` active-query caps: the same tenant budgets the
+        // PG-wire path takes its permits from (empty unless configured).
+        #[cfg(feature = "multi-tenancy")]
+        let policy =
+            policy.with_tenant_slots(self.state.tenant_slots.clone(), self.state.latency.clone());
         policy
     }
 
