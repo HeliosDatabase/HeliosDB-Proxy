@@ -184,6 +184,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     backend. The HTTP, MCP and GraphQL gateways refuse it the same way.
   - Statements that touch no tenant table, and tenant statements of the shapes listed
     in `docs/configuration.md`, are unchanged.
+- **Row-level tenant filter: remaining bypasses.** Unicode-escaped identifiers
+  (`U&"…"`, `UESCAPE`) are refused, since they can spell a tenant table the lexer does not
+  read. `INSERT` into a tenant table is rewritten only for `INSERT INTO <table> (<columns>)
+  VALUES (<row>)[, (<row>)...]` with optional `ON CONFLICT (...) DO NOTHING` and
+  `RETURNING`: the tenant column and value are added to the list and to every row. Other
+  `INSERT` shapes are refused (the old text rewrite put the tenant id into the first column,
+  left `INSERT ... SELECT` and `DEFAULT VALUES` unfiltered, and filled only the first row).
+  `ON CONFLICT ... DO UPDATE` is refused, since a conflicting row may belong to another
+  tenant. An `UPDATE` that assigns the tenant column is refused. A tenant id is escaped in
+  every generated literal (`'` doubled), and one containing a NUL byte is refused.
+
+### Library API (breaking)
+
+- `GatewayPolicy::tenant_sql` now returns `Result<Cow<str>, PolicyDenied>` (it was
+  `Cow<str>`), so a refused statement is an `Err` (`PolicyDenied::TenantStatement`, HTTP 403)
+  and never a passthrough. Downstream callers must handle the `Err`; the release is a
+  breaking change for the library API.
 
 ### Development
 

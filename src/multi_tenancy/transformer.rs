@@ -162,6 +162,9 @@ impl TenantQueryTransformer {
     /// rewritten here or refused (SQLSTATE 42501, see
     /// [`TransformResult::refusal`]); none is passed through unfiltered.
     fn rewrite_row(&self, query: &str, tenant: &TenantId, column: &str) -> TransformResult {
+        if tenant.0.contains('\0') {
+            return refuse("the tenant id contains a NUL byte");
+        }
         let Some(all) = lex_units(query) else {
             // The lexer gave up: where the backends end a token is unknown,
             // so fail closed if any tenant table might be named.
@@ -180,6 +183,11 @@ impl TenantQueryTransformer {
             .into_iter()
             .filter(|u| u.kind != LexKind::Comment)
             .collect();
+        if (0..units.len()).any(|i| is_unicode_escape(query, &units, i)) {
+            return refuse(
+                "a Unicode-escaped identifier (U&\"...\") or a UESCAPE clause cannot be read with confidence",
+            );
+        }
         let statements = split_statements(query, &units);
         if statements.len() > 1 {
             return if self.tenant_refs(query, &units).is_empty() {
@@ -205,6 +213,9 @@ impl TenantQueryTransformer {
         if is_word(query, &first, "select") {
             self.rewrite_select(query, stmt, &depth, &refs, tenant, column)
         } else if is_word(query, &first, "update") {
+            if set_names_column(query, stmt, &depth, column) {
+                return refuse("an UPDATE assigns the tenant column, which would move the row to another tenant");
+            }
             match target_at(query, stmt, 1, true) {
                 Some(target) => self.rewrite_write(query, stmt, &depth, target, tenant, column),
                 None => refuse("the UPDATE target is not a table name"),
@@ -219,18 +230,7 @@ impl TenantQueryTransformer {
         } else if is_word(query, &first, "insert")
             && stmt.get(1).is_some_and(|u| is_word(query, u, "into"))
         {
-            match target_at(query, stmt, 2, false) {
-                Some(target) if refs == [target] => {
-                    let name = self
-                        .tenant_table_of(query, &stmt[target])
-                        .unwrap_or_default();
-                    // A tenant value goes into the INSERT text, as before.
-                    let rewritten = self.inject_tenant_value(query, tenant, column);
-                    TransformResult::transformed(rewritten, vec![name])
-                        .with_warning("Tenant column injection may require schema awareness")
-                }
-                _ => refuse("an INSERT reads a tenant table besides its target, or has no target"),
-            }
+            self.rewrite_insert(query, stmt, &depth, &refs, tenant, column)
         } else {
             refuse("the statement shape is not rewritten (WITH, TABLE, VALUES, a parenthesised query, ...)")
         }
@@ -305,6 +305,37 @@ impl TenantQueryTransformer {
         TransformResult::transformed(apply_edits(sql, edits), filtered)
     }
 
+    /// Rewrite an INSERT into a tenant table. Only `INSERT INTO <table>
+    /// (<columns>) VALUES (<row>) [, (<row>) ...] [ON CONFLICT [(<cols>)]
+    /// DO NOTHING] [RETURNING ...]` is accepted, and the tenant column and
+    /// its value are added to the column list and to every row. Anything
+    /// else (no column list, the tenant column in the list, `SELECT`,
+    /// `DEFAULT VALUES`, `ON CONFLICT ... DO UPDATE`) is refused: a conflicting
+    /// row can belong to another tenant, so it must not be updated.
+    fn rewrite_insert(
+        &self,
+        sql: &str,
+        stmt: &[LexUnit],
+        depth: &[u32],
+        refs: &[usize],
+        tenant: &TenantId,
+        column: &str,
+    ) -> TransformResult {
+        if refs != [2] {
+            return refuse("an INSERT reads a tenant table besides its target");
+        }
+        let name = self.tenant_table_of(sql, &stmt[2]).unwrap_or_default();
+        let value = format!("'{}'", escape_literal(&tenant.0));
+        match insert_edits(sql, stmt, depth, column, &value) {
+            Some(edits) => TransformResult::transformed(apply_edits(sql, edits), vec![name]),
+            None => refuse(
+                "an INSERT into a tenant table is accepted only as INSERT INTO <table> \
+                 (<columns without the tenant column>) VALUES (<row>)[, (<row>) ...] \
+                 [ON CONFLICT [(<columns>)] DO NOTHING] [RETURNING ...]",
+            ),
+        }
+    }
+
     /// Rewrite an UPDATE or DELETE whose target is the only tenant table it
     /// names.
     fn rewrite_write(
@@ -336,7 +367,7 @@ impl TenantQueryTransformer {
                 if self.use_parameters {
                     format!("{}.{} = $1", table, column)
                 } else {
-                    format!("{}.{} = '{}'", table, column, tenant.0)
+                    format!("{}.{} = '{}'", table, column, escape_literal(&tenant.0))
                 }
             })
             .collect();
@@ -352,58 +383,10 @@ impl TenantQueryTransformer {
             match &self.filter_template {
                 Some(template) => template
                     .replace("{column}", column)
-                    .replace("{value}", &tenant.0),
-                None => format!("{} = '{}'", column, tenant.0),
+                    .replace("{value}", &escape_literal(&tenant.0)),
+                None => format!("{} = '{}'", column, escape_literal(&tenant.0)),
             }
         }
-    }
-
-    /// Inject tenant value into INSERT statement
-    fn inject_tenant_value(&self, query: &str, tenant: &TenantId, column: &str) -> String {
-        // Simple implementation - a real one would parse SQL properly
-        let upper = query.to_uppercase();
-
-        if let Some(values_pos) = upper.find(" VALUES ") {
-            if let Some(paren_pos) = query[values_pos..].find('(') {
-                let insert_pos = values_pos + paren_pos + 1;
-
-                // Check if there's a column list
-                if let Some(cols_start) = upper.find('(') {
-                    if cols_start < values_pos {
-                        // There's a column list - add column to it
-                        let cols_end = upper[cols_start..].find(')').unwrap_or(0) + cols_start;
-                        let before_cols_end = &query[..cols_end];
-                        let after_cols_end = &query[cols_end..];
-
-                        // Insert column name
-                        let with_column =
-                            format!("{}, {}{}", before_cols_end, column, after_cols_end);
-
-                        // Now insert the value
-                        let upper_new = with_column.to_uppercase();
-                        if let Some(new_values_pos) = upper_new.find(" VALUES ") {
-                            if let Some(new_paren_pos) = with_column[new_values_pos..].find('(') {
-                                let new_insert_pos = new_values_pos + new_paren_pos + 1;
-                                let before = &with_column[..new_insert_pos];
-                                let after = &with_column[new_insert_pos..];
-                                return format!("{}'{}'", before, tenant.0)
-                                    + if !after.starts_with(')') { ", " } else { "" }
-                                    + after;
-                            }
-                        }
-                    }
-                }
-
-                // No column list or couldn't parse - just add to values
-                let before = &query[..insert_pos];
-                let after = &query[insert_pos..];
-                return format!("{}'{}'", before, tenant.0)
-                    + if !after.starts_with(')') { ", " } else { "" }
-                    + after;
-            }
-        }
-
-        query.to_string()
     }
 
     /// The FROM and JOIN table names of `query` (a test helper: the rewrite
@@ -705,6 +688,128 @@ fn apply_edits(sql: &str, mut edits: Vec<(usize, String)>) -> String {
     }
     out.push_str(&sql[last..]);
     out
+}
+
+/// `value` with each `'` doubled, for a quoted SQL string literal.
+fn escape_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+/// Whether unit `i` is a Unicode escape that can spell a name the lexer does
+/// not read: a quoted identifier written directly after `&` (`U&"…"`), or the
+/// `UESCAPE` word. Refused under row isolation whatever it spells.
+fn is_unicode_escape(sql: &str, units: &[LexUnit], i: usize) -> bool {
+    let unit = &units[i];
+    if is_word(sql, unit, "uescape") {
+        return true;
+    }
+    if unit.kind != LexKind::Ident || i == 0 {
+        return false;
+    }
+    let prev = &units[i - 1];
+    prev.kind == LexKind::Op && prev.end == unit.start && text(sql, prev).ends_with('&')
+}
+
+/// Whether the SET list of the UPDATE `stmt` names `column`, quoted or not,
+/// qualified or not.
+fn set_names_column(sql: &str, stmt: &[LexUnit], depth: &[u32], column: &str) -> bool {
+    let Some(set) = (0..stmt.len()).find(|&i| depth[i] == 0 && is_word(sql, &stmt[i], "set"))
+    else {
+        return false;
+    };
+    let column = column.to_lowercase();
+    for (i, unit) in stmt.iter().enumerate().skip(set + 1) {
+        if depth[i] == 0 && is_one_of(sql, unit, &["where", "from", "returning"]) {
+            break;
+        }
+        if unit_name(sql, unit).is_some_and(|name| name == column) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The index of the `)` closing the `(` at `open`, at the same depth.
+fn matching_close(sql: &str, stmt: &[LexUnit], depth: &[u32], open: usize) -> Option<usize> {
+    let level = depth[open];
+    (open + 1..stmt.len()).find(|&p| depth[p] == level && is_punct(sql, &stmt[p], ")"))
+}
+
+/// The edits of an accepted INSERT into a tenant table, or `None` for any
+/// other shape: `INSERT INTO <table> (<names>) VALUES (<row>) [, (<row>)]...`
+/// followed by nothing, `RETURNING ...`, or `ON CONFLICT [(<names>)] DO NOTHING`
+/// (optionally followed by `RETURNING ...`). The names must not include
+/// `column`. `value` is the quoted tenant literal.
+fn insert_edits(
+    sql: &str,
+    stmt: &[LexUnit],
+    depth: &[u32],
+    column: &str,
+    value: &str,
+) -> Option<Vec<(usize, String)>> {
+    let n = stmt.len();
+    if n < 4 || !is_punct(sql, &stmt[3], "(") {
+        return None;
+    }
+    let close = matching_close(sql, stmt, depth, 3)?;
+    if close == 4 || !matches!(stmt[close - 1].kind, LexKind::Word | LexKind::Ident) {
+        return None;
+    }
+    let tenant_column = column.to_lowercase();
+    let mut k = 4;
+    while k < close {
+        let unit = &stmt[k];
+        let named = matches!(unit.kind, LexKind::Word | LexKind::Ident);
+        if !named || unit_name(sql, unit).is_some_and(|name| name == tenant_column) {
+            return None;
+        }
+        k += 1;
+        if k < close {
+            if !is_punct(sql, &stmt[k], ",") {
+                return None;
+            }
+            k += 1;
+        }
+    }
+    let mut edits = vec![(stmt[close - 1].end, format!(", {column}"))];
+    let mut k = close + 1;
+    if !(k < n && is_word(sql, &stmt[k], "values")) {
+        return None;
+    }
+    k += 1;
+    loop {
+        if !(k < n && is_punct(sql, &stmt[k], "(") && depth[k] == 0) {
+            return None;
+        }
+        let row_close = matching_close(sql, stmt, depth, k)?;
+        if row_close == k + 1 {
+            return None;
+        }
+        edits.push((stmt[row_close - 1].end, format!(", {value}")));
+        k = row_close + 1;
+        if k < n && is_punct(sql, &stmt[k], ",") {
+            k += 1;
+        } else {
+            break;
+        }
+    }
+    if k == n || is_word(sql, &stmt[k], "returning") {
+        return Some(edits);
+    }
+    if is_word(sql, &stmt[k], "on") && k + 1 < n && is_word(sql, &stmt[k + 1], "conflict") {
+        let mut j = k + 2;
+        if j < n && is_punct(sql, &stmt[j], "(") {
+            j = matching_close(sql, stmt, depth, j)? + 1;
+        }
+        if !(j + 1 < n && is_word(sql, &stmt[j], "do") && is_word(sql, &stmt[j + 1], "nothing")) {
+            return None;
+        }
+        j += 2;
+        if j == n || is_word(sql, &stmt[j], "returning") {
+            return Some(edits);
+        }
+    }
+    None
 }
 
 /// Validate that a query doesn't try to bypass tenant isolation
@@ -1147,5 +1252,92 @@ mod tests {
             assert!(res.refusal.is_none(), "wrongly refused: {sql}");
             assert!(!res.transformed, "untouched: {sql}");
         }
+    }
+
+    /// Row-isolated transform of `sql` for `tenant`, with `orders` tenant-scoped
+    /// on `tenant_id`.
+    fn orders_for(tenant: &str, sql: &str) -> TransformResult {
+        TenantQueryTransformer::new()
+            .register_table("orders", "tenant_id")
+            .transform(sql, &TenantId::new(tenant), &create_row_config(tenant))
+    }
+
+    #[test]
+    fn unicode_escaped_identifiers_are_refused_whatever_they_spell() {
+        assert_refused(r#"SELECT * FROM U&"\006Frders""#);
+        assert_refused(r#"SELECT * FROM u&"o\0072ders" UESCAPE '!'"#);
+        assert_refused(r#"SELECT * FROM U&"!006Frders" UESCAPE '!'"#);
+        assert_refused(r#"SELECT * FROM logs U&"x""#);
+    }
+
+    #[test]
+    fn insert_adds_the_tenant_column_and_value_to_every_row() {
+        assert_eq!(
+            rewritten("INSERT INTO orders (id, status) VALUES (1, 'open')"),
+            "INSERT INTO orders (id, status, tenant_id) VALUES (1, 'open', 'acme')"
+        );
+        assert_eq!(
+            rewritten("INSERT INTO orders (id) VALUES (1), (2)"),
+            "INSERT INTO orders (id, tenant_id) VALUES (1, 'acme'), (2, 'acme')"
+        );
+        assert_eq!(
+            rewritten("INSERT INTO orders (id) VALUES (1) ON CONFLICT (id) DO NOTHING"),
+            "INSERT INTO orders (id, tenant_id) VALUES (1, 'acme') ON CONFLICT (id) DO NOTHING"
+        );
+        assert_eq!(
+            rewritten("INSERT INTO orders (id) VALUES (1) RETURNING id"),
+            "INSERT INTO orders (id, tenant_id) VALUES (1, 'acme') RETURNING id"
+        );
+    }
+
+    #[test]
+    fn insert_shapes_that_could_write_another_tenant_are_refused() {
+        assert_refused("INSERT INTO orders VALUES ('other')");
+        assert_refused("INSERT INTO orders SELECT * FROM logs");
+        assert_refused("INSERT INTO orders (id) SELECT id FROM logs");
+        assert_refused("INSERT INTO orders DEFAULT VALUES");
+        assert_refused("INSERT INTO orders (id, tenant_id) VALUES (1, 'other')");
+        assert_refused(
+            "INSERT INTO orders (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET status = 'x'",
+        );
+        assert_refused(
+            "INSERT INTO orders (id) VALUES (1) ON CONFLICT (id) WHERE id > 0 DO NOTHING",
+        );
+    }
+
+    #[test]
+    fn insert_into_other_tables_is_untouched() {
+        let res = orders("INSERT INTO logs (a) VALUES (1)");
+        assert!(res.refusal.is_none());
+        assert!(!res.transformed);
+    }
+
+    #[test]
+    fn update_that_assigns_the_tenant_column_is_refused() {
+        assert_refused("UPDATE orders SET tenant_id = 'other' WHERE id = 1");
+        assert_refused("UPDATE orders SET orders.tenant_id = 'other' WHERE id = 1");
+        assert_refused(r#"UPDATE orders SET "tenant_id" = 'other' WHERE id = 1"#);
+        assert_refused("UPDATE orders SET status = 'x', tenant_id = 'other'");
+    }
+
+    #[test]
+    fn tenant_ids_are_escaped_in_every_literal() {
+        assert_eq!(
+            orders_for("a'b", "SELECT * FROM orders").query,
+            "SELECT * FROM orders WHERE orders.tenant_id = 'a''b'"
+        );
+        assert_eq!(
+            orders_for("a'b", "UPDATE orders SET s = 1 WHERE id = 1").query,
+            "UPDATE orders SET s = 1 WHERE tenant_id = 'a''b' AND id = 1"
+        );
+        assert_eq!(
+            orders_for("a'b", "INSERT INTO orders (id) VALUES (1)").query,
+            "INSERT INTO orders (id, tenant_id) VALUES (1, 'a''b')"
+        );
+    }
+
+    #[test]
+    fn a_tenant_id_with_a_nul_byte_is_refused() {
+        assert!(orders_for("a\0b", "SELECT * FROM orders").refusal.is_some());
     }
 }

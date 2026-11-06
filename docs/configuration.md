@@ -1847,8 +1847,9 @@ Shapes the rewrite handles:
   Each branch of `UNION`, `INTERSECT` or `EXCEPT` is filtered on its own tables.
 - `UPDATE <table> SET ...` and `DELETE FROM <table> ...` (with `ONLY`, `USING`,
   `RETURNING`), where `<table>` is the tenant table.
-- `INSERT INTO <table> ...`: the tenant value is added to the row (see the warning on
-  schema-aware column lists).
+- `INSERT INTO <table> (<columns>) VALUES (<row>) [, (<row>) ...] [ON CONFLICT [(<cols>)]
+  DO NOTHING] [RETURNING ...]`, where `<columns>` is a column list that does not name the
+  tenant column. The tenant column is added to the list and `'<tenant>'` to every row.
 
 Placement: an existing `WHERE` becomes `WHERE <filter> AND <condition>`, with the
 condition in parentheses when it has a top-level `OR`. Without a `WHERE`, the filter
@@ -1869,11 +1870,25 @@ table in a shape the rewrite cannot filter with confidence:
 - a `SELECT` naming a tenant table outside its FROM and JOIN items;
 - an `UPDATE`, `DELETE` or `INSERT` that also reads another tenant table (`FROM`,
   `USING`, a subquery, `INSERT ... SELECT`);
+- an `INSERT` into a tenant table in any other shape: no column list, a column list that
+  names the tenant column, `VALUES` absent (`INSERT ... SELECT`, `DEFAULT VALUES`), or an
+  `ON CONFLICT` clause other than `DO NOTHING` (a conflicting row may belong to another
+  tenant, so `DO UPDATE` is refused whatever its `SET` list);
+- an `UPDATE` whose `SET` list names the tenant column (it would move the row to another
+  tenant), quoted, qualified or not;
+- a Unicode-escaped identifier (`U&"…"`) or a `UESCAPE` clause, anywhere, since it can spell
+  a tenant table the lexer cannot read;
 - text the lexer cannot read unambiguously (a backend-ambiguous comment or literal,
   or a non-ASCII keyword) that may name a tenant table.
 
 A statement that names no tenant table passes unchanged, as does one a `tenant_tables`
 entry excludes.
+
+The tenant id is written into generated literals with each `'` doubled. A tenant id
+containing a NUL byte is refused for every statement. The alias limitation stands: for
+`FROM orders o` the filter is qualified with the table name (`orders.tenant_id`), which
+PostgreSQL rejects once the item is aliased, so the statement fails at the backend rather
+than running unfiltered.
 
 Not covered: the extended protocol (`Parse`, `Bind`, `Execute`) is not transformed, so a
 prepared statement that names a tenant table reaches the backend unfiltered. The HTTP,
