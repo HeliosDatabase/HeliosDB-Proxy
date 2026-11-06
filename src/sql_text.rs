@@ -1630,6 +1630,19 @@ impl IdentifierScan {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        Self::with_kind(names, Some(aho_corasick::AhoCorasickKind::DFA))
+    }
+
+    /// [`Self::new`] with the automaton of `kind` (`None`: the crate picks
+    /// one, as before). The DFA reads one table entry per byte, where the
+    /// NFA follows failure links; both report the same matches. A DFA that
+    /// cannot be built falls back to the crate's pick, and only a failure of
+    /// that is fail-closed.
+    fn with_kind<I, S>(names: I, kind: Option<aho_corasick::AhoCorasickKind>) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let names: Vec<String> = names
             .into_iter()
             .map(|n| n.as_ref().to_ascii_lowercase())
@@ -1638,10 +1651,13 @@ impl IdentifierScan {
         let automaton = if names.is_empty() {
             None
         } else {
-            match aho_corasick::AhoCorasick::builder()
-                .ascii_case_insensitive(true)
-                .build(&names)
-            {
+            let build = |kind| {
+                aho_corasick::AhoCorasick::builder()
+                    .ascii_case_insensitive(true)
+                    .kind(kind)
+                    .build(&names)
+            };
+            match build(kind).or_else(|_| build(None)) {
                 Ok(automaton) => Some(automaton),
                 Err(error) => {
                     tracing::warn!(
@@ -3791,5 +3807,77 @@ mod fast_path_tests {
         assert_eq!(single_statement(";"), None);
         assert_eq!(single_statement("  \n"), None);
         assert_eq!(single_statement("; SELECT 1"), None);
+    }
+}
+
+#[cfg(test)]
+mod exclusion_scan_tests {
+    use super::*;
+
+    /// Names over a small alphabet, so they overlap and share prefixes
+    /// (`pay`, `payroll`), with one of 60 bytes or more (the truncation rule)
+    /// and one that ends in a non-ASCII letter.
+    fn generated_names(seed: &mut u64) -> Vec<String> {
+        const PARTS: &[&str] = &["pay", "roll", "t", "_", "s", "A", "9"];
+        let mut names: Vec<String> = (0..1 + next(seed) % 5)
+            .map(|_| {
+                (0..1 + next(seed) % 4)
+                    .map(|_| PARTS[(next(seed) % PARTS.len() as u64) as usize])
+                    .collect()
+            })
+            .collect();
+        if next(seed) % 4 == 0 {
+            names.push("q".repeat(60) + "é");
+        }
+        names
+    }
+
+    fn next(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    fn generated_text(seed: &mut u64) -> String {
+        const PIECES: &[&str] = &[
+            "pay", "PAYROLL", "payroll", "roll", "t", "T", "_", "$", " ", ",", ".", "\"", "'", "é",
+            "ı", "\u{3000}", "\u{a0}", "9", "A", "qqqqq", "--", "/*", "*/", "\n",
+        ];
+        (0..next(seed) % 60)
+            .map(|_| PIECES[(next(seed) % PIECES.len() as u64) as usize])
+            .collect()
+    }
+
+    /// The DFA automaton (the new `IdentifierScan::new`) and the crate's own
+    /// pick (the matcher before the change) find the same names, in each
+    /// text, with the same whole-identifier rule.
+    #[test]
+    fn dfa_scan_finds_what_the_crate_pick_finds() {
+        let mut seed = 0x1234_5678_9ABC_DEF1_u64;
+        let mut hits = 0usize;
+        for _ in 0..3_000 {
+            let names = generated_names(&mut seed);
+            let dfa = IdentifierScan::new(&names);
+            let old = IdentifierScan::with_kind(&names, None);
+            for _ in 0..8 {
+                let text = generated_text(&mut seed);
+                let mut new: Vec<usize> = dfa.found(text.as_bytes()).collect();
+                let mut want: Vec<usize> = old.found(text.as_bytes()).collect();
+                new.sort_unstable();
+                want.sort_unstable();
+                hits += want.len();
+                assert_eq!(new, want, "names {names:?}, text {text:?}");
+            }
+        }
+        assert!(hits > 1_000, "{hits} matches: the corpus must match often");
+    }
+
+    /// A DFA kind is the automaton `new` uses: it builds for the set.
+    #[test]
+    fn small_sets_build_a_dfa() {
+        let scan = IdentifierScan::new(["secrets", "audit_log", "payroll"]);
+        let automaton = scan.automaton.as_ref().expect("built");
+        assert_eq!(automaton.kind(), aho_corasick::AhoCorasickKind::DFA);
     }
 }

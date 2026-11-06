@@ -663,6 +663,12 @@ fn bench_exclusions(c: &mut Criterion) {
     group.bench_function("scan_3_names_1k", |b| {
         b.iter(|| black_box(exclusions.matches(black_box(&sql))))
     });
+    // The same scan of a 100-byte read, where the per-call cost dominates.
+    let short = &sql[..100];
+    assert!(!exclusions.matches(short));
+    group.bench_function("scan_3_names_100b", |b| {
+        b.iter(|| black_box(exclusions.matches(black_box(short))))
+    });
     group.bench_function("scan_1100_names_1k", |b| {
         b.iter(|| black_box(many.matches(black_box(&sql))))
     });

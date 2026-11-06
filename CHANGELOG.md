@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   journal's statement classifier skip the lexer pass for plain ASCII statements: no
   quote, `$`, backslash, `-`, `/`, CR, and no `;` but a final one. The answers are the
   same (a property test compares both paths on generated statements). No behaviour change.
+- The `[cache] exclude_tables` scan builds its automaton as a DFA (one table lookup per
+  byte) instead of the crate's default pick, which is slower for small name sets. The
+  matches are the same (a test compares the two automata on generated names and text).
+
 - The SQL lexer core (`Piece`, `Pieces`, comment and statement-start reads, the
   multi-tenancy identifier scan, the routing hint comments) moved from `sql_text` to a new
   `sql_lex` module, compiled only with the features that read it. Single-feature builds of
