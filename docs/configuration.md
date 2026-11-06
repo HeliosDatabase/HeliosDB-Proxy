@@ -338,6 +338,23 @@ panic the health-check timer and silently stop probing).
 
 ---
 
+## Admin API Tunables (`[admin]`)
+
+Tunables of the admin API. Its address and token stay the top-level keys
+`admin_address`, `admin_token` and `admin_allow_insecure` above. An absent `[admin]`
+block changes nothing.
+
+```toml
+[admin]
+stats_max_items = 1000
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `stats_max_items` | usize | `1000` | Most entries `GET /api/stats` reports in one list (`nodes.items`, `tenants.items`). A longer list is sorted, cut to this many entries, and reports `"truncated": true` with its full length in `count`. Must be ≥ 1 (`validate()` rejects `0`). Read once at startup. See [GET /api/stats](admin-api.md#get-apistats--schema_version-1). |
+
+---
+
 ## Pool Mode (`[pool_mode]`)
 
 Controls Session/Transaction/Statement pooling.

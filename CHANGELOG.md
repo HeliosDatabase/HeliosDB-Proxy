@@ -80,6 +80,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`GET /api/stats`, schema_version 1, for HeliosDB-Lite and other pollers (Sprinter
+  c3397d898b25).** One versioned JSON document on the admin listener, token-gated like
+  every other `/api/*` route: `schema_version`, `proxy_version`, `generated_at`,
+  `uptime_secs`, and the sections `nodes` (role, health, lag, override, circuit state,
+  per-node backend connections at a `max_connections` cap), `pools`, `sessions`,
+  `traffic`, `cache` (per tier entries, bytes, hits, evictions; heatmap summary),
+  `tenants`, `rate_limit`, `transaction_replay` and `gateways` (HTTP, GraphQL, MCP and its
+  tool cache). Every section is always present: one whose feature is compiled out or
+  switched off is `{"enabled": false, "reason": "..."}`. It is built from the snapshots
+  `/metrics`, `/nodes`, `/topology`, `/api/circuit`, `/api/cache/heatmap` and
+  `/api/mcp/cache` already take, plus configuration values and the existing counters of
+  the transaction/statement-mode idle backend pool; no counter is added to the data path.
+  Lists are sorted and cut at the new `[admin] stats_max_items` (default 1000, must be
+  >= 1) with `count` and `truncated`. Contract: within version 1 fields are only ever
+  added, a breaking change bumps `schema_version`; documented field by field in
+  docs/admin-api.md and pinned by `tests/fixtures/api-stats-v1.schema.json` (JSON Schema)
+  and `tests/fixtures/api-stats-v1.example.json`, against which a test validates the live
+  response strictly. Lite's view poller (S2) reads this instead of linking the proxy
+  crate.
 - **MCP tool-result cache (`[mcp] tool_cache_*`, Sprinter 20bcc218385f).** Off by default
   (`tool_cache_enabled = false`; needs the `query-cache` feature). With it on, the MCP
   gateway answers a repeated `query` or `list_tables` from memory; `explain` is never

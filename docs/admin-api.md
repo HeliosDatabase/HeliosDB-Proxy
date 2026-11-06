@@ -89,6 +89,7 @@ Auth column: **token** = requires bearer token when `admin_token` is set; **open
 | `GET` | `/readyz` | Readiness — alias of `/health/ready` | — | open |
 | `GET` | `/metrics` | Server metrics (JSON) | — | token |
 | `GET` | `/metrics/prometheus` | Server metrics (Prometheus text, wrapped in JSON `text`) | — | token |
+| `GET` | `/api/stats` | One versioned stats document for pollers such as HeliosDB-Lite (`schema_version` 1): nodes, pools, sessions, traffic, cache, tenants, rate limit, transaction replay, gateways; every section always present (`{"enabled":false,"reason":…}` when off). See [GET /api/stats](#get-apistats--schema_version-1) | — | token |
 | `GET` | `/version` | Proxy version | — | token |
 | `GET` | `/capabilities` | Per-subsystem compiled/enabled/wired manifest + `strict_config` flag (D-05); also at `/api/capabilities` | — | token |
 | `GET` | `/config` | Current configuration snapshot | — | token |
@@ -502,6 +503,255 @@ Per-node connection pool statistics (active/idle/pending, lifetime created/close
 ### GET /config
 
 Returns a snapshot of the running configuration (secrets such as `admin_token` and TLS material that serialize as `None` are omitted). `ignored_config_keys` lists the keys the loaded file carried that the proxy does not know (each was warned at load with the key it most likely meant; `strict_config = true` refuses them); it follows a SIGHUP reload. `GET /health` reports their count as `ignored_config_keys` and `/metrics/prometheus` the gauge `heliosdb_proxy_config_ignored_keys`, so a monitor can alert on a policy that silently runs at its defaults.
+
+---
+
+## Stats for Pollers
+
+### GET /api/stats — schema_version 1
+
+One JSON document with the proxy's state, for external pollers (HeliosDB-Lite fills its
+`helios_proxy_*` system views from it) that would otherwise stitch `/metrics`, `/nodes`,
+`/topology`, `/api/circuit`, `/api/cache/heatmap`, `/api/mcp/cache` and `/sessions`
+together. It reads the snapshots those endpoints take, plus configuration values:
+building it adds no counter to the data path. It is token-gated like every other
+`/api/*` route, ignores a query string, and always answers `200` (a missing subsystem is
+reported inside the document).
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/api/stats
+```
+
+**Stability contract**
+
+- `schema_version` is `1`. Within version 1, fields and enum values are only ever added.
+  None is removed or renamed, and none changes type or meaning. A breaking change bumps
+  `schema_version`. A poller must ignore fields and enum values it does not know.
+- Every section below is always present. A section, gateway or sub-section whose cargo
+  feature is not compiled in, or whose configuration switch is off, is exactly
+  `{"enabled": false, "reason": "..."}`. With `"enabled": true` it carries every field of
+  its table. `reason` is for people: it names the feature or the key, and its wording is
+  not part of the contract.
+- A field whose name ends in `_total` is a counter since the proxy started; it restarts
+  from 0 with the process, a SIGUSR2 binary handoff included. Every other number is a
+  value now. A *nullable* field is `null` when the value is not known: nothing is
+  reported as an invented zero.
+- Lists (`nodes.items`, `tenants.items`) are sorted by their key and cut at
+  `[admin] stats_max_items` (default 1000). `count` is the full length and `truncated`
+  says whether the list was cut. Totals such as `nodes.healthy_count` are taken before
+  the cut.
+- Timestamps are RFC 3339, UTC, with millisecond precision
+  (`2026-11-06T10:15:02.123Z`).
+- Configuration values are those the proxy started with; a SIGHUP reload does not
+  change them here.
+- Machine-readable contract: `tests/fixtures/api-stats-v1.schema.json` (JSON Schema
+  2020-12), with a full example in `tests/fixtures/api-stats-v1.example.json`. The
+  proxy's contract test validates the live response strictly against the schema (a field
+  the schema does not list fails it), so the schema, this section and the response change
+  together.
+
+Example (abridged; the example fixture has every field):
+
+```json
+{
+  "schema_version": 1,
+  "proxy_version": "2.2.0",
+  "generated_at": "2026-11-06T10:15:02.123Z",
+  "uptime_secs": 86400,
+  "nodes": {
+    "enabled": true, "write_leader": "db-a:5432", "load_balancer": "round_robin",
+    "failovers_total": 1, "count": 2, "healthy_count": 2, "truncated": false,
+    "items": [
+      { "address": "db-a:5432", "role": "primary", "write_leader": true, "healthy": true,
+        "latency_ms": 0.42, "lag_bytes": null, "circuit": "closed", "override": null,
+        "backend_connections": { "limit": 200, "in_use": 38, "waits_total": 0, "refusals_total": 0 } },
+      { "address": "db-b:5432", "role": "standby", "write_leader": false, "healthy": true,
+        "latency_ms": 0.57, "lag_bytes": 4096, "circuit": "closed", "override": null,
+        "backend_connections": null }
+    ]
+  },
+  "pools": { "enabled": true, "mode": "transaction", "max_pool_size": 20,
+             "idle_pool": { "idle": 14, "reuses_total": 912344 } },
+  "sessions": { "enabled": true, "active": 42, "connections_open": 43, "waiting_admission": 0 },
+  "traffic": { "enabled": true, "queries_total": 892451 },
+  "cache": {
+    "enabled": true,
+    "tiers": { "l1": { "entries": 1200, "bytes": 2457600, "hits_total": 50211, "evictions_total": 310 } },
+    "misses_total": 40112, "compression_saved_bytes": 10485760,
+    "refresh_ahead": { "claims_total": 0, "completed_total": 0, "abandoned_total": 0 },
+    "heatmap": { "enabled": false, "reason": "the cache heatmap is off ([cache] heatmap_enabled = false)" }
+  },
+  "tenants": { "enabled": true, "count": 2, "truncated": false,
+               "items": [ { "tenant": "acme", "queries": { "limit": 8, "active": 3, "refusals_total": 2 } } ] },
+  "rate_limit": { "enabled": true, "key_by": "user", "max_concurrent": 64, "concurrency_refused_total": 0 },
+  "transaction_replay": { "enabled": true, "mode": "session", "failovers_total": 1,
+                          "journal": { "committed_total": 120044 } },
+  "gateways": {
+    "enabled": true,
+    "http": { "enabled": true, "results_refused_total": 0, "write_invalidations_total": 220 },
+    "graphql": { "enabled": false, "reason": "[graphql_gateway] enabled = false" },
+    "mcp": { "enabled": true, "tool_cache": { "enabled": true, "entries": 37, "hits_total": 812 } }
+  }
+}
+```
+
+**Top level**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `schema_version` | integer | `1`. |
+| `proxy_version` | string | The proxy's version, as `GET /version`. |
+| `generated_at` | string | When the document was built. |
+| `uptime_secs` | integer, seconds | Since the admin API started, at daemon startup. |
+| `nodes`, `pools`, `sessions`, `traffic`, `cache`, `tenants`, `rate_limit`, `transaction_replay`, `gateways` | object | The sections below, always present. |
+
+**`nodes`**: always enabled. From `/nodes`, `/topology`, `/api/circuit` and `/metrics`
+(`node_slots`, `reconnect_slots`, the server counters).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `write_leader` | string, nullable | The node writes go to now (`/topology` `currentPrimary`); `null` while there is none. |
+| `load_balancer` | string | `[load_balancer] read_strategy`: `round_robin`, `weighted_round_robin`, `least_connections`, `latency_based`, `random` or `power_of_two`. |
+| `failovers_total` | counter | Primary switches (`/metrics` `failovers`). |
+| `reconnect_attempts_total` | counter | Jittered waits in the primary-select recovery loops. |
+| `backend_capacity_waits_total` | counter | Backend connections refused at the backend's `max_connections` (53300) and retried after an idle pooled connection was closed. |
+| `backend_capacity_refusals_total` | counter | Clients refused with 53300 because the backend stayed at `max_connections` for the whole acquire timeout. |
+| `reconnects` | object, nullable | `[limits] max_concurrent_reconnects_per_node`, `null` when it is `0`: `limit_per_node`, `in_progress` (connections being opened on a session's behalf now, all nodes), `peak_per_node` (most at once to one node since startup), `waits_total`, `refusals_total`. |
+| `count` | integer | Nodes known: the configured ones and any other the health checker reports. |
+| `healthy_count` | integer | Of those, the ones passing health checks. |
+| `truncated` | boolean | `items` was cut at `stats_max_items`. |
+| `items` | array | One object per node, by address (below). |
+
+Per node:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `address` | string | `host:port`. |
+| `role` | string, nullable | Configured role: `primary`, `standby` or `replica`. `null` for a node the proxy learned after startup. Under a topology provider the write target is `write_leader`, not this. |
+| `enabled` | boolean, nullable | Configured `enabled`; `null` as for `role`. |
+| `weight` | integer, nullable | Configured `weight`; `null` as for `role`. |
+| `write_leader` | boolean | This node is `nodes.write_leader`. |
+| `healthy` | boolean, nullable | Passing health checks (`false` while an override holds it out); `null` before its first check. |
+| `latency_ms` | number, nullable, milliseconds | Latency of the last successful check. |
+| `failure_count` | integer, nullable | Consecutive failed checks. |
+| `last_check` | string, nullable | Time of the last check. |
+| `last_error` | string, nullable | Error of the last failed check. |
+| `lag_bytes` | integer, nullable, bytes | Replication lag from the WAL-position probe; `null` when unknown (a primary, or no probe has succeeded). |
+| `lag_sampled_at` | string, nullable | When `lag_bytes` was sampled. |
+| `override` | string, nullable | The operator override holding the node out of routing: `disabled` (`POST /nodes/{addr}/disable`) or `force_unhealthy` (`POST /api/chaos`). |
+| `circuit` | string, nullable | Circuit-breaker state: `closed`, `open` or `half_open`. `null` without the `circuit-breaker` feature or with `[circuit_breaker] enabled = false`. |
+| `backend_connections` | object, nullable | Only for a node with `[[nodes]] max_connections`: `limit`, `in_use` (backend connections held to it now, in use or parked idle), `waits_total`, `refusals_total` (53300 at the cap). `null` for an uncapped node: the proxy does not count its connections. |
+
+**`pools`**: needs the `pool-modes` feature (in the default build). Configuration from
+`[pool_mode]` and `[limits]`, and the counters of the data-path idle pool.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `mode` | string | `[pool_mode] mode`: `session`, `transaction` or `statement`. |
+| `max_pool_size` | integer | Idle connections kept per (node, user, database) identity. |
+| `min_idle` | integer | `[pool_mode] min_idle`. |
+| `max_total_idle` | integer | `[limits] max_total_idle_backend_conns`: idle connections kept across all identities. |
+| `idle_timeout_secs` | integer, seconds | `[pool_mode] idle_timeout_secs`. |
+| `acquire_timeout_secs` | integer, seconds | `[pool_mode] acquire_timeout_secs`. |
+| `idle_pool` | object, nullable | The data-path pool of parked, authenticated backend connections (transaction and statement mode); `null` in session mode. `idle` (parked now), `reuses_total` (checkouts that reused one), `parked_total` (check-ins), `over_capacity_total` (check-ins refused at an idle cap), `stale_evicted_total` (found dead at checkout), `reaped_total` (closed by the idle reaper), `resets_skipped_total` (parked without the reset query because provably clean), `capacity_evictions_total` (closed to make room on a backend at `max_connections`). |
+
+Version 1 has no per-(user, database) breakdown: the proxy keeps no counters by pool
+identity. Per-node connection counts are `nodes.items[].backend_connections`.
+
+**`sessions`**: always enabled. From `/sessions` and `/metrics`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `active` | integer | Client sessions registered now (`/sessions`). |
+| `connections_open` | integer | Client connections open now: accepted minus closed, including ones still in startup or waiting for admission. |
+| `waiting_admission` | integer | Connections waiting now for a slot at `[limits] max_client_connections` or at their tenant's cap. |
+| `accepted_total` | counter | Client connections accepted. |
+| `closed_total` | counter | Client connections closed. |
+| `rejected_total` | counter | Connections refused at `max_client_connections` (also counted in `accepted_total` and `closed_total`). |
+| `admission_waited_total` | counter | Admissions that waited for a slot. |
+| `admission_timeouts_total` | counter | Waits that expired (a subset of `rejected_total`). |
+| `startup_waits_total` | counter | Startups that waited for an eligible node (`[limits] startup_node_wait_ms`). |
+| `startup_wait_timeouts_total` | counter | Those waits that expired (refused with 08006). |
+
+**`traffic`**: always enabled. From `/metrics`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `queries_total` | counter | Queries processed. |
+| `bytes_received_total` | counter, bytes | Received from clients. |
+| `bytes_sent_total` | counter, bytes | Sent to clients. |
+| `reads_offloaded_total` | counter | Requests served by a standby under `[load_balancer] standby_reads`. |
+| `read_mirror_failures_total` | counter | Offloaded reads served by the primary because the standby connection could not be opened or could not take the session's settings. |
+
+**`cache`**: the query-result cache, from `/metrics` `query_cache` and the server
+counters. Disabled without the `query-cache` feature or with `[cache] enabled = false`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tiers` | object | `l1`, `l2` and `l3`, each with `entries` (now), `bytes` (retained now), `hits_total` and `evictions_total`. L1 sums every connection's cache; L3 is the semantic tier (zeros while it is off). |
+| `misses_total` | counter | Lookups no tier answered. A miss is counted once per lookup, not per tier. |
+| `skips_total` | counter | Lookups skipped by a cache hint. |
+| `puts_total` | counter | Results stored. |
+| `invalidations_total` | counter | Invalidation operations. |
+| `tables_invalidated_total` | counter | Tables those operations named. |
+| `clears_total` | counter | Whole-cache clears. |
+| `stale_rejected_total` | counter | Hits refused because a table they read was written since the fetch. |
+| `fills_raced_total` | counter | Fills not stored because a write raced their backend fetch. |
+| `unseen_write_invalidations_total` | counter | Whole-cache invalidations for a statement the journal capture could not see. |
+| `refresh_hint_total` | counter | Reads hinted `cache_refresh`. |
+| `compression_saved_bytes` | integer, bytes | Bytes L2 compression saves on the entries L2 holds now. |
+| `refresh_ahead` | object | `claims_total`, `completed_total`, `abandoned_total`; zeros while `[cache] refresh_ahead_ratio = 0`. |
+| `not_cached` | object | Cacheable reads kept out of the cache: `oversize_total` (response over `max_cacheable_response_bytes`, not stored), `excluded_total` (`exclude_tables`), `catalog_total` (may name a system catalog), `time_travel_total` (an `AS OF` / `VERSIONS BETWEEN` comment), `ambiguous_text_total` (text PostgreSQL and HeliosDB-Nano/Lite may read differently). The last four are not looked up either. |
+| `heatmap` | object | Disabled while `[cache] heatmap_enabled = false`. Otherwise a summary of `GET /api/cache/heatmap` without per-table data: `window_secs`, `bucket_secs`, `max_tables`, `tables_tracked`, `tables_in_window`, `recommendations` (how many), `untracked_misses` and `invalidate_all` (in the window), `overflow_total`. |
+
+**`tenants`**: from `/metrics` `tenant_slots` and `tenant_budgets`. Disabled while
+`[multi_tenancy] enabled = false`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `count`, `truncated`, `items` | | As for `nodes`, by tenant name. Only tenants with a client cap, an active-query cap or a replay-byte budget are listed: the proxy keeps no counters for the others. |
+
+Per tenant:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tenant` | string | Tenant id. |
+| `sessions` | object, nullable | The client cap (`max_clients_per_tenant` / `tenant_max_clients`), `null` without one: `limit`, `active` (sessions holding a slot now), `waiting` (now), `waits_total`, `refusals_total` (53300). |
+| `queries` | object, nullable | The active-query cap (`max_active_queries_per_tenant` / `tenant_max_active_queries`), `null` without one: `limit`, `active` (permits held now), `idle` (holders idle now), `waiting` (now), `admitted_total`, `waits_total`, `refusals_total` (53300), `wait_cancels_total`, `idle_permit_timeouts_total`. |
+| `replay` | object, nullable | The replay-byte budget (`max_replay_bytes_per_tenant` / `tenant_max_replay_bytes`), `null` without one: `byte_limit`, `bytes` (held now), `refusals_total` (transactions marked non-replayable). |
+
+**`rate_limit`**: disabled without the `rate-limiting` feature or with
+`[rate_limit] enabled = false`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `key_by` | string | `[rate_limit] key_by`: `user`, `client_ip`, `database` or `global`. |
+| `max_concurrent` | integer | `[rate_limit] max_concurrent`, the in-flight cap per bucket; `0` = none. |
+| `concurrency_refused_total` | counter | Requests refused with 53400 at `max_concurrent`. |
+
+Version 1 reports only the concurrency refusals: the token-bucket decisions are not
+counted in `/metrics`.
+
+**`transaction_replay`**: from `/metrics`. Disabled while `tr_enabled = false`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `mode` | string | The effective `tr_mode`: `session`, `select`, `transaction` or `none`. |
+| `failovers_total`, `statements_reexecuted_total`, `transactions_replayed_total`, `replay_failures_total`, `unknown_outcome_errors_total`, `replay_cap_exceeded_total`, `session_set_cap_exceeded_total`, `session_set_untracked_total` | counter | The in-session replay counters, as the `/metrics` `tr_*_total` fields. |
+| `refusals_total` | object, nullable | Backend faults replay did not transparently continue, by reason: `outcome_unknown`, `not_replayable`, `cap_exceeded`, `diverged`, `deadline`, `backend_unavailable` (as `heliosdb_proxy_tr_replay_refusals_total`). `null` when the latency histograms are not attached (library use). |
+| `journal` | object | The recovery journal (TR-07): `committed_total`, `rolled_back_total`, `statements_total`. |
+
+**`gateways`**: always enabled. `http`, `graphql` and `mcp` are each disabled while that
+gateway is off (`[http_gateway] enabled`; `[graphql_gateway] enabled` with the
+`graphql-gateway` feature; `[mcp] enabled`).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pool` | object, nullable | The gateway's backend pool, `null` when not attached (library use): `idle` (now), `reuses_total`, `misses_total` (fresh dials), `discards_total`. The gateways count no requests as such; `reuses_total + misses_total` is the number of backend checkouts. |
+| `results_refused_total` | counter | `http` and `graphql` only: requests refused at `max_result_rows` / `max_result_bytes`. |
+| `results_truncated_total` | counter | `mcp` only: tool results cut at `[mcp] max_result_rows` / `max_result_bytes`. |
+| `write_invalidations_total` | counter, nullable | Statements through the gateway that retired cached reads (C-02); `null` without the `query-cache` feature. |
+| `tool_cache` | object | `mcp` only: the MCP tool-result cache. Disabled without the `query-cache` feature or while `[mcp] tool_cache_enabled = false`. Otherwise `entries`, `bytes` and `owners` (now), `hits_total` and `misses_total` (all tools), `stores_total`, `stale_rejected_total`, `expired_total`, `fills_raced_total`, `evictions_total` (per-owner and global). Per-owner usage is `GET /api/mcp/cache`. |
 
 ---
 

@@ -378,6 +378,35 @@ pub struct ProxyConfig {
     /// the journal in memory only.
     #[serde(default)]
     pub journal: JournalToml,
+    /// Admin API tunables (`[admin]`): the per-list cap of `GET /api/stats`.
+    /// Every key has a default, so an absent `[admin]` changes nothing. The
+    /// admin listener's address and token stay top-level keys
+    /// (`admin_address`, `admin_token`, `admin_allow_insecure`).
+    #[serde(default)]
+    pub admin: AdminToml,
+}
+
+/// `[admin]` — admin API tunables.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminToml {
+    /// Most entries `GET /api/stats` reports in one list (`nodes.items`,
+    /// `tenants.items`). A longer list is sorted, cut to this many, and
+    /// reports `"truncated": true` with its full length in `count`. Must be
+    /// >= 1. Read at startup.
+    #[serde(default = "default_admin_stats_max_items")]
+    pub stats_max_items: usize,
+}
+
+fn default_admin_stats_max_items() -> usize {
+    1000
+}
+
+impl Default for AdminToml {
+    fn default() -> Self {
+        Self {
+            stats_max_items: default_admin_stats_max_items(),
+        }
+    }
 }
 
 /// `[journal]` — recovery-journal retention and durability (TR-07).
@@ -3553,6 +3582,7 @@ impl Default for ProxyConfig {
             shutdown_drain_timeout_secs: default_drain_timeout_secs(),
             limits: LimitsToml::default(),
             journal: JournalToml::default(),
+            admin: AdminToml::default(),
         }
     }
 }
@@ -4578,6 +4608,11 @@ impl ProxyConfig {
                 }
             }
         }
+        if self.admin.stats_max_items == 0 {
+            return Err(ProxyError::Config(
+                "admin.stats_max_items must be >= 1".to_string(),
+            ));
+        }
 
         // Operational limits/timeouts. Each of these was a compiled-in safety
         // bound; a 0 disables the bound (slow-loris handshake never times out,
@@ -5558,6 +5593,32 @@ mod tests {
         assert!(
             checked >= 3,
             "expected the shipped example configs, found {checked}"
+        );
+    }
+
+    /// `[admin] stats_max_items` (the `GET /api/stats` list cap): 1000 when
+    /// absent, read from the file, a known key, and 0 is refused by name.
+    #[test]
+    fn admin_stats_max_items_defaults_parses_and_rejects_zero() {
+        assert_eq!(ProxyConfig::default().admin.stats_max_items, 1000);
+        let base = "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n";
+        let (parsed, ignored) =
+            deserialize_reporting_ignored_paths(&format!("{base}[admin]\nstats_max_items = 25\n"))
+                .unwrap();
+        assert_eq!(parsed.admin.stats_max_items, 25);
+        assert!(ignored.is_empty(), "unexpected ignored keys: {ignored:?}");
+        assert!(parsed.validate().is_ok());
+        assert!(known_config_keys().contains("admin.stats_max_items"));
+
+        let (absent, _) = deserialize_reporting_ignored_paths(base).unwrap();
+        assert_eq!(absent.admin.stats_max_items, 1000);
+
+        let mut zero = absent.clone();
+        zero.admin.stats_max_items = 0;
+        let err = zero.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("admin.stats_max_items"),
+            "unexpected error: {err}"
         );
     }
 

@@ -2133,6 +2133,12 @@ impl ProxyServer {
             if let Some(ref pm) = state.pool_manager {
                 admin_state.with_pool_manager(pm.clone()).await;
             }
+            // The data-path idle pool (transaction / statement mode), for its
+            // counters on /api/stats.
+            #[cfg(feature = "pool-modes")]
+            if let Some(ref pool) = state.backend_pool {
+                admin_state.with_backend_pool(pool.clone()).await;
+            }
 
             // Attach the circuit-breaker manager so /api/circuit reports live
             // per-node breaker state.

@@ -29,6 +29,9 @@ use tokio::sync::{broadcast, RwLock};
 /// serving or asset bundling. Served at `GET /` and `GET /ui`.
 const ADMIN_UI_HTML: &str = include_str!("admin_ui.html");
 
+/// `GET /api/stats` (schema_version 1) for external pollers.
+mod stats;
+
 /// Admin API server
 /// Constant-time string comparison (admin token check).
 fn constant_time_eq_str(a: &str, b: &str) -> bool {
@@ -151,6 +154,14 @@ pub struct AdminState {
     /// Branch-database config for `/api/branch`. `Some` when `[branch]
     /// enabled`.
     pub branch: RwLock<Option<crate::config::BranchConfig>>,
+    /// The data-path idle backend pool (`[pool_mode] mode = "transaction"`
+    /// or `"statement"`), for its existing counters on `/api/stats`.
+    /// Attached at startup; `None` in session mode.
+    #[cfg(feature = "pool-modes")]
+    pub backend_pool: RwLock<Option<Arc<crate::pool::BackendIdlePool>>>,
+    /// When this state was created (daemon startup): `/api/stats`
+    /// `uptime_secs`.
+    started_at: std::time::Instant,
 }
 
 /// What the admin API needs to report migration status, without owning the
@@ -1107,6 +1118,13 @@ impl AdminServer {
                     build_time: env!("CARGO_PKG_VERSION").to_string(),
                 };
                 Ok((200, serde_json::to_value(response)?))
+            }
+
+            // One versioned stats document for external pollers (HeliosDB-Lite's
+            // proxy system views): schema_version 1, every section always
+            // present (docs/admin-api.md, tests/fixtures/api-stats-v1.schema.json).
+            ("GET", p) if p == "/api/stats" || p.starts_with("/api/stats?") => {
+                Ok((200, serde_json::to_value(stats::build(state).await)?))
             }
 
             // Capabilities manifest (D-05): per-subsystem compiled/enabled/
@@ -3655,6 +3673,9 @@ impl AdminState {
             auth_token: RwLock::new(None),
             migration: RwLock::new(None),
             branch: RwLock::new(None),
+            #[cfg(feature = "pool-modes")]
+            backend_pool: RwLock::new(None),
+            started_at: std::time::Instant::now(),
         }
     }
 
@@ -3678,6 +3699,14 @@ impl AdminState {
     #[cfg(feature = "pool-modes")]
     pub async fn with_pool_manager(&self, manager: Arc<crate::pool::ConnectionPoolManager>) {
         *self.pool_manager.write().await = Some(manager);
+    }
+
+    /// Attach the data-path idle backend pool so `/api/stats` reports its
+    /// counters. Wired by the server at startup in transaction and statement
+    /// pooling modes.
+    #[cfg(feature = "pool-modes")]
+    pub async fn with_backend_pool(&self, pool: Arc<crate::pool::BackendIdlePool>) {
+        *self.backend_pool.write().await = Some(pool);
     }
 
     /// Attach the automatic-promotion status so `/api/promotion` is live.

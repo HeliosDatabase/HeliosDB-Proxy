@@ -237,6 +237,15 @@ write_timeout_secs = 30
 # replay_deadline_secs = 300
 
 # =============================================================================
+# ADMIN — Admin API tunables (address and token are the top-level keys above)
+# =============================================================================
+# [admin]
+# # Most entries GET /api/stats reports in one list (nodes.items, tenants.items).
+# # A longer list is sorted, cut to this many, and reports "truncated": true with
+# # its full length in "count". Must be >= 1. Read once at startup.
+# stats_max_items = 1000
+
+# =============================================================================
 # POOL — Backend connection pool (proxy -> database)
 # =============================================================================
 

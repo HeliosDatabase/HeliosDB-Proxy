@@ -1,0 +1,274 @@
+{
+  "schema_version": 1,
+  "proxy_version": "2.2.0",
+  "generated_at": "2026-11-06T10:15:02.123Z",
+  "uptime_secs": 86400,
+  "nodes": {
+    "enabled": true,
+    "write_leader": "db-a:5432",
+    "load_balancer": "round_robin",
+    "failovers_total": 1,
+    "reconnect_attempts_total": 12,
+    "backend_capacity_waits_total": 0,
+    "backend_capacity_refusals_total": 0,
+    "reconnects": {
+      "limit_per_node": 16,
+      "in_progress": 0,
+      "peak_per_node": 9,
+      "waits_total": 0,
+      "refusals_total": 0
+    },
+    "count": 2,
+    "healthy_count": 2,
+    "truncated": false,
+    "items": [
+      {
+        "address": "db-a:5432",
+        "role": "primary",
+        "enabled": true,
+        "weight": 100,
+        "write_leader": true,
+        "healthy": true,
+        "latency_ms": 0.42,
+        "failure_count": 0,
+        "last_check": "2026-11-06T10:15:01.900Z",
+        "last_error": null,
+        "lag_bytes": null,
+        "lag_sampled_at": null,
+        "override": null,
+        "circuit": "closed",
+        "backend_connections": {
+          "limit": 200,
+          "in_use": 38,
+          "waits_total": 0,
+          "refusals_total": 0
+        }
+      },
+      {
+        "address": "db-b:5432",
+        "role": "standby",
+        "enabled": true,
+        "weight": 100,
+        "write_leader": false,
+        "healthy": true,
+        "latency_ms": 0.57,
+        "failure_count": 0,
+        "last_check": "2026-11-06T10:15:01.902Z",
+        "last_error": null,
+        "lag_bytes": 4096,
+        "lag_sampled_at": "2026-11-06T10:15:01.902Z",
+        "override": null,
+        "circuit": "closed",
+        "backend_connections": null
+      }
+    ]
+  },
+  "pools": {
+    "enabled": true,
+    "mode": "transaction",
+    "max_pool_size": 20,
+    "min_idle": 0,
+    "max_total_idle": 8192,
+    "idle_timeout_secs": 600,
+    "acquire_timeout_secs": 30,
+    "idle_pool": {
+      "idle": 14,
+      "reuses_total": 912344,
+      "parked_total": 912401,
+      "over_capacity_total": 0,
+      "stale_evicted_total": 3,
+      "reaped_total": 40,
+      "resets_skipped_total": 880102,
+      "capacity_evictions_total": 0
+    }
+  },
+  "sessions": {
+    "enabled": true,
+    "active": 42,
+    "connections_open": 43,
+    "waiting_admission": 0,
+    "accepted_total": 15234,
+    "closed_total": 15191,
+    "rejected_total": 0,
+    "admission_waited_total": 0,
+    "admission_timeouts_total": 0,
+    "startup_waits_total": 2,
+    "startup_wait_timeouts_total": 0
+  },
+  "traffic": {
+    "enabled": true,
+    "queries_total": 892451,
+    "bytes_received_total": 45623891,
+    "bytes_sent_total": 189234567,
+    "reads_offloaded_total": 310522,
+    "read_mirror_failures_total": 0
+  },
+  "cache": {
+    "enabled": true,
+    "tiers": {
+      "l1": {
+        "entries": 1200,
+        "bytes": 2457600,
+        "hits_total": 50211,
+        "evictions_total": 310
+      },
+      "l2": {
+        "entries": 8400,
+        "bytes": 41943040,
+        "hits_total": 120554,
+        "evictions_total": 1022
+      },
+      "l3": {
+        "entries": 0,
+        "bytes": 0,
+        "hits_total": 0,
+        "evictions_total": 0
+      }
+    },
+    "misses_total": 40112,
+    "skips_total": 87,
+    "puts_total": 40001,
+    "invalidations_total": 5321,
+    "tables_invalidated_total": 6402,
+    "clears_total": 0,
+    "stale_rejected_total": 12,
+    "fills_raced_total": 4,
+    "unseen_write_invalidations_total": 0,
+    "refresh_hint_total": 0,
+    "compression_saved_bytes": 10485760,
+    "refresh_ahead": {
+      "claims_total": 0,
+      "completed_total": 0,
+      "abandoned_total": 0
+    },
+    "not_cached": {
+      "oversize_total": 3,
+      "excluded_total": 210,
+      "catalog_total": 55,
+      "time_travel_total": 0,
+      "ambiguous_text_total": 0
+    },
+    "heatmap": {
+      "enabled": false,
+      "reason": "the cache heatmap is off ([cache] heatmap_enabled = false)"
+    }
+  },
+  "tenants": {
+    "enabled": true,
+    "count": 2,
+    "truncated": false,
+    "items": [
+      {
+        "tenant": "acme",
+        "sessions": {
+          "limit": 50,
+          "active": 12,
+          "waiting": 0,
+          "waits_total": 4,
+          "refusals_total": 0
+        },
+        "queries": {
+          "limit": 8,
+          "active": 3,
+          "idle": 1,
+          "waiting": 0,
+          "admitted_total": 51022,
+          "waits_total": 17,
+          "refusals_total": 2,
+          "wait_cancels_total": 0,
+          "idle_permit_timeouts_total": 0
+        },
+        "replay": null
+      },
+      {
+        "tenant": "globex",
+        "sessions": {
+          "limit": 50,
+          "active": 7,
+          "waiting": 0,
+          "waits_total": 0,
+          "refusals_total": 0
+        },
+        "queries": null,
+        "replay": {
+          "byte_limit": 67108864,
+          "bytes": 1024,
+          "refusals_total": 0
+        }
+      }
+    ]
+  },
+  "rate_limit": {
+    "enabled": true,
+    "key_by": "user",
+    "max_concurrent": 64,
+    "concurrency_refused_total": 0
+  },
+  "transaction_replay": {
+    "enabled": true,
+    "mode": "session",
+    "failovers_total": 1,
+    "statements_reexecuted_total": 3,
+    "transactions_replayed_total": 0,
+    "replay_failures_total": 0,
+    "unknown_outcome_errors_total": 1,
+    "replay_cap_exceeded_total": 0,
+    "session_set_cap_exceeded_total": 0,
+    "session_set_untracked_total": 0,
+    "refusals_total": {
+      "outcome_unknown": 1,
+      "not_replayable": 0,
+      "cap_exceeded": 0,
+      "diverged": 0,
+      "deadline": 0,
+      "backend_unavailable": 0
+    },
+    "journal": {
+      "committed_total": 120044,
+      "rolled_back_total": 311,
+      "statements_total": 402233
+    }
+  },
+  "gateways": {
+    "enabled": true,
+    "http": {
+      "enabled": true,
+      "pool": {
+        "idle": 2,
+        "reuses_total": 10422,
+        "misses_total": 18,
+        "discards_total": 1
+      },
+      "results_refused_total": 0,
+      "write_invalidations_total": 220
+    },
+    "graphql": {
+      "enabled": false,
+      "reason": "[graphql_gateway] enabled = false"
+    },
+    "mcp": {
+      "enabled": true,
+      "pool": {
+        "idle": 1,
+        "reuses_total": 3001,
+        "misses_total": 4,
+        "discards_total": 0
+      },
+      "results_truncated_total": 2,
+      "write_invalidations_total": 0,
+      "tool_cache": {
+        "enabled": true,
+        "entries": 37,
+        "bytes": 91234,
+        "owners": 3,
+        "hits_total": 812,
+        "misses_total": 140,
+        "stores_total": 120,
+        "stale_rejected_total": 9,
+        "expired_total": 22,
+        "fills_raced_total": 0,
+        "evictions_total": 0
+      }
+    }
+  }
+}

@@ -1,0 +1,1262 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/HeliosDatabase/HeliosDB-Proxy/tests/fixtures/api-stats-v1.schema.json",
+  "title": "HeliosProxy GET /api/stats, schema_version 1",
+  "description": "The admin API's stats document for external pollers (docs/admin-api.md, \"GET /api/stats - schema_version 1\"). Every section is always present: {\"enabled\": false, \"reason\": ...} when its feature is compiled out or switched off. Within version 1 fields and enum values are only ever added, so a consumer must ignore the ones it does not know; a breaking change bumps schema_version. The proxy's own contract test validates strictly (a field not listed here fails it), so every field the proxy sends is listed.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "proxy_version",
+    "generated_at",
+    "uptime_secs",
+    "nodes",
+    "pools",
+    "sessions",
+    "traffic",
+    "cache",
+    "tenants",
+    "rate_limit",
+    "transaction_replay",
+    "gateways"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "proxy_version": {
+      "type": "string"
+    },
+    "generated_at": {
+      "$ref": "#/$defs/time"
+    },
+    "uptime_secs": {
+      "$ref": "#/$defs/count"
+    },
+    "nodes": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/disabled"
+        },
+        {
+          "$ref": "#/$defs/nodes"
+        }
+      ]
+    },
+    "pools": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/disabled"
+        },
+        {
+          "$ref": "#/$defs/pools"
+        }
+      ]
+    },
+    "sessions": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/disabled"
+        },
+        {
+          "$ref": "#/$defs/sessions"
+        }
+      ]
+    },
+    "traffic": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/disabled"
+        },
+        {
+          "$ref": "#/$defs/traffic"
+        }
+      ]
+    },
+    "cache": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/disabled"
+        },
+        {
+          "$ref": "#/$defs/cache"
+        }
+      ]
+    },
+    "tenants": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/disabled"
+        },
+        {
+          "$ref": "#/$defs/tenants"
+        }
+      ]
+    },
+    "rate_limit": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/disabled"
+        },
+        {
+          "$ref": "#/$defs/rate_limit"
+        }
+      ]
+    },
+    "transaction_replay": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/disabled"
+        },
+        {
+          "$ref": "#/$defs/transaction_replay"
+        }
+      ]
+    },
+    "gateways": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/disabled"
+        },
+        {
+          "$ref": "#/$defs/gateways"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "count": {
+      "description": "A non-negative integer: a counter when the name ends in _total (since startup), otherwise a value now.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "count_or_null": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "string_or_null": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "time": {
+      "description": "RFC 3339, UTC, millisecond precision.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "time_or_null": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/time"
+        }
+      ]
+    },
+    "disabled": {
+      "description": "A section (or sub-section) whose feature is compiled out or switched off. It carries no other field.",
+      "type": "object",
+      "required": [
+        "enabled",
+        "reason"
+      ],
+      "properties": {
+        "enabled": {
+          "const": false
+        },
+        "reason": {
+          "description": "Why: the cargo feature is not compiled in, or the configuration key that turns it on.",
+          "type": "string"
+        }
+      }
+    },
+    "nodes": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "write_leader",
+        "load_balancer",
+        "failovers_total",
+        "reconnect_attempts_total",
+        "backend_capacity_waits_total",
+        "backend_capacity_refusals_total",
+        "reconnects",
+        "count",
+        "healthy_count",
+        "truncated",
+        "items"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "write_leader": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "load_balancer": {
+          "enum": [
+            "round_robin",
+            "weighted_round_robin",
+            "least_connections",
+            "latency_based",
+            "random",
+            "power_of_two"
+          ]
+        },
+        "failovers_total": {
+          "$ref": "#/$defs/count"
+        },
+        "reconnect_attempts_total": {
+          "$ref": "#/$defs/count"
+        },
+        "backend_capacity_waits_total": {
+          "$ref": "#/$defs/count"
+        },
+        "backend_capacity_refusals_total": {
+          "$ref": "#/$defs/count"
+        },
+        "reconnects": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/reconnects"
+            }
+          ]
+        },
+        "count": {
+          "$ref": "#/$defs/count"
+        },
+        "healthy_count": {
+          "$ref": "#/$defs/count"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/node"
+          }
+        }
+      }
+    },
+    "node": {
+      "type": "object",
+      "required": [
+        "address",
+        "role",
+        "enabled",
+        "weight",
+        "write_leader",
+        "healthy",
+        "latency_ms",
+        "failure_count",
+        "last_check",
+        "last_error",
+        "lag_bytes",
+        "lag_sampled_at",
+        "override",
+        "circuit",
+        "backend_connections"
+      ],
+      "properties": {
+        "address": {
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "primary",
+            "standby",
+            "replica",
+            null
+          ]
+        },
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "weight": {
+          "$ref": "#/$defs/count_or_null"
+        },
+        "write_leader": {
+          "type": "boolean"
+        },
+        "healthy": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "latency_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "failure_count": {
+          "$ref": "#/$defs/count_or_null"
+        },
+        "last_check": {
+          "$ref": "#/$defs/time_or_null"
+        },
+        "last_error": {
+          "$ref": "#/$defs/string_or_null"
+        },
+        "lag_bytes": {
+          "$ref": "#/$defs/count_or_null"
+        },
+        "lag_sampled_at": {
+          "$ref": "#/$defs/time_or_null"
+        },
+        "override": {
+          "enum": [
+            "disabled",
+            "force_unhealthy",
+            null
+          ]
+        },
+        "circuit": {
+          "enum": [
+            "closed",
+            "open",
+            "half_open",
+            null
+          ]
+        },
+        "backend_connections": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/backend_connections"
+            }
+          ]
+        }
+      }
+    },
+    "backend_connections": {
+      "type": "object",
+      "required": [
+        "limit",
+        "in_use",
+        "waits_total",
+        "refusals_total"
+      ],
+      "properties": {
+        "limit": {
+          "$ref": "#/$defs/count"
+        },
+        "in_use": {
+          "$ref": "#/$defs/count"
+        },
+        "waits_total": {
+          "$ref": "#/$defs/count"
+        },
+        "refusals_total": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "reconnects": {
+      "type": "object",
+      "required": [
+        "limit_per_node",
+        "in_progress",
+        "peak_per_node",
+        "waits_total",
+        "refusals_total"
+      ],
+      "properties": {
+        "limit_per_node": {
+          "$ref": "#/$defs/count"
+        },
+        "in_progress": {
+          "$ref": "#/$defs/count"
+        },
+        "peak_per_node": {
+          "$ref": "#/$defs/count"
+        },
+        "waits_total": {
+          "$ref": "#/$defs/count"
+        },
+        "refusals_total": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "pools": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "mode",
+        "max_pool_size",
+        "min_idle",
+        "max_total_idle",
+        "idle_timeout_secs",
+        "acquire_timeout_secs",
+        "idle_pool"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "mode": {
+          "enum": [
+            "session",
+            "transaction",
+            "statement"
+          ]
+        },
+        "max_pool_size": {
+          "$ref": "#/$defs/count"
+        },
+        "min_idle": {
+          "$ref": "#/$defs/count"
+        },
+        "max_total_idle": {
+          "$ref": "#/$defs/count"
+        },
+        "idle_timeout_secs": {
+          "$ref": "#/$defs/count"
+        },
+        "acquire_timeout_secs": {
+          "$ref": "#/$defs/count"
+        },
+        "idle_pool": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/idle_pool"
+            }
+          ]
+        }
+      }
+    },
+    "idle_pool": {
+      "type": "object",
+      "required": [
+        "idle",
+        "reuses_total",
+        "parked_total",
+        "over_capacity_total",
+        "stale_evicted_total",
+        "reaped_total",
+        "resets_skipped_total",
+        "capacity_evictions_total"
+      ],
+      "properties": {
+        "idle": {
+          "$ref": "#/$defs/count"
+        },
+        "reuses_total": {
+          "$ref": "#/$defs/count"
+        },
+        "parked_total": {
+          "$ref": "#/$defs/count"
+        },
+        "over_capacity_total": {
+          "$ref": "#/$defs/count"
+        },
+        "stale_evicted_total": {
+          "$ref": "#/$defs/count"
+        },
+        "reaped_total": {
+          "$ref": "#/$defs/count"
+        },
+        "resets_skipped_total": {
+          "$ref": "#/$defs/count"
+        },
+        "capacity_evictions_total": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "sessions": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "active",
+        "connections_open",
+        "waiting_admission",
+        "accepted_total",
+        "closed_total",
+        "rejected_total",
+        "admission_waited_total",
+        "admission_timeouts_total",
+        "startup_waits_total",
+        "startup_wait_timeouts_total"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "active": {
+          "$ref": "#/$defs/count"
+        },
+        "connections_open": {
+          "$ref": "#/$defs/count"
+        },
+        "waiting_admission": {
+          "$ref": "#/$defs/count"
+        },
+        "accepted_total": {
+          "$ref": "#/$defs/count"
+        },
+        "closed_total": {
+          "$ref": "#/$defs/count"
+        },
+        "rejected_total": {
+          "$ref": "#/$defs/count"
+        },
+        "admission_waited_total": {
+          "$ref": "#/$defs/count"
+        },
+        "admission_timeouts_total": {
+          "$ref": "#/$defs/count"
+        },
+        "startup_waits_total": {
+          "$ref": "#/$defs/count"
+        },
+        "startup_wait_timeouts_total": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "traffic": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "queries_total",
+        "bytes_received_total",
+        "bytes_sent_total",
+        "reads_offloaded_total",
+        "read_mirror_failures_total"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "queries_total": {
+          "$ref": "#/$defs/count"
+        },
+        "bytes_received_total": {
+          "$ref": "#/$defs/count"
+        },
+        "bytes_sent_total": {
+          "$ref": "#/$defs/count"
+        },
+        "reads_offloaded_total": {
+          "$ref": "#/$defs/count"
+        },
+        "read_mirror_failures_total": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "tiers",
+        "misses_total",
+        "skips_total",
+        "puts_total",
+        "invalidations_total",
+        "tables_invalidated_total",
+        "clears_total",
+        "stale_rejected_total",
+        "fills_raced_total",
+        "unseen_write_invalidations_total",
+        "refresh_hint_total",
+        "compression_saved_bytes",
+        "refresh_ahead",
+        "not_cached",
+        "heatmap"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "tiers": {
+          "type": "object",
+          "required": [
+            "l1",
+            "l2",
+            "l3"
+          ],
+          "properties": {
+            "l1": {
+              "$ref": "#/$defs/cache_tier"
+            },
+            "l2": {
+              "$ref": "#/$defs/cache_tier"
+            },
+            "l3": {
+              "$ref": "#/$defs/cache_tier"
+            }
+          }
+        },
+        "misses_total": {
+          "$ref": "#/$defs/count"
+        },
+        "skips_total": {
+          "$ref": "#/$defs/count"
+        },
+        "puts_total": {
+          "$ref": "#/$defs/count"
+        },
+        "invalidations_total": {
+          "$ref": "#/$defs/count"
+        },
+        "tables_invalidated_total": {
+          "$ref": "#/$defs/count"
+        },
+        "clears_total": {
+          "$ref": "#/$defs/count"
+        },
+        "stale_rejected_total": {
+          "$ref": "#/$defs/count"
+        },
+        "fills_raced_total": {
+          "$ref": "#/$defs/count"
+        },
+        "unseen_write_invalidations_total": {
+          "$ref": "#/$defs/count"
+        },
+        "refresh_hint_total": {
+          "$ref": "#/$defs/count"
+        },
+        "compression_saved_bytes": {
+          "$ref": "#/$defs/count"
+        },
+        "refresh_ahead": {
+          "type": "object",
+          "required": [
+            "claims_total",
+            "completed_total",
+            "abandoned_total"
+          ],
+          "properties": {
+            "claims_total": {
+              "$ref": "#/$defs/count"
+            },
+            "completed_total": {
+              "$ref": "#/$defs/count"
+            },
+            "abandoned_total": {
+              "$ref": "#/$defs/count"
+            }
+          }
+        },
+        "not_cached": {
+          "type": "object",
+          "required": [
+            "oversize_total",
+            "excluded_total",
+            "catalog_total",
+            "time_travel_total",
+            "ambiguous_text_total"
+          ],
+          "properties": {
+            "oversize_total": {
+              "$ref": "#/$defs/count"
+            },
+            "excluded_total": {
+              "$ref": "#/$defs/count"
+            },
+            "catalog_total": {
+              "$ref": "#/$defs/count"
+            },
+            "time_travel_total": {
+              "$ref": "#/$defs/count"
+            },
+            "ambiguous_text_total": {
+              "$ref": "#/$defs/count"
+            }
+          }
+        },
+        "heatmap": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/disabled"
+            },
+            {
+              "$ref": "#/$defs/heatmap"
+            }
+          ]
+        }
+      }
+    },
+    "cache_tier": {
+      "type": "object",
+      "required": [
+        "entries",
+        "bytes",
+        "hits_total",
+        "evictions_total"
+      ],
+      "properties": {
+        "entries": {
+          "$ref": "#/$defs/count"
+        },
+        "bytes": {
+          "$ref": "#/$defs/count"
+        },
+        "hits_total": {
+          "$ref": "#/$defs/count"
+        },
+        "evictions_total": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "heatmap": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "window_secs",
+        "bucket_secs",
+        "max_tables",
+        "tables_tracked",
+        "tables_in_window",
+        "recommendations",
+        "untracked_misses",
+        "invalidate_all",
+        "overflow_total"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "window_secs": {
+          "$ref": "#/$defs/count"
+        },
+        "bucket_secs": {
+          "$ref": "#/$defs/count"
+        },
+        "max_tables": {
+          "$ref": "#/$defs/count"
+        },
+        "tables_tracked": {
+          "$ref": "#/$defs/count"
+        },
+        "tables_in_window": {
+          "$ref": "#/$defs/count"
+        },
+        "recommendations": {
+          "$ref": "#/$defs/count"
+        },
+        "untracked_misses": {
+          "$ref": "#/$defs/count"
+        },
+        "invalidate_all": {
+          "$ref": "#/$defs/count"
+        },
+        "overflow_total": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "tenants": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "count",
+        "truncated",
+        "items"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "count": {
+          "$ref": "#/$defs/count"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/tenant"
+          }
+        }
+      }
+    },
+    "tenant": {
+      "type": "object",
+      "required": [
+        "tenant",
+        "sessions",
+        "queries",
+        "replay"
+      ],
+      "properties": {
+        "tenant": {
+          "type": "string"
+        },
+        "sessions": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/tenant_sessions"
+            }
+          ]
+        },
+        "queries": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/tenant_queries"
+            }
+          ]
+        },
+        "replay": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/tenant_replay"
+            }
+          ]
+        }
+      }
+    },
+    "tenant_sessions": {
+      "type": "object",
+      "required": [
+        "limit",
+        "active",
+        "waiting",
+        "waits_total",
+        "refusals_total"
+      ],
+      "properties": {
+        "limit": {
+          "$ref": "#/$defs/count"
+        },
+        "active": {
+          "$ref": "#/$defs/count"
+        },
+        "waiting": {
+          "$ref": "#/$defs/count"
+        },
+        "waits_total": {
+          "$ref": "#/$defs/count"
+        },
+        "refusals_total": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "tenant_queries": {
+      "type": "object",
+      "required": [
+        "limit",
+        "active",
+        "idle",
+        "waiting",
+        "admitted_total",
+        "waits_total",
+        "refusals_total",
+        "wait_cancels_total",
+        "idle_permit_timeouts_total"
+      ],
+      "properties": {
+        "limit": {
+          "$ref": "#/$defs/count"
+        },
+        "active": {
+          "$ref": "#/$defs/count"
+        },
+        "idle": {
+          "$ref": "#/$defs/count"
+        },
+        "waiting": {
+          "$ref": "#/$defs/count"
+        },
+        "admitted_total": {
+          "$ref": "#/$defs/count"
+        },
+        "waits_total": {
+          "$ref": "#/$defs/count"
+        },
+        "refusals_total": {
+          "$ref": "#/$defs/count"
+        },
+        "wait_cancels_total": {
+          "$ref": "#/$defs/count"
+        },
+        "idle_permit_timeouts_total": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "tenant_replay": {
+      "type": "object",
+      "required": [
+        "byte_limit",
+        "bytes",
+        "refusals_total"
+      ],
+      "properties": {
+        "byte_limit": {
+          "$ref": "#/$defs/count"
+        },
+        "bytes": {
+          "$ref": "#/$defs/count"
+        },
+        "refusals_total": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "rate_limit": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "key_by",
+        "max_concurrent",
+        "concurrency_refused_total"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "key_by": {
+          "enum": [
+            "user",
+            "client_ip",
+            "database",
+            "global"
+          ]
+        },
+        "max_concurrent": {
+          "$ref": "#/$defs/count"
+        },
+        "concurrency_refused_total": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "transaction_replay": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "mode",
+        "failovers_total",
+        "statements_reexecuted_total",
+        "transactions_replayed_total",
+        "replay_failures_total",
+        "unknown_outcome_errors_total",
+        "replay_cap_exceeded_total",
+        "session_set_cap_exceeded_total",
+        "session_set_untracked_total",
+        "refusals_total",
+        "journal"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "mode": {
+          "enum": [
+            "session",
+            "select",
+            "transaction",
+            "none"
+          ]
+        },
+        "failovers_total": {
+          "$ref": "#/$defs/count"
+        },
+        "statements_reexecuted_total": {
+          "$ref": "#/$defs/count"
+        },
+        "transactions_replayed_total": {
+          "$ref": "#/$defs/count"
+        },
+        "replay_failures_total": {
+          "$ref": "#/$defs/count"
+        },
+        "unknown_outcome_errors_total": {
+          "$ref": "#/$defs/count"
+        },
+        "replay_cap_exceeded_total": {
+          "$ref": "#/$defs/count"
+        },
+        "session_set_cap_exceeded_total": {
+          "$ref": "#/$defs/count"
+        },
+        "session_set_untracked_total": {
+          "$ref": "#/$defs/count"
+        },
+        "refusals_total": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/replay_refusals"
+            }
+          ]
+        },
+        "journal": {
+          "type": "object",
+          "required": [
+            "committed_total",
+            "rolled_back_total",
+            "statements_total"
+          ],
+          "properties": {
+            "committed_total": {
+              "$ref": "#/$defs/count"
+            },
+            "rolled_back_total": {
+              "$ref": "#/$defs/count"
+            },
+            "statements_total": {
+              "$ref": "#/$defs/count"
+            }
+          }
+        }
+      }
+    },
+    "replay_refusals": {
+      "type": "object",
+      "required": [
+        "outcome_unknown",
+        "not_replayable",
+        "cap_exceeded",
+        "diverged",
+        "deadline",
+        "backend_unavailable"
+      ],
+      "properties": {
+        "outcome_unknown": {
+          "$ref": "#/$defs/count"
+        },
+        "not_replayable": {
+          "$ref": "#/$defs/count"
+        },
+        "cap_exceeded": {
+          "$ref": "#/$defs/count"
+        },
+        "diverged": {
+          "$ref": "#/$defs/count"
+        },
+        "deadline": {
+          "$ref": "#/$defs/count"
+        },
+        "backend_unavailable": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "gateways": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "http",
+        "graphql",
+        "mcp"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "http": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/disabled"
+            },
+            {
+              "$ref": "#/$defs/gateway"
+            }
+          ]
+        },
+        "graphql": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/disabled"
+            },
+            {
+              "$ref": "#/$defs/gateway"
+            }
+          ]
+        },
+        "mcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/disabled"
+            },
+            {
+              "$ref": "#/$defs/mcp_gateway"
+            }
+          ]
+        }
+      }
+    },
+    "gateway": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "pool",
+        "results_refused_total",
+        "write_invalidations_total"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "pool": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/gateway_pool"
+            }
+          ]
+        },
+        "results_refused_total": {
+          "$ref": "#/$defs/count"
+        },
+        "write_invalidations_total": {
+          "$ref": "#/$defs/count_or_null"
+        }
+      }
+    },
+    "mcp_gateway": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "pool",
+        "results_truncated_total",
+        "write_invalidations_total",
+        "tool_cache"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "pool": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/gateway_pool"
+            }
+          ]
+        },
+        "results_truncated_total": {
+          "$ref": "#/$defs/count"
+        },
+        "write_invalidations_total": {
+          "$ref": "#/$defs/count_or_null"
+        },
+        "tool_cache": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/disabled"
+            },
+            {
+              "$ref": "#/$defs/tool_cache"
+            }
+          ]
+        }
+      }
+    },
+    "gateway_pool": {
+      "type": "object",
+      "required": [
+        "idle",
+        "reuses_total",
+        "misses_total",
+        "discards_total"
+      ],
+      "properties": {
+        "idle": {
+          "$ref": "#/$defs/count"
+        },
+        "reuses_total": {
+          "$ref": "#/$defs/count"
+        },
+        "misses_total": {
+          "$ref": "#/$defs/count"
+        },
+        "discards_total": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "tool_cache": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "entries",
+        "bytes",
+        "owners",
+        "hits_total",
+        "misses_total",
+        "stores_total",
+        "stale_rejected_total",
+        "expired_total",
+        "fills_raced_total",
+        "evictions_total"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "entries": {
+          "$ref": "#/$defs/count"
+        },
+        "bytes": {
+          "$ref": "#/$defs/count"
+        },
+        "owners": {
+          "$ref": "#/$defs/count"
+        },
+        "hits_total": {
+          "$ref": "#/$defs/count"
+        },
+        "misses_total": {
+          "$ref": "#/$defs/count"
+        },
+        "stores_total": {
+          "$ref": "#/$defs/count"
+        },
+        "stale_rejected_total": {
+          "$ref": "#/$defs/count"
+        },
+        "expired_total": {
+          "$ref": "#/$defs/count"
+        },
+        "fills_raced_total": {
+          "$ref": "#/$defs/count"
+        },
+        "evictions_total": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    }
+  }
+}
