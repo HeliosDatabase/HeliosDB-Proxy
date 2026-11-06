@@ -48,7 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`[multi_tenancy] unknown_tenant` (new key, default `"refuse"`).** Under row isolation
   (`tenant_tables`), a session whose tenant cannot be identified is refused with SQLSTATE
   42501 when a simple-protocol statement references a tenant table, instead of being
-  forwarded unfiltered. A name inside a string literal or a comment does not count. Extended-protocol
+  forwarded unfiltered. A name inside a string literal or a comment does not count; identifiers
+  are read as PostgreSQL truncates them (63 bytes), as by the row filter. Extended-protocol
   `Parse`/`Bind` statements are not covered by this check. **Upgrade note:** this changes behaviour for deployments with
   `enabled = true`, non-empty `tenant_tables` and sessions that name no configured tenant;
   set `unknown_tenant = "passthrough"` to keep the previous behaviour. Also, with

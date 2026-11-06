@@ -242,11 +242,14 @@ impl TenantManager {
     /// Whether a statement from a session with no identified tenant must be
     /// refused under `unknown_tenant = "refuse"`: it names a table in
     /// `refuse_unknown_tenant_tables`. Only consulted for such sessions.
+    /// Identifiers are read as PostgreSQL truncates them (63 bytes), as the
+    /// row filter reads them, so a longer spelling of a tenant table counts.
     pub fn refuses_unknown_tenant_query(&self, query: &str) -> bool {
         let Some(tables) = self.config.refuse_unknown_tenant_tables.as_ref() else {
             return false;
         };
-        crate::sql_text::code_identifiers(query).any(|id| tables.contains(id.as_ref()))
+        crate::sql_text::code_identifiers(query)
+            .any(|id| tables.contains(crate::sql_text::truncated_identifier(&id)))
     }
 
     /// Create default configuration for a new tenant
@@ -652,6 +655,27 @@ mod tests {
             })
             .build();
         assert!(!none.refuses_unknown_tenant_query("select * from orders"));
+    }
+
+    /// The unknown-tenant refusal reads identifiers as PostgreSQL truncates
+    /// them (63 bytes), like the row filter: a longer spelling of a 63-byte
+    /// tenant table names that table and is refused.
+    #[test]
+    fn unknown_tenant_refusal_reads_truncated_identifiers() {
+        let table = "t".repeat(crate::sql_text::MAX_IDENTIFIER_BYTES);
+        let tm = TenantManagerBuilder::new()
+            .config(MultiTenancyConfig {
+                enabled: true,
+                refuse_unknown_tenant_tables: Some([table.clone()].into_iter().collect()),
+                ..Default::default()
+            })
+            .build();
+        let refuses = |sql: String| tm.refuses_unknown_tenant_query(&sql);
+        assert!(refuses(format!("select * from {table}")));
+        assert!(refuses(format!("select * from {table}_x")));
+        assert!(refuses(format!("select * from \"{table}_X\"")));
+        // A shorter name is another table.
+        assert!(!refuses(format!("select * from {}", &table[1..])));
     }
 
     #[test]
