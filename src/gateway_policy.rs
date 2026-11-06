@@ -372,6 +372,56 @@ impl std::fmt::Debug for GatewayPolicy {
 /// A policy shared by a gateway's tasks.
 pub type SharedGatewayPolicy = Arc<GatewayPolicy>;
 
+/// The gateways whose results `max_result_rows` / `max_result_bytes` refuse
+/// (`heliosdb_proxy_gateway_results_refused_total{gateway=...}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultGateway {
+    Http,
+    Graphql,
+}
+
+impl ResultGateway {
+    /// The `gateway` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            ResultGateway::Http => "http",
+            ResultGateway::Graphql => "graphql",
+        }
+    }
+}
+
+/// Requests refused because their result passed a result cap, per gateway
+/// (index = `ResultGateway as usize`).
+static RESULTS_REFUSED: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Count one result refused by a result cap.
+pub fn note_result_refused(gateway: ResultGateway) {
+    RESULTS_REFUSED[gateway as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Results refused by a result cap since the process started.
+pub fn results_refused_total(gateway: ResultGateway) -> u64 {
+    RESULTS_REFUSED[gateway as usize].load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The refusal message for a result the `section` cap cut (`http_gateway` or
+/// `graphql_gateway`): names the key that was passed, with its value.
+pub fn result_cap_message(
+    section: &str,
+    truncation: crate::backend::client::Truncation,
+    max_rows: usize,
+    max_bytes: usize,
+) -> String {
+    if truncation.row_limit_hit {
+        format!("result exceeds {section}.max_result_rows ({max_rows})")
+    } else {
+        format!("result exceeds {section}.max_result_bytes ({max_bytes})")
+    }
+}
+
 /// A policy for the gateway tests: tenants `acme` and `globex` behind
 /// `header`, each with an active-query cap of 1 that refuses at once (no
 /// wait), and `free` with no cap.

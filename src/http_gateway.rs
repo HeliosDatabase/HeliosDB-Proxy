@@ -27,6 +27,13 @@ use crate::gateway_policy::{GatewayPolicy, GatewayTenant, RequestIdentity, Share
 use crate::gateway_pool::{statement_is_session_neutral, SharedBackendPool};
 use crate::{ProxyError, Result};
 
+/// Why a `/sql` statement produced no result: a result past a result cap
+/// (HTTP 413) or any other failure (HTTP 400).
+enum SqlError {
+    TooLarge(String),
+    Failed(String),
+}
+
 pub struct HttpGateway {
     config: HttpGatewayConfig,
     pool: SharedBackendPool,
@@ -222,7 +229,12 @@ impl HttpGateway {
                 let body = neon_result(&qr, array_mode);
                 Self::respond(&mut writer, 200, &body).await
             }
-            Err(e) => Self::respond(&mut writer, 400, &json!({ "error": e })).await,
+            Err(SqlError::TooLarge(msg)) => {
+                Self::respond(&mut writer, 413, &json!({ "error": msg })).await
+            }
+            Err(SqlError::Failed(e)) => {
+                Self::respond(&mut writer, 400, &json!({ "error": e })).await
+            }
         }
     }
 
@@ -233,11 +245,11 @@ impl HttpGateway {
         tenant: Option<&GatewayTenant>,
         sql: &str,
         params: &[ParamValue],
-    ) -> std::result::Result<QueryResult, String> {
+    ) -> std::result::Result<QueryResult, SqlError> {
         let rewritten = policy.rewrite(sql);
         let filtered = policy
             .tenant_sql(&rewritten, tenant)
-            .map_err(|denied| denied.to_string())?;
+            .map_err(|denied| SqlError::Failed(denied.to_string()))?;
         let sql = filtered.as_ref();
         let node = format!("{}:{}", cfg.backend_host, cfg.backend_port);
         let bcfg = BackendConfig {
@@ -256,17 +268,23 @@ impl HttpGateway {
             Ok(c) => c,
             Err(e) => {
                 policy.record(&node, false, &e.to_string());
-                return Err(format!("backend connect: {}", e));
+                return Err(SqlError::Failed(format!("backend connect: {}", e)));
             }
         };
         policy.record(&node, true, "");
+        // Bounded reads: a result past `max_result_rows` / `max_result_bytes`
+        // is drained (the connection stays in sync) and then refused.
         let res = if params.is_empty() {
-            client.simple_query(sql).await
+            client
+                .simple_query_bounded(sql, cfg.max_result_rows, cfg.max_result_bytes)
+                .await
         } else {
-            client.query_with_params(sql, params).await
+            client
+                .query_with_params_bounded(sql, params, cfg.max_result_rows, cfg.max_result_bytes)
+                .await
         };
         match res {
-            Ok(qr) => {
+            Ok(bounded) => {
                 // H-06: reuse the authenticated connection only when the
                 // statement left no session state behind.
                 if statement_is_session_neutral(sql) {
@@ -274,11 +292,24 @@ impl HttpGateway {
                 } else {
                     pool.discard(client);
                 }
-                Ok(qr)
+                if bounded.truncation.is_truncated() {
+                    crate::gateway_policy::note_result_refused(
+                        crate::gateway_policy::ResultGateway::Http,
+                    );
+                    return Err(SqlError::TooLarge(
+                        crate::gateway_policy::result_cap_message(
+                            "http_gateway",
+                            bounded.truncation,
+                            cfg.max_result_rows,
+                            cfg.max_result_bytes,
+                        ),
+                    ));
+                }
+                Ok(bounded.result)
             }
             Err(e) => {
                 pool.discard(client);
-                Err(format!("{}", e))
+                Err(SqlError::Failed(format!("{}", e)))
             }
         }
     }
@@ -712,5 +743,97 @@ mod tests {
             assert!(!resp.starts_with("HTTP/1.1 429"), "{resp}");
             assert!(!resp.contains("too many active queries"), "{resp}");
         }
+    }
+
+    /// One `/sql` request through `handle` against `port`, sharing `pool`.
+    async fn post_sql_to(cfg: HttpGatewayConfig, pool: SharedBackendPool, sql: &str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        let task = tokio::spawn(HttpGateway::handle(
+            server,
+            peer,
+            Arc::new(cfg),
+            pool,
+            Arc::new(tokio::sync::Semaphore::new(4)),
+            Arc::new(GatewayPolicy::default()),
+        ));
+        let body = format!(r#"{{"query":"{sql}"}}"#);
+        let req = format!(
+            "POST /sql HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        client.write_all(body.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        task.await.unwrap().unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// `[http_gateway] max_result_rows`: a result past the cap is refused with
+    /// 413 and the gateway's error shape, not truncated; a result at the cap is
+    /// served; both run over one pooled connection, which stays in sync.
+    #[tokio::test]
+    async fn handle_refuses_a_result_past_max_result_rows_and_serves_one_at_it() {
+        use std::sync::atomic::Ordering;
+        let fake = crate::gateway_fake_pg::spawn(5, 4).await;
+        let cfg = HttpGatewayConfig {
+            backend_port: fake.port,
+            max_result_rows: 3,
+            ..HttpGatewayConfig::default()
+        };
+        let pool: SharedBackendPool = Arc::new(crate::gateway_pool::BackendClientPool::new(4));
+
+        let refused = post_sql_to(cfg.clone(), pool.clone(), "select 1").await;
+        assert!(refused.starts_with("HTTP/1.1 413 "), "{refused}");
+        assert!(
+            refused.contains("result exceeds http_gateway.max_result_rows (3)"),
+            "{refused}"
+        );
+
+        fake.rows.store(3, Ordering::SeqCst);
+        let served = post_sql_to(cfg.clone(), pool.clone(), "select 1").await;
+        assert!(served.starts_with("HTTP/1.1 200 "), "{served}");
+        assert!(served.contains("\"rowCount\":3"), "{served}");
+
+        fake.rows.store(4, Ordering::SeqCst);
+        let refused = post_sql_to(cfg.clone(), pool.clone(), "select 1").await;
+        assert!(refused.starts_with("HTTP/1.1 413 "), "{refused}");
+
+        fake.rows.store(2, Ordering::SeqCst);
+        let served = post_sql_to(cfg, pool, "select 1").await;
+        assert!(served.contains("\"rowCount\":2"), "{served}");
+        assert_eq!(
+            fake.connections.load(Ordering::SeqCst),
+            1,
+            "connection reused"
+        );
+    }
+
+    /// `[http_gateway] max_result_bytes`: cell bytes past the cap refuse the
+    /// result (413, naming the byte key); a result at the cap is served.
+    #[tokio::test]
+    async fn handle_refuses_a_result_past_max_result_bytes_and_serves_one_at_it() {
+        use std::sync::atomic::Ordering;
+        // 3 rows of 4-byte cells: 12 bytes against a 10-byte cap.
+        let fake = crate::gateway_fake_pg::spawn(3, 4).await;
+        let cfg = HttpGatewayConfig {
+            backend_port: fake.port,
+            max_result_bytes: 10,
+            ..HttpGatewayConfig::default()
+        };
+        let pool: SharedBackendPool = Arc::new(crate::gateway_pool::BackendClientPool::new(4));
+        let refused = post_sql_to(cfg.clone(), pool.clone(), "select 1").await;
+        assert!(refused.starts_with("HTTP/1.1 413 "), "{refused}");
+        assert!(
+            refused.contains("result exceeds http_gateway.max_result_bytes (10)"),
+            "{refused}"
+        );
+        fake.rows.store(2, Ordering::SeqCst); // 8 bytes: at the cap
+        let served = post_sql_to(cfg, pool, "select 1").await;
+        assert!(served.starts_with("HTTP/1.1 200 "), "{served}");
+        assert!(served.contains("\"rowCount\":2"), "{served}");
     }
 }

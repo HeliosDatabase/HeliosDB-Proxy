@@ -396,6 +396,18 @@ max_cacheable_response_bytes = 4194304
 # [limits]
 # startup_node_wait_ms = 5000
 
+# [http_gateway]
+# # Result caps for the HTTP /sql gateway (defaults shown). A result past either cap is
+# # refused with HTTP 413 (not truncated).
+# max_result_rows  = 10000
+# max_result_bytes = 16777216
+
+# [graphql_gateway]
+# # Result caps for the GraphQL gateway (defaults shown). A result past either cap is
+# # refused with a RESULT_TOO_LARGE GraphQL error (not truncated).
+# max_result_rows  = 10000
+# max_result_bytes = 16777216
+
 # [mcp]
 # # Result caps for the MCP gateway's query / list_tables / explain tools (defaults shown).
 # # Rows past max_result_rows, or cell bytes past max_result_bytes, are cut and the

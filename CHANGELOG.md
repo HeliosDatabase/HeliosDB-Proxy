@@ -189,6 +189,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   permit is released when the request ends, however it ends. `max_clients_per_tenant`
   does not apply to stateless gateway requests (it counts PG-wire sessions only).
   Sprinter 1d73ba306c92.
+- **HTTP `/sql` and GraphQL results are capped.** Both gateways buffered every row of a
+  result. They now read through the bounded query path and refuse a result past
+  `[http_gateway] max_result_rows` (default `10000`) or `max_result_bytes` (default
+  `16777216`), and `[graphql_gateway]`'s same two keys. A refused `/sql` request gets
+  HTTP 413 with `{"error": "result exceeds http_gateway.max_result_rows (N)"}`; a refused
+  GraphQL request gets an error with `extensions.code` `RESULT_TOO_LARGE`. The connection
+  is kept, and results at or below the caps are served unchanged. Counted in
+  `heliosdb_proxy_gateway_results_refused_total{gateway="http"|"graphql"}`. The
+  one oversized DataRow read whole (a single row larger than the byte cap is still read
+  into memory before it is refused) is not addressed here. Sprinter 2a43c1f4d4d7.
+  - **Upgrade note:** a `/sql` or GraphQL query that returned more than 10000 rows or
+    16 MiB of cell data before now fails with the refusal above. Raise the caps (up to
+    1000000 rows and 1 GiB) for such a workload, or narrow the query.
 ### Security
 
 - **Routing hints are read only from comments outside literals.** With

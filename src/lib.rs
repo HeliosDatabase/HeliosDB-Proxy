@@ -71,6 +71,8 @@ pub mod config;
 pub mod connection_pool;
 pub mod database_name;
 pub mod failover_controller;
+#[cfg(test)]
+mod gateway_fake_pg;
 pub mod gateway_policy;
 pub mod gateway_pool;
 pub mod health_checker;

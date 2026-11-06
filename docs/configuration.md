@@ -2186,6 +2186,8 @@ max_concurrent_requests = 64
 | `query_timeout_ms` | u64 | `30000` | Per-request backend execution timeout, milliseconds. Was a hardcoded 30 s. Must be > 0. |
 | `max_concurrent_requests` | usize | `64` | Maximum `/sql` requests admitted concurrently; beyond this the gateway answers `503 Service Unavailable` with a `Retry-After` header instead of queuing indefinitely (`/health` is never gated). Must be > 0. |
 | `tenant_header` | string | `""` | With `[multi_tenancy]` (H-06): the request header naming the tenant (e.g. `X-Helios-Tenant`). Every request must name a known tenant in it (403 otherwise), and its statements get that tenant's row filter, as a PG-wire session does. Trusted as sent: put the gateway behind a front end that authenticates the caller and sets the header. Empty = no per-request tenant, which `[multi_tenancy]` refuses under `strict_config` (warns otherwise). |
+| `max_result_rows` | usize | `10000` | Most rows a `/sql` result carries. A result past it is **refused** with HTTP 413 and the error body `{"error": "result exceeds http_gateway.max_result_rows (N)"}`, not truncated: the Neon-compatible response has no truncation field. A result of exactly the cap is served. The backend connection stays pooled. Counted in `heliosdb_proxy_gateway_results_refused_total{gateway="http"}`. Must be 1 to 1000000. |
+| `max_result_bytes` | usize | `16777216` (16 MiB) | Most cell bytes a `/sql` result carries (the text bytes of the stored values, NULL counting 0). Past it the result is refused as with `max_result_rows` (HTTP 413, naming `http_gateway.max_result_bytes`). A result that exactly fits is served. Must be 1 to 1073741824 (1 GiB). |
 
 ---
 
@@ -2228,6 +2230,8 @@ columns = ["id", "customer_id", "total", "created_at"]
 | `query_timeout_ms` | u64 | `30000` | Per-request backend execution timeout, milliseconds. Was a hardcoded 30 s. Must be > 0. |
 | `max_concurrent_requests` | usize | `64` | Maximum GraphQL requests admitted concurrently; beyond this the gateway answers `503 Service Unavailable` with a `Retry-After` header instead of queuing indefinitely (`/health` is never gated). Must be > 0. |
 | `tenant_header` | string | `""` | With `[multi_tenancy]` (H-06): the request header naming the tenant (e.g. `X-Helios-Tenant`). Every request must name a known tenant in it (403 otherwise), and its statements get that tenant's row filter, as a PG-wire session does. Trusted as sent: put the gateway behind a front end that authenticates the caller and sets the header. Empty = no per-request tenant, which `[multi_tenancy]` refuses under `strict_config` (warns otherwise). |
+| `max_result_rows` | usize | `10000` | Most rows one request's generated SQL may return. A result past it is **refused**: the response carries a GraphQL error `{"message": "result exceeds graphql_gateway.max_result_rows (N)", "extensions": {"code": "RESULT_TOO_LARGE"}}` (HTTP 200, the GraphQL convention), not truncated data. Counted in `heliosdb_proxy_gateway_results_refused_total{gateway="graphql"}`. Must be 1 to 1000000. |
+| `max_result_bytes` | usize | `16777216` (16 MiB) | Most cell bytes one request's generated SQL may return. Past it the request is refused as with `max_result_rows` (`RESULT_TOO_LARGE`, naming `graphql_gateway.max_result_bytes`). Must be 1 to 1073741824 (1 GiB). |
 
 Each `[[graphql_gateway.tables]]`: `name` (string) and `columns` (array of strings).
 

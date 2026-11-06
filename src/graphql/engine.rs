@@ -239,10 +239,12 @@ impl GraphQLError {
         }
 
         let mut extensions = self.extensions.as_deref().cloned().unwrap_or_default();
-        extensions.insert(
-            "code".to_string(),
-            serde_json::Value::String(format!("{:?}", self.code)),
-        );
+        let code = if matches!(self.code, ErrorCode::ResultTooLarge) {
+            "RESULT_TOO_LARGE".to_string()
+        } else {
+            format!("{:?}", self.code)
+        };
+        extensions.insert("code".to_string(), serde_json::Value::String(code));
         result.insert(
             "extensions".to_string(),
             serde_json::Value::Object(extensions.into_iter().collect()),
@@ -359,6 +361,23 @@ pub struct Directive {
 /// GraphQL Engine
 ///
 /// Main entry point for GraphQL query execution.
+/// The caps on one backend query's result (`[graphql_gateway]
+/// max_result_rows` / `max_result_bytes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResultCaps {
+    pub max_rows: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for ResultCaps {
+    fn default() -> Self {
+        Self {
+            max_rows: crate::config::default_gateway_max_result_rows(),
+            max_bytes: crate::config::default_gateway_max_result_bytes(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct GraphQLEngine {
     /// Configuration
@@ -380,6 +399,8 @@ pub struct GraphQLEngine {
     /// H-06: the PG-wire rewrite rules and circuit breaker, applied to every
     /// generated statement.
     policy: Option<crate::gateway_policy::SharedGatewayPolicy>,
+    /// The result caps of each backend query: a result past them is refused.
+    result_caps: ResultCaps,
 }
 
 impl GraphQLEngine {
@@ -397,7 +418,18 @@ impl GraphQLEngine {
             backend: None,
             pool: None,
             policy: None,
+            result_caps: ResultCaps::default(),
         }
+    }
+
+    /// Cap the rows and cell bytes one backend query may return
+    /// (`[graphql_gateway] max_result_rows` / `max_result_bytes`).
+    pub fn with_result_caps(mut self, max_rows: usize, max_bytes: usize) -> Self {
+        self.result_caps = ResultCaps {
+            max_rows,
+            max_bytes,
+        };
+        self
     }
 
     /// Attach the backend the generated SQL runs against.
@@ -933,10 +965,27 @@ impl GraphQLEngine {
             }
             let mut client =
                 connected.map_err(|e| GraphQLError::internal(format!("backend connect: {}", e)))?;
-            let qr = client
-                .simple_query(&sql)
+            let bounded = client
+                .simple_query_bounded(&sql, self.result_caps.max_rows, self.result_caps.max_bytes)
                 .await
                 .map_err(|e| GraphQLError::internal(format!("backend query: {}", e)))?;
+            // A result past a cap is refused, not truncated; the reader drained
+            // the rest of it, so the connection is in sync and is still pooled.
+            let refused = bounded.truncation.is_truncated().then(|| {
+                crate::gateway_policy::note_result_refused(
+                    crate::gateway_policy::ResultGateway::Graphql,
+                );
+                GraphQLError::new(
+                    crate::gateway_policy::result_cap_message(
+                        "graphql_gateway",
+                        bounded.truncation,
+                        self.result_caps.max_rows,
+                        self.result_caps.max_bytes,
+                    ),
+                    ErrorCode::ResultTooLarge,
+                )
+            });
+            let qr = bounded.result;
             let rows: Vec<serde_json::Value> = qr
                 .rows
                 .iter()
@@ -960,6 +1009,9 @@ impl GraphQLEngine {
                 } else {
                     pool.discard(client);
                 }
+            }
+            if let Some(err) = refused {
+                return Err(err);
             }
             out.push(rows);
         }
@@ -1023,6 +1075,7 @@ impl Clone for GraphQLEngine {
             backend: self.backend.clone(),
             policy: self.policy.clone(),
             pool: self.pool.clone(),
+            result_caps: self.result_caps,
         }
     }
 }

@@ -71,7 +71,8 @@ impl GraphqlGateway {
         };
         let engine = GraphQLEngine::new(GraphQLConfig::default(), schema)
             .with_backend(bcfg)
-            .with_pool(pool);
+            .with_pool(pool)
+            .with_result_caps(config.max_result_rows, config.max_result_bytes);
         let admission = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_requests));
 
         Self {
@@ -281,7 +282,15 @@ impl GraphqlGateway {
             .await;
         let errors = response.errors.map(|errs| {
             errs.iter()
-                .map(|e| json!({ "message": e.to_string() }))
+                .map(|e| {
+                    // A refused result carries its code (`RESULT_TOO_LARGE`) in
+                    // extensions; other errors keep the message-only shape.
+                    if matches!(e.code, crate::graphql::ErrorCode::ResultTooLarge) {
+                        e.to_json()
+                    } else {
+                        json!({ "message": e.to_string() })
+                    }
+                })
                 .collect::<Vec<_>>()
         });
         let body = json!({ "data": response.data, "errors": errors });
@@ -640,5 +649,72 @@ mod tests {
             let resp = post_query_as(policy.clone(), "X-Helios-Tenant: acme\r\n").await;
             assert_eq!(status_line(&resp), "HTTP/1.1 200 OK", "{resp}");
         }
+    }
+
+    /// `[graphql_gateway] max_result_rows`: a request whose generated SQL
+    /// returns past the cap gets a GraphQL error with extensions.code
+    /// RESULT_TOO_LARGE (not truncated data); at the cap it is served; the
+    /// pooled connection is reused, in sync, across both.
+    #[tokio::test]
+    async fn a_result_past_max_result_rows_is_refused_with_result_too_large() {
+        use std::sync::atomic::Ordering;
+        let fake = crate::gateway_fake_pg::spawn(5, 4).await;
+        let config = GraphqlGatewayConfig {
+            backend_port: fake.port,
+            max_result_rows: 3,
+            tables: vec![crate::config::GqlTableToml {
+                name: "users".into(),
+                columns: vec!["id".into()],
+            }],
+            ..GraphqlGatewayConfig::default()
+        };
+        let pool: crate::gateway_pool::SharedBackendPool =
+            Arc::new(crate::gateway_pool::BackendClientPool::new(4));
+        let gw = GraphqlGateway::new(config.clone(), pool);
+
+        let refused = post_graphql(&gw, &config, "{ users { id } }").await;
+        assert_eq!(status_line(&refused), "HTTP/1.1 200 OK", "{refused}");
+        assert!(refused.contains("RESULT_TOO_LARGE"), "{refused}");
+        assert!(
+            refused.contains("result exceeds graphql_gateway.max_result_rows (3)"),
+            "{refused}"
+        );
+
+        fake.rows.store(3, Ordering::SeqCst);
+        let served = post_graphql(&gw, &config, "{ users { id } }").await;
+        assert!(!served.contains("RESULT_TOO_LARGE"), "{served}");
+        assert!(served.contains("\"users\""), "{served}");
+        assert_eq!(
+            fake.connections.load(Ordering::SeqCst),
+            1,
+            "connection reused"
+        );
+    }
+
+    /// POST one GraphQL query to `gw`'s engine (no request policies).
+    async fn post_graphql(
+        gw: &GraphqlGateway,
+        config: &GraphqlGatewayConfig,
+        query: &str,
+    ) -> String {
+        let (mut client, server) = tcp_pair().await;
+        let task = tokio::spawn(GraphqlGateway::handle_with(
+            server,
+            None,
+            Arc::new(config.clone()),
+            gw.engine.clone(),
+            admission(4),
+            Arc::new(crate::gateway_policy::GatewayPolicy::default()),
+        ));
+        let body = format!(r#"{{"query":"{query}"}}"#);
+        let req = format!(
+            "POST /graphql HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        client.write_all(body.as_bytes()).await.unwrap();
+        let resp = read_all(&mut client).await;
+        task.await.unwrap().unwrap();
+        resp
     }
 }

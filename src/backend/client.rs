@@ -195,6 +195,21 @@ impl BackendClient {
         self.run_query(&substituted).await
     }
 
+    /// [`Self::query_with_params`] with the result caps of
+    /// [`Self::simple_query_bounded`]: the gateways' parameterised path, which
+    /// must not buffer a result past its `max_result_rows` / `max_result_bytes`.
+    pub async fn query_with_params_bounded(
+        &mut self,
+        sql: &str,
+        params: &[ParamValue],
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> BackendResult<BoundedQueryResult> {
+        let substituted = interpolate_params(sql, params)?;
+        self.simple_query_bounded(&substituted, max_rows, max_bytes)
+            .await
+    }
+
     /// Replay an entry using its captured wire protocol. Simple-query batches
     /// remain one unmodified `Query`, preserving PostgreSQL's batch semantics.
     /// Extended entries retain their declared OIDs and bound bytes, including

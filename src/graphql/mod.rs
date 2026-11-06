@@ -317,6 +317,9 @@ pub enum ErrorCode {
     RateLimited,
     /// Timeout
     Timeout,
+    /// A result past `[graphql_gateway] max_result_rows` / `max_result_bytes`
+    /// (refused, not truncated). Serialised as `RESULT_TOO_LARGE`.
+    ResultTooLarge,
 }
 
 impl ErrorCode {
@@ -330,6 +333,7 @@ impl ErrorCode {
             ErrorCode::QueryTooComplex | ErrorCode::RateLimited => 429,
             ErrorCode::Timeout => 408,
             ErrorCode::InternalError => 500,
+            ErrorCode::ResultTooLarge => 413,
         }
     }
 }

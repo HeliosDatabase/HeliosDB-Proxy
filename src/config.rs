@@ -667,6 +667,16 @@ pub struct HttpGatewayConfig {
     /// `strict_config` (warns otherwise).
     #[serde(default)]
     pub tenant_header: String,
+    /// Most rows a `/sql` result carries. A result past it is refused with
+    /// HTTP 413 (the Neon-compatible response has no truncation field), not
+    /// truncated. Must be >= 1 and <= [`MCP_MAX_RESULT_ROWS_CEILING`].
+    #[serde(default = "default_gateway_max_result_rows")]
+    pub max_result_rows: usize,
+    /// Most cell bytes (the text bytes of the stored values; NULL counts 0) a
+    /// `/sql` result carries; past it the result is refused (HTTP 413). Must be
+    /// >= 1 and <= [`MCP_MAX_RESULT_BYTES_CEILING`].
+    #[serde(default = "default_gateway_max_result_bytes")]
+    pub max_result_bytes: usize,
 }
 
 impl Default for HttpGatewayConfig {
@@ -683,8 +693,22 @@ impl Default for HttpGatewayConfig {
             query_timeout_ms: default_gateway_query_timeout_ms(),
             max_concurrent_requests: default_gateway_max_concurrent_requests(),
             tenant_header: String::new(),
+            max_result_rows: default_gateway_max_result_rows(),
+            max_result_bytes: default_gateway_max_result_bytes(),
         }
     }
+}
+
+/// Default `[http_gateway]` / `[graphql_gateway]` `max_result_rows`: rows a
+/// result carries before it is refused.
+pub(crate) fn default_gateway_max_result_rows() -> usize {
+    10_000
+}
+
+/// Default `[http_gateway]` / `[graphql_gateway]` `max_result_bytes`: 16 MiB of
+/// cell bytes per result.
+pub(crate) fn default_gateway_max_result_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 fn default_http_gw_listen() -> String {
@@ -1218,6 +1242,16 @@ pub struct GraphqlGatewayConfig {
     /// (default) = no per-request tenant, which `[multi_tenancy]` refuses under
     /// `strict_config` (warns otherwise).
     pub tenant_header: String,
+    /// Most rows one GraphQL request's generated SQL may return. A result past
+    /// it is refused with a GraphQL error (`extensions.code` `RESULT_TOO_LARGE`),
+    /// not truncated. Must be >= 1 and <= [`MCP_MAX_RESULT_ROWS_CEILING`].
+    #[serde(default = "default_gateway_max_result_rows")]
+    pub max_result_rows: usize,
+    /// Most cell bytes one GraphQL request's generated SQL may return; past it
+    /// the request is refused as with `max_result_rows`. Must be >= 1 and <=
+    /// [`MCP_MAX_RESULT_BYTES_CEILING`].
+    #[serde(default = "default_gateway_max_result_bytes")]
+    pub max_result_bytes: usize,
 }
 
 impl Default for GraphqlGatewayConfig {
@@ -1235,6 +1269,8 @@ impl Default for GraphqlGatewayConfig {
             query_timeout_ms: default_gateway_query_timeout_ms(),
             max_concurrent_requests: default_gateway_max_concurrent_requests(),
             tenant_header: String::new(),
+            max_result_rows: default_gateway_max_result_rows(),
+            max_result_bytes: default_gateway_max_result_bytes(),
         }
     }
 }
@@ -4723,6 +4759,31 @@ impl ProxyConfig {
                 "mcp.max_result_bytes must be between 1 and {MCP_MAX_RESULT_BYTES_CEILING} (got {})",
                 self.mcp.max_result_bytes
             )));
+        }
+        // The same result caps for the HTTP /sql and GraphQL gateways, which
+        // refuse (not truncate) a result past them.
+        for (section, rows, bytes) in [
+            (
+                "http_gateway",
+                self.http_gateway.max_result_rows,
+                self.http_gateway.max_result_bytes,
+            ),
+            (
+                "graphql_gateway",
+                self.graphql_gateway.max_result_rows,
+                self.graphql_gateway.max_result_bytes,
+            ),
+        ] {
+            if !(1..=MCP_MAX_RESULT_ROWS_CEILING).contains(&rows) {
+                return Err(ProxyError::Config(format!(
+                    "{section}.max_result_rows must be between 1 and {MCP_MAX_RESULT_ROWS_CEILING} (got {rows})"
+                )));
+            }
+            if !(1..=MCP_MAX_RESULT_BYTES_CEILING).contains(&bytes) {
+                return Err(ProxyError::Config(format!(
+                    "{section}.max_result_bytes must be between 1 and {MCP_MAX_RESULT_BYTES_CEILING} (got {bytes})"
+                )));
+            }
         }
 
         Ok(())
@@ -8499,6 +8560,59 @@ exclude = true
             }),
             ("http_gateway.max_concurrent_requests", |c| {
                 c.http_gateway.max_concurrent_requests = 0
+            }),
+        ];
+        for (name, mutate) in cases {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            mutate(&mut c);
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains(name), "{name}: unexpected error {err}");
+        }
+    }
+
+    #[test]
+    fn gateway_result_caps_default_parse_and_validate_by_key() {
+        let config: ProxyConfig = toml::from_str("").expect("parse");
+        assert_eq!(config.http_gateway.max_result_rows, 10_000);
+        assert_eq!(config.http_gateway.max_result_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.graphql_gateway.max_result_rows, 10_000);
+        assert_eq!(config.graphql_gateway.max_result_bytes, 16 * 1024 * 1024);
+        let parsed: ProxyConfig = toml::from_str(
+            "[http_gateway]\nenabled = true\nmax_result_rows = 250\nmax_result_bytes = 4096\n\
+             [graphql_gateway]\nenabled = true\nmax_result_rows = 7\nmax_result_bytes = 8\n",
+        )
+        .expect("parse");
+        assert_eq!(parsed.http_gateway.max_result_rows, 250);
+        assert_eq!(parsed.http_gateway.max_result_bytes, 4096);
+        assert_eq!(parsed.graphql_gateway.max_result_rows, 7);
+        assert_eq!(parsed.graphql_gateway.max_result_bytes, 8);
+
+        type BadCase = (&'static str, fn(&mut ProxyConfig));
+        let cases: [BadCase; 8] = [
+            ("http_gateway.max_result_rows", |c| {
+                c.http_gateway.max_result_rows = 0
+            }),
+            ("http_gateway.max_result_rows", |c| {
+                c.http_gateway.max_result_rows = MCP_MAX_RESULT_ROWS_CEILING + 1
+            }),
+            ("http_gateway.max_result_bytes", |c| {
+                c.http_gateway.max_result_bytes = 0
+            }),
+            ("http_gateway.max_result_bytes", |c| {
+                c.http_gateway.max_result_bytes = MCP_MAX_RESULT_BYTES_CEILING + 1
+            }),
+            ("graphql_gateway.max_result_rows", |c| {
+                c.graphql_gateway.max_result_rows = 0
+            }),
+            ("graphql_gateway.max_result_rows", |c| {
+                c.graphql_gateway.max_result_rows = MCP_MAX_RESULT_ROWS_CEILING + 1
+            }),
+            ("graphql_gateway.max_result_bytes", |c| {
+                c.graphql_gateway.max_result_bytes = 0
+            }),
+            ("graphql_gateway.max_result_bytes", |c| {
+                c.graphql_gateway.max_result_bytes = MCP_MAX_RESULT_BYTES_CEILING + 1
             }),
         ];
         for (name, mutate) in cases {

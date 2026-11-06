@@ -662,6 +662,7 @@ impl AdminServer {
                     Self::push_gateway_pool_prometheus(&mut prometheus, p);
                 }
                 Self::push_mcp_prometheus(&mut prometheus);
+                Self::push_gateway_result_refusals_prometheus(&mut prometheus);
                 if let Some(s) = state.node_slots.read().await.as_ref() {
                     Self::push_node_slots_prometheus(&mut prometheus, &s.stats());
                     if let Some(r) = s.reconnect_stats() {
@@ -2713,6 +2714,30 @@ impl AdminServer {
         }
     }
 
+    /// Append the HTTP and GraphQL gateways' result-cap refusals
+    /// (`[http_gateway]` / `[graphql_gateway]` `max_result_rows` /
+    /// `max_result_bytes`), by gateway, to a Prometheus body.
+    fn push_gateway_result_refusals_prometheus(output: &mut String) {
+        use crate::gateway_policy::{results_refused_total, ResultGateway};
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            output,
+            "# HELP heliosdb_proxy_gateway_results_refused_total Gateway requests refused because their result passed a result cap ([http_gateway] / [graphql_gateway] max_result_rows or max_result_bytes)"
+        );
+        let _ = writeln!(
+            output,
+            "# TYPE heliosdb_proxy_gateway_results_refused_total counter"
+        );
+        for gateway in [ResultGateway::Http, ResultGateway::Graphql] {
+            let _ = writeln!(
+                output,
+                "heliosdb_proxy_gateway_results_refused_total{{gateway=\"{}\"}} {}",
+                gateway.label(),
+                results_refused_total(gateway)
+            );
+        }
+    }
+
     /// Append the MCP gateway's result-cap counter (`[mcp] max_result_rows` /
     /// `max_result_bytes`) to a Prometheus body.
     fn push_mcp_prometheus(output: &mut String) {
@@ -4179,6 +4204,17 @@ struct VersionResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_result_refusal_counter_is_labelled_by_gateway() {
+        let mut out = String::new();
+        AdminServer::push_gateway_result_refusals_prometheus(&mut out);
+        assert!(out.contains("# TYPE heliosdb_proxy_gateway_results_refused_total counter\n"));
+        assert!(out.contains("\nheliosdb_proxy_gateway_results_refused_total{gateway=\"http\"} "));
+        assert!(
+            out.contains("\nheliosdb_proxy_gateway_results_refused_total{gateway=\"graphql\"} ")
+        );
+    }
 
     #[test]
     fn mcp_truncation_counter_is_exported() {
