@@ -1469,6 +1469,10 @@ strip_hints = true
 | `enabled` | bool | `false` | Parse and honor `/*helios:...*/` hints; an applied hint overrides default verb routing (but never a plugin `Block`). |
 | `strip_hints` | bool | `true` | Remove the hint comment from SQL before forwarding to the backend. |
 
+Hints are recognised only in comments outside string literals, dollar-quoted
+literals and quoted identifiers; text such as `/*helios:route=standby*/` inside a
+literal is data, neither routed on nor changed.
+
 ---
 
 ## Rate Limiting (`[rate_limit]`)

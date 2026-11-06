@@ -116,7 +116,11 @@ pub mod shadow_execute;
 pub mod cache;
 
 // ── Quote-aware SQL text scanning shared by both result caches ─────
-#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+#[cfg(any(
+    feature = "query-cache",
+    feature = "edge-proxy",
+    feature = "routing-hints"
+))]
 pub mod sql_text;
 
 // ── Query routing hints ─────────────────────────────────────────────

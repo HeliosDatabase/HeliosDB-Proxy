@@ -104,6 +104,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   phantom total grew until the 32 MiB byte budget evicted every live entry and the
   connection's L1 held next to nothing.
 
+### Security
+
+- **Routing hints are read only from comments outside literals.** With
+  `[routing_hints]` on and `strip_hints = true` (the default), a
+  `/*helios:…*/` sequence inside a `'…'` or `E'…'` string, a `$$…$$` or
+  `$tag$…$tag$` literal, or a `"quoted identifier"` was parsed as a hint and
+  stripped from the statement, so `INSERT INTO notes(body) VALUES ('see
+  /*helios:route=standby*/ here')` stored `'see  here'` and could route the
+  statement. Hints are now found with the crate's quote-aware lexer
+  (`crate::sql_text`): text inside those literals is neither parsed nor
+  changed, and real hint comments keep their behaviour. Tracked as Sprinter
+  6c6503dd6d1e.
+
 ### Development
 
 - **Nano pair drill: online promotion.** `scripts/regress/nano-pair-drill.py

@@ -1655,6 +1655,17 @@ fn fingerprint_with(sql: &str, verbatim: bool) -> Option<Fingerprint> {
     Some(fp)
 }
 
+/// Every comment outside quotes, in order, with its byte offset and its text
+/// including the delimiters (`/*…*/`, or `--` to the end of the line). Reading
+/// stops at the backend-ambiguous rest ([`Piece::Rest`]): no comment after it
+/// is yielded. Not feature-gated, so the routing hint parser can use it.
+pub(crate) fn comments(sql: &str) -> impl Iterator<Item = (usize, &str)> {
+    Pieces::new(sql).filter_map(|(at, piece)| match piece {
+        Piece::Comment(comment) => Some((at, comment)),
+        _ => None,
+    })
+}
+
 /// The body of every `helios:` comment outside quotes, in order: the text
 /// after `helios:` up to the end of a block comment, or of the line for a
 /// `--` comment. Only a comment whose text starts with `helios:` (after

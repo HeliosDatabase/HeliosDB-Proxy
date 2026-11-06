@@ -9,17 +9,26 @@
 //! /*helios:key=value*/
 //! /*helios:key1=value1,key2=value2*/
 //! ```
+//!
+//! Hints are read only from comments outside string literals, dollar-quoted
+//! literals and quoted identifiers ([`crate::sql_text`]). Text such as
+//! `/*helios:route=standby*/` inside a literal is data: it is neither parsed
+//! nor stripped.
 
 use super::{parse_duration, Result, RoutingError};
 use once_cell::sync::Lazy;
 use regex::Regex;
+use std::borrow::Cow;
 use std::str::FromStr;
 use std::time::Duration;
 
 #[cfg(feature = "pool-modes")]
 use crate::pool::PoolingMode;
 
-/// Compiled regex for hint parsing
+/// Text every hint contains; a query without it has no hint to find.
+const HINT_MARKER: &str = "helios:";
+
+/// Compiled regex for hint parsing, applied to one comment at a time
 static HINT_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"/\*\s*helios:([^*]+)\*/").expect("Invalid hint regex"));
 
@@ -45,15 +54,14 @@ impl HintParser {
         Self { strip_hints: false }
     }
 
-    /// Parse all routing hints from a SQL query
+    /// Parse all routing hints from a SQL query. Only hint comments outside
+    /// string literals, dollar quotes and quoted identifiers are read.
     pub fn parse(&self, query: &str) -> ParsedHints {
         let mut hints = ParsedHints::default();
 
-        for cap in HINT_REGEX.captures_iter(query) {
-            let hint_content = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-
+        for span in hint_spans(query) {
             // Parse key-value pairs
-            for kv in KV_REGEX.captures_iter(hint_content) {
+            for kv in KV_REGEX.captures_iter(span.body) {
                 let key = kv.get(1).map(|m| m.as_str()).unwrap_or("");
                 let value = kv.get(2).map(|m| m.as_str()).unwrap_or("");
 
@@ -107,18 +115,74 @@ impl HintParser {
         }
     }
 
-    /// Strip hints from query for backend execution
-    pub fn strip(&self, query: &str) -> String {
-        HINT_REGEX.replace_all(query, "").trim().to_string()
+    /// Strip hints from query for backend execution. Removes only the hint
+    /// comments [`parse`](Self::parse) reads and trims the ends, as before.
+    /// Bytes inside literals and quoted identifiers are never changed. A
+    /// query without a hint is returned borrowed (trimmed), with no copy.
+    pub fn strip<'a>(&self, query: &'a str) -> Cow<'a, str> {
+        let spans = hint_spans(query);
+        if spans.is_empty() {
+            return Cow::Borrowed(query.trim());
+        }
+        let mut out = String::with_capacity(query.len());
+        let mut last = 0;
+        for span in &spans {
+            out.push_str(&query[last..span.start]);
+            last = span.end;
+        }
+        out.push_str(&query[last..]);
+        let trimmed = out.trim();
+        if trimmed.len() == out.len() {
+            Cow::Owned(out)
+        } else {
+            Cow::Owned(trimmed.to_string())
+        }
     }
 
     /// Extract raw hint string from query (for logging)
     pub fn extract_raw(&self, query: &str) -> Vec<String> {
-        HINT_REGEX
-            .captures_iter(query)
-            .filter_map(|cap| cap.get(0).map(|m| m.as_str().to_string()))
+        hint_spans(query)
+            .into_iter()
+            .map(|span| query[span.start..span.end].to_string())
             .collect()
     }
+}
+
+/// A `/*helios:…*/` hint comment outside literals and quoted identifiers.
+#[derive(Debug, Clone, Copy)]
+struct HintSpan<'a> {
+    /// Byte offset of the hint's first byte in the query.
+    start: usize,
+    /// Byte offset just past the hint's last byte in the query.
+    end: usize,
+    /// The text after `helios:` up to the closing `*/`.
+    body: &'a str,
+}
+
+/// Every hint in `query`, in order. A hint counts only inside a comment the
+/// quote-aware lexer ([`crate::sql_text::comments`]) reads outside literals,
+/// dollar quotes and quoted identifiers, so `/*helios:…*/` inside `'…'` is
+/// data. A query without `helios:` is never lexed and yields no spans.
+fn hint_spans(query: &str) -> Vec<HintSpan<'_>> {
+    if !query.contains(HINT_MARKER) {
+        return Vec::new();
+    }
+    let mut spans = Vec::new();
+    for (at, comment) in crate::sql_text::comments(query) {
+        if !comment.contains(HINT_MARKER) {
+            continue;
+        }
+        for cap in HINT_REGEX.captures_iter(comment) {
+            if let (Some(whole), Some(body)) = (cap.get(0), cap.get(1)) {
+                spans.push(HintSpan {
+                    start: at + whole.start(),
+                    end: at + whole.end(),
+                    body: body.as_str(),
+                });
+            }
+        }
+    }
+    spans
 }
 
 /// Parsed hints collection
@@ -672,5 +736,142 @@ mod tests {
         assert_eq!(raw.len(), 2);
         assert!(raw[0].contains("route=primary"));
         assert!(raw[1].contains("cache=skip"));
+    }
+
+    // Hints are read only from comments outside string literals, dollar
+    // quotes and quoted identifiers. Text inside them is data: it is neither
+    // parsed (no routing) nor stripped (no byte changes).
+
+    #[test]
+    fn hint_text_in_single_quoted_literal_is_not_parsed_or_stripped() {
+        let parser = HintParser::new();
+        let query = "INSERT INTO notes(body) VALUES ('see /*helios:route=standby*/ here')";
+
+        assert!(parser.parse(query).is_empty());
+        assert_eq!(parser.parse(query).route, None);
+        assert_eq!(parser.strip(query), query);
+        assert!(parser.extract_raw(query).is_empty());
+    }
+
+    #[test]
+    fn hint_text_in_escape_string_literal_is_not_parsed_or_stripped() {
+        let parser = HintParser::new();
+        // A doubled quote, and a backslash-escaped quote (which the lexer
+        // leaves ambiguous, so nothing after it is read).
+        for query in [
+            "INSERT INTO notes(body) VALUES (E'it''s /*helios:route=standby*/ here')",
+            "INSERT INTO notes(body) VALUES (E'it\\'s /*helios:route=standby*/ here')",
+        ] {
+            assert!(parser.parse(query).is_empty(), "parsed hint in {query}");
+            assert_eq!(parser.strip(query), query, "stripped {query}");
+        }
+    }
+
+    #[test]
+    fn hint_text_in_dollar_quoted_literal_is_not_parsed_or_stripped() {
+        let parser = HintParser::new();
+        for query in [
+            "SELECT $$see /*helios:route=standby*/ here$$",
+            "SELECT $tag$see /*helios:route=standby*/ here$tag$",
+        ] {
+            assert!(parser.parse(query).is_empty(), "parsed hint in {query}");
+            assert_eq!(parser.strip(query), query, "stripped {query}");
+        }
+    }
+
+    #[test]
+    fn hint_text_in_quoted_identifier_is_not_parsed_or_stripped() {
+        let parser = HintParser::new();
+        let query = r#"SELECT "col/*helios:route=standby*/" FROM t"#;
+
+        assert!(parser.parse(query).is_empty());
+        assert_eq!(parser.strip(query), query);
+    }
+
+    #[test]
+    fn literal_containing_comment_close_is_kept_byte_identical() {
+        let parser = HintParser::new();
+        let query = "SELECT 'a */ /*helios:route=standby*/ b */ FROM t";
+
+        assert!(parser.parse(query).is_empty());
+        assert_eq!(parser.strip(query), query);
+    }
+
+    #[test]
+    fn real_hints_around_literal_are_parsed_and_stripped_literal_unchanged() {
+        let parser = HintParser::new();
+        let query = "/*helios:route=primary*/ INSERT INTO notes(body) VALUES \
+                     ('see /*helios:route=standby*/ */ here') /*helios:cache=skip*/";
+
+        let hints = parser.parse(query);
+        assert_eq!(hints.route, Some(RouteTarget::Primary));
+        assert_eq!(hints.cache, Some(CacheBehavior::Skip));
+        assert_eq!(hints.len(), 2);
+        assert_eq!(
+            parser.strip(query),
+            "INSERT INTO notes(body) VALUES ('see /*helios:route=standby*/ */ here')"
+        );
+    }
+
+    #[test]
+    fn real_hint_after_escape_string_with_doubled_quote_is_read() {
+        let parser = HintParser::new();
+        let query = "SELECT E'it''s /*helios:route=standby*/' , 1 /*helios:consistency=eventual*/";
+
+        let hints = parser.parse(query);
+        assert_eq!(hints.route, None);
+        assert_eq!(hints.consistency, Some(ConsistencyLevel::Eventual));
+        assert_eq!(
+            parser.strip(query),
+            "SELECT E'it''s /*helios:route=standby*/' , 1"
+        );
+    }
+
+    #[test]
+    fn adjacent_hint_comments_are_both_parsed_and_stripped() {
+        let parser = HintParser::new();
+        let query = "/*helios:route=standby*//*helios:consistency=eventual*/ SELECT 1";
+
+        let hints = parser.parse(query);
+        assert_eq!(hints.route, Some(RouteTarget::Standby));
+        assert_eq!(hints.consistency, Some(ConsistencyLevel::Eventual));
+        assert_eq!(parser.strip(query), "SELECT 1");
+    }
+
+    #[test]
+    fn hint_inside_nested_comment_is_not_read() {
+        // A `/*` before the first `*/` makes the comment ambiguous between
+        // PostgreSQL (nests) and HeliosDB-Nano (does not), so nothing after
+        // it is read.
+        let parser = HintParser::new();
+        let query = "/* note /*helios:route=primary*/ SELECT 1";
+
+        assert!(parser.parse(query).is_empty());
+        assert_eq!(parser.strip(query), query);
+    }
+
+    #[test]
+    fn line_comment_hint_is_still_parsed_and_stripped() {
+        let parser = HintParser::new();
+        let query = "-- /*helios:route=primary*/\nSELECT 1";
+
+        assert_eq!(parser.parse(query).route, Some(RouteTarget::Primary));
+        assert_eq!(parser.strip(query), "-- \nSELECT 1");
+    }
+
+    #[test]
+    fn strip_without_hint_marker_borrows_the_input() {
+        let parser = HintParser::new();
+        let query = "SELECT '*/ /* x' FROM t";
+
+        let out = parser.strip(query);
+        assert_eq!(&*out, query);
+        assert!(std::ptr::eq(out.as_ptr(), query.as_ptr()));
+    }
+
+    #[test]
+    fn strip_without_hint_marker_still_trims_whitespace() {
+        let parser = HintParser::new();
+        assert_eq!(parser.strip("  SELECT 1 \n"), "SELECT 1");
     }
 }

@@ -353,7 +353,12 @@ impl ProxyServer {
             hint_override => hint_override,
         };
         let forward = if parser.strip_hints {
-            Some(crate::protocol::QueryMessage { query: stripped }.encode())
+            Some(
+                crate::protocol::QueryMessage {
+                    query: stripped.into_owned(),
+                }
+                .encode(),
+            )
         } else {
             None
         };

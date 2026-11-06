@@ -83,3 +83,15 @@ fn strip_removes_hint_comment() {
         "SELECT 42"
     );
 }
+
+// A hint-looking string inside a literal is data: the statement must neither
+// route nor reach the backend with its bytes changed (the stored value).
+#[test]
+fn hint_text_in_literal_neither_routes_nor_rewrites_the_insert() {
+    let parser = HintParser::new();
+    let raw = "INSERT INTO notes(body) VALUES ('see /*helios:route=standby*/ here')";
+    assert!(parser.parse(raw).is_empty());
+    assert!(matches!(over(raw), RouteOverride::None));
+    assert_eq!(parser.strip(raw), raw);
+    assert!(ProxyServer::is_write_query(&parser.strip(raw)));
+}

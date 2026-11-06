@@ -201,7 +201,7 @@ impl QueryRouter {
     /// Strip hints from query for backend execution
     pub fn strip_hints(&self, query: &str) -> String {
         if self.config.hints.strip_hints {
-            self.parser.strip(query)
+            self.parser.strip(query).into_owned()
         } else {
             query.to_string()
         }
