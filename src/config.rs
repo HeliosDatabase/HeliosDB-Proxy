@@ -1326,6 +1326,23 @@ pub struct MultiTenancyToml {
     /// Per-tenant overrides of `max_replay_bytes_per_tenant` (`0` = none for
     /// that tenant). Every key must be in `tenants`.
     pub tenant_max_replay_bytes: std::collections::BTreeMap<String, usize>,
+    /// What a session whose tenant cannot be identified may do with the
+    /// tenant tables (`tenant_tables`) when row isolation is on. `refuse`
+    /// (default): a simple-protocol statement that references a tenant table
+    /// is refused with 42501, since it could not be row-filtered. `passthrough`:
+    /// it is forwarded unfiltered (the behaviour before this key existed).
+    pub unknown_tenant: UnknownTenantPolicy,
+}
+
+/// The `[multi_tenancy] unknown_tenant` policy (see [`MultiTenancyToml`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnknownTenantPolicy {
+    /// Refuse statements on tenant tables from a session with no tenant.
+    #[default]
+    Refuse,
+    /// Forward them unfiltered.
+    Passthrough,
 }
 
 /// The functions refused by default under row isolation
@@ -1378,6 +1395,7 @@ impl Default for MultiTenancyToml {
             idle_permit_timeout_ms: 0,
             max_replay_bytes_per_tenant: 0,
             tenant_max_replay_bytes: std::collections::BTreeMap::new(),
+            unknown_tenant: UnknownTenantPolicy::Refuse,
         }
     }
 }
@@ -5229,6 +5247,34 @@ mod tests {
             .starts_with("http://127.0.0.1:"));
         assert_eq!(config.cache.exclude_tables, ["secret"]);
         assert!(config.routing_hints.enabled && config.routing_hints.strip_hints);
+    }
+
+    /// `[multi_tenancy] unknown_tenant` defaults to `refuse`; `passthrough`
+    /// restores the unfiltered forward; any other value is a parse error.
+    #[test]
+    fn unknown_tenant_policy_parses() {
+        use super::UnknownTenantPolicy;
+        let base = "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n[multi_tenancy]\nenabled = true\ntenants = [\"acme\"]\n";
+        let default: ProxyConfig = toml::from_str(base).unwrap();
+        assert_eq!(
+            default.multi_tenancy.unknown_tenant,
+            UnknownTenantPolicy::Refuse
+        );
+        let refuse: ProxyConfig =
+            toml::from_str(&format!("{base}unknown_tenant = \"refuse\"\n")).unwrap();
+        assert_eq!(
+            refuse.multi_tenancy.unknown_tenant,
+            UnknownTenantPolicy::Refuse
+        );
+        let pass: ProxyConfig =
+            toml::from_str(&format!("{base}unknown_tenant = \"passthrough\"\n")).unwrap();
+        assert_eq!(
+            pass.multi_tenancy.unknown_tenant,
+            UnknownTenantPolicy::Passthrough
+        );
+        assert!(
+            toml::from_str::<ProxyConfig>(&format!("{base}unknown_tenant = \"allow\"\n")).is_err()
+        );
     }
 
     #[test]

@@ -141,7 +141,9 @@ impl ProxyServer {
     ) -> bool {
         for r in rules {
             let user_ok = r.user == "all" || r.user == user;
-            let db_ok = r.database == "all" || r.database == database;
+            // A rule without `@` covers its base too (`prod` admits
+            // `prod@feature`); a rule with `@` matches the exact value only.
+            let db_ok = crate::database_name::hba_database_matches(&r.database, database);
             if user_ok && db_ok && Self::hba_addr_matches(&r.address, ip) {
                 return r.action == HbaAction::Allow;
             }

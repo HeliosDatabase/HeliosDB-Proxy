@@ -45,6 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text from the statement and serialises the form into pre-sized buffers, and the
   store shares each slot's database, user and branch strings as `Arc<str>` (no
   behaviour change; `f96d0d9a13bc`).
+- **`[multi_tenancy] unknown_tenant` (new key, default `"refuse"`).** Under row isolation
+  (`tenant_tables`), a session whose tenant cannot be identified is refused with SQLSTATE
+  42501 when a simple-protocol statement references a tenant table, instead of being
+  forwarded unfiltered. A name inside a string literal or a comment does not count. Extended-protocol
+  `Parse`/`Bind` statements are not covered by this check. **Upgrade note:** this changes behaviour for deployments with
+  `enabled = true`, non-empty `tenant_tables` and sessions that name no configured tenant;
+  set `unknown_tenant = "passthrough"` to keep the previous behaviour. Also, with
+  `identify_by = "database"` a session with no `database` parameter now uses its user
+  name as the tenant, as PostgreSQL does.
 
 ### Added
 
@@ -202,6 +211,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   column, or refused. Identifiers are matched as PostgreSQL truncates them (63 bytes). Writes
   use the table's own tenant column. A tenant id containing a backslash is refused. Proxy-side
   filtering is documented as not a hard boundary.
+- **Branch names no longer escape `[[hba]]` or tenancy (69ae2a33ff96).** A startup
+  `database=<db>@<branch>` (HeliosDB-Nano branch selection) was matched as a whole
+  string, so a `database = "prod"` rule with `action = "reject"` did not refuse
+  `prod@feature`, and `[multi_tenancy] identify_by = "database"` treated `acme@b` as
+  an unknown tenant: its session was forwarded unfiltered and held none of acme's caps.
+  An `[[hba]]` rule without `@` now covers the full value and its base (a rule with `@`
+  matches only that exact value). `identify_by = "database"` resolves a name like Nano:
+  the whole value if it is a configured tenant, else its base before the first `@`. Row
+  filtering and the per-tenant caps now share that resolution (`src/database_name.rs`).
 
 ### Library API (breaking)
 

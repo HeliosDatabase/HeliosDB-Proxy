@@ -1,6 +1,35 @@
 use super::*;
 
+/// The refusal message for a statement naming a tenant table from a session
+/// with no identified tenant (`[multi_tenancy] unknown_tenant = "refuse"`).
+#[cfg(feature = "multi-tenancy")]
+const UNIDENTIFIED_TENANT_REFUSAL: &str =
+    "statement refused: this session has no identified tenant and the statement references a tenant table";
+
 impl ProxyServer {
+    /// Answer a simple Query the proxy refuses before any backend: an
+    /// ErrorResponse (`sqlstate`, `reason`) then ReadyForQuery with the
+    /// backend's own transaction status, the last one relayed (nothing reached
+    /// it, so a transaction open there stays 'T' or 'E'). Returns the bytes
+    /// written. Shared by every tenant-isolation refusal.
+    #[cfg(feature = "multi-tenancy")]
+    async fn write_statement_refusal(
+        client: &mut ClientStream,
+        session: &ClientSession,
+        sqlstate: &str,
+        reason: &str,
+    ) -> Result<u64> {
+        let mut response = Self::create_error_response(sqlstate, reason);
+        response.extend_from_slice(&Self::create_ready_for_query(
+            session.last_rfq_status.load(Ordering::Relaxed),
+        ));
+        client
+            .write_all(&response)
+            .await
+            .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+        Ok(response.len() as u64)
+    }
+
     /// Forward a simple-query (`Query`) message and stream its response back
     /// to the client frame-by-frame, ending at ReadyForQuery. Picks (and, if
     /// needed, opens) the target node's connection from the per-session
@@ -161,7 +190,7 @@ impl ProxyServer {
         // tenant filter. Done BEFORE the cache lookup so each tenant's results
         // are cached under their own (filtered) SQL — no cross-tenant leakage.
         #[cfg(feature = "multi-tenancy")]
-        let mut tenant_refusal: Option<String> = None;
+        let mut tenant_refusal: Option<std::borrow::Cow<'static, str>> = None;
         #[cfg(feature = "multi-tenancy")]
         let tenant_msg: Option<Message> = if let Some(tm) = state.tenant_manager.as_ref() {
             match crate::protocol::query_text(&forward_msg.payload) {
@@ -172,7 +201,7 @@ impl ProxyServer {
                             let res = tm.transform_query(sql, &tenant);
                             if let Some(reason) = res.refusal {
                                 // Never forwarded: a shape the rewrite cannot filter.
-                                tenant_refusal = Some(reason);
+                                tenant_refusal = Some(reason.into());
                                 None
                             } else if res.transformed {
                                 tracing::debug!(target: "helios::tenant", tenant = %tenant.0, "tenant filter injected");
@@ -181,7 +210,14 @@ impl ProxyServer {
                                 None
                             }
                         }
-                        None => None,
+                        None => {
+                            // No tenant to filter by: `unknown_tenant = "refuse"`
+                            // stops a statement on a tenant table here.
+                            if tm.refuses_unknown_tenant_query(sql) {
+                                tenant_refusal = Some(UNIDENTIFIED_TENANT_REFUSAL.into());
+                            }
+                            None
+                        }
                     }
                 }
                 None => None,
@@ -189,23 +225,21 @@ impl ProxyServer {
         } else {
             None
         };
-        // A refused tenant statement is answered here, with SQLSTATE 42501 and
-        // ReadyForQuery, and never reaches a backend.
+        // A refused tenant statement (a shape the row filter cannot cover, or
+        // a tenant table named by a session with no identified tenant) is
+        // answered here, with SQLSTATE 42501 and ReadyForQuery, and never
+        // reaches a backend.
         #[cfg(feature = "multi-tenancy")]
         if let Some(reason) = tenant_refusal {
             tracing::info!(target: "helios::tenant", reason = %reason, "tenant statement refused");
-            let mut response = Self::create_error_response(
+            let sent = Self::write_statement_refusal(
+                client,
+                session,
                 crate::multi_tenancy::transformer::REFUSAL_SQLSTATE,
                 &reason,
-            );
-            response.extend_from_slice(&Self::create_ready_for_query(
-                session.last_rfq_status.load(Ordering::Relaxed),
-            ));
-            client
-                .write_all(&response)
-                .await
-                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
-            return Ok((None, response.len() as u64));
+            )
+            .await?;
+            return Ok((None, sent));
         }
         #[cfg(feature = "multi-tenancy")]
         if tenant_msg.is_some() {

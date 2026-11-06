@@ -9,6 +9,23 @@ use tokio::task::JoinHandle;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A startup packet naming `user` and `database` (protocol 3.0).
+fn startup_bytes_db(user: &str, database: &str) -> Vec<u8> {
+    let mut params = Vec::new();
+    for (k, v) in [("user", user), ("database", database)] {
+        params.extend_from_slice(k.as_bytes());
+        params.push(0);
+        params.extend_from_slice(v.as_bytes());
+        params.push(0);
+    }
+    params.push(0);
+    let mut out = Vec::new();
+    out.extend_from_slice(&((8 + params.len()) as u32).to_be_bytes());
+    out.extend_from_slice(&196608u32.to_be_bytes());
+    out.extend_from_slice(&params);
+    out
+}
+
 fn wire(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut out = vec![tag];
     out.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
@@ -634,6 +651,15 @@ impl Harness {
     }
 
     async fn connect(&self, user: &str) -> Client {
+        self.connect_with(startup_bytes(user)).await
+    }
+
+    /// A session whose startup packet names `user` and `database`.
+    async fn connect_db(&self, user: &str, database: &str) -> Client {
+        self.connect_with(startup_bytes_db(user, database)).await
+    }
+
+    async fn connect_with(&self, startup: Vec<u8>) -> Client {
         let (proxy, mut s) = pair().await;
         let peer = proxy.peer_addr().unwrap();
         let task = tokio::spawn(ProxyServer::handle_client(
@@ -643,7 +669,7 @@ impl Harness {
             Arc::new(self.config.clone()),
             self.server.shutdown_tx.clone(),
         ));
-        s.write_all(&startup_bytes(user)).await.unwrap();
+        s.write_all(&startup).await.unwrap();
         let mut client = Client {
             s,
             key: (0, 0),
@@ -5641,4 +5667,61 @@ async fn a_refused_tenant_statement_never_reaches_the_backend() {
     );
     let frames = acme.query("SELECT 1").await;
     assert_served(&frames, b'I');
+}
+
+/// Tenants are identified by the startup database (`identify_by =
+/// "database"`), with `orders` as the tenant table.
+fn by_database(c: &mut ProxyConfig) {
+    c.multi_tenancy.identify_by = "database".into();
+    c.multi_tenancy.tenant_tables = vec!["orders".into()];
+}
+
+/// `[multi_tenancy] unknown_tenant = "refuse"` (the default): a session whose
+/// database names no tenant cannot run a statement on a tenant table, since
+/// it could not be row-filtered; the statement is refused with 42501, never
+/// forwarded, and the session stays usable.
+#[tokio::test]
+async fn an_unidentified_session_is_refused_on_tenant_tables() {
+    let h = Harness::on(FakeBackend::start(None).await, 0, by_database);
+    let mut u = h.connect_db("u", "nobody").await;
+    let refused = u.query("select * from orders").await;
+    assert_refused(&refused, "42501", "no identified tenant");
+    assert!(
+        !h.backend.saw_query("select * from orders"),
+        "never forwarded"
+    );
+    assert_served(&u.query("select 1").await, b'I');
+}
+
+/// `unknown_tenant = "passthrough"` keeps the unfiltered forward.
+#[tokio::test]
+async fn an_unidentified_session_is_forwarded_under_passthrough() {
+    let h = Harness::on(FakeBackend::start(None).await, 0, |c| {
+        by_database(c);
+        c.multi_tenancy.unknown_tenant = crate::config::UnknownTenantPolicy::Passthrough;
+    });
+    let mut u = h.connect_db("u", "nobody").await;
+    assert_served(&u.query("select * from orders").await, b'I');
+    assert!(h.backend.saw_query("select * from orders"));
+}
+
+/// `acme@feat` is tenant `acme`: its tenant table statements get acme's
+/// row filter, and its requests count against acme's active-query cap.
+#[tokio::test]
+async fn a_branch_database_gets_its_base_tenants_filter_and_caps() {
+    let h = Harness::on(FakeBackend::start(None).await, 0, by_database);
+    let mut a = h.connect_db("u", "acme@feat").await;
+    assert_served(&a.query("select * from orders").await, b'I');
+    let filtered = h.backend.log().into_iter().any(|s| {
+        s.tag == b'Q' && s.text.to_lowercase().contains("where") && s.text.contains("acme")
+    });
+    assert!(filtered, "acme's row filter reached the backend");
+
+    h.hold_permit(&mut a, "select 'slow a'").await;
+    h.until("acme", "the branch session holds acme's permit", |s| {
+        s.queries_active == 1
+    })
+    .await;
+    h.backend.release_slow();
+    assert_served(&a.until_ready().await, b'I');
 }

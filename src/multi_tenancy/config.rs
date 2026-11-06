@@ -740,6 +740,15 @@ pub struct MultiTenancyConfig {
 
     /// Admin user pattern (for cross-tenant access)
     pub admin_user_pattern: Option<String>,
+
+    /// The tenant tables (`[multi_tenancy] unknown_tenant = "refuse"`) a
+    /// statement from a session with no identified tenant must not reference,
+    /// built once at startup: lower-cased, schema-less names. `None` = no
+    /// refusal. A statement is refused when its code (string literals,
+    /// comments and dollar-quoted bodies excluded) names one of them as an
+    /// identifier, so a statement the transformer cannot rewrite (`WITH`,
+    /// `COPY`, ...) is refused too.
+    pub(crate) refuse_unknown_tenant_tables: Option<std::collections::HashSet<String>>,
 }
 
 impl Default for MultiTenancyConfig {
@@ -756,6 +765,7 @@ impl Default for MultiTenancyConfig {
             max_tenants: 1000,
             cross_tenant_analytics: false,
             admin_user_pattern: None,
+            refuse_unknown_tenant_tables: None,
         }
     }
 }

@@ -207,7 +207,22 @@ impl TenantManager {
 
     /// Identify tenant from request context
     pub fn identify_tenant(&self, request: &RequestContext) -> Option<TenantId> {
-        let tenant_id = self.identifier.identify(request)?;
+        // `identify_by = "database"` resolves the startup database exactly as
+        // the per-tenant caps do (crate::database_name): the whole value if it
+        // is a known tenant, else its base before the first `@`.
+        let tenant_id = if matches!(
+            self.config.identification,
+            IdentificationMethod::DatabaseName
+        ) {
+            let known = |t: &str| self.has_tenant(&TenantId::new(t));
+            TenantId::new(crate::database_name::tenant_from_startup(
+                request.database.as_deref(),
+                request.username.as_deref(),
+                known,
+            )?)
+        } else {
+            self.identifier.identify(request)?
+        };
 
         // Check if tenant exists or if unknown tenants are allowed
         if self.has_tenant(&tenant_id) {
@@ -222,6 +237,16 @@ impl TenantManager {
         } else {
             None
         }
+    }
+
+    /// Whether a statement from a session with no identified tenant must be
+    /// refused under `unknown_tenant = "refuse"`: it names a table in
+    /// `refuse_unknown_tenant_tables`. Only consulted for such sessions.
+    pub fn refuses_unknown_tenant_query(&self, query: &str) -> bool {
+        let Some(tables) = self.config.refuse_unknown_tenant_tables.as_ref() else {
+            return false;
+        };
+        crate::sql_text::code_identifiers(query).any(|id| tables.contains(id.as_ref()))
     }
 
     /// Create default configuration for a new tenant
@@ -531,6 +556,102 @@ mod tests {
 
         let retrieved = manager.get_tenant(&TenantId::new("acme")).unwrap();
         assert_eq!(retrieved.name, "Acme Corp");
+    }
+
+    /// `identify_by = "database"` resolves a branch database to its base
+    /// tenant, a whole value that is a tenant wins, and the user name stands
+    /// in when there is no database.
+    #[test]
+    fn database_identification_resolves_branches() {
+        let tm = TenantManagerBuilder::new()
+            .config(MultiTenancyConfig {
+                enabled: true,
+                identification: IdentificationMethod::DatabaseName,
+                ..Default::default()
+            })
+            .build();
+        tm.register_tenant(TenantConfig::new(
+            TenantId::new("acme"),
+            IsolationStrategy::row("public", "tid"),
+        ));
+        tm.register_tenant(TenantConfig::new(
+            TenantId::new("acme@b"),
+            IsolationStrategy::row("public", "tid"),
+        ));
+        let id = |ctx: RequestContext| tm.identify_tenant(&ctx).map(|t| t.0);
+        assert_eq!(
+            id(RequestContext::new().with_database("acme@c")),
+            Some("acme".into())
+        );
+        assert_eq!(
+            id(RequestContext::new().with_database("acme@b")),
+            Some("acme@b".into())
+        );
+        assert_eq!(
+            id(RequestContext::new().with_database("acme")),
+            Some("acme".into())
+        );
+        assert_eq!(id(RequestContext::new().with_database("x@acme")), None);
+        assert_eq!(
+            id(RequestContext::new().with_username("acme")),
+            Some("acme".into())
+        );
+    }
+
+    /// The unknown-tenant refusal names a tenant table as a whole identifier
+    /// in the statement's code: a name inside a string literal, a comment or
+    /// a dollar-quoted body does not count; a real reference does, schema-
+    /// qualified, quoted, in a CTE, or after a literal or comment. A column
+    /// with a table's name still refuses (conservative).
+    #[test]
+    fn unknown_tenant_refusal_names_tenant_tables() {
+        let tm = TenantManagerBuilder::new()
+            .config(MultiTenancyConfig {
+                enabled: true,
+                refuse_unknown_tenant_tables: Some(["orders".to_string()].into_iter().collect()),
+                ..Default::default()
+            })
+            .build();
+        let refuses = |sql: &str| tm.refuses_unknown_tenant_query(sql);
+        // Real references.
+        assert!(refuses("select * from orders"));
+        assert!(refuses("SELECT * FROM public.Orders"));
+        assert!(refuses("select * from \"orders\""));
+        assert!(refuses("with x as (select 1 from orders) select * from x"));
+        assert!(refuses("select 'x' from orders"));
+        assert!(refuses("/* c */ select * from orders"));
+        assert!(refuses("select 1 -- note\n from orders"));
+        assert!(refuses("select * from \"it's\", orders"));
+        assert!(refuses("select $t$ x $t$ from orders"));
+        // A column with the same name stays conservative.
+        assert!(refuses("select orders from x"));
+        // Names inside literals, comments and dollar-quoted bodies do not.
+        assert!(!refuses("select 'from orders'"));
+        assert!(!refuses("select 'it''s orders'"));
+        // The lexer does not read `E'…'` backslash escapes, so the literal ends
+        // at `\'` and `orders` reads as code: refused (fail-closed).
+        assert!(refuses("select E'a\\'orders' as x"));
+        assert!(!refuses("select 1 -- from orders"));
+        assert!(!refuses("/* select * from orders */ select 1"));
+        // A nested comment is backend-ambiguous (PostgreSQL nests block
+        // comments, other engines end at the first `*/`), so the lexer stops
+        // there and the rest counts as code: refused (fail-closed).
+        assert!(refuses("/* a /* nested orders */ still */ select 1"));
+        assert!(!refuses("select $$orders$$"));
+        assert!(!refuses("select $t$ from orders $t$"));
+        // A longer identifier and a parameter are not the table.
+        assert!(!refuses("select * from order_items"));
+        assert!(!refuses("select $1"));
+        assert!(!refuses("select 1"));
+        // An unterminated literal fails closed: the rest counts as code.
+        assert!(refuses("select 'x from orders"));
+        let none = TenantManagerBuilder::new()
+            .config(MultiTenancyConfig {
+                enabled: true,
+                ..Default::default()
+            })
+            .build();
+        assert!(!none.refuses_unknown_tenant_query("select * from orders"));
     }
 
     #[test]

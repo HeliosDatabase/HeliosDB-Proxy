@@ -32,7 +32,7 @@
 //!   [`TenantCharge`]s. A statement whose recording would take the tenant over
 //!   marks its transaction non-replayable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -549,6 +549,9 @@ struct KeyHolders {
 #[derive(Default)]
 pub struct TenantSlots {
     identify_by: String,
+    /// Every configured tenant (capped or not): the names `identify_by =
+    /// "database"` resolves a startup database against, as TenantManager does.
+    known: HashSet<String>,
     tenants: HashMap<String, TenantSlot>,
     budgets: HashMap<String, Arc<TenantBudget>>,
     /// Some tenant has an active-query cap: only then can a session wait
@@ -616,6 +619,7 @@ impl TenantSlots {
         }
         Self {
             identify_by: mt.identify_by.clone(),
+            known: mt.tenants.iter().cloned().collect(),
             tenants,
             budgets,
             track_cancel_keys,
@@ -642,14 +646,20 @@ impl TenantSlots {
         self.tenants.is_empty()
     }
 
-    /// The tenant id a startup packet names (`identify_by`); `identify_by =
-    /// "database"` falls back to `user`, as PostgreSQL does for a startup
-    /// packet without a database.
-    fn key<'p>(&self, params: &'p HashMap<String, String>) -> Option<&'p String> {
+    /// The tenant id a startup packet names (`identify_by`). `identify_by =
+    /// "database"` resolves the database as TenantManager does
+    /// ([`crate::database_name::tenant_from_startup`]): the whole value if it
+    /// is a configured tenant, else its base before the first `@`; without a
+    /// database, the user name (as PostgreSQL does).
+    fn key<'p>(&self, params: &'p HashMap<String, String>) -> Option<&'p str> {
         if self.identify_by == "database" {
-            params.get("database").or_else(|| params.get("user"))
+            crate::database_name::tenant_from_startup(
+                params.get("database").map(String::as_str),
+                params.get("user").map(String::as_str),
+                |t| self.known.contains(t),
+            )
         } else {
-            params.get(&self.identify_by)
+            params.get(&self.identify_by).map(String::as_str)
         }
     }
 
@@ -658,7 +668,7 @@ impl TenantSlots {
     /// packet without a database.
     pub fn tenant_of<'p>(&self, params: &'p HashMap<String, String>) -> Option<&'p str> {
         let value = self.key(params)?;
-        self.tenants.contains_key(value).then_some(value.as_str())
+        self.tenants.contains_key(value).then_some(value)
     }
 
     /// Take a slot of `tenant` for a new client session. Uncapped or unknown
@@ -895,6 +905,27 @@ mod tests {
         );
         // No database in the packet: PostgreSQL uses the user name.
         assert_eq!(by_db.tenant_of(&params(&[("user", "acme")])), Some("acme"));
+    }
+
+    /// `<db>@<branch>` is the tenant `<db>` for the caps and the budgets, as
+    /// for the row filter (crate::database_name); a whole value that is a
+    /// tenant wins over its base.
+    #[test]
+    fn a_branch_database_takes_its_base_tenant_caps_and_budgets() {
+        let mut config = ProxyConfig::default();
+        config.multi_tenancy.enabled = true;
+        config.multi_tenancy.identify_by = "database".into();
+        config.multi_tenancy.tenants = vec!["acme".into(), "big@x".into()];
+        config.multi_tenancy.max_clients_per_tenant = 1;
+        config.multi_tenancy.max_active_queries_per_tenant = 1;
+        let s = TenantSlots::from_config(&config);
+        let db = |d: &str| params(&[("database", d), ("user", "u")]);
+        assert_eq!(s.tenant_of(&db("acme@feat")), Some("acme"));
+        assert_eq!(s.tenant_of(&db("acme")), Some("acme"));
+        assert!(s.budget_of(&db("acme@feat")).is_some());
+        assert_eq!(s.tenant_of(&db("big@x")), Some("big@x"));
+        assert_eq!(s.tenant_of(&db("big@y")), None);
+        assert_eq!(s.tenant_of(&db("nobody@feat")), None);
     }
 
     #[tokio::test]

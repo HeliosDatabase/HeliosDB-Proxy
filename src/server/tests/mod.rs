@@ -147,6 +147,40 @@ fn test_hba_admits() {
     assert!(!ProxyServer::hba_admits(&rules, ip, "alice", "benchdb"));
 }
 
+/// Branch names (`<db>@<branch>`) against `[[hba]] database` rules.
+#[test]
+fn test_hba_database_branch_policy() {
+    use crate::config::{HbaAction, HbaRule};
+    use std::net::IpAddr;
+    let ip: IpAddr = "10.0.0.5".parse().unwrap();
+    let rule = |action, database: &str| HbaRule {
+        action,
+        user: "all".into(),
+        database: database.into(),
+        address: "all".into(),
+    };
+    // Deny `prod` refuses its branches too.
+    let deny = vec![rule(HbaAction::Reject, "prod")];
+    assert!(!ProxyServer::hba_admits(&deny, ip, "u", "prod"));
+    assert!(!ProxyServer::hba_admits(&deny, ip, "u", "prod@b"));
+    assert!(ProxyServer::hba_admits(&deny, ip, "u", "prodx@b"));
+    // Allow `prod` admits its branches.
+    let allow = vec![
+        rule(HbaAction::Allow, "prod"),
+        rule(HbaAction::Reject, "all"),
+    ];
+    assert!(ProxyServer::hba_admits(&allow, ip, "u", "prod@b"));
+    assert!(!ProxyServer::hba_admits(&allow, ip, "u", "dev@b"));
+    // A rule with `@` matches only that exact value.
+    let exact = vec![rule(HbaAction::Reject, "prod@b")];
+    assert!(!ProxyServer::hba_admits(&exact, ip, "u", "prod@b"));
+    assert!(ProxyServer::hba_admits(&exact, ip, "u", "prod@c"));
+    assert!(ProxyServer::hba_admits(&exact, ip, "u", "prod"));
+    // `all` is unchanged.
+    let all = vec![rule(HbaAction::Reject, "all")];
+    assert!(!ProxyServer::hba_admits(&all, ip, "u", "prod@b"));
+}
+
 #[test]
 fn test_initial_metrics() {
     let config = test_config();

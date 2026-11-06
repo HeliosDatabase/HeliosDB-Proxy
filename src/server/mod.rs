@@ -1100,48 +1100,61 @@ impl ProxyServer {
 
         // Build the multi-tenancy manager from the configured tenants.
         #[cfg(feature = "multi-tenancy")]
-        let tenant_manager =
-            if config.multi_tenancy.enabled && !config.multi_tenancy.tenants.is_empty() {
-                use crate::multi_tenancy::{
-                    IdentificationMethod, IsolationStrategy, MultiTenancyConfig, TenantConfig,
-                    TenantId, TenantManagerBuilder, TenantQueryTransformer,
-                };
-                let mt = &config.multi_tenancy;
-                let identification = match mt.identify_by.as_str() {
-                    "database" => IdentificationMethod::DatabaseName,
-                    param => IdentificationMethod::Header {
-                        header_name: param.to_string(),
-                    },
-                };
-                let mtc = MultiTenancyConfig {
-                    enabled: true,
-                    identification,
-                    ..Default::default()
-                };
-                // Configure which tables are tenant-scoped + the filter column.
-                let table_refs: Vec<&str> = mt.tenant_tables.iter().map(|s| s.as_str()).collect();
-                let transformer = TenantQueryTransformer::new()
-                    .register_tables(&table_refs, mt.tenant_column.clone())
-                    .with_refused_functions(&mt.refused_functions);
-                let tm = TenantManagerBuilder::new()
-                    .config(mtc)
-                    .query_transformer(transformer)
-                    .build();
-                for id in &mt.tenants {
-                    tm.register_tenant(TenantConfig::new(
-                        TenantId::new(id.clone()),
-                        IsolationStrategy::row("public", mt.tenant_column.clone()),
-                    ));
-                }
-                tracing::info!(
-                    tenants = mt.tenants.len(),
-                    identify_by = %mt.identify_by,
-                    "multi-tenancy enabled"
-                );
-                Some(Arc::new(tm))
-            } else {
-                None
+        let tenant_manager = if config.multi_tenancy.enabled
+            && !config.multi_tenancy.tenants.is_empty()
+        {
+            use crate::multi_tenancy::{
+                IdentificationMethod, IsolationStrategy, MultiTenancyConfig, TenantConfig,
+                TenantId, TenantManagerBuilder, TenantQueryTransformer,
             };
+            let mt = &config.multi_tenancy;
+            let identification = match mt.identify_by.as_str() {
+                "database" => IdentificationMethod::DatabaseName,
+                param => IdentificationMethod::Header {
+                    header_name: param.to_string(),
+                },
+            };
+            // `unknown_tenant = "refuse"`: a session with no identified
+            // tenant may not run statements on the tenant tables.
+            let refuse_unknown_tenant_tables = match mt.unknown_tenant {
+                crate::config::UnknownTenantPolicy::Refuse if !mt.tenant_tables.is_empty() => Some(
+                    mt.tenant_tables
+                        .iter()
+                        .map(|t| t.rsplit('.').next().unwrap_or(t).to_ascii_lowercase())
+                        .collect(),
+                ),
+                _ => None,
+            };
+            let mtc = MultiTenancyConfig {
+                enabled: true,
+                identification,
+                refuse_unknown_tenant_tables,
+                ..Default::default()
+            };
+            // Configure which tables are tenant-scoped + the filter column.
+            let table_refs: Vec<&str> = mt.tenant_tables.iter().map(|s| s.as_str()).collect();
+            let transformer = TenantQueryTransformer::new()
+                .register_tables(&table_refs, mt.tenant_column.clone())
+                .with_refused_functions(&mt.refused_functions);
+            let tm = TenantManagerBuilder::new()
+                .config(mtc)
+                .query_transformer(transformer)
+                .build();
+            for id in &mt.tenants {
+                tm.register_tenant(TenantConfig::new(
+                    TenantId::new(id.clone()),
+                    IsolationStrategy::row("public", mt.tenant_column.clone()),
+                ));
+            }
+            tracing::info!(
+                tenants = mt.tenants.len(),
+                identify_by = %mt.identify_by,
+                "multi-tenancy enabled"
+            );
+            Some(Arc::new(tm))
+        } else {
+            None
+        };
 
         // Build the schema/workload query analyzer when enabled.
         #[cfg(feature = "schema-routing")]

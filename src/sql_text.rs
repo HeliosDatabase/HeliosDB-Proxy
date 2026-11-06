@@ -2183,10 +2183,77 @@ pub(crate) fn unicode_escaped_identifier(sql: &[u8]) -> bool {
         .any(|at| at > 0 && sql[at - 1].eq_ignore_ascii_case(&b'u'))
 }
 
+/// The identifiers of `sql`'s code, in text order: each unquoted word of the
+/// text pieces, ASCII-lower-cased, and each quoted identifier unquoted (with
+/// `""` unescaped, lower-cased too). String literals, dollar-quoted bodies,
+/// comments and numbers yield nothing; a qualified name yields each of its
+/// parts. The rest of the text after a piece the lexer cannot read
+/// ([`Piece::Rest`], an unterminated token) is code, so it yields its words:
+/// fail-closed.
+#[cfg(any(feature = "multi-tenancy", test))]
+pub(crate) fn code_identifiers(sql: &str) -> impl Iterator<Item = Cow<'_, str>> + '_ {
+    Pieces::new(sql).flat_map(|(_, piece)| -> Vec<Cow<'_, str>> {
+        match piece {
+            Piece::Text(t) | Piece::Rest(t) => text_words(t).collect(),
+            Piece::Ident(t) => {
+                let inner = &t[1..t.len() - 1];
+                let unescaped = if inner.contains("\"\"") {
+                    Cow::Owned(inner.replace("\"\"", "\""))
+                } else {
+                    Cow::Borrowed(inner)
+                };
+                vec![lower(unescaped)]
+            }
+            Piece::Space(_)
+            | Piece::Comment(_)
+            | Piece::Str(_)
+            | Piece::Dollar(..)
+            | Piece::Number(_) => Vec::new(),
+        }
+    })
+}
+
+/// The words of a text piece: runs of letters, digits, `_` and `$`.
+#[cfg(any(feature = "multi-tenancy", test))]
+fn text_words(text: &str) -> impl Iterator<Item = Cow<'_, str>> {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+        .filter(|w| !w.is_empty())
+        .map(|w| lower(Cow::Borrowed(w)))
+}
+
+/// `text` ASCII-lower-cased, borrowed when it has no upper-case letter.
+#[cfg(any(feature = "multi-tenancy", test))]
+fn lower(text: Cow<'_, str>) -> Cow<'_, str> {
+    if text.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(text.to_ascii_lowercase())
+    } else {
+        text
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::hash_map::DefaultHasher;
+
+    #[test]
+    fn code_identifiers_skip_literals_comments_and_dollar_bodies() {
+        let ids = |sql: &str| {
+            code_identifiers(sql)
+                .map(|c| c.into_owned())
+                .collect::<Vec<String>>()
+        };
+        assert_eq!(ids("select * from Orders"), ["select", "from", "orders"]);
+        assert_eq!(ids("select 'orders' -- orders\n"), ["select"]);
+        assert_eq!(ids("/* orders */ select $$orders$$"), ["select"]);
+        assert_eq!(ids("select \"Or\"\"ders\".x"), ["select", "or\"ders", "x"]);
+        assert_eq!(ids("select public.orders"), ["select", "public", "orders"]);
+        // An unterminated literal: the rest is code.
+        assert_eq!(
+            ids("select 'x from orders"),
+            ["select", "x", "from", "orders"]
+        );
+    }
 
     /// The cache key the normalizer derives: text, then the literals.
     fn key(sql: &str) -> u64 {
