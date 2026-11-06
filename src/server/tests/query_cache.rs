@@ -1361,6 +1361,86 @@ fn locking_and_volatile_checks_stay_case_insensitive() {
     ));
 }
 
+/// Volatile / session-scoped functions the original list missed (Sprinter
+/// 87c5caf119f8): each one's result changes between calls or between
+/// sessions, so a cached read of it would serve a stale or foreign value.
+#[test]
+fn volatile_functions_missing_from_the_old_list_refuse_the_cache() {
+    for sql in [
+        "SELECT LOCALTIME",
+        "SELECT localtimestamp",
+        "SELECT localtime()",
+        "select transaction_timestamp()",
+        "select timeofday()",
+        "select txid_current()",
+        "select txid_current_if_assigned()",
+        "select txid_current_snapshot()",
+        "select pg_current_xact_id()",
+        "select pg_current_xact_id_if_assigned()",
+        "select pg_current_snapshot()",
+        "select setseed(0.5)",
+        "select currval('s')",
+        "select lastval()",
+        "select pg_backend_pid()",
+        "select inet_client_addr()",
+        "select inet_client_port()",
+        "select inet_server_addr()",
+        "select inet_server_port()",
+        "select current_setting('search_path')",
+        "SELECT current_user",
+        "select current_role",
+        "select session_user",
+    ] {
+        assert!(!ProxyServer::is_cacheable_read_sql(sql), "{sql}");
+    }
+}
+
+/// The special timestamp input literals resolve against the clock at parse
+/// time (`'now'::timestamptz` is `now()` in disguise).
+#[test]
+fn special_timestamp_literals_refuse_the_cache() {
+    for sql in [
+        "SELECT 'now'::timestamptz",
+        "select timestamp 'today'",
+        "select date 'tomorrow'",
+        "select 'yesterday'::date",
+        "select v from t where ts > 'now'",
+    ] {
+        assert!(!ProxyServer::is_cacheable_read_sql(sql), "{sql}");
+    }
+}
+
+/// The new families match regardless of letter case, like the old ones.
+#[test]
+fn new_volatile_families_match_case_insensitively() {
+    assert!(!ProxyServer::is_cacheable_read_sql("SELECT LOCALTIMESTAMP"));
+    assert!(!ProxyServer::is_cacheable_read_sql("select Txid_Current()"));
+    assert!(!ProxyServer::is_cacheable_read_sql(
+        "SELECT PG_BACKEND_PID()"
+    ));
+    assert!(!ProxyServer::is_cacheable_read_sql(
+        "SELECT 'NOW'::timestamptz"
+    ));
+    assert!(!ProxyServer::is_cacheable_read_sql(
+        "select Inet_Client_Addr()"
+    ));
+}
+
+/// Reads that merely contain a name fragment, or a quoted word that is not
+/// one of the special literals, stay cacheable.
+#[test]
+fn reads_without_volatile_functions_stay_cacheable() {
+    assert!(ProxyServer::is_cacheable_read_sql(
+        "select lastname, setup, txid from t where s = 'nowhere'"
+    ));
+    assert!(ProxyServer::is_cacheable_read_sql(
+        "select currency, timeofday_label from t where k = 'epoch'"
+    ));
+    assert!(ProxyServer::is_cacheable_read_sql(
+        "select v from t where name = 'Tomorrowland' and inet_note = 'x'"
+    ));
+}
+
 /// Non-ASCII bytes in the SQL text must not panic the lowercasing
 /// buffer (`to_ascii_lowercase` only touches ASCII bytes, so UTF-8
 /// validity is preserved) and must not be case-folded — same

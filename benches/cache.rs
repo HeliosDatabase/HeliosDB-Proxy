@@ -699,6 +699,45 @@ fn bench_heatmap(c: &mut Criterion) {
 #[cfg(not(feature = "query-cache"))]
 fn bench_heatmap(_c: &mut Criterion) {}
 
+/// The volatile-function refusal every cacheable read pays while a result
+/// cache runs (Sprinter 87c5caf119f8): one Aho-Corasick pass over the
+/// statement against the built-in list, the row-locking clauses and the
+/// literal forms. A short read and a 1 KiB read, neither naming a volatile
+/// function, so the scan runs to the end of the text.
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+fn bench_volatile_scan(c: &mut Criterion) {
+    use heliosdb_proxy::sql_text::VolatileScan;
+    use std::time::Duration;
+    let scan = VolatileScan::builtin();
+    let short = "SELECT id, total FROM orders WHERE id = 42 AND status = 'open'";
+    let mut long = String::from("SELECT o.id, o.total, c.name FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.id IN (");
+    let mut i = 0u32;
+    while long.len() < 1024 {
+        if i > 0 {
+            long.push(',');
+        }
+        long.push_str(&i.to_string());
+        i += 1;
+    }
+    long.push(')');
+    assert!(!scan.refuses(short));
+    assert!(!scan.refuses(&long));
+    let mut group = c.benchmark_group("cache/policy");
+    group.sample_size(50);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
+    group.bench_function("volatile_scan_short", |b| {
+        b.iter(|| black_box(scan.refuses(black_box(short))))
+    });
+    group.bench_function("volatile_scan_1k", |b| {
+        b.iter(|| black_box(scan.refuses(black_box(&long))))
+    });
+    group.finish();
+}
+
+#[cfg(not(any(feature = "query-cache", feature = "edge-proxy")))]
+fn bench_volatile_scan(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_l2_cache,
@@ -706,6 +745,7 @@ criterion_group!(
     bench_edge_fingerprint,
     bench_semantic_cache,
     bench_exclusions,
-    bench_heatmap
+    bench_heatmap,
+    bench_volatile_scan
 );
 criterion_main!(benches);

@@ -331,10 +331,24 @@ impl ProxyServer {
 
     /// Pure predicate: is `sql` a plain, deterministic, SINGLE-statement
     /// SELECT safe to cache? (Not WITH/locking/volatile/multi-statement/
-    /// SELECT INTO.) Transaction state is checked separately. Shared by the
-    /// query-cache and edge-cache read gates.
-    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    /// SELECT INTO.) Uses the built-in volatile list
+    /// ([`crate::sql_text::VolatileScan::builtin`]); a result cache that
+    /// configures `[cache] extra_volatile_functions` calls
+    /// [`Self::is_cacheable_read_sql_with`] with its own scan. Transaction
+    /// state is checked separately. Shared by the query-cache and edge-cache
+    /// read gates.
+    #[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
     pub(super) fn is_cacheable_read_sql(sql: &str) -> bool {
+        Self::is_cacheable_read_sql_with(sql, crate::sql_text::VolatileScan::builtin())
+    }
+
+    /// [`Self::is_cacheable_read_sql`] against an explicit `volatile` scan
+    /// (the built-in list plus `[cache] extra_volatile_functions`).
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) fn is_cacheable_read_sql_with(
+        sql: &str,
+        volatile: &crate::sql_text::VolatileScan,
+    ) -> bool {
         use crate::protocol::starts_with_ci;
         let t = sql.trim_start();
         if !starts_with_ci(t, "SELECT") {
@@ -358,37 +372,12 @@ impl ProxyServer {
         if Self::contains_word_ci(core, "into") {
             return false;
         }
-        // The remaining checks are all "does `t` contain one of these
-        // needles, case-insensitively" — instead of the 13 separate
-        // windowed case-insensitive scans (FOR UPDATE, FOR SHARE, 11
-        // VOLATILE tokens) that used to each walk `t` byte-by-byte,
-        // lowercase `t` ONCE into a scratch buffer and do plain `str::contains`
-        // checks against it (Two-Way substring search — no SIMD, but a single
-        // linear scan replacing 13 windowed case-insensitive ones is still a
-        // clear win). ASCII-only lowercasing (`to_ascii_lowercase`) leaves any
-        // non-ASCII bytes untouched, matching `contains_ci`'s byte-for-byte
-        // semantics for non-ASCII input.
-        let lower = t.to_ascii_lowercase();
-        if lower.contains("for update") || lower.contains("for share") {
-            return false;
-        }
-        // Non-deterministic or side-effectful reads must not be reused
-        // (set_config emits ParameterStatus and mutates GUCs — replaying it
-        // would suppress the side effect).
-        const VOLATILE: [&str; 11] = [
-            "now(",
-            "current_timestamp",
-            "current_date",
-            "current_time",
-            "clock_timestamp",
-            "statement_timestamp",
-            "random(",
-            "nextval(",
-            "uuid_generate",
-            "gen_random_uuid",
-            "set_config(",
-        ];
-        !VOLATILE.iter().any(|v| lower.contains(v))
+        // Row-locking clauses, non-deterministic reads (clock, random,
+        // sequences, transaction ids, per-connection values) and side-effecting
+        // calls (`set_config` emits ParameterStatus and mutates GUCs; replaying
+        // it would suppress the side effect) are all one ASCII-case-insensitive
+        // Aho-Corasick pass inside `volatile`. Allocation-free.
+        !volatile.refuses(t)
     }
 
     /// Whether a result cache would look up a cacheable read of `session`

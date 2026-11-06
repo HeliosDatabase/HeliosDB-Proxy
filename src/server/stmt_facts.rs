@@ -182,14 +182,13 @@ impl<'a> StmtFacts<'a> {
         )
     }
 
-    /// See [`ProxyServer::is_cacheable_read_sql`].
+    /// See [`ProxyServer::is_cacheable_read_sql_with`]: `volatile` is the
+    /// result cache's scan (built-in list plus `extra_volatile_functions`).
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
-    pub(super) fn is_cacheable_read(&mut self) -> bool {
-        Self::memo(
-            &mut self.is_cacheable_read,
-            self.sql,
-            ProxyServer::is_cacheable_read_sql,
-        )
+    pub(super) fn is_cacheable_read(&mut self, volatile: &crate::sql_text::VolatileScan) -> bool {
+        Self::memo(&mut self.is_cacheable_read, self.sql, |sql| {
+            ProxyServer::is_cacheable_read_sql_with(sql, volatile)
+        })
     }
 
     /// See [`ProxyServer::standby_safe_read`].

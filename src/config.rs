@@ -1746,6 +1746,13 @@ pub struct CacheToml {
     /// returns the other's rows without naming it). Counted in
     /// `heliosdb_proxy_cache_excluded_total`. Default empty.
     pub exclude_tables: Vec<String>,
+    /// Extra volatile functions for both result caches: names or prefixes
+    /// (ASCII, no whitespace or control characters; matched
+    /// case-insensitively as substrings of the statement, like the built-in
+    /// list). A read naming one is never cached, in either tier. Add a
+    /// user-defined function here if it returns different values per call or
+    /// per session. Startup only. Default empty.
+    pub extra_volatile_functions: Vec<String>,
     /// Per-table settings (`[[cache.tables]]`). Kept last: TOML writes
     /// arrays of tables after plain values.
     pub tables: Vec<CacheTableToml>,
@@ -1910,6 +1917,18 @@ pub(crate) const POSTGRES_RESERVED_WORDS: &[&str] = &[
     "window",
     "with",
 ];
+
+/// Validation of one `[cache] extra_volatile_functions` entry: a non-empty
+/// ASCII name or prefix with no whitespace or control characters.
+pub(crate) fn extra_volatile_name_error(name: &str) -> Option<String> {
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_graphic()) {
+        return Some(format!(
+            "cache.extra_volatile_functions entry {name:?} must be a non-empty ASCII function \
+             name or prefix with no whitespace or control characters"
+        ));
+    }
+    None
+}
 
 /// Why the `[cache]` table name `name`, given as `what`, is refused, if it
 /// is: not a bare identifier, or a PostgreSQL reserved word.
@@ -2124,6 +2143,11 @@ impl CacheToml {
         }
         for name in &self.exclude_tables {
             if let Some(error) = cache_table_name_error("cache.exclude_tables entry", name) {
+                return bad(error);
+            }
+        }
+        for name in &self.extra_volatile_functions {
+            if let Some(error) = extra_volatile_name_error(name) {
                 return bad(error);
             }
         }
@@ -2408,6 +2432,7 @@ impl Default for CacheToml {
             heatmap_max_tables: 1024,
             heatmap_min_samples: 100,
             exclude_tables: Vec::new(),
+            extra_volatile_functions: Vec::new(),
             tables: Vec::new(),
         }
     }
@@ -7156,6 +7181,39 @@ database = "helios"
         assert_eq!(parsed.max_cacheable_response_bytes, 4 * 1024 * 1024);
         let parsed: CacheToml = toml::from_str("max_cacheable_response_bytes = 8192\n").unwrap();
         assert_eq!(parsed.max_cacheable_response_bytes, 8192);
+    }
+
+    /// `[cache] extra_volatile_functions` (Sprinter 87c5caf119f8): a list of
+    /// names or prefixes, empty by default, documented (no ignored-key
+    /// warning), and every entry validated as an ASCII name or prefix with no
+    /// whitespace or control characters. An error names the key.
+    #[test]
+    fn extra_volatile_functions_parse_and_validate() {
+        let node = "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n";
+        let (config, ignored) = deserialize_reporting_ignored_paths(&format!(
+            "[cache]\nextra_volatile_functions = [\"my_clock\", \"Audit_\"]\n{node}"
+        ))
+        .unwrap();
+        assert!(ignored.is_empty(), "{ignored:?}");
+        assert_eq!(
+            config.cache.extra_volatile_functions,
+            ["my_clock", "Audit_"]
+        );
+        assert!(config.cache.validate_semantic_and_tables().is_ok());
+        assert!(CacheToml::default().extra_volatile_functions.is_empty());
+        assert!(known_config_keys().contains("cache.extra_volatile_functions"));
+        for bad in ["\"\"", "\"my clock\"", "\"caf\\u00e9\"", "\"tab\\there\""] {
+            let cache: CacheToml =
+                toml::from_str(&format!("extra_volatile_functions = [{bad}]")).unwrap();
+            let err = cache
+                .validate_semantic_and_tables()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("cache.extra_volatile_functions"),
+                "{bad}: {err}"
+            );
+        }
     }
 
     const CACHE_KEYS_TOML: &str = r#"

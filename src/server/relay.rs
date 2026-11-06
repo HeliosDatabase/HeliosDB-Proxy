@@ -268,7 +268,7 @@ impl ProxyServer {
                 .in_transaction
                 .load(std::sync::atomic::Ordering::Relaxed)
             && Self::result_cache_consulted(session, state, config)
-            && facts.is_cacheable_read()
+            && facts.is_cacheable_read(&state.volatile_scan)
             && Self::cache_refuses(state, facts.sql());
         #[cfg(feature = "edge-proxy")]
         let edge_ctx: Option<(
@@ -290,7 +290,7 @@ impl ProxyServer {
             let sql = facts.sql();
             // Same gate as the query-cache: a plain deterministic SELECT, and
             // never mid-transaction (visibility would be wrong).
-            if facts.is_cacheable_read()
+            if facts.is_cacheable_read(&state.volatile_scan)
                 && !session
                     .in_transaction
                     .load(std::sync::atomic::Ordering::Relaxed)
@@ -379,35 +379,39 @@ impl ProxyServer {
         // once instead of twice. A `cache=skip` read keeps no context, so no
         // capture is armed for it.
         #[cfg(feature = "query-cache")]
-        let cache_ctx: Option<(crate::cache::CacheContext, crate::cache::QueryPrep)> =
-            if is_write || continues_cycle.is_some() || cache_refused {
-                None
-            } else if let Some(qc) = state.query_cache.as_ref() {
-                let sql = facts.sql();
-                match Self::cacheable_read_ctx(session, facts.is_cacheable_read()).await {
-                    Some(ctx) => {
-                        // [routing_hints] strip_hints, a rewrite or the tenant
-                        // transform may have removed the client's cache hints
-                        // from the forwarded text: read them from the client's
-                        // own text as well.
-                        let client_sql = (!std::ptr::eq(forward_msg, msg))
-                            .then(|| crate::protocol::query_text(&msg.payload))
-                            .flatten();
-                        let (lookup, prep) = qc.get_with_prep_hinted(sql, client_sql, &ctx).await;
-                        if let crate::cache::CacheLookup::Hit { result, level } = lookup {
-                            tracing::debug!(target: "helios::cache", level = %level, "cache hit");
-                            client.write_all(&result.data).await.map_err(|e| {
-                                ProxyError::Network(format!("Client write error: {}", e))
-                            })?;
-                            return Ok((None, result.data.len() as u64));
-                        }
-                        prep.storable().then_some((ctx, prep))
+        let cache_ctx: Option<(crate::cache::CacheContext, crate::cache::QueryPrep)> = if is_write
+            || continues_cycle.is_some()
+            || cache_refused
+        {
+            None
+        } else if let Some(qc) = state.query_cache.as_ref() {
+            let sql = facts.sql();
+            match Self::cacheable_read_ctx(session, facts.is_cacheable_read(&state.volatile_scan))
+                .await
+            {
+                Some(ctx) => {
+                    // [routing_hints] strip_hints, a rewrite or the tenant
+                    // transform may have removed the client's cache hints
+                    // from the forwarded text: read them from the client's
+                    // own text as well.
+                    let client_sql = (!std::ptr::eq(forward_msg, msg))
+                        .then(|| crate::protocol::query_text(&msg.payload))
+                        .flatten();
+                    let (lookup, prep) = qc.get_with_prep_hinted(sql, client_sql, &ctx).await;
+                    if let crate::cache::CacheLookup::Hit { result, level } = lookup {
+                        tracing::debug!(target: "helios::cache", level = %level, "cache hit");
+                        client.write_all(&result.data).await.map_err(|e| {
+                            ProxyError::Network(format!("Client write error: {}", e))
+                        })?;
+                        return Ok((None, result.data.len() as u64));
                     }
-                    None => None,
+                    prep.storable().then_some((ctx, prep))
                 }
-            } else {
-                None
-            };
+                None => None,
+            }
+        } else {
+            None
+        };
 
         // Schema/workload routing: pin an analytical (OLAP) read to the
         // configured analytics node, unless something already forced a target.

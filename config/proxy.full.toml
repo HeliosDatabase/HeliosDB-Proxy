@@ -438,6 +438,10 @@ max_cacheable_response_bytes = 4194304
 # literal of the same name also excludes the read). List views and functions
 # over them too. Counted in heliosdb_proxy_cache_excluded_total.
 exclude_tables = []
+# Extra volatile functions (names or prefixes, case-insensitive) for user-defined
+# functions whose value changes per call or per session: a read naming one is never
+# cached, on top of the built-in list. Startup only.
+# extra_volatile_functions = ["my_clock", "audit_next_"]
 
 # Semantic tier (L3), opt-in twice: this switch, and a /*helios:cache=semantic*/
 # hint on each statement that may use it. Only single-table SELECTs of its

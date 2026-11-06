@@ -99,7 +99,7 @@ fn facts_agree_with_legacy_classifiers() {
         );
         #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
         assert_eq!(
-            f.is_cacheable_read(),
+            f.is_cacheable_read(crate::sql_text::VolatileScan::builtin()),
             ProxyServer::is_cacheable_read_sql(sql),
             "is_cacheable_read mismatch for {sql:?}"
         );
@@ -162,8 +162,8 @@ fn each_fact_is_classified_at_most_once() {
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     {
         let before = stmt_fact_classifications();
-        let _ = f.is_cacheable_read();
-        let _ = f.is_cacheable_read();
+        let _ = f.is_cacheable_read(crate::sql_text::VolatileScan::builtin());
+        let _ = f.is_cacheable_read(crate::sql_text::VolatileScan::builtin());
         assert_eq!(stmt_fact_classifications() - before, 1);
     }
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
@@ -189,7 +189,7 @@ fn rebuilding_on_changed_sql_clears_the_memo() {
     let mut before = StmtFacts::new(hinted);
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     assert!(
-        !before.is_cacheable_read(),
+        !before.is_cacheable_read(crate::sql_text::VolatileScan::builtin()),
         "leading comment masks the SELECT lead"
     );
     #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
@@ -208,7 +208,7 @@ fn rebuilding_on_changed_sql_clears_the_memo() {
     let count_before = stmt_fact_classifications();
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     assert!(
-        after.is_cacheable_read(),
+        after.is_cacheable_read(crate::sql_text::VolatileScan::builtin()),
         "the stripped SELECT is cacheable"
     );
     #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
@@ -268,7 +268,7 @@ fn of_query_reads_the_message_payload() {
     #[cfg(any(feature = "pool-modes", feature = "edge-proxy"))]
     assert!(!f.leaves_session_state());
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
-    assert!(!f.is_cacheable_read());
+    assert!(!f.is_cacheable_read(crate::sql_text::VolatileScan::builtin()));
     #[cfg(feature = "edge-proxy")]
     assert!(!f.has_interior_semicolon());
 }

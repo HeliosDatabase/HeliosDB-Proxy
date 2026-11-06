@@ -137,6 +137,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cell data are now truncated; raise the keys (up to 1000000 rows and 1 GiB) if agents depend
   on larger results. Counted by `heliosdb_proxy_mcp_results_truncated_total`. Sprinter
   b2cbd0f6f29d.
+- **Result cache: volatile reads were served stale.** The refusal list missed functions and
+  literals whose value changes per call or per session, so a cached `SELECT` of one returned
+  a stale or another session's value. Now refused, in both the query cache and the edge
+  cache: `localtime`/`localtimestamp`, `transaction_timestamp`, `timeofday`,
+  `txid_current*`, `pg_current_xact_id*`, `pg_current_snapshot`, `setseed`, `currval`,
+  `lastval`, `pg_backend_pid`, `inet_client_*`/`inet_server_*`, the session-state reads
+  `current_setting`, `current_user`, `current_role`, `session_user` (the cache key carries
+  neither `SET ROLE` nor GUCs), and the special timestamp
+  literals `'now'`, `'today'`, `'tomorrow'`, `'yesterday'` (over-refusal when such a literal
+  is plain data only means that read is not cached). The scan is one Aho-Corasick pass over
+  the statement with no lower-casing allocation. Sprinter 87c5caf119f8.
+- **Result cache: `[cache] extra_volatile_functions`.** New key (default `[]`): names or
+  prefixes of user-defined volatile functions that also make both result caches refuse a
+  read. Validated at startup; restart to change. Sprinter 87c5caf119f8.
 
 ### Security
 

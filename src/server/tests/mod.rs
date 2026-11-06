@@ -20,6 +20,8 @@ mod startup_terminal;
 mod startup_wait;
 mod stmt_facts;
 mod tls_reload;
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+mod volatile_scan;
 
 /// A connected loopback `TcpStream` pair, shared by the relay tests
 /// below that need a real socket (so `try_read_buf`/`WouldBlock`
@@ -494,6 +496,10 @@ async fn test_apply_authenticate_hook_with_manager_no_plugins_defers() {
         query_cache: None,
         #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
         table_exclusions: None,
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        volatile_scan: Arc::new(crate::sql_text::VolatileScan::new(
+            std::iter::empty::<&str>(),
+        )),
         #[cfg(feature = "edge-proxy")]
         edge_table_ttls: None,
         #[cfg(feature = "query-rewriting")]

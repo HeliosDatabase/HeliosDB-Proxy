@@ -3823,3 +3823,120 @@ mod tests {
         );
     }
 }
+
+/// Functions, keywords and literals whose value changes between calls, or
+/// depends on the session or connection that runs the read, so a cached read
+/// of one is never reused (Sprinter 87c5caf119f8). Each entry is a substring
+/// matched ASCII-case-insensitively against the whole statement; an entry
+/// that is a family name (`localtime`, `txid_current`) also covers every name
+/// it prefixes (`localtimestamp`, `txid_current_snapshot`).
+///
+/// Matching is lexical, so over-refusal is the accepted failure mode: a
+/// column or literal that happens to contain one of these fragments (`'now'`
+/// as plain data, say) only means that read is not cached.
+const VOLATILE_FUNCTION_PATTERNS: &[&str] = &[
+    // Clock reads.
+    "now(",
+    "current_timestamp",
+    "current_date",
+    "current_time",
+    "localtime",
+    "clock_timestamp",
+    "statement_timestamp",
+    "transaction_timestamp",
+    "timeofday(",
+    // Random values, and sequence / GUC / PRNG side effects.
+    "random(",
+    "setseed(",
+    "nextval(",
+    "currval(",
+    "lastval(",
+    "uuid_generate",
+    "gen_random_uuid",
+    "set_config(",
+    // Transaction ids and snapshots: they change per transaction.
+    "txid_current",
+    "pg_current_xact_id",
+    "pg_current_snapshot",
+    // Per-connection values: two sessions sharing one entry would see the
+    // other's answer.
+    "pg_backend_pid",
+    "inet_client_",
+    "inet_server_",
+    // Session state the cache key does not carry (SET ROLE, GUCs).
+    "current_setting(",
+    "current_user",
+    "current_role",
+    "session_user",
+    // Special timestamp input literals: parsed against the clock at read time.
+    "'now'",
+    "'today'",
+    "'tomorrow'",
+    "'yesterday'",
+];
+
+/// Row-locking clauses: a locking read must reach the primary and is never
+/// served from a cache.
+const LOCKING_CLAUSE_PATTERNS: &[&str] = &["for update", "for share"];
+
+/// One-pass refusal scan for result caches: the built-in volatile list, the
+/// row-locking clauses and the operator's `[cache] extra_volatile_functions`
+/// in a single Aho-Corasick automaton, so a read costs one linear pass over
+/// its text with no lower-casing allocation.
+///
+/// Built once: [`VolatileScan::builtin`] for the default list, or
+/// [`VolatileScan::new`] at startup for a list with extras.
+#[derive(Debug)]
+pub struct VolatileScan {
+    /// `None` only if the automaton could not be built (never for a realistic
+    /// list); every statement is then refused (fail-closed).
+    automaton: Option<aho_corasick::AhoCorasick>,
+}
+
+impl VolatileScan {
+    /// The scan over the built-in list alone.
+    pub fn builtin() -> &'static VolatileScan {
+        static BUILTIN: once_cell::sync::Lazy<VolatileScan> =
+            once_cell::sync::Lazy::new(|| VolatileScan::new(std::iter::empty::<&str>()));
+        &BUILTIN
+    }
+
+    /// The built-in list plus `extra` (names or prefixes, validated by
+    /// [`crate::config::extra_volatile_name_error`]; matched case-insensitively).
+    pub fn new<I, S>(extra: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let patterns: Vec<String> = VOLATILE_FUNCTION_PATTERNS
+            .iter()
+            .chain(LOCKING_CLAUSE_PATTERNS.iter())
+            .map(|p| (*p).to_string())
+            .chain(extra.into_iter().map(|n| n.as_ref().to_ascii_lowercase()))
+            .collect();
+        let automaton = match aho_corasick::AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(&patterns)
+        {
+            Ok(automaton) => Some(automaton),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "volatile-function scan could not be built: every cached read is refused \
+                     (fail-closed)"
+                );
+                None
+            }
+        };
+        Self { automaton }
+    }
+
+    /// Whether a result cache must refuse `sql`: it names a volatile function
+    /// or special literal, an extra, or a row-locking clause. Allocation-free.
+    pub fn refuses(&self, sql: &str) -> bool {
+        match &self.automaton {
+            Some(automaton) => automaton.is_match(sql),
+            None => true,
+        }
+    }
+}

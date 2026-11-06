@@ -429,6 +429,11 @@ struct ServerState {
     /// `[cache]` nor `[edge]` is enabled. Built once at startup.
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     table_exclusions: Option<Arc<crate::sql_text::TableExclusions>>,
+    /// The result caches' volatile-function scan: the built-in list plus
+    /// `[cache] extra_volatile_functions`, checked by the relay ahead of both
+    /// caches. Built once at startup, like `table_exclusions`.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    volatile_scan: Arc<crate::sql_text::VolatileScan>,
     /// The `[[cache.tables]]` TTLs shorter than `[edge] default_ttl_secs`:
     /// an edge entry lives at most as long as the shortest of them its read
     /// names (fail-closed scan). `None` when `[edge]` is off or no table TTL
@@ -1025,6 +1030,12 @@ impl ProxyServer {
             (caching && !names.is_empty())
                 .then(|| Arc::new(crate::sql_text::TableExclusions::new(names)))
         };
+        // Volatile-function refusal, shared by both result caches: the built-in
+        // list plus the operator's extras. Always built (startup only; cheap).
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        let volatile_scan = Arc::new(crate::sql_text::VolatileScan::new(
+            &config.cache.extra_volatile_functions,
+        ));
         // Table TTLs bind the edge cache too, as a cap: an edge entry never
         // outlives a shorter `[[cache.tables]]` TTL of a table its read names.
         #[cfg(feature = "edge-proxy")]
@@ -1230,6 +1241,8 @@ impl ProxyServer {
             query_cache,
             #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
             table_exclusions,
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            volatile_scan,
             #[cfg(feature = "edge-proxy")]
             edge_table_ttls,
             #[cfg(feature = "query-rewriting")]
