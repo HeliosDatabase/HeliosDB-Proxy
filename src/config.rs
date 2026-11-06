@@ -747,8 +747,18 @@ pub struct McpConfig {
     /// `Authorization: Bearer <token>` is rejected. Absent (default) = open, so
     /// set this for any non-loopback deployment — like the HTTP/GraphQL
     /// gateways, MCP exposes SQL and must not be anonymous off localhost.
+    /// Its holders are the principal [`MCP_DEFAULT_PRINCIPAL`]; give each
+    /// agent its own token with [`Self::principals`] instead.
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// Per-agent principals (`[[mcp.principals]]`, Sprinter 20bcc218385f):
+    /// a request's bearer token selects its principal, the unit that, with
+    /// the request's tenant, isolates per-agent state (the tool-result
+    /// cache). With `auth_token` and no principals every caller is the one
+    /// principal `default`, as before; with any token configured a request
+    /// whose token matches none is refused (401).
+    #[serde(default)]
+    pub principals: Vec<McpPrincipal>,
     /// Per-request backend execution timeout, milliseconds. Was a hardcoded
     /// 30 s; must be > 0.
     #[serde(default = "default_gateway_query_timeout_ms")]
@@ -781,6 +791,91 @@ pub struct McpConfig {
     pub max_result_bytes: usize,
 }
 
+/// The principal of an MCP request authenticated by `[mcp] auth_token`, or
+/// of every request when no token is configured. Reserved: no
+/// `[[mcp.principals]]` entry may use it.
+pub const MCP_DEFAULT_PRINCIPAL: &str = "default";
+
+/// Longest `[[mcp.principals]] id`.
+pub const MCP_PRINCIPAL_ID_MAX_LEN: usize = 64;
+
+/// One `[[mcp.principals]]` entry: an agent and the bearer token that
+/// identifies it. The token is never serialised (so no config dump can carry
+/// it) nor printed by `Debug`, and validation errors name only the id.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct McpPrincipal {
+    /// `[A-Za-z0-9_.-]{1,64}`, unique; [`MCP_DEFAULT_PRINCIPAL`] is reserved.
+    pub id: String,
+    /// The bearer token; non-empty, unique, and not `[mcp] auth_token`.
+    #[serde(default, skip_serializing)]
+    pub token: String,
+}
+
+impl std::fmt::Debug for McpPrincipal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpPrincipal")
+            .field("id", &self.id)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Why a `[[mcp.principals]] id` is invalid, or `None`.
+fn mcp_principal_id_error(id: &str) -> Option<String> {
+    if id.is_empty() || id.len() > MCP_PRINCIPAL_ID_MAX_LEN {
+        return Some(format!(
+            "must be 1 to {MCP_PRINCIPAL_ID_MAX_LEN} characters"
+        ));
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+    {
+        return Some("may hold only A-Z, a-z, 0-9, '_', '.' and '-'".to_string());
+    }
+    if id == MCP_DEFAULT_PRINCIPAL {
+        return Some(format!(
+            "{MCP_DEFAULT_PRINCIPAL:?} is reserved for [mcp] auth_token"
+        ));
+    }
+    None
+}
+
+impl McpConfig {
+    /// `[[mcp.principals]]`: ids well-formed and unique, tokens non-empty,
+    /// unique and distinct from `auth_token`. Errors name the entry by id
+    /// (or position), never a token.
+    fn validate_principals(&self) -> Result<()> {
+        let mut ids = std::collections::HashSet::new();
+        let mut tokens = std::collections::HashSet::new();
+        for (i, p) in self.principals.iter().enumerate() {
+            if let Some(why) = mcp_principal_id_error(&p.id) {
+                return Err(ProxyError::Config(format!("mcp.principals[{i}].id {why}")));
+            }
+            if !ids.insert(p.id.as_str()) {
+                return Err(ProxyError::Config(format!(
+                    "mcp.principals[{i}].id {:?} is used by an earlier entry",
+                    p.id
+                )));
+            }
+            if p.token.is_empty() {
+                return Err(ProxyError::Config(format!(
+                    "mcp.principals[{i}].token (id {:?}) must be non-empty",
+                    p.id
+                )));
+            }
+            if !tokens.insert(p.token.as_str()) || self.auth_token.as_deref() == Some(&p.token) {
+                return Err(ProxyError::Config(format!(
+                    "mcp.principals[{i}].token (id {:?}) is the token of another principal \
+                     or [mcp] auth_token: each token must name one principal",
+                    p.id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Upper bound accepted for `[mcp] max_result_rows`.
 pub const MCP_MAX_RESULT_ROWS_CEILING: usize = 1_000_000;
 /// Upper bound accepted for `[mcp] max_result_bytes` (1 GiB).
@@ -799,6 +894,7 @@ impl Default for McpConfig {
             read_only: true,
             contract: None,
             auth_token: None,
+            principals: Vec::new(),
             query_timeout_ms: default_gateway_query_timeout_ms(),
             max_concurrent_requests: default_gateway_max_concurrent_requests(),
             tenant_header: String::new(),
@@ -3765,6 +3861,9 @@ const KNOWN_KEYS_NOT_IN_DEFAULT: &[&str] = &[
     "cache.tables.name",
     "cache.tables.ttl_secs",
     "cache.tables.exclude",
+    "mcp.auth_token",
+    "mcp.principals.id",
+    "mcp.principals.token",
 ];
 
 /// Every dotted key path `ProxyConfig` knows, taken from a serialised default
@@ -4785,6 +4884,7 @@ impl ProxyConfig {
                 )));
             }
         }
+        self.mcp.validate_principals()?;
 
         Ok(())
     }
@@ -8621,6 +8721,101 @@ exclude = true
             mutate(&mut c);
             let err = c.validate().unwrap_err().to_string();
             assert!(err.contains(name), "{name}: unexpected error {err}");
+        }
+    }
+
+    #[test]
+    fn mcp_principals_parse_and_are_optional() {
+        let absent: ProxyConfig = toml::from_str("").expect("parse");
+        assert!(absent.mcp.principals.is_empty());
+        let mut config: ProxyConfig = toml::from_str(
+            "[mcp]\nenabled = true\nauth_token = \"shared\"\n\
+             [[mcp.principals]]\nid = \"etl-agent\"\ntoken = \"t-etl\"\n\
+             [[mcp.principals]]\nid = \"bi.agent_2\"\ntoken = \"t-bi\"\n",
+        )
+        .expect("parse");
+        assert_eq!(config.mcp.principals.len(), 2);
+        assert_eq!(config.mcp.principals[1].id, "bi.agent_2");
+        assert_eq!(config.mcp.principals[1].token, "t-bi");
+        config.add_node("localhost:5432", "primary").unwrap();
+        config.validate().expect("valid principals");
+        // The keys are known (no ignored-key warning, no did-you-mean).
+        let known = known_config_keys();
+        assert!(known.contains("mcp.principals.id"));
+        assert!(known.contains("mcp.principals.token"));
+    }
+
+    #[test]
+    fn mcp_principal_tokens_are_redacted() {
+        let p = McpPrincipal {
+            id: "etl-agent".into(),
+            token: "s3cret-token".into(),
+        };
+        let debug = format!("{p:?}");
+        assert!(
+            debug.contains("etl-agent") && !debug.contains("s3cret"),
+            "{debug}"
+        );
+        let mut c = ProxyConfig::default();
+        c.mcp.principals.push(p.clone());
+        let text = toml::to_string(&c).unwrap();
+        assert!(
+            !text.contains("s3cret"),
+            "a config dump never carries a token"
+        );
+        assert!(!format!("{:?}", c.mcp).contains("s3cret"));
+    }
+
+    #[test]
+    fn mcp_principals_validate_ids_and_tokens() {
+        let principal = |id: &str, token: &str| McpPrincipal {
+            id: id.into(),
+            token: token.into(),
+        };
+        let base = || {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            c.mcp.auth_token = Some("shared".into());
+            c
+        };
+        let mut ok = base();
+        ok.mcp.principals = vec![principal("a", "ta"), principal("B-1.x_y", "tb")];
+        ok.validate().expect("valid");
+        let long = "x".repeat(MCP_PRINCIPAL_ID_MAX_LEN);
+        ok.mcp.principals = vec![principal(&long, "t")];
+        ok.validate().expect("64 characters are allowed");
+
+        for (principals, want) in [
+            (
+                vec![principal("", "t")],
+                "mcp.principals[0].id must be 1 to 64",
+            ),
+            (
+                vec![principal(&"x".repeat(MCP_PRINCIPAL_ID_MAX_LEN + 1), "t")],
+                "must be 1 to 64",
+            ),
+            (vec![principal("a b", "t")], "may hold only"),
+            (vec![principal("ünï", "t")], "may hold only"),
+            (vec![principal("default", "t")], "reserved"),
+            (
+                vec![principal("a", "t1"), principal("a", "t2")],
+                "mcp.principals[1].id \"a\" is used by an earlier entry",
+            ),
+            (vec![principal("a", "")], "must be non-empty"),
+            (
+                vec![principal("a", "same"), principal("b", "same")],
+                "mcp.principals[1].token (id \"b\")",
+            ),
+            (vec![principal("a", "shared")], "auth_token"),
+        ] {
+            let mut c = base();
+            c.mcp.principals = principals;
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains(want), "want {want:?}, got {err}");
+            assert!(
+                !err.contains("same\"") && !err.contains("t1"),
+                "no token in {err}"
+            );
         }
     }
 

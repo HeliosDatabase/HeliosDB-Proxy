@@ -72,6 +72,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP: per-agent principals (`[[mcp.principals]]`, Sprinter 20bcc218385f).** Each
+  entry has an `id` (`[A-Za-z0-9_.-]{1,64}`, unique; `default` reserved) and a `token`
+  (non-empty, unique, not `auth_token`). The request's bearer token selects its
+  principal: the presented token's SHA-256 is compared in constant time against every
+  configured one, with no early exit; an unknown or missing token gets 401 once any
+  token is configured. Backward compatible: `[mcp] auth_token` keeps working, and its
+  holders (or every caller, with no token configured) are the principal `default`. The
+  principal, with the request's tenant, is the isolation unit for per-agent MCP state; it
+  is logged with each tool call, and tokens are never logged, serialised or shown by
+  `Debug`. Startup-only, like the rest of `[mcp]`. Library API: `config::McpPrincipal`,
+  `McpConfig::principals` (struct literals must set it), `MCP_DEFAULT_PRINCIPAL`.
 - **Query-cache refresh-ahead** (`[cache] refresh_ahead_ratio`, default `0.0` = off;
   `refresh_ahead_claim_timeout_ms`, default `5000`). Once an L1/L2 entry is at least
   ratio × its TTL old, exactly one read of it claims the refill: it is treated as a miss

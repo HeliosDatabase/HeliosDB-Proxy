@@ -2181,31 +2181,24 @@ mod gateway_writes {
     async fn mcp_gateway_write_retires_a_cached_pg_wire_read() {
         let (mut relay, backend) = cached_relay(1).await;
         let (port, seen) = start_gateway_backend().await;
-        let cfg = Arc::new(crate::config::McpConfig {
+        let cfg = crate::config::McpConfig {
             backend_port: port,
             read_only: false,
             ..Default::default()
-        });
+        };
         let policy = Arc::new(relay.server.gateway_policy());
         let pool: crate::gateway_pool::SharedBackendPool =
             Arc::new(crate::gateway_pool::BackendClientPool::new(0));
+        let shared = crate::mcp::McpServer::new(cfg, None, pool)
+            .with_policy(policy)
+            .into_shared();
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": "query", "arguments": { "sql": WRITE } }
         })
         .to_string();
         let resp = http_exchange(
-            move |stream, peer| {
-                crate::mcp::McpServer::handle_connection(
-                    stream,
-                    peer,
-                    cfg,
-                    Arc::new(None),
-                    pool,
-                    policy,
-                    Arc::new(tokio::sync::Semaphore::new(4)),
-                )
-            },
+            move |stream, peer| crate::mcp::McpServer::handle_connection(stream, peer, shared),
             post("/", &body),
         )
         .await;

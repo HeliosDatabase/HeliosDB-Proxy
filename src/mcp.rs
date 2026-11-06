@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
@@ -24,7 +25,7 @@ use crate::agent_contract::{self, AgentContract};
 use crate::backend::client::{BoundedQueryResult, QueryResult};
 use crate::backend::types::TextValue;
 use crate::backend::{tls::default_client_config, BackendConfig, TlsMode};
-use crate::config::McpConfig;
+use crate::config::{McpConfig, MCP_DEFAULT_PRINCIPAL};
 use crate::gateway_policy::{GatewayPolicy, RequestIdentity};
 use crate::{ProxyError, Result};
 
@@ -47,6 +48,82 @@ struct Gateway<'a> {
     peer: Option<std::net::IpAddr>,
     /// The tenant the request acts for (`[multi_tenancy]` + `tenant_header`).
     tenant: Option<&'a crate::gateway_policy::GatewayTenant>,
+    /// The principal the request's bearer token named ([`Principals`]).
+    principal: &'a str,
+}
+
+/// The bearer tokens the MCP gateway accepts and the principal each names:
+/// `[mcp] auth_token` names [`MCP_DEFAULT_PRINCIPAL`], each
+/// `[[mcp.principals]]` entry its `id` (Sprinter 20bcc218385f). Only the
+/// tokens' SHA-256 digests are kept.
+pub(crate) struct Principals {
+    /// `(principal id, SHA-256 of its token)`.
+    entries: Vec<(Arc<str>, [u8; 32])>,
+    /// [`MCP_DEFAULT_PRINCIPAL`], the principal of every request when no
+    /// token is configured.
+    default: Arc<str>,
+}
+
+impl Principals {
+    /// The principals `cfg` configures.
+    pub(crate) fn from_config(cfg: &McpConfig) -> Self {
+        let default: Arc<str> = Arc::from(MCP_DEFAULT_PRINCIPAL);
+        let digest = |token: &str| -> [u8; 32] { Sha256::digest(token.as_bytes()).into() };
+        let mut entries = Vec::with_capacity(cfg.principals.len() + 1);
+        if let Some(token) = cfg.auth_token.as_deref() {
+            entries.push((default.clone(), digest(token)));
+        }
+        for p in &cfg.principals {
+            entries.push((Arc::from(p.id.as_str()), digest(&p.token)));
+        }
+        Self { entries, default }
+    }
+
+    /// The principal a request whose `Authorization` header value is
+    /// `authorization` acts as: `default` when no token is configured;
+    /// otherwise the principal whose token its `Bearer` token is, found by
+    /// comparing SHA-256 digests in constant time against every principal,
+    /// with no early exit. `None` (answer 401) for a missing, malformed or
+    /// unknown token.
+    pub(crate) fn resolve(&self, authorization: Option<&str>) -> Option<Arc<str>> {
+        if self.entries.is_empty() {
+            return Some(self.default.clone());
+        }
+        let presented = authorization.and_then(|v| v.strip_prefix("Bearer "));
+        let digest: [u8; 32] = Sha256::digest(presented.unwrap_or("").as_bytes()).into();
+        let mut hit = usize::MAX;
+        for (i, (_, expected)) in self.entries.iter().enumerate() {
+            let diff = digest
+                .iter()
+                .zip(expected)
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+            // All ones when the digests are equal, zero otherwise.
+            let mask = ((diff as usize).wrapping_sub(1) >> (usize::BITS - 1)).wrapping_neg();
+            hit = (hit & !mask) | (i & mask);
+        }
+        presented
+            .and_then(|_| self.entries.get(hit))
+            .map(|(id, _)| id.clone())
+    }
+
+    /// Number of principals that hold a token (0: every caller is
+    /// `default`).
+    pub(crate) fn count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// What every connection of one MCP gateway shares.
+pub(crate) struct McpShared {
+    cfg: McpConfig,
+    contract: Option<AgentContract>,
+    pool: crate::gateway_pool::SharedBackendPool,
+    policy: crate::gateway_policy::SharedGatewayPolicy,
+    /// Admission cap (H-06 `max_concurrent_requests`): guards only
+    /// `tools/call` (the method that runs SQL against the backend); the
+    /// cheap protocol handshake methods and notifications are never gated.
+    admission: tokio::sync::Semaphore,
+    principals: Principals,
 }
 
 /// The MCP gateway server.
@@ -160,16 +237,13 @@ impl McpServer {
                 ),
             }
         }
-        // Admission cap (H-06 `max_concurrent_requests`): guards only
-        // `tools/call` (the method that runs SQL against the backend); the
-        // cheap protocol handshake methods and notifications are never gated.
-        let admission = Arc::new(tokio::sync::Semaphore::new(
-            self.config.max_concurrent_requests,
-        ));
-        let cfg = Arc::new(self.config);
-        let contract = Arc::new(self.contract);
-        let pool = self.pool.clone();
-        let policy = self.policy.clone();
+        let shared = self.into_shared();
+        if shared.principals.count() > 0 {
+            tracing::info!(
+                principals = shared.principals.count(),
+                "MCP gateway: bearer tokens select the principal"
+            );
+        }
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(x) => x,
@@ -178,30 +252,31 @@ impl McpServer {
                     continue;
                 }
             };
-            let cfg = cfg.clone();
-            let contract = contract.clone();
-            let pool = pool.clone();
-            let admission = admission.clone();
-            let policy = policy.clone();
+            let shared = shared.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    Self::handle_connection(stream, peer, cfg, contract, pool, policy, admission)
-                        .await
-                {
+                if let Err(e) = Self::handle_connection(stream, peer, shared).await {
                     tracing::debug!(%peer, "MCP connection error: {}", e);
                 }
             });
         }
     }
 
+    /// What this gateway's connections share.
+    pub(crate) fn into_shared(self) -> Arc<McpShared> {
+        Arc::new(McpShared {
+            admission: tokio::sync::Semaphore::new(self.config.max_concurrent_requests),
+            principals: Principals::from_config(&self.config),
+            cfg: self.config,
+            contract: self.contract,
+            pool: self.pool,
+            policy: self.policy,
+        })
+    }
+
     pub(crate) async fn handle_connection(
         mut stream: tokio::net::TcpStream,
         peer: std::net::SocketAddr,
-        cfg: Arc<McpConfig>,
-        contract: Arc<Option<AgentContract>>,
-        pool: crate::gateway_pool::SharedBackendPool,
-        policy: crate::gateway_policy::SharedGatewayPolicy,
-        admission: Arc<tokio::sync::Semaphore>,
+        shared: Arc<McpShared>,
     ) -> Result<()> {
         use crate::http_util;
         let (reader, mut writer) = stream.split();
@@ -214,27 +289,22 @@ impl McpServer {
             Err(_) => return Ok(()), // timeout / oversized headers / early close
         };
 
-        // Bearer auth, when configured. Unlike the wire port there is no
-        // pass-through identity here — the gateway runs SQL under its own
-        // backend credentials — so an unauthenticated request must be refused.
-        // Constant-time comparison (no `==` oracle).
-        if let Some(tok) = cfg.auth_token.as_ref() {
-            let ok = head
-                .header("authorization")
-                .and_then(|v| v.strip_prefix("Bearer "))
-                .map(|got| http_util::constant_time_eq_str(got, tok))
-                .unwrap_or(false);
-            if !ok {
-                Self::write_http(
-                    &mut writer,
-                    401,
-                    "application/json",
-                    br#"{"error":"unauthorized"}"#,
-                )
-                .await?;
-                return Ok(());
-            }
-        }
+        // Bearer auth, when configured: the token selects the principal.
+        // Unlike the wire port there is no pass-through identity here — the
+        // gateway runs SQL under its own backend credentials — so an
+        // unauthenticated request must be refused. Constant-time comparison
+        // of digests against every principal (no `==` oracle, no early exit).
+        let Some(principal) = shared.principals.resolve(head.header("authorization")) else {
+            Self::write_http(
+                &mut writer,
+                401,
+                "application/json",
+                br#"{"error":"unauthorized"}"#,
+            )
+            .await?;
+            return Ok(());
+        };
+        let (cfg, policy) = (&shared.cfg, &*shared.policy);
 
         // Reject an oversized declared body BEFORE allocating for it.
         if head.content_length > http_util::MAX_HTTP_BODY_BYTES {
@@ -268,13 +338,20 @@ impl McpServer {
             }
         };
         let gateway = Gateway {
-            pool: &pool,
-            policy: &policy,
+            pool: &shared.pool,
+            policy,
             peer: Some(peer.ip()),
             tenant: tenant.as_ref(),
+            principal: &principal,
         };
-        let response =
-            Self::dispatch_with(&body, &cfg, (*contract).as_ref(), &gateway, &admission).await;
+        let response = Self::dispatch_with(
+            &body,
+            cfg,
+            shared.contract.as_ref(),
+            &gateway,
+            &shared.admission,
+        )
+        .await;
         match response {
             Some(v) => {
                 let payload = serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string());
@@ -300,6 +377,7 @@ impl McpServer {
             policy: &policy,
             peer: None,
             tenant: None,
+            principal: MCP_DEFAULT_PRINCIPAL,
         };
         Self::dispatch_with(body, cfg, contract, &gateway, admission).await
     }
@@ -465,7 +543,7 @@ impl McpServer {
 
         match result {
             Ok((text, structured)) => {
-                tracing::info!(tool = %name, "MCP tool call ok");
+                tracing::info!(tool = %name, principal = %gateway.principal, "MCP tool call ok");
                 let mut result =
                     json!({ "content": [{ "type": "text", "text": text }], "isError": false });
                 if let Some(structured) = structured {
@@ -474,7 +552,8 @@ impl McpServer {
                 rpc_ok(id, result)
             }
             Err(e) => {
-                tracing::info!(tool = %name, error = %e, "MCP tool call error");
+                tracing::info!(tool = %name, principal = %gateway.principal, error = %e,
+                    "MCP tool call error");
                 // Tool errors are reported in-band (isError) per MCP, not as a
                 // protocol error, so the agent can read + self-correct.
                 rpc_ok(
@@ -1476,6 +1555,127 @@ mod tests {
         assert_eq!(r["result"], json!({}));
     }
 
+    fn principal(id: &str, token: &str) -> crate::config::McpPrincipal {
+        crate::config::McpPrincipal {
+            id: id.into(),
+            token: token.into(),
+        }
+    }
+
+    /// With no token configured every caller is `default`; with tokens, the
+    /// bearer token selects its principal and anything else is refused.
+    #[test]
+    fn bearer_tokens_select_the_principal() {
+        let open = Principals::from_config(&McpConfig::default());
+        assert_eq!(open.count(), 0);
+        for header in [None, Some("Bearer x"), Some("garbage")] {
+            assert_eq!(open.resolve(header).as_deref(), Some("default"));
+        }
+
+        let shared_only = Principals::from_config(&McpConfig {
+            auth_token: Some("shared".into()),
+            ..McpConfig::default()
+        });
+        assert_eq!(
+            shared_only.resolve(Some("Bearer shared")).as_deref(),
+            Some("default")
+        );
+        assert_eq!(shared_only.resolve(Some("Bearer other")), None);
+        assert_eq!(shared_only.resolve(None), None);
+
+        let cfg = McpConfig {
+            auth_token: Some("shared".into()),
+            principals: vec![principal("etl-agent", "t-etl"), principal("bi", "t-bi")],
+            ..McpConfig::default()
+        };
+        let p = Principals::from_config(&cfg);
+        assert_eq!(p.count(), 3);
+        assert_eq!(
+            p.resolve(Some("Bearer t-etl")).as_deref(),
+            Some("etl-agent")
+        );
+        assert_eq!(p.resolve(Some("Bearer t-bi")).as_deref(), Some("bi"));
+        assert_eq!(p.resolve(Some("Bearer shared")).as_deref(), Some("default"));
+        for header in [
+            None,
+            Some(""),
+            Some("Bearer "),
+            Some("Bearer t-et"),
+            Some("Bearer t-etl "),
+            Some("t-etl"),
+            Some("Basic t-etl"),
+        ] {
+            assert_eq!(p.resolve(header), None, "{header:?}");
+        }
+
+        // Principals without the shared token: a token is still required.
+        let agents_only = Principals::from_config(&McpConfig {
+            principals: vec![principal("a", "ta")],
+            ..McpConfig::default()
+        });
+        assert_eq!(agents_only.resolve(None), None);
+        assert_eq!(agents_only.resolve(Some("Bearer ta")).as_deref(), Some("a"));
+    }
+
+    /// One HTTP exchange with a gateway connection; the raw response.
+    async fn exchange(shared: Arc<McpShared>, request: String) -> String {
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        let task = tokio::spawn(McpServer::handle_connection(server, peer, shared));
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        task.await.unwrap().unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    fn ping(authorization: Option<&str>) -> String {
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+        let auth = authorization
+            .map(|a| format!("Authorization: {a}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "POST / HTTP/1.1\r\n{auth}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A request whose token names no principal gets 401 before any work.
+    #[tokio::test]
+    async fn an_unknown_token_is_refused_with_401() {
+        let cfg = McpConfig {
+            principals: vec![principal("etl-agent", "t-etl")],
+            ..McpConfig::default()
+        };
+        let shared = McpServer::new(cfg, None, test_pool()).into_shared();
+        for auth in [None, Some("Bearer nope"), Some("Bearer default")] {
+            let resp = exchange(shared.clone(), ping(auth)).await;
+            assert!(resp.starts_with("HTTP/1.1 401"), "{auth:?}: {resp}");
+            assert!(resp.contains("unauthorized"), "{resp}");
+        }
+        let resp = exchange(shared, ping(Some("Bearer t-etl"))).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.contains(r#""result":{}"#), "{resp}");
+    }
+
+    /// The shared `auth_token` keeps working unchanged next to principals.
+    #[tokio::test]
+    async fn the_shared_token_still_authenticates() {
+        let cfg = McpConfig {
+            auth_token: Some("shared".into()),
+            principals: vec![principal("etl-agent", "t-etl")],
+            ..McpConfig::default()
+        };
+        let shared = McpServer::new(cfg, None, test_pool()).into_shared();
+        let resp = exchange(shared.clone(), ping(Some("Bearer shared"))).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let resp = exchange(shared, ping(None)).await;
+        assert!(resp.starts_with("HTTP/1.1 401"), "{resp}");
+    }
+
     fn bounded_fixture(
         rows: usize,
         truncation: crate::backend::client::Truncation,
@@ -1598,6 +1798,7 @@ mod tests {
             policy: &policy,
             peer: None,
             tenant: Some(&acme),
+            principal: MCP_DEFAULT_PRINCIPAL,
         };
         let refused = McpServer::dispatch_with(&body, &cfg, None, &gw, &admission)
             .await
@@ -1614,6 +1815,7 @@ mod tests {
             policy: &policy,
             peer: None,
             tenant: Some(&globex),
+            principal: MCP_DEFAULT_PRINCIPAL,
         };
         let other = McpServer::dispatch_with(&body, &cfg, None, &gw_other, &admission)
             .await

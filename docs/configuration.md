@@ -2105,6 +2105,11 @@ max_concurrent_requests = 64
 max_result_rows = 10000
 max_result_bytes = 16777216
 
+# One entry per agent (optional, repeatable): its bearer token selects it.
+[[mcp.principals]]
+id = "etl-agent"
+token = "${MCP_ETL_TOKEN}"
+
 [[agent_contracts]]
 id = "reporting-agent"
 read_only = true
@@ -2127,13 +2132,34 @@ max_rows = 1000
 | `backend_database` | string | *(none)* | Backend database. |
 | `read_only` | bool | `true` | Refuse write/DDL — agents get a read-only surface. |
 | `contract` | string | *(none)* | Name of an `[[agent_contracts]]` entry to enforce on every tool call. |
-| `auth_token` | string | *(none)* | Bearer token required on every MCP request. Absent = open, so **set this for any non-loopback deployment** — MCP exposes SQL and must not be anonymous off localhost. |
+| `auth_token` | string | *(none)* | Bearer token required on every MCP request. Absent = open, so **set this for any non-loopback deployment** — MCP exposes SQL and must not be anonymous off localhost. Its holders are the one principal `default` (see `principals`). |
+| `principals` | array of tables | `[]` | Per-agent principals, `[[mcp.principals]]` with `id` and `token` (below). |
 | `query_timeout_ms` | u64 | `30000` | Per-`tools/call` backend execution timeout, milliseconds. Was a hardcoded 30 s. Must be > 0. |
 | `max_concurrent_requests` | usize | `64` | Maximum `tools/call` requests admitted concurrently; beyond this the gateway answers a JSON-RPC error (code `-32000`) instead of queuing indefinitely. `initialize`/`ping`/`tools/list` and notifications are never gated. Must be > 0. |
 | `tenant_header` | string | `""` | With `[multi_tenancy]` (H-06): the request header naming the tenant (e.g. `X-Helios-Tenant`). Every request must name a known tenant in it (403 otherwise), and its statements get that tenant's row filter, as a PG-wire session does. Trusted as sent: put the gateway behind a front end that authenticates the caller and sets the header. Empty = no per-request tenant, which `[multi_tenancy]` refuses under `strict_config` (warns otherwise). |
 
 | `max_result_rows` | usize | `10000` | Most rows a `query`, `list_tables` or `explain` result carries back. The gateway reads the backend's rows but stops storing them at this cap, drains the rest of the result so the backend connection stays in sync, and marks the result truncated. Must be 1 to 1000000. |
 | `max_result_bytes` | usize | `16777216` (16 MiB) | Most cell bytes a tool result carries back: the text bytes of the stored values, NULL counting 0 (the table's separators and footer are not counted). Enforced while reading, like `max_result_rows`; a result that exactly fits is not truncated. Must be 1 to 1073741824 (1 GiB). |
+
+**Principals (`[[mcp.principals]]`).** A principal is the identity a request acts as:
+its bearer token (`Authorization: Bearer <token>`) selects it. Each entry has:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `id` | string | — | 1 to 64 characters of `A-Z a-z 0-9 _ . -`, unique. `default` is reserved for `auth_token`. Appears in the gateway's log lines. |
+| `token` | string | — | The principal's bearer token: non-empty, unique, and not `auth_token`. Never logged, never in `/config`, never serialised, and not shown by `Debug`; validation errors name the `id` only. |
+
+The presented token is hashed (SHA-256) and compared in constant time against every
+configured token with no early exit. With no `auth_token` and no principals every caller is
+the principal `default` (the gateway is open, as before). As soon as any token is
+configured, a request without a matching one is refused with 401 before any work,
+`ping` and `tools/list` included. `auth_token` keeps working unchanged: its holders are
+`default`. Everyone holding one token is one principal, so per-principal isolation (the
+tool-result cache below) cannot tell a shared token's holders apart: give each agent its
+own `[[mcp.principals]]` entry. The owner of a request — the unit its cache entries and
+budgets belong to — is the pair (principal, tenant), the tenant coming from
+`tenant_header`. Like the rest of `[mcp]`, principals are read at startup (restart to
+change them).
 
 **Truncated tool results.** A result is truncated when either cap cut it. The text
 table then ends with a `(truncated: the row limit was reached; the first N rows are
