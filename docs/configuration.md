@@ -1832,6 +1832,60 @@ acme = 50
 | `max_replay_bytes_per_tenant` | usize | `0` | Most transaction-replay bytes (`[limits] tr_max_replay_bytes`'s measure: statement text and raw extended-protocol frames) all sessions of one known tenant may hold at once. Applies to sessions whose `tr_mode` is `select` or `transaction` (`tr_mode` follows a SIGHUP for new sessions; a warning is logged at startup when no recording mode is configured, and on a SIGHUP that changes it). A `select`-mode transaction with writes is never replayed, so it is not charged, and a `Flush` chunk that may write is not checked against the budget either (its write is recorded only at the cycle's `Sync`). The statement whose recording would take the tenant over marks its transaction non-replayable, the same degradation as `tr_max_replay_bytes` (P-03 refusal reason `cap_exceeded`; `heliosdb_proxy_tr_replay_cap_exceeded_total` keeps counting only the `[limits]` caps, and a transaction one of them degrades is not counted as a tenant refusal as well). Inside a transaction, chunks of an open Flush-terminated cycle are checked against the budget and charged when the `Sync` records the cycle; an autocommit chunk holds no budget bytes (a cycle that opens a transaction is charged, or refused, at its `Sync`). The bytes return at transaction end and at session end. `0` = no budget. |
 | `tenant_max_replay_bytes` | table | `{}` | Per-tenant overrides of `max_replay_bytes_per_tenant` (`0` = no budget for that tenant). Every key must be in `tenants`. |
 
+### Row filter (`tenant_tables`)
+
+Under row isolation (`tenant_column`), a simple-query statement that names a
+`tenant_tables` entry, quoted or schema-qualified, is rewritten to add
+`<table>.<tenant_column> = '<tenant>'` (an unqualified `<tenant_column> = '<tenant>'`
+on the target of an UPDATE or DELETE). Keywords are found by a quote- and
+comment-aware lexer: a `WHERE`, `ORDER`, `--` or `;` inside a string, a quoted
+identifier or a comment decides nothing.
+
+Shapes the rewrite handles:
+
+- `SELECT` with tenant tables in its FROM or JOIN list (also `SELECT ... FOR UPDATE`).
+  Each branch of `UNION`, `INTERSECT` or `EXCEPT` is filtered on its own tables.
+- `UPDATE <table> SET ...` and `DELETE FROM <table> ...` (with `ONLY`, `USING`,
+  `RETURNING`), where `<table>` is the tenant table.
+- `INSERT INTO <table> ...`: the tenant value is added to the row (see the warning on
+  schema-aware column lists).
+
+Placement: an existing `WHERE` becomes `WHERE <filter> AND <condition>`, with the
+condition in parentheses when it has a top-level `OR`. Without a `WHERE`, the filter
+goes right before the first top-level `ORDER BY`, `GROUP BY`, `HAVING`, `WINDOW`,
+`LIMIT`, `OFFSET`, `FETCH`, `FOR`, `UNION`, `INTERSECT`, `EXCEPT` or `RETURNING`, or
+after the last token before a trailing comment or `;`. It is never placed after a `--`
+comment.
+
+Refused with SQLSTATE `42501` (the message starts `statement refused under row-level
+tenant isolation`), never forwarded to a backend, when the statement names a tenant
+table in a shape the rewrite cannot filter with confidence:
+
+- `WITH` (a CTE that reads a tenant table), a parenthesised query `(SELECT ...)`,
+  `TABLE <t>`, `VALUES`, or any other statement that is not `SELECT`, `UPDATE`,
+  `DELETE` or `INSERT`;
+- more than one statement in one simple-query string;
+- a tenant table read inside a subquery, a parenthesised expression or a CTE;
+- a `SELECT` naming a tenant table outside its FROM and JOIN items;
+- an `UPDATE`, `DELETE` or `INSERT` that also reads another tenant table (`FROM`,
+  `USING`, a subquery, `INSERT ... SELECT`);
+- text the lexer cannot read unambiguously (a backend-ambiguous comment or literal,
+  or a non-ASCII keyword) that may name a tenant table.
+
+A statement that names no tenant table passes unchanged, as does one a `tenant_tables`
+entry excludes.
+
+Not covered: the extended protocol (`Parse`, `Bind`, `Execute`) is not transformed, so a
+prepared statement that names a tenant table reaches the backend unfiltered. The HTTP,
+MCP and GraphQL gateways apply the same rewrite and refuse a shape it cannot cover with
+HTTP 403 (MCP and GraphQL report it as an error).
+
+This is a proxy-side filter, not a security boundary: anything that reaches the backend
+by another route is unfiltered. For a hard boundary, enforce tenant isolation in the
+database with PostgreSQL row-level security (`ALTER TABLE ... ENABLE ROW LEVEL SECURITY`
+with a policy on the tenant column, and a session setting the tenant), and keep this
+filter as defence in depth.
+
 `/metrics` reports `tenant_slots` (`tenant`, `limit`, `in_use`, `waiting`, `waits`,
 `refusals`) for capped tenants; Prometheus has `heliosdb_proxy_tenant_clients`,
 `heliosdb_proxy_tenant_client_limit`, `heliosdb_proxy_tenant_admission_queue_depth`,

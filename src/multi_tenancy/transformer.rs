@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::config::{IsolationStrategy, TenantConfig, TenantId};
+use crate::sql_text::{lex_units, LexKind, LexUnit};
 
 /// Result of query transformation
 #[derive(Debug, Clone)]
@@ -21,6 +22,11 @@ pub struct TransformResult {
 
     /// Warnings generated during transformation
     pub warnings: Vec<String>,
+
+    /// Set when the statement touches a tenant table in a shape the
+    /// transformer cannot rewrite with confidence: it must not be forwarded
+    /// (the relay answers SQLSTATE 42501). The message says why.
+    pub refusal: Option<String>,
 }
 
 impl TransformResult {
@@ -31,6 +37,7 @@ impl TransformResult {
             transformed: false,
             filtered_tables: Vec::new(),
             warnings: Vec::new(),
+            refusal: None,
         }
     }
 
@@ -41,6 +48,7 @@ impl TransformResult {
             transformed: true,
             filtered_tables: tables,
             warnings: Vec::new(),
+            refusal: None,
         }
     }
 
@@ -143,105 +151,180 @@ impl TenantQueryTransformer {
             _ => return TransformResult::passthrough(query),
         };
 
-        // Parse and transform query
-        let upper = query.trim().to_uppercase();
-
-        if upper.starts_with("SELECT") {
-            self.transform_select(query, tenant, tenant_column)
-        } else if upper.starts_with("UPDATE") {
-            self.transform_update(query, tenant, tenant_column)
-        } else if upper.starts_with("DELETE") {
-            self.transform_delete(query, tenant, tenant_column)
-        } else if upper.starts_with("INSERT") {
-            self.transform_insert(query, tenant, tenant_column)
-        } else {
-            TransformResult::passthrough(query)
-        }
+        self.rewrite_row(query, tenant, tenant_column)
     }
 
-    /// Transform a SELECT query
-    fn transform_select(
-        &self,
-        query: &str,
-        tenant: &TenantId,
-        tenant_column: &str,
-    ) -> TransformResult {
-        let tables = self.extract_tables(query);
-        let filtered_tables: Vec<String> = tables
-            .iter()
-            .filter(|t| self.requires_filtering(t))
-            .cloned()
+    /// Rewrite a statement under row isolation, or refuse it.
+    ///
+    /// The statement is lexed once by the result-cache lexer ([`lex_units`]),
+    /// so keywords count only outside literals, quoted identifiers, comments
+    /// and parentheses. Every shape that names a tenant table is either
+    /// rewritten here or refused (SQLSTATE 42501, see
+    /// [`TransformResult::refusal`]); none is passed through unfiltered.
+    fn rewrite_row(&self, query: &str, tenant: &TenantId, column: &str) -> TransformResult {
+        let Some(all) = lex_units(query) else {
+            // The lexer gave up: where the backends end a token is unknown,
+            // so fail closed if any tenant table might be named.
+            let lower = query.to_lowercase();
+            let named = self
+                .tenant_tables
+                .keys()
+                .any(|t| self.requires_filtering(t) && lower.contains(t.as_str()));
+            return if named || lower.contains("u&") {
+                refuse("the text is ambiguous to the parser and may name a tenant table")
+            } else {
+                TransformResult::passthrough(query)
+            };
+        };
+        let units: Vec<LexUnit> = all
+            .into_iter()
+            .filter(|u| u.kind != LexKind::Comment)
             .collect();
-
-        if filtered_tables.is_empty() {
+        let statements = split_statements(query, &units);
+        if statements.len() > 1 {
+            return if self.tenant_refs(query, &units).is_empty() {
+                TransformResult::passthrough(query)
+            } else {
+                refuse("more than one statement names a tenant table")
+            };
+        }
+        let Some(stmt) = statements.first().copied() else {
+            return TransformResult::passthrough(query);
+        };
+        let refs = self.tenant_refs(query, stmt);
+        if refs.is_empty() {
             return TransformResult::passthrough(query);
         }
-
-        let filter = self.build_filter(tenant, tenant_column, &filtered_tables);
-        let transformed = self.inject_where_clause(query, &filter);
-
-        TransformResult::transformed(transformed, filtered_tables)
+        let depth = depths(query, stmt);
+        if refs.iter().any(|&i| depth[i] > 0) {
+            return refuse(
+                "a tenant table is read inside a subquery, CTE or parenthesised expression",
+            );
+        }
+        let first = stmt[0];
+        if is_word(query, &first, "select") {
+            self.rewrite_select(query, stmt, &depth, &refs, tenant, column)
+        } else if is_word(query, &first, "update") {
+            match target_at(query, stmt, 1, true) {
+                Some(target) => self.rewrite_write(query, stmt, &depth, target, tenant, column),
+                None => refuse("the UPDATE target is not a table name"),
+            }
+        } else if is_word(query, &first, "delete")
+            && stmt.get(1).is_some_and(|u| is_word(query, u, "from"))
+        {
+            match target_at(query, stmt, 2, true) {
+                Some(target) => self.rewrite_write(query, stmt, &depth, target, tenant, column),
+                None => refuse("the DELETE target is not a table name"),
+            }
+        } else if is_word(query, &first, "insert")
+            && stmt.get(1).is_some_and(|u| is_word(query, u, "into"))
+        {
+            match target_at(query, stmt, 2, false) {
+                Some(target) if refs == [target] => {
+                    let name = self
+                        .tenant_table_of(query, &stmt[target])
+                        .unwrap_or_default();
+                    // A tenant value goes into the INSERT text, as before.
+                    let rewritten = self.inject_tenant_value(query, tenant, column);
+                    TransformResult::transformed(rewritten, vec![name])
+                        .with_warning("Tenant column injection may require schema awareness")
+                }
+                _ => refuse("an INSERT reads a tenant table besides its target, or has no target"),
+            }
+        } else {
+            refuse("the statement shape is not rewritten (WITH, TABLE, VALUES, a parenthesised query, ...)")
+        }
     }
 
-    /// Transform an UPDATE query
-    fn transform_update(
-        &self,
-        query: &str,
-        tenant: &TenantId,
-        tenant_column: &str,
-    ) -> TransformResult {
-        let table = self.extract_update_table(query);
-
-        if let Some(table) = table {
-            if self.requires_filtering(&table) {
-                let filter = self.build_single_filter(tenant, tenant_column);
-                let transformed = self.inject_where_clause(query, &filter);
-                return TransformResult::transformed(transformed, vec![table]);
-            }
-        }
-
-        TransformResult::passthrough(query)
+    /// Indices of the units of `stmt` that name a tenant table, except a
+    /// qualifier (a unit followed by `.`), which names a FROM item rather
+    /// than reading a table.
+    fn tenant_refs(&self, sql: &str, stmt: &[LexUnit]) -> Vec<usize> {
+        (0..stmt.len())
+            .filter(|&i| {
+                self.tenant_table_of(sql, &stmt[i]).is_some()
+                    && !stmt.get(i + 1).is_some_and(|next| is_punct(sql, next, "."))
+            })
+            .collect()
     }
 
-    /// Transform a DELETE query
-    fn transform_delete(
-        &self,
-        query: &str,
-        tenant: &TenantId,
-        tenant_column: &str,
-    ) -> TransformResult {
-        let table = self.extract_delete_table(query);
-
-        if let Some(table) = table {
-            if self.requires_filtering(&table) {
-                let filter = self.build_single_filter(tenant, tenant_column);
-                let transformed = self.inject_where_clause(query, &filter);
-                return TransformResult::transformed(transformed, vec![table]);
-            }
-        }
-
-        TransformResult::passthrough(query)
+    /// The registered tenant table a unit names (lower-case), when it is one
+    /// that gets filtered: quoted or not.
+    fn tenant_table_of(&self, sql: &str, unit: &LexUnit) -> Option<String> {
+        let name = unit_name(sql, unit)?;
+        self.requires_filtering(&name).then_some(name)
     }
 
-    /// Transform an INSERT query (add tenant_id column)
-    fn transform_insert(
+    /// Rewrite a SELECT. Each branch of a set operation is filtered on its
+    /// own FROM and JOIN tenant tables.
+    fn rewrite_select(
         &self,
-        query: &str,
+        sql: &str,
+        stmt: &[LexUnit],
+        depth: &[u32],
+        refs: &[usize],
         tenant: &TenantId,
-        tenant_column: &str,
+        column: &str,
     ) -> TransformResult {
-        let table = self.extract_insert_table(query);
-
-        if let Some(table) = table {
-            if self.requires_filtering(&table) {
-                // For INSERT, we need to add tenant_id to the values
-                let transformed = self.inject_tenant_value(query, tenant, tenant_column);
-                return TransformResult::transformed(transformed, vec![table])
-                    .with_warning("Tenant column injection may require schema awareness");
-            }
+        let captured = from_items(sql, stmt, depth);
+        if refs.iter().any(|i| !captured.contains(i)) {
+            return refuse(
+                "a tenant table is named outside the FROM and JOIN items the rewrite filters",
+            );
         }
+        let mut edits = Vec::new();
+        let mut filtered: Vec<String> = Vec::new();
+        for (start, end) in set_branches(sql, stmt, depth) {
+            let mut tables: Vec<String> = Vec::new();
+            for i in captured
+                .iter()
+                .copied()
+                .filter(|i| (start..end).contains(i))
+            {
+                if let Some(name) = self.tenant_table_of(sql, &stmt[i]) {
+                    if !tables.contains(&name) {
+                        tables.push(name);
+                    }
+                }
+            }
+            if tables.is_empty() {
+                continue;
+            }
+            let head = (start..end)
+                .find(|&i| !is_word(sql, &stmt[i], "all") && !is_word(sql, &stmt[i], "distinct"));
+            if !head.is_some_and(|h| is_word(sql, &stmt[h], "select")) {
+                return refuse("a set operation branch that names a tenant table is not a SELECT");
+            }
+            let filter = self.build_filter(tenant, column, &tables);
+            match filter_edits(sql, stmt, depth, start, end, &filter) {
+                Some(found) => edits.extend(found),
+                None => return refuse("no place to put the tenant filter"),
+            }
+            filtered.extend(tables);
+        }
+        TransformResult::transformed(apply_edits(sql, edits), filtered)
+    }
 
-        TransformResult::passthrough(query)
+    /// Rewrite an UPDATE or DELETE whose target is the only tenant table it
+    /// names.
+    fn rewrite_write(
+        &self,
+        sql: &str,
+        stmt: &[LexUnit],
+        depth: &[u32],
+        target: usize,
+        tenant: &TenantId,
+        column: &str,
+    ) -> TransformResult {
+        if self.tenant_refs(sql, stmt) != [target] {
+            return refuse("a tenant table is named besides the target of the write");
+        }
+        let name = self.tenant_table_of(sql, &stmt[target]).unwrap_or_default();
+        let filter = self.build_single_filter(tenant, column);
+        match filter_edits(sql, stmt, depth, 0, stmt.len(), &filter) {
+            Some(edits) => TransformResult::transformed(apply_edits(sql, edits), vec![name]),
+            None => refuse("no place to put the tenant filter"),
+        }
     }
 
     /// Build a filter clause for multiple tables
@@ -271,36 +354,6 @@ impl TenantQueryTransformer {
                     .replace("{column}", column)
                     .replace("{value}", &tenant.0),
                 None => format!("{} = '{}'", column, tenant.0),
-            }
-        }
-    }
-
-    /// Inject WHERE clause into query
-    fn inject_where_clause(&self, query: &str, filter: &str) -> String {
-        let upper = query.to_uppercase();
-
-        // Find existing WHERE clause
-        if let Some(where_pos) = upper.find(" WHERE ") {
-            // Add to existing WHERE
-            let (before, after) = query.split_at(where_pos + 7);
-            format!("{}{} AND {}", before, filter, after)
-        } else {
-            // Find position to insert WHERE
-            // Look for ORDER BY, GROUP BY, LIMIT, etc.
-            let insert_before = [" ORDER ", " GROUP ", " LIMIT ", " HAVING ", " UNION "]
-                .iter()
-                .filter_map(|kw| upper.find(kw))
-                .min();
-
-            match insert_before {
-                Some(pos) => {
-                    let (before, after) = query.split_at(pos);
-                    format!("{} WHERE {}{}", before, filter, after)
-                }
-                None => {
-                    // Append at end
-                    format!("{} WHERE {}", query.trim_end_matches(';'), filter)
-                }
             }
         }
     }
@@ -353,106 +406,22 @@ impl TenantQueryTransformer {
         query.to_string()
     }
 
-    /// Extract table names from SELECT query
+    /// The FROM and JOIN table names of `query` (a test helper: the rewrite
+    /// reads the same items as indices of the lexed statement).
+    #[cfg(test)]
     fn extract_tables(&self, query: &str) -> Vec<String> {
-        let upper = query.to_uppercase();
-        let mut tables = Vec::new();
-
-        // Find FROM clause
-        if let Some(from_pos) = upper.find(" FROM ") {
-            let after_from = &query[from_pos + 6..];
-
-            // Find end of table list
-            let end_markers = [
-                " WHERE ", " JOIN ", " LEFT ", " RIGHT ", " INNER ", " OUTER ", " GROUP ",
-                " ORDER ", " LIMIT ", " HAVING ",
-            ];
-            let end_pos = end_markers
-                .iter()
-                .filter_map(|m| after_from.to_uppercase().find(m))
-                .min()
-                .unwrap_or(after_from.len());
-
-            let table_section = &after_from[..end_pos];
-
-            // Parse table names (handle aliases)
-            for part in table_section.split(',') {
-                let trimmed = part.trim();
-                if let Some(table) = trimmed.split_whitespace().next() {
-                    let clean =
-                        table.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
-                    if !clean.is_empty() {
-                        tables.push(clean.to_string());
-                    }
-                }
-            }
-        }
-
-        // Also look for JOINs
-        let words: Vec<&str> = query.split_whitespace().collect();
-        for (i, word) in words.iter().enumerate() {
-            if word.to_uppercase() == "JOIN" && i + 1 < words.len() {
-                let table =
-                    words[i + 1].trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
-                if !table.is_empty() && !tables.contains(&table.to_string()) {
-                    tables.push(table.to_string());
-                }
-            }
-        }
-
-        tables
-    }
-
-    /// Extract table name from UPDATE query
-    fn extract_update_table(&self, query: &str) -> Option<String> {
-        let upper = query.to_uppercase();
-        if let Some(update_pos) = upper.find("UPDATE ") {
-            let after_update = &query[update_pos + 7..];
-            if let Some(set_pos) = after_update.to_uppercase().find(" SET ") {
-                let table_section = &after_update[..set_pos];
-                let table = table_section
-                    .split_whitespace()
-                    .next()?
-                    .trim_matches(|c| c == '"' || c == '`');
-                return Some(table.to_string());
-            }
-        }
-        None
-    }
-
-    /// Extract table name from DELETE query
-    fn extract_delete_table(&self, query: &str) -> Option<String> {
-        let upper = query.to_uppercase();
-        if let Some(from_pos) = upper.find(" FROM ") {
-            let after_from = &query[from_pos + 6..];
-            let end_pos = after_from
-                .to_uppercase()
-                .find(" WHERE ")
-                .unwrap_or(after_from.len());
-            let table_section = &after_from[..end_pos];
-            let table = table_section
-                .split_whitespace()
-                .next()?
-                .trim_matches(|c| c == '"' || c == '`');
-            return Some(table.to_string());
-        }
-        None
-    }
-
-    /// Extract table name from INSERT query
-    fn extract_insert_table(&self, query: &str) -> Option<String> {
-        let upper = query.to_uppercase();
-        if let Some(into_pos) = upper.find(" INTO ") {
-            let after_into = &query[into_pos + 6..];
-            let end_pos = after_into
-                .find(|c: char| c == '(' || c.is_whitespace())
-                .unwrap_or(after_into.len());
-            let table = after_into[..end_pos]
-                .trim()
-                .trim_matches(|c| c == '"' || c == '`');
-            return Some(table.to_string());
-        }
-        None
+        let Some(all) = lex_units(query) else {
+            return Vec::new();
+        };
+        let units: Vec<LexUnit> = all
+            .into_iter()
+            .filter(|u| u.kind != LexKind::Comment)
+            .collect();
+        let depth = depths(query, &units);
+        from_items(query, &units, &depth)
+            .into_iter()
+            .filter_map(|i| unit_name(query, &units[i]))
+            .collect()
     }
 
     /// Generate SET search_path command for schema isolation
@@ -476,6 +445,266 @@ impl TenantQueryTransformer {
             None
         }
     }
+}
+
+/// SQLSTATE of a statement refused under row isolation (`insufficient_privilege`).
+pub const REFUSAL_SQLSTATE: &str = "42501";
+
+/// Keywords that end a WHERE condition, and mark where a missing WHERE goes.
+const CLAUSE_END: &[&str] = &[
+    "order",
+    "group",
+    "having",
+    "window",
+    "limit",
+    "offset",
+    "fetch",
+    "for",
+    "union",
+    "intersect",
+    "except",
+    "returning",
+];
+
+/// Set operators: each branch of a set operation is rewritten on its own.
+const SET_OPERATORS: &[&str] = &["union", "intersect", "except"];
+
+/// Keywords after which a FROM or JOIN list is over.
+const FROM_END: &[&str] = &[
+    "where",
+    "group",
+    "having",
+    "window",
+    "order",
+    "limit",
+    "offset",
+    "fetch",
+    "for",
+    "union",
+    "intersect",
+    "except",
+    "returning",
+    "on",
+    "using",
+    "set",
+    "values",
+    "select",
+];
+
+/// A refusal of `reason`, for [`TransformResult::refusal`].
+fn refuse(reason: &str) -> TransformResult {
+    let mut res = TransformResult::passthrough(String::new());
+    res.refusal = Some(format!(
+        "statement refused under row-level tenant isolation: {reason}"
+    ));
+    res
+}
+
+/// The text of `unit` in `sql`.
+fn text<'a>(sql: &'a str, unit: &LexUnit) -> &'a str {
+    &sql[unit.start..unit.end]
+}
+
+/// Whether `unit` is the unquoted word `word` (ASCII case-insensitive).
+fn is_word(sql: &str, unit: &LexUnit, word: &str) -> bool {
+    unit.kind == LexKind::Word && text(sql, unit).eq_ignore_ascii_case(word)
+}
+
+/// Whether `unit` is the punctuation `p`.
+fn is_punct(sql: &str, unit: &LexUnit, p: &str) -> bool {
+    unit.kind == LexKind::Punct && text(sql, unit) == p
+}
+
+/// The name a word or quoted identifier spells (lower-case, unquoted).
+fn unit_name(sql: &str, unit: &LexUnit) -> Option<String> {
+    match unit.kind {
+        LexKind::Word => Some(text(sql, unit).to_ascii_lowercase()),
+        LexKind::Ident => Some(text(sql, unit).trim_matches('"').to_lowercase()),
+        _ => None,
+    }
+}
+
+/// Whether the word `unit` is one of the lower-case `words`.
+fn is_one_of(sql: &str, unit: &LexUnit, words: &[&str]) -> bool {
+    unit.kind == LexKind::Word && words.iter().any(|w| is_word(sql, unit, w))
+}
+
+/// Parenthesis depth of each unit: a `(` or `)` sits outside what it encloses.
+fn depths(sql: &str, stmt: &[LexUnit]) -> Vec<u32> {
+    let mut depth = 0u32;
+    stmt.iter()
+        .map(|unit| {
+            if is_punct(sql, unit, ")") {
+                depth = depth.saturating_sub(1);
+                depth
+            } else if is_punct(sql, unit, "(") {
+                depth += 1;
+                depth - 1
+            } else {
+                depth
+            }
+        })
+        .collect()
+}
+
+/// The statements of `units` (comments already dropped), split at each `;`.
+/// A statement holding nothing is left out.
+fn split_statements<'a>(sql: &str, units: &'a [LexUnit]) -> Vec<&'a [LexUnit]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, unit) in units.iter().enumerate() {
+        if is_punct(sql, unit, ";") {
+            if start < i {
+                out.push(&units[start..i]);
+            }
+            start = i + 1;
+        }
+    }
+    if start < units.len() {
+        out.push(&units[start..]);
+    }
+    out
+}
+
+/// The index of the target table of a DML statement at `at`, past an
+/// optional `ONLY` when `only` is set; `None` unless a word or quoted
+/// identifier stands there.
+fn target_at(sql: &str, stmt: &[LexUnit], at: usize, only: bool) -> Option<usize> {
+    let mut i = at;
+    if only && stmt.get(i).is_some_and(|u| is_word(sql, u, "only")) {
+        i += 1;
+    }
+    stmt.get(i)
+        .filter(|u| matches!(u.kind, LexKind::Word | LexKind::Ident))
+        .map(|_| i)
+}
+
+/// The byte ranges `(start, end)` of the branches of a statement: the parts
+/// between top-level set operators.
+fn set_branches(sql: &str, stmt: &[LexUnit], depth: &[u32]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, unit) in stmt.iter().enumerate() {
+        if depth[i] == 0 && is_one_of(sql, unit, SET_OPERATORS) {
+            out.push((start, i));
+            start = i + 1;
+        }
+    }
+    out.push((start, stmt.len()));
+    out
+}
+
+/// Indices of the FROM and JOIN items of a statement, at the top level: the
+/// last unit of each table name (the table of a qualified `schema.table`).
+/// A name after `FROM` or `JOIN`, or after a comma in a FROM list, is an item.
+fn from_items(sql: &str, stmt: &[LexUnit], depth: &[u32]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let (mut in_from, mut expect) = (false, false);
+    let mut i = 0;
+    while i < stmt.len() {
+        let unit = stmt[i];
+        if depth[i] != 0 {
+            i += 1;
+            continue;
+        }
+        if is_one_of(sql, &unit, &["from", "join"]) {
+            in_from = true;
+            expect = true;
+        } else if is_one_of(sql, &unit, FROM_END) {
+            in_from = false;
+            expect = false;
+        } else if is_punct(sql, &unit, ",") {
+            expect = in_from;
+        } else if expect && matches!(unit.kind, LexKind::Word | LexKind::Ident) {
+            let mut last = i;
+            while last + 2 < stmt.len()
+                && is_punct(sql, &stmt[last + 1], ".")
+                && matches!(stmt[last + 2].kind, LexKind::Word | LexKind::Ident)
+                && depth[last + 2] == 0
+            {
+                last += 2;
+            }
+            out.push(last);
+            expect = false;
+            i = last + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The edits that put `filter` into the WHERE of the branch `stmt[start..end]`:
+/// `WHERE <filter> AND <condition>` (parenthesised only when the condition
+/// has a top-level OR), or ` WHERE <filter>` right after the last unit before
+/// the first clause that ends the branch. Keywords count only at the top
+/// level, so a `WHERE` in a literal, a comment or a subquery is not one.
+fn filter_edits(
+    sql: &str,
+    stmt: &[LexUnit],
+    depth: &[u32],
+    start: usize,
+    end: usize,
+    filter: &str,
+) -> Option<Vec<(usize, String)>> {
+    let top = |i: usize| depth[i] == 0;
+    let mut clause = end;
+    let mut where_at = None;
+    for (i, unit) in stmt.iter().enumerate().take(end).skip(start) {
+        if !top(i) || unit.kind != LexKind::Word {
+            continue;
+        }
+        if is_word(sql, unit, "where") {
+            where_at = Some(i);
+            break;
+        }
+        if is_one_of(sql, unit, CLAUSE_END) {
+            clause = i;
+            break;
+        }
+    }
+    match where_at {
+        Some(w) => {
+            let first = w + 1;
+            let cond_end = (first..end)
+                .find(|&i| top(i) && is_one_of(sql, &stmt[i], CLAUSE_END))
+                .unwrap_or(end);
+            if cond_end == first {
+                return None;
+            }
+            let last = cond_end - 1;
+            let has_or = (first..cond_end).any(|i| top(i) && is_word(sql, &stmt[i], "or"));
+            Some(if has_or {
+                vec![
+                    (stmt[first].start, format!("{filter} AND (")),
+                    (stmt[last].end, ")".to_string()),
+                ]
+            } else {
+                vec![(stmt[first].start, format!("{filter} AND "))]
+            })
+        }
+        None => {
+            if clause == start {
+                return None;
+            }
+            Some(vec![(stmt[clause - 1].end, format!(" WHERE {filter}"))])
+        }
+    }
+}
+
+/// `sql` with each `(position, text)` inserted at its position.
+fn apply_edits(sql: &str, mut edits: Vec<(usize, String)>) -> String {
+    edits.sort_by_key(|(at, _)| *at);
+    let added: usize = edits.iter().map(|(_, text)| text.len()).sum();
+    let mut out = String::with_capacity(sql.len() + added);
+    let mut last = 0;
+    for (at, text) in edits {
+        out.push_str(&sql[last..at]);
+        out.push_str(&text);
+        last = at;
+    }
+    out.push_str(&sql[last..]);
+    out
 }
 
 /// Validate that a query doesn't try to bypass tenant isolation
@@ -734,5 +963,189 @@ mod tests {
         // Valid - system catalog
         let validation = validate_query("SELECT * FROM pg_catalog.pg_tables", &tenant, &config);
         assert!(validation.valid);
+    }
+
+    /// Row-isolated transform of `sql` for tenant `acme`, with `orders`
+    /// tenant-scoped on `tenant_id`.
+    fn orders(sql: &str) -> TransformResult {
+        TenantQueryTransformer::new()
+            .register_table("orders", "tenant_id")
+            .transform(sql, &TenantId::new("acme"), &create_row_config("acme"))
+    }
+
+    /// The rewritten text of `sql`, which must be transformed and not refused.
+    fn rewritten(sql: &str) -> String {
+        let res = orders(sql);
+        assert!(res.refusal.is_none(), "refused: {:?}", res.refusal);
+        assert!(res.transformed, "not transformed: {sql}");
+        res.query
+    }
+
+    /// Asserts that `sql` is refused under row isolation (SQLSTATE 42501).
+    fn assert_refused(sql: &str) {
+        let res = orders(sql);
+        assert!(res.refusal.is_some(), "not refused: {sql}");
+        assert!(!res.transformed, "a refused statement is not rewritten");
+    }
+
+    #[test]
+    fn or_in_select_stays_inside_the_tenant_filter() {
+        assert_eq!(
+            rewritten("SELECT * FROM orders WHERE status = 'open' OR status = 'late'"),
+            "SELECT * FROM orders WHERE orders.tenant_id = 'acme' AND (status = 'open' OR status = 'late')"
+        );
+        assert_eq!(
+            rewritten(
+                "SELECT * FROM orders WHERE status = 'open' OR status = 'late' ORDER BY id LIMIT 10"
+            ),
+            "SELECT * FROM orders WHERE orders.tenant_id = 'acme' AND (status = 'open' OR status = 'late') ORDER BY id LIMIT 10"
+        );
+    }
+
+    #[test]
+    fn or_in_update_stays_inside_the_tenant_filter() {
+        assert_eq!(
+            rewritten("UPDATE orders SET s = 'x' WHERE id = 1 OR id = 2"),
+            "UPDATE orders SET s = 'x' WHERE tenant_id = 'acme' AND (id = 1 OR id = 2)"
+        );
+        assert_eq!(
+            rewritten("UPDATE orders SET s = 'x' WHERE id = 1 OR id = 2 RETURNING id"),
+            "UPDATE orders SET s = 'x' WHERE tenant_id = 'acme' AND (id = 1 OR id = 2) RETURNING id"
+        );
+    }
+
+    #[test]
+    fn or_in_delete_stays_inside_the_tenant_filter() {
+        assert_eq!(
+            rewritten("DELETE FROM orders WHERE id = 1 OR id = 2"),
+            "DELETE FROM orders WHERE tenant_id = 'acme' AND (id = 1 OR id = 2)"
+        );
+        assert_eq!(
+            rewritten("DELETE FROM orders WHERE id = 1 OR id = 2 RETURNING id"),
+            "DELETE FROM orders WHERE tenant_id = 'acme' AND (id = 1 OR id = 2) RETURNING id"
+        );
+    }
+
+    #[test]
+    fn nested_parentheses_need_no_extra_wrapping() {
+        assert_eq!(
+            rewritten("SELECT * FROM orders WHERE (a = 1 OR b = 2) AND c = 3"),
+            "SELECT * FROM orders WHERE orders.tenant_id = 'acme' AND (a = 1 OR b = 2) AND c = 3"
+        );
+    }
+
+    #[test]
+    fn trailing_line_comment_is_never_commented_out() {
+        assert_eq!(
+            rewritten("SELECT * FROM orders -- note"),
+            "SELECT * FROM orders WHERE orders.tenant_id = 'acme' -- note"
+        );
+        assert_eq!(
+            rewritten("SELECT * FROM orders WHERE a = 1 OR b = 2 -- note"),
+            "SELECT * FROM orders WHERE orders.tenant_id = 'acme' AND (a = 1 OR b = 2) -- note"
+        );
+    }
+
+    #[test]
+    fn trailing_block_comment_stays_after_the_filter() {
+        assert_eq!(
+            rewritten("SELECT * FROM orders /* note */"),
+            "SELECT * FROM orders WHERE orders.tenant_id = 'acme' /* note */"
+        );
+    }
+
+    #[test]
+    fn semicolon_then_comment_keeps_the_filter_before_the_semicolon() {
+        assert_eq!(
+            rewritten("SELECT * FROM orders;"),
+            "SELECT * FROM orders WHERE orders.tenant_id = 'acme';"
+        );
+        assert_eq!(
+            rewritten("SELECT * FROM orders; -- note"),
+            "SELECT * FROM orders WHERE orders.tenant_id = 'acme'; -- note"
+        );
+    }
+
+    #[test]
+    fn keywords_inside_literals_and_comments_do_not_place_the_filter() {
+        assert_eq!(
+            rewritten("SELECT ' WHERE ' AS s FROM orders"),
+            "SELECT ' WHERE ' AS s FROM orders WHERE orders.tenant_id = 'acme'"
+        );
+        assert_eq!(
+            rewritten("SELECT ' ORDER BY ' AS s FROM orders"),
+            "SELECT ' ORDER BY ' AS s FROM orders WHERE orders.tenant_id = 'acme'"
+        );
+        assert_eq!(
+            rewritten("SELECT * FROM orders WHERE note = ' WHERE x ' OR id = 1"),
+            "SELECT * FROM orders WHERE orders.tenant_id = 'acme' AND (note = ' WHERE x ' OR id = 1)"
+        );
+        assert_eq!(
+            rewritten("SELECT * FROM orders /* ORDER BY id */"),
+            "SELECT * FROM orders WHERE orders.tenant_id = 'acme' /* ORDER BY id */"
+        );
+        assert_eq!(
+            rewritten("SELECT * FROM orders -- WHERE x\nORDER BY id"),
+            "SELECT * FROM orders WHERE orders.tenant_id = 'acme' -- WHERE x\nORDER BY id"
+        );
+    }
+
+    #[test]
+    fn leading_comments_do_not_hide_the_statement() {
+        assert_eq!(
+            rewritten("/* x */ SELECT * FROM orders"),
+            "/* x */ SELECT * FROM orders WHERE orders.tenant_id = 'acme'"
+        );
+        assert_eq!(
+            rewritten("-- x\nSELECT * FROM orders"),
+            "-- x\nSELECT * FROM orders WHERE orders.tenant_id = 'acme'"
+        );
+    }
+
+    #[test]
+    fn set_operations_and_locking_clauses_are_rewritten_per_branch() {
+        assert_eq!(
+            rewritten("SELECT * FROM orders UNION SELECT * FROM orders"),
+            "SELECT * FROM orders WHERE orders.tenant_id = 'acme' UNION SELECT * FROM orders WHERE orders.tenant_id = 'acme'"
+        );
+        assert_eq!(
+            rewritten("SELECT * FROM orders FOR UPDATE"),
+            "SELECT * FROM orders WHERE orders.tenant_id = 'acme' FOR UPDATE"
+        );
+    }
+
+    #[test]
+    fn delete_using_keeps_its_filter_valid() {
+        assert_eq!(
+            rewritten("DELETE FROM orders USING logs"),
+            "DELETE FROM orders USING logs WHERE tenant_id = 'acme'"
+        );
+    }
+
+    #[test]
+    fn statement_shapes_that_cannot_be_rewritten_are_refused() {
+        assert_refused("WITH o AS (SELECT * FROM orders) SELECT * FROM o");
+        assert_refused("(SELECT * FROM orders)");
+        assert_refused("TABLE orders");
+        assert_refused("SELECT * FROM orders; SELECT 1");
+        assert_refused("SELECT * FROM logs WHERE id IN (SELECT id FROM orders)");
+        assert_refused("UPDATE logs SET x = 1 WHERE id IN (SELECT id FROM orders)");
+        assert_refused("INSERT INTO logs SELECT * FROM orders");
+        assert_refused("SELECT * FROM logs JOIN logs2 ON true, orders");
+    }
+
+    #[test]
+    fn refusal_is_not_taken_for_statements_without_tenant_tables() {
+        for sql in [
+            "WITH l AS (SELECT * FROM logs) SELECT * FROM l",
+            "(SELECT 1)",
+            "TABLE logs",
+            "/* x */ SELECT * FROM logs",
+            "SELECT * FROM logs; SELECT 1",
+        ] {
+            let res = orders(sql);
+            assert!(res.refusal.is_none(), "wrongly refused: {sql}");
+            assert!(!res.transformed, "untouched: {sql}");
+        }
     }
 }

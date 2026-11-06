@@ -574,7 +574,9 @@ impl McpServer {
             .and(policy.check_node(&node))
             .map_err(|denied| denied.to_string())?;
         let rewritten = policy.rewrite(sql);
-        let filtered = policy.tenant_sql(&rewritten, gateway.tenant);
+        let filtered = policy
+            .tenant_sql(&rewritten, gateway.tenant)
+            .map_err(|denied| denied.to_string())?;
         let sql = filtered.as_ref();
         let bcfg = BackendConfig {
             host: cfg.backend_host.clone(),

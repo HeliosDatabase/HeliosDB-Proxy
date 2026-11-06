@@ -41,6 +41,9 @@ pub enum PolicyDenied {
     CircuitOpen { node: String },
     /// `[multi_tenancy]` is on and the request names no known tenant.
     Tenant { reason: String },
+    /// `[multi_tenancy]` is on and the statement touches a tenant table in a
+    /// shape its row filter cannot cover; it is not forwarded.
+    TenantStatement { reason: String },
 }
 
 impl PolicyDenied {
@@ -49,7 +52,7 @@ impl PolicyDenied {
         match self {
             PolicyDenied::RateLimited { .. } => 429,
             PolicyDenied::CircuitOpen { .. } => 503,
-            PolicyDenied::Tenant { .. } => 403,
+            PolicyDenied::Tenant { .. } | PolicyDenied::TenantStatement { .. } => 403,
         }
     }
 }
@@ -71,6 +74,7 @@ impl std::fmt::Display for PolicyDenied {
                 )
             }
             PolicyDenied::Tenant { reason } => write!(f, "tenant required: {reason}"),
+            PolicyDenied::TenantStatement { reason } => write!(f, "{reason}"),
         }
     }
 }
@@ -175,18 +179,28 @@ impl GatewayPolicy {
 
     /// The tenant's row filter on one statement (apply after
     /// [`Self::rewrite`], as the PG-wire listener does).
-    pub fn tenant_sql<'a>(&self, sql: &'a str, tenant: Option<&GatewayTenant>) -> Cow<'a, str> {
+    ///
+    /// `Err` when the statement touches a tenant table in a shape the filter
+    /// cannot cover: the caller must not run it.
+    pub fn tenant_sql<'a>(
+        &self,
+        sql: &'a str,
+        tenant: Option<&GatewayTenant>,
+    ) -> Result<Cow<'a, str>, PolicyDenied> {
         #[cfg(feature = "multi-tenancy")]
         if let (Some((manager, _)), Some(t)) = (&self.tenancy, tenant) {
             let res =
                 manager.transform_query(sql, &crate::multi_tenancy::TenantId::new(t.0.as_str()));
+            if let Some(reason) = res.refusal {
+                return Err(PolicyDenied::TenantStatement { reason });
+            }
             if res.transformed {
                 tracing::debug!(target: "helios::tenant", tenant = %t.0, "gateway tenant filter injected");
-                return Cow::Owned(res.query);
+                return Ok(Cow::Owned(res.query));
             }
         }
         let _ = tenant;
-        Cow::Borrowed(sql)
+        Ok(Cow::Borrowed(sql))
     }
 
     /// The rate-limit check for one gateway request. A throttle verdict
@@ -369,7 +383,7 @@ mod tests {
         assert_eq!(p.request_tenant(|_| None), Ok(None));
         assert!(matches!(
             p.tenant_sql("SELECT * FROM t", Some(&GatewayTenant("acme".into()))),
-            Cow::Borrowed(_)
+            Ok(Cow::Borrowed(_))
         ));
     }
 
@@ -404,13 +418,24 @@ mod tests {
             .unwrap()
             .expect("tenant");
         assert_eq!(acme, GatewayTenant("acme".into()));
-        let filtered = p.tenant_sql("SELECT * FROM orders", Some(&acme));
+        let filtered = p.tenant_sql("SELECT * FROM orders", Some(&acme)).unwrap();
         assert!(
             filtered.contains("tid") && filtered.contains("acme"),
             "{filtered}"
         );
         // Tables outside the tenant set pass through.
-        assert_eq!(p.tenant_sql("SELECT 1", Some(&acme)), "SELECT 1");
+        assert_eq!(p.tenant_sql("SELECT 1", Some(&acme)).unwrap(), "SELECT 1");
+        // A shape the filter cannot cover is refused, not forwarded.
+        let refused = p
+            .tenant_sql(
+                "WITH o AS (SELECT * FROM orders) SELECT * FROM o",
+                Some(&acme),
+            )
+            .unwrap_err();
+        assert_eq!(refused.http_status(), 403);
+        assert!(refused
+            .to_string()
+            .contains("refused under row-level tenant isolation"));
     }
 
     #[cfg(feature = "query-rewriting")]

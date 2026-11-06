@@ -1062,6 +1062,74 @@ pub(crate) fn lead(sql: &str) -> Lead<'_> {
     Lead::Nothing
 }
 
+/// The kind of one lexical unit of statement text ([`lex_units`]).
+#[cfg(any(feature = "multi-tenancy", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LexKind {
+    /// An unquoted word (keyword or identifier), as written.
+    Word,
+    /// A quoted identifier `"…"`, quotes included.
+    Ident,
+    /// Punctuation: `(`, `)`, `,`, `;` or `.`.
+    Punct,
+    /// An operator run, `::`, `..` or a `$n` parameter.
+    Op,
+    /// A string, dollar-quoted or numeric literal.
+    Literal,
+    /// A `--` or `/* */` comment.
+    Comment,
+}
+
+/// One lexical unit of statement text, by byte range.
+#[cfg(any(feature = "multi-tenancy", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LexUnit {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) kind: LexKind,
+}
+
+/// The lexical units of `sql` in order, whitespace dropped, read by the same
+/// lexer as the result caches. `None` when the lexer reaches a
+/// backend-ambiguous rest ([`Piece::Rest`]) or meets a non-ASCII byte outside
+/// a literal, quoted identifier or comment (HeliosDB-Lite matches keywords
+/// by their Unicode upper-case form, so no word is certain): a caller must
+/// then fail closed.
+#[cfg(any(feature = "multi-tenancy", test))]
+pub(crate) fn lex_units(sql: &str) -> Option<Vec<LexUnit>> {
+    let mut out = Vec::new();
+    for (start, piece) in Pieces::new(sql) {
+        let (len, kind) = match piece {
+            Piece::Space(_) => continue,
+            Piece::Rest(_) => return None,
+            Piece::Comment(t) => (t.len(), LexKind::Comment),
+            Piece::Ident(t) => (t.len(), LexKind::Ident),
+            Piece::Str(t) | Piece::Dollar(t, _) | Piece::Number(t) => (t.len(), LexKind::Literal),
+            Piece::Text(t) => {
+                let c = t.as_bytes()[0];
+                let kind = if !t.is_ascii() {
+                    return None;
+                } else if ident_start(c) {
+                    LexKind::Word
+                } else if matches!(t, "(" | ")" | "," | ";" | ".") {
+                    LexKind::Punct
+                } else if c.is_ascii_digit() || (c == b'.' && t.len() > 1) {
+                    LexKind::Literal
+                } else {
+                    LexKind::Op
+                };
+                (t.len(), kind)
+            }
+        };
+        out.push(LexUnit {
+            start,
+            end: start + len,
+            kind,
+        });
+    }
+    Some(out)
+}
+
 /// The statements of the simple-query string `sql`, split at each `;` the
 /// lexer finds outside literals, quoted identifiers, dollar quotes and
 /// comments (R6-2: a statement boundary comes from nowhere else), each from

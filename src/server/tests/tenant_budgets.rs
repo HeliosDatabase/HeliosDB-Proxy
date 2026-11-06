@@ -5623,3 +5623,24 @@ mod max_concurrent {
         assert_served(&b.query("select 'b'").await, b'I');
     }
 }
+
+/// A statement the row filter cannot cover is answered with SQLSTATE 42501
+/// and ReadyForQuery, and the backend never receives it; the session stays
+/// usable for the next statement.
+#[tokio::test]
+async fn a_refused_tenant_statement_never_reaches_the_backend() {
+    let h = Harness::new(0, None, |c| {
+        c.multi_tenancy.tenant_tables = vec!["orders".into()];
+    })
+    .await;
+    let mut acme = h.connect("acme").await;
+    let refused = "WITH o AS (SELECT * FROM orders) SELECT * FROM o";
+    let frames = acme.query(refused).await;
+    assert_refused(&frames, "42501", "row-level tenant isolation");
+    assert!(
+        !h.backend.saw_query(refused),
+        "the refused statement reached the backend"
+    );
+    let frames = acme.query("SELECT 1").await;
+    assert_served(&frames, b'I');
+}

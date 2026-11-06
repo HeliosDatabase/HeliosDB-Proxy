@@ -222,7 +222,9 @@ impl HttpGateway {
         params: &[ParamValue],
     ) -> std::result::Result<QueryResult, String> {
         let rewritten = policy.rewrite(sql);
-        let filtered = policy.tenant_sql(&rewritten, tenant);
+        let filtered = policy
+            .tenant_sql(&rewritten, tenant)
+            .map_err(|denied| denied.to_string())?;
         let sql = filtered.as_ref();
         let node = format!("{}:{}", cfg.backend_host, cfg.backend_port);
         let bcfg = BackendConfig {

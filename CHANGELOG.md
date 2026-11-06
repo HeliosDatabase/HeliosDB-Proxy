@@ -168,6 +168,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`crate::sql_text`): text inside those literals is neither parsed nor
   changed, and real hint comments keep their behaviour. Tracked as Sprinter
   6c6503dd6d1e.
+- **Row-level tenant filter: OR, comments and unrewritable shapes (2b3c3706f133,
+  40fae8854295, a497b9ae7c97).** Under `[multi_tenancy]` row isolation the filter is
+  now placed by a quote- and comment-aware lexer, not by searching raw text.
+  - An existing `WHERE` is rewritten as `WHERE <filter> AND <condition>`, with the
+    condition parenthesised when it has a top-level `OR`. Before, `WHERE a OR b` became
+    `WHERE <filter> AND a OR b`, which returned other tenants' rows (SELECT) or deleted
+    them (UPDATE, DELETE).
+  - A missing `WHERE` goes before the first top-level clause or trailing `;`, never
+    after a `--` comment, so the filter is no longer commented out.
+  - Leading comments, `WITH` through a comment, and other shapes are no longer skipped.
+    A statement that touches a tenant table in a shape the rewrite does not cover (a
+    `WITH`, a parenthesised query, `TABLE t`, a `VALUES`, several statements, a tenant
+    table inside a subquery) is refused with SQLSTATE 42501 and never reaches the
+    backend. The HTTP, MCP and GraphQL gateways refuse it the same way.
+  - Statements that touch no tenant table, and tenant statements of the shapes listed
+    in `docs/configuration.md`, are unchanged.
 
 ### Development
 

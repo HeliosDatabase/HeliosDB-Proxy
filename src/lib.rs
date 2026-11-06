@@ -119,7 +119,8 @@ pub mod cache;
 #[cfg(any(
     feature = "query-cache",
     feature = "edge-proxy",
-    feature = "routing-hints"
+    feature = "routing-hints",
+    feature = "multi-tenancy"
 ))]
 pub mod sql_text;
 

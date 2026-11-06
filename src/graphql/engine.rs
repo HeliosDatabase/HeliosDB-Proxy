@@ -912,7 +912,10 @@ impl GraphQLEngine {
                     match tenant {
                         None => rewritten,
                         Some(t) => {
-                            std::borrow::Cow::Owned(p.tenant_sql(&rewritten, Some(&t)).into_owned())
+                            let filtered = p
+                                .tenant_sql(&rewritten, Some(&t))
+                                .map_err(|denied| GraphQLError::internal(denied.to_string()))?;
+                            std::borrow::Cow::Owned(filtered.into_owned())
                         }
                     }
                 }
