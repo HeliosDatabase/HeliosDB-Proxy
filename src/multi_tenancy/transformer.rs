@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::config::{IsolationStrategy, TenantConfig, TenantId};
+use crate::config::DEFAULT_REFUSED_FUNCTIONS;
 use crate::sql_text::{lex_units, LexKind, LexUnit};
 
 /// Result of query transformation
@@ -52,6 +53,16 @@ impl TransformResult {
         }
     }
 
+    /// A refused result: the statement must not be forwarded.
+    pub fn refused(reason: impl Into<String>) -> Self {
+        let mut res = Self::passthrough(String::new());
+        res.refusal = Some(format!(
+            "statement refused under row-level tenant isolation: {}",
+            reason.into()
+        ));
+        res
+    }
+
     /// Add a warning
     pub fn with_warning(mut self, warning: impl Into<String>) -> Self {
         self.warnings.push(warning.into());
@@ -72,6 +83,9 @@ pub struct TenantQueryTransformer {
 
     /// Custom filter template (default: "{column} = '{value}'")
     filter_template: Option<String>,
+
+    /// Functions a statement may not call under row isolation (lower-case)
+    refused_functions: HashSet<String>,
 }
 
 impl Default for TenantQueryTransformer {
@@ -88,6 +102,10 @@ impl TenantQueryTransformer {
             excluded_tables: HashSet::new(),
             use_parameters: false,
             filter_template: None,
+            refused_functions: DEFAULT_REFUSED_FUNCTIONS
+                .iter()
+                .map(|f| f.to_string())
+                .collect(),
         }
     }
 
@@ -122,6 +140,20 @@ impl TenantQueryTransformer {
     /// Set custom filter template
     pub fn with_filter_template(mut self, template: impl Into<String>) -> Self {
         self.filter_template = Some(template.into());
+        self
+    }
+
+    /// Replace the functions refused under row isolation (the default is
+    /// `DEFAULT_REFUSED_FUNCTIONS`); matched case-insensitively.
+    pub fn with_refused_functions<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.refused_functions = names
+            .into_iter()
+            .map(|name| name.as_ref().to_lowercase())
+            .collect();
         self
     }
 
@@ -162,8 +194,8 @@ impl TenantQueryTransformer {
     /// rewritten here or refused (SQLSTATE 42501, see
     /// [`TransformResult::refusal`]); none is passed through unfiltered.
     fn rewrite_row(&self, query: &str, tenant: &TenantId, column: &str) -> TransformResult {
-        if tenant.0.contains('\0') {
-            return refuse("the tenant id contains a NUL byte");
+        if tenant.0.chars().any(|c| c == '\0' || c == '\\') {
+            return refuse("the tenant id contains a NUL byte or a backslash");
         }
         let Some(all) = lex_units(query) else {
             // The lexer gave up: where the backends end a token is unknown,
@@ -187,6 +219,9 @@ impl TenantQueryTransformer {
             return refuse(
                 "a Unicode-escaped identifier (U&\"...\") or a UESCAPE clause cannot be read with confidence",
             );
+        }
+        if let Some(reason) = self.dynamic_sql_reason(query, &units) {
+            return refuse(&reason);
         }
         let statements = split_statements(query, &units);
         if statements.len() > 1 {
@@ -213,9 +248,6 @@ impl TenantQueryTransformer {
         if is_word(query, &first, "select") {
             self.rewrite_select(query, stmt, &depth, &refs, tenant, column)
         } else if is_word(query, &first, "update") {
-            if set_names_column(query, stmt, &depth, column) {
-                return refuse("an UPDATE assigns the tenant column, which would move the row to another tenant");
-            }
             match target_at(query, stmt, 1, true) {
                 Some(target) => self.rewrite_write(query, stmt, &depth, target, tenant, column),
                 None => refuse("the UPDATE target is not a table name"),
@@ -267,6 +299,12 @@ impl TenantQueryTransformer {
         column: &str,
     ) -> TransformResult {
         let captured = from_items(sql, stmt, depth);
+        if captured
+            .iter()
+            .any(|&i| self.tenant_table_of(sql, &stmt[i]).is_some() && !item_ends(sql, stmt, i))
+        {
+            return refuse("a tenant table is aliased, which the row filter cannot qualify");
+        }
         if refs.iter().any(|i| !captured.contains(i)) {
             return refuse(
                 "a tenant table is named outside the FROM and JOIN items the rewrite filters",
@@ -305,6 +343,46 @@ impl TenantQueryTransformer {
         TransformResult::transformed(apply_edits(sql, edits), filtered)
     }
 
+    /// Why `units` run dynamic SQL or call a refused function, if they do:
+    /// a `DO` or `CALL` statement, or a function from `refused_functions`
+    /// (a word followed by `(`, schema-qualified or not). Literals never count.
+    fn dynamic_sql_reason(&self, sql: &str, units: &[LexUnit]) -> Option<String> {
+        for statement in split_statements(sql, units) {
+            if let Some(first) = statement.first() {
+                if is_one_of(sql, first, &["do", "call"]) {
+                    return Some("DO and CALL can run dynamic SQL".to_string());
+                }
+            }
+        }
+        for (i, unit) in units.iter().enumerate() {
+            if !matches!(unit.kind, LexKind::Word | LexKind::Ident) {
+                continue;
+            }
+            let called = units
+                .get(i + 1)
+                .is_some_and(|next| is_punct(sql, next, "("));
+            if !called {
+                continue;
+            }
+            if let Some(name) = unit_name(sql, unit) {
+                if self.refused_functions.contains(&name) {
+                    return Some(format!(
+                        "the function {name} is refused under row isolation"
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// The tenant column of the table `unit` names, or `default` for a table
+    /// without its own registration.
+    fn column_of(&self, sql: &str, unit: &LexUnit, default: &str) -> String {
+        self.tenant_table_of(sql, unit)
+            .and_then(|name| self.get_tenant_column(&name).map(str::to_string))
+            .unwrap_or_else(|| default.to_string())
+    }
+
     /// Rewrite an INSERT into a tenant table. Only `INSERT INTO <table>
     /// (<columns>) VALUES (<row>) [, (<row>) ...] [ON CONFLICT [(<cols>)]
     /// DO NOTHING] [RETURNING ...]` is accepted, and the tenant column and
@@ -325,8 +403,9 @@ impl TenantQueryTransformer {
             return refuse("an INSERT reads a tenant table besides its target");
         }
         let name = self.tenant_table_of(sql, &stmt[2]).unwrap_or_default();
+        let column = self.column_of(sql, &stmt[2], column);
         let value = format!("'{}'", escape_literal(&tenant.0));
-        match insert_edits(sql, stmt, depth, column, &value) {
+        match insert_edits(sql, stmt, depth, &column, &value) {
             Some(edits) => TransformResult::transformed(apply_edits(sql, edits), vec![name]),
             None => refuse(
                 "an INSERT into a tenant table is accepted only as INSERT INTO <table> \
@@ -347,11 +426,17 @@ impl TenantQueryTransformer {
         tenant: &TenantId,
         column: &str,
     ) -> TransformResult {
+        let column = self.column_of(sql, &stmt[target], column);
+        if is_word(sql, &stmt[0], "update") && set_names_column(sql, stmt, depth, &column) {
+            return refuse(
+                "an UPDATE assigns the tenant column, which would move the row to another tenant",
+            );
+        }
         if self.tenant_refs(sql, stmt) != [target] {
             return refuse("a tenant table is named besides the target of the write");
         }
         let name = self.tenant_table_of(sql, &stmt[target]).unwrap_or_default();
-        let filter = self.build_single_filter(tenant, column);
+        let filter = self.build_single_filter(tenant, &column);
         match filter_edits(sql, stmt, depth, 0, stmt.len(), &filter) {
             Some(edits) => TransformResult::transformed(apply_edits(sql, edits), vec![name]),
             None => refuse("no place to put the tenant filter"),
@@ -476,11 +561,7 @@ const FROM_END: &[&str] = &[
 
 /// A refusal of `reason`, for [`TransformResult::refusal`].
 fn refuse(reason: &str) -> TransformResult {
-    let mut res = TransformResult::passthrough(String::new());
-    res.refusal = Some(format!(
-        "statement refused under row-level tenant isolation: {reason}"
-    ));
-    res
+    TransformResult::refused(reason)
 }
 
 /// The text of `unit` in `sql`.
@@ -500,11 +581,13 @@ fn is_punct(sql: &str, unit: &LexUnit, p: &str) -> bool {
 
 /// The name a word or quoted identifier spells (lower-case, unquoted).
 fn unit_name(sql: &str, unit: &LexUnit) -> Option<String> {
-    match unit.kind {
-        LexKind::Word => Some(text(sql, unit).to_ascii_lowercase()),
-        LexKind::Ident => Some(text(sql, unit).trim_matches('"').to_lowercase()),
-        _ => None,
-    }
+    let name = match unit.kind {
+        LexKind::Word => text(sql, unit).to_ascii_lowercase(),
+        LexKind::Ident => text(sql, unit).trim_matches('"').to_lowercase(),
+        _ => return None,
+    };
+    // PostgreSQL keeps the first 63 bytes of an identifier.
+    Some(crate::sql_text::truncated_identifier(&name).to_string())
 }
 
 /// Whether the word `unit` is one of the lower-case `words`.
@@ -598,6 +681,8 @@ fn from_items(sql: &str, stmt: &[LexUnit], depth: &[u32]) -> Vec<usize> {
             expect = false;
         } else if is_punct(sql, &unit, ",") {
             expect = in_from;
+        } else if is_punct(sql, &unit, "(") {
+            expect = false;
         } else if expect && matches!(unit.kind, LexKind::Word | LexKind::Ident) {
             let mut last = i;
             while last + 2 < stmt.len()
@@ -810,6 +895,36 @@ fn insert_edits(
         }
     }
     None
+}
+
+/// The statement items that may follow a FROM or JOIN item without an alias:
+/// the clause keywords and the join keywords.
+const JOIN_WORDS: &[&str] = &[
+    "join",
+    "natural",
+    "cross",
+    "left",
+    "right",
+    "full",
+    "inner",
+    "outer",
+    "lateral",
+    "tablesample",
+];
+
+/// Whether the FROM or JOIN item whose name is at `i` ends there (no alias
+/// follows): the end of the statement, `,`, `)`, a clause keyword or a join
+/// keyword. Anything else is an alias, which the row filter cannot qualify.
+fn item_ends(sql: &str, stmt: &[LexUnit], i: usize) -> bool {
+    match stmt.get(i + 1) {
+        None => true,
+        Some(next) => {
+            is_punct(sql, next, ",")
+                || is_punct(sql, next, ")")
+                || (next.kind == LexKind::Word
+                    && (is_one_of(sql, next, FROM_END) || is_one_of(sql, next, JOIN_WORDS)))
+        }
+    }
 }
 
 /// Validate that a query doesn't try to bypass tenant isolation
@@ -1339,5 +1454,123 @@ mod tests {
     #[test]
     fn a_tenant_id_with_a_nul_byte_is_refused() {
         assert!(orders_for("a\0b", "SELECT * FROM orders").refusal.is_some());
+    }
+
+    /// Row-isolated transform of `sql` for tenant `acme`, with `orders`
+    /// tenant-scoped on `org_id` (not the config's `tenant_id`).
+    fn orders_on_org(sql: &str) -> TransformResult {
+        TenantQueryTransformer::new()
+            .register_table("orders", "org_id")
+            .transform(sql, &TenantId::new("acme"), &create_row_config("acme"))
+    }
+
+    #[test]
+    fn a_derived_table_cannot_shadow_a_tenant_table() {
+        assert_refused("SELECT o.* FROM orders o, (SELECT 'acme' AS tenant_id) orders");
+        assert_refused("SELECT * FROM logs JOIN (VALUES ('acme')) orders(tenant_id) ON true");
+    }
+
+    #[test]
+    fn an_aliased_tenant_table_is_refused() {
+        assert_refused("SELECT * FROM orders o");
+        assert_refused("SELECT * FROM orders AS o");
+        assert_refused("SELECT * FROM logs JOIN orders o ON true");
+        assert_refused("SELECT * FROM orders AS OF TIMESTAMP '2020-01-01'");
+    }
+
+    #[test]
+    fn a_tenant_table_followed_by_a_clause_is_not_aliased() {
+        rewritten("SELECT * FROM orders WHERE id = 1");
+        rewritten("SELECT * FROM orders LEFT JOIN logs ON true");
+        rewritten("SELECT * FROM orders, logs");
+        rewritten("SELECT * FROM orders ORDER BY id");
+    }
+
+    #[test]
+    fn dynamic_sql_and_refused_functions_are_refused_under_row_isolation() {
+        assert_refused("DO $$ BEGIN END $$");
+        assert_refused("/* x */ CALL refresh()");
+        assert_refused("SELECT * FROM logs; DO $$ BEGIN END $$");
+        assert_refused("SELECT table_to_xml('orders', true, false, '')");
+        assert_refused("SELECT pg_catalog.PG_READ_FILE('/etc/passwd')");
+        assert_refused("SELECT dblink('host=x', 'SELECT 1')");
+    }
+
+    #[test]
+    fn ordinary_literals_that_name_tables_or_functions_are_not_refused() {
+        for sql in [
+            "SELECT * FROM logs WHERE note = 'orders shipped'",
+            "SELECT * FROM logs WHERE note = 'table_to_xml(orders)'",
+        ] {
+            assert!(orders(sql).refusal.is_none(), "wrongly refused: {sql}");
+        }
+    }
+
+    #[test]
+    fn a_long_spelling_of_a_tenant_table_is_the_same_table() {
+        // PostgreSQL keeps the first 63 bytes of an identifier.
+        let name = "a".repeat(63);
+        let long = format!("{name}bbbbbbb");
+        let transformer = TenantQueryTransformer::new().register_table(name.as_str(), "tenant_id");
+        let res = transformer.transform(
+            &format!("SELECT * FROM {long}"),
+            &TenantId::new("acme"),
+            &create_row_config("acme"),
+        );
+        assert!(res.refusal.is_none(), "refused: {:?}", res.refusal);
+        assert!(res.transformed, "not transformed: {}", res.query);
+        assert!(res.query.contains(&format!("{name}.tenant_id = 'acme'")));
+    }
+
+    #[test]
+    fn a_tenant_id_with_a_backslash_is_refused() {
+        assert!(orders_for("a\\b", "SELECT * FROM orders").refusal.is_some());
+    }
+
+    #[test]
+    fn writes_use_the_tables_own_tenant_column() {
+        assert_eq!(
+            orders_on_org("UPDATE orders SET s = 1 WHERE id = 1").query,
+            "UPDATE orders SET s = 1 WHERE org_id = 'acme' AND id = 1"
+        );
+        assert_eq!(
+            orders_on_org("DELETE FROM orders WHERE id = 1").query,
+            "DELETE FROM orders WHERE org_id = 'acme' AND id = 1"
+        );
+        assert_eq!(
+            orders_on_org("INSERT INTO orders (id) VALUES (1)").query,
+            "INSERT INTO orders (id, org_id) VALUES (1, 'acme')"
+        );
+        assert!(orders_on_org("UPDATE orders SET org_id = 'x' WHERE id = 1")
+            .refusal
+            .is_some());
+    }
+
+    #[test]
+    fn an_unconfigured_tenant_is_row_isolated_by_the_default_or_refused() {
+        use crate::multi_tenancy::{MultiTenancyConfig, TenantManagerBuilder};
+        let manager = |default: IsolationStrategy| {
+            TenantManagerBuilder::new()
+                .config(MultiTenancyConfig {
+                    default_config: TenantConfig::new(TenantId::new("default"), default),
+                    allow_unknown_tenants: true,
+                    ..Default::default()
+                })
+                .query_transformer(
+                    TenantQueryTransformer::new().register_table("orders", "tenant_id"),
+                )
+                .build()
+        };
+        let row = manager(IsolationStrategy::row("public", "tenant_id"));
+        assert_eq!(
+            row.transform_query("SELECT * FROM orders", &TenantId::new("zed"))
+                .query,
+            "SELECT * FROM orders WHERE orders.tenant_id = 'zed'"
+        );
+        let schema = manager(IsolationStrategy::schema("public", "public"));
+        assert!(schema
+            .transform_query("SELECT * FROM orders", &TenantId::new("zed"))
+            .refusal
+            .is_some());
     }
 }

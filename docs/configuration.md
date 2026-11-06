@@ -1822,6 +1822,7 @@ acme = 50
 | `identify_by` | string | `"application_name"` | Connection attribute naming the tenant: a startup parameter name (e.g. `application_name`, `user`) or the literal `database`. |
 | `tenant_column` | string | `"tenant_id"` | The row-level tenant column injected into queries. |
 | `tenant_tables` | array | `[]` | Tables that get the tenant filter injected; others pass through. |
+| `refused_functions` | array | `["table_to_xml", "table_to_xmlschema", "table_to_xml_and_xmlschema", "query_to_xml", "query_to_xmlschema", "query_to_xml_and_xmlschema", "cursor_to_xml", "cursor_to_xmlschema", "schema_to_xml", "schema_to_xmlschema", "schema_to_xml_and_xmlschema", "database_to_xml", "database_to_xmlschema", "database_to_xml_and_xmlschema", "dblink", "dblink_exec", "dblink_open", "dblink_fetch", "dblink_send_query", "lo_import", "lo_export", "pg_read_file", "pg_read_binary_file"]` | Functions a statement may not call under row isolation: a word followed by `(`, case-insensitive, schema-qualified or not. A `DO` or `CALL` statement is always refused. Literals that merely contain a name are not refused. `[]` refuses none (not recommended). |
 | `tenants` | array | `[]` | Known tenant ids. |
 | `max_clients_per_tenant` | usize | `0` | Most client sessions one known tenant may hold on this proxy at once (H-05). The tenant is read from the startup packet (`identify_by`; `database` falls back to `user` as PostgreSQL does). A tenant at its cap waits up to `[limits] client_admission_wait_secs` for one of its own sessions to end, then is refused with SQLSTATE 53300 naming the tenant; other tenants are not affected. The tenant slot is taken before the process-wide `[limits] max_client_connections` slot, so connections queued at their tenant's cap never hold process-wide capacity. Sessions naming no known tenant count only against `max_client_connections`. To guarantee a small tenant its share, keep the sum of tenant caps at or below `max_client_connections`. `0` = no per-tenant cap. Must be ≤ `Semaphore::MAX_PERMITS`. |
 | `tenant_max_clients` | table | `{}` | Per-tenant overrides of `max_clients_per_tenant` (`0` = no cap for that tenant). Every key must be in `tenants` (startup error otherwise); each value ≤ `Semaphore::MAX_PERMITS`. |
@@ -1881,11 +1882,33 @@ table in a shape the rewrite cannot filter with confidence:
 - text the lexer cannot read unambiguously (a backend-ambiguous comment or literal,
   or a non-ASCII keyword) that may name a tenant table.
 
+Aliases are refused: a tenant table in FROM or JOIN followed by an alias (`FROM orders o`,
+`FROM orders AS o`, or Nano's `FROM orders AS OF ...`) gets SQLSTATE 42501, since the filter
+cannot qualify it. A derived table (`(SELECT ...) orders`, `(VALUES ...) orders(...)`) that
+reuses a tenant table's name is not a tenant table, and a tenant table left unqualified by
+it is refused.
+
+Under row isolation the following are refused in any statement, tenant table or not: `DO`
+and `CALL` (dynamic SQL can read a table the filter never sees), and any call to a function
+in `refused_functions`. A tenant table's identifiers are matched as PostgreSQL stores them:
+a longer spelling that PostgreSQL cuts to 63 bytes is the same table, so register names of
+at most 63 bytes. A partition, an inheritance child or a table reachable under another name
+is a separate table and must be listed under each name (no patterns). Writes use the table's
+own tenant column (`tenant_tables` registration) and fall back to `tenant_column`.
+
+An identified tenant with no `tenants` entry is filtered by the default config's row column
+when that config is row isolation; otherwise its statements are refused with 42501.
+
+This filter is not a hard boundary. A user-defined function, a view or a dynamic SQL path not
+listed above can read a tenant table without the filter. For a hard boundary, use PostgreSQL
+row-level security or a restricted database role for each tenant; keep this filter as
+defence in depth.
+
 A statement that names no tenant table passes unchanged, as does one a `tenant_tables`
 entry excludes.
 
 The tenant id is written into generated literals with each `'` doubled. A tenant id
-containing a NUL byte is refused for every statement. The alias limitation stands: for
+containing a NUL byte or a backslash is refused for every statement. The alias limitation stands: for
 `FROM orders o` the filter is qualified with the table name (`orders.tenant_id`), which
 PostgreSQL rejects once the item is aliased, so the statement fails at the backend rather
 than running unfiltered.

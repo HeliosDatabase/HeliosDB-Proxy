@@ -1267,8 +1267,17 @@ pub struct MultiTenancyToml {
     /// The row-level tenant column injected into queries (e.g. `tenant_id`).
     pub tenant_column: String,
     /// Tables that are tenant-scoped (get the filter injected). Other tables
-    /// pass through unchanged.
+    /// pass through unchanged. A table must be listed under each name it can
+    /// be reached by (a partition, an inheritance child, a second schema): the
+    /// filter matches names, not patterns. Register names of at most 63 bytes
+    /// (PostgreSQL's identifier limit; a longer spelling is cut to 63 first).
     pub tenant_tables: Vec<String>,
+    /// Functions a statement under row isolation may not call (matched as a
+    /// word followed by `(`, schema-qualified or not, case-insensitively). A
+    /// `DO` or `CALL` statement is always refused. Proxy-side row filtering is
+    /// not a hard boundary: these functions can read tenant tables without the
+    /// filter. Default: `DEFAULT_REFUSED_FUNCTIONS`. An empty list refuses none.
+    pub refused_functions: Vec<String>,
     /// Known tenant ids.
     pub tenants: Vec<String>,
     /// Most client sessions one known tenant may hold on this proxy at once
@@ -1319,6 +1328,36 @@ pub struct MultiTenancyToml {
     pub tenant_max_replay_bytes: std::collections::BTreeMap<String, usize>,
 }
 
+/// The functions refused by default under row isolation
+/// (`[multi_tenancy] refused_functions`): XML export of tables, queries,
+/// cursors, schemas and databases; dblink; large-object import and export;
+/// and server-side file reads.
+pub const DEFAULT_REFUSED_FUNCTIONS: &[&str] = &[
+    "table_to_xml",
+    "table_to_xmlschema",
+    "table_to_xml_and_xmlschema",
+    "query_to_xml",
+    "query_to_xmlschema",
+    "query_to_xml_and_xmlschema",
+    "cursor_to_xml",
+    "cursor_to_xmlschema",
+    "schema_to_xml",
+    "schema_to_xmlschema",
+    "schema_to_xml_and_xmlschema",
+    "database_to_xml",
+    "database_to_xmlschema",
+    "database_to_xml_and_xmlschema",
+    "dblink",
+    "dblink_exec",
+    "dblink_open",
+    "dblink_fetch",
+    "dblink_send_query",
+    "lo_import",
+    "lo_export",
+    "pg_read_file",
+    "pg_read_binary_file",
+];
+
 impl Default for MultiTenancyToml {
     fn default() -> Self {
         Self {
@@ -1326,6 +1365,10 @@ impl Default for MultiTenancyToml {
             identify_by: "application_name".to_string(),
             tenant_column: "tenant_id".to_string(),
             tenant_tables: Vec::new(),
+            refused_functions: DEFAULT_REFUSED_FUNCTIONS
+                .iter()
+                .map(|f| f.to_string())
+                .collect(),
             tenants: Vec::new(),
             max_clients_per_tenant: 0,
             tenant_max_clients: std::collections::BTreeMap::new(),

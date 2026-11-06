@@ -1722,11 +1722,9 @@ async fn only_a_statement_naming_a_lock_function_pins_the_permit() {
         h.until("acme", sql, |s| s.queries_active == 0).await;
         assert_served(&b.query("select 'b'").await, b'I');
     }
-    assert_served(
-        &a.query("DO $$BEGIN PERFORM pg_advisory_lock(1); END$$")
-            .await,
-        b'I',
-    );
+    // A DO block is refused under row isolation (dynamic SQL), so the lock is
+    // taken by a plain statement.
+    assert_served(&a.query("SELECT pg_advisory_lock(1)").await, b'I');
     h.until("acme", "A idle holding the permit", |s| {
         s.queries_active == 1 && s.queries_idle == 1
     })

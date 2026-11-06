@@ -194,10 +194,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ON CONFLICT ... DO UPDATE` is refused, since a conflicting row may belong to another
   tenant. An `UPDATE` that assigns the tenant column is refused. A tenant id is escaped in
   every generated literal (`'` doubled), and one containing a NUL byte is refused.
+- **Row-level tenant filter: round 3.** A tenant table followed by an alias is refused
+  (42501); a derived table reusing a tenant table's name no longer shadows it. `DO`, `CALL`
+  and the functions in the new `[multi_tenancy] refused_functions` key (default: the XML
+  exports, dblink, large-object import/export and server-side file reads) are refused under
+  row isolation. An identified tenant with no configuration is filtered by the default row
+  column, or refused. Identifiers are matched as PostgreSQL truncates them (63 bytes). Writes
+  use the table's own tenant column. A tenant id containing a backslash is refused. Proxy-side
+  filtering is documented as not a hard boundary.
 
 ### Library API (breaking)
 
-- `GatewayPolicy::tenant_sql` now returns `Result<Cow<str>, PolicyDenied>` (it was
+- `TenantQueryTransformer::with_refused_functions` and `TransformResult::refused` are new;
+  `GatewayPolicy::tenant_sql` now returns `Result<Cow<str>, PolicyDenied>` (it was
   `Cow<str>`), so a refused statement is an `Err` (`PolicyDenied::TenantStatement`, HTTP 403)
   and never a passthrough. Downstream callers must handle the `Err`; the release is a
   breaking change for the library API.

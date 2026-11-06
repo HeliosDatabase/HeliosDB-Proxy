@@ -1121,7 +1121,8 @@ impl ProxyServer {
                 // Configure which tables are tenant-scoped + the filter column.
                 let table_refs: Vec<&str> = mt.tenant_tables.iter().map(|s| s.as_str()).collect();
                 let transformer = TenantQueryTransformer::new()
-                    .register_tables(&table_refs, mt.tenant_column.clone());
+                    .register_tables(&table_refs, mt.tenant_column.clone())
+                    .with_refused_functions(&mt.refused_functions);
                 let tm = TenantManagerBuilder::new()
                     .config(mtc)
                     .query_transformer(transformer)

@@ -250,9 +250,17 @@ impl TenantManager {
     /// Transform a query for tenant isolation
     pub fn transform_query(&self, query: &str, tenant: &TenantId) -> TransformResult {
         if let Some(config) = self.get_tenant(tenant) {
-            self.query_transformer.transform(query, tenant, &config)
-        } else {
-            TransformResult::passthrough(query)
+            return self.query_transformer.transform(query, tenant, &config);
+        }
+        // An identified tenant with no configuration of its own is isolated by
+        // the default config's row column, or refused: it must not run unfiltered.
+        match &self.config.default_config.isolation {
+            IsolationStrategy::Row { .. } => {
+                let config =
+                    TenantConfig::new(tenant.clone(), self.config.default_config.isolation.clone());
+                self.query_transformer.transform(query, tenant, &config)
+            }
+            _ => TransformResult::refused("the tenant has no row-isolation configuration"),
         }
     }
 
