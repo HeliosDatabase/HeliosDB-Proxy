@@ -84,7 +84,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[cache]`), with the fill-race rule, and by a TTL (`tool_cache_ttl_secs = 60`, a shorter
   `[[cache.tables]] ttl_secs` applying; `list_tables` follows DDL and
   `tool_cache_catalog_ttl_secs = 30`). Admission, the read-only guard or contract and the
-  rate limit run first (hits consume rate-limit tokens). Bounded per owner and overall in
+  rate limit run first (hits consume rate-limit tokens); the circuit check and the
+  tenant's active-query permit apply only on a miss (a hit runs nothing on the backend,
+  so it is served while its tenant is at its cap). Bounded per owner and overall in
   entries and bytes (`tool_cache_max_entries = 10000`, `tool_cache_max_bytes = 64 MiB`,
   `tool_cache_max_entries_per_principal = 1000`, `tool_cache_max_bytes_per_principal =
   8 MiB`, `tool_cache_max_entry_bytes = 1 MiB`, `tool_cache_max_statement_bytes = 16384`),

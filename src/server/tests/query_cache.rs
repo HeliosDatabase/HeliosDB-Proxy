@@ -2546,6 +2546,88 @@ mod mcp_tool_cache {
         );
     }
 
+    /// `[multi_tenancy]` active-query cap with the tool cache: the permit
+    /// bounds backend work, so a hit (which runs nothing on the backend) is
+    /// served while the tenant is at its cap; a miss and a `fresh` read need
+    /// the backend, take the permit, and are refused at the cap, never
+    /// stored. Once the permit returns, a miss runs again.
+    #[cfg(feature = "multi-tenancy")]
+    #[tokio::test]
+    async fn a_hit_takes_no_tenant_active_query_permit() {
+        use crate::gateway_policy::GatewayTenant;
+        let (relay, _backend) = relay_with_tool_cache(false, 0, |_| {}).await;
+        // acme: an active-query cap of 1 that refuses at once.
+        let policy = Arc::new(crate::gateway_policy::capped_tenancy_policy(
+            "X-Helios-Tenant",
+        ));
+        let (port, seen) = start_gateway_backend().await;
+        let cfg = crate::config::McpConfig {
+            enabled: true,
+            backend_port: port,
+            read_only: false,
+            tool_cache_enabled: true,
+            tenant_header: "X-Helios-Tenant".into(),
+            ..Default::default()
+        };
+        let pool: crate::gateway_pool::SharedBackendPool =
+            Arc::new(crate::gateway_pool::BackendClientPool::new(0));
+        let mcp = crate::mcp::McpServer::new(cfg, None, pool)
+            .with_policy(policy.clone())
+            .with_tool_cache(relay.server.state.mcp_tool_cache.clone())
+            .into_shared();
+        let acme = "X-Helios-Tenant: acme\r\n";
+        let other_read = "SELECT id FROM widgets";
+
+        let miss = call(&mcp, acme, "query", serde_json::json!({ "sql": READ })).await;
+        assert_eq!(miss["result"]["isError"], false, "{miss}");
+        assert_eq!(cache_meta(&miss)["stored"], true, "{miss}");
+
+        // acme's only permit is held, as by an in-flight request.
+        let in_flight = policy
+            .admit_tenant_query(Some(&GatewayTenant("acme".into())))
+            .await
+            .unwrap();
+        assert!(in_flight.is_some());
+
+        let hit = call(&mcp, acme, "query", serde_json::json!({ "sql": READ })).await;
+        assert_eq!(hit["result"]["isError"], false, "{hit}");
+        assert_eq!(cache_meta(&hit)["hit"], true, "{hit}");
+        assert_eq!(hit["result"]["content"], miss["result"]["content"]);
+
+        for args in [
+            serde_json::json!({ "sql": other_read }),
+            serde_json::json!({ "sql": READ, "fresh": true }),
+        ] {
+            let r = call(&mcp, acme, "query", args).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                r["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("too many active queries for tenant \"acme\""),
+                "{r}"
+            );
+            assert_eq!(cache_meta(&r)["stored"], false, "{r}");
+        }
+        assert_eq!(
+            seen.lock().len(),
+            1,
+            "only the first miss ran on the backend"
+        );
+
+        drop(in_flight);
+        let r = call(
+            &mcp,
+            acme,
+            "query",
+            serde_json::json!({ "sql": other_read }),
+        )
+        .await;
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        assert_eq!(cache_meta(&r)["stored"], true, "{r}");
+        assert_eq!(seen.lock().len(), 2);
+    }
+
     /// A hit still consumes a rate-limit token: once the burst is spent the
     /// cached read is refused like any other.
     #[cfg(feature = "rate-limiting")]
