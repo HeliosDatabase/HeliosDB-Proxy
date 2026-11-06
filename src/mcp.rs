@@ -194,7 +194,7 @@ impl McpServer {
         }
     }
 
-    async fn handle_connection(
+    pub(crate) async fn handle_connection(
         mut stream: tokio::net::TcpStream,
         peer: std::net::SocketAddr,
         cfg: Arc<McpConfig>,
@@ -616,10 +616,15 @@ impl McpServer {
                 return Err(format!("failed to enforce read-only mode: {}", e));
             }
         }
-        match client
+        let res = client
             .simple_query_bounded(sql, cfg.max_result_rows, cfg.max_result_bytes)
-            .await
-        {
+            .await;
+        // C-02: a write retires the cached reads of its tables, whatever the
+        // outcome (a statement that timed out may still commit).
+        policy
+            .note_statement(sql, crate::gateway_policy::GatewayKind::Mcp)
+            .await;
+        match res {
             Ok(bounded) => {
                 // read_only connections are retained (their only state is the
                 // GUC, re-asserted on checkout); otherwise only session-neutral

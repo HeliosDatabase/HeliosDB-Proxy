@@ -135,6 +135,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Gateway writes retire cached reads (C-02, Sprinter 6a0c6c34d27a).** The HTTP `/sql`,
+  MCP and GraphQL gateways run SQL on their own backend connections, which the PG-wire
+  relay's journal capture never sees, so a write through them moved no `[cache]`
+  generation and a cached PG-wire read of the written table stayed stale until its TTL.
+  The write generations now live in one clock the daemon owns (`ServerState`), which the
+  query cache reads with unchanged semantics (the fill-time snapshot checked at store,
+  `fills_raced`, the relay's statement- and commit-time marks, the unseen-write signal,
+  `COMMIT PREPARED`, the logical source); each gateway moves it after every statement
+  that may have written, once the backend answered, failed or timed out (a statement
+  that timed out may still commit): the tables the text as sent names, by the relay's
+  extraction, or every entry when they are unknown (fail-closed; an `EXPLAIN ... ANALYZE`
+  counts as unknown). Reads move nothing. Counted in the new
+  `heliosdb_proxy_cache_gateway_write_invalidations_total{gateway="http|mcp|graphql"}`.
+  With `[cache]` off nothing changes (no clock, no capture). Library API: new
+  `cache::TableGenerations` (`mark_written`, `invalidate_all`, `generation_of`,
+  `global_generation`, `write_tables`, `note_write`), `cache::GatewayWrites`,
+  `cache::WriteScope`, `gateway_policy::GatewayKind`,
+  `GatewayPolicy::{with_cache_writes, note_statement}`,
+  `QueryCache::{with_generations, generations}`; `QueryCache::new` keeps its signature
+  (its own clock).
 - **L1 byte account after an entry-bound eviction:** when a connection's L1 dropped its
   least recently used entry to stay within its entry bound, the entry's bytes stayed in
   the byte account, so on a long-lived connection running many distinct reads the

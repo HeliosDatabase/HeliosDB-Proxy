@@ -57,6 +57,7 @@
 pub(crate) mod canonical;
 pub mod codec;
 pub mod config;
+pub mod generations;
 pub mod heatmap;
 pub mod hints;
 pub mod invalidation;
@@ -72,6 +73,7 @@ pub mod result;
 // Re-exports
 pub use codec::{L2Codec, L2Payload};
 pub use config::{CacheConfig, L1Config, L2Config, L3Config, StorageBackend};
+pub use generations::{GatewayWrites, TableGenerations, WriteScope};
 pub use heatmap::{
     CacheHeatmap, HeatRecorder, HeatmapConfig, HeatmapSnapshot, Recommendation, TableHeatSnapshot,
     Temperature,
@@ -294,14 +296,12 @@ pub struct QueryCache {
     /// Metrics collector
     metrics: Arc<CacheMetrics>,
 
-    /// Per-table write generations (C-02). Bumped by every invalidation of the
-    /// table; a cached result stores the sum observed before its fetch and is
-    /// served only while the sum is unchanged, on every tier (L1/L2/L3).
-    table_generations: DashMap<String, u64>,
-
-    /// Generation of invalidations whose table set is unknown (DDL,
-    /// `EXECUTE`/`CALL`/`DO`, `COPY`, unparsable writes): part of every sum.
-    global_generation: std::sync::atomic::AtomicU64,
+    /// The write generations (C-02), per table plus the global one, shared
+    /// with every other writer the daemon wires to it (the gateways, the
+    /// MCP tool cache). A cached result stores the sum observed before its
+    /// fetch and is served only while the sum is unchanged, on every tier
+    /// (L1/L2/L3).
+    generations: Arc<TableGenerations>,
 
     /// Work for the `cache-reclaim` thread, so bulk deallocation (10^5-10^6
     /// entries after a read-heavy phase) never runs on a connection: key
@@ -344,8 +344,16 @@ enum Reclaim {
 }
 
 impl QueryCache {
-    /// Create a new query cache with the given configuration
+    /// Create a new query cache with the given configuration and its own
+    /// write generations.
     pub fn new(config: CacheConfig) -> Self {
+        Self::with_generations(config, Arc::new(TableGenerations::new()))
+    }
+
+    /// Create a query cache whose write generations are `generations`, the
+    /// clock the daemon shares with every other path that writes (the
+    /// gateways) or caches (the MCP tool cache).
+    pub fn with_generations(config: CacheConfig, generations: Arc<TableGenerations>) -> Self {
         let l2_cache = if config.l2.enabled {
             Some(Arc::new(L2WarmCache::new(config.l2.clone())))
         } else {
@@ -401,8 +409,7 @@ impl QueryCache {
             normalizer: Arc::new(QueryNormalizer::new()),
             invalidator,
             metrics,
-            table_generations: DashMap::new(),
-            global_generation: std::sync::atomic::AtomicU64::new(0),
+            generations,
             reclaim_tx,
             logical: std::sync::OnceLock::new(),
             heliosdb_backend: std::sync::atomic::AtomicBool::new(false),
@@ -1157,15 +1164,12 @@ impl QueryCache {
     /// a result that read these tables before this point.
     pub fn mark_written(&self, tables: &[String]) {
         self.heat.record_invalidation(tables);
-        for table in tables {
-            // Runs before the write's ReadyForQuery: a known table (the common
-            // case) is bumped in place without allocating its name again.
-            if let Some(mut g) = self.table_generations.get_mut(table.as_str()) {
-                *g += 1;
-            } else {
-                *self.table_generations.entry(table.clone()).or_insert(0) += 1;
-            }
-        }
+        self.generations.mark_written(tables);
+    }
+
+    /// The write generations this cache reads ([`Self::with_generations`]).
+    pub fn generations(&self) -> &Arc<TableGenerations> {
+        &self.generations
     }
 
     /// Release the invalidation index of `tables` — the memory half of
@@ -1213,8 +1217,7 @@ impl QueryCache {
     /// `EXECUTE`/`CALL`/`DO`, `COPY`, a statement no table could be read
     /// from). Every cached result on every tier stops being served.
     pub fn invalidate_all(&self) {
-        self.global_generation
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.generations.invalidate_all();
         self.metrics.record_invalidation(0);
         self.heat.record_invalidate_all();
     }
@@ -1228,46 +1231,13 @@ impl QueryCache {
     /// `sql_text::single_statement`) — the caller then invalidates
     /// everything.
     pub fn write_tables(&self, sql: &str) -> Option<Vec<String>> {
-        use crate::protocol::starts_with_ci;
-        const OPAQUE: &[&str] = &[
-            "CREATE", "ALTER", "DROP", "TRUNCATE", "COMMENT", "GRANT", "REVOKE", "EXECUTE", "CALL",
-            "DO", "COPY", "IMPORT", "SECURITY", "REFRESH", "REINDEX", "CLUSTER", "VACUUM", "LOCK",
-            "SELECT",
-        ];
-        // Only the table names are needed, and this runs before the client
-        // sees the write's ReadyForQuery: one pass of the lexer gives the
-        // first word past the leading comments (so one cannot hide a DDL
-        // keyword) and the comment-free text the tables are matched on (so
-        // an inner comment cannot hide a table name), without the literal
-        // rewriting and hashing of `normalize`. A journaled `SELECT`
-        // (`SELECT … INTO`, a function call) has an unknown scope.
-        let (t, text) = crate::sql_text::single_statement(sql)?;
-        if OPAQUE.iter().any(|kw| starts_with_ci(t, kw))
-            || crate::sql_text::merge_without_into(t)
-            || crate::sql_text::insert_without_into(t)
-        {
-            return None;
-        }
-        let tables = self.normalizer.write_statement_tables(&text)?;
-        if tables.is_empty() {
-            None
-        } else {
-            Some(tables)
-        }
+        self.generations.write_tables(sql)
     }
 
     /// Sum of the global generation and the generations of `tables`.
     /// Generations only grow, so the sum changes whenever any of them does.
     fn generation_of(&self, tables: &[String]) -> u64 {
-        let mut sum = self
-            .global_generation
-            .load(std::sync::atomic::Ordering::Relaxed);
-        for table in tables {
-            if let Some(g) = self.table_generations.get(table) {
-                sum = sum.wrapping_add(*g);
-            }
-        }
-        sum
+        self.generations.generation_of(tables)
     }
 
     /// Whether `result` may still be served: nothing it read has been
@@ -1565,6 +1535,51 @@ mod tests {
         assert_eq!(cache.fills_raced(), 1);
         assert!(!is_hit(&cache, q, 1).await);
         assert!(!is_hit(&cache, q, 2).await);
+    }
+
+    /// A cache built on shared generations (the daemon's, 6a0c6c34d27a) is
+    /// retired by a write another writer notes on them (a gateway): its
+    /// entries stop being served, a fill that write raced is not stored, and
+    /// a write of unknown scope retires everything.
+    #[tokio::test]
+    async fn shared_generations_retire_entries_and_race_fills() {
+        let shared = Arc::new(TableGenerations::new());
+        let cache = QueryCache::with_generations(CacheConfig::default(), shared.clone());
+        assert!(Arc::ptr_eq(cache.generations(), &shared));
+        let q = "SELECT v FROM accounts WHERE id = 1";
+        fill(&cache, q, 1, b"v").await;
+        assert!(is_hit(&cache, q, 2).await);
+        shared.mark_written(&["accounts".to_string()]);
+        assert!(!is_hit(&cache, q, 1).await, "L1 refused");
+        assert!(!is_hit(&cache, q, 2).await, "L2 refused");
+
+        let (lookup, prep) = cache.get_with_prep(q, &ctx(3)).await;
+        assert!(matches!(lookup, CacheLookup::Miss));
+        assert_eq!(
+            shared.note_write("UPDATE accounts SET v = 3 WHERE id = 1"),
+            WriteScope::Tables(vec!["accounts".to_string()])
+        );
+        let raced = cache.fills_raced();
+        cache
+            .put_prepared(
+                q,
+                &ctx(3),
+                &prep,
+                Bytes::from_static(b"old"),
+                1,
+                Duration::ZERO,
+            )
+            .await;
+        assert_eq!(cache.fills_raced(), raced + 1, "not stored");
+        assert!(!is_hit(&cache, q, 4).await);
+
+        fill(&cache, q, 1, b"v2").await;
+        assert!(is_hit(&cache, q, 2).await);
+        shared.invalidate_all();
+        assert!(
+            !is_hit(&cache, q, 2).await,
+            "unknown scope retires everything"
+        );
     }
 
     /// An invalidation of unknown scope refuses every cached result.

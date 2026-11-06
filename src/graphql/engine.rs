@@ -912,6 +912,15 @@ impl GraphQLEngine {
         filters
     }
 
+    /// Run `sql` as if the generator had produced it (tests): the path every
+    /// generated statement takes to the backend.
+    #[cfg(test)]
+    pub(crate) async fn execute_sql_for_test(&self, sql: &str) -> Result<(), GraphQLError> {
+        self.execute_queries(&[super::SqlQuery::new(sql)], &ExecutionContext::default())
+            .await
+            .map(|_| ())
+    }
+
     /// Execute the generated SQL against the configured backend, returning one
     /// vector of row-objects (`{column: value}`) per query. With no backend
     /// attached the engine returns empty result sets.
@@ -965,10 +974,17 @@ impl GraphQLEngine {
             }
             let mut client =
                 connected.map_err(|e| GraphQLError::internal(format!("backend connect: {}", e)))?;
-            let bounded = client
+            let res = client
                 .simple_query_bounded(&sql, self.result_caps.max_rows, self.result_caps.max_bytes)
-                .await
-                .map_err(|e| GraphQLError::internal(format!("backend query: {}", e)))?;
+                .await;
+            // C-02: a write retires the cached reads of its tables, whatever
+            // the outcome (a statement that timed out may still commit).
+            if let Some(p) = &self.policy {
+                p.note_statement(&sql, crate::gateway_policy::GatewayKind::Graphql)
+                    .await;
+            }
+            let bounded =
+                res.map_err(|e| GraphQLError::internal(format!("backend query: {}", e)))?;
             // A result past a cap is refused, not truncated; the reader drained
             // the rest of it, so the connection is in sync and is still pooled.
             let refused = bounded.truncation.is_truncated().then(|| {

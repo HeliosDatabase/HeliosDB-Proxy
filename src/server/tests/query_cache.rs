@@ -1968,3 +1968,323 @@ async fn refresh_ahead_refills_a_hot_key_once_per_window() {
         }
     );
 }
+
+/// Writes through the HTTP `/sql`, MCP and GraphQL gateways retire the
+/// PG-wire query cache's entries for the tables they write (C-02 for the
+/// gateways, Sprinter 6a0c6c34d27a): the gateways run SQL on their own
+/// backend clients, which the relay's journal capture never sees.
+mod gateway_writes {
+    use super::*;
+
+    /// The read the relay cache was prefilled with.
+    const READ: &str = "SELECT value FROM widgets";
+    /// A write of its table.
+    const WRITE: &str = "UPDATE widgets SET value = 2 WHERE id = 1";
+    /// Marks a statement the gateway backend fails.
+    const FAIL: &str = "/* fail */";
+
+    /// A PG-wire backend for the gateways' pooled clients: every connection
+    /// gets `AuthenticationOk` + `ReadyForQuery`, then each simple query a
+    /// one-row result (a `SELECT`), an `ErrorResponse` (a text holding
+    /// [`FAIL`]) or a command tag (anything else). The texts it ran are
+    /// recorded.
+    async fn gateway_backend(listener: TcpListener, seen: Arc<parking_lot::Mutex<Vec<String>>>) {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut len = [0u8; 4];
+                if sock.read_exact(&mut len).await.is_err() {
+                    return;
+                }
+                let mut startup = vec![0u8; u32::from_be_bytes(len) as usize - 4];
+                if sock.read_exact(&mut startup).await.is_err() {
+                    return;
+                }
+                let hello = [
+                    wire_frame(b'R', &0u32.to_be_bytes()),
+                    wire_frame(b'Z', b"I"),
+                ]
+                .concat();
+                if sock.write_all(&hello).await.is_err() {
+                    return;
+                }
+                loop {
+                    let mut head = [0u8; 5];
+                    if sock.read_exact(&mut head).await.is_err() {
+                        return;
+                    }
+                    let n = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize - 4;
+                    let mut body = vec![0u8; n];
+                    if sock.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    if head[0] != b'Q' {
+                        return;
+                    }
+                    let sql = String::from_utf8_lossy(&body[..n.saturating_sub(1)]).into_owned();
+                    let verb = sql
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_uppercase();
+                    seen.lock().push(sql.clone());
+                    let reply = if sql.contains(FAIL) {
+                        [
+                            wire_frame(b'E', b"SERROR\0C57014\0Mcanceling statement\0\0"),
+                            wire_frame(b'Z', b"I"),
+                        ]
+                        .concat()
+                    } else if verb == "SELECT" {
+                        let mut desc = 1u16.to_be_bytes().to_vec();
+                        desc.extend_from_slice(b"value\0");
+                        desc.extend_from_slice(&0u32.to_be_bytes());
+                        desc.extend_from_slice(&0u16.to_be_bytes());
+                        desc.extend_from_slice(&25u32.to_be_bytes());
+                        desc.extend_from_slice(&(-1i16).to_be_bytes());
+                        desc.extend_from_slice(&(-1i32).to_be_bytes());
+                        desc.extend_from_slice(&0u16.to_be_bytes());
+                        let mut row = 1u16.to_be_bytes().to_vec();
+                        row.extend_from_slice(&1u32.to_be_bytes());
+                        row.push(b'1');
+                        [
+                            wire_frame(b'T', &desc),
+                            wire_frame(b'D', &row),
+                            wire_frame(b'C', b"SELECT 1\0"),
+                            wire_frame(b'Z', b"I"),
+                        ]
+                        .concat()
+                    } else {
+                        [
+                            wire_frame(b'C', format!("{verb} 1\0").as_bytes()),
+                            wire_frame(b'Z', b"I"),
+                        ]
+                        .concat()
+                    };
+                    if sock.write_all(&reply).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
+    /// A gateway backend on a loopback port, and the texts it ran.
+    async fn start_gateway_backend() -> (u16, Arc<parking_lot::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        tokio::spawn(gateway_backend(listener, seen.clone()));
+        (port, seen)
+    }
+
+    /// One HTTP exchange with a gateway connection handler: `serve` gets the
+    /// accepted socket and its peer; the raw response is returned.
+    async fn http_exchange<F, Fut>(serve: F, request: String) -> String
+    where
+        F: FnOnce(TcpStream, SocketAddr) -> Fut,
+        Fut: std::future::Future<Output = crate::Result<()>> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        let task = tokio::spawn(serve(server, peer));
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        task.await.unwrap().unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    fn post(path: &str, body: &str) -> String {
+        format!(
+            "POST {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A relay with [`READ`] in the shared cache, and a first read of it
+    /// served from cache (which also puts it in this session's L1).
+    async fn cached_relay(queries: usize) -> (Relay, tokio::task::JoinHandle<Vec<String>>) {
+        let (mut relay, backend) = Relay::start(|_| {}, &[READ], queries).await;
+        let (node, got) = relay.query(READ).await;
+        assert_eq!((node, got), (None, cached_reply()), "served from cache");
+        (relay, backend)
+    }
+
+    /// Run `sql` through the HTTP gateway with the daemon's gateway policy;
+    /// its backend must run exactly that. The gateway's response.
+    async fn http_gateway_runs(relay: &Relay, sql: &str) -> String {
+        let (port, seen) = start_gateway_backend().await;
+        let cfg = Arc::new(crate::config::HttpGatewayConfig {
+            backend_port: port,
+            ..Default::default()
+        });
+        let policy = Arc::new(relay.server.gateway_policy());
+        let pool: crate::gateway_pool::SharedBackendPool =
+            Arc::new(crate::gateway_pool::BackendClientPool::new(0));
+        let body = serde_json::json!({ "query": sql }).to_string();
+        let resp = http_exchange(
+            move |stream, peer| {
+                crate::http_gateway::HttpGateway::handle(
+                    stream,
+                    peer,
+                    cfg,
+                    pool,
+                    Arc::new(tokio::sync::Semaphore::new(4)),
+                    policy,
+                )
+            },
+            post("/sql", &body),
+        )
+        .await;
+        assert_eq!(*seen.lock(), [sql]);
+        resp
+    }
+
+    /// An `UPDATE` through `POST /sql` retires the cached read of its table:
+    /// the next PG-wire read goes to the backend (L2 and the session's L1).
+    #[tokio::test]
+    async fn http_gateway_write_retires_a_cached_pg_wire_read() {
+        let (mut relay, backend) = cached_relay(1).await;
+        let before = crate::cache::generations::gateway_write_invalidations(
+            crate::gateway_policy::GatewayKind::Http,
+        );
+        let resp = http_gateway_runs(&relay, WRITE).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(
+            crate::cache::generations::gateway_write_invalidations(
+                crate::gateway_policy::GatewayKind::Http
+            ) > before
+        );
+        relay.answered_by_backend(READ).await;
+        drop(relay);
+        assert_eq!(backend.await.unwrap(), [READ]);
+    }
+
+    /// Control: a read through the gateway retires nothing.
+    #[tokio::test]
+    async fn http_gateway_read_keeps_the_cached_pg_wire_read() {
+        let (mut relay, _backend) = cached_relay(0).await;
+        let resp = http_gateway_runs(&relay, READ).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let (node, got) = relay.query(READ).await;
+        assert_eq!((node, got), (None, cached_reply()), "still cached");
+    }
+
+    /// An `UPDATE` through the MCP `query` tool (`read_only = false`) retires
+    /// the cached read of its table.
+    #[tokio::test]
+    async fn mcp_gateway_write_retires_a_cached_pg_wire_read() {
+        let (mut relay, backend) = cached_relay(1).await;
+        let (port, seen) = start_gateway_backend().await;
+        let cfg = Arc::new(crate::config::McpConfig {
+            backend_port: port,
+            read_only: false,
+            ..Default::default()
+        });
+        let policy = Arc::new(relay.server.gateway_policy());
+        let pool: crate::gateway_pool::SharedBackendPool =
+            Arc::new(crate::gateway_pool::BackendClientPool::new(0));
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "query", "arguments": { "sql": WRITE } }
+        })
+        .to_string();
+        let resp = http_exchange(
+            move |stream, peer| {
+                crate::mcp::McpServer::handle_connection(
+                    stream,
+                    peer,
+                    cfg,
+                    Arc::new(None),
+                    pool,
+                    policy,
+                    Arc::new(tokio::sync::Semaphore::new(4)),
+                )
+            },
+            post("/", &body),
+        )
+        .await;
+        assert!(resp.contains("\"isError\":false"), "{resp}");
+        assert_eq!(*seen.lock(), [WRITE]);
+        relay.answered_by_backend(READ).await;
+        drop(relay);
+        assert_eq!(backend.await.unwrap(), [READ]);
+    }
+
+    /// A write statement on the GraphQL engine's statement path (the one
+    /// every generated statement takes) retires the cached read of its table.
+    #[cfg(feature = "graphql-gateway")]
+    #[tokio::test]
+    async fn graphql_gateway_write_retires_a_cached_pg_wire_read() {
+        let (mut relay, backend) = cached_relay(1).await;
+        let (port, seen) = start_gateway_backend().await;
+        let cfg = crate::config::GraphqlGatewayConfig {
+            backend_port: port,
+            ..Default::default()
+        };
+        let policy = Arc::new(relay.server.gateway_policy());
+        let pool: crate::gateway_pool::SharedBackendPool =
+            Arc::new(crate::gateway_pool::BackendClientPool::new(0));
+        let gw = crate::graphql_gateway::GraphqlGateway::new(cfg, pool).with_policy(policy);
+        gw.execute_sql_for_test(WRITE).await.unwrap();
+        assert_eq!(*seen.lock(), [WRITE]);
+        relay.answered_by_backend(READ).await;
+        drop(relay);
+        assert_eq!(backend.await.unwrap(), [READ]);
+    }
+
+    /// With every cache off there are no write generations: the relay
+    /// captures nothing for them and the gateways' policy carries no
+    /// writes. With `[cache]` on the generations are the query cache's.
+    #[test]
+    fn generations_exist_only_with_a_cache() {
+        let off = ProxyServer::new(test_config()).unwrap();
+        assert!(off.state.table_generations.is_none());
+        assert!(!ProxyServer::cache_needs_capture(&off.state));
+        assert!(!format!("{:?}", off.gateway_policy()).contains("cache_writes: true"));
+
+        let mut config = test_config();
+        config.cache.enabled = true;
+        let on = ProxyServer::new(config).unwrap();
+        let generations = on.state.table_generations.as_ref().expect("cache on");
+        let qc = on.state.query_cache.as_ref().expect("cache on");
+        assert!(Arc::ptr_eq(generations, qc.generations()));
+        assert!(ProxyServer::cache_needs_capture(&on.state));
+        assert!(format!("{:?}", on.gateway_policy()).contains("cache_writes: true"));
+    }
+
+    /// A write the gateway sent that failed on the backend still retires the
+    /// cached read: one that timed out may have committed, so the outcome
+    /// does not matter.
+    #[tokio::test]
+    async fn a_failed_gateway_write_still_retires_the_cached_read() {
+        let (mut relay, backend) = cached_relay(1).await;
+        let failing = format!("{WRITE} {FAIL}");
+        let resp = http_gateway_runs(&relay, &failing).await;
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        relay.answered_by_backend(READ).await;
+        drop(relay);
+        assert_eq!(backend.await.unwrap(), [READ]);
+    }
+
+    /// A write of another table leaves the cached read served.
+    #[tokio::test]
+    async fn a_gateway_write_of_another_table_keeps_the_cached_read() {
+        let (mut relay, _backend) = cached_relay(0).await;
+        relay
+            .server
+            .gateway_policy()
+            .note_statement(
+                "UPDATE gadgets SET value = 2",
+                crate::gateway_policy::GatewayKind::Mcp,
+            )
+            .await;
+        let (node, got) = relay.query(READ).await;
+        assert_eq!((node, got), (None, cached_reply()), "still cached");
+    }
+}

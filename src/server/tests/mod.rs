@@ -528,6 +528,8 @@ async fn test_apply_authenticate_hook_with_manager_no_plugins_defers() {
         analytics: None,
         #[cfg(feature = "query-cache")]
         query_cache: None,
+        #[cfg(feature = "query-cache")]
+        table_generations: None,
         #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
         table_exclusions: None,
         #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]

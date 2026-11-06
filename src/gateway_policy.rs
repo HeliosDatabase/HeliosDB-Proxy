@@ -24,7 +24,11 @@
 //!   for the tenant's permit (the PG-wire path's permit, the same semaphore)
 //!   and is refused (429) when it does not get one. Only the SQL-running part
 //!   of a request holds the permit. `max_clients_per_tenant` does not apply to
-//!   these stateless requests: it counts PG-wire sessions only.
+//!   these stateless requests: it counts PG-wire sessions only;
+//! - `[cache]` (C-02): every statement a gateway sends that may have written
+//!   retires the cached reads of the tables it wrote, or every cached read
+//!   when they are unknown, as a write through the PG-wire listener does
+//!   ([`GatewayPolicy::note_statement`], Sprinter 6a0c6c34d27a).
 
 use std::borrow::Cow;
 use std::net::IpAddr;
@@ -98,6 +102,44 @@ pub struct RequestIdentity<'a> {
     pub database: Option<&'a str>,
 }
 
+/// Which gateway a statement came through (metric label).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GatewayKind {
+    /// The HTTP `/sql` gateway.
+    Http,
+    /// The MCP agent gateway.
+    Mcp,
+    /// The GraphQL gateway.
+    Graphql,
+}
+
+impl GatewayKind {
+    /// Number of gateways.
+    pub const COUNT: usize = 3;
+    /// Every gateway, in label order.
+    pub const ALL: [GatewayKind; GatewayKind::COUNT] =
+        [GatewayKind::Http, GatewayKind::Mcp, GatewayKind::Graphql];
+
+    /// The metric label (`http`, `mcp`, `graphql`), as the gateway pool
+    /// series use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GatewayKind::Http => "http",
+            GatewayKind::Mcp => "mcp",
+            GatewayKind::Graphql => "graphql",
+        }
+    }
+
+    /// Position in [`Self::ALL`].
+    pub fn index(self) -> usize {
+        match self {
+            GatewayKind::Http => 0,
+            GatewayKind::Mcp => 1,
+            GatewayKind::Graphql => 2,
+        }
+    }
+}
+
 /// The tenant a gateway request acts for (`[multi_tenancy]`, H-06).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayTenant(pub String);
@@ -128,6 +170,10 @@ pub struct GatewayPolicy {
     rewriter: Option<Arc<crate::rewriter::QueryRewriter>>,
     #[cfg(feature = "circuit-breaker")]
     circuit: Option<Arc<crate::circuit_breaker::CircuitBreakerManager>>,
+    /// Where a statement that may have written retires cached reads (C-02),
+    /// when a cache runs.
+    #[cfg(feature = "query-cache")]
+    cache_writes: Option<crate::cache::GatewayWrites>,
 }
 
 impl GatewayPolicy {
@@ -154,6 +200,29 @@ impl GatewayPolicy {
     ) -> Self {
         self.circuit = Some(circuit);
         self
+    }
+
+    /// Retire cached reads through `writes` after every statement that may
+    /// have written ([`Self::note_statement`]).
+    #[cfg(feature = "query-cache")]
+    pub fn with_cache_writes(mut self, writes: crate::cache::GatewayWrites) -> Self {
+        self.cache_writes = Some(writes);
+        self
+    }
+
+    /// Note one statement `gateway` sent to the backend (the text as sent,
+    /// after the rewrite and the tenant filter), once the backend answered,
+    /// failed or timed out, whatever the outcome: a statement that timed out
+    /// may still commit. When a cache runs, a statement that may have
+    /// written retires the cached reads of the tables it wrote, or every
+    /// cached read when they are unknown (C-02, Sprinter 6a0c6c34d27a); a
+    /// read changes nothing. A no-op without a cache.
+    pub async fn note_statement(&self, sql: &str, gateway: GatewayKind) {
+        #[cfg(feature = "query-cache")]
+        if let Some(writes) = &self.cache_writes {
+            writes.note_statement(sql, gateway).await;
+        }
+        let _ = (sql, gateway);
     }
 
     /// Take the tenant of every request from header `header` and filter its
@@ -365,6 +434,8 @@ impl std::fmt::Debug for GatewayPolicy {
         d.field("rewriter", &self.rewriter.is_some());
         #[cfg(feature = "circuit-breaker")]
         d.field("circuit_breaker", &self.circuit.is_some());
+        #[cfg(feature = "query-cache")]
+        d.field("cache_writes", &self.cache_writes.is_some());
         d.finish()
     }
 }

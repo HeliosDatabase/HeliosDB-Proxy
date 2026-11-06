@@ -3,7 +3,9 @@ use super::*;
 impl ProxyServer {
     /// The request policies the HTTP, GraphQL and MCP gateways apply (H-06):
     /// the daemon's own rate limiter (with `[rate_limit] key_by`), query
-    /// rewriter and circuit breaker, when those are enabled.
+    /// rewriter and circuit breaker, when those are enabled, and, when a
+    /// cache runs, the write generations their writes move (C-02,
+    /// Sprinter 6a0c6c34d27a).
     pub(super) fn gateway_policy(&self) -> crate::gateway_policy::GatewayPolicy {
         let policy = crate::gateway_policy::GatewayPolicy::default();
         #[cfg(feature = "rate-limiting")]
@@ -28,6 +30,14 @@ impl ProxyServer {
         #[cfg(feature = "multi-tenancy")]
         let policy =
             policy.with_tenant_slots(self.state.tenant_slots.clone(), self.state.latency.clone());
+        #[cfg(feature = "query-cache")]
+        let policy = match self.state.table_generations.as_ref() {
+            Some(generations) => policy.with_cache_writes(crate::cache::GatewayWrites::new(
+                generations.clone(),
+                self.state.query_cache.clone(),
+            )),
+            None => policy,
+        };
         policy
     }
 

@@ -129,6 +129,15 @@ impl GraphqlGateway {
         }
     }
 
+    /// Run `sql` through the engine's statement path (tests).
+    #[cfg(test)]
+    pub(crate) async fn execute_sql_for_test(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<(), crate::graphql::GraphQLError> {
+        self.engine.execute_sql_for_test(sql).await
+    }
+
     /// [`Self::handle_with`] with no request policies (tests).
     #[cfg(test)]
     async fn handle(

@@ -997,7 +997,20 @@ feeds the transaction journal), on the simple and the extended protocol alike:
   only `t`), and a `$`, a backslash or a comment marker alone is no ambiguity. The capture splits a
   string as PostgreSQL does: a `$` that continues an identifier is part of it
   (`SELECT 1 AS a$b$ ; UPDATE b …` is the write it is), a dollar tag may hold non-ASCII
-  bytes and never starts with a digit, and a `--` comment ends at a lone `\r`.
+  bytes and never starts with a digit, and a `--` comment ends at a lone `\r`;
+- a statement sent through the HTTP `/sql`, MCP or GraphQL gateway that may have
+  written moves the generations once its backend answered, failed or timed out
+  (whatever the outcome: a statement that timed out may still commit): the tables its
+  text as sent (after `[query_rewrite]` and the tenant filter) names, by the same
+  extraction as above, or everything when they are unknown. "May have written" is what
+  the capture does not read as a read (a write, DDL, `COPY`, `EXECUTE`, transaction
+  control), a string with a `;` inside backend-ambiguous text (above), and an `EXPLAIN`
+  that holds `ANALYZE` (it runs the statement; whole cache). A `SELECT`, a function
+  called from one included, moves nothing, as on the PG-wire listener. The gateways run
+  their own backend connections, so before this they moved nothing and a cached PG-wire
+  read stayed stale after a gateway write until its TTL (Sprinter 6a0c6c34d27a).
+  Counted per statement in `heliosdb_proxy_cache_gateway_write_invalidations_total`
+  (label `gateway` = `http`, `mcp`, `graphql`).
 
 Not covered with `invalidation_source = "proxy"` (the default): writes that do not pass
 through this proxy (another proxy, a direct connection, a trigger or function writing a

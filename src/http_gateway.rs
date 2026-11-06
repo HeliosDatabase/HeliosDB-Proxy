@@ -95,7 +95,7 @@ impl HttpGateway {
         }
     }
 
-    async fn handle(
+    pub(crate) async fn handle(
         mut stream: tokio::net::TcpStream,
         peer: std::net::SocketAddr,
         cfg: Arc<HttpGatewayConfig>,
@@ -283,6 +283,11 @@ impl HttpGateway {
                 .query_with_params_bounded(sql, params, cfg.max_result_rows, cfg.max_result_bytes)
                 .await
         };
+        // C-02: a write retires the cached reads of its tables, whatever the
+        // outcome (a statement that timed out may still commit).
+        policy
+            .note_statement(sql, crate::gateway_policy::GatewayKind::Http)
+            .await;
         match res {
             Ok(bounded) => {
                 // H-06: reuse the authenticated connection only when the

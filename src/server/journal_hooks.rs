@@ -239,8 +239,11 @@ impl ProxyServer {
         if session.cache_unseen_write.load(Ordering::Relaxed)
             && session.cache_unseen_write.swap(false, Ordering::Relaxed)
         {
-            if let Some(qc) = state.query_cache.as_ref() {
-                qc.invalidate_all_for_unseen_write();
+            if let Some(generations) = state.table_generations.as_ref() {
+                match state.query_cache.as_ref() {
+                    Some(qc) => qc.invalidate_all_for_unseen_write(),
+                    None => generations.invalidate_all(),
+                }
                 if outcome.status != b'I' {
                     session
                         .tx_cache_stage
@@ -263,21 +266,35 @@ impl ProxyServer {
                 .store(cap.in_transaction(), Ordering::Relaxed);
             ops
         };
+        // The generations are the query cache's when it runs, so its
+        // heatmap and invalidation index follow the write; without it (the
+        // MCP tool cache alone) only the generations move.
         #[cfg(feature = "query-cache")]
-        let purge = match state.query_cache.as_ref() {
-            Some(qc) if !ops.is_empty() => {
+        let purge = match state.table_generations.as_ref() {
+            Some(generations) if !ops.is_empty() => {
                 let work = {
                     let mut stage = session
                         .tx_cache_stage
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    Self::cache_work_from_ops(qc, &ops, &mut stage)
+                    Self::cache_work_from_ops(generations, &ops, &mut stage)
                 };
-                if work.all {
-                    qc.invalidate_all();
+                match state.query_cache.as_ref() {
+                    Some(qc) => {
+                        if work.all {
+                            qc.invalidate_all();
+                        }
+                        qc.mark_written(&work.tables);
+                        work.tables
+                    }
+                    None => {
+                        if work.all {
+                            generations.invalidate_all();
+                        }
+                        generations.mark_written(&work.tables);
+                        Vec::new()
+                    }
                 }
-                qc.mark_written(&work.tables);
-                work.tables
             }
             _ => Vec::new(),
         };
@@ -314,12 +331,13 @@ impl ProxyServer {
         Self::journal_apply(state, cycle.ops, &source, session.id, cap.active_mut());
     }
 
-    /// Whether the journal capture must run for the query cache even when TR
-    /// is off: commit-aware invalidation (C-02) is driven by its ops.
+    /// Whether the journal capture must run for the caches even when TR is
+    /// off: commit-aware invalidation (C-02) is driven by its ops. True
+    /// whenever the write generations exist (a cache that reads them runs).
     pub(super) fn cache_needs_capture(state: &ServerState) -> bool {
         #[cfg(feature = "query-cache")]
         {
-            state.query_cache.is_some()
+            state.table_generations.is_some()
         }
         #[cfg(not(feature = "query-cache"))]
         {
@@ -338,7 +356,7 @@ impl ProxyServer {
     /// everything.
     #[cfg(feature = "query-cache")]
     pub(super) fn cache_work_from_ops(
-        qc: &crate::cache::QueryCache,
+        generations: &crate::cache::TableGenerations,
         ops: &[crate::journal_capture::JournalOp],
         stage: &mut TxCacheStage,
     ) -> CacheWork {
@@ -359,7 +377,7 @@ impl ProxyServer {
                 // it is in a transaction. Marking it at statement time as well
                 // cost every in-transaction statement a generation bump and a
                 // purge before its ReadyForQuery (C-02 user-path gate).
-                JournalOp::Log { entry, .. } => match qc.write_tables(&entry.statement) {
+                JournalOp::Log { entry, .. } => match generations.write_tables(&entry.statement) {
                     Some(t) => add(&mut stage.tables, t),
                     None => stage.unknown = true,
                 },
@@ -373,7 +391,7 @@ impl ProxyServer {
                         work.all = true;
                     }
                     for e in entries {
-                        match qc.write_tables(&e.statement) {
+                        match generations.write_tables(&e.statement) {
                             Some(t) => add(&mut work.tables, t),
                             None => work.all = true,
                         }

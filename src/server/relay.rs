@@ -690,7 +690,7 @@ impl ProxyServer {
         // none after it, and a statement whose first word lies behind such
         // text is journaled as one of unknown scope by the capture itself.
         #[cfg(feature = "query-cache")]
-        if state.query_cache.is_some()
+        if state.table_generations.is_some()
             && facts.has_interior_semicolon()
             && crate::sql_text::ambiguous_rest(facts.sql()).is_some_and(|rest| rest.contains(';'))
         {
@@ -2091,7 +2091,7 @@ impl ProxyServer {
     /// later error or a missing Sync. Never inspect row/notice payload substrings.
     pub(super) fn observe_prepared_commit_frames(frames: &[u8], state: &ServerState) {
         #[cfg(feature = "query-cache")]
-        if let Some(cache) = state.query_cache.as_ref() {
+        if let Some(generations) = state.table_generations.as_ref() {
             let mut rest = frames;
             while rest.len() >= 5 {
                 let len = u32::from_be_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
@@ -2101,7 +2101,10 @@ impl ProxyServer {
                 if frame.first() == Some(&b'C')
                     && frame.get(5..) == Some(b"COMMIT PREPARED\0".as_slice())
                 {
-                    cache.invalidate_all();
+                    match state.query_cache.as_ref() {
+                        Some(cache) => cache.invalidate_all(),
+                        None => generations.invalidate_all(),
+                    }
                 }
                 rest = &rest[frame.len()..];
             }

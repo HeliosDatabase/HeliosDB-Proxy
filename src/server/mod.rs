@@ -423,6 +423,15 @@ struct ServerState {
     /// invalidate referenced tables.
     #[cfg(feature = "query-cache")]
     query_cache: Option<Arc<crate::cache::QueryCache>>,
+    /// The C-02 write generations (Sprinter 6a0c6c34d27a): the clock the
+    /// query cache reads (it is `query_cache`'s), moved by every path that
+    /// writes: the relay (journal capture, unseen writes, `COMMIT
+    /// PREPARED`), the logical source and the HTTP, MCP and GraphQL
+    /// gateways. `Some` whenever a cache that reads it runs (`[cache]
+    /// enabled`); `None` otherwise, so with every cache off the relay
+    /// captures nothing for it.
+    #[cfg(feature = "query-cache")]
+    table_generations: Option<Arc<crate::cache::TableGenerations>>,
     /// Tables neither result cache may serve or store (`[cache]
     /// exclude_tables` and `[[cache.tables]] exclude = true`), checked by the
     /// relay ahead of both. `None` when the list is empty or neither
@@ -957,9 +966,18 @@ impl ProxyServer {
             None
         };
 
+        // The write generations every cache reads, when one runs.
+        #[cfg(feature = "query-cache")]
+        let table_generations = config
+            .cache
+            .enabled
+            .then(|| Arc::new(crate::cache::TableGenerations::new()));
+
         // Build the query-result cache when enabled.
         #[cfg(feature = "query-cache")]
-        let query_cache = if config.cache.enabled {
+        let query_cache = if let (true, Some(generations)) =
+            (config.cache.enabled, table_generations.as_ref())
+        {
             let c = &config.cache;
             let table_ttls = c.tables.iter().filter(|t| t.ttl_secs.is_some()).count();
             tracing::info!(
@@ -1016,7 +1034,10 @@ impl ProxyServer {
                     "cache heatmap on: GET /api/cache/heatmap"
                 );
             }
-            Some(Arc::new(crate::cache::QueryCache::new(c.to_cache_config())))
+            Some(Arc::new(crate::cache::QueryCache::with_generations(
+                c.to_cache_config(),
+                generations.clone(),
+            )))
         } else {
             None
         };
@@ -1256,6 +1277,8 @@ impl ProxyServer {
             analytics,
             #[cfg(feature = "query-cache")]
             query_cache,
+            #[cfg(feature = "query-cache")]
+            table_generations,
             #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
             table_exclusions,
             #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]

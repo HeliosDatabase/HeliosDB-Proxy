@@ -3812,7 +3812,7 @@ mod c02_cache_work {
 
     fn run(ops: Vec<JournalOp>, stage: &mut TxCacheStage) -> CacheWork {
         let qc = QueryCache::new(CacheConfig::default());
-        ProxyServer::cache_work_from_ops(&qc, &ops, stage)
+        ProxyServer::cache_work_from_ops(qc.generations(), &ops, stage)
     }
 
     // Regression coverage uses only pre-existing APIs so the same tests run
@@ -3869,7 +3869,7 @@ mod c02_cache_work {
                 completions: vec![Completion::Tag(tag.into())],
                 error: None,
             });
-            let work = ProxyServer::cache_work_from_ops(&qc, &ops, &mut stage);
+            let work = ProxyServer::cache_work_from_ops(qc.generations(), &ops, &mut stage);
             assert!(!work.all && work.tables.is_empty(), "{sql} is not a commit");
             if sql.starts_with("UPDATE") {
                 assert_eq!(stage.tables, vec!["accounts"]);

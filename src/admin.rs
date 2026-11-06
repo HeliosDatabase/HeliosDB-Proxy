@@ -2755,6 +2755,29 @@ impl AdminServer {
             "heliosdb_proxy_mcp_results_truncated_total {}",
             crate::mcp::results_truncated_total()
         );
+        #[cfg(feature = "query-cache")]
+        Self::push_gateway_write_prometheus(output);
+    }
+
+    /// Append the gateways' write-invalidation counters (C-02 for the HTTP,
+    /// MCP and GraphQL gateways, Sprinter 6a0c6c34d27a), labelled by gateway.
+    #[cfg(feature = "query-cache")]
+    fn push_gateway_write_prometheus(output: &mut String) {
+        use std::fmt::Write as _;
+        let name = "heliosdb_proxy_cache_gateway_write_invalidations_total";
+        let _ = writeln!(
+            output,
+            "# HELP {name} Statements through a gateway that retired cached reads (a write)\n\
+             # TYPE {name} counter"
+        );
+        for gateway in crate::gateway_policy::GatewayKind::ALL {
+            let _ = writeln!(
+                output,
+                "{name}{{gateway=\"{}\"}} {}",
+                gateway.as_str(),
+                crate::cache::generations::gateway_write_invalidations(gateway)
+            );
+        }
     }
 
     /// Append the gateway pools' counters and idle gauge, labelled by gateway
@@ -4222,6 +4245,15 @@ mod tests {
         AdminServer::push_mcp_prometheus(&mut out);
         assert!(out.contains("# TYPE heliosdb_proxy_mcp_results_truncated_total counter\n"));
         assert!(out.contains("\nheliosdb_proxy_mcp_results_truncated_total "));
+        #[cfg(feature = "query-cache")]
+        for gateway in ["http", "mcp", "graphql"] {
+            assert!(
+                out.contains(&format!(
+                    "\nheliosdb_proxy_cache_gateway_write_invalidations_total{{gateway=\"{gateway}\"}} "
+                )),
+                "{out}"
+            );
+        }
     }
 
     #[test]
