@@ -82,6 +82,7 @@ pub mod load_balancer;
 pub mod mcp;
 #[cfg(feature = "query-cache")]
 pub mod mcp_cache;
+pub mod mcp_memory;
 pub mod metrics_hist;
 pub mod mirror;
 pub mod node_overrides;

@@ -188,6 +188,13 @@ pub fn manifest(config: &ProxyConfig) -> Vec<Capability> {
             Some("[mcp] tool_cache_enabled; needs the query-cache feature"),
         ),
         c(
+            "mcp-memory",
+            true,
+            config.mcp.memory_on(),
+            true,
+            Some("[mcp] memory_enabled; rows of [mcp] memory_table on the MCP backend"),
+        ),
+        c(
             "http-gateway",
             true,
             config.http_gateway.enabled,
@@ -418,5 +425,16 @@ mod tests {
         let row = m.iter().find(|c| c.name == "mcp-tool-cache").unwrap();
         assert!(row.enabled);
         assert_eq!(row.compiled, cfg!(feature = "query-cache"));
+        // The memory tools: in every build, on with [mcp] and memory_enabled.
+        let row = |c: &ProxyConfig| {
+            let m = manifest(c);
+            let r = m.iter().find(|c| c.name == "mcp-memory").unwrap();
+            (r.compiled, r.enabled, r.wired)
+        };
+        assert_eq!(row(&config), (true, false, true));
+        config.mcp.memory_enabled = true;
+        assert_eq!(row(&config), (true, true, true));
+        config.mcp.enabled = false;
+        assert_eq!(row(&config), (true, false, true));
     }
 }

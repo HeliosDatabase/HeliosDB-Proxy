@@ -99,6 +99,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `tests/fixtures/api-stats-v1.example.json`, against which a test validates the live
   response strictly. Lite's view poller (S2) reads this instead of linking the proxy
   crate.
+- **MCP agent memory tools (`[mcp] memory_*`, Sprinter 20bcc218385f).** Off by default
+  (`memory_enabled = false`: the tool catalog and responses are unchanged). With it on, the
+  MCP gateway adds `memory_put` (key, any JSON value, optional `ttl_secs` and `tags`),
+  `memory_get`, `memory_list` (keys, tags and times; `prefix`, `tag`, `limit`, `cursor`),
+  `memory_search` (the same page with values; exact prefix and tag match, no similarity)
+  and `memory_delete`. Entries are rows of `memory_table` (default `heliosdb_mcp_memory`)
+  on the MCP backend, so they survive restarts and are shared by every proxy instance on
+  it. Every row is owned by the request's principal and tenant, which the proxy binds as
+  `$1` and `$2` of every statement and no argument can set. The statements are a fixed set
+  sent through the extended protocol with every value bound (new
+  `BackendClient::query_bound_bounded`), as `memory_backend_user` (default `backend_user`)
+  on connections of their own. The shared principal `default` is refused, and
+  `memory_enabled` needs a `[[mcp.principals]]` entry. `memory_put` and `memory_delete` are
+  writes: refused by `read_only` or a read-only contract. They run after admission, the
+  read-only guard, the rate limit, the circuit breaker and the tenant's active-query permit,
+  and move the C-02 write generations of the memory table. Entries expire
+  (`memory_default_ttl_secs = 604800`, `memory_max_ttl_secs = 2592000`); reads filter
+  expired rows and each put deletes its owner's. Bounds: `memory_max_key_bytes = 256`,
+  `memory_max_value_bytes = 65536`, `memory_max_entries_per_owner = 1000`,
+  `memory_max_tags = 16`, `memory_max_tag_bytes = 64`, `memory_list_max_limit = 100`.
+  `memory_auto_create = false` checks the table at startup and refuses to start, naming the
+  DDL, when it is missing; `true` creates it at the first call. While memory is on, `query`
+  and `explain` refuse statements that name the memory table. `strict_config` refuses a
+  memory role equal to `backend_user` (startup warns otherwise), because that role could
+  read every owner's rows through `query`. Needs a PostgreSQL MCP backend: HeliosDB-Nano and
+  HeliosDB-Lite lack the interval arithmetic, and Lite a bound `LIMIT`. New metrics:
+  `heliosdb_proxy_mcp_memory_ops_total{op}`, `_refused_total{reason}`,
+  `_entries_quota_hits_total` (no principal or tenant labels), `mcp_memory` on `/metrics`,
+  and an `mcp-memory` row on `/capabilities`. Documented under "MCP agent memory tools" in
+  `docs/configuration.md`, with the DDL. Library API: `McpConfig` gains the `memory_*`
+  fields (struct literals must set them); new module `mcp_memory`.
 - **MCP tool-result cache (`[mcp] tool_cache_*`, Sprinter 20bcc218385f).** Off by default
   (`tool_cache_enabled = false`; needs the `query-cache` feature). With it on, the MCP
   gateway answers a repeated `query` or `list_tables` from memory; `explain` is never

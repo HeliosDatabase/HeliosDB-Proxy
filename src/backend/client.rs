@@ -556,7 +556,108 @@ impl BackendClient {
         payload.put_u8(0);
         let frame = Message::new(MessageType::Query, payload).encode();
         stream.write_all(&frame).await?;
+        Self::read_result(stream, bounds).await
+    }
 
+    /// Run `sql` through the extended protocol with `params` bound as text
+    /// (`None` = SQL NULL), keeping at most `max_rows` rows and `max_bytes`
+    /// cell bytes like [`Self::simple_query_bounded`]. Unlike
+    /// [`Self::query_with_params_bounded`] nothing is interpolated: the
+    /// statement text goes in an unnamed `Parse` with every parameter type
+    /// left to the server, and each value travels in the `Bind` as its own
+    /// length-prefixed field, so no value can be read as SQL whatever the
+    /// session's `standard_conforming_strings`. The unnamed statement and
+    /// portal leave no session state after the closing `Sync`.
+    pub async fn query_bound_bounded(
+        &mut self,
+        sql: &str,
+        params: &[Option<&str>],
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> BackendResult<BoundedQueryResult> {
+        let count = u16::try_from(params.len()).map_err(|_| {
+            BackendError::Protocol(format!(
+                "{} parameters exceed the protocol's 65535",
+                params.len()
+            ))
+        })?;
+        let bounds = Some(ResultBounds {
+            max_rows,
+            max_bytes,
+        });
+        let t = self.stream_query_timeout();
+        let (result, truncation) = tokio::time::timeout(
+            t,
+            Self::bound_query_inner(&mut self.stream, sql, count, params, bounds),
+        )
+        .await
+        .map_err(|_| {
+            BackendError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("query exceeded {:?}: {}", t, truncate(sql, 64)),
+            ))
+        })??;
+        Ok(BoundedQueryResult { result, truncation })
+    }
+
+    async fn bound_query_inner(
+        stream: &mut Stream,
+        sql: &str,
+        count: u16,
+        params: &[Option<&str>],
+        bounds: Option<ResultBounds>,
+    ) -> BackendResult<(QueryResult, Truncation)> {
+        let values: usize = params.iter().map(|v| 4 + v.map_or(0, str::len)).sum();
+        let mut batch = BytesMut::with_capacity(64 + sql.len() + values);
+        // Parse: unnamed statement, no declared parameter types.
+        let mut p = BytesMut::with_capacity(sql.len() + 4);
+        p.put_u8(0);
+        p.extend_from_slice(sql.as_bytes());
+        p.put_u8(0);
+        p.put_u16(0);
+        Message::new(MessageType::Parse, p).encode_into(&mut batch);
+        // Bind: unnamed portal and statement, every parameter in text format
+        // (no format codes), every result column in text format.
+        let mut b = BytesMut::with_capacity(8 + values);
+        b.put_u8(0);
+        b.put_u8(0);
+        b.put_u16(0);
+        b.put_u16(count);
+        for value in params {
+            match value {
+                None => b.put_i32(-1),
+                Some(v) => {
+                    let len = i32::try_from(v.len()).map_err(|_| {
+                        BackendError::Protocol("a parameter exceeds the protocol's 2 GiB".into())
+                    })?;
+                    b.put_i32(len);
+                    b.extend_from_slice(v.as_bytes());
+                }
+            }
+        }
+        b.put_u16(0);
+        Message::new(MessageType::Bind, b).encode_into(&mut batch);
+        let mut d = BytesMut::with_capacity(2);
+        d.put_u8(b'P');
+        d.put_u8(0);
+        Message::new(MessageType::Describe, d).encode_into(&mut batch);
+        let mut e = BytesMut::with_capacity(5);
+        e.put_u8(0);
+        e.put_i32(0);
+        Message::new(MessageType::Execute, e).encode_into(&mut batch);
+        Message::empty(MessageType::Sync).encode_into(&mut batch);
+        stream.write_all(&batch).await?;
+        Self::read_result(stream, bounds).await
+    }
+
+    /// Read one statement's answer up to `ReadyForQuery`: its rows (within
+    /// `bounds`), command tag and last error. Extended-protocol
+    /// acknowledgements (`ParseComplete`, `BindComplete`, `NoData`) carry
+    /// nothing and are skipped.
+    async fn read_result(
+        stream: &mut Stream,
+        bounds: Option<ResultBounds>,
+    ) -> BackendResult<(QueryResult, Truncation)> {
         let mut buffer = BytesMut::with_capacity(8192);
         let codec = ProtocolCodec::new();
         let mut columns: Vec<ColumnMeta> = Vec::new();
@@ -1434,6 +1535,71 @@ mod tests {
         });
         let out = client.simple_query(sql).await.unwrap();
         assert_eq!(out.rows.len(), 5);
+        assert_eq!(
+            client.simple_query("SELECT 2").await.unwrap().command_tag,
+            "SELECT 0"
+        );
+        backend.await.unwrap();
+    }
+
+    /// `query_bound_bounded` sends Parse (no declared types), Bind (every
+    /// value as text, NULL as -1), Describe portal, Execute, Sync: the
+    /// statement text holds no value. The result is capped like a simple
+    /// query's, and the connection stays in sync.
+    #[tokio::test]
+    async fn query_bound_bounded_binds_every_value_and_caps_the_result() {
+        const SQL: &str = "SELECT v FROM t WHERE a = $1 AND b = $2 AND c = $3";
+        const VALUES: [Option<&str>; 3] = [Some("x'); DROP TABLE t; --"), None, Some("")];
+        let (mut client, mut peer) = journal_replay_pair().await;
+        let backend = tokio::spawn(async move {
+            let mut parse = vec![0u8];
+            parse.extend_from_slice(SQL.as_bytes());
+            parse.extend_from_slice(&[0, 0, 0]);
+            assert_eq!(journal_replay_read(&mut peer).await, (b'P', parse));
+            // Portal and statement unnamed, no format codes, 3 values.
+            let mut bind = vec![0u8, 0, 0, 0, 0, 3];
+            for v in VALUES {
+                match v {
+                    None => bind.extend_from_slice(&(-1i32).to_be_bytes()),
+                    Some(s) => {
+                        bind.extend_from_slice(&(s.len() as i32).to_be_bytes());
+                        bind.extend_from_slice(s.as_bytes());
+                    }
+                }
+            }
+            bind.extend_from_slice(&[0, 0]);
+            assert_eq!(journal_replay_read(&mut peer).await, (b'B', bind));
+            assert_eq!(
+                journal_replay_read(&mut peer).await,
+                (b'D', b"P\0".to_vec())
+            );
+            assert_eq!(
+                journal_replay_read(&mut peer).await,
+                (b'E', vec![0, 0, 0, 0, 0])
+            );
+            assert_eq!(journal_replay_read(&mut peer).await, (b'S', Vec::new()));
+            journal_replay_reply(&mut peer, b'1', b"").await;
+            journal_replay_reply(&mut peer, b'2', b"").await;
+            journal_replay_reply(&mut peer, b'T', &row_description_body(1)).await;
+            for v in ["a", "b", "c"] {
+                journal_replay_reply(&mut peer, b'D', &data_row_body(&[Some(v)])).await;
+            }
+            journal_replay_reply(&mut peer, b'C', b"SELECT 3\0").await;
+            journal_replay_reply(&mut peer, b'Z', b"I").await;
+            assert_eq!(
+                journal_replay_read(&mut peer).await,
+                (b'Q', b"SELECT 2\0".to_vec())
+            );
+            journal_replay_reply(&mut peer, b'C', b"SELECT 0\0").await;
+            journal_replay_reply(&mut peer, b'Z', b"I").await;
+        });
+        let out = client
+            .query_bound_bounded(SQL, &VALUES, 2, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(out.result.rows.len(), 2);
+        assert!(out.truncation.row_limit_hit);
+        assert_eq!(out.result.command_tag, "SELECT 3");
         assert_eq!(
             client.simple_query("SELECT 2").await.unwrap().command_tag,
             "SELECT 0"

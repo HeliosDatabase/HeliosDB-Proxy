@@ -2115,8 +2115,8 @@ reply reports the transaction's status (`T`) and does not abort the transaction:
 
 ## MCP Agent Gateway (`[mcp]`) and Agent Contracts (`[[agent_contracts]]`)
 
-Native MCP server exposing `query` / `list_tables` / `explain` tools. Disabled by
-default.
+Native MCP server exposing `query` / `list_tables` / `explain` tools, and with
+`memory_enabled` the [agent memory tools](#mcp-agent-memory-tools). Disabled by default.
 
 ```toml
 [mcp]
@@ -2138,6 +2138,10 @@ max_result_bytes = 16777216
 # tool_cache_enabled = true
 # tool_cache_ttl_secs = 60
 # tool_cache_catalog_ttl_secs = 30
+# Agent memory tools (off by default; need a [[mcp.principals]] entry).
+# memory_enabled = true
+# memory_backend_user = "helios_memory"
+# memory_backend_password = "${MCP_MEMORY_PASSWORD}"
 
 # One entry per agent (optional, repeatable): its bearer token selects it.
 [[mcp.principals]]
@@ -2183,6 +2187,19 @@ max_rows = 1000
 | `tool_cache_max_bytes_per_principal` | usize | `8388608` (8 MiB) | Most bytes one owner (principal, tenant) holds; past it only that owner's oldest entries go. 1 to `tool_cache_max_bytes`. |
 | `tool_cache_max_entry_bytes` | usize | `1048576` (1 MiB) | Largest entry stored (key and result bytes); a larger result is served and not stored (`entry_too_large`). 1 to `tool_cache_max_bytes_per_principal`. |
 | `tool_cache_max_statement_bytes` | usize | `16384` | Longest final statement whose result is cached (`statement_too_large` past it). 1 to 8388608 (the largest request body the gateway reads). |
+| `memory_enabled` | bool | `false` | Add the agent memory tools `memory_put`, `memory_get`, `memory_list`, `memory_search` and `memory_delete` ([below](#mcp-agent-memory-tools)). Needs at least one `[[mcp.principals]]` entry: startup refuses it without one, because the shared principal `default` is refused. Off, the tool catalog and every response are unchanged. |
+| `memory_table` | string | `"heliosdb_mcp_memory"` | The table on the MCP backend that holds the entries. An unquoted identifier, optionally `schema.table`, each part `[A-Za-z_][A-Za-z0-9_]*` and at most 63 bytes (PostgreSQL folds it to lower case). It is the only name written into the memory statements; every value is a bound parameter. |
+| `memory_auto_create` | bool | `false` | `true`: the first memory call creates the table (`CREATE TABLE IF NOT EXISTS`, the DDL below) as the memory role. `false`: the gateway checks the table at startup and refuses to start, naming the DDL, when the backend says it is missing or unusable. When the backend cannot be reached at startup, the check runs again before the first memory call, and while the table is missing each call is refused with the DDL. |
+| `memory_backend_user` | string | *(`backend_user`)* | The role the memory statements run as, on their own pooled connections. Give this role alone the privileges on `memory_table`: `query` and `explain` run as `backend_user`, which could otherwise read every principal's entries. `strict_config = true` refuses a memory role equal to `backend_user`; startup warns otherwise. |
+| `memory_backend_password` | string | *(none)* | Password of `memory_backend_user`, and only with it (an error without it). Unset `memory_backend_user` means `backend_user` with `backend_password`. Never serialised. |
+| `memory_max_key_bytes` | usize | `256` | Longest key, UTF-8 bytes; also bounds `prefix` and `cursor`. 1 to 1024. |
+| `memory_max_value_bytes` | usize | `65536` (64 KiB) | Largest value, bytes of its compact JSON text. 1 to `max_result_bytes`, and at most 8388608 (the largest request body). |
+| `memory_max_entries_per_owner` | usize | `1000` | Most live entries one owner (principal, tenant) holds. A `memory_put` of a new key past it is refused; replacing a held key is not. 1 to 1000000. |
+| `memory_default_ttl_secs` | u64 | `604800` (7 days) | TTL of a `memory_put` without `ttl_secs`. 1 to `memory_max_ttl_secs`. |
+| `memory_max_ttl_secs` | u64 | `2592000` (30 days) | Longest `ttl_secs` a `memory_put` may ask for. 1 to 315360000 (10 years). Every entry expires. |
+| `memory_max_tags` | usize | `16` | Most distinct tags per entry; `0` refuses tags. 0 to 256. |
+| `memory_max_tag_bytes` | usize | `64` | Longest tag, UTF-8 bytes. 1 to 1024. |
+| `memory_list_max_limit` | usize | `100` | Most entries a `memory_list` or `memory_search` page returns, and the default `limit`. 1 to 10000. |
 
 **Principals (`[[mcp.principals]]`).** A principal is the identity a request acts as:
 its bearer token (`Authorization: Bearer <token>`) selects it. Each entry has:
@@ -2295,6 +2312,146 @@ beyond the text. Every truncated result increments
 `heliosdb_proxy_mcp_results_truncated_total` on `/metrics/prometheus`. The caps apply to
 the one MCP gateway's tool calls only; the HTTP `/sql` and GraphQL gateways are not capped
 by these keys.
+
+### MCP agent memory tools
+
+With `memory_enabled = true` the gateway adds five tools that keep an agent's notes as rows
+of one table on the MCP backend (`memory_table`). The rows are the source of truth, so the
+entries survive a proxy restart and every proxy instance on that backend sees the same ones.
+They are not a cache: nothing is held in proxy memory. With `memory_enabled = false` (the
+default) the tool catalog and every response are exactly as before, and a `tools/call` of a
+memory tool answers `unknown tool`.
+
+**Tools.** Every result is a JSON object, sent both as `structuredContent` and as the
+`text` of the one `content` item. A refusal is a tool error (`isError: true`) whose text
+says why; it never echoes a stored value.
+
+| Tool | Arguments | Result |
+|------|-----------|--------|
+| `memory_put` | `key` (string, required), `value` (any JSON value, required; a string for plain text), `ttl_secs` (integer, optional), `tags` (array of strings, optional) | `{"key", "stored": true, "created_at", "updated_at", "expires_at"}`. Replaces the key's value, tags and expiry. A write. |
+| `memory_get` | `key` | `{"key", "found": true, "value", "tags", "created_at", "updated_at", "expires_at"}`, or `{"key", "found": false}` when there is no live entry |
+| `memory_list` | `prefix`, `tag`, `limit`, `cursor` (all optional) | `{"entries": [{"key", "tags", "created_at", "updated_at", "expires_at"}], "next_cursor"}`: keys in key order, without values |
+| `memory_search` | as `memory_list` | the same page with each entry's `value` |
+| `memory_delete` | `key` | `{"key", "deleted"}`, `deleted` true when an entry was removed. A write. |
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_put",
+ "arguments":{"key":"plan/2026-11","value":{"step":2,"todo":["review","ship"]},
+              "ttl_secs":86400,"tags":["plan"]}}}
+```
+```json
+{"jsonrpc":"2.0","id":1,"result":{"isError":false,
+ "content":[{"type":"text","text":"{\"created_at\":\"2026-11-06 10:00:00.12+00\",\"expires_at\":\"2026-11-07 10:00:00.12+00\",\"key\":\"plan/2026-11\",\"stored\":true,\"updated_at\":\"2026-11-06 10:00:00.12+00\"}"}],
+ "structuredContent":{"key":"plan/2026-11","stored":true,"created_at":"2026-11-06 10:00:00.12+00",
+                      "updated_at":"2026-11-06 10:00:00.12+00","expires_at":"2026-11-07 10:00:00.12+00"}}}
+```
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_search",
+ "arguments":{"tag":"plan","limit":10}}}
+```
+```json
+{"jsonrpc":"2.0","id":2,"result":{"isError":false,"content":[{"type":"text","text":"…"}],
+ "structuredContent":{"entries":[{"key":"plan/2026-11","value":{"step":2,"todo":["review","ship"]},
+   "tags":["plan"],"created_at":"…","updated_at":"…","expires_at":"…"}],"next_cursor":null}}}
+```
+
+- **Arguments.** A key is 1 to `memory_max_key_bytes` bytes with no control characters. A
+  value is at most `memory_max_value_bytes` bytes as compact JSON and holds no NUL
+  character. `ttl_secs` is 1 to `memory_max_ttl_secs` (default `memory_default_ttl_secs`).
+  At most `memory_max_tags` distinct tags, each 1 to `memory_max_tag_bytes` bytes.
+  `prefix` keeps the keys that start with it, compared as text (`%` and `_` are ordinary
+  characters). `tag` keeps the entries that carry it. `limit` is 1 to
+  `memory_list_max_limit` (its default). `cursor` is the previous page's `next_cursor`, which
+  is `null` on the last page. The timestamps are as the backend renders `timestamptz`.
+  Arguments the tools do not define, such as `owner_principal` or `tenant`, are ignored.
+- **Isolation.** Every row belongs to an owner: the request's principal (its bearer
+  token, `[[mcp.principals]]`) and tenant (from `tenant_header`, or `''` when the gateway
+  applies no tenancy). The proxy binds them as `$1` and `$2` of every memory statement, and no
+  tool argument reaches them, so through these tools an agent can neither read nor change
+  another principal's or tenant's entries. The shared principal `default` (the `auth_token`
+  holders, or every caller when no token is configured) is refused, because its holders
+  cannot be told apart. The tenant is as trustworthy as `tenant_header`, which is trusted as
+  sent. The statements are a fixed set built at startup from `memory_table`. They go
+  through the extended protocol with every value bound, never interpolated, on connections
+  of their own (`application_name` `heliosproxy-mcp-memory`) as `memory_backend_user`.
+  `[query_rewrite]` and the tenant row filter do not apply to them: the owner columns are
+  the filter.
+- **The SQL tools.** While the memory tools are on, `query` and `explain` refuse any
+  statement whose text names the memory table (the table part of `memory_table`, in any
+  case). That is a lexical guard, not a boundary: a function or dynamic SQL can name the
+  table without spelling it. The boundary is a `memory_backend_user` that alone holds
+  privileges on the table, with none for `backend_user`; `strict_config` refuses a shared
+  role.
+- **Order of a call.** Admission (`max_concurrent_requests`). Then the read-only guard:
+  `memory_put` and `memory_delete` are writes, refused when `read_only = true` or the
+  gateway's contract is read-only. Then the principal and argument checks, the rate limit,
+  the circuit breaker, the tenant's active-query permit, and the backend. Every write
+  statement is then noted for the C-02 write generations whatever its outcome, so a
+  cached read of the memory table is retired as by any write. A contract's verb and table
+  lists govern SQL the agent sends; they do not apply to the memory statements.
+- **Expiry.** Every entry expires, on the database's clock. Reads never return an expired
+  row. Each `memory_put` first deletes its owner's expired rows. That batch is bounded by
+  the quota: a put leaves its owner no expired row, and between two puts only rows that
+  were live, at most `memory_max_entries_per_owner`, can expire. The rows of an owner that
+  never writes again stay until they are deleted out of band, for example with a periodic
+  `DELETE FROM heliosdb_mcp_memory WHERE expires_at <= now()`.
+- **Quota.** A `memory_put` of a new key is refused once its owner holds
+  `memory_max_entries_per_owner` live entries. The count is read just before the write,
+  so concurrent puts of new keys by one owner can overshoot it by their number.
+- **Untrusted data.** Memory is a persistent prompt-injection channel: an entry holds
+  whatever an agent stored. Values come back inside the JSON envelope, and the tool
+  descriptions tell the agent to treat them as data, not instructions.
+
+**Table.** Create it as the memory role, or set `memory_auto_create = true`:
+
+```sql
+CREATE TABLE IF NOT EXISTS heliosdb_mcp_memory (
+    owner_principal text        NOT NULL,
+    owner_tenant    text        NOT NULL,
+    key             text        NOT NULL,
+    value           jsonb       NOT NULL,
+    tags            jsonb       NOT NULL DEFAULT '[]',
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    expires_at      timestamptz NOT NULL,
+    PRIMARY KEY (owner_principal, owner_tenant, key)
+);
+-- Only the memory role may touch it; the role of the query/explain tools may not.
+REVOKE ALL ON heliosdb_mcp_memory FROM PUBLIC;
+```
+
+On PostgreSQL 15 and later, a role needs `CREATE` on the schema to create the table
+(`memory_auto_create`). The proxy writes `value` as compact JSON text cast to `jsonb`, and
+reads text that is not JSON back as a string. The primary key serves every statement:
+each one filters on the owner columns first.
+
+**Backends.** The memory statements are PostgreSQL: `jsonb` and `jsonb @>`, interval
+arithmetic (`now() + INTERVAL '1 second' * $6`), `INSERT … ON CONFLICT … DO UPDATE`, and a
+bound `LIMIT`. HeliosDB-Nano (4.41) and HeliosDB-Lite (3.7) accept the table's DDL, `jsonb`,
+`ON CONFLICT … DO UPDATE` and the bound parameters. But Nano cannot multiply an interval by a
+number and Lite has no interval type, so `memory_put` fails on both, and Lite's `LIMIT`
+takes only a literal, so `memory_list` and `memory_search` fail there too. These findings
+come from reading their source, not from running the statements. The memory tools
+therefore need a PostgreSQL MCP backend; against Nano or Lite, a refused statement is a
+tool error (`backend`), and the other MCP tools are unaffected.
+
+**Metrics** (no principal or tenant label):
+- `heliosdb_proxy_mcp_memory_ops_total{op}` counts completed calls (`op` = `put`, `get`,
+  `list`, `search`, `delete`).
+- `heliosdb_proxy_mcp_memory_refused_total{reason}` counts every other call. `reason` is
+  `read_only`, `default_principal`, `invalid_argument`, `key_too_large`,
+  `value_too_large`, `quota`, `policy` (rate limit, circuit, tenant cap), `not_ready` (the
+  table is missing or unusable) or `backend`.
+- `heliosdb_proxy_mcp_memory_entries_quota_hits_total` counts the `quota` refusals as a
+  series of their own.
+
+The same counters appear under `mcp_memory` on `GET /metrics` (`ops`, `refused`,
+`entries_quota_hits`). `/capabilities` has an `mcp-memory` row.
+
+Not provided: similarity or embedding search (`memory_search` is exact prefix and tag
+match only); sharing between agents, principals or tenants; per-principal metric labels;
+`resources/*` for the entries; a bytes-per-owner budget (entries × `memory_max_value_bytes`
+bound it). Like the rest of `[mcp]`, the memory keys are read at startup only.
 
 Each `[[agent_contracts]]` entry (scoped grants, referenced by `id` from `[mcp] contract`):
 

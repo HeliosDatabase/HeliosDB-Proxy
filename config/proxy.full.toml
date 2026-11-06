@@ -814,6 +814,23 @@ heatmap_min_samples = 100   # reads in the window before a recommendation
 # tool_cache_max_entry_bytes           = 1048576     # 1 MiB
 # tool_cache_max_statement_bytes       = 16384
 #
+# # Agent memory tools: memory_put / get / list / search / delete, rows of
+# # memory_table on the MCP backend owned by (principal, tenant). Off by default;
+# # needs a [[mcp.principals]] entry and a PostgreSQL backend. Defaults shown.
+# memory_enabled               = false
+# memory_table                 = "heliosdb_mcp_memory"
+# memory_auto_create           = false       # false: startup checks the table
+# # memory_backend_user        = "helios_memory"   # default backend_user; give it
+# # memory_backend_password    = "${MCP_MEMORY_PASSWORD}"  # alone the table
+# memory_max_key_bytes         = 256
+# memory_max_value_bytes       = 65536       # 64 KiB of compact JSON
+# memory_max_entries_per_owner = 1000        # live entries per (principal, tenant)
+# memory_default_ttl_secs      = 604800      # 7 days
+# memory_max_ttl_secs          = 2592000     # 30 days
+# memory_max_tags              = 16
+# memory_max_tag_bytes         = 64
+# memory_list_max_limit        = 100
+#
 # # Per-agent principals (optional, repeatable). The bearer token selects the
 # # principal; holders of the shared auth_token are the one principal "default".
 # # Once any token is configured, an unknown token gets 401.

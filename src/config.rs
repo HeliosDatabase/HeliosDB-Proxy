@@ -852,6 +852,137 @@ pub struct McpConfig {
     /// (1..=[`MCP_TOOL_CACHE_MAX_STATEMENT_BYTES_CEILING`]).
     #[serde(default = "default_mcp_tool_cache_max_statement_bytes")]
     pub tool_cache_max_statement_bytes: usize,
+    /// Agent memory tools (Sprinter 20bcc218385f): `memory_put`, `memory_get`,
+    /// `memory_list`, `memory_search` and `memory_delete`, backed by rows of
+    /// [`Self::memory_table`] on the MCP backend, each owned by the request's
+    /// principal and tenant (set by the proxy, never by the agent). Needs at
+    /// least one `[[mcp.principals]]` entry: the shared principal `default`
+    /// is refused. Default `false`: the tool catalog is unchanged.
+    #[serde(default)]
+    pub memory_enabled: bool,
+    /// The memory table: an unquoted identifier, optionally schema-qualified
+    /// (`schema.table`), each part `[A-Za-z_][A-Za-z0-9_]*` and at most 63
+    /// bytes. Its DDL is in `docs/configuration.md`.
+    #[serde(default = "default_mcp_memory_table")]
+    pub memory_table: String,
+    /// `true`: create the memory table (`CREATE TABLE IF NOT EXISTS`) at the
+    /// first memory call. `false` (default): the gateway checks the table at
+    /// startup and refuses to start when the backend says it is missing or
+    /// unusable (the error names the DDL); a table it could not check then is
+    /// checked again before the first memory call.
+    #[serde(default)]
+    pub memory_auto_create: bool,
+    /// The backend role the memory statements run as (default: `backend_user`).
+    /// Give it alone the privileges on `memory_table`: the `query` and
+    /// `explain` tools run as `backend_user`, so a shared role can read every
+    /// owner's rows through them (`strict_config` refuses a shared role).
+    #[serde(default)]
+    pub memory_backend_user: Option<String>,
+    /// Password of `memory_backend_user` (only with it). Never serialised.
+    #[serde(default, skip_serializing)]
+    pub memory_backend_password: Option<String>,
+    /// Longest memory key, bytes (1..=[`MCP_MEMORY_MAX_KEY_BYTES_CEILING`]).
+    #[serde(default = "default_mcp_memory_max_key_bytes")]
+    pub memory_max_key_bytes: usize,
+    /// Largest memory value, bytes of its compact JSON text
+    /// (1..=`max_result_bytes`, and at most the gateway's request body cap).
+    #[serde(default = "default_mcp_memory_max_value_bytes")]
+    pub memory_max_value_bytes: usize,
+    /// Most live entries one owner (principal, tenant) holds; a `memory_put`
+    /// of a new key past it is refused
+    /// (1..=[`MCP_MEMORY_MAX_ENTRIES_CEILING`]).
+    #[serde(default = "default_mcp_memory_max_entries_per_owner")]
+    pub memory_max_entries_per_owner: usize,
+    /// TTL of a `memory_put` that names none, seconds
+    /// (1..=`memory_max_ttl_secs`).
+    #[serde(default = "default_mcp_memory_default_ttl_secs")]
+    pub memory_default_ttl_secs: u64,
+    /// Longest TTL a `memory_put` may ask for, seconds
+    /// (1..=[`MCP_MEMORY_MAX_TTL_CEILING_SECS`]).
+    #[serde(default = "default_mcp_memory_max_ttl_secs")]
+    pub memory_max_ttl_secs: u64,
+    /// Most tags one entry carries (0..=[`MCP_MEMORY_MAX_TAGS_CEILING`];
+    /// 0 = tags are refused).
+    #[serde(default = "default_mcp_memory_max_tags")]
+    pub memory_max_tags: usize,
+    /// Longest tag, bytes (1..=[`MCP_MEMORY_MAX_KEY_BYTES_CEILING`]).
+    #[serde(default = "default_mcp_memory_max_tag_bytes")]
+    pub memory_max_tag_bytes: usize,
+    /// Most entries one `memory_list` / `memory_search` page returns, and its
+    /// default `limit` (1..=[`MCP_MEMORY_LIST_MAX_LIMIT_CEILING`]).
+    #[serde(default = "default_mcp_memory_list_max_limit")]
+    pub memory_list_max_limit: usize,
+}
+
+/// Upper bound of `[mcp] memory_max_key_bytes` and `memory_max_tag_bytes`
+/// (well inside a PostgreSQL B-tree entry with the owner columns).
+pub const MCP_MEMORY_MAX_KEY_BYTES_CEILING: usize = 1024;
+/// Upper bound of `[mcp] memory_max_entries_per_owner`.
+pub const MCP_MEMORY_MAX_ENTRIES_CEILING: usize = 1_000_000;
+/// Upper bound of `[mcp] memory_max_ttl_secs` (ten years).
+pub const MCP_MEMORY_MAX_TTL_CEILING_SECS: u64 = 315_360_000;
+/// Upper bound of `[mcp] memory_max_tags`.
+pub const MCP_MEMORY_MAX_TAGS_CEILING: usize = 256;
+/// Upper bound of `[mcp] memory_list_max_limit`.
+pub const MCP_MEMORY_LIST_MAX_LIMIT_CEILING: usize = 10_000;
+/// Longest part of `[mcp] memory_table` (PostgreSQL's `NAMEDATALEN` - 1).
+pub const MCP_MEMORY_TABLE_PART_MAX_LEN: usize = 63;
+
+fn default_mcp_memory_table() -> String {
+    "heliosdb_mcp_memory".to_string()
+}
+fn default_mcp_memory_max_key_bytes() -> usize {
+    256
+}
+/// 64 KiB.
+fn default_mcp_memory_max_value_bytes() -> usize {
+    64 * 1024
+}
+fn default_mcp_memory_max_entries_per_owner() -> usize {
+    1_000
+}
+/// Seven days.
+fn default_mcp_memory_default_ttl_secs() -> u64 {
+    604_800
+}
+/// Thirty days.
+fn default_mcp_memory_max_ttl_secs() -> u64 {
+    2_592_000
+}
+fn default_mcp_memory_max_tags() -> usize {
+    16
+}
+fn default_mcp_memory_max_tag_bytes() -> usize {
+    64
+}
+fn default_mcp_memory_list_max_limit() -> usize {
+    100
+}
+
+/// Why `[mcp] memory_table` is not an unquoted, optionally schema-qualified
+/// identifier, or `None`. The name is written into the memory statements'
+/// text (an identifier cannot be a bound parameter), so nothing else passes.
+pub fn mcp_memory_table_error(name: &str) -> Option<String> {
+    let parts: Vec<&str> = name.split('.').collect();
+    if parts.len() > 2 {
+        return Some("may name at most a schema and a table (schema.table)".to_string());
+    }
+    for part in parts {
+        let mut bytes = part.bytes();
+        let starts_ok = bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_');
+        if !starts_ok
+            || part.len() > MCP_MEMORY_TABLE_PART_MAX_LEN
+            || !bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Some(format!(
+                "must be [A-Za-z_][A-Za-z0-9_]* (at most {MCP_MEMORY_TABLE_PART_MAX_LEN} bytes \
+                 per part), optionally schema-qualified"
+            ));
+        }
+    }
+    None
 }
 
 /// Upper bound of `[mcp] tool_cache_ttl_secs` and `tool_cache_catalog_ttl_secs`
@@ -944,6 +1075,119 @@ impl McpConfig {
     /// Whether the tool-result cache runs: `[mcp]` and `tool_cache_enabled`.
     pub fn tool_cache_on(&self) -> bool {
         self.enabled && self.tool_cache_enabled
+    }
+
+    /// Whether the memory tools run: `[mcp]` and `memory_enabled`.
+    pub fn memory_on(&self) -> bool {
+        self.enabled && self.memory_enabled
+    }
+
+    /// The backend role the memory statements run as.
+    pub fn memory_user(&self) -> &str {
+        self.memory_backend_user
+            .as_deref()
+            .unwrap_or(&self.backend_user)
+    }
+
+    /// The password of [`Self::memory_user`].
+    pub fn memory_password(&self) -> Option<&str> {
+        match &self.memory_backend_user {
+            Some(_) => self.memory_backend_password.as_deref(),
+            None => self.backend_password.as_deref(),
+        }
+    }
+
+    /// Whether the memory statements run as the role the `query` and
+    /// `explain` tools use, which can then read every owner's rows.
+    pub fn memory_shares_query_role(&self) -> bool {
+        self.memory_user() == self.backend_user
+    }
+
+    /// The `memory_*` bounds and the table name, each named in its error.
+    /// Checked on every build, like the tool-cache bounds; the rules that
+    /// need the memory tools on are in [`ProxyConfig::validate`].
+    fn validate_memory(&self) -> Result<()> {
+        if let Some(why) = mcp_memory_table_error(&self.memory_table) {
+            return Err(ProxyError::Config(format!(
+                "mcp.memory_table {:?} {why}",
+                self.memory_table
+            )));
+        }
+        if self.memory_backend_user.is_none() && self.memory_backend_password.is_some() {
+            return Err(ProxyError::Config(
+                "mcp.memory_backend_password is set without mcp.memory_backend_user: \
+                 the memory statements would use backend_password"
+                    .to_string(),
+            ));
+        }
+        if self
+            .memory_backend_user
+            .as_deref()
+            .is_some_and(|u| u.trim().is_empty())
+        {
+            return Err(ProxyError::Config(
+                "mcp.memory_backend_user must be non-empty (omit it to use backend_user)"
+                    .to_string(),
+            ));
+        }
+        let range = |name: &str, value: u64, min: u64, max: u64| -> Result<()> {
+            if (min..=max).contains(&value) {
+                Ok(())
+            } else {
+                Err(ProxyError::Config(format!(
+                    "mcp.{name} must be between {min} and {max} (got {value})"
+                )))
+            }
+        };
+        range(
+            "memory_max_key_bytes",
+            self.memory_max_key_bytes as u64,
+            1,
+            MCP_MEMORY_MAX_KEY_BYTES_CEILING as u64,
+        )?;
+        range(
+            "memory_max_value_bytes",
+            self.memory_max_value_bytes as u64,
+            1,
+            self.max_result_bytes
+                .min(crate::http_util::MAX_HTTP_BODY_BYTES) as u64,
+        )?;
+        range(
+            "memory_max_entries_per_owner",
+            self.memory_max_entries_per_owner as u64,
+            1,
+            MCP_MEMORY_MAX_ENTRIES_CEILING as u64,
+        )?;
+        range(
+            "memory_max_ttl_secs",
+            self.memory_max_ttl_secs,
+            1,
+            MCP_MEMORY_MAX_TTL_CEILING_SECS,
+        )?;
+        range(
+            "memory_default_ttl_secs",
+            self.memory_default_ttl_secs,
+            1,
+            self.memory_max_ttl_secs,
+        )?;
+        range(
+            "memory_max_tags",
+            self.memory_max_tags as u64,
+            0,
+            MCP_MEMORY_MAX_TAGS_CEILING as u64,
+        )?;
+        range(
+            "memory_max_tag_bytes",
+            self.memory_max_tag_bytes as u64,
+            1,
+            MCP_MEMORY_MAX_KEY_BYTES_CEILING as u64,
+        )?;
+        range(
+            "memory_list_max_limit",
+            self.memory_list_max_limit as u64,
+            1,
+            MCP_MEMORY_LIST_MAX_LIMIT_CEILING as u64,
+        )
     }
 
     /// The `tool_cache_*` bounds, each named in its error. Checked on every
@@ -1076,6 +1320,19 @@ impl Default for McpConfig {
             tool_cache_max_bytes_per_principal: default_mcp_tool_cache_max_bytes_per_principal(),
             tool_cache_max_entry_bytes: default_mcp_tool_cache_max_entry_bytes(),
             tool_cache_max_statement_bytes: default_mcp_tool_cache_max_statement_bytes(),
+            memory_enabled: false,
+            memory_table: default_mcp_memory_table(),
+            memory_auto_create: false,
+            memory_backend_user: None,
+            memory_backend_password: None,
+            memory_max_key_bytes: default_mcp_memory_max_key_bytes(),
+            memory_max_value_bytes: default_mcp_memory_max_value_bytes(),
+            memory_max_entries_per_owner: default_mcp_memory_max_entries_per_owner(),
+            memory_default_ttl_secs: default_mcp_memory_default_ttl_secs(),
+            memory_max_ttl_secs: default_mcp_memory_max_ttl_secs(),
+            memory_max_tags: default_mcp_memory_max_tags(),
+            memory_max_tag_bytes: default_mcp_memory_max_tag_bytes(),
+            memory_list_max_limit: default_mcp_memory_list_max_limit(),
         }
     }
 }
@@ -4000,6 +4257,17 @@ const IGNORED_KEY_ALIASES: &[(&str, &str)] = &[
         "mcp.tokens",
         "there is no mcp.tokens: give each agent a [[mcp.principals]] entry (id, token)",
     ),
+    // The agent memory tools' keys are flat under [mcp] too (20bcc218385f).
+    (
+        "mcp.memory",
+        "there is no [mcp.memory]: the memory tool keys are flat under [mcp] \
+         (memory_enabled, memory_table, memory_max_entries_per_owner, ...)",
+    ),
+    ("mcp.memory_ttl_secs", "did you mean 'mcp.memory_default_ttl_secs'?"),
+    (
+        "mcp.memory_max_entries",
+        "did you mean 'mcp.memory_max_entries_per_owner'?",
+    ),
     (
         "cache.query",
         "there is no [cache.query]: the keys are flat under [cache] (max_result_size is \
@@ -4058,6 +4326,8 @@ const KNOWN_KEYS_NOT_IN_DEFAULT: &[&str] = &[
     "mcp.auth_token",
     "mcp.principals.id",
     "mcp.principals.token",
+    "mcp.memory_backend_user",
+    "mcp.memory_backend_password",
 ];
 
 /// Every dotted key path `ProxyConfig` knows, taken from a serialised default
@@ -5085,6 +5355,32 @@ impl ProxyConfig {
         }
         self.mcp.validate_principals()?;
         self.mcp.validate_tool_cache()?;
+        self.mcp.validate_memory()?;
+        // Memory is per principal, and the shared principal `default` (the
+        // `auth_token` holders, or every caller with no token) is refused,
+        // so the tools need a `[[mcp.principals]]` entry to be usable.
+        if self.mcp.memory_on() && self.mcp.principals.is_empty() {
+            return Err(ProxyError::Config(
+                "[mcp] memory_enabled = true needs at least one [[mcp.principals]] entry: \
+                 memory belongs to a principal, and the memory tools refuse the shared \
+                 principal \"default\" (the auth_token holders, or every caller when no token \
+                 is configured)"
+                    .to_string(),
+            ));
+        }
+        // The `query` and `explain` tools run as `backend_user`: when the
+        // memory statements do too, that role can read every owner's rows
+        // through them, so per-owner isolation rests on the lexical guard
+        // alone. Refused under strict_config (the daemon warns otherwise).
+        if self.strict_config && self.mcp.memory_on() && self.mcp.memory_shares_query_role() {
+            return Err(ProxyError::Config(format!(
+                "strict_config: [mcp] memory_enabled = true and the memory statements run as \
+                 backend_user {:?}, the role the query and explain tools use, which can then \
+                 read every principal's memory rows; set memory_backend_user to a role that \
+                 alone holds privileges on {}, or set strict_config = false to accept it",
+                self.mcp.backend_user, self.mcp.memory_table
+            )));
+        }
         // The tool cache is retired by the writes the proxy sees. Writes to a
         // backend no path of this proxy reaches are seen only by a logical
         // source, so without one such a cache is stale up to its TTL:
@@ -9262,6 +9558,197 @@ exclude = true
             !c.mcp_tool_cache_sees_writes(),
             "no logical source without [cache]"
         );
+    }
+
+    /// A config with the memory tools on and one principal.
+    fn memory_config() -> ProxyConfig {
+        let mut c = ProxyConfig::default();
+        c.add_node("localhost:5432", "primary").unwrap();
+        c.mcp.enabled = true;
+        c.mcp.memory_enabled = true;
+        c.mcp.principals = vec![McpPrincipal {
+            id: "agent".into(),
+            token: "t-agent".into(),
+        }];
+        c
+    }
+
+    #[test]
+    fn mcp_memory_keys_default_off_and_parse() {
+        let d = McpConfig::default();
+        assert!(!d.memory_enabled && !d.memory_on());
+        assert_eq!(d.memory_table, "heliosdb_mcp_memory");
+        assert!(!d.memory_auto_create);
+        assert!(d.memory_backend_user.is_none());
+        assert_eq!(d.memory_max_key_bytes, 256);
+        assert_eq!(d.memory_max_value_bytes, 64 * 1024);
+        assert_eq!(d.memory_max_entries_per_owner, 1_000);
+        assert_eq!(d.memory_default_ttl_secs, 604_800);
+        assert_eq!(d.memory_max_ttl_secs, 2_592_000);
+        assert_eq!(d.memory_max_tags, 16);
+        assert_eq!(d.memory_max_tag_bytes, 64);
+        assert_eq!(d.memory_list_max_limit, 100);
+        // The memory role defaults to the gateway's role and password.
+        assert_eq!(d.memory_user(), d.backend_user);
+        assert!(d.memory_shares_query_role());
+        let mut c: ProxyConfig = toml::from_str(
+            "[mcp]\nenabled = true\nbackend_password = \"main\"\nmemory_enabled = true\n\
+             memory_table = \"agents.memory\"\nmemory_auto_create = true\n\
+             memory_backend_user = \"mem\"\nmemory_backend_password = \"m-secret\"\n\
+             memory_max_entries_per_owner = 5\nmemory_default_ttl_secs = 60\n\
+             [[mcp.principals]]\nid = \"a\"\ntoken = \"t\"\n",
+        )
+        .unwrap();
+        assert!(c.mcp.memory_on() && c.mcp.memory_auto_create);
+        assert_eq!(c.mcp.memory_table, "agents.memory");
+        assert_eq!(c.mcp.memory_user(), "mem");
+        assert_eq!(c.mcp.memory_password(), Some("m-secret"));
+        assert!(!c.mcp.memory_shares_query_role());
+        assert_eq!(c.mcp.memory_max_entries_per_owner, 5);
+        assert_eq!(c.mcp.memory_default_ttl_secs, 60);
+        c.add_node("localhost:5432", "primary").unwrap();
+        c.validate().unwrap();
+        // The memory password is never serialised.
+        let dumped = serde_json::to_string(&c.mcp).unwrap();
+        assert!(!dumped.contains("m-secret"), "{dumped}");
+        assert!(
+            dumped.contains("\"memory_backend_user\":\"mem\""),
+            "{dumped}"
+        );
+        let known = known_config_keys();
+        for key in [
+            "mcp.memory_enabled",
+            "mcp.memory_table",
+            "mcp.memory_auto_create",
+            "mcp.memory_backend_user",
+            "mcp.memory_backend_password",
+            "mcp.memory_max_key_bytes",
+            "mcp.memory_max_value_bytes",
+            "mcp.memory_max_entries_per_owner",
+            "mcp.memory_default_ttl_secs",
+            "mcp.memory_max_ttl_secs",
+            "mcp.memory_max_tags",
+            "mcp.memory_max_tag_bytes",
+            "mcp.memory_list_max_limit",
+        ] {
+            assert!(known.contains(key), "{key}");
+        }
+        assert_eq!(
+            ignored_key_hint("mcp.memory_ttl_secs", &known).as_deref(),
+            Some("did you mean 'mcp.memory_default_ttl_secs'?")
+        );
+        assert!(ignored_key_hint("mcp.memory", &known)
+            .unwrap()
+            .contains("flat under [mcp]"));
+    }
+
+    #[test]
+    fn mcp_memory_bounds_validate_and_name_the_key() {
+        let cases: [InvalidCase; 17] = [
+            ("mcp.memory_table", |c| c.mcp.memory_table = String::new()),
+            ("mcp.memory_table", |c| {
+                c.mcp.memory_table = "memory; DROP TABLE x".into()
+            }),
+            ("mcp.memory_table", |c| c.mcp.memory_table = "a.b.c".into()),
+            ("mcp.memory_table", |c| {
+                c.mcp.memory_table = "1memory".into()
+            }),
+            ("mcp.memory_table", |c| {
+                c.mcp.memory_table = "\"memory\"".into()
+            }),
+            ("mcp.memory_table", |c| {
+                c.mcp.memory_table = "m".repeat(MCP_MEMORY_TABLE_PART_MAX_LEN + 1)
+            }),
+            ("mcp.memory_backend_password", |c| {
+                c.mcp.memory_backend_password = Some("p".into())
+            }),
+            ("mcp.memory_backend_user", |c| {
+                c.mcp.memory_backend_user = Some(" ".into())
+            }),
+            ("mcp.memory_max_key_bytes", |c| {
+                c.mcp.memory_max_key_bytes = 0
+            }),
+            ("mcp.memory_max_key_bytes", |c| {
+                c.mcp.memory_max_key_bytes = MCP_MEMORY_MAX_KEY_BYTES_CEILING + 1
+            }),
+            ("mcp.memory_max_value_bytes", |c| {
+                c.mcp.memory_max_value_bytes = c.mcp.max_result_bytes + 1
+            }),
+            ("mcp.memory_max_entries_per_owner", |c| {
+                c.mcp.memory_max_entries_per_owner = 0
+            }),
+            ("mcp.memory_max_ttl_secs", |c| {
+                c.mcp.memory_max_ttl_secs = MCP_MEMORY_MAX_TTL_CEILING_SECS + 1
+            }),
+            ("mcp.memory_default_ttl_secs", |c| {
+                c.mcp.memory_default_ttl_secs = c.mcp.memory_max_ttl_secs + 1
+            }),
+            ("mcp.memory_max_tags", |c| {
+                c.mcp.memory_max_tags = MCP_MEMORY_MAX_TAGS_CEILING + 1
+            }),
+            ("mcp.memory_max_tag_bytes", |c| {
+                c.mcp.memory_max_tag_bytes = 0
+            }),
+            ("mcp.memory_list_max_limit", |c| {
+                c.mcp.memory_list_max_limit = MCP_MEMORY_LIST_MAX_LIMIT_CEILING + 1
+            }),
+        ];
+        for (name, mutate) in cases {
+            // Checked on every build, memory on or off.
+            for on in [false, true] {
+                let mut c = memory_config();
+                c.mcp.memory_enabled = on;
+                mutate(&mut c);
+                let err = c.validate().unwrap_err().to_string();
+                assert!(err.contains(name), "{name}: unexpected error {err}");
+            }
+        }
+        // The edges themselves are accepted.
+        let mut c = memory_config();
+        c.mcp.memory_table = format!("s.{}", "m".repeat(MCP_MEMORY_TABLE_PART_MAX_LEN));
+        c.mcp.memory_max_key_bytes = MCP_MEMORY_MAX_KEY_BYTES_CEILING;
+        c.mcp.memory_max_value_bytes = c.mcp.max_result_bytes.min(8 * 1024 * 1024);
+        c.mcp.memory_max_entries_per_owner = MCP_MEMORY_MAX_ENTRIES_CEILING;
+        c.mcp.memory_max_ttl_secs = MCP_MEMORY_MAX_TTL_CEILING_SECS;
+        c.mcp.memory_default_ttl_secs = MCP_MEMORY_MAX_TTL_CEILING_SECS;
+        c.mcp.memory_max_tags = 0;
+        c.mcp.memory_list_max_limit = MCP_MEMORY_LIST_MAX_LIMIT_CEILING;
+        c.validate().unwrap();
+        assert_eq!(mcp_memory_table_error("_Agent_Memory2"), None);
+    }
+
+    /// The memory tools need a `[[mcp.principals]]` entry (the shared
+    /// `default` is refused), and strict_config refuses a memory role that is
+    /// the `query` tool's role.
+    #[test]
+    fn mcp_memory_needs_principals_and_a_separate_role_under_strict_config() {
+        let mut c = memory_config();
+        c.mcp.principals.clear();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("[[mcp.principals]]"), "{err}");
+        // Off ([mcp] or memory), nothing is required.
+        c.mcp.memory_enabled = false;
+        c.validate().unwrap();
+        c.mcp.memory_enabled = true;
+        c.mcp.enabled = false;
+        c.validate().unwrap();
+
+        let c = memory_config();
+        c.validate().expect("non-strict: warned at startup only");
+        let mut strict = memory_config();
+        strict.strict_config = true;
+        let err = strict.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("strict_config") && err.contains("memory_backend_user"),
+            "{err}"
+        );
+        // Naming the gateway's own role is still a shared role.
+        strict.mcp.memory_backend_user = Some(strict.mcp.backend_user.clone());
+        assert!(strict.validate().is_err());
+        strict.mcp.memory_backend_user = Some("helios_memory".into());
+        strict.mcp.memory_backend_password = Some("m".into());
+        strict.validate().unwrap();
+        assert_eq!(strict.mcp.memory_password(), Some("m"));
     }
 
     #[test]

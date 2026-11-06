@@ -639,6 +639,7 @@ impl AdminServer {
                     if let Some(c) = state.mcp_cache.read().await.as_ref() {
                         map.insert("mcp_cache".into(), c.stats_json());
                     }
+                    map.insert("mcp_memory".into(), crate::mcp_memory::stats_json());
                     #[cfg(feature = "edge-proxy")]
                     if let Some(e) = state.edge_cache.read().await.as_ref() {
                         let s = e.stats();
@@ -2798,6 +2799,7 @@ impl AdminServer {
             "heliosdb_proxy_mcp_results_truncated_total {}",
             crate::mcp::results_truncated_total()
         );
+        crate::mcp_memory::write_prometheus(output);
         #[cfg(feature = "query-cache")]
         Self::push_gateway_write_prometheus(output);
     }
@@ -5211,6 +5213,34 @@ mod tests {
             .unwrap();
         assert_eq!(all["cleared"], 2, "no body clears every owner");
         assert_eq!(cache.retained_bytes(), 0);
+    }
+
+    /// The memory tool counters are on both metrics endpoints, with no
+    /// principal or tenant label.
+    #[tokio::test]
+    async fn mcp_memory_metrics_are_exported_on_both_endpoints() {
+        let state = Arc::new(AdminState::new());
+        let (_, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
+            .await
+            .unwrap();
+        let text = body["text"].as_str().unwrap();
+        for line in [
+            "# TYPE heliosdb_proxy_mcp_memory_ops_total counter\n",
+            "\nheliosdb_proxy_mcp_memory_ops_total{op=\"put\"} ",
+            "\nheliosdb_proxy_mcp_memory_refused_total{reason=\"quota\"} ",
+            "\nheliosdb_proxy_mcp_memory_entries_quota_hits_total ",
+        ] {
+            assert!(text.contains(line), "missing {line}");
+        }
+        let (_, json) = AdminServer::route_request("GET", "/metrics", None, &state)
+            .await
+            .unwrap();
+        assert!(json["mcp_memory"]["ops"]["delete"].is_u64(), "{json}");
+        assert!(
+            json["mcp_memory"]["refused"]["read_only"].is_u64(),
+            "{json}"
+        );
+        assert!(json["mcp_memory"]["entries_quota_hits"].is_u64(), "{json}");
     }
 
     #[cfg(feature = "query-cache")]

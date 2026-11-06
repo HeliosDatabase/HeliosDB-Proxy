@@ -13,6 +13,7 @@ fn test_config() -> ProxyConfig {
 
 // ---- single-pass statement facts ----
 mod ext_set;
+mod mcp_memory;
 mod node_overrides;
 mod prepared_commit_flush;
 mod read_offload;

@@ -54,6 +54,8 @@ struct Gateway<'a> {
     /// The tool-result cache, when `[mcp] tool_cache_enabled`.
     #[cfg(feature = "query-cache")]
     cache: Option<&'a crate::mcp_cache::McpToolCache>,
+    /// The agent memory tools, when `[mcp] memory_enabled`.
+    memory: Option<&'a crate::mcp_memory::McpMemory>,
 }
 
 impl Gateway<'_> {
@@ -184,6 +186,8 @@ pub(crate) struct McpShared {
     /// The tool-result cache, when `[mcp] tool_cache_enabled`.
     #[cfg(feature = "query-cache")]
     cache: Option<Arc<crate::mcp_cache::McpToolCache>>,
+    /// The agent memory tools, when `[mcp] memory_enabled`.
+    memory: Option<Arc<crate::mcp_memory::McpMemory>>,
 }
 
 /// The MCP gateway server.
@@ -319,6 +323,33 @@ impl McpServer {
                 "MCP gateway: bearer tokens select the principal"
             );
         }
+        if let Some(memory) = &shared.memory {
+            let cfg = &shared.cfg;
+            // `memory_auto_create = false`: a table the backend says is
+            // missing or unusable refuses the start, naming the DDL.
+            memory
+                .startup_check(cfg, &shared.pool)
+                .await
+                .map_err(ProxyError::Config)?;
+            if cfg.memory_shares_query_role() {
+                tracing::warn!(
+                    backend_user = %cfg.backend_user,
+                    table = %cfg.memory_table,
+                    "[mcp] the memory statements run as backend_user, the role of the query and \
+                     explain tools: that role can read every principal's memory rows, and only \
+                     the statement guard keeps those tools off the table; set \
+                     memory_backend_user to a role that alone holds privileges on it \
+                     (strict_config = true refuses this)"
+                );
+            }
+            tracing::info!(
+                table = %cfg.memory_table,
+                role = %cfg.memory_user(),
+                auto_create = cfg.memory_auto_create,
+                max_entries_per_owner = cfg.memory_max_entries_per_owner,
+                "MCP agent memory tools enabled"
+            );
+        }
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(x) => x,
@@ -338,6 +369,10 @@ impl McpServer {
 
     /// What this gateway's connections share.
     pub(crate) fn into_shared(self) -> Arc<McpShared> {
+        let memory = self
+            .config
+            .memory_on()
+            .then(|| Arc::new(crate::mcp_memory::McpMemory::new(&self.config)));
         Arc::new(McpShared {
             admission: tokio::sync::Semaphore::new(self.config.max_concurrent_requests),
             principals: Principals::from_config(&self.config),
@@ -347,6 +382,7 @@ impl McpServer {
             policy: self.policy,
             #[cfg(feature = "query-cache")]
             cache: self.cache,
+            memory,
         })
     }
 
@@ -422,6 +458,7 @@ impl McpServer {
             principal: &principal,
             #[cfg(feature = "query-cache")]
             cache: shared.cache.as_deref(),
+            memory: shared.memory.as_deref(),
         };
         let response = Self::dispatch_with(
             &body,
@@ -460,6 +497,7 @@ impl McpServer {
             principal: &principal,
             #[cfg(feature = "query-cache")]
             cache: None,
+            memory: None,
         };
         Self::dispatch_with(body, cfg, contract, &gateway, admission).await
     }
@@ -500,7 +538,7 @@ impl McpServer {
             "ping" => Some(rpc_ok(id, json!({}))),
             "tools/list" => Some(rpc_ok(
                 id,
-                json!({ "tools": Self::tool_defs(cfg, gateway.cache_ttls()) }),
+                json!({ "tools": Self::tool_defs(cfg, gateway.cache_ttls(), gateway.memory.is_some()) }),
             )),
             "tools/call" => {
                 // Admission cap (H-06 `max_concurrent_requests`): this is the
@@ -529,8 +567,9 @@ impl McpServer {
 
     /// The tool catalog. With the tool cache on (`cache_ttls` = the `query`
     /// and `list_tables` TTLs), those two tools say how old a result may be
-    /// and take an optional `fresh`; with it off the catalog is unchanged.
-    fn tool_defs(cfg: &McpConfig, cache_ttls: Option<(Duration, Duration)>) -> Value {
+    /// and take an optional `fresh`; with `memory` the memory tools follow
+    /// the three SQL tools; with both off the catalog is unchanged.
+    fn tool_defs(cfg: &McpConfig, cache_ttls: Option<(Duration, Duration)>, memory: bool) -> Value {
         let query_desc = if cfg.read_only {
             "Run a read-only SQL query and return rows. Writes/DDL are refused."
         } else {
@@ -570,7 +609,7 @@ impl McpServer {
                 )
             }
         };
-        json!([
+        let mut tools = json!([
             {
                 "name": "query",
                 "description": query_desc,
@@ -594,7 +633,13 @@ impl McpServer {
                     "required": ["sql"]
                 }
             }
-        ])
+        ]);
+        if memory {
+            if let Some(list) = tools.as_array_mut() {
+                list.extend(crate::mcp_memory::tool_defs(cfg));
+            }
+        }
+        tools
     }
 
     async fn handle_tool_call(
@@ -619,6 +664,8 @@ impl McpServer {
                     .trim();
                 if sql.is_empty() {
                     (Err("missing 'sql'".to_string()), None)
+                } else if let Err(refused) = memory_table_guard(gateway, sql) {
+                    (Err(refused), None)
                 } else {
                     match Self::check_policy(cfg, contract, sql) {
                         Err(hint) => (Err(hint), None),
@@ -648,6 +695,8 @@ impl McpServer {
                     .trim();
                 let result = if sql.is_empty() {
                     Err("missing 'sql'".to_string())
+                } else if let Err(refused) = memory_table_guard(gateway, sql) {
+                    Err(refused)
                 } else {
                     match Self::check_policy(cfg, contract, sql) {
                         Err(hint) => Err(hint),
@@ -665,7 +714,31 @@ impl McpServer {
                 };
                 (result, None)
             }
-            other => (Err(format!("unknown tool: {}", other)), None),
+            other => match (
+                gateway.memory,
+                crate::mcp_memory::MemoryOp::from_tool(other),
+            ) {
+                (Some(memory), Some(op)) => {
+                    let call = crate::mcp_memory::MemoryCall {
+                        cfg,
+                        pool: gateway.pool,
+                        policy: gateway.policy,
+                        peer: gateway.peer,
+                        tenant: gateway.tenant,
+                        principal: gateway.principal,
+                        read_only,
+                    };
+                    // The result object is both the text (as JSON) and the
+                    // structured content.
+                    let result = memory
+                        .call(op, &args, &call)
+                        .await
+                        .map(|object| (object.to_string(), Some(object)))
+                        .map_err(|refusal| refusal.message);
+                    (result, None)
+                }
+                _ => (Err(format!("unknown tool: {}", other)), None),
+            },
         };
 
         let mut result = match result {
@@ -955,6 +1028,20 @@ impl McpServer {
                 .map_err(|e| ProxyError::Network(format!("MCP write: {}", e)))?;
         }
         Ok(())
+    }
+}
+
+/// The `query` / `explain` guard of the memory tools: with them on, a
+/// statement that names the memory table is refused, so an agent cannot read
+/// or change other owners' rows with SQL of its own (defense in depth; the
+/// boundary is a `memory_backend_user` that alone holds the table).
+fn memory_table_guard(gateway: &Gateway<'_>, sql: &str) -> std::result::Result<(), String> {
+    match gateway.memory {
+        Some(memory) if memory.names_table(sql) => Err(
+            "statements that name the MCP memory table are refused: use the memory_* tools"
+                .to_string(),
+        ),
+        _ => Ok(()),
     }
 }
 
@@ -1689,6 +1776,36 @@ mod tests {
         assert!(names.contains(&"explain"));
     }
 
+    /// The memory tools join the catalog only when the gateway runs them;
+    /// the three SQL tools are the same either way.
+    #[test]
+    fn memory_tools_join_the_catalog_only_when_enabled() {
+        let cfg = McpConfig {
+            memory_enabled: true,
+            ..McpConfig::default()
+        };
+        let off = McpServer::tool_defs(&cfg, None, false);
+        let on = McpServer::tool_defs(&cfg, None, true);
+        let names = |v: &Value| -> Vec<String> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(names(&off), ["query", "list_tables", "explain"]);
+        assert_eq!(
+            off,
+            McpServer::tool_defs(&McpConfig::default(), None, false)
+        );
+        let on_names = names(&on);
+        assert_eq!(on_names.len(), 3 + crate::mcp_memory::MemoryOp::COUNT);
+        assert_eq!(on.as_array().unwrap()[..3], off.as_array().unwrap()[..]);
+        for op in crate::mcp_memory::MemoryOp::ALL {
+            assert!(on_names.iter().any(|n| n == op.tool()), "{}", op.tool());
+        }
+    }
+
     #[tokio::test]
     async fn notification_has_no_response() {
         let cfg = McpConfig::default();
@@ -2007,6 +2124,7 @@ mod tests {
             principal: &principal,
             #[cfg(feature = "query-cache")]
             cache: None,
+            memory: None,
         };
         let refused = McpServer::dispatch_with(&body, &cfg, None, &gw, &admission)
             .await
@@ -2026,6 +2144,7 @@ mod tests {
             principal: &principal,
             #[cfg(feature = "query-cache")]
             cache: None,
+            memory: None,
         };
         let other = McpServer::dispatch_with(&body, &cfg, None, &gw_other, &admission)
             .await
