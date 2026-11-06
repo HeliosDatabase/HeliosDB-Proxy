@@ -133,7 +133,8 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
 use crate::config::POSTGRES_RESERVED_WORDS;
-use crate::sql_text::{self, Token, TokenKind, MAX_IDENTIFIER_BYTES};
+use crate::sql_lex::MAX_IDENTIFIER_BYTES;
+use crate::sql_text::{self, Token, TokenKind};
 
 /// Words this grammar gives a meaning: never an identifier.
 const GRAMMAR_WORDS: &[&str] = &[
@@ -1116,7 +1117,7 @@ pub(crate) fn semantic_form(
 mod legacy {
     use super::*;
     use crate::replay_sql::{ident_cont, ident_start};
-    use crate::sql_text::{Piece, Pieces};
+    use crate::sql_lex::{Piece, Pieces};
 
     const LEGACY_GRAMMAR_WORDS: &[&str] = &[
         "all", "and", "as", "asc", "avg", "between", "by", "count", "desc", "distinct", "false",

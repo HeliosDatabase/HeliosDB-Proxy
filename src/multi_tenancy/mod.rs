@@ -248,8 +248,8 @@ impl TenantManager {
         let Some(tables) = self.config.refuse_unknown_tenant_tables.as_ref() else {
             return false;
         };
-        crate::sql_text::code_identifiers(query)
-            .any(|id| tables.contains(crate::sql_text::truncated_identifier(&id)))
+        crate::sql_lex::code_identifiers(query)
+            .any(|id| tables.contains(crate::sql_lex::truncated_identifier(&id)))
     }
 
     /// Create default configuration for a new tenant
@@ -662,7 +662,7 @@ mod tests {
     /// tenant table names that table and is refused.
     #[test]
     fn unknown_tenant_refusal_reads_truncated_identifiers() {
-        let table = "t".repeat(crate::sql_text::MAX_IDENTIFIER_BYTES);
+        let table = "t".repeat(crate::sql_lex::MAX_IDENTIFIER_BYTES);
         let tm = TenantManagerBuilder::new()
             .config(MultiTenancyConfig {
                 enabled: true,

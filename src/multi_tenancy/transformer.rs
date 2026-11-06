@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::config::{IsolationStrategy, TenantConfig, TenantId};
 use crate::config::DEFAULT_REFUSED_FUNCTIONS;
-use crate::sql_text::{lex_units, LexKind, LexUnit};
+use crate::sql_lex::{lex_units, LexKind, LexUnit};
 
 /// Result of query transformation
 #[derive(Debug, Clone)]
@@ -113,7 +113,7 @@ impl TenantQueryTransformer {
     pub fn register_table(mut self, table: impl Into<String>, column: impl Into<String>) -> Self {
         let name = table.into().to_lowercase();
         self.tenant_tables.insert(
-            crate::sql_text::truncated_identifier(&name).to_string(),
+            crate::sql_lex::truncated_identifier(&name).to_string(),
             column.into(),
         );
         self
@@ -125,7 +125,7 @@ impl TenantQueryTransformer {
         for table in tables {
             let name = table.to_lowercase();
             self.tenant_tables.insert(
-                crate::sql_text::truncated_identifier(&name).to_string(),
+                crate::sql_lex::truncated_identifier(&name).to_string(),
                 col.clone(),
             );
         }
@@ -594,7 +594,7 @@ fn unit_name(sql: &str, unit: &LexUnit) -> Option<String> {
         _ => return None,
     };
     // PostgreSQL keeps the first 63 bytes of an identifier.
-    Some(crate::sql_text::truncated_identifier(&name).to_string())
+    Some(crate::sql_lex::truncated_identifier(&name).to_string())
 }
 
 /// Whether the word `unit` is one of the lower-case `words`.

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The SQL lexer core (`Piece`, `Pieces`, comment and statement-start reads, the
+  multi-tenancy identifier scan, the routing hint comments) moved from `sql_text` to a new
+  `sql_lex` module, compiled only with the features that read it. Single-feature builds of
+  `multi-tenancy`, `routing-hints`, `query-cache`, `edge-proxy` and `rate-limiting` now
+  compile without dead-code warnings. No behaviour change.
+
 - **Upgrade note: the `cache_refresh` hint, documented as a no-op, is now active.**
   `/*helios:cache_refresh*/` (also `refresh`, `nocache_read`, and `cache=refresh`,
   `cache=force`, `cache=update`, the routing parser's refresh words, which it strips) used

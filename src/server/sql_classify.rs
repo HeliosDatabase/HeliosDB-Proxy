@@ -93,7 +93,7 @@ impl ProxyServer {
     /// - `COPY ... FROM` loads rows but is not classified `is_write` (it
     ///   must not be re-routed); catch it here for invalidation.
     /// - The statement is read from its first word past leading comments
-    ///   (`sql_text::lead`, the lexer the caches share), so
+    ///   (`crate::sql_lex::lead`, the lexer the caches share), so
     ///   `/* job */ UPDATE …` and `-- v2` newline `CREATE OR REPLACE VIEW …`
     ///   are writes, and a `MERGE` (`MERGE INTO … USING …`, HeliosDB-Nano's
     ///   `MERGE BRANCH src INTO dst`) is one too ([`Self::is_edge_dml_sql`]).
@@ -141,7 +141,7 @@ impl ProxyServer {
     /// backend adds), so its string flushes every edge entry.
     #[cfg(feature = "edge-proxy")]
     fn edge_statement_changes_nothing(statement: &str) -> bool {
-        crate::sql_text::statement_start(statement).is_some_and(|lead| {
+        crate::sql_lex::statement_start(statement).is_some_and(|lead| {
             EDGE_QUIET_LEADS
                 .iter()
                 .any(|word| crate::sql_text::starts_with_keyword(lead, word))
@@ -153,10 +153,10 @@ impl ProxyServer {
     #[cfg(feature = "edge-proxy")]
     fn edge_statement_needs_invalidation(is_write: bool, core: &str) -> bool {
         use crate::protocol::starts_with_ci;
-        let lead = match crate::sql_text::lead(core) {
-            crate::sql_text::Lead::Start(start) => start,
-            crate::sql_text::Lead::Rest => return true,
-            crate::sql_text::Lead::Nothing => core,
+        let lead = match crate::sql_lex::lead(core) {
+            crate::sql_lex::Lead::Start(start) => start,
+            crate::sql_lex::Lead::Rest => return true,
+            crate::sql_lex::Lead::Nothing => core,
         };
         if crate::journal_capture::first_word_not_ascii(lead) {
             return true;
@@ -255,7 +255,7 @@ impl ProxyServer {
     /// HeliosDB-Lite matches keywords (`ınsert` is `INSERT` there); text the
     /// backends may read differently (a backend-ambiguous rest) may hold
     /// one. The verb
-    /// is the first word past leading comments (`sql_text::lead`); a leading
+    /// is the first word past leading comments (`crate::sql_lex::lead`); a leading
     /// comment the backends may end in different places (`Lead::Rest`)
     /// hides it, and a first word holding a non-ASCII character other than a
     /// space (`journal_capture::first_word_not_ascii`) cannot be read as
@@ -270,10 +270,10 @@ impl ProxyServer {
     #[cfg(feature = "edge-proxy")]
     pub(super) fn is_edge_dml_sql(sql: &str) -> bool {
         use crate::protocol::starts_with_ci;
-        let t = match crate::sql_text::lead(sql) {
-            crate::sql_text::Lead::Start(start) => start,
-            crate::sql_text::Lead::Rest => return true,
-            crate::sql_text::Lead::Nothing => return false,
+        let t = match crate::sql_lex::lead(sql) {
+            crate::sql_lex::Lead::Start(start) => start,
+            crate::sql_lex::Lead::Rest => return true,
+            crate::sql_lex::Lead::Nothing => return false,
         };
         if crate::journal_capture::first_word_not_ascii(t) {
             return true;

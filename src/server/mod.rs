@@ -1122,7 +1122,7 @@ impl ProxyServer {
                         .iter()
                         .map(|t| {
                             let name = t.rsplit('.').next().unwrap_or(t).to_ascii_lowercase();
-                            crate::sql_text::truncated_identifier(&name).to_string()
+                            crate::sql_lex::truncated_identifier(&name).to_string()
                         })
                         .collect(),
                 ),

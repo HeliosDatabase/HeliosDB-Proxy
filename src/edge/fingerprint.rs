@@ -83,13 +83,13 @@ const UNKNOWN_SCOPE: &[&str] = &[
 
 /// Just the referenced table set — byte-identical to
 /// `analyze(..).tables` (both extract from the comment-free text,
-/// `sql_text::strip_comments`), without the literal folding, the
+/// `crate::sql_lex::strip_comments`), without the literal folding, the
 /// fingerprint copy, or the params hash. The write-invalidation path
 /// ([`write_tables`]) discards everything else, so a bulk INSERT must not
 /// pay full fingerprinting (F19).
 pub fn tables_only(sql: &str) -> Vec<String> {
     let mut tables = Vec::new();
-    add_tables(&mut tables, &sql_text::strip_comments(sql));
+    add_tables(&mut tables, &crate::sql_lex::strip_comments(sql));
     tables
 }
 
@@ -205,7 +205,7 @@ fn add_tables(tables: &mut Vec<String>, sql: &str) {
 /// Add one captured `table` to `tables` as [`add_tables`] does.
 fn add_table(tables: &mut Vec<String>, table: &str) {
     let name = table.rsplit('.').next().unwrap_or(table).trim();
-    let name = sql_text::truncated_identifier(name).to_lowercase();
+    let name = crate::sql_lex::truncated_identifier(name).to_lowercase();
     if !tables.contains(&name) {
         tables.push(name);
     }

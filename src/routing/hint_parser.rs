@@ -160,7 +160,7 @@ struct HintSpan<'a> {
 }
 
 /// Every hint in `query`, in order. A hint counts only inside a comment the
-/// quote-aware lexer ([`crate::sql_text::comments`]) reads outside literals,
+/// quote-aware lexer ([`crate::sql_lex::comments`]) reads outside literals,
 /// dollar quotes and quoted identifiers, so `/*helios:…*/` inside `'…'` is
 /// data. A query without `helios:` is never lexed and yields no spans.
 fn hint_spans(query: &str) -> Vec<HintSpan<'_>> {
@@ -168,7 +168,7 @@ fn hint_spans(query: &str) -> Vec<HintSpan<'_>> {
         return Vec::new();
     }
     let mut spans = Vec::new();
-    for (at, comment) in crate::sql_text::comments(query) {
+    for (at, comment) in crate::sql_lex::comments(query) {
         if !comment.contains(HINT_MARKER) {
             continue;
         }

@@ -140,13 +140,13 @@ impl QueryNormalizer {
     /// Borrowed (no scan, no allocation) when it contains neither `/*` nor
     /// `--`, and borrowed when those only occur inside literals.
     pub fn strip_comments<'a>(&self, sql: &'a str) -> std::borrow::Cow<'a, str> {
-        sql_text::strip_comments(sql)
+        crate::sql_lex::strip_comments(sql)
     }
 
     /// The tables the statement `sql` names, read from its comment-free
-    /// text ([`sql_text::strip_comments`]), first seen first, each once.
+    /// text ([`crate::sql_lex::strip_comments`]), first seen first, each once.
     pub(crate) fn statement_tables(&self, sql: &str) -> Vec<String> {
-        self.extract_tables(&sql_text::strip_comments(sql))
+        self.extract_tables(&crate::sql_lex::strip_comments(sql))
     }
 
     /// The tables a write may change, read from its comment-free `text`
@@ -185,7 +185,7 @@ impl QueryNormalizer {
         // dot), and cut the name to the 63 bytes PostgreSQL keeps of it
         // (the catalog's name, which writes and decoded changes use).
         let table_name = table.rsplit('.').next().unwrap_or(table).trim();
-        let table_name = sql_text::truncated_identifier(table_name).to_lowercase();
+        let table_name = crate::sql_lex::truncated_identifier(table_name).to_lowercase();
         if !tables.contains(&table_name) {
             tables.push(table_name);
         }
@@ -516,7 +516,7 @@ mod tests {
             "INSERT OR REPLACE INTO \u{e9}t\u{e9} VALUES (1)",
             "DELETE FROM ONLY \"kv\" WHERE id = 1",
         ] {
-            let text = sql_text::strip_comments(sql);
+            let text = crate::sql_lex::strip_comments(sql);
             assert_eq!(normalizer.write_statement_tables(&text), None, "{sql:?}");
         }
         for (sql, want) in [
