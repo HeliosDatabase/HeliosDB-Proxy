@@ -2041,6 +2041,18 @@ impl ProxyServer {
         session.tenant_replay_settle(&ts);
     }
 
+    /// A statement or batch the proxy refused before any backend (rate limit,
+    /// open circuit, route-plugin Block) ran nothing: it is not recorded and
+    /// does not change the transaction's replay record or its session
+    /// settings (d7350c9b1c93). Only an open extended prefix is settled here:
+    /// its statements did run, so the transaction can no longer be replayed.
+    pub(super) fn tr_discard_refused(tr: &mut TrSession, session: &Arc<ClientSession>) {
+        let open = tr.ext_cycle.take().is_some();
+        if std::mem::take(&mut tr.ext_cycle_dropped) || open {
+            session.tr_replay_tainted.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Bookkeeping after a simple-query response.
     pub(super) async fn tr_after_simple(
         tr: &mut TrSession,

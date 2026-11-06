@@ -2588,6 +2588,9 @@ impl ProxyServer {
                         // moved to the replacement all the same) ran nowhere.
                         let reached = used_node.is_some() && (!faulted || tr.fault_resent);
                         let settled = faulted || reached;
+                        // Refused before any backend (rate limit, open circuit,
+                        // route-plugin Block): nothing ran, so nothing is recorded.
+                        let refused = !faulted && used_node.is_none();
                         if let Some(n) = used_node {
                             current_node = Some(n);
                         }
@@ -2602,7 +2605,17 @@ impl ProxyServer {
                         {
                             Self::copy_drained(tr, false, session, state, config).await;
                         }
-                        Self::tr_after_simple(tr, &msg, session, state).await;
+                        if refused {
+                            Self::tr_discard_refused(tr, session);
+                            if !session
+                                .copy_in_progress
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                Self::tally_reset(session);
+                            }
+                        } else {
+                            Self::tr_after_simple(tr, &msg, session, state).await;
+                        }
                         if settled {
                             tr.ext_dispatched = false;
                             tr.ext_copy_end = None;
@@ -3512,21 +3525,28 @@ impl ProxyServer {
                             Self::copy_drained(tr, false, session, state, config).await;
                         }
                         if !skip_forward {
-                            Self::tr_after_extended(
-                                tr,
-                                ExtBatch {
-                                    batch: &batch,
-                                    route_sql: pending_route_sql.as_deref(),
-                                    wait_ready,
-                                    defines: &batch_defines,
-                                    unnamed: held_unnamed.as_ref(),
-                                },
-                                &batch_refs,
-                                &stmt_registry,
-                                session,
-                                state,
-                            )
-                            .await;
+                            if forwarded || faulted {
+                                Self::tr_after_extended(
+                                    tr,
+                                    ExtBatch {
+                                        batch: &batch,
+                                        route_sql: pending_route_sql.as_deref(),
+                                        wait_ready,
+                                        defines: &batch_defines,
+                                        unnamed: held_unnamed.as_ref(),
+                                    },
+                                    &batch_refs,
+                                    &stmt_registry,
+                                    session,
+                                    state,
+                                )
+                                .await;
+                            } else {
+                                // Refused before any backend (rate limit, open
+                                // circuit): the batch ran nothing, so it is not
+                                // recorded nor its names acknowledged.
+                                Self::tr_discard_refused(tr, session);
+                            }
                             // Only a batch that reached the backend moves its
                             // cycle on there: a Flush leaves it open (on the
                             // node recorded in `cycle_node`), a Sync ends it. A

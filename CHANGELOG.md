@@ -112,6 +112,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0 now takes effect; a bucket busier than that value is refused where it was served before.
   Raise the value or set it to `0` to keep the old behaviour. Requires `[rate_limit]
   enabled = true`.
+- **TR: refused statements are not recorded or replayed.** A simple Query or an
+  extended batch the proxy refused before any backend (rate limit, open circuit,
+  route-plugin Block) was recorded in the transaction replay log as if it had run,
+  so a failover replayed a statement the client was told failed. Refused statements
+  now leave the record and the session settings untouched; an open extended prefix
+  they close makes the transaction non-replayable. Test: `server::tests::tr_refusal`.
+  (d7350c9b1c93)
 
 ### Security
 

@@ -2406,6 +2406,11 @@ fn anomaly_fingerprint_collapses_literals() {
 
 mod tr_in_session;
 
+// ---- TR: locally refused statements are neither recorded nor replayed ----
+
+#[cfg(feature = "rate-limiting")]
+mod tr_refusal;
+
 fn idle_frame(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut f = vec![tag];
     f.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
