@@ -1,5 +1,8 @@
 use super::*;
 
+/// One node's probe result: its latency and, when sampled, its replication lag.
+type ProbeOutcome = Result<(f64, Option<u64>)>;
+
 impl ProxyServer {
     /// Spawn health checker background task
     pub(super) fn spawn_health_checker(&self) -> tokio::task::JoinHandle<()> {
@@ -80,7 +83,35 @@ impl ProxyServer {
                 results.push(pair);
             }
         }
+        Self::apply_probe_results(state, config, results);
+    }
 
+    /// Probe one node immediately, outside the sweep cadence, and fold the
+    /// result into the health snapshot by the same rules as a sweep. Used when
+    /// the primary tracker resolves a new leader, so the leader's first success
+    /// does not wait for the next `check_interval_secs` tick. A node that is
+    /// not an enabled configured node is ignored.
+    pub(super) async fn probe_node_now(state: &Arc<ServerState>, addr: &str) {
+        let config = state.live_config.load_full();
+        if !config
+            .nodes
+            .iter()
+            .any(|n| n.enabled && n.address() == addr)
+        {
+            return;
+        }
+        let timeout = Duration::from_secs(config.health.check_timeout_secs);
+        let result = Self::probe_node(&config.health, addr, false, None, timeout).await;
+        Self::apply_probe_results(state, &config, vec![(addr.to_string(), result)]);
+    }
+
+    /// Fold probe results into a new health snapshot and publish it. Shared by
+    /// the periodic sweep and the immediate leader probe.
+    fn apply_probe_results(
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+        results: Vec<(String, ProbeOutcome)>,
+    ) {
         // Clone-and-modify the current snapshot, then atomically swap it in.
         // Hold the write lock so a concurrent in-band demotion landing in this
         // load→store window (or a SIGHUP reconcile) cannot clobber, or be

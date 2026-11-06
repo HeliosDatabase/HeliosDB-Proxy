@@ -2625,6 +2625,15 @@ pub struct LimitsToml {
     /// must be > 0. Default 5000.
     #[serde(default = "default_backend_slot_wait_ms")]
     pub backend_slot_wait_ms: u64,
+    /// How long a new client startup waits for an eligible healthy node when
+    /// none is healthy at that moment (for example both nodes are marked
+    /// unhealthy during a promotion, before the health checker re-marks the new
+    /// leader). The startup polls with the jittered reconnect backoff until a
+    /// node is eligible or this bound expires, then is refused with SQLSTATE
+    /// 08006 as before. Milliseconds; `0` refuses at once (the pre-wait
+    /// behaviour); at most `MAX_STARTUP_NODE_WAIT_MS`. Default 5000.
+    #[serde(default = "default_startup_node_wait_ms")]
+    pub startup_node_wait_ms: u64,
     /// Most backend connections the proxy opens at once to one node on a
     /// session's behalf after its startup connection (a transaction-replay
     /// re-home, a reconnect after a lost backend, a standby connection for
@@ -2665,6 +2674,16 @@ pub struct LimitsToml {
 fn default_backend_slot_wait_ms() -> u64 {
     5000
 }
+
+fn default_startup_node_wait_ms() -> u64 {
+    5000
+}
+
+/// Upper bound of `[limits] startup_node_wait_ms` (10 minutes). A client
+/// startup holds its task and its admission slot for the whole wait, so an
+/// unbounded value would turn a dead cluster into an unbounded pile of parked
+/// connections.
+pub const MAX_STARTUP_NODE_WAIT_MS: u64 = 600_000;
 
 fn default_max_concurrent_reconnects_per_node() -> usize {
     16
@@ -2799,6 +2818,7 @@ impl Default for LimitsToml {
             tr_max_cycle_statements: default_tr_max_cycle_statements(),
             latency_buckets_ms: crate::metrics_hist::default_latency_buckets_ms(),
             backend_slot_wait_ms: default_backend_slot_wait_ms(),
+            startup_node_wait_ms: default_startup_node_wait_ms(),
             max_concurrent_reconnects_per_node: default_max_concurrent_reconnects_per_node(),
             backend_cancel_timeout_ms: default_backend_cancel_timeout_ms(),
             tr_buffer_small_reads_bytes: 0,
@@ -4297,6 +4317,11 @@ impl ProxyConfig {
                 return Err(ProxyError::Config(
                     "limits.backend_slot_wait_ms must be >= 1".to_string(),
                 ));
+            }
+            if l.startup_node_wait_ms > MAX_STARTUP_NODE_WAIT_MS {
+                return Err(ProxyError::Config(format!(
+                    "limits.startup_node_wait_ms must be <= {MAX_STARTUP_NODE_WAIT_MS} ms (10 minutes); 0 refuses at once"
+                )));
             }
             if !(1..=MAX_LIMIT_SECS * 1000).contains(&l.backend_cancel_timeout_ms) {
                 return Err(ProxyError::Config(format!(
@@ -6722,6 +6747,7 @@ database = "helios"
         );
         assert!(c.validate().is_ok());
         assert_eq!(LimitsToml::default().backend_slot_wait_ms, 5000);
+        assert_eq!(LimitsToml::default().startup_node_wait_ms, 5000);
         assert_eq!(LimitsToml::default().max_concurrent_reconnects_per_node, 16);
         let off: ProxyConfig = toml::from_str(
             "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n\n[limits]\nmax_concurrent_reconnects_per_node = 0\n",
@@ -6740,6 +6766,34 @@ database = "helios"
             .unwrap_err()
             .to_string()
             .contains("backend_slot_wait_ms"));
+    }
+
+    /// `[limits] startup_node_wait_ms` parses, defaults to 5000 ms, accepts 0
+    /// (refuse at once) and the 10-minute bound, and rejects anything above the
+    /// bound with an error that names the key.
+    #[test]
+    fn startup_node_wait_parses_defaults_and_validates() {
+        let base = "[[nodes]]\nhost = \"db\"\nport = 5432\nrole = \"primary\"\n";
+        let absent: ProxyConfig = toml::from_str(base).expect("parse");
+        assert_eq!(absent.limits.startup_node_wait_ms, 5000);
+        assert!(absent.validate().is_ok());
+
+        let off: ProxyConfig =
+            toml::from_str(&format!("{base}\n[limits]\nstartup_node_wait_ms = 0\n"))
+                .expect("parse");
+        assert_eq!(off.limits.startup_node_wait_ms, 0);
+        assert!(off.validate().is_ok(), "0 is the pre-wait behaviour");
+
+        let max: ProxyConfig = toml::from_str(&format!(
+            "{base}\n[limits]\nstartup_node_wait_ms = {MAX_STARTUP_NODE_WAIT_MS}\n"
+        ))
+        .expect("parse");
+        assert!(max.validate().is_ok(), "the bound itself is accepted");
+
+        let mut over: ProxyConfig = toml::from_str(base).expect("parse");
+        over.limits.startup_node_wait_ms = MAX_STARTUP_NODE_WAIT_MS + 1;
+        let err = over.validate().unwrap_err().to_string();
+        assert!(err.contains("startup_node_wait_ms"), "{err}");
     }
 
     /// ac858d61400b: `[limits] backend_cancel_timeout_ms` bounds every

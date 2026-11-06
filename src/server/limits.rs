@@ -60,6 +60,9 @@ pub(super) struct ResolvedLimits {
     pub(super) tr_max_cycle_statements: usize,
     /// Wait for a backend slot on a node at its `max_connections` (H-05).
     pub(super) backend_slot_wait: Duration,
+    /// Bounded wait for an eligible healthy node at client startup; `ZERO`
+    /// refuses at once (`[limits] startup_node_wait_ms = 0`).
+    pub(super) startup_node_wait: Duration,
     /// Bound on sending one CancelRequest to a backend (connect, request,
     /// the backend's close). `[limits] backend_cancel_timeout_ms`.
     pub(super) backend_cancel_timeout: Duration,
@@ -121,6 +124,7 @@ impl ResolvedLimits {
             tr_max_tracked_savepoints: l.tr_max_tracked_savepoints,
             tr_max_cycle_statements: l.tr_max_cycle_statements,
             backend_slot_wait: Duration::from_millis(l.backend_slot_wait_ms),
+            startup_node_wait: Duration::from_millis(l.startup_node_wait_ms),
             backend_cancel_timeout: Duration::from_millis(l.backend_cancel_timeout_ms),
             tr_buffer_small_reads: l.tr_buffer_small_reads_bytes,
         }

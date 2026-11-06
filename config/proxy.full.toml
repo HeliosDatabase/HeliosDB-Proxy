@@ -196,6 +196,10 @@ write_timeout_secs = 30
 # # being refused with 53300. 0 (default) refuses immediately. Read once at
 # # startup.
 # client_admission_wait_secs = 0
+# Bounded wait (ms) for a new client startup that finds no eligible healthy node
+# (for example during a promotion). 0 refuses at once with 08006. Upper bound
+# 600000. Read once at startup.
+# startup_node_wait_ms = 5000
 # # TCP keepalive on every accepted client socket: probes after this many
 # # seconds without client traffic, repeated at the same interval; once the
 # # OS's probe count goes unanswered (9 on Linux) the connection fails, so a

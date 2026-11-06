@@ -111,16 +111,25 @@ impl ProxyServer {
             let mut tick = tokio::time::interval(state.primary_tracker.tracking_interval());
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
+                // The address of a leader the tracker just resolved, probed at
+                // once below instead of at the next health sweep.
+                let mut new_leader: Option<String> = None;
                 tokio::select! {
-                    event = events.recv() => {
-                        if let Err(tokio::sync::broadcast::error::RecvError::Closed) = event {
-                            return;
+                    event = events.recv() => match event {
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        Ok(crate::primary_tracker::PrimaryChangeEvent::Changed { address, .. }) => {
+                            new_leader = Some(address);
                         }
-                    }
+                        _ => {}
+                    },
                     _ = tick.tick() => {}
                     _ = shutdown_rx.recv() => return,
                 }
                 Self::publish_routing(&state);
+                if let Some(address) = new_leader {
+                    let st = state.clone();
+                    tokio::spawn(async move { Self::probe_node_now(&st, &address).await });
+                }
             }
         }))
     }

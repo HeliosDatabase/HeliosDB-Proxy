@@ -3213,6 +3213,24 @@ impl AdminServer {
         ));
 
         output.push_str(
+            "# HELP heliosdb_proxy_startup_waits_total Client startups that found no eligible healthy node and waited for one (startup_node_wait_ms)\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_startup_waits_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_startup_waits_total {}\n",
+            metrics.startup_waits
+        ));
+
+        output.push_str(
+            "# HELP heliosdb_proxy_startup_wait_timeouts_total Startup waits that expired without an eligible node (refused with 08006)\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_startup_wait_timeouts_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_startup_wait_timeouts_total {}\n",
+            metrics.startup_wait_timeouts
+        ));
+
+        output.push_str(
             "# HELP heliosdb_proxy_backend_capacity_waits_total Backend connections refused at max_connections (53300) and retried after freeing an idle pooled connection\n",
         );
         output.push_str("# TYPE heliosdb_proxy_backend_capacity_waits_total counter\n");
@@ -3410,6 +3428,8 @@ impl AdminState {
                 admission_timeouts: 0,
                 admission_queue_depth: 0,
                 reconnect_attempts: 0,
+                startup_waits: 0,
+                startup_wait_timeouts: 0,
                 backend_capacity_waits: 0,
                 backend_capacity_refusals: 0,
                 reads_offloaded: 0,
@@ -3709,6 +3729,10 @@ struct MetricsResponse {
     /// Sessions whose settings changed in a way the proxy could not follow.
     tr_session_set_untracked_total: u64,
     /// TR-07 recovery journal: transactions recorded as committed.
+    /// Client startups that waited for an eligible healthy node.
+    startup_waits_total: u64,
+    /// Startup waits that expired (refused with 08006).
+    startup_wait_timeouts_total: u64,
     journal_committed_total: u64,
     /// TR-07 recovery journal: captured transactions the backend rolled back.
     journal_rolled_back_total: u64,
@@ -3741,6 +3765,8 @@ impl From<ServerMetricsSnapshot> for MetricsResponse {
             tr_replay_cap_exceeded_total: m.tr.replay_cap_exceeded,
             tr_session_set_cap_exceeded_total: m.tr.session_set_cap_exceeded,
             tr_session_set_untracked_total: m.tr.session_set_untracked,
+            startup_waits_total: m.startup_waits,
+            startup_wait_timeouts_total: m.startup_wait_timeouts,
             journal_committed_total: m.journal_committed,
             journal_rolled_back_total: m.journal_rolled_back,
             journal_statements_total: m.journal_statements,
@@ -4604,6 +4630,8 @@ mod tests {
             admission_timeouts: 0,
             admission_queue_depth: 0,
             reconnect_attempts: 0,
+            startup_waits: 0,
+            startup_wait_timeouts: 0,
             backend_capacity_waits: 0,
             backend_capacity_refusals: 0,
             reads_offloaded: 0,
@@ -4648,6 +4676,8 @@ mod tests {
         assert!(output.contains("heliosdb_proxy_admission_waited_total 0"));
         assert!(output.contains("heliosdb_proxy_admission_timeout_total 0"));
         assert!(output.contains("heliosdb_proxy_reconnect_attempts_total 0"));
+        assert!(output.contains("heliosdb_proxy_startup_waits_total 0"));
+        assert!(output.contains("heliosdb_proxy_startup_wait_timeouts_total 0"));
         assert!(output.contains("heliosdb_proxy_backend_capacity_waits_total 0"));
         assert!(output.contains("heliosdb_proxy_backend_capacity_refusals_total 0"));
         assert!(output.contains("heliosdb_proxy_journal_committed_total 0"));
@@ -4702,6 +4732,8 @@ mod tests {
             admission_timeouts: 0,
             admission_queue_depth: 0,
             reconnect_attempts: 0,
+            startup_waits: 0,
+            startup_wait_timeouts: 0,
             backend_capacity_waits: 0,
             backend_capacity_refusals: 0,
             reads_offloaded: 0,

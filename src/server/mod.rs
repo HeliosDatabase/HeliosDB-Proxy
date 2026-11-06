@@ -2163,6 +2163,14 @@ impl ProxyServer {
                                 .metrics
                                 .reconnect_attempts
                                 .load(Ordering::Relaxed),
+                            startup_waits: server_state
+                                .metrics
+                                .startup_waits
+                                .load(Ordering::Relaxed),
+                            startup_wait_timeouts: server_state
+                                .metrics
+                                .startup_wait_timeouts
+                                .load(Ordering::Relaxed),
                             backend_capacity_waits: server_state
                                 .metrics
                                 .backend_capacity_waits
@@ -2440,6 +2448,12 @@ impl ProxyServer {
                 .state
                 .metrics
                 .reconnect_attempts
+                .load(Ordering::Relaxed),
+            startup_waits: self.state.metrics.startup_waits.load(Ordering::Relaxed),
+            startup_wait_timeouts: self
+                .state
+                .metrics
+                .startup_wait_timeouts
                 .load(Ordering::Relaxed),
             backend_capacity_waits: self
                 .state

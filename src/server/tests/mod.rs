@@ -17,6 +17,7 @@ mod node_overrides;
 mod prepared_commit_flush;
 mod read_offload;
 mod startup_terminal;
+mod startup_wait;
 mod stmt_facts;
 mod tls_reload;
 

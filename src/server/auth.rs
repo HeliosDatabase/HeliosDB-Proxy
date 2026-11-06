@@ -364,7 +364,7 @@ impl ProxyServer {
             (t.addr.clone(), p)
         } else {
             (
-                Self::select_node(session, state, config).await?,
+                Self::select_node_for_startup(session, state, config).await?,
                 params.clone(),
             )
         };

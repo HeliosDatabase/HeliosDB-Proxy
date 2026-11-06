@@ -32,6 +32,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `QueryCache::{entry_counts, compression_saved_bytes}`,
   `CacheMetrics::record_evictions`.
 - **Docs: branch databases.** `[branch]` (`CREATE DATABASE … TEMPLATE`) is documented as a PostgreSQL copy that is not instant, not as an instant branch; Nano branches are selected per connection with `database=<db>@<branch>` (Sprinter 45ab08af3f00).
+- **New client connections wait for a healthy node instead of failing at once** (sprint
+  f4ae895f36ad). A client startup that finds no eligible healthy node, as happens for about
+  a second after a promotion until the health checker re-marks the new leader, now waits up
+  to `[limits] startup_node_wait_ms` (default 5000) before being refused with 08006
+  `Startup failed: No healthy nodes available`. The wait re-checks with the reconnect
+  backoff and serves the connection as soon as a node is eligible. Upgrade note: a client
+  that used to get an immediate refusal during an outage now waits up to 5 s for an answer;
+  set `startup_node_wait_ms = 0` to restore the immediate refusal. Counted by
+  `heliosdb_proxy_startup_waits_total` and `heliosdb_proxy_startup_wait_timeouts_total`.
 
 ### Added
 

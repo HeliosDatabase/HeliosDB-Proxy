@@ -58,6 +58,12 @@ pub(super) struct ServerMetrics {
     /// P-03: jittered waits performed by the primary-select recovery loops. A
     /// large burst after a failover is the reconnect wave H-05 bounds.
     pub(super) reconnect_attempts: AtomicU64,
+    /// Client startups that found no eligible healthy node and entered the
+    /// `[limits] startup_node_wait_ms` wait.
+    pub(super) startup_waits: AtomicU64,
+    /// Startup waits that expired without an eligible node (the client was
+    /// refused with 08006). A subset of `startup_waits`.
+    pub(super) startup_wait_timeouts: AtomicU64,
     /// Backend connections the backend refused at `max_connections` (53300)
     /// that were retried after freeing an idle pooled connection.
     pub(super) backend_capacity_waits: AtomicU64,
@@ -158,6 +164,10 @@ pub struct ServerMetricsSnapshot {
     pub admission_queue_depth: u64,
     /// P-03: jittered waits in the primary-select recovery loops.
     pub reconnect_attempts: u64,
+    /// Client startups that waited for an eligible healthy node.
+    pub startup_waits: u64,
+    /// Startup waits that expired (refused with 08006).
+    pub startup_wait_timeouts: u64,
     /// Startup / redial retries after the backend refused at `max_connections`.
     pub backend_capacity_waits: u64,
     /// Refusals passed to the client as 53300 after the capacity wait expired.

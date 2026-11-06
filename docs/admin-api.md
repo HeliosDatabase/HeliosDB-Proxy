@@ -379,9 +379,15 @@ Server metrics in JSON.
   "queries_processed": 892451,
   "bytes_received": 45623891,
   "bytes_sent": 189234567,
-  "failovers": 1
+  "failovers": 1,
+  "startup_waits_total": 0,
+  "startup_wait_timeouts_total": 0
 }
 ```
+
+`startup_waits_total` and `startup_wait_timeouts_total` count client startups that
+waited for an eligible healthy node (`[limits] startup_node_wait_ms`) and the waits that
+expired. The other fields are as in the Prometheus table below.
 
 `connections_active` is computed as `accepted − closed`. `connections_rejected`
 counts connections refused because the `[limits] max_client_connections` cap was
@@ -407,6 +413,8 @@ Besides the counters above, the body carries (P-03):
 | `heliosdb_proxy_operator_replay_seconds` | histogram | — | `POST /api/replay` runs. |
 | `heliosdb_proxy_tr_replay_refusals_total` | counter | `reason` = `outcome_unknown`, `not_replayable`, `cap_exceeded`, `diverged`, `deadline`, `backend_unavailable` | Backend faults Transaction Replay did not transparently continue. `cap_exceeded` covers transactions over the `[limits] tr_max_replay_*` caps and over their tenant's `[multi_tenancy]` replay-byte budget; `heliosdb_proxy_tr_replay_cap_exceeded_total` counts only the `[limits]` caps. |
 | `heliosdb_proxy_reads_offloaded_total` | counter | — | Requests served by a standby under `[load_balancer] standby_reads`. |
+| `heliosdb_proxy_startup_waits_total` | counter | — | Client startups that found no eligible healthy node and entered the `[limits] startup_node_wait_ms` wait (a startup that finds one at once does not count). |
+| `heliosdb_proxy_startup_wait_timeouts_total` | counter | — | Startup waits that expired without an eligible node; those clients were refused with 08006. A subset of `heliosdb_proxy_startup_waits_total`. |
 | `heliosdb_proxy_read_mirror_failures_total` | counter | — | Offloaded reads served by the primary because the standby connection could not be opened (for example a standby that wants a password pass-through auth does not hold) or could not take the session's `SET`s. |
 | `heliosdb_proxy_cache_hits_total` | counter | `tier` = `l1`, `l2`, `l3` | Query cache hits (`[cache] enabled`). |
 | `heliosdb_proxy_cache_misses_total`, `_puts_total`, `_invalidations_total` | counter | — | Query cache misses, stores, invalidation operations. |

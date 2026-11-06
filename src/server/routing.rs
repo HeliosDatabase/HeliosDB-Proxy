@@ -671,4 +671,50 @@ impl ProxyServer {
         // No nodes available
         Err(ProxyError::NoHealthyNodes)
     }
+
+    /// Node selection for a new client startup, with the bounded wait of
+    /// `[limits] startup_node_wait_ms`. A startup that finds no eligible
+    /// healthy node (both nodes marked unhealthy during a promotion, before the
+    /// health checker re-marks the new leader) polls [`Self::select_node`] with
+    /// the reconnect backoff until one is eligible or the wait expires; only
+    /// then is it refused with `NoHealthyNodes` (08006). The healthy path is
+    /// the first `select_node` call and nothing else. No lock is held across
+    /// the sleep, and the waiting task owns nothing but its deadline, so a
+    /// dropped (disconnected) waiter frees everything it holds.
+    pub(super) async fn select_node_for_startup(
+        session: &Arc<ClientSession>,
+        state: &Arc<ServerState>,
+        config: &ProxyConfig,
+    ) -> Result<String> {
+        match Self::select_node(session, state, config).await {
+            Err(ProxyError::NoHealthyNodes) if !state.limits.startup_node_wait.is_zero() => {}
+            other => return other,
+        }
+        state.metrics.startup_waits.fetch_add(1, Ordering::Relaxed);
+        let deadline = tokio::time::Instant::now() + state.limits.startup_node_wait;
+        let seed = session.id.as_u128() as u64;
+        let mut attempt: u32 = 0;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                state
+                    .metrics
+                    .startup_wait_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    waited_ms = state.limits.startup_node_wait.as_millis() as u64,
+                    "startup: no eligible healthy node within [limits] startup_node_wait_ms; refusing"
+                );
+                return Err(ProxyError::NoHealthyNodes);
+            }
+            // The last retry runs at the deadline itself, so a node that
+            // became eligible in the final sleep still serves the client.
+            tokio::time::sleep(Self::reconnect_backoff(attempt, seed).min(deadline - now)).await;
+            attempt = attempt.saturating_add(1);
+            match Self::select_node(session, state, config).await {
+                Err(ProxyError::NoHealthyNodes) => continue,
+                other => return other,
+            }
+        }
+    }
 }
