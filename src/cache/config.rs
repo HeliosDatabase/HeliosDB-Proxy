@@ -37,6 +37,17 @@ pub struct CacheConfig {
     /// Excluded tables. Not read by `QueryCache`: the daemon enforces
     /// `[cache] exclude_tables` in the relay, ahead of both result caches.
     pub excluded_tables: Vec<String>,
+
+    /// Refresh-ahead: once a shared (L2) entry's age reaches this fraction of
+    /// its TTL, one reader refills it (single flight) while every other is
+    /// served the entry. `0.0` (default) is off; otherwise in (0, 1). Needs
+    /// L2.
+    pub refresh_ahead_ratio: f64,
+
+    /// How long a refresh-ahead claim holds before the next reader that finds
+    /// the entry due takes it over. Default 5 s; non-zero when refresh-ahead
+    /// is on.
+    pub refresh_ahead_claim_timeout: Duration,
 }
 
 impl Default for CacheConfig {
@@ -51,6 +62,8 @@ impl Default for CacheConfig {
             max_result_size: 10 * 1024 * 1024,     // 10 MB
             table_configs: HashMap::new(),
             excluded_tables: Vec::new(),
+            refresh_ahead_ratio: 0.0,
+            refresh_ahead_claim_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -134,6 +147,18 @@ impl CacheConfig {
                 crate::config::CACHE_ZSTD_LEVELS.start(),
                 crate::config::CACHE_ZSTD_LEVELS.end()
             ));
+        }
+
+        let r = self.refresh_ahead_ratio;
+        if !(r == 0.0 || (r > 0.0 && r < 1.0)) {
+            return Err(format!(
+                "refresh_ahead_ratio must be 0 (off) or in (0, 1), got {r}"
+            ));
+        }
+        if r > 0.0 && self.refresh_ahead_claim_timeout.is_zero() {
+            return Err(
+                "refresh_ahead_claim_timeout cannot be 0 when refresh-ahead is on".to_string(),
+            );
         }
 
         let t = self.l3.similarity_threshold;
@@ -556,5 +581,35 @@ mod tests {
     #[test]
     fn test_storage_backend() {
         assert_eq!(StorageBackend::default(), StorageBackend::Memory);
+    }
+
+    #[test]
+    fn validation_bounds_refresh_ahead() {
+        let d = CacheConfig::default();
+        assert_eq!(d.refresh_ahead_ratio, 0.0, "off by default");
+        assert_eq!(d.refresh_ahead_claim_timeout, Duration::from_secs(5));
+        for r in [0.0, 0.01, 0.5, 0.99] {
+            let c = CacheConfig {
+                refresh_ahead_ratio: r,
+                ..Default::default()
+            };
+            assert!(c.validate().is_ok(), "ratio {r}");
+        }
+        for r in [1.0, 1.5, -0.1, f64::NAN, f64::INFINITY] {
+            let c = CacheConfig {
+                refresh_ahead_ratio: r,
+                ..Default::default()
+            };
+            let err = c.validate().unwrap_err();
+            assert!(err.contains("refresh_ahead_ratio"), "{r}: {err}");
+        }
+        let mut c = CacheConfig {
+            refresh_ahead_claim_timeout: Duration::ZERO,
+            ..Default::default()
+        };
+        assert!(c.validate().is_ok(), "the timeout is not read while off");
+        c.refresh_ahead_ratio = 0.8;
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("refresh_ahead_claim_timeout"), "{err}");
     }
 }

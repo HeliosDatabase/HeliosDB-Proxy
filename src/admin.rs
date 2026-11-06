@@ -2751,6 +2751,8 @@ impl AdminServer {
             "stale_rejected": cache.stale_rejected(),
             "fills_raced": cache.fills_raced(),
             "unseen_write_invalidations": cache.unseen_write_invalidations(),
+            "refresh_hint": cache.refresh_hints(),
+            "refresh_ahead": cache.refresh_ahead_stats(),
             "retained_bytes": cache.retained_bytes(),
             "entries": cache.entry_counts(),
             "evictions": {"l1": s.l1.evictions, "l2": s.l2.evictions, "l3": s.l3.evictions},
@@ -2776,6 +2778,7 @@ impl AdminServer {
         use std::fmt::Write as _;
         let s = cache.stats();
         let retained = cache.retained_bytes();
+        let refresh = cache.refresh_ahead_stats();
         let _ = writeln!(
             output,
             "# HELP heliosdb_proxy_cache_hits_total Query cache hits by tier
@@ -2815,6 +2818,26 @@ impl AdminServer {
                 "heliosdb_proxy_cache_unseen_write_invalidations_total",
                 "Whole-cache invalidations for a simple-query string a backend may split into a statement the journal capture does not see",
                 cache.unseen_write_invalidations(),
+            ),
+            (
+                "heliosdb_proxy_cache_refresh_hint_total",
+                "Reads hinted cache_refresh: no tier looked up, the result stored",
+                cache.refresh_hints(),
+            ),
+            (
+                "heliosdb_proxy_cache_refresh_ahead_claims_total",
+                "Reads that claimed the refill of an entry past refresh_ahead_ratio of its TTL (each a miss)",
+                refresh.claims,
+            ),
+            (
+                "heliosdb_proxy_cache_refresh_ahead_completed_total",
+                "Refresh-ahead claims whose refill was stored",
+                refresh.completed,
+            ),
+            (
+                "heliosdb_proxy_cache_refresh_ahead_abandoned_total",
+                "Refresh-ahead claims that ended without a stored refill, or were taken over after refresh_ahead_claim_timeout_ms",
+                refresh.abandoned,
             ),
         ] {
             let _ = writeln!(
@@ -4796,6 +4819,10 @@ mod tests {
             "heliosdb_proxy_cache_entries{tier=\"l3\"} 0",
             "# TYPE heliosdb_proxy_cache_compression_saved_bytes gauge",
             "heliosdb_proxy_cache_compression_saved_bytes 0",
+            "heliosdb_proxy_cache_refresh_hint_total 0",
+            "heliosdb_proxy_cache_refresh_ahead_claims_total 0",
+            "heliosdb_proxy_cache_refresh_ahead_completed_total 0",
+            "heliosdb_proxy_cache_refresh_ahead_abandoned_total 0",
         ] {
             assert!(text.contains(line), "missing {line}");
         }
@@ -4813,6 +4840,10 @@ mod tests {
         assert_eq!(json["query_cache"]["retained_bytes"]["l1"], 0);
         assert_eq!(json["query_cache"]["unseen_write_invalidations"], 0);
         assert!(json["query_cache"]["semantic"].is_null());
+        assert_eq!(json["query_cache"]["refresh_hint"], 0);
+        for field in ["claims", "completed", "abandoned"] {
+            assert_eq!(json["query_cache"]["refresh_ahead"][field], 0, "{field}");
+        }
         for tier in ["l1", "l2", "l3"] {
             assert_eq!(json["query_cache"]["entries"][tier], 0, "{tier}");
             assert_eq!(json["query_cache"]["evictions"][tier], 0, "{tier}");
@@ -4872,6 +4903,35 @@ mod tests {
         assert_eq!(q["evictions"]["l1"], 1);
         assert_eq!(q["entries"]["l2"], 2);
         assert_eq!(q["compression_saved_bytes"], saved);
+    }
+
+    /// The refresh hint and refresh-ahead counters reach both metrics
+    /// surfaces once they move.
+    #[cfg(feature = "query-cache")]
+    #[tokio::test]
+    async fn query_cache_refresh_counters_on_metrics() {
+        let cache = Arc::new(crate::cache::QueryCache::new(crate::cache::CacheConfig {
+            refresh_ahead_ratio: 0.5,
+            ..Default::default()
+        }));
+        let ctx = crate::cache::CacheContext::default();
+        let (lookup, _) = cache
+            .get_with_prep("SELECT v FROM t /*helios:cache_refresh*/", &ctx)
+            .await;
+        assert!(matches!(lookup, crate::cache::CacheLookup::Miss));
+        let state = Arc::new(AdminState::new());
+        state.with_query_cache(cache).await;
+        let (_, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
+            .await
+            .unwrap();
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("heliosdb_proxy_cache_refresh_hint_total 1\n"));
+        assert!(text.contains("# TYPE heliosdb_proxy_cache_refresh_ahead_claims_total counter"));
+        let (_, json) = AdminServer::route_request("GET", "/metrics", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(json["query_cache"]["refresh_hint"], 1);
+        assert_eq!(json["query_cache"]["refresh_ahead"]["claims"], 0);
     }
 
     /// With the semantic tier on and its endpoint down (closed port), the

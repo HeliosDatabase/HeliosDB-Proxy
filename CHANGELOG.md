@@ -7,8 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Upgrade note: the `cache_refresh` hint, documented as a no-op, is now active.**
+  `/*helios:cache_refresh*/` (also `refresh`, `nocache_read`, and `cache=refresh`,
+  `cache=force`, `cache=update`, the routing parser's refresh words, which it strips) used
+  to be parsed and ignored, so such a read was served from cache. It now looks nothing up
+  on any tier (L1, L2, L3): the read goes to the backend and its result is stored through
+  the normal store path (cacheable read outside a transaction, exclusions,
+  `max_result_bytes`, the C-02 write generation), replacing the shared entry and this
+  text's L1 copy. A `cache=skip` next to it still wins. Applications that left the hint in
+  their SQL now send those reads to the backend every time. Counted in
+  `heliosdb_proxy_cache_refresh_hint_total` (JSON `query_cache.refresh_hint`), not as
+  misses.
+- **Dependencies:** `zstd` and `lz4_flex` are optional, pulled by the `query-cache` and
+  `distribcache` features; a build with neither no longer compiles them.
+- **Library API** (crates that use `heliosdb-proxy` as a library): `cache::L2Config`'s
+  `size_mb` is replaced by `max_bytes` (bytes) and it gains `compression`,
+  `compression_min_bytes` and `zstd_level`; `CacheToml` gains the six keys above and
+  `L2Entry` gains `raw_len` (struct literals must set them). `L1HotCache::put`,
+  `L2WarmCache::put_evicting`, `shed` and `shed_paced` return the number of entries
+  they evicted or removed. New: `cache::codec` (`L2Codec`, `L2Payload`),
+  `L2WarmCache::{encode_payload, put_payload_evicting, compression_saved_bytes}`,
+  `QueryCache::{entry_counts, compression_saved_bytes}`,
+  `CacheMetrics::record_evictions`.
+
 ### Added
 
+- **Query-cache refresh-ahead** (`[cache] refresh_ahead_ratio`, default `0.0` = off;
+  `refresh_ahead_claim_timeout_ms`, default `5000`). Once an L1/L2 entry is at least
+  ratio × its TTL old, exactly one read of it claims the refill: it is treated as a miss
+  (bypassing its own L1 copy), runs on its own backend connection, and its result replaces
+  the entry through the normal store path, while every other read is still served the
+  entry until the refill lands or the TTL ends; connections whose L1 copy is past the
+  refresh point pick the refill up from L2. A hot key no longer stampedes the backend at
+  expiry, and its readers see no latency cliff there, for one extra backend read per hot
+  entry per TTL. A claim ends when its refill is stored or, for any other outcome (error
+  response, oversized result, a write racing the fetch, a standby's answer, a lost client),
+  is abandoned; a claim older than the timeout is taken over, so a lost claimant never
+  blocks refreshes. New counters `heliosdb_proxy_cache_refresh_ahead_claims_total`,
+  `_completed_total`, `_abandoned_total` (JSON `query_cache.refresh_ahead`). Off, the
+  lookup pays one branch. Validated at startup (an error names the key); `[cache]` stays
+  startup-only on SIGHUP. Library API: `CacheConfig` gains `refresh_ahead_ratio` and
+  `refresh_ahead_claim_timeout`, and `CacheToml` the two keys (struct literals must set
+  them).
 - **Query cache: tier sizes and L2 payload compression** (distribcache merge P1,
   7c860e8a2e14). New flat `[cache]` keys, defaults unchanged behaviour:
   `l1_max_entries = 500` and `l1_max_bytes = 33554432` (per client connection; were
@@ -34,20 +76,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Criterion: `cache/l2/compress_{lz4,zstd}_{4k,64k,1m}`,
   `cache/l2/hit_{lz4,zstd}_{4k,64k,1m}` and the control `cache/l2/hit_none_64k`, on
   DataRow payloads.
-
-### Changed
-
-- **Dependencies:** `zstd` and `lz4_flex` are optional, pulled by the `query-cache` and
-  `distribcache` features; a build with neither no longer compiles them.
-- **Library API** (crates that use `heliosdb-proxy` as a library): `cache::L2Config`'s
-  `size_mb` is replaced by `max_bytes` (bytes) and it gains `compression`,
-  `compression_min_bytes` and `zstd_level`; `CacheToml` gains the six keys above and
-  `L2Entry` gains `raw_len` (struct literals must set them). `L1HotCache::put`,
-  `L2WarmCache::put_evicting`, `shed` and `shed_paced` return the number of entries
-  they evicted or removed. New: `cache::codec` (`L2Codec`, `L2Payload`),
-  `L2WarmCache::{encode_payload, put_payload_evicting, compression_saved_bytes}`,
-  `QueryCache::{entry_counts, compression_saved_bytes}`,
-  `CacheMetrics::record_evictions`.
 
 ### Fixed
 

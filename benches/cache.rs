@@ -6,7 +6,8 @@
 //! included) of a DataRow payload, `hit_none_64k` the raw control. `cache/query/*` go through the
 //! public `QueryCache` API (hint parse, normalization, tier lookups) the relay
 //! calls for every cacheable read, and its `write_tables` for every journaled
-//! write; `cache/edge/*` the edge-cache key the relay computes for every
+//! write (`l1_hit_refresh_ahead_1k` and `l1_due_claim_held_1k` with
+//! `refresh_ahead_ratio` on); `cache/edge/*` the edge-cache key the relay computes for every
 //! cacheable read when `[edge]` is on, and the edge invalidation's table set.
 //! `cache/l3/*` measure the semantic tier through its public API (canonical
 //! form included; `store_lookup_contended_8` with eight threads at once) and
@@ -277,6 +278,47 @@ fn bench_query_cache(c: &mut Criterion) {
     group.bench_function("write_tables_insert_1m", |b| {
         b.iter(|| black_box(cache.write_tables(black_box(&insert))))
     });
+
+    // Refresh-ahead on (`[cache] refresh_ahead_ratio`, P3b): an L1 hit on a
+    // young entry pays the due check only; an L1 copy past its refresh point,
+    // while another reader's refill is in flight (the claim held below),
+    // consults L2 and is served its own copy.
+    let ahead = |ratio: f64| {
+        QueryCache::new(CacheConfig {
+            refresh_ahead_ratio: ratio,
+            refresh_ahead_claim_timeout: Duration::from_secs(3600),
+            ..CacheConfig::default()
+        })
+    };
+    let young = ahead(0.5);
+    // 0.001 x the 300 s default TTL: due 300 ms after the store.
+    let due = ahead(0.001);
+    rt.block_on(async {
+        for cache in [&young, &due] {
+            cache
+                .put(point, &conn, data.clone(), 1, Duration::ZERO)
+                .await;
+        }
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    let claimant = CacheContext {
+        connection_id: Some(2),
+        ..conn.clone()
+    };
+    let (lookup, held) = rt.block_on(due.get_with_prep(point, &claimant));
+    assert!(matches!(lookup, CacheLookup::Miss), "the refill is claimed");
+    let hit_in = |cache: &QueryCache, sql: &str, ctx: &CacheContext| {
+        let lookup = rt.block_on(cache.get(black_box(sql), black_box(ctx)));
+        assert!(matches!(lookup, CacheLookup::Hit { .. }), "{sql} must hit");
+        black_box(lookup)
+    };
+    group.bench_function("l1_hit_refresh_ahead_1k", |b| {
+        b.iter(|| hit_in(&young, point, &conn))
+    });
+    group.bench_function("l1_due_claim_held_1k", |b| {
+        b.iter(|| hit_in(&due, point, &conn))
+    });
+    drop(held);
     group.finish();
 }
 

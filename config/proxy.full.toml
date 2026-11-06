@@ -476,6 +476,17 @@ semantic_embedding_retry_secs = 30   # after a failure, one probe per window
 # Parsing takes ~100x the statement's size; at most 1048576 (1 MiB).
 semantic_max_statement_bytes = 16384
 
+# Refresh-ahead: once an entry is refresh_ahead_ratio x its TTL old, ONE read of it
+# refills it from the backend (on its own connection, through the normal store path)
+# while every other read is still served the entry until the refill lands or the TTL
+# ends. Buys: no expiry stampede on hot keys and no latency cliff at expiry. Costs:
+# one extra backend read per hot entry per TTL. 0 = off; otherwise in (0, 1).
+# Counted in heliosdb_proxy_cache_refresh_ahead_{claims,completed,abandoned}_total.
+# refresh_ahead_ratio = 0.0
+# A claimant that neither stored nor failed its refill by then is taken over by the
+# next read that finds the entry due (1..=3600000 ms).
+# refresh_ahead_claim_timeout_ms = 5000
+
 # Per-table settings: exactly one of ttl_secs or exclude = true. A ttl_secs longer
 # than ttl_secs above applies only to single-table reads of the semantic grammar
 # without qualified columns; a shorter one holds for every read that names the

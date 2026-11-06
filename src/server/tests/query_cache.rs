@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::AtomicUsize;
 
 /// A `[cache]` section with every semantic key off its default and per-table
 /// settings.
@@ -1519,4 +1520,332 @@ async fn a_heliosdb_backend_keys_the_edge_cache_as_written() {
     assert_eq!(node, None, "the same text is still served");
     drop(relay);
     assert_eq!(backend.await.unwrap().len(), 4);
+}
+
+// ---- the cache_refresh hint and refresh-ahead (P3) ----
+
+/// `/*helios:cache_refresh*/` used to be parsed and ignored: the read was
+/// served from cache. It now reaches the backend even with an entry cached
+/// for its own text (L1) and the statement (L2), and the fresh result is
+/// stored, so other texts of the statement are served it from L2.
+#[tokio::test]
+async fn a_cache_refresh_hint_reaches_the_backend_and_refills() {
+    const READ: &str = "SELECT value FROM widgets";
+    let hinted = "SELECT value FROM widgets /*helios:cache_refresh*/";
+    let (mut relay, backend) = Relay::start(|_| {}, &[READ], 2).await;
+    relay.prefill_l1(hinted).await;
+    let puts = relay.cache().stats().puts;
+    relay.answered_by_backend(hinted).await;
+    assert_eq!(relay.cache().stats().puts, puts + 1, "the result is stored");
+    assert_eq!(relay.cache().refresh_hints(), 1);
+    let (node, got) = relay.query(READ).await;
+    assert_eq!((node, got), (None, backend_reply()), "L2 holds the refill");
+    relay.answered_by_backend(hinted).await;
+    assert_eq!(relay.cache().refresh_hints(), 2);
+    drop(relay);
+    assert_eq!(backend.await.unwrap(), [hinted, hinted]);
+}
+
+/// The relay's guards come before the hint: an excluded, an in-transaction
+/// and an uncacheable (volatile) read with it reach the backend, are not
+/// stored, and the cache is not even consulted (nothing counted).
+#[tokio::test]
+async fn a_cache_refresh_hint_keeps_the_relay_guards() {
+    let reads = [
+        "SELECT value FROM payroll /*helios:cache_refresh*/",
+        "SELECT value FROM widgets /*helios:cache_refresh*/",
+        "SELECT now() FROM widgets /*helios:cache_refresh*/",
+    ];
+    let (mut relay, backend) = Relay::start(
+        |c| c.cache.exclude_tables = vec!["payroll".to_string()],
+        &[],
+        reads.len(),
+    )
+    .await;
+    relay.answered_by_backend(reads[0]).await;
+    assert_eq!(relay.excluded(), 1);
+    relay.session.in_transaction.store(true, Ordering::Relaxed);
+    relay.answered_by_backend(reads[1]).await;
+    relay.session.in_transaction.store(false, Ordering::Relaxed);
+    relay.answered_by_backend(reads[2]).await;
+    assert_eq!(relay.cache().stats().puts, 0, "nothing stored");
+    assert_eq!(
+        relay.cache().refresh_hints(),
+        0,
+        "the cache was not consulted"
+    );
+    drop(relay);
+    assert_eq!(backend.await.unwrap().len(), reads.len());
+}
+
+/// `cache=refresh` is a refresh to the routing parser too, which strips a
+/// leading one from the forwarded text; the cache reads it back from the
+/// client's text, and the refill lands under the forwarded (plain) text.
+#[cfg(feature = "routing-hints")]
+#[tokio::test]
+async fn forward_simple_query_honours_a_stripped_refresh_hint() {
+    const READ: &str = "SELECT value FROM widgets";
+    let (mut relay, backend) = Relay::start(|c| c.routing_hints.enabled = true, &[READ], 1).await;
+    relay.prefill_l1(READ).await;
+    let (node, got) = relay
+        .query("/*helios:cache=refresh*/ SELECT value FROM widgets")
+        .await;
+    assert_eq!(node.as_deref(), Some(relay.addr.as_str()));
+    assert_eq!(got, backend_reply());
+    let (node, got) = relay.query(READ).await;
+    assert_eq!(
+        (node, got),
+        (None, backend_reply()),
+        "its L1 copy refreshed"
+    );
+    drop(relay);
+    assert_eq!(backend.await.unwrap(), [READ], "the comment was stripped");
+}
+
+/// The hot key of the refresh-ahead tests.
+const HOT: &str = "SELECT value FROM hot WHERE id = 1";
+
+/// A backend accepting any number of connections that answers each simple
+/// query with [`backend_reply`] after `delay`, counting the queries.
+async fn counting_backend(listener: TcpListener, delay: Duration, reads: Arc<AtomicUsize>) {
+    while let Ok((mut sock, _)) = listener.accept().await {
+        let reads = Arc::clone(&reads);
+        tokio::spawn(async move {
+            let mut head = [0u8; 5];
+            while sock.read_exact(&mut head).await.is_ok() {
+                let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize - 4;
+                let mut body = vec![0u8; len];
+                if sock.read_exact(&mut body).await.is_err() {
+                    return;
+                }
+                reads.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                if sock.write_all(&backend_reply()).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+}
+
+/// One client of [`HotKey`]: its own session, backend connection and
+/// client socket.
+struct HotClient {
+    session: Arc<ClientSession>,
+    conns: HashMap<String, BackendConn>,
+    client: crate::client_tls::ClientStream,
+    peer: TcpStream,
+}
+
+/// Many sessions of one relay reading [`HOT`], against a
+/// [`counting_backend`]; the shared entry prefilled with [`cached_reply`].
+struct HotKey {
+    _server: ProxyServer,
+    state: Arc<ServerState>,
+    config: Arc<ProxyConfig>,
+    addr: String,
+    clients: Vec<HotClient>,
+    backend_reads: Arc<AtomicUsize>,
+}
+
+impl HotKey {
+    async fn start(tune: impl FnOnce(&mut ProxyConfig), clients: usize, delay: Duration) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let backend_reads = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(counting_backend(
+            listener,
+            delay,
+            Arc::clone(&backend_reads),
+        ));
+        let mut config = ProxyConfig {
+            listen_address: "127.0.0.1:0".to_string(),
+            ..Default::default()
+        };
+        config.add_node(&addr, "primary").unwrap();
+        config.cache.enabled = true;
+        tune(&mut config);
+        config.validate().unwrap();
+        let server = ProxyServer::new(config.clone()).unwrap();
+        let shared = crate::cache::CacheContext {
+            database: "default".to_string(),
+            ..Default::default()
+        };
+        server
+            .state
+            .query_cache
+            .as_ref()
+            .expect("cache on")
+            .put(
+                HOT,
+                &shared,
+                bytes::Bytes::from(cached_reply()),
+                1,
+                Duration::ZERO,
+            )
+            .await;
+        let mut hot_clients = Vec::with_capacity(clients);
+        for _ in 0..clients {
+            let mut conns = HashMap::new();
+            conns.insert(
+                addr.clone(),
+                BackendConn::new(TcpStream::connect(&addr).await.unwrap()),
+            );
+            let (client_raw, peer) = pair().await;
+            hot_clients.push(HotClient {
+                session: make_test_session(),
+                conns,
+                client: crate::client_tls::ClientStream::Plain(client_raw),
+                peer,
+            });
+        }
+        Self {
+            state: Arc::clone(&server.state),
+            _server: server,
+            config: Arc::new(config),
+            addr,
+            clients: hot_clients,
+            backend_reads,
+        }
+    }
+
+    /// Every client reads [`HOT`] at once, each on its own task: per client,
+    /// whether the backend answered it and the bytes it received.
+    async fn wave(&mut self) -> Vec<(bool, Vec<u8>)> {
+        let tasks: Vec<_> = self
+            .clients
+            .drain(..)
+            .map(|mut c| {
+                let state = Arc::clone(&self.state);
+                let config = Arc::clone(&self.config);
+                let addr = self.addr.clone();
+                tokio::spawn(async move {
+                    let msg = QueryMessage {
+                        query: HOT.to_string(),
+                    }
+                    .encode();
+                    let mut fault = None;
+                    let (node, sent) = ProxyServer::forward_simple_query(
+                        ForwardCtx {
+                            client: &mut c.client,
+                            conns: &mut c.conns,
+                            current_node: Some(addr.as_str()),
+                            reads: &ReadRouting::OFF,
+                            session: &c.session,
+                            state: &state,
+                            config: &config,
+                            fault: &mut fault,
+                            continues_cycle: None,
+                        },
+                        &msg,
+                    )
+                    .await
+                    .unwrap();
+                    let mut got = vec![0u8; sent as usize];
+                    c.peer.read_exact(&mut got).await.unwrap();
+                    (c, (node.is_some(), got))
+                })
+            })
+            .collect();
+        let mut outcomes = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            let (client, outcome) = task.await.unwrap();
+            self.clients.push(client);
+            outcomes.push(outcome);
+        }
+        outcomes
+    }
+
+    fn backend_reads(&self) -> usize {
+        self.backend_reads.load(Ordering::SeqCst)
+    }
+
+    fn cache(&self) -> &crate::cache::QueryCache {
+        self.state.query_cache.as_deref().unwrap()
+    }
+}
+
+/// The number of clients of a wave the backend answered.
+fn refills(wave: &[(bool, Vec<u8>)]) -> usize {
+    wave.iter().filter(|(by_backend, _)| *by_backend).count()
+}
+
+const HOT_CLIENTS: usize = 16;
+/// Long enough that every client's read of a wave is decided while the
+/// backend is still answering the first one.
+const HOT_BACKEND_DELAY: Duration = Duration::from_millis(500);
+
+/// Without refresh-ahead, a hot key's expiry sends every client to the
+/// backend at once: one miss per client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hot_key_stampedes_the_backend_at_expiry_without_refresh_ahead() {
+    let mut hot = HotKey::start(|c| c.cache.ttl_secs = 1, HOT_CLIENTS, HOT_BACKEND_DELAY).await;
+    let filled = tokio::time::Instant::now();
+    let wave = hot.wave().await;
+    assert_eq!(refills(&wave), 0);
+    tokio::time::sleep_until(filled + Duration::from_millis(1200)).await;
+    let wave = hot.wave().await;
+    assert_eq!(refills(&wave), HOT_CLIENTS, "every client missed");
+    assert_eq!(hot.backend_reads(), HOT_CLIENTS);
+    assert_eq!(hot.cache().refresh_ahead_stats().claims, 0);
+}
+
+/// With `refresh_ahead_ratio`, many clients reading a hot key across its
+/// refresh point cost the backend exactly one read per refresh window: one
+/// client refills it while the others are served the current entry, and
+/// nobody misses when the first entry's TTL ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refresh_ahead_refills_a_hot_key_once_per_window() {
+    // TTL 3 s, refresh point 1.8 s.
+    let mut hot = HotKey::start(
+        |c| {
+            c.cache.ttl_secs = 3;
+            c.cache.refresh_ahead_ratio = 0.6;
+        },
+        HOT_CLIENTS,
+        HOT_BACKEND_DELAY,
+    )
+    .await;
+    let filled = tokio::time::Instant::now();
+    // Every client reads it once (an L1 copy each).
+    let wave = hot.wave().await;
+    assert_eq!(refills(&wave), 0);
+    assert!(wave.iter().all(|(_, got)| *got == cached_reply()));
+
+    // Past the refresh point, before the end.
+    tokio::time::sleep_until(filled + Duration::from_millis(1900)).await;
+    let wave = hot.wave().await;
+    let refilled = tokio::time::Instant::now();
+    assert_eq!(refills(&wave), 1, "one client refilled the entry");
+    for (by_backend, got) in &wave {
+        let expected = if *by_backend {
+            backend_reply()
+        } else {
+            cached_reply()
+        };
+        assert_eq!(got, &expected, "the others were served the current entry");
+    }
+    assert_eq!(hot.backend_reads(), 1);
+
+    // Past the first entry's end: every client is served the refill, from
+    // its L1 copy or from L2; nobody misses.
+    tokio::time::sleep_until(filled + Duration::from_millis(3200)).await;
+    let wave = hot.wave().await;
+    assert_eq!(refills(&wave), 0, "no stampede at expiry");
+    assert!(wave.iter().all(|(_, got)| *got == backend_reply()));
+    assert_eq!(hot.backend_reads(), 1);
+
+    // The refill's own refresh window: one more read.
+    tokio::time::sleep_until(refilled + Duration::from_millis(1900)).await;
+    let wave = hot.wave().await;
+    assert_eq!(refills(&wave), 1);
+    assert_eq!(hot.backend_reads(), 2);
+    assert_eq!(
+        hot.cache().refresh_ahead_stats(),
+        crate::cache::RefreshAheadStats {
+            claims: 2,
+            completed: 2,
+            abandoned: 0
+        }
+    );
 }

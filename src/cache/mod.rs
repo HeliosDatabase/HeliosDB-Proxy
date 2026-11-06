@@ -65,6 +65,7 @@ pub mod l3_semantic;
 pub mod logical_source;
 pub mod metrics;
 pub mod normalizer;
+pub mod refresh;
 pub mod result;
 
 // Re-exports
@@ -77,6 +78,7 @@ pub use l2_warm::L2WarmCache;
 pub use l3_semantic::{EndpointState, L3SemanticCache, SemanticHealth};
 pub use metrics::{CacheMetrics, CacheStatsLevelSnapshot, CacheStatsSnapshot};
 pub use normalizer::{NormalizedQuery, QueryNormalizer};
+pub use refresh::RefreshAheadStats;
 pub use result::{CacheKey, CachedResult};
 
 use bytes::Bytes;
@@ -136,6 +138,11 @@ pub struct QueryPrep {
     generation: Option<u64>,
     /// What the semantic tier made of the query, so it is parsed once.
     semantic: SemanticPrep,
+    /// Refresh-ahead: this read claimed the refill of an entry past its
+    /// refresh point. `put_prepared` ends the claim after its store (or
+    /// refusal); dropping the prep without one (an error response, an
+    /// oversized capture, a standby's answer, a lost client) abandons it.
+    refresh_claim: Option<Arc<refresh::RefreshClaim>>,
 }
 
 impl QueryPrep {
@@ -144,6 +151,20 @@ impl QueryPrep {
     /// capture the response at all.
     pub(crate) fn storable(&self) -> bool {
         !self.hints.skip
+    }
+
+    /// The prep of a read served past L1 (L2, or its own L1 copy after the
+    /// L2 lookup refresh-ahead made): nothing to store.
+    #[inline]
+    fn served(hints: CacheHint, normalized: NormalizedQuery, keyed_verbatim: bool) -> Self {
+        Self {
+            hints,
+            normalized: Some(normalized),
+            keyed_verbatim,
+            generation: None,
+            semantic: SemanticPrep::NotConsulted,
+            refresh_claim: None,
+        }
     }
 }
 
@@ -197,6 +218,17 @@ pub enum CacheLookup {
         level: CacheLevel,
     },
     /// Cache miss
+    Miss,
+}
+
+/// What refresh-ahead makes of a read that missed L1, or whose L1 copy is
+/// past its refresh point.
+enum RefreshPick {
+    /// Serve this entry, from this tier.
+    Serve(CachedResult, CacheLevel),
+    /// This read claimed the entry's refill: a miss on every tier.
+    Claimed(refresh::RefreshClaim),
+    /// Nothing to serve: an ordinary miss (L3 may still serve it).
     Miss,
 }
 
@@ -287,6 +319,10 @@ pub struct QueryCache {
     /// whitespace and comments, and a canonical semantic tier neither
     /// stores nor serves.
     heliosdb_backend: std::sync::atomic::AtomicBool,
+
+    /// Refresh-ahead (`refresh_ahead_ratio` in (0, 1), with L2): claims of
+    /// refills in flight. `None` when off: the lookup then pays one branch.
+    refresh_ahead: Option<Arc<refresh::RefreshAhead>>,
 }
 
 /// A job for the `cache-reclaim` thread.
@@ -361,6 +397,16 @@ impl QueryCache {
             reclaim_tx,
             logical: std::sync::OnceLock::new(),
             heliosdb_backend: std::sync::atomic::AtomicBool::new(false),
+            // Refills are claimed on the shared tier: without one there is no
+            // entry other connections could be served while one refills.
+            refresh_ahead: if config.l2.enabled {
+                refresh::RefreshAhead::new(
+                    config.refresh_ahead_ratio,
+                    config.refresh_ahead_claim_timeout,
+                )
+            } else {
+                None
+            },
         }
     }
 
@@ -522,6 +568,21 @@ impl QueryCache {
         client_sql: Option<&str>,
         context: &CacheContext,
     ) -> (CacheLookup, QueryPrep) {
+        self.lookup(query, client_sql, context, Instant::now).await
+    }
+
+    /// [`Self::get_with_prep_hinted`] with the time read from `clock`, once,
+    /// past the hint checks (where the lookup takes its start time).
+    /// Refresh-ahead decides on it whether an entry is past its refresh
+    /// point and whether a claim timed out, so tests move it instead of
+    /// sleeping.
+    async fn lookup(
+        &self,
+        query: &str,
+        client_sql: Option<&str>,
+        context: &CacheContext,
+        clock: impl FnOnce() -> Instant,
+    ) -> (CacheLookup, QueryPrep) {
         // Parse cache hints
         let mut hints = parse_cache_hints(query);
         if let Some(client_sql) = client_sql {
@@ -539,17 +600,43 @@ impl QueryCache {
                     keyed_verbatim: false,
                     generation: None,
                     semantic: SemanticPrep::NotConsulted,
+                    refresh_claim: None,
                 },
             );
         }
 
-        let start = Instant::now();
+        // `cache_refresh` (also `refresh`, `nocache_read`, `cache=refresh`,
+        // `cache=force`, `cache=update`): no tier is looked up and the read
+        // goes to the backend; `put_prepared` stores its result as it stores
+        // a miss's, every guard included (size, the C-02 generation taken
+        // here, the key mode), replacing the shared entry and this text's L1
+        // copy. Counted apart from misses.
+        if hints.refresh {
+            self.metrics.record_refresh_hint();
+            let keyed_verbatim = self.heliosdb_backend();
+            let normalized = self.normalizer.normalize_with(query, keyed_verbatim);
+            let prep = self.miss_prep(
+                hints,
+                normalized,
+                keyed_verbatim,
+                SemanticPrep::NotConsulted,
+                None,
+            );
+            return (CacheLookup::Miss, prep);
+        }
+
+        let start = clock();
 
         // A TTL hint bounds what the read is served too: an entry older than
         // it (stored by an unhinted read, or under a longer hint) is a miss
         // on every tier, and the refill stores the result with that TTL.
         let max_age = hints.ttl;
         let young_enough = |r: &CachedResult| max_age.is_none_or(|age| r.age() <= age);
+
+        // Refresh-ahead: an L1 copy past its refresh point is not served
+        // yet; the shared tier decides below (another connection's refill may
+        // have landed, or this read claims the refill and bypasses the copy).
+        let mut l1_due = None;
 
         // L1: Check hot cache (exact match)
         if self.config.l1.enabled {
@@ -567,20 +654,26 @@ impl QueryCache {
                     None => None,
                 };
                 if let Some(result) = hit {
-                    self.metrics.record_hit(CacheLevel::L1Hot, start.elapsed());
-                    return (
-                        CacheLookup::Hit {
-                            result,
-                            level: CacheLevel::L1Hot,
-                        },
-                        QueryPrep {
-                            hints,
-                            normalized: None,
-                            keyed_verbatim: false,
-                            generation: None,
-                            semantic: SemanticPrep::NotConsulted,
-                        },
-                    );
+                    match &self.refresh_ahead {
+                        Some(ra) if ra.due(&result, start) => l1_due = Some(result),
+                        _ => {
+                            self.metrics.record_hit(CacheLevel::L1Hot, start.elapsed());
+                            return (
+                                CacheLookup::Hit {
+                                    result,
+                                    level: CacheLevel::L1Hot,
+                                },
+                                QueryPrep {
+                                    hints,
+                                    normalized: None,
+                                    keyed_verbatim: false,
+                                    generation: None,
+                                    semantic: SemanticPrep::NotConsulted,
+                                    refresh_claim: None,
+                                },
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -604,30 +697,44 @@ impl QueryCache {
                 }
                 None => None,
             };
-            if let Some(result) = hit {
-                self.metrics.record_hit(CacheLevel::L2Warm, start.elapsed());
-
-                // Promote to L1 (raw: L2 returned the payload decompressed)
-                if self.config.l1.enabled {
-                    if let Some(conn_id) = context.connection_id {
-                        let l1 = self.get_l1_cache(conn_id);
-                        self.l1_store(&l1, query, result.clone());
+            match &self.refresh_ahead {
+                None => {
+                    if let Some(result) = hit {
+                        let prep = QueryPrep::served(hints, normalized, keyed_verbatim);
+                        return self.l2_hit(query, context, result, start, prep);
                     }
                 }
-
-                return (
-                    CacheLookup::Hit {
-                        result,
-                        level: CacheLevel::L2Warm,
-                    },
-                    QueryPrep {
-                        hints,
-                        normalized: Some(normalized),
-                        keyed_verbatim,
-                        generation: None,
-                        semantic: SemanticPrep::NotConsulted,
-                    },
-                );
+                Some(ra) => {
+                    match self
+                        .refresh_ahead_pick(ra, &cache_key, l1_due, hit, start, max_age)
+                        .await
+                    {
+                        RefreshPick::Serve(result, level) => {
+                            let prep = QueryPrep::served(hints, normalized, keyed_verbatim);
+                            if level == CacheLevel::L2Warm {
+                                return self.l2_hit(query, context, result, start, prep);
+                            }
+                            // Its own L1 copy, past the refresh point while
+                            // another reader refills the entry.
+                            self.metrics.record_hit(level, start.elapsed());
+                            return (CacheLookup::Hit { result, level }, prep);
+                        }
+                        RefreshPick::Claimed(claim) => {
+                            // The claimant is a miss on every tier (L3 too):
+                            // its result refills the entry.
+                            self.metrics.record_miss(start.elapsed());
+                            let prep = self.miss_prep(
+                                hints,
+                                normalized,
+                                keyed_verbatim,
+                                SemanticPrep::NotConsulted,
+                                Some(Arc::new(claim)),
+                            );
+                            return (CacheLookup::Miss, prep);
+                        }
+                        RefreshPick::Miss => {}
+                    }
+                }
             }
         }
 
@@ -668,6 +775,7 @@ impl QueryCache {
                                         keyed_verbatim,
                                         generation: None,
                                         semantic,
+                                        refresh_claim: None,
                                     },
                                 );
                             }
@@ -683,17 +791,113 @@ impl QueryCache {
         }
 
         self.metrics.record_miss(start.elapsed());
+        let prep = self.miss_prep(hints, normalized, keyed_verbatim, semantic, None);
+        (CacheLookup::Miss, prep)
+    }
+
+    /// The prep of a read that goes to the backend. Its generation is taken
+    /// now, before the fetch (C-02): `put_prepared` refuses a result whose
+    /// tables were written while it was being fetched.
+    #[inline]
+    fn miss_prep(
+        &self,
+        hints: CacheHint,
+        normalized: NormalizedQuery,
+        keyed_verbatim: bool,
+        semantic: SemanticPrep,
+        refresh_claim: Option<Arc<refresh::RefreshClaim>>,
+    ) -> QueryPrep {
         let generation = Some(self.generation_of(&normalized.tables));
+        QueryPrep {
+            hints,
+            normalized: Some(normalized),
+            keyed_verbatim,
+            generation,
+            semantic,
+            refresh_claim,
+        }
+    }
+
+    /// Serve an L2 hit: counted, and promoted to the connection's L1.
+    #[inline]
+    fn l2_hit(
+        &self,
+        query: &str,
+        context: &CacheContext,
+        result: CachedResult,
+        start: Instant,
+        prep: QueryPrep,
+    ) -> (CacheLookup, QueryPrep) {
+        self.metrics.record_hit(CacheLevel::L2Warm, start.elapsed());
+
+        // Promote to L1 (raw: L2 returned the payload decompressed)
+        if self.config.l1.enabled {
+            if let Some(conn_id) = context.connection_id {
+                let l1 = self.get_l1_cache(conn_id);
+                self.l1_store(&l1, query, result.clone());
+            }
+        }
+
         (
-            CacheLookup::Miss,
-            QueryPrep {
-                hints,
-                normalized: Some(normalized),
-                keyed_verbatim,
-                generation,
-                semantic,
+            CacheLookup::Hit {
+                result,
+                level: CacheLevel::L2Warm,
             },
+            prep,
         )
+    }
+
+    /// Refresh-ahead's choice for a read that missed L1, or whose L1 copy is
+    /// past its refresh point (`l1_due`), given the shared entry (`l2_hit`,
+    /// current and young enough). The newer of the two is the entry the read
+    /// would be served; when both are the same fill, the shared entry's own
+    /// TTL decides whether it is due (L1 may clamp its copy's). Past the
+    /// refresh point the first reader claims the refill and misses; every
+    /// other reader is served the entry until the refill lands, and a reader
+    /// whose L1 copy is due then picks the refill up from L2.
+    async fn refresh_ahead_pick(
+        &self,
+        ra: &Arc<refresh::RefreshAhead>,
+        key: &CacheKey,
+        l1_due: Option<CachedResult>,
+        l2_hit: Option<CachedResult>,
+        now: Instant,
+        max_age: Option<Duration>,
+    ) -> RefreshPick {
+        let (result, level, due) = match (l1_due, l2_hit) {
+            (Some(own), Some(shared)) if own.cached_at >= shared.cached_at => {
+                let due = own.cached_at > shared.cached_at || ra.due(&shared, now);
+                (own, CacheLevel::L1Hot, due)
+            }
+            (_, Some(shared)) => {
+                let due = ra.due(&shared, now);
+                (shared, CacheLevel::L2Warm, due)
+            }
+            (Some(own), None) => (own, CacheLevel::L1Hot, true),
+            (None, None) => return RefreshPick::Miss,
+        };
+        if !due {
+            return RefreshPick::Serve(result, level);
+        }
+        let Some(claim) = ra.try_claim(key.hash_value(), now) else {
+            return RefreshPick::Serve(result, level);
+        };
+        // A refill that landed after the lookup above, its claim ended just
+        // before this one was made, is what to serve: claiming it again
+        // would refill the entry twice. (The claimant stores before it ends
+        // its claim, so a claim made after that end sees the refill here.)
+        if let Some(l2) = &self.l2_cache {
+            let newer = l2.get(key).await.filter(|r| {
+                r.cached_at > result.cached_at
+                    && self.is_current(r)
+                    && max_age.is_none_or(|age| r.age() <= age)
+            });
+            if let Some(newer) = newer {
+                claim.withdraw();
+                return RefreshPick::Serve(newer, CacheLevel::L2Warm);
+            }
+        }
+        RefreshPick::Claimed(claim)
     }
 
     /// Store a query result in the cache
@@ -711,6 +915,7 @@ impl QueryCache {
             keyed_verbatim: false,
             generation: None,
             semantic: SemanticPrep::NotConsulted,
+            refresh_claim: None,
         };
         self.put_prepared(query, context, &prep, data, row_count, execution_time)
             .await
@@ -727,6 +932,10 @@ impl QueryCache {
     /// foreign prep would key, TTL, or skip the entry differently from
     /// [`Self::put`]. Hence `pub(crate)`, and hence `QueryPrep` has no
     /// `Default`: the only way to obtain one is from a lookup.
+    ///
+    /// A refresh-ahead claim the prep carries ends here, after the store
+    /// (completed) or the refusal (abandoned): only then may another reader
+    /// claim the entry's next refill.
     pub(crate) async fn put_prepared(
         &self,
         query: &str,
@@ -736,11 +945,29 @@ impl QueryCache {
         row_count: usize,
         execution_time: Duration,
     ) {
+        let stored = self
+            .store_prepared(query, context, prep, data, row_count, execution_time)
+            .await;
+        if let Some(claim) = &prep.refresh_claim {
+            claim.end(stored);
+        }
+    }
+
+    /// [`Self::put_prepared`]'s store; whether the result was stored.
+    async fn store_prepared(
+        &self,
+        query: &str,
+        context: &CacheContext,
+        prep: &QueryPrep,
+        data: Bytes,
+        row_count: usize,
+        execution_time: Duration,
+    ) -> bool {
         let hints = &prep.hints;
 
         // Skip if hint says so
         if !prep.storable() {
-            return;
+            return false;
         }
 
         // Normalize query (reusing the lookup's normalization when it has
@@ -789,7 +1016,7 @@ impl QueryCache {
         // Check size limit
         if data.len() > self.config.max_result_size {
             self.metrics.record_size_exceeded();
-            return;
+            return false;
         }
 
         // The form L2 keeps the payload in (`[cache] l2_compression`; zstd
@@ -812,7 +1039,7 @@ impl QueryCache {
         let generation = prep.generation.unwrap_or(current);
         if generation != current || self.heliosdb_backend() != keyed_verbatim {
             self.metrics.record_fill_raced();
-            return;
+            return false;
         }
 
         // Create cached result
@@ -868,6 +1095,7 @@ impl QueryCache {
         }
 
         self.metrics.record_put();
+        true
     }
 
     /// Invalidate any cached results that reference a table written by `sql`.
@@ -1028,6 +1256,18 @@ impl QueryCache {
     /// Fills not stored because a write raced their backend fetch.
     pub fn fills_raced(&self) -> u64 {
         self.metrics.fills_raced()
+    }
+
+    /// Reads hinted `cache_refresh` (no tier looked up; the result stored).
+    pub fn refresh_hints(&self) -> u64 {
+        self.metrics.refresh_hints()
+    }
+
+    /// Refresh-ahead's counters; all zero when it is off.
+    pub fn refresh_ahead_stats(&self) -> RefreshAheadStats {
+        self.refresh_ahead
+            .as_ref()
+            .map_or_else(RefreshAheadStats::default, |ra| ra.stats())
     }
 
     /// [`Self::invalidate_all`] for a simple-query string a backend may

@@ -26,6 +26,9 @@ pub struct CacheMetrics {
     /// Total skips (due to hints)
     skips: AtomicU64,
 
+    /// Reads hinted `cache_refresh`: no tier looked up, the result stored.
+    refresh_hints: AtomicU64,
+
     /// Total puts
     puts: AtomicU64,
 
@@ -162,6 +165,7 @@ impl CacheMetrics {
             l3: CacheStats::new(),
             misses: AtomicU64::new(0),
             skips: AtomicU64::new(0),
+            refresh_hints: AtomicU64::new(0),
             puts: AtomicU64::new(0),
             invalidations: AtomicU64::new(0),
             tables_invalidated: AtomicU64::new(0),
@@ -191,6 +195,16 @@ impl CacheMetrics {
     /// Record a cache skip (due to hint)
     pub fn record_skip(&self) {
         self.skips.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a read hinted `cache_refresh` (looked up nowhere, stored).
+    pub fn record_refresh_hint(&self) {
+        self.refresh_hints.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reads hinted `cache_refresh`.
+    pub fn refresh_hints(&self) -> u64 {
+        self.refresh_hints.load(Ordering::Relaxed)
     }
 
     /// Record a cache put

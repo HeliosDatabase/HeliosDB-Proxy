@@ -1458,6 +1458,10 @@ pub const CACHE_ZSTD_LEVELS: std::ops::RangeInclusive<i32> = 1..=19;
 /// would let one client statement take gigabytes.
 pub const SEMANTIC_MAX_STATEMENT_BYTES_CEILING: usize = 1 << 20;
 
+/// Upper bound of `[cache] refresh_ahead_claim_timeout_ms` (one hour): a claim
+/// held longer only delays the takeover of a lost claimant.
+pub const REFRESH_AHEAD_CLAIM_TIMEOUT_MS_CEILING: u64 = 3_600_000;
+
 /// Query-result cache configuration (TOML-friendly, always present). Converted
 /// to `crate::cache::CacheConfig` at startup (L1 hot / L2 warm, and the L3
 /// semantic tier when `semantic_enabled`) and only active when the
@@ -1658,6 +1662,20 @@ pub struct CacheToml {
     /// ([`SEMANTIC_MAX_STATEMENT_BYTES_CEILING`]: a statement at the bound
     /// parses in about 100 MiB). Default 16384.
     pub semantic_max_statement_bytes: usize,
+    /// Refresh-ahead: once a shared (L2) entry's age reaches this fraction of
+    /// its TTL, exactly one read of it is treated as a miss and refills it on
+    /// its own backend connection (single flight), while every other read is
+    /// still served the entry until the refill lands or the TTL ends. A hot
+    /// key then never stampedes the backend at expiry and its reads never
+    /// see an expiry miss, for one extra backend read per hot entry per TTL.
+    /// Applies to L1/L2 entries (not L3). `0` (default) is off; otherwise in
+    /// (0, 1), e.g. `0.8`.
+    pub refresh_ahead_ratio: f64,
+    /// How long a refresh-ahead claim holds, milliseconds: a claimant whose
+    /// refill has neither been stored nor failed by then (a slow statement, a
+    /// lost task) is taken over by the next read that finds the entry due,
+    /// so it never blocks refreshes. Range 1..=3600000. Default 5000.
+    pub refresh_ahead_claim_timeout_ms: u64,
     /// Tables whose reads neither result cache (this one and `[edge]`)
     /// looks up, captures or stores. Bare identifiers (`[a-z_][a-z0-9_]*`,
     /// case-insensitive, at most 63 bytes, no schema or quotes), matched as
@@ -2105,6 +2123,30 @@ impl CacheToml {
         Ok(())
     }
 
+    /// Validate the refresh-ahead keys (P3b). Unconditional, like
+    /// [`Self::validate_semantic_and_tables`]; every error names its key.
+    pub fn validate_refresh_ahead(&self) -> Result<()> {
+        let r = self.refresh_ahead_ratio;
+        if !(r == 0.0 || (r > 0.0 && r < 1.0)) {
+            return Err(ProxyError::Config(format!(
+                "cache.refresh_ahead_ratio must be 0 (off) or in (0, 1), got {r}"
+            )));
+        }
+        let timeout = self.refresh_ahead_claim_timeout_ms;
+        if !(1..=REFRESH_AHEAD_CLAIM_TIMEOUT_MS_CEILING).contains(&timeout) {
+            return Err(ProxyError::Config(format!(
+                "cache.refresh_ahead_claim_timeout_ms must be in \
+                 1..={REFRESH_AHEAD_CLAIM_TIMEOUT_MS_CEILING}, got {timeout}"
+            )));
+        }
+        if r > 0.0 && !self.enabled {
+            tracing::warn!(
+                "cache.refresh_ahead_ratio = {r} has no effect while cache.enabled = false"
+            );
+        }
+        Ok(())
+    }
+
     /// The startup warning for a semantic byte budget below
     /// `max_result_bytes`: a cacheable result whose entry alone exceeds
     /// `semantic_max_bytes` is never stored in the semantic tier (it would
@@ -2198,6 +2240,8 @@ impl CacheToml {
             },
             table_configs,
             excluded_tables: Vec::new(),
+            refresh_ahead_ratio: self.refresh_ahead_ratio,
+            refresh_ahead_claim_timeout: Duration::from_millis(self.refresh_ahead_claim_timeout_ms),
             ..Default::default()
         }
     }
@@ -2239,6 +2283,8 @@ impl Default for CacheToml {
             semantic_embedding_concurrency: 4,
             semantic_embedding_retry_secs: 30,
             semantic_max_statement_bytes: 16 * 1024,
+            refresh_ahead_ratio: 0.0,
+            refresh_ahead_claim_timeout_ms: 5000,
             exclude_tables: Vec::new(),
             tables: Vec::new(),
         }
@@ -3350,6 +3396,15 @@ const IGNORED_KEY_ALIASES: &[(&str, &str)] = &[
         "did you mean 'cache.semantic_enabled'?",
     ),
     (
+        "cache.refresh_ahead",
+        "did you mean 'cache.refresh_ahead_ratio'? (a fraction of the TTL in (0, 1), 0 = off)",
+    ),
+    (
+        "cache.prefetch_enabled",
+        "there is no prefetch: cache.refresh_ahead_ratio (e.g. 0.8) has one read of a hot \
+         entry refill it before it expires, while the others are still served",
+    ),
+    (
         "cache.exclude_patterns",
         "there is no exclude_patterns: writes are never cached; keep a table out with \
          cache.exclude_tables",
@@ -3957,6 +4012,7 @@ impl ProxyConfig {
         }
         self.cache.validate_sizes_and_compression()?;
         self.cache.validate_semantic_and_tables()?;
+        self.cache.validate_refresh_ahead()?;
 
         // Refuse to expose the admin API beyond loopback without a token. The
         // admin surface runs privileged operations (arbitrary SQL via
@@ -6924,6 +6980,8 @@ semantic_embedding_timeout_ms = 250
 semantic_embedding_concurrency = 2
 semantic_embedding_retry_secs = 9
 semantic_max_statement_bytes = 2048
+refresh_ahead_ratio = 0.8
+refresh_ahead_claim_timeout_ms = 1500
 exclude_tables = ["Secret", "audit_log", "secret"]
 
 [[tables]]
@@ -6956,8 +7014,11 @@ exclude = true
         assert_eq!(d.semantic_embedding_concurrency, 4);
         assert_eq!(d.semantic_embedding_retry_secs, 30);
         assert_eq!(d.semantic_max_statement_bytes, 16 * 1024);
+        assert_eq!(d.refresh_ahead_ratio, 0.0);
+        assert_eq!(d.refresh_ahead_claim_timeout_ms, 5000);
         assert!(d.exclude_tables.is_empty() && d.tables.is_empty());
         assert!(d.validate_semantic_and_tables().is_ok());
+        assert!(d.validate_refresh_ahead().is_ok());
 
         let text = format!("[cache]{CACHE_KEYS_TOML}").replace("[[tables]]", "[[cache.tables]]");
         let (config, ignored) = deserialize_reporting_ignored_paths(&format!(
@@ -6983,6 +7044,8 @@ exclude = true
         assert_eq!(c.semantic_embedding_concurrency, 2);
         assert_eq!(c.semantic_embedding_retry_secs, 9);
         assert_eq!(c.semantic_max_statement_bytes, 2048);
+        assert_eq!(c.refresh_ahead_ratio, 0.8);
+        assert_eq!(c.refresh_ahead_claim_timeout_ms, 1500);
         assert_eq!(c.tables.len(), 3);
         assert_eq!(c.tables[0].ttl_secs, Some(3600));
         assert!(c.tables[2].exclude && c.tables[2].ttl_secs.is_none());
@@ -7262,6 +7325,11 @@ exclude = true
         assert_eq!(l3.embedding_concurrency, 2);
         assert_eq!(l3.embedding_retry_after, Duration::from_secs(9));
         assert_eq!(l3.max_statement_bytes, 2048);
+        assert_eq!(cc.refresh_ahead_ratio, 0.8);
+        assert_eq!(
+            cc.refresh_ahead_claim_timeout,
+            Duration::from_millis(c.refresh_ahead_claim_timeout_ms)
+        );
         let mut keys: Vec<&String> = cc.table_configs.keys().collect();
         keys.sort();
         assert_eq!(keys, ["orders", "prices"]);
@@ -7283,6 +7351,75 @@ exclude = true
             Duration::from_secs(300)
         );
         CacheToml::default().to_cache_config().validate().unwrap();
+        // Refresh-ahead is off by default, in the daemon and the library alike.
+        let d = CacheToml::default().to_cache_config();
+        let lib = crate::cache::CacheConfig::default();
+        assert_eq!(d.refresh_ahead_ratio, 0.0);
+        assert_eq!(d.refresh_ahead_ratio, lib.refresh_ahead_ratio);
+        assert_eq!(
+            d.refresh_ahead_claim_timeout,
+            lib.refresh_ahead_claim_timeout
+        );
+    }
+
+    /// `[cache] refresh_ahead_ratio` is 0 (off) or in (0, 1) and
+    /// `refresh_ahead_claim_timeout_ms` in 1..=3600000, validated whether or
+    /// not the cache is enabled; every error names its key.
+    #[test]
+    fn cache_refresh_ahead_validation_names_the_key() {
+        type Breaker = fn(&mut CacheToml);
+        let cases: Vec<(&str, Breaker)> = vec![
+            ("cache.refresh_ahead_ratio", |c| c.refresh_ahead_ratio = 1.0),
+            ("cache.refresh_ahead_ratio", |c| c.refresh_ahead_ratio = 1.5),
+            ("cache.refresh_ahead_ratio", |c| {
+                c.refresh_ahead_ratio = -0.2
+            }),
+            ("cache.refresh_ahead_ratio", |c| {
+                c.refresh_ahead_ratio = f64::NAN
+            }),
+            ("cache.refresh_ahead_ratio", |c| {
+                c.refresh_ahead_ratio = f64::INFINITY
+            }),
+            ("cache.refresh_ahead_claim_timeout_ms", |c| {
+                c.refresh_ahead_claim_timeout_ms = 0
+            }),
+            ("cache.refresh_ahead_claim_timeout_ms", |c| {
+                c.refresh_ahead_claim_timeout_ms = REFRESH_AHEAD_CLAIM_TIMEOUT_MS_CEILING + 1
+            }),
+        ];
+        for enabled in [false, true] {
+            for (key, brk) in &cases {
+                let mut config = ProxyConfig::default();
+                config.add_node("localhost:5432", "primary").unwrap();
+                config.cache.enabled = enabled;
+                brk(&mut config.cache);
+                let err = config.validate().unwrap_err().to_string();
+                assert!(err.contains(key), "enabled={enabled}: {err} lacks {key}");
+            }
+        }
+        for (ratio, timeout) in [
+            (0.0, 1),
+            (0.01, 5000),
+            (0.8, REFRESH_AHEAD_CLAIM_TIMEOUT_MS_CEILING),
+            (0.999, 1),
+        ] {
+            let mut config = ProxyConfig::default();
+            config.add_node("localhost:5432", "primary").unwrap();
+            config.cache.enabled = true;
+            config.cache.refresh_ahead_ratio = ratio;
+            config.cache.refresh_ahead_claim_timeout_ms = timeout;
+            config.validate().unwrap();
+        }
+        let node = "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n";
+        let (config, ignored) = deserialize_reporting_ignored_paths(&format!(
+            "[cache]\nrefresh_ahead_ratio = 0.75\nrefresh_ahead_claim_timeout_ms = 250\n{node}"
+        ))
+        .unwrap();
+        assert!(ignored.is_empty(), "{ignored:?}");
+        assert_eq!(config.cache.refresh_ahead_ratio, 0.75);
+        assert_eq!(config.cache.refresh_ahead_claim_timeout_ms, 250);
+        assert!(known_config_keys().contains("cache.refresh_ahead_ratio"));
+        assert!(known_config_keys().contains("cache.refresh_ahead_claim_timeout_ms"));
     }
 
     #[test]
@@ -7626,6 +7763,12 @@ exclude = true
             ("cache.exclude_columns", "exclude = true"),
             ("cache.excluded_tables", "cache.exclude_tables"),
             ("cache.tables.0.ttl_sec", "cache.tables.0.ttl_secs"),
+            ("cache.refresh_ahead", "cache.refresh_ahead_ratio"),
+            ("cache.prefetch_enabled", "cache.refresh_ahead_ratio"),
+            (
+                "cache.refresh_ahead_timeout_ms",
+                "cache.refresh_ahead_claim_timeout_ms",
+            ),
         ] {
             let hint = ignored_key_hint(path, &known).unwrap_or_default();
             assert!(hint.contains(needle), "{path}: {hint:?} lacks {needle:?}");

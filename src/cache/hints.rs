@@ -6,6 +6,7 @@
 //!
 //! ```sql
 //! /* helios:cache=skip */          -- Neither look up nor store this read
+//! /* helios:cache_refresh */       -- Look up nothing; store the fresh result
 //! /* helios:cache_ttl=60 */        -- A shorter TTL (seconds, or 5m, 1h, ...)
 //! /* helios:cache=semantic */      -- Use the semantic tier (L3) too
 //! /*helios:cache=semantic,cache_ttl=30*/  -- several, comma-separated
@@ -25,13 +26,18 @@
 //!
 //! `QueryCache` acts on `cache=skip` (also `bypass` and `none`, which the
 //! routing parser reads as a skip too and strips, and `no`, `off`, `false`,
-//! `disable`), `cache_ttl`/`ttl` (seconds, or `500ms`, `5m`, `1h`,
+//! `disable`), `cache_refresh` (also `refresh`, `nocache_read`, and
+//! `cache=refresh`, `cache=force`, `cache=update`, which the routing parser
+//! reads as a refresh and strips): no tier is looked up, the read goes to the
+//! backend, and its result is stored as a miss's is (every store guard
+//! applies), replacing the shared entry and this text's L1 copy; a skip wins
+//! over it. Also `cache_ttl`/`ttl` (seconds, or `500ms`, `5m`, `1h`,
 //! `1d`), which can only shorten the TTL the configuration gives the read
 //! and also bounds what the read is served (an entry older than it is a miss
 //! on every tier, refilled; a zero TTL is `cache=skip`), and
 //! `cache=semantic` (also `semantic`,
-//! `cache=l3`, `cache=vector`). `cache_tables`, `cache_refresh` and
-//! `cache=l1|l2|all` are parsed into [`CacheHint`] and have no effect.
+//! `cache=l3`, `cache=vector`). `cache_tables` and `cache=l1|l2|all` are
+//! parsed into [`CacheHint`] and have no effect.
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -52,7 +58,8 @@ pub struct CacheHint {
     /// Override table dependencies
     pub tables: Option<Vec<String>>,
 
-    /// Force cache refresh (bypass read, update cache)
+    /// Force a refresh: no tier is looked up, the result is stored
+    /// (`cache_refresh`, `refresh`, `nocache_read`, `cache=refresh|force|update`).
     pub refresh: bool,
 
     /// Specific cache level to use
@@ -169,6 +176,12 @@ fn apply_hint(hint: &mut CacheHint, key: &str, value: Option<&str>) {
                     }
                     "semantic" | "l3" | "vector" => {
                         hint.semantic_cache = true;
+                    }
+                    // The routing parser's refresh words: it strips such a
+                    // comment too, and the cache reads it back from the
+                    // client's text.
+                    "refresh" | "force" | "update" => {
+                        hint.refresh = true;
                     }
                     "l1" | "hot" | "local" => {
                         hint.level = Some(CacheLevelHint::L1Only);
@@ -562,6 +575,54 @@ mod tests {
                 !routing || cache,
                 "{v}: the routing parser skips, the cache does not"
             );
+        }
+    }
+
+    #[test]
+    fn every_refresh_spelling_is_a_refresh() {
+        for sql in [
+            "SELECT 1 /*helios:cache_refresh*/",
+            "SELECT 1 /* helios:refresh */",
+            "SELECT 1 /*helios:nocache_read*/",
+            "SELECT 1 /*helios:cache=refresh*/",
+            "SELECT 1 /*helios:cache=FORCE*/",
+            "SELECT 1 /*helios:cache=update*/",
+            "SELECT 1 /*helios:cache=semantic,cache_refresh*/",
+            "SELECT 1 -- helios:cache_refresh",
+        ] {
+            let hint = parse_cache_hints(sql);
+            assert!(hint.refresh && !hint.skip, "{sql}");
+        }
+        for sql in [
+            "SELECT 1",
+            "SELECT 1 /*helios:cache=semantic*/",
+            "SELECT 'helios:cache_refresh'",
+            "SELECT 1 /*helios:cache=refreshed*/",
+        ] {
+            assert!(!parse_cache_hints(sql).refresh, "{sql}");
+        }
+        // A skip and a refresh together: both are kept; the cache skips.
+        let hint = parse_cache_hints("SELECT 1 /*helios:cache=skip,cache_refresh*/");
+        assert!(hint.skip && hint.refresh);
+        // The client's text (routing hints stripped the forwarded one).
+        let mut forwarded = parse_cache_hints("SELECT 1");
+        forwarded.merge(parse_cache_hints("/*helios:cache=refresh*/ SELECT 1"));
+        assert!(forwarded.refresh);
+    }
+
+    /// Every `cache=` value the routing parser reads as a refresh (and
+    /// strips) is a refresh here too.
+    #[cfg(feature = "routing-hints")]
+    #[test]
+    fn both_parsers_agree_on_refreshes() {
+        use crate::routing::hint_parser::CacheBehavior;
+        use std::str::FromStr;
+        for v in [
+            "refresh", "force", "update", "Refresh", "FORCE", "skip", "normal", "semantic", "l1",
+        ] {
+            let routing = CacheBehavior::from_str(v).ok() == Some(CacheBehavior::Refresh);
+            let cache = parse_cache_hints(&format!("SELECT 1 /*helios:cache={v}*/")).refresh;
+            assert_eq!(routing, cache, "{v}");
         }
     }
 

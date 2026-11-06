@@ -208,7 +208,7 @@ pub fn manifest(config: &ProxyConfig) -> Vec<Capability> {
 /// config key path whose promise the binary cannot keep.
 pub fn unavailable_enabled(config: &ProxyConfig) -> Vec<&'static str> {
     // (config key path, enabled now, compiled into this build)
-    let checks: [(&'static str, bool, bool); 18] = [
+    let checks: [(&'static str, bool, bool); 19] = [
         (
             "cache.enabled",
             config.cache.enabled,
@@ -223,6 +223,11 @@ pub fn unavailable_enabled(config: &ProxyConfig) -> Vec<&'static str> {
             "cache.l2_compression",
             config.cache.enabled
                 && config.cache.l2_compression != crate::config::CacheCompression::None,
+            cfg!(feature = "query-cache"),
+        ),
+        (
+            "cache.refresh_ahead_ratio",
+            config.cache.enabled && config.cache.refresh_ahead_ratio > 0.0,
             cfg!(feature = "query-cache"),
         ),
         (
@@ -367,5 +372,13 @@ mod tests {
         );
         config.cache.enabled = false;
         assert!(!unavailable_enabled(&config).contains(&"cache.l2_compression"));
+        // So is refresh-ahead.
+        config.cache.refresh_ahead_ratio = 0.8;
+        assert!(!unavailable_enabled(&config).contains(&"cache.refresh_ahead_ratio"));
+        config.cache.enabled = true;
+        assert_eq!(
+            unavailable_enabled(&config).contains(&"cache.refresh_ahead_ratio"),
+            !cfg!(feature = "query-cache")
+        );
     }
 }

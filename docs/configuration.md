@@ -889,6 +889,8 @@ ttl_secs = 10
 | `semantic_embedding_concurrency` | usize | `4` | Background embedding calls in flight at most. When none is free the call is skipped (`semantic_embed_skipped`), nothing waits. 1–256. |
 | `semantic_embedding_retry_secs` | u64 | `30` | After an endpoint failure (error, timeout, non-2xx, bad JSON, wrong dimension, oversized body) no embedding call is made for this long; then exactly one call probes the endpoint. Exact canonical hits continue meanwhile. 1–86400. |
 | `semantic_max_statement_bytes` | usize | `16384` | Longest statement the semantic tier's grammar is parsed for. A longer one is not parsed at all (parsing takes about a hundred times the statement's size, transiently): it never uses the tier (counted in `semantic_ineligible` when hinted) and a `[[cache.tables]]` TTL longer than `ttl_secs` never applies to it (a shorter one still does). Applies whether or not the tier is enabled. Range 1..=1048576 (1 MiB): a statement at the bound parses in about 100 MiB on the connection's task, so the bound stays far below `[limits] max_pending_bytes`. |
+| `refresh_ahead_ratio` | f64 | `0.0` | Refresh-ahead ([below](#refresh-ahead)): once a shared (L2) entry's age reaches this fraction of its TTL, exactly one read of it is treated as a miss and refills it on its own backend connection, while every other read is still served the entry until the refill lands or the TTL ends. What it buys: no expiry stampede on hot keys, and no latency cliff at expiry. What it costs: one extra backend read per hot entry per TTL (refilled every ratio × TTL instead of every TTL). `0` = off (the lookup pays one branch); otherwise in (0, 1), e.g. `0.8`. Validated whether or not the cache is enabled; with `enabled = false` it only logs a warning. |
+| `refresh_ahead_claim_timeout_ms` | u64 | `5000` | How long a refresh-ahead claim holds: a claimant whose refill has neither been stored nor failed by then (a slow statement, a lost task) is taken over by the next read that finds the entry due, so a lost claimant never blocks refreshes (counted as abandoned). 1–3600000. |
 
 Every key is validated at startup whether or not its tier is enabled, and an error names
 the key. **`[cache]` is applied at startup only:** a SIGHUP that changes it keeps the
@@ -1304,6 +1306,50 @@ shorter (found by the same fail-closed text scan, comments and literals included
 that table's TTL. A longer table TTL never extends an edge entry. This holds whether or
 not `[cache]` itself is enabled.
 
+### Refresh-ahead
+
+Without it, a hot key's entry ends for every reader at once: each connection's L1 copy
+and the shared L2 entry expire together, and every client that reads the key in the next
+round trip misses and runs the statement on the backend (a stampede), each paying the full
+backend latency. With `refresh_ahead_ratio = r` (0 < r < 1), the first read that finds an
+L1 or L2 entry at least r × its own TTL old (the TTL a `cache_ttl` hint or a
+`[[cache.tables]]` TTL gave it) **claims its refill**: that one read is treated as a miss
+— it bypasses its own L1 copy, runs on its own backend connection, and its result is
+stored through the normal store path (every guard applies: `max_result_bytes`, the
+capture ceiling, exclusions, the C-02 write generation taken when the fill starts),
+replacing the entry. Every other read keeps being served the current entry until the
+refill lands or the entry's TTL ends. So:
+
+- the backend runs a hot statement once per refresh window instead of once per client at
+  expiry, and a key read at least once between its refresh point and its end is refilled
+  before it ends, so its readers see no expiry miss (unless the refill takes longer than
+  the TTL left);
+- an entry nobody reads after its refresh point is not refilled: it expires as before.
+  There is no background work and no proxy-owned connection: the refill is a client's own
+  read, under that client's credentials and session;
+- the cost is one extra backend read per hot entry per TTL (an entry refreshed at
+  `0.8` is refilled every 0.8 × TTL instead of every TTL). What a read is served between
+  the refresh point and the refill is never older than without refresh-ahead.
+
+**L1 copies.** A connection whose L1 copy is past the refresh point checks the shared
+entry on each read (the L2 lookup an L1 hit otherwise skips) until it picks up the refill
+from L2; until the refill lands it is served its own copy. A connection that does not read
+the key in that window keeps its old copy, which expires on its own TTL; its next read then
+takes the refill from L2. L3 (semantic) entries are not refreshed ahead: they expire on
+their TTL. Refresh-ahead needs L2, which the daemon always runs.
+
+**Claims.** A claim ends when the claimant's refill is stored (counted in
+`heliosdb_proxy_cache_refresh_ahead_completed_total`), or when it is not stored for any
+reason — an error response, a result over `max_result_bytes` or the capture ceiling, a
+write that raced the fetch, a standby's answer, a client that went away (counted in
+`heliosdb_proxy_cache_refresh_ahead_abandoned_total`); the next read past the refresh point
+then claims again. A claim older than `refresh_ahead_claim_timeout_ms` is taken over by the
+next read that finds the entry due (counted as abandoned), so a lost claimant never blocks
+refreshes; its refill is still stored if it arrives. Claims are counted in
+`heliosdb_proxy_cache_refresh_ahead_claims_total` (each is also a miss); JSON
+`query_cache.refresh_ahead` on `/metrics`. `[cache]` is read at startup, so a new ratio
+takes a restart.
+
 ### Cache hints
 
 Hints are SQL block comments `/*helios:key=value,…*/`, read only outside string literals
@@ -1322,8 +1368,9 @@ the tenant filter the proxy appends to a SELECT without `WHERE`. The cache acts 
 | `cache=skip` (also `bypass`, `none`, `no`, `off`, `false`, `disable`) | Neither look up nor store this read. `bypass` and `none` are the routing parser's words for it too, which strips them (below). |
 | `cache_ttl=N` / `ttl=N` (seconds, or `500ms`, `5m`, `1h`, `1d`) | A shorter TTL for this result; a longer one is capped at the configured TTL. It also bounds what the read is served: an entry older than `N` (stored by an unhinted read, or under a longer hint) is a miss on every tier, and the result is fetched and stored with the shorter TTL. A zero TTL (`0`, `0ms`) means "always fresh" and acts as `cache=skip` (nothing looked up, captured or stored, so the entry unhinted reads share stays). A value too large or unparsable is ignored. |
 | `cache=semantic` (also `semantic`, `cache=l3`, `cache=vector`) | Use the semantic tier (with `semantic_enabled`). |
+| `cache_refresh` (also `refresh`, `nocache_read`, `cache=refresh`, `cache=force`, `cache=update`) | Look nothing up on any tier: the read goes to the backend and its result is stored as a miss's is, every guard included (a cacheable read outside a transaction, exclusions, `max_result_bytes`, a write racing the fetch), replacing the shared L2 entry, this text's L1 copy on this connection and, with `cache=semantic`, its L3 entry. Other connections' L1 copies, and this connection's copy under another text of the statement, are served until their TTL ends (or, with [refresh-ahead](#refresh-ahead), until they pick the refill up past their refresh point). With `cache=skip` it is a skip. Counted in `heliosdb_proxy_cache_refresh_hint_total`, not as a miss. `cache=refresh`, `force` and `update` are the routing parser's refresh words too, which it strips (so a leading `/*helios:cache=refresh*/` works with `[routing_hints]`; a leading bare `cache_refresh` does not, below). |
 
-`cache_tables`, `cache_refresh` and `cache=l1|l2|all` are parsed and have no effect.
+`cache_tables` and `cache=l1|l2|all` are parsed and have no effect.
 Placement: a hint **after** the statement always works (`SELECT … /*helios:cache=skip*/`).
 A **leading** hint works when `[routing_hints] enabled` (with the default `strip_hints`)
 and the key is one the routing parser knows (`cache=…`, `cache_ttl=<seconds>`): the

@@ -412,6 +412,9 @@ Besides the counters above, the body carries (P-03):
 | `heliosdb_proxy_cache_stale_rejected_total` | counter | — | Hits refused because a table they read was written since the fetch. |
 | `heliosdb_proxy_cache_fills_raced_total` | counter | — | Fills not stored because a write raced their backend fetch. |
 | `heliosdb_proxy_cache_unseen_write_invalidations_total` | counter | — | Whole-cache invalidations for a simple-query string with a `;` inside text PostgreSQL and HeliosDB-Nano/Lite read differently, which may end a statement the proxy's journal capture does not see; see [Query Cache](configuration.md#query-cache-cache). |
+| `heliosdb_proxy_cache_refresh_hint_total` | counter | — | Reads hinted `cache_refresh` (also `refresh`, `nocache_read`, `cache=refresh`): no tier looked up, the result stored (not counted as misses); see [Cache hints](configuration.md#cache-hints). |
+| `heliosdb_proxy_cache_refresh_ahead_claims_total` | counter | — | Reads that claimed the refill of an entry past `[cache] refresh_ahead_ratio` of its TTL (each is also a miss); see [Refresh-ahead](configuration.md#refresh-ahead). |
+| `heliosdb_proxy_cache_refresh_ahead_completed_total`, `_abandoned_total` | counter | — | Claims whose refill was stored, and claims that ended without a stored refill (error response, oversized result, a write racing the fetch, a standby's answer, a lost client) or were taken over after `refresh_ahead_claim_timeout_ms`. `claims − completed − abandoned` are in flight. |
 | `heliosdb_proxy_cache_retained_bytes` | gauge | `tier` | Bytes the query cache retains per tier (L1 includes per-entry overhead; L3 counts entries plus remembered embeddings). |
 | `heliosdb_proxy_cache_evictions_total` | counter | `tier` = `l1`, `l2`, `l3` | Entries a tier dropped to stay within its bounds: L1 `[cache] l1_max_entries` / `l1_max_bytes` (per connection, summed), L2 `l2_max_bytes` (including the expired and write-retired entries an eviction pass sheds), L3 `semantic_max_entries` / `semantic_max_bytes` / `semantic_max_variants`. Not counted: expiry found by a lookup, hits refused as stale (`_stale_rejected_total`), replacements of the same key. |
 | `heliosdb_proxy_cache_entries` | gauge | `tier` | Entries the query cache retains per tier (L1: every connection's). |
@@ -458,7 +461,9 @@ Histogram buckets are `[limits] latency_buckets_ms`, exported in seconds as `_bu
 `query_cache.semantic` is the semantic tier's state (`endpoint`, `embed_requests`,
 `embed_errors`, `embed_skipped`, `embed_seconds_sum`, `embed_seconds_count`,
 `approximate_hits`, `ineligible`, `too_large`, `entries`, `embeddings`), `null` when the
-tier is off; the server counters carry `cache_excluded`, `cache_catalog_skipped`,
+tier is off; `query_cache.refresh_hint` and `query_cache.refresh_ahead` (`claims`,
+`completed`, `abandoned`; zeros while refresh-ahead is off) are the refresh counters above;
+the server counters carry `cache_excluded`, `cache_catalog_skipped`,
 `cache_time_travel_skipped` and `cache_ambiguous_skipped`.
 
 > This is not directly scrapable as raw Prometheus text — the payload is JSON with the exposition string in `text`, so a scraper must unwrap the `text` field. This endpoint is served unconditionally; there is no separate build flag that changes its format (the `observability` feature only pulls in the `prometheus`/`opentelemetry` crates and wires no exporter — see the feature-flags reference).
