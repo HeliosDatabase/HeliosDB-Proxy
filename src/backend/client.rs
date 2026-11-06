@@ -25,6 +25,11 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+/// Bytes moved at a time when a frame is streamed rather than held whole: the
+/// `COPY` data chunk, and the drain of an oversized DataRow (whose buffer
+/// then never grows past this).
+const STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
 /// Backend connection parameters.
 #[derive(Debug, Clone)]
 pub struct BackendConfig {
@@ -450,10 +455,9 @@ impl BackendClient {
         }
 
         // 3. Stream the payload as CopyData frames, then CopyDone.
-        const CHUNK: usize = 64 * 1024;
         let mut off = 0;
         while off < data.len() {
-            let end = (off + CHUNK).min(data.len());
+            let end = (off + STREAM_CHUNK_BYTES).min(data.len());
             let mut p = BytesMut::with_capacity(end - off);
             p.extend_from_slice(&data[off..end]);
             stream
@@ -563,7 +567,37 @@ impl BackendClient {
         let mut stored_bytes: usize = 0;
 
         loop {
-            let msg = read_one(stream, &mut buffer, &codec).await?;
+            let msg = match bounds {
+                None => read_one(stream, &mut buffer, &codec).await?,
+                Some(b) => {
+                    // The most payload a DataRow may carry and still fit the
+                    // remaining byte budget; 0 once a cap is reached, so
+                    // every further row is drained, not buffered.
+                    let limit = if truncation.is_truncated() || rows.len() >= b.max_rows {
+                        0
+                    } else {
+                        b.max_bytes
+                            .saturating_sub(stored_bytes)
+                            .saturating_add(data_row_overhead(columns.len()))
+                    };
+                    match read_one_bounded(stream, &mut buffer, &codec, limit).await? {
+                        Some(msg) => msg,
+                        None => {
+                            // A row drained unbuffered: it is past a cap
+                            // (the first cap it hit is named, as for a row
+                            // read whole).
+                            if !truncation.is_truncated() {
+                                if rows.len() >= b.max_rows {
+                                    truncation.row_limit_hit = true;
+                                } else {
+                                    truncation.byte_limit_hit = true;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+            };
             match msg.msg_type {
                 // Both 'T' (RowDescription) and 'C' (CommandComplete)
                 // may appear; from_tag conflates T with… nothing. It
@@ -909,32 +943,108 @@ async fn read_one(
     codec: &ProtocolCodec,
 ) -> BackendResult<Message> {
     loop {
-        if let Some(mut msg) = codec
-            .decode_message(buffer)
-            .map_err(|e| BackendError::Protocol(e.to_string()))?
-        {
-            // The shared tag decoder is direction-agnostic and resolves the
-            // tags that collide between client and server frames to their
-            // CLIENT-side meaning. `read_one` only ever reads SERVER frames,
-            // so remap those collisions to their server semantics:
-            //   'S' Sync->ParameterStatus, 'D' Describe->DataRow,
-            //   'E' Execute->ErrorResponse, 'C' Close->CommandComplete.
-            msg.msg_type = match msg.msg_type {
-                MessageType::Sync => MessageType::ParameterStatus,
-                MessageType::Describe => MessageType::DataRow,
-                MessageType::Execute => MessageType::ErrorResponse,
-                MessageType::Close => MessageType::CommandComplete,
-                other => other,
-            };
+        if let Some(msg) = decode_server_frame(buffer, codec)? {
             return Ok(msg);
         }
-        let mut tmp = vec![0u8; 4096];
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
+        read_more(stream, buffer).await?;
+    }
+}
+
+/// Cell framing bytes of a DataRow of `columns` cells that are not cell text:
+/// the 2-byte cell count and the 4-byte length word of each cell (NULL
+/// included). A row's text bytes are its payload minus this, so a payload
+/// past `remaining + data_row_overhead` cannot fit the remaining byte budget.
+fn data_row_overhead(columns: usize) -> usize {
+    2 + 4 * columns
+}
+
+/// Like `read_one`, for a bounded read: a DataRow whose payload is longer
+/// than `max_data_row_payload` is not read into `buffer`. Its payload is
+/// drained `STREAM_CHUNK_BYTES` at a time and `None` is returned, so the
+/// connection stays in sync and the frame costs no more memory than one chunk.
+async fn read_one_bounded(
+    stream: &mut Stream,
+    buffer: &mut BytesMut,
+    codec: &ProtocolCodec,
+    max_data_row_payload: usize,
+) -> BackendResult<Option<Message>> {
+    loop {
+        // The header alone decides: a DataRow header is `D`, then the frame
+        // length (which includes its own 4 bytes).
+        if buffer.len() >= 5 && buffer[0] == b'D' {
+            let declared = u32::from_be_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]);
+            let payload = (declared as usize).saturating_sub(4);
+            if payload > max_data_row_payload {
+                buffer.advance(5);
+                drain_payload(stream, buffer, payload).await?;
+                return Ok(None);
+            }
+        }
+        if let Some(msg) = decode_server_frame(buffer, codec)? {
+            return Ok(Some(msg));
+        }
+        read_more(stream, buffer).await?;
+    }
+}
+
+/// Discard the next `left` bytes of the stream. `buffer` holds the bytes read
+/// so far and never grows past `STREAM_CHUNK_BYTES` beyond them.
+async fn drain_payload(
+    stream: &mut Stream,
+    buffer: &mut BytesMut,
+    mut left: usize,
+) -> BackendResult<()> {
+    loop {
+        if buffer.len() >= left {
+            buffer.advance(left);
+            return Ok(());
+        }
+        left -= buffer.len();
+        buffer.clear();
+        buffer.reserve(left.min(STREAM_CHUNK_BYTES));
+        if stream.read_buf(buffer).await? == 0 {
             return Err(BackendError::Closed);
         }
-        buffer.extend_from_slice(&tmp[..n]);
     }
+}
+
+/// Read more bytes from the stream into `buffer`.
+async fn read_more(stream: &mut Stream, buffer: &mut BytesMut) -> BackendResult<()> {
+    let mut tmp = vec![0u8; 4096];
+    let n = stream.read(&mut tmp).await?;
+    if n == 0 {
+        return Err(BackendError::Closed);
+    }
+    buffer.extend_from_slice(&tmp[..n]);
+    Ok(())
+}
+
+/// Decode one complete server frame from `buffer`, if it holds one, with
+/// the tags the client-side decoder resolves to their server meaning.
+fn decode_server_frame(
+    buffer: &mut BytesMut,
+    codec: &ProtocolCodec,
+) -> BackendResult<Option<Message>> {
+    if let Some(mut msg) = codec
+        .decode_message(buffer)
+        .map_err(|e| BackendError::Protocol(e.to_string()))?
+    {
+        // The shared tag decoder is direction-agnostic and resolves the
+        // tags that collide between client and server frames to their
+        // CLIENT-side meaning. The readers only ever read SERVER frames,
+        // so remap those collisions to their server semantics:
+        //   'S' Sync->ParameterStatus, 'D' Describe->DataRow,
+        //   'E' Execute->ErrorResponse, 'C' Close->CommandComplete.
+        msg.msg_type = match msg.msg_type {
+            MessageType::Sync => MessageType::ParameterStatus,
+            MessageType::Describe => MessageType::DataRow,
+            MessageType::Execute => MessageType::ErrorResponse,
+            MessageType::Close => MessageType::CommandComplete,
+            other => other,
+        };
+        return Ok(Some(msg));
+    }
+    Ok(None)
 }
 
 async fn handle_auth(
@@ -1755,5 +1865,47 @@ mod tests {
             "SELECT 0"
         );
         backend.await.unwrap();
+    }
+
+    /// The bounded reader drains an oversized DataRow through a chunk-sized
+    /// buffer: the buffer never holds the 64 MiB payload, and the next frame
+    /// is read whole.
+    #[tokio::test]
+    async fn an_oversized_row_is_drained_through_a_chunk_sized_buffer() {
+        const HUGE_CELL: usize = 64 * 1024 * 1024;
+        let (mut client, mut peer) = journal_replay_pair().await;
+        let writer = tokio::spawn(async move {
+            peer.write_u8(b'D').await.unwrap();
+            peer.write_u32((2 + 4 + HUGE_CELL + 4) as u32)
+                .await
+                .unwrap();
+            peer.write_u16(1).await.unwrap();
+            peer.write_u32(HUGE_CELL as u32).await.unwrap();
+            let chunk = vec![b'x'; STREAM_CHUNK_BYTES];
+            let mut left = HUGE_CELL;
+            while left > 0 {
+                let take = left.min(chunk.len());
+                peer.write_all(&chunk[..take]).await.unwrap();
+                left -= take;
+            }
+            journal_replay_reply(&mut peer, b'C', b"SELECT 1\0").await;
+        });
+        let codec = ProtocolCodec::new();
+        let mut buffer = BytesMut::new();
+        let drained = read_one_bounded(&mut client.stream, &mut buffer, &codec, 1024)
+            .await
+            .unwrap();
+        assert!(drained.is_none(), "the row is drained, not returned");
+        assert!(
+            buffer.capacity() <= 2 * STREAM_CHUNK_BYTES,
+            "the frame buffer grew to {} bytes",
+            buffer.capacity()
+        );
+        let next = read_one_bounded(&mut client.stream, &mut buffer, &codec, 1024)
+            .await
+            .unwrap()
+            .expect("the CommandComplete after the drained row");
+        assert_eq!(next.msg_type, MessageType::CommandComplete);
+        writer.await.unwrap();
     }
 }

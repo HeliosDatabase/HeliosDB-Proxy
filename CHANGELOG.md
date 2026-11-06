@@ -200,6 +200,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cache/heatmap/record_hit_{off,on,contended_8}`.
 
 ### Fixed
+- **Bounded backend reads drain an oversized row without allocating it (Sprinter 2a43c1f4d4d7).**
+  The bounded readers behind the MCP, HTTP `/sql` and GraphQL gateways read a whole
+  frame into memory before the result caps applied, so one huge DataRow allocated
+  without bound even with `max_result_bytes` set. A DataRow whose payload cannot fit the
+  call's remaining byte budget is now drained in 64 KiB chunks and the cap is reported.
+  The connection stays in sync. The unbounded `simple_query` is unchanged.
+
 - **EXPLAIN ANALYZE writes and gateway writes invalidate every cache (Sprinter 73f84de3ded3).**
   `EXPLAIN ANALYZE UPDATE t ...` (also `ANALYSE`, `EXPLAIN (ANALYZE, ...)`) was classified
   as a read: the C-02 table generations were not bumped although the write ran, and a
