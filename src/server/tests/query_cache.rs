@@ -1977,9 +1977,9 @@ mod gateway_writes {
     use super::*;
 
     /// The read the relay cache was prefilled with.
-    const READ: &str = "SELECT value FROM widgets";
+    pub(super) const READ: &str = "SELECT value FROM widgets";
     /// A write of its table.
-    const WRITE: &str = "UPDATE widgets SET value = 2 WHERE id = 1";
+    pub(super) const WRITE: &str = "UPDATE widgets SET value = 2 WHERE id = 1";
     /// Marks a statement the gateway backend fails.
     const FAIL: &str = "/* fail */";
 
@@ -2072,7 +2072,7 @@ mod gateway_writes {
     }
 
     /// A gateway backend on a loopback port, and the texts it ran.
-    async fn start_gateway_backend() -> (u16, Arc<parking_lot::Mutex<Vec<String>>>) {
+    pub(super) async fn start_gateway_backend() -> (u16, Arc<parking_lot::Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -2082,7 +2082,7 @@ mod gateway_writes {
 
     /// One HTTP exchange with a gateway connection handler: `serve` gets the
     /// accepted socket and its peer; the raw response is returned.
-    async fn http_exchange<F, Fut>(serve: F, request: String) -> String
+    pub(super) async fn http_exchange<F, Fut>(serve: F, request: String) -> String
     where
         F: FnOnce(TcpStream, SocketAddr) -> Fut,
         Fut: std::future::Future<Output = crate::Result<()>> + Send + 'static,
@@ -2099,7 +2099,7 @@ mod gateway_writes {
         String::from_utf8(buf).unwrap()
     }
 
-    fn post(path: &str, body: &str) -> String {
+    pub(super) fn post(path: &str, body: &str) -> String {
         format!(
             "POST {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
@@ -2279,5 +2279,414 @@ mod gateway_writes {
             .await;
         let (node, got) = relay.query(READ).await;
         assert_eq!((node, got), (None, cached_reply()), "still cached");
+    }
+}
+
+/// The MCP tool-result cache through the gateway (Sprinter 20bcc218385f):
+/// served on a repeat, retired by writes through the PG-wire relay (with or
+/// without `[cache]`), isolated per principal and tenant, behind the request
+/// policies, and absent (no `_meta`) when off.
+mod mcp_tool_cache {
+    use super::gateway_writes::{http_exchange, post, start_gateway_backend, READ, WRITE};
+    use super::*;
+
+    /// A relay whose config also runs the MCP gateway with its tool cache;
+    /// `[cache]` as `query_cache` says (nothing prefilled).
+    async fn relay_with_tool_cache(
+        query_cache: bool,
+        queries: usize,
+        tune: impl FnOnce(&mut ProxyConfig),
+    ) -> (Relay, tokio::task::JoinHandle<Vec<String>>) {
+        Relay::start(
+            move |c| {
+                c.cache.enabled = query_cache;
+                c.mcp.enabled = true;
+                c.mcp.tool_cache_enabled = true;
+                tune(c);
+            },
+            &[],
+            queries,
+        )
+        .await
+    }
+
+    /// The daemon's MCP gateway on a gateway backend at `port`: its policy
+    /// (or `policy`) and tool cache, `cfg` tuned.
+    fn mcp_gateway(
+        relay: &Relay,
+        port: u16,
+        policy: Option<crate::gateway_policy::GatewayPolicy>,
+        tune: impl FnOnce(&mut crate::config::McpConfig),
+    ) -> Arc<crate::mcp::McpShared> {
+        let mut cfg = crate::config::McpConfig {
+            enabled: true,
+            backend_port: port,
+            read_only: false,
+            tool_cache_enabled: true,
+            ..Default::default()
+        };
+        tune(&mut cfg);
+        let pool: crate::gateway_pool::SharedBackendPool =
+            Arc::new(crate::gateway_pool::BackendClientPool::new(0));
+        crate::mcp::McpServer::new(cfg, None, pool)
+            .with_policy(Arc::new(
+                policy.unwrap_or_else(|| relay.server.gateway_policy()),
+            ))
+            .with_tool_cache(relay.server.state.mcp_tool_cache.clone())
+            .into_shared()
+    }
+
+    /// One `tools/call` (with `headers`): the JSON-RPC response.
+    async fn call(
+        shared: &Arc<crate::mcp::McpShared>,
+        headers: &str,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments }
+        })
+        .to_string();
+        let request = post("/", &body).replacen("\r\n", &format!("\r\n{headers}"), 1);
+        let shared = shared.clone();
+        let resp = http_exchange(
+            move |stream, peer| crate::mcp::McpServer::handle_connection(stream, peer, shared),
+            request,
+        )
+        .await;
+        let (_, json) = resp.split_once("\r\n\r\n").expect("an HTTP body");
+        serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}: {resp}"))
+    }
+
+    async fn query(shared: &Arc<crate::mcp::McpShared>, sql: &str) -> serde_json::Value {
+        call(shared, "", "query", serde_json::json!({ "sql": sql })).await
+    }
+
+    fn cache_meta(resp: &serde_json::Value) -> &serde_json::Value {
+        &resp["result"]["_meta"]["heliosdb.com/cache"]
+    }
+
+    /// A repeated read is served from the tool cache with the same content;
+    /// a PG-wire write of its table retires it, with `[cache]` off: the
+    /// generations exist for the tool cache alone and the relay captures
+    /// writes for it.
+    #[tokio::test]
+    async fn a_pg_wire_write_retires_a_tool_cache_entry_without_the_query_cache() {
+        let (mut relay, backend) = relay_with_tool_cache(false, 1, |_| {}).await;
+        assert!(relay.server.state.query_cache.is_none());
+        assert!(relay.server.state.table_generations.is_some());
+        assert!(ProxyServer::cache_needs_capture(&relay.server.state));
+        let (port, seen) = start_gateway_backend().await;
+        let mcp = mcp_gateway(&relay, port, None, |_| {});
+
+        let miss = query(&mcp, READ).await;
+        assert_eq!(miss["result"]["isError"], false, "{miss}");
+        assert_eq!(
+            *cache_meta(&miss),
+            serde_json::json!({"hit": false, "stored": true})
+        );
+        let hit = query(&mcp, READ).await;
+        assert_eq!(cache_meta(&hit)["hit"], true, "{hit}");
+        assert_eq!(hit["result"]["content"], miss["result"]["content"]);
+        assert_eq!(seen.lock().len(), 1, "the hit did not reach the backend");
+
+        relay.answered_by_backend(WRITE).await;
+        let after = query(&mcp, READ).await;
+        assert_eq!(cache_meta(&after)["hit"], false, "{after}");
+        assert_eq!(seen.lock().len(), 2);
+        drop(relay);
+        assert_eq!(backend.await.unwrap(), [WRITE]);
+    }
+
+    /// With `[cache]` on too, the two caches share one clock: a PG-wire
+    /// write retires the tool cache's entry, and an MCP write retires both.
+    #[tokio::test]
+    async fn the_query_cache_and_the_tool_cache_share_the_generations() {
+        let (mut relay, backend) = relay_with_tool_cache(true, 1, |_| {}).await;
+        let generations = relay.server.state.table_generations.clone().unwrap();
+        assert!(Arc::ptr_eq(
+            &generations,
+            relay
+                .server
+                .state
+                .query_cache
+                .as_ref()
+                .unwrap()
+                .generations()
+        ));
+        let (port, seen) = start_gateway_backend().await;
+        let mcp = mcp_gateway(&relay, port, None, |_| {});
+        query(&mcp, READ).await;
+        assert_eq!(cache_meta(&query(&mcp, READ).await)["hit"], true);
+        relay.answered_by_backend(WRITE).await;
+        assert_eq!(cache_meta(&query(&mcp, READ).await)["hit"], false);
+        // An MCP write moves the shared generations.
+        let before = generations.generation_of(&["widgets".to_string()]);
+        let w = query(&mcp, WRITE).await;
+        assert_eq!(
+            *cache_meta(&w),
+            serde_json::json!({"hit": false, "stored": false, "skipped": "write"})
+        );
+        assert!(generations.generation_of(&["widgets".to_string()]) > before);
+        assert_eq!(cache_meta(&query(&mcp, READ).await)["hit"], false);
+        assert_eq!(seen.lock().len(), 4);
+        drop(relay);
+        assert_eq!(backend.await.unwrap(), [WRITE]);
+    }
+
+    /// DDL through the PG-wire listener (unknown scope: the global
+    /// generation) makes `list_tables` fresh; a table write does not.
+    #[tokio::test]
+    async fn ddl_through_the_relay_makes_list_tables_fresh() {
+        let (mut relay, _backend) = relay_with_tool_cache(false, 2, |_| {}).await;
+        let (port, seen) = start_gateway_backend().await;
+        let mcp = mcp_gateway(&relay, port, None, |_| {});
+        let list = || call(&mcp, "", "list_tables", serde_json::json!({}));
+        assert_eq!(cache_meta(&list().await)["stored"], true);
+        assert_eq!(cache_meta(&list().await)["hit"], true);
+        relay.answered_by_backend(WRITE).await;
+        assert_eq!(cache_meta(&list().await)["hit"], true, "a write is no DDL");
+        relay
+            .answered_by_backend("CREATE TABLE gadgets (id int)")
+            .await;
+        assert_eq!(cache_meta(&list().await)["hit"], false);
+        assert_eq!(seen.lock().len(), 2);
+    }
+
+    /// Two principals never share an entry, nor do two tenants of one.
+    #[tokio::test]
+    async fn principals_are_isolated() {
+        let (relay, _backend) = relay_with_tool_cache(false, 0, |_| {}).await;
+        let (port, seen) = start_gateway_backend().await;
+        let principal = |id: &str, token: &str| crate::config::McpPrincipal {
+            id: id.into(),
+            token: token.into(),
+        };
+        let mcp = mcp_gateway(&relay, port, None, |c| {
+            c.principals = vec![principal("etl", "t-etl"), principal("bi", "t-bi")];
+        });
+        let sql = serde_json::json!({ "sql": READ });
+        let as_etl = "Authorization: Bearer t-etl\r\n";
+        let as_bi = "Authorization: Bearer t-bi\r\n";
+        assert_eq!(
+            cache_meta(&call(&mcp, as_etl, "query", sql.clone()).await)["hit"],
+            false
+        );
+        assert_eq!(
+            cache_meta(&call(&mcp, as_bi, "query", sql.clone()).await)["hit"],
+            false
+        );
+        assert_eq!(
+            cache_meta(&call(&mcp, as_etl, "query", sql.clone()).await)["hit"],
+            true
+        );
+        assert_eq!(
+            cache_meta(&call(&mcp, as_bi, "query", sql).await)["hit"],
+            true
+        );
+        assert_eq!(seen.lock().len(), 2);
+        let usage = relay
+            .server
+            .state
+            .mcp_tool_cache
+            .as_ref()
+            .unwrap()
+            .owner_usage();
+        let owners: Vec<&str> = usage.iter().map(|u| u.principal.as_str()).collect();
+        assert_eq!(owners, ["bi", "etl"]);
+    }
+
+    #[cfg(feature = "multi-tenancy")]
+    #[tokio::test]
+    async fn tenants_are_isolated() {
+        use crate::multi_tenancy::{
+            IsolationStrategy, MultiTenancyConfig, TenantConfig, TenantId, TenantManagerBuilder,
+        };
+        let (relay, _backend) = relay_with_tool_cache(false, 0, |_| {}).await;
+        let tm = TenantManagerBuilder::new()
+            .config(MultiTenancyConfig {
+                enabled: true,
+                ..Default::default()
+            })
+            .build();
+        for t in ["acme", "globex"] {
+            tm.register_tenant(TenantConfig::new(
+                TenantId::new(t),
+                IsolationStrategy::row("public", "tid"),
+            ));
+        }
+        let policy = relay
+            .server
+            .gateway_policy()
+            .with_tenancy(Arc::new(tm), "X-Helios-Tenant".into());
+        let (port, seen) = start_gateway_backend().await;
+        let mcp = mcp_gateway(&relay, port, Some(policy), |c| {
+            c.tenant_header = "X-Helios-Tenant".into();
+        });
+        let sql = serde_json::json!({ "sql": READ });
+        let acme = "X-Helios-Tenant: acme\r\n";
+        let globex = "X-Helios-Tenant: globex\r\n";
+        assert_eq!(
+            cache_meta(&call(&mcp, acme, "query", sql.clone()).await)["hit"],
+            false
+        );
+        assert_eq!(
+            cache_meta(&call(&mcp, globex, "query", sql.clone()).await)["hit"],
+            false
+        );
+        assert_eq!(
+            cache_meta(&call(&mcp, acme, "query", sql).await)["hit"],
+            true
+        );
+        assert_eq!(
+            seen.lock().len(),
+            2,
+            "same text, another tenant: another entry"
+        );
+    }
+
+    /// A hit still consumes a rate-limit token: once the burst is spent the
+    /// cached read is refused like any other.
+    #[cfg(feature = "rate-limiting")]
+    #[tokio::test]
+    async fn hits_consume_rate_limit_tokens() {
+        let (relay, _backend) = relay_with_tool_cache(false, 0, |_| {}).await;
+        let limiter = Arc::new(crate::rate_limit::RateLimiter::new(
+            crate::rate_limit::RateLimitConfig {
+                enabled: true,
+                default_qps: 1,
+                default_burst: 2,
+                ..Default::default()
+            },
+        ));
+        let policy = relay
+            .server
+            .gateway_policy()
+            .with_rate_limiter(limiter, crate::config::RateLimitKeyBy::User);
+        let (port, seen) = start_gateway_backend().await;
+        let mcp = mcp_gateway(&relay, port, Some(policy), |_| {});
+        let mut refused = None;
+        for i in 0..20 {
+            let r = query(&mcp, READ).await;
+            if r["result"]["isError"] == true {
+                refused = Some((i, r));
+                break;
+            }
+        }
+        let (i, r) = refused.expect("the burst runs out");
+        assert!(
+            i >= 2,
+            "the miss and a hit were admitted, then the burst ran out"
+        );
+        assert!(
+            r["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("rate limit"),
+            "{r}"
+        );
+        assert!(
+            r["result"]["_meta"].is_null(),
+            "a refusal never reached the cache"
+        );
+        assert_eq!(
+            seen.lock().len(),
+            1,
+            "every admitted call after the first was a hit"
+        );
+    }
+
+    /// A refused statement never reaches the cache, `explain` is never
+    /// cached, and `fresh` reads the backend and refreshes the entry.
+    #[tokio::test]
+    async fn refusals_explain_and_fresh() {
+        let (relay, _backend) = relay_with_tool_cache(false, 0, |_| {}).await;
+        let (port, seen) = start_gateway_backend().await;
+        let mcp = mcp_gateway(&relay, port, None, |c| c.read_only = true);
+        let cache = relay.server.state.mcp_tool_cache.clone().unwrap();
+        let refused = query(&mcp, "DELETE FROM widgets").await;
+        assert_eq!(refused["result"]["isError"], true);
+        assert!(refused["result"]["_meta"].is_null());
+        assert_eq!(cache.entries(), 0);
+        assert_eq!(cache.stats_json()["misses"]["query"], 0);
+        assert!(seen.lock().is_empty(), "never sent");
+
+        for _ in 0..2 {
+            let e = call(&mcp, "", "explain", serde_json::json!({ "sql": READ })).await;
+            assert_eq!(e["result"]["isError"], false, "{e}");
+            assert!(e["result"]["_meta"].is_null());
+        }
+        let explains = seen
+            .lock()
+            .iter()
+            .filter(|s| s.starts_with("EXPLAIN"))
+            .count();
+        assert_eq!(explains, 2);
+
+        query(&mcp, READ).await;
+        let fresh = call(
+            &mcp,
+            "",
+            "query",
+            serde_json::json!({ "sql": READ, "fresh": true }),
+        )
+        .await;
+        assert_eq!(
+            *cache_meta(&fresh),
+            serde_json::json!({"hit": false, "stored": true, "skipped": "fresh"})
+        );
+        assert_eq!(cache_meta(&query(&mcp, READ).await)["hit"], true);
+        let reads = seen.lock().iter().filter(|s| s.as_str() == READ).count();
+        assert_eq!(reads, 2, "the first read and the fresh one");
+    }
+
+    /// With the tool cache off nothing changes: no `_meta`, and the tool
+    /// catalog has no `fresh`; on, `query` and `list_tables` take `fresh`
+    /// and say how old a result may be.
+    #[tokio::test]
+    async fn the_cache_off_leaves_responses_unchanged() {
+        let (relay, _backend) = Relay::start(|_| {}, &[], 0).await;
+        assert!(relay.server.state.mcp_tool_cache.is_none());
+        let (port, seen) = start_gateway_backend().await;
+        let mcp = mcp_gateway(&relay, port, None, |c| c.tool_cache_enabled = false);
+        for _ in 0..2 {
+            let r = query(&mcp, READ).await;
+            assert_eq!(r["result"]["isError"], false);
+            assert!(r["result"].get("_meta").is_none(), "{r}");
+        }
+        assert_eq!(seen.lock().len(), 2);
+        let list = |shared: &Arc<crate::mcp::McpShared>| {
+            let shared = shared.clone();
+            async move {
+                let body = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+                let resp = http_exchange(
+                    move |stream, peer| {
+                        crate::mcp::McpServer::handle_connection(stream, peer, shared)
+                    },
+                    post("/", body),
+                )
+                .await;
+                let (_, json) = resp.split_once("\r\n\r\n").unwrap();
+                serde_json::from_str::<serde_json::Value>(json).unwrap()
+            }
+        };
+        let off = list(&mcp).await;
+        assert!(off["result"]["tools"][0]["inputSchema"]["properties"]["fresh"].is_null());
+
+        let (relay, _backend) = relay_with_tool_cache(false, 0, |_| {}).await;
+        let on = list(&mcp_gateway(&relay, port, None, |_| {})).await;
+        for i in [0usize, 1] {
+            let tool = &on["result"]["tools"][i];
+            assert_eq!(
+                tool["inputSchema"]["properties"]["fresh"]["type"],
+                "boolean"
+            );
+            assert!(
+                tool["description"].as_str().unwrap().contains("s late"),
+                "{tool}"
+            );
+        }
+        assert!(on["result"]["tools"][2]["inputSchema"]["properties"]["fresh"].is_null());
     }
 }

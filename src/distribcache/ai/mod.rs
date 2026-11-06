@@ -6,6 +6,10 @@
 //! - Tool result cache
 //! - Semantic query cache
 //! - Cross-feature AI integration
+//!
+//! Library-only: none of these is wired into the daemon. The daemon caches
+//! MCP tool results with `[mcp] tool_cache_*` (`crate::mcp_cache`), retired
+//! by the C-02 write generations, and SQL results with `[cache]`.
 
 mod conversation;
 mod integration;

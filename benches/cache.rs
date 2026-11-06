@@ -11,8 +11,10 @@
 //! cacheable read when `[edge]` is on, and the edge invalidation's table set.
 //! `cache/l3/*` measure the semantic tier through its public API (canonical
 //! form included; `store_lookup_contended_8` with eight threads at once),
-//! `cache/excl/*` the relay's `[cache] exclude_tables` scan, and
-//! `cache/heatmap/*` what the `[cache] heatmap_enabled` heatmap adds to a hit.
+//! `cache/excl/*` the relay's `[cache] exclude_tables` scan,
+//! `cache/heatmap/*` what the `[cache] heatmap_enabled` heatmap adds to a hit,
+//! and `cache/mcp/*` the MCP tool-result cache (`[mcp] tool_cache_*`): a hit,
+//! a miss that stores, and a store that evicts at the owner's bound.
 
 use criterion::{criterion_group, criterion_main, Criterion};
 #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
@@ -793,6 +795,88 @@ fn bench_volatile_scan(c: &mut Criterion) {
 #[cfg(not(any(feature = "query-cache", feature = "edge-proxy")))]
 fn bench_volatile_scan(_c: &mut Criterion) {}
 
+/// The MCP tool-result cache through its public API, for one owner and a
+/// 1 KiB result: `hit_1k` a lookup that hits (eligibility, key, generation
+/// and TTL checks, the result copy), `miss_store_1k` a `"fresh": true` call
+/// that skips the lookup and replaces the entry (eligibility, the fill-race
+/// check, the store), and `evict_at_capacity_1k` a store of a new statement
+/// that evicts the owner's oldest entry at its bound of 64. The fetch is a
+/// ready future (no backend).
+#[cfg(feature = "query-cache")]
+fn bench_mcp_tool_cache(c: &mut Criterion) {
+    use heliosdb_proxy::cache::TableGenerations;
+    use heliosdb_proxy::config::McpConfig;
+    use heliosdb_proxy::mcp::CachedTool;
+    use heliosdb_proxy::mcp_cache::{McpToolCache, Outcome, Owner, ToolCacheSettings};
+    use heliosdb_proxy::sql_text::VolatileScan;
+    use std::sync::Arc;
+    use std::time::Duration;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let new_cache = |settings: ToolCacheSettings| {
+        McpToolCache::new(
+            settings,
+            Arc::new(TableGenerations::new()),
+            Arc::new(VolatileScan::new(std::iter::empty::<&str>())),
+            None,
+            std::iter::empty(),
+        )
+    };
+    let owner = Owner::new(Arc::from("default"), None);
+    let payload = "x".repeat(1024);
+    let sql = "SELECT id, total FROM orders WHERE id = 42 AND status = 'open'";
+    let defaults = ToolCacheSettings::from_config(&McpConfig::default());
+    let serve = |cache: &McpToolCache, sql: &str, fresh: bool| {
+        rt.block_on(
+            cache.serve(&owner, CachedTool::Query, black_box(sql), fresh, || async {
+                Ok((payload.clone(), None))
+            }),
+        )
+    };
+
+    let cache = new_cache(defaults.clone());
+    let _ = serve(&cache, sql, false);
+    assert!(matches!(serve(&cache, sql, false).1, Outcome::Hit { .. }));
+
+    let bounded = new_cache(ToolCacheSettings {
+        max_entries_per_owner: 64,
+        ..defaults
+    });
+    let statements: Vec<String> = (0..1024)
+        .map(|i| format!("SELECT id, total FROM orders WHERE id = {i}"))
+        .collect();
+    for s in statements.iter().take(64) {
+        let _ = serve(&bounded, s, false);
+    }
+    assert_eq!(bounded.entries(), 64);
+    let mut next = 64usize;
+
+    let mut group = c.benchmark_group("cache/mcp");
+    group.sample_size(50);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(2));
+    group.bench_function("hit_1k", |b| {
+        b.iter(|| black_box(serve(&cache, sql, false)))
+    });
+    group.bench_function("miss_store_1k", |b| {
+        b.iter(|| black_box(serve(&cache, sql, true)))
+    });
+    group.bench_function("evict_at_capacity_1k", |b| {
+        b.iter(|| {
+            let s = &statements[next % statements.len()];
+            next += 1;
+            black_box(serve(&bounded, s, false))
+        })
+    });
+    group.finish();
+    assert_eq!(bounded.entries(), 64);
+}
+
+#[cfg(not(feature = "query-cache"))]
+fn bench_mcp_tool_cache(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_l2_cache,
@@ -801,6 +885,7 @@ criterion_group!(
     bench_semantic_cache,
     bench_exclusions,
     bench_heatmap,
-    bench_volatile_scan
+    bench_volatile_scan,
+    bench_mcp_tool_cache
 );
 criterion_main!(benches);

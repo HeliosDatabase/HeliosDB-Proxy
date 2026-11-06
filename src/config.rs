@@ -789,6 +789,76 @@ pub struct McpConfig {
     /// `max_result_rows`. Must be >= 1 and <= [`MCP_MAX_RESULT_BYTES_CEILING`].
     #[serde(default = "default_mcp_max_result_bytes")]
     pub max_result_bytes: usize,
+    /// The tool-result cache (Sprinter 20bcc218385f): `query` and
+    /// `list_tables` results, keyed by owner (principal, tenant), tool and the
+    /// final backend SQL, retired by the C-02 write generations and a TTL.
+    /// Needs the `query-cache` feature. Default `false`.
+    #[serde(default)]
+    pub tool_cache_enabled: bool,
+    /// Longest a cached `query` result is served, seconds (1..=86400); a
+    /// shorter `[[cache.tables]] ttl_secs` of a table its text names applies.
+    #[serde(default = "default_mcp_tool_cache_ttl_secs")]
+    pub tool_cache_ttl_secs: u64,
+    /// Longest a cached `list_tables` result is served, seconds (0..=86400);
+    /// `0` = `list_tables` is not cached.
+    #[serde(default = "default_mcp_tool_cache_catalog_ttl_secs")]
+    pub tool_cache_catalog_ttl_secs: u64,
+    /// Most entries the tool cache holds (>= 1).
+    #[serde(default = "default_mcp_tool_cache_max_entries")]
+    pub tool_cache_max_entries: usize,
+    /// Most bytes (keys and results) the tool cache holds (>= 1).
+    #[serde(default = "default_mcp_tool_cache_max_bytes")]
+    pub tool_cache_max_bytes: usize,
+    /// Most entries one owner (principal, tenant) holds (1..=`tool_cache_max_entries`).
+    #[serde(default = "default_mcp_tool_cache_max_entries_per_principal")]
+    pub tool_cache_max_entries_per_principal: usize,
+    /// Most bytes one owner (principal, tenant) holds (1..=`tool_cache_max_bytes`).
+    #[serde(default = "default_mcp_tool_cache_max_bytes_per_principal")]
+    pub tool_cache_max_bytes_per_principal: usize,
+    /// Largest entry (key and result bytes) stored
+    /// (1..=`tool_cache_max_bytes_per_principal`).
+    #[serde(default = "default_mcp_tool_cache_max_entry_bytes")]
+    pub tool_cache_max_entry_bytes: usize,
+    /// Longest final statement whose result is cached, bytes
+    /// (1..=[`MCP_TOOL_CACHE_MAX_STATEMENT_BYTES_CEILING`]).
+    #[serde(default = "default_mcp_tool_cache_max_statement_bytes")]
+    pub tool_cache_max_statement_bytes: usize,
+}
+
+/// Upper bound of `[mcp] tool_cache_ttl_secs` and `tool_cache_catalog_ttl_secs`
+/// (one day).
+pub const MCP_TOOL_CACHE_MAX_TTL_SECS: u64 = 86_400;
+/// Upper bound of `[mcp] tool_cache_max_statement_bytes`: the largest request
+/// body the gateway reads.
+pub const MCP_TOOL_CACHE_MAX_STATEMENT_BYTES_CEILING: usize = 8 * 1024 * 1024;
+
+fn default_mcp_tool_cache_ttl_secs() -> u64 {
+    60
+}
+fn default_mcp_tool_cache_catalog_ttl_secs() -> u64 {
+    30
+}
+fn default_mcp_tool_cache_max_entries() -> usize {
+    10_000
+}
+/// 64 MiB.
+fn default_mcp_tool_cache_max_bytes() -> usize {
+    64 * 1024 * 1024
+}
+fn default_mcp_tool_cache_max_entries_per_principal() -> usize {
+    1_000
+}
+/// 8 MiB.
+fn default_mcp_tool_cache_max_bytes_per_principal() -> usize {
+    8 * 1024 * 1024
+}
+/// 1 MiB, the `[cache] max_result_bytes` default.
+fn default_mcp_tool_cache_max_entry_bytes() -> usize {
+    1024 * 1024
+}
+/// 16 KiB, the `[cache] semantic_max_statement_bytes` default.
+fn default_mcp_tool_cache_max_statement_bytes() -> usize {
+    16 * 1024
 }
 
 /// The principal of an MCP request authenticated by `[mcp] auth_token`, or
@@ -842,6 +912,73 @@ fn mcp_principal_id_error(id: &str) -> Option<String> {
 }
 
 impl McpConfig {
+    /// Whether the tool-result cache runs: `[mcp]` and `tool_cache_enabled`.
+    pub fn tool_cache_on(&self) -> bool {
+        self.enabled && self.tool_cache_enabled
+    }
+
+    /// The `tool_cache_*` bounds, each named in its error. Checked on every
+    /// build, like the result caps.
+    fn validate_tool_cache(&self) -> Result<()> {
+        let range = |name: &str, value: u64, min: u64, max: u64| -> Result<()> {
+            if (min..=max).contains(&value) {
+                Ok(())
+            } else {
+                Err(ProxyError::Config(format!(
+                    "mcp.{name} must be between {min} and {max} (got {value})"
+                )))
+            }
+        };
+        range(
+            "tool_cache_ttl_secs",
+            self.tool_cache_ttl_secs,
+            1,
+            MCP_TOOL_CACHE_MAX_TTL_SECS,
+        )?;
+        range(
+            "tool_cache_catalog_ttl_secs",
+            self.tool_cache_catalog_ttl_secs,
+            0,
+            MCP_TOOL_CACHE_MAX_TTL_SECS,
+        )?;
+        range(
+            "tool_cache_max_entries",
+            self.tool_cache_max_entries as u64,
+            1,
+            u64::MAX,
+        )?;
+        range(
+            "tool_cache_max_bytes",
+            self.tool_cache_max_bytes as u64,
+            1,
+            u64::MAX,
+        )?;
+        range(
+            "tool_cache_max_entries_per_principal",
+            self.tool_cache_max_entries_per_principal as u64,
+            1,
+            self.tool_cache_max_entries as u64,
+        )?;
+        range(
+            "tool_cache_max_bytes_per_principal",
+            self.tool_cache_max_bytes_per_principal as u64,
+            1,
+            self.tool_cache_max_bytes as u64,
+        )?;
+        range(
+            "tool_cache_max_entry_bytes",
+            self.tool_cache_max_entry_bytes as u64,
+            1,
+            self.tool_cache_max_bytes_per_principal as u64,
+        )?;
+        range(
+            "tool_cache_max_statement_bytes",
+            self.tool_cache_max_statement_bytes as u64,
+            1,
+            MCP_TOOL_CACHE_MAX_STATEMENT_BYTES_CEILING as u64,
+        )
+    }
+
     /// `[[mcp.principals]]`: ids well-formed and unique, tokens non-empty,
     /// unique and distinct from `auth_token`. Errors name the entry by id
     /// (or position), never a token.
@@ -900,6 +1037,16 @@ impl Default for McpConfig {
             tenant_header: String::new(),
             max_result_rows: default_mcp_max_result_rows(),
             max_result_bytes: default_mcp_max_result_bytes(),
+            tool_cache_enabled: false,
+            tool_cache_ttl_secs: default_mcp_tool_cache_ttl_secs(),
+            tool_cache_catalog_ttl_secs: default_mcp_tool_cache_catalog_ttl_secs(),
+            tool_cache_max_entries: default_mcp_tool_cache_max_entries(),
+            tool_cache_max_bytes: default_mcp_tool_cache_max_bytes(),
+            tool_cache_max_entries_per_principal: default_mcp_tool_cache_max_entries_per_principal(
+            ),
+            tool_cache_max_bytes_per_principal: default_mcp_tool_cache_max_bytes_per_principal(),
+            tool_cache_max_entry_bytes: default_mcp_tool_cache_max_entry_bytes(),
+            tool_cache_max_statement_bytes: default_mcp_tool_cache_max_statement_bytes(),
         }
     }
 }
@@ -3803,8 +3950,25 @@ const IGNORED_KEY_ALIASES: &[(&str, &str)] = &[
         "there is no [ai_cache] section: the semantic tier is under [cache] — \
          cache.semantic_enabled (was semantic_cache_enabled) and \
          cache.semantic_similarity_threshold (was similarity_threshold), used by statements that \
-         carry /*helios:cache=semantic*/; conversation and RAG caches are not provided (the proxy \
-         caches SQL results)",
+         carry /*helios:cache=semantic*/; MCP tool results are cached by [mcp] tool_cache_enabled; \
+         conversation and RAG caches are not provided (the proxy caches SQL results)",
+    ),
+    // The MCP tool-result cache's keys are flat under [mcp] (20bcc218385f).
+    (
+        "mcp.cache",
+        "there is no [mcp.cache]: the tool-result cache keys are flat under [mcp] \
+         (tool_cache_enabled, tool_cache_ttl_secs, tool_cache_max_entries, ...)",
+    ),
+    (
+        "mcp.tool_cache",
+        "there is no [mcp.tool_cache]: the tool-result cache keys are flat under [mcp] \
+         (tool_cache_enabled, tool_cache_ttl_secs, tool_cache_max_entries, ...)",
+    ),
+    ("mcp.cache_enabled", "did you mean 'mcp.tool_cache_enabled'?"),
+    ("mcp.tool_cache_ttl", "did you mean 'mcp.tool_cache_ttl_secs'?"),
+    (
+        "mcp.tokens",
+        "there is no mcp.tokens: give each agent a [[mcp.principals]] entry (id, token)",
     ),
     (
         "cache.query",
@@ -4885,8 +5049,65 @@ impl ProxyConfig {
             }
         }
         self.mcp.validate_principals()?;
+        self.mcp.validate_tool_cache()?;
+        // The tool cache is retired by the writes the proxy sees. Writes to a
+        // backend no path of this proxy reaches are seen only by a logical
+        // source, so without one such a cache is stale up to its TTL:
+        // refused under strict_config (the daemon warns otherwise).
+        if self.strict_config && self.mcp.tool_cache_on() && !self.mcp_tool_cache_sees_writes() {
+            return Err(ProxyError::Config(format!(
+                "strict_config: [mcp] tool_cache_enabled = true, but the MCP backend {}:{} is \
+                 neither a [[nodes]] address nor this proxy's listen_address and [cache] \
+                 invalidation_source is not \"logical\" (with [cache] enabled): writes to it \
+                 that bypass this proxy would be served stale for up to tool_cache_ttl_secs \
+                 ({} s); point [mcp] backend_host/backend_port at a node or the proxy, use the \
+                 logical source, or set strict_config = false to accept it",
+                self.mcp.backend_host, self.mcp.backend_port, self.mcp.tool_cache_ttl_secs
+            )));
+        }
 
         Ok(())
+    }
+
+    /// Whether the writes that reach the MCP gateway's backend are seen by
+    /// this proxy, so its tool cache is retired by them (C-02): the backend
+    /// is a `[[nodes]]` address (every write through the proxy reaches it),
+    /// this proxy's own listener (every MCP statement then runs through the
+    /// relay; a wildcard listener counts for a loopback backend on its
+    /// port), or `[cache]` runs the logical source.
+    pub fn mcp_tool_cache_sees_writes(&self) -> bool {
+        if self.cache.enabled && self.cache.invalidation_source == CacheInvalidationSource::Logical
+        {
+            return true;
+        }
+        let host = self
+            .mcp
+            .backend_host
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let port = self.mcp.backend_port;
+        let same_host = |a: &str| {
+            a.trim_start_matches('[')
+                .trim_end_matches(']')
+                .eq_ignore_ascii_case(host)
+        };
+        if self
+            .nodes
+            .iter()
+            .any(|n| n.port == port && same_host(&n.host))
+        {
+            return true;
+        }
+        let Some((listen_host, listen_port)) = self.listen_address.rsplit_once(':') else {
+            return false;
+        };
+        if listen_port.parse::<u16>().ok() != Some(port) {
+            return false;
+        }
+        let listen_host = listen_host.trim_start_matches('[').trim_end_matches(']');
+        let loopback =
+            matches!(host, "127.0.0.1" | "::1") || host.eq_ignore_ascii_case("localhost");
+        same_host(listen_host) || (matches!(listen_host, "0.0.0.0" | "::" | "") && loopback)
     }
 
     /// Get primary node
@@ -8817,6 +9038,169 @@ exclude = true
                 "no token in {err}"
             );
         }
+    }
+
+    #[test]
+    fn mcp_tool_cache_keys_default_off_and_parse() {
+        let d = McpConfig::default();
+        assert!(!d.tool_cache_enabled && !d.tool_cache_on());
+        assert_eq!(d.tool_cache_ttl_secs, 60);
+        assert_eq!(d.tool_cache_catalog_ttl_secs, 30);
+        assert_eq!(d.tool_cache_max_entries, 10_000);
+        assert_eq!(d.tool_cache_max_bytes, 64 * 1024 * 1024);
+        assert_eq!(d.tool_cache_max_entries_per_principal, 1_000);
+        assert_eq!(d.tool_cache_max_bytes_per_principal, 8 * 1024 * 1024);
+        assert_eq!(d.tool_cache_max_entry_bytes, 1024 * 1024);
+        assert_eq!(d.tool_cache_max_statement_bytes, 16 * 1024);
+        let c: ProxyConfig = toml::from_str(
+            "[mcp]\nenabled = true\ntool_cache_enabled = true\ntool_cache_ttl_secs = 5\n\
+             tool_cache_catalog_ttl_secs = 0\ntool_cache_max_entries = 7\n",
+        )
+        .unwrap();
+        assert!(c.mcp.tool_cache_on());
+        assert_eq!(c.mcp.tool_cache_ttl_secs, 5);
+        assert_eq!(c.mcp.tool_cache_catalog_ttl_secs, 0);
+        assert_eq!(c.mcp.tool_cache_max_entries, 7);
+        let known = known_config_keys();
+        for key in [
+            "mcp.tool_cache_enabled",
+            "mcp.tool_cache_ttl_secs",
+            "mcp.tool_cache_catalog_ttl_secs",
+            "mcp.tool_cache_max_entries",
+            "mcp.tool_cache_max_bytes",
+            "mcp.tool_cache_max_entries_per_principal",
+            "mcp.tool_cache_max_bytes_per_principal",
+            "mcp.tool_cache_max_entry_bytes",
+            "mcp.tool_cache_max_statement_bytes",
+        ] {
+            assert!(known.contains(key), "{key}");
+        }
+        assert_eq!(
+            ignored_key_hint("mcp.tool_cache_ttl", &known).as_deref(),
+            Some("did you mean 'mcp.tool_cache_ttl_secs'?")
+        );
+    }
+
+    #[test]
+    fn mcp_tool_cache_bounds_validate_and_name_the_key() {
+        let cases: [InvalidCase; 12] = [
+            ("mcp.tool_cache_ttl_secs", |c| c.mcp.tool_cache_ttl_secs = 0),
+            ("mcp.tool_cache_ttl_secs", |c| {
+                c.mcp.tool_cache_ttl_secs = MCP_TOOL_CACHE_MAX_TTL_SECS + 1
+            }),
+            ("mcp.tool_cache_catalog_ttl_secs", |c| {
+                c.mcp.tool_cache_catalog_ttl_secs = MCP_TOOL_CACHE_MAX_TTL_SECS + 1
+            }),
+            ("mcp.tool_cache_max_entries", |c| {
+                c.mcp.tool_cache_max_entries = 0
+            }),
+            ("mcp.tool_cache_max_bytes", |c| {
+                c.mcp.tool_cache_max_bytes = 0
+            }),
+            ("mcp.tool_cache_max_entries_per_principal", |c| {
+                c.mcp.tool_cache_max_entries_per_principal = 0
+            }),
+            ("mcp.tool_cache_max_entries_per_principal", |c| {
+                c.mcp.tool_cache_max_entries_per_principal = c.mcp.tool_cache_max_entries + 1
+            }),
+            ("mcp.tool_cache_max_bytes_per_principal", |c| {
+                c.mcp.tool_cache_max_bytes_per_principal = c.mcp.tool_cache_max_bytes + 1
+            }),
+            ("mcp.tool_cache_max_entry_bytes", |c| {
+                c.mcp.tool_cache_max_entry_bytes = 0
+            }),
+            ("mcp.tool_cache_max_entry_bytes", |c| {
+                c.mcp.tool_cache_max_entry_bytes = c.mcp.tool_cache_max_bytes_per_principal + 1
+            }),
+            ("mcp.tool_cache_max_statement_bytes", |c| {
+                c.mcp.tool_cache_max_statement_bytes = 0
+            }),
+            ("mcp.tool_cache_max_statement_bytes", |c| {
+                c.mcp.tool_cache_max_statement_bytes =
+                    MCP_TOOL_CACHE_MAX_STATEMENT_BYTES_CEILING + 1
+            }),
+        ];
+        for (name, mutate) in cases {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            mutate(&mut c);
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains(name), "{name}: unexpected error {err}");
+        }
+        // The edges themselves are accepted.
+        let mut c = ProxyConfig::default();
+        c.add_node("localhost:5432", "primary").unwrap();
+        c.mcp.tool_cache_catalog_ttl_secs = 0;
+        c.mcp.tool_cache_ttl_secs = MCP_TOOL_CACHE_MAX_TTL_SECS;
+        c.mcp.tool_cache_max_entries_per_principal = c.mcp.tool_cache_max_entries;
+        c.mcp.tool_cache_max_bytes_per_principal = c.mcp.tool_cache_max_bytes;
+        c.mcp.tool_cache_max_entry_bytes = c.mcp.tool_cache_max_bytes;
+        c.mcp.tool_cache_max_statement_bytes = MCP_TOOL_CACHE_MAX_STATEMENT_BYTES_CEILING;
+        assert!(c.validate().is_ok());
+    }
+
+    /// The tool cache sees the writes to its backend when the backend is a
+    /// node or this proxy's listener, or a logical source runs; otherwise
+    /// strict_config refuses it (and a non-strict config loads). Without the
+    /// `query-cache` feature strict_config refuses the cache outright.
+    #[cfg(feature = "query-cache")]
+    #[test]
+    fn mcp_tool_cache_on_an_unobserved_backend_is_refused_under_strict_config() {
+        let base = || {
+            let mut c = ProxyConfig {
+                listen_address: "0.0.0.0:6432".into(),
+                ..ProxyConfig::default()
+            };
+            c.add_node("db1.internal:5432", "primary").unwrap();
+            c.mcp.enabled = true;
+            c.mcp.tool_cache_enabled = true;
+            c.mcp.backend_host = "elsewhere.internal".into();
+            c.mcp.backend_port = 5432;
+            c
+        };
+        let c = base();
+        assert!(!c.mcp_tool_cache_sees_writes());
+        c.validate().expect("non-strict: warned at startup only");
+        let mut strict = base();
+        strict.strict_config = true;
+        let err = strict.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("strict_config") && err.contains("elsewhere.internal:5432"),
+            "{err}"
+        );
+        // Off, nothing is checked.
+        strict.mcp.tool_cache_enabled = false;
+        strict.validate().expect("tool cache off");
+
+        for (host, port) in [
+            ("db1.internal", 5432),
+            ("DB1.internal", 5432),
+            ("127.0.0.1", 6432),
+            ("localhost", 6432),
+        ] {
+            let mut c = base();
+            c.strict_config = true;
+            c.mcp.backend_host = host.into();
+            c.mcp.backend_port = port;
+            assert!(c.mcp_tool_cache_sees_writes(), "{host}:{port}");
+            c.validate()
+                .unwrap_or_else(|e| panic!("{host}:{port}: {e}"));
+        }
+        // Another port of a node is another server.
+        let mut c = base();
+        c.mcp.backend_host = "db1.internal".into();
+        c.mcp.backend_port = 5433;
+        assert!(!c.mcp_tool_cache_sees_writes());
+        // A logical source (with [cache]) sees every committed change.
+        let mut c = base();
+        c.cache.enabled = true;
+        c.cache.invalidation_source = CacheInvalidationSource::Logical;
+        assert!(c.mcp_tool_cache_sees_writes());
+        c.cache.enabled = false;
+        assert!(
+            !c.mcp_tool_cache_sees_writes(),
+            "no logical source without [cache]"
+        );
     }
 
     #[test]

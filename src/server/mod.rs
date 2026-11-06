@@ -428,10 +428,15 @@ struct ServerState {
     /// writes: the relay (journal capture, unseen writes, `COMMIT
     /// PREPARED`), the logical source and the HTTP, MCP and GraphQL
     /// gateways. `Some` whenever a cache that reads it runs (`[cache]
-    /// enabled`); `None` otherwise, so with every cache off the relay
-    /// captures nothing for it.
+    /// enabled`, or the MCP tool cache: `[mcp] enabled` and
+    /// `tool_cache_enabled`); `None` otherwise, so with every cache off the
+    /// relay captures nothing for it.
     #[cfg(feature = "query-cache")]
     table_generations: Option<Arc<crate::cache::TableGenerations>>,
+    /// The MCP gateway's tool-result cache (`[mcp] tool_cache_enabled`), on
+    /// `table_generations`; shared with the admin API.
+    #[cfg(feature = "query-cache")]
+    mcp_tool_cache: Option<Arc<crate::mcp_cache::McpToolCache>>,
     /// Tables neither result cache may serve or store (`[cache]
     /// exclude_tables` and `[[cache.tables]] exclude = true`), checked by the
     /// relay ahead of both. `None` when the list is empty or neither
@@ -968,9 +973,7 @@ impl ProxyServer {
 
         // The write generations every cache reads, when one runs.
         #[cfg(feature = "query-cache")]
-        let table_generations = config
-            .cache
-            .enabled
+        let table_generations = (config.cache.enabled || config.mcp.tool_cache_on())
             .then(|| Arc::new(crate::cache::TableGenerations::new()));
 
         // Build the query-result cache when enabled.
@@ -1042,11 +1045,12 @@ impl ProxyServer {
             None
         };
 
-        // Table exclusions bind both result caches; only built when one runs.
+        // Table exclusions bind every result cache; only built when one runs.
         #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
         let table_exclusions = {
             let names = config.cache.excluded_table_names();
-            let caching = (cfg!(feature = "query-cache") && config.cache.enabled)
+            let caching = (cfg!(feature = "query-cache")
+                && (config.cache.enabled || config.mcp.tool_cache_on()))
                 || (cfg!(feature = "edge-proxy") && config.edge.enabled);
             (caching && !names.is_empty())
                 .then(|| Arc::new(crate::sql_text::TableExclusions::new(names)))
@@ -1057,6 +1061,30 @@ impl ProxyServer {
         let volatile_scan = Arc::new(crate::sql_text::VolatileScan::new(
             &config.cache.extra_volatile_functions,
         ));
+        // The MCP tool-result cache, on the shared generations, volatile scan
+        // and exclusions.
+        #[cfg(feature = "query-cache")]
+        let mcp_tool_cache = match (config.mcp.tool_cache_on(), table_generations.as_ref()) {
+            (true, Some(generations)) => {
+                let m = &config.mcp;
+                tracing::info!(
+                    ttl_secs = m.tool_cache_ttl_secs,
+                    catalog_ttl_secs = m.tool_cache_catalog_ttl_secs,
+                    max_entries = m.tool_cache_max_entries,
+                    max_bytes = m.tool_cache_max_bytes,
+                    max_entries_per_principal = m.tool_cache_max_entries_per_principal,
+                    max_bytes_per_principal = m.tool_cache_max_bytes_per_principal,
+                    "MCP tool-result cache enabled (query, list_tables)"
+                );
+                Some(Arc::new(crate::mcp_cache::McpToolCache::from_config(
+                    &config,
+                    generations.clone(),
+                    volatile_scan.clone(),
+                    table_exclusions.clone(),
+                )))
+            }
+            _ => None,
+        };
         // Table TTLs bind the edge cache too, as a cap: an edge entry never
         // outlives a shorter `[[cache.tables]]` TTL of a table its read names.
         #[cfg(feature = "edge-proxy")]
@@ -1279,6 +1307,8 @@ impl ProxyServer {
             query_cache,
             #[cfg(feature = "query-cache")]
             table_generations,
+            #[cfg(feature = "query-cache")]
+            mcp_tool_cache,
             #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
             table_exclusions,
             #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
@@ -1769,13 +1799,33 @@ impl ProxyServer {
                 }
                 found
             });
+            #[cfg(feature = "query-cache")]
+            let tool_cache = self.state.mcp_tool_cache.clone();
+            #[cfg(feature = "query-cache")]
+            if tool_cache.is_some() && !self.config.mcp_tool_cache_sees_writes() {
+                tracing::warn!(
+                    backend = %format!("{}:{}", mcp_cfg.backend_host, mcp_cfg.backend_port),
+                    ttl_secs = mcp_cfg.tool_cache_ttl_secs,
+                    "[mcp] tool cache: the MCP backend is neither a [[nodes]] address nor this \
+                     proxy's listener and no logical source runs, so writes to it that bypass \
+                     this proxy stay invisible: a cached result may be stale for up to \
+                     tool_cache_ttl_secs (strict_config = true refuses this)"
+                );
+            }
+            #[cfg(not(feature = "query-cache"))]
+            if mcp_cfg.tool_cache_enabled {
+                tracing::warn!(
+                    "[mcp] tool_cache_enabled = true but this build lacks the `query-cache` \
+                     feature: tool results are not cached"
+                );
+            }
             Some(tokio::spawn(async move {
-                if let Err(e) = crate::mcp::McpServer::new(mcp_cfg, contract, pool)
+                let server = crate::mcp::McpServer::new(mcp_cfg, contract, pool)
                     .with_policy(policy)
-                    .with_strict_read_only_role(strict)
-                    .run()
-                    .await
-                {
+                    .with_strict_read_only_role(strict);
+                #[cfg(feature = "query-cache")]
+                let server = server.with_tool_cache(tool_cache);
+                if let Err(e) = server.run().await {
                     tracing::error!("MCP gateway error: {}", e);
                 }
             }))
@@ -2027,6 +2077,10 @@ impl ProxyServer {
             #[cfg(feature = "query-cache")]
             if let Some(cache) = state.query_cache.as_ref() {
                 admin_state.with_query_cache(cache.clone()).await;
+            }
+            #[cfg(feature = "query-cache")]
+            if let Some(cache) = state.mcp_tool_cache.as_ref() {
+                admin_state.with_mcp_cache(cache.clone()).await;
             }
 
             // Set proxy config for SQL routing

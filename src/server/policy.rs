@@ -343,9 +343,11 @@ impl ProxyServer {
     }
 
     /// [`Self::is_cacheable_read_sql`] against an explicit `volatile` scan
-    /// (the built-in list plus `[cache] extra_volatile_functions`).
+    /// (the built-in list plus `[cache] extra_volatile_functions`). Shared by
+    /// every result cache: the query cache, the edge cache and the MCP tool
+    /// cache.
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
-    pub(super) fn is_cacheable_read_sql_with(
+    pub(crate) fn is_cacheable_read_sql_with(
         sql: &str,
         volatile: &crate::sql_text::VolatileScan,
     ) -> bool {

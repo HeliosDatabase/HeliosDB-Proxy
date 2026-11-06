@@ -181,6 +181,13 @@ pub fn manifest(config: &ProxyConfig) -> Vec<Capability> {
         ),
         c("mcp", true, config.mcp.enabled, true, None),
         c(
+            "mcp-tool-cache",
+            cfg!(feature = "query-cache"),
+            config.mcp.tool_cache_on(),
+            cfg!(feature = "query-cache"),
+            Some("[mcp] tool_cache_enabled; needs the query-cache feature"),
+        ),
+        c(
             "http-gateway",
             true,
             config.http_gateway.enabled,
@@ -208,7 +215,7 @@ pub fn manifest(config: &ProxyConfig) -> Vec<Capability> {
 /// config key path whose promise the binary cannot keep.
 pub fn unavailable_enabled(config: &ProxyConfig) -> Vec<&'static str> {
     // (config key path, enabled now, compiled into this build)
-    let checks: [(&'static str, bool, bool); 20] = [
+    let checks: [(&'static str, bool, bool); 21] = [
         (
             "cache.enabled",
             config.cache.enabled,
@@ -233,6 +240,11 @@ pub fn unavailable_enabled(config: &ProxyConfig) -> Vec<&'static str> {
         (
             "cache.heatmap_enabled",
             config.cache.enabled && config.cache.heatmap_enabled,
+            cfg!(feature = "query-cache"),
+        ),
+        (
+            "mcp.tool_cache_enabled",
+            config.mcp.tool_cache_on(),
             cfg!(feature = "query-cache"),
         ),
         (
@@ -394,5 +406,17 @@ mod tests {
             unavailable_enabled(&config).contains(&"cache.heatmap_enabled"),
             !cfg!(feature = "query-cache")
         );
+        // The MCP tool cache, only with the MCP gateway.
+        config.mcp.tool_cache_enabled = true;
+        assert!(!unavailable_enabled(&config).contains(&"mcp.tool_cache_enabled"));
+        config.mcp.enabled = true;
+        assert_eq!(
+            unavailable_enabled(&config).contains(&"mcp.tool_cache_enabled"),
+            !cfg!(feature = "query-cache")
+        );
+        let m = manifest(&config);
+        let row = m.iter().find(|c| c.name == "mcp-tool-cache").unwrap();
+        assert!(row.enabled);
+        assert_eq!(row.compiled, cfg!(feature = "query-cache"));
     }
 }

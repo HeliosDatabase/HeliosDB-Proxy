@@ -12,6 +12,7 @@
 //! `initialize`, `notifications/initialized`, `ping`, `tools/list`,
 //! `tools/call`.
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,8 +50,64 @@ struct Gateway<'a> {
     /// The tenant the request acts for (`[multi_tenancy]` + `tenant_header`).
     tenant: Option<&'a crate::gateway_policy::GatewayTenant>,
     /// The principal the request's bearer token named ([`Principals`]).
-    principal: &'a str,
+    principal: &'a Arc<str>,
+    /// The tool-result cache, when `[mcp] tool_cache_enabled`.
+    #[cfg(feature = "query-cache")]
+    cache: Option<&'a crate::mcp_cache::McpToolCache>,
 }
+
+impl Gateway<'_> {
+    /// The tool cache's `query` and `list_tables` TTLs, when it runs.
+    fn cache_ttls(&self) -> Option<(Duration, Duration)> {
+        #[cfg(feature = "query-cache")]
+        if let Some(cache) = self.cache {
+            let s = cache.settings();
+            return Some((s.ttl, s.catalog_ttl));
+        }
+        None
+    }
+}
+
+/// A tool whose result the tool cache may serve (`[mcp] tool_cache_*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum CachedTool {
+    /// `query`.
+    Query,
+    /// `list_tables`.
+    ListTables,
+}
+
+impl CachedTool {
+    /// Number of cacheable tools.
+    pub const COUNT: usize = 2;
+    /// Every cacheable tool, in label order.
+    pub const ALL: [CachedTool; CachedTool::COUNT] = [CachedTool::Query, CachedTool::ListTables];
+
+    /// The tool name (the `tool` metric label).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CachedTool::Query => "query",
+            CachedTool::ListTables => "list_tables",
+        }
+    }
+
+    /// Position in [`Self::ALL`].
+    pub fn index(self) -> usize {
+        match self {
+            CachedTool::Query => 0,
+            CachedTool::ListTables => 1,
+        }
+    }
+}
+
+/// A tool result: its text and, when a result cap cut it, the
+/// `structuredContent` truncation note.
+pub type ToolOutput = (String, Option<Value>);
+
+/// The statement `list_tables` runs.
+const LIST_TABLES_SQL: &str = "SELECT table_schema, table_name FROM information_schema.tables \
+                               WHERE table_schema NOT IN ('pg_catalog','information_schema') \
+                               ORDER BY table_schema, table_name";
 
 /// The bearer tokens the MCP gateway accepts and the principal each names:
 /// `[mcp] auth_token` names [`MCP_DEFAULT_PRINCIPAL`], each
@@ -124,6 +181,9 @@ pub(crate) struct McpShared {
     /// cheap protocol handshake methods and notifications are never gated.
     admission: tokio::sync::Semaphore,
     principals: Principals,
+    /// The tool-result cache, when `[mcp] tool_cache_enabled`.
+    #[cfg(feature = "query-cache")]
+    cache: Option<Arc<crate::mcp_cache::McpToolCache>>,
 }
 
 /// The MCP gateway server.
@@ -135,6 +195,10 @@ pub struct McpServer {
     /// Refuse to start in read-only mode when the backend role can write
     /// (`strict_config`); otherwise only warn (H-06).
     strict_read_only_role: bool,
+    /// The tool-result cache (`[mcp] tool_cache_enabled`), built by the
+    /// daemon on its shared write generations.
+    #[cfg(feature = "query-cache")]
+    cache: Option<Arc<crate::mcp_cache::McpToolCache>>,
 }
 
 impl McpServer {
@@ -149,7 +213,18 @@ impl McpServer {
             pool,
             policy: Arc::new(GatewayPolicy::default()),
             strict_read_only_role: false,
+            #[cfg(feature = "query-cache")]
+            cache: None,
         }
+    }
+
+    /// Serve `query` and `list_tables` through `cache` (`[mcp]
+    /// tool_cache_enabled`). The cache belongs to this gateway: `[mcp]` is
+    /// read at startup only, so nothing reloads under it.
+    #[cfg(feature = "query-cache")]
+    pub fn with_tool_cache(mut self, cache: Option<Arc<crate::mcp_cache::McpToolCache>>) -> Self {
+        self.cache = cache;
+        self
     }
 
     /// With `true` (the daemon passes `strict_config`), read-only mode
@@ -270,6 +345,8 @@ impl McpServer {
             contract: self.contract,
             pool: self.pool,
             policy: self.policy,
+            #[cfg(feature = "query-cache")]
+            cache: self.cache,
         })
     }
 
@@ -343,6 +420,8 @@ impl McpServer {
             peer: Some(peer.ip()),
             tenant: tenant.as_ref(),
             principal: &principal,
+            #[cfg(feature = "query-cache")]
+            cache: shared.cache.as_deref(),
         };
         let response = Self::dispatch_with(
             &body,
@@ -372,12 +451,15 @@ impl McpServer {
         admission: &tokio::sync::Semaphore,
     ) -> Option<Value> {
         let policy = GatewayPolicy::default();
+        let principal: Arc<str> = Arc::from(MCP_DEFAULT_PRINCIPAL);
         let gateway = Gateway {
             pool,
             policy: &policy,
             peer: None,
             tenant: None,
-            principal: MCP_DEFAULT_PRINCIPAL,
+            principal: &principal,
+            #[cfg(feature = "query-cache")]
+            cache: None,
         };
         Self::dispatch_with(body, cfg, contract, &gateway, admission).await
     }
@@ -416,7 +498,10 @@ impl McpServer {
             // Notifications (no id) — no response.
             "notifications/initialized" | "notifications/cancelled" => None,
             "ping" => Some(rpc_ok(id, json!({}))),
-            "tools/list" => Some(rpc_ok(id, json!({ "tools": Self::tool_defs(cfg) }))),
+            "tools/list" => Some(rpc_ok(
+                id,
+                json!({ "tools": Self::tool_defs(cfg, gateway.cache_ttls()) }),
+            )),
             "tools/call" => {
                 // Admission cap (H-06 `max_concurrent_requests`): this is the
                 // one method that runs SQL against the backend, so it is the
@@ -442,11 +527,48 @@ impl McpServer {
         }
     }
 
-    fn tool_defs(cfg: &McpConfig) -> Value {
+    /// The tool catalog. With the tool cache on (`cache_ttls` = the `query`
+    /// and `list_tables` TTLs), those two tools say how old a result may be
+    /// and take an optional `fresh`; with it off the catalog is unchanged.
+    fn tool_defs(cfg: &McpConfig, cache_ttls: Option<(Duration, Duration)>) -> Value {
         let query_desc = if cfg.read_only {
             "Run a read-only SQL query and return rows. Writes/DDL are refused."
         } else {
             "Run a SQL query and return rows (or the command tag for writes)."
+        };
+        let list_desc = "List user tables (schema.table) in the connected database.";
+        let mut query_props =
+            json!({ "sql": { "type": "string", "description": "SQL to execute" } });
+        let mut list_props = json!({});
+        let (query_desc, list_desc) = match cache_ttls {
+            None => (query_desc.to_string(), list_desc.to_string()),
+            Some((ttl, catalog_ttl)) => {
+                let fresh = json!({
+                    "type": "boolean",
+                    "description": "Skip the cached result and read the database now (the result \
+                                    is cached again)."
+                });
+                query_props["fresh"] = fresh.clone();
+                list_props["fresh"] = fresh;
+                (
+                    format!(
+                        "{query_desc} A read may be answered from the proxy's cache: writes through \
+                         this proxy retire it at once, writes made outside this proxy may show up \
+                         to {} s late; pass \"fresh\": true to read the database now.",
+                        ttl.as_secs()
+                    ),
+                    if catalog_ttl.is_zero() {
+                        list_desc.to_string()
+                    } else {
+                        format!(
+                            "{list_desc} May be answered from the proxy's cache: DDL through this \
+                             proxy retires it at once, DDL made outside this proxy may show up \
+                             to {} s late; pass \"fresh\": true to read the database now.",
+                            catalog_ttl.as_secs()
+                        )
+                    },
+                )
+            }
         };
         json!([
             {
@@ -454,14 +576,14 @@ impl McpServer {
                 "description": query_desc,
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "sql": { "type": "string", "description": "SQL to execute" } },
+                    "properties": query_props,
                     "required": ["sql"]
                 }
             },
             {
                 "name": "list_tables",
-                "description": "List user tables (schema.table) in the connected database.",
-                "inputSchema": { "type": "object", "properties": {} }
+                "description": list_desc,
+                "inputSchema": { "type": "object", "properties": list_props }
             },
             {
                 "name": "explain",
@@ -485,7 +607,10 @@ impl McpServer {
         let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-        let result: std::result::Result<(String, Option<Value>), String> = match name {
+        let fresh = args.get("fresh").and_then(Value::as_bool).unwrap_or(false);
+        let read_only = effective_read_only(cfg, contract);
+        // `meta`: the tool cache's `_meta`, for a call that reached it.
+        let (result, meta): (std::result::Result<ToolOutput, String>, Option<Value>) = match name {
             "query" => {
                 let sql = args
                     .get("sql")
@@ -493,25 +618,27 @@ impl McpServer {
                     .unwrap_or("")
                     .trim();
                 if sql.is_empty() {
-                    Err("missing 'sql'".to_string())
+                    (Err("missing 'sql'".to_string()), None)
                 } else {
                     match Self::check_policy(cfg, contract, sql) {
-                        Err(hint) => Err(hint),
+                        Err(hint) => (Err(hint), None),
                         Ok(()) => {
-                            Self::run_sql(cfg, gateway, sql, effective_read_only(cfg, contract))
+                            Self::run_tool(cfg, gateway, sql, read_only, CachedTool::Query, fresh)
                                 .await
-                                .map(render_result)
                         }
                     }
                 }
             }
             "list_tables" => {
-                let sql = "SELECT table_schema, table_name FROM information_schema.tables \
-                           WHERE table_schema NOT IN ('pg_catalog','information_schema') \
-                           ORDER BY table_schema, table_name";
-                Self::run_sql(cfg, gateway, sql, effective_read_only(cfg, contract))
-                    .await
-                    .map(render_result)
+                Self::run_tool(
+                    cfg,
+                    gateway,
+                    LIST_TABLES_SQL,
+                    read_only,
+                    CachedTool::ListTables,
+                    fresh,
+                )
+                .await
             }
             "explain" => {
                 let sql = args
@@ -519,29 +646,29 @@ impl McpServer {
                     .and_then(|s| s.as_str())
                     .unwrap_or("")
                     .trim();
-                if sql.is_empty() {
+                let result = if sql.is_empty() {
                     Err("missing 'sql'".to_string())
                 } else {
                     match Self::check_policy(cfg, contract, sql) {
                         Err(hint) => Err(hint),
                         // Policy is checked against the RAW sql (so `EXPLAIN a;
                         // DROP b` is caught as multi-statement); the `EXPLAIN `
-                        // prefix is applied only for execution.
-                        Ok(()) => Self::run_sql(
-                            cfg,
-                            gateway,
-                            &format!("EXPLAIN {}", sql),
-                            effective_read_only(cfg, contract),
-                        )
-                        .await
-                        .map(render_result),
+                        // prefix is applied only for execution. Never cached:
+                        // EXPLAIN ANALYZE runs the statement, and plans follow
+                        // statistics no write generation tracks.
+                        Ok(()) => {
+                            Self::run_sql(cfg, gateway, &format!("EXPLAIN {}", sql), read_only)
+                                .await
+                                .map(render_result)
+                        }
                     }
-                }
+                };
+                (result, None)
             }
-            other => Err(format!("unknown tool: {}", other)),
+            other => (Err(format!("unknown tool: {}", other)), None),
         };
 
-        match result {
+        let mut result = match result {
             Ok((text, structured)) => {
                 tracing::info!(tool = %name, principal = %gateway.principal, "MCP tool call ok");
                 let mut result =
@@ -549,19 +676,61 @@ impl McpServer {
                 if let Some(structured) = structured {
                     result["structuredContent"] = structured;
                 }
-                rpc_ok(id, result)
+                result
             }
             Err(e) => {
                 tracing::info!(tool = %name, principal = %gateway.principal, error = %e,
                     "MCP tool call error");
                 // Tool errors are reported in-band (isError) per MCP, not as a
                 // protocol error, so the agent can read + self-correct.
-                rpc_ok(
-                    id,
-                    json!({ "content": [{ "type": "text", "text": e }], "isError": true }),
-                )
+                json!({ "content": [{ "type": "text", "text": e }], "isError": true })
             }
+        };
+        // The tool cache's outcome (hit, age, stored, skip reason): never
+        // text derived from data. Absent with the cache off.
+        if let Some(meta) = meta {
+            result["_meta"] = meta;
         }
+        rpc_ok(id, result)
+    }
+
+    /// Run a cacheable tool's statement: the request policies, then the tool
+    /// cache when it runs (keyed by owner, tool and the final statement),
+    /// else the backend. The result, and the cache's `_meta` when it ran.
+    async fn run_tool(
+        cfg: &McpConfig,
+        gateway: &Gateway<'_>,
+        sql: &str,
+        read_only: bool,
+        tool: CachedTool,
+        fresh: bool,
+    ) -> (std::result::Result<ToolOutput, String>, Option<Value>) {
+        let final_sql = match Self::prepare_sql(cfg, gateway, sql).await {
+            Ok(text) => text,
+            Err(denied) => return (Err(denied), None),
+        };
+        #[cfg(feature = "query-cache")]
+        if let Some(cache) = gateway.cache {
+            let owner = crate::mcp_cache::Owner::new(
+                gateway.principal.clone(),
+                gateway.tenant.map(|t| t.0.as_str()),
+            );
+            let (result, outcome) = cache
+                .serve(&owner, tool, &final_sql, fresh, || async {
+                    Self::execute_sql(cfg, gateway, &final_sql, read_only)
+                        .await
+                        .map(render_result)
+                })
+                .await;
+            return (result, Some(outcome.meta()));
+        }
+        let _ = (tool, fresh);
+        (
+            Self::execute_sql(cfg, gateway, &final_sql, read_only)
+                .await
+                .map(render_result),
+            None,
+        )
     }
 
     /// Gate a SQL statement: when an agent contract is configured, validate
@@ -639,10 +808,21 @@ impl McpServer {
         sql: &str,
         read_only: bool,
     ) -> std::result::Result<BoundedQueryResult, String> {
-        // H-06: the PG-wire rate limit, circuit breaker and rewrite rules
-        // apply to tool calls too (after the read-only guard saw the raw SQL).
-        let (pool, policy) = (gateway.pool, gateway.policy);
-        let node = format!("{}:{}", cfg.backend_host, cfg.backend_port);
+        let sql = Self::prepare_sql(cfg, gateway, sql).await?;
+        Self::execute_sql(cfg, gateway, &sql, read_only).await
+    }
+
+    /// The statement as the backend will run it. H-06: the PG-wire rate
+    /// limit and rewrite rules apply to tool calls too (after the read-only
+    /// guard saw the raw SQL), then the request tenant's row filter. Runs
+    /// before the tool cache is consulted, so a hit consumes a rate-limit
+    /// token too and a refused statement never reaches the cache.
+    async fn prepare_sql<'s>(
+        cfg: &McpConfig,
+        gateway: &Gateway<'_>,
+        sql: &'s str,
+    ) -> std::result::Result<Cow<'s, str>, String> {
+        let policy = gateway.policy;
         policy
             .admit_request(RequestIdentity {
                 peer: gateway.peer,
@@ -650,15 +830,40 @@ impl McpServer {
                 database: cfg.backend_database.as_deref(),
             })
             .await
-            .and(policy.check_node(&node))
             .map_err(|denied| denied.to_string())?;
         let rewritten = policy.rewrite(sql);
         let filtered = policy
             .tenant_sql(&rewritten, gateway.tenant)
             .map_err(|denied| denied.to_string())?;
-        let sql = filtered.as_ref();
-        // `[multi_tenancy]` active-query cap: held until this call's result
-        // is built, released on every path.
+        // Borrowed: the tenant filter left the rewritten text as it was.
+        let filtered = match filtered {
+            Cow::Borrowed(_) => None,
+            Cow::Owned(text) => Some(text),
+        };
+        Ok(match filtered {
+            Some(text) => Cow::Owned(text),
+            None => rewritten,
+        })
+    }
+
+    /// Run the final statement ([`Self::prepare_sql`]) on the backend: the
+    /// circuit breaker (only now, so a cache hit needs no backend), the
+    /// pooled connection, the read-only backstop and the bounded read.
+    async fn execute_sql(
+        cfg: &McpConfig,
+        gateway: &Gateway<'_>,
+        sql: &str,
+        read_only: bool,
+    ) -> std::result::Result<BoundedQueryResult, String> {
+        let (pool, policy) = (gateway.pool, gateway.policy);
+        let node = format!("{}:{}", cfg.backend_host, cfg.backend_port);
+        policy
+            .check_node(&node)
+            .map_err(|denied| denied.to_string())?;
+        // `[multi_tenancy]` active-query cap: taken here, where the call runs
+        // SQL on the backend, so a tool-cache hit (which needs no backend)
+        // takes none; held until this call's result is built, released on
+        // every path.
         let _query_permit = policy
             .admit_tenant_query(gateway.tenant)
             .await
@@ -1791,6 +1996,7 @@ mod tests {
             )
         };
 
+        let principal: Arc<str> = Arc::from(MCP_DEFAULT_PRINCIPAL);
         let in_flight = policy.admit_tenant_query(Some(&acme)).await.unwrap();
         assert!(in_flight.is_some());
         let gw = Gateway {
@@ -1798,7 +2004,9 @@ mod tests {
             policy: &policy,
             peer: None,
             tenant: Some(&acme),
-            principal: MCP_DEFAULT_PRINCIPAL,
+            principal: &principal,
+            #[cfg(feature = "query-cache")]
+            cache: None,
         };
         let refused = McpServer::dispatch_with(&body, &cfg, None, &gw, &admission)
             .await
@@ -1815,7 +2023,9 @@ mod tests {
             policy: &policy,
             peer: None,
             tenant: Some(&globex),
-            principal: MCP_DEFAULT_PRINCIPAL,
+            principal: &principal,
+            #[cfg(feature = "query-cache")]
+            cache: None,
         };
         let other = McpServer::dispatch_with(&body, &cfg, None, &gw_other, &admission)
             .await

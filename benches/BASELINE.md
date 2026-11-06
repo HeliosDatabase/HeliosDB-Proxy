@@ -17,6 +17,23 @@ stay under 3%.
   candidate's CI does not overlap the baseline CI (Criterion's own change report says
   "regressed" / "improved" / "within noise").
 
+## 2026-11-06 — MCP tool-result cache (3 new cases, values pending)
+
+The MCP tool-result cache (sprinter `20bcc218385f`, `[mcp] tool_cache_*`). Three new cases
+in `benches/cache.rs` (`bench_mcp_tool_cache`), `--features all-features`: `hit_1k`,
+`miss_store_1k` (a `"fresh": true` call: no lookup, the entry replaced) and
+`evict_at_capacity_1k` (a new statement each iteration at the owner bound of 64, so each
+store evicts one entry), one owner, a 1 KiB result, a ready fetch future. They are NEW in
+`scripts/bench-gate.sh` (no base arm). The values were not measured on the implementing
+branch (agents do not run benchmarks in this batch); the lead records them from the
+candidate arm of the gate run.
+
+| Benchmark | Metric | Value | Date | Host | Features | Commit |
+|---|---|---:|---|---|---|---|
+| `cache/mcp/hit_1k` | median ns | pending | 2026-11-06 | gpc001ca | `all-features` | feat/mcp-tool-cache-20261106 |
+| `cache/mcp/miss_store_1k` | median ns | pending | 2026-11-06 | gpc001ca | `all-features` | feat/mcp-tool-cache-20261106 |
+| `cache/mcp/evict_at_capacity_1k` | median ns | pending | 2026-11-06 | gpc001ca | `all-features` | feat/mcp-tool-cache-20261106 |
+
 ## 2026-10-29 — tenant request budgets (3 new cases)
 
 Per-tenant active-query and replay-byte budgets (sprinter `ac858d61400b`). Three new cases

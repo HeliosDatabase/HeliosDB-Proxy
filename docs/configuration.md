@@ -2104,6 +2104,10 @@ query_timeout_ms = 30000
 max_concurrent_requests = 64
 max_result_rows = 10000
 max_result_bytes = 16777216
+# Tool-result cache (off by default; needs the query-cache feature).
+# tool_cache_enabled = true
+# tool_cache_ttl_secs = 60
+# tool_cache_catalog_ttl_secs = 30
 
 # One entry per agent (optional, repeatable): its bearer token selects it.
 [[mcp.principals]]
@@ -2140,6 +2144,15 @@ max_rows = 1000
 
 | `max_result_rows` | usize | `10000` | Most rows a `query`, `list_tables` or `explain` result carries back. The gateway reads the backend's rows but stops storing them at this cap, drains the rest of the result so the backend connection stays in sync, and marks the result truncated. Must be 1 to 1000000. |
 | `max_result_bytes` | usize | `16777216` (16 MiB) | Most cell bytes a tool result carries back: the text bytes of the stored values, NULL counting 0 (the table's separators and footer are not counted). Enforced while reading, like `max_result_rows`; a result that exactly fits is not truncated. Must be 1 to 1073741824 (1 GiB). |
+| `tool_cache_enabled` | bool | `false` | Cache `query` and `list_tables` results ([tool-result cache](#mcp-tool-result-cache), below). Needs the `query-cache` feature: `strict_config` refuses it in a build without one (a warning otherwise, and nothing is cached). |
+| `tool_cache_ttl_secs` | u64 | `60` | Longest a cached `query` result is served, seconds; a shorter `[[cache.tables]] ttl_secs` of a table the statement names applies instead. 1 to 86400. |
+| `tool_cache_catalog_ttl_secs` | u64 | `30` | Longest a cached `list_tables` result is served, seconds. `0` = `list_tables` is not cached. 0 to 86400. |
+| `tool_cache_max_entries` | usize | `10000` | Most entries the cache holds; past it the globally oldest go. At least 1. |
+| `tool_cache_max_bytes` | usize | `67108864` (64 MiB) | Most bytes the cache holds (keys, results and table names counted); past it the globally oldest entries go. At least 1. |
+| `tool_cache_max_entries_per_principal` | usize | `1000` | Most entries one owner — a principal *and* tenant pair — holds; past it only that owner's oldest go. 1 to `tool_cache_max_entries`. |
+| `tool_cache_max_bytes_per_principal` | usize | `8388608` (8 MiB) | Most bytes one owner (principal, tenant) holds; past it only that owner's oldest entries go. 1 to `tool_cache_max_bytes`. |
+| `tool_cache_max_entry_bytes` | usize | `1048576` (1 MiB) | Largest entry stored (key and result bytes); a larger result is served and not stored (`entry_too_large`). 1 to `tool_cache_max_bytes_per_principal`. |
+| `tool_cache_max_statement_bytes` | usize | `16384` | Longest final statement whose result is cached (`statement_too_large` past it). 1 to 8388608 (the largest request body the gateway reads). |
 
 **Principals (`[[mcp.principals]]`).** A principal is the identity a request acts as:
 its bearer token (`Authorization: Bearer <token>`) selects it. Each entry has:
@@ -2160,6 +2173,84 @@ own `[[mcp.principals]]` entry. The owner of a request — the unit its cache en
 budgets belong to — is the pair (principal, tenant), the tenant coming from
 `tenant_header`. Like the rest of `[mcp]`, principals are read at startup (restart to
 change them).
+
+### MCP tool-result cache
+
+With `tool_cache_enabled = true` the gateway answers a repeated `query` or `list_tables`
+from memory. It is off by default; with it off, requests and responses are exactly as
+before (no `_meta`, no `fresh` in the tool catalog). `explain` is never cached:
+`EXPLAIN ANALYZE` runs the statement, and plans follow statistics no write tracks.
+
+- **Key.** The owner (the request's principal and tenant), the tool and the final
+  statement the backend would run — after `[query_rewrite]` and the tenant filter —
+  compared on every byte; the hash table uses a per-process random key. Everything else
+  that decides the backend's answer (the backend role, database, contract and result
+  caps) is fixed for the gateway, so a hit returns only what the same request could have
+  fetched. Holders of one token are one principal: give each agent its own
+  `[[mcp.principals]]` entry.
+- **Order of a call.** Admission (`max_concurrent_requests`), the read-only guard or
+  contract, and the rate limit run first, unchanged: a refused statement never reaches
+  the cache, and a hit consumes a rate-limit token like any call. The circuit breaker
+  is checked only on a miss.
+- **What is cached.** A `query` is eligible when its final statement is one plain
+  `SELECT` (no `INTO`, no `FOR UPDATE`/`FOR SHARE`, nothing volatile: the result caches'
+  own list plus `[cache] extra_volatile_functions`), names no system catalog, holds no
+  backend-ambiguous text or time-travel comment, names no `[cache]` excluded table
+  (`exclude_tables`, `[[cache.tables]] exclude = true`), names at least one table
+  (`SELECT 1`, `SELECT now()` are not cached) and is at most
+  `tool_cache_max_statement_bytes` long. `list_tables` reads the catalog: it is cached
+  for at most `tool_cache_catalog_ttl_secs` and retired by any write of unknown scope
+  (DDL, `GRANT`, `REVOKE`, `TRUNCATE`, ... through the proxy). Errors (`isError`) are
+  never stored; a truncated result is stored with its `structuredContent`.
+- **Freshness.** An entry is retired by the C-02 write generations
+  ([`[cache]`](#query-cache-cache)), which every write through this proxy moves — the
+  PG-wire listener's, the HTTP `/sql`, GraphQL and MCP gateways', and with `[cache]
+  invalidation_source = "logical"` every decoded change — whether or not `[cache]` itself
+  is enabled. A result whose tables were written while it was fetched is served and not
+  stored. Otherwise an entry lives `tool_cache_ttl_secs`, or less when a
+  `[[cache.tables]] ttl_secs` of a table its text names is shorter.
+- **Staleness.** Writes the proxy cannot see stay visible as stale for up to the TTL:
+  direct connections, other proxy instances, triggers, functions called from a `SELECT`,
+  views over other tables, a failover to a standby missing commits. When the MCP
+  backend (`backend_host:backend_port`) is neither a `[[nodes]]` address nor this
+  proxy's own listener and no logical source runs, nothing the proxy sees writes it:
+  startup warns, and `strict_config = true` refuses to start. After an out-of-band write,
+  clear the cache with `POST /api/mcp/cache/clear`.
+- **`fresh`.** With the cache on, `query` and `list_tables` take an optional
+  `"fresh": true`: the lookup is skipped, the backend answers, and the result replaces
+  the entry. Their descriptions in `tools/list` say how old a result may be.
+- **`_meta`.** A cacheable call that reached the cache carries
+  `"_meta": {"heliosdb.com/cache": …}` in its result: `{"hit": true, "age_ms": …,
+  "expires_in_ms": …}` on a hit, or `{"hit": false, "stored": true|false}` with
+  `"skipped": "<reason>"` when the lookup was skipped or the result not stored (the
+  reasons below, or `raced` when a write moved the generations during the fetch).
+  `content` is byte-identical on a hit and on a miss, and `_meta` never carries text
+  derived from data.
+- **Bounds.** Per owner and overall, in entries and bytes (keys counted). Past an
+  owner's bound only that owner's oldest entries go; past the overall bound the
+  globally oldest. Each operation is O(1) amortized, under one lock never held across
+  I/O. The number of owners is bounded by principals × tenants.
+
+Admin API (token-gated like every admin endpoint): `GET /api/mcp/cache` returns the
+counters below, the totals and per-owner entries and bytes (`owners_usage`, which names
+principals and tenants), or `{"enabled": false}` when the cache is off.
+`POST /api/mcp/cache/clear` with `{}` (or no body) clears everything, with
+`{"principal": "…"}`, `{"tenant": "…"}` or both only the owners they select, and
+answers `{"cleared": N}`.
+
+Metrics (no principal or tenant label): `heliosdb_proxy_mcp_cache_hits_total{tool}` and
+`_misses_total{tool}` (`tool` = `query`, `list_tables`), `_stores_total`,
+`_stale_rejected_total`, `_expired_total`, `_fills_raced_total`,
+`_skipped_total{reason}` (`reason` = `write`, `volatile`, `catalog`, `excluded`,
+`ambiguous`, `no_tables`, `statement_too_large`, `entry_too_large`, `error`, `fresh`),
+`_evictions_total{scope}` (`principal` for the per-owner bounds, `global`), and the
+gauges `heliosdb_proxy_mcp_cache_entries`, `_retained_bytes` and `_owners`; the same
+under `mcp_cache` on `GET /metrics`. Gateway writes that moved the generations are
+counted in `heliosdb_proxy_cache_gateway_write_invalidations_total{gateway}`.
+
+Not provided: similarity matching or embeddings, `WITH` reads, stampede coalescing,
+persistence or sharing across proxy instances, a flush on failover, and per-principal
+metric labels. Like the rest of `[mcp]`, the cache is configured at startup only.
 
 **Truncated tool results.** A result is truncated when either cap cut it. The text
 table then ends with a `(truncated: the row limit was reached; the first N rows are

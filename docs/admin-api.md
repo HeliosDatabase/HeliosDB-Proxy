@@ -108,6 +108,8 @@ Auth column: **token** = requires bearer token when `admin_token` is set; **open
 | `GET` | `/anomalies` | Anomaly-detector recent events (`?limit=N`) | `anomaly-detection` | token |
 | `GET` | `/analytics`, `/api/analytics` | Top queries + slow-query log (`?limit=N`) | `query-analytics` | token |
 | `GET` | `/api/cache/heatmap` | Per-table query-cache heatmap + recommendations (`{"enabled":false}` while off) | `query-cache` | token |
+| `GET` | `/api/mcp/cache` | MCP tool-result cache counters, totals and per-owner (principal, tenant) usage (`{"enabled":false}` while off) | `query-cache` | token |
+| `POST` | `/api/mcp/cache/clear` | Clear the MCP tool-result cache: `{}` all, or the owners `{"principal","tenant"}` select (503 while off) | `query-cache` | token |
 | `GET` | `/api/chaos` | Read current chaos overrides | — | token |
 | `POST` | `/api/chaos` | Inject/clear a fault (`force_unhealthy`/`restore`/`reset`) | — | token |
 | `POST` | `/api/replay` | Replay a journal window against a target backend (503 when `tr_enabled = false`) | *(default build)* | token |
@@ -587,6 +589,34 @@ Top queries by call count plus the slow-query log. Optional `?limit=N` (default 
 
 ```bash
 curl -H "Authorization: Bearer $ADMIN_TOKEN" "http://localhost:9090/api/analytics?limit=50"
+```
+
+### GET /api/mcp/cache
+
+The MCP gateway's tool-result cache ([configuration.md → MCP tool-result
+cache](configuration.md#mcp-tool-result-cache)): the counters also on `/metrics`
+(`hits` and `misses` by tool, `stores`, `stale_rejected`, `expired`, `fills_raced`,
+`skipped` by reason, `evictions` by scope), the totals (`entries`, `retained_bytes`,
+`owners`), and `owners_usage`, one `{"principal", "tenant", "entries", "bytes"}` per owner,
+ordered by principal then tenant. It names principals and tenants, which the metrics do
+not. While `[mcp] tool_cache_enabled` is off the answer is **`200 {"enabled": false,
+"reason": "…"}`**. **`503` unless built with `--features query-cache`.**
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/api/mcp/cache
+```
+
+### POST /api/mcp/cache/clear
+
+Drop tool-cache entries after a write the proxy did not see (a direct connection,
+another proxy instance). No body or `{}` clears everything; `{"principal": "etl-agent"}`,
+`{"tenant": "acme"}` or both clear only the owners they select. Answers
+`{"cleared": N}`; `400` for a body that is not such an object, **`503`** while the cache is
+off or the build lacks `query-cache`.
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -d '{"principal":"etl-agent"}' \
+  http://localhost:9090/api/mcp/cache/clear
 ```
 
 ### GET /api/cache/heatmap

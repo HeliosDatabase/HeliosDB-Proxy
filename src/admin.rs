@@ -104,6 +104,11 @@ pub struct AdminState {
     /// `/metrics` (P-03). Attached at startup when `[cache] enabled`.
     #[cfg(feature = "query-cache")]
     pub query_cache: RwLock<Option<Arc<crate::cache::QueryCache>>>,
+    /// The MCP gateway's tool-result cache, for `/metrics` and `GET` /
+    /// `POST /api/mcp/cache[/clear]`. Attached at startup when `[mcp]
+    /// tool_cache_enabled`.
+    #[cfg(feature = "query-cache")]
+    pub mcp_cache: RwLock<Option<Arc<crate::mcp_cache::McpToolCache>>>,
     /// Live `[auto_promote]` status for `GET /api/promotion`.
     pub promoter: RwLock<Option<Arc<parking_lot::Mutex<crate::auto_promote::PromoterStatus>>>>,
     /// WASM plugin manager. None when the proxy started without
@@ -619,6 +624,10 @@ impl AdminServer {
                     if let Some(c) = state.query_cache.read().await.as_ref() {
                         map.insert("query_cache".into(), Self::query_cache_json(c));
                     }
+                    #[cfg(feature = "query-cache")]
+                    if let Some(c) = state.mcp_cache.read().await.as_ref() {
+                        map.insert("mcp_cache".into(), c.stats_json());
+                    }
                     #[cfg(feature = "edge-proxy")]
                     if let Some(e) = state.edge_cache.read().await.as_ref() {
                         let s = e.stats();
@@ -676,6 +685,10 @@ impl AdminServer {
                 #[cfg(feature = "query-cache")]
                 if let Some(c) = state.query_cache.read().await.as_ref() {
                     Self::push_query_cache_prometheus(&mut prometheus, c);
+                }
+                #[cfg(feature = "query-cache")]
+                if let Some(c) = state.mcp_cache.read().await.as_ref() {
+                    c.write_prometheus(&mut prometheus);
                 }
                 #[cfg(feature = "edge-proxy")]
                 if let Some(e) = state.edge_cache.read().await.as_ref() {
@@ -816,6 +829,18 @@ impl AdminServer {
                     serde_json::json!({ "error": "query-analytics feature not compiled in" }),
                 ))
             }
+
+            // MCP tool-result cache: totals and per-owner usage, and a clear
+            // after writes the proxy did not see.
+            #[cfg(feature = "query-cache")]
+            ("GET", "/api/mcp/cache") => Self::handle_mcp_cache(state).await,
+            #[cfg(feature = "query-cache")]
+            ("POST", "/api/mcp/cache/clear") => Self::handle_mcp_cache_clear(body, state).await,
+            #[cfg(not(feature = "query-cache"))]
+            ("GET", "/api/mcp/cache") | ("POST", "/api/mcp/cache/clear") => Ok((
+                503,
+                serde_json::json!({ "error": "query-cache feature not compiled in" }),
+            )),
 
             // Query-cache heatmap: per-table counters over the window, plus
             // recommendations naming real [cache] keys.
@@ -2845,6 +2870,84 @@ impl AdminServer {
         Ok((200, body))
     }
 
+    /// `GET /api/mcp/cache`: the MCP tool cache's counters, totals and
+    /// per-owner (principal, tenant) entries and bytes. 200 with
+    /// `{"enabled": false}` while it is off.
+    #[cfg(feature = "query-cache")]
+    async fn handle_mcp_cache(state: &Arc<AdminState>) -> Result<(u16, serde_json::Value)> {
+        let Some(cache) = state.mcp_cache.read().await.clone() else {
+            return Ok((
+                200,
+                serde_json::json!({
+                    "enabled": false,
+                    "reason": "the MCP tool cache is off ([mcp] tool_cache_enabled = false)",
+                }),
+            ));
+        };
+        let mut body = cache.stats_json();
+        body["enabled"] = serde_json::Value::Bool(true);
+        body["owners_usage"] = serde_json::to_value(cache.owner_usage())?;
+        Ok((200, body))
+    }
+
+    /// `POST /api/mcp/cache/clear`: drop the MCP tool cache's entries, all of
+    /// them (`{}` or no body) or those of the owners `principal` and/or
+    /// `tenant` select, after writes the proxy did not see. 503 while it is
+    /// off.
+    #[cfg(feature = "query-cache")]
+    async fn handle_mcp_cache_clear(
+        body: Option<&str>,
+        state: &Arc<AdminState>,
+    ) -> Result<(u16, serde_json::Value)> {
+        let Some(cache) = state.mcp_cache.read().await.clone() else {
+            return Ok((
+                503,
+                serde_json::json!({
+                    "error": "the MCP tool cache is off ([mcp] tool_cache_enabled = false)",
+                }),
+            ));
+        };
+        let request: serde_json::Value = match body.map(str::trim).filter(|b| !b.is_empty()) {
+            None => serde_json::json!({}),
+            Some(text) => match serde_json::from_str(text) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Ok((
+                        400,
+                        serde_json::json!({ "error": format!("invalid JSON: {e}") }),
+                    ))
+                }
+            },
+        };
+        let Some(fields) = request.as_object() else {
+            return Ok((
+                400,
+                serde_json::json!({ "error": "expected a JSON object" }),
+            ));
+        };
+        let mut filter = [None, None];
+        for (slot, key) in filter.iter_mut().zip(["principal", "tenant"]) {
+            match fields.get(key) {
+                None | Some(serde_json::Value::Null) => {}
+                Some(serde_json::Value::String(v)) => *slot = Some(v.as_str()),
+                Some(_) => {
+                    return Ok((
+                        400,
+                        serde_json::json!({ "error": format!("{key} must be a string") }),
+                    ))
+                }
+            }
+        }
+        if let Some(unknown) = fields.keys().find(|k| *k != "principal" && *k != "tenant") {
+            return Ok((
+                400,
+                serde_json::json!({ "error": format!("unknown field {unknown:?}") }),
+            ));
+        }
+        let cleared = cache.clear(filter[0], filter[1]);
+        Ok((200, serde_json::json!({ "cleared": cleared })))
+    }
+
     /// The query cache's counters and retained bytes for `GET /metrics`.
     #[cfg(feature = "query-cache")]
     fn query_cache_json(cache: &crate::cache::QueryCache) -> serde_json::Value {
@@ -3534,6 +3637,8 @@ impl AdminState {
             tenant_slots: RwLock::new(None),
             #[cfg(feature = "query-cache")]
             query_cache: RwLock::new(None),
+            #[cfg(feature = "query-cache")]
+            mcp_cache: RwLock::new(None),
             promoter: RwLock::new(None),
             #[cfg(feature = "wasm-plugins")]
             plugin_manager: RwLock::new(None),
@@ -3665,6 +3770,12 @@ impl AdminState {
     #[cfg(feature = "query-cache")]
     pub async fn with_query_cache(&self, cache: Arc<crate::cache::QueryCache>) {
         *self.query_cache.write().await = Some(cache);
+    }
+
+    /// Attach the MCP tool-result cache (`/metrics`, `/api/mcp/cache`).
+    #[cfg(feature = "query-cache")]
+    pub async fn with_mcp_cache(&self, cache: Arc<crate::mcp_cache::McpToolCache>) {
+        *self.mcp_cache.write().await = Some(cache);
     }
 
     /// Attach a WASM plugin manager. Production startup calls this
@@ -4972,6 +5083,139 @@ mod tests {
             10_000
         );
         assert_eq!(json["latency"]["tr_replay_refusals"]["outcome_unknown"], 1);
+    }
+
+    /// A tool cache with one entry for owner (`p`, `t`).
+    #[cfg(feature = "query-cache")]
+    async fn mcp_cache_with_entry(p: &str, t: Option<&str>) -> Arc<crate::mcp_cache::McpToolCache> {
+        let cache = Arc::new(crate::mcp_cache::McpToolCache::new(
+            crate::mcp_cache::ToolCacheSettings::from_config(&crate::config::McpConfig::default()),
+            Arc::new(crate::cache::TableGenerations::new()),
+            Arc::new(crate::sql_text::VolatileScan::new(
+                std::iter::empty::<&str>(),
+            )),
+            None,
+            std::iter::empty(),
+        ));
+        mcp_cache_fill(&cache, p, t).await;
+        cache
+    }
+
+    /// Store one entry for owner (`p`, `t`) in `cache`.
+    #[cfg(feature = "query-cache")]
+    async fn mcp_cache_fill(cache: &crate::mcp_cache::McpToolCache, p: &str, t: Option<&str>) {
+        let owner = crate::mcp_cache::Owner::new(Arc::from(p), t);
+        let (_, outcome) = cache
+            .serve(
+                &owner,
+                crate::mcp::CachedTool::Query,
+                "SELECT v FROM t",
+                false,
+                || async { Ok(("v\n1\n(1 rows)".to_string(), None)) },
+            )
+            .await;
+        assert!(matches!(
+            outcome,
+            crate::mcp_cache::Outcome::Miss { stored: true, .. }
+        ));
+    }
+
+    #[cfg(feature = "query-cache")]
+    #[tokio::test]
+    async fn mcp_cache_endpoints_report_and_clear_per_owner() {
+        let state = Arc::new(AdminState::new());
+        let (status, off) = AdminServer::route_request("GET", "/api/mcp/cache", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(
+            (status, off["enabled"].clone()),
+            (200, serde_json::json!(false))
+        );
+        let (status, _) =
+            AdminServer::route_request("POST", "/api/mcp/cache/clear", Some("{}"), &state)
+                .await
+                .unwrap();
+        assert_eq!(status, 503);
+
+        let cache = mcp_cache_with_entry("etl-agent", Some("acme")).await;
+        state.with_mcp_cache(cache.clone()).await;
+        let (status, body) = AdminServer::route_request("GET", "/api/mcp/cache", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["entries"], 1);
+        assert_eq!(body["owners_usage"][0]["principal"], "etl-agent");
+        assert_eq!(body["owners_usage"][0]["tenant"], "acme");
+        assert_eq!(body["stores"], 1);
+
+        for bad in ["[1]", "{\"principal\": 1}", "{\"who\": \"x\"}", "nope"] {
+            let (status, _) =
+                AdminServer::route_request("POST", "/api/mcp/cache/clear", Some(bad), &state)
+                    .await
+                    .unwrap();
+            assert_eq!(status, 400, "{bad}");
+        }
+        let (_, none) = AdminServer::route_request(
+            "POST",
+            "/api/mcp/cache/clear",
+            Some(r#"{"principal":"etl-agent","tenant":"globex"}"#),
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(none["cleared"], 0);
+        let (_, one) = AdminServer::route_request(
+            "POST",
+            "/api/mcp/cache/clear",
+            Some(r#"{"principal":"etl-agent","tenant":"acme"}"#),
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(one["cleared"], 1);
+        assert_eq!(cache.entries(), 0);
+        mcp_cache_fill(&cache, "a", None).await;
+        mcp_cache_fill(&cache, "b", Some("acme")).await;
+        let (_, all) = AdminServer::route_request("POST", "/api/mcp/cache/clear", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(all["cleared"], 2, "no body clears every owner");
+        assert_eq!(cache.retained_bytes(), 0);
+    }
+
+    #[cfg(feature = "query-cache")]
+    #[tokio::test]
+    async fn mcp_cache_metrics_are_exported_without_owner_labels() {
+        let state = Arc::new(AdminState::new());
+        let (_, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
+            .await
+            .unwrap();
+        assert!(!body["text"]
+            .as_str()
+            .unwrap()
+            .contains("heliosdb_proxy_mcp_cache_"));
+        state
+            .with_mcp_cache(mcp_cache_with_entry("etl-agent", Some("acme")).await)
+            .await;
+        let (_, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
+            .await
+            .unwrap();
+        let text = body["text"].as_str().unwrap();
+        for line in [
+            "heliosdb_proxy_mcp_cache_misses_total{tool=\"query\"} 1",
+            "heliosdb_proxy_mcp_cache_stores_total 1",
+            "heliosdb_proxy_mcp_cache_entries 1",
+            "heliosdb_proxy_mcp_cache_owners 1",
+        ] {
+            assert!(text.contains(line), "missing {line}");
+        }
+        assert!(!text.contains("etl-agent") && !text.contains("acme"));
+        let (_, json) = AdminServer::route_request("GET", "/metrics", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(json["mcp_cache"]["entries"], 1);
+        assert_eq!(json["mcp_cache"]["misses"]["query"], 1);
     }
 
     #[cfg(feature = "query-cache")]

@@ -72,6 +72,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MCP tool-result cache (`[mcp] tool_cache_*`, Sprinter 20bcc218385f).** Off by default
+  (`tool_cache_enabled = false`; needs the `query-cache` feature). With it on, the MCP
+  gateway answers a repeated `query` or `list_tables` from memory; `explain` is never
+  cached. Entries are keyed by owner (principal, tenant), tool and the final backend SQL
+  (after `[query_rewrite]` and the tenant filter), compared on every byte; only a single
+  plain `SELECT` naming at least one table and no system catalog, excluded table,
+  backend-ambiguous text or volatile function (the result caches' scan, with `[cache]
+  extra_volatile_functions`) is cached. Entries are retired by the shared C-02 write
+  generations (writes through the PG-wire listener and every gateway, with or without
+  `[cache]`), with the fill-race rule, and by a TTL (`tool_cache_ttl_secs = 60`, a shorter
+  `[[cache.tables]] ttl_secs` applying; `list_tables` follows DDL and
+  `tool_cache_catalog_ttl_secs = 30`). Admission, the read-only guard or contract and the
+  rate limit run first (hits consume rate-limit tokens). Bounded per owner and overall in
+  entries and bytes (`tool_cache_max_entries = 10000`, `tool_cache_max_bytes = 64 MiB`,
+  `tool_cache_max_entries_per_principal = 1000`, `tool_cache_max_bytes_per_principal =
+  8 MiB`, `tool_cache_max_entry_bytes = 1 MiB`, `tool_cache_max_statement_bytes = 16384`),
+  with O(1) amortized eviction. `query` and `list_tables` gain an optional `"fresh": true`
+  that bypasses and refreshes the entry; a cacheable call's result carries
+  `_meta["heliosdb.com/cache"]` (hit, age, stored, skip reason; never data). With the cache
+  off, responses are unchanged. `strict_config` refuses the cache when the MCP backend is
+  neither a `[[nodes]]` address nor the proxy's listener and no logical source runs
+  (startup warns otherwise). New admin endpoints `GET /api/mcp/cache` and
+  `POST /api/mcp/cache/clear`; new metrics `heliosdb_proxy_mcp_cache_*` (hits, misses,
+  stores, stale, expired, raced fills, skips by reason, evictions by scope, entries,
+  bytes, owners; no principal or tenant labels); a `mcp-tool-cache` row on
+  `/capabilities`. Documented under `[mcp]` in `docs/configuration.md`.
 - **MCP: per-agent principals (`[[mcp.principals]]`, Sprinter 20bcc218385f).** Each
   entry has an `id` (`[A-Za-z0-9_.-]{1,64}`, unique; `default` reserved) and a `token`
   (non-empty, unique, not `auth_token`). The request's bearer token selects its
