@@ -200,6 +200,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cache/heatmap/record_hit_{off,on,contended_8}`.
 
 ### Fixed
+- **EXPLAIN ANALYZE writes and gateway writes invalidate every cache (Sprinter 73f84de3ded3).**
+  `EXPLAIN ANALYZE UPDATE t ...` (also `ANALYSE`, `EXPLAIN (ANALYZE, ...)`) was classified
+  as a read: the C-02 table generations were not bumped although the write ran, and a
+  cached read of `t` stayed stale. It is now classified as the statement it runs (fail
+  closed when that cannot be read). `EXPLAIN` without ANALYZE stays a read. A write
+  through the HTTP, MCP or GraphQL gateway on an `[edge] role = "home"` proxy now also
+  invalidates the home's edge cache and broadcasts to the edges, as a PG-wire write does.
+  `docs/configuration.md` documents that a gateway statement which commits after its
+  timeout can leave a refill stale until the next write or the TTL.
 
 - **Gateway writes retire cached reads (C-02, Sprinter 6a0c6c34d27a).** The HTTP `/sql`,
   MCP and GraphQL gateways run SQL on their own backend connections, which the PG-wire

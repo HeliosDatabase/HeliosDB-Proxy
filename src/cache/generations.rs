@@ -113,6 +113,13 @@ impl TableGenerations {
         // rewriting and hashing of `normalize`. A journaled `SELECT`
         // (`SELECT … INTO`, a function call) has an unknown scope.
         let (t, text) = crate::sql_text::single_statement(sql)?;
+        // EXPLAIN ANALYZE: the tables of the statement it runs; unreadable
+        // (or DDL under it) is unknown scope.
+        let (t, text) = if starts_with_ci(t, "EXPLAIN") {
+            crate::sql_text::single_statement(crate::sql_lex::explain_innermost(sql)?)?
+        } else {
+            (t, text)
+        };
         if OPAQUE.iter().any(|kw| starts_with_ci(t, kw))
             || crate::sql_text::merge_without_into(t)
             || crate::sql_text::insert_without_into(t)
@@ -154,6 +161,10 @@ impl TableGenerations {
 /// PG-wire relay.
 pub(crate) fn gateway_statement_may_write(sql: &str) -> bool {
     use crate::journal_capture::{classify, StmtKind};
+    // `EXPLAIN ANALYZE` runs the statement it explains: that one decides.
+    let Some(sql) = crate::sql_lex::explain_innermost(sql) else {
+        return true;
+    };
     if classify(sql).0 != StmtKind::Read {
         return true;
     }
@@ -361,5 +372,52 @@ mod tests {
         );
         assert_eq!(g.global_generation(), 1);
         assert!(gateway_write_invalidations(GatewayKind::Http) >= before + 2);
+    }
+}
+
+#[cfg(test)]
+mod explain_analyze_tests {
+    use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// An `EXPLAIN ANALYZE` write moves the tables of the statement it runs;
+    /// an unknown scope inside it moves everything.
+    #[test]
+    fn an_explain_analyze_write_moves_the_tables_it_runs() {
+        let g = TableGenerations::new();
+        assert_eq!(
+            g.write_tables("EXPLAIN ANALYZE UPDATE accounts SET v = 2 WHERE id = 1"),
+            Some(names(&["accounts"]))
+        );
+        assert_eq!(
+            g.write_tables("EXPLAIN (ANALYZE, COSTS OFF) DELETE FROM accounts"),
+            Some(names(&["accounts"]))
+        );
+        assert_eq!(g.write_tables("EXPLAIN ANALYZE DROP TABLE accounts"), None);
+        assert_eq!(g.write_tables("EXPLAIN ANALYZE"), None);
+        assert_eq!(
+            g.note_write("EXPLAIN ANALYZE UPDATE accounts SET v = 3"),
+            WriteScope::Tables(names(&["accounts"]))
+        );
+        assert_eq!(g.generation_of(&names(&["accounts"])), 1);
+        assert_eq!(g.global_generation(), 0);
+    }
+
+    /// A gateway statement that runs an EXPLAIN ANALYZE of a read may not
+    /// write; an EXPLAIN without ANALYZE executes nothing.
+    #[test]
+    fn a_gateway_explain_analyze_moves_only_for_a_write() {
+        assert!(!gateway_statement_may_write(
+            "EXPLAIN ANALYZE SELECT v FROM accounts"
+        ));
+        assert!(gateway_statement_may_write(
+            "EXPLAIN ANALYZE UPDATE accounts SET v = 1"
+        ));
+        assert!(!gateway_statement_may_write(
+            "EXPLAIN UPDATE accounts SET v = 1"
+        ));
     }
 }

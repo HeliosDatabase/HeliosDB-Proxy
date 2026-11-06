@@ -726,4 +726,43 @@ mod tests {
         task.await.unwrap().unwrap();
         resp
     }
+
+    /// `[graphql_gateway] max_result_bytes` with one 64 MiB cell: a
+    /// RESULT_TOO_LARGE error without the cell held, and the pooled connection
+    /// serves the next request.
+    #[tokio::test]
+    async fn an_oversized_cell_is_refused_and_the_connection_stays_in_sync() {
+        use std::sync::atomic::Ordering;
+        const HUGE_CELL: usize = 64 * 1024 * 1024;
+        let fake = crate::gateway_fake_pg::spawn(1, HUGE_CELL).await;
+        let config = GraphqlGatewayConfig {
+            backend_port: fake.port,
+            max_result_bytes: 1024,
+            tables: vec![crate::config::GqlTableToml {
+                name: "users".into(),
+                columns: vec!["id".into()],
+            }],
+            ..GraphqlGatewayConfig::default()
+        };
+        let pool: crate::gateway_pool::SharedBackendPool =
+            Arc::new(crate::gateway_pool::BackendClientPool::new(4));
+        let gw = GraphqlGateway::new(config.clone(), pool);
+
+        let refused = post_graphql(&gw, &config, "{ users { id } }").await;
+        assert_eq!(status_line(&refused), "HTTP/1.1 200 OK", "{refused}");
+        assert!(refused.contains("RESULT_TOO_LARGE"), "{refused}");
+        assert!(
+            refused.contains("result exceeds graphql_gateway.max_result_bytes (1024)"),
+            "{refused}"
+        );
+
+        fake.cell_len.store(4, Ordering::SeqCst);
+        let served = post_graphql(&gw, &config, "{ users { id } }").await;
+        assert!(!served.contains("RESULT_TOO_LARGE"), "{served}");
+        assert_eq!(
+            fake.connections.load(Ordering::SeqCst),
+            1,
+            "connection reused"
+        );
+    }
 }

@@ -466,3 +466,51 @@ async fn a_sighup_reload_moves_the_edge_entry_ceiling() {
     assert!(edge.insert_if_fresh(key(), entry()), "24 bytes <= 32");
     assert_eq!(edge.stats().oversize_rejected, 1);
 }
+
+/// A write through a gateway (`GatewayPolicy::note_statement`, the one the
+/// HTTP, MCP and GraphQL gateways call) on an `[edge] role = "home"` proxy
+/// retires the home's edge entries for its tables, as a PG-wire write does.
+#[tokio::test]
+async fn a_gateway_write_invalidates_the_home_edge_cache() {
+    let mut config = crate::config::ProxyConfig {
+        listen_address: "127.0.0.1:0".to_string(),
+        ..Default::default()
+    };
+    config.add_node("pg-p:5432", "primary").unwrap();
+    config.edge.enabled = true;
+    config.edge.role = crate::edge::EdgeRole::Home;
+    let server = ProxyServer::new(config).unwrap();
+    let edge = &server.state.edge_cache;
+    // Stamped above the home's invalidation high-water mark (0): a version at
+    // or below it is refused by `insert_if_fresh`.
+    let entry = |tables: &[&str]| crate::edge::CacheEntry {
+        version: 1,
+        response_bytes: bytes::Bytes::from_static(b"x"),
+        tables: tables.iter().map(|t| t.to_string()).collect(),
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
+    };
+    let key = |sql: &str| crate::edge::CacheKey::new(sql, "p");
+    const READ_T: &str = "SELECT v FROM t WHERE id = 1";
+    const READ_U: &str = "SELECT v FROM u WHERE id = 1";
+    assert!(edge.insert_if_fresh(key(READ_T), entry(&["t"])));
+    assert!(edge.insert_if_fresh(key(READ_U), entry(&["u"])));
+
+    let policy = server.gateway_policy();
+    policy
+        .note_statement(
+            "EXPLAIN ANALYZE UPDATE u SET v = 2 WHERE id = 1",
+            crate::gateway_policy::GatewayKind::Http,
+        )
+        .await;
+    assert!(edge.get(&key(READ_U)).is_none(), "u's entry is invalidated");
+    assert!(edge.get(&key(READ_T)).is_some(), "t's entry is kept");
+
+    policy
+        .note_statement(
+            "UPDATE t SET v = 2 WHERE id = 1",
+            crate::gateway_policy::GatewayKind::Mcp,
+        )
+        .await;
+    assert!(edge.get(&key(READ_T)).is_none(), "t's entry is invalidated");
+    assert_eq!(edge.stats().current_entries, 0);
+}

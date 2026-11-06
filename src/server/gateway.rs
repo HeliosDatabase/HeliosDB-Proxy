@@ -38,6 +38,16 @@ impl ProxyServer {
             )),
             None => policy,
         };
+        #[cfg(feature = "edge-proxy")]
+        let policy =
+            if self.config.edge.enabled && self.config.edge.role == crate::edge::EdgeRole::Home {
+                policy.with_edge_home(
+                    self.state.edge_cache.clone(),
+                    self.state.edge_registry.clone(),
+                )
+            } else {
+                policy
+            };
         policy
     }
 

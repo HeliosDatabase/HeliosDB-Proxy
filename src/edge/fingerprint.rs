@@ -115,6 +115,19 @@ pub fn write_tables(sql: &str) -> Vec<String> {
     let Some((t, text)) = sql_text::single_statement(sql) else {
         return Vec::new();
     };
+    // EXPLAIN ANALYZE: the tables of the statement it runs. An unreadable
+    // one gives the empty (everything) set, as a bare unknown write does.
+    let (t, text) = if crate::protocol::starts_with_ci(t, "EXPLAIN") {
+        let Some(inner) = crate::sql_lex::explain_innermost(sql) else {
+            return Vec::new();
+        };
+        match sql_text::single_statement(inner) {
+            Some(found) => found,
+            None => return Vec::new(),
+        }
+    } else {
+        (t, text)
+    };
     if sql_text::merge_without_into(t)
         || sql_text::insert_without_into(t)
         || UNKNOWN_SCOPE
@@ -878,5 +891,26 @@ mod write_tables_fast_path_tests {
             let slow = crate::sql_text::with_lexer_only(|| write_tables(&sql));
             assert_eq!(fast, slow, "{sql:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod explain_analyze_write_tables_tests {
+    use super::write_tables;
+
+    /// The edge home stamps the tables an EXPLAIN ANALYZE write runs; a
+    /// statement it cannot scope gives the empty wildcard, as a bare one does.
+    #[test]
+    fn explain_analyze_writes_name_the_tables_they_run() {
+        assert_eq!(
+            write_tables("EXPLAIN ANALYZE UPDATE kv SET v = 2 WHERE id = 1"),
+            vec!["kv".to_string()]
+        );
+        assert_eq!(
+            write_tables("EXPLAIN (ANALYZE) DELETE FROM kv"),
+            vec!["kv".to_string()]
+        );
+        assert!(write_tables("EXPLAIN ANALYZE DROP TABLE kv").is_empty());
+        assert!(write_tables("EXPLAIN ANALYZE").is_empty());
     }
 }

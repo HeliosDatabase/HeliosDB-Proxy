@@ -3,8 +3,9 @@
 //! It completes the startup handshake (AuthenticationOk, ReadyForQuery) and
 //! answers every simple `Query` with `rows` one-column DataRows whose cells
 //! are `cell_len` bytes, then CommandComplete and ReadyForQuery. The row
-//! count is read per query, so a test changes it between requests while the
-//! gateway reuses one pooled connection.
+//! count and cell size are read per query, so a test changes them between
+//! requests while the gateway reuses one pooled connection. Cells are written
+//! in chunks, so a test can serve a result far larger than it holds in memory.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -18,6 +19,8 @@ pub(crate) struct FakePg {
     pub(crate) port: u16,
     /// Rows the next query returns.
     pub(crate) rows: Arc<AtomicUsize>,
+    /// Bytes in each cell of the next query's rows.
+    pub(crate) cell_len: Arc<AtomicUsize>,
     /// Client connections accepted so far (one means the connection was reused).
     pub(crate) connections: Arc<AtomicUsize>,
     task: JoinHandle<()>,
@@ -39,12 +42,13 @@ pub(crate) async fn spawn(rows: usize, cell_len: usize) -> FakePg {
     let task = tokio::spawn(accept_loop(
         listener,
         rows.clone(),
-        cell_len,
+        cell_len.clone(),
         connections.clone(),
     ));
     FakePg {
         port,
         rows,
+        cell_len,
         connections,
         task,
     }
@@ -67,6 +71,9 @@ async fn accept_loop(
         });
     }
 }
+
+/// Bytes of a cell the fake writes at a time.
+const CELL_CHUNK_BYTES: usize = 64 * 1024;
 
 fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
     let mut out = vec![tag];
@@ -98,8 +105,7 @@ async fn serve_connection(
             b'X' => return Ok(()),
             b'Q' => {
                 let n = rows.load(Ordering::SeqCst);
-                let cell = vec![b'x'; cell_len.load(Ordering::SeqCst)];
-                let mut out = Vec::new();
+                let cell_len = cell_len.load(Ordering::SeqCst);
                 // RowDescription: one text column named `v`.
                 let mut desc = Vec::new();
                 desc.extend_from_slice(&1u16.to_be_bytes());
@@ -110,17 +116,27 @@ async fn serve_connection(
                 desc.extend_from_slice(&(-1i16).to_be_bytes());
                 desc.extend_from_slice(&(-1i32).to_be_bytes());
                 desc.extend_from_slice(&0u16.to_be_bytes());
-                out.extend_from_slice(&frame(b'T', &desc));
+                stream.write_all(&frame(b'T', &desc)).await?;
+                // Each DataRow is written in chunks: a huge cell is never
+                // held whole, by the test or by the fake.
+                let chunk = vec![b'x'; CELL_CHUNK_BYTES];
                 for _ in 0..n {
-                    let mut row = Vec::new();
-                    row.extend_from_slice(&1u16.to_be_bytes());
-                    row.extend_from_slice(&(cell.len() as u32).to_be_bytes());
-                    row.extend_from_slice(&cell);
-                    out.extend_from_slice(&frame(b'D', &row));
+                    let mut head = Vec::new();
+                    head.push(b'D');
+                    head.extend_from_slice(&((2 + 4 + cell_len + 4) as u32).to_be_bytes());
+                    head.extend_from_slice(&1u16.to_be_bytes());
+                    head.extend_from_slice(&(cell_len as u32).to_be_bytes());
+                    stream.write_all(&head).await?;
+                    let mut left = cell_len;
+                    while left > 0 {
+                        let take = left.min(chunk.len());
+                        stream.write_all(&chunk[..take]).await?;
+                        left -= take;
+                    }
                 }
-                out.extend_from_slice(&frame(b'C', format!("SELECT {n}\0").as_bytes()));
-                out.extend_from_slice(&frame(b'Z', b"I"));
-                stream.write_all(&out).await?;
+                let mut tail = frame(b'C', format!("SELECT {n}\0").as_bytes());
+                tail.extend_from_slice(&frame(b'Z', b"I"));
+                stream.write_all(&tail).await?;
             }
             _ => {}
         }

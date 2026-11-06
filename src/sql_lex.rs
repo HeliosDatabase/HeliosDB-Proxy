@@ -459,6 +459,103 @@ pub(crate) fn lead(sql: &str) -> Lead<'_> {
     Lead::Nothing
 }
 
+/// What an `EXPLAIN` prefix makes of the text it starts ([`explain`]).
+#[cfg(any(feature = "query-cache", feature = "edge-proxy", test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Explain<'a> {
+    /// The text does not start with EXPLAIN: it is a statement of its own.
+    NotExplain,
+    /// `EXPLAIN` without ANALYZE: it executes nothing.
+    Plan,
+    /// `EXPLAIN ... ANALYZE`: it executes the statement from this point on.
+    Analyze(&'a str),
+    /// The options or the explained statement cannot be read (an unterminated
+    /// option list, a backend-ambiguous rest, nothing after ANALYZE).
+    Unknown,
+}
+
+/// Read the `EXPLAIN` prefix of `sql`, quote- and comment-aware through the
+/// lexer. Forms: `EXPLAIN [ANALYZE|ANALYSE] [VERBOSE] stmt` and
+/// `EXPLAIN ( option [, ...] ) stmt`. In the option list `ANALYZE` turns
+/// analysis on, unless a following `false`, `off` or `0` turns it off.
+#[cfg(any(feature = "query-cache", feature = "edge-proxy", test))]
+pub(crate) fn explain(sql: &str) -> Explain<'_> {
+    let mut pieces = Pieces::new(sql)
+        .filter(|(_, p)| !matches!(p, Piece::Space(_) | Piece::Comment(_)))
+        .peekable();
+    match pieces.next() {
+        Some((_, Piece::Text(w))) if w.eq_ignore_ascii_case("EXPLAIN") => {}
+        _ => return Explain::NotExplain,
+    }
+    let mut analyze = false;
+    if matches!(pieces.peek(), Some((_, Piece::Text("(")))) {
+        pieces.next();
+        loop {
+            match pieces.next() {
+                None | Some((_, Piece::Rest(_))) => return Explain::Unknown,
+                Some((_, Piece::Text(")"))) => break,
+                Some((_, Piece::Text(w)))
+                    if w.eq_ignore_ascii_case("ANALYZE") || w.eq_ignore_ascii_case("ANALYSE") =>
+                {
+                    let on = match pieces.peek() {
+                        Some((_, Piece::Text(v)))
+                            if v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") =>
+                        {
+                            pieces.next();
+                            false
+                        }
+                        Some((_, Piece::Text(v)))
+                            if v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on") =>
+                        {
+                            pieces.next();
+                            true
+                        }
+                        Some((_, Piece::Number(n))) => {
+                            let on = *n != "0";
+                            pieces.next();
+                            on
+                        }
+                        _ => true,
+                    };
+                    analyze |= on;
+                }
+                Some(_) => {}
+            }
+        }
+    } else {
+        while let Some((_, Piece::Text(w))) = pieces.peek() {
+            if w.eq_ignore_ascii_case("ANALYZE") || w.eq_ignore_ascii_case("ANALYSE") {
+                analyze = true;
+            } else if !w.eq_ignore_ascii_case("VERBOSE") {
+                break;
+            }
+            pieces.next();
+        }
+    }
+    match pieces.peek() {
+        Some((_, Piece::Rest(_))) => Explain::Unknown,
+        Some(&(at, _)) if analyze => Explain::Analyze(&sql[at..]),
+        Some(_) => Explain::Plan,
+        None if analyze => Explain::Unknown,
+        None => Explain::Plan,
+    }
+}
+
+/// The statement `sql` runs once its `EXPLAIN ... ANALYZE` prefixes are
+/// peeled: `sql` itself unless it is an analysed EXPLAIN. `None` when that
+/// statement cannot be read (fail closed: the caller treats it as unknown).
+#[cfg(any(feature = "query-cache", feature = "edge-proxy", test))]
+pub(crate) fn explain_innermost(sql: &str) -> Option<&str> {
+    let mut text = sql;
+    loop {
+        match explain(text) {
+            Explain::NotExplain | Explain::Plan => return Some(text),
+            Explain::Analyze(inner) => text = inner,
+            Explain::Unknown => return None,
+        }
+    }
+}
+
 /// The kind of one lexical unit of statement text ([`lex_units`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(any(feature = "multi-tenancy", test))]

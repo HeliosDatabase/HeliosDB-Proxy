@@ -268,7 +268,7 @@ impl ProxyServer {
     /// `ANALYSE`) outside its literals and comments, which runs the
     /// statement it explains.
     #[cfg(feature = "edge-proxy")]
-    pub(super) fn is_edge_dml_sql(sql: &str) -> bool {
+    pub(crate) fn is_edge_dml_sql(sql: &str) -> bool {
         use crate::protocol::starts_with_ci;
         let t = match crate::sql_lex::lead(sql) {
             crate::sql_lex::Lead::Start(start) => start,
@@ -367,21 +367,11 @@ impl ProxyServer {
         tables: Vec<String>,
     ) {
         if config.edge.role == crate::edge::EdgeRole::Home {
-            let version = state.edge_cache.next_version();
-            let dropped = state.edge_cache.invalidate(version, &tables);
-            let (notified, pruned) = state
-                .edge_registry
-                .broadcast(crate::edge::InvalidationEvent {
-                    seq: 0,
-                    up_to_version: version,
-                    tables,
-                    committed_at: chrono::Utc::now().to_rfc3339(),
-                    epoch: state.edge_cache.epoch(),
-                })
-                .await;
+            let (dropped, notified, pruned) =
+                crate::edge::invalidate_home_write(&state.edge_cache, &state.edge_registry, tables)
+                    .await;
             tracing::debug!(
                 target: "helios::edge",
-                version,
                 dropped,
                 notified,
                 pruned,

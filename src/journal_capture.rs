@@ -174,6 +174,17 @@ fn classify_single(sql: &str) -> StmtKind {
         return StmtKind::Opaque;
     }
     let s = statement_body(sql);
+    // EXPLAIN ANALYZE runs the statement it explains: that statement decides
+    // (an unreadable one is opaque, fail closed). Only an EXPLAIN is peeled.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    let s = if word_eq(first_word(s).0, "EXPLAIN") {
+        match crate::sql_lex::explain_innermost(s) {
+            Some(inner) => inner,
+            None => return StmtKind::Opaque,
+        }
+    } else {
+        s
+    };
     // A first word the proxy cannot read as HeliosDB-Lite does: a statement
     // the journal cannot reproduce, of unknown scope.
     if first_word_not_ascii(s) {
@@ -2022,6 +2033,62 @@ mod classify_fast_path_tests {
             let fast = classify(&sql);
             let slow = crate::sql_text::with_lexer_only(|| classify(&sql));
             assert_eq!(fast, slow, "{sql:?}");
+        }
+    }
+}
+
+#[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
+mod explain_analyze_tests {
+    use super::{classify, StmtKind};
+
+    /// `EXPLAIN ANALYZE` executes the statement it explains: the journal and
+    /// the C-02 generations see the write it makes, in every spelling.
+    #[test]
+    fn explain_analyze_of_a_write_is_a_write() {
+        for sql in [
+            "EXPLAIN ANALYZE UPDATE t SET v = 1 WHERE id = 1",
+            "explain analyse update t set v = 1",
+            "EXPLAIN (ANALYZE) DELETE FROM t",
+            "EXPLAIN (ANALYZE true, COSTS OFF) INSERT INTO t VALUES (1)",
+            "EXPLAIN (COSTS OFF, ANALYZE on) UPDATE t SET v = 1",
+            "EXPLAIN (ANALYZE 1) UPDATE t SET v = 1",
+            "EXPLAIN ANALYZE VERBOSE UPDATE t SET v = 1",
+            "EXPLAIN /* plan */ ANALYZE -- why\n UPDATE t SET v = 1",
+            "EXPLAIN ANALYZE WITH x AS (SELECT 1) DELETE FROM t",
+            "EXPLAIN ANALYZE CREATE TABLE t2 (a int)",
+            "EXPLAIN ANALYZE UPDATE t SET v = 1; SELECT 1",
+        ] {
+            assert_eq!(classify(sql).0, StmtKind::Write, "{sql:?}");
+        }
+    }
+
+    /// `EXPLAIN` without ANALYZE executes nothing, and an explained read is
+    /// a read.
+    #[test]
+    fn explain_without_analyze_and_explained_reads_are_reads() {
+        for sql in [
+            "EXPLAIN UPDATE t SET v = 1",
+            "EXPLAIN (VERBOSE, COSTS OFF) UPDATE t SET v = 1",
+            "EXPLAIN (ANALYZE false) UPDATE t SET v = 1",
+            "EXPLAIN (ANALYZE off, BUFFERS) DELETE FROM t",
+            "EXPLAIN ANALYZE SELECT * FROM t",
+            "EXPLAIN ANALYZE SELECT v FROM t WHERE id = 1",
+        ] {
+            assert_eq!(classify(sql).0, StmtKind::Read, "{sql:?}");
+        }
+    }
+
+    /// An EXPLAIN ANALYZE whose statement the lexer cannot read is of
+    /// unknown effect: opaque, so the transaction is marked incomplete.
+    #[test]
+    fn explain_analyze_without_a_readable_statement_fails_closed() {
+        for sql in [
+            "EXPLAIN ANALYZE",
+            "EXPLAIN (ANALYZE",
+            "EXPLAIN (ANALYZE) ",
+            "EXPLAIN ANALYZE /* open",
+        ] {
+            assert_eq!(classify(sql).0, StmtKind::Opaque, "{sql:?}");
         }
     }
 }

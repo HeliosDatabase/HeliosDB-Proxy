@@ -1702,4 +1702,58 @@ mod tests {
         };
         assert_eq!(r.rows_affected(), None);
     }
+
+    /// Serve one DataRow whose single cell is `cell` bytes, written in chunks
+    /// (neither side holds the whole cell), then a follow-up `SELECT 2` that
+    /// proves the connection is in sync.
+    async fn serve_one_huge_row(peer: &mut TcpStream, cell: usize) {
+        assert_eq!(
+            journal_replay_read(peer).await,
+            (b'Q', b"SELECT v FROM t\0".to_vec())
+        );
+        journal_replay_reply(peer, b'T', &row_description_body(1)).await;
+        peer.write_u8(b'D').await.unwrap();
+        peer.write_u32((2 + 4 + cell + 4) as u32).await.unwrap();
+        peer.write_u16(1).await.unwrap();
+        peer.write_u32(cell as u32).await.unwrap();
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut left = cell;
+        while left > 0 {
+            let take = left.min(chunk.len());
+            peer.write_all(&chunk[..take]).await.unwrap();
+            left -= take;
+        }
+        journal_replay_reply(peer, b'C', b"SELECT 1\0").await;
+        journal_replay_reply(peer, b'Z', b"I").await;
+        assert_eq!(
+            journal_replay_read(peer).await,
+            (b'Q', b"SELECT 2\0".to_vec())
+        );
+        journal_replay_reply(peer, b'C', b"SELECT 0\0").await;
+        journal_replay_reply(peer, b'Z', b"I").await;
+    }
+
+    /// A bounded read past `max_bytes` with one 64 MiB cell: no row is stored,
+    /// the byte cap is reported, and the connection serves the next query.
+    #[tokio::test]
+    async fn bounded_read_drains_an_oversized_row_and_stays_in_sync() {
+        const HUGE_CELL: usize = 64 * 1024 * 1024;
+        let (mut client, mut peer) = journal_replay_pair().await;
+        let backend = tokio::spawn(async move {
+            serve_one_huge_row(&mut peer, HUGE_CELL).await;
+        });
+        let out = client
+            .simple_query_bounded("SELECT v FROM t", usize::MAX, 1024)
+            .await
+            .unwrap();
+        assert!(out.result.rows.is_empty());
+        assert!(out.truncation.byte_limit_hit);
+        assert!(!out.truncation.row_limit_hit);
+        assert_eq!(out.result.command_tag, "SELECT 1");
+        assert_eq!(
+            client.simple_query("SELECT 2").await.unwrap().command_tag,
+            "SELECT 0"
+        );
+        backend.await.unwrap();
+    }
 }

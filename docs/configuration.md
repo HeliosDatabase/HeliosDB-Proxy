@@ -1022,12 +1022,25 @@ feeds the transaction journal), on the simple and the extended protocol alike:
   extraction as above, or everything when they are unknown. "May have written" is what
   the capture does not read as a read (a write, DDL, `COPY`, `EXECUTE`, transaction
   control), a string with a `;` inside backend-ambiguous text (above), and an `EXPLAIN`
-  that holds `ANALYZE` (it runs the statement; whole cache). A `SELECT`, a function
+  with `ANALYZE` only when the statement it runs is such a statement (`EXPLAIN ANALYZE
+  UPDATE t …` moves `t`; an `EXPLAIN ANALYZE` of a `SELECT` moves nothing; a statement
+  it cannot read moves everything). A `SELECT`, a function
   called from one included, moves nothing, as on the PG-wire listener. The gateways run
   their own backend connections, so before this they moved nothing and a cached PG-wire
   read stayed stale after a gateway write until its TTL (Sprinter 6a0c6c34d27a).
   Counted per statement in `heliosdb_proxy_cache_gateway_write_invalidations_total`
   (label `gateway` = `http`, `mcp`, `graphql`).
+- **A gateway statement that times out.** It moves the generations at the timeout,
+  but the backend may still commit it afterwards. A read that another session refilled
+  from the pre-commit data in between is then stale until the next write to its tables
+  or its TTL; the proxy cannot see that commit. Choose a `[cache]` TTL that is short
+  enough for the staleness you accept, and keep the gateway statements' timeouts
+  (`query_timeout_ms` of each gateway) above the longest write you run through them.
+- **`[edge] role = "home"`.** A gateway write that moves the generations also
+  invalidates the home's `[edge]` cache for its tables and broadcasts the invalidation
+  to the registered edges, as a PG-wire write does (the same table extraction, the
+  whole cache when the tables are unknown). An `EXPLAIN ANALYZE` write is classified by
+  the statement it runs, as on the PG-wire listener.
 
 Not covered with `invalidation_source = "proxy"` (the default): writes that do not pass
 through this proxy (another proxy, a direct connection, a trigger or function writing a

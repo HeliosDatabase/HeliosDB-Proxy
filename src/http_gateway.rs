@@ -841,4 +841,35 @@ mod tests {
         assert!(served.starts_with("HTTP/1.1 200 "), "{served}");
         assert!(served.contains("\"rowCount\":2"), "{served}");
     }
+
+    /// `[http_gateway] max_result_bytes` with one 64 MiB cell: refused (413)
+    /// without the gateway holding the cell, the connection stays in sync, and
+    /// the next request on it is served.
+    #[tokio::test]
+    async fn handle_refuses_an_oversized_cell_and_keeps_the_connection() {
+        use std::sync::atomic::Ordering;
+        const HUGE_CELL: usize = 64 * 1024 * 1024;
+        let fake = crate::gateway_fake_pg::spawn(1, HUGE_CELL).await;
+        let cfg = HttpGatewayConfig {
+            backend_port: fake.port,
+            max_result_bytes: 1024,
+            ..HttpGatewayConfig::default()
+        };
+        let pool: SharedBackendPool = Arc::new(crate::gateway_pool::BackendClientPool::new(4));
+        let refused = post_sql_to(cfg.clone(), pool.clone(), "select 1").await;
+        assert!(refused.starts_with("HTTP/1.1 413 "), "{refused}");
+        assert!(
+            refused.contains("result exceeds http_gateway.max_result_bytes (1024)"),
+            "{refused}"
+        );
+        fake.cell_len.store(4, Ordering::SeqCst);
+        let served = post_sql_to(cfg, pool, "select 1").await;
+        assert!(served.starts_with("HTTP/1.1 200 "), "{served}");
+        assert!(served.contains("\"rowCount\":1"), "{served}");
+        assert_eq!(
+            fake.connections.load(Ordering::SeqCst),
+            1,
+            "connection reused"
+        );
+    }
 }

@@ -2772,3 +2772,69 @@ mod mcp_tool_cache {
         assert!(on["result"]["tools"][2]["inputSchema"]["properties"]["fresh"].is_null());
     }
 }
+
+/// `EXPLAIN ANALYZE` runs the statement it explains: a write under it retires
+/// the cached reads of its table as the bare write does (the relay used to
+/// classify it as a read, so the cached read stayed stale).
+#[tokio::test]
+async fn explain_analyze_of_a_write_retires_the_cached_read() {
+    const READ: &str = "SELECT v FROM kv WHERE id = 1";
+    for sql in [
+        "EXPLAIN ANALYZE UPDATE kv SET v = 2 WHERE id = 1",
+        "explain analyse update kv set v = 2 where id = 1",
+        "EXPLAIN (ANALYZE, COSTS OFF) UPDATE kv SET v = 2 WHERE id = 1",
+    ] {
+        let (mut relay, backend) = Relay::start(|_| {}, &[READ], 2).await;
+        let (node, got) = relay.query(READ).await;
+        assert_eq!((node, got), (None, cached_reply()), "{sql:?}: cached first");
+        relay.answered_by_backend(sql).await;
+        relay.answered_by_backend(READ).await;
+        drop(relay);
+        assert_eq!(backend.await.unwrap(), [sql, READ], "{sql:?}");
+    }
+}
+
+/// `EXPLAIN` without ANALYZE executes nothing: the cached read is kept.
+#[tokio::test]
+async fn explain_without_analyze_keeps_the_cached_read() {
+    const READ: &str = "SELECT v FROM kv WHERE id = 1";
+    const PLAN: &str = "EXPLAIN UPDATE kv SET v = 2 WHERE id = 1";
+    let (mut relay, backend) = Relay::start(|_| {}, &[READ], 1).await;
+    relay.answered_by_backend(PLAN).await;
+    let (node, got) = relay.query(READ).await;
+    assert_eq!(
+        (node, got),
+        (None, cached_reply()),
+        "the plan kept the read"
+    );
+    drop(relay);
+    assert_eq!(backend.await.unwrap(), [PLAN]);
+}
+
+/// The edge home's write invalidation (the relay's edge check) also covers an
+/// EXPLAIN ANALYZE write, as the fingerprint of the statement it runs.
+#[tokio::test]
+async fn explain_analyze_write_invalidates_the_edge_entry() {
+    const READ: &str = "SELECT v FROM kv WHERE id = 1";
+    const WRITE: &str = "EXPLAIN ANALYZE UPDATE kv SET v = 2 WHERE id = 1";
+    let (mut relay, backend) = Relay::start(
+        |c| {
+            c.cache.enabled = false;
+            c.edge.enabled = true;
+        },
+        &[],
+        2,
+    )
+    .await;
+    relay.answered_by_backend(READ).await;
+    let (node, got) = relay.query(READ).await;
+    assert_eq!((node, got), (None, backend_reply()), "edge hit");
+    relay.answered_by_backend(WRITE).await;
+    assert_eq!(
+        relay.server.state.edge_cache.stats().current_entries,
+        0,
+        "the read's edge entry is invalidated"
+    );
+    drop(relay);
+    assert_eq!(backend.await.unwrap(), [READ, WRITE]);
+}

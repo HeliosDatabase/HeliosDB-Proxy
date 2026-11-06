@@ -102,6 +102,28 @@ pub struct RequestIdentity<'a> {
     pub database: Option<&'a str>,
 }
 
+/// The `[edge]` home's invalidation state a gateway write moves.
+#[cfg(feature = "edge-proxy")]
+#[derive(Clone)]
+struct EdgeHomeWrites {
+    cache: Arc<crate::edge::EdgeCache>,
+    registry: Arc<crate::edge::EdgeRegistry>,
+}
+
+#[cfg(feature = "edge-proxy")]
+impl EdgeHomeWrites {
+    /// The same decision as the PG-wire relay: a statement the edge check
+    /// reads as data-modifying invalidates the tables it names (everything
+    /// when they are unknown).
+    async fn note_statement(&self, sql: &str) {
+        if !crate::server::ProxyServer::is_edge_dml_sql(sql) {
+            return;
+        }
+        let tables = crate::edge::fingerprint::write_tables(sql);
+        crate::edge::invalidate_home_write(&self.cache, &self.registry, tables).await;
+    }
+}
+
 /// Which gateway a statement came through (metric label).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GatewayKind {
@@ -152,6 +174,10 @@ pub const TENANT_METADATA_KEY: &str = "helios.gateway_tenant";
 /// rewritten) unless the daemon attached its objects.
 #[derive(Default, Clone)]
 pub struct GatewayPolicy {
+    /// The `[edge]` home's cache and registry, when this proxy is the home:
+    /// a gateway write invalidates the edge entries as a PG-wire write does.
+    #[cfg(feature = "edge-proxy")]
+    edge_home: Option<EdgeHomeWrites>,
     /// The tenant manager and the request header naming the tenant.
     #[cfg(feature = "multi-tenancy")]
     tenancy: Option<(Arc<crate::multi_tenancy::TenantManager>, String)>,
@@ -222,7 +248,24 @@ impl GatewayPolicy {
         if let Some(writes) = &self.cache_writes {
             writes.note_statement(sql, gateway).await;
         }
+        #[cfg(feature = "edge-proxy")]
+        if let Some(home) = &self.edge_home {
+            home.note_statement(sql).await;
+        }
         let _ = (sql, gateway);
+    }
+
+    /// Attach the `[edge]` home's cache and registry (`role = "home"`):
+    /// gateway writes then invalidate the home's edge entries and broadcast
+    /// to the registered edges, as a PG-wire write does.
+    #[cfg(feature = "edge-proxy")]
+    pub fn with_edge_home(
+        mut self,
+        cache: Arc<crate::edge::EdgeCache>,
+        registry: Arc<crate::edge::EdgeRegistry>,
+    ) -> Self {
+        self.edge_home = Some(EdgeHomeWrites { cache, registry });
+        self
     }
 
     /// Take the tenant of every request from header `header` and filter its

@@ -65,6 +65,31 @@ pub use registry::{EdgeNode, EdgeRegistry, InvalidationEvent, Resume};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// Home role, a committed write of `tables` (an empty set: everything the
+/// write may have touched): stamp it with the next home version, drop the
+/// home's matching entries, and broadcast the invalidation to every
+/// registered edge. Returns `(dropped, notified, pruned)`. The PG-wire relay
+/// and the gateways (HTTP, MCP, GraphQL) share it, so a write is handled the
+/// same whichever way it came in.
+pub(crate) async fn invalidate_home_write(
+    cache: &EdgeCache,
+    registry: &EdgeRegistry,
+    tables: Vec<String>,
+) -> (usize, u32, u32) {
+    let version = cache.next_version();
+    let dropped = cache.invalidate(version, &tables);
+    let (notified, pruned) = registry
+        .broadcast(InvalidationEvent {
+            seq: 0,
+            up_to_version: version,
+            tables,
+            committed_at: chrono::Utc::now().to_rfc3339(),
+            epoch: cache.epoch(),
+        })
+        .await;
+    (dropped, notified, pruned)
+}
+
 /// Edge-mode runtime config (`[edge]` in proxy.toml). Every field is
 /// serde-defaulted so a partial — or absent — section parses on any
 /// build; the machinery only runs when `enabled` *and* the
