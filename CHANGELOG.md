@@ -69,6 +69,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   set `unknown_tenant = "passthrough"` to keep the previous behaviour. Also, with
   `identify_by = "database"` a session with no `database` parameter now uses its user
   name as the tenant, as PostgreSQL does.
+- **Query-cache read and store cost** (Criterion `cache/query/l1_hit_1k`,
+  `miss_store_1k`, `cache/l2/memory_hit_1k`): no cache tier waits, so the lookup behind
+  `QueryCache::{get, get_with_prep, get_with_prep_hinted}` and the L2 operations behind
+  their async methods are plain calls, and a store waits only for zstd compression on the
+  blocking pool. The futures the relay awaits per cacheable read are 40-56 bytes again
+  (the compression, refresh-ahead and heatmap work above had grown the lookup's to
+  1.2 KiB, and every await copies a future whole: an L1 hit cost 13 % more); the store's
+  is 912 bytes, below 2.2.0's. No behaviour change.
 
 ### Added
 

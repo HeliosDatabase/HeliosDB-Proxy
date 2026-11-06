@@ -528,17 +528,15 @@ impl QueryCache {
         self.metrics.record_evictions(CacheLevel::L1Hot, evicted);
     }
 
-    /// The form L2 keeps `data` in (`[cache] l2_compression`). zstd runs on
-    /// the blocking thread pool: compressing a large result inline would hold
-    /// this async worker, and every task queued on it, for milliseconds per
-    /// MiB. LZ4 (several times faster) and the raw form are made inline, the
-    /// raw form without any work. Outside a tokio runtime zstd runs inline
-    /// too; if the pool refuses the job (the runtime is shutting down) the
-    /// payload is kept raw.
-    async fn l2_payload(l2: &Arc<L2WarmCache>, data: &Bytes) -> L2Payload {
-        if !l2.compresses_off_worker(data.len()) {
-            return l2.encode_payload(data);
-        }
+    /// The form L2 keeps `data` in when it is compressed with zstd
+    /// ([`L2WarmCache::compresses_off_worker`]): on the blocking thread pool,
+    /// since compressing a large result inline would hold this async worker,
+    /// and every task queued on it, for milliseconds per MiB. LZ4 (several
+    /// times faster) and the raw form are made inline by the store, the raw
+    /// form without any work. Outside a tokio runtime zstd runs inline too;
+    /// if the pool refuses the job (the runtime is shutting down) the payload
+    /// is kept raw.
+    async fn l2_payload_off_worker(l2: &Arc<L2WarmCache>, data: &Bytes) -> L2Payload {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return l2.encode_payload(data);
         };
@@ -558,7 +556,7 @@ impl QueryCache {
 
     /// Look up a query in the cache hierarchy
     pub async fn get(&self, query: &str, context: &CacheContext) -> CacheLookup {
-        self.get_with_prep(query, context).await.0
+        self.lookup(query, None, context, Instant::now).0
     }
 
     /// Look up a query in the cache hierarchy, also returning the [`QueryPrep`]
@@ -571,7 +569,7 @@ impl QueryCache {
         query: &str,
         context: &CacheContext,
     ) -> (CacheLookup, QueryPrep) {
-        self.get_with_prep_hinted(query, None, context).await
+        self.lookup(query, None, context, Instant::now)
     }
 
     /// [`Self::get_with_prep`] for a `query` that is not the text the client
@@ -585,7 +583,7 @@ impl QueryCache {
         client_sql: Option<&str>,
         context: &CacheContext,
     ) -> (CacheLookup, QueryPrep) {
-        self.lookup(query, client_sql, context, Instant::now).await
+        self.lookup(query, client_sql, context, Instant::now)
     }
 
     /// [`Self::get_with_prep_hinted`] with the time read from `clock`, once,
@@ -593,7 +591,11 @@ impl QueryCache {
     /// Refresh-ahead decides on it whether an entry is past its refresh
     /// point and whether a claim timed out, so tests move it instead of
     /// sleeping.
-    async fn lookup(
+    ///
+    /// A plain call, as is every tier lookup it makes (none waits): the
+    /// async entry points above then carry only their arguments, not the
+    /// lookup's state, which their callers would copy at every await.
+    fn lookup(
         &self,
         query: &str,
         client_sql: Option<&str>,
@@ -709,10 +711,10 @@ impl QueryCache {
         // there but past its TTL is the heatmap's `expired`.
         let mut expired = false;
         if let Some(ref l2) = self.l2_cache {
-            let hit = match l2.get_noting_expiry(&cache_key, &mut expired).await {
+            let hit = match l2.get_now(&cache_key, &mut expired) {
                 Some(result) if self.is_current(&result) => young_enough(&result).then_some(result),
                 Some(stale) => {
-                    l2.remove(&cache_key).await;
+                    l2.remove_now(&cache_key);
                     self.metrics.record_stale_rejected();
                     self.heat.record_stale_rejected(&stale.tables, start);
                     None
@@ -727,10 +729,7 @@ impl QueryCache {
                     }
                 }
                 Some(ra) => {
-                    match self
-                        .refresh_ahead_pick(ra, &cache_key, l1_due, hit, start, max_age)
-                        .await
-                    {
+                    match self.refresh_ahead_pick(ra, &cache_key, l1_due, hit, start, max_age) {
                         RefreshPick::Serve(result, level) => {
                             let prep = QueryPrep::served(hints, normalized, keyed_verbatim);
                             if level == CacheLevel::L2Warm {
@@ -884,7 +883,7 @@ impl QueryCache {
     /// refresh point the first reader claims the refill and misses; every
     /// other reader is served the entry until the refill lands, and a reader
     /// whose L1 copy is due then picks the refill up from L2.
-    async fn refresh_ahead_pick(
+    fn refresh_ahead_pick(
         &self,
         ra: &Arc<refresh::RefreshAhead>,
         key: &CacheKey,
@@ -916,7 +915,7 @@ impl QueryCache {
         // would refill the entry twice. (The claimant stores before it ends
         // its claim, so a claim made after that end sees the refill here.)
         if let Some(l2) = &self.l2_cache {
-            let newer = l2.get(key).await.filter(|r| {
+            let newer = l2.get_now(key, &mut false).filter(|r| {
                 r.cached_at > result.cached_at
                     && self.is_current(r)
                     && max_age.is_none_or(|age| r.age() <= age)
@@ -1051,9 +1050,14 @@ impl QueryCache {
         // The form L2 keeps the payload in (`[cache] l2_compression`; zstd
         // on the blocking pool). Made before the C-02 check below, so that
         // check stays the last step before the stores, as without
-        // compression: a write while it compresses retires the fill.
+        // compression: a write while it compresses retires the fill. Only
+        // zstd waits (boxed: this future then saves a pointer, not the
+        // pool job's state, across the store's one suspension point).
         let l2_payload = match &self.l2_cache {
-            Some(l2) => Some(Self::l2_payload(l2, &data).await),
+            Some(l2) if l2.compresses_off_worker(data.len()) => {
+                Some(Box::pin(Self::l2_payload_off_worker(l2, &data)).await)
+            }
+            Some(l2) => Some(l2.encode_payload(&data)),
             None => None,
         };
 
@@ -1096,15 +1100,13 @@ impl QueryCache {
             let cache_key = CacheKey::new(normalized, context);
             // When L2 must make room, one pass sheds every write-retired
             // entry, on the reclaim thread.
-            let evicted = l2
-                .put_payload_evicting(
-                    cache_key.clone(),
-                    result.clone(),
-                    payload,
-                    |r| !self.is_current(r),
-                    |hashes| self.hand_off_shed(hashes),
-                )
-                .await;
+            let evicted = l2.put_payload_now(
+                cache_key.clone(),
+                result.clone(),
+                payload,
+                |r| !self.is_current(r),
+                |hashes| self.hand_off_shed(hashes),
+            );
             self.metrics.record_evictions(CacheLevel::L2Warm, evicted);
 
             // Register for invalidation
@@ -3382,6 +3384,33 @@ mod tests {
         cache.invalidate_all();
         assert!(cache.heat.heatmap().is_none());
         assert!(cache.heatmap_snapshot().is_none());
+    }
+
+    /// The lookup entry points are plain calls behind `async`: no tier lookup
+    /// waits, so their futures carry their arguments and nothing of the
+    /// lookup. The relay awaits one per cacheable read (and the benches hand
+    /// one to `block_on`), and every move of a larger future copies all of
+    /// it: with the lookup's state saved across its no-op awaits, the future
+    /// had grown to over a KiB, which `cache/query/l1_hit_1k` paid.
+    #[test]
+    fn lookup_futures_carry_only_their_arguments() {
+        use std::mem::{size_of, size_of_val};
+        let cache = QueryCache::new(CacheConfig::default());
+        let c = ctx(1);
+        let sql = "SELECT v FROM t WHERE id = 1";
+        // The arguments, and the future's state tag (padded).
+        let bound =
+            size_of::<(&QueryCache, &str, Option<&str>, &CacheContext)>() + size_of::<usize>();
+        assert!(size_of_val(&cache.get(sql, &c)) <= bound);
+        assert!(size_of_val(&cache.get_with_prep(sql, &c)) <= bound);
+        assert!(size_of_val(&cache.get_with_prep_hinted(sql, Some(sql), &c)) <= bound);
+
+        let l2 = cache.l2_cache.clone().expect("L2 on by default");
+        let key = CacheKey::from_parts(1, "db".to_string(), None, None);
+        let bound = size_of::<(&L2WarmCache, &CacheKey, &mut bool)>() + size_of::<usize>();
+        assert!(size_of_val(&l2.get(&key)) <= bound);
+        assert!(size_of_val(&l2.get_noting_expiry(&key, &mut false)) <= bound);
+        assert!(size_of_val(&l2.remove(&key)) <= bound);
     }
 }
 

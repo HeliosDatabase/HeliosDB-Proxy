@@ -142,7 +142,7 @@ impl L2WarmCache {
 
     /// Look up a cache key
     pub async fn get(&self, key: &CacheKey) -> Option<CachedResult> {
-        self.get_noting_expiry(key, &mut false).await
+        self.get_now(key, &mut false)
     }
 
     /// [`Self::get`], also setting `expired` when the key's in-memory entry
@@ -153,34 +153,40 @@ impl L2WarmCache {
         key: &CacheKey,
         expired: &mut bool,
     ) -> Option<CachedResult> {
+        self.get_now(key, expired)
+    }
+
+    /// [`Self::get_noting_expiry`] as a plain call. A lookup never waits (the
+    /// memory map is sharded, the spill file is read under a blocking lock),
+    /// so the query cache calls this directly: its own lookup then has no
+    /// suspension point, and its future no state saved across one, which
+    /// every caller would copy.
+    pub(crate) fn get_now(&self, key: &CacheKey, expired: &mut bool) -> Option<CachedResult> {
         if !self.config.enabled {
             return None;
         }
 
         let hash = key.hash_value();
 
-        // Try memory storage first. A compressed entry is copied out (a
-        // reference count) and decoded after the shard's lock is released.
-        let found = match self.memory_entries.get_mut(&hash) {
-            Some(mut entry) => {
-                if entry.is_expired() {
-                    *expired = true;
-                    drop(entry);
-                    if let Some((_, old)) = self.memory_entries.remove(&hash) {
-                        self.release(&old);
-                    }
-                    return None;
+        // Try memory storage first. A raw entry is served under the shard's
+        // lock; a compressed one is copied out (a reference count) and
+        // decoded after the lock is released.
+        if let Some(mut entry) = self.memory_entries.get_mut(&hash) {
+            if entry.is_expired() {
+                *expired = true;
+                drop(entry);
+                if let Some((_, old)) = self.memory_entries.remove(&hash) {
+                    self.release(&old);
                 }
-                entry.touch();
-                Some((entry.result.clone(), entry.raw_len))
+                return None;
             }
-            None => None,
-        };
-        if let Some((result, raw_len)) = found {
-            return match raw_len {
-                None => Some(result),
-                Some(raw_len) => self.decoded(hash, result, raw_len),
+            entry.touch();
+            let result = entry.result.clone();
+            let Some(raw_len) = entry.raw_len else {
+                return Some(result);
             };
+            drop(entry);
+            return self.decoded(hash, result, raw_len);
         }
 
         // Try mmap storage
@@ -248,8 +254,7 @@ impl L2WarmCache {
             return 0;
         }
         let payload = self.encode_payload(&result.data);
-        self.put_payload_evicting(key, result, payload, is_stale, hand_off)
-            .await
+        self.put_payload_now(key, result, payload, is_stale, hand_off)
     }
 
     /// [`Self::put_evicting`] with the payload already in its stored form:
@@ -257,6 +262,20 @@ impl L2WarmCache {
     /// cache makes it on the blocking pool for zstd). The entry is charged
     /// at the stored size.
     pub async fn put_payload_evicting(
+        &self,
+        key: CacheKey,
+        result: CachedResult,
+        payload: L2Payload,
+        is_stale: impl Fn(&CachedResult) -> bool,
+        hand_off: impl FnOnce(Vec<u64>) -> Result<(), Vec<u64>>,
+    ) -> usize {
+        self.put_payload_now(key, result, payload, is_stale, hand_off)
+    }
+
+    /// [`Self::put_payload_evicting`] as a plain call: a store never waits
+    /// (an eviction pass runs inline or is handed off), so the query cache's
+    /// store calls it directly, as it calls [`Self::get_now`].
+    pub(crate) fn put_payload_now(
         &self,
         key: CacheKey,
         mut result: CachedResult,
@@ -303,7 +322,7 @@ impl L2WarmCache {
                 .map(|e| *e.key())
                 .collect();
             if retired.is_empty() {
-                evicted += self.evict_to_fit(entry_size).await;
+                evicted += self.evict_to_fit(entry_size);
                 self.end_eviction();
             } else if let Err(retired) = hand_off(retired) {
                 evicted += self.shed(&retired);
@@ -386,6 +405,12 @@ impl L2WarmCache {
 
     /// Remove an entry from the cache
     pub async fn remove(&self, key: &CacheKey) {
+        self.remove_now(key)
+    }
+
+    /// [`Self::remove`] as a plain call (it never waits), for the query
+    /// cache's lookup, as [`Self::get_now`].
+    pub(crate) fn remove_now(&self, key: &CacheKey) {
         let hash = key.hash_value();
 
         if let Some((_, entry)) = self.memory_entries.remove(&hash) {
@@ -448,7 +473,7 @@ impl L2WarmCache {
     }
 
     /// Evict entries to fit new data; returns how many it evicted.
-    async fn evict_to_fit(&self, required_bytes: usize) -> usize {
+    fn evict_to_fit(&self, required_bytes: usize) -> usize {
         let max_bytes = self.config.max_bytes;
         let target = max_bytes.saturating_sub(required_bytes);
         let mut evicted = 0;

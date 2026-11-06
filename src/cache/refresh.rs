@@ -454,7 +454,7 @@ mod lookup_tests {
         conn: u64,
         now: Instant,
     ) -> (CacheLookup, QueryPrep) {
-        cache.lookup(sql, None, &ctx(conn), || now).await
+        cache.lookup(sql, None, &ctx(conn), || now)
     }
 
     /// The payload and tier of a hit, `None` for a miss.
@@ -764,10 +764,7 @@ mod lookup_tests {
         let normalized = cache.normalizer.normalize_with(SQL, false);
         let key = CacheKey::new(&normalized, &ctx(1));
         let now = Instant::now();
-        match cache
-            .refresh_ahead_pick(ra(&cache), &key, None, Some(seen), now, None)
-            .await
-        {
+        match cache.refresh_ahead_pick(ra(&cache), &key, None, Some(seen), now, None) {
             RefreshPick::Serve(result, CacheLevel::L2Warm) => {
                 assert_eq!(&result.data[..], b"new")
             }
