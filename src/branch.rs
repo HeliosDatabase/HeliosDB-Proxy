@@ -1,12 +1,19 @@
-//! Instant branch databases.
+//! Branch database provisioning for PostgreSQL backends.
 //!
-//! Provisions copy-on-write-ish database branches through the proxy:
-//! `CREATE DATABASE <branch> TEMPLATE <base>` (vanilla PostgreSQL's fast
-//! file-clone — the proxy-layer approximation of Neon/PlanetScale branching;
-//! a Nano backend can branch natively). The proxy issues the maintenance
-//! statements over its backend PG-wire client; clients then connect to the
-//! branch simply by database name (the proxy relays the startup unchanged), so
-//! routing is native — branching here is the *provisioning + lifecycle* layer.
+//! The proxy issues `CREATE DATABASE <branch> TEMPLATE <base>` (and the matching
+//! `DROP DATABASE`) over its admin maintenance connection. PostgreSQL implements
+//! this as a full copy of the template database, so creation time and disk use
+//! grow with the template's size. PostgreSQL also refuses the call while any
+//! other session is connected to the template, so the base database must be
+//! idle when a branch is created. This is not an instant copy-on-write clone.
+//!
+//! HeliosDB-Nano does not use this path. Nano selects a branch per connection:
+//! a client connects with the startup parameter `database=<db>@<branch>`. The
+//! proxy relays startup parameters unchanged, and its pool key, query-cache
+//! identity and transaction-replay re-homing all key on `database`, so branches
+//! stay separate without any proxy-side provisioning. Nano branches are created
+//! on the Nano server (`CREATE DATABASE BRANCH <name> FROM <parent>`), which
+//! needs a Nano build with per-connection branch support.
 
 use std::time::Duration;
 

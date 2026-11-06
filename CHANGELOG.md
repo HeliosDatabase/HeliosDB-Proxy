@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `L2WarmCache::{encode_payload, put_payload_evicting, compression_saved_bytes}`,
   `QueryCache::{entry_counts, compression_saved_bytes}`,
   `CacheMetrics::record_evictions`.
+- **Docs: branch databases.** `[branch]` (`CREATE DATABASE … TEMPLATE`) is documented as a PostgreSQL copy that is not instant, not as an instant branch; Nano branches are selected per connection with `database=<db>@<branch>` (Sprinter 45ab08af3f00).
 
 ### Added
 

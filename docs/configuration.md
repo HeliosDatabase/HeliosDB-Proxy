@@ -2223,10 +2223,26 @@ identifiers and comments is `INSERT`, `UPDATE`, `DELETE` or `MERGE`:
 
 ---
 
-## Instant Branch Databases (`[branch]`)
+## Branch Databases (`[branch]`)
 
-Provision `CREATE DATABASE <branch> TEMPLATE <base>` clones through the proxy. Disabled
-by default.
+Provisions PostgreSQL branch databases through the proxy with
+`CREATE DATABASE <branch> TEMPLATE <base>` (and `DROP DATABASE` for removal). Disabled by
+default.
+
+**PostgreSQL semantics.** `TEMPLATE` makes a full copy of the base database, so it is
+not instant: creation time and disk use grow with the template's size. PostgreSQL
+refuses the copy while any other session is connected to the base database, so keep
+the base idle (no open connections) when creating a branch. Once created, a branch is
+an ordinary database: clients connect to it by database name.
+
+**HeliosDB-Nano.** `[branch]` provisioning is not how Nano branches are created. Nano
+branches are created on the Nano server with `CREATE DATABASE BRANCH <name> FROM <parent>
+[AS OF ...]`, and a client selects a branch per connection with the startup parameter
+`database=<db>@<branch>`. The proxy relays that parameter unchanged, and pooling, the
+query cache and transaction-replay re-homing all key on `database`, so each branch is
+kept separate. Names of the form `<db>@<branch>` are subject to the `[[hba]]` rules
+described in [Authentication (`[auth]`) and HBA Rules](#authentication-auth-and-hba-rules-hba).
+This requires a Nano build with per-connection branch support.
 
 ```toml
 [branch]
