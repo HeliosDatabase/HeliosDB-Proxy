@@ -864,3 +864,19 @@ mod tests {
         assert!(write_tables("COPY orders FROM STDIN").contains(&"orders".to_string()));
     }
 }
+
+#[cfg(test)]
+mod write_tables_fast_path_tests {
+    use super::*;
+
+    /// The plain-ASCII fast path answers `write_tables` as the lexer does, on
+    /// generated plain and non-plain statements.
+    #[test]
+    fn write_tables_fast_path_matches_the_lexer() {
+        for sql in crate::sql_text::generated_statements(0x2545_F491_4F6C_DD1D, 20_000) {
+            let fast = write_tables(&sql);
+            let slow = crate::sql_text::with_lexer_only(|| write_tables(&sql));
+            assert_eq!(fast, slow, "{sql:?}");
+        }
+    }
+}

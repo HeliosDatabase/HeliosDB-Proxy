@@ -3369,3 +3369,20 @@ mod tests {
         assert!(cache.heatmap_snapshot().is_none());
     }
 }
+
+#[cfg(test)]
+mod write_tables_fast_path_tests {
+    use super::*;
+
+    /// The plain-ASCII fast path answers `QueryCache::write_tables` as the
+    /// lexer does, on generated plain and non-plain statements.
+    #[test]
+    fn write_tables_fast_path_matches_the_lexer() {
+        let cache = QueryCache::new(CacheConfig::default());
+        for sql in crate::sql_text::generated_statements(0x0DDB_1A5E_5BAD_5EED, 20_000) {
+            let fast = cache.write_tables(&sql);
+            let slow = crate::sql_text::with_lexer_only(|| cache.write_tables(&sql));
+            assert_eq!(fast, slow, "{sql:?}");
+        }
+    }
+}

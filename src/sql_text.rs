@@ -201,6 +201,24 @@ pub(crate) fn ambiguous_rest(sql: &str) -> Option<&str> {
 /// Statement boundaries come only from the lexer: a `;` inside a literal
 /// ends nothing, and no literal's text is ever read as SQL.
 pub(crate) fn single_statement(sql: &str) -> Option<(&str, Cow<'_, str>)> {
+    if !fast_path(sql) {
+        return single_statement_lexed(sql);
+    }
+    // A plain statement (`plain_ascii`) is its own comment-free text, and
+    // its first word is its first non-whitespace byte: the lexer's answer
+    // with no pass over the pieces. Nothing is a name a write could target
+    // (no quoted identifier, no literal, no `$`), so no table spot can fail,
+    // and only a `;` other than the final byte ends the statement early.
+    let body = sql.trim_start_matches(|c: char| c.is_ascii() && is_space(c as u8));
+    if body.is_empty() || body.starts_with(';') {
+        return None;
+    }
+    Some((body, Cow::Borrowed(sql)))
+}
+
+/// The lexer's answer for `single_statement`: the path for text the fast
+/// path does not take.
+fn single_statement_lexed(sql: &str) -> Option<(&str, Cow<'_, str>)> {
     let b = sql.as_bytes();
     let mut stripped = Stripped::default();
     let mut first = None;
@@ -638,6 +656,61 @@ pub fn uncacheable_text(sql: &str) -> Option<UncacheableText> {
     None
 }
 
+/// Whether `sql` is plain ASCII SQL the lexer reads as text with no piece
+/// it could split differently from a plain scan: no `'` or `"` (literals and
+/// quoted names), no `$` (dollar quotes, `$n`), no `\`, `-` or `/` (comments and
+/// the escape rules), no CR (a lone `\r` ends a `--` comment for PostgreSQL
+/// only), and at most one `;`, as the final byte. For such text the lexer
+/// yields only whitespace, words, numbers and single punctuation bytes, so
+/// [`single_statement`] and [`leading_rest`] answer from the raw text (the
+/// statement and its comment-free text are `sql` itself, and `leading_rest`
+/// is `false`). Three byte scans, each vectorised by `memchr`, and an ASCII
+/// test: far cheaper than the lexer on the statements a write path sees.
+pub(crate) fn plain_ascii(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    b.is_ascii()
+        && memchr::memchr3(b'\'', b'"', b'$', b).is_none()
+        && memchr::memchr3(b'\\', b'-', b'/', b).is_none()
+        && memchr::memchr(b'\r', b).is_none()
+        && memchr::memchr(b';', b).is_none_or(|at| at + 1 == b.len())
+}
+
+/// Whether the fast path answers for `sql`: [`plain_ascii`], unless a test
+/// has switched the lexer on for its comparison ([`with_lexer_only`]).
+fn fast_path(sql: &str) -> bool {
+    !lexer_only() && plain_ascii(sql)
+}
+
+/// Test-only: whether the lexer answers for every statement
+/// ([`with_lexer_only`]).
+#[cfg(test)]
+fn lexer_only() -> bool {
+    LEXER_ONLY.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn lexer_only() -> bool {
+    false
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by [`with_lexer_only`] for the duration of its closure.
+    static LEXER_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the fast path off: every call in it takes the lexer, so a
+/// test can compare the two answers on the same text.
+#[cfg(test)]
+pub(crate) fn with_lexer_only<R>(f: impl FnOnce() -> R) -> R {
+    LEXER_ONLY.with(|on| {
+        let before = on.replace(true);
+        let answer = f();
+        on.set(before);
+        answer
+    })
+}
+
 /// Whether the lexer reaches a backend-ambiguous rest ([`Piece::Rest`])
 /// before the first word of `sql` (past its leading whitespace and
 /// comments): what the statement is (a read, a write, DDL, transaction
@@ -648,7 +721,8 @@ pub fn uncacheable_text(sql: &str) -> Option<UncacheableText> {
 /// Nano). The journal capture takes such a statement for a write it cannot
 /// reproduce, and `[edge]` for a write of unknown scope.
 pub(crate) fn leading_rest(sql: &str) -> bool {
-    matches!(lead(sql), Lead::Rest)
+    // A plain statement holds no `Piece::Rest` (see `plain_ascii`).
+    !fast_path(sql) && matches!(lead(sql), Lead::Rest)
 }
 
 /// The statements of the simple-query string `sql`, split at each `;` the
@@ -3553,5 +3627,169 @@ impl VolatileScan {
             Some(automaton) => automaton.is_match(sql),
             None => true,
         }
+    }
+}
+
+/// Test-only: `count` generated statements from `seed` (xorshift), for the
+/// fast path's equivalence checks. Plain ones mix words, identifiers,
+/// numbers, operators, punctuation and whitespace; the others add the bytes
+/// the fast path leaves to the lexer (quotes, `$`, backslash, `--`, `/*`,
+/// CR), a second statement, and non-ASCII words.
+#[cfg(test)]
+pub(crate) fn generated_statements(mut seed: u64, count: usize) -> Vec<String> {
+    const WORDS: &[&str] = &[
+        "SELECT",
+        "select",
+        "UPDATE",
+        "INSERT",
+        "INTO",
+        "DELETE",
+        "FROM",
+        "JOIN",
+        "TABLE",
+        "MERGE",
+        "OR",
+        "IGNORE",
+        "REPLACE",
+        "ONLY",
+        "SET",
+        "WHERE",
+        "AND",
+        "NOT",
+        "IS",
+        "DISTINCT",
+        "ALTER",
+        "CREATE",
+        "DROP",
+        "WITH",
+        "AS",
+        "VALUES",
+        "RETURNING",
+        "kv",
+        "accounts",
+        "History",
+        "id",
+        "x_1",
+        "t2",
+        "pg_x",
+        "a1b2",
+    ];
+    const NUMBERS: &[&str] = &["1", "42", "0x1F", "1.5", ".5", "1e3", "7x", "1.e3", "0"];
+    const OPERATORS: &[&str] = &[
+        "=", "<>", "||", "::", "+", "*", "..", "<", ">", "!=", ",", "(", ")", ".", ":",
+    ];
+    const SPACES: &[&str] = &[" ", "\t", "\n", "\u{b}", "\u{c}", "  ", " \n "];
+    const EXCLUDED: &[&str] = &[
+        "'", "\"", "$", "\\", "-", "/", "\r", "$1", "--", "/*", "*/", "'x'", "\"Q\"",
+    ];
+    const NON_ASCII: &[&str] = &["ınsert", "ſet", "名前", "\u{a0}"];
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    (0..count)
+        .map(|_| {
+            let mixed = next() % 10 < 3;
+            let mut sql = String::new();
+            for _ in 0..next() % 14 {
+                let token = match next() % 10 {
+                    0..=3 => WORDS[(next() % WORDS.len() as u64) as usize],
+                    4 | 5 => NUMBERS[(next() % NUMBERS.len() as u64) as usize],
+                    6 | 7 => OPERATORS[(next() % OPERATORS.len() as u64) as usize],
+                    _ if mixed && next() % 2 == 0 => {
+                        EXCLUDED[(next() % EXCLUDED.len() as u64) as usize]
+                    }
+                    _ if mixed => NON_ASCII[(next() % NON_ASCII.len() as u64) as usize],
+                    _ => WORDS[(next() % WORDS.len() as u64) as usize],
+                };
+                sql.push_str(token);
+                if next() % 4 != 0 {
+                    sql.push_str(SPACES[(next() % SPACES.len() as u64) as usize]);
+                }
+            }
+            match next() % 12 {
+                0..=2 => sql.push(';'),
+                3 => sql.push_str("; SELECT 1"),
+                4 => sql.insert_str(0, "  \n"),
+                5 => sql.push_str(" ;"),
+                _ => {}
+            }
+            sql
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod fast_path_tests {
+    use super::*;
+
+    /// The statements of `generated_statements`, each one answered by the
+    /// fast path and by the lexer: the same single-statement reads and
+    /// `leading_rest`, and both paths must have been taken.
+    #[test]
+    fn fast_path_answers_as_the_lexer_does() {
+        let mut plain = 0;
+        let mut lexed = 0;
+        for sql in generated_statements(0x9E37_79B9_7F4A_7C15, 20_000) {
+            let fast = single_statement(&sql).map(|(t, text)| (t.to_owned(), text.into_owned()));
+            let slow = with_lexer_only(|| single_statement(&sql))
+                .map(|(t, text)| (t.to_owned(), text.into_owned()));
+            assert_eq!(fast, slow, "{sql:?}");
+            assert_eq!(
+                leading_rest(&sql),
+                with_lexer_only(|| leading_rest(&sql)),
+                "{sql:?}"
+            );
+            if plain_ascii(&sql) {
+                plain += 1;
+            } else {
+                lexed += 1;
+            }
+        }
+        assert!(
+            plain > 1_000 && lexed > 1_000,
+            "plain {plain}, lexed {lexed}"
+        );
+    }
+
+    #[test]
+    fn plain_ascii_names_the_bytes_the_fast_path_leaves_out() {
+        for sql in [
+            "UPDATE kv SET v = 2",
+            "SELECT 1;",
+            "  \n\t UPDATE t SET a = b ",
+            "",
+            "   ",
+            ";",
+            "a;",
+        ] {
+            assert!(plain_ascii(sql), "{sql:?}");
+        }
+        for sql in [
+            "UPDATE kv SET v = '2'",
+            "SELECT \"x\"",
+            "SELECT $1",
+            "SELECT 1 -- c",
+            "SELECT 1 /* c */",
+            "SELECT a\\b",
+            "SELECT 1\r",
+            "SELECT 1; SELECT 2",
+            "SELECT 1 ; ",
+            "SELECT 名",
+        ] {
+            assert!(!plain_ascii(sql), "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn plain_statements_answer_from_the_raw_text() {
+        let (t, text) = single_statement("  \n UPDATE kv SET v = 2;").unwrap();
+        assert_eq!(t, "UPDATE kv SET v = 2;");
+        assert!(matches!(text, Cow::Borrowed(s) if s == "  \n UPDATE kv SET v = 2;"));
+        assert_eq!(single_statement(";"), None);
+        assert_eq!(single_statement("  \n"), None);
+        assert_eq!(single_statement("; SELECT 1"), None);
     }
 }

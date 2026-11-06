@@ -321,6 +321,55 @@ fn bench_query_cache(c: &mut Criterion) {
     });
     drop(held);
     group.finish();
+
+    // The C-02 write path's table scan and the journal's classifier on plain
+    // ASCII statements, which the lexer-free fast path answers (no quote,
+    // dollar, comment or second statement in them).
+    use heliosdb_proxy::journal_capture::classify;
+    let update_accounts =
+        "UPDATE accounts SET balance = balance + 10, version = version + 1 WHERE id = 42";
+    let insert_history =
+        "INSERT INTO history (account_id, amount, created_at) VALUES (42, 10, 1700000000)";
+    let short_update = "UPDATE kv SET v = 2 WHERE id = 1";
+    assert_eq!(
+        cache.write_tables(update_accounts),
+        Some(vec!["accounts".to_string()])
+    );
+    assert_eq!(
+        cache.write_tables(insert_history),
+        Some(vec!["history".to_string()])
+    );
+    assert_eq!(
+        cache.write_tables(short_update),
+        Some(vec!["kv".to_string()])
+    );
+    let mut writes = c.benchmark_group("cache/write_tables");
+    writes.sample_size(50);
+    writes.warm_up_time(Duration::from_secs(1));
+    writes.measurement_time(Duration::from_secs(2));
+    writes.bench_function("update_accounts", |b| {
+        b.iter(|| black_box(cache.write_tables(black_box(update_accounts))))
+    });
+    writes.bench_function("insert_history", |b| {
+        b.iter(|| black_box(cache.write_tables(black_box(insert_history))))
+    });
+    writes.bench_function("short_update", |b| {
+        b.iter(|| black_box(cache.write_tables(black_box(short_update))))
+    });
+    writes.finish();
+    let select_only = "SELECT id, name FROM accounts WHERE id = 42 ORDER BY id";
+    let begin = "BEGIN";
+    let mut classes = c.benchmark_group("cache/classify");
+    classes.sample_size(50);
+    classes.warm_up_time(Duration::from_secs(1));
+    classes.measurement_time(Duration::from_secs(2));
+    classes.bench_function("select_only", |b| {
+        b.iter(|| black_box(classify(black_box(select_only))))
+    });
+    classes.bench_function("begin", |b| {
+        b.iter(|| black_box(classify(black_box(begin))))
+    });
+    classes.finish();
 }
 
 #[cfg(not(feature = "query-cache"))]

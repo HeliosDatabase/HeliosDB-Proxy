@@ -2009,3 +2009,19 @@ mod tests {
         assert!(bind_params(&[0, 0, 0]).is_none());
     }
 }
+
+#[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
+mod classify_fast_path_tests {
+    use super::classify;
+
+    /// The plain-ASCII fast path answers the journal's `classify` as the
+    /// lexer does, on generated plain and non-plain statements.
+    #[test]
+    fn classify_fast_path_matches_the_lexer() {
+        for sql in crate::sql_text::generated_statements(0x5EED_CAFE_F00D_1234, 20_000) {
+            let fast = classify(&sql);
+            let slow = crate::sql_text::with_lexer_only(|| classify(&sql));
+            assert_eq!(fast, slow, "{sql:?}");
+        }
+    }
+}
