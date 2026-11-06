@@ -1021,17 +1021,19 @@ impl L3SemanticCache {
     /// any lock is taken; under the shard's lock the store only files it and
     /// keeps the bucket and eviction books; what it replaced or evicted is
     /// freed after the lock is released. The memo's lock is taken only when
-    /// it can matter ([`Self::after_store`]).
+    /// it can matter ([`Self::after_store`]). Returns the number of entries
+    /// evicted for it (by `max_variants`, `max_entries` or `max_bytes`; the
+    /// expired, retired and same-select slots it replaced are not counted).
     pub(crate) fn store(
         &self,
         c: &Canonical,
         ctx: &CacheContext,
         mut result: CachedResult,
         is_current: &dyn Fn(&CachedResult) -> bool,
-    ) {
+    ) -> usize {
         let inner = &self.inner;
         if !inner.config.enabled {
-            return;
+            return 0;
         }
         if result.ttl > inner.config.ttl {
             result.ttl = inner.config.ttl;
@@ -1049,7 +1051,7 @@ impl L3SemanticCache {
             + std::mem::size_of::<Slot>();
         if inner.config.max_bytes > 0 && charge > inner.config.max_bytes {
             inner.counters.too_large.fetch_add(1, Ordering::Relaxed);
-            return;
+            return 0;
         }
         let slot = Slot {
             seq: 0,
@@ -1064,7 +1066,7 @@ impl L3SemanticCache {
         };
         let home = inner.shard_index(key);
         let mut dead: Vec<Slot> = Vec::new();
-        let settled = {
+        let (settled, replaced) = {
             let mut guard = inner.shards[home].write();
             let shard = &mut *guard;
             let seq = shard.next_seq;
@@ -1074,6 +1076,7 @@ impl L3SemanticCache {
                 s.matches(c, ctx)
                     && (expired(&s.result, now) || !is_current(&s.result) || s.select == c.select)
             });
+            let replaced = dead.len();
             if bucket.len() >= inner.config.max_variants.max(1) {
                 dead.push(bucket.remove(0));
             }
@@ -1084,7 +1087,7 @@ impl L3SemanticCache {
             shard.bytes = shard.bytes + charge - freed;
             shift(&inner.entry_count, 1, dead.len());
             shift(&inner.entry_bytes, charge, freed);
-            inner.evict_from(shard, Some(seq), &mut dead)
+            (inner.evict_from(shard, Some(seq), &mut dead), replaced)
         };
         if !settled {
             // The home shard holds nothing older than the new entry: the
@@ -1098,8 +1101,10 @@ impl L3SemanticCache {
                 inner.evict_from(&mut other, None, &mut dead);
             }
         }
+        let evicted = dead.len() - replaced;
         drop(dead);
         self.after_store(c);
+        evicted
     }
 
     /// The memo's part of a store of `c`, after the shard's lock is released
@@ -2732,6 +2737,27 @@ mod tests {
         assert_eq!(variants.len(), 2);
         assert!(look(&variants, "SELECT a FROM t WHERE id = 1").is_none());
         assert!(look(&variants, "SELECT c FROM t WHERE id = 1").is_some());
+    }
+
+    /// `store` reports the entries it evicted (the tier's entry bound, a full
+    /// shape), not the slot it replaced for the same statement.
+    #[test]
+    fn store_counts_its_evictions() {
+        let cache = L3SemanticCache::new(L3Config {
+            max_entries: 3,
+            max_variants: 2,
+            ..config(&closed_endpoint(), 0.9)
+        });
+        let store = |sql: &str| cache.store(&canon(sql), &ctx(), create_result("r"), &|_| true);
+        for i in 0..3 {
+            assert_eq!(store(&format!("SELECT v FROM t WHERE id = {i}")), 0);
+        }
+        assert_eq!(store("SELECT v FROM t WHERE id = 3"), 1, "entry bound");
+        assert_eq!(store("SELECT v FROM t WHERE id = 3"), 0, "replaced");
+        assert_eq!(cache.len(), 3);
+        assert_eq!(store("SELECT w FROM t WHERE id = 3"), 1, "entry bound");
+        assert_eq!(store("SELECT x FROM t WHERE id = 3"), 1, "full shape");
+        assert_eq!(cache.len(), 3);
     }
 
     #[tokio::test]

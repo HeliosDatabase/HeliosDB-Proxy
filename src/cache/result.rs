@@ -222,8 +222,13 @@ impl L1Entry {
 /// Entry in the L2 warm cache
 #[derive(Debug, Clone)]
 pub struct L2Entry {
-    /// The cached result
+    /// The cached result. Its `data` is the payload as L2 stores it: raw, or
+    /// a compressed blob when `raw_len` is set (`[cache] l2_compression`).
     pub result: CachedResult,
+
+    /// The payload's decoded length when `result.data` is a compressed blob
+    /// (`super::codec`); `None` when it is the raw payload.
+    pub raw_len: Option<usize>,
 
     /// Normalized query fingerprint
     pub fingerprint: String,
@@ -253,12 +258,35 @@ impl L2Entry {
 
         Self {
             result,
+            raw_len: None,
             fingerprint,
             key,
             access_count: 1,
             last_access: Instant::now(),
             memory_size,
         }
+    }
+
+    /// [`Self::new`] for a payload stored compressed: `result.data` is the
+    /// blob, which decodes to `raw_len` bytes. The memory size counts the
+    /// blob, so the L2 budget holds more entries.
+    pub fn compressed(
+        key: CacheKey,
+        fingerprint: String,
+        result: CachedResult,
+        raw_len: usize,
+    ) -> Self {
+        Self {
+            raw_len: Some(raw_len),
+            ..Self::new(key, fingerprint, result)
+        }
+    }
+
+    /// Bytes compression saves on this entry: the decoded length minus the
+    /// stored one (`0` for a raw payload).
+    pub fn saved_bytes(&self) -> usize {
+        self.raw_len
+            .map_or(0, |raw| raw.saturating_sub(self.result.size()))
     }
 
     /// Record an access to this entry

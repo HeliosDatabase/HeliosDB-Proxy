@@ -835,6 +835,11 @@ Never looked up, captured or stored by **any tier** (L1, L2, L3 and `[edge]`):
 enabled = true
 ttl_secs = 300
 max_result_bytes = 1048576
+# tier sizes (the defaults) and opt-in L2 payload compression
+l1_max_entries = 500
+l1_max_bytes = 33554432
+l2_max_bytes = 268435456
+l2_compression = "none"
 # keep these tables out of both result caches (this one and [edge])
 exclude_tables = ["payroll"]
 # opt-in semantic tier; "verbatim" = the same statement text only
@@ -862,6 +867,12 @@ ttl_secs = 10
 | `logical_max_slot_lag_bytes` | u64 | `1073741824` | *(logical)* A slot lagging more than this behind the primary's WAL invalidates the whole cache and logs an error (an unread slot also retains WAL on the primary). |
 | `l2_shed_batch` | usize | `1024` | When L2 is full and writes have retired entries, one eviction pass sheds them on the `cache-reclaim` thread, this many per step (`0` = all at once). |
 | `l2_shed_pause_us` | u64 | `2000` | Pause between those steps, microseconds (`0` = none). After a write retires a whole working set (10^5-10^6 entries) the shed then contends with concurrent readers at a lower rate, for longer, instead of at full rate for 3-5 s. |
+| `l1_max_entries` | usize | `500` | Entries each client connection's L1 holds at most; the least recently used is evicted first (`heliosdb_proxy_cache_evictions_total{tier="l1"}`). A connection's L1 allocates its index for this many entries (about 20-40 bytes each) at its first cached read. Range 1..=100000. |
+| `l1_max_bytes` | usize | `33554432` | Bytes each client connection's L1 retains at most: payloads, query texts and per-entry overhead (32 MiB). Least recently used first; a result larger than this is not kept in L1 and evicts the connection's other entries on its way through. Multiply by the client connections for the worst case. Range 1..=1073741824 (1 GiB). |
+| `l2_max_bytes` | usize | `268435456` | Bytes the shared L2 retains at most (256 MiB), counted at the **stored** size: with `l2_compression` a compressed payload counts its compressed bytes, so the same budget holds more entries. When a store needs room, one eviction pass sheds the expired and write-retired entries (`l2_shed_*`), else the least recently used. Range 1..=1099511627776 (1 TiB). |
+| `l2_compression` | string | `"none"` | How L2 stores a payload of at least `l2_compression_min_bytes`: `"none"` (as received), `"lz4"` (fast, a moderate ratio) or `"zstd"` (`l2_zstd_level`; a better ratio, slower to compress). It trades CPU for L2 memory: it saves L2 bytes (`heliosdb_proxy_cache_compression_saved_bytes`) and costs a compression on every L2 store and a **decompression on every L2 hit**, before the result is served or promoted to the connection's L1 (L1 keeps the raw bytes, so repeat hits on one connection decode nothing). It only pays when the hot set does not fit `l2_max_bytes` uncompressed: watch `heliosdb_proxy_cache_evictions_total{tier="l2"}`. A payload it does not shrink is stored raw. zstd compresses on the blocking thread pool, not on the connection's async worker; LZ4 runs inline. An entry that does not decompress (unknown marker, damaged frame, wrong length) is dropped and the read misses; like a raw entry, a payload carries no checksum. Any other value is a startup error. |
+| `l2_compression_min_bytes` | usize | `4096` | Smallest payload `l2_compression` compresses; smaller results are stored raw (compressing them saves little and costs the same per hit). Range 1..=1073741824. |
+| `l2_zstd_level` | i32 | `3` | zstd level of `l2_compression = "zstd"`: higher levels compress better and store more slowly (decompression speed barely changes). Range 1..=19; validated whichever codec is chosen. |
 | `exclude_tables` | list of strings | `[]` | Tables whose reads neither result cache (this one and `[edge]`) looks up, captures or stores. Bare identifiers (`[a-z_][a-z0-9_]*`, case-insensitive, at most 63 bytes, no schema or quotes). On HeliosDB-Nano, list its live system views that clients read (`helios_ha_status`, `helios_topology`, …, above). See [Exclusions and per-table TTL](#exclusions-and-per-table-ttl). |
 | `[[cache.tables]]` `name`, `ttl_secs`, `exclude` | table array | none | Per-table settings: `name` (required, same rule, unique) and exactly one of `ttl_secs` (≥ 1) or `exclude = true` (same as listing the table in `exclude_tables`). `exclude_columns` is refused at load, here or flat under `[cache]`. |
 | `semantic_enabled` | bool | `false` | Turn on the L3 semantic tier (with `enabled = true`; alone it only logs a warning). Used only by statements that carry `/*helios:cache=semantic*/` (also `semantic`, `cache=l3`, `cache=vector`), after L1 and L2 miss, and only by single-table SELECTs of its [grammar](#semantic-tier-l3); any other statement uses L1/L2. Under `strict_config`, a build without `query-cache` refuses it. |

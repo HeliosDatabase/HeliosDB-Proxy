@@ -55,6 +55,7 @@
 //! ```
 
 pub(crate) mod canonical;
+pub mod codec;
 pub mod config;
 pub mod hints;
 pub mod invalidation;
@@ -67,6 +68,7 @@ pub mod normalizer;
 pub mod result;
 
 // Re-exports
+pub use codec::{L2Codec, L2Payload};
 pub use config::{CacheConfig, L1Config, L2Config, L3Config, StorageBackend};
 pub use hints::{parse_cache_hints, CacheHint};
 pub use invalidation::{InvalidationManager, InvalidationMode};
@@ -224,6 +226,14 @@ pub struct RetainedBytes {
     pub l3: u64,
 }
 
+/// Entries a [`QueryCache`] retains in each tier (L1: every connection's).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TierEntries {
+    pub l1: u64,
+    pub l2: u64,
+    pub l3: u64,
+}
+
 /// Main query cache implementation
 pub struct QueryCache {
     /// Configuration
@@ -304,6 +314,7 @@ impl QueryCache {
         };
 
         let invalidator = Arc::new(InvalidationManager::new(config.invalidation.clone()));
+        let metrics = Arc::new(CacheMetrics::new());
 
         // Purges run on the connection that acknowledged a write; dropping a
         // table's key set there (10^5-10^6 keys after a read-heavy phase)
@@ -312,6 +323,7 @@ impl QueryCache {
         let reclaim_tx = {
             let (tx, rx) = std::sync::mpsc::channel::<Reclaim>();
             let l2 = l2_cache.clone();
+            let metrics = Arc::clone(&metrics);
             std::thread::Builder::new()
                 .name("cache-reclaim".into())
                 .spawn(move || {
@@ -320,7 +332,8 @@ impl QueryCache {
                             Reclaim::Keys(keys) => drop(keys),
                             Reclaim::Shed(hashes) => {
                                 if let Some(l2) = &l2 {
-                                    l2.shed_paced(&hashes);
+                                    let shed = l2.shed_paced(&hashes);
+                                    metrics.record_evictions(CacheLevel::L2Warm, shed);
                                     l2.end_eviction();
                                 }
                             }
@@ -342,7 +355,7 @@ impl QueryCache {
             l3_cache,
             normalizer: Arc::new(QueryNormalizer::new()),
             invalidator,
-            metrics: Arc::new(CacheMetrics::new()),
+            metrics,
             table_generations: DashMap::new(),
             global_generation: std::sync::atomic::AtomicU64::new(0),
             reclaim_tx,
@@ -425,6 +438,52 @@ impl QueryCache {
                 .as_ref()
                 .map_or(0, |c| c.retained_bytes() as u64),
         }
+    }
+
+    /// Entries retained per tier, for `/metrics`: every connection's L1, L2
+    /// in memory, and L3.
+    pub fn entry_counts(&self) -> TierEntries {
+        TierEntries {
+            l1: self.l1_caches.iter().map(|c| c.len() as u64).sum(),
+            l2: self.l2_cache.as_ref().map_or(0, |c| c.len() as u64),
+            l3: self.l3_cache.as_ref().map_or(0, |c| c.len() as u64),
+        }
+    }
+
+    /// Bytes L2 compression saves on the entries L2 retains: their raw minus
+    /// their stored payload sizes (`0` without `l2_compression`).
+    pub fn compression_saved_bytes(&self) -> u64 {
+        self.l2_cache
+            .as_ref()
+            .map_or(0, |c| c.compression_saved_bytes() as u64)
+    }
+
+    /// Store `result` in a connection's L1 under `query`, counting what it
+    /// evicted.
+    fn l1_store(&self, l1: &L1HotCache, query: &str, result: CachedResult) {
+        let evicted = l1.put(query.to_string(), result);
+        self.metrics.record_evictions(CacheLevel::L1Hot, evicted);
+    }
+
+    /// The form L2 keeps `data` in (`[cache] l2_compression`). zstd runs on
+    /// the blocking thread pool: compressing a large result inline would hold
+    /// this async worker, and every task queued on it, for milliseconds per
+    /// MiB. LZ4 (several times faster) and the raw form are made inline, the
+    /// raw form without any work. Outside a tokio runtime zstd runs inline
+    /// too; if the pool refuses the job (the runtime is shutting down) the
+    /// payload is kept raw.
+    async fn l2_payload(l2: &Arc<L2WarmCache>, data: &Bytes) -> L2Payload {
+        if !l2.compresses_off_worker(data.len()) {
+            return l2.encode_payload(data);
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return l2.encode_payload(data);
+        };
+        let (codec_l2, raw) = (Arc::clone(l2), data.clone());
+        runtime
+            .spawn_blocking(move || codec_l2.encode_payload(&raw))
+            .await
+            .unwrap_or_else(|_| L2Payload::raw(data.clone()))
     }
 
     /// Number of per-connection L1 caches currently retained. Grows by one per
@@ -548,11 +607,11 @@ impl QueryCache {
             if let Some(result) = hit {
                 self.metrics.record_hit(CacheLevel::L2Warm, start.elapsed());
 
-                // Promote to L1
+                // Promote to L1 (raw: L2 returned the payload decompressed)
                 if self.config.l1.enabled {
                     if let Some(conn_id) = context.connection_id {
                         let l1 = self.get_l1_cache(conn_id);
-                        l1.put(query.to_string(), result.clone());
+                        self.l1_store(&l1, query, result.clone());
                     }
                 }
 
@@ -733,6 +792,15 @@ impl QueryCache {
             return;
         }
 
+        // The form L2 keeps the payload in (`[cache] l2_compression`; zstd
+        // on the blocking pool). Made before the C-02 check below, so that
+        // check stays the last step before the stores, as without
+        // compression: a write while it compresses retires the fill.
+        let l2_payload = match &self.l2_cache {
+            Some(l2) => Some(Self::l2_payload(l2, &data).await),
+            None => None,
+        };
+
         // A write to one of these tables since the lookup missed (i.e. while
         // the result was being fetched) means the rows may predate it: do not
         // store them (C-02). Without a lookup snapshot (plain `put`) the
@@ -758,26 +826,29 @@ impl QueryCache {
             generation,
         };
 
-        // Store in L1 (exact match)
+        // Store in L1 (exact match), raw
         if self.config.l1.enabled {
             if let Some(conn_id) = context.connection_id {
                 let l1 = self.get_l1_cache(conn_id);
-                l1.put(query.to_string(), result.clone());
+                self.l1_store(&l1, query, result.clone());
             }
         }
 
-        // Store in L2 (normalized)
-        if let Some(ref l2) = self.l2_cache {
+        // Store in L2 (normalized), in the form made above
+        if let (Some(l2), Some(payload)) = (&self.l2_cache, l2_payload) {
             let cache_key = CacheKey::new(normalized, context);
             // When L2 must make room, one pass sheds every write-retired
             // entry, on the reclaim thread.
-            l2.put_evicting(
-                cache_key.clone(),
-                result.clone(),
-                |r| !self.is_current(r),
-                |hashes| self.hand_off_shed(hashes),
-            )
-            .await;
+            let evicted = l2
+                .put_payload_evicting(
+                    cache_key.clone(),
+                    result.clone(),
+                    payload,
+                    |r| !self.is_current(r),
+                    |hashes| self.hand_off_shed(hashes),
+                )
+                .await;
+            self.metrics.record_evictions(CacheLevel::L2Warm, evicted);
 
             // Register for invalidation
             for table in &normalized.tables {
@@ -790,7 +861,9 @@ impl QueryCache {
         // backend may have been dialed for this very read).
         if hints.semantic_cache && !self.canonical_tier_off() {
             if let (Some(l3), SemanticPrep::Canonical(c)) = (&self.l3_cache, semantic) {
-                l3.store(c, context, result, &|r| self.is_current(r));
+                let evicted = l3.store(c, context, result, &|r| self.is_current(r));
+                self.metrics
+                    .record_evictions(CacheLevel::L3Semantic, evicted);
             }
         }
 
@@ -2635,5 +2708,226 @@ mod tests {
         assert_eq!(cache.fills_raced(), raced + 1, "not stored");
         assert!(!is_hit(&cache, plain, 2).await);
         assert!(!is_hit(&cache, commented, 1).await);
+    }
+
+    /// A default cache with L2 compressing by `compression`.
+    fn compressed_config(compression: crate::config::CacheCompression) -> CacheConfig {
+        CacheConfig {
+            l2: L2Config {
+                compression,
+                ..L2Config::default()
+            },
+            ..CacheConfig::default()
+        }
+    }
+
+    const CODECS: [crate::config::CacheCompression; 2] = [
+        crate::config::CacheCompression::Lz4,
+        crate::config::CacheCompression::Zstd,
+    ];
+
+    /// [`fill`] with an owned payload.
+    async fn fill_with(cache: &QueryCache, sql: &str, conn: u64, payload: Bytes) {
+        let (lookup, prep) = cache.get_with_prep(sql, &ctx(conn)).await;
+        assert!(
+            matches!(lookup, CacheLookup::Miss),
+            "{sql} should miss first"
+        );
+        cache
+            .put_prepared(sql, &ctx(conn), &prep, payload, 1, Duration::ZERO)
+            .await;
+    }
+
+    /// The result and tier a lookup of `sql` on connection `conn` hits.
+    async fn hit_of(cache: &QueryCache, sql: &str, conn: u64) -> Option<(Bytes, CacheLevel)> {
+        match cache.get(sql, &ctx(conn)).await {
+            CacheLookup::Hit { result, level } => Some((result.data, level)),
+            CacheLookup::Miss => None,
+        }
+    }
+
+    /// With L2 compression, another connection's hit (L2, decompressed)
+    /// returns the stored bytes exactly, and is promoted raw to that
+    /// connection's L1, whose repeat hit returns them again with no decoding.
+    #[tokio::test]
+    async fn a_compressed_l2_hit_is_byte_identical() {
+        for compression in CODECS {
+            let cache = QueryCache::new(compressed_config(compression));
+            let data = codec::data_rows(64 * 1024);
+            let q = "SELECT id, name, status FROM accounts WHERE region = 'eu'";
+            fill_with(&cache, q, 1, data.clone()).await;
+            let saved = cache.compression_saved_bytes();
+            assert!(saved > 0, "{compression:?} stored compressed");
+            let l2 = cache.l2_cache.clone().unwrap();
+            assert!(l2.memory_usage() < data.len(), "{compression:?}");
+
+            let (hit, level) = hit_of(&cache, q, 2).await.unwrap();
+            assert_eq!(level, CacheLevel::L2Warm);
+            assert_eq!(hit, data, "{compression:?} L2 hit");
+            let l1 = cache.get_l1_cache(2);
+            assert!(l1.retained_bytes() > data.len(), "L1 keeps the raw bytes");
+            let (again, level) = hit_of(&cache, q, 2).await.unwrap();
+            assert_eq!(level, CacheLevel::L1Hot);
+            assert_eq!(again, data, "{compression:?} L1 hit");
+            assert_eq!(cache.compression_saved_bytes(), saved);
+        }
+    }
+
+    /// C-02 holds for compressed entries: a write refuses them on L1 and L2,
+    /// and a fill raced by a write is not stored (zstd compresses it on the
+    /// blocking pool before the generation check, which still runs last).
+    #[tokio::test]
+    async fn c02_refuses_compressed_entries_and_raced_fills() {
+        for compression in CODECS {
+            let cache = QueryCache::new(compressed_config(compression));
+            let data = codec::data_rows(16 * 1024);
+            let q = "SELECT v FROM accounts WHERE id = 1";
+            let other = "SELECT name FROM users WHERE id = 1";
+            fill_with(&cache, q, 1, data.clone()).await;
+            fill_with(&cache, other, 1, data.clone()).await;
+            assert!(cache.compression_saved_bytes() > 0);
+            assert!(is_hit(&cache, q, 2).await, "{compression:?} L2 hit");
+
+            cache.mark_written(&["accounts".to_string()]);
+            assert!(!is_hit(&cache, q, 1).await, "{compression:?} L1 refused");
+            assert!(!is_hit(&cache, q, 3).await, "{compression:?} L2 refused");
+            assert!(is_hit(&cache, other, 3).await, "unrelated table served");
+
+            let raced = cache.fills_raced();
+            let (lookup, prep) = cache.get_with_prep(q, &ctx(4)).await;
+            assert!(matches!(lookup, CacheLookup::Miss));
+            cache.mark_written(&["accounts".to_string()]);
+            cache
+                .put_prepared(q, &ctx(4), &prep, data.clone(), 1, Duration::ZERO)
+                .await;
+            assert_eq!(cache.fills_raced(), raced + 1, "{compression:?}");
+            assert!(!is_hit(&cache, q, 5).await);
+
+            // A fill after the write is stored and served, decompressed.
+            fill_with(&cache, q, 6, data.clone()).await;
+            let (hit, _) = hit_of(&cache, q, 7).await.unwrap();
+            assert_eq!(hit, data);
+        }
+    }
+
+    /// When L2 must make room, the write-retired compressed entries are the
+    /// ones the eviction pass sheds (on the reclaim thread): they leave the
+    /// saved-bytes gauge and count as L2 evictions.
+    #[tokio::test]
+    async fn an_eviction_pass_sheds_write_retired_compressed_entries() {
+        for compression in CODECS {
+            let data = codec::data_rows(64 * 1024);
+            let probe = QueryCache::new(compressed_config(compression));
+            fill_with(
+                &probe,
+                "SELECT v FROM accounts WHERE id = 0",
+                1,
+                data.clone(),
+            )
+            .await;
+            let one = probe.l2_cache.as_ref().unwrap().memory_usage();
+            let cache = QueryCache::new(CacheConfig {
+                l2: L2Config {
+                    compression,
+                    max_bytes: one * 4 + one / 2,
+                    ..L2Config::default()
+                },
+                ..CacheConfig::default()
+            });
+            for id in 0..4 {
+                let q = format!("SELECT v FROM accounts WHERE id = {id}");
+                fill_with(&cache, &q, 1, data.clone()).await;
+            }
+            let l2 = cache.l2_cache.clone().unwrap();
+            assert_eq!(l2.len(), 4, "{compression:?} four fit");
+            let saved = cache.compression_saved_bytes();
+            assert!(saved > 0);
+
+            cache.mark_written(&["accounts".to_string()]);
+            let users = "SELECT v FROM users WHERE id = 0";
+            fill_with(&cache, users, 1, data.clone()).await;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while l2.len() > 1 {
+                assert!(Instant::now() < deadline, "the reclaim thread sheds");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(
+                cache.compression_saved_bytes(),
+                saved / 4,
+                "{compression:?}"
+            );
+            // The thread records the shed before it ends the pass.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while cache.stats().l2.evictions < 4 {
+                assert!(Instant::now() < deadline, "evictions recorded");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(cache.stats().l2.evictions, 4);
+            let (hit, _) = hit_of(&cache, users, 2).await.unwrap();
+            assert_eq!(hit, data);
+        }
+    }
+
+    /// Evictions of every tier reach the metrics: a connection's L1 entry
+    /// bound, the semantic tier's entry bound, the L2 byte budget; the entry
+    /// gauges follow.
+    #[tokio::test]
+    async fn evictions_reach_the_metrics() {
+        let mut config = semantic_config(1.0, None);
+        config.l1.size = 2;
+        config.l3.max_entries = 2;
+        let cache = QueryCache::new(config);
+        for id in 0..3 {
+            let q = format!("SELECT val FROM kv WHERE id = {id} /*helios:cache=semantic*/");
+            fill(&cache, &q, 1, b"v").await;
+        }
+        let s = cache.stats();
+        assert_eq!((s.l1.evictions, s.l2.evictions, s.l3.evictions), (1, 0, 1));
+        assert_eq!(
+            cache.entry_counts(),
+            TierEntries {
+                l1: 2,
+                l2: 3,
+                l3: 2
+            }
+        );
+        // An L2 hit promoted into a full L1 evicts there too.
+        assert!(
+            is_hit(
+                &cache,
+                "SELECT val FROM kv WHERE id = 0 /*helios:cache=semantic*/",
+                1
+            )
+            .await
+        );
+        assert_eq!(cache.stats().l1.evictions, 2);
+
+        // L2: a budget of about two 1 KiB entries.
+        let probe = QueryCache::new(CacheConfig::default());
+        fill(&probe, "SELECT v FROM t WHERE id = 0", 1, &[b'x'; 1024]).await;
+        let one = probe.l2_cache.as_ref().unwrap().memory_usage();
+        let small = QueryCache::new(CacheConfig {
+            l2: L2Config {
+                max_bytes: one * 2 + one / 2,
+                ..L2Config::default()
+            },
+            ..CacheConfig::default()
+        });
+        for id in 0..5 {
+            fill(
+                &small,
+                &format!("SELECT v FROM t WHERE id = {id}"),
+                1,
+                &[b'x'; 1024],
+            )
+            .await;
+        }
+        assert_eq!(small.stats().l2.evictions, 3);
+        assert_eq!(small.entry_counts().l2, 2);
+        assert_eq!(
+            small.compression_saved_bytes(),
+            0,
+            "nothing compressed by default"
+        );
     }
 }

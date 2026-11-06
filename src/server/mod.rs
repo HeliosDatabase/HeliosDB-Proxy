@@ -959,6 +959,8 @@ impl ProxyServer {
             tracing::info!(
                 ttl_secs = c.ttl_secs,
                 max_result_bytes = c.max_result_bytes,
+                l2_max_bytes = c.l2_max_bytes,
+                l2_compression = c.l2_compression.as_str(),
                 semantic = c.semantic_enabled,
                 exclude_tables = c.excluded_table_names().len(),
                 table_ttls,

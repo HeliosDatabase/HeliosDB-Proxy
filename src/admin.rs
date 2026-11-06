@@ -2752,6 +2752,9 @@ impl AdminServer {
             "fills_raced": cache.fills_raced(),
             "unseen_write_invalidations": cache.unseen_write_invalidations(),
             "retained_bytes": cache.retained_bytes(),
+            "entries": cache.entry_counts(),
+            "evictions": {"l1": s.l1.evictions, "l2": s.l2.evictions, "l3": s.l3.evictions},
+            "compression_saved_bytes": cache.compression_saved_bytes(),
             "semantic": cache.semantic_health(),
             "logical_source": cache.logical_stats().map(|l| {
                 use std::sync::atomic::Ordering::Relaxed;
@@ -2829,6 +2832,30 @@ impl AdminServer {
              heliosdb_proxy_cache_retained_bytes{{tier=\"l2\"}} {}
              heliosdb_proxy_cache_retained_bytes{{tier=\"l3\"}} {}",
             retained.l1, retained.l2, retained.l3
+        );
+        let entries = cache.entry_counts();
+        let _ = writeln!(
+            output,
+            "# HELP heliosdb_proxy_cache_evictions_total Entries the query cache dropped to stay within a tier's entry or byte bounds, by tier\n\
+             # TYPE heliosdb_proxy_cache_evictions_total counter\n\
+             heliosdb_proxy_cache_evictions_total{{tier=\"l1\"}} {}\n\
+             heliosdb_proxy_cache_evictions_total{{tier=\"l2\"}} {}\n\
+             heliosdb_proxy_cache_evictions_total{{tier=\"l3\"}} {}\n\
+             # HELP heliosdb_proxy_cache_entries Entries the query cache retains by tier\n\
+             # TYPE heliosdb_proxy_cache_entries gauge\n\
+             heliosdb_proxy_cache_entries{{tier=\"l1\"}} {}\n\
+             heliosdb_proxy_cache_entries{{tier=\"l2\"}} {}\n\
+             heliosdb_proxy_cache_entries{{tier=\"l3\"}} {}\n\
+             # HELP heliosdb_proxy_cache_compression_saved_bytes Bytes L2 compression saves on the entries L2 retains (raw minus stored payload size)\n\
+             # TYPE heliosdb_proxy_cache_compression_saved_bytes gauge\n\
+             heliosdb_proxy_cache_compression_saved_bytes {}",
+            s.l1.evictions,
+            s.l2.evictions,
+            s.l3.evictions,
+            entries.l1,
+            entries.l2,
+            entries.l3,
+            cache.compression_saved_bytes()
         );
         if let Some(h) = cache.semantic_health() {
             let _ = writeln!(
@@ -4759,6 +4786,16 @@ mod tests {
             "heliosdb_proxy_cache_fills_raced_total 0",
             "heliosdb_proxy_cache_unseen_write_invalidations_total 0",
             "heliosdb_proxy_cache_retained_bytes{tier=\"l3\"} 0",
+            "# TYPE heliosdb_proxy_cache_evictions_total counter",
+            "heliosdb_proxy_cache_evictions_total{tier=\"l1\"} 0",
+            "heliosdb_proxy_cache_evictions_total{tier=\"l2\"} 0",
+            "heliosdb_proxy_cache_evictions_total{tier=\"l3\"} 0",
+            "# TYPE heliosdb_proxy_cache_entries gauge",
+            "heliosdb_proxy_cache_entries{tier=\"l1\"} 0",
+            "heliosdb_proxy_cache_entries{tier=\"l2\"} 0",
+            "heliosdb_proxy_cache_entries{tier=\"l3\"} 0",
+            "# TYPE heliosdb_proxy_cache_compression_saved_bytes gauge",
+            "heliosdb_proxy_cache_compression_saved_bytes 0",
         ] {
             assert!(text.contains(line), "missing {line}");
         }
@@ -4776,6 +4813,65 @@ mod tests {
         assert_eq!(json["query_cache"]["retained_bytes"]["l1"], 0);
         assert_eq!(json["query_cache"]["unseen_write_invalidations"], 0);
         assert!(json["query_cache"]["semantic"].is_null());
+        for tier in ["l1", "l2", "l3"] {
+            assert_eq!(json["query_cache"]["entries"][tier], 0, "{tier}");
+            assert_eq!(json["query_cache"]["evictions"][tier], 0, "{tier}");
+        }
+        assert_eq!(json["query_cache"]["compression_saved_bytes"], 0);
+    }
+
+    /// The eviction, entry and compression series move with the cache: an
+    /// L1 bound of one entry evicts, and a compressed L2 entry saves bytes.
+    #[cfg(feature = "query-cache")]
+    #[tokio::test]
+    async fn query_cache_eviction_and_compression_series_move() {
+        use crate::cache::{CacheConfig, CacheContext, L1Config, L2Config, QueryCache};
+        let cache = Arc::new(QueryCache::new(CacheConfig {
+            l1: L1Config {
+                size: 1,
+                ..L1Config::default()
+            },
+            l2: L2Config {
+                compression: crate::config::CacheCompression::Lz4,
+                ..L2Config::default()
+            },
+            ..CacheConfig::default()
+        }));
+        let ctx = CacheContext {
+            database: "db".into(),
+            connection_id: Some(1),
+            ..CacheContext::default()
+        };
+        let payload = bytes::Bytes::from("row 42 of the result, active; ".repeat(512));
+        for id in 0..2 {
+            let sql = format!("SELECT v FROM t WHERE id = {id}");
+            cache
+                .put(&sql, &ctx, payload.clone(), 1, std::time::Duration::ZERO)
+                .await;
+        }
+        let saved = cache.compression_saved_bytes();
+        assert!(saved > 0);
+        let state = Arc::new(AdminState::new());
+        state.with_query_cache(cache).await;
+        let (_, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
+            .await
+            .unwrap();
+        let text = body["text"].as_str().unwrap();
+        for line in [
+            "heliosdb_proxy_cache_evictions_total{tier=\"l1\"} 1".to_string(),
+            "heliosdb_proxy_cache_entries{tier=\"l1\"} 1".to_string(),
+            "heliosdb_proxy_cache_entries{tier=\"l2\"} 2".to_string(),
+            format!("heliosdb_proxy_cache_compression_saved_bytes {saved}"),
+        ] {
+            assert!(text.contains(&line), "missing {line}:\n{text}");
+        }
+        let (_, json) = AdminServer::route_request("GET", "/metrics", None, &state)
+            .await
+            .unwrap();
+        let q = &json["query_cache"];
+        assert_eq!(q["evictions"]["l1"], 1);
+        assert_eq!(q["entries"]["l2"], 2);
+        assert_eq!(q["compression_saved_bytes"], saved);
     }
 
     /// With the semantic tier on and its endpoint down (closed port), the

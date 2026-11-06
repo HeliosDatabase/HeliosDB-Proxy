@@ -89,20 +89,22 @@ impl L1HotCache {
         Some(entry.result.clone())
     }
 
-    /// Store a query result in the cache
-    pub fn put(&self, query: String, result: CachedResult) {
+    /// Store a query result in the cache. Returns the number of entries
+    /// evicted to stay within `size` and `max_bytes` (a replacement of the
+    /// same query is none).
+    pub fn put(&self, query: String, result: CachedResult) -> usize {
         if !self.config.enabled {
-            return;
+            return 0;
         }
 
         let mut entries = self.entries.write();
 
-        // No eviction bookkeeping here: `entries.put` below is O(1) and
-        // evicts the true least-recently-used entry itself when the
-        // cache is full and this is a new key (built into the `lru`
-        // crate). Expired entries are reclaimed lazily — on `get()`,
-        // when a lookup lands on one, or in bulk by `evict_expired()` —
-        // not preferentially on insert, which would need an O(n) scan.
+        // No eviction scan here: `entries.push` below is O(1) and evicts
+        // the true least-recently-used entry itself when the cache is full
+        // and this is a new key (built into the `lru` crate). Expired
+        // entries are reclaimed lazily — on `get()`, when a lookup lands on
+        // one, or in bulk by `evict_expired()` — not preferentially on
+        // insert, which would need an O(n) scan.
 
         // Create TTL-adjusted result
         let mut adjusted_result = result;
@@ -110,12 +112,19 @@ impl L1HotCache {
             adjusted_result.ttl = self.config.ttl;
         }
 
-        // Insert or update entry (promotes to most-recently-used).
+        // Insert or update entry (promotes to most-recently-used). `push`
+        // hands back what it took out: the entry this key replaced, or the
+        // least-recently-used entry it dropped to stay within `size` (an
+        // eviction, whose bytes `put` used to leave in the account).
         let entry = L1Entry::new(query.clone(), adjusted_result);
         let charge = entry_charge(&entry);
-        if let Some(old) = entries.put(query, entry) {
+        let mut evicted = 0;
+        if let Some((key, old)) = entries.push(query, entry) {
             self.retained_bytes
                 .fetch_sub(entry_charge(&old), Ordering::Relaxed);
+            if entries.peek_mru().is_some_and(|(newest, _)| *newest != key) {
+                evicted += 1;
+            }
         }
         self.retained_bytes.fetch_add(charge, Ordering::Relaxed);
         // C-01: trim to the aggregate byte budget, LRU-first.
@@ -126,8 +135,10 @@ impl L1HotCache {
                 };
                 self.retained_bytes
                     .fetch_sub(entry_charge(&victim), Ordering::Relaxed);
+                evicted += 1;
             }
         }
+        evicted
     }
 
     /// Remove an entry from the cache
@@ -633,6 +644,79 @@ mod byte_budget_tests {
         assert_eq!(cache.retained_bytes(), charge);
         cache.clear();
         assert_eq!(cache.retained_bytes(), 0);
+    }
+
+    /// An entry dropped for room (the entry bound) leaves the byte account:
+    /// `lru`'s `put` dropped it without handing it back, so its bytes stayed
+    /// counted and, on a long-lived connection, the phantom total grew until
+    /// the byte budget evicted every live entry. Fails on the old logic
+    /// (519 retained instead of 346).
+    #[test]
+    fn a_capacity_eviction_releases_its_bytes() {
+        let config = L1Config {
+            enabled: true,
+            size: 2,
+            max_bytes: 0,
+            ttl: Duration::from_secs(60),
+        };
+        let probe = L1HotCache::new(config.clone());
+        probe.put("a".to_string(), result(b"xxxx"));
+        let charge = probe.retained_bytes();
+
+        let cache = L1HotCache::new(config);
+        cache.put("a".to_string(), result(b"aaaa"));
+        cache.put("b".to_string(), result(b"bbbb"));
+        cache.put("c".to_string(), result(b"cccc"));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(
+            cache.retained_bytes(),
+            charge * 2,
+            "the entry dropped for room left the account"
+        );
+    }
+
+    /// `put` reports its evictions, by the entry bound and by the byte
+    /// budget; replacing the same query evicts nothing.
+    #[test]
+    fn put_counts_its_evictions() {
+        let config = L1Config {
+            enabled: true,
+            size: 2,
+            max_bytes: 0,
+            ttl: Duration::from_secs(60),
+        };
+        let cache = L1HotCache::new(config.clone());
+        assert_eq!(cache.put("a".to_string(), result(b"aaaa")), 0);
+        assert_eq!(cache.put("b".to_string(), result(b"bbbb")), 0);
+        assert_eq!(cache.put("b".to_string(), result(b"BBBB")), 0, "replaced");
+        assert_eq!(
+            cache.put("c".to_string(), result(b"cccc")),
+            1,
+            "entry bound"
+        );
+        assert!(cache.get("a").is_none());
+
+        let charge = cache.retained_bytes() / 2;
+        let budget = L1HotCache::new(L1Config {
+            size: 100,
+            max_bytes: charge * 2,
+            ..config
+        });
+        assert_eq!(budget.put("a".to_string(), result(b"aaaa")), 0);
+        assert_eq!(budget.put("b".to_string(), result(b"bbbb")), 0);
+        assert_eq!(
+            budget.put("c".to_string(), result(b"cccc")),
+            1,
+            "byte budget"
+        );
+        assert_eq!(budget.retained_bytes(), charge * 2);
+        // A larger entry does not fit next to either of the others: both go.
+        assert_eq!(
+            budget.put("d".to_string(), result(&[b'd'; 12])),
+            2,
+            "two evicted for a larger one"
+        );
+        assert_eq!(budget.len(), 1);
     }
 
     #[test]

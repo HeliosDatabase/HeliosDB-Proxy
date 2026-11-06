@@ -1080,7 +1080,8 @@ async fn a_sighup_reload_keeps_the_running_cache_section() {
         &path,
         format!(
             "[cache]\nenabled = true\nmax_cacheable_response_bytes = 8192\n\
-             semantic_enabled = true\nexclude_tables = [\"secret\"]\nttl_secs = 9\n{nodes}"
+             semantic_enabled = true\nexclude_tables = [\"secret\"]\nttl_secs = 9\n\
+             l1_max_entries = 7\nl2_max_bytes = 1048576\nl2_compression = \"zstd\"\n{nodes}"
         ),
     )
     .unwrap();
@@ -1090,6 +1091,19 @@ async fn a_sighup_reload_keeps_the_running_cache_section() {
     expected.max_cacheable_response_bytes = 8192;
     assert_eq!(live.cache, expected);
     assert!(!live.cache.semantic_enabled && live.cache.exclude_tables.is_empty());
+    assert_eq!(
+        (
+            live.cache.l1_max_entries,
+            live.cache.l2_max_bytes,
+            live.cache.l2_compression
+        ),
+        (
+            running.l1_max_entries,
+            running.l2_max_bytes,
+            crate::config::CacheCompression::None
+        ),
+        "sizes and compression are startup-only too"
+    );
 
     // Only max_cacheable_response_bytes changed: applied, no section kept.
     std::fs::write(
@@ -1138,6 +1152,59 @@ async fn the_capture_ceiling_follows_the_live_config() {
     assert_eq!(relay.cache().stats().puts, puts + 1, "under it again");
     drop(relay);
     assert_eq!(backend.await.unwrap().len(), 2);
+}
+
+/// A backend that answers one simple query with `reply`.
+async fn backend_answering(listener: TcpListener, reply: Vec<u8>) -> Vec<String> {
+    let (mut sock, _) = listener.accept().await.unwrap();
+    let sql = read_query(&mut sock).await;
+    sock.write_all(&reply).await.unwrap();
+    vec![sql]
+}
+
+/// With `[cache] l2_compression`, a large read the relay captured is stored
+/// in L2 compressed (zstd on the blocking pool), and an L2 hit through the
+/// relay sends the client the backend's bytes exactly.
+#[tokio::test]
+async fn a_compressed_l2_entry_serves_the_backend_bytes() {
+    for compression in [
+        crate::config::CacheCompression::Lz4,
+        crate::config::CacheCompression::Zstd,
+    ] {
+        let reply = [
+            crate::cache::codec::data_rows(64 * 1024).to_vec(),
+            wire_frame(b'C', b"SELECT 1000\0"),
+            wire_frame(b'Z', b"I"),
+        ]
+        .concat();
+        let served = reply.clone();
+        let (mut relay, backend) = Relay::start_with(
+            |c| c.cache.l2_compression = compression,
+            &[],
+            move |listener| tokio::spawn(backend_answering(listener, served)),
+        )
+        .await;
+        let sql = "SELECT id, name, status FROM accounts";
+        let (node, got) = relay.query(sql).await;
+        assert!(node.is_some(), "the backend answered");
+        assert_eq!(got, reply);
+        assert!(
+            relay.cache().compression_saved_bytes() > 0,
+            "{compression:?}: stored compressed"
+        );
+        // The session's L1 holds the raw bytes; without it the read is an
+        // L2 hit, decompressed.
+        relay
+            .cache()
+            .remove_l1_cache(relay.session.id.as_u64_pair().0);
+        let hits = relay.cache().stats().l2.hits;
+        let (node, got) = relay.query(sql).await;
+        assert_eq!(node, None, "served from the cache");
+        assert_eq!(got, reply, "{compression:?}: byte-identical");
+        assert_eq!(relay.cache().stats().l2.hits, hits + 1);
+        drop(relay);
+        assert_eq!(backend.await.unwrap(), [sql]);
+    }
 }
 
 #[test]

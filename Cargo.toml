@@ -52,8 +52,9 @@ heliosdb-topology = []
 
 # ── Proxy feature modules ───────────────────────────────────────────
 
-# Query caching (L1 hot / L2 warm / L3 semantic)
-query-cache = ["dep:lru"]
+# Query caching (L1 hot / L2 warm / L3 semantic). zstd and lz4_flex back the
+# opt-in L2 payload compression (`[cache] l2_compression`).
+query-cache = ["dep:lru", "dep:zstd", "dep:lz4_flex"]
 
 # Query routing hints (/*+ route=primary */)
 routing-hints = []
@@ -93,8 +94,9 @@ graphql-gateway = []
 # Schema-aware routing (data temperature, workload classification)
 schema-routing = []
 
-# Distributed intelligent caching (DistribCache)
-distribcache = []
+# Distributed intelligent caching (DistribCache); its L2 tier compresses with
+# zstd / lz4_flex.
+distribcache = ["dep:zstd", "dep:lz4_flex"]
 
 # Anomaly detection (rate spikes, credential stuffing, SQL injection
 # heuristics, novel query shapes). In-process sliding windows; no
@@ -211,11 +213,12 @@ rand = "0.8"
 # consistent with the crate's pure-Rust rustls stack.
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
-# Compression (used by distribcache tiers)
-zstd = "0.13"
-# LZ4 block compression for the DistribCache L2 tier (fast, moderate ratio).
-# Pure-Rust, safe-decode; the default tier compressor where latency matters.
-lz4_flex = "0.13"
+# Compression of L2 payloads: the query cache's (`[cache] l2_compression`) and
+# the DistribCache L2 tier's. Optional — only compiled with the `query-cache`
+# or `distribcache` feature.
+zstd = { version = "0.13", optional = true }
+# LZ4 block compression (fast, moderate ratio). Pure-Rust, safe-decode.
+lz4_flex = { version = "0.13", optional = true }
 
 # Backend PG client (src/backend/) — auth + TLS + text-format I/O.
 # Kept lightweight: ring for crypto, no BoringSSL, no tokio-postgres.

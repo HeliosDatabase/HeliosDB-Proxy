@@ -413,6 +413,9 @@ Besides the counters above, the body carries (P-03):
 | `heliosdb_proxy_cache_fills_raced_total` | counter | — | Fills not stored because a write raced their backend fetch. |
 | `heliosdb_proxy_cache_unseen_write_invalidations_total` | counter | — | Whole-cache invalidations for a simple-query string with a `;` inside text PostgreSQL and HeliosDB-Nano/Lite read differently, which may end a statement the proxy's journal capture does not see; see [Query Cache](configuration.md#query-cache-cache). |
 | `heliosdb_proxy_cache_retained_bytes` | gauge | `tier` | Bytes the query cache retains per tier (L1 includes per-entry overhead; L3 counts entries plus remembered embeddings). |
+| `heliosdb_proxy_cache_evictions_total` | counter | `tier` = `l1`, `l2`, `l3` | Entries a tier dropped to stay within its bounds: L1 `[cache] l1_max_entries` / `l1_max_bytes` (per connection, summed), L2 `l2_max_bytes` (including the expired and write-retired entries an eviction pass sheds), L3 `semantic_max_entries` / `semantic_max_bytes` / `semantic_max_variants`. Not counted: expiry found by a lookup, hits refused as stale (`_stale_rejected_total`), replacements of the same key. |
+| `heliosdb_proxy_cache_entries` | gauge | `tier` | Entries the query cache retains per tier (L1: every connection's). |
+| `heliosdb_proxy_cache_compression_saved_bytes` | gauge | — | Bytes `[cache] l2_compression` saves on the entries L2 retains: their raw minus their stored payload size (`0` with `"none"`). `_retained_bytes{tier="l2"}` already counts the stored size. |
 | `heliosdb_proxy_cache_excluded_total` | counter | — | Cacheable reads neither result cache looked up or stored because they name a table of `[cache] exclude_tables` / `[[cache.tables]] exclude = true` (always emitted). |
 | `heliosdb_proxy_cache_catalog_skipped_total` | counter | — | Cacheable reads no result cache tier (L1, L2, L3, `[edge]`) looked up or stored because they may name a system catalog relation: a word starting with `pg_` or `information_schema`, anywhere in the text, or a Unicode-escaped quoted identifier (`U&"…"`, which can spell one without its bytes) (always emitted; see [Query Cache](configuration.md#query-cache-cache)). |
 | `heliosdb_proxy_cache_time_travel_skipped_total` | counter | — | Cacheable reads no result cache tier looked up or stored because a comment holds `AS OF` or `VERSIONS BETWEEN` (any whitespace between the words; always emitted). |
@@ -450,6 +453,8 @@ Histogram buckets are `[limits] latency_buckets_ms`, exported in seconds as `_bu
 `_sum` and `_count`. `GET /metrics` carries the same data as JSON under `latency`
 (`bounds_us`, cumulative counts, `sum_us`, `count`, and `tr_replay_refusals`),
 `gateway_pools`, `query_cache`, `edge_cache`, `tenant_slots` and `tenant_budgets`.
+`query_cache` carries `entries`, `evictions` (each by `l1`, `l2`, `l3`) and
+`compression_saved_bytes` next to the counters above.
 `query_cache.semantic` is the semantic tier's state (`endpoint`, `embed_requests`,
 `embed_errors`, `embed_skipped`, `embed_seconds_sum`, `embed_seconds_count`,
 `approximate_hits`, `ineligible`, `too_large`, `entries`, `embeddings`), `null` when the

@@ -1,20 +1,26 @@
 //! L2 Warm Cache
 //!
 //! Shared cache with normalized queries and configurable storage backend.
-//! Supports both in-memory and memory-mapped file storage.
+//! Supports both in-memory and memory-mapped file storage. Payloads of at
+//! least `compression_min_bytes` may be stored compressed
+//! (`[cache] l2_compression`, [`super::codec`]); a hit decompresses them.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
 
+use super::codec::{self, L2Codec, L2Payload};
 use super::config::{L2Config, StorageBackend};
 use super::result::{CacheKey, CachedResult, L2Entry};
+use crate::config::CacheCompression;
 
 /// L2 warm cache (shared across connections)
 ///
@@ -23,10 +29,19 @@ use super::result::{CacheKey, CachedResult, L2Entry};
 /// - Memory: Fast, volatile storage
 /// - Mmap: File-backed spill storage with a process-local index. Entries
 ///   are not recovered after restart.
+///
+/// With `compression` set, an entry keeps a payload of at least
+/// `compression_min_bytes` compressed when that shrinks it, and the byte
+/// budget counts the compressed size. [`Self::get`] returns the raw payload;
+/// an entry whose blob does not decode is dropped and reads as a miss.
 #[derive(Debug)]
 pub struct L2WarmCache {
     /// Cache configuration
     config: L2Config,
+
+    /// The payload codec (`compression`, `compression_min_bytes`,
+    /// `zstd_level` of `config`).
+    codec: L2Codec,
 
     /// Cache entries (in-memory storage)
     memory_entries: DashMap<u64, L2Entry>,
@@ -35,13 +50,17 @@ pub struct L2WarmCache {
     mmap_storage: Option<RwLock<MmapStorage>>,
 
     /// Current memory usage in bytes
-    memory_usage: std::sync::atomic::AtomicUsize,
+    memory_usage: AtomicUsize,
+
+    /// Bytes compression saves on the entries in memory: their raw minus
+    /// their stored payload sizes.
+    compression_saved: AtomicUsize,
 
     /// Set while an eviction pass runs. When L2 fills up, every concurrent
     /// put would otherwise scan and shed the same entries — a herd that
     /// stalled all readers for seconds. A put that finds a pass in progress
     /// inserts without evicting: the size bound is soft for that long.
-    evicting: std::sync::atomic::AtomicBool,
+    evicting: AtomicBool,
 }
 
 /// File-backed spill storage. The index, including monotonic entry timing,
@@ -90,12 +109,35 @@ impl L2WarmCache {
         };
 
         Self {
+            codec: L2Codec {
+                compression: config.compression,
+                min_bytes: config.compression_min_bytes,
+                zstd_level: config.zstd_level,
+            },
             config,
             memory_entries: DashMap::new(),
             mmap_storage,
-            memory_usage: std::sync::atomic::AtomicUsize::new(0),
-            evicting: std::sync::atomic::AtomicBool::new(false),
+            memory_usage: AtomicUsize::new(0),
+            compression_saved: AtomicUsize::new(0),
+            evicting: AtomicBool::new(false),
         }
+    }
+
+    /// The form this cache stores `data` in: compressed when the codec
+    /// applies and shrinks it, else `data` itself. CPU-bound when it
+    /// compresses (zstd of a large payload takes milliseconds): see
+    /// [`Self::compresses_off_worker`].
+    pub fn encode_payload(&self, data: &Bytes) -> L2Payload {
+        self.codec.encode(data)
+    }
+
+    /// Whether storing a payload of `len` bytes runs zstd, which the query
+    /// cache does on the blocking thread pool rather than the async worker
+    /// (LZ4 is fast enough to run inline).
+    pub fn compresses_off_worker(&self, len: usize) -> bool {
+        self.config.enabled
+            && self.codec.compression == CacheCompression::Zstd
+            && self.codec.applies(len)
     }
 
     /// Look up a cache key
@@ -106,19 +148,27 @@ impl L2WarmCache {
 
         let hash = key.hash_value();
 
-        // Try memory storage first
-        if let Some(mut entry) = self.memory_entries.get_mut(&hash) {
-            if entry.is_expired() {
-                drop(entry);
-                if let Some((_, old)) = self.memory_entries.remove(&hash) {
-                    self.memory_usage
-                        .fetch_sub(old.memory_size, std::sync::atomic::Ordering::Relaxed);
+        // Try memory storage first. A compressed entry is copied out (a
+        // reference count) and decoded after the shard's lock is released.
+        let found = match self.memory_entries.get_mut(&hash) {
+            Some(mut entry) => {
+                if entry.is_expired() {
+                    drop(entry);
+                    if let Some((_, old)) = self.memory_entries.remove(&hash) {
+                        self.release(&old);
+                    }
+                    return None;
                 }
-                return None;
+                entry.touch();
+                Some((entry.result.clone(), entry.raw_len))
             }
-
-            entry.touch();
-            return Some(entry.result.clone());
+            None => None,
+        };
+        if let Some((result, raw_len)) = found {
+            return match raw_len {
+                None => Some(result),
+                Some(raw_len) => self.decoded(hash, result, raw_len),
+            };
         }
 
         // Try mmap storage
@@ -132,6 +182,29 @@ impl L2WarmCache {
             }
         }
 
+        None
+    }
+
+    /// `result` of a compressed entry with its payload decoded. A blob that
+    /// does not decode is never served: the entry is dropped (unless a store
+    /// replaced it meanwhile) and the read misses.
+    fn decoded(&self, hash: u64, mut result: CachedResult, raw_len: usize) -> Option<CachedResult> {
+        if let Some(raw) = codec::decode(&result.data, raw_len) {
+            result.data = Bytes::from(raw);
+            return Some(result);
+        }
+        let blob = result.data;
+        if let Some((_, old)) = self.memory_entries.remove_if(&hash, |_, e| {
+            e.result.data.as_ptr() == blob.as_ptr() && e.result.data.len() == blob.len()
+        }) {
+            self.release(&old);
+        }
+        tracing::warn!(
+            target: "helios::cache",
+            stored_bytes = blob.len(),
+            raw_bytes = raw_len,
+            "an L2 entry did not decompress; dropped it (the read misses)"
+        );
         None
     }
 
@@ -149,25 +222,56 @@ impl L2WarmCache {
     /// path; it must then call [`Self::shed`] and [`Self::end_eviction`].
     /// If it hands them back (`Err`), they are shed here. With nothing stale
     /// or expired, the pass evicts least-recently-used entries inline.
+    /// Returns the number of entries evicted here (not those handed off).
+    /// The payload is compressed inline: [`Self::put_payload_evicting`]
+    /// takes one compressed elsewhere.
     pub async fn put_evicting(
         &self,
         key: CacheKey,
         result: CachedResult,
         is_stale: impl Fn(&CachedResult) -> bool,
         hand_off: impl FnOnce(Vec<u64>) -> Result<(), Vec<u64>>,
-    ) {
+    ) -> usize {
         if !self.config.enabled {
-            return;
+            return 0;
         }
+        let payload = self.encode_payload(&result.data);
+        self.put_payload_evicting(key, result, payload, is_stale, hand_off)
+            .await
+    }
+
+    /// [`Self::put_evicting`] with the payload already in its stored form:
+    /// `payload` must be [`Self::encode_payload`] of `result.data` (the query
+    /// cache makes it on the blocking pool for zstd). The entry is charged
+    /// at the stored size.
+    pub async fn put_payload_evicting(
+        &self,
+        key: CacheKey,
+        mut result: CachedResult,
+        payload: L2Payload,
+        is_stale: impl Fn(&CachedResult) -> bool,
+        hand_off: impl FnOnce(Vec<u64>) -> Result<(), Vec<u64>>,
+    ) -> usize {
+        if !self.config.enabled {
+            return 0;
+        }
+        let (stored, raw_len) = payload.into_parts();
+        debug_assert_eq!(
+            raw_len.unwrap_or(stored.len()),
+            result.data.len(),
+            "the payload of another result"
+        );
+        result.data = stored;
 
         let entry_size = result.size() + std::mem::size_of::<L2Entry>();
         let hash = key.hash_value();
+        let mut evicted = 0;
 
         // Check size limit. Replacing an existing entry for the same key
         // (e.g. refilling one a write made stale) only grows the cache by
         // the difference.
-        let max_bytes = self.config.size_mb * 1024 * 1024;
-        let current_usage = self.memory_usage.load(std::sync::atomic::Ordering::Relaxed);
+        let max_bytes = self.config.max_bytes;
+        let current_usage = self.memory_usage.load(Ordering::Relaxed);
         let replacing = self
             .memory_entries
             .get(&hash)
@@ -177,12 +281,7 @@ impl L2WarmCache {
         if current_usage.saturating_sub(replacing) + entry_size > max_bytes
             && self
                 .evicting
-                .compare_exchange(
-                    false,
-                    true,
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Relaxed,
-                )
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
         {
             let retired: Vec<u64> = self
@@ -192,64 +291,85 @@ impl L2WarmCache {
                 .map(|e| *e.key())
                 .collect();
             if retired.is_empty() {
-                self.evict_to_fit(entry_size).await;
+                evicted += self.evict_to_fit(entry_size).await;
                 self.end_eviction();
             } else if let Err(retired) = hand_off(retired) {
-                self.shed(&retired);
+                evicted += self.shed(&retired);
                 self.end_eviction();
             }
         }
 
         let fingerprint = format!("{:016x}", hash);
-        let entry = L2Entry::new(key, fingerprint, result);
-        let entry_memory = entry.memory_size;
+        let entry = match raw_len {
+            Some(raw_len) => L2Entry::compressed(key, fingerprint, result, raw_len),
+            None => L2Entry::new(key, fingerprint, result),
+        };
+        self.insert(hash, entry);
+        evicted
+    }
 
-        // Replacing an entry for the same key (a refill after a write made
-        // it stale, a promotion) takes the old one's bytes out of the account,
-        // or the usage only grows and forces evictions of live entries.
+    /// Insert `entry` under `hash`. Replacing an entry for the same key (a
+    /// refill after a write made it stale, a promotion) takes the old one's
+    /// bytes out of the account, or the usage only grows and forces
+    /// evictions of live entries.
+    fn insert(&self, hash: u64, entry: L2Entry) {
+        let (memory, saved) = (entry.memory_size, entry.saved_bytes());
         if let Some(old) = self.memory_entries.insert(hash, entry) {
-            self.memory_usage
-                .fetch_sub(old.memory_size, std::sync::atomic::Ordering::Relaxed);
+            self.release(&old);
         }
+        self.memory_usage.fetch_add(memory, Ordering::Relaxed);
+        if saved > 0 {
+            self.compression_saved.fetch_add(saved, Ordering::Relaxed);
+        }
+    }
+
+    /// Take an entry that left the map out of the byte accounts.
+    fn release(&self, entry: &L2Entry) {
         self.memory_usage
-            .fetch_add(entry_memory, std::sync::atomic::Ordering::Relaxed);
+            .fetch_sub(entry.memory_size, Ordering::Relaxed);
+        let saved = entry.saved_bytes();
+        if saved > 0 {
+            self.compression_saved.fetch_sub(saved, Ordering::Relaxed);
+        }
     }
 
     /// Drop the entries with these key hashes (an eviction pass's retired
-    /// set, see [`Self::put_evicting`]).
-    pub fn shed(&self, hashes: &[u64]) {
+    /// set, see [`Self::put_evicting`]); returns how many were still there.
+    pub fn shed(&self, hashes: &[u64]) -> usize {
+        let mut removed = 0;
         for hash in hashes {
             if let Some((_, old)) = self.memory_entries.remove(hash) {
-                self.memory_usage
-                    .fetch_sub(old.memory_size, std::sync::atomic::Ordering::Relaxed);
+                self.release(&old);
+                removed += 1;
             }
         }
+        removed
     }
 
     /// [`Self::shed`] in steps of `shed_batch` entries with `shed_pause`
     /// between them, for the `cache-reclaim` thread (blocking: never call it
     /// on an async worker). Each removal is short; the pacing spreads a bulk
     /// shed out so concurrent readers are not contended at full rate for its
-    /// whole duration.
-    pub fn shed_paced(&self, hashes: &[u64]) {
+    /// whole duration. Returns how many entries it removed.
+    pub fn shed_paced(&self, hashes: &[u64]) -> usize {
         let batch = self.config.shed_batch;
         if batch == 0 || self.config.shed_pause.is_zero() || hashes.len() <= batch {
-            self.shed(hashes);
-            return;
+            return self.shed(hashes);
         }
+        let mut removed = 0;
         let mut chunks = hashes.chunks(batch).peekable();
         while let Some(chunk) = chunks.next() {
-            self.shed(chunk);
+            removed += self.shed(chunk);
             if chunks.peek().is_some() {
                 std::thread::sleep(self.config.shed_pause);
             }
         }
+        removed
     }
 
     /// End the eviction pass [`Self::put_evicting`] handed off.
     pub fn end_eviction(&self) {
-        self.evicting
-            .store(false, std::sync::atomic::Ordering::Release);
+        self.evicting.store(false, Ordering::Release);
     }
 
     /// Remove an entry from the cache
@@ -257,8 +377,7 @@ impl L2WarmCache {
         let hash = key.hash_value();
 
         if let Some((_, entry)) = self.memory_entries.remove(&hash) {
-            self.memory_usage
-                .fetch_sub(entry.memory_size, std::sync::atomic::Ordering::Relaxed);
+            self.release(&entry);
         }
 
         // Also remove from mmap if present
@@ -272,8 +391,8 @@ impl L2WarmCache {
     /// Clear all entries
     pub async fn clear(&self) {
         self.memory_entries.clear();
-        self.memory_usage
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.memory_usage.store(0, Ordering::Relaxed);
+        self.compression_saved.store(0, Ordering::Relaxed);
 
         if let Some(ref mmap) = self.mmap_storage {
             if let Ok(mut storage) = mmap.write() {
@@ -294,7 +413,13 @@ impl L2WarmCache {
 
     /// Get current memory usage in bytes
     pub fn memory_usage(&self) -> usize {
-        self.memory_usage.load(std::sync::atomic::Ordering::Relaxed)
+        self.memory_usage.load(Ordering::Relaxed)
+    }
+
+    /// Bytes compression saves on the entries in memory: the raw minus the
+    /// stored size of their payloads (`0` without compression).
+    pub fn compression_saved_bytes(&self) -> usize {
+        self.compression_saved.load(Ordering::Relaxed)
     }
 
     /// Get cache statistics
@@ -304,16 +429,17 @@ impl L2WarmCache {
         L2CacheStats {
             entry_count: self.memory_entries.len(),
             memory_usage_bytes: self.memory_usage(),
-            max_memory_bytes: self.config.size_mb * 1024 * 1024,
+            max_memory_bytes: self.config.max_bytes,
             total_accesses: total_access,
             storage_backend: self.config.storage.clone(),
         }
     }
 
-    /// Evict entries to fit new data
-    async fn evict_to_fit(&self, required_bytes: usize) {
-        let max_bytes = self.config.size_mb * 1024 * 1024;
+    /// Evict entries to fit new data; returns how many it evicted.
+    async fn evict_to_fit(&self, required_bytes: usize) -> usize {
+        let max_bytes = self.config.max_bytes;
         let target = max_bytes.saturating_sub(required_bytes);
+        let mut evicted = 0;
 
         // First, evict expired entries
         let expired: Vec<u64> = self
@@ -325,13 +451,13 @@ impl L2WarmCache {
 
         for hash in expired {
             if let Some((_, entry)) = self.memory_entries.remove(&hash) {
-                self.memory_usage
-                    .fetch_sub(entry.memory_size, std::sync::atomic::Ordering::Relaxed);
+                self.release(&entry);
+                evicted += 1;
             }
         }
 
         // If still over limit, evict LRU entries
-        while self.memory_usage.load(std::sync::atomic::Ordering::Relaxed) > target {
+        while self.memory_usage.load(Ordering::Relaxed) > target {
             // Find LRU entry
             let lru_hash = self
                 .memory_entries
@@ -343,43 +469,57 @@ impl L2WarmCache {
                 // Optionally move to mmap before evicting
                 if self.mmap_storage.is_some() {
                     if let Some(entry) = self.memory_entries.get(&hash) {
-                        self.demote_to_mmap(&entry);
+                        self.demote_to_mmap(hash, &entry);
                     }
                 }
 
                 if let Some((_, entry)) = self.memory_entries.remove(&hash) {
-                    self.memory_usage
-                        .fetch_sub(entry.memory_size, std::sync::atomic::Ordering::Relaxed);
+                    self.release(&entry);
+                    evicted += 1;
                 }
             } else {
                 break;
             }
         }
+        evicted
     }
 
-    /// Promote an entry from mmap to memory
-    fn promote_to_memory(&self, key: &CacheKey, result: CachedResult) {
+    /// Promote an entry from mmap to memory (the file keeps raw payloads:
+    /// it is compressed again here when the codec applies).
+    fn promote_to_memory(&self, key: &CacheKey, mut result: CachedResult) {
         let hash = key.hash_value();
         let fingerprint = format!("{:016x}", hash);
-        let entry = L2Entry::new(key.clone(), fingerprint, result);
-        let entry_memory = entry.memory_size;
-
-        // Replacing an entry for the same key (a refill after a write made
-        // it stale, a promotion) takes the old one's bytes out of the account,
-        // or the usage only grows and forces evictions of live entries.
-        if let Some(old) = self.memory_entries.insert(hash, entry) {
-            self.memory_usage
-                .fetch_sub(old.memory_size, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.memory_usage
-            .fetch_add(entry_memory, std::sync::atomic::Ordering::Relaxed);
+        let (stored, raw_len) = self.encode_payload(&result.data).into_parts();
+        result.data = stored;
+        let entry = match raw_len {
+            Some(raw_len) => L2Entry::compressed(key.clone(), fingerprint, result, raw_len),
+            None => L2Entry::new(key.clone(), fingerprint, result),
+        };
+        self.insert(hash, entry);
     }
 
-    /// Demote an entry to mmap storage
-    fn demote_to_mmap(&self, entry: &dashmap::mapref::one::Ref<u64, L2Entry>) {
+    /// `entry`'s result with its raw payload (decoded when it is stored
+    /// compressed; `None` when that blob does not decode).
+    fn raw_result(entry: &L2Entry) -> Option<Cow<'_, CachedResult>> {
+        match entry.raw_len {
+            None => Some(Cow::Borrowed(&entry.result)),
+            Some(raw_len) => {
+                let raw = codec::decode(&entry.result.data, raw_len)?;
+                Some(Cow::Owned(CachedResult {
+                    data: Bytes::from(raw),
+                    ..entry.result.clone()
+                }))
+            }
+        }
+    }
+
+    /// Demote an entry to mmap storage, with its raw payload.
+    fn demote_to_mmap(&self, hash: u64, entry: &L2Entry) {
         if let Some(ref mmap) = self.mmap_storage {
-            if let Ok(mut storage) = mmap.write() {
-                storage.put(*entry.key(), &entry.result);
+            if let Some(result) = Self::raw_result(entry) {
+                if let Ok(mut storage) = mmap.write() {
+                    storage.put(hash, &result);
+                }
             }
         }
     }
@@ -397,8 +537,10 @@ impl L2WarmCache {
         let mut count = 0;
         for entry in self.memory_entries.iter() {
             if !entry.is_expired() {
-                storage.put(*entry.key(), &entry.result);
-                count += 1;
+                if let Some(result) = Self::raw_result(&entry) {
+                    storage.put(*entry.key(), &result);
+                    count += 1;
+                }
             }
         }
 
@@ -866,7 +1008,7 @@ mod tests {
     #[tokio::test]
     async fn eviction_sheds_stale_entries_first_and_a_replace_evicts_nothing() {
         let cache = L2WarmCache::new(L2Config {
-            size_mb: 1,
+            max_bytes: 1024 * 1024,
             ..L2Config::default()
         });
         for i in 0..9u64 {
@@ -882,8 +1024,9 @@ mod tests {
         cache.put(create_key(8), again).await;
         assert_eq!(cache.stats().entry_count, 9, "a replace evicts nothing");
 
-        // A new key needs room: the five stale entries all go, not one LRU.
-        cache
+        // A new key needs room: the five stale entries all go, not one LRU
+        // (shed here, the hand-off refusing them), and count as evicted.
+        let evicted = cache
             .put_evicting(
                 create_key(100),
                 sized(300 * 1024),
@@ -891,6 +1034,7 @@ mod tests {
                 Err,
             )
             .await;
+        assert_eq!(evicted, 5);
         for i in 0..5 {
             assert!(cache.get(&create_key(i)).await.is_none(), "stale {i} shed");
         }
@@ -909,7 +1053,7 @@ mod tests {
     #[test]
     fn a_paced_shed_removes_everything_in_steps() {
         let cache = L2WarmCache::new(L2Config {
-            size_mb: 64,
+            max_bytes: 64 * 1024 * 1024,
             shed_batch: 3,
             shed_pause: Duration::from_millis(5),
             ..Default::default()
@@ -940,7 +1084,7 @@ mod tests {
     #[tokio::test]
     async fn one_eviction_pass_at_a_time() {
         let cache = L2WarmCache::new(L2Config {
-            size_mb: 1,
+            max_bytes: 1024 * 1024,
             ..L2Config::default()
         });
         for i in 0..9u64 {
@@ -1054,7 +1198,7 @@ mod tests {
     #[tokio::test]
     async fn test_memory_eviction() {
         let config = L2Config {
-            size_mb: 1, // 1 MB limit
+            max_bytes: 1024 * 1024, // 1 MB limit
             ..Default::default()
         };
         let cache = L2WarmCache::new(config);
@@ -1125,5 +1269,227 @@ mod tests {
         assert_eq!(deserialized.data, result.data);
         assert_eq!(deserialized.row_count, result.row_count);
         assert_eq!(deserialized.ttl.as_secs(), result.ttl.as_secs());
+    }
+
+    fn codec_cache(compression: CacheCompression, max_bytes: usize) -> L2WarmCache {
+        L2WarmCache::new(L2Config {
+            max_bytes,
+            compression,
+            ..L2Config::default()
+        })
+    }
+
+    /// A result whose payload is `bytes` of DataRow frames.
+    fn rows_result(bytes: usize) -> CachedResult {
+        CachedResult::new(
+            codec::data_rows(bytes),
+            1,
+            Duration::from_secs(60),
+            vec!["test".to_string()],
+            Duration::ZERO,
+        )
+    }
+
+    /// The budget counts stored bytes: compressed, a 1 MiB L2 keeps all
+    /// twenty 100 KiB DataRow results, raw at most ten. Every hit returns the
+    /// bytes stored, and the saved-bytes gauge is the raw minus the stored
+    /// total.
+    #[tokio::test]
+    async fn compression_fits_more_entries_in_the_budget() {
+        const ENTRIES: u64 = 20;
+        let result = rows_result(100 * 1024);
+        let raw = codec_cache(CacheCompression::None, 1024 * 1024);
+        for i in 0..ENTRIES {
+            raw.put(create_key(i), result.clone()).await;
+        }
+        assert!(raw.len() <= 10, "raw: {} entries", raw.len());
+        assert_eq!(raw.compression_saved_bytes(), 0);
+        for compression in [CacheCompression::Lz4, CacheCompression::Zstd] {
+            let cache = codec_cache(compression, 1024 * 1024);
+            for i in 0..ENTRIES {
+                cache.put(create_key(i), result.clone()).await;
+            }
+            assert_eq!(cache.len() as u64, ENTRIES, "{compression:?}");
+            assert!(cache.memory_usage() <= 1024 * 1024, "{compression:?}");
+            let stored: usize = cache.memory_entries.iter().map(|e| e.result.size()).sum();
+            assert_eq!(
+                cache.compression_saved_bytes(),
+                ENTRIES as usize * result.data.len() - stored,
+                "{compression:?}"
+            );
+            for i in 0..ENTRIES {
+                let hit = cache.get(&create_key(i)).await.unwrap();
+                assert_eq!(hit.data, result.data, "{compression:?} entry {i}");
+                assert_eq!(hit.row_count, result.row_count);
+                assert_eq!(hit.tables, result.tables);
+            }
+        }
+    }
+
+    /// Below `compression_min_bytes`, or without a codec, the payload is
+    /// stored as given (the same buffer, nothing saved).
+    #[tokio::test]
+    async fn small_payloads_and_the_default_stay_raw() {
+        for (compression, bytes) in [
+            (CacheCompression::None, 64 * 1024),
+            (CacheCompression::Lz4, 1024),
+            (CacheCompression::Zstd, 4095),
+        ] {
+            let cache = codec_cache(compression, 64 * 1024 * 1024);
+            let result = rows_result(bytes);
+            let result = CachedResult {
+                data: result.data.slice(..bytes),
+                ..result
+            };
+            cache.put(create_key(1), result.clone()).await;
+            let entry = cache
+                .memory_entries
+                .get(&create_key(1).hash_value())
+                .unwrap();
+            assert_eq!(entry.raw_len, None, "{compression:?}");
+            assert_eq!(entry.result.data.as_ptr(), result.data.as_ptr());
+            drop(entry);
+            assert_eq!(cache.compression_saved_bytes(), 0);
+            assert_eq!(cache.get(&create_key(1)).await.unwrap().data, result.data);
+        }
+    }
+
+    /// Only zstd above the threshold leaves the async worker.
+    #[test]
+    fn only_zstd_compresses_off_the_worker() {
+        let zstd = codec_cache(CacheCompression::Zstd, 1024 * 1024);
+        assert!(zstd.compresses_off_worker(4096));
+        assert!(!zstd.compresses_off_worker(4095));
+        assert!(!codec_cache(CacheCompression::Lz4, 1024 * 1024).compresses_off_worker(1 << 20));
+        assert!(!codec_cache(CacheCompression::None, 1024 * 1024).compresses_off_worker(1 << 20));
+        let off = L2WarmCache::new(L2Config {
+            enabled: false,
+            compression: CacheCompression::Zstd,
+            ..L2Config::default()
+        });
+        assert!(!off.compresses_off_worker(1 << 20));
+    }
+
+    /// A compressed entry whose blob does not decode (an unknown marker, a
+    /// damaged frame) is never served: the read misses and the entry leaves
+    /// the cache and both byte accounts.
+    #[tokio::test]
+    async fn a_corrupt_compressed_entry_is_a_miss_and_is_dropped() {
+        let damages: [fn(&mut [u8]); 2] = [|blob| blob[0] = 0xff, |blob| blob[1..].fill(0xff)];
+        for compression in [CacheCompression::Lz4, CacheCompression::Zstd] {
+            for (i, damage) in damages.iter().enumerate() {
+                let cache = codec_cache(compression, 64 * 1024 * 1024);
+                let key = create_key(7);
+                cache.put(key.clone(), rows_result(64 * 1024)).await;
+                cache.put(create_key(8), rows_result(64 * 1024)).await;
+                let both = cache.compression_saved_bytes();
+                assert!(both > 0);
+                {
+                    let mut entry = cache.memory_entries.get_mut(&key.hash_value()).unwrap();
+                    assert!(entry.raw_len.is_some());
+                    let mut blob = entry.result.data.to_vec();
+                    damage(&mut blob);
+                    entry.result.data = Bytes::from(blob);
+                }
+                assert!(
+                    cache.get(&key).await.is_none(),
+                    "{compression:?} damage {i}"
+                );
+                assert_eq!(cache.len(), 1, "dropped");
+                assert_eq!(cache.compression_saved_bytes(), both / 2);
+                cache.shed(&[create_key(8).hash_value()]);
+                assert_eq!(cache.memory_usage(), 0);
+                assert_eq!(cache.compression_saved_bytes(), 0);
+            }
+        }
+    }
+
+    /// The saved-bytes account follows every way an entry leaves: replaced,
+    /// removed, shed, evicted, cleared.
+    #[tokio::test]
+    async fn saved_bytes_follow_every_removal() {
+        let cache = codec_cache(CacheCompression::Lz4, 64 * 1024 * 1024);
+        let result = rows_result(32 * 1024);
+        for i in 0..4 {
+            cache.put(create_key(i), result.clone()).await;
+        }
+        let one = cache.compression_saved_bytes() / 4;
+        assert!(one > 0);
+        assert_eq!(cache.compression_saved_bytes(), 4 * one);
+        cache.put(create_key(0), result.clone()).await;
+        assert_eq!(cache.compression_saved_bytes(), 4 * one, "replaced");
+        cache.remove(&create_key(0)).await;
+        assert_eq!(cache.compression_saved_bytes(), 3 * one, "removed");
+        assert_eq!(cache.shed(&[create_key(1).hash_value()]), 1);
+        assert_eq!(cache.compression_saved_bytes(), 2 * one, "shed");
+        cache.clear().await;
+        assert_eq!(cache.compression_saved_bytes(), 0, "cleared");
+        assert_eq!(cache.memory_usage(), 0);
+
+        // Evicted to make room: a budget of about three entries.
+        let small = codec_cache(CacheCompression::Lz4, 1);
+        small.put(create_key(1), result.clone()).await;
+        let budget = small.memory_usage() * 3;
+        let small = codec_cache(CacheCompression::Lz4, budget);
+        let mut evicted = 0;
+        for i in 0..10 {
+            evicted += small
+                .put_evicting(create_key(i), result.clone(), |_| false, Err)
+                .await;
+        }
+        assert_eq!(evicted, 10 - small.len());
+        assert!(evicted > 0);
+        assert_eq!(small.compression_saved_bytes(), small.len() * one);
+    }
+
+    /// `put_evicting` reports the entries it evicted to make room: expired
+    /// and least recently used.
+    #[tokio::test]
+    async fn put_evicting_counts_its_evictions() {
+        let cache = L2WarmCache::new(L2Config {
+            max_bytes: 1024 * 1024,
+            ..L2Config::default()
+        });
+        let mut evicted = 0;
+        for i in 0..15u64 {
+            evicted += cache
+                .put_evicting(create_key(i), sized(100 * 1024), |_| false, Err)
+                .await;
+        }
+        assert!(evicted > 0);
+        assert_eq!(evicted, 15 - cache.len());
+        // A replacement is no eviction.
+        let before = cache.len();
+        assert_eq!(
+            cache
+                .put_evicting(create_key(14), sized(100 * 1024), |_| false, Err)
+                .await,
+            0
+        );
+        assert_eq!(cache.len(), before);
+    }
+
+    /// A compressed entry demoted to the spill file is written raw and comes
+    /// back byte-identical, compressed again in memory.
+    #[tokio::test]
+    async fn a_compressed_entry_spills_raw_and_comes_back_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = L2WarmCache::new(L2Config {
+            storage: StorageBackend::Mmap,
+            mmap_path: Some(dir.path().join("cache")),
+            compression: CacheCompression::Zstd,
+            ..L2Config::default()
+        });
+        let key = create_key(1);
+        let result = rows_result(64 * 1024);
+        cache.put(key.clone(), result.clone()).await;
+        assert!(cache.compression_saved_bytes() > 0);
+        assert_eq!(cache.flush_to_disk().unwrap(), 1);
+        cache.shed(&[key.hash_value()]);
+        assert_eq!(cache.compression_saved_bytes(), 0);
+        let back = cache.get(&key).await.unwrap();
+        assert_eq!(back.data, result.data, "from the file");
+        assert!(cache.compression_saved_bytes() > 0, "promoted compressed");
+        assert_eq!(cache.get(&key).await.unwrap().data, result.data);
     }
 }

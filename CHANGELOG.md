@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Query cache: tier sizes and L2 payload compression** (distribcache merge P1,
+  7c860e8a2e14). New flat `[cache]` keys, defaults unchanged behaviour:
+  `l1_max_entries = 500` and `l1_max_bytes = 33554432` (per client connection; were
+  hardcoded), `l2_max_bytes = 268435456` (shared L2; was hardcoded as 256 MiB),
+  `l2_compression = "none" | "lz4" | "zstd"` (default `"none"`),
+  `l2_compression_min_bytes = 4096` and `l2_zstd_level = 3` (1..=19). With a codec, L2
+  stores payloads of at least the threshold compressed when that shrinks them (a
+  marker byte names the codec; an entry that does not decompress is dropped and the
+  read misses), counts the compressed size against `l2_max_bytes`, and decompresses on
+  every L2 hit before serving or promoting to L1, which keeps raw bytes. zstd runs on the
+  blocking thread pool, before the C-02 generation check, which still runs last before
+  the stores; LZ4 runs inline. It only pays when the hot set does not fit `l2_max_bytes`
+  uncompressed. Every key is validated at startup and an error names it. Startup logs
+  `l2_max_bytes` and `l2_compression`; `/capabilities` reports `cache.l2_compression`
+  on a build without `query-cache`.
+- **Query cache metrics:** `heliosdb_proxy_cache_evictions_total{tier="l1|l2|l3"}`
+  (evictions were counted only in tests), `heliosdb_proxy_cache_entries{tier}` and
+  `heliosdb_proxy_cache_compression_saved_bytes` (raw minus stored bytes L2 retains),
+  with `entries`, `evictions` and `compression_saved_bytes` under `query_cache` in
+  `GET /metrics`.
+- **Config hints:** `[cache.l1]`, `[cache.l2]` and `[distribcache]` name the new flat
+  keys.
+- Criterion: `cache/l2/compress_{lz4,zstd}_{4k,64k,1m}`,
+  `cache/l2/hit_{lz4,zstd}_{4k,64k,1m}` and the control `cache/l2/hit_none_64k`, on
+  DataRow payloads.
+
+### Changed
+
+- **Dependencies:** `zstd` and `lz4_flex` are optional, pulled by the `query-cache` and
+  `distribcache` features; a build with neither no longer compiles them.
+- **Library API** (crates that use `heliosdb-proxy` as a library): `cache::L2Config`'s
+  `size_mb` is replaced by `max_bytes` (bytes) and it gains `compression`,
+  `compression_min_bytes` and `zstd_level`; `CacheToml` gains the six keys above and
+  `L2Entry` gains `raw_len` (struct literals must set them). `L1HotCache::put`,
+  `L2WarmCache::put_evicting`, `shed` and `shed_paced` return the number of entries
+  they evicted or removed. New: `cache::codec` (`L2Codec`, `L2Payload`),
+  `L2WarmCache::{encode_payload, put_payload_evicting, compression_saved_bytes}`,
+  `QueryCache::{entry_counts, compression_saved_bytes}`,
+  `CacheMetrics::record_evictions`.
+
+### Fixed
+
+- **L1 byte account after an entry-bound eviction:** when a connection's L1 dropped its
+  least recently used entry to stay within its entry bound, the entry's bytes stayed in
+  the byte account, so on a long-lived connection running many distinct reads the
+  phantom total grew until the 32 MiB byte budget evicted every live entry and the
+  connection's L1 held next to nothing.
+
 ### Development
 
 - **Nano pair drill: online promotion.** `scripts/regress/nano-pair-drill.py

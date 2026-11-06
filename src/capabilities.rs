@@ -208,7 +208,7 @@ pub fn manifest(config: &ProxyConfig) -> Vec<Capability> {
 /// config key path whose promise the binary cannot keep.
 pub fn unavailable_enabled(config: &ProxyConfig) -> Vec<&'static str> {
     // (config key path, enabled now, compiled into this build)
-    let checks: [(&'static str, bool, bool); 17] = [
+    let checks: [(&'static str, bool, bool); 18] = [
         (
             "cache.enabled",
             config.cache.enabled,
@@ -217,6 +217,12 @@ pub fn unavailable_enabled(config: &ProxyConfig) -> Vec<&'static str> {
         (
             "cache.semantic_enabled",
             config.cache.enabled && config.cache.semantic_enabled,
+            cfg!(feature = "query-cache"),
+        ),
+        (
+            "cache.l2_compression",
+            config.cache.enabled
+                && config.cache.l2_compression != crate::config::CacheCompression::None,
             cfg!(feature = "query-cache"),
         ),
         (
@@ -351,5 +357,15 @@ mod tests {
         );
         config.cache.enabled = false;
         assert!(!unavailable_enabled(&config).contains(&"cache.semantic_enabled"));
+        // So is L2 compression, and only when a codec is chosen.
+        config.cache.enabled = true;
+        assert!(!unavailable_enabled(&config).contains(&"cache.l2_compression"));
+        config.cache.l2_compression = crate::config::CacheCompression::Zstd;
+        assert_eq!(
+            unavailable_enabled(&config).contains(&"cache.l2_compression"),
+            !cfg!(feature = "query-cache")
+        );
+        config.cache.enabled = false;
+        assert!(!unavailable_enabled(&config).contains(&"cache.l2_compression"));
     }
 }

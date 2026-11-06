@@ -1409,6 +1409,47 @@ impl SemanticMatch {
     }
 }
 
+/// How the query cache's L2 tier stores a payload (`[cache] l2_compression`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheCompression {
+    /// As received (the default): an L2 hit costs no decompression.
+    #[default]
+    None,
+    /// LZ4 block compression: fast, a moderate ratio.
+    Lz4,
+    /// zstd at `l2_zstd_level`: a better ratio, slower to compress.
+    Zstd,
+}
+
+impl CacheCompression {
+    /// The `l2_compression` value as written in `proxy.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheCompression::None => "none",
+            CacheCompression::Lz4 => "lz4",
+            CacheCompression::Zstd => "zstd",
+        }
+    }
+}
+
+/// Upper bound of `[cache] l1_max_entries`: a connection's L1 allocates its
+/// index for that many entries (about 20-40 bytes each) at its first cached
+/// read, so 100000 costs up to 4 MiB per connection.
+pub const CACHE_L1_MAX_ENTRIES_CEILING: u64 = 100_000;
+
+/// Upper bound of `[cache] l1_max_bytes` (per connection) and of
+/// `l2_compression_min_bytes`: 1 GiB, far above any result the cache stores
+/// (`max_result_bytes` defaults to 1 MiB).
+pub const CACHE_ENTRY_BYTES_CEILING: u64 = 1 << 30;
+
+/// Upper bound of `[cache] l2_max_bytes`, the shared L2 budget: 1 TiB.
+pub const CACHE_L2_MAX_BYTES_CEILING: u64 = 1 << 40;
+
+/// Accepted `[cache] l2_zstd_level` values: zstd's regular levels without
+/// the ultra levels 20-22, which need a much larger window per compression.
+pub const CACHE_ZSTD_LEVELS: std::ops::RangeInclusive<i32> = 1..=19;
+
 /// Upper bound of `[cache] semantic_max_statement_bytes` (1 MiB): the
 /// semantic tier's grammar parse that key bounds takes about a hundred times
 /// the statement's size, transiently, on the connection's task, and it also
@@ -1487,6 +1528,31 @@ pub struct CacheToml {
     /// contend with concurrent readers at full rate for its whole duration.
     /// Default 2000.
     pub l2_shed_pause_us: u64,
+    /// Entries each client connection's L1 holds at most (least recently
+    /// used evicted first). Range 1..=100000
+    /// ([`CACHE_L1_MAX_ENTRIES_CEILING`]). Default 500.
+    pub l1_max_entries: usize,
+    /// Bytes each client connection's L1 retains at most (payloads, query
+    /// texts and per-entry overhead; least recently used evicted first).
+    /// Range 1..=1073741824 ([`CACHE_ENTRY_BYTES_CEILING`]). Default 32 MiB.
+    pub l1_max_bytes: usize,
+    /// Bytes the shared L2 retains at most, counted at the stored size (a
+    /// compressed payload counts its compressed bytes). Range
+    /// 1..=1099511627776 ([`CACHE_L2_MAX_BYTES_CEILING`]). Default 256 MiB.
+    pub l2_max_bytes: usize,
+    /// How L2 stores a payload of at least `l2_compression_min_bytes`:
+    /// `"none"` (default), `"lz4"` or `"zstd"`. Compression lets
+    /// `l2_max_bytes` hold more entries and costs a decompression on every
+    /// L2 hit (L1 keeps the raw bytes); it only pays when the hot set does
+    /// not fit `l2_max_bytes` uncompressed. A payload it does not shrink is
+    /// stored raw.
+    pub l2_compression: CacheCompression,
+    /// Smallest payload, in bytes, that `l2_compression` compresses. Range
+    /// 1..=1073741824 ([`CACHE_ENTRY_BYTES_CEILING`]). Default 4096.
+    pub l2_compression_min_bytes: usize,
+    /// zstd level of `l2_compression = "zstd"`. Range 1..=19
+    /// ([`CACHE_ZSTD_LEVELS`]). Default 3.
+    pub l2_zstd_level: i32,
     /// Turn on the semantic tier (L3) when `enabled = true`. Only
     /// simple-protocol reads whose cache hints carry `cache=semantic` (also
     /// `semantic`, `cache=l3`, `cache=vector`) use it, only after L1 and L2
@@ -1815,6 +1881,51 @@ impl CacheToml {
         names
     }
 
+    /// Validate the tier sizes (`l1_max_entries`, `l1_max_bytes`,
+    /// `l2_max_bytes`) and the L2 compression keys. Unconditional, like
+    /// [`Self::validate_semantic_and_tables`]: a key that is set must be valid
+    /// whether or not the cache or the codec it tunes is on, and every error
+    /// names its key.
+    pub fn validate_sizes_and_compression(&self) -> Result<()> {
+        for (key, value, hi) in [
+            (
+                "cache.l1_max_entries",
+                self.l1_max_entries as u64,
+                CACHE_L1_MAX_ENTRIES_CEILING,
+            ),
+            (
+                "cache.l1_max_bytes",
+                self.l1_max_bytes as u64,
+                CACHE_ENTRY_BYTES_CEILING,
+            ),
+            (
+                "cache.l2_max_bytes",
+                self.l2_max_bytes as u64,
+                CACHE_L2_MAX_BYTES_CEILING,
+            ),
+            (
+                "cache.l2_compression_min_bytes",
+                self.l2_compression_min_bytes as u64,
+                CACHE_ENTRY_BYTES_CEILING,
+            ),
+        ] {
+            if !(1..=hi).contains(&value) {
+                return Err(ProxyError::Config(format!(
+                    "{key} must be in 1..={hi}, got {value}"
+                )));
+            }
+        }
+        if !CACHE_ZSTD_LEVELS.contains(&self.l2_zstd_level) {
+            return Err(ProxyError::Config(format!(
+                "cache.l2_zstd_level must be in {}..={}, got {}",
+                CACHE_ZSTD_LEVELS.start(),
+                CACHE_ZSTD_LEVELS.end(),
+                self.l2_zstd_level
+            )));
+        }
+        Ok(())
+    }
+
     /// Validate the `semantic_*`, `exclude_tables` and `[[cache.tables]]`
     /// keys. Unconditional — the defaults are valid and a key that is set
     /// must be valid whether or not the tier is enabled — and every error
@@ -2052,10 +2163,16 @@ impl CacheToml {
             max_result_size: self.max_result_bytes,
             l1: L1Config {
                 ttl: longest,
+                size: self.l1_max_entries,
+                max_bytes: self.l1_max_bytes,
                 ..Default::default()
             },
             l2: L2Config {
                 ttl,
+                max_bytes: self.l2_max_bytes,
+                compression: self.l2_compression,
+                compression_min_bytes: self.l2_compression_min_bytes,
+                zstd_level: self.l2_zstd_level,
                 shed_batch: self.l2_shed_batch,
                 shed_pause: Duration::from_micros(self.l2_shed_pause_us),
                 ..Default::default()
@@ -2102,6 +2219,12 @@ impl Default for CacheToml {
             logical_max_slot_lag_bytes: 1024 * 1024 * 1024,
             l2_shed_batch: 1024,
             l2_shed_pause_us: 2000,
+            l1_max_entries: 500,
+            l1_max_bytes: 32 * 1024 * 1024,
+            l2_max_bytes: 256 * 1024 * 1024,
+            l2_compression: CacheCompression::None,
+            l2_compression_min_bytes: 4096,
+            l2_zstd_level: 3,
             semantic_enabled: false,
             semantic_match: SemanticMatch::Verbatim,
             semantic_similarity_threshold: 1.0,
@@ -3205,8 +3328,18 @@ const IGNORED_KEY_ALIASES: &[(&str, &str)] = &[
     ),
     (
         "cache.l1",
-        "there is no [cache.l1]: the cache's keys are flat under [cache] (per-table settings are \
-         [[cache.tables]])",
+        "there is no [cache.l1]: the cache's keys are flat under [cache] (l1_max_entries, \
+         l1_max_bytes; per-table settings are [[cache.tables]])",
+    ),
+    (
+        "cache.l2",
+        "there is no [cache.l2]: the cache's keys are flat under [cache] (l2_max_bytes, \
+         l2_compression, l2_compression_min_bytes, l2_zstd_level)",
+    ),
+    (
+        "distribcache",
+        "there is no [distribcache] section: the daemon's result cache is [cache] (sizes \
+         l1_max_entries, l1_max_bytes, l2_max_bytes; compression l2_compression)",
     ),
     (
         "cache.similarity_threshold",
@@ -3822,6 +3955,7 @@ impl ProxyConfig {
                 "cache.max_cacheable_response_bytes must be >= 1".to_string(),
             ));
         }
+        self.cache.validate_sizes_and_compression()?;
         self.cache.validate_semantic_and_tables()?;
 
         // Refuse to expose the admin API beyond loopback without a token. The
@@ -6770,6 +6904,12 @@ database = "helios"
 
     const CACHE_KEYS_TOML: &str = r#"
 enabled = true
+l1_max_entries = 64
+l1_max_bytes = 1048576
+l2_max_bytes = 8388608
+l2_compression = "zstd"
+l2_compression_min_bytes = 512
+l2_zstd_level = 7
 semantic_enabled = true
 semantic_match = "canonical"
 semantic_similarity_threshold = 0.9
@@ -6856,6 +6996,167 @@ exclude = true
         assert!(toml::from_str::<CacheToml>("[[tables]]\nttl_secs = 5\n").is_err());
     }
 
+    /// The tier sizes and L2 compression keys (7c860e8a2e14): the defaults
+    /// are the sizes L1 and L2 had before the keys existed and compress
+    /// nothing; set values parse with no ignored key and survive a round trip;
+    /// `l2_compression` takes exactly its three names.
+    #[test]
+    fn cache_size_and_compression_keys_round_trip() {
+        let d = CacheToml::default();
+        assert_eq!(d.l1_max_entries, 500);
+        assert_eq!(d.l1_max_bytes, 32 * 1024 * 1024);
+        assert_eq!(d.l2_max_bytes, 256 * 1024 * 1024);
+        assert_eq!(d.l2_compression, CacheCompression::None);
+        assert_eq!(d.l2_compression_min_bytes, 4096);
+        assert_eq!(d.l2_zstd_level, 3);
+        assert!(d.validate_sizes_and_compression().is_ok());
+
+        let text = format!("[cache]{CACHE_KEYS_TOML}").replace("[[tables]]", "[[cache.tables]]");
+        let (config, ignored) = deserialize_reporting_ignored_paths(&format!(
+            "{text}\n[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n"
+        ))
+        .unwrap();
+        assert!(ignored.is_empty(), "{ignored:?}");
+        let c = &config.cache;
+        assert_eq!(c.l1_max_entries, 64);
+        assert_eq!(c.l1_max_bytes, 1024 * 1024);
+        assert_eq!(c.l2_max_bytes, 8 * 1024 * 1024);
+        assert_eq!(c.l2_compression, CacheCompression::Zstd);
+        assert_eq!(c.l2_compression_min_bytes, 512);
+        assert_eq!(c.l2_zstd_level, 7);
+        config.validate().unwrap();
+        let back: CacheToml = toml::from_str(&toml::to_string(c).unwrap()).unwrap();
+        assert_eq!(&back, c);
+
+        let node = "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n";
+        for want in [
+            CacheCompression::None,
+            CacheCompression::Lz4,
+            CacheCompression::Zstd,
+        ] {
+            let (config, ignored) = deserialize_reporting_ignored_paths(&format!(
+                "[cache]\nl2_compression = \"{}\"\n{node}",
+                want.as_str()
+            ))
+            .unwrap();
+            assert!(ignored.is_empty(), "{ignored:?}");
+            assert_eq!(config.cache.l2_compression, want);
+        }
+        for bad in ["gzip", "LZ4", ""] {
+            let err = deserialize_reporting_ignored_paths(&format!(
+                "[cache]\nl2_compression = \"{bad}\"\n{node}"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("l2_compression"), "{bad:?}: {err}");
+        }
+        let known = known_config_keys();
+        for key in [
+            "cache.l1_max_entries",
+            "cache.l1_max_bytes",
+            "cache.l2_max_bytes",
+            "cache.l2_compression",
+            "cache.l2_compression_min_bytes",
+            "cache.l2_zstd_level",
+        ] {
+            assert!(known.contains(key), "{key}");
+        }
+    }
+
+    /// Every size and compression key out of range is a startup error that
+    /// names it, whether or not the cache is on and whichever codec is
+    /// chosen; the bounds themselves are accepted.
+    #[test]
+    fn cache_size_and_compression_validation_names_the_key() {
+        type Breaker = fn(&mut CacheToml);
+        let cases: Vec<(&str, Breaker)> = vec![
+            ("cache.l1_max_entries", |c| c.l1_max_entries = 0),
+            ("cache.l1_max_entries", |c| {
+                c.l1_max_entries = CACHE_L1_MAX_ENTRIES_CEILING as usize + 1
+            }),
+            ("cache.l1_max_bytes", |c| c.l1_max_bytes = 0),
+            ("cache.l1_max_bytes", |c| {
+                c.l1_max_bytes = CACHE_ENTRY_BYTES_CEILING as usize + 1
+            }),
+            ("cache.l2_max_bytes", |c| c.l2_max_bytes = 0),
+            ("cache.l2_max_bytes", |c| {
+                c.l2_max_bytes = CACHE_L2_MAX_BYTES_CEILING as usize + 1
+            }),
+            ("cache.l2_compression_min_bytes", |c| {
+                c.l2_compression_min_bytes = 0
+            }),
+            ("cache.l2_compression_min_bytes", |c| {
+                c.l2_compression_min_bytes = CACHE_ENTRY_BYTES_CEILING as usize + 1
+            }),
+            ("cache.l2_zstd_level", |c| c.l2_zstd_level = 0),
+            ("cache.l2_zstd_level", |c| c.l2_zstd_level = -1),
+            ("cache.l2_zstd_level", |c| c.l2_zstd_level = 20),
+        ];
+        for enabled in [false, true] {
+            for compression in [
+                CacheCompression::None,
+                CacheCompression::Lz4,
+                CacheCompression::Zstd,
+            ] {
+                for (key, brk) in &cases {
+                    let mut config = ProxyConfig::default();
+                    config.add_node("localhost:5432", "primary").unwrap();
+                    config.cache.enabled = enabled;
+                    config.cache.l2_compression = compression;
+                    brk(&mut config.cache);
+                    let err = config.validate().unwrap_err().to_string();
+                    assert!(
+                        err.contains(key),
+                        "enabled={enabled} {compression:?}: {err} lacks {key}"
+                    );
+                }
+            }
+        }
+        for high in [false, true] {
+            let mut config = ProxyConfig::default();
+            config.add_node("localhost:5432", "primary").unwrap();
+            config.cache.enabled = true;
+            config.cache.l2_compression = CacheCompression::Zstd;
+            let pick = |hi: u64| if high { hi as usize } else { 1 };
+            config.cache.l1_max_entries = pick(CACHE_L1_MAX_ENTRIES_CEILING);
+            config.cache.l1_max_bytes = pick(CACHE_ENTRY_BYTES_CEILING);
+            config.cache.l2_max_bytes = pick(CACHE_L2_MAX_BYTES_CEILING);
+            config.cache.l2_compression_min_bytes = pick(CACHE_ENTRY_BYTES_CEILING);
+            config.cache.l2_zstd_level = if high {
+                *CACHE_ZSTD_LEVELS.end()
+            } else {
+                *CACHE_ZSTD_LEVELS.start()
+            };
+            config.validate().unwrap();
+        }
+    }
+
+    /// The daemon's defaults are the library's: an absent key keeps the
+    /// L1/L2 sizes and the raw L2 payloads of before the keys existed.
+    #[cfg(feature = "query-cache")]
+    #[test]
+    fn cache_toml_defaults_match_l1_l2_config() {
+        let t = CacheToml::default();
+        let (l1, l2) = (
+            crate::cache::L1Config::default(),
+            crate::cache::L2Config::default(),
+        );
+        assert_eq!(t.l1_max_entries, l1.size);
+        assert_eq!(t.l1_max_bytes, l1.max_bytes);
+        assert_eq!(t.l2_max_bytes, l2.max_bytes);
+        assert_eq!(t.l2_compression, l2.compression);
+        assert_eq!(t.l2_compression_min_bytes, l2.compression_min_bytes);
+        assert_eq!(t.l2_zstd_level, l2.zstd_level);
+        let cc = t.to_cache_config();
+        assert_eq!(
+            (cc.l1.size, cc.l1.max_bytes),
+            (l1.size, l1.max_bytes),
+            "L1 sizes"
+        );
+        assert_eq!(cc.l2.max_bytes, l2.max_bytes);
+        assert_eq!(cc.l2.compression, CacheCompression::None);
+    }
+
     #[cfg(feature = "query-cache")]
     #[test]
     fn cache_toml_defaults_match_l3_config() {
@@ -6939,6 +7240,13 @@ exclude = true
         assert_eq!(cc.l2.shed_pause, Duration::from_micros(c.l2_shed_pause_us));
         // L1 clamps every entry to its TTL: the longest any table gets.
         assert_eq!(cc.l1.ttl, Duration::from_secs(3600));
+        // Tier sizes and L2 compression.
+        assert_eq!(cc.l1.size, 64);
+        assert_eq!(cc.l1.max_bytes, 1024 * 1024);
+        assert_eq!(cc.l2.max_bytes, 8 * 1024 * 1024);
+        assert_eq!(cc.l2.compression, CacheCompression::Zstd);
+        assert_eq!(cc.l2.compression_min_bytes, 512);
+        assert_eq!(cc.l2.zstd_level, 7);
         let l3 = &cc.l3;
         assert!(l3.enabled);
         assert_eq!(l3.semantic_match, SemanticMatch::Canonical);
@@ -7305,6 +7613,13 @@ exclude = true
             ("cache.semantic", "semantic_enabled"),
             ("cache.l3", "semantic_enabled"),
             ("cache.l1", "[[cache.tables]]"),
+            ("cache.l1", "l1_max_entries"),
+            ("cache.l2", "l2_max_bytes"),
+            ("cache.l2", "l2_compression"),
+            ("distribcache", "[cache]"),
+            ("distribcache", "l2_compression"),
+            ("cache.l1_max_byts", "cache.l1_max_bytes"),
+            ("cache.l2_compresion", "cache.l2_compression"),
             ("cache.tables.0.ttl", "ttl_secs"),
             ("cache.tables.0.table", "name"),
             ("cache.tables.0.exclude_columns", "exclude = true"),

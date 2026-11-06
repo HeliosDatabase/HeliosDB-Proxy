@@ -83,7 +83,7 @@ impl CacheConfig {
                 ..Default::default()
             },
             l2: L2Config {
-                size_mb: 1024,
+                max_bytes: 1024 * 1024 * 1024,
                 ttl: Duration::from_secs(600),
                 ..Default::default()
             },
@@ -122,8 +122,18 @@ impl CacheConfig {
             return Err("L1 cache max_bytes cannot be 0 when enabled".to_string());
         }
 
-        if self.l2.size_mb == 0 && self.l2.enabled {
-            return Err("L2 cache size cannot be 0 when enabled".to_string());
+        if self.l2.max_bytes == 0 && self.l2.enabled {
+            return Err("L2 cache max_bytes cannot be 0 when enabled".to_string());
+        }
+
+        if self.l2.compression == crate::config::CacheCompression::Zstd
+            && !crate::config::CACHE_ZSTD_LEVELS.contains(&self.l2.zstd_level)
+        {
+            return Err(format!(
+                "L2 zstd_level must be in {}..={}",
+                crate::config::CACHE_ZSTD_LEVELS.start(),
+                crate::config::CACHE_ZSTD_LEVELS.end()
+            ));
         }
 
         let t = self.l3.similarity_threshold;
@@ -207,8 +217,23 @@ pub struct L2Config {
     /// Enable L2 cache
     pub enabled: bool,
 
-    /// Maximum cache size in MB
-    pub size_mb: usize,
+    /// Aggregate byte budget for retained entries, counted at their stored
+    /// size (a compressed payload counts its compressed bytes) plus per-entry
+    /// overhead (`[cache] l2_max_bytes`). Default 256 MiB. Replaces the former
+    /// `size_mb`.
+    pub max_bytes: usize,
+
+    /// How a payload of at least `compression_min_bytes` is stored
+    /// (`[cache] l2_compression`): raw (the default), LZ4 or zstd. A hit
+    /// decompresses before the result is served or promoted to L1; a payload
+    /// compression does not shrink is stored raw.
+    pub compression: crate::config::CacheCompression,
+
+    /// Smallest payload `compression` applies to, in bytes. Default 4096.
+    pub compression_min_bytes: usize,
+
+    /// zstd level of `compression = Zstd` (1..=19). Default 3.
+    pub zstd_level: i32,
 
     /// Time-to-live for cached entries
     pub ttl: Duration,
@@ -236,7 +261,10 @@ impl Default for L2Config {
     fn default() -> Self {
         Self {
             enabled: true,
-            size_mb: 256,
+            max_bytes: 256 * 1024 * 1024,
+            compression: crate::config::CacheCompression::None,
+            compression_min_bytes: 4096,
+            zstd_level: 3,
             ttl: Duration::from_secs(300),
             normalize_queries: true,
             storage: StorageBackend::Memory,
@@ -406,7 +434,9 @@ mod tests {
         assert!(config.l2.enabled);
         assert!(!config.l3.enabled); // Disabled by default
         assert_eq!(config.l1.size, 500);
-        assert_eq!(config.l2.size_mb, 256);
+        assert_eq!(config.l1.max_bytes, 32 * 1024 * 1024);
+        assert_eq!(config.l2.max_bytes, 256 * 1024 * 1024);
+        assert_eq!(config.l2.compression, crate::config::CacheCompression::None);
     }
 
     #[test]
@@ -421,7 +451,7 @@ mod tests {
     fn test_high_throughput_config() {
         let config = CacheConfig::high_throughput();
         assert_eq!(config.l1.size, 2000);
-        assert_eq!(config.l2.size_mb, 1024);
+        assert_eq!(config.l2.max_bytes, 1024 * 1024 * 1024);
         assert!(!config.l3.enabled);
     }
 
@@ -444,6 +474,28 @@ mod tests {
         let mut invalid2 = CacheConfig::default();
         invalid2.l3.similarity_threshold = 1.5;
         assert!(invalid2.validate().is_err());
+
+        let mut no_l2_budget = CacheConfig::default();
+        no_l2_budget.l2.max_bytes = 0;
+        assert!(no_l2_budget.validate().unwrap_err().contains("max_bytes"));
+        no_l2_budget.l2.enabled = false;
+        assert!(
+            no_l2_budget.validate().is_ok(),
+            "only checked while enabled"
+        );
+
+        // The zstd level matters only to the zstd codec.
+        let mut zstd = CacheConfig::default();
+        zstd.l2.zstd_level = 0;
+        assert!(zstd.validate().is_ok(), "unused without zstd");
+        zstd.l2.compression = crate::config::CacheCompression::Zstd;
+        assert!(zstd.validate().unwrap_err().contains("zstd_level"));
+        for level in [1, 3, 19] {
+            zstd.l2.zstd_level = level;
+            assert!(zstd.validate().is_ok(), "level {level}");
+        }
+        zstd.l2.zstd_level = 20;
+        assert!(zstd.validate().is_err());
     }
 
     #[test]

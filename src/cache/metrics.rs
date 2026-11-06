@@ -248,10 +248,22 @@ impl CacheMetrics {
 
     /// Record eviction for a cache level
     pub fn record_eviction(&self, level: CacheLevel) {
+        self.record_evictions(level, 1);
+    }
+
+    /// Record `count` evictions for a cache level: entries a tier dropped to
+    /// stay within its entry or byte bounds (L2 also counts the expired and
+    /// write-retired entries an eviction pass sheds). A count of zero, the
+    /// common case of a store, costs one branch.
+    pub fn record_evictions(&self, level: CacheLevel, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let count = count as u64;
         match level {
-            CacheLevel::L1Hot => self.l1.evictions.fetch_add(1, Ordering::Relaxed),
-            CacheLevel::L2Warm => self.l2.evictions.fetch_add(1, Ordering::Relaxed),
-            CacheLevel::L3Semantic => self.l3.evictions.fetch_add(1, Ordering::Relaxed),
+            CacheLevel::L1Hot => self.l1.evictions.fetch_add(count, Ordering::Relaxed),
+            CacheLevel::L2Warm => self.l2.evictions.fetch_add(count, Ordering::Relaxed),
+            CacheLevel::L3Semantic => self.l3.evictions.fetch_add(count, Ordering::Relaxed),
         };
     }
 
@@ -573,5 +585,13 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.l1.evictions, 2);
         assert_eq!(snapshot.l2.evictions, 1);
+
+        metrics.record_evictions(CacheLevel::L2Warm, 5);
+        metrics.record_evictions(CacheLevel::L3Semantic, 0);
+        metrics.record_evictions(CacheLevel::L3Semantic, 2);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.l1.evictions, 2);
+        assert_eq!(snapshot.l2.evictions, 6);
+        assert_eq!(snapshot.l3.evictions, 2);
     }
 }

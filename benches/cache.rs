@@ -1,6 +1,9 @@
 //! Query-cache, L2 memory/file-spill and edge-fingerprint benchmarks.
 //!
-//! `cache/l2/*` measure the L2 tier directly. `cache/query/*` go through the
+//! `cache/l2/*` measure the L2 tier directly, including its payload
+//! compression (`[cache] l2_compression`): `compress_{lz4,zstd}_*` a store
+//! (compression included) and `hit_{lz4,zstd}_*` a hit (decompression
+//! included) of a DataRow payload, `hit_none_64k` the raw control. `cache/query/*` go through the
 //! public `QueryCache` API (hint parse, normalization, tier lookups) the relay
 //! calls for every cacheable read, and its `write_tables` for every journaled
 //! write; `cache/edge/*` the edge-cache key the relay computes for every
@@ -16,7 +19,9 @@ use std::hint::black_box;
 /// One 1 KiB result: an L2 memory-hit control and a real file read/decode/promotion.
 /// The spill file is seeded once outside the timed loop, and shedding memory
 /// forces the disk fallback each iteration without growing the file. This
-/// measures warm OS-page-cache reads, including shed/runtime overhead.
+/// measures warm OS-page-cache reads, including shed/runtime overhead. Then
+/// the payload codec: a store and a hit of 4 KiB, 64 KiB and 1 MiB DataRow
+/// results with LZ4 and zstd (level 3), and a raw 64 KiB hit.
 #[cfg(feature = "query-cache")]
 fn bench_l2_cache(c: &mut Criterion) {
     use bytes::Bytes;
@@ -41,7 +46,7 @@ fn bench_l2_cache(c: &mut Criterion) {
     let spill = L2WarmCache::new(L2Config {
         storage: StorageBackend::Mmap,
         mmap_path: Some(dir.path().join("spill")),
-        size_mb: 1,
+        max_bytes: 1024 * 1024,
         ..L2Config::default()
     });
     rt.block_on(spill.put(key.clone(), result));
@@ -61,7 +66,84 @@ fn bench_l2_cache(c: &mut Criterion) {
             black_box(rt.block_on(spill.get(black_box(&key))).unwrap())
         });
     });
+
+    // L2 payload compression: a store (compress, account, replace the entry
+    // of the same key) and a hit (decompress) of a DataRow result per codec
+    // and size, and the raw hit at 64 KiB as the control.
+    use heliosdb_proxy::config::CacheCompression;
+    let codec_cache = |compression| {
+        L2WarmCache::new(L2Config {
+            compression,
+            ..L2Config::default()
+        })
+    };
+    let rows = |bytes: usize| {
+        CachedResult::new(
+            data_rows(bytes),
+            1,
+            Duration::from_secs(3600),
+            vec!["bench_table".to_string()],
+            Duration::ZERO,
+        )
+    };
+    for (name, compression) in [
+        ("lz4", CacheCompression::Lz4),
+        ("zstd", CacheCompression::Zstd),
+    ] {
+        for (size, bytes) in [("4k", 4096), ("64k", 64 * 1024), ("1m", 1024 * 1024)] {
+            let cache = codec_cache(compression);
+            let result = rows(bytes);
+            rt.block_on(cache.put(key.clone(), result.clone()));
+            assert!(
+                cache.compression_saved_bytes() > 0,
+                "{name} {size} compresses"
+            );
+            group.bench_function(format!("compress_{name}_{size}"), |b| {
+                b.iter(|| rt.block_on(cache.put(black_box(key.clone()), result.clone())))
+            });
+            assert_eq!(rt.block_on(cache.get(&key)).unwrap().data, result.data);
+            group.bench_function(format!("hit_{name}_{size}"), |b| {
+                b.iter(|| black_box(rt.block_on(cache.get(black_box(&key))).unwrap()))
+            });
+        }
+    }
+    let raw = codec_cache(CacheCompression::None);
+    rt.block_on(raw.put(key.clone(), rows(64 * 1024)));
+    assert_eq!(raw.compression_saved_bytes(), 0);
+    group.bench_function("hit_none_64k", |b| {
+        b.iter(|| black_box(rt.block_on(raw.get(black_box(&key))).unwrap()))
+    });
     group.finish();
+}
+
+/// Exactly `bytes` bytes of PostgreSQL DataRow frames (an int, a name, a
+/// status and a timestamp per row, as text): the repetitive payload cached
+/// reads carry, not random bytes. The last frame may be cut.
+#[cfg(feature = "query-cache")]
+fn data_rows(bytes: usize) -> bytes::Bytes {
+    let mut out = Vec::with_capacity(bytes + 128);
+    let mut i = 0u32;
+    while out.len() < bytes {
+        let id = i.to_string();
+        let name = format!("user_{i:06}");
+        let fields: [&[u8]; 4] = [
+            id.as_bytes(),
+            name.as_bytes(),
+            b"active",
+            b"2026-11-06 12:00:00+00",
+        ];
+        let body: usize = fields.iter().map(|f| 4 + f.len()).sum();
+        out.push(b'D');
+        out.extend_from_slice(&((4 + 2 + body) as u32).to_be_bytes());
+        out.extend_from_slice(&(fields.len() as u16).to_be_bytes());
+        for f in fields {
+            out.extend_from_slice(&(f.len() as u32).to_be_bytes());
+            out.extend_from_slice(f);
+        }
+        i += 1;
+    }
+    out.truncate(bytes);
+    bytes::Bytes::from(out)
 }
 
 #[cfg(not(feature = "query-cache"))]
