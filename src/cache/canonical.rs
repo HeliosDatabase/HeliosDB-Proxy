@@ -215,18 +215,18 @@ const NANO_RESERVED_FOR_TABLE_ALIAS: &[&str] = &[
 /// PostgreSQL resolves it, for the checks that refuse a name PostgreSQL may
 /// read otherwise) and as written when that differs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ColRef {
-    qual: Option<String>,
-    name: String,
-    written: Option<String>,
+struct ColRef<'a> {
+    qual: Option<&'a str>,
+    name: &'a str,
+    written: Option<&'a str>,
 }
 
-impl ColRef {
+impl ColRef<'_> {
     /// The column's name as written: what the form keeps (a backend that
     /// does not fold names reads another column, or labels the output
     /// column with it).
     fn spelling(&self) -> &str {
-        self.written.as_deref().unwrap_or(&self.name)
+        self.written.unwrap_or(self.name)
     }
 }
 
@@ -234,65 +234,66 @@ impl ColRef {
 /// PostgreSQL resolves it) and as written (the RowDescription label on a
 /// backend that does not fold it).
 #[derive(Debug, Clone)]
-struct Alias {
+struct Alias<'a> {
     with_as: bool,
-    name: String,
-    spelling: String,
+    name: &'a str,
+    spelling: &'a str,
 }
 
 /// A select-list expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Expr {
-    Col(ColRef),
-    /// `func([DISTINCT] arg)`, or `count(*)` with `arg` `None`.
+enum Expr<'a> {
+    Col(ColRef<'a>),
+    /// `func([DISTINCT] arg)`, or `count(*)` with `arg` `None`. `func` is
+    /// one of [`AGGREGATES`].
     Agg {
-        func: String,
+        func: &'static str,
         distinct: bool,
-        arg: Option<ColRef>,
+        arg: Option<ColRef<'a>>,
     },
 }
 
 /// A select item: an expression and its output alias.
 #[derive(Debug, Clone)]
-struct Item {
-    expr: Expr,
-    alias: Option<Alias>,
+struct Item<'a> {
+    expr: Expr<'a>,
+    alias: Option<Alias<'a>>,
 }
 
 /// One piece of a WHERE clause: a token kept as is, or a column.
 #[derive(Debug, Clone)]
-enum Part {
-    Tok(char, String),
-    Col(ColRef),
+enum Part<'a> {
+    Tok(char, &'a str),
+    Col(ColRef<'a>),
 }
 
 #[derive(Debug, Clone)]
-struct OrderItem {
-    col: ColRef,
-    direction: Option<String>,
-    nulls: Option<String>,
+struct OrderItem<'a> {
+    col: ColRef<'a>,
+    direction: Option<&'static str>,
+    nulls: Option<&'static str>,
 }
 
 /// A statement of the grammar.
 #[derive(Debug)]
-struct Statement {
-    /// `all` or `distinct`, as written.
-    quantifier: Option<String>,
+struct Statement<'a> {
+    /// `all` or `distinct`, as written (lower case).
+    quantifier: Option<&'static str>,
     /// The select items; `None` for `*`.
-    items: Option<Vec<Item>>,
+    items: Option<Vec<Item<'a>>>,
     /// The schema, as written.
-    schema: Option<String>,
+    schema: Option<&'a str>,
     /// The relation, lower-cased (the table extraction's form) and as
     /// written.
-    relation: String,
-    relation_spelling: String,
+    relation: &'a str,
+    relation_spelling: &'a str,
     /// The relation's alias.
-    alias: Option<Alias>,
-    filter: Vec<Part>,
-    group_by: Vec<ColRef>,
-    order_by: Vec<OrderItem>,
-    limit: Option<String>,
-    offset: Option<String>,
+    alias: Option<Alias<'a>>,
+    filter: Vec<Part<'a>>,
+    group_by: Vec<ColRef<'a>>,
+    order_by: Vec<OrderItem<'a>>,
+    limit: Option<&'a str>,
+    offset: Option<&'a str>,
 }
 
 /// Whether `t` is an identifier of the grammar: not a word of the grammar,
@@ -306,15 +307,14 @@ struct Statement {
 /// a form). Nor does a word longer than [`MAX_IDENTIFIER_BYTES`]: PostgreSQL
 /// truncates it, so two different longer words can name the same column or
 /// table.
-fn is_ident(t: &Token) -> bool {
+fn is_ident(t: &Token<'_>) -> bool {
+    let w: &str = &t.text;
     t.kind == TokenKind::Word
-        && t.text.is_ascii()
-        && t.text.len() <= MAX_IDENTIFIER_BYTES
-        && !GRAMMAR_WORDS.contains(&t.text.as_str())
-        && POSTGRES_RESERVED_WORDS
-            .binary_search(&t.text.as_str())
-            .is_err()
-        && !NANO_NON_IDENTIFIERS.contains(&t.text.as_str())
+        && w.is_ascii()
+        && w.len() <= MAX_IDENTIFIER_BYTES
+        && !GRAMMAR_WORDS.contains(&w)
+        && POSTGRES_RESERVED_WORDS.binary_search(&w).is_err()
+        && !NANO_NON_IDENTIFIERS.contains(&w)
 }
 
 /// Whether `text` is a number as PostgreSQL's lexer reads one, without `_`
@@ -354,18 +354,18 @@ fn plain_number(text: &str) -> bool {
 /// `N`) and no backslash, whose meaning depends on
 /// `standard_conforming_strings` (a session setting the cache does not key
 /// on).
-fn plain_string(t: &Token) -> bool {
+fn plain_string(t: &Token<'_>) -> bool {
     t.kind == TokenKind::Str && !t.prefixed && !t.text.contains('\\')
 }
 
 /// A cursor over the tokens.
 struct Parser<'a> {
-    toks: &'a [Token],
+    toks: &'a [Token<'a>],
     at: usize,
 }
 
 impl<'a> Parser<'a> {
-    fn peek(&self) -> Option<&'a Token> {
+    fn peek(&self) -> Option<&'a Token<'a>> {
         self.toks.get(self.at)
     }
 
@@ -381,21 +381,21 @@ impl<'a> Parser<'a> {
         hit
     }
 
-    fn eat_one_of(&mut self, words: &[&str]) -> Option<String> {
+    fn eat_one_of(&mut self, words: &[&'static str]) -> Option<&'static str> {
         let t = self.peek()?;
         let w = words.iter().find(|w| t.is_word(w))?;
         self.at += 1;
-        Some((*w).to_string())
+        Some(*w)
     }
 
     /// An identifier, lower-cased, and as written when that differs.
-    fn spelled_ident(&mut self) -> Option<(String, Option<String>)> {
+    fn spelled_ident(&mut self) -> Option<(&'a str, Option<&'a str>)> {
         let t = self.peek().filter(|t| is_ident(t))?;
         self.at += 1;
-        Some((t.text.clone(), t.written.clone()))
+        Some((&*t.text, t.written))
     }
 
-    fn colref(&mut self) -> Option<ColRef> {
+    fn colref(&mut self) -> Option<ColRef<'a>> {
         let (first, first_written) = self.spelled_ident()?;
         if self.eat_punct(".") {
             let (name, written) = self.spelled_ident()?;
@@ -414,12 +414,12 @@ impl<'a> Parser<'a> {
     }
 
     /// `[[AS] ident]`.
-    fn alias(&mut self) -> Option<Option<Alias>> {
+    fn alias(&mut self) -> Option<Option<Alias<'a>>> {
         let with_as = self.eat_word("as");
         match self.spelled_ident() {
             Some((name, written)) => Some(Some(Alias {
                 with_as,
-                spelling: written.unwrap_or_else(|| name.clone()),
+                spelling: written.unwrap_or(name),
                 name,
             })),
             None if with_as => None,
@@ -427,13 +427,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn item(&mut self) -> Option<Item> {
+    fn item(&mut self) -> Option<Item<'a>> {
         let t = self.peek()?;
-        let aggregate = t.kind == TokenKind::Word
-            && AGGREGATES.contains(&t.text.as_str())
-            && self.toks.get(self.at + 1).is_some_and(|n| n.is_punct("("));
-        let expr = if aggregate {
-            let func = t.text.clone();
+        let aggregate = if t.kind == TokenKind::Word
+            && self.toks.get(self.at + 1).is_some_and(|n| n.is_punct("("))
+        {
+            AGGREGATES.iter().copied().find(|a| *a == &*t.text)
+        } else {
+            None
+        };
+        let expr = if let Some(func) = aggregate {
             self.at += 2;
             if func == "count" && self.eat_punct("*") {
                 if !self.eat_punct(")") {
@@ -466,23 +469,23 @@ impl<'a> Parser<'a> {
     }
 
     /// `literal`, appended to `out`.
-    fn literal(&mut self, out: &mut Vec<Part>) -> Option<()> {
+    fn literal(&mut self, out: &mut Vec<Part<'a>>) -> Option<()> {
         let t = self.peek()?;
         if t.kind == TokenKind::Op && t.text == "-" {
             let n = self.toks.get(self.at + 1)?;
             if n.kind != TokenKind::Number || !plain_number(&n.text) {
                 return None;
             }
-            out.push(Part::Tok('o', "-".to_string()));
-            out.push(Part::Tok('n', n.text.clone()));
+            out.push(Part::Tok('o', "-"));
+            out.push(Part::Tok('n', &n.text));
             self.at += 2;
             return Some(());
         }
         let part = match t.kind {
-            TokenKind::Number if plain_number(&t.text) => Part::Tok('n', t.text.clone()),
-            TokenKind::Str if plain_string(t) => Part::Tok('s', t.text.clone()),
-            TokenKind::Word if matches!(t.text.as_str(), "true" | "false" | "null") => {
-                Part::Tok('k', t.text.clone())
+            TokenKind::Number if plain_number(&t.text) => Part::Tok('n', &t.text),
+            TokenKind::Str if plain_string(t) => Part::Tok('s', &t.text),
+            TokenKind::Word if matches!(&*t.text, "true" | "false" | "null") => {
+                Part::Tok('k', &t.text)
             }
             _ => return None,
         };
@@ -492,46 +495,46 @@ impl<'a> Parser<'a> {
     }
 
     /// `pred`, appended to `out`.
-    fn predicate(&mut self, out: &mut Vec<Part>) -> Option<()> {
+    fn predicate(&mut self, out: &mut Vec<Part<'a>>) -> Option<()> {
         out.push(Part::Col(self.colref()?));
         let t = self.peek()?;
-        if t.kind == TokenKind::Op && COMPARISONS.contains(&t.text.as_str()) {
-            out.push(Part::Tok('o', t.text.clone()));
+        if t.kind == TokenKind::Op && COMPARISONS.contains(&&*t.text) {
+            out.push(Part::Tok('o', &t.text));
             self.at += 1;
             if self.literal(out).is_none() {
                 out.push(Part::Col(self.colref()?));
             }
             return Some(());
         }
-        let kw = |w: &str| Part::Tok('k', w.to_string());
+        let kw = |w: &'static str| Part::Tok('k', w);
         if self.eat_word("is") {
             out.push(kw("is"));
             if self.eat_word("not") {
                 out.push(kw("not"));
             }
-            out.push(kw(&self.eat_one_of(&["null", "true", "false"])?));
+            out.push(kw(self.eat_one_of(&["null", "true", "false"])?));
             return Some(());
         }
         if self.eat_word("not") {
             out.push(kw("not"));
         }
         let op = self.eat_one_of(&["in", "between", "like", "ilike"])?;
-        out.push(kw(&op));
-        match op.as_str() {
+        out.push(kw(op));
+        match op {
             "in" => {
                 if !self.eat_punct("(") {
                     return None;
                 }
-                out.push(Part::Tok('u', "(".to_string()));
+                out.push(Part::Tok('u', "("));
                 self.literal(out)?;
                 while self.eat_punct(",") {
-                    out.push(Part::Tok('u', ",".to_string()));
+                    out.push(Part::Tok('u', ","));
                     self.literal(out)?;
                 }
                 if !self.eat_punct(")") {
                     return None;
                 }
-                out.push(Part::Tok('u', ")".to_string()));
+                out.push(Part::Tok('u', ")"));
             }
             "between" => {
                 self.literal(out)?;
@@ -543,7 +546,7 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 let t = self.peek().filter(|t| plain_string(t))?;
-                out.push(Part::Tok('s', t.text.clone()));
+                out.push(Part::Tok('s', &t.text));
                 self.at += 1;
             }
         }
@@ -552,21 +555,21 @@ impl<'a> Parser<'a> {
 
     /// `bool_expr`, appended to `out`, without recursion: a parenthesized
     /// `bool_expr` only moves a depth counter.
-    fn bool_expr(&mut self, out: &mut Vec<Part>) -> Option<()> {
+    fn bool_expr(&mut self, out: &mut Vec<Part<'a>>) -> Option<()> {
         let mut depth = 0usize;
         loop {
             // bool_term := [NOT] (pred | '(' bool_expr ')')
             if self.eat_word("not") {
-                out.push(Part::Tok('k', "not".to_string()));
+                out.push(Part::Tok('k', "not"));
             }
             if self.eat_punct("(") {
-                out.push(Part::Tok('u', "(".to_string()));
+                out.push(Part::Tok('u', "("));
                 depth += 1;
                 continue;
             }
             self.predicate(out)?;
             while depth > 0 && self.eat_punct(")") {
-                out.push(Part::Tok('u', ")".to_string()));
+                out.push(Part::Tok('u', ")"));
                 depth -= 1;
             }
             match self.eat_one_of(&["and", "or"]) {
@@ -577,7 +580,7 @@ impl<'a> Parser<'a> {
         (depth == 0).then_some(())
     }
 
-    fn order_item(&mut self) -> Option<OrderItem> {
+    fn order_item(&mut self) -> Option<OrderItem<'a>> {
         let col = self.colref()?;
         let direction = self.eat_one_of(&["asc", "desc"]);
         let nulls = if self.eat_word("nulls") {
@@ -592,15 +595,15 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn int(&mut self) -> Option<String> {
+    fn int(&mut self) -> Option<&'a str> {
         let t = self.peek().filter(|t| {
             t.kind == TokenKind::Number && t.text.bytes().all(|b| b.is_ascii_digit())
         })?;
         self.at += 1;
-        Some(t.text.clone())
+        Some(&*t.text)
     }
 
-    fn statement(&mut self) -> Option<Statement> {
+    fn statement(&mut self) -> Option<Statement<'a>> {
         if !self.eat_word("select") {
             return None;
         }
@@ -623,11 +626,11 @@ impl<'a> Parser<'a> {
         } else {
             (first, None)
         };
-        let relation_spelling = written.unwrap_or_else(|| relation.clone());
+        let relation_spelling = written.unwrap_or(relation);
         let alias = match self.alias()? {
             // HeliosDB-Nano refuses these as an alias without `AS`, and the
             // form drops the alias.
-            Some(a) if !a.with_as && NANO_RESERVED_FOR_TABLE_ALIAS.contains(&a.name.as_str()) => {
+            Some(a) if !a.with_as && NANO_RESERVED_FOR_TABLE_ALIAS.contains(&a.name) => {
                 return None
             }
             alias => alias,
@@ -683,9 +686,9 @@ impl<'a> Parser<'a> {
     }
 }
 
-impl Statement {
+impl<'a> Statement<'a> {
     /// Every column reference, in no particular order.
-    fn colrefs(&self) -> impl Iterator<Item = &ColRef> {
+    fn colrefs(&self) -> impl Iterator<Item = &ColRef<'a>> {
         let items = self
             .items
             .iter()
@@ -714,12 +717,12 @@ impl Statement {
         let qualifier = self
             .alias
             .as_ref()
-            .map_or(self.relation_spelling.as_str(), |a| a.spelling.as_str());
-        let alias = self.alias.as_ref().map(|a| a.name.as_str());
+            .map_or(self.relation_spelling, |a| a.spelling);
+        let alias = self.alias.as_ref().map(|a| a.name);
         self.colrefs().all(|c| {
-            c.qual.as_deref().is_none_or(|q| q == qualifier)
+            c.qual.is_none_or(|q| q == qualifier)
                 && c.name != self.relation
-                && alias != Some(c.name.as_str())
+                && alias != Some(c.name)
         })
     }
 
@@ -735,13 +738,13 @@ impl Statement {
             .items
             .iter()
             .flatten()
-            .filter_map(|i| i.alias.as_ref().map(|a| a.name.as_str()))
+            .filter_map(|i| i.alias.as_ref().map(|a| a.name))
             .collect();
         !self
             .group_by
             .iter()
             .chain(self.order_by.iter().map(|o| &o.col))
-            .any(|c| c.qual.is_none() && aliases.contains(c.name.as_str()))
+            .any(|c| c.qual.is_none() && aliases.contains(c.name))
     }
 
     /// Whether the extracted `tables` name every relation the statement's
@@ -754,7 +757,8 @@ impl Statement {
     /// the relation itself reads (a view's base tables, a row-level security
     /// policy's) is not seen.
     fn relations_complete(&self, tables: &[String]) -> bool {
-        tables.contains(&self.relation_spelling) && self.colrefs().all(|c| c.qual.is_none())
+        tables.iter().any(|t| t == self.relation_spelling)
+            && self.colrefs().all(|c| c.qual.is_none())
     }
 }
 
@@ -773,7 +777,7 @@ impl Statement {
 /// `IS [NOT] JSON`, which no statement of the grammar holds outside a
 /// literal, SQLite's `DATETIME('now')`, a function call) take any spacing
 /// and read every statement sharing a form alike.
-fn nano_rewrites(toks: &[Token]) -> bool {
+fn nano_rewrites(toks: &[Token<'_>]) -> bool {
     let words = toks.windows(2).any(|pair| {
         pair[0].kind == TokenKind::Word
             && pair[1].kind == TokenKind::Word
@@ -820,16 +824,14 @@ thread_local! {
     pub(crate) static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Parse `sql` under the grammar; `None` when it is longer than
+/// Tokenize `sql` for the grammar; `None` when it is longer than
 /// `max_bytes` (it is not even tokenized: the tokens and the parse take
 /// about a hundred times the text's size), it names a catalog
 /// HeliosDB-Nano emulates ([`sql_text::names_nano_catalog`]), it holds a
-/// comment other than a plain hint ([`inert_comment`]), one of
-/// HeliosDB-Nano's spacing-exact rewrites may fire on it ([`nano_rewrites`]),
-/// it does not parse, a column reference is not one of the relation's
-/// columns beyond doubt, or a lone `GROUP BY`/`ORDER BY` name equals an
-/// output alias.
-fn parse(sql: &str, max_bytes: usize) -> Option<Statement> {
+/// comment other than a plain hint ([`inert_comment`]), it does not tokenize,
+/// or one of HeliosDB-Nano's spacing-exact rewrites may fire on it
+/// ([`nano_rewrites`]). The tokens borrow `sql`.
+fn tokenize(sql: &str, max_bytes: usize) -> Option<Vec<Token<'_>>> {
     #[cfg(test)]
     PARSES.with(|n| n.set(n.get() + 1));
     if sql.len() > max_bytes {
@@ -839,10 +841,14 @@ fn parse(sql: &str, max_bytes: usize) -> Option<Statement> {
         return None;
     }
     let toks = sql_text::tokens(sql, inert_comment).ok()?;
-    if nano_rewrites(&toks) {
-        return None;
-    }
-    let statement = Parser { toks: &toks, at: 0 }.statement()?;
+    (!nano_rewrites(&toks)).then_some(toks)
+}
+
+/// Parse the tokens of [`tokenize`] under the grammar; `None` when they do
+/// not parse, a column reference is not one of the relation's columns beyond
+/// doubt, or a lone `GROUP BY`/`ORDER BY` name equals an output alias.
+fn parse_tokens<'a>(toks: &'a [Token<'a>]) -> Option<Statement<'a>> {
+    let statement = Parser { toks, at: 0 }.statement()?;
     (statement.columns_resolve() && statement.keys_unambiguous()).then_some(statement)
 }
 
@@ -858,7 +864,8 @@ fn parse(sql: &str, max_bytes: usize) -> Option<Statement> {
 /// policy reads other tables, still reads relations the text never names
 /// (the documentation says never to give one a longer TTL).
 pub(crate) fn relations_complete(sql: &str, tables: &[String], max_bytes: usize) -> bool {
-    parse(sql, max_bytes).is_some_and(|s| s.relations_complete(tables))
+    tokenize(sql, max_bytes)
+        .is_some_and(|toks| parse_tokens(&toks).is_some_and(|s| s.relations_complete(tables)))
 }
 
 /// What the semantic tier compares of a statement.
@@ -910,7 +917,7 @@ fn push_col(out: &mut String, c: &ColRef) {
 /// function's name, which every backend folds. `t.double precision` is
 /// column `double` labelled `precision`, a bare `double precision` a type
 /// name: [`push_col`] tells them apart.
-fn push_item(out: &mut String, item: &Item) {
+fn push_item(out: &mut String, item: &Item<'_>) {
     match &item.expr {
         Expr::Col(c) => push_col(out, c),
         Expr::Agg {
@@ -934,7 +941,7 @@ fn push_item(out: &mut String, item: &Item) {
         if alias.with_as {
             push(out, 'k', "as");
         }
-        push(out, 'a', &alias.spelling);
+        push(out, 'a', alias.spelling);
     }
 }
 
@@ -945,19 +952,23 @@ fn push_item(out: &mut String, item: &Item) {
 /// C-02, whatever the relation's spelling). Linear in the statement's
 /// tokens.
 pub(crate) fn canonicalize(sql: &str, tables: &[String], max_bytes: usize) -> Option<Canonical> {
-    let s = parse(sql, max_bytes)?;
-    if !tables.contains(&s.relation) {
+    let toks = tokenize(sql, max_bytes)?;
+    let s = parse_tokens(&toks)?;
+    if !tables.iter().any(|t| t == s.relation) {
         return None;
     }
-    let distinct = s.quantifier.as_deref() == Some("distinct")
+    let distinct = s.quantifier == Some("distinct")
         || s.items
             .iter()
             .flatten()
             .any(|i| matches!(i.expr, Expr::Agg { distinct: true, .. }));
     let approximable = !distinct && s.group_by.is_empty();
 
-    let mut shape = String::new();
-    let mut select = String::new();
+    // One buffer each, sized for the statement: a form holds about two bytes
+    // per token of the text (a kind byte and a NUL), so the common case
+    // takes no reallocation.
+    let mut shape = String::with_capacity(sql.len() * 2);
+    let mut select = String::with_capacity(sql.len() * 2);
     push(&mut shape, 'k', "select");
     if let Some(q) = &s.quantifier {
         push(&mut shape, 'k', q);
@@ -978,25 +989,26 @@ pub(crate) fn canonicalize(sql: &str, tables: &[String], max_bytes: usize) -> Op
                     (Expr::Col(c), None) if approximable && c.qual.is_none() => Some(c),
                     _ => None,
                 };
-                let mut text = String::new();
-                push_item(&mut text, item);
-                push(&mut shape, 'm', "item");
+                // The item is serialised into `select` alone, then copied
+                // into `shape` from there (no temporary string).
                 push(&mut select, 'm', "item");
+                let text_at = select.len();
+                push_item(&mut select, item);
+                push(&mut shape, 'm', "item");
                 match slot {
                     Some(_) => push(&mut shape, 'm', "slot"),
-                    None => shape.push_str(&text),
+                    None => shape.push_str(&select[text_at..]),
                 }
-                select.push_str(&text);
                 slot.map(|c| c.spelling().to_string())
             })
             .collect(),
     };
     push(&mut shape, 'k', "from");
-    if let Some(schema) = &s.schema {
+    if let Some(schema) = s.schema {
         push(&mut shape, 'r', schema);
         push(&mut shape, 'u', ".");
     }
-    push(&mut shape, 'r', &s.relation_spelling);
+    push(&mut shape, 'r', s.relation_spelling);
     if !s.filter.is_empty() {
         push(&mut shape, 'k', "where");
         for part in &s.filter {
@@ -1062,8 +1074,9 @@ pub(crate) fn canonicalize(sql: &str, tables: &[String], max_bytes: usize) -> Op
 /// the fast path looks up as written). Nothing is folded, so there are no
 /// substitutable columns and the statement is not approximable.
 pub(crate) fn verbatim(sql: &str, tables: &[String], max_bytes: usize) -> Option<Canonical> {
-    let s = parse(sql, max_bytes)?;
-    if !tables.contains(&s.relation) {
+    let toks = tokenize(sql, max_bytes)?;
+    let s = parse_tokens(&toks)?;
+    if !tables.iter().any(|t| t == s.relation) {
         return None;
     }
     let mut shape = String::with_capacity(sql.len() + 2);
@@ -1095,8 +1108,900 @@ pub(crate) fn semantic_form(
     }
 }
 
+/// The pre-change canonical path, copied verbatim (renames only, doc comments
+/// dropped) so that [`tests::canonical_path_matches_the_legacy_path_on_the_corpus`]
+/// can compare the two. Test-only: delete it with that test once the change
+/// has settled.
+#[cfg(test)]
+mod legacy {
+    use super::*;
+    use crate::replay_sql::{ident_cont, ident_start};
+    use crate::sql_text::{Piece, Pieces};
+
+    const LEGACY_GRAMMAR_WORDS: &[&str] = &[
+        "all", "and", "as", "asc", "avg", "between", "by", "count", "desc", "distinct", "false",
+        "first", "from", "group", "ilike", "in", "is", "last", "like", "limit", "max", "min",
+        "not", "null", "nulls", "offset", "or", "order", "select", "sum", "true", "where",
+    ];
+
+    const LEGACY_AGGREGATES: &[&str] = &["avg", "count", "max", "min", "sum"];
+
+    const LEGACY_COMPARISONS: &[&str] = &["=", "<>", "<", "<=", ">", ">="];
+
+    const LEGACY_NANO_NON_IDENTIFIERS: &[&str] = &["exists", "interval", "struct", "top", "trim"];
+
+    const LEGACY_NANO_RESERVED_FOR_TABLE_ALIAS: &[&str] = &[
+        "analyze",
+        "anti",
+        "cluster",
+        "connect",
+        "cross",
+        "distribute",
+        "end",
+        "except",
+        "explain",
+        "fetch",
+        "for",
+        "format",
+        "full",
+        "global",
+        "group",
+        "having",
+        "inner",
+        "intersect",
+        "join",
+        "lateral",
+        "left",
+        "limit",
+        "match_recognize",
+        "natural",
+        "offset",
+        "on",
+        "order",
+        "outer",
+        "partition",
+        "pivot",
+        "prewhere",
+        "qualify",
+        "right",
+        "select",
+        "semi",
+        "set",
+        "settings",
+        "sort",
+        "start",
+        "top",
+        "union",
+        "unpivot",
+        "using",
+        "view",
+        "where",
+        "window",
+        "with",
+    ];
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct LegacyColRef {
+        qual: Option<String>,
+        name: String,
+        written: Option<String>,
+    }
+
+    impl LegacyColRef {
+        fn spelling(&self) -> &str {
+            self.written.as_deref().unwrap_or(&self.name)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct LegacyAlias {
+        with_as: bool,
+        name: String,
+        spelling: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum LegacyExpr {
+        Col(LegacyColRef),
+        Agg {
+            func: String,
+            distinct: bool,
+            arg: Option<LegacyColRef>,
+        },
+    }
+
+    #[derive(Debug, Clone)]
+    struct LegacyItem {
+        expr: LegacyExpr,
+        alias: Option<LegacyAlias>,
+    }
+
+    #[derive(Debug, Clone)]
+    enum LegacyPart {
+        Tok(char, String),
+        Col(LegacyColRef),
+    }
+
+    #[derive(Debug, Clone)]
+    struct LegacyOrderItem {
+        col: LegacyColRef,
+        direction: Option<String>,
+        nulls: Option<String>,
+    }
+
+    #[derive(Debug)]
+    struct LegacyStatement {
+        quantifier: Option<String>,
+        items: Option<Vec<LegacyItem>>,
+        schema: Option<String>,
+        relation: String,
+        relation_spelling: String,
+        alias: Option<LegacyAlias>,
+        filter: Vec<LegacyPart>,
+        group_by: Vec<LegacyColRef>,
+        order_by: Vec<LegacyOrderItem>,
+        limit: Option<String>,
+        offset: Option<String>,
+    }
+
+    fn legacy_is_ident(t: &LegacyToken) -> bool {
+        t.kind == TokenKind::Word
+            && t.text.is_ascii()
+            && t.text.len() <= MAX_IDENTIFIER_BYTES
+            && !LEGACY_GRAMMAR_WORDS.contains(&t.text.as_str())
+            && POSTGRES_RESERVED_WORDS
+                .binary_search(&t.text.as_str())
+                .is_err()
+            && !LEGACY_NANO_NON_IDENTIFIERS.contains(&t.text.as_str())
+    }
+
+    fn legacy_plain_number(text: &str) -> bool {
+        let b = text.as_bytes();
+        let digits = |mut i: usize| {
+            while b.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+            i
+        };
+        let mut i = digits(0);
+        let mut mantissa = i;
+        if b.get(i) == Some(&b'.') {
+            let end = digits(i + 1);
+            mantissa += end - (i + 1);
+            i = end;
+        }
+        if mantissa == 0 {
+            return false;
+        }
+        if matches!(b.get(i), Some(b'e' | b'E')) {
+            let start = i + 1 + usize::from(matches!(b.get(i + 1), Some(b'+' | b'-')));
+            let end = digits(start);
+            if end == start {
+                return false;
+            }
+            i = end;
+        }
+        i == b.len()
+    }
+
+    fn legacy_plain_string(t: &LegacyToken) -> bool {
+        t.kind == TokenKind::Str && !t.prefixed && !t.text.contains('\\')
+    }
+
+    struct LegacyParser<'a> {
+        toks: &'a [LegacyToken],
+        at: usize,
+    }
+
+    impl<'a> LegacyParser<'a> {
+        fn peek(&self) -> Option<&'a LegacyToken> {
+            self.toks.get(self.at)
+        }
+
+        fn eat_word(&mut self, w: &str) -> bool {
+            let hit = self.peek().is_some_and(|t| t.is_word(w));
+            self.at += usize::from(hit);
+            hit
+        }
+
+        fn eat_punct(&mut self, p: &str) -> bool {
+            let hit = self.peek().is_some_and(|t| t.is_punct(p));
+            self.at += usize::from(hit);
+            hit
+        }
+
+        fn eat_one_of(&mut self, words: &[&str]) -> Option<String> {
+            let t = self.peek()?;
+            let w = words.iter().find(|w| t.is_word(w))?;
+            self.at += 1;
+            Some((*w).to_string())
+        }
+
+        fn spelled_ident(&mut self) -> Option<(String, Option<String>)> {
+            let t = self.peek().filter(|t| legacy_is_ident(t))?;
+            self.at += 1;
+            Some((t.text.clone(), t.written.clone()))
+        }
+
+        fn colref(&mut self) -> Option<LegacyColRef> {
+            let (first, first_written) = self.spelled_ident()?;
+            if self.eat_punct(".") {
+                let (name, written) = self.spelled_ident()?;
+                Some(LegacyColRef {
+                    qual: Some(first_written.unwrap_or(first)),
+                    name,
+                    written,
+                })
+            } else {
+                Some(LegacyColRef {
+                    qual: None,
+                    name: first,
+                    written: first_written,
+                })
+            }
+        }
+
+        fn alias(&mut self) -> Option<Option<LegacyAlias>> {
+            let with_as = self.eat_word("as");
+            match self.spelled_ident() {
+                Some((name, written)) => Some(Some(LegacyAlias {
+                    with_as,
+                    spelling: written.unwrap_or_else(|| name.clone()),
+                    name,
+                })),
+                None if with_as => None,
+                None => Some(None),
+            }
+        }
+
+        fn item(&mut self) -> Option<LegacyItem> {
+            let t = self.peek()?;
+            let aggregate = t.kind == TokenKind::Word
+                && LEGACY_AGGREGATES.contains(&t.text.as_str())
+                && self.toks.get(self.at + 1).is_some_and(|n| n.is_punct("("));
+            let expr = if aggregate {
+                let func = t.text.clone();
+                self.at += 2;
+                if func == "count" && self.eat_punct("*") {
+                    if !self.eat_punct(")") {
+                        return None;
+                    }
+                    LegacyExpr::Agg {
+                        func,
+                        distinct: false,
+                        arg: None,
+                    }
+                } else {
+                    let distinct = self.eat_word("distinct");
+                    let arg = self.colref()?;
+                    if !self.eat_punct(")") {
+                        return None;
+                    }
+                    LegacyExpr::Agg {
+                        func,
+                        distinct,
+                        arg: Some(arg),
+                    }
+                }
+            } else {
+                LegacyExpr::Col(self.colref()?)
+            };
+            Some(LegacyItem {
+                expr,
+                alias: self.alias()?,
+            })
+        }
+
+        fn literal(&mut self, out: &mut Vec<LegacyPart>) -> Option<()> {
+            let t = self.peek()?;
+            if t.kind == TokenKind::Op && t.text == "-" {
+                let n = self.toks.get(self.at + 1)?;
+                if n.kind != TokenKind::Number || !legacy_plain_number(&n.text) {
+                    return None;
+                }
+                out.push(LegacyPart::Tok('o', "-".to_string()));
+                out.push(LegacyPart::Tok('n', n.text.clone()));
+                self.at += 2;
+                return Some(());
+            }
+            let part = match t.kind {
+                TokenKind::Number if legacy_plain_number(&t.text) => {
+                    LegacyPart::Tok('n', t.text.clone())
+                }
+                TokenKind::Str if legacy_plain_string(t) => LegacyPart::Tok('s', t.text.clone()),
+                TokenKind::Word if matches!(t.text.as_str(), "true" | "false" | "null") => {
+                    LegacyPart::Tok('k', t.text.clone())
+                }
+                _ => return None,
+            };
+            self.at += 1;
+            out.push(part);
+            Some(())
+        }
+
+        fn predicate(&mut self, out: &mut Vec<LegacyPart>) -> Option<()> {
+            out.push(LegacyPart::Col(self.colref()?));
+            let t = self.peek()?;
+            if t.kind == TokenKind::Op && LEGACY_COMPARISONS.contains(&t.text.as_str()) {
+                out.push(LegacyPart::Tok('o', t.text.clone()));
+                self.at += 1;
+                if self.literal(out).is_none() {
+                    out.push(LegacyPart::Col(self.colref()?));
+                }
+                return Some(());
+            }
+            let kw = |w: &str| LegacyPart::Tok('k', w.to_string());
+            if self.eat_word("is") {
+                out.push(kw("is"));
+                if self.eat_word("not") {
+                    out.push(kw("not"));
+                }
+                out.push(kw(&self.eat_one_of(&["null", "true", "false"])?));
+                return Some(());
+            }
+            if self.eat_word("not") {
+                out.push(kw("not"));
+            }
+            let op = self.eat_one_of(&["in", "between", "like", "ilike"])?;
+            out.push(kw(&op));
+            match op.as_str() {
+                "in" => {
+                    if !self.eat_punct("(") {
+                        return None;
+                    }
+                    out.push(LegacyPart::Tok('u', "(".to_string()));
+                    self.literal(out)?;
+                    while self.eat_punct(",") {
+                        out.push(LegacyPart::Tok('u', ",".to_string()));
+                        self.literal(out)?;
+                    }
+                    if !self.eat_punct(")") {
+                        return None;
+                    }
+                    out.push(LegacyPart::Tok('u', ")".to_string()));
+                }
+                "between" => {
+                    self.literal(out)?;
+                    if !self.eat_word("and") {
+                        return None;
+                    }
+                    out.push(kw("and"));
+                    self.literal(out)?;
+                }
+                _ => {
+                    let t = self.peek().filter(|t| legacy_plain_string(t))?;
+                    out.push(LegacyPart::Tok('s', t.text.clone()));
+                    self.at += 1;
+                }
+            }
+            Some(())
+        }
+
+        fn bool_expr(&mut self, out: &mut Vec<LegacyPart>) -> Option<()> {
+            let mut depth = 0usize;
+            loop {
+                // bool_term := [NOT] (pred | '(' bool_expr ')')
+                if self.eat_word("not") {
+                    out.push(LegacyPart::Tok('k', "not".to_string()));
+                }
+                if self.eat_punct("(") {
+                    out.push(LegacyPart::Tok('u', "(".to_string()));
+                    depth += 1;
+                    continue;
+                }
+                self.predicate(out)?;
+                while depth > 0 && self.eat_punct(")") {
+                    out.push(LegacyPart::Tok('u', ")".to_string()));
+                    depth -= 1;
+                }
+                match self.eat_one_of(&["and", "or"]) {
+                    Some(w) => out.push(LegacyPart::Tok('k', w)),
+                    None => break,
+                }
+            }
+            (depth == 0).then_some(())
+        }
+
+        fn order_item(&mut self) -> Option<LegacyOrderItem> {
+            let col = self.colref()?;
+            let direction = self.eat_one_of(&["asc", "desc"]);
+            let nulls = if self.eat_word("nulls") {
+                Some(self.eat_one_of(&["first", "last"])?)
+            } else {
+                None
+            };
+            Some(LegacyOrderItem {
+                col,
+                direction,
+                nulls,
+            })
+        }
+
+        fn int(&mut self) -> Option<String> {
+            let t = self.peek().filter(|t| {
+                t.kind == TokenKind::Number && t.text.bytes().all(|b| b.is_ascii_digit())
+            })?;
+            self.at += 1;
+            Some(t.text.clone())
+        }
+
+        fn statement(&mut self) -> Option<LegacyStatement> {
+            if !self.eat_word("select") {
+                return None;
+            }
+            let quantifier = self.eat_one_of(&["all", "distinct"]);
+            let items = if self.eat_punct("*") {
+                None
+            } else {
+                let mut items = vec![self.item()?];
+                while self.eat_punct(",") {
+                    items.push(self.item()?);
+                }
+                Some(items)
+            };
+            if !self.eat_word("from") {
+                return None;
+            }
+            let first = self.spelled_ident()?;
+            let ((relation, written), schema) = if self.eat_punct(".") {
+                (self.spelled_ident()?, Some(first.1.unwrap_or(first.0)))
+            } else {
+                (first, None)
+            };
+            let relation_spelling = written.unwrap_or_else(|| relation.clone());
+            let alias = match self.alias()? {
+                // HeliosDB-Nano refuses these as an alias without `AS`, and the
+                // form drops the alias.
+                Some(a)
+                    if !a.with_as
+                        && LEGACY_NANO_RESERVED_FOR_TABLE_ALIAS.contains(&a.name.as_str()) =>
+                {
+                    return None
+                }
+                alias => alias,
+            };
+            let mut filter = Vec::new();
+            if self.eat_word("where") {
+                self.bool_expr(&mut filter)?;
+            }
+            let mut group_by = Vec::new();
+            if self.eat_word("group") {
+                if !self.eat_word("by") {
+                    return None;
+                }
+                group_by.push(self.colref()?);
+                while self.eat_punct(",") {
+                    group_by.push(self.colref()?);
+                }
+            }
+            let mut order_by = Vec::new();
+            if self.eat_word("order") {
+                if !self.eat_word("by") {
+                    return None;
+                }
+                order_by.push(self.order_item()?);
+                while self.eat_punct(",") {
+                    order_by.push(self.order_item()?);
+                }
+            }
+            let limit = if self.eat_word("limit") {
+                Some(self.int()?)
+            } else {
+                None
+            };
+            let offset = if self.eat_word("offset") {
+                Some(self.int()?)
+            } else {
+                None
+            };
+            self.eat_punct(";");
+            (self.at == self.toks.len()).then_some(LegacyStatement {
+                quantifier,
+                items,
+                schema,
+                relation,
+                relation_spelling,
+                alias,
+                filter,
+                group_by,
+                order_by,
+                limit,
+                offset,
+            })
+        }
+    }
+
+    impl LegacyStatement {
+        fn colrefs(&self) -> impl Iterator<Item = &LegacyColRef> {
+            let items = self
+                .items
+                .iter()
+                .flatten()
+                .filter_map(|item| match &item.expr {
+                    LegacyExpr::Col(c) => Some(c),
+                    LegacyExpr::Agg { arg, .. } => arg.as_ref(),
+                });
+            let filter = self.filter.iter().filter_map(|p| match p {
+                LegacyPart::Col(c) => Some(c),
+                LegacyPart::Tok(..) => None,
+            });
+            items
+                .chain(filter)
+                .chain(&self.group_by)
+                .chain(self.order_by.iter().map(|o| &o.col))
+        }
+
+        fn columns_resolve(&self) -> bool {
+            let qualifier = self
+                .alias
+                .as_ref()
+                .map_or(self.relation_spelling.as_str(), |a| a.spelling.as_str());
+            let alias = self.alias.as_ref().map(|a| a.name.as_str());
+            self.colrefs().all(|c| {
+                c.qual.as_deref().is_none_or(|q| q == qualifier)
+                    && c.name != self.relation
+                    && alias != Some(c.name.as_str())
+            })
+        }
+
+        fn keys_unambiguous(&self) -> bool {
+            let aliases: HashSet<&str> = self
+                .items
+                .iter()
+                .flatten()
+                .filter_map(|i| i.alias.as_ref().map(|a| a.name.as_str()))
+                .collect();
+            !self
+                .group_by
+                .iter()
+                .chain(self.order_by.iter().map(|o| &o.col))
+                .any(|c| c.qual.is_none() && aliases.contains(c.name.as_str()))
+        }
+
+        fn relations_complete(&self, tables: &[String]) -> bool {
+            tables.contains(&self.relation_spelling) && self.colrefs().all(|c| c.qual.is_none())
+        }
+    }
+
+    fn legacy_nano_rewrites(toks: &[LegacyToken]) -> bool {
+        let words = toks.windows(2).any(|pair| {
+            pair[0].kind == TokenKind::Word
+                && pair[1].kind == TokenKind::Word
+                && sql_text::nano_rewrite_words(&pair[0].text, &pair[1].text)
+        });
+        words
+            || toks
+                .iter()
+                .any(|t| t.kind == TokenKind::Str && sql_text::holds_nano_rewrite_text(&t.text))
+    }
+
+    pub(crate) fn legacy_inert_comment(comment: &str) -> bool {
+        let body = match comment.strip_prefix("--") {
+            Some(line) => line,
+            None => &comment[2..comment.len() - 2],
+        };
+        let Some(hint) = body.trim_start().strip_prefix("helios:") else {
+            return false;
+        };
+        let word = |w: &str| {
+            !w.is_empty()
+                && w.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
+        };
+        hint.split(',').all(|piece| {
+            let piece = piece.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\x0B');
+            piece.is_empty() || (piece.split('=').count() <= 2 && piece.split('=').all(word))
+        })
+    }
+
+    fn legacy_parse(sql: &str, max_bytes: usize) -> Option<LegacyStatement> {
+        if sql.len() > max_bytes {
+            return None;
+        }
+        if sql_text::names_nano_catalog(sql.as_bytes()) {
+            return None;
+        }
+        let toks = legacy_tokens(sql, legacy_inert_comment).ok()?;
+        if legacy_nano_rewrites(&toks) {
+            return None;
+        }
+        let statement = LegacyParser { toks: &toks, at: 0 }.statement()?;
+        (statement.columns_resolve() && statement.keys_unambiguous()).then_some(statement)
+    }
+
+    pub(crate) fn legacy_relations_complete(
+        sql: &str,
+        tables: &[String],
+        max_bytes: usize,
+    ) -> bool {
+        legacy_parse(sql, max_bytes).is_some_and(|s| s.relations_complete(tables))
+    }
+
+    fn legacy_push(out: &mut String, kind: char, text: &str) {
+        out.push(kind);
+        out.push_str(text);
+        out.push('\0');
+    }
+
+    fn legacy_push_col(out: &mut String, c: &LegacyColRef) {
+        legacy_push(out, if c.qual.is_some() { 'p' } else { 'c' }, c.spelling());
+    }
+
+    fn legacy_push_item(out: &mut String, item: &LegacyItem) {
+        match &item.expr {
+            LegacyExpr::Col(c) => legacy_push_col(out, c),
+            LegacyExpr::Agg {
+                func,
+                distinct,
+                arg,
+            } => {
+                legacy_push(out, 'f', func);
+                legacy_push(out, 'u', "(");
+                if *distinct {
+                    legacy_push(out, 'k', "distinct");
+                }
+                match arg {
+                    Some(c) => legacy_push_col(out, c),
+                    None => legacy_push(out, 'u', "*"),
+                }
+                legacy_push(out, 'u', ")");
+            }
+        }
+        if let Some(alias) = &item.alias {
+            if alias.with_as {
+                legacy_push(out, 'k', "as");
+            }
+            legacy_push(out, 'a', &alias.spelling);
+        }
+    }
+
+    pub(crate) fn legacy_canonicalize(
+        sql: &str,
+        tables: &[String],
+        max_bytes: usize,
+    ) -> Option<Canonical> {
+        let s = legacy_parse(sql, max_bytes)?;
+        if !tables.contains(&s.relation) {
+            return None;
+        }
+        let distinct = s.quantifier.as_deref() == Some("distinct")
+            || s.items
+                .iter()
+                .flatten()
+                .any(|i| matches!(i.expr, LegacyExpr::Agg { distinct: true, .. }));
+        let approximable = !distinct && s.group_by.is_empty();
+
+        let mut shape = String::new();
+        let mut select = String::new();
+        legacy_push(&mut shape, 'k', "select");
+        if let Some(q) = &s.quantifier {
+            legacy_push(&mut shape, 'k', q);
+        }
+        let columns: Vec<Option<String>> = match &s.items {
+            None => {
+                legacy_push(&mut shape, 'u', "*");
+                legacy_push(&mut select, 'u', "*");
+                vec![None]
+            }
+            Some(items) => items
+                .iter()
+                .map(|item| {
+                    // Only an unqualified column is a slot: a qualified `q.name`
+                    // may be the call `name(q)`, which can return another number
+                    // of rows than a column (set-returning) or fail.
+                    let slot = match (&item.expr, &item.alias) {
+                        (LegacyExpr::Col(c), None) if approximable && c.qual.is_none() => Some(c),
+                        _ => None,
+                    };
+                    let mut text = String::new();
+                    legacy_push_item(&mut text, item);
+                    legacy_push(&mut shape, 'm', "item");
+                    legacy_push(&mut select, 'm', "item");
+                    match slot {
+                        Some(_) => legacy_push(&mut shape, 'm', "slot"),
+                        None => shape.push_str(&text),
+                    }
+                    select.push_str(&text);
+                    slot.map(|c| c.spelling().to_string())
+                })
+                .collect(),
+        };
+        legacy_push(&mut shape, 'k', "from");
+        if let Some(schema) = &s.schema {
+            legacy_push(&mut shape, 'r', schema);
+            legacy_push(&mut shape, 'u', ".");
+        }
+        legacy_push(&mut shape, 'r', &s.relation_spelling);
+        if !s.filter.is_empty() {
+            legacy_push(&mut shape, 'k', "where");
+            for part in &s.filter {
+                match part {
+                    LegacyPart::Tok(kind, text) => legacy_push(&mut shape, *kind, text),
+                    LegacyPart::Col(c) => legacy_push_col(&mut shape, c),
+                }
+            }
+        }
+        if !s.group_by.is_empty() {
+            legacy_push(&mut shape, 'k', "group by");
+            for c in &s.group_by {
+                legacy_push_col(&mut shape, c);
+            }
+        }
+        if !s.order_by.is_empty() {
+            legacy_push(&mut shape, 'k', "order by");
+            for o in &s.order_by {
+                legacy_push(&mut shape, 'm', "key");
+                legacy_push_col(&mut shape, &o.col);
+                if let Some(d) = &o.direction {
+                    legacy_push(&mut shape, 'k', d);
+                }
+                if let Some(n) = &o.nulls {
+                    legacy_push(&mut shape, 'k', "nulls");
+                    legacy_push(&mut shape, 'k', n);
+                }
+            }
+        }
+        if let Some(limit) = &s.limit {
+            legacy_push(&mut shape, 'k', "limit");
+            legacy_push(&mut shape, 'n', limit);
+        }
+        if let Some(offset) = &s.offset {
+            legacy_push(&mut shape, 'k', "offset");
+            legacy_push(&mut shape, 'n', offset);
+        }
+        let hash = |text: &str| {
+            let mut h = DefaultHasher::new();
+            text.hash(&mut h);
+            h.finish()
+        };
+        Some(Canonical {
+            guard: hash(&shape),
+            select_hash: hash(&select),
+            shape,
+            select,
+            columns,
+            approximable,
+            relations_complete: s.relations_complete(tables),
+        })
+    }
+
+    pub(crate) fn legacy_verbatim(
+        sql: &str,
+        tables: &[String],
+        max_bytes: usize,
+    ) -> Option<Canonical> {
+        let s = legacy_parse(sql, max_bytes)?;
+        if !tables.contains(&s.relation) {
+            return None;
+        }
+        let mut shape = String::with_capacity(sql.len() + 2);
+        legacy_push(&mut shape, 'v', sql);
+        let mut h = DefaultHasher::new();
+        shape.hash(&mut h);
+        Some(Canonical {
+            guard: h.finish(),
+            select_hash: 0,
+            shape,
+            select: String::new(),
+            columns: Vec::new(),
+            approximable: false,
+            relations_complete: s.relations_complete(tables),
+        })
+    }
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct LegacyToken {
+        pub(crate) kind: TokenKind,
+        pub(crate) text: String,
+        pub(crate) prefixed: bool,
+        pub(crate) written: Option<String>,
+    }
+    impl LegacyToken {
+        pub(crate) fn is_word(&self, w: &str) -> bool {
+            self.kind == TokenKind::Word && self.text == w
+        }
+
+        pub(crate) fn is_punct(&self, p: &str) -> bool {
+            matches!(self.kind, TokenKind::Punct | TokenKind::Op) && self.text == p
+        }
+    }
+    pub(crate) fn legacy_tokens(
+        sql: &str,
+        mut inert: impl FnMut(&str) -> bool,
+    ) -> Result<Vec<LegacyToken>, ()> {
+        const OPERATOR: &[u8] = b"+-*/<>=~!@#%^&|`?";
+        let b = sql.as_bytes();
+        let mut out: Vec<LegacyToken> = Vec::new();
+        // End offset of the previous non-separator piece.
+        let mut prev_end = usize::MAX;
+        for (start, piece) in Pieces::new(sql) {
+            let adjacent = prev_end == start;
+            let glued = start
+                .checked_sub(1)
+                .map(|i| b[i])
+                .is_some_and(|c| ident_cont(c) || c == b'&');
+            let (kind, text, prefixed) = match piece {
+                Piece::Space(_) => continue,
+                Piece::Comment(comment) if inert(comment) => continue,
+                Piece::Comment(_) => return Err(()),
+                Piece::Rest(_) => return Err(()),
+                Piece::Ident(t) => (TokenKind::Ident, t.to_string(), glued),
+                Piece::Str(t) => (TokenKind::Str, t.to_string(), glued),
+                Piece::Dollar(t, _) => (TokenKind::Dollar, t.to_string(), false),
+                Piece::Number(t) => (TokenKind::Number, t.to_string(), false),
+                Piece::Text(t) => {
+                    let c = t.as_bytes()[0];
+                    if ident_start(c) {
+                        (TokenKind::Word, t.to_ascii_lowercase(), false)
+                    } else if c.is_ascii_digit()
+                        || (c == b'.' && t.as_bytes().get(1).is_some_and(u8::is_ascii_digit))
+                    {
+                        // A number running into an identifier (`1x`, `.5x`).
+                        (TokenKind::Number, t.to_string(), false)
+                    } else if c == b'$' && t.len() > 1 {
+                        (TokenKind::Param, t.to_string(), false)
+                    } else if OPERATOR.contains(&c) {
+                        match out.last_mut() {
+                            Some(last) if adjacent && last.kind == TokenKind::Op => {
+                                last.text.push_str(t);
+                                prev_end = start + t.len();
+                                continue;
+                            }
+                            _ => (TokenKind::Op, t.to_string(), false),
+                        }
+                    } else if c == b':' {
+                        match out.last_mut() {
+                            Some(last)
+                                if adjacent
+                                    && last.kind == TokenKind::Punct
+                                    && last.text == ":" =>
+                            {
+                                last.text.push(':');
+                                prev_end = start + 1;
+                                continue;
+                            }
+                            _ => (TokenKind::Punct, t.to_string(), false),
+                        }
+                    } else {
+                        (TokenKind::Punct, t.to_string(), false)
+                    }
+                }
+            };
+            prev_end = start + legacy_piece_len(piece);
+            let written = match piece {
+                Piece::Text(t) if kind == TokenKind::Word && t != text => Some(t.to_string()),
+                _ => None,
+            };
+            out.push(LegacyToken {
+                kind,
+                text,
+                prefixed,
+                written,
+            });
+        }
+        for token in &mut out {
+            if token.kind == TokenKind::Op && token.text == "!=" {
+                token.text = "<>".to_string();
+            }
+        }
+        Ok(out)
+    }
+    fn legacy_piece_len(piece: Piece<'_>) -> usize {
+        match piece {
+            Piece::Space(t)
+            | Piece::Comment(t)
+            | Piece::Text(t)
+            | Piece::Ident(t)
+            | Piece::Str(t)
+            | Piece::Dollar(t, _)
+            | Piece::Number(t)
+            | Piece::Rest(t) => t.len(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::legacy;
     use super::*;
     use crate::cache::QueryNormalizer;
 
@@ -2191,5 +3096,375 @@ mod tests {
             ),
             canon(same)
         );
+    }
+
+    /// The equivalence corpus: every statement of the combinations below, in
+    /// the three casings and with the spacing the generator picks, plus
+    /// random token soup. Each is run through the legacy path and the current
+    /// one, which must agree on every output (or refuse together).
+    fn equivalence_corpus() -> Vec<String> {
+        const SELECTS: &[&str] = &[
+            "*",
+            "v",
+            "t.v",
+            "T.V",
+            "\"Val\"",
+            "count(*)",
+            "count(v)",
+            "count(DISTINCT v)",
+            "sum(t.x)",
+            "max( v )",
+            "v AS a",
+            "v a",
+            "t.v AS \"A\"",
+            "v, w",
+            "t.v x, count(*) AS c",
+            "x.double precision",
+            "trim.val",
+            "top.val",
+            "exists",
+            "interval",
+            "v AS of",
+            "1",
+            "'s'",
+            "a.b.c",
+            "DISTINCT v",
+            "v + 1",
+            "v::int",
+            "CASE WHEN v THEN 1 END",
+            "v, *",
+            "avg(v) avg",
+            "ALL v",
+            "v AS sort",
+            "v select",
+            "orders.v",
+            "count(*) count",
+            "Orders.v",
+            "v AS Kv",
+            "kv.v",
+            "k.v",
+            "E'x'",
+            "v AS \"select\"",
+            "v AS BIGINT",
+        ];
+        const FROMS: &[&str] = &[
+            " FROM kv",
+            " FROM kv AS t",
+            " FROM kv t",
+            " FROM kv AS sort",
+            " FROM kv sort",
+            " FROM s.kv",
+            " FROM S.kv k",
+            " FROM Kv",
+            " FROM kv, b",
+            " FROM kv JOIN b ON 1=1",
+            " FROM \"kv\"",
+            " FROM kv AS of",
+            " FROM xsecurity definer",
+            " FROM x SECURITY DEFINER",
+            " FROM kv k",
+            " FROM kv t(c)",
+            " FROM ONLY kv",
+            " FROM kv AS t TABLESAMPLE SYSTEM (1)",
+            " FROM generate_series(1,2)",
+            " FROM kv AS a1",
+            " FROM kv AS Kv",
+            " FROM b",
+            " FROM kv AS trim",
+            " FROM kv AS top",
+            " FROM kv AS BIGINT",
+            " FROM kv AS t WINDOW w AS ()",
+        ];
+        const WHERES: &[&str] = &[
+            "",
+            " WHERE id = 1",
+            " WHERE t.id = 1",
+            " WHERE id = -1",
+            " WHERE id = - 1",
+            " WHERE x <> 'a'",
+            " WHERE x != 2",
+            " WHERE (a = 1 OR b = 2) AND NOT c IS NULL",
+            " WHERE a IN (1,2,'x')",
+            " WHERE a NOT IN (1)",
+            " WHERE a NOT BETWEEN 1 AND 5",
+            " WHERE s LIKE 'a%'",
+            " WHERE s ILIKE E'x'",
+            " WHERE s LIKE B'x'",
+            " WHERE x = $1",
+            " WHERE x::int = 1",
+            " WHERE x = 'a\\b'",
+            " WHERE x = 1e5",
+            " WHERE x = 1_000",
+            " WHERE x = .5",
+            " WHERE x = 1.",
+            " WHERE x IS TRUE",
+            " WHERE x IS NOT FALSE",
+            " WHERE x = y",
+            " WHERE x = 'it''s'",
+            " WHERE x = U&'a'",
+            " WHERE x = null",
+            " WHERE t.x = t.y",
+            " WHERE x = 5 AND (y = 6",
+            " WHERE x = 5)",
+            " WHERE x = -'a'",
+            " WHERE NOT NOT x = 1",
+            " WHERE x = 1 -- as of now\n",
+            " WHERE x = 1 /* c */",
+            " WHERE x = 1 /*helios:cache=semantic*/",
+            " WHERE x = 1 -- helios:a=b\n",
+            " WHERE x = 'AS OF'",
+            " WHERE id = 1 AND 'a' = 'a'",
+            " WHERE x = 1 AND y = 2 OR z = 3",
+            " WHERE x = 1 ILIKE 'a'",
+            " WHERE x = 1 >= 2",
+            " WHERE x = '\u{e9}'",
+        ];
+        const GROUPS: &[&str] = &[
+            "",
+            " GROUP BY v",
+            " GROUP BY t.v",
+            " GROUP BY 1",
+            " GROUP BY v, w",
+            " GROUP BY a",
+            " GROUP BY ALL v",
+            " GROUP BY v a",
+            " GROUP BY kv.v",
+            " GROUP BY Kv",
+        ];
+        const ORDERS: &[&str] = &[
+            "",
+            " ORDER BY v",
+            " ORDER BY v DESC NULLS LAST",
+            " ORDER BY t.v ASC",
+            " ORDER BY 1",
+            " ORDER BY a",
+            " ORDER BY v, w DESC",
+            " ORDER BY v NULLS",
+            " ORDER BY v nulls first",
+            " ORDER BY v ASC NULLS FIRST, w",
+            " ORDER BY Val",
+            " ORDER BY t.v DESC, t.w",
+        ];
+        const LIMITS: &[&str] = &[
+            "",
+            " LIMIT 10",
+            " LIMIT 10 OFFSET 5",
+            " OFFSET 2",
+            " LIMIT -1",
+            " LIMIT 1.5",
+            " LIMIT 10 OFFSET 2 OFFSET 3",
+            " LIMIT 007",
+        ];
+        const TAILS: &[&str] = &[
+            "",
+            ";",
+            " ",
+            "\n",
+            " -- helios:cache=semantic\n",
+            " /*helios:x=1*/",
+            " /* comment */",
+            "  ;  ",
+            "\t",
+            " ;;",
+            "-- as of now\n",
+        ];
+        const SOUP: &[&str] = &[
+            "SELECT",
+            "select",
+            "FROM",
+            "from",
+            "WHERE",
+            "AND",
+            "OR",
+            "NOT",
+            "IN",
+            "(",
+            ")",
+            ",",
+            ".",
+            "=",
+            "<>",
+            "!=",
+            "<",
+            "-",
+            "1",
+            "'x'",
+            "v",
+            "t",
+            "kv",
+            "Val",
+            "\"V\"",
+            "AS",
+            "count",
+            "*",
+            "::",
+            ":",
+            "$1",
+            "/*helios:a=1*/",
+            "--c\n",
+            "IS",
+            "NULL",
+            "LIMIT",
+            "OFFSET",
+            "ORDER",
+            "BY",
+            "GROUP",
+            "ASC",
+            "DESC",
+            "NULLS",
+            "FIRST",
+            "LAST",
+            "BETWEEN",
+            "LIKE",
+            "of",
+            "as",
+            "distinct",
+            "DISTINCT",
+            "avg",
+            "sum",
+            "E'x'",
+            "1e",
+            "'",
+            "/*",
+            "\\",
+            "x'",
+            "\u{e9}v",
+            "trim",
+            "top",
+            "t.v",
+            "kv.v",
+            "1.5",
+            ".5",
+            "b",
+            "U&\"x\"",
+            "--",
+            "*/",
+            ";",
+            "+",
+            "~",
+        ];
+        let casings: [fn(&str) -> String; 3] = [
+            |s| s.to_string(),
+            |s| s.to_ascii_uppercase(),
+            |s| {
+                s.char_indices()
+                    .map(|(i, c)| {
+                        if i % 2 == 0 {
+                            c.to_ascii_uppercase()
+                        } else {
+                            c
+                        }
+                    })
+                    .collect()
+            },
+        ];
+        let mut out = Vec::new();
+        // Exhaustive: select lists x FROM clauses x a WHERE clause, cased.
+        for sel in SELECTS {
+            for from in FROMS {
+                for wh in [&WHERES[0], &WHERES[1], &WHERES[27]] {
+                    for case in casings {
+                        out.push(case(&format!("SELECT {sel}{from}{wh}")));
+                    }
+                }
+            }
+        }
+        // Sampled: every clause at once, with a seeded generator.
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..20_000 {
+            let sel = SELECTS[next(SELECTS.len())];
+            let from = FROMS[next(FROMS.len())];
+            let wh = WHERES[next(WHERES.len())];
+            let group = GROUPS[next(GROUPS.len())];
+            let order = ORDERS[next(ORDERS.len())];
+            let limit = LIMITS[next(LIMITS.len())];
+            let tail = TAILS[next(TAILS.len())];
+            let sql = format!("SELECT {sel}{from}{wh}{group}{order}{limit}{tail}");
+            out.push(casings[next(casings.len())](&sql));
+        }
+        // Token soup: refusals and odd spellings the grammar must read alike.
+        for _ in 0..10_000 {
+            let n = 1 + next(12);
+            let mut sql = String::from("SELECT ");
+            for _ in 0..n {
+                sql.push_str(SOUP[next(SOUP.len())]);
+                sql.push_str([" ", "", "  ", "\n"][next(4)]);
+            }
+            out.push(sql);
+        }
+        out
+    }
+
+    /// The current canonical path agrees with the legacy one on every
+    /// statement of the corpus: the same tokens, the same canonical form,
+    /// verbatim form and relation analysis, the same accept/refuse decisions.
+    #[test]
+    fn canonical_path_matches_the_legacy_path_on_the_corpus() {
+        let corpus = equivalence_corpus();
+        let fixed: [Vec<String>; 3] = [tables(&["kv"]), tables(&["kv", "b"]), tables(&[])];
+        let (mut accepted, mut refused) = (0usize, 0usize);
+        for sql in &corpus {
+            for inert in [legacy::legacy_inert_comment as fn(&str) -> bool, |_| true] {
+                let new = sql_text::tokens(sql, inert).map(|toks| {
+                    toks.iter()
+                        .map(|t| {
+                            (
+                                t.kind,
+                                t.text.to_string(),
+                                t.prefixed,
+                                t.written.map(str::to_string),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let old = legacy::legacy_tokens(sql, inert).map(|toks| {
+                    toks.iter()
+                        .map(|t| (t.kind, t.text.clone(), t.prefixed, t.written.clone()))
+                        .collect::<Vec<_>>()
+                });
+                assert_eq!(new, old, "tokens of {sql:?}");
+            }
+            let normalized = QueryNormalizer::new().normalize(sql).tables;
+            let table_sets = [
+                normalized,
+                fixed[0].clone(),
+                fixed[1].clone(),
+                fixed[2].clone(),
+            ];
+            for names in &table_sets {
+                for max in [UNBOUNDED, 40] {
+                    let new = canonicalize(sql, names, max);
+                    let old = legacy::legacy_canonicalize(sql, names, max);
+                    assert_eq!(
+                        new, old,
+                        "canonical form of {sql:?} over {names:?} (max {max})"
+                    );
+                    assert_eq!(
+                        verbatim(sql, names, max),
+                        legacy::legacy_verbatim(sql, names, max),
+                        "verbatim form of {sql:?} over {names:?} (max {max})"
+                    );
+                    assert_eq!(
+                        relations_complete(sql, names, max),
+                        legacy::legacy_relations_complete(sql, names, max),
+                        "relations of {sql:?} over {names:?} (max {max})"
+                    );
+                    if new.is_some() {
+                        accepted += 1;
+                    } else {
+                        refused += 1;
+                    }
+                }
+            }
+        }
+        // The corpus exercises both decisions, not one of them.
+        assert!(accepted > 1_000, "accepted {accepted}");
+        assert!(refused > 1_000, "refused {refused}");
     }
 }

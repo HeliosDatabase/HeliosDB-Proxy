@@ -62,7 +62,7 @@ pub(crate) const KIND_NUMBER: u8 = b'n';
 
 /// One lexical piece of SQL text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Piece<'a> {
+pub(crate) enum Piece<'a> {
     /// A run of whitespace.
     Space(&'a str),
     /// A `--` or `/* */` comment.
@@ -88,7 +88,7 @@ enum Piece<'a> {
 }
 
 /// The pieces of `sql` in order, each with its byte offset.
-struct Pieces<'a> {
+pub(crate) struct Pieces<'a> {
     sql: &'a str,
     i: usize,
     /// The offset of the last `;` in `sql` without its trailing whitespace
@@ -99,7 +99,7 @@ struct Pieces<'a> {
 }
 
 impl<'a> Pieces<'a> {
-    fn new(sql: &'a str) -> Self {
+    pub(crate) fn new(sql: &'a str) -> Self {
         Self {
             sql,
             i: 0,
@@ -1710,9 +1710,12 @@ pub(crate) enum TokenKind {
 /// One token of a statement, as the semantic tier compares them.
 #[cfg(feature = "query-cache")]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Token {
+pub(crate) struct Token<'a> {
     pub(crate) kind: TokenKind,
-    pub(crate) text: String,
+    /// The token's text: borrowed from the statement, except an unquoted
+    /// word with upper-case letters (lower-cased, a keyword as a static
+    /// string) and a run of operator bytes spelled `<>` for `!=`.
+    pub(crate) text: Cow<'a, str>,
     /// A string or quoted identifier glued to a preceding identifier byte or
     /// `&` (`E'…'`, `B'…'`, `U&'…'`, `U&"…"`): its meaning is not its text.
     pub(crate) prefixed: bool,
@@ -1720,11 +1723,11 @@ pub(crate) struct Token {
     /// upper-case letters). PostgreSQL folds it, but a backend may not:
     /// HeliosDB-Nano labels an output column with its alias or column name
     /// as written.
-    pub(crate) written: Option<String>,
+    pub(crate) written: Option<&'a str>,
 }
 
 #[cfg(feature = "query-cache")]
-impl Token {
+impl Token<'_> {
     /// Whether this is the unquoted word `w` (lower-case).
     pub(crate) fn is_word(&self, w: &str) -> bool {
         self.kind == TokenKind::Word && self.text == w
@@ -1746,10 +1749,13 @@ impl Token {
 /// `standard_conforming_strings` readings disagree), or `inert` refuses a
 /// comment.
 #[cfg(feature = "query-cache")]
-pub(crate) fn tokens(sql: &str, mut inert: impl FnMut(&str) -> bool) -> Result<Vec<Token>, ()> {
+pub(crate) fn tokens<'a>(
+    sql: &'a str,
+    mut inert: impl FnMut(&str) -> bool,
+) -> Result<Vec<Token<'a>>, ()> {
     const OPERATOR: &[u8] = b"+-*/<>=~!@#%^&|`?";
     let b = sql.as_bytes();
-    let mut out: Vec<Token> = Vec::new();
+    let mut out: Vec<Token<'a>> = Vec::new();
     // End offset of the previous non-separator piece.
     let mut prev_end = usize::MAX;
     for (start, piece) in Pieces::new(sql) {
@@ -1763,49 +1769,55 @@ pub(crate) fn tokens(sql: &str, mut inert: impl FnMut(&str) -> bool) -> Result<V
             Piece::Comment(comment) if inert(comment) => continue,
             Piece::Comment(_) => return Err(()),
             Piece::Rest(_) => return Err(()),
-            Piece::Ident(t) => (TokenKind::Ident, t.to_string(), glued),
-            Piece::Str(t) => (TokenKind::Str, t.to_string(), glued),
-            Piece::Dollar(t, _) => (TokenKind::Dollar, t.to_string(), false),
-            Piece::Number(t) => (TokenKind::Number, t.to_string(), false),
+            Piece::Ident(t) => (TokenKind::Ident, Cow::Borrowed(t), glued),
+            Piece::Str(t) => (TokenKind::Str, Cow::Borrowed(t), glued),
+            Piece::Dollar(t, _) => (TokenKind::Dollar, Cow::Borrowed(t), false),
+            Piece::Number(t) => (TokenKind::Number, Cow::Borrowed(t), false),
             Piece::Text(t) => {
                 let c = t.as_bytes()[0];
                 if ident_start(c) {
-                    (TokenKind::Word, t.to_ascii_lowercase(), false)
+                    (TokenKind::Word, lowercase_word(t), false)
                 } else if c.is_ascii_digit()
                     || (c == b'.' && t.as_bytes().get(1).is_some_and(u8::is_ascii_digit))
                 {
                     // A number running into an identifier (`1x`, `.5x`).
-                    (TokenKind::Number, t.to_string(), false)
+                    (TokenKind::Number, Cow::Borrowed(t), false)
                 } else if c == b'$' && t.len() > 1 {
-                    (TokenKind::Param, t.to_string(), false)
+                    (TokenKind::Param, Cow::Borrowed(t), false)
                 } else if OPERATOR.contains(&c) {
                     match out.last_mut() {
                         Some(last) if adjacent && last.kind == TokenKind::Op => {
-                            last.text.push_str(t);
+                            // Adjacent operator bytes: the run is one slice
+                            // of the statement, which `last` already ends at
+                            // `start`.
+                            last.text =
+                                Cow::Borrowed(&sql[start - last.text.len()..start + t.len()]);
                             prev_end = start + t.len();
                             continue;
                         }
-                        _ => (TokenKind::Op, t.to_string(), false),
+                        _ => (TokenKind::Op, Cow::Borrowed(t), false),
                     }
                 } else if c == b':' {
                     match out.last_mut() {
                         Some(last)
                             if adjacent && last.kind == TokenKind::Punct && last.text == ":" =>
                         {
-                            last.text.push(':');
+                            // `::` (or `..`-style pairs of colons): `last`
+                            // is the colon before `start`.
+                            last.text = Cow::Borrowed(&sql[start - last.text.len()..start + 1]);
                             prev_end = start + 1;
                             continue;
                         }
-                        _ => (TokenKind::Punct, t.to_string(), false),
+                        _ => (TokenKind::Punct, Cow::Borrowed(t), false),
                     }
                 } else {
-                    (TokenKind::Punct, t.to_string(), false)
+                    (TokenKind::Punct, Cow::Borrowed(t), false)
                 }
             }
         };
         prev_end = start + piece_len(piece);
         let written = match piece {
-            Piece::Text(t) if kind == TokenKind::Word && t != text => Some(t.to_string()),
+            Piece::Text(t) if kind == TokenKind::Word && t != text.as_ref() => Some(t),
             _ => None,
         };
         out.push(Token {
@@ -1817,10 +1829,35 @@ pub(crate) fn tokens(sql: &str, mut inert: impl FnMut(&str) -> bool) -> Result<V
     }
     for token in &mut out {
         if token.kind == TokenKind::Op && token.text == "!=" {
-            token.text = "<>".to_string();
+            token.text = Cow::Borrowed("<>");
         }
     }
     Ok(out)
+}
+
+/// An unquoted word lower-cased: borrowed when it has no upper-case letter,
+/// a static keyword when it is one (no allocation), else owned.
+#[cfg(feature = "query-cache")]
+fn lowercase_word(t: &str) -> Cow<'_, str> {
+    if !t.bytes().any(|c| c.is_ascii_uppercase()) {
+        return Cow::Borrowed(t);
+    }
+    // Every keyword is no longer than the longest identifier PostgreSQL
+    // keeps, so a longer word is no keyword and takes the owned path.
+    if t.len() <= MAX_IDENTIFIER_BYTES {
+        let mut buf = [0u8; MAX_IDENTIFIER_BYTES];
+        let folded = &mut buf[..t.len()];
+        folded.copy_from_slice(t.as_bytes());
+        folded.make_ascii_lowercase();
+        if let Ok(lower) = std::str::from_utf8(folded) {
+            if let Ok(i) =
+                crate::config::POSTGRES_RESERVED_WORDS.binary_search_by(|w| (*w).cmp(lower))
+            {
+                return Cow::Borrowed(crate::config::POSTGRES_RESERVED_WORDS[i]);
+            }
+        }
+    }
+    Cow::Owned(t.to_ascii_lowercase())
 }
 
 /// The byte length of a piece.
@@ -2421,7 +2458,7 @@ mod tests {
             |_| true,
         )
         .unwrap();
-        let text: Vec<&str> = toks.iter().map(|t| t.text.as_str()).collect();
+        let text: Vec<&str> = toks.iter().map(|t| &*t.text).collect();
         assert_eq!(
             text,
             [
@@ -2431,13 +2468,13 @@ mod tests {
         );
         assert_eq!(toks[14].kind, TokenKind::Param);
         // A word keeps its spelling aside, only when the fold changed it.
-        let written: Vec<Option<&str>> = toks.iter().map(|t| t.written.as_deref()).collect();
+        let written: Vec<Option<&str>> = toks.iter().map(|t| t.written).collect();
         assert_eq!(
             written[..4],
             [Some("SELECT"), Some("T"), None, None],
             "the quoted \"Val\" is verbatim already"
         );
-        assert_eq!((toks[9].text.as_str(), written[9]), ("kv", None));
+        assert_eq!((&*toks[9].text, written[9]), ("kv", None));
         let glued = tokens("SELECT E'x', U&'y'", |_| true).unwrap();
         assert_eq!(glued.iter().filter(|t| t.prefixed).count(), 2);
         assert!(!tokens("SELECT 'x'", |_| true).unwrap()[1].prefixed);
@@ -2490,7 +2527,7 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .skip(1)
-                .map(|t| t.text)
+                .map(|t| t.text.into_owned())
                 .collect()
         };
         assert_eq!(texts("SELECT 1.e3"), ["1.e3"]);
@@ -2506,7 +2543,7 @@ mod tests {
         assert_eq!(texts("SELECT t.c, t.5"), ["t", ".", "c", ",", "t", ".5"]);
         // A number running into an identifier is one number token.
         let junk = tokens("SELECT 1.x, .5x", |_| true).unwrap();
-        let junk: Vec<_> = junk.iter().map(|t| (t.kind, t.text.as_str())).collect();
+        let junk: Vec<_> = junk.iter().map(|t| (t.kind, &*t.text)).collect();
         assert_eq!(
             junk[1..],
             [

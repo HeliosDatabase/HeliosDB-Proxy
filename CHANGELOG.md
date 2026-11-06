@@ -41,6 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that used to get an immediate refusal during an outage now waits up to 5 s for an answer;
   set `startup_node_wait_ms = 0` to restore the immediate refusal. Counted by
   `heliosdb_proxy_startup_waits_total` and `heliosdb_proxy_startup_wait_timeouts_total`.
+- **Semantic cache (L3) hinted-miss CPU (perf).** The canonical parse borrows token
+  text from the statement and serialises the form into pre-sized buffers, and the
+  store shares each slot's database, user and branch strings as `Arc<str>` (no
+  behaviour change; `f96d0d9a13bc`).
 
 ### Added
 

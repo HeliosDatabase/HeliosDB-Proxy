@@ -245,12 +245,33 @@ struct Counters {
     too_large: AtomicU64,
 }
 
+/// The strings of a session context, shared by the slots that hold it: a
+/// new slot takes them from a live slot of the same bucket (see
+/// [`Inner::shared_context`]), so they are never interned beyond the slots
+/// that use them.
+#[derive(Clone)]
+struct SharedContext {
+    database: Arc<str>,
+    user: Option<Arc<str>>,
+    branch: Option<Arc<str>>,
+}
+
+impl SharedContext {
+    fn new(ctx: &CacheContext) -> Self {
+        Self {
+            database: Arc::from(ctx.database.as_str()),
+            user: ctx.user.as_deref().map(Arc::from),
+            branch: ctx.branch.as_deref().map(Arc::from),
+        }
+    }
+}
+
 /// One cached result of one canonical statement in one session context.
 struct Slot {
     seq: u64,
-    database: String,
-    user: Option<String>,
-    branch: Option<String>,
+    database: Arc<str>,
+    user: Option<Arc<str>>,
+    branch: Option<Arc<str>>,
     shape: String,
     select: String,
     columns: Vec<Option<String>>,
@@ -262,10 +283,21 @@ impl Slot {
     /// Same statement shape in the same context (a bucket can, after a hash
     /// collision, hold others).
     fn matches(&self, c: &Canonical, ctx: &CacheContext) -> bool {
-        self.shape == c.shape
-            && self.database == ctx.database
-            && self.user == ctx.user
-            && self.branch == ctx.branch
+        self.shape == c.shape && self.same_context(ctx)
+    }
+
+    fn same_context(&self, ctx: &CacheContext) -> bool {
+        *self.database == *ctx.database
+            && self.user.as_deref() == ctx.user.as_deref()
+            && self.branch.as_deref() == ctx.branch.as_deref()
+    }
+
+    fn shared_context(&self) -> SharedContext {
+        SharedContext {
+            database: self.database.clone(),
+            user: self.user.clone(),
+            branch: self.branch.clone(),
+        }
     }
 }
 
@@ -567,6 +599,25 @@ impl Inner {
     }
 
     /// The index of the shard holding bucket `key`.
+    /// The context's strings for a new slot in shard `shard`, bucket `key`:
+    /// those of a live slot of that bucket holding the same context, else new
+    /// ones. Nothing is interned beyond the live slots (a string is freed with
+    /// the last slot holding it), and the shard is read-locked only for the
+    /// clone.
+    fn shared_context(&self, shard: usize, key: u64, ctx: &CacheContext) -> SharedContext {
+        let held = self.shards[shard]
+            .read()
+            .buckets
+            .get(&key)
+            .and_then(|bucket| {
+                bucket
+                    .iter()
+                    .find(|s| s.same_context(ctx))
+                    .map(Slot::shared_context)
+            });
+        held.unwrap_or_else(|| SharedContext::new(ctx))
+    }
+
     fn shard_index(&self, key: u64) -> usize {
         // Truncation on a 32-bit target keeps the low bits, all the mask reads.
         key as usize & self.shard_mask
@@ -1053,18 +1104,19 @@ impl L3SemanticCache {
             inner.counters.too_large.fetch_add(1, Ordering::Relaxed);
             return 0;
         }
+        let home = inner.shard_index(key);
+        let shared = inner.shared_context(home, key, ctx);
         let slot = Slot {
             seq: 0,
-            database: ctx.database.clone(),
-            user: ctx.user.clone(),
-            branch: ctx.branch.clone(),
+            database: shared.database,
+            user: shared.user,
+            branch: shared.branch,
             shape: c.shape.clone(),
             select: c.select.clone(),
             columns: c.columns.clone(),
             result,
             charge,
         };
-        let home = inner.shard_index(key);
         let mut dead: Vec<Slot> = Vec::new();
         let (settled, replaced) = {
             let mut guard = inner.shards[home].write();
