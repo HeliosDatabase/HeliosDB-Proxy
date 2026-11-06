@@ -887,11 +887,9 @@ impl ProxyServer {
                 enabled: true,
                 default_qps: rl.default_qps,
                 default_burst: rl.default_burst,
-                default_concurrency: if rl.max_concurrent > 0 {
-                    rl.max_concurrent
-                } else {
-                    crate::rate_limit::RateLimitConfig::default().default_concurrency
-                },
+                default_concurrency: crate::rate_limit::RateLimitConfig::default()
+                    .default_concurrency,
+                max_in_flight: rl.max_concurrent,
                 ..Default::default()
             };
             Some(Arc::new(crate::rate_limit::RateLimiter::new(rlc)))
@@ -2130,6 +2128,10 @@ impl ProxyServer {
                                 .metrics
                                 .cache_excluded
                                 .load(Ordering::Relaxed),
+                            rate_limit_concurrency_refused: server_state
+                                .metrics
+                                .rate_limit_concurrency_refused
+                                .load(Ordering::Relaxed),
                             cache_catalog_skipped: server_state
                                 .metrics
                                 .cache_catalog_skipped
@@ -2400,6 +2402,11 @@ impl ProxyServer {
                 .cache_capture_oversize
                 .load(Ordering::Relaxed),
             cache_excluded: self.state.metrics.cache_excluded.load(Ordering::Relaxed),
+            rate_limit_concurrency_refused: self
+                .state
+                .metrics
+                .rate_limit_concurrency_refused
+                .load(Ordering::Relaxed),
             cache_catalog_skipped: self
                 .state
                 .metrics

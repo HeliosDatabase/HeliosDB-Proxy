@@ -211,6 +211,11 @@ pub struct RateLimitConfig {
     /// Default max concurrent queries
     pub default_concurrency: u32,
 
+    /// Requests a rate-limit bucket may have in flight at once (`[rate_limit]
+    /// max_concurrent`). A request over the cap is refused (53400) instead of
+    /// queued. `0` = not enforced.
+    pub max_in_flight: u32,
+
     /// Action when limit exceeded
     pub exceeded_action: ExceededAction,
 
@@ -262,6 +267,7 @@ impl Default for RateLimitConfig {
             default_qps: 1000,
             default_burst: 2000,
             default_concurrency: 100,
+            max_in_flight: 0,
             exceeded_action: ExceededAction::Reject,
             retry_after: true,
             overrides: HashMap::new(),
@@ -394,6 +400,12 @@ impl RateLimitConfigBuilder {
 
     pub fn default_concurrency(mut self, concurrency: u32) -> Self {
         self.config.default_concurrency = concurrency;
+        self
+    }
+
+    /// Cap each bucket's in-flight requests (`0` = not enforced).
+    pub fn max_in_flight(mut self, max: u32) -> Self {
+        self.config.max_in_flight = max;
         self
     }
 

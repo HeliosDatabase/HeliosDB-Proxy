@@ -1494,7 +1494,7 @@ key_by = "user"
 | `enabled` | bool | `false` | Enforce rate limits. |
 | `default_qps` | u32 | `1000` | Sustained queries/sec per bucket. |
 | `default_burst` | u32 | `2000` | Token-bucket depth (burst) per bucket. |
-| `max_concurrent` | u32 | `0` | Not enforced: nothing on the data path checks it (see `[multi_tenancy] max_active_queries_per_tenant` for a per-tenant concurrency cap). |
+| `max_concurrent` | u32 | `0` | Enforced per bucket: at most this many requests of one `key_by` bucket are in flight at once. A request over the cap is refused with SQLSTATE `53400` (the same refusal and message style as the QPS limit, with its ReadyForQuery reporting the transaction's real status), not queued; it is counted in `heliosdb_proxy_rate_limit_concurrency_refused_total`. A request takes its bucket's slot at the request boundary, and returns it when its ReadyForQuery is relayed (a Flush-dispatched extended cycle keeps it until its `Sync`), when it fails, and when its client disconnects. A refused request spends no QPS token. `COMMIT`, `END`, `ROLLBACK` and `ABORT` (a single statement, 2PC forms included, as a simple query or an extended cycle whose statement is one of them) run past the cap, so a session can always end its transaction. A bucket with nothing in flight keeps no state. `0` = not enforced (the default; no request pays for the check beyond one branch). Read at startup, like `default_qps`. For a per-tenant cap that queues instead of refusing, see `[multi_tenancy] max_active_queries_per_tenant`. |
 | `key_by` | string | `"user"` | Bucket key: `user`, `client_ip`, `database`, `global`. |
 
 > The keys are `default_qps` / `default_burst`. A file that says `global_qps` /

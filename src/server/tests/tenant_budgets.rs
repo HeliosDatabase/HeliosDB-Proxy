@@ -5403,3 +5403,223 @@ fn the_backend_key_is_read_from_the_startup_frames() {
     assert_eq!(ProxyServer::backend_key_data(&[b'K', 0, 0, 0, 2]), None);
     assert_eq!(ProxyServer::backend_key_data(&[]), None);
 }
+
+/// `[rate_limit] max_concurrent`: the in-flight cap per rate-limit bucket,
+/// through the whole client handler against the same fake backend. The
+/// bucket is the user (`key_by` defaults to `user`).
+#[cfg(feature = "rate-limiting")]
+mod max_concurrent {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    const REFUSED_ALICE: &str = "too many concurrent queries for user:alice (max_concurrent 1)";
+
+    struct Rate {
+        server: ProxyServer,
+        state: Arc<ServerState>,
+        config: ProxyConfig,
+        backend: FakeBackend,
+    }
+
+    impl Rate {
+        async fn new(tweak: impl FnOnce(&mut ProxyConfig)) -> Self {
+            let backend = FakeBackend::start(None).await;
+            let mut config = test_config();
+            config.nodes.clear();
+            config
+                .add_node(&backend.addr.to_string(), "primary")
+                .unwrap();
+            config.pool.acquire_timeout_secs = 1;
+            config.limits.startup_timeout_secs = 3;
+            config.rate_limit.enabled = true;
+            config.rate_limit.max_concurrent = 1;
+            tweak(&mut config);
+            let server = ProxyServer::new(config.clone()).unwrap();
+            let state = server.state.clone();
+            Self {
+                server,
+                state,
+                config,
+                backend,
+            }
+        }
+
+        async fn connect(&self, user: &str) -> Client {
+            let (proxy, mut s) = pair().await;
+            let peer = proxy.peer_addr().unwrap();
+            let task = tokio::spawn(ProxyServer::handle_client(
+                proxy,
+                peer,
+                self.state.clone(),
+                Arc::new(self.config.clone()),
+                self.server.shutdown_tx.clone(),
+            ));
+            s.write_all(&startup_bytes(user)).await.unwrap();
+            let mut client = Client {
+                s,
+                key: (0, 0),
+                task,
+            };
+            for f in client.until_ready().await {
+                if f[0] == b'K' {
+                    client.key = (
+                        u32::from_be_bytes(f[5..9].try_into().unwrap()),
+                        u32::from_be_bytes(f[9..13].try_into().unwrap()),
+                    );
+                }
+            }
+            client
+        }
+
+        /// The bucket's in-flight count for `user` right now.
+        fn in_flight(&self, user: &str) -> u32 {
+            let limiter = self.state.rate_limiter.as_ref().expect("enabled");
+            limiter.in_flight(&crate::rate_limit::CachedLimiterKey::new(
+                crate::rate_limit::LimiterKey::User(user.to_string()),
+            ))
+        }
+
+        /// Wait until `user`'s bucket has no request in flight.
+        async fn until_idle(&self, user: &str) {
+            let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
+            while self.in_flight(user) != 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{user}'s bucket never went idle"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        /// Send `sql` on `client` and wait until the backend has it (it is
+        /// held in flight until `release_slow`).
+        async fn hold(&self, client: &mut Client, sql: &str) {
+            client.send(&query(sql)).await;
+            let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
+            while !self.backend.saw_query(sql) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "never forwarded {sql:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        fn refusals(&self) -> u64 {
+            self.state
+                .metrics
+                .rate_limit_concurrency_refused
+                .load(Ordering::Relaxed)
+        }
+    }
+
+    /// The frames are exactly ErrorResponse 53400 (naming the bucket) then
+    /// ReadyForQuery `status`, with the statement never forwarded.
+    fn assert_bucket_refused(frames: &[Vec<u8>], status: u8) {
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert_eq!(sqlstate(&frames[0]), "53400", "{frames:?}");
+        assert!(has_text(&frames[0], REFUSED_ALICE), "{:?}", frames[0]);
+        assert_eq!(frames[1], wire(b'Z', &[status]));
+    }
+
+    #[tokio::test]
+    async fn a_second_query_in_the_bucket_is_refused_while_the_first_is_in_flight() {
+        let r = Rate::new(|_| {}).await;
+        let mut a = r.connect("alice").await;
+        let mut b = r.connect("alice").await;
+        r.hold(&mut a, "select 'slow a'").await;
+        assert_eq!(r.in_flight("alice"), 1);
+
+        assert_bucket_refused(&b.query("select 'b'").await, b'I');
+        assert!(
+            !r.backend.saw_query("select 'b'"),
+            "a refusal never reaches the backend"
+        );
+        assert_eq!(r.refusals(), 1);
+
+        r.backend.release_slow();
+        assert_served(&a.until_ready().await, b'I');
+        r.until_idle("alice").await;
+        assert_served(&b.query("select 'b'").await, b'I');
+        assert_eq!(r.refusals(), 1, "the second attempt was admitted");
+        r.until_idle("alice").await;
+    }
+
+    #[tokio::test]
+    async fn another_bucket_is_not_refused() {
+        let r = Rate::new(|_| {}).await;
+        let mut a = r.connect("alice").await;
+        let mut bob = r.connect("bob").await;
+        r.hold(&mut a, "select 'slow a'").await;
+
+        assert_served(&bob.query("select 'bob'").await, b'I');
+        assert_eq!(r.refusals(), 0);
+
+        r.backend.release_slow();
+        assert_served(&a.until_ready().await, b'I');
+        r.until_idle("alice").await;
+    }
+
+    #[tokio::test]
+    async fn a_zero_cap_is_no_cap() {
+        let r = Rate::new(|c| c.rate_limit.max_concurrent = 0).await;
+        let mut a = r.connect("alice").await;
+        let mut b = r.connect("alice").await;
+        r.hold(&mut a, "select 'slow a'").await;
+
+        assert_served(&b.query("select 'b'").await, b'I');
+        assert_eq!(r.in_flight("alice"), 0, "nothing is counted without a cap");
+        assert_eq!(r.refusals(), 0);
+
+        r.backend.release_slow();
+        assert_served(&a.until_ready().await, b'I');
+    }
+
+    #[tokio::test]
+    async fn commit_is_exempt_from_the_bucket_cap_inside_a_transaction() {
+        let r = Rate::new(|_| {}).await;
+        let mut a = r.connect("alice").await;
+        let mut b = r.connect("alice").await;
+        assert_served(&b.query("BEGIN").await, b'T');
+        r.hold(&mut a, "select 'slow a'").await;
+
+        assert_bucket_refused(&b.query("select 'b'").await, b'T');
+        assert_served(&b.query("COMMIT").await, b'I');
+        assert!(
+            r.backend.saw_query("COMMIT"),
+            "the exempt COMMIT reached the backend"
+        );
+        assert_eq!(r.refusals(), 1, "only the select was refused");
+
+        r.backend.release_slow();
+        assert_served(&a.until_ready().await, b'I');
+        r.until_idle("alice").await;
+    }
+
+    #[tokio::test]
+    async fn an_error_response_releases_the_slot() {
+        let r = Rate::new(|_| {}).await;
+        let mut a = r.connect("alice").await;
+        let mut b = r.connect("alice").await;
+        let frames = a.query("select * from missing_table").await;
+        assert_eq!(sqlstate(&frames[0]), "42P01", "{frames:?}");
+        r.until_idle("alice").await;
+
+        assert_served(&b.query("select 'b'").await, b'I');
+        assert_eq!(r.refusals(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_while_in_flight_releases_the_slot() {
+        let r = Rate::new(|_| {}).await;
+        let mut a = r.connect("alice").await;
+        let mut b = r.connect("alice").await;
+        r.hold(&mut a, "select 'slow a'").await;
+        assert_eq!(r.in_flight("alice"), 1);
+
+        drop(a);
+        r.backend.release_slow();
+        r.until_idle("alice").await;
+        assert_served(&b.query("select 'b'").await, b'I');
+    }
+}

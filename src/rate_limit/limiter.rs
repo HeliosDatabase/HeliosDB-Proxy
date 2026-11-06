@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
-use super::concurrency::ConcurrencyLimiter;
 use super::config::{ExceededAction, PriorityLevel, RateLimitConfig};
 use super::cost_estimator::QueryCostEstimator;
 use super::metrics::RateLimitMetrics;
@@ -241,6 +241,65 @@ impl std::fmt::Display for LimitType {
     }
 }
 
+/// Requests in flight per bucket for `[rate_limit] max_concurrent` (the
+/// config's `max_in_flight`), keyed by the bucket's rendered key. A bucket
+/// has an entry only while at least one of its requests holds a slot, so the
+/// map is bounded by the requests in flight, not by the buckets ever seen.
+type InFlightMap = DashMap<Arc<str>, u32>;
+
+/// A bucket is at its `max_concurrent` cap: the request is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InFlightRefusal {
+    /// The cap the bucket is at (`[rate_limit] max_concurrent`).
+    pub limit: u32,
+}
+
+/// One in-flight slot of a bucket, given back when it is dropped (the
+/// request ends, or its session goes away, however it ends). A permit that
+/// holds no slot (the cap is not enforced) drops as a no-op.
+pub struct BucketPermit {
+    slot: Option<(Arc<InFlightMap>, Arc<str>)>,
+}
+
+impl BucketPermit {
+    /// Whether the permit holds a slot of a bucket.
+    pub fn holds_slot(&self) -> bool {
+        self.slot.is_some()
+    }
+}
+
+impl Drop for BucketPermit {
+    fn drop(&mut self) {
+        if let Some((map, key)) = self.slot.take() {
+            release_in_flight(&map, &key);
+        }
+    }
+}
+
+impl std::fmt::Debug for BucketPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BucketPermit")
+            .field("holds_slot", &self.holds_slot())
+            .finish()
+    }
+}
+
+/// Give one slot of `key` back, and drop the bucket's entry once it has none
+/// left. The removal re-checks the count under the map's shard lock, so an
+/// acquisition that raced the release keeps its entry.
+fn release_in_flight(map: &InFlightMap, key: &str) {
+    let idle = match map.get_mut(key) {
+        Some(mut count) => {
+            *count = count.saturating_sub(1);
+            *count == 0
+        }
+        None => false,
+    };
+    if idle {
+        map.remove_if(key, |_, count| *count == 0);
+    }
+}
+
 /// Main rate limiter
 pub struct RateLimiter {
     /// Configuration. Held in an `ArcSwap` rather than a `RwLock` so the
@@ -255,8 +314,8 @@ pub struct RateLimiter {
     /// Sliding window limiters (rolling counts)
     sliding_windows: DashMap<LimiterKey, SlidingWindow>,
 
-    /// Concurrency limiters (active query count)
-    concurrency: DashMap<LimiterKey, Arc<ConcurrencyLimiter>>,
+    /// Requests in flight per bucket (`[rate_limit] max_concurrent`).
+    in_flight: Arc<InFlightMap>,
 
     /// Query cost estimator
     cost_estimator: QueryCostEstimator,
@@ -275,7 +334,7 @@ impl RateLimiter {
             config: ArcSwap::from_pointee(config),
             token_buckets: DashMap::new(),
             sliding_windows: DashMap::new(),
-            concurrency: DashMap::new(),
+            in_flight: Arc::new(InFlightMap::new()),
             cost_estimator: QueryCostEstimator::new(),
             metrics: Arc::new(RateLimitMetrics::new()),
             created_at: Instant::now(),
@@ -288,7 +347,7 @@ impl RateLimiter {
             config: ArcSwap::from_pointee(config),
             token_buckets: DashMap::new(),
             sliding_windows: DashMap::new(),
-            concurrency: DashMap::new(),
+            in_flight: Arc::new(InFlightMap::new()),
             cost_estimator: estimator,
             metrics: Arc::new(RateLimitMetrics::new()),
             created_at: Instant::now(),
@@ -374,49 +433,45 @@ impl RateLimiter {
         RateLimitResult::Allowed
     }
 
-    /// Check and acquire concurrency slot
-    pub fn check_concurrency(
+    /// Whether `[rate_limit] max_concurrent` is enforced (a cap above 0).
+    pub fn in_flight_enforced(&self) -> bool {
+        self.config.load().max_in_flight > 0
+    }
+
+    /// Take one in-flight slot of `key`'s bucket. Refused (no slot taken)
+    /// when the bucket already has `max_in_flight` requests in flight; with
+    /// no cap the permit holds nothing. The slot returns when the permit is
+    /// dropped.
+    pub fn try_acquire_in_flight(
         &self,
-        key: &LimiterKey,
-    ) -> Result<Arc<ConcurrencyLimiter>, RateLimitExceeded> {
-        let config = self.config.load();
-
-        if !config.enabled {
-            // Return a dummy limiter that allows everything
-            return Ok(Arc::new(ConcurrencyLimiter::new(u32::MAX)));
+        key: &CachedLimiterKey,
+    ) -> Result<BucketPermit, InFlightRefusal> {
+        let limit = self.config.load().max_in_flight;
+        if limit == 0 {
+            return Ok(BucketPermit { slot: None });
         }
-
-        let max = config.effective_concurrency(key, PriorityLevel::Normal);
-
-        // Hit path first: an existing limiter is looked up with `get_mut`
-        // (still the DashMap shard *write* guard, so the key is only cloned
-        // when a new bucket actually has to be inserted) rather than `get`
-        // (a read guard). See `check_token_bucket` for why the write guard
-        // matters: DashMap's `entry()` and `get_mut()` take the same shard
-        // write lock, so this preserves the mutual exclusion `entry()` gave
-        // us between two threads racing to insert the same fresh key.
-        let limiter = match self.concurrency.get_mut(key) {
-            Some(existing) => Arc::clone(existing.value()),
-            None => self
-                .concurrency
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(ConcurrencyLimiter::new(max)))
-                .clone(),
-        };
-
-        // Check if would exceed
-        if limiter.at_capacity() {
-            return Err(RateLimitExceeded {
-                key: key.clone(),
-                limit_type: LimitType::Concurrency,
-                current: limiter.active_count() as u64,
-                limit: max as u64,
-                retry_after: Duration::from_millis(100), // Estimate
-                message: "Concurrency limit exceeded".to_string(),
-            });
+        let name = key.display();
+        match self.in_flight.entry(Arc::clone(name)) {
+            Entry::Occupied(mut count) => {
+                if *count.get() >= limit {
+                    return Err(InFlightRefusal { limit });
+                }
+                *count.get_mut() += 1;
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(1);
+            }
         }
+        Ok(BucketPermit {
+            slot: Some((Arc::clone(&self.in_flight), Arc::clone(name))),
+        })
+    }
 
-        Ok(limiter)
+    /// Requests of `key`'s bucket in flight right now.
+    pub fn in_flight(&self, key: &CachedLimiterKey) -> u32 {
+        self.in_flight
+            .get(&**key.display())
+            .map_or(0, |count| *count)
     }
 
     /// Check for a query with automatic cost estimation
@@ -462,9 +517,6 @@ impl RateLimiter {
         if let Some(window) = self.sliding_windows.get(key) {
             window.reset();
         }
-        if let Some(limiter) = self.concurrency.get(key) {
-            limiter.reset_stats();
-        }
         self.metrics.reset_key(key);
     }
 
@@ -485,16 +537,15 @@ impl RateLimiter {
             stats.insert("window_max".to_string(), window.max_events() as u64);
         }
 
-        if let Some(limiter) = self.concurrency.get(key) {
+        let max_in_flight = self.config.load().max_in_flight;
+        if max_in_flight > 0 {
             stats.insert(
                 "active_concurrent".to_string(),
-                limiter.active_count() as u64,
+                self.in_flight
+                    .get(&*key.to_string())
+                    .map_or(0, |count| *count) as u64,
             );
-            stats.insert(
-                "max_concurrent".to_string(),
-                limiter.max_concurrent() as u64,
-            );
-            stats.insert("queued".to_string(), limiter.queue_length() as u64);
+            stats.insert("max_concurrent".to_string(), max_in_flight as u64);
         }
 
         stats
@@ -652,7 +703,7 @@ impl std::fmt::Debug for RateLimiter {
             .field("enabled", &self.config.load().enabled)
             .field("token_buckets", &self.token_buckets.len())
             .field("sliding_windows", &self.sliding_windows.len())
-            .field("concurrency_limiters", &self.concurrency.len())
+            .field("in_flight_buckets", &self.in_flight.len())
             .field("uptime", &self.uptime())
             .finish()
     }
@@ -879,18 +930,106 @@ mod tests {
         assert_eq!(limiter.config().default_qps, 200);
     }
 
+    fn in_flight_limiter(max_in_flight: u32) -> RateLimiter {
+        RateLimiter::new(RateLimitConfig {
+            enabled: true,
+            max_in_flight,
+            ..Default::default()
+        })
+    }
+
+    fn bucket(name: &str) -> CachedLimiterKey {
+        CachedLimiterKey::new(LimiterKey::User(name.to_string()))
+    }
+
+    /// The cap applies per bucket: a bucket at its cap refuses, while another
+    /// bucket still takes its own slots.
     #[test]
-    fn test_concurrency_check() {
-        let config = RateLimitConfig::builder().default_concurrency(10).build();
-        let limiter = RateLimiter::new(config);
+    fn in_flight_refuses_past_the_cap_per_bucket() {
+        let limiter = in_flight_limiter(2);
+        let alice = bucket("alice");
+        let a1 = limiter.try_acquire_in_flight(&alice).unwrap();
+        let a2 = limiter.try_acquire_in_flight(&alice).unwrap();
+        assert!(a1.holds_slot() && a2.holds_slot());
+        assert_eq!(limiter.in_flight(&alice), 2);
 
-        let key = LimiterKey::User("test".to_string());
+        let refused = limiter.try_acquire_in_flight(&alice).unwrap_err();
+        assert_eq!(refused, InFlightRefusal { limit: 2 });
+        assert_eq!(limiter.in_flight(&alice), 2, "a refusal takes no slot");
 
-        let result = limiter.check_concurrency(&key);
-        assert!(result.is_ok());
+        let b1 = limiter.try_acquire_in_flight(&bucket("bob")).unwrap();
+        assert!(b1.holds_slot());
+        assert_eq!(limiter.in_flight(&bucket("bob")), 1);
+        assert_eq!(limiter.in_flight(&alice), 2);
+    }
 
-        let conc_limiter = result.unwrap();
-        assert_eq!(conc_limiter.max_concurrent(), 10);
+    /// Dropping a permit returns its slot (RAII), and an idle bucket's entry
+    /// is removed: the map is bounded by the requests in flight.
+    #[test]
+    fn in_flight_permit_drop_releases_the_slot_and_the_entry() {
+        let limiter = in_flight_limiter(1);
+        let alice = bucket("alice");
+        let permit = limiter.try_acquire_in_flight(&alice).unwrap();
+        assert!(limiter.try_acquire_in_flight(&alice).is_err());
+        drop(permit);
+
+        assert_eq!(limiter.in_flight(&alice), 0);
+        assert!(
+            limiter.in_flight.is_empty(),
+            "an idle bucket keeps no entry"
+        );
+        assert!(limiter.try_acquire_in_flight(&alice).is_ok());
+    }
+
+    /// Many distinct buckets, each used once: no entry survives its request.
+    #[test]
+    fn in_flight_entries_do_not_accumulate_across_buckets() {
+        let limiter = in_flight_limiter(4);
+        for i in 0..1000 {
+            let permit = limiter
+                .try_acquire_in_flight(&bucket(&format!("user{i}")))
+                .unwrap();
+            assert!(permit.holds_slot());
+        }
+        assert!(limiter.in_flight.is_empty());
+    }
+
+    /// A panicking request still gives its slot back: the permit is dropped
+    /// during unwinding.
+    #[test]
+    fn in_flight_slot_returns_when_the_holder_unwinds() {
+        let limiter = Arc::new(in_flight_limiter(1));
+        let holder = Arc::clone(&limiter);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _permit = holder.try_acquire_in_flight(&bucket("alice")).unwrap();
+            panic!("request failed");
+        }));
+        assert!(result.is_err());
+        assert!(limiter.try_acquire_in_flight(&bucket("alice")).is_ok());
+    }
+
+    /// Cap 0 is no cap: nothing is counted and no entry is made.
+    #[test]
+    fn in_flight_zero_cap_counts_nothing() {
+        let limiter = in_flight_limiter(0);
+        assert!(!limiter.in_flight_enforced());
+        let alice = bucket("alice");
+        let permits: Vec<_> = (0..5)
+            .map(|_| limiter.try_acquire_in_flight(&alice).unwrap())
+            .collect();
+        assert!(permits.iter().all(|p| !p.holds_slot()));
+        assert_eq!(limiter.in_flight(&alice), 0);
+        assert!(limiter.in_flight.is_empty());
+    }
+
+    #[test]
+    fn in_flight_is_reported_in_key_stats_when_enforced() {
+        let limiter = in_flight_limiter(3);
+        let key = LimiterKey::User("alice".to_string());
+        let _permit = limiter.try_acquire_in_flight(&bucket("alice")).unwrap();
+        let stats = limiter.get_key_stats(&key);
+        assert_eq!(stats.get("active_concurrent"), Some(&1));
+        assert_eq!(stats.get("max_concurrent"), Some(&3));
     }
 
     /// Regression test for the O4 rate-limiter-key fix: the token-bucket hit

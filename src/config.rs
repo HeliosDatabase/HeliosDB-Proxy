@@ -3044,8 +3044,9 @@ pub struct RateLimitToml {
     pub default_qps: u32,
     /// Burst capacity (token-bucket depth) per bucket.
     pub default_burst: u32,
-    /// Not enforced: nothing on the data path checks it. Kept so configs that
-    /// set it still load; per-tenant concurrency is `[multi_tenancy]
+    /// Requests each bucket may have in flight at once; a request over it is
+    /// refused with 53400 (not queued). `0` = not enforced. Per-tenant
+    /// concurrency with queueing is `[multi_tenancy]
     /// max_active_queries_per_tenant`.
     pub max_concurrent: u32,
     /// What each bucket is keyed on.
@@ -3558,7 +3559,8 @@ const IGNORED_KEY_ALIASES: &[(&str, &str)] = &[
     (
         "rate_limit.global_connections",
         "there is no global connection cap here: per-tenant concurrency is [multi_tenancy] \
-         max_active_queries_per_tenant, and 'rate_limit.max_concurrent' is not enforced",
+         max_active_queries_per_tenant, and 'rate_limit.max_concurrent' caps each bucket's \
+         in-flight requests",
     ),
     (
         "rate_limit.tenant",
@@ -5428,7 +5430,7 @@ role = "primary"
                 "rate_limit.global_connections",
                 "[multi_tenancy] max_active_queries_per_tenant",
             ),
-            ("rate_limit.global_connections", "not enforced"),
+            ("rate_limit.global_connections", "in-flight requests"),
             ("rate_limit.tenant", "key_by"),
             ("circuit_breaker.reset_timeout", "circuit_breaker.open_secs"),
             (

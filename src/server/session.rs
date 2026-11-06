@@ -149,6 +149,13 @@ pub struct ClientSession {
     /// are present; see `ProxyServer::rate_limit_key`.
     #[cfg(feature = "rate-limiting")]
     pub rate_limit_key: std::sync::OnceLock<crate::rate_limit::CachedLimiterKey>,
+    /// The in-flight slot (`[rate_limit] max_concurrent`) of the request this
+    /// session is running. Taken at the request boundary by
+    /// `ProxyServer::rate_limit_check`; returned when the client loop finds
+    /// the session idle again (its request's ReadyForQuery relayed, or none
+    /// in flight), and when the session ends.
+    #[cfg(feature = "rate-limiting")]
+    pub(crate) rate_permit: parking_lot::Mutex<Option<crate::rate_limit::BucketPermit>>,
     /// The node slot (H-05) of the backend connection opened during startup,
     /// handed to that connection's `BackendConn` once the session starts.
     pub(crate) startup_slot: parking_lot::Mutex<crate::node_slots::Slot>,
@@ -179,6 +186,19 @@ pub struct ClientSession {
 }
 
 impl ClientSession {
+    /// Give back the in-flight slot the session's request holds, if any.
+    #[cfg(feature = "rate-limiting")]
+    pub(crate) fn release_rate_permit(&self) {
+        let permit = self.rate_permit.lock().take();
+        drop(permit);
+    }
+
+    /// Whether the session's request holds an in-flight slot.
+    #[cfg(feature = "rate-limiting")]
+    pub(crate) fn holds_rate_permit(&self) -> bool {
+        self.rate_permit.lock().is_some()
+    }
+
     /// The session's tenant request budgets, if its tenant has any.
     pub(crate) fn tenant_budget(&self) -> Option<&crate::tenant_slots::TenantBudget> {
         self.tenant_charge

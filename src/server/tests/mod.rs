@@ -224,6 +224,8 @@ fn make_test_session_mode(tr_mode: crate::config::TrMode) -> Arc<ClientSession> 
         pending_edge_copy_tables: std::sync::Mutex::new(None),
         #[cfg(feature = "rate-limiting")]
         rate_limit_key: std::sync::OnceLock::new(),
+        #[cfg(feature = "rate-limiting")]
+        rate_permit: parking_lot::Mutex::new(None),
         startup_slot: parking_lot::Mutex::new(None),
         reads_pinned: std::sync::atomic::AtomicBool::new(false),
         read_node: parking_lot::Mutex::new(None),

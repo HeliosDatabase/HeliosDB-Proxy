@@ -42,6 +42,9 @@ pub(super) struct ServerMetrics {
     /// Cacheable reads no result cache tier looked up or stored because
     /// their text is backend-ambiguous (`sql_text::UncacheableText`).
     pub(super) cache_ambiguous_skipped: AtomicU64,
+    /// Requests refused with 53400 because their rate-limit bucket was at
+    /// `[rate_limit] max_concurrent` in-flight requests.
+    pub(super) rate_limit_concurrency_refused: AtomicU64,
     /// P-03: client admissions that had to wait for a permit at the
     /// `max_client_connections` cap (the bounded H-05 queue bit).
     pub(super) admission_waited: AtomicU64,
@@ -144,6 +147,9 @@ pub struct ServerMetricsSnapshot {
     /// Cacheable reads kept out of every result cache tier because
     /// PostgreSQL and HeliosDB-Nano/Lite may read their text differently.
     pub cache_ambiguous_skipped: u64,
+    /// Requests refused (53400) at their rate-limit bucket's `max_concurrent`
+    /// in-flight cap.
+    pub rate_limit_concurrency_refused: u64,
     /// P-03: admissions that waited on the bounded cap queue (H-05).
     pub admission_waited: u64,
     /// P-03: admissions whose bounded wait expired (subset of rejections).

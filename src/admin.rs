@@ -3141,6 +3141,15 @@ impl AdminServer {
         ));
 
         output.push_str(
+            "# HELP heliosdb_proxy_rate_limit_concurrency_refused_total Requests refused with 53400 because their rate-limit bucket was at [rate_limit] max_concurrent in-flight requests\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_rate_limit_concurrency_refused_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_rate_limit_concurrency_refused_total {}\n",
+            metrics.rate_limit_concurrency_refused
+        ));
+
+        output.push_str(
             "# HELP heliosdb_proxy_cache_catalog_skipped_total Cacheable reads no result cache tier looked up or stored because they may name a system catalog relation (pg_*, information_schema)\n",
         );
         output.push_str("# TYPE heliosdb_proxy_cache_catalog_skipped_total counter\n");
@@ -3393,6 +3402,7 @@ impl AdminState {
                 failovers: 0,
                 cache_capture_oversize: 0,
                 cache_excluded: 0,
+                rate_limit_concurrency_refused: 0,
                 cache_catalog_skipped: 0,
                 cache_time_travel_skipped: 0,
                 cache_ambiguous_skipped: 0,
@@ -3669,6 +3679,9 @@ struct MetricsResponse {
     /// Cacheable reads kept out of both result caches by
     /// `[cache] exclude_tables`.
     cache_excluded: u64,
+    /// Requests refused (53400) at their rate-limit bucket's
+    /// `[rate_limit] max_concurrent` in-flight cap.
+    rate_limit_concurrency_refused: u64,
     /// Cacheable reads kept out of every result cache tier because they may
     /// name a system catalog relation (`pg_*`, `information_schema`).
     cache_catalog_skipped: u64,
@@ -3716,6 +3729,7 @@ impl From<ServerMetricsSnapshot> for MetricsResponse {
             failovers: m.failovers,
             cache_capture_oversize: m.cache_capture_oversize,
             cache_excluded: m.cache_excluded,
+            rate_limit_concurrency_refused: m.rate_limit_concurrency_refused,
             cache_catalog_skipped: m.cache_catalog_skipped,
             cache_time_travel_skipped: m.cache_time_travel_skipped,
             cache_ambiguous_skipped: m.cache_ambiguous_skipped,
@@ -4582,6 +4596,7 @@ mod tests {
             failovers: 2,
             cache_capture_oversize: 7,
             cache_excluded: 11,
+            rate_limit_concurrency_refused: 23,
             cache_catalog_skipped: 13,
             cache_time_travel_skipped: 17,
             cache_ambiguous_skipped: 19,
@@ -4615,6 +4630,7 @@ mod tests {
         // O1: the capture byte-cap counter is scrapeable.
         assert!(output.contains("heliosdb_proxy_cache_capture_oversize_total 7"));
         assert!(output.contains("heliosdb_proxy_cache_excluded_total 11"));
+        assert!(output.contains("heliosdb_proxy_rate_limit_concurrency_refused_total 23\n"));
         assert!(output.contains("heliosdb_proxy_cache_catalog_skipped_total 13"));
         assert!(output.contains("heliosdb_proxy_cache_time_travel_skipped_total 17"));
         assert!(output.contains("heliosdb_proxy_cache_ambiguous_text_skipped_total 19"));
@@ -4678,6 +4694,7 @@ mod tests {
             failovers: 1,
             cache_capture_oversize: 3,
             cache_excluded: 5,
+            rate_limit_concurrency_refused: 9,
             cache_catalog_skipped: 6,
             cache_time_travel_skipped: 8,
             cache_ambiguous_skipped: 4,
@@ -4702,6 +4719,7 @@ mod tests {
         assert_eq!(response.connections_active, 70);
         assert_eq!(response.cache_capture_oversize, 3);
         assert_eq!(response.cache_excluded, 5);
+        assert_eq!(response.rate_limit_concurrency_refused, 9);
         assert_eq!(response.cache_catalog_skipped, 6);
         assert_eq!(response.cache_time_travel_skipped, 8);
         assert_eq!(response.cache_ambiguous_skipped, 4);

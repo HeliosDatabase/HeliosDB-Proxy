@@ -103,6 +103,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the byte account, so on a long-lived connection running many distinct reads the
   phantom total grew until the 32 MiB byte budget evicted every live entry and the
   connection's L1 held next to nothing.
+- **`[rate_limit] max_concurrent` is enforced (0a9d45da9c50).** The key was documented as the
+  in-flight cap per rate-limit bucket, but nothing on the data path checked it. Now each
+  `key_by` bucket admits at most that many requests in flight; a request over the cap gets
+  `53400` (not queued), counted in `heliosdb_proxy_rate_limit_concurrency_refused_total`.
+  `COMMIT`, `END`, `ROLLBACK` and `ABORT` run past the cap. The default `0` is unchanged.
+  **Upgrade note:** a config that already sets `[rate_limit] max_concurrent` to a value above
+  0 now takes effect; a bucket busier than that value is refused where it was served before.
+  Raise the value or set it to `0` to keep the old behaviour. Requires `[rate_limit]
+  enabled = true`.
 
 ### Security
 

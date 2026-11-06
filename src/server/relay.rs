@@ -35,7 +35,12 @@ impl ProxyServer {
         // request admitted already, and is paced instead).
         #[cfg(feature = "rate-limiting")]
         let limited = match continues_cycle {
-            None => Self::rate_limit_check(session, state, config).await,
+            None => {
+                Self::rate_limit_check(session, state, config, || {
+                    crate::protocol::query_text(&msg.payload).is_some_and(Self::tx_end_exempt)
+                })
+                .await
+            }
             Some(cycle) => {
                 if cycle.runs {
                     Self::rate_limit_pace(session, state, config).await;
@@ -885,7 +890,12 @@ impl ProxyServer {
         // that executes anything is paced instead.
         #[cfg(feature = "rate-limiting")]
         let limited = match continues_cycle {
-            None => Self::rate_limit_check(session, state, config).await,
+            None => {
+                Self::rate_limit_check(session, state, config, || {
+                    route_sql.is_some_and(Self::tx_end_exempt)
+                })
+                .await
+            }
             Some(cycle) => {
                 if cycle.runs {
                     Self::rate_limit_pace(session, state, config).await;

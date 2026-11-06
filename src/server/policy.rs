@@ -70,16 +70,47 @@ impl ProxyServer {
     /// appends one as the protocol requires) — when the query is denied; `None`
     /// when it may proceed. A throttle/queue verdict is honored by sleeping for
     /// the engine-supplied delay (real backpressure, capped) and then allowing.
+    ///
+    /// This is the request boundary, so it also takes the request's in-flight
+    /// slot of its bucket when `[rate_limit] max_concurrent` is set (see
+    /// [`ClientSession::rate_permit`]). `exempt` names the statements that run
+    /// past the cap (transaction ends); it is only evaluated when the cap is
+    /// enforced. A request over the cap is refused before its QPS token is
+    /// spent, with the same 53400 refusal as the QPS denial.
     #[cfg(feature = "rate-limiting")]
     pub(super) async fn rate_limit_check(
         session: &Arc<ClientSession>,
         state: &Arc<ServerState>,
         config: &ProxyConfig,
+        exempt: impl FnOnce() -> bool,
     ) -> Option<Vec<u8>> {
         use crate::rate_limit::RateLimitResult;
         let limiter = state.rate_limiter.as_ref()?;
         let key = Self::rate_limit_key(session, config).await;
         let key = key.as_ref();
+        let mut took_slot = false;
+        if limiter.in_flight_enforced() && !session.holds_rate_permit() && !exempt() {
+            match limiter.try_acquire_in_flight(key) {
+                Ok(permit) => {
+                    took_slot = permit.holds_slot();
+                    *session.rate_permit.lock() = Some(permit);
+                }
+                Err(refusal) => {
+                    state
+                        .metrics
+                        .rate_limit_concurrency_refused
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!(key = %key, limit = refusal.limit, "rate limit concurrency exceeded");
+                    return Some(Self::create_error_response(
+                        "53400",
+                        &format!(
+                            "rate limit exceeded: too many concurrent queries for {} (max_concurrent {}); retry when a query completes",
+                            key, refusal.limit
+                        ),
+                    ));
+                }
+            }
+        }
         match limiter.check_cached(key, 1) {
             RateLimitResult::Allowed => None,
             RateLimitResult::Warned(msg) => {
@@ -91,6 +122,9 @@ impl ProxyServer {
                 None
             }
             RateLimitResult::Denied(exc) => {
+                if took_slot {
+                    session.release_rate_permit();
+                }
                 tracing::info!(key = %key, "rate limit exceeded");
                 let msg = format!(
                     "rate limit exceeded: {} (retry after {}ms)",

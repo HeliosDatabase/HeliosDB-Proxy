@@ -429,6 +429,25 @@ impl ProxyServer {
             && Self::tr_word_is(sql, &words, 1, "PREPARED")
     }
 
+    /// A single transaction-ending statement (`COMMIT`, `END`, `ROLLBACK`,
+    /// `ABORT`; their 2PC forms too): exempt from the `[rate_limit]
+    /// max_concurrent` cap, so a session can always end its transaction even
+    /// while its bucket is at the cap.
+    #[cfg(feature = "rate-limiting")]
+    pub(super) fn tx_end_exempt(sql: &str) -> bool {
+        let core = sql.trim_ascii_end();
+        let single = memchr::memchr(b';', core.as_bytes()).is_none_or(|i| i + 1 == core.len());
+        if !single {
+            return false;
+        }
+        let Some(words) = Self::tr_lead_words(sql, 1) else {
+            return false;
+        };
+        ["COMMIT", "END", "ROLLBACK", "ABORT"]
+            .iter()
+            .any(|k| Self::tr_word_is(sql, &words, 0, k))
+    }
+
     /// Track session-level advisory locks under session pooling (they
     /// outlive ReadyForQuery 'I', so their holder keeps its active-query
     /// permit): a statement taking one ([`Self::takes_session_lock`]) sets
@@ -1029,6 +1048,8 @@ impl ProxyServer {
             pending_edge_copy_tables: std::sync::Mutex::new(None),
             #[cfg(feature = "rate-limiting")]
             rate_limit_key: std::sync::OnceLock::new(),
+            #[cfg(feature = "rate-limiting")]
+            rate_permit: parking_lot::Mutex::new(None),
             startup_slot: parking_lot::Mutex::new(None),
             reads_pinned: std::sync::atomic::AtomicBool::new(false),
             read_node: parking_lot::Mutex::new(None),
@@ -1540,6 +1561,9 @@ impl ProxyServer {
         let result =
             Self::serve_client(stream, pre, buffer, session, state, config, &mut held).await;
         Self::cancel_open_cycle(&mut held, session, state).await;
+        // `[rate_limit] max_concurrent`: the session's request ends with it.
+        #[cfg(feature = "rate-limiting")]
+        session.release_rate_permit();
         result
     }
 
@@ -1835,6 +1859,19 @@ impl ProxyServer {
             // and are relayed verbatim. A mid-COPY backend is excluded — it is
             // legitimately awaiting CopyData, which the client drives.
             buffer.reserve(16384);
+            // `[rate_limit] max_concurrent`: the request this session ran is
+            // over once its ReadyForQuery is relayed, so its in-flight slot
+            // returns before the next message is read. A Flush-dispatched
+            // cycle, or a COPY, is still in flight and keeps it.
+            #[cfg(feature = "rate-limiting")]
+            if !tr.ext_dispatched
+                && tr.ext_copy_end.is_none()
+                && !session
+                    .copy_in_progress
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                session.release_rate_permit();
+            }
             // Idle-session deadline — armed only when this session is genuinely
             // waiting for a NEW command (see `client_idle_deadline`), i.e. never
             // mid-COPY and never with a partially received message pending.

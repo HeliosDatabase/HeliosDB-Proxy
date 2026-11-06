@@ -156,7 +156,7 @@ async fn a_rate_limited_statement_inside_a_transaction_reports_status_t() {
     let session = super::make_test_session();
     // Spend the bucket's only token: the next statements are refused.
     assert!(
-        super::ProxyServer::rate_limit_check(&session, &state, &config)
+        super::ProxyServer::rate_limit_check(&session, &state, &config, || false)
             .await
             .is_none()
     );
