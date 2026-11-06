@@ -128,6 +128,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now leave the record and the session settings untouched; an open extended prefix
   they close makes the transaction non-replayable. Test: `server::tests::tr_refusal`.
   (d7350c9b1c93)
+- **MCP gateway result caps (memory DoS).** The `query`, `list_tables` and `explain` tools
+  buffered a whole result set with no limit, so one agent query could hold unbounded memory
+  in the proxy. The new `[mcp] max_result_rows` (default `10000`) and `max_result_bytes`
+  (default `16777216`, 16 MiB) stop storing rows while the result is read, keep the backend
+  connection in sync, and mark the result `truncated` (`structuredContent` on the tool result,
+  documented in `docs/configuration.md`). Upgrade note: results above 10000 rows or 16 MiB of
+  cell data are now truncated; raise the keys (up to 1000000 rows and 1 GiB) if agents depend
+  on larger results. Counted by `heliosdb_proxy_mcp_results_truncated_total`. Sprinter
+  b2cbd0f6f29d.
 
 ### Security
 

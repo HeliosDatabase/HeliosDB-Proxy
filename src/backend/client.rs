@@ -159,6 +159,30 @@ impl BackendClient {
         self.run_query(sql).await
     }
 
+    /// Like `simple_query`, but stores at most `max_rows` rows and at most
+    /// `max_bytes` cell bytes (the text bytes of the stored values; NULL counts
+    /// 0). Past either cap the remaining messages are still read up to
+    /// `ReadyForQuery` but not stored or parsed, so the connection is left in
+    /// protocol sync and reusable, and the result reports what was cut.
+    /// A result that exactly fits the caps is not truncated.
+    pub async fn simple_query_bounded(
+        &mut self,
+        sql: &str,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> BackendResult<BoundedQueryResult> {
+        let (result, truncation) = self
+            .run_query_bounded(
+                sql,
+                Some(ResultBounds {
+                    max_rows,
+                    max_bytes,
+                }),
+            )
+            .await?;
+        Ok(BoundedQueryResult { result, truncation })
+    }
+
     /// Like `simple_query` but substitutes `$1`, `$2`, … with
     /// text-format literals before sending. We stick to simple-query
     /// rather than the extended protocol to keep the surface narrow.
@@ -468,8 +492,16 @@ impl BackendClient {
     }
 
     async fn run_query(&mut self, sql: &str) -> BackendResult<QueryResult> {
+        self.run_query_bounded(sql, None).await.map(|(r, _)| r)
+    }
+
+    async fn run_query_bounded(
+        &mut self,
+        sql: &str,
+        bounds: Option<ResultBounds>,
+    ) -> BackendResult<(QueryResult, Truncation)> {
         let t = self.stream_query_timeout();
-        tokio::time::timeout(t, Self::run_query_inner(&mut self.stream, sql))
+        tokio::time::timeout(t, Self::run_query_inner(&mut self.stream, sql, bounds))
             .await
             .map_err(|_| {
                 BackendError::Io(std::io::Error::new(
@@ -494,7 +526,11 @@ impl BackendClient {
         }
     }
 
-    async fn run_query_inner(stream: &mut Stream, sql: &str) -> BackendResult<QueryResult> {
+    async fn run_query_inner(
+        stream: &mut Stream,
+        sql: &str,
+        bounds: Option<ResultBounds>,
+    ) -> BackendResult<(QueryResult, Truncation)> {
         // Build and send a Query message (tag 'Q', payload = SQL + \0).
         let mut payload = BytesMut::with_capacity(sql.len() + 1);
         payload.extend_from_slice(sql.as_bytes());
@@ -508,6 +544,8 @@ impl BackendClient {
         let mut rows: Vec<Vec<TextValue>> = Vec::new();
         let mut command_tag = String::new();
         let mut last_error: Option<String> = None;
+        let mut truncation = Truncation::default();
+        let mut stored_bytes: usize = 0;
 
         loop {
             let msg = read_one(stream, &mut buffer, &codec).await?;
@@ -521,10 +559,29 @@ impl BackendClient {
                 MessageType::RowDescription => {
                     columns = parse_row_description(&msg.payload);
                 }
-                MessageType::DataRow => {
-                    let row = parse_data_row(&msg.payload, columns.len())?;
-                    rows.push(row);
-                }
+                // Past a cap a row is only read off the wire to keep the
+                // connection in sync: parsing or storing it would spend the
+                // memory the cap exists to bound.
+                MessageType::DataRow if truncation.is_truncated() => {}
+                MessageType::DataRow => match bounds {
+                    None => rows.push(parse_data_row(&msg.payload, columns.len())?),
+                    Some(b) if rows.len() >= b.max_rows => {
+                        truncation.row_limit_hit = true;
+                    }
+                    Some(b) => {
+                        let row = parse_data_row(&msg.payload, columns.len())?;
+                        let row_bytes = row_text_bytes(&row);
+                        if stored_bytes
+                            .checked_add(row_bytes)
+                            .is_some_and(|total| total <= b.max_bytes)
+                        {
+                            stored_bytes += row_bytes;
+                            rows.push(row);
+                        } else {
+                            truncation.byte_limit_hit = true;
+                        }
+                    }
+                },
                 // PG tag 'C' = CommandComplete (server → client). The
                 // shared MessageType enum also has Close (client → server)
                 // under the same tag; again, the direction fixes the
@@ -545,11 +602,14 @@ impl BackendClient {
                     if let Some(e) = last_error {
                         return Err(BackendError::BackendError(e));
                     }
-                    return Ok(QueryResult {
-                        columns,
-                        rows,
-                        command_tag,
-                    });
+                    return Ok((
+                        QueryResult {
+                            columns,
+                            rows,
+                            command_tag,
+                        },
+                        truncation,
+                    ));
                 }
                 MessageType::ParameterStatus => {
                     // Server may push parameter changes (e.g. after SET).
@@ -616,6 +676,48 @@ pub struct QueryResult {
     pub columns: Vec<ColumnMeta>,
     pub rows: Vec<Vec<TextValue>>,
     pub command_tag: String,
+}
+
+/// Which cap of a [`BackendClient::simple_query_bounded`] call cut the result:
+/// the first one a row hit (no row is examined after that, so at most one flag
+/// is set).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Truncation {
+    /// A row past `max_rows` was received and not stored.
+    pub row_limit_hit: bool,
+    /// A row whose cells would exceed `max_bytes` was received and not stored.
+    pub byte_limit_hit: bool,
+}
+
+impl Truncation {
+    /// True when at least one cap cut the result.
+    pub fn is_truncated(&self) -> bool {
+        self.row_limit_hit || self.byte_limit_hit
+    }
+}
+
+/// Caps applied by `run_query_bounded`; `None` means unbounded.
+#[derive(Debug, Clone, Copy)]
+struct ResultBounds {
+    max_rows: usize,
+    max_bytes: usize,
+}
+
+/// Cell bytes of a row: text lengths, NULL counts 0.
+fn row_text_bytes(row: &[TextValue]) -> usize {
+    row.iter()
+        .map(|v| match v {
+            TextValue::Null => 0,
+            TextValue::Text(s) => s.len(),
+        })
+        .sum()
+}
+
+/// A bounded query result: the rows kept, and what was cut.
+#[derive(Debug, Clone)]
+pub struct BoundedQueryResult {
+    pub result: QueryResult,
+    pub truncation: Truncation,
 }
 
 impl QueryResult {
@@ -1055,6 +1157,163 @@ mod tests {
             protocol,
         }
         .into_journal_entry(1)
+    }
+
+    /// Test helper: the RowDescription body for `n` text columns.
+    fn row_description_body(n: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(n as u16).to_be_bytes());
+        for i in 0..n {
+            b.extend_from_slice(format!("c{i}\0").as_bytes());
+            b.extend_from_slice(&0u32.to_be_bytes()); // table oid
+            b.extend_from_slice(&0u16.to_be_bytes()); // column attr
+            b.extend_from_slice(&25u32.to_be_bytes()); // text
+            b.extend_from_slice(&(-1i16).to_be_bytes()); // type size
+            b.extend_from_slice(&(-1i32).to_be_bytes()); // type mod
+            b.extend_from_slice(&0u16.to_be_bytes()); // format
+        }
+        b
+    }
+
+    /// Test helper: a DataRow body; `None` is SQL NULL.
+    fn data_row_body(cells: &[Option<&str>]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(cells.len() as u16).to_be_bytes());
+        for c in cells {
+            match c {
+                None => b.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(s) => {
+                    b.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                    b.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
+        b
+    }
+
+    /// Fake backend: answers `sql` with `rows`, then answers a follow-up
+    /// `SELECT 2` on the same connection, proving the connection is in sync.
+    async fn serve_rows(peer: &mut TcpStream, sql: &str, rows: &[Vec<Option<&str>>]) {
+        assert_eq!(
+            journal_replay_read(peer).await,
+            (b'Q', format!("{sql}\0").into_bytes())
+        );
+        let width = rows.first().map_or(1, |r| r.len());
+        journal_replay_reply(peer, b'T', &row_description_body(width)).await;
+        for row in rows {
+            journal_replay_reply(peer, b'D', &data_row_body(row)).await;
+        }
+        journal_replay_reply(peer, b'C', format!("SELECT {}\0", rows.len()).as_bytes()).await;
+        journal_replay_reply(peer, b'Z', b"I").await;
+        assert_eq!(
+            journal_replay_read(peer).await,
+            (b'Q', b"SELECT 2\0".to_vec())
+        );
+        journal_replay_reply(peer, b'C', b"SELECT 0\0").await;
+        journal_replay_reply(peer, b'Z', b"I").await;
+    }
+
+    /// Run a bounded query against the fake backend, then a second query on
+    /// the same client; asserts the second query completes (connection reuse).
+    async fn run_bounded(
+        rows: Vec<Vec<Option<&'static str>>>,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> BoundedQueryResult {
+        let sql = "SELECT v FROM t";
+        let (mut client, mut peer) = journal_replay_pair().await;
+        let backend = tokio::spawn(async move {
+            serve_rows(&mut peer, sql, &rows).await;
+        });
+        let out = client
+            .simple_query_bounded(sql, max_rows, max_bytes)
+            .await
+            .unwrap();
+        assert_eq!(
+            client.simple_query("SELECT 2").await.unwrap().command_tag,
+            "SELECT 0"
+        );
+        backend.await.unwrap();
+        out
+    }
+
+    #[tokio::test]
+    async fn bounded_row_cap_stores_only_the_cap_and_keeps_connection_in_sync() {
+        let rows = vec![
+            vec![Some("a")],
+            vec![Some("b")],
+            vec![Some("c")],
+            vec![Some("d")],
+            vec![Some("e")],
+        ];
+        let out = run_bounded(rows, 3, usize::MAX).await;
+        assert_eq!(out.result.rows.len(), 3);
+        assert_eq!(out.result.command_tag, "SELECT 5");
+        assert!(out.truncation.row_limit_hit);
+        assert!(!out.truncation.byte_limit_hit);
+        assert!(out.truncation.is_truncated());
+    }
+
+    #[tokio::test]
+    async fn bounded_row_cap_exact_fit_is_not_truncated() {
+        let rows = vec![vec![Some("a")], vec![Some("b")], vec![Some("c")]];
+        let out = run_bounded(rows, 3, usize::MAX).await;
+        assert_eq!(out.result.rows.len(), 3);
+        assert_eq!(out.truncation, Truncation::default());
+        assert!(!out.truncation.is_truncated());
+    }
+
+    #[tokio::test]
+    async fn bounded_byte_cap_stops_storing_at_the_first_row_that_does_not_fit() {
+        // 4 + 4 bytes would be 8 > 7: the second row is cut, and the third
+        // (which alone would fit) is not stored either.
+        let rows = vec![vec![Some("aaaa")], vec![Some("bbbb")], vec![Some("c")]];
+        let out = run_bounded(rows, usize::MAX, 7).await;
+        assert_eq!(out.result.rows.len(), 1);
+        assert!(out.truncation.byte_limit_hit);
+        assert!(!out.truncation.row_limit_hit);
+    }
+
+    #[tokio::test]
+    async fn bounded_byte_cap_exact_fit_is_not_truncated() {
+        let rows = vec![vec![Some("aaaa")], vec![Some("bbbb")]];
+        let out = run_bounded(rows, usize::MAX, 8).await;
+        assert_eq!(out.result.rows.len(), 2);
+        assert_eq!(out.truncation, Truncation::default());
+    }
+
+    #[tokio::test]
+    async fn bounded_null_cells_cost_no_bytes() {
+        let rows = vec![vec![None], vec![None], vec![Some("")]];
+        let out = run_bounded(rows, usize::MAX, 0).await;
+        assert_eq!(out.result.rows.len(), 3);
+        assert!(!out.truncation.is_truncated());
+    }
+
+    #[tokio::test]
+    async fn bounded_byte_cap_counts_every_cell_of_a_row() {
+        // One row of two 4-byte cells is 8 bytes: over a cap of 7 it is cut whole.
+        let rows = vec![vec![Some("aaaa"), Some("bbbb")]];
+        let out = run_bounded(rows, usize::MAX, 7).await;
+        assert!(out.result.rows.is_empty());
+        assert!(out.truncation.byte_limit_hit);
+    }
+
+    #[tokio::test]
+    async fn unbounded_simple_query_still_returns_every_row() {
+        let sql = "SELECT v FROM t";
+        let rows: Vec<Vec<Option<&str>>> = (0..5).map(|_| vec![Some("x")]).collect();
+        let (mut client, mut peer) = journal_replay_pair().await;
+        let backend = tokio::spawn(async move {
+            serve_rows(&mut peer, sql, &rows).await;
+        });
+        let out = client.simple_query(sql).await.unwrap();
+        assert_eq!(out.rows.len(), 5);
+        assert_eq!(
+            client.simple_query("SELECT 2").await.unwrap().command_tag,
+            "SELECT 0"
+        );
+        backend.await.unwrap();
     }
 
     #[tokio::test]

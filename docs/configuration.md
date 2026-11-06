@@ -1983,6 +1983,8 @@ read_only = true
 auth_token = "${MCP_TOKEN}"
 query_timeout_ms = 30000
 max_concurrent_requests = 64
+max_result_rows = 10000
+max_result_bytes = 16777216
 
 [[agent_contracts]]
 id = "reporting-agent"
@@ -2010,6 +2012,20 @@ max_rows = 1000
 | `query_timeout_ms` | u64 | `30000` | Per-`tools/call` backend execution timeout, milliseconds. Was a hardcoded 30 s. Must be > 0. |
 | `max_concurrent_requests` | usize | `64` | Maximum `tools/call` requests admitted concurrently; beyond this the gateway answers a JSON-RPC error (code `-32000`) instead of queuing indefinitely. `initialize`/`ping`/`tools/list` and notifications are never gated. Must be > 0. |
 | `tenant_header` | string | `""` | With `[multi_tenancy]` (H-06): the request header naming the tenant (e.g. `X-Helios-Tenant`). Every request must name a known tenant in it (403 otherwise), and its statements get that tenant's row filter, as a PG-wire session does. Trusted as sent: put the gateway behind a front end that authenticates the caller and sets the header. Empty = no per-request tenant, which `[multi_tenancy]` refuses under `strict_config` (warns otherwise). |
+
+| `max_result_rows` | usize | `10000` | Most rows a `query`, `list_tables` or `explain` result carries back. The gateway reads the backend's rows but stops storing them at this cap, drains the rest of the result so the backend connection stays in sync, and marks the result truncated. Must be 1 to 1000000. |
+| `max_result_bytes` | usize | `16777216` (16 MiB) | Most cell bytes a tool result carries back: the text bytes of the stored values, NULL counting 0 (the table's separators and footer are not counted). Enforced while reading, like `max_result_rows`; a result that exactly fits is not truncated. Must be 1 to 1073741824 (1 GiB). |
+
+**Truncated tool results.** A result is truncated when either cap cut it. The text
+table then ends with a `(truncated: the row limit was reached; the first N rows are
+shown)` line (`row`, `byte` or `row and byte`), and the `tools/call` result carries a
+`structuredContent` object with `truncated: true`, `rows_returned` (the rows kept),
+`row_limit_hit` and `byte_limit_hit` (booleans; both may be set). A result within both
+caps carries no `structuredContent` at all, so clients that do not read it see no change
+beyond the text. Every truncated result increments
+`heliosdb_proxy_mcp_results_truncated_total` on `/metrics/prometheus`. The caps apply to
+the one MCP gateway's tool calls only; the HTTP `/sql` and GraphQL gateways are not capped
+by these keys.
 
 Each `[[agent_contracts]]` entry (scoped grants, referenced by `id` from `[mcp] contract`):
 

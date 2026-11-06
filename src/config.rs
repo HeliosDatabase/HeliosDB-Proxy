@@ -743,7 +743,24 @@ pub struct McpConfig {
     /// `strict_config` (warns otherwise).
     #[serde(default)]
     pub tenant_header: String,
+    /// Most rows a `query` / `list_tables` / `explain` tool result carries back
+    /// to the agent. The gateway reads the backend's rows but stops storing them
+    /// past this cap, drains the rest of the result so the connection stays in
+    /// protocol sync, and marks the tool result `truncated`. Must be >= 1 and
+    /// <= [`MCP_MAX_RESULT_ROWS_CEILING`].
+    #[serde(default = "default_mcp_max_result_rows")]
+    pub max_result_rows: usize,
+    /// Most cell bytes (the text bytes of the stored values; NULL counts 0) a
+    /// tool result carries back. Enforced while reading, like
+    /// `max_result_rows`. Must be >= 1 and <= [`MCP_MAX_RESULT_BYTES_CEILING`].
+    #[serde(default = "default_mcp_max_result_bytes")]
+    pub max_result_bytes: usize,
 }
+
+/// Upper bound accepted for `[mcp] max_result_rows`.
+pub const MCP_MAX_RESULT_ROWS_CEILING: usize = 1_000_000;
+/// Upper bound accepted for `[mcp] max_result_bytes` (1 GiB).
+pub const MCP_MAX_RESULT_BYTES_CEILING: usize = 1024 * 1024 * 1024;
 
 impl Default for McpConfig {
     fn default() -> Self {
@@ -761,8 +778,20 @@ impl Default for McpConfig {
             query_timeout_ms: default_gateway_query_timeout_ms(),
             max_concurrent_requests: default_gateway_max_concurrent_requests(),
             tenant_header: String::new(),
+            max_result_rows: default_mcp_max_result_rows(),
+            max_result_bytes: default_mcp_max_result_bytes(),
         }
     }
+}
+
+/// Default `[mcp] max_result_rows`: rows a tool result carries before the
+/// result is truncated.
+fn default_mcp_max_result_rows() -> usize {
+    10_000
+}
+/// Default `[mcp] max_result_bytes`: 16 MiB of cell bytes per tool result.
+fn default_mcp_max_result_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 fn default_mcp_listen() -> String {
@@ -4594,6 +4623,22 @@ impl ProxyConfig {
             }
         }
 
+        // `[mcp]` result caps: they bound what one tool call buffers, so zero
+        // would truncate every result and an unbounded value would defeat the
+        // cap. Checked on every build, like the gateway tunables above.
+        if !(1..=MCP_MAX_RESULT_ROWS_CEILING).contains(&self.mcp.max_result_rows) {
+            return Err(ProxyError::Config(format!(
+                "mcp.max_result_rows must be between 1 and {MCP_MAX_RESULT_ROWS_CEILING} (got {})",
+                self.mcp.max_result_rows
+            )));
+        }
+        if !(1..=MCP_MAX_RESULT_BYTES_CEILING).contains(&self.mcp.max_result_bytes) {
+            return Err(ProxyError::Config(format!(
+                "mcp.max_result_bytes must be between 1 and {MCP_MAX_RESULT_BYTES_CEILING} (got {})",
+                self.mcp.max_result_bytes
+            )));
+        }
+
         Ok(())
     }
 
@@ -8316,5 +8361,54 @@ exclude = true
             let err = c.validate().unwrap_err().to_string();
             assert!(err.contains(name), "{name}: unexpected error {err}");
         }
+    }
+
+    #[test]
+    fn mcp_result_caps_default_and_parse() {
+        let defaults = McpConfig::default();
+        assert_eq!(defaults.max_result_rows, 10_000);
+        assert_eq!(defaults.max_result_bytes, 16 * 1024 * 1024);
+        let config: ProxyConfig = toml::from_str(
+            "[mcp]\nenabled = true\nmax_result_rows = 250\nmax_result_bytes = 4096\n",
+        )
+        .expect("parse");
+        assert_eq!(config.mcp.max_result_rows, 250);
+        assert_eq!(config.mcp.max_result_bytes, 4096);
+        // An absent section keeps the defaults.
+        let absent: ProxyConfig = toml::from_str("").expect("parse");
+        assert_eq!(absent.mcp.max_result_rows, 10_000);
+        assert_eq!(absent.mcp.max_result_bytes, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn mcp_result_caps_validate_range_and_name_the_key() {
+        let mut c = ProxyConfig::default();
+        c.add_node("localhost:5432", "primary").unwrap();
+        assert!(c.validate().is_ok());
+
+        let cases: [InvalidCase; 4] = [
+            ("mcp.max_result_rows", |c| c.mcp.max_result_rows = 0),
+            ("mcp.max_result_rows", |c| {
+                c.mcp.max_result_rows = MCP_MAX_RESULT_ROWS_CEILING + 1
+            }),
+            ("mcp.max_result_bytes", |c| c.mcp.max_result_bytes = 0),
+            ("mcp.max_result_bytes", |c| {
+                c.mcp.max_result_bytes = MCP_MAX_RESULT_BYTES_CEILING + 1
+            }),
+        ];
+        for (name, mutate) in cases {
+            let mut c = ProxyConfig::default();
+            c.add_node("localhost:5432", "primary").unwrap();
+            mutate(&mut c);
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains(name), "{name}: unexpected error {err}");
+        }
+
+        // The ceilings themselves are accepted.
+        let mut c = ProxyConfig::default();
+        c.add_node("localhost:5432", "primary").unwrap();
+        c.mcp.max_result_rows = MCP_MAX_RESULT_ROWS_CEILING;
+        c.mcp.max_result_bytes = MCP_MAX_RESULT_BYTES_CEILING;
+        assert!(c.validate().is_ok());
     }
 }

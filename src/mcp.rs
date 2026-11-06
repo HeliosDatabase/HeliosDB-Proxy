@@ -12,6 +12,7 @@
 //! `initialize`, `notifications/initialized`, `ping`, `tools/list`,
 //! `tools/call`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use crate::agent_contract::{self, AgentContract};
-use crate::backend::client::QueryResult;
+use crate::backend::client::{BoundedQueryResult, QueryResult};
 use crate::backend::types::TextValue;
 use crate::backend::{tls::default_client_config, BackendConfig, TlsMode};
 use crate::config::McpConfig;
@@ -31,6 +32,15 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// The backend side of one MCP connection: its pool, the request policies
 /// and the client's address (for the rate-limit key).
+/// Tool results cut by `[mcp] max_result_rows` / `max_result_bytes`, process-wide.
+static RESULTS_TRUNCATED: AtomicU64 = AtomicU64::new(0);
+
+/// Total `query` / `list_tables` / `explain` results cut by the result caps
+/// since the process started (`heliosdb_proxy_mcp_results_truncated_total`).
+pub fn results_truncated_total() -> u64 {
+    RESULTS_TRUNCATED.load(Ordering::Relaxed)
+}
+
 struct Gateway<'a> {
     pool: &'a crate::gateway_pool::SharedBackendPool,
     policy: &'a GatewayPolicy,
@@ -397,7 +407,7 @@ impl McpServer {
         let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-        let result: std::result::Result<String, String> = match name {
+        let result: std::result::Result<(String, Option<Value>), String> = match name {
             "query" => {
                 let sql = args
                     .get("sql")
@@ -412,7 +422,7 @@ impl McpServer {
                         Ok(()) => {
                             Self::run_sql(cfg, gateway, sql, effective_read_only(cfg, contract))
                                 .await
-                                .map(|r| format_result(&r))
+                                .map(render_result)
                         }
                     }
                 }
@@ -423,7 +433,7 @@ impl McpServer {
                            ORDER BY table_schema, table_name";
                 Self::run_sql(cfg, gateway, sql, effective_read_only(cfg, contract))
                     .await
-                    .map(|r| format_result(&r))
+                    .map(render_result)
             }
             "explain" => {
                 let sql = args
@@ -446,7 +456,7 @@ impl McpServer {
                             effective_read_only(cfg, contract),
                         )
                         .await
-                        .map(|r| format_result(&r)),
+                        .map(render_result),
                     }
                 }
             }
@@ -454,12 +464,14 @@ impl McpServer {
         };
 
         match result {
-            Ok(text) => {
+            Ok((text, structured)) => {
                 tracing::info!(tool = %name, "MCP tool call ok");
-                rpc_ok(
-                    id,
-                    json!({ "content": [{ "type": "text", "text": text }], "isError": false }),
-                )
+                let mut result =
+                    json!({ "content": [{ "type": "text", "text": text }], "isError": false });
+                if let Some(structured) = structured {
+                    result["structuredContent"] = structured;
+                }
+                rpc_ok(id, result)
             }
             Err(e) => {
                 tracing::info!(tool = %name, error = %e, "MCP tool call error");
@@ -547,7 +559,7 @@ impl McpServer {
         gateway: &Gateway<'_>,
         sql: &str,
         read_only: bool,
-    ) -> std::result::Result<QueryResult, String> {
+    ) -> std::result::Result<BoundedQueryResult, String> {
         // H-06: the PG-wire rate limit, circuit breaker and rewrite rules
         // apply to tool calls too (after the read-only guard saw the raw SQL).
         let (pool, policy) = (gateway.pool, gateway.policy);
@@ -596,17 +608,24 @@ impl McpServer {
                 return Err(format!("failed to enforce read-only mode: {}", e));
             }
         }
-        match client.simple_query(sql).await {
-            Ok(qr) => {
+        match client
+            .simple_query_bounded(sql, cfg.max_result_rows, cfg.max_result_bytes)
+            .await
+        {
+            Ok(bounded) => {
                 // read_only connections are retained (their only state is the
                 // GUC, re-asserted on checkout); otherwise only session-neutral
-                // statements may be pooled (H-06).
+                // statements may be pooled (H-06). A capped result leaves the
+                // connection in sync, so it is pooled the same way.
                 if read_only || crate::gateway_pool::statement_is_session_neutral(sql) {
                     pool.release(&bcfg, client);
                 } else {
                     pool.discard(client);
                 }
-                Ok(qr)
+                if bounded.truncation.is_truncated() {
+                    RESULTS_TRUNCATED.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(bounded)
             }
             Err(e) => {
                 pool.discard(client);
@@ -648,6 +667,34 @@ fn rpc_ok(id: Value, result: Value) -> Value {
 
 fn rpc_error(id: Value, code: i32, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+/// Render a bounded tool result: the text table, plus `structuredContent` only
+/// when a cap cut it (`truncated`, `rows_returned`, `row_limit_hit`,
+/// `byte_limit_hit`). An untruncated result carries no extra fields.
+fn render_result(b: BoundedQueryResult) -> (String, Option<Value>) {
+    let mut text = format_result(&b.result);
+    if !b.truncation.is_truncated() {
+        return (text, None);
+    }
+    let reason = match (b.truncation.row_limit_hit, b.truncation.byte_limit_hit) {
+        (true, true) => "row and byte",
+        (true, false) => "row",
+        _ => "byte",
+    };
+    let rows_returned = b.result.rows.len();
+    text.push_str(&format!(
+        "\n(truncated: the {reason} limit was reached; the first {rows_returned} rows are shown)"
+    ));
+    (
+        text,
+        Some(json!({
+            "truncated": true,
+            "rows_returned": rows_returned,
+            "row_limit_hit": b.truncation.row_limit_hit,
+            "byte_limit_hit": b.truncation.byte_limit_hit,
+        })),
+    )
 }
 
 /// Render a QueryResult as a compact text table for the agent.
@@ -1414,5 +1461,80 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r["result"], json!({}));
+    }
+
+    fn bounded_fixture(
+        rows: usize,
+        truncation: crate::backend::client::Truncation,
+    ) -> BoundedQueryResult {
+        use crate::backend::client::ColumnMeta;
+        BoundedQueryResult {
+            result: QueryResult {
+                columns: vec![ColumnMeta {
+                    name: "v".into(),
+                    type_oid: 25,
+                }],
+                rows: (0..rows)
+                    .map(|_| vec![TextValue::Text("x".into())])
+                    .collect(),
+                command_tag: format!("SELECT {rows}"),
+            },
+            truncation,
+        }
+    }
+
+    #[test]
+    fn render_result_untruncated_adds_no_structured_fields() {
+        let (text, structured) = render_result(bounded_fixture(2, Default::default()));
+        assert!(
+            structured.is_none(),
+            "untruncated results carry no extra fields"
+        );
+        assert!(text.ends_with("(2 rows)"), "{text}");
+        assert!(!text.contains("truncated"));
+    }
+
+    #[test]
+    fn render_result_row_cap_reports_counts_and_flags() {
+        let t = crate::backend::client::Truncation {
+            row_limit_hit: true,
+            byte_limit_hit: false,
+        };
+        let (text, structured) = render_result(bounded_fixture(3, t));
+        let s = structured.expect("truncated results carry structuredContent");
+        assert_eq!(s["truncated"], true);
+        assert_eq!(s["rows_returned"], 3);
+        assert_eq!(s["row_limit_hit"], true);
+        assert_eq!(s["byte_limit_hit"], false);
+        assert!(
+            text.contains("(truncated: the row limit was reached; the first 3 rows are shown)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn render_result_byte_cap_reports_byte_reason() {
+        let t = crate::backend::client::Truncation {
+            row_limit_hit: false,
+            byte_limit_hit: true,
+        };
+        let (text, structured) = render_result(bounded_fixture(1, t));
+        let s = structured.unwrap();
+        assert_eq!(s["byte_limit_hit"], true);
+        assert_eq!(s["row_limit_hit"], false);
+        assert!(text.contains("the byte limit was reached"), "{text}");
+    }
+
+    #[test]
+    fn render_result_both_caps_named() {
+        let t = crate::backend::client::Truncation {
+            row_limit_hit: true,
+            byte_limit_hit: true,
+        };
+        let (text, _) = render_result(bounded_fixture(1, t));
+        assert!(
+            text.contains("the row and byte limit was reached"),
+            "{text}"
+        );
     }
 }

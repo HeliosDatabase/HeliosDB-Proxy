@@ -768,3 +768,10 @@ heatmap_min_samples = 100   # reads in the window before a recommendation
 # # pattern    = "ORDER BY .+ <-> "
 # # target     = "standby-vector-1"
 # # priority   = 90
+
+# [mcp]
+# # Result caps for the MCP gateway's query / list_tables / explain tools (defaults shown).
+# # Rows past max_result_rows, or cell bytes past max_result_bytes, are cut and the
+# # tool result is marked truncated (structuredContent.truncated = true).
+# max_result_rows  = 10000
+# max_result_bytes = 16777216

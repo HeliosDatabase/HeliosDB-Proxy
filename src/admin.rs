@@ -661,6 +661,7 @@ impl AdminServer {
                 if let Some(p) = state.gateway_pools.read().await.as_ref() {
                     Self::push_gateway_pool_prometheus(&mut prometheus, p);
                 }
+                Self::push_mcp_prometheus(&mut prometheus);
                 if let Some(s) = state.node_slots.read().await.as_ref() {
                     Self::push_node_slots_prometheus(&mut prometheus, &s.stats());
                     if let Some(r) = s.reconnect_stats() {
@@ -2712,6 +2713,25 @@ impl AdminServer {
         }
     }
 
+    /// Append the MCP gateway's result-cap counter (`[mcp] max_result_rows` /
+    /// `max_result_bytes`) to a Prometheus body.
+    fn push_mcp_prometheus(output: &mut String) {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            output,
+            "# HELP heliosdb_proxy_mcp_results_truncated_total MCP tool results cut by [mcp] max_result_rows or max_result_bytes"
+        );
+        let _ = writeln!(
+            output,
+            "# TYPE heliosdb_proxy_mcp_results_truncated_total counter"
+        );
+        let _ = writeln!(
+            output,
+            "heliosdb_proxy_mcp_results_truncated_total {}",
+            crate::mcp::results_truncated_total()
+        );
+    }
+
     /// Append the gateway pools' counters and idle gauge, labelled by gateway
     /// (`mcp`, `http`, `graphql`), to a Prometheus body (H-06 / P-03).
     fn push_gateway_pool_prometheus(
@@ -4159,6 +4179,14 @@ struct VersionResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_truncation_counter_is_exported() {
+        let mut out = String::new();
+        AdminServer::push_mcp_prometheus(&mut out);
+        assert!(out.contains("# TYPE heliosdb_proxy_mcp_results_truncated_total counter\n"));
+        assert!(out.contains("\nheliosdb_proxy_mcp_results_truncated_total "));
+    }
 
     #[test]
     fn tenant_slot_metrics_are_labelled_and_escaped() {
