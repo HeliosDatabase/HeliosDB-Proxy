@@ -229,6 +229,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Cow<str>`), so a refused statement is an `Err` (`PolicyDenied::TenantStatement`, HTTP 403)
   and never a passthrough. Downstream callers must handle the `Err`; the release is a
   breaking change for the library API.
+- `routing::HintParser::strip` returns `Cow<'_, str>` (it was `String`): a statement
+  without a hint is returned borrowed. `QueryRouter::strip_hints` keeps its `String`.
+- `cache::L2Config::size_mb` is replaced by `max_bytes` (see ### Changed above for the
+  other cache structs that gained fields).
 
 ### Development
 

@@ -1120,7 +1120,10 @@ impl ProxyServer {
                 crate::config::UnknownTenantPolicy::Refuse if !mt.tenant_tables.is_empty() => Some(
                     mt.tenant_tables
                         .iter()
-                        .map(|t| t.rsplit('.').next().unwrap_or(t).to_ascii_lowercase())
+                        .map(|t| {
+                            let name = t.rsplit('.').next().unwrap_or(t).to_ascii_lowercase();
+                            crate::sql_text::truncated_identifier(&name).to_string()
+                        })
                         .collect(),
                 ),
                 _ => None,

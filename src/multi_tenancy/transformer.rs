@@ -111,8 +111,11 @@ impl TenantQueryTransformer {
 
     /// Register a table with its tenant column
     pub fn register_table(mut self, table: impl Into<String>, column: impl Into<String>) -> Self {
-        self.tenant_tables
-            .insert(table.into().to_lowercase(), column.into());
+        let name = table.into().to_lowercase();
+        self.tenant_tables.insert(
+            crate::sql_text::truncated_identifier(&name).to_string(),
+            column.into(),
+        );
         self
     }
 
@@ -120,7 +123,11 @@ impl TenantQueryTransformer {
     pub fn register_tables(mut self, tables: &[&str], column: impl Into<String>) -> Self {
         let col = column.into();
         for table in tables {
-            self.tenant_tables.insert(table.to_lowercase(), col.clone());
+            let name = table.to_lowercase();
+            self.tenant_tables.insert(
+                crate::sql_text::truncated_identifier(&name).to_string(),
+                col.clone(),
+            );
         }
         self
     }
@@ -1520,6 +1527,24 @@ mod tests {
         assert!(res.refusal.is_none(), "refused: {:?}", res.refusal);
         assert!(res.transformed, "not transformed: {}", res.query);
         assert!(res.query.contains(&format!("{name}.tenant_id = 'acme'")));
+    }
+
+    #[test]
+    fn a_configured_name_longer_than_63_bytes_is_the_truncated_table() {
+        // The backend stores the configured name truncated, so its 63-byte
+        // spelling names the same tenant table and must be filtered.
+        let short = "a".repeat(63);
+        let configured = format!("{short}bbbbbbb");
+        let transformer =
+            TenantQueryTransformer::new().register_table(configured.as_str(), "tenant_id");
+        let res = transformer.transform(
+            &format!("SELECT * FROM {short}"),
+            &TenantId::new("acme"),
+            &create_row_config("acme"),
+        );
+        assert!(res.refusal.is_none(), "refused: {:?}", res.refusal);
+        assert!(res.transformed, "not transformed: {}", res.query);
+        assert!(res.query.contains(&format!("{short}.tenant_id = 'acme'")));
     }
 
     #[test]

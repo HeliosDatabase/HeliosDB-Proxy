@@ -598,7 +598,6 @@ impl Inner {
         self.config.similarity_threshold < 1.0
     }
 
-    /// The index of the shard holding bucket `key`.
     /// The context's strings for a new slot in shard `shard`, bucket `key`:
     /// those of a live slot of that bucket holding the same context, else new
     /// ones. Nothing is interned beyond the live slots (a string is freed with
@@ -618,6 +617,7 @@ impl Inner {
         held.unwrap_or_else(|| SharedContext::new(ctx))
     }
 
+    /// The index of the shard holding bucket `key`.
     fn shard_index(&self, key: u64) -> usize {
         // Truncation on a 32-bit target keeps the low bits, all the mask reads.
         key as usize & self.shard_mask
