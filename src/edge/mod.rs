@@ -71,6 +71,7 @@ use std::time::Duration;
 /// registered edge. Returns `(dropped, notified, pruned)`. The PG-wire relay
 /// and the gateways (HTTP, MCP, GraphQL) share it, so a write is handled the
 /// same whichever way it came in.
+#[cfg(feature = "edge-proxy")]
 pub(crate) async fn invalidate_home_write(
     cache: &EdgeCache,
     registry: &EdgeRegistry,

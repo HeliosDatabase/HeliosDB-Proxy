@@ -464,7 +464,7 @@ pub(crate) fn lead(sql: &str) -> Lead<'_> {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Explain<'a> {
     /// The text does not start with EXPLAIN: it is a statement of its own.
-    NotExplain,
+    NoPrefix,
     /// `EXPLAIN` without ANALYZE: it executes nothing.
     Plan,
     /// `EXPLAIN ... ANALYZE`: it executes the statement from this point on.
@@ -485,7 +485,7 @@ pub(crate) fn explain(sql: &str) -> Explain<'_> {
         .peekable();
     match pieces.next() {
         Some((_, Piece::Text(w))) if w.eq_ignore_ascii_case("EXPLAIN") => {}
-        _ => return Explain::NotExplain,
+        _ => return Explain::NoPrefix,
     }
     let mut analyze = false;
     if matches!(pieces.peek(), Some((_, Piece::Text("(")))) {
@@ -549,7 +549,7 @@ pub(crate) fn explain_innermost(sql: &str) -> Option<&str> {
     let mut text = sql;
     loop {
         match explain(text) {
-            Explain::NotExplain | Explain::Plan => return Some(text),
+            Explain::NoPrefix | Explain::Plan => return Some(text),
             Explain::Analyze(inner) => text = inner,
             Explain::Unknown => return None,
         }
