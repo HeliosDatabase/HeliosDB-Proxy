@@ -624,16 +624,122 @@ pub(crate) fn lex_units(sql: &str) -> Option<Vec<LexUnit>> {
     Some(out)
 }
 
-/// Every comment outside quotes, in order, with its byte offset and its text
-/// including the delimiters (`/*…*/`, or `--` to the end of the line). Reading
-/// stops at the backend-ambiguous rest ([`Piece::Rest`]): no comment after it
-/// is yielded. Used by the routing hint parser.
+/// Every comment outside quotes that starts at or before byte `last`, in
+/// order, with its byte offset and its text including the delimiters
+/// (`/*…*/`, or `--` to the end of the line). Reading stops at the
+/// backend-ambiguous rest ([`Piece::Rest`]): no comment after it is yielded.
+/// The lexer reads nothing past the first piece that starts after `last`.
+/// Used by the routing hint parser, which passes the offset of the last
+/// `helios:` in the text: no comment after it holds a hint.
 #[cfg(any(feature = "routing-hints", test))]
-pub(crate) fn comments(sql: &str) -> impl Iterator<Item = (usize, &str)> {
-    Pieces::new(sql).filter_map(|(at, piece)| match piece {
-        Piece::Comment(comment) => Some((at, comment)),
-        _ => None,
-    })
+pub(crate) fn comments(sql: &str, last: usize) -> impl Iterator<Item = (usize, &str)> {
+    Pieces::new(sql)
+        .take_while(move |&(at, _)| at <= last)
+        .filter_map(|(at, piece)| match piece {
+            Piece::Comment(comment) => Some((at, comment)),
+            _ => None,
+        })
+}
+
+/// Whether `sql` holds no `'`, `"` or `$`: no string literal (`'…'`, `E'…'`,
+/// `U&'…'`), quoted identifier (`"…"`, `U&"…"`), dollar quote or `$n`
+/// parameter can start in it, so [`quote_free_comments`] reads its comments
+/// as [`comments`] does. One vectorised byte scan.
+#[cfg(any(feature = "routing-hints", test))]
+pub(crate) fn quote_free(sql: &str) -> bool {
+    memchr::memchr3(b'\'', b'"', b'$', sql.as_bytes()).is_none()
+}
+
+/// [`comments`] for text that is [`quote_free`], without the lexer: it
+/// jumps from one `-` or `/` to the next. Without a quote or a `$`, no piece
+/// but a comment holds a `--` or a `/*` (a word, a number or a punctuation
+/// byte cannot; the `-` of an exponent, `1e-5`, is followed by a digit), the
+/// lexer reaches a backend-ambiguous rest only at a comment, and each
+/// comment starts at the first `--` or `/*` after the previous one ends. The
+/// comment rules are the lexer's: a `--` comment ends at the first CR or LF,
+/// and one a lone CR ends is a rest; a block comment ends at its first `*/`,
+/// and one without it or holding a `/*` before it is a rest; HeliosDB-Lite's
+/// statement splitter makes a comment a rest the same way
+/// ([`Pieces::comment`]). For text with a quote or a `$` this is not the
+/// lexer's answer: callers check [`quote_free`] first.
+#[cfg(any(feature = "routing-hints", test))]
+pub(crate) fn quote_free_comments(sql: &str, last: usize) -> QuoteFreeComments<'_> {
+    QuoteFreeComments {
+        pieces: Pieces::new(sql),
+        at: 0,
+        end: last.saturating_add(1).min(sql.len()),
+    }
+}
+
+/// The iterator of [`quote_free_comments`].
+#[cfg(any(feature = "routing-hints", test))]
+pub(crate) struct QuoteFreeComments<'a> {
+    /// The text, and the last `;` the HeliosDB-Lite rule of its comments
+    /// reads, found once when first needed ([`Pieces::comment`]).
+    pieces: Pieces<'a>,
+    /// Where the search for the next comment starts.
+    at: usize,
+    /// One past the last offset a yielded comment may start at.
+    end: usize,
+}
+
+#[cfg(any(feature = "routing-hints", test))]
+impl<'a> Iterator for QuoteFreeComments<'a> {
+    type Item = (usize, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let sql = self.pieces.sql;
+        let b = sql.as_bytes();
+        loop {
+            let start = self.at + memchr::memchr2(b'-', b'/', b.get(self.at..self.end)?)?;
+            let end = match (b[start], b.get(start + 1)) {
+                (b'-', Some(&b'-')) => {
+                    let end = run(b, start + 2, |c| c != b'\n' && c != b'\r');
+                    // A `\r` alone ends the comment for PostgreSQL only.
+                    (b.get(end) != Some(&b'\r') || b.get(end + 1) == Some(&b'\n')).then_some(end)
+                }
+                (b'/', Some(&b'*')) => short_block_comment_end(b, start),
+                _ => {
+                    self.at = start + 1;
+                    continue;
+                }
+            };
+            // Nothing is read past a rest: the search range is left empty.
+            self.at = self.end;
+            return match self.pieces.comment(start, end?) {
+                (Piece::Comment(comment), end) => {
+                    self.at = end.min(self.end);
+                    Some((start, comment))
+                }
+                _ => None,
+            };
+        }
+    }
+}
+
+/// [`block_comment_end`] with byte searches instead of a substring search
+/// built for each call: the first `*` followed by `/`, then a `/` followed
+/// by `*` before it (the `*` may be the closing one's). The same answer for
+/// every text and start; cheaper for the short comments a hint is.
+#[cfg(any(feature = "routing-hints", test))]
+fn short_block_comment_end(b: &[u8], start: usize) -> Option<usize> {
+    let body = &b[start + 2..];
+    let mut at = 0;
+    let close = loop {
+        let star = at + memchr::memchr(b'*', &body[at..])?;
+        if body.get(star + 1) == Some(&b'/') {
+            break star;
+        }
+        at = star + 1;
+    };
+    let mut at = 0;
+    while let Some(slash) = memchr::memchr(b'/', &body[at..close]) {
+        if body[at + slash + 1] == b'*' {
+            return None;
+        }
+        at += slash + 1;
+    }
+    Some(start + 2 + close + 2)
 }
 
 /// The longest identifier PostgreSQL keeps (`NAMEDATALEN - 1` bytes): it
@@ -713,5 +819,252 @@ pub(crate) fn lower(text: Cow<'_, str>) -> Cow<'_, str> {
         Cow::Owned(text.to_ascii_lowercase())
     } else {
         text
+    }
+}
+
+/// Test-only: `count` generated statements from `seed` (xorshift) for the
+/// comment readers' equivalence checks: words, numbers (an exponent's `-`
+/// too), punctuation, every whitespace byte (a lone CR included), `--`, `/*`,
+/// `*/`, nested, unterminated and empty comments, `;` inside and outside
+/// them, routing hints (`/*helios:…*/`, in a line comment too) and stray
+/// `helios:` text. With `quotes`, about half also hold literals, quoted
+/// identifiers, dollar quotes and `$n` (a hint inside some of them).
+#[cfg(test)]
+pub(crate) fn generated_comment_texts(mut seed: u64, count: usize, quotes: bool) -> Vec<String> {
+    const PLAIN: &[&str] = &[
+        "SELECT",
+        "select",
+        "x",
+        "t1",
+        "a_b",
+        "FROM",
+        "1",
+        "42",
+        "1e-5",
+        "1e--5",
+        "1.5",
+        ".5",
+        "e",
+        "é",
+        "名",
+        "\u{a0}",
+        ";",
+        ",",
+        "(",
+        ")",
+        "=",
+        "+",
+        "<>",
+        "::",
+        "..",
+        ".",
+        "-",
+        "/",
+        "*",
+        "--",
+        "/*",
+        "*/",
+        "/**/",
+        "/*/",
+        "-- c",
+        "/* c */",
+        "/* a; b */",
+        "/*;*/",
+        "/* it */",
+        "/* / * */",
+        "helios:",
+        "/*helios:route=primary*/",
+        "/* helios:cache=skip */",
+        "/*helios:route=standby,consistency=eventual*/",
+        "/*helios:a=1 * b*/",
+        "/*helios:*/",
+        "/*helios:route=primary",
+        "-- /*helios:route=standby*/",
+        "--/*helios:cache=skip*/",
+        "/* /*helios:route=primary*/",
+        "/*helios:route=sync*//*helios:lag=5s*/",
+        "/*\u{a0}helios:route=primary*/",
+        "/*\nhelios:route=standby\n*/",
+        "/*helios:a=1**/",
+        "/**helios:route=primary*/",
+        "--helios:route=primary",
+    ];
+    const SPACES: &[&str] = &[" ", "\n", "\r", "\r\n", "\t", "\u{b}", "\u{c}", "  "];
+    const QUOTED: &[&str] = &[
+        "'",
+        "\"",
+        "$",
+        "$$",
+        "$1",
+        "$a$",
+        "a$$",
+        "'x'",
+        "'it''s'",
+        "E'a\\'b'",
+        "U&'d'",
+        "U&\"q\"",
+        "\"id\"",
+        "\"a\"\"b\"",
+        "$$ x $$",
+        "$t$ /* $t$",
+        "'/*helios:route=standby*/'",
+        "$$/*helios:route=standby*/$$",
+        "\"/*helios:cache=skip*/\"",
+        "/* it's */",
+        "/* $ */",
+    ];
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    (0..count)
+        .map(|_| {
+            let quoted = quotes && next() % 2 == 0;
+            let mut sql = String::new();
+            for _ in 0..next() % 16 {
+                let token = if quoted && next() % 5 == 0 {
+                    QUOTED[(next() % QUOTED.len() as u64) as usize]
+                } else {
+                    PLAIN[(next() % PLAIN.len() as u64) as usize]
+                };
+                sql.push_str(token);
+                if next() % 3 != 0 {
+                    sql.push_str(SPACES[(next() % SPACES.len() as u64) as usize]);
+                }
+            }
+            if next() % 4 == 0 {
+                sql.push(';');
+            }
+            sql
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod comment_reader_tests {
+    use super::*;
+
+    /// Every comment of `sql`, read by the lexer with no limit.
+    fn all_comments(sql: &str) -> Vec<(usize, &str)> {
+        Pieces::new(sql)
+            .filter_map(|(at, piece)| match piece {
+                Piece::Comment(comment) => Some((at, comment)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// On quote-free text the scanner yields what the lexer yields, for
+    /// every limit; the lexer's limit drops only the comments after it.
+    #[test]
+    fn quote_free_comments_match_the_lexer() {
+        let mut found = 0;
+        for sql in generated_comment_texts(0x51A7_E5C0_FFEE_1234, 20_000, false) {
+            assert!(quote_free(&sql), "{sql:?}");
+            let all = all_comments(&sql);
+            let limits = [0, sql.len() / 3, sql.len() / 2, sql.len(), usize::MAX];
+            for last in limits.into_iter().chain(all.iter().map(|&(at, _)| at)) {
+                let lexed: Vec<_> = comments(&sql, last).collect();
+                let want: Vec<_> = all.iter().copied().filter(|&(at, _)| at <= last).collect();
+                assert_eq!(lexed, want, "lexer limit {last} in {sql:?}");
+                let scanned: Vec<_> = quote_free_comments(&sql, last).collect();
+                assert_eq!(scanned, lexed, "limit {last} in {sql:?}");
+            }
+            found += all.len();
+        }
+        assert!(
+            found > 2_000,
+            "only {found} comments read: the corpus must hold many"
+        );
+    }
+
+    /// `short_block_comment_end` answers as `block_comment_end` at every
+    /// `/*` of generated byte strings over `/`, `*` and filler bytes (nested,
+    /// unterminated, `/*/`, `**/` and `/**/` included).
+    #[test]
+    fn short_block_comment_end_matches_block_comment_end() {
+        const BYTES: &[u8] = b"/*/*a \n";
+        let mut seed = 0x0B10_C0DE_7E57_0001_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut checked = 0;
+        for _ in 0..20_000 {
+            let len = (next() % 24) as usize;
+            let text: Vec<u8> = (0..len)
+                .map(|_| BYTES[(next() % BYTES.len() as u64) as usize])
+                .collect();
+            for start in 0..text.len().saturating_sub(1) {
+                if &text[start..start + 2] == b"/*" {
+                    assert_eq!(
+                        short_block_comment_end(&text, start),
+                        block_comment_end(&text, start),
+                        "{:?} at {start}",
+                        String::from_utf8_lossy(&text)
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 5_000, "{checked} openers checked");
+        for (text, want) in [
+            ("/**/", Some(4)),
+            ("/*/", None),
+            ("/* a /* b */", None),
+            ("/* a */ /* b */", Some(7)),
+            ("/* a **/", Some(8)),
+            ("/* a /*/", None),
+            ("/*", None),
+        ] {
+            assert_eq!(
+                short_block_comment_end(text.as_bytes(), 0),
+                want,
+                "{text:?}"
+            );
+            assert_eq!(block_comment_end(text.as_bytes(), 0), want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn quote_free_names_the_bytes_that_start_quoted_text() {
+        for sql in ["SELECT 1 /* x */", "-- c\nSELECT a - b / c", ""] {
+            assert!(quote_free(sql), "{sql:?}");
+        }
+        for sql in [
+            "SELECT 'a'",
+            "SELECT \"a\"",
+            "SELECT $1",
+            "SELECT $$a$$",
+            "U&'x'",
+        ] {
+            assert!(!quote_free(sql), "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn quote_free_comments_stop_at_a_rest() {
+        // A lone CR ends a `--` comment for PostgreSQL only; a nested and an
+        // unterminated block comment; a `;` HeliosDB-Lite splits inside.
+        for sql in [
+            "SELECT 1 -- a\r/*helios:route=primary*/",
+            "/* a /*helios:route=primary*/ SELECT 1",
+            "SELECT 1 /* open",
+            "/* a; */ SELECT 1; SELECT 2 /* b */",
+        ] {
+            assert_eq!(
+                quote_free_comments(sql, usize::MAX).collect::<Vec<_>>(),
+                all_comments(sql),
+                "{sql:?}"
+            );
+        }
+        assert_eq!(
+            quote_free_comments("SELECT 1 -- a\r\n/* b */", usize::MAX).collect::<Vec<_>>(),
+            [(9, "-- a"), (15, "/* b */")]
+        );
     }
 }

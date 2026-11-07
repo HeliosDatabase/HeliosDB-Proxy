@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Routing hints: parse and strip cost restored (perf).** Reading hints only from
+  comments outside literals (the `[routing_hints]` literal fix) lexed every hinted
+  statement whole and ran the hint regex with captures per comment, so parse and strip
+  cost up to 3x what they did. The reader now stops after the last `helios:` in the
+  statement, finds the comments of a statement without `'`, `"` or `$` with a byte scan
+  (no literal or quoted identifier can exist there; the lexer's comment rules, rests
+  included), matches a block-comment hint without a regex search, and strip trims in
+  place. Hints inside literals are still never read or stripped; property tests compare
+  the scanner with the lexer and the new reader with the old one on generated statements,
+  with and without literals. No behaviour change.
 - The C-02 write path (`QueryCache::write_tables`, the edge `write_tables`) and the
   journal's statement classifier skip the lexer pass for plain ASCII statements: no
   quote, `$`, backslash, `-`, `/`, CR, and no `;` but a final one. The answers are the

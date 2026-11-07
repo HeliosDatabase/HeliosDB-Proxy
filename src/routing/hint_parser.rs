@@ -28,7 +28,15 @@ use crate::pool::PoolingMode;
 /// Text every hint contains; a query without it has no hint to find.
 const HINT_MARKER: &str = "helios:";
 
-/// Compiled regex for hint parsing, applied to one comment at a time
+/// Finds [`HINT_MARKER`] in a query, built once: a forward (vectorised)
+/// search, so a statement without a hint costs one fast pass, as
+/// `str::contains` did.
+static HINT_MARKER_FINDER: Lazy<memchr::memmem::Finder<'static>> =
+    Lazy::new(|| memchr::memmem::Finder::new(HINT_MARKER.as_bytes()));
+
+/// Compiled regex for hint parsing, applied to one comment at a time: a
+/// hint is a match of it inside one comment. Block comments are matched by
+/// [`block_hint`], which finds the same match without a regex search.
 static HINT_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"/\*\s*helios:([^*]+)\*/").expect("Invalid hint regex"));
 
@@ -131,12 +139,11 @@ impl HintParser {
             last = span.end;
         }
         out.push_str(&query[last..]);
-        let trimmed = out.trim();
-        if trimmed.len() == out.len() {
-            Cow::Owned(out)
-        } else {
-            Cow::Owned(trimmed.to_string())
-        }
+        // Trimmed in place: one allocation.
+        out.truncate(out.trim_end().len());
+        let lead = out.len() - out.trim_start().len();
+        out.drain(..lead);
+        Cow::Owned(out)
     }
 
     /// Extract raw hint string from query (for logging)
@@ -162,27 +169,70 @@ struct HintSpan<'a> {
 /// Every hint in `query`, in order. A hint counts only inside a comment the
 /// quote-aware lexer ([`crate::sql_lex::comments`]) reads outside literals,
 /// dollar quotes and quoted identifiers, so `/*helios:…*/` inside `'…'` is
-/// data. A query without `helios:` is never lexed and yields no spans.
+/// data. A query without `helios:` is never lexed and yields no spans, and
+/// nothing after its last `helios:` is read. A query without a quote or a
+/// `$` has no literal or quoted identifier, and its comments are found
+/// without the lexer ([`crate::sql_lex::quote_free_comments`], the same
+/// comments).
 fn hint_spans(query: &str) -> Vec<HintSpan<'_>> {
-    if !query.contains(HINT_MARKER) {
+    // The last `helios:` (one cannot overlap another, so the iterator sees
+    // every one).
+    let Some(last) = HINT_MARKER_FINDER.find_iter(query.as_bytes()).last() else {
         return Vec::new();
-    }
+    };
     let mut spans = Vec::new();
-    for (at, comment) in crate::sql_lex::comments(query) {
-        if !comment.contains(HINT_MARKER) {
-            continue;
-        }
-        for cap in HINT_REGEX.captures_iter(comment) {
-            if let (Some(whole), Some(body)) = (cap.get(0), cap.get(1)) {
+    if crate::sql_lex::quote_free(query) {
+        push_hint_spans(&mut spans, crate::sql_lex::quote_free_comments(query, last));
+    } else {
+        push_hint_spans(&mut spans, crate::sql_lex::comments(query, last));
+    }
+    spans
+}
+
+/// Push the hints of each comment (offset, text) to `spans`: the matches of
+/// [`HINT_REGEX`] in it.
+fn push_hint_spans<'a>(
+    spans: &mut Vec<HintSpan<'a>>,
+    comments: impl Iterator<Item = (usize, &'a str)>,
+) {
+    for (at, comment) in comments {
+        if comment.starts_with("/*") {
+            if let Some(body) = block_hint(comment) {
                 spans.push(HintSpan {
-                    start: at + whole.start(),
-                    end: at + whole.end(),
-                    body: body.as_str(),
+                    start: at,
+                    end: at + comment.len(),
+                    body,
                 });
+            }
+        } else if comment.contains(HINT_MARKER) {
+            for found in HINT_REGEX.find_iter(comment) {
+                let hint = found.as_str();
+                // The regex's group 1: past the first `helios:` (the `\s*`
+                // before it holds none), up to the closing `*/`.
+                if let Some(marker) = hint.find(HINT_MARKER) {
+                    spans.push(HintSpan {
+                        start: at + found.start(),
+                        end: at + found.end(),
+                        body: &hint[marker + HINT_MARKER.len()..hint.len() - 2],
+                    });
+                }
             }
         }
     }
-    spans
+}
+
+/// The body of the hint a block comment the lexer read (`/*…*/`, with no
+/// other `/*` in it, ending at its first `*/`) holds, or `None`: the match of
+/// [`HINT_REGEX`] in it, which can only start at its `/*` and so is the
+/// whole comment or nothing. `\s*` is Unicode whitespace in both; the body
+/// (`[^*]+`) runs to the first `*`, which must close the comment.
+fn block_hint(comment: &str) -> Option<&str> {
+    let rest = comment
+        .strip_prefix("/*")?
+        .trim_start_matches(char::is_whitespace)
+        .strip_prefix(HINT_MARKER)?;
+    let (body, close) = rest.split_at(rest.find('*')?);
+    (!body.is_empty() && close == "*/").then_some(body)
 }
 
 /// Parsed hints collection
@@ -873,5 +923,116 @@ mod tests {
     fn strip_without_hint_marker_still_trims_whitespace() {
         let parser = HintParser::new();
         assert_eq!(parser.strip("  SELECT 1 \n"), "SELECT 1");
+    }
+
+    /// The hint reader as it was before its fast paths: every comment the
+    /// lexer reads (no limit), the regex with its capture group on each.
+    fn lexer_hint_spans(query: &str) -> Vec<(usize, usize, &str)> {
+        if !query.contains(HINT_MARKER) {
+            return Vec::new();
+        }
+        let mut spans = Vec::new();
+        for (at, comment) in crate::sql_lex::comments(query, usize::MAX) {
+            if !comment.contains(HINT_MARKER) {
+                continue;
+            }
+            for cap in HINT_REGEX.captures_iter(comment) {
+                if let (Some(whole), Some(body)) = (cap.get(0), cap.get(1)) {
+                    spans.push((at + whole.start(), at + whole.end(), body.as_str()));
+                }
+            }
+        }
+        spans
+    }
+
+    /// `strip` as it was, on [`lexer_hint_spans`].
+    fn lexer_strip(query: &str) -> String {
+        let mut out = String::new();
+        let mut last = 0;
+        for (start, end, _) in lexer_hint_spans(query) {
+            out.push_str(&query[last..start]);
+            last = end;
+        }
+        out.push_str(&query[last..]);
+        out.trim().to_string()
+    }
+
+    /// The fast paths (the quote-free comment scanner, the stop after the
+    /// last `helios:`, the block-comment match, the in-place trim) read the
+    /// same hints as the lexer and the regex on generated statements, with
+    /// and without literals, quoted identifiers and dollar quotes: the same
+    /// spans and bodies, so the same `parse`, `strip` and `extract_raw`.
+    #[test]
+    fn fast_paths_read_the_hints_the_lexer_reads() {
+        let parser = HintParser::new();
+        let (mut quote_free, mut lexed, mut hinted) = (0, 0, 0);
+        for query in crate::sql_lex::generated_comment_texts(0xC0DE_D00D_5EED_0042, 30_000, true) {
+            let fast: Vec<_> = hint_spans(&query)
+                .iter()
+                .map(|s| (s.start, s.end, s.body))
+                .collect();
+            let want = lexer_hint_spans(&query);
+            assert_eq!(fast, want, "{query:?}");
+            assert_eq!(parser.strip(&query), lexer_strip(&query), "{query:?}");
+            assert_eq!(
+                parser.extract_raw(&query),
+                want.iter()
+                    .map(|&(s, e, _)| query[s..e].to_string())
+                    .collect::<Vec<_>>(),
+                "{query:?}"
+            );
+            if crate::sql_lex::quote_free(&query) {
+                quote_free += 1;
+            } else {
+                lexed += 1;
+            }
+            if !want.is_empty() {
+                hinted += 1;
+            }
+        }
+        assert!(
+            quote_free > 5_000 && lexed > 5_000 && hinted > 2_000,
+            "quote-free {quote_free}, lexed {lexed}, with hints {hinted}"
+        );
+    }
+
+    #[test]
+    fn block_hint_is_the_regex_match_of_a_block_comment() {
+        for comment in [
+            "/*helios:route=primary*/",
+            "/* helios:cache=skip */",
+            "/*\u{a0}\nhelios:route=standby\n*/",
+            "/*helios:*/",
+            "/*helios:a=1**/",
+            "/*helios:a=1 * b*/",
+            "/**helios:route=primary*/",
+            "/* x helios:route=primary*/",
+            "/*helios:route=primary /*/",
+        ] {
+            let want = HINT_REGEX
+                .captures(comment)
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str());
+            assert_eq!(block_hint(comment), want, "{comment:?}");
+        }
+    }
+
+    #[test]
+    fn hints_after_the_last_marker_are_not_read_past_and_quotes_take_the_lexer() {
+        let parser = HintParser::new();
+        // The lexer reads up to the last `helios:` only; a literal after it
+        // (with an unterminated quote) changes nothing.
+        let query = "/*helios:route=primary*/ SELECT 'it''s', $1 FROM t WHERE a = 'x";
+        assert_eq!(parser.parse(query).route, Some(RouteTarget::Primary));
+        assert_eq!(
+            parser.strip(query),
+            "SELECT 'it''s', $1 FROM t WHERE a = 'x"
+        );
+        // Quote-free: hints at the start and at the end are both read.
+        let query = "/*helios:route=standby*/ SELECT a - b / c FROM t -- x\n/*helios:cache=skip*/";
+        let hints = parser.parse(query);
+        assert_eq!(hints.route, Some(RouteTarget::Standby));
+        assert_eq!(hints.cache, Some(CacheBehavior::Skip));
+        assert_eq!(parser.strip(query), "SELECT a - b / c FROM t -- x");
     }
 }
