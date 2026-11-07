@@ -17,22 +17,54 @@ stay under 3%.
   candidate's CI does not overlap the baseline CI (Criterion's own change report says
   "regressed" / "improved" / "within noise").
 
-## 2026-11-06 — MCP tool-result cache (3 new cases, values pending)
+## 2026-11-07 — distribcache merge (P1-P3), backlog batch and MCP tool cache (29 new cases)
 
-The MCP tool-result cache (sprinter `20bcc218385f`, `[mcp] tool_cache_*`). Three new cases
-in `benches/cache.rs` (`bench_mcp_tool_cache`), `--features all-features`: `hit_1k`,
-`miss_store_1k` (a `"fresh": true` call: no lookup, the entry replaced) and
-`evict_at_capacity_1k` (a new statement each iteration at the owner bound of 64, so each
-store evicts one entry), one owner, a 1 KiB result, a ready fetch future. They are NEW in
-`scripts/bench-gate.sh` (no base arm). The values were not measured on the implementing
-branch (agents do not run benchmarks in this batch); the lead records them from the
-candidate arm of the gate run.
+NEW cases in `scripts/bench-gate.sh` (no base arm) from the 2026-11-06 batch. Values: the candidate arm of the gate run
+`final-crit-20261106` (base main d407730, candidate 987d85e (built as 90b8352 on the integration branch, same tree); host gpc001ca, toolchain rustc
+1.95.0 as bench-gate ran it, 3 interleaved rounds), each the median of the three rounds' Criterion median
+estimates. The two perf commits that followed (552afe9 hint reader, bec0345 plain-ASCII scan order) do not change
+these cases' statements (all plain ASCII) beyond placement; the gate archive and its ATTRIBUTION.md are under
+/home/gpc/HDB/sprint/baselines/proxy/final-crit-20261106/.
+
+- `benches/cache.rs` `bench_l2_codec` (P1, sprinter `7c860e8a2e14`): L2 payload compression on DataRow payloads; `compress_*` is the store path, `hit_*` an L2 hit including decompression, `hit_none_64k` the uncompressed control.
+- `bench_heatmap` (P2, `c6271bc39d4b`): one heatmap record on the read path, off / on / 8 threads on one table.
+- `cache/query` refresh-ahead cases (P3, `918edffa62e1`): an L1 hit with refresh-ahead on, and a due L1 copy while another reader holds the claim.
+- `bench_volatile_scan` (`87c5caf119f8`): the one-pass volatile-function scan (`sql_text::VolatileScan`) on a short read and a 1 KiB read.
+- `cache/write_tables` and `cache/classify` (`52d930745a3d`, plain-ASCII fast path): pgbench tpcb-like writes and journal classification of a SELECT and BEGIN.
+- `cache/excl/scan_3_names_100b` (`7d0bc926559f`): a three-name `exclude_tables` scan of a short read.
+- `bench_mcp_tool_cache` (`20bcc218385f`): MCP tool-result cache `hit_1k`, `miss_store_1k` (a `"fresh": true` call) and `evict_at_capacity_1k` (owner bound 64), one owner, a 1 KiB result.
 
 | Benchmark | Metric | Value | Date | Host | Features | Commit |
 |---|---|---:|---|---|---|---|
-| `cache/mcp/hit_1k` | median ns | pending | 2026-11-06 | gpc001ca | `all-features` | feat/mcp-tool-cache-20261106 |
-| `cache/mcp/miss_store_1k` | median ns | pending | 2026-11-06 | gpc001ca | `all-features` | feat/mcp-tool-cache-20261106 |
-| `cache/mcp/evict_at_capacity_1k` | median ns | pending | 2026-11-06 | gpc001ca | `all-features` | feat/mcp-tool-cache-20261106 |
+| `cache/l2/compress_lz4_1m` | median ns | 718,790 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/l2/compress_lz4_4k` | median ns | 3,608 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/l2/compress_lz4_64k` | median ns | 43,405 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/l2/compress_zstd_1m` | median ns | 1,287,400 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/l2/compress_zstd_4k` | median ns | 9,926 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/l2/compress_zstd_64k` | median ns | 90,700 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/l2/hit_lz4_1m` | median ns | 310,780 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/l2/hit_lz4_4k` | median ns | 1,815 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/l2/hit_lz4_64k` | median ns | 17,026 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/l2/hit_none_64k` | median ns | 327.1 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/l2/hit_zstd_1m` | median ns | 405,180 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/l2/hit_zstd_4k` | median ns | 4,490 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/l2/hit_zstd_64k` | median ns | 27,636 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/heatmap/record_hit_contended_8` | median ns | 341.6 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/heatmap/record_hit_off` | median ns | 1.5 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/heatmap/record_hit_on` | median ns | 55.9 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/query/l1_due_claim_held_1k` | median ns | 3,075 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/query/l1_hit_refresh_ahead_1k` | median ns | 511.4 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/policy/volatile_scan_1k` | median ns | 1,670 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/policy/volatile_scan_short` | median ns | 106.4 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/classify/begin` | median ns | 122.9 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/classify/select_only` | median ns | 203.7 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/write_tables/insert_history` | median ns | 1,449 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/write_tables/short_update` | median ns | 735.6 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/write_tables/update_accounts` | median ns | 954.2 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/excl/scan_3_names_100b` | median ns | 243.7 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/mcp/evict_at_capacity_1k` | median ns | 2,521 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/mcp/hit_1k` | median ns | 2,324 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
+| `cache/mcp/miss_store_1k` | median ns | 2,919 | 2026-11-07 | gpc001ca | `all-features` | 987d85e |
 
 ## 2026-10-29 — tenant request budgets (3 new cases)
 
