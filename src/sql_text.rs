@@ -664,15 +664,20 @@ pub fn uncacheable_text(sql: &str) -> Option<UncacheableText> {
 /// yields only whitespace, words, numbers and single punctuation bytes, so
 /// [`single_statement`] and [`leading_rest`] answer from the raw text (the
 /// statement and its comment-free text are `sql` itself, and `leading_rest`
-/// is `false`). Three byte scans, each vectorised by `memchr`, and an ASCII
+/// is `false`). Four byte scans, each vectorised by `memchr`, and an ASCII
 /// test: far cheaper than the lexer on the statements a write path sees.
+/// Each scan stops at the first byte it finds, and the quote scan, which
+/// stops early in most statements that are not plain (a literal), runs
+/// first; the ASCII test, which reads every byte of a statement that is
+/// all ASCII, runs last, so a long statement with an early quote costs a
+/// few bytes, not a pass over its whole text.
 pub(crate) fn plain_ascii(sql: &str) -> bool {
     let b = sql.as_bytes();
-    b.is_ascii()
-        && memchr::memchr3(b'\'', b'"', b'$', b).is_none()
+    memchr::memchr3(b'\'', b'"', b'$', b).is_none()
         && memchr::memchr3(b'\\', b'-', b'/', b).is_none()
         && memchr::memchr(b'\r', b).is_none()
         && memchr::memchr(b';', b).is_none_or(|at| at + 1 == b.len())
+        && b.is_ascii()
 }
 
 /// Whether the fast path answers for `sql`: [`plain_ascii`], unless a test
@@ -3768,6 +3773,37 @@ mod fast_path_tests {
             plain > 1_000 && lexed > 1_000,
             "plain {plain}, lexed {lexed}"
         );
+    }
+
+    /// The scan order (the quote scan first, the ASCII test last) changes
+    /// no answer: the same as the ASCII test first, on the generated
+    /// statements and on long ones with a disqualifying byte at the start,
+    /// in the middle or at the end.
+    #[test]
+    fn plain_ascii_scan_order_changes_no_answer() {
+        let ascii_first = |sql: &str| {
+            let b = sql.as_bytes();
+            b.is_ascii()
+                && memchr::memchr3(b'\'', b'"', b'$', b).is_none()
+                && memchr::memchr3(b'\\', b'-', b'/', b).is_none()
+                && memchr::memchr(b'\r', b).is_none()
+                && memchr::memchr(b';', b).is_none_or(|at| at + 1 == b.len())
+        };
+        let mut texts = generated_statements(0x0DDB_A11C_AFE5_7EED, 5_000);
+        let long = "INSERT INTO t VALUES (1, 2) ".repeat(64);
+        for byte in ["'", "\"", "$", "\\", "-", "/", "\r", ";", "é", "\u{a0}"] {
+            texts.push(format!("{byte}{long}"));
+            texts.push(format!(
+                "{}{byte}{}",
+                &long[..long.len() / 2],
+                &long[long.len() / 2..]
+            ));
+            texts.push(format!("{long}{byte}"));
+        }
+        texts.push(long);
+        for sql in &texts {
+            assert_eq!(plain_ascii(sql), ascii_first(sql), "{sql:?}");
+        }
     }
 
     #[test]

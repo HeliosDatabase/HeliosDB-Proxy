@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **C-02 write path: the plain-ASCII check stops at the first quote (perf).** The
+  plain-ASCII fast path of `write_tables` (query cache and edge) and the journal's
+  classifier ran its whole-text ASCII test first, so every statement that is not plain
+  (a bulk `INSERT ... VALUES ('...')` of 1 MiB) paid a full pass over its text, about
+  1.1 ms per MiB, before it took the lexer anyway. The quote scan now runs first and the
+  ASCII test last; the answers are the same (tested). No behaviour change.
 - **Routing hints: parse and strip cost restored (perf).** Reading hints only from
   comments outside literals (the `[routing_hints]` literal fix) lexed every hinted
   statement whole and ran the hint regex with captures per comment, so parse and strip
