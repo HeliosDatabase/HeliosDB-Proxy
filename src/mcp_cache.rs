@@ -62,7 +62,8 @@ const FIFO_SLACK_FACTOR: usize = 2;
 /// `reason` label of `heliosdb_proxy_mcp_cache_skipped_total`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SkipReason {
-    /// Not one plain `SELECT` (a write, DDL, `INTO`, several statements).
+    /// Not a proven plain SELECT: writes, DDL, INTO, multiple statements,
+    /// syntactic calls, or a rewritten list_tables catalog statement.
     Write,
     /// A volatile function or literal, an extra of `[cache]
     /// extra_volatile_functions`, or a locking clause.
@@ -409,6 +410,8 @@ impl McpToolCache {
     /// A cache with `settings`, retired by `generations`, refusing what
     /// `volatile` and `exclusions` refuse (the result caches' own scans),
     /// with the shorter of `table_ttls` (`[[cache.tables]]`) applied.
+    /// The caller owns the cache-compatible read-effects and backend-context
+    /// equivalence contract; the daemon gateway enforces its separate config.
     pub fn new<'a>(
         settings: ToolCacheSettings,
         generations: Arc<TableGenerations>,
@@ -429,6 +432,8 @@ impl McpToolCache {
     }
 
     /// The cache `config` configures, on the daemon's shared objects.
+    /// This builds settings; callers must enforce the backend contract before
+    /// serving results. The daemon and MCP gateway do so independently.
     pub fn from_config(
         config: &ProxyConfig,
         generations: Arc<TableGenerations>,
@@ -455,15 +460,6 @@ impl McpToolCache {
     /// Whether `tool`'s result for the final statement `sql` may be cached,
     /// and if so its tables and TTL.
     fn plan(&self, tool: CachedTool, sql: &str) -> Result<Plan, SkipReason> {
-        if tool == CachedTool::ListTables {
-            if self.settings.catalog_ttl.is_zero() {
-                return Err(SkipReason::Catalog);
-            }
-            return Ok(Plan {
-                tables: Vec::new(),
-                ttl: self.settings.catalog_ttl,
-            });
-        }
         if sql.len() > self.settings.max_statement_bytes {
             return Err(SkipReason::StatementTooLarge);
         }
@@ -475,14 +471,40 @@ impl McpToolCache {
                 SkipReason::Write
             });
         }
-        if crate::sql_text::names_system_catalog(sql.as_bytes()) {
-            return Err(SkipReason::Catalog);
-        }
+        // Preserve the established ambiguity reason. Both refusal guards
+        // still run before any ordinary or catalog cache plan is eligible.
         if crate::sql_text::uncacheable_text(sql).is_some() {
             return Err(SkipReason::Ambiguous);
         }
+        // A function call needs `(`. Most cached SELECTs contain none, so
+        // avoid a second full lexical walk on that common path. Keep the
+        // scanner for any possible call and for NUL, which it rejects
+        // fail-closed even though it cannot introduce a call.
+        if memchr::memchr2(b'(', 0, sql.as_bytes()).is_some()
+            && !matches!(
+                crate::replay_sql::all_calls_satisfy(sql, |_| false),
+                Ok(true)
+            )
+        {
+            return Err(SkipReason::Write);
+        }
         if self.exclusions.as_ref().is_some_and(|x| x.matches(sql)) {
             return Err(SkipReason::Excluded);
+        }
+        if tool == CachedTool::ListTables {
+            if sql != crate::mcp::LIST_TABLES_SQL {
+                return Err(SkipReason::Write);
+            }
+            if self.settings.catalog_ttl.is_zero() {
+                return Err(SkipReason::Catalog);
+            }
+            return Ok(Plan {
+                tables: Vec::new(),
+                ttl: self.settings.catalog_ttl,
+            });
+        }
+        if crate::sql_text::names_system_catalog(sql.as_bytes()) {
+            return Err(SkipReason::Catalog);
         }
         let tables = self.normalizer.statement_tables(sql);
         if tables.is_empty() {
@@ -1187,7 +1209,7 @@ mod tests {
         let (cache, g) = cache();
         let who = owner("default", None);
         let n = std::cell::Cell::new(0);
-        let sql = "SELECT table_schema, table_name FROM information_schema.tables";
+        let sql = crate::mcp::LIST_TABLES_SQL;
         let _ = call(
             &cache,
             &who,
@@ -1277,6 +1299,7 @@ mod tests {
             ("SELECT * FROM orders; SELECT 1", SkipReason::Write),
             ("SELECT * INTO copy FROM orders", SkipReason::Write),
             ("WITH x AS (SELECT 1) SELECT * FROM x", SkipReason::Write),
+            ("SELECT\0 * FROM orders", SkipReason::Write),
             ("SELECT now(), id FROM orders", SkipReason::Volatile),
             ("SELECT * FROM orders FOR UPDATE", SkipReason::Volatile),
             (

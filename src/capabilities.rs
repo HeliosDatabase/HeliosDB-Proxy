@@ -417,6 +417,9 @@ mod tests {
         config.mcp.tool_cache_enabled = true;
         assert!(!unavailable_enabled(&config).contains(&"mcp.tool_cache_enabled"));
         config.mcp.enabled = true;
+        // Result caching is enabled only after the operator trusts backend
+        // read effects under the C-06 contract.
+        config.mcp.trust_backend_read_effects = true;
         assert_eq!(
             unavailable_enabled(&config).contains(&"mcp.tool_cache_enabled"),
             !cfg!(feature = "query-cache")

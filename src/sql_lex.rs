@@ -9,9 +9,12 @@
 //! rules are documented on `sql_text`.
 
 use crate::replay_sql::{ident_cont, ident_start};
+use memchr::memmem::Finder;
+use once_cell::sync::Lazy;
 #[cfg(any(
-    any(feature = "multi-tenancy", test),
-    any(feature = "query-cache", feature = "edge-proxy", test)
+    feature = "multi-tenancy",
+    feature = "query-cache",
+    feature = "edge-proxy"
 ))]
 use std::borrow::Cow;
 use std::fmt;
@@ -144,9 +147,21 @@ pub(crate) fn is_space(c: u8) -> bool {
 /// comment stripper, which knows no dollar quotes, reads as SQL: the start of
 /// a comment, or a quote (which flips its idea of what is quoted).
 pub(crate) fn nano_reads_into(body: &[u8]) -> bool {
-    memchr::memchr2(b'\'', b'"', body).is_some()
-        || memchr::memmem::find(body, b"--").is_some()
-        || memchr::memmem::find(body, b"/*").is_some()
+    memchr::memchr2(b'\'', b'"', body).is_some() || holds_comment_start(body)
+}
+
+/// The searchers for the comment markers, each built once.
+/// `memchr::memmem::find` builds its searcher for every call, which costs
+/// more than the search of a statement-sized text: in a sampled profile
+/// building them was 84 ns of a 2.6 us L2 cache hit and, for the hint
+/// marker's alone, 34 ns of a 480 ns L1 hit (gpc001ca, 2026-11-16).
+static LINE_COMMENT_START: Lazy<Finder<'static>> = Lazy::new(|| Finder::new(b"--"));
+static BLOCK_COMMENT_START: Lazy<Finder<'static>> = Lazy::new(|| Finder::new(b"/*"));
+static BLOCK_COMMENT_END: Lazy<Finder<'static>> = Lazy::new(|| Finder::new(b"*/"));
+
+/// Whether `b` holds `--` or `/*` anywhere.
+fn holds_comment_start(b: &[u8]) -> bool {
+    LINE_COMMENT_START.find(b).is_some() || BLOCK_COMMENT_START.find(b).is_some()
 }
 
 impl<'a> Iterator for Pieces<'a> {
@@ -236,8 +251,9 @@ pub(crate) fn run(b: &[u8], mut i: usize, keep: impl Fn(u8) -> bool) -> usize {
 /// comments, HeliosDB-Nano ends one at its first `*/`).
 pub(crate) fn block_comment_end(b: &[u8], start: usize) -> Option<usize> {
     let body = &b[start + 2..];
-    let close = memchr::memmem::find(body, b"*/")?;
-    memchr::memmem::find(&body[..=close], b"/*")
+    let close = BLOCK_COMMENT_END.find(body)?;
+    BLOCK_COMMENT_START
+        .find(&body[..=close])
         .is_none()
         .then_some(start + 2 + close + 2)
 }
@@ -356,7 +372,7 @@ pub(crate) fn decinteger_end(b: &[u8], mut i: usize) -> usize {
 /// unchanged: the text the table extraction reads (a comment can neither
 /// hide a table name nor glue one to its keyword). Borrowed when there is no
 /// comment, without a scan when the text contains neither `--` nor `/*`.
-#[cfg(any(feature = "query-cache", feature = "edge-proxy", test))]
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 pub(crate) fn strip_comments(sql: &str) -> Cow<'_, str> {
     let mut stripped = Stripped::default();
     if has_comment_marker(sql.as_bytes()) {
@@ -371,13 +387,13 @@ pub(crate) fn strip_comments(sql: &str) -> Cow<'_, str> {
 
 /// [`strip_comments`], built one comment at a time.
 #[derive(Default)]
-#[cfg(any(feature = "query-cache", feature = "edge-proxy", test))]
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 pub(crate) struct Stripped {
     out: Option<String>,
     copied: usize,
 }
 
-#[cfg(any(feature = "query-cache", feature = "edge-proxy", test))]
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 impl Stripped {
     /// Replace the comment of `len` bytes at `start` with one space.
     pub(crate) fn comment(&mut self, sql: &str, start: usize, len: usize) {
@@ -402,9 +418,9 @@ impl Stripped {
 
 /// Whether `b` holds the start of a comment, `--` or `/*`, anywhere (in a
 /// literal too): without one the lexer finds no comment.
-#[cfg(any(feature = "query-cache", feature = "edge-proxy", test))]
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 pub(crate) fn has_comment_marker(b: &[u8]) -> bool {
-    memchr::memmem::find(b, b"--").is_some() || memchr::memmem::find(b, b"/*").is_some()
+    holds_comment_start(b)
 }
 
 /// `sql` from its first token that is neither whitespace nor a comment, or
@@ -418,7 +434,7 @@ pub(crate) fn has_comment_marker(b: &[u8]) -> bool {
 /// so and run the statement after it (`\u{a0}CREATE OR REPLACE VIEW …`),
 /// while PostgreSQL reads it as part of an identifier and fails the
 /// statement.
-#[cfg(any(feature = "query-cache", feature = "edge-proxy", test))]
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 pub(crate) fn statement_start(sql: &str) -> Option<&str> {
     match lead(sql) {
         Lead::Start(start) => Some(start),
@@ -428,7 +444,7 @@ pub(crate) fn statement_start(sql: &str) -> Option<&str> {
 
 /// What comes first in a statement past its leading whitespace and
 /// comments ([`lead`]).
-#[cfg(any(feature = "query-cache", feature = "edge-proxy", test))]
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 pub(crate) enum Lead<'a> {
     /// The statement from its first word.
     Start(&'a str),
@@ -441,7 +457,7 @@ pub(crate) enum Lead<'a> {
 /// What `sql` starts with past its leading whitespace and comments, in one
 /// pass of the lexer up to its first word: [`statement_start`] and
 /// [`leading_rest`] at once.
-#[cfg(any(feature = "query-cache", feature = "edge-proxy", test))]
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 pub(crate) fn lead(sql: &str) -> Lead<'_> {
     for (start, piece) in Pieces::new(sql) {
         match piece {
@@ -460,7 +476,7 @@ pub(crate) fn lead(sql: &str) -> Lead<'_> {
 }
 
 /// What an `EXPLAIN` prefix makes of the text it starts ([`explain`]).
-#[cfg(any(feature = "query-cache", feature = "edge-proxy", test))]
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Explain<'a> {
     /// The text does not start with EXPLAIN: it is a statement of its own.
@@ -478,7 +494,7 @@ pub(crate) enum Explain<'a> {
 /// lexer. Forms: `EXPLAIN [ANALYZE|ANALYSE] [VERBOSE] stmt` and
 /// `EXPLAIN ( option [, ...] ) stmt`. In the option list `ANALYZE` turns
 /// analysis on, unless a following `false`, `off` or `0` turns it off.
-#[cfg(any(feature = "query-cache", feature = "edge-proxy", test))]
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 pub(crate) fn explain(sql: &str) -> Explain<'_> {
     let mut pieces = Pieces::new(sql)
         .filter(|(_, p)| !matches!(p, Piece::Space(_) | Piece::Comment(_)))
@@ -544,7 +560,7 @@ pub(crate) fn explain(sql: &str) -> Explain<'_> {
 /// The statement `sql` runs once its `EXPLAIN ... ANALYZE` prefixes are
 /// peeled: `sql` itself unless it is an analysed EXPLAIN. `None` when that
 /// statement cannot be read (fail closed: the caller treats it as unknown).
-#[cfg(any(feature = "query-cache", feature = "edge-proxy", test))]
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
 pub(crate) fn explain_innermost(sql: &str) -> Option<&str> {
     let mut text = sql;
     loop {
@@ -558,7 +574,7 @@ pub(crate) fn explain_innermost(sql: &str) -> Option<&str> {
 
 /// The kind of one lexical unit of statement text ([`lex_units`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(any(feature = "multi-tenancy", test))]
+#[cfg(feature = "multi-tenancy")]
 pub(crate) enum LexKind {
     /// An unquoted word (keyword or identifier), as written.
     Word,
@@ -576,7 +592,7 @@ pub(crate) enum LexKind {
 
 /// One lexical unit of statement text, by byte range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(any(feature = "multi-tenancy", test))]
+#[cfg(feature = "multi-tenancy")]
 pub(crate) struct LexUnit {
     pub(crate) start: usize,
     pub(crate) end: usize,
@@ -589,7 +605,7 @@ pub(crate) struct LexUnit {
 /// a literal, quoted identifier or comment (HeliosDB-Lite matches keywords
 /// by their Unicode upper-case form, so no word is certain): a caller must
 /// then fail closed.
-#[cfg(any(feature = "multi-tenancy", test))]
+#[cfg(feature = "multi-tenancy")]
 pub(crate) fn lex_units(sql: &str) -> Option<Vec<LexUnit>> {
     let mut out = Vec::new();
     for (start, piece) in Pieces::new(sql) {
@@ -748,8 +764,7 @@ fn short_block_comment_end(b: &[u8], start: usize) -> Option<usize> {
 #[cfg(any(
     feature = "multi-tenancy",
     feature = "query-cache",
-    feature = "edge-proxy",
-    test
+    feature = "edge-proxy"
 ))]
 pub(crate) const MAX_IDENTIFIER_BYTES: usize = 63;
 
@@ -760,8 +775,7 @@ pub(crate) const MAX_IDENTIFIER_BYTES: usize = 63;
 #[cfg(any(
     feature = "multi-tenancy",
     feature = "query-cache",
-    feature = "edge-proxy",
-    test
+    feature = "edge-proxy"
 ))]
 pub(crate) fn truncated_identifier(name: &str) -> &str {
     if name.len() <= MAX_IDENTIFIER_BYTES {
@@ -781,7 +795,10 @@ pub(crate) fn truncated_identifier(name: &str) -> &str {
 /// parts. The rest of the text after a piece the lexer cannot read
 /// ([`Piece::Rest`], an unterminated token) is code, so it yields its words:
 /// fail-closed.
-#[cfg(any(feature = "multi-tenancy", test))]
+#[cfg(any(
+    feature = "multi-tenancy",
+    all(test, any(feature = "query-cache", feature = "edge-proxy"))
+))]
 pub(crate) fn code_identifiers(sql: &str) -> impl Iterator<Item = Cow<'_, str>> + '_ {
     Pieces::new(sql).flat_map(|(_, piece)| -> Vec<Cow<'_, str>> {
         match piece {
@@ -805,7 +822,10 @@ pub(crate) fn code_identifiers(sql: &str) -> impl Iterator<Item = Cow<'_, str>> 
 }
 
 /// The words of a text piece: runs of letters, digits, `_` and `$`.
-#[cfg(any(feature = "multi-tenancy", test))]
+#[cfg(any(
+    feature = "multi-tenancy",
+    all(test, any(feature = "query-cache", feature = "edge-proxy"))
+))]
 pub(crate) fn text_words(text: &str) -> impl Iterator<Item = Cow<'_, str>> {
     text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
         .filter(|w| !w.is_empty())
@@ -813,7 +833,10 @@ pub(crate) fn text_words(text: &str) -> impl Iterator<Item = Cow<'_, str>> {
 }
 
 /// `text` ASCII-lower-cased, borrowed when it has no upper-case letter.
-#[cfg(any(feature = "multi-tenancy", test))]
+#[cfg(any(
+    feature = "multi-tenancy",
+    all(test, any(feature = "query-cache", feature = "edge-proxy"))
+))]
 pub(crate) fn lower(text: Cow<'_, str>) -> Cow<'_, str> {
     if text.bytes().any(|b| b.is_ascii_uppercase()) {
         Cow::Owned(text.to_ascii_lowercase())
@@ -1027,6 +1050,44 @@ mod comment_reader_tests {
                 "{text:?}"
             );
             assert_eq!(block_comment_end(text.as_bytes(), 0), want, "{text:?}");
+        }
+    }
+
+    /// The searchers built once find `--` and `/*` exactly where a window
+    /// scan does, over generated byte strings of `-`, `/`, `*`, quotes and
+    /// filler (empty, one byte and a marker split across the end included).
+    #[test]
+    fn comment_start_searchers_match_a_window_scan() {
+        const BYTES: &[u8] = b"-/*'\"a \n";
+        let mut seed = 0x0C0D_E5EA_7C4E_0001_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (mut with, mut without) = (0, 0);
+        for _ in 0..20_000 {
+            let len = (next() % 12) as usize;
+            let text: Vec<u8> = (0..len)
+                .map(|_| BYTES[(next() % BYTES.len() as u64) as usize])
+                .collect();
+            let want = text.windows(2).any(|pair| pair == b"--" || pair == b"/*");
+            assert_eq!(holds_comment_start(&text), want, "{text:?}");
+            let quoted = text.iter().any(|b| matches!(b, b'\'' | b'"'));
+            assert_eq!(nano_reads_into(&text), want || quoted, "{text:?}");
+            if want {
+                with += 1;
+            } else {
+                without += 1;
+            }
+        }
+        assert!(
+            with > 2_000 && without > 2_000,
+            "{with} with, {without} without"
+        );
+        for text in ["", "-", "/", "a-", "a/", "- -", "/ *", "*/"] {
+            assert!(!holds_comment_start(text.as_bytes()), "{text:?}");
         }
     }
 

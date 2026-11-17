@@ -7,7 +7,152 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Default query/edge result caching to a tiny scalar-literal subset unless the operator explicitly vouches for backend read effects and dependencies. MCP tool-result caching requires a separate effects and pooled-context-equivalence contract, including manually attached caches. Native SQL forwarding remains available. Scope rejection publication now obeys the configured client write timeout and retires lost sockets even when the client write fails.
+
+- Verify daemon query/edge cache execution scope on the selected backend with bounded effective-settings probes, clear L1 when that scope changes, and validate a native fill again before publication. Backend role/database defaults now partition shared entries; unsupported proof responses execute natively. The default adds backend round trips to cache reads (two `SHOW ALL` per miss, one per hit: pgbench's select-only script over the simple protocol at 16 clients measured 4 200 reads per second with the cache on, against 68 000 before the proof and 66 000 with `backend_context_immutable = true`); `cache.backend_context_immutable` permits proof reuse only under an explicit immutable-backend-context contract. Opaque view/RLS dependencies remain unvalidated.
+- Refuse function-name-only cache context proof, including schema-qualified builtin names, overloads and comment-separated calls; those sessions keep executing natively after the unverified call.
+
+- Namespace daemon SQL-result cache keys by every startup parameter and permanently bypass lookup/store after statements that may change execution context on either protocol. Mixed read/write sessions may have fewer hits. Opaque backend catalog dependencies still require validation.
+
+### Added
+
+- **SIGHUP resizes per-tenant caps.** A reload that only changes the size of caps or
+  byte budgets tenants already run under (`[multi_tenancy]` client caps, active-query
+  caps, replay-byte and recovery-journal budgets, defaults and per-tenant overrides)
+  now applies to the running process instead of being kept back for a restart. A raised
+  cap admits waiters in FIFO order; a lowered cap ends nothing and admits nobody new
+  until the tenant's holders are back under it. Any other change to the section, and a
+  cap a tenant would gain or lose, still refuses the whole section with a warning that
+  names the reason (unchanged behaviour for those).
+- The HTTP gateway's `POST /sql` can use the daemon's SQL result cache. It is consulted only when writes to the gateway's backend are visible to cache invalidation (the backend is a `[[nodes]]` target or this proxy's own listener, or `[cache] invalidation_source = "logical"`); otherwise reads execute natively and startup logs the bypass. Keys bind the backend endpoint, user, database, tenant, typed parameter values and the Neon array/object result shape. Results over the HTTP row/byte limits, errors, session-dependent statements and function calls are never cached, and without `[cache] trust_backend_read_effects` only literal scalar `SELECT`s are considered. The MCP tool-result cache skips its function-call scan for statements with no `(`.
+
+- Optional `[limits] copy_idle_timeout_secs` (default 0/off) bounds stalled COPY input, including partial frames and the final extended Sync after backend completion. Backend processing time is excluded. Expiry cancels and drops the COPY backend, rolls back unfinished input, closes with FATAL 57014 and returns tenant capacity. JSON/Prometheus counters expose COPY expiries and query-cache context bypasses without changing the public metrics snapshot shape.
+
+### Fixed
+
+- Reject malformed simple-Query CStrings with bounded FATAL 08P01 before hooks, rewriting or cache lookup; preserve empty queries, native byte encodings and typed Parse payloads.
+
+- Allow proven standalone unnamed extended COMMIT PREPARED and ROLLBACK PREPARED cycles through a saturated tenant query cap, including fragmented wire input, without admitting mixed work.
+
+- Keep edge reconnect cursors at the last complete, successfully applied invalidation. Reserve sequence zero for legacy/hello frames, preserve replay order across chunks, and retain the prior checkpoint while a warm replay tail is still queued.
+
+- Check the executed extended-cycle shape before granting a rate-concurrency completion exemption; a first COMMIT Parse cannot exempt a different executed statement.
+
+- Honor L1/L2 cache-tier restrictions across lookup, promotion, compression and store; combine dependency hints with inferred relations and protect their fill generations. Rewritten/client hints take the shortest TTL and intersect restrictions. Automatic opaque catalog dependencies remain open.
+
+- Compile shared SQL-lexer helpers only for their consuming features and guard the edge-cache regression by its feature, keeping isolated SQL-text test builds warning-free.
+
+- **Query cache on the extended protocol** (`[cache] extended_protocol`, default `true`). The query cache now answers reads sent as `Parse`/`Bind`/`Execute`/`Sync` with an unnamed statement, and the `Bind`/`Execute`/`Sync` of a prepared (named) statement, each optionally with a `Describe` of the portal, under every condition a simple query's lookup has. An entry is keyed by the statement text, the declared parameter types, the bound parameter values and their format codes, the result format codes and the batch's shape, so text and binary results, and different parameter values, never share one; the statement's name is not part of the key. A hit runs nothing on the backend but leaves it holding the unnamed statement the client was told it parsed. Other batch shapes, transactions and sessions that have written go to the backend as before. See "Extended-protocol reads" in `docs/configuration.md`. Like a simple query's lookup, each one runs the backend settings proof (`SHOW ALL`) before the lookup and before the store unless `backend_context_immutable = true`: measured with pgbench's prepared select-only script at 16 clients, 4 400 reads per second with the per-read proof against 84 000 with the proof reused per connection (81 000 with the cache bypassed).
+
+- Borrow existing named-statement references through extended-protocol forwarding and recovery, avoiding a second vector and String clones per batch.
+
+- Legacy FunctionCall (fastpath) messages no longer bypass tenant admission, the rate limiter, the circuit breaker, cache invalidation and replay bookkeeping, and the large-object client API keeps working. New top-level key `function_call`: `"large-objects"` (default) forwards PostgreSQL's built-in large-object functions (`lo_open`, `lo_close`, `loread`, `lowrite`, `lo_lseek`, `lo_lseek64`, `lo_tell`, `lo_tell64`, `lo_creat`, `lo_create`, `lo_unlink`, `lo_truncate`, `lo_truncate64`, by catalog OID) as admitted requests on the primary and refuses every other function with `0A000` and ReadyForQuery; `"any"` forwards every OID and treats each call as a write of unknown scope (all cached results retired, reads pinned to the primary, the tenant permit kept as for a session-level lock); `"refuse"` refuses all. A transaction that ran a forwarded call is never replayed after a failover, and a journaled one that ran a writing call is marked incomplete. Plugins, rewrite rules, tenant row filters, anomaly detection and analytics do not see these calls (they carry no SQL). A malformed FunctionCall and unexpected frontend messages end the session with `08P01`. libpq `lo_*`, JDBC `LargeObject` and `pg_dump` of large objects work through the proxy by default.
+
+- Reject node, pool and reconnect caps above Tokio's semaphore limit during config validation, before startup or a reconnect can panic.
+
+- Replace the multi-tenant example and full-config comments with supported startup-parameter identity, row filtering and tenant budgets; document restart requirements and validate the example through the real config loader.
+
 ### Changed
+
+- **Recovery journal: the per-statement size cap no longer re-walks the transaction
+  (perf).** Every statement appended to an explicit transaction's journal checked
+  `[journal] max_bytes_per_transaction` by summing all earlier entries again, so a
+  transaction of `n` statements measured `n²/2` entries (up to the 10,000-entry
+  default). The append path now keeps a running size and measures only what was
+  appended since the last check; a savepoint rollback, a cleared journal or a decoded
+  one is measured again once. The cap is enforced at the same point (tested);
+  `total_size()` still walks and stays exact. New Criterion cases
+  `journal/append_entry/after/{16,1024}`. No behaviour change.
+- **Capture relay: a write cycle that arrives whole skips the response stash (perf).**
+  With capture armed, each backend read chunk's completion metadata was stashed under
+  the session's response-prefix lock and merged back at `ReadyForQuery`, even when the
+  `ReadyForQuery` was in the same chunk and nothing was held from an earlier
+  Flush/COPY boundary. That common cycle now hands its metadata to the observation
+  directly, under the same `limits.max_pending_bytes` bound. Cycles that span chunks,
+  hold earlier metadata or carry an explicit `COMMIT` keep the stash and its
+  commit-prefix proof. No behaviour change.
+- **Recovery journal: `SAVEPOINT` without a tenant journal budget no longer measures
+  the whole transaction (perf).** The retained-size walk it took to undo a refused
+  reservation now runs only when `[multi_tenancy]` configures a journal budget.
+- **Recovery journal: the size walk reads scalar parameters inline (perf).** The
+  per-parameter size estimate is inlined for scalars and kept out of line only for
+  arrays, which removes the call per parameter that `total_size()` and the running
+  size paid (`journal/total_size/{1,16,128}`). Same estimate for every value.
+- **L2 cache: a compressed payload no longer pins its worst-case buffer.** LZ4 and
+  zstd payloads were compressed into a buffer sized for the worst case and stored
+  truncated, so each kept an allocation at least as large as the uncompressed rows
+  while L2 charged only the stored length against `l2_size_mb`. The buffer is now
+  shrunk to the stored length before it is shared. No format or config change.
+- **Statement-mode safety scan: one keyword compare instead of nine (perf).**
+  `StatementModeHandler::is_safe_query` / `get_query_warning` tested nine keyword
+  prefixes in turn; they now pick the candidate keyword from the statement's first
+  byte and compare it with a case-bit mask, and skip the trim when the statement
+  already starts and ends on a visible ASCII byte. Same answers for every input
+  (differential test against the sequential scan, ~80k statements).
+- **Journal manager: beginning a transaction hashes its id once (perf).** The
+  active-journal store inserted the journal and then looked the same key up again
+  to return its handle. No behaviour change (replacement and eviction order tested).
+- **Semantic cache (L3): a slot is 216 bytes again, not 288 (perf).** The cache
+  namespace added to every slot grew it from 256 to 288 bytes, which took a bucket's
+  first block of four slots (and the list a store evicts into) from 1024 to 1152
+  bytes, past what glibc serves from its per-thread cache: a store into a full tier
+  ran 6 % slower and eight threads storing at once 21 % slower
+  (`cache/l3/store_full_5000`, `cache/l3/store_lookup_contended_8`). The namespace
+  and the context strings now sit behind one pointer shared by the slots of a
+  bucket; a compile-time check keeps the block within 1024 bytes. Same isolation
+  (namespace and context tests).
+- **Pool-mode transaction detection reads keywords, not prefixes.**
+  `TransactionEvent::detect` (the library pool's lease state; the daemon follows the
+  backend's ReadyForQuery status) compared prefixes of the trimmed text. It now
+  reads the statement's leading words, separated by any whitespace PostgreSQL's
+  lexer skips: `START\tTRANSACTION` and `ROLLBACK\nTO sp` are recognised (the
+  second was read as a full rollback, ending the lease's transaction); `ABORT` is a
+  rollback; `COMMIT` / `END` / `ROLLBACK` / `ABORT ... AND CHAIN` keep the session in
+  a transaction (`Begin`), where they were read as its end; a keyword is a whole
+  word (`BEGINNING`, `ENDPOINT`, `START SLAVE` and `START WORK TRANSACTION` are
+  statements); and a `TO` elsewhere in a `ROLLBACK` no longer names a savepoint.
+  Statements written with single spaces classify as before (reference test against
+  the prefix form). Allocation-free as before; it reads at most four words.
+- **Cache lookup: the comment and hint searchers are built once (perf).** The cache
+  hint parser and the lexer's comment tests called `memchr::memmem::find`, which
+  builds its searcher on every call: about 30 ns each, more than the search of a
+  statement-sized text. Building them was 34 ns of a 480 ns L1 hit, 84 ns of a
+  2.6 us L2 hit and 174 ns of a 5.5 us miss and store (sampled profile,
+  gpc001ca). The searchers for `--`, `/*`, `*/`,
+  `&"` and `helios:` are now statics, as the routing hint parser's already was.
+  Same answers (generated-text test against a window scan).
+- **Router write detection reads the first word without allocating (perf).**
+  `QueryRouter::is_write_query` upper-cased the whole statement into a new string to
+  compare its first word. An ASCII first word is now upper-cased in a ten-byte stack
+  buffer; text with a non-ASCII byte before the end of its first word takes the old
+  path, so Unicode case and whitespace rules decide exactly as before (reference
+  test against the upper-casing form). The journal classifier's call-free shortcut
+  searches for `(` with `memchr` instead of the slice's byte loop.
+- **An unnamed `Parse` inside a batch ends the promotion of the one before it.**
+  `optimize_unnamed_parse` records the unnamed statement a backend connection
+  holds when its `Parse` is the first message of a batch. An unnamed `Parse` later
+  in a batch (after a named `Parse`, for instance) replaced that statement on the
+  backend without replacing the record, so an identical `Parse` of the earlier text
+  was answered by the proxy and its `Bind` ran the newer statement. The record is
+  now dropped when such a batch is delivered.
+- **Query cache and journal classifier: two restructurings, no measured gain.** The
+  query cache merges a hint's dependencies into the caller's normalized query instead
+  of returning a new one inside an `Option`, and the journal classifier's
+  function-call scan is out of line. Both were meant to take back per-call costs of
+  this release's changes (6-12 ns per L2 lookup, 5-10 ns per classified statement);
+  the Criterion gate of 2026-11-17 separated neither. No behaviour change.
+- **Journal classifier: the unterminated-nested-comment check looks at one byte
+  first (perf).** The `/* /* */` tail test trimmed every statement; it now runs only
+  when the last non-blank byte could end such a comment. Same classification
+  (tested with ASCII and non-ASCII trailing blanks).
+
+- **Retry safety:** builtin-looking function names no longer imply safe retry or
+  standby offload. Call-shaped reads require explicit `tr_read_functions` trust.
+  Calls separated from parentheses by comments are recognized; EXPLAIN and COPY
+  query wrappers use the same eligibility check. Ordinary execution remains
+  native; an untrusted call returns an error on an uncertain outcome.
 
 - **C-02 write path: the plain-ASCII check stops at the first quote (perf).** The
   plain-ASCII fast path of `write_tables` (query cache and edge) and the journal's

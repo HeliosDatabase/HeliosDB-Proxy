@@ -36,8 +36,11 @@
 //! and also bounds what the read is served (an entry older than it is a miss
 //! on every tier, refilled; a zero TTL is `cache=skip`), and
 //! `cache=semantic` (also `semantic`,
-//! `cache=l3`, `cache=vector`). `cache_tables` and `cache=l1|l2|all` are
-//! parsed into [`CacheHint`] and have no effect.
+//! `cache=l3`, `cache=vector`). `cache=l1` and `cache=l2` restrict both
+//! lookup and store to that tier; `cache=all` permits the normal hierarchy
+//! (L3 still needs its semantic hint). `cache_tables` adds dependencies to
+//! inferred relations; it never replaces them. Every dependent read must
+//! carry that declaration while automatic catalog dependencies are unavailable.
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -55,7 +58,7 @@ pub struct CacheHint {
     /// Enable semantic/L3 caching
     pub semantic_cache: bool,
 
-    /// Override table dependencies
+    /// Additional table dependencies (never replace inferred relations)
     pub tables: Option<Vec<String>>,
 
     /// Force a refresh: no tier is looked up, the result is stored
@@ -70,21 +73,94 @@ impl CacheHint {
     /// Fold `other` (hints from another text of the same statement, e.g. the
     /// client's own text when routing hints or a rewrite changed the
     /// forwarded one) into `self`: `skip`, `semantic_cache` and `refresh`
-    /// hold if either holds; `ttl`, `tables` and `level` keep `self`'s value
-    /// when it has one.
+    /// hold if either holds. TTLs take the minimum, dependencies are combined,
+    /// and tier restrictions intersect; conflicting restrictions bypass caching.
     pub fn merge(&mut self, other: CacheHint) {
         self.skip |= other.skip;
         self.semantic_cache |= other.semantic_cache;
         self.refresh |= other.refresh;
-        if self.ttl.is_none() {
-            self.ttl = other.ttl;
+        if let Some(ttl) = other.ttl {
+            self.limit_ttl(ttl);
         }
-        if self.tables.is_none() {
-            self.tables = other.tables;
+        if let Some(tables) = other.tables {
+            self.tables.get_or_insert_with(Vec::new).extend(tables);
         }
-        if self.level.is_none() {
-            self.level = other.level;
+        if let Some(level) = other.level {
+            self.restrict_level(level);
         }
+    }
+    fn limit_ttl(&mut self, ttl: Duration) {
+        self.ttl = Some(self.ttl.map_or(ttl, |old| old.min(ttl)));
+        self.skip |= ttl.is_zero();
+    }
+
+    fn restrict_level(&mut self, level: CacheLevelHint) {
+        use CacheLevelHint::All;
+        self.level = match (self.level, level) {
+            (None | Some(All), next) => Some(next),
+            (old, All) => old,
+            (Some(old), next) if old == next => Some(old),
+            _ => {
+                self.skip = true;
+                None
+            }
+        };
+    }
+
+    #[inline]
+    pub(super) fn allows_l1(&self) -> bool {
+        !matches!(
+            self.level,
+            Some(CacheLevelHint::L2Only | CacheLevelHint::L3Only)
+        )
+    }
+    #[inline]
+    pub(super) fn allows_l2(&self) -> bool {
+        !matches!(
+            self.level,
+            Some(CacheLevelHint::L1Only | CacheLevelHint::L3Only)
+        )
+    }
+    #[inline]
+    pub(super) fn allows_l3(&self) -> bool {
+        (self.semantic_cache || self.level == Some(CacheLevelHint::L3Only))
+            && !matches!(
+                self.level,
+                Some(CacheLevelHint::L1Only | CacheLevelHint::L2Only)
+            )
+    }
+
+    /// Declaration grammar is intentionally narrow; an unreadable dependency
+    /// bypasses caching instead of being silently discarded. Invalidation uses
+    /// coarse, lowercase basenames, matching the normalizer/write generations.
+    pub(super) fn additional_tables(&self) -> Result<Vec<String>, ()> {
+        let Some(names) = &self.tables else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let mut last = None;
+            let mut count = 0;
+            for part in name.trim().split('.') {
+                count += 1;
+                let bytes = part.as_bytes();
+                if count > 3
+                    || bytes.is_empty()
+                    || bytes.len() > crate::sql_lex::MAX_IDENTIFIER_BYTES
+                    || !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
+                    || !bytes[1..]
+                        .iter()
+                        .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                {
+                    return Err(());
+                }
+                last = Some(part);
+            }
+            out.push(last.ok_or(())?.to_ascii_lowercase());
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
     }
 }
 
@@ -118,6 +194,11 @@ const FLAG_WORDS: &[&str] = &[
     "nocache_read",
 ];
 
+/// Finds the text every hint contains, built once: every cache lookup asks
+/// (see `sql_lex::LINE_COMMENT_START` for what a searcher per call cost).
+static HINT_MARKER: Lazy<memchr::memmem::Finder<'static>> =
+    Lazy::new(|| memchr::memmem::Finder::new(b"helios:"));
+
 /// Parse cache hints from a SQL query.
 ///
 /// Each `helios:` comment outside quotes is split on `,`: a `key=value`
@@ -126,7 +207,7 @@ const FLAG_WORDS: &[&str] = &[
 /// (`cache_tables=users,orders`) unless it is a flag word.
 pub fn parse_cache_hints(sql: &str) -> CacheHint {
     let mut hint = CacheHint::default();
-    if memchr::memmem::find(sql.as_bytes(), b"helios:").is_none() {
+    if HINT_MARKER.find(sql.as_bytes()).is_none() {
         return hint;
     }
     for body in crate::sql_text::helios_hint_bodies(sql) {
@@ -184,13 +265,13 @@ fn apply_hint(hint: &mut CacheHint, key: &str, value: Option<&str>) {
                         hint.refresh = true;
                     }
                     "l1" | "hot" | "local" => {
-                        hint.level = Some(CacheLevelHint::L1Only);
+                        hint.restrict_level(CacheLevelHint::L1Only);
                     }
                     "l2" | "warm" | "shared" => {
-                        hint.level = Some(CacheLevelHint::L2Only);
+                        hint.restrict_level(CacheLevelHint::L2Only);
                     }
                     "all" | "yes" | "on" | "true" | "enable" => {
-                        hint.level = Some(CacheLevelHint::All);
+                        hint.restrict_level(CacheLevelHint::All);
                     }
                     _ => {}
                 }
@@ -199,9 +280,9 @@ fn apply_hint(hint: &mut CacheHint, key: &str, value: Option<&str>) {
         "cache_ttl" | "ttl" => {
             if let Some(v) = value {
                 if let Ok(secs) = v.parse::<u64>() {
-                    hint.ttl = Some(Duration::from_secs(secs));
+                    hint.limit_ttl(Duration::from_secs(secs));
                 } else if let Some(duration) = parse_duration(v) {
-                    hint.ttl = Some(duration);
+                    hint.limit_ttl(duration);
                 }
                 // A zero TTL ("always fresh") is a skip: no tier could serve
                 // the read, and storing it would replace the entry unhinted
@@ -219,7 +300,7 @@ fn apply_hint(hint: &mut CacheHint, key: &str, value: Option<&str>) {
                     .filter(|s| !s.is_empty())
                     .collect();
                 if !tables.is_empty() {
-                    hint.tables = Some(tables);
+                    hint.tables.get_or_insert_with(Vec::new).extend(tables);
                 }
             }
         }

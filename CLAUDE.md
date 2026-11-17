@@ -104,14 +104,14 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
   `ProxyConfig` in `src/config.rs` (~4300 lines).
   Top-level keys: `listen_address`, `admin_address`, `admin_token`,
   `admin_allow_insecure`, `tr_enabled`, `tr_mode`, `write_timeout_secs`,
-  `optimize_unnamed_parse`, `shutdown_drain_timeout_secs`, `strict_config`.
+  `optimize_unnamed_parse`, `function_call`, `shutdown_drain_timeout_secs`, `strict_config`.
   Sections: `[pool]`, `[pool_mode]`, `[load_balancer]`, `[health]`, `[[nodes]]`, `[tls]`,
   `[cache]`, `[routing_hints]`, `[lag_routing]`, `[rate_limit]`, `[circuit_breaker]`,
   `[limits]`, `[analytics]`, `[anomaly]`, `[multi_tenancy]`, `[auth]` (only `mode = "passthrough"|"scram"` +
   `auth_file`), `[[hba]]`, `[query_rewrite]` (+`[[query_rewrite.rules]]`), `[plugins]`,
   `[graphql_gateway]` (+`[[graphql_gateway.tables]]`), `[schema_routing]`, `[mcp]`,
   `[[agent_contracts]]`, `[http_gateway]`, `[mirror]`, `[edge]`, `[branch]`, `[topology]`,
-  `[journal]`, `[auto_promote]` (opt-in, off by default).
+  `[journal]`, `[admin]` (`stats_max_items` for `GET /api/stats`), `[auto_promote]` (opt-in, off by default).
   `[ha]` is REJECTED at startup even without `strict_config` (the proxy promotes only via the opt-in
   `[auto_promote]` section, single-proxy; otherwise an external HA manager must, and
   `[topology]` tracks it); an empty
@@ -141,6 +141,7 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
   `/nodes/{addr}/enable|disable`, `/sessions`, `/pools`, `/plugins`, `/analytics`,
   `/anomalies`, `/branch`, `/api/sql`, `/api/chaos`, `/api/replay`, `/api/shadow`,
   `/api/branch`, `/api/circuit`, `/api/promotion`, `/api/analytics`,
+  `/api/stats` (schema version 1), `/api/cache/heatmap`,
   `/api/edge` (+`/register`, `/subscribe`, `/invalidate`),
   `/api/migration/{snapshot,cutover,cutover/rollback,status}`
 - **Web UI**: embedded admin dashboard at `GET /` and `/ui` on the admin port
@@ -151,7 +152,11 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
   (default `0.0.0.0:9091`), `POST` body `{"query": "..."}` → `{"data": ...}`
   (src/graphql_gateway.rs; tables exposed via `[[graphql_gateway.tables]]`)
 - **MCP agent gateway** (`[mcp] enabled = true`): JSON-RPC 2.0 over HTTP POST; tools
-  `query`, `list_tables`, `explain` (src/mcp.rs)
+  `query`, `list_tables`, `explain`, plus opt-in PostgreSQL-backed `memory_put`,
+  `memory_get`, `memory_list`, `memory_search`, `memory_delete` (src/mcp.rs).
+  `[mcp] principals` binds authenticated agent identity; `tool_cache_*` controls
+  per-principal tool-result caching, and `memory_*` controls conversation/RAG
+  memory with a separate backend role and owner quotas. See docs/configuration.md.
 
 ## Resource Constraints
 
@@ -162,6 +167,10 @@ Therefore:
 - Run at most ONE heavy build/test/benchmark at a time — never in parallel; no
   `cargo build & cargo test &`, no parallel feature-matrix runs. Prefer sequential
   matrix runs and let one finish before starting the next.
+- Give each isolated worktree its own debug and plain-release target directories.
+  Do not reuse a sibling worktree's `CARGO_TARGET_DIR`: copied source timestamps
+  can leave stale artifacts that omit a new regression. Record Cargo's source
+  path and require each named regression to run a nonzero test count.
 - Cap benchmark dataset sizes and client counts to what the recorded baselines used
   (`bench-scalability.sh` defaults: `CLIENTS="1 16 64"`, `DUR=8`; the 2026-07-04
   evidence baseline in `docs/perf-2026-07/README.md` was run with `CLIENTS="1 4 16 64"`,

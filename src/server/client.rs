@@ -373,14 +373,14 @@ impl ProxyServer {
 
     /// Whether the backend answered the end of the session's extended COPY
     /// (`tr.ext_copy_end`): its CommandComplete, or the error that failed
-    /// it, relayed by the idle watch into the request tally, which the Sync
-    /// of the batch that started the COPY reset (its client then owes only
-    /// its Sync, and waits for nothing).
-    pub(super) fn copy_end_answered(session: &ClientSession) -> bool {
+    /// it, relayed by the idle watch into the request tally. Only completions
+    /// after this COPY end count: earlier statements in its Flush cycle can
+    /// already have completed while COPY still does backend work.
+    pub(super) fn copy_end_answered(session: &ClientSession, completions_before: u32) -> bool {
         session
             .cycle_completions
             .load(std::sync::atomic::Ordering::Relaxed)
-            > 0
+            != completions_before
             || session
                 .cycle_errored
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -429,6 +429,28 @@ impl ProxyServer {
             && Self::tr_word_is(sql, &words, 1, "PREPARED")
     }
 
+    /// Start a deferred, fresh completion proof without changing frontend or
+    /// backend state. Only the exact unnamed P/B/E/S shape is supported; SQL
+    /// rewriting or row transforms would invalidate this pre-transform proof.
+    fn tenant_completion_parse(msg: &Message, config: &ProxyConfig) -> bool {
+        if msg.msg_type != MessageType::Parse
+            || config.query_rewrite.enabled
+            || config.plugins.enabled
+            || !config.multi_tenancy.tenant_tables.is_empty()
+            || msg.payload.first() != Some(&0)
+        {
+            return false;
+        }
+        let body = &msg.payload[1..];
+        let Some(end) = body.iter().position(|&b| b == 0) else {
+            return false;
+        };
+        // No parameter OIDs or trailing bytes: PREPARED takes a literal gid.
+        body.get(end + 1..) == Some(&[0, 0][..])
+            && std::str::from_utf8(&body[..end])
+                .is_ok_and(|sql| !sql.contains('\\') && Self::tenant_gate_exempt(sql))
+    }
+
     /// A single transaction-ending statement (`COMMIT`, `END`, `ROLLBACK`,
     /// `ABORT`; their 2PC forms too): exempt from the `[rate_limit]
     /// max_concurrent` cap, so a session can always end its transaction even
@@ -446,6 +468,64 @@ impl ProxyServer {
         ["COMMIT", "END", "ROLLBACK", "ABORT"]
             .iter()
             .any(|k| Self::tr_word_is(sql, &words, 0, k))
+    }
+
+    /// Exempt only a proved standalone transaction-ending execution. The
+    /// first routing Parse alone says nothing about which portal runs.
+    #[cfg(feature = "rate-limiting")]
+    pub(super) fn tx_end_batch_exempt(
+        batch: &[u8],
+        held_parse: Option<&[u8]>,
+        config: &ProxyConfig,
+    ) -> bool {
+        fn frame<'a>(input: &mut &'a [u8]) -> Option<(u8, &'a [u8])> {
+            let (&tag, rest) = input.split_first()?;
+            let len = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+            if len < 4 {
+                return None;
+            }
+            let (whole, left) = rest.split_at_checked(len)?;
+            *input = left;
+            Some((tag, &whole[4..]))
+        }
+        if config.query_rewrite.enabled
+            || config.plugins.enabled
+            || !config.multi_tenancy.tenant_tables.is_empty()
+        {
+            return false;
+        }
+        let mut rest = batch;
+        let first = if let Some(mut held) = held_parse {
+            let first = frame(&mut held);
+            if !held.is_empty() {
+                return false;
+            }
+            first
+        } else {
+            frame(&mut rest)
+        };
+        let Some((b'P', payload)) = first else {
+            return false;
+        };
+        let Some(sql) = payload.strip_prefix(&[0]) else {
+            return false;
+        };
+        let Some(end) = sql.iter().position(|&b| b == 0) else {
+            return false;
+        };
+        if sql[end + 1..] != [0, 0] {
+            return false;
+        }
+        let Ok(sql) = std::str::from_utf8(&sql[..end]) else {
+            return false;
+        };
+        if sql.contains('\\') || !Self::tx_end_exempt(sql) {
+            return false;
+        }
+        matches!(frame(&mut rest), Some((b'B', body)) if body == [0; 8])
+            && matches!(frame(&mut rest), Some((b'E', body)) if body == [0; 5])
+            && matches!(frame(&mut rest), Some((b'S', body)) if body.is_empty())
+            && rest.is_empty()
     }
 
     /// Track session-level advisory locks under session pooling (they
@@ -648,8 +728,9 @@ impl ProxyServer {
     /// the connection holding that cycle, wherever routing sent it (a
     /// `route=standby` hint, a node hint): the rest of its results reach the
     /// client only through this watch, and the client waits for them before
-    /// it sends anything else. `None` mid-COPY (the backend is legitimately
-    /// awaiting CopyData) or without a cached connection.
+    /// it sends anything else. With `watch_copy`, watch during COPY too so
+    /// backend cancellation can disarm the input deadline. Otherwise COPY
+    /// keeps the default client-only wait. None without a cached connection.
     fn watch_target<'n>(
         conns: &HashMap<String, BackendConn>,
         home_node: Option<&'n str>,
@@ -657,10 +738,12 @@ impl ProxyServer {
         cycle: Option<&'n str>,
         offload_on: bool,
         session: &ClientSession,
+        watch_copy: bool,
     ) -> Option<&'n str> {
-        if session
-            .copy_in_progress
-            .load(std::sync::atomic::Ordering::Relaxed)
+        if !watch_copy
+            && session
+                .copy_in_progress
+                .load(std::sync::atomic::Ordering::Relaxed)
         {
             None
         } else if let Some(node) = cycle.filter(|node| conns.contains_key(*node)) {
@@ -872,6 +955,7 @@ impl ProxyServer {
                 None,
                 offload_on,
                 session,
+                false,
             )
             .map(str::to_string);
             if let Some(node) = watch_node {
@@ -879,6 +963,7 @@ impl ProxyServer {
                 let watch = IdleWatch {
                     session,
                     keep_session: session.tr_mode != TrMode::None || !watching_home,
+                    copy_end_wait: None,
                 };
                 if Self::probe_watched_backend(client, conns, &node, state, watch).await? {
                     Self::note_watched_gone(
@@ -1027,6 +1112,8 @@ impl ProxyServer {
             tx_cache_stage: std::sync::Mutex::new(TxCacheStage::default()),
             #[cfg(feature = "query-cache")]
             cache_unseen_write: std::sync::atomic::AtomicBool::new(false),
+            journal_response_prefix: std::sync::Mutex::new(None),
+            journal_response_pending: std::sync::atomic::AtomicBool::new(false),
             journal: std::sync::Mutex::new(crate::journal_capture::SessionCapture::new(
                 config.journal.max_statement_bytes,
             )),
@@ -1042,6 +1129,12 @@ impl ProxyServer {
             pool_client_id: ClientId::new(),
             #[cfg(feature = "wasm-plugins")]
             plugin_identity: RwLock::new(None),
+            #[cfg(feature = "query-cache")]
+            cache_ineligible: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            cache_startup_namespace: std::sync::OnceLock::new(),
+            #[cfg(feature = "query-cache")]
+            cache_effective_namespace: std::sync::Mutex::new(None),
             #[cfg(feature = "edge-proxy")]
             edge_ineligible: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "edge-proxy")]
@@ -1204,7 +1297,8 @@ impl ProxyServer {
     ///   truncate a legitimate statement;
     /// * not while the session is inside a `COPY FROM STDIN` — a COPY producer
     ///   that pauses longer than the timeout would otherwise be killed
-    ///   mid-stream and the bulk load aborted.
+    ///   mid-stream and the bulk load aborted. COPY instead uses its separate
+    ///   `copy_idle_timeout_secs`, including while a frame is partly received.
     ///
     /// `None` is also returned when the timeout is disabled (the default), in
     /// which case the read below is unbounded exactly as it was before the key
@@ -1214,14 +1308,25 @@ impl ProxyServer {
         buffer: &BytesMut,
         session: &ClientSession,
     ) -> Option<tokio::time::Instant> {
-        let idle = state.limits.client_idle_timeout?;
-        if !buffer.is_empty() {
-            return None;
-        }
         if session
             .copy_in_progress
             .load(std::sync::atomic::Ordering::Relaxed)
         {
+            // A stalled partial CopyData frame is still stalled input. This
+            // clock resets only after a client read, not on backend notices.
+            let timeout = state.limits.copy_idle_timeout?;
+            // After the backend's COPY error it owes RFQ (or awaits Sync),
+            // not more client input. Keep the lease pinned without this timer.
+            if session
+                .cycle_errored
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return None;
+            }
+            return Some(tokio::time::Instant::now() + timeout);
+        }
+        let idle = state.limits.client_idle_timeout?;
+        if !buffer.is_empty() {
             return None;
         }
         Some(tokio::time::Instant::now() + idle)
@@ -1407,6 +1512,7 @@ impl ProxyServer {
         let IdleWatch {
             session,
             keep_session,
+            ..
         } = watch;
         let whole = Self::complete_frame_prefix(buf, state.limits.max_backend_frame_bytes)?;
         let cut = if keep_session {
@@ -1424,6 +1530,25 @@ impl ProxyServer {
         let sent = Self::forward_buffered_backend_frames(stream, &mut head, session, state).await?;
         buf.clear();
         Ok((sent, true))
+    }
+
+    fn copy_wait_changed(
+        session: &ClientSession,
+        copying_before: bool,
+        error_before: bool,
+        end_answered_before: Option<(u32, bool)>,
+    ) -> bool {
+        let copying = session
+            .copy_in_progress
+            .load(std::sync::atomic::Ordering::Relaxed);
+        end_answered_before.is_some_and(|(completions, before)| {
+            before != Self::copy_end_answered(session, completions)
+        }) || copying != copying_before
+            || (copying
+                && session
+                    .cycle_errored
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    != error_before)
     }
 
     /// Wait for the client's next message.
@@ -1454,6 +1579,26 @@ impl ProxyServer {
         let Some(node) = watch_node else {
             return Self::read_client_bytes(stream, buffer, idle_deadline).await;
         };
+        let watch_copy = state.limits.copy_idle_timeout.is_some();
+        let copying_before = watch_copy
+            && watch
+                .session
+                .copy_in_progress
+                .load(std::sync::atomic::Ordering::Relaxed);
+        let copy_error_before = watch_copy
+            && watch
+                .session
+                .cycle_errored
+                .load(std::sync::atomic::Ordering::Relaxed);
+        let copy_end_before = watch
+            .copy_end_wait
+            .filter(|_| watch_copy)
+            .map(|completions| {
+                (
+                    completions,
+                    Self::copy_end_answered(watch.session, completions),
+                )
+            });
         // Built once, outside the watch loop: a `select!` evaluates even a
         // disabled branch's expression, so an inline `sleep_until` would
         // construct a timer on every relay iteration — and with no idle timeout
@@ -1481,6 +1626,17 @@ impl ProxyServer {
                 bc.response_buf.reserve(16 * 1024);
                 if ended {
                     backend_gone = true;
+                } else if watch_copy
+                    && Self::copy_wait_changed(
+                        watch.session,
+                        copying_before,
+                        copy_error_before,
+                        copy_end_before,
+                    )
+                {
+                    // The frame may already have been buffered on entry.
+                    // Do not enter an unarmed select before the caller sees it.
+                    return Ok(ClientRead::CopyStateChanged);
                 } else {
                     tokio::select! {
                         r = stream.read_buf(buffer) => {
@@ -1525,6 +1681,19 @@ impl ProxyServer {
             }
             if let Some(cn) = client_bytes {
                 return Ok(ClientRead::Bytes(cn));
+            }
+            if watch_copy
+                && Self::copy_wait_changed(
+                    watch.session,
+                    copying_before,
+                    copy_error_before,
+                    copy_end_before,
+                )
+            {
+                // A delayed CopyInResponse can arrive after Flush returned:
+                // the caller had no COPY timer to arm before this watch.
+                // Ordinary backend notices do not change or reset a deadline.
+                return Ok(ClientRead::CopyStateChanged);
             }
             // Otherwise we relayed async backend bytes; keep watching.
         }
@@ -1764,6 +1933,13 @@ impl ProxyServer {
         // pooling: they are marked on the backend connection that took them
         // (`session_locks_held`).
         let mut cycle_refused = false;
+        // A completion candidate has no permit and reaches no backend. Keep
+        // its original wire frames aside until a complete P/B/E/S proof, so
+        // TCP fragmentation cannot change admission and rejected candidates
+        // leave registry, promotion and transaction state untouched.
+        let mut deferred_completion: Option<(BytesMut, MessageType)> = None;
+        let mut proved_completion = false;
+        let mut declined_completion = false;
         // A Sync or Query was answered (ReadyForQuery) without reaching the
         // backend while a cycle stays open there (`tr.ext_dispatched`,
         // `tr.ext_copy_end`): only a plugin Block refuses a request that
@@ -1877,7 +2053,21 @@ impl ProxyServer {
             // mid-COPY and never with a partially received message pending.
             // `None` (the default, `client_idle_timeout_secs = 0`) leaves every
             // read unbounded exactly as before.
-            let client_deadline = Self::client_idle_deadline(state, &buffer, session);
+            // Extended COPY still owns an implicit transaction after its
+            // completion/error, until the client sends the final Sync. Only
+            // start that clock once the backend answered; its computation time
+            // is not stalled client input. A simple COPY error owes backend RFQ.
+            let copy_waiting_sync = (ext_copy
+                && session.copy_in_progress.load(Ordering::Relaxed)
+                && session.cycle_errored.load(Ordering::Relaxed))
+                || (tr.ext_copy_end.is_some()
+                    && Self::copy_end_answered(session, tr.ext_copy_end_completions));
+            let copy_sync_deadline = copy_waiting_sync
+                .then_some(state.limits.copy_idle_timeout)
+                .flatten()
+                .map(|timeout| tokio::time::Instant::now() + timeout);
+            let client_deadline =
+                copy_sync_deadline.or_else(|| Self::client_idle_deadline(state, &buffer, session));
             // ac858d61400b: a permit holder waiting for its client with
             // nothing in flight is idle (in a transaction, holding
             // session-level advisory locks, or behind a refusal that left a
@@ -1929,6 +2119,7 @@ impl ProxyServer {
                     .filter(|_| !refused_open && (tr.ext_dispatched || tr.ext_copy_end.is_some())),
                 offload_on,
                 session,
+                state.limits.copy_idle_timeout.is_some(),
             );
             // Only the home socket's loss is the session's: a standby socket
             // used for offloaded reads holds nothing the session cannot rebuild,
@@ -1954,10 +2145,36 @@ impl ProxyServer {
                     keep_session: cycle_watched
                         || session.tr_mode != TrMode::None
                         || !watching_home,
+                    copy_end_wait: tr.ext_copy_end.map(|_| tr.ext_copy_end_completions),
                 },
             )
             .await?;
+            if read == ClientRead::CopyStateChanged {
+                if !session
+                    .copy_in_progress
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    && tr.copy_query.is_some()
+                {
+                    Self::copy_drained(tr, false, session, state, config).await;
+                }
+                continue;
+            }
             if read == ClientRead::BackendGone {
+                if session
+                    .copy_in_progress
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    Self::refuse_with(
+                        stream,
+                        &Self::create_fatal_response(
+                            "08006",
+                            "backend connection lost during COPY; connection closed",
+                        ),
+                        state.limits.client_write_timeout,
+                    )
+                    .await;
+                    break;
+                }
                 // ac858d61400b: the lost connection held the cycle its client
                 // is still in, and the client may be waiting for answers it
                 // will never get: the rest of a Flush-dispatched cycle's
@@ -1971,7 +2188,9 @@ impl ProxyServer {
                 // and the permit returns. A client whose COPY end was
                 // answered owes only the Sync, which the fault path settles.
                 if let Some(node) = watch_node.filter(|_| {
-                    cycle_watched && (tr.ext_dispatched || !Self::copy_end_answered(session))
+                    cycle_watched
+                        && (tr.ext_dispatched
+                            || !Self::copy_end_answered(session, tr.ext_copy_end_completions))
                 }) {
                     Self::end_session_with_lost_cycle(stream, state, session, node).await;
                     break;
@@ -2032,6 +2251,33 @@ impl ProxyServer {
                     Self::terminate_idle_permit_session(stream, state, session).await;
                     break;
                 }
+                ClientRead::IdleTimeout
+                    if session
+                        .copy_in_progress
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        || copy_sync_deadline.is_some() =>
+                {
+                    state
+                        .metrics
+                        .policy
+                        .copy_input_timeouts
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(client = %session.client_addr, "COPY input stalled; ending session");
+                    Self::refuse_with(
+                        stream,
+                        &Self::create_fatal_response(
+                            "57014",
+                            "terminating connection due to COPY input timeout",
+                        ),
+                        state.limits.client_write_timeout,
+                    )
+                    .await;
+                    // COPY input accepted by the socket may still be running
+                    // on the backend. Cancel and drop its connection before
+                    // returning the tenant permit, for simple COPY too.
+                    Self::abandon_cycle_conn(conns, current_node.as_deref(), session, state).await;
+                    break;
+                }
                 ClientRead::IdleTimeout => {
                     // PostgreSQL's `idle_session_timeout` behaviour: tell the
                     // client why, then close. A session idle INSIDE an open
@@ -2050,7 +2296,9 @@ impl ProxyServer {
                     break;
                 }
                 // Settled above: `read_client_bytes` never ends with it.
-                ClientRead::BackendGone => unreachable!("handled above"),
+                ClientRead::BackendGone | ClientRead::CopyStateChanged => {
+                    unreachable!("handled above")
+                }
             };
             if let Some(h) = hold.as_mut() {
                 h.set_idle(false);
@@ -2069,7 +2317,12 @@ impl ProxyServer {
             // Bound a single in-flight message: refuse before the accumulation
             // buffer for one (possibly malicious) oversized frame can exhaust
             // memory. A legitimate client never needs a single >64 MiB message.
-            if buffer.len() > state.limits.max_pending_bytes {
+            if buffer.len().saturating_add(
+                deferred_completion
+                    .as_ref()
+                    .map_or(0, |(wire, _)| wire.len()),
+            ) > state.limits.max_pending_bytes
+            {
                 let emsg =
                     Self::create_error_response("53400", "message exceeds per-session size limit");
                 let _ = stream.write_all(&emsg).await;
@@ -2117,11 +2370,77 @@ impl ProxyServer {
                         _ => continue,
                     }
                 }
+                if let Some((mut wire, expected)) = deferred_completion.take() {
+                    if msg.msg_type == MessageType::Terminate {
+                        return Ok(());
+                    }
+                    let valid = msg.msg_type == expected
+                        && match expected {
+                            // Empty portal and statement, no parameter/result
+                            // formats or parameter values.
+                            MessageType::Bind => msg.payload.as_ref() == [0; 8],
+                            // Empty portal; no Execute row limit.
+                            MessageType::Execute => msg.payload.as_ref() == [0; 5],
+                            MessageType::Sync => msg.payload.is_empty(),
+                            _ => false,
+                        };
+                    msg.encode_into(&mut wire);
+                    if valid && expected != MessageType::Sync {
+                        let next = if expected == MessageType::Bind {
+                            MessageType::Execute
+                        } else {
+                            MessageType::Sync
+                        };
+                        deferred_completion = Some((wire, next));
+                    } else {
+                        // Re-enter ordinary handling from the first Parse.
+                        // A declined proof must encounter normal admission
+                        // once, rather than starting the same candidate again.
+                        proved_completion = valid;
+                        declined_completion = !valid;
+                        wire.extend_from_slice(&buffer);
+                        buffer = wire;
+                    }
+                    continue;
+                }
                 match msg.msg_type {
                     MessageType::Terminate => return Ok(()),
 
                     // ---- Simple query protocol ----
-                    MessageType::Query => {
+                    // A legacy FunctionCall is answered like a simple Query
+                    // (a reply, then ReadyForQuery) and takes the same path
+                    // as a request with no SQL text: no hook, rewrite or
+                    // cache reads it, and `forward_function_call` decides by
+                    // function OID whether it reaches a backend
+                    // (`function_call`).
+                    MessageType::Query | MessageType::FunctionCall => {
+                        let fcall = (msg.msg_type == MessageType::FunctionCall)
+                            .then(|| FunctionCallClass::of_message(config.function_call, &msg));
+                        // Validate the complete request body before hooks,
+                        // rewrites, cache answers or admission exemptions can
+                        // interpret only its prefix. Closing avoids fabricating
+                        // an idle/transaction status for a malformed request.
+                        let query_end = if fcall.is_some() {
+                            super::fastpath::function_call_oid(&msg.payload).map(|_| 0)
+                        } else {
+                            crate::protocol::simple_query_payload_end(&msg.payload)
+                        };
+                        let Some(query_end) = query_end else {
+                            Self::refuse_with(
+                                stream,
+                                &Self::create_fatal_response(
+                                    "08P01",
+                                    if fcall.is_some() {
+                                        "invalid FunctionCall payload"
+                                    } else {
+                                        "invalid simple Query payload"
+                                    },
+                                ),
+                                state.limits.client_write_timeout,
+                            )
+                            .await;
+                            return Ok(());
+                        };
                         // A fresh tally for the query's response (see
                         // `ClientSession::cycle_completions`).
                         Self::tally_reset(session);
@@ -2164,22 +2483,25 @@ impl ProxyServer {
                         // received cycle reaches the backend after the query,
                         // its own unnamed Parse included: what it binds is
                         // still recorded.
-                        Self::orphan_unnamed(
-                            conns,
-                            UnnamedStale::query(
-                                session
-                                    .last_rfq_status
-                                    .load(std::sync::atomic::Ordering::Relaxed)
-                                    != b'I',
-                            ),
-                        );
-                        if pending.is_empty() && held_unnamed.is_none() {
-                            unnamed_bound = if continues_cycle {
-                                Bound::Unknown
-                            } else {
-                                Bound::Other
-                            };
-                            unnamed_node = None;
+                        // A FunctionCall destroys neither.
+                        if fcall.is_none() {
+                            Self::orphan_unnamed(
+                                conns,
+                                UnnamedStale::query(
+                                    session
+                                        .last_rfq_status
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                        != b'I',
+                                ),
+                            );
+                            if pending.is_empty() && held_unnamed.is_none() {
+                                unnamed_bound = if continues_cycle {
+                                    Bound::Unknown
+                                } else {
+                                    Bound::Other
+                                };
+                                unnamed_node = None;
+                            }
                         }
                         if tr.ext_copy_end.is_some() {
                             // An extended COPY ended without the Sync that
@@ -2225,7 +2547,25 @@ impl ProxyServer {
 
                         // Plugin pre-query hook — may rewrite the SQL, block,
                         // or return a cached response.
-                        let (msg, action) = Self::apply_pre_query_hook(msg, state, session);
+                        let (msg, action, rewritten) =
+                            Self::apply_pre_query_hook(msg, state, session);
+                        let query_end = if rewritten {
+                            msg.payload.len() - 1
+                        } else {
+                            query_end
+                        };
+                        // Keep one borrowed view of the post-rewrite SQL for
+                        // the admission, mirror, recovery, and tracking paths
+                        // below. For an unchanged message reuse the terminator
+                        // found during structural validation; rewritten SQL
+                        // has a new payload and needs its own terminator scan.
+                        let query_sql = if fcall.is_some() {
+                            None
+                        } else if rewritten {
+                            crate::protocol::query_text(&msg.payload)
+                        } else {
+                            std::str::from_utf8(&msg.payload[..query_end]).ok()
+                        };
                         // Without wasm-plugins the hook can only forward.
                         #[cfg(not(feature = "wasm-plugins"))]
                         let PreQueryAction::Forward = action;
@@ -2316,9 +2656,11 @@ impl ProxyServer {
                         // session is idle takes one of its tenant's
                         // active-query permits (refused requests are never
                         // mirrored). Inside a transaction the session already
-                        // holds one.
+                        // holds one. A FunctionCall the configured mode
+                        // refuses is answered below without one.
                         if let Some(h) = hold.as_mut() {
                             if !h.is_held()
+                                && fcall != Some(FunctionCallClass::Refused)
                                 && !session
                                     .in_transaction
                                     .load(std::sync::atomic::Ordering::Relaxed)
@@ -2340,7 +2682,7 @@ impl ProxyServer {
                                             state,
                                             config,
                                         },
-                                        crate::protocol::query_text(&msg.payload),
+                                        query_sql,
                                     )
                                     .await?
                                     {
@@ -2362,7 +2704,7 @@ impl ProxyServer {
                         // statement to the secondary backend. Non-blocking —
                         // never delays the client path.
                         if let Some(ref mirror) = state.mirror {
-                            if let Some(sql) = crate::protocol::query_text(&msg.payload) {
+                            if let Some(sql) = query_sql {
                                 mirror.offer(sql, Self::is_write_query(sql));
                             }
                         }
@@ -2373,7 +2715,7 @@ impl ProxyServer {
                         // statement is refused exactly as PostgreSQL would
                         // (25P02) — never run in autocommit on the new backend.
                         if tr.tx_aborted {
-                            let sql = crate::protocol::query_text(&msg.payload).unwrap_or("");
+                            let sql = query_sql.unwrap_or("");
                             let mut resp = if Self::tr_ends_transaction(sql) {
                                 tr.tx_aborted = false;
                                 Self::note_ready_for_query(session, b'I', false);
@@ -2448,8 +2790,7 @@ impl ProxyServer {
                             && !session
                                 .reads_pinned
                                 .load(std::sync::atomic::Ordering::Relaxed)
-                            && crate::protocol::query_text(&msg.payload)
-                                .is_some_and(Self::pins_reads)
+                            && query_sql.is_some_and(Self::pins_reads)
                         {
                             session
                                 .reads_pinned
@@ -2482,38 +2823,40 @@ impl ProxyServer {
                                 ))
                             }
                             None => {
-                                Self::forward_simple_query(
-                                    ForwardCtx {
-                                        client: stream,
-                                        conns,
-                                        current_node: current_node.as_deref(),
-                                        reads: &ReadRouting {
-                                            offload_on,
-                                            may_offload: offload_on
-                                                && !tr.guc_cap_hit
-                                                && !tr.serializable_default
-                                                && !session
-                                                    .reads_pinned
-                                                    .load(std::sync::atomic::Ordering::Relaxed),
-                                            batch_reads: false,
-                                            batch_whole: true,
-                                            gucs: &tr.gucs,
-                                            guc_epoch: tr.guc_epoch,
-                                            read_your_writes: ryw,
-                                        },
-                                        session,
-                                        state,
-                                        config,
-                                        fault: &mut fault,
-                                        continues_cycle: cycle_node
-                                            .as_deref()
-                                            .filter(|_| cycle_open)
-                                            .or_else(|| current_node.as_deref().filter(|_| copy_in))
-                                            .map(|node| OpenCycle { node, runs: true }),
+                                let fwd = ForwardCtx {
+                                    client: stream,
+                                    conns,
+                                    current_node: current_node.as_deref(),
+                                    reads: &ReadRouting {
+                                        offload_on,
+                                        may_offload: offload_on
+                                            && !tr.guc_cap_hit
+                                            && !tr.serializable_default
+                                            && !session
+                                                .reads_pinned
+                                                .load(std::sync::atomic::Ordering::Relaxed),
+                                        batch_reads: false,
+                                        batch_whole: true,
+                                        gucs: &tr.gucs,
+                                        guc_epoch: tr.guc_epoch,
+                                        read_your_writes: ryw,
                                     },
-                                    &msg,
-                                )
-                                .await
+                                    session,
+                                    state,
+                                    config,
+                                    fault: &mut fault,
+                                    continues_cycle: cycle_node
+                                        .as_deref()
+                                        .filter(|_| cycle_open)
+                                        .or_else(|| current_node.as_deref().filter(|_| copy_in))
+                                        .map(|node| OpenCycle { node, runs: true }),
+                                };
+                                if fcall.is_some() {
+                                    Self::forward_function_call(fwd, &msg).await
+                                } else {
+                                    Self::forward_simple_query_prevalidated(fwd, &msg, query_end)
+                                        .await
+                                }
                             }
                         };
                         #[cfg(feature = "wasm-plugins")]
@@ -2629,12 +2972,15 @@ impl ProxyServer {
                         // they were, and `last_response_error` still describes
                         // an earlier reply. Locks of a connection the session
                         // lost died with it.
+                        // An arbitrary function called by OID
+                        // (`function_call = "any"`) may have taken one.
                         if track_session_locks && reached {
-                            if let (Some(sql), Some(bc)) = (
-                                crate::protocol::query_text(&msg.payload),
-                                current_node.as_ref().and_then(|n| conns.get_mut(n)),
-                            ) {
-                                Self::note_session_locks(&mut bc.session_locks, sql, session);
+                            if let Some(bc) = current_node.as_ref().and_then(|n| conns.get_mut(n)) {
+                                if let Some(sql) = query_sql {
+                                    Self::note_session_locks(&mut bc.session_locks, sql, session);
+                                } else if fcall == Some(FunctionCallClass::Unknown) {
+                                    bc.session_locks = true;
+                                }
                             }
                         }
                         // Transaction/Statement pooling: park the connection
@@ -2680,6 +3026,8 @@ impl ProxyServer {
                     | MessageType::Execute
                     | MessageType::Close => {
                         if pending.is_empty() && held_unnamed.is_none() && !tr.ext_dispatched {
+                            let proved = std::mem::take(&mut proved_completion);
+                            let declined = std::mem::take(&mut declined_completion);
                             // ac858d61400b: the cycle's first message takes
                             // one of the tenant's active-query permits, before
                             // anything of the cycle is recorded, so a refusal
@@ -2693,6 +3041,18 @@ impl ProxyServer {
                                     let gate = h.budget();
                                     match gate.try_acquire_query() {
                                         Some(p) => h.hold(p),
+                                        None if proved => {}
+                                        None if !declined
+                                            && tr.ext_copy_end.is_none()
+                                            && !session
+                                                .copy_in_progress
+                                                .load(std::sync::atomic::Ordering::Relaxed)
+                                            && Self::tenant_completion_parse(&msg, config) =>
+                                        {
+                                            deferred_completion =
+                                                Some((msg.encode(), MessageType::Bind));
+                                            continue;
+                                        }
                                         None => match Self::gate_slow_path(
                                             GateCtx {
                                                 gate,
@@ -2873,6 +3233,24 @@ impl ProxyServer {
                                         }
                                     }
                                 }
+                                // Parse can change session context before a later
+                                // simple query; refuse future cache reuse immediately.
+                                #[cfg(feature = "query-cache")]
+                                if state.query_cache.is_some()
+                                    && !session
+                                        .cache_ineligible
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    let sql =
+                                        msg.payload.iter().position(|&b| b == 0).and_then(|end| {
+                                            crate::protocol::query_text(&msg.payload[end + 1..])
+                                        });
+                                    if sql.is_none_or(Self::cache_context_may_change) {
+                                        session
+                                            .cache_ineligible
+                                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
                                 // Edge invalidation metadata: classify every
                                 // Parse'd statement ONCE (is it DML? which
                                 // tables?) so Sync-time invalidation of
@@ -2890,7 +3268,8 @@ impl ProxyServer {
                                             if !session
                                                 .edge_ineligible
                                                 .load(std::sync::atomic::Ordering::Relaxed)
-                                                && Self::stmt_leaves_session_state(q)
+                                                && (Self::stmt_leaves_session_state(q)
+                                                    || Self::cache_context_may_change(q))
                                             {
                                                 session.edge_ineligible.store(
                                                     true,
@@ -3144,14 +3523,10 @@ impl ProxyServer {
                         // promotion held aside, or its first frame.
                         let leads_unnamed_parse = held_unnamed.is_some()
                             || (batch.first() == Some(&b'P') && batch.get(5) == Some(&0));
-                        // Re-prepare any named statement this batch references
-                        // but does not itself define, in case the target
-                        // connection (after a switch/redial) is missing it.
-                        let reprepare: Vec<String> = batch_refs
-                            .iter()
-                            .filter(|r| !batch_defines.contains(r))
-                            .cloned()
-                            .collect();
+                        // Forwarding borrows the referenced names and excludes
+                        // this batch's own definitions when it needs to prepare
+                        // them. Keep the original set for recording/recovery,
+                        // without cloning every name at each boundary.
                         // Aborted-transaction emulation (see the simple-query
                         // path): only a transaction end goes through to the new
                         // backend; anything else is refused with 25P02. A bare
@@ -3354,7 +3729,7 @@ impl ProxyServer {
                                             defines: &batch_defines,
                                             unnamed: held_unnamed.as_ref(),
                                         },
-                                        &reprepare,
+                                        &batch_refs,
                                         &stmt_registry,
                                         hold,
                                     )
@@ -3387,7 +3762,7 @@ impl ProxyServer {
                                                     defines: &batch_defines,
                                                     unnamed: held_unnamed.as_ref(),
                                                 },
-                                                reprepare: &reprepare,
+                                                reprepare: &batch_refs,
                                             },
                                         )
                                         .await?
@@ -3660,7 +4035,7 @@ impl ProxyServer {
                         // metadata; only Sync-terminated batches fire (a pure
                         // Flush pipeline accumulates refs until its Sync).
                         #[cfg(feature = "edge-proxy")]
-                        if wait_ready && config.edge.enabled {
+                        if wait_ready && config.edge.enabled && !config.tr_enabled {
                             if let Some(tables) = Self::edge_extended_batch_tables(
                                 &batch_refs,
                                 edge_batch_bound_unnamed,
@@ -3765,7 +4140,17 @@ impl ProxyServer {
                         let conn = current_node.as_ref().and_then(|n| conns.get_mut(n));
                         match conn {
                             Some(b) => {
-                                if let Err(e) = b.stream.write_all(&msg.encode()).await {
+                                let mut copy_message = msg.encode();
+                                if ends_copy && ext_copy && state.limits.copy_idle_timeout.is_some()
+                                {
+                                    // PostgreSQL can buffer CommandComplete after
+                                    // CopyDone until Flush/Sync. Request its reply
+                                    // without ending the implicit transaction, so
+                                    // the final-Sync timer starts after backend
+                                    // work completes rather than staying unarmed.
+                                    copy_message.extend_from_slice(&[b'H', 0, 0, 0, 4]);
+                                }
+                                if let Err(e) = b.stream.write_all(&copy_message).await {
                                     // The backend died mid-COPY: the data stream
                                     // cannot be recovered in any tr_mode — one
                                     // error, then close (never a bare drop).
@@ -3795,6 +4180,8 @@ impl ProxyServer {
                                     return Ok(());
                                 }
                                 if ends_copy && ext_copy {
+                                    tr.ext_copy_end_completions =
+                                        session.cycle_completions.load(Ordering::Relaxed);
                                     // An extended-protocol COPY: the backend
                                     // ignored the cycle's Sync during copy-in, so
                                     // the ReadyForQuery answers the client's next
@@ -3981,13 +4368,21 @@ impl ProxyServer {
                         }
                     }
 
-                    // ---- Anything else: forward to current backend best-effort ----
+                    // Unknown and backend-only messages are protocol errors:
+                    // nothing of them reaches a backend. End the session: a
+                    // fabricated ReadyForQuery could mask an open
+                    // transaction, COPY or extended cycle.
                     _ => {
-                        if let Some(ref node) = current_node {
-                            if let Some(b) = conns.get_mut(node) {
-                                let _ = b.stream.write_all(&msg.encode()).await;
-                            }
-                        }
+                        Self::refuse_with(
+                            stream,
+                            &Self::create_fatal_response(
+                                "08P01",
+                                "unexpected frontend message type",
+                            ),
+                            state.limits.client_write_timeout,
+                        )
+                        .await;
+                        return Ok(());
                     }
                 }
             }

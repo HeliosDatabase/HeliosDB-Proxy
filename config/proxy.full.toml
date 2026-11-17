@@ -98,20 +98,26 @@ tr_mode    = "session"
 # List your own provably pure functions to make reads calling them eligible.
 # tr_read_functions = ["my_pure_udf", "tenant_scope"]
 
+# Legacy FunctionCall (fastpath) messages: libpq lo_*, JDBC LargeObject, pg_dump
+# of large objects. They carry a function OID and no SQL, so plugins, rewrite
+# rules, tenant row filters and anomaly detection never see them.
+#   "large-objects" (default) — forward PostgreSQL's built-in large-object
+#       functions as admitted requests on the primary; refuse the rest (0A000).
+#   "any"    — forward every function OID; each call retires all cached results
+#       and pins the session's reads to the primary.
+#   "refuse" — refuse every FunctionCall (0A000).
+function_call = "large-objects"
+
 # Seconds to wait for a new primary during failover before returning an error.
 write_timeout_secs = 30
 
 # =============================================================================
 # LIMITS — Operational safety bounds & timeouts (PG-wire data path)
 # =============================================================================
-# Every key below was previously a hardcoded constant in the proxy. The values
-# shown are the built-in defaults, so leaving the whole [limits] block out (or
-# omitting any single key) is byte-for-byte identical to the historical
-# behaviour. Every value MUST be > 0 — a 0 disables a safety bound rather than
-# meaning "unbounded", so the proxy refuses to start with any 0 here. Timeouts
-# are whole seconds; counts/bytes are plain integers. The two OPT-IN keys at the
-# end of the block (max_client_connections, client_idle_timeout_secs) are the
-# exception: there 0 is the default and means "off".
+# Values shown are the built-in defaults; omitted keys keep their defaults.
+# Timeouts are whole seconds unless the key ends in _ms; counts/bytes are plain
+# integers. Required safety bounds must be positive. Optional ceilings and
+# deadlines documented below use 0 to mean disabled or unlimited.
 #
 # [limits]
 # # Capacity of the query-cancellation key map (BackendKeyData -> backend addr).
@@ -191,6 +197,10 @@ write_timeout_secs = 30
 # # left idle inside an open transaction is terminated by this timeout too. Read
 # # once at startup.
 # client_idle_timeout_secs = 0
+# # Longest pause in COPY input, including a partial frame and the final
+# # extended Sync after backend completion. Backend COPY processing time is
+# # excluded. 0 = off; read once at startup.
+# copy_idle_timeout_secs = 0
 # # Bounded fair-admission queue (H-05): when max_client_connections is reached,
 # # a new connection waits up to this many seconds for a permit (FIFO) before
 # # being refused with 53300. 0 (default) refuses immediately. Read once at
@@ -403,9 +413,13 @@ enabled = true
 # =============================================================================
 
 [cache]
+# Cache arbitrary backend reads only under an explicit effects/dependency contract.
+trust_backend_read_effects = false
 # Unquoted so `${VAR:-default}` expands to a bare TOML boolean (a quoted
 # "${...}" would deserialize as a string and fail the bool field).
 enabled = ${HELIOS_PROXY_CACHE_ENABLED:-true}
+# Bound inferred plus declared cache dependencies; larger sets bypass caching.
+max_dependency_tables = 64
 
 # Hard ceiling, in bytes, on the backend response the proxy will buffer in
 # memory while streaming a cacheable read to the client. The capture is a
@@ -427,6 +441,9 @@ enabled = ${HELIOS_PROXY_CACHE_ENABLED:-true}
 # on /metrics/prometheus (and `oversize_rejected` in the edge cache stats) to
 # see how often reads bypass the caches on size grounds.
 max_cacheable_response_bytes = 4194304
+# backend_context_immutable = false  # true requires immutable effective backend settings
+# extended_protocol = true           # also answer Parse/Bind/Execute/Sync and prepared-statement reads
+# max_backend_context_bytes = 524288 # complete SHOW ALL proof, also bounded by limits
 
 # Tier sizes (the defaults shown) and opt-in L2 payload compression. See
 # docs/configuration.md, "Query Cache".
@@ -694,37 +711,30 @@ heatmap_min_samples = 100   # reads in the window before a recommendation
 # MULTI-TENANCY — Tenant isolation and per-tenant resource limits
 # =============================================================================
 
+# Build with multi-tenancy. Identity is an exact startup parameter, not a
+# username prefix or JWT claim. Authenticate it at a trusted application boundary;
+# use backend privileges/RLS as the security boundary. Applied at startup; a
+# SIGHUP can only resize caps and byte budgets that tenants already have.
 # [multi_tenancy]
-# enabled               = false
-# allow_unknown_tenants = false
-# auto_create_tenants   = false
-# max_tenants           = 1000
-# cross_tenant_analytics = false
-# # admin_user_pattern   = "admin@*"
+# enabled = true
+# identify_by = "application_name"  # Or "database", "user", another startup key
+# tenants = ["acme", "widgetco"]
+# tenant_column = "tenant_id"
+# tenant_tables = ["orders", "products"]
+# unknown_tenant = "refuse"
+# max_clients_per_tenant = 20
+# max_active_queries_per_tenant = 4
+# active_query_wait_ms = 5000
+# idle_permit_timeout_ms = 60000
+# max_replay_bytes_per_tenant = 8388608
+# max_journal_bytes_per_tenant = 67108864
 #
-# # How to identify which tenant a request belongs to:
-# #   header        — read from HTTP header (X-Tenant-Id)
-# #   username_prefix — parse "tenant.user" usernames (separator = '.')
-# #   jwt_claim     — extract from JWT token claim
-# #   database_name — map database name to tenant
-# #   sql_context   — SET helios.tenant_id = '...'
-# [multi_tenancy.identification]
-# method      = "header"
-# header_name = "X-Tenant-Id"
-# # separator = "."            # For username_prefix method
-# # claim_name = "tenant_id"   # For jwt_claim method
-#
-# # Example tenant definition:
-# # [[multi_tenancy.tenants]]
-# # id         = "acme"
-# # name       = "Acme Corp"
-# # isolation  = "schema"       # database | schema | row | branch
-# # database   = "shared_db"
-# # schema     = "acme"
-# # max_connections = 50
-# # qps_limit  = 1000
-# # read_only  = false
-# # allow_ddl  = false
+# [multi_tenancy.tenant_max_clients]
+# acme = 50
+# [multi_tenancy.tenant_max_active_queries]
+# acme = 8
+# [multi_tenancy.tenant_max_journal_bytes]
+# acme = 134217728
 
 # =============================================================================
 # AUTH — Client authentication
@@ -795,6 +805,8 @@ heatmap_min_samples = 100   # reads in the window before a recommendation
 # max_result_bytes = 16777216
 
 # [mcp]
+# Vouch separately for hidden read effects and equivalent pooled backend contexts.
+# trust_backend_read_effects = false
 # # Result caps for the MCP gateway's query / list_tables / explain tools (defaults shown).
 # # Rows past max_result_rows, or cell bytes past max_result_bytes, are cut and the
 # # tool result is marked truncated (structuredContent.truncated = true).

@@ -228,23 +228,23 @@ fn tr_classify_table() {
     let c = |sql: &str| ProxyServer::tr_classify(sql, &TrReadPolicy::default());
     assert_eq!(c("SELECT 1"), Read);
     assert_eq!(c("  select * from t where x = 'a;b' "), Write);
-    assert_eq!(c("SELECT count(*) FROM t;"), Read);
+    assert_eq!(c("SELECT count(*) FROM t;"), Other);
     assert_eq!(c("SELECT CASE WHEN x THEN 1 END FROM t"), Read);
     assert_eq!(c("SELECT * INTO t2 FROM t"), Other);
     assert_eq!(c("SELECT nextval('s')"), Other);
-    assert_eq!(c("SELECT pg_sleep(0.5), 42"), Read);
-    // TR-03: a read is re-executable only if every call is a known
-    // side-effect-free built-in. Anything else may already have run.
+    assert_eq!(c("SELECT pg_sleep(0.5), 42"), Other);
+    // Call-shaped syntax requires explicit trust, including builtin names:
+    // a user-defined schema/signature may resolve under the same spelling.
     assert_eq!(c("SELECT audit_side_effect()"), Other);
     assert_eq!(c("SELECT my_schema.my_udf(1)"), Other);
-    assert_eq!(c("SELECT lower(name), count(*) FROM t"), Read);
-    assert_eq!(c("SELECT pg_catalog.upper('x')"), Read);
+    assert_eq!(c("SELECT lower(name), count(*) FROM t"), Other);
+    assert_eq!(c("SELECT pg_catalog.upper('x')"), Other);
     assert_eq!(c("SELECT \"MyFn\"(1)"), Other);
     assert_eq!(c("SELECT currval('s')"), Other);
     assert_eq!(c("SELECT pg_notify('c', 'p')"), Other);
     assert_eq!(c("SELECT set_config('a', 'b', false)"), Other);
     assert_eq!(c("SELECT pg_advisory_lock(1)"), Other);
-    assert_eq!(c("SELECT random(), now(), gen_random_uuid()"), Read);
+    assert_eq!(c("SELECT random(), now(), gen_random_uuid()"), Other);
     assert_eq!(c("SELECT 'f(x)' AS s, $$g()$$ FROM t"), Read); // calls only in literals
     assert_eq!(
         c("WITH x AS (SELECT audit_side_effect()) SELECT * FROM x"),
@@ -252,9 +252,9 @@ fn tr_classify_table() {
     );
     assert_eq!(
         c("SELECT * FROM t WHERE id IN (1, 2) AND EXISTS (SELECT 1)"),
-        Read
+        Other
     );
-    assert_eq!(c("SELECT CAST(x AS int), COALESCE(a, b) FROM t"), Read);
+    assert_eq!(c("SELECT CAST(x AS int), COALESCE(a, b) FROM t"), Other);
     // Operator-listed UDFs become eligible.
     let policy = TrReadPolicy::from_config(&["Audit_Side_Effect".to_string()]);
     assert_eq!(
@@ -266,9 +266,9 @@ fn tr_classify_table() {
         Other
     );
     assert_eq!(c("SHOW application_name"), Read);
-    assert_eq!(c("VALUES (1)"), Read);
+    assert_eq!(c("VALUES (1)"), Other);
     assert_eq!(c("TABLE t"), Read);
-    assert_eq!(c("WITH x AS (SELECT 1) SELECT * FROM x"), Read);
+    assert_eq!(c("WITH x AS (SELECT 1) SELECT * FROM x"), Other);
     assert_eq!(
         c("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"),
         Write
@@ -5234,4 +5234,74 @@ async fn f2_replay_closes_a_stale_statement_first() {
     assert_eq!(frame(b'P', &seen[2].1), parse);
     let bc = &conns[&addr];
     assert!(bc.prepared.contains("ins") && bc.stale.is_empty());
+}
+
+#[test]
+fn replay_function_identity_requires_explicit_operator_trust() {
+    for sql in [
+        "SELECT public.abs(1)",
+        "SELECT abs('x'::text)",
+        "SELECT mutator /* trivia */ ()",
+        "SELECT count(*) FROM t",
+        "SELECT pg_catalog.lower('X')",
+        "EXPLAIN SELECT public.abs(1)",
+        "COPY (SELECT public.abs(1)) TO STDOUT",
+    ] {
+        assert_eq!(
+            ProxyServer::tr_classify(sql, &TrReadPolicy::default()),
+            StmtKind::Other,
+            "{sql}"
+        );
+    }
+    let trusted = TrReadPolicy::from_config(&["abs".into(), "count".into(), "lower".into()]);
+    for sql in [
+        "SELECT public.abs(1)",
+        "SELECT abs('x'::text)",
+        "SELECT count(*) FROM t",
+        "SELECT pg_catalog.lower('X')",
+    ] {
+        assert_eq!(
+            ProxyServer::tr_classify(sql, &trusted),
+            StmtKind::Read,
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        ProxyServer::tr_classify("SELECT 42", &TrReadPolicy::default()),
+        StmtKind::Read
+    );
+}
+
+#[test]
+fn dual_read_call_tr_eligibility() {
+    let policy = TrReadPolicy::default();
+    for sql in [
+        r"SELECT CASE WHEN E'\'' IS NOT NULL THEN fixture_untrusted() ELSE 0 END -- '",
+        r"SELECT '\' AS value --' , fixture_untrusted() -- tail",
+    ] {
+        assert!(!ProxyServer::tr_read_eligible(sql, &policy), "{sql}");
+    }
+}
+
+#[test]
+fn dual_read_call_preserves_paths_regex_and_order() {
+    let policy = TrReadPolicy::from_config(&["regexp_match".into()]);
+    for sql in [
+        r"SELECT 'C:\work\data'",
+        r"SELECT '\\'",
+        r"SELECT regexp_match('C:\work\data', '\w+\\d')",
+        r"SELECT 'fixture_untrusted()'",
+        r"SELECT $q$fixture_untrusted() \path$q$",
+        r"SELECT 42 /* fixture_untrusted() \path */",
+    ] {
+        assert!(ProxyServer::tr_read_eligible(sql, &policy), "{sql}");
+        assert!(ProxyServer::standby_safe_read(sql, &policy), "{sql}");
+    }
+    let mut words = Vec::new();
+    crate::replay_sql::words(r"SELECT 'C:\work\data' AS value", |w| {
+        words.push(w.text.to_owned());
+        true
+    })
+    .unwrap();
+    assert_eq!(words, ["SELECT", "AS", "value"]);
 }

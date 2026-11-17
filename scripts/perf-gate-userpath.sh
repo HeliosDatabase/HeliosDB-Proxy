@@ -24,6 +24,8 @@
 #                  extended-protocol relay; use a distinct label per protocol
 #   TR_MODE        the proxies' tr_mode                  (default unset = session;
 #                  `transaction` exercises the in-session replay recording)
+#   TR_ENABLED     enable or disable Transaction Replay on both arms
+#                  (default true; diagnostic ablations may set false)
 #   EXTRA_TOML     TOML appended to both proxies' config  (default empty; e.g. a
 #                  `[multi_tenancy]` section for a capped run, both arms alike)
 #   BUDGET_PCT     regression budget, TPS and p99        (default 3.0, see compare-usertp.py)
@@ -103,6 +105,7 @@ mkdir -p "$OUT"
   echo "PGOPTIONS=$PGOPTIONS"
   echo "PGBENCH_PROTOCOL=${PGBENCH_PROTOCOL:-simple}"
   echo "TR_MODE=${TR_MODE:-session}"
+  echo "TR_ENABLED=${TR_ENABLED:-true}"
   printf 'EXTRA_TOML=%q\n' "${EXTRA_TOML:-}"
   echo "BUDGET_PCT=$BUDGET_PCT"
 } > "$OUT/$LABEL-env.txt"
@@ -123,7 +126,7 @@ if ! pg psql -h "$PGHOST" -p "$PGPORT" -U "$BUSER" -d "$BDB" -tAc "select 1" >/d
   exit 2
 fi
 
-rows="$(pg psql -h "$PGHOST" -p "$PGPORT" -U "$BUSER" -d "$BDB" -tAc "select count(*) from pgbench_accounts" 2>/dev/null | tr -d '[:space:]')"
+rows="$(pg psql -h "$PGHOST" -p "$PGPORT" -U "$BUSER" -d "$BDB" -tAc "select count(*) from pgbench_accounts" 2>/dev/null | tr -d '[:space:]' || true)"
 if [ "${rows:-0}" != "1000000" ]; then
   echo "pgbench_accounts has ${rows:-0} row(s) (want 1,000,000) — initializing with pgbench -i -s 10"
   # inlined rather than via the pg() shell function: heavy()'s systemd-run
@@ -139,7 +142,8 @@ run_pass(){
   # invoked via `bash` rather than relying on the file's executable bit —
   # scripts/regress/bench-usertp.sh is tracked without +x in git.
   heavy env OUT="$OUT" CLIENTS="$CLIENTS" DUR="$DUR" MODES="$MODES" PGOPTIONS="$PGOPTIONS" \
-    PGBENCH_PROTOCOL="$PGBENCH_PROTOCOL" TR_MODE="${TR_MODE:-}" EXTRA_TOML="${EXTRA_TOML:-}" \
+    PGBENCH_PROTOCOL="$PGBENCH_PROTOCOL" TR_MODE="${TR_MODE:-}" TR_ENABLED="${TR_ENABLED:-true}" \
+    EXTRA_TOML="${EXTRA_TOML:-}" \
     bash "$HERE/regress/bench-usertp.sh" "$bin" "$plabel"
 }
 

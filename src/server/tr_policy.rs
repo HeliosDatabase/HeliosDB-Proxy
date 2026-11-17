@@ -22,15 +22,9 @@ pub(super) const STANDBY_UNSAFE_FUNCTIONS: &[&str] = &[
     "txid_current_snapshot",
 ];
 
-/// PostgreSQL built-in functions that have no side effects when re-executed
-/// (TR-03). This is the whole basis for calling an interrupted read
-/// re-executable on an unknown outcome: a read calling anything NOT listed here
-/// — a user-defined function, `nextval`, `pg_notify`, `set_config`, advisory
-/// locks, large-object or replication functions — may already have run once and
-/// is never run again by the proxy. Nondeterminism (`random`, `now`, `pg_sleep`)
-/// is deliberately allowed: an unknown-outcome autocommit read published nothing
-/// to the client, so only side effects matter. Sorted; looked up by binary
-/// search on the ASCII-lowercased call name.
+/// Historical builtin spellings for explicit-trust policy test fixtures.
+/// Runtime eligibility never infers purity from these names.
+#[cfg(test)]
 pub(super) const TR_PURE_BUILTINS: &[&str] = &[
     "abs",
     "acos",
@@ -336,6 +330,7 @@ pub(super) const TR_PURE_BUILTINS: &[&str] = &[
 ];
 
 /// SQL keywords that can be followed by `(` without being a function call.
+#[cfg(test)]
 pub(super) const TR_CALL_KEYWORDS: &[&str] = &[
     "all",
     "and",
@@ -408,7 +403,7 @@ pub(super) const TR_CALL_KEYWORDS: &[&str] = &[
     "within",
 ];
 
-/// Operator-extended read-eligibility policy (`tr_read_functions`).
+/// Explicit operator trust for call-shaped read syntax (`tr_read_functions`).
 #[derive(Debug, Default)]
 pub struct TrReadPolicy {
     /// Lowercased extra function names treated as side-effect-free.
@@ -423,6 +418,11 @@ impl TrReadPolicy {
     }
 
     pub(super) fn allows_call(&self, name: &str) -> bool {
+        // A spelling cannot prove which schema/signature the backend resolves.
+        // Only an explicit operator assertion permits retry/offload of a call.
+        if self.extra.is_empty() {
+            return false;
+        }
         // Names are ASCII identifiers by validation; fold without allocating
         // for the overwhelmingly common short case.
         let mut buf = [0u8; 64];
@@ -434,9 +434,7 @@ impl TrReadPolicy {
         } else {
             return self.extra.contains(&name.to_ascii_lowercase());
         };
-        TR_CALL_KEYWORDS.binary_search(&lower).is_ok()
-            || TR_PURE_BUILTINS.binary_search(&lower).is_ok()
-            || self.extra.contains(lower)
+        self.extra.contains(lower)
     }
 }
 

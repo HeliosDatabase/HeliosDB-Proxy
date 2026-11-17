@@ -190,6 +190,20 @@ fn classify_single(sql: &str) -> StmtKind {
     if first_word_not_ascii(s) {
         return StmtKind::Opaque;
     }
+    // This comment edge case was already classified as a replayable read by
+    // the journal's backend boundary reconciliation. Keep that behavior:
+    // the unknown-function guard below only addresses executable calls.
+    // Only a text whose last byte past ASCII whitespace is `/` (or is not
+    // ASCII, where the Unicode trim decides) can end that way: every other
+    // statement skips the trim.
+    if s.bytes()
+        .rev()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| b == b'/' || !b.is_ascii())
+        && s.trim_end().ends_with("/* /* */")
+    {
+        return StmtKind::Read;
+    }
     let (w, rest) = first_word(s);
     let (w2, rest2) = first_word(rest.trim_start());
     let upper = |kw: &str| word_eq(w, kw);
@@ -288,7 +302,36 @@ fn classify_single(sql: &str) -> StmtKind {
     if WRITES.iter().any(|kw| upper(kw)) {
         return StmtKind::Write;
     }
-    StmtKind::Read
+    // A SQL function call must contain an opening parenthesis. If none is
+    // present, no function can be exposed by either PostgreSQL string reading,
+    // so avoid walking both readings for the common call-free statement.
+    // Keep the full fail-closed scanner whenever one is present.
+    if memchr::memchr(b'(', sql.as_bytes()).is_none() {
+        return StmtKind::Read;
+    }
+    read_unless_it_calls(sql)
+}
+
+/// A statement no keyword above made a write: a read, unless it calls
+/// something other than SQL syntax that takes parentheses (a function may
+/// write). Kept out of line so that `classify_single` does not carry the
+/// lexer's frame for the statements a keyword decides. The Criterion gate
+/// of 2026-11-17 measured no gain from it (`cache/classify/begin`).
+#[inline(never)]
+fn read_unless_it_calls(sql: &str) -> StmtKind {
+    if crate::replay_sql::all_calls_satisfy(sql, |word| {
+        [
+            "AS", "EXPLAIN", "IN", "EXISTS", "OVER", "FILTER", "CAST", "ROW",
+        ]
+        .iter()
+        .any(|keyword| word.text.eq_ignore_ascii_case(keyword))
+    })
+    .unwrap_or(false)
+    {
+        StmtKind::Read
+    } else {
+        StmtKind::Opaque
+    }
 }
 
 /// Split a simple-query string into statements on `;` outside quotes,
@@ -553,6 +596,7 @@ pub struct SessionCapture {
     /// here and handed to the shared journal only when it commits (see
     /// [`apply_ops`]).
     active: Option<TransactionJournalEntry>,
+    raw_prepared_published: usize,
 }
 
 impl Default for SessionCapture {
@@ -601,6 +645,7 @@ impl SessionCapture {
             max_statement_bytes: max_statement_bytes.max(1),
             deferred: Vec::new(),
             active: None,
+            raw_prepared_published: 0,
         }
     }
 
@@ -619,6 +664,7 @@ impl SessionCapture {
     /// is strictly request → response per session, so a leftover means the
     /// previous cycle's response was synthesized without observing it.
     pub fn begin_cycle(&mut self) {
+        self.raw_prepared_published = 0;
         self.pending.clear();
         self.execs = 0;
     }
@@ -774,9 +820,103 @@ impl SessionCapture {
         }
     }
 
+    /// Mark only newly raw-applied tags that still exist in bounded held
+    /// metadata. Actual cycle/discard/close boundaries reset this ownership.
+    pub(crate) fn note_raw_prepared_published(&mut self, applied: usize, retained: usize) {
+        self.raw_prepared_published = self
+            .raw_prepared_published
+            .saturating_add(applied)
+            .min(retained);
+    }
+
     /// Reconcile the registered statements with the backend's response and
     /// return the journal operations to apply. Also clears the cycle.
     pub fn observe(&mut self, outcome: &ResponseOutcome) -> Vec<JournalOp> {
+        self.observe_inner(outcome, false)
+    }
+
+    /// Apply only proven completed extended transaction boundaries. A plain
+    /// DML completion does not end the implicit transaction before Sync.
+    /// Keep later Execute positions, portals and errors for the real RFQ.
+    pub(crate) fn observe_committed_prefix(
+        &mut self,
+        outcome: &mut ResponseOutcome,
+        mut proven: usize,
+    ) -> Vec<JournalOp> {
+        if self
+            .pending
+            .iter()
+            .any(|p| p.protocol == WireProtocol::Simple)
+        {
+            // A sole ordinary simple COMMIT is provable without inventing an
+            // RFQ. A multi-string/mixed registration cannot be partitioned.
+            let sole_commit = self.pending.len() == 1
+                && self.execs == 0
+                && !self.pending[0].multi
+                && matches!(self.pending[0].kind, StmtKind::Control(Control::Commit))
+                && outcome.completions.len() == 1
+                && proven >= 1
+                && matches!(&outcome.completions[0], Completion::Tag(tag) if tag.eq_ignore_ascii_case("COMMIT"));
+            if !sole_commit || self.raw_prepared_published > 0 {
+                return Vec::new();
+            }
+            let portals = std::mem::take(&mut self.portals);
+            let prefix = ResponseOutcome {
+                status: b'I',
+                completions: std::mem::take(&mut outcome.completions),
+                error: None,
+            };
+            let ops = self.observe_inner(&prefix, true);
+            self.portals = portals;
+            return ops;
+        }
+        // A raw fallback's metadata may not map to Execute ordinals. Preserve
+        // that unpartitionable tail until actual RFQ, including fresh suffixes.
+        if self.raw_prepared_published > 0 {
+            return Vec::new();
+        }
+        let mut ops = Vec::new();
+        while let Some(at) = outcome.completions[..proven.min(outcome.completions.len())]
+            .iter()
+            .position(|completion| {
+                matches!(completion, Completion::Tag(tag)
+                    if tag.eq_ignore_ascii_case("COMMIT")
+                        || tag.eq_ignore_ascii_case("COMMIT PREPARED"))
+            })
+        {
+            let completed = at + 1;
+            if completed > self.execs {
+                // No registered extended execution proves this mapping.
+                break;
+            }
+            let pending_at = self.pending.partition_point(|p| p.exec_index < completed);
+            let mut future = self.pending.split_off(pending_at);
+            let future_execs = self.execs - completed;
+            let portals = std::mem::take(&mut self.portals);
+            let suffix = outcome.completions.split_off(completed);
+            let prefix = ResponseOutcome {
+                status: b'I',
+                completions: std::mem::replace(&mut outcome.completions, suffix),
+                // An error following this successful explicit commit belongs
+                // to the suffix and cannot undo the durable prefix.
+                error: None,
+            };
+            ops.extend(self.observe_inner(&prefix, true));
+            for p in &mut future {
+                p.exec_index -= completed;
+            }
+            self.pending = future;
+            self.execs = future_execs;
+            proven -= completed;
+            // Metadata may already contain a Bind sent after this commit,
+            // before its first Execute. Only actual RFQ clears the cycle's
+            // portals; invalid pre-commit portals are rejected by the backend.
+            self.portals = portals;
+        }
+        ops
+    }
+
+    fn observe_inner(&mut self, outcome: &ResponseOutcome, prefix: bool) -> Vec<JournalOp> {
         let mut ops = std::mem::take(&mut self.deferred);
         // CommandComplete is authoritative: the preparing session and its
         // write set may be unknown here. Inspect every completion, including
@@ -784,9 +924,12 @@ impl SessionCapture {
         // error cannot undo a prepared transaction already committed. Using
         // the backend tag also covers comments and batches without parsing a
         // global transaction identifier or changing journal replay semantics.
-        if outcome.completions.iter().any(
+        let prepared = outcome.completions.iter().filter(
             |completion| matches!(completion, Completion::Tag(tag) if tag.eq_ignore_ascii_case("COMMIT PREPARED")),
-        ) {
+        ).count();
+        let already = prepared.min(self.raw_prepared_published);
+        self.raw_prepared_published -= already;
+        if prepared > already {
             ops.push(JournalOp::PreparedCommitted);
         }
         let pending = std::mem::take(&mut self.pending);
@@ -819,10 +962,41 @@ impl SessionCapture {
                 }
                 Resolved::Ok(tag) => match &p.kind {
                     StmtKind::Read => {}
-                    StmtKind::Control(c) => self.apply_control(c, &tag, &mut ops, &mut implicit),
+                    StmtKind::Control(c) => {
+                        if prefix
+                            && (tag.eq_ignore_ascii_case("ROLLBACK")
+                                || matches!(c, Control::PrepareTransaction))
+                        {
+                            // A preceding implicit transaction was rolled
+                            // back or prepared, not committed by this boundary.
+                            implicit.clear();
+                            implicit_incomplete = None;
+                        }
+                        let opening = matches!(c, Control::Begin) && self.open.is_none();
+                        self.apply_control(c, &tag, &mut ops, &mut implicit);
+                        if opening {
+                            // BEGIN moves prior implicit entries into the
+                            // new journal. Their existing incomplete reason
+                            // belongs to that journal as well (also at RFQ).
+                            if let Some(reason) = implicit_incomplete.take() {
+                                if let Some(open) = self.open.as_ref() {
+                                    ops.push(JournalOp::Incomplete {
+                                        tx_id: open.tx_id,
+                                        reason,
+                                    });
+                                }
+                            }
+                        }
+                    }
                     StmtKind::Write | StmtKind::Copy | StmtKind::Opaque => {
+                        let suspended = matches!(
+                            outcome.completions.get(p.exec_index),
+                            Some(Completion::Suspended)
+                        );
                         let entry = NewEntry::from_pending(p, StatementOutcome::Succeeded { tag });
-                        let reason = if p.oversize {
+                        let reason = if prefix && suspended {
+                            Some("mutation portal suspended before explicit commit; full statement effects unproven".to_string())
+                        } else if p.oversize {
                             Some("statement text exceeds journal.max_statement_bytes".to_string())
                         } else {
                             p.kind.incomplete_reason().map(str::to_string)
@@ -987,6 +1161,7 @@ impl SessionCapture {
     /// `observe`/`close` (it only removes an active journal, so delaying it
     /// is harmless).
     pub fn discard(&mut self, status: u8) {
+        self.raw_prepared_published = 0;
         self.pending.clear();
         self.execs = 0;
         self.prev_status = status;
@@ -995,6 +1170,19 @@ impl SessionCapture {
             if let Some(o) = self.open.take() {
                 self.deferred.push(JournalOp::Rollback { tx_id: o.tx_id });
             }
+        }
+    }
+
+    /// Something the capture has no statement for ran in the session (a
+    /// legacy `FunctionCall`): an explicit transaction being captured is
+    /// marked incomplete with `reason` at the next `observe`. Outside one
+    /// there is no journal to mark.
+    pub fn mark_open_incomplete(&mut self, reason: &str) {
+        if let Some(open) = self.open.as_ref() {
+            self.deferred.push(JournalOp::Incomplete {
+                tx_id: open.tx_id,
+                reason: reason.to_string(),
+            });
         }
     }
 
@@ -1016,6 +1204,7 @@ impl SessionCapture {
     }
 
     pub fn close(&mut self) -> Vec<JournalOp> {
+        self.raw_prepared_published = 0;
         self.pending.clear();
         self.portals.clear();
         let mut ops = std::mem::take(&mut self.deferred);
@@ -1135,6 +1324,58 @@ pub fn apply_ops(
     source: &SourceIdentity,
     local: &mut Option<TransactionJournalEntry>,
 ) -> Applied {
+    apply_ops_with_tenant_budget(journal, ops, session_id, node_id, source, local, None)
+}
+
+const TENANT_JOURNAL_BUDGET_REASON: &str = "tenant recovery-journal byte budget exceeded";
+
+/// Drop captured payloads after a tenant reservation failure and keep a
+/// charged incomplete marker if the configured budget can hold it.
+fn retain_incomplete_marker(
+    tx: &mut TransactionJournalEntry,
+    budget: Option<&std::sync::Arc<crate::tenant_slots::TenantJournalBudget>>,
+) -> bool {
+    tx.clear_entries();
+    tx.savepoints.clear();
+    tx.current_sequence = 0;
+    tx.has_mutations = false;
+    tx.incomplete_reason = Some(TENANT_JOURNAL_BUDGET_REASON.to_string());
+    budget.is_none_or(|budget| tx.settle_tenant_journal_budget(budget))
+}
+
+/// Include the backend's commit tag in the tenant charge. If a complete
+/// record no longer fits, retain only a charged incomplete marker; if that
+/// marker plus its commit metadata also cannot fit, fail closed with a sticky
+/// capture gap.
+fn settle_commit_tag(
+    tx: &mut TransactionJournalEntry,
+    budget: &std::sync::Arc<crate::tenant_slots::TenantJournalBudget>,
+    tag: &str,
+) -> bool {
+    let projected = tx.retained_size_bytes().saturating_add(tag.len());
+    if tx.settle_tenant_journal_size(projected, budget) {
+        return true;
+    }
+    if !retain_incomplete_marker(tx, Some(budget)) {
+        return false;
+    }
+    let marker_with_tag = tx.retained_size_bytes().saturating_add(tag.len());
+    tx.settle_tenant_journal_size(marker_with_tag, budget)
+}
+
+/// Apply capture operations while reserving recovery-journal bytes against
+/// the tenant's shared budget. Durable sinks are rejected at configuration
+/// validation when this budget is enabled because the current sink contract
+/// accepts only a complete committed transaction.
+pub fn apply_ops_with_tenant_budget(
+    journal: &TransactionJournal,
+    ops: Vec<JournalOp>,
+    session_id: Uuid,
+    node_id: NodeId,
+    source: &SourceIdentity,
+    local: &mut Option<TransactionJournalEntry>,
+    budget: Option<&std::sync::Arc<crate::tenant_slots::TenantJournalBudget>>,
+) -> Applied {
     let mut applied = Applied::default();
     for op in ops {
         match op {
@@ -1145,43 +1386,148 @@ pub fn apply_ops(
                     journal.local_end();
                     journal.note_rollback();
                 }
-                *local = Some(
-                    TransactionJournalEntry::new(tx_id, session_id, node_id, 0)
-                        .with_source(source.clone()),
-                );
-                journal.local_begin();
+                let mut tx = TransactionJournalEntry::new(tx_id, session_id, node_id, 0)
+                    .with_source(source.clone());
+                if budget.is_some_and(|budget| !tx.settle_tenant_journal_budget(budget)) {
+                    // The backend transaction proceeds, but no uncharged
+                    // recovery record is retained. Remember the loss of
+                    // capture so committed-history replay cannot skip it.
+                    journal.mark_capture_gap();
+                    *local = None;
+                } else {
+                    *local = Some(tx);
+                    journal.local_begin();
+                }
             }
             JournalOp::Log { tx_id, entry } => {
                 applied.statements += 1;
-                if let Some(tx) = local.as_mut().filter(|t| t.tx_id == tx_id) {
-                    if let Err(e) = journal.append_entry(tx, entry) {
+                let mut remove_local = false;
+                if let Some(tx) = local.as_mut().filter(|t| {
+                    t.tx_id == tx_id
+                        && t.incomplete_reason.as_deref() != Some(TENANT_JOURNAL_BUDGET_REASON)
+                }) {
+                    // With no tenant journal budget this path must remain
+                    // independent of retained-history accounting. Rewalking
+                    // every prior entry for each statement makes a long
+                    // transaction quadratic. A charged transaction already
+                    // owns its exact reservation, so grow it by this entry's
+                    // deterministic size instead of rescanning its history.
+                    let previous_size = tx
+                        .tenant_journal_charge
+                        .as_ref()
+                        .map(|charge| charge.bytes());
+                    let reserved = match (budget, tx.tenant_journal_charge.as_ref()) {
+                        (_, Some(charge)) => charge
+                            .settle(charge.bytes().saturating_add(entry.retained_size_bytes())),
+                        (None, None) => true,
+                        (Some(budget), None) => tx.settle_tenant_journal_size(
+                            tx.retained_size_bytes()
+                                .saturating_add(entry.retained_size_bytes()),
+                            budget,
+                        ),
+                    };
+                    if !reserved {
+                        remove_local = !retain_incomplete_marker(tx, budget);
+                    } else if let Err(e) = journal.append_entry(tx, entry) {
+                        if let (Some(charge), Some(previous_size)) =
+                            (&tx.tenant_journal_charge, previous_size)
+                        {
+                            let _ = charge.settle(previous_size);
+                        }
                         tx.mark_incomplete(format!("journal cap: {}", e));
+                        if let Some(budget) = budget {
+                            if !tx.settle_tenant_journal_budget(budget) {
+                                remove_local = !retain_incomplete_marker(tx, Some(budget));
+                            }
+                        }
                     }
+                }
+                if remove_local {
+                    journal.mark_capture_gap();
+                    local.take();
+                    journal.local_end();
                 }
             }
             JournalOp::Savepoint { tx_id, name } => {
-                if let Some(tx) = local.as_mut().filter(|t| t.tx_id == tx_id) {
+                let mut remove_local = false;
+                if let Some(tx) = local.as_mut().filter(|t| {
+                    t.tx_id == tx_id
+                        && t.incomplete_reason.as_deref() != Some(TENANT_JOURNAL_BUDGET_REASON)
+                }) {
+                    // Only a budgeted transaction needs its prior size: without
+                    // a tenant budget a SAVEPOINT must not walk every entry.
+                    let previous_size = budget.map_or(0, |_| tx.retained_size_bytes());
                     tx.create_savepoint(name);
+                    if let Some(budget) = budget {
+                        if !tx.settle_tenant_journal_budget(budget) {
+                            tx.savepoints.pop();
+                            let _ = tx.settle_tenant_journal_size(previous_size, budget);
+                            remove_local = !retain_incomplete_marker(tx, Some(budget));
+                        }
+                    }
+                }
+                if remove_local {
+                    journal.mark_capture_gap();
+                    local.take();
+                    journal.local_end();
                 }
             }
             JournalOp::RollbackTo { tx_id, name } => {
-                if let Some(tx) = local.as_mut().filter(|t| t.tx_id == tx_id) {
+                let mut remove_local = false;
+                if let Some(tx) = local.as_mut().filter(|t| {
+                    t.tx_id == tx_id
+                        && t.incomplete_reason.as_deref() != Some(TENANT_JOURNAL_BUDGET_REASON)
+                }) {
                     if tx.rollback_to_savepoint(&name).is_none() {
                         tx.mark_incomplete(format!(
                             "ROLLBACK TO unknown journal savepoint {:?}",
                             name
                         ));
                     }
+                    if let Some(budget) = budget {
+                        if !tx.settle_tenant_journal_budget(budget) {
+                            remove_local = !retain_incomplete_marker(tx, Some(budget));
+                        }
+                    }
+                }
+                if remove_local {
+                    journal.mark_capture_gap();
+                    local.take();
+                    journal.local_end();
                 }
             }
             JournalOp::Incomplete { tx_id, reason } => {
+                let mut remove_local = false;
                 if let Some(tx) = local.as_mut().filter(|t| t.tx_id == tx_id) {
                     tx.mark_incomplete(reason);
+                    if let Some(budget) = budget {
+                        if !tx.settle_tenant_journal_budget(budget) {
+                            remove_local = !retain_incomplete_marker(tx, Some(budget));
+                        }
+                    }
+                }
+                if remove_local {
+                    journal.mark_capture_gap();
+                    local.take();
+                    journal.local_end();
                 }
             }
             JournalOp::Commit { tx_id, tag } => {
-                if let Some(tx) = local.take_if(|t| t.tx_id == tx_id) {
+                let mut tx = local.take_if(|t| t.tx_id == tx_id);
+                let had_active = tx.is_some();
+                if let Some(entry) = tx.as_mut() {
+                    if let Some(budget) = budget {
+                        if !settle_commit_tag(entry, budget, &tag) {
+                            tx = None;
+                            journal.mark_capture_gap();
+                        }
+                    }
+                }
+                // Pair local_end with Begin even if the record cannot fit.
+                if had_active {
                     journal.local_end();
+                }
+                if let Some(tx) = tx {
                     if journal.record_committed_sync(tx, &tag).is_some() {
                         applied.committed += 1;
                     }
@@ -1213,6 +1559,18 @@ pub fn apply_ops(
                 }
                 if let Some(r) = incomplete {
                     tx.mark_incomplete(r);
+                }
+                if let Some(budget) = budget {
+                    if !tx.settle_tenant_journal_budget(budget)
+                        && !retain_incomplete_marker(&mut tx, Some(budget))
+                    {
+                        journal.mark_capture_gap();
+                        continue;
+                    }
+                    if !settle_commit_tag(&mut tx, budget, &tag) {
+                        journal.mark_capture_gap();
+                        continue;
+                    }
                 }
                 if journal.record_committed_sync(tx, &tag).is_some() {
                     applied.committed += 1;
@@ -1310,7 +1668,7 @@ mod tests {
             classify("WITH x AS (SELECT 1) SELECT * FROM x").0,
             StmtKind::Read
         );
-        assert_eq!(classify("SELECT nextval('s')").0, StmtKind::Read);
+        assert_eq!(classify("SELECT nextval('s')").0, StmtKind::Opaque);
         assert_eq!(classify("SET search_path = a").0, StmtKind::Read);
         assert_eq!(classify("VACUUM t").0, StmtKind::Read);
         assert_eq!(classify("CALL p()").0, StmtKind::Write);
@@ -1462,6 +1820,9 @@ mod tests {
         assert_eq!(classify("/* a */ UPDATE kv SET v = 2").0, StmtKind::Write);
         assert_eq!(classify("-- c\r\nSELECT 1").0, StmtKind::Read);
         assert_eq!(classify("SELECT 1 /* /* */").0, StmtKind::Read);
+        // The same ending behind whitespace, ASCII or not, is still found.
+        assert_eq!(classify("SELECT 1 /* /* */ \t\n").0, StmtKind::Read);
+        assert_eq!(classify("SELECT 1 /* /* */\u{a0}").0, StmtKind::Read);
         // HeliosDB-Lite's splitter, which knows no comments, also leaves a
         // comment whose quotes all close where PostgreSQL does (sqlcommenter
         // tags): a `;` in a later literal ends nothing. Such a read used to
@@ -1865,6 +2226,29 @@ mod tests {
     }
 
     #[test]
+    fn an_uncaptured_effect_marks_only_an_open_transaction_incomplete() {
+        let mut c = SessionCapture::default();
+        // Outside a transaction there is no journal to mark.
+        c.mark_open_incomplete("not captured");
+        assert!(!c.has_deferred());
+        let tx = match &simple(&mut c, "BEGIN", ok(b'T', &["BEGIN"]))[..] {
+            [JournalOp::Begin { tx_id }] => *tx_id,
+            o => panic!("{:?}", o),
+        };
+        c.mark_open_incomplete("not captured");
+        // The mark rides along with the next observation, the request's own.
+        let ops = c.observe(&ResponseOutcome::status_only(b'T'));
+        assert_eq!(
+            ops,
+            vec![JournalOp::Incomplete {
+                tx_id: tx,
+                reason: "not captured".to_string(),
+            }]
+        );
+        assert!(c.in_transaction());
+    }
+
+    #[test]
     fn unseen_transaction_state_is_reconciled_from_status() {
         // A failed transaction the capture never saw open (e.g. opened by a
         // path that did not register) is tracked so its end is observed.
@@ -1964,6 +2348,316 @@ mod tests {
         assert_eq!(stats.committed_transactions, 2);
         assert_eq!(stats.commit_seq_high, 2);
         assert_eq!(stats.committed_total, 2);
+    }
+
+    #[tokio::test]
+    async fn tenant_budget_refusal_retains_only_an_incomplete_charged_record() {
+        let journal = TransactionJournal::new();
+        let mut capture = SessionCapture::default();
+        let source = SourceIdentity {
+            client_addr: "c".into(),
+            user: "u".into(),
+            database: "d".into(),
+            backend: "b".into(),
+            tenant: Some("t".into()),
+        };
+        let mut ops = simple(&mut capture, "BEGIN", ok(b'T', &["BEGIN"]));
+        ops.extend(simple(
+            &mut capture,
+            "INSERT INTO t VALUES ('a long payload that must exceed the tenant cap')",
+            ok(b'T', &["INSERT 0 1"]),
+        ));
+        ops.extend(simple(
+            &mut capture,
+            "INSERT INTO t VALUES ('another statement after capture was disabled')",
+            ok(b'T', &["INSERT 0 1"]),
+        ));
+        ops.extend(simple(&mut capture, "COMMIT", ok(b'I', &["COMMIT"])));
+
+        // The initial transaction record fits, and the deliberately compact
+        // incomplete marker plus commit tag fits; the captured statement does
+        // not. This proves the refusal path keeps no partial replay payload.
+        let marker_size =
+            512 + 1 + 1 + 1 + 1 + 1 + TENANT_JOURNAL_BUDGET_REASON.len() + "COMMIT".len();
+        let budget = crate::tenant_slots::TenantJournalBudget::new("t", marker_size);
+        let mut local = None;
+        let applied = apply_ops_with_tenant_budget(
+            &journal,
+            ops,
+            Uuid::new_v4(),
+            NodeId::new(),
+            &source,
+            &mut local,
+            Some(&budget),
+        );
+
+        assert_eq!(applied.committed, 1);
+        assert!(local.is_none());
+        let committed = journal.committed_after(0).await;
+        assert_eq!(committed.len(), 1);
+        assert!(committed[0].entries.is_empty());
+        assert_eq!(
+            committed[0].incomplete_reason.as_deref(),
+            Some(TENANT_JOURNAL_BUDGET_REASON)
+        );
+        assert!(committed[0].tenant_journal_charge.is_some());
+        assert_eq!(budget.used(), committed[0].retained_size_bytes());
+    }
+
+    #[tokio::test]
+    async fn tenant_budget_that_cannot_hold_marker_sets_sticky_capture_gap() {
+        let journal = TransactionJournal::new();
+        let mut capture = SessionCapture::default();
+        let source = SourceIdentity {
+            tenant: Some("t".into()),
+            ..SourceIdentity::default()
+        };
+        let ops = simple(
+            &mut capture,
+            "BEGIN; INSERT INTO t VALUES (1); COMMIT",
+            ok(b'I', &["BEGIN", "INSERT 0 1", "COMMIT"]),
+        );
+        let budget = crate::tenant_slots::TenantJournalBudget::new("t", 1);
+        let mut local = None;
+        apply_ops_with_tenant_budget(
+            &journal,
+            ops,
+            Uuid::new_v4(),
+            NodeId::new(),
+            &source,
+            &mut local,
+            Some(&budget),
+        );
+        assert!(journal.has_capture_gap());
+        assert!(local.is_none());
+        assert!(journal.committed_after(0).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tenant_budget_shrinks_on_rollback_to_and_releases_on_rollback() {
+        let journal = TransactionJournal::new();
+        let mut capture = SessionCapture::default();
+        let source = SourceIdentity {
+            tenant: Some("t".into()),
+            ..SourceIdentity::default()
+        };
+        let budget = crate::tenant_slots::TenantJournalBudget::new("t", 16 * 1024);
+        let mut local = None;
+        let apply = |ops, local: &mut Option<TransactionJournalEntry>| {
+            apply_ops_with_tenant_budget(
+                &journal,
+                ops,
+                Uuid::nil(),
+                NodeId::new(),
+                &source,
+                local,
+                Some(&budget),
+            )
+        };
+
+        apply(
+            simple(&mut capture, "BEGIN", ok(b'T', &["BEGIN"])),
+            &mut local,
+        );
+        apply(
+            simple(
+                &mut capture,
+                "INSERT INTO t VALUES (1)",
+                ok(b'T', &["INSERT 0 1"]),
+            ),
+            &mut local,
+        );
+        apply(
+            simple(&mut capture, "SAVEPOINT s", ok(b'T', &["SAVEPOINT"])),
+            &mut local,
+        );
+        let at_savepoint = budget.used();
+        apply(
+            simple(
+                &mut capture,
+                "INSERT INTO t VALUES (2)",
+                ok(b'T', &["INSERT 0 1"]),
+            ),
+            &mut local,
+        );
+        let after_second_entry = budget.used();
+        assert!(after_second_entry > at_savepoint);
+        apply(
+            simple(&mut capture, "ROLLBACK TO s", ok(b'T', &["ROLLBACK"])),
+            &mut local,
+        );
+        let after_rollback_to = budget.used();
+        assert!(after_rollback_to < after_second_entry);
+        assert!(after_rollback_to >= at_savepoint);
+        apply(
+            simple(&mut capture, "ROLLBACK", ok(b'I', &["ROLLBACK"])),
+            &mut local,
+        );
+        assert!(local.is_none());
+        assert_eq!(budget.used(), 0);
+        assert_eq!(journal.active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn tenant_budget_is_shared_by_active_sessions() {
+        let journal = TransactionJournal::new();
+        let source = SourceIdentity {
+            client_addr: "c".into(),
+            user: "u".into(),
+            database: "d".into(),
+            backend: "b".into(),
+            tenant: Some("t".into()),
+        };
+        let cap = TransactionJournalEntry::new(Uuid::nil(), Uuid::nil(), NodeId::new(), 0)
+            .with_source(source.clone())
+            .retained_size_bytes();
+        let budget = crate::tenant_slots::TenantJournalBudget::new("t", cap);
+        let mut first = None;
+        let mut second = None;
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        apply_ops_with_tenant_budget(
+            &journal,
+            vec![JournalOp::Begin { tx_id: first_id }],
+            Uuid::new_v4(),
+            NodeId::new(),
+            &source,
+            &mut first,
+            Some(&budget),
+        );
+        apply_ops_with_tenant_budget(
+            &journal,
+            vec![JournalOp::Begin { tx_id: second_id }],
+            Uuid::new_v4(),
+            NodeId::new(),
+            &source,
+            &mut second,
+            Some(&budget),
+        );
+        assert!(first.is_some());
+        assert!(second.is_none());
+        assert_eq!(budget.used(), cap);
+        assert_eq!(journal.active_count().await, 1);
+        assert!(journal.has_capture_gap());
+    }
+
+    #[tokio::test]
+    async fn auto_commit_budget_refusal_keeps_only_incomplete_marker() {
+        let journal = TransactionJournal::new();
+        let mut capture = SessionCapture::default();
+        let source = SourceIdentity {
+            client_addr: "c".into(),
+            user: "u".into(),
+            database: "d".into(),
+            backend: "b".into(),
+            tenant: Some("t".into()),
+        };
+        let ops = simple(
+            &mut capture,
+            "INSERT INTO t VALUES ('a payload too large for this cap')",
+            ok(b'I', &["INSERT 0 1"]),
+        );
+        let marker_size =
+            512 + 1 + 1 + 1 + 1 + 1 + TENANT_JOURNAL_BUDGET_REASON.len() + "INSERT 0 1".len();
+        let budget = crate::tenant_slots::TenantJournalBudget::new("t", marker_size);
+        let mut local = None;
+        let applied = apply_ops_with_tenant_budget(
+            &journal,
+            ops,
+            Uuid::new_v4(),
+            NodeId::new(),
+            &source,
+            &mut local,
+            Some(&budget),
+        );
+        assert_eq!(applied.committed, 1);
+        let committed = journal.committed_after(0).await;
+        assert_eq!(committed.len(), 1);
+        assert!(committed[0].entries.is_empty());
+        assert_eq!(
+            committed[0].incomplete_reason.as_deref(),
+            Some(TENANT_JOURNAL_BUDGET_REASON)
+        );
+        assert_eq!(budget.used(), committed[0].retained_size_bytes());
+    }
+
+    #[tokio::test]
+    async fn explicit_and_auto_commit_tags_are_included_in_tenant_budget() {
+        let source = SourceIdentity {
+            client_addr: "c".into(),
+            user: "u".into(),
+            database: "d".into(),
+            backend: "b".into(),
+            tenant: Some("t".into()),
+        };
+        let mut explicit_capture = SessionCapture::default();
+        let mut explicit_ops = simple(&mut explicit_capture, "BEGIN", ok(b'T', &["BEGIN"]));
+        explicit_ops.extend(simple(
+            &mut explicit_capture,
+            "INSERT INTO t VALUES ('payload')",
+            ok(b'T', &["INSERT 0 1"]),
+        ));
+        explicit_ops.extend(simple(
+            &mut explicit_capture,
+            "COMMIT",
+            ok(b'I', &["COMMIT"]),
+        ));
+
+        let mut auto_capture = SessionCapture::default();
+        let auto_ops = simple(
+            &mut auto_capture,
+            "INSERT INTO t VALUES ('payload')",
+            ok(b'I', &["INSERT 0 1"]),
+        );
+
+        for (name, ops, tag) in [
+            ("explicit commit", explicit_ops, "COMMIT"),
+            ("auto-commit", auto_ops, "INSERT 0 1"),
+        ] {
+            let node = NodeId::new();
+            let session_id = Uuid::new_v4();
+            let baseline = TransactionJournal::new();
+            let mut baseline_local = None;
+            apply_ops_with_tenant_budget(
+                &baseline,
+                ops.clone(),
+                session_id,
+                node,
+                &source,
+                &mut baseline_local,
+                None,
+            );
+            let full_record_size = baseline.committed_after(0).await[0].retained_size_bytes();
+            let cap_without_commit_tag = full_record_size - tag.len();
+
+            let journal = TransactionJournal::new();
+            let budget = crate::tenant_slots::TenantJournalBudget::new("t", cap_without_commit_tag);
+            let mut local = None;
+            let applied = apply_ops_with_tenant_budget(
+                &journal,
+                ops,
+                session_id,
+                node,
+                &source,
+                &mut local,
+                Some(&budget),
+            );
+            let committed = journal.committed_after(0).await;
+
+            assert_eq!(applied.committed, 1, "{name}");
+            assert_eq!(committed.len(), 1, "{name}");
+            assert!(committed[0].entries.is_empty(), "{name}");
+            assert_eq!(
+                committed[0].incomplete_reason.as_deref(),
+                Some(TENANT_JOURNAL_BUDGET_REASON),
+                "{name}"
+            );
+            assert_eq!(committed[0].commit_tag.as_deref(), Some(tag), "{name}");
+            assert_eq!(budget.used(), committed[0].retained_size_bytes(), "{name}");
+            assert!(budget.used() <= cap_without_commit_tag, "{name}");
+            assert!(!journal.has_capture_gap(), "{name}");
+            assert_eq!(budget.refusals(), 1, "{name}");
+        }
     }
 
     /// Build a `Bind` payload: portal, statement, param formats, values.

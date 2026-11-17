@@ -1161,6 +1161,7 @@ impl ProxyServer {
             && bc.prepared.is_empty()
             && bc.stale.is_empty()
             && bc.unnamed_sig.is_none()
+            && !bc.unnamed_untracked
             && !bc.unnamed_stale.any();
         if config.pool_mode.skip_clean_reset && clean {
             let key = Self::pool_key_for(node, session).await;

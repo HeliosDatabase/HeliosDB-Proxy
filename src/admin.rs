@@ -61,6 +61,7 @@ pub struct AdminState {
     pub node_health: RwLock<HashMap<String, NodeHealth>>,
     /// Server metrics
     pub metrics: RwLock<ServerMetricsSnapshot>,
+    session_policy: RwLock<Option<Arc<crate::server::SessionPolicyCounters>>>,
     /// Active sessions count
     pub active_sessions: RwLock<u64>,
     /// Configuration (read-only)
@@ -593,6 +594,23 @@ impl AdminServer {
                 let metrics = state.metrics.read().await.clone();
                 let mut body = serde_json::to_value(MetricsResponse::from(metrics))?;
                 if let Some(map) = body.as_object_mut() {
+                    let policy = state.session_policy.read().await;
+                    map.insert(
+                        "copy_input_timeouts".into(),
+                        policy
+                            .as_ref()
+                            .map_or(0, |p| p.copy_input_timeouts.load(Ordering::Relaxed))
+                            .into(),
+                    );
+                    map.insert(
+                        "query_cache_context_bypassed".into(),
+                        policy
+                            .as_ref()
+                            .map_or(0, |p| {
+                                p.query_cache_context_bypassed.load(Ordering::Relaxed)
+                            })
+                            .into(),
+                    );
                     if let Some(l) = state.latency.read().await.as_ref() {
                         map.insert("latency".into(), l.to_json());
                     }
@@ -657,6 +675,31 @@ impl AdminServer {
             ("GET", "/metrics/prometheus") => {
                 let metrics = state.metrics.read().await.clone();
                 let mut prometheus = Self::format_prometheus_metrics(&metrics);
+                {
+                    use std::fmt::Write as _;
+                    let policy = state.session_policy.read().await;
+                    for (name, help, value) in [
+                        (
+                            "heliosdb_proxy_copy_input_timeouts_total",
+                            "Sessions terminated because client COPY input stalled",
+                            policy
+                                .as_ref()
+                                .map_or(0, |p| p.copy_input_timeouts.load(Ordering::Relaxed)),
+                        ),
+                        (
+                            "heliosdb_proxy_query_cache_context_bypassed_total",
+                            "Read candidates bypassed after session context became unprovable",
+                            policy.as_ref().map_or(0, |p| {
+                                p.query_cache_context_bypassed.load(Ordering::Relaxed)
+                            }),
+                        ),
+                    ] {
+                        let _ = writeln!(
+                            prometheus,
+                            "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}"
+                        );
+                    }
+                }
                 Self::push_config_prometheus(
                     &mut prometheus,
                     state.config_snapshot.read().await.ignored_config_keys.len(),
@@ -2668,6 +2711,7 @@ impl AdminServer {
         type Value = fn(&crate::tenant_slots::TenantBudgetStats) -> u64;
         let queries: Vec<_> = stats.iter().filter(|s| s.query_limit > 0).collect();
         let replay: Vec<_> = stats.iter().filter(|s| s.replay_byte_limit > 0).collect();
+        let journal: Vec<_> = stats.iter().filter(|s| s.journal_byte_limit > 0).collect();
         let query_series: [(&str, &str, &str, Value); 9] = [
             (
                 "heliosdb_proxy_tenant_active_queries",
@@ -2744,7 +2788,31 @@ impl AdminServer {
                 |s| s.replay_refusals,
             ),
         ];
-        for (rows, series) in [(&queries, &query_series[..]), (&replay, &replay_series[..])] {
+        let journal_series: [(&str, &str, &str, Value); 3] = [
+            (
+                "heliosdb_proxy_tenant_journal_bytes",
+                "gauge",
+                "Recovery-journal bytes reserved by the tenant now",
+                |s| s.journal_bytes as u64,
+            ),
+            (
+                "heliosdb_proxy_tenant_journal_byte_limit",
+                "gauge",
+                "The tenant's recovery-journal byte budget",
+                |s| s.journal_byte_limit as u64,
+            ),
+            (
+                "heliosdb_proxy_tenant_journal_budget_refusals_total",
+                "counter",
+                "Recovery-journal reservations refused by the tenant byte budget",
+                |s| s.journal_refusals,
+            ),
+        ];
+        for (rows, series) in [
+            (&queries, &query_series[..]),
+            (&replay, &replay_series[..]),
+            (&journal, &journal_series[..]),
+        ] {
             if rows.is_empty() {
                 continue;
             }
@@ -3630,6 +3698,7 @@ impl AdminState {
                 journal_statements: 0,
                 tr: Default::default(),
             }),
+            session_policy: RwLock::new(None),
             active_sessions: RwLock::new(0),
             config_snapshot: RwLock::new(ConfigSnapshot {
                 ignored_config_keys: Vec::new(),
@@ -3769,6 +3838,13 @@ impl AdminState {
     /// reports the snapshot the data path routes by.
     pub async fn with_routing_view(&self, routing: Arc<crate::routing_snapshot::RoutingView>) {
         *self.routing.write().await = Some(routing);
+    }
+
+    pub(crate) async fn with_session_policy(
+        &self,
+        counters: Arc<crate::server::SessionPolicyCounters>,
+    ) {
+        *self.session_policy.write().await = Some(counters);
     }
 
     /// Attach the daemon's latency histograms (P-03).
@@ -4425,6 +4501,7 @@ mod tests {
         tenant: &str,
         query_limit: usize,
         replay_limit: usize,
+        journal_limit: usize,
     ) -> crate::tenant_slots::TenantBudgetStats {
         crate::tenant_slots::TenantBudgetStats {
             tenant: tenant.into(),
@@ -4440,6 +4517,9 @@ mod tests {
             replay_byte_limit: replay_limit,
             replay_bytes: 900,
             replay_refusals: 9,
+            journal_byte_limit: journal_limit,
+            journal_bytes: 800,
+            journal_refusals: 10,
         }
     }
 
@@ -4456,7 +4536,7 @@ mod tests {
         };
 
         // A query-only tenant: exactly the nine active-query series.
-        AdminServer::push_tenant_budgets_prometheus(&mut out, &[budget_row("a\"b\\c", 4, 0)]);
+        AdminServer::push_tenant_budgets_prometheus(&mut out, &[budget_row("a\"b\\c", 4, 0, 0)]);
         assert_eq!(
             names(&out),
             [
@@ -4491,7 +4571,7 @@ mod tests {
 
         // A replay-only tenant: exactly the three replay series.
         let mut out = String::new();
-        AdminServer::push_tenant_budgets_prometheus(&mut out, &[budget_row("r", 0, 1000)]);
+        AdminServer::push_tenant_budgets_prometheus(&mut out, &[budget_row("r", 0, 1000, 0)]);
         assert_eq!(
             names(&out),
             [
@@ -4503,11 +4583,24 @@ mod tests {
         assert!(out.contains("heliosdb_proxy_tenant_replay_bytes{tenant=\"r\"} 900\n"));
         assert!(out.contains("# TYPE heliosdb_proxy_tenant_replay_budget_refusals_total counter"));
 
+        let mut out = String::new();
+        AdminServer::push_tenant_budgets_prometheus(&mut out, &[budget_row("j", 0, 0, 4096)]);
+        assert_eq!(
+            names(&out),
+            [
+                "heliosdb_proxy_tenant_journal_bytes",
+                "heliosdb_proxy_tenant_journal_byte_limit",
+                "heliosdb_proxy_tenant_journal_budget_refusals_total",
+            ]
+        );
+        assert!(out.contains("heliosdb_proxy_tenant_journal_bytes{tenant=\"j\"} 800\n"));
+        assert!(out.contains("heliosdb_proxy_tenant_journal_byte_limit{tenant=\"j\"} 4096\n"));
+
         // Mixed rows: each tenant only in the series its budget covers.
         let mut out = String::new();
         AdminServer::push_tenant_budgets_prometheus(
             &mut out,
-            &[budget_row("q", 4, 0), budget_row("r", 0, 1000)],
+            &[budget_row("q", 4, 0, 0), budget_row("r", 0, 1000, 0)],
         );
         assert_eq!(names(&out).len(), 12);
         assert!(!out.contains("heliosdb_proxy_tenant_replay_bytes{tenant=\"q\"}"));
@@ -4534,6 +4627,7 @@ mod tests {
 
         config.multi_tenancy.max_active_queries_per_tenant = 2;
         config.multi_tenancy.max_replay_bytes_per_tenant = 1000;
+        config.multi_tenancy.max_journal_bytes_per_tenant = 4096;
         state
             .with_tenant_slots(Arc::new(crate::tenant_slots::TenantSlots::from_config(
                 &config,
@@ -4546,6 +4640,7 @@ mod tests {
         assert_eq!(row["tenant"], "acme");
         assert_eq!(row["query_limit"], 2);
         assert_eq!(row["replay_byte_limit"], 1000);
+        assert_eq!(row["journal_byte_limit"], 4096);
         assert_eq!(row["queries_active"], 0);
         let (_, body) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
             .await
@@ -6908,5 +7003,41 @@ mod tests {
             .await
             .expect_err("oversized Content-Length must be rejected before allocating");
         assert!(err.to_string().contains("413"), "unexpected error: {err}");
+    }
+}
+
+#[cfg(test)]
+mod session_policy_counter_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn json_and_prometheus_report_attached_policy_counters() {
+        let state = Arc::new(AdminState::new());
+        let (_, initial) = AdminServer::route_request("GET", "/metrics", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(initial["copy_input_timeouts"], 0);
+        assert_eq!(initial["query_cache_context_bypassed"], 0);
+        let counters = Arc::new(crate::server::SessionPolicyCounters::default());
+        counters.copy_input_timeouts.store(2, Ordering::Relaxed);
+        counters
+            .query_cache_context_bypassed
+            .store(3, Ordering::Relaxed);
+        state.with_session_policy(counters).await;
+        let (_, json) = AdminServer::route_request("GET", "/metrics", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(json["copy_input_timeouts"], 2);
+        assert_eq!(json["query_cache_context_bypassed"], 3);
+        let (_, json) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
+            .await
+            .unwrap();
+        let text = json["text"].as_str().unwrap();
+        for metric in [
+            "heliosdb_proxy_copy_input_timeouts_total 2",
+            "heliosdb_proxy_query_cache_context_bypassed_total 3",
+        ] {
+            assert!(text.lines().any(|line| line == metric), "missing {metric}");
+        }
     }
 }

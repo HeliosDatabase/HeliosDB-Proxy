@@ -88,6 +88,20 @@ pub struct ClientSession {
     /// transaction the commit does again.
     #[cfg(feature = "query-cache")]
     pub(crate) cache_unseen_write: std::sync::atomic::AtomicBool,
+    /// Fail-closed result-cache eligibility. Any statement whose effects on
+    /// execution context are not provably neutral makes this sticky.
+    #[cfg(feature = "query-cache")]
+    pub(crate) cache_ineligible: std::sync::atomic::AtomicBool,
+    /// Complete startup identity, initialized once before the first lookup.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(crate) cache_startup_namespace: std::sync::OnceLock<[u8; 32]>,
+    /// Last effective scope used by this client's raw-SQL L1 cache.
+    #[cfg(feature = "query-cache")]
+    pub(crate) cache_effective_namespace: std::sync::Mutex<Option<[u8; 32]>>,
+    /// Journal metadata already relayed by a Flush or COPY yield; never rows.
+    pub(crate) journal_response_prefix:
+        std::sync::Mutex<Option<(crate::journal_capture::ResponseOutcome, usize)>>,
+    pub(crate) journal_response_pending: std::sync::atomic::AtomicBool,
     /// TR-07 recovery-journal capture: the per-session state machine that
     /// turns registered statements + observed backend responses into
     /// committed transactions (`journal_capture`). Locked briefly on the
@@ -369,6 +383,15 @@ pub struct ExtendedBatchLog {
 /// names move from `prepared` to `stale` and are closed on that socket before
 /// a later batch uses or redefines them (F2).
 pub(super) struct BackendConn {
+    /// A cleanly drained backend that cannot provide the settings proof.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) cache_scope_unsupported: bool,
+    /// Reused only under the explicit immutable-backend-context contract.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) cache_scope_verified: Option<[u8; 32]>,
+    /// Explicit proof for synthetic protocol fixtures; absent from production.
+    #[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
+    pub(super) cache_scope_test_override: Option<[u8; 32]>,
     pub(super) stream: TcpStream,
     /// Unpublished backend frame tail, owned by this socket across Flush,
     /// idle watch and Sync. Dropped with the socket, never moved to another node.
@@ -391,6 +414,13 @@ pub(super) struct BackendConn {
     /// (the backend's unnamed statement already holds that SQL) and synthesize
     /// the `ParseComplete` locally — the unnamed-Parse promotion (Batch H).
     pub(super) unnamed_sig: Option<bytes::Bytes>,
+    /// The socket may hold an unnamed statement of the client's that
+    /// `unnamed_sig` does not describe (the promotion is off, or its `Parse`
+    /// did not open its batch): the proxy could not re-establish it, so
+    /// nothing that destroys the unnamed statement (the result cache's
+    /// settings probe, a simple Query of the proxy's own) may run ahead of a
+    /// batch of the client's that does not replace it.
+    pub(super) unnamed_untracked: bool,
     /// The unnamed statement and portal this socket may still hold although
     /// the session's were destroyed without it (see [`UnnamedStale`]). Never
     /// set on a fresh or pooled connection.
@@ -440,6 +470,12 @@ pub(super) struct BackendConn {
 impl BackendConn {
     pub(super) fn new(stream: TcpStream) -> Self {
         Self {
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            cache_scope_unsupported: false,
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            cache_scope_verified: None,
+            #[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
+            cache_scope_test_override: None,
             stream,
             response_buf: BytesMut::new(),
             prepared: HashSet::new(),
@@ -447,6 +483,7 @@ impl BackendConn {
             gucs_synced: None,
             gucs_role: false,
             unnamed_sig: None,
+            unnamed_untracked: false,
             unnamed_stale: UnnamedStale::default(),
             #[cfg(feature = "pool-modes")]
             dirty: false,
@@ -470,6 +507,7 @@ impl BackendConn {
     /// the backend destroyed its unnamed statement and portal.
     pub(super) fn unnamed_destroyed(&mut self) {
         self.unnamed_sig = None;
+        self.unnamed_untracked = false;
         self.unnamed_stale = UnnamedStale::default();
     }
 }

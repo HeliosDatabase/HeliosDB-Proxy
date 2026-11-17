@@ -39,6 +39,49 @@ fn cstring(s: &str) -> Vec<u8> {
     out
 }
 
+fn text_row_description(names: &[&str]) -> Vec<u8> {
+    let mut body = (names.len() as u16).to_be_bytes().to_vec();
+    for name in names {
+        body.extend(cstring(name));
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&25u32.to_be_bytes());
+        body.extend_from_slice(&(-1i16).to_be_bytes());
+        body.extend_from_slice(&(-1i32).to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+    }
+    wire(b'T', &body)
+}
+
+fn text_data_row(values: &[&str]) -> Vec<u8> {
+    let mut body = (values.len() as u16).to_be_bytes().to_vec();
+    for value in values {
+        body.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        body.extend_from_slice(value.as_bytes());
+    }
+    wire(b'D', &body)
+}
+
+/// A real, bounded settings exchange, consumed by the production scope parser.
+/// No cache-scope override is installed on the connection.
+fn show_all_reply(status: u8) -> Vec<u8> {
+    let mut reply = text_row_description(&["name", "setting", "description"]);
+    for (name, value) in [
+        ("search_path", "\"$user\", public"),
+        ("row_security", "on"),
+        ("DateStyle", "ISO, MDY"),
+        ("TimeZone", "UTC"),
+        ("client_encoding", "UTF8"),
+        ("standard_conforming_strings", "on"),
+        ("server_version", "18.4"),
+    ] {
+        reply.extend(text_data_row(&[name, value, "tenant fixture setting"]));
+    }
+    reply.extend(wire(b'C', b"SHOW\0"));
+    reply.extend(wire(b'Z', &[status]));
+    reply
+}
+
 fn query(sql: &str) -> Vec<u8> {
     wire(b'Q', &cstring(sql))
 }
@@ -104,6 +147,9 @@ struct BackendCtl {
     /// Permits that let a held query or Execute (its SQL contains `slow`)
     /// answer.
     slow: Semaphore,
+    /// Withhold a settings proof until the test explicitly releases it.
+    hold_scope_probes: std::sync::atomic::AtomicBool,
+    scope_probes: Semaphore,
     /// Per connection: closes it from the backend side.
     kills: StdMutex<HashMap<u32, Arc<Notify>>>,
     /// Delay before answering a `DISCARD ALL` (the pool's reset).
@@ -207,6 +253,8 @@ impl FakeBackend {
         let ctl = Arc::new(BackendCtl {
             log: StdMutex::new(Vec::new()),
             slow: Semaphore::new(0),
+            hold_scope_probes: std::sync::atomic::AtomicBool::new(false),
+            scope_probes: Semaphore::new(0),
             kills: StdMutex::new(HashMap::new()),
             discard_delay,
             shared_key,
@@ -273,6 +321,9 @@ impl FakeBackend {
         // transaction ends.
         let mut statements: HashMap<String, String> = HashMap::new();
         let mut portal: Option<String> = None;
+        // A COPY completion may stay in PostgreSQL's output buffer until a
+        // Flush or Sync. Exercise that path separately from eager replies.
+        let mut copy_completion = Vec::new();
         loop {
             let mut header = [0u8; 5];
             tokio::select! {
@@ -296,11 +347,27 @@ impl FakeBackend {
                 b'P' => cstrings(1),
                 // The kind and the name: `S` for the unnamed statement.
                 b'C' => cstrings(0),
+                // The function OID.
+                b'F' => body
+                    .first_chunk::<4>()
+                    .map(|oid| u32::from_be_bytes(*oid).to_string())
+                    .unwrap_or_default(),
                 _ => String::new(),
             };
             ctl.note(pid, tag, &text);
             match (mode, tag) {
                 (_, b'X') => return,
+                (BackendMode::Ready, b'H' | b'S') if !copy_completion.is_empty() => {
+                    if tag == b'S' {
+                        copy_completion.extend(wire(b'Z', &[status]));
+                        portal = None;
+                    }
+                    if sock.write_all(&copy_completion).await.is_err() {
+                        return;
+                    }
+                    copy_completion.clear();
+                    continue;
+                }
                 // Everything up to the Sync is discarded after an error.
                 (BackendMode::SkipToSync, b'S') => mode = BackendMode::Ready,
                 (BackendMode::SkipToSync, _) => continue,
@@ -322,7 +389,14 @@ impl FakeBackend {
                         kill.notified().await;
                         return;
                     }
+                    if portal.as_deref().is_some_and(|p| p.contains("slow_end")) {
+                        ctl.slow.acquire().await.unwrap().forget();
+                    }
                     mode = BackendMode::Ready;
+                    if portal.as_deref().is_some_and(|p| p.contains("flush_ack")) {
+                        copy_completion = wire(b'C', &cstring("COPY 1"));
+                        continue;
+                    }
                     if sock
                         .write_all(&wire(b'C', &cstring("COPY 1")))
                         .await
@@ -412,6 +486,19 @@ impl FakeBackend {
                     mode = BackendMode::CopySimple;
                     wire(b'G', &[0, 0, 0])
                 }
+                b'Q' if text == "SHOW ALL" => {
+                    if ctl.hold_scope_probes.load(Ordering::Relaxed) {
+                        ctl.scope_probes.acquire().await.unwrap().forget();
+                    }
+                    show_all_reply(status)
+                }
+                b'Q' if text == "SELECT v FROM scope_tenant_fixture" => [
+                    text_row_description(&["v"]),
+                    text_data_row(&["1"]),
+                    wire(b'C', b"SELECT 1\0"),
+                    wire(b'Z', &[status]),
+                ]
+                .concat(),
                 b'Q' => {
                     if text.contains("slow") {
                         ctl.slow.acquire().await.unwrap().forget();
@@ -488,6 +575,8 @@ impl FakeBackend {
                     wire(b'3', &[])
                 }
                 b'D' => wire(b'n', &[]),
+                // FunctionCallResponse (a four-byte result), ReadyForQuery.
+                b'F' => [wire(b'V', &[0, 0, 0, 4, 0, 0, 0, 1]), wire(b'Z', &[status])].concat(),
                 b'S' => {
                     // The implicit transaction ends here, and its portals.
                     if status == b'I' {
@@ -606,6 +695,845 @@ fn assert_served(frames: &[Vec<u8>], status: u8) {
 }
 
 const REFUSED: &str = "too many active queries for tenant \"acme\" (limit 1)";
+
+/// A complete CopyInResponse already in the socket accumulator must arm
+/// the timer before the backend/client select begins waiting for more bytes.
+#[tokio::test]
+async fn copy_stall_deadline_arms_for_an_already_buffered_response() {
+    let h = Harness::new(0, None, |config| {
+        config.limits = toml::from_str("copy_idle_timeout_secs = 1").unwrap();
+    })
+    .await;
+    let session = make_test_session();
+    let (socket, _backend_peer) = pair().await;
+    let mut backend = BackendConn::new(socket);
+    backend
+        .response_buf
+        .extend_from_slice(&wire(b'G', &[0, 0, 0]));
+    let mut conns = HashMap::from([("buffered".into(), backend)]);
+    let (socket, _client_peer) = pair().await;
+    let mut client = crate::client_tls::ClientStream::Plain(socket);
+    let mut buffer = BytesMut::new();
+    let read = tokio::time::timeout(
+        Duration::from_millis(200),
+        ProxyServer::read_next_client_message(
+            &mut client,
+            &mut buffer,
+            &mut conns,
+            Some("buffered"),
+            None,
+            &h.state,
+            IdleWatch {
+                session: &session,
+                keep_session: false,
+                copy_end_wait: None,
+            },
+        ),
+    )
+    .await
+    .expect("buffered COPY must re-arm before waiting")
+    .unwrap();
+    assert_eq!(read, ClientRead::CopyStateChanged);
+    assert!(session.copy_in_progress.load(Ordering::Relaxed));
+}
+
+/// An ErrorResponse ends the input obligation before RFQ arrives. Keep the
+/// backend pinned, but do not label the wait for its RFQ as stalled input.
+#[tokio::test]
+async fn copy_stall_deadline_disarms_on_a_backend_error_before_ready() {
+    let h = Harness::new(0, None, |config| {
+        config.limits = toml::from_str("copy_idle_timeout_secs = 1").unwrap();
+    })
+    .await;
+    let session = make_test_session();
+    session.copy_in_progress.store(true, Ordering::Relaxed);
+    let (socket, _backend_peer) = pair().await;
+    let mut backend = BackendConn::new(socket);
+    backend
+        .response_buf
+        .extend_from_slice(&wire(b'E', b"SERROR\0C57014\0Mcancelled\0\0"));
+    let mut conns = HashMap::from([("buffered".into(), backend)]);
+    let (socket, _client_peer) = pair().await;
+    let mut client = crate::client_tls::ClientStream::Plain(socket);
+    let mut buffer = BytesMut::new();
+    let read = tokio::time::timeout(
+        Duration::from_millis(200),
+        ProxyServer::read_next_client_message(
+            &mut client,
+            &mut buffer,
+            &mut conns,
+            Some("buffered"),
+            None,
+            &h.state,
+            IdleWatch {
+                session: &session,
+                keep_session: false,
+                copy_end_wait: None,
+            },
+        ),
+    )
+    .await
+    .expect("COPY error must disarm before waiting")
+    .unwrap();
+    assert_eq!(read, ClientRead::CopyStateChanged);
+    assert!(
+        session.copy_in_progress.load(Ordering::Relaxed),
+        "RFQ still owed"
+    );
+    assert!(ProxyServer::client_idle_deadline(&h.state, &buffer, &session).is_none());
+    conns
+        .get_mut("buffered")
+        .unwrap()
+        .response_buf
+        .extend_from_slice(&wire(b'Z', b"I"));
+    let read = tokio::time::timeout(
+        Duration::from_millis(200),
+        ProxyServer::read_next_client_message(
+            &mut client,
+            &mut buffer,
+            &mut conns,
+            Some("buffered"),
+            None,
+            &h.state,
+            IdleWatch {
+                session: &session,
+                keep_session: false,
+                copy_end_wait: None,
+            },
+        ),
+    )
+    .await
+    .expect("COPY RFQ must settle before waiting")
+    .unwrap();
+    assert_eq!(read, ClientRead::CopyStateChanged);
+    assert!(!session.copy_in_progress.load(Ordering::Relaxed));
+}
+
+/// A watched COPY backend dying is a backend failure, never client inactivity.
+#[tokio::test]
+async fn copy_stall_deadline_reports_backend_loss_without_waiting_for_input() {
+    let h = Harness::new(0, None, |config| {
+        config.limits = toml::from_str("copy_idle_timeout_secs = 1").unwrap();
+    })
+    .await;
+    let mut a = h.connect("acme").await;
+    let mut b = h.connect("acme").await;
+    a.send(&query("COPY data FROM STDIN")).await;
+    assert_eq!(a.frame().await[0], b'G');
+    h.backend.kill(a.key.0);
+    let error = a.frame().await;
+    assert_eq!(sqlstate(&error), "08006");
+    assert!(has_text(&error, "FATAL"));
+    let mut byte = [0];
+    assert_eq!(
+        tokio::time::timeout(TEST_TIMEOUT, a.s.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    h.until("acme", "lost COPY returned capacity", |s| {
+        s.queries_active == 0
+    })
+    .await;
+    assert_served(&b.query("select 1").await, b'I');
+}
+
+/// A backend cancellation can finish COPY without another client byte.
+/// The buffered/Flush relay must observe that boundary before arming a timer.
+#[tokio::test]
+async fn copy_stall_deadline_disarms_when_backend_ends_copy() {
+    let h = Harness::new(0, None, |config| {
+        config.limits = toml::from_str("copy_idle_timeout_secs = 1").unwrap();
+    })
+    .await;
+    let session = make_test_session();
+    let (stream, mut peer) = pair().await;
+    let mut stream = crate::client_tls::ClientStream::Plain(stream);
+    let start = wire(b'G', &[0, 0, 0]);
+    let mut frames = BytesMut::from(start.as_slice());
+    ProxyServer::forward_buffered_backend_frames(&mut stream, &mut frames, &session, &h.state)
+        .await
+        .unwrap();
+    assert!(session.copy_in_progress.load(Ordering::Relaxed));
+    assert!(ProxyServer::client_idle_deadline(&h.state, &BytesMut::new(), &session).is_some());
+    let end = [
+        wire(b'E', b"SERROR\0C57014\0Mcancelled\0\0"),
+        wire(b'Z', b"I"),
+    ]
+    .concat();
+    frames.extend_from_slice(&end);
+    ProxyServer::forward_buffered_backend_frames(&mut stream, &mut frames, &session, &h.state)
+        .await
+        .unwrap();
+    assert!(!session.copy_in_progress.load(Ordering::Relaxed));
+    assert!(session.last_response_error.load(Ordering::Relaxed));
+    assert!(ProxyServer::client_idle_deadline(&h.state, &BytesMut::new(), &session).is_none());
+    let expected = [start, end].concat();
+    let mut received = vec![0; expected.len()];
+    peer.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, expected);
+}
+
+/// A stalled COPY, including a partial CopyData frame, must roll back and
+/// release its tenant's capacity without requiring any further client input.
+#[tokio::test]
+async fn copy_stall_deadline_reclaims_simple_extended_and_partial_input() {
+    for extended in [false, true] {
+        for partial in [false, true] {
+            let h = Harness::new(0, None, |config| {
+                config.limits = toml::from_str("copy_idle_timeout_secs = 1").unwrap();
+            })
+            .await;
+            let mut a = h.connect("acme").await;
+            let mut b = h.connect("acme").await;
+            if extended {
+                a.send(
+                    &[
+                        parse("c", "COPY data FROM STDIN"),
+                        bind("c"),
+                        execute(),
+                        flush(),
+                    ]
+                    .concat(),
+                )
+                .await;
+                assert_eq!(a.frame().await[0], b'1');
+                assert_eq!(a.frame().await[0], b'2');
+            } else {
+                a.send(&query("COPY data FROM STDIN")).await;
+            }
+            assert_eq!(a.frame().await[0], b'G');
+            assert_refused(&b.query("select 'blocked'").await, "53300", REFUSED);
+            if partial {
+                // A CopyData header announcing 12 payload bytes, only one sent.
+                a.send(&[b'd', 0, 0, 0, 16, b'x']).await;
+            }
+            let fatal = a.frame().await;
+            assert_eq!(sqlstate(&fatal), "57014");
+            assert!(has_text(&fatal, "FATAL") && has_text(&fatal, "COPY input timeout"));
+            let mut byte = [0];
+            assert_eq!(
+                tokio::time::timeout(TEST_TIMEOUT, a.s.read(&mut byte))
+                    .await
+                    .expect("stalled COPY session must close")
+                    .unwrap(),
+                0
+            );
+            h.until("acme", "stalled COPY returned its permit", |stats| {
+                stats.queries_active == 0
+            })
+            .await;
+            assert_eq!(h.backend_cancels(), 1, "cancelled before capacity returned");
+            assert_eq!(
+                h.state
+                    .metrics
+                    .policy
+                    .copy_input_timeouts
+                    .load(Ordering::Relaxed),
+                1
+            );
+            assert!(h
+                .backend
+                .frames_of(a.key.0)
+                .iter()
+                .all(|frame| frame.tag != b'd'));
+            assert_served(&b.query("select 'after timeout'").await, b'I');
+        }
+    }
+}
+
+/// The COPY inactivity clock follows client progress rather than total load
+/// duration, and a completed COPY leaves the connection usable.
+#[tokio::test]
+async fn copy_stall_deadline_resets_on_client_progress() {
+    let h = Harness::new(0, None, |config| {
+        config.limits = toml::from_str("copy_idle_timeout_secs = 1").unwrap();
+    })
+    .await;
+    let mut a = h.connect("acme").await;
+    a.send(&query("COPY data FROM STDIN")).await;
+    assert_eq!(a.frame().await[0], b'G');
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        a.send(&wire(b'd', b"one row\n")).await;
+    }
+    a.send(&wire(b'c', &[])).await;
+    assert_served(&a.until_ready().await, b'I');
+    assert_served(&a.query("select 'still usable'").await, b'I');
+}
+
+/// A FunctionCall frame: `oid`, no argument format codes, no arguments, a
+/// binary result.
+fn function_call(oid: u32) -> Vec<u8> {
+    let mut body = oid.to_be_bytes().to_vec();
+    body.extend_from_slice(&[0, 0, 0, 0, 0, 1]);
+    wire(b'F', &body)
+}
+
+/// `lo_open` and `lowrite` (large-object functions the default mode
+/// forwards), and an OID that is neither a large-object function nor, in the
+/// fake backend, anything else.
+const LO_OPEN: u32 = 952;
+const LOWRITE: u32 = 955;
+const SOME_FUNCTION: u32 = 42;
+
+fn saw_function_call(h: &Harness, oid: u32) -> bool {
+    h.backend
+        .log()
+        .iter()
+        .any(|s| s.tag == b'F' && s.text == oid.to_string())
+}
+
+/// `function_call` decides by OID what reaches the backend. A refused call
+/// is answered `0A000` and ReadyForQuery, and the session goes on.
+#[tokio::test]
+async fn the_function_call_mode_decides_what_reaches_the_backend() {
+    use crate::config::FunctionCallMode::{Any, LargeObjects, Refuse};
+    for (mode, oid, forwarded) in [
+        (LargeObjects, LO_OPEN, true),
+        (LargeObjects, LOWRITE, true),
+        (LargeObjects, SOME_FUNCTION, false),
+        (Refuse, LO_OPEN, false),
+        (Any, SOME_FUNCTION, true),
+    ] {
+        let h = Harness::new(0, None, |c| c.function_call = mode).await;
+        let mut a = h.connect("acme").await;
+        a.send(&function_call(oid)).await;
+        let frames = a.until_ready().await;
+        if forwarded {
+            assert_eq!(tags(&frames), b"VZ", "{mode:?} {oid}");
+            assert_served(&frames, b'I');
+        } else {
+            assert_refused(&frames, "0A000", "FunctionCall");
+        }
+        assert_eq!(saw_function_call(&h, oid), forwarded, "{mode:?} {oid}");
+        // Refused inside a transaction, the status stays the backend's.
+        assert_served(&a.query("BEGIN").await, b'T');
+        a.send(&function_call(oid)).await;
+        let frames = a.until_ready().await;
+        assert_eq!(frames.last().unwrap(), &wire(b'Z', b"T"), "{mode:?} {oid}");
+        assert_eq!(frames[0][0] == b'E', !forwarded, "{mode:?} {oid}");
+        assert_served(&a.query("COMMIT").await, b'I');
+        assert_eq!(
+            h.backend
+                .log()
+                .iter()
+                .filter(|s| s.tag == b'F' && s.text == oid.to_string())
+                .count(),
+            if forwarded { 2 } else { 0 },
+            "{mode:?} {oid}"
+        );
+    }
+}
+
+/// A forwarded FunctionCall is a request under the tenant's active-query
+/// cap: refused at the cap without reaching the backend, holding the permit
+/// while it runs, and returning it with ReadyForQuery `I`.
+#[tokio::test]
+async fn a_function_call_takes_and_returns_the_tenant_permit() {
+    let h = Harness::new(0, None, |_| {}).await;
+    let mut a = h.connect("acme").await;
+    let mut b = h.connect("acme").await;
+    h.hold_permit(&mut a, "select 'slow a'").await;
+    b.send(&function_call(LO_OPEN)).await;
+    assert_refused(&b.until_ready().await, "53300", REFUSED);
+    assert!(!saw_function_call(&h, LO_OPEN), "never forwarded");
+    h.backend.release_slow();
+    assert_served(&a.until_ready().await, b'I');
+    h.until("acme", "the permit returned", |s| s.queries_active == 0)
+        .await;
+
+    b.send(&function_call(LO_OPEN)).await;
+    assert_eq!(tags(&b.until_ready().await), b"VZ");
+    h.until("acme", "the permit returned", |s| s.queries_active == 0)
+        .await;
+    // A transaction's calls run under the permit it holds.
+    assert_served(&b.query("BEGIN").await, b'T');
+    b.send(&function_call(LOWRITE)).await;
+    assert_served(&b.until_ready().await, b'T');
+    assert_refused(&a.query("select 'a'").await, "53300", REFUSED);
+    assert_served(&b.query("COMMIT").await, b'I');
+    h.until("acme", "the permit returned", |s| s.queries_active == 0)
+        .await;
+    assert_served(&a.query("select 'a'").await, b'I');
+}
+
+/// A large-object call takes no session lock: the session returns its permit
+/// when it idles. A function called by OID under `function_call = "any"`
+/// may have taken one, so the session keeps permit and connection until it
+/// unlocks everything.
+#[tokio::test]
+async fn only_an_arbitrary_function_call_pins_the_permit() {
+    let h = Harness::new(0, None, |c| {
+        c.function_call = crate::config::FunctionCallMode::Any;
+    })
+    .await;
+    let mut a = h.connect("acme").await;
+    let mut b = h.connect("acme").await;
+    a.send(&function_call(SOME_FUNCTION)).await;
+    assert_served(&a.until_ready().await, b'I');
+    h.until("acme", "A idle holding the permit", |s| {
+        s.queries_active == 1 && s.queries_idle == 1
+    })
+    .await;
+    assert_refused(&b.query("select 'b'").await, "53300", REFUSED);
+    assert_served(&a.query("SELECT pg_advisory_unlock_all()").await, b'I');
+    h.until("acme", "the permit returned", |s| s.queries_active == 0)
+        .await;
+    assert_served(&b.query("select 'b'").await, b'I');
+}
+
+/// A function called by OID under `function_call = "any"` may have written
+/// any table: every cached result is retired before its ReadyForQuery
+/// reaches the client. A large-object call retires nothing.
+#[cfg(feature = "query-cache")]
+#[tokio::test]
+async fn an_arbitrary_function_call_retires_every_cached_result() {
+    use crate::config::FunctionCallMode::{Any, LargeObjects};
+    for (mode, oid, retired) in [(LargeObjects, LOWRITE, 0), (Any, SOME_FUNCTION, 1)] {
+        let h = Harness::new(0, None, |c| {
+            c.function_call = mode;
+            c.cache.enabled = true;
+        })
+        .await;
+        let mut a = h.connect("acme").await;
+        a.send(&function_call(oid)).await;
+        assert_eq!(tags(&a.until_ready().await), b"VZ");
+        let cache = h.state.query_cache.as_ref().expect("the query cache runs");
+        assert_eq!(cache.unseen_write_invalidations(), retired, "{mode:?}");
+    }
+}
+
+/// The journal has no text for a FunctionCall: a transaction that ran one
+/// is not replayed on a replacement backend. Without the call it is.
+#[tokio::test]
+async fn a_transaction_with_a_function_call_is_never_replayed() {
+    for with_call in [false, true] {
+        let h = Harness::new(0, None, |c| {
+            c.tr_mode = crate::config::TrMode::Transaction;
+        })
+        .await;
+        let mut a = h.connect("acme").await;
+        assert_served(&a.query("BEGIN").await, b'T');
+        assert_served(&a.query("insert into t values (1)").await, b'T');
+        if with_call {
+            a.send(&function_call(LOWRITE)).await;
+            assert_served(&a.until_ready().await, b'T');
+        }
+        h.backend.kill(a.key.0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let frames = a.query("select 'a'").await;
+        let replayed =
+            h.backend.log().iter().any(|s| {
+                s.conn != a.key.0 && s.tag == b'Q' && s.text == "insert into t values (1)"
+            });
+        assert_eq!(replayed, !with_call, "{frames:?}");
+        if with_call {
+            assert_eq!(sqlstate(&frames[0]), "57P01");
+            assert_eq!(frames.last().unwrap(), &wire(b'Z', b"E"));
+            assert!(!h.backend.saw_query("select 'a'"));
+        } else {
+            assert_served(&frames, b'T');
+        }
+        assert_served(&a.query("ROLLBACK").await, b'I');
+    }
+}
+
+/// A FunctionCall in copy-in ends the COPY at its own connection, like any
+/// other message, and the session goes on.
+#[tokio::test]
+async fn a_function_call_in_copy_in_ends_the_copy() {
+    let h = Harness::new(0, None, |_| {}).await;
+    let mut a = h.connect("acme").await;
+    a.send(&query("COPY data FROM STDIN")).await;
+    assert_eq!(a.frame().await[0], b'G');
+    a.send(&function_call(LO_OPEN)).await;
+    let frames = a.until_ready().await;
+    assert_eq!(sqlstate(&frames[0]), "08P01");
+    assert_eq!(frames.last().unwrap(), &wire(b'Z', b"I"));
+    assert_served(&a.query("select 'still usable'").await, b'I');
+    h.until("acme", "the permit returned", |s| s.queries_active == 0)
+        .await;
+}
+
+/// A Bind of `stmt` into the unnamed portal with one text parameter `value`
+/// and one result column in `result_format` (0 text, 1 binary).
+#[cfg(feature = "query-cache")]
+fn bind_value(stmt: &str, value: &str, result_format: u16) -> Vec<u8> {
+    let mut body = [cstring(""), cstring(stmt)].concat();
+    body.extend_from_slice(&[0, 0, 0, 1]);
+    body.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    body.extend_from_slice(value.as_bytes());
+    body.extend_from_slice(&[0, 1]);
+    body.extend_from_slice(&result_format.to_be_bytes());
+    wire(b'B', &body)
+}
+
+/// Describe of the unnamed portal.
+#[cfg(feature = "query-cache")]
+fn describe_portal() -> Vec<u8> {
+    wire(b'D', b"P\0")
+}
+
+#[cfg(feature = "query-cache")]
+const KV_READ: &str = "SELECT v FROM kv WHERE id = $1";
+
+/// A harness whose query cache answers reads the operator vouched for.
+#[cfg(feature = "query-cache")]
+async fn cache_harness(tweak: impl FnOnce(&mut ProxyConfig)) -> Harness {
+    Harness::new(0, None, |c| {
+        c.cache.enabled = true;
+        c.cache.trust_backend_read_effects = true;
+        tweak(c);
+    })
+    .await
+}
+
+/// How many `tag` frames the backend received.
+#[cfg(feature = "query-cache")]
+fn backend_saw(h: &Harness, tag: u8) -> usize {
+    h.backend.log().iter().filter(|s| s.tag == tag).count()
+}
+
+/// An unnamed Parse/Bind/Execute/Sync read is stored at its first run and
+/// answered from the cache after it, byte for byte, without an Execute on
+/// the backend. Another parameter value, another result format and a
+/// described portal are other entries.
+#[cfg(feature = "query-cache")]
+#[tokio::test]
+async fn an_unnamed_extended_read_is_answered_from_the_cache() {
+    let h = cache_harness(|_| {}).await;
+    let mut a = h.connect("acme").await;
+    let read = |value: &str, format: u16, describe: bool| {
+        let mut batch = [parse("", KV_READ), bind_value("", value, format)].concat();
+        if describe {
+            batch.extend(describe_portal());
+        }
+        batch.extend(execute());
+        batch.extend(sync());
+        batch
+    };
+    a.send(&read("1", 0, false)).await;
+    let first = a.until_ready().await;
+    assert_eq!(tags(&first), b"12CZ");
+    assert_eq!(backend_saw(&h, b'E'), 1);
+    for _ in 0..3 {
+        a.send(&read("1", 0, false)).await;
+        assert_eq!(
+            a.until_ready().await,
+            first,
+            "the stored response, as it was"
+        );
+    }
+    assert_eq!(backend_saw(&h, b'E'), 1, "three hits ran nothing");
+    // What the response depends on separates the entries.
+    let mut executed = 1;
+    for (value, format, describe, shape) in [
+        ("2", 0, false, &b"12CZ"[..]),
+        ("1", 1, false, b"12CZ"),
+        ("1", 0, true, b"12nCZ"),
+    ] {
+        for hit in [false, true] {
+            a.send(&read(value, format, describe)).await;
+            assert_eq!(
+                tags(&a.until_ready().await),
+                shape,
+                "{value} {format} {describe}"
+            );
+            if !hit {
+                executed += 1;
+            }
+            assert_eq!(
+                backend_saw(&h, b'E'),
+                executed,
+                "{value} {format} {describe} hit={hit}"
+            );
+        }
+    }
+    // The first entry is still there.
+    a.send(&read("1", 0, false)).await;
+    assert_eq!(a.until_ready().await, first);
+    assert_eq!(backend_saw(&h, b'E'), executed);
+    h.until("acme", "the permit returned", |s| s.queries_active == 0)
+        .await;
+}
+
+/// A prepared (named) statement's Bind/Execute/Sync is cached the same way,
+/// and another session's identical statement under another name shares the
+/// entry.
+#[cfg(feature = "query-cache")]
+#[tokio::test]
+async fn a_named_extended_read_is_answered_from_the_cache() {
+    let h = cache_harness(|_| {}).await;
+    let mut a = h.connect("acme").await;
+    a.send(&[parse("s1", KV_READ), sync()].concat()).await;
+    assert_eq!(tags(&a.until_ready().await), b"1Z");
+    let run = |name: &str, value: &str| [bind_value(name, value, 0), execute(), sync()].concat();
+    a.send(&run("s1", "1")).await;
+    let first = a.until_ready().await;
+    assert_eq!(tags(&first), b"2CZ");
+    assert_eq!(backend_saw(&h, b'E'), 1);
+    a.send(&run("s1", "1")).await;
+    assert_eq!(a.until_ready().await, first);
+    assert_eq!(backend_saw(&h, b'E'), 1);
+    a.send(&run("s1", "2")).await;
+    assert_eq!(tags(&a.until_ready().await), b"2CZ");
+    assert_eq!(backend_saw(&h, b'E'), 2);
+    drop(a);
+    h.until("acme", "the permit returned", |s| s.queries_active == 0)
+        .await;
+    let mut b = h.connect("acme").await;
+    b.send(&[parse("other_name", KV_READ), sync()].concat())
+        .await;
+    assert_eq!(tags(&b.until_ready().await), b"1Z");
+    b.send(&run("other_name", "1")).await;
+    assert_eq!(b.until_ready().await, first);
+    assert_eq!(backend_saw(&h, b'E'), 2, "the other session's entry");
+}
+
+/// A write to the table retires the entries that read it, a transaction's
+/// reads are never cached, and `extended_protocol = false` leaves every
+/// batch to the backend.
+#[cfg(feature = "query-cache")]
+#[tokio::test]
+async fn extended_cache_entries_follow_writes_transactions_and_the_switch() {
+    let read = || {
+        [
+            parse("", KV_READ),
+            bind_value("", "1", 0),
+            execute(),
+            sync(),
+        ]
+        .concat()
+    };
+    let h = cache_harness(|_| {}).await;
+    let mut a = h.connect("acme").await;
+    for expected in [1, 1] {
+        a.send(&read()).await;
+        assert_eq!(tags(&a.until_ready().await), b"12CZ");
+        assert_eq!(backend_saw(&h, b'E'), expected);
+    }
+    // Another session writes the table (a session that writes is no longer
+    // served from the cache itself).
+    h.until("acme", "the permit returned", |s| s.queries_active == 0)
+        .await;
+    let mut writer = h.connect("acme").await;
+    assert_served(
+        &writer.query("UPDATE kv SET v = 2 WHERE id = 1").await,
+        b'I',
+    );
+    h.until("acme", "the permit returned", |s| s.queries_active == 0)
+        .await;
+    for expected in [2, 2] {
+        a.send(&read()).await;
+        assert_eq!(tags(&a.until_ready().await), b"12CZ");
+        assert_eq!(backend_saw(&h, b'E'), expected, "refilled after the write");
+    }
+    // The writer's own reads run on the backend from then on.
+    for expected in [3, 4] {
+        writer.send(&read()).await;
+        assert_eq!(tags(&writer.until_ready().await), b"12CZ");
+        assert_eq!(backend_saw(&h, b'E'), expected, "a session that wrote");
+        h.until("acme", "the permit returned", |s| s.queries_active == 0)
+            .await;
+    }
+    // Inside a transaction every read runs.
+    assert_served(&a.query("BEGIN").await, b'T');
+    for expected in [5, 6] {
+        a.send(&read()).await;
+        let frames = a.until_ready().await;
+        assert_eq!(frames.last().unwrap(), &wire(b'Z', b"T"));
+        assert_eq!(backend_saw(&h, b'E'), expected);
+    }
+    assert_served(&a.query("COMMIT").await, b'I');
+
+    let h = cache_harness(|c| c.cache.extended_protocol = false).await;
+    let mut a = h.connect("acme").await;
+    for expected in [1, 2, 3] {
+        a.send(&read()).await;
+        assert_eq!(tags(&a.until_ready().await), b"12CZ");
+        assert_eq!(backend_saw(&h, b'E'), expected);
+    }
+}
+
+/// A hit runs nothing, but the client was told its unnamed Parse
+/// succeeded: a later Bind of the unnamed statement without a Parse runs
+/// that statement, on a backend that was given it.
+#[cfg(feature = "query-cache")]
+#[tokio::test]
+async fn the_unnamed_statement_survives_a_cache_hit() {
+    for immutable in [false, true] {
+        let h = cache_harness(|c| c.cache.backend_context_immutable = immutable).await;
+        let mut a = h.connect("acme").await;
+        let read = |sql: &str| [parse("", sql), bind_value("", "1", 0), execute(), sync()].concat();
+        let other = "SELECT w FROM kv WHERE id = $1";
+        // Both statements are cached; the backend's unnamed one is `other`.
+        for sql in [KV_READ, other] {
+            a.send(&read(sql)).await;
+            assert_eq!(tags(&a.until_ready().await), b"12CZ");
+        }
+        let executed = backend_saw(&h, b'E');
+        let probes = h
+            .backend
+            .log()
+            .iter()
+            .filter(|s| s.text == "SHOW ALL")
+            .count();
+        // A hit on the first: the client's unnamed statement is KV_READ.
+        a.send(&read(KV_READ)).await;
+        assert_eq!(tags(&a.until_ready().await), b"12CZ");
+        assert_eq!(backend_saw(&h, b'E'), executed, "a hit");
+        if immutable {
+            assert_eq!(
+                h.backend
+                    .log()
+                    .iter()
+                    .filter(|s| s.text == "SHOW ALL")
+                    .count(),
+                probes,
+                "the proof of an immutable backend context is reused"
+            );
+        }
+        // Bound again without a Parse, it runs as KV_READ on the backend.
+        a.send(&[bind_value("", "9", 0), execute(), sync()].concat())
+            .await;
+        assert_eq!(
+            tags(&a.until_ready().await),
+            b"2CZ",
+            "immutable={immutable}"
+        );
+        assert_eq!(backend_saw(&h, b'E'), executed + 1);
+        let last_unnamed_parse = h
+            .backend
+            .frames_of(a.key.0)
+            .iter()
+            .rev()
+            .find(|s| s.tag == b'P')
+            .map(|s| s.text.clone());
+        assert_eq!(
+            last_unnamed_parse.as_deref(),
+            Some(KV_READ),
+            "immutable={immutable}"
+        );
+    }
+}
+
+/// An unnamed Parse that does not open its batch replaces the backend's
+/// unnamed statement all the same: an identical Parse of the one before it
+/// must reach the backend again, not be answered by the promotion.
+#[tokio::test]
+async fn an_unnamed_parse_inside_a_batch_ends_the_promotion_of_the_one_before() {
+    let h = Harness::new(0, None, |_| {}).await;
+    let mut a = h.connect("acme").await;
+    let unnamed_parses = |h: &Harness, sql: &str| {
+        h.backend
+            .log()
+            .iter()
+            .filter(|s| s.tag == b'P' && s.text == sql)
+            .count()
+    };
+    a.send(&[cycle("select 'x'"), sync()].concat()).await;
+    assert_eq!(tags(&a.until_ready().await), b"12CZ");
+    // The promotion answers an identical Parse.
+    a.send(&[cycle("select 'x'"), sync()].concat()).await;
+    assert_eq!(tags(&a.until_ready().await), b"12CZ");
+    assert_eq!(unnamed_parses(&h, "select 'x'"), 1);
+    // A named Parse first, then another unnamed statement.
+    a.send(&[parse("s9", "select 9"), cycle("select 'y'"), sync()].concat())
+        .await;
+    assert_eq!(tags(&a.until_ready().await), b"112CZ");
+    a.send(&[cycle("select 'x'"), sync()].concat()).await;
+    assert_eq!(tags(&a.until_ready().await), b"12CZ");
+    assert_eq!(
+        unnamed_parses(&h, "select 'x'"),
+        2,
+        "the backend held 'y': the Parse of 'x' reached it again"
+    );
+}
+
+/// Unsupported execution must not evade SQL policy, admission, invalidation
+/// or replay bookkeeping through the client's fallback message arm.
+#[tokio::test]
+async fn unsupported_frontend_messages_never_reach_the_backend() {
+    for cap in [0, 1] {
+        let h = Harness::new(0, None, |config| {
+            config.multi_tenancy.max_active_queries_per_tenant = cap;
+        })
+        .await;
+        for (tag, body, code) in [
+            // A FunctionCall cut short after its function OID.
+            (b'F', vec![0, 0, 0, 42], "08P01"),
+            (b'Y', vec![], "08P01"),
+            (b'R', vec![0, 0, 0, 0], "08P01"),
+        ] {
+            let mut client = h.connect("acme").await;
+            client.send(&wire(tag, &body)).await;
+            let error = client.frame().await;
+            assert_eq!(sqlstate(&error), code, "tag {tag}, cap {cap}");
+            assert!(has_text(&error, "FATAL"));
+            let mut byte = [0];
+            let read = tokio::time::timeout(TEST_TIMEOUT, client.s.read(&mut byte))
+                .await
+                .expect("the refused session must close")
+                .unwrap();
+            assert_eq!(read, 0, "no ReadyForQuery after a terminal refusal");
+            assert!(
+                h.backend
+                    .frames_of(client.key.0)
+                    .iter()
+                    .all(|f| f.tag != tag),
+                "unsupported tag {tag} reached the backend"
+            );
+            // Refusing one connection must not consume another's tenant permit.
+            let mut control = h.connect("acme").await;
+            assert_served(&control.query("select 1").await, b'I');
+        }
+    }
+}
+
+/// Flush completions belong to the eventual Sync's journal observation,
+/// including read positions before a write and a previous read-only cycle.
+#[tokio::test]
+async fn journal_keeps_flushed_write_completions_and_cycle_positions() {
+    let h = Harness::new(0, None, |_| {}).await;
+    let mut a = h.connect("acme").await;
+    for sql in ["select 1", "insert into t values (1)"] {
+        a.send(&[cycle(sql), flush()].concat()).await;
+        assert_eq!(tags(&a.frames(3).await), b"12C");
+    }
+    assert_eq!(
+        h.state.metrics.journal_committed.load(Ordering::Relaxed),
+        0,
+        "no commit before Sync"
+    );
+    a.send(&sync()).await;
+    assert_eq!(tags(&a.until_ready().await), b"Z");
+    h.until("acme", "first journaled cycle released its permit", |s| {
+        s.queries_active == 0
+    })
+    .await;
+    assert_eq!(
+        h.state.metrics.journal_committed.load(Ordering::Relaxed),
+        1,
+        "flushed write completion was lost"
+    );
+
+    a.send(&[cycle("select 1"), sync()].concat()).await;
+    assert_served(&a.until_ready().await, b'I');
+    a.send(&[cycle("insert into t values (2)"), sync()].concat())
+        .await;
+    assert_served(&a.until_ready().await, b'I');
+    h.until("acme", "second journaled cycle released its permit", |s| {
+        s.queries_active == 0
+    })
+    .await;
+    assert_eq!(
+        h.state.metrics.journal_committed.load(Ordering::Relaxed),
+        2,
+        "read-only cycle polluted execute positions"
+    );
+}
 
 struct Harness {
     server: ProxyServer,
@@ -734,6 +1662,28 @@ impl Harness {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "the backend never saw {sql:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[cfg(feature = "query-cache")]
+    async fn until_scope_probes(&self, count: usize) -> Vec<Seen> {
+        let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
+        loop {
+            let probes: Vec<_> = self
+                .backend
+                .log()
+                .into_iter()
+                .filter(|s| s.tag == b'Q' && s.text == "SHOW ALL")
+                .collect();
+            if probes.len() >= count {
+                return probes;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "only {} scope probes arrived; expected {count}",
+                probes.len()
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -2450,7 +3400,11 @@ async fn the_rate_limiter_never_refuses_a_message_continuing_a_flushed_cycle() {
 #[cfg(feature = "query-cache")]
 #[tokio::test]
 async fn a_query_continuing_a_flushed_cycle_is_not_answered_from_the_cache() {
-    let h = Harness::new(0, None, |c| c.cache.enabled = true).await;
+    let h = Harness::new(0, None, |c| {
+        c.cache.enabled = true;
+        c.cache.trust_backend_read_effects = true;
+    })
+    .await;
     let mut a = h.connect("acme").await;
     let sql = "select v from t";
     let forwarded = || {
@@ -2479,13 +3433,123 @@ async fn a_query_continuing_a_flushed_cycle_is_not_answered_from_the_cache() {
     );
 }
 
+/// Scope verification is real backend work even for a cache hit. It holds
+/// the tenant permit through the proof and pool cleanup, before the next
+/// warm reader may start its own proof.
+#[cfg(feature = "query-cache")]
+#[tokio::test]
+async fn delayed_cache_scope_probe_holds_tenant_admission_through_pool_cleanup() {
+    const SQL: &str = "SELECT v FROM scope_tenant_fixture";
+    for pooled in poolings() {
+        let h = Harness::new(5000, Some(Duration::from_millis(50)), |c| {
+            c.cache.enabled = true;
+            c.cache.trust_backend_read_effects = true;
+            c.pool_mode.skip_clean_reset = false;
+            transaction_pooling(c, pooled);
+        })
+        .await;
+        let mut a = h.connect("acme").await;
+        let mut b = h.connect("acme").await;
+        let first = b.query(SQL).await;
+        assert_eq!(tags(&first), b"TDCZ", "proof frames must remain internal");
+        assert_eq!(b.query(SQL).await, first);
+        h.until("acme", "warm reader idle after cleanup", |s| {
+            s.queries_active == 0
+        })
+        .await;
+        let cache = h.state.query_cache.as_ref().expect("enabled");
+        let hits_before = cache.stats().total_hits;
+        assert!(hits_before > 0, "a positive cache hit is required");
+        let business_queries = || {
+            h.backend
+                .log()
+                .iter()
+                .filter(|s| s.tag == b'Q' && s.text == SQL)
+                .count()
+        };
+        assert_eq!(business_queries(), 1, "the warm lookup must hit");
+        let before = h.until_scope_probes(1).await.len();
+        h.backend
+            .ctl
+            .hold_scope_probes
+            .store(true, Ordering::Relaxed);
+        a.send(&query(SQL)).await;
+        let first_probe = h.until_scope_probes(before + 1).await[before].clone();
+        assert_eq!(
+            h.stats("acme").queries_active,
+            1,
+            "the delayed proof owns the permit"
+        );
+        b.send(&query(SQL)).await;
+        h.until("acme", "second warm reader queued", |s| {
+            s.queries_waiting == 1
+        })
+        .await;
+        assert_eq!(
+            h.until_scope_probes(before + 1).await.len(),
+            before + 1,
+            "a queued cache hit must not probe before admission"
+        );
+        assert_eq!(business_queries(), 1);
+
+        h.backend.ctl.scope_probes.add_permits(1);
+        assert_eq!(a.until_ready().await, first);
+        let second_probe = h.until_scope_probes(before + 2).await[before + 1].clone();
+        let budget = h.stats("acme");
+        assert_eq!((budget.queries_active, budget.queries_waiting), (1, 0));
+        assert_eq!(
+            business_queries(),
+            1,
+            "both delayed readers must be cache hits"
+        );
+        if pooled {
+            let reset = h
+                .backend
+                .log()
+                .into_iter()
+                .find(|s| {
+                    s.conn == first_probe.conn && s.tag == RESET_ANSWERED && s.at > first_probe.at
+                })
+                .expect("the first hit's physical connection was reset");
+            assert!(
+                reset.at < second_probe.at,
+                "pool cleanup precedes waiter admission"
+            );
+        }
+        h.backend
+            .ctl
+            .hold_scope_probes
+            .store(false, Ordering::Relaxed);
+        h.backend.ctl.scope_probes.add_permits(1);
+        assert_eq!(b.until_ready().await, first);
+        h.until("acme", "all proof owners released after cleanup", |s| {
+            s.queries_active == 0 && s.queries_waiting == 0
+        })
+        .await;
+        assert_eq!(business_queries(), 1);
+        assert_eq!(cache.stats().total_hits, hits_before + 2);
+        assert_eq!(h.until_scope_probes(before + 2).await.len(), before + 2);
+        #[cfg(feature = "pool-modes")]
+        if pooled {
+            assert!(
+                h.state.backend_pool.as_ref().unwrap().idle_count() > 0,
+                "the admitted waiter's hit returned its lease before its permit"
+            );
+        }
+    }
+}
+
 /// The cache's refusal checks run only outside an open cycle: a query
 /// continuing a flushed cycle is not classified, so naming a catalog relation
 /// there counts no catalog skip, while the same read at idle counts one.
 #[cfg(feature = "query-cache")]
 #[tokio::test]
 async fn a_query_continuing_a_flushed_cycle_counts_no_cache_skip() {
-    let h = Harness::new(0, None, |c| c.cache.enabled = true).await;
+    let h = Harness::new(0, None, |c| {
+        c.cache.enabled = true;
+        c.cache.trust_backend_read_effects = true;
+    })
+    .await;
     let mut a = h.connect("acme").await;
     let sql = "select relname from pg_class";
     let skipped = || {
@@ -4567,6 +5631,7 @@ fn session_locks_are_taken_by_statements_naming_the_lock_functions() {
         "select PG_ADVISORY_UNLOCK_ALL ()",
         "SELECT pg_catalog.pg_advisory_unlock_all()",
         "/* done */ SELECT pg_advisory_unlock_all()",
+        "SELECT pg_advisory_unlock_all/**/()",
     ] {
         assert!(ProxyServer::calls_unlock_all(sql), "{sql}");
     }
@@ -4576,7 +5641,6 @@ fn session_locks_are_taken_by_statements_naming_the_lock_functions() {
         "SELECT 1 /* pg_advisory_unlock_all() */",
         "SELECT \"pg_advisory_unlock_all\"()",
         "SELECT pg_advisory_unlock_all",
-        "SELECT pg_advisory_unlock_all/**/()",
         "SELECT my_pg_advisory_unlock_all()",
         "DO $$BEGIN PERFORM pg_advisory_unlock_all(); END$$",
         "SELECT E'\\' pg_advisory_unlock_all() --'",
@@ -5599,6 +6663,83 @@ mod max_concurrent {
         assert_served(&a.until_ready().await, b'I');
     }
 
+    async fn mixed_rate_completion_cycle(prior: bool) {
+        for wait_ready in [true, false] {
+            let r = Rate::new(|c| c.optimize_unnamed_parse = false).await;
+            let mut a = r.connect("alice").await;
+            let mut b = r.connect("alice").await;
+            if prior {
+                b.send(&[parse("work", "UPDATE rate_ledger SET v=v+1"), sync()].concat())
+                    .await;
+                assert_eq!(tags(&b.until_ready().await), b"1Z");
+                r.until_idle("alice").await;
+            }
+            r.hold(&mut a, "select 'slow holder'").await;
+            assert_eq!(r.in_flight("alice"), 1);
+            let before = r.backend.log().len();
+            let mut batch = parse("end", "COMMIT");
+            if !prior {
+                batch.extend(parse("work", "UPDATE rate_ledger SET v=v+1"));
+            }
+            batch.extend(bind("work"));
+            batch.extend(execute());
+            batch.extend(if wait_ready { sync() } else { flush() });
+            b.send(&batch).await;
+            if wait_ready {
+                assert_bucket_refused(&b.until_ready().await, b'I');
+            } else {
+                let error = b.frame().await;
+                assert_eq!(sqlstate(&error), "53400", "prior={prior}: {error:?}");
+                assert!(has_text(&error, REFUSED_ALICE));
+                b.send(&sync()).await;
+                assert_eq!(b.until_ready().await, vec![wire(b'Z', b"I")]);
+            }
+            assert_eq!(r.in_flight("alice"), 1, "mixed work took no extra slot");
+            assert!(
+                r.backend.log()[before..]
+                    .iter()
+                    .all(|s| !matches!(s.tag, b'P' | b'B' | b'E')),
+                "mixed batch reached the backend: {:?}",
+                r.backend.log()
+            );
+            r.backend.release_slow();
+            assert_served(&a.until_ready().await, b'I');
+            r.until_idle("alice").await;
+            assert_served(&b.query("select 'healthy'").await, b'I');
+            assert_eq!(r.refusals(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_completion_mixed_fresh_work_is_gated() {
+        mixed_rate_completion_cycle(false).await;
+    }
+
+    #[tokio::test]
+    async fn rate_completion_prior_work_is_gated() {
+        mixed_rate_completion_cycle(true).await;
+    }
+
+    #[tokio::test]
+    async fn rate_completion_standalone_unnamed_commit_still_progresses() {
+        for promoted in [false, true] {
+            let r = Rate::new(|c| c.optimize_unnamed_parse = promoted).await;
+            let mut a = r.connect("alice").await;
+            let mut b = r.connect("alice").await;
+            assert_served(&b.query("BEGIN").await, b'T');
+            r.hold(&mut a, "select 'slow holder'").await;
+            b.send(&[cycle("COMMIT"), sync()].concat()).await;
+            let reply = b.until_ready().await;
+            assert_served(&reply, b'I');
+            assert_eq!(tags(&reply), b"12CZ");
+            assert_eq!(r.in_flight("alice"), 1);
+            assert_eq!(r.refusals(), 0);
+            r.backend.release_slow();
+            assert_served(&a.until_ready().await, b'I');
+            r.until_idle("alice").await;
+        }
+    }
+
     #[tokio::test]
     async fn commit_is_exempt_from_the_bucket_cap_inside_a_transaction() {
         let r = Rate::new(|_| {}).await;
@@ -5724,4 +6865,651 @@ async fn a_branch_database_gets_its_base_tenants_filter_and_caps() {
     .await;
     h.backend.release_slow();
     assert_served(&a.until_ready().await, b'I');
+}
+
+/// COPY's extended transaction still owns its tenant permit until Sync.
+/// Completing/failing the input must not turn the configured COPY timer off.
+#[tokio::test]
+async fn copy_stall_deadline_requires_final_sync_after_done_or_fail() {
+    for done in [true, false] {
+        let h = Harness::new(0, None, |config| {
+            config.limits = toml::from_str("copy_idle_timeout_secs = 1").unwrap();
+        })
+        .await;
+        let mut a = h.connect("acme").await;
+        let mut b = h.connect("acme").await;
+        a.send(&[cycle("COPY data FROM STDIN"), flush()].concat())
+            .await;
+        assert_eq!(tags(&a.frames(3).await), b"12G");
+        a.send(&wire(
+            if done { b'c' } else { b'f' },
+            if done { b"" } else { b"cancelled\0" },
+        ))
+        .await;
+        let answer = a.frame().await;
+        assert_eq!(answer[0], if done { b'C' } else { b'E' });
+        assert_refused(&b.query("select 'still pinned'").await, "53300", REFUSED);
+        let fatal = a.frame().await;
+        assert_eq!(
+            sqlstate(&fatal),
+            "57014",
+            "COPY final Sync must be bounded: {done}"
+        );
+        assert!(has_text(&fatal, "SFATAL"));
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(TEST_TIMEOUT, a.s.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        h.until("acme", "withheld COPY Sync returned capacity", |s| {
+            s.queries_active == 0
+        })
+        .await;
+        assert_served(&b.query("select 'capacity returned'").await, b'I');
+    }
+}
+
+#[tokio::test]
+async fn copy_stall_deadline_final_sync_cancels_timer_and_settles_outcome() {
+    for done in [true, false] {
+        let h = Harness::new(0, None, |config| {
+            config.limits = toml::from_str("copy_idle_timeout_secs = 1").unwrap();
+        })
+        .await;
+        let mut a = h.connect("acme").await;
+        a.send(&[cycle("COPY data FROM STDIN"), flush()].concat())
+            .await;
+        assert_eq!(tags(&a.frames(3).await), b"12G");
+        a.send(&wire(
+            if done { b'c' } else { b'f' },
+            if done { b"" } else { b"cancelled\0" },
+        ))
+        .await;
+        assert_eq!(a.frame().await[0], if done { b'C' } else { b'E' });
+        a.send(&sync()).await;
+        assert_served(&a.until_ready().await, b'I');
+        h.until("acme", "COPY Sync returned capacity", |s| {
+            s.queries_active == 0
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_served(&a.query("select 'after COPY Sync'").await, b'I');
+    }
+}
+
+/// PostgreSQL may buffer CommandComplete until Flush. The proxy needs that
+/// acknowledgement to start its final-Sync timer after backend work finishes.
+#[tokio::test]
+async fn copy_stall_deadline_flushes_extended_copy_completion() {
+    let h = Harness::new(0, None, |config| {
+        config.limits = toml::from_str("copy_idle_timeout_secs = 1").unwrap();
+    })
+    .await;
+    let mut a = h.connect("acme").await;
+    let mut b = h.connect("acme").await;
+    a.send(&[cycle("COPY flush_ack FROM STDIN"), flush()].concat())
+        .await;
+    assert_eq!(tags(&a.frames(3).await), b"12G");
+    a.send(&wire(b'c', b"")).await;
+    assert_eq!(a.frame().await[0], b'C');
+    assert_refused(&b.query("select 'still pinned'").await, "53300", REFUSED);
+    let fatal = a.frame().await;
+    assert_eq!(sqlstate(&fatal), "57014");
+    assert!(has_text(&fatal, "SFATAL"));
+    h.until("acme", "buffered COPY completion returned capacity", |s| {
+        s.queries_active == 0
+    })
+    .await;
+    assert_served(&b.query("select 'capacity returned'").await, b'I');
+}
+
+/// A preceding statement's CommandComplete in this Flush cycle is not the
+/// acknowledgement of COPY completion. Backend COPY work may exceed the
+/// configured client input timeout before the final-Sync wait starts.
+#[tokio::test]
+async fn copy_stall_deadline_ignores_prior_cycle_completion_during_backend_work() {
+    let h = Harness::new(0, None, |config| {
+        config.limits = toml::from_str("copy_idle_timeout_secs = 1").unwrap();
+    })
+    .await;
+    let mut a = h.connect("acme").await;
+    a.send(&[cycle("SELECT 42"), flush()].concat()).await;
+    assert_eq!(tags(&a.frames(3).await), b"12C");
+    a.send(&[cycle("COPY slow_end FROM STDIN"), flush()].concat())
+        .await;
+    assert_eq!(tags(&a.frames(3).await), b"12G");
+    a.send(&wire(b'c', b"")).await;
+    h.until_conn_got(a.key.0, b'c').await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    h.backend.release_slow();
+    assert_eq!(
+        a.frame().await[0],
+        b'C',
+        "backend work is not stalled client input"
+    );
+    a.send(&sync()).await;
+    assert_served(&a.until_ready().await, b'I');
+    h.until("acme", "mixed COPY cycle returned capacity", |s| {
+        s.queries_active == 0
+    })
+    .await;
+    assert_served(&a.query("select 'after COPY'").await, b'I');
+}
+
+/// The COPY completion retained before Sync must be committed once, then
+/// cleared so a subsequent same-session Flush cycle keeps its own prefix.
+#[tokio::test]
+async fn journal_after_extended_copy_keeps_flushed_committed_prefix() {
+    for done in [true, false] {
+        let h = Harness::new(0, None, |config| {
+            config.limits = toml::from_str("copy_idle_timeout_secs = 1").unwrap();
+        })
+        .await;
+        let mut a = h.connect("acme").await;
+        a.send(&[cycle("SELECT 42"), flush()].concat()).await;
+        assert_eq!(tags(&a.frames(3).await), b"12C");
+        a.send(&[cycle("COPY data FROM STDIN"), flush()].concat())
+            .await;
+        assert_eq!(tags(&a.frames(3).await), b"12G");
+        a.send(&wire(
+            if done { b'c' } else { b'f' },
+            if done { b"" } else { b"cancelled\0" },
+        ))
+        .await;
+        assert_eq!(a.frame().await[0], if done { b'C' } else { b'E' });
+        a.send(&sync()).await;
+        assert_eq!(tags(&a.until_ready().await), b"Z");
+        h.until("acme", "COPY journal observation completed", |s| {
+            s.queries_active == 0
+        })
+        .await;
+        let copy_commits = u64::from(done);
+        assert_eq!(
+            h.state.metrics.journal_committed.load(Ordering::Relaxed),
+            copy_commits
+        );
+        for sql in ["SELECT 42", "INSERT INTO t VALUES (1)"] {
+            a.send(&[cycle(sql), flush()].concat()).await;
+            assert_eq!(tags(&a.frames(3).await), b"12C");
+        }
+        assert_eq!(
+            h.state.metrics.journal_committed.load(Ordering::Relaxed),
+            copy_commits,
+            "Flush did not commit"
+        );
+        a.send(&sync()).await;
+        assert_eq!(tags(&a.until_ready().await), b"Z");
+        h.until(
+            "acme",
+            "post-COPY write journal observation completed",
+            |s| s.queries_active == 0,
+        )
+        .await;
+        assert_eq!(
+            h.state.metrics.journal_committed.load(Ordering::Relaxed),
+            copy_commits + 1,
+            "post-COPY flushed write completion was lost: done={done}"
+        );
+    }
+}
+
+/// Completion-only extended cycles release prepared locks without waiting for
+/// a permit held by a transaction that may itself be waiting for those locks.
+#[tokio::test]
+async fn extended_2pc_complete_fresh_cycle_is_exempt_at_the_cap() {
+    for pooled in poolings() {
+        for promote in [false, true] {
+            let h = Harness::new(0, None, |c| {
+                transaction_pooling(c, pooled);
+                c.optimize_unnamed_parse = promote;
+            })
+            .await;
+            let mut a = h.connect("acme").await;
+            let mut b = h.connect("acme").await;
+            assert_served(&a.query("BEGIN").await, b'T');
+            for sql in ["COMMIT PREPARED 'x'", "ROLLBACK PREPARED 'y';"] {
+                b.send(&[parse("", sql), bind(""), execute(), sync()].concat())
+                    .await;
+                let reply = b.until_ready().await;
+                assert_eq!(
+                    tags(&reply),
+                    b"12CZ",
+                    "{sql}, pooled={pooled}, promote={promote}"
+                );
+                assert!(h
+                    .backend
+                    .log()
+                    .iter()
+                    .any(|s| s.tag == b'P' && s.text == sql));
+                assert_eq!(
+                    h.stats("acme").queries_active,
+                    1,
+                    "completion borrowed no permit"
+                );
+            }
+            // The exemption ends at its Sync even if the next cycle was
+            // already pipelined in the same TCP write.
+            b.send(
+                &[
+                    parse("", "ROLLBACK PREPARED 'pipeline'"),
+                    bind(""),
+                    execute(),
+                    sync(),
+                    parse("", "SELECT 1"),
+                    bind(""),
+                    execute(),
+                    sync(),
+                ]
+                .concat(),
+            )
+            .await;
+            assert_eq!(tags(&b.until_ready().await), b"12CZ");
+            assert_refused(&b.until_ready().await, "53300", REFUSED);
+            assert_refused(&b.query("SELECT 1").await, "53300", REFUSED);
+            assert_served(&a.query("COMMIT").await, b'I');
+            // RFQ publication precedes reset/checkin and permit release.
+            // Wait for the actual ownership boundary before testing reuse.
+            h.until("acme", "A commit cleanup returned its permit", |s| {
+                s.queries_active == 0 && s.queries_waiting == 0
+            })
+            .await;
+            let admitted = b.query("SELECT 1").await;
+            assert_eq!(
+                tags(&admitted),
+                b"CZ",
+                "after cleanup: pooled={pooled}, promote={promote}"
+            );
+            assert_served(&admitted, b'I');
+        }
+    }
+}
+
+#[tokio::test]
+async fn extended_2pc_fragmented_cycle_is_exempt_at_the_cap() {
+    for bytewise in [false, true] {
+        for promote in [false, true] {
+            let h = Harness::new(0, None, |c| c.optimize_unnamed_parse = promote).await;
+            let mut a = h.connect("acme").await;
+            let mut b = h.connect("acme").await;
+            assert_served(&a.query("BEGIN").await, b'T');
+            let frames = [
+                parse("", "ROLLBACK PREPARED 'split'"),
+                bind(""),
+                execute(),
+                sync(),
+            ];
+            if bytewise {
+                for byte in frames.concat() {
+                    b.send(&[byte]).await;
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            } else {
+                for frame in frames {
+                    b.send(&frame).await;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+            assert_eq!(
+                tags(&b.until_ready().await),
+                b"12CZ",
+                "bytewise={bytewise}, promote={promote}"
+            );
+            assert_eq!(h.stats("acme").queries_active, 1);
+            assert_served(&a.query("COMMIT").await, b'I');
+        }
+    }
+}
+
+/// An exemption must prove the entire fresh cycle, including its bound
+/// statement and single execution, before any Parse reaches a backend.
+#[tokio::test]
+async fn extended_2pc_mixed_partial_and_prior_identity_stay_gated() {
+    let sql = "COMMIT PREPARED 'x'";
+    let shapes = [
+        (
+            "named definition",
+            vec![parse("named", sql), bind("named"), execute(), sync()],
+        ),
+        (
+            "different statement",
+            vec![parse("", sql), bind("prior"), execute(), sync()],
+        ),
+        (
+            "Parse parameter OID",
+            vec![
+                wire(
+                    b'P',
+                    &[cstring(""), cstring(sql), vec![0, 1, 0, 0, 0, 23]].concat(),
+                ),
+                bind(""),
+                execute(),
+                sync(),
+            ],
+        ),
+        (
+            "Bind parameter formats",
+            vec![
+                parse("", sql),
+                wire(b'B', &[0, 0, 0, 1, 0, 0, 0, 0, 0, 0]),
+                execute(),
+                sync(),
+            ],
+        ),
+        (
+            "Execute row limit",
+            vec![
+                parse("", sql),
+                bind(""),
+                wire(b'E', &[0, 0, 0, 0, 1]),
+                sync(),
+            ],
+        ),
+        ("prior portal", vec![execute(), sync()]),
+        (
+            "multiple executions",
+            vec![parse("", sql), bind(""), execute(), execute(), sync()],
+        ),
+        (
+            "redefinition",
+            vec![
+                parse("", "SELECT 1"),
+                parse("", sql),
+                bind(""),
+                execute(),
+                sync(),
+            ],
+        ),
+        (
+            "extra work",
+            vec![
+                parse("", sql),
+                bind(""),
+                execute(),
+                parse("", "SELECT 1"),
+                bind(""),
+                execute(),
+                sync(),
+            ],
+        ),
+        (
+            "Flush boundary",
+            vec![parse("", sql), bind(""), execute(), flush(), sync()],
+        ),
+    ];
+    for (name, messages) in shapes {
+        let h = Harness::new(0, None, |_| {}).await;
+        let mut a = h.connect("acme").await;
+        let mut b = h.connect("acme").await;
+        // A previous named definition and portal must not supply identity
+        // that makes a fresh completion-shaped request safe by accident.
+        b.send(&[parse("prior", "SELECT 1"), bind("prior"), execute(), sync()].concat())
+            .await;
+        assert_served(&b.until_ready().await, b'I');
+        assert_served(&a.query("BEGIN").await, b'T');
+        let before = h.backend.log().len();
+        b.send(&messages.concat()).await;
+        assert_refused(&b.until_ready().await, "53300", REFUSED);
+        assert_eq!(
+            h.backend.log().len(),
+            before,
+            "{name}: no work reached backend"
+        );
+        assert_served(&a.query("COMMIT").await, b'I');
+        assert_served(&b.query("SELECT 1").await, b'I');
+    }
+    for bind_arrived in [false, true] {
+        let h = Harness::new(0, None, |_| {}).await;
+        let mut a = h.connect("acme").await;
+        let mut b = h.connect("acme").await;
+        assert_served(&a.query("BEGIN").await, b'T');
+        let mut first = parse("", sql);
+        if bind_arrived {
+            first.extend(bind(""));
+        }
+        // Ending the Parse/Bind cycle without executing proves no
+        // completion. A later Bind/Execute cannot reuse that exemption.
+        first.extend(sync());
+        b.send(&first).await;
+        assert_refused(&b.until_ready().await, "53300", REFUSED);
+        let rest = if bind_arrived {
+            vec![execute(), sync()]
+        } else {
+            vec![bind(""), execute(), sync()]
+        };
+        b.send(&rest.concat()).await;
+        assert_refused(&b.until_ready().await, "53300", REFUSED);
+        assert!(!h
+            .backend
+            .log()
+            .iter()
+            .any(|s| s.tag == b'P' && s.text == sql));
+        assert_served(&a.query("COMMIT").await, b'I');
+    }
+}
+
+#[tokio::test]
+async fn extended_2pc_transform_context_stays_gated() {
+    for mode in ["rewrite", "tenant tables", "plugins"] {
+        let h = Harness::new(0, None, |c| match mode {
+            "rewrite" => c.query_rewrite.enabled = true,
+            "tenant tables" => c.multi_tenancy.tenant_tables = vec!["widgets".into()],
+            "plugins" => c.plugins.enabled = true,
+            _ => unreachable!(),
+        })
+        .await;
+        let mut a = h.connect("acme").await;
+        let mut b = h.connect("acme").await;
+        assert_served(&a.query("BEGIN").await, b'T');
+        let before = h.backend.log().len();
+        b.send(
+            &[
+                parse("", "COMMIT PREPARED 'x'"),
+                bind(""),
+                execute(),
+                sync(),
+            ]
+            .concat(),
+        )
+        .await;
+        assert_refused(&b.until_ready().await, "53300", REFUSED);
+        assert_eq!(h.backend.log().len(), before, "{mode}");
+        assert_served(&a.query("COMMIT").await, b'I');
+    }
+}
+
+mod simple_query_payload_regressions {
+    use super::*;
+
+    async fn rejected(h: &Harness, client: &mut Client, body: &[u8]) {
+        let before = h.backend.log().len();
+        client.send(&wire(b'Q', body)).await;
+        let error = client.frame().await;
+        assert_eq!(
+            error[0], b'E',
+            "malformed Query must not return a cached/native prefix response"
+        );
+        assert_eq!(sqlstate(&error), "08P01", "{error:?}");
+        assert!(
+            has_text(&error, "FATAL"),
+            "structural failure must close rather than fabricate transaction state"
+        );
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(TEST_TIMEOUT, client.s.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(
+            h.backend.log()[before..].iter().all(|f| f.tag != b'Q'),
+            "malformed Query must be rejected before any backend/probe dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn simple_query_payload_handler_rejects_before_backend_dispatch() {
+        let h = Harness::new(0, None, |_| {}).await;
+        for body in [
+            b"SELECT 42\0junk".as_slice(),
+            b"SELECT 42",
+            b"",
+            b"SELECT 42\0\0",
+        ] {
+            let mut client = h.connect("acme").await;
+            rejected(&h, &mut client, body).await;
+        }
+    }
+
+    #[cfg(feature = "query-cache")]
+    #[tokio::test]
+    async fn simple_query_payload_warm_cache_cannot_mask_trailing_bytes() {
+        let h = Harness::new(0, None, |c| c.cache.enabled = true).await;
+        let mut client = h.connect("acme").await;
+        assert_served(&client.query("SELECT 42").await, b'I');
+        let hits = || {
+            let s = h.state.query_cache.as_ref().unwrap().stats();
+            s.l1.hits + s.l2.hits + s.l3.hits
+        };
+        let before = hits();
+        assert_served(&client.query("SELECT 42").await, b'I');
+        assert!(hits() > before, "positive actual cache hit required");
+        let before = hits();
+        rejected(&h, &mut client, b"SELECT 42\0junk").await;
+        assert_eq!(
+            hits(),
+            before,
+            "malformed request cannot consult a warmed prefix cache key"
+        );
+    }
+
+    #[tokio::test]
+    async fn simple_query_payload_valid_empty_and_following_query_stay_live() {
+        let h = Harness::new(0, None, |_| {}).await;
+        let mut client = h.connect("acme").await;
+        assert_served(&client.query("").await, b'I');
+        assert_served(&client.query("SELECT 42").await, b'I');
+        // Structural validation cannot impose UTF-8 on a client's encoding.
+        // This canned backend accepts these raw bytes; the Rust String parser
+        // intentionally retains its separate UTF-8 contract.
+        client.send(&wire(b'Q', b"SELECT '\xff'\0")).await;
+        assert_served(&client.until_ready().await, b'I');
+        assert!(h.backend.saw_query("SELECT '\u{fffd}'"));
+    }
+
+    #[cfg(feature = "query-rewriting")]
+    #[tokio::test]
+    async fn simple_query_payload_rewrite_cannot_clean_a_malformed_prefix() {
+        let h = Harness::new(0, None, |c| {
+            c.query_rewrite = toml::from_str(
+                "enabled = true\n[[rules]]\nmatch_regex = '^SELECT 42$'\nadd_limit = 1\n",
+            )
+            .unwrap();
+        })
+        .await;
+        let mut client = h.connect("acme").await;
+        assert_served(&client.query("SELECT 42").await, b'I');
+        assert!(
+            h.backend
+                .log()
+                .iter()
+                .any(|f| f.tag == b'Q' && f.text.to_ascii_lowercase().contains("limit 1")),
+            "positive valid rewrite must actually run"
+        );
+        rejected(&h, &mut client, b"SELECT 42\0junk").await;
+    }
+
+    #[tokio::test]
+    async fn simple_query_payload_direct_forward_cannot_bypass_validation() {
+        let (backend_socket, mut peer) = pair().await;
+        let target = backend_socket.peer_addr().unwrap().to_string();
+        let backend = tokio::spawn(async move {
+            let mut head = [0u8; 5];
+            if peer.read_exact(&mut head).await.is_err() {
+                return None;
+            }
+            assert_eq!(head[0], b'Q');
+            let len = u32::from_be_bytes(head[1..].try_into().unwrap()) as usize;
+            assert!((4..1024).contains(&len));
+            let mut body = vec![0; len - 4];
+            peer.read_exact(&mut body).await.unwrap();
+            peer.write_all(&[wire(b'C', b"SELECT 1\0"), wire(b'Z', b"I")].concat())
+                .await
+                .unwrap();
+            Some(body)
+        });
+        let mut config = test_config();
+        config.nodes.clear();
+        config.add_node(&target, "primary").unwrap();
+        let server = ProxyServer::new(config.clone()).unwrap();
+        let session = make_test_session();
+        let mut conns = HashMap::from([(target.clone(), BackendConn::new(backend_socket))]);
+        let (client, mut client_peer) = pair().await;
+        let mut client = ClientStream::Plain(client);
+        let mut fault = None;
+        let result = ProxyServer::forward_simple_query(
+            ForwardCtx {
+                client: &mut client,
+                conns: &mut conns,
+                current_node: Some(&target),
+                reads: &ReadRouting::OFF,
+                session: &session,
+                state: &server.state,
+                config: &config,
+                fault: &mut fault,
+                continues_cycle: None,
+            },
+            &crate::protocol::Message::new(
+                crate::protocol::MessageType::Query,
+                BytesMut::from(b"SELECT 42\0junk".as_slice()),
+            ),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ProxyError::Protocol(_))),
+            "malformed direct forwarding must fail before native dispatch: {result:?}"
+        );
+        assert!(fault.is_none(), "structural refusal cannot trigger replay");
+        let mut response = Vec::new();
+        tokio::time::timeout(TEST_TIMEOUT, client_peer.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response,
+            ProxyServer::create_fatal_response("08P01", "invalid simple Query payload")
+        );
+        drop(conns);
+        assert!(
+            backend.await.unwrap().is_none(),
+            "no malformed Query was dispatched"
+        );
+    }
+}
+
+#[tokio::test]
+async fn journal_source_uses_startup_tenant_budget_identity() {
+    let mut config = test_config();
+    config.multi_tenancy.enabled = true;
+    config.multi_tenancy.identify_by = "database".into();
+    config.multi_tenancy.tenants = vec!["benchdb".into()];
+    config.multi_tenancy.max_journal_bytes_per_tenant = 4096;
+    let server = ProxyServer::new(config).unwrap();
+    let session = make_test_session();
+    assert!(session.variables.read().await.get("tenant_id").is_none());
+
+    let startup = crate::protocol::StartupMessage::Startup {
+        protocol_version: 196608,
+        params: HashMap::from([
+            ("user".into(), "bench".into()),
+            ("database".into(), "benchdb".into()),
+        ]),
+    };
+    ProxyServer::attach_tenant_budget(&server.state, &session, &startup);
+
+    let source = ProxyServer::journal_source(&session).await;
+    assert_eq!(source.tenant.as_deref(), Some("benchdb"));
 }

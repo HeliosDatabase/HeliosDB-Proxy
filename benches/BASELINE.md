@@ -17,6 +17,27 @@ stay under 3%.
   candidate's CI does not overlap the baseline CI (Criterion's own change report says
   "regressed" / "improved" / "within noise").
 
+## 2026-11-16 — journal append under the per-tenant memory cap (2 new cases)
+
+`benches/relay.rs` `bench_append_entry`: one statement appended (`TransactionJournal::append_entry`,
+the capture path's per-statement call) to an explicit transaction that already holds 16 or 1024
+statements. The entry and size caps are checked before the append, and the size cap reads the
+transaction's running byte count instead of walking the earlier statements
+(`journal/total_size/n` is that walk). The setup clones the seeded transaction and reserves room
+for one entry, so no reallocation and no drop is timed. NEW in `scripts/bench-gate.sh` (no base
+arm). Values: the candidate arm of the gate run `pre3-criterion-integrated-admin-20261116-r3`
+(base 93fb08f clean, candidate 93fb08f plus the uncommitted pre-3.0 tree, tracked diff sha256
+`095fe57787d66f95…`; host gpc001ca, governor performance, toolchain rustc 1.95.0 as bench-gate
+ran it, 3 interleaved rounds), each the median of the three rounds' Criterion estimates
+(136.15 / 140.85 / 136.70 ns and 220.13 / 221.04 / 213.69 ns). The gate archive and its
+ATTRIBUTION.md are under
+/home/admin/HDB/sprint/baselines/proxy/pre3-criterion-integrated-admin-20261116-r3/.
+
+| Benchmark | Metric | Value | Date | Host | Features | Commit |
+|---|---|---:|---|---|---|---|
+| `journal/append_entry/after/16` | median ns | 136.7 | 2026-11-16 | gpc001ca | `all-features` | 93fb08f + uncommitted |
+| `journal/append_entry/after/1024` | median ns | 220.1 | 2026-11-16 | gpc001ca | `all-features` | 93fb08f + uncommitted |
+
 ## 2026-11-07 — distribcache merge (P1-P3), backlog batch and MCP tool cache (29 new cases)
 
 NEW cases in `scripts/bench-gate.sh` (no base arm) from the 2026-11-06 batch. Values: the candidate arm of the gate run

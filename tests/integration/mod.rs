@@ -1334,6 +1334,10 @@ async fn test_c02_commit_aware_cache_invalidation_serves_no_stale_reads() {
     let Some(fx) = fixture::start_proxy_with(|c| {
         c.cache.enabled = true;
         c.cache.ttl_secs = 300;
+        // This test deliberately writes directly to PostgreSQL and expects
+        // the subsequent read to hit the proxy cache. Enable the documented
+        // opt-in required for trusting reads that may have backend-side effects.
+        c.cache.trust_backend_read_effects = true;
     })
     .await
     else {
@@ -1435,15 +1439,34 @@ async fn test_c02_commit_aware_cache_invalidation_serves_no_stale_reads() {
         "DDL invalidates everything"
     );
 
-    // COPY (server-side program source; needs a superuser backend role).
+    // Exercise COPY through the client protocol, with an asserted outcome.
     assert_eq!(scalar(&reader, read_n).await, 1);
-    match writer
-        .batch_execute("COPY c02_t (id, v) FROM PROGRAM 'printf ''2\\t7\\n'''")
+    let mut copy =
+        heliosdb_proxy::backend::BackendClient::connect(&heliosdb_proxy::backend::BackendConfig {
+            host: "127.0.0.1".into(),
+            port: fx.proxy_port,
+            user: b.user.clone(),
+            password: Some(b.password.clone()),
+            database: Some(b.dbname.clone()),
+            application_name: Some("c02-copy-invalidation".into()),
+            tls_mode: heliosdb_proxy::backend::TlsMode::Disable,
+            connect_timeout: std::time::Duration::from_secs(5),
+            query_timeout: std::time::Duration::from_secs(5),
+            tls_config: heliosdb_proxy::backend::tls::default_client_config(),
+        })
         .await
-    {
-        Ok(()) => assert_eq!(scalar(&reader, read_n).await, 2, "COPY invalidates"),
-        Err(e) => eprintln!("COPY FROM PROGRAM not permitted here, COPY step skipped: {e}"),
-    }
+        .expect("connect COPY client through the proxy");
+    let copied = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        copy.copy_in("COPY c02_t (id, v) FROM STDIN", b"2\t7\n"),
+    )
+    .await
+    .expect("COPY completes within the fixture deadline")
+    .expect("COPY FROM STDIN succeeds");
+    assert_eq!(copied, 1);
+    assert_eq!(scalar(&reader, read_n).await, 2, "COPY invalidates");
+    assert_eq!(scalar(&reader, "SELECT v FROM c02_t WHERE id = 2").await, 7);
+    drop(copy);
 
     direct.batch_execute("DROP TABLE c02_t").await.unwrap();
 }
@@ -1577,13 +1600,14 @@ async fn test_tr07_committed_history_replay_reproduces_the_ledger() {
     )
     .await
     .expect("S1");
-    // A read in between: never journaled.
-    a.query("SELECT count(*) FROM tr07_ledger", &[])
-        .await
-        .expect("read");
     // S2 explicit transaction, committed.
     {
         let tx = a.transaction().await.expect("S2 begin");
+        // Read-only prepared statements are deliberately omitted from the
+        // recovery journal and must not contaminate the following writes.
+        tx.query("SELECT id FROM tr07_ledger LIMIT 1", &[])
+            .await
+            .expect("S2 read");
         tx.execute(
             "INSERT INTO tr07_ledger (id, amount, tag) VALUES ($1, $2, $3)",
             &[&2i32, &20i64, &"two"],

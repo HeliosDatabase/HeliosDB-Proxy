@@ -203,6 +203,7 @@ async fn pump_stream(
     cursor: &mut Option<(u64, u64)>,
 ) -> Result<(), String> {
     let mut parser = SseParser::default();
+    let mut stream_boot = None;
     loop {
         let chunk = match tokio::time::timeout(IDLE_TIMEOUT, resp.chunk()).await {
             Err(_) => {
@@ -211,44 +212,101 @@ async fn pump_stream(
                     IDLE_TIMEOUT.as_secs()
                 ))
             }
-            Ok(Err(e)) => return Err(format!("read: {}", e)),
-            Ok(Ok(None)) => return Ok(()), // clean EOF
-            Ok(Ok(Some(c))) => c,
+            Ok(Err(e)) => return Err(format!("read: {e}")),
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Ok(Some(chunk))) => chunk,
         };
-        // The home declares resume status before any event (C-03).
-        if let Some(marker) = parser.take_resume() {
-            if let Some(rest) = marker.strip_prefix("resume ") {
-                let boot = field(rest, "boot=");
-                let upto = field(rest, "upto=").unwrap_or(0);
-                if let Some(boot) = boot {
-                    let warm = rest.starts_with("warm");
-                    *cursor = Some((boot, upto));
-                    if warm {
+        let payloads = parser.feed(&chunk);
+        // Preserve the exact order within a feed: a later marker cannot
+        // authorize an earlier event, even when both share a network chunk.
+        for delivered in parser.take_deliveries() {
+            match delivered {
+                SseDelivery::Resume(marker) => {
+                    let rest = marker.strip_prefix("resume ").unwrap_or("");
+                    let Some(boot) = field(rest, "boot=") else {
+                        cache.flush_all();
+                        *cursor = None;
+                        return Err("invalid edge resume boot".into());
+                    };
+                    let Some(upto) = field(rest, "upto=") else {
+                        cache.flush_all();
+                        *cursor = None;
+                        return Err("invalid edge resume position".into());
+                    };
+                    if rest.starts_with("warm ") {
+                        if !cursor
+                            .is_some_and(|(prior_boot, seq)| prior_boot == boot && seq <= upto)
+                        {
+                            cache.flush_all();
+                            *cursor = None;
+                            return Err("warm edge resume has no matching applied cursor".into());
+                        }
+                        // `upto` describes the queued replay tail. The only
+                        // checkpoint remains the last event actually applied.
                         tracing::info!(
                             boot,
                             upto,
-                            "edge client: warm resume — cache kept, replaying missed tail"
+                            "edge client: warm resume — awaiting replay tail"
                         );
-                    } else {
+                    } else if rest.starts_with("gap ") {
                         let dropped = cache.flush_all();
+                        // Zero is also the checkpoint of an empty stream on
+                        // old homes. Do not acknowledge a possible first seq0.
+                        *cursor = (upto > 0).then_some((boot, upto));
                         tracing::warn!(
                             boot,
                             upto,
                             dropped,
-                            "edge client: invalidation gap — flushed cache before resuming"
+                            "edge client: invalidation gap — cache flushed"
                         );
+                    } else {
+                        cache.flush_all();
+                        *cursor = None;
+                        return Err("invalid edge resume mode".into());
                     }
+                    stream_boot = Some(boot);
+                }
+                SseDelivery::Event { index, id } => {
+                    let sequenced = id.filter(|seq| *seq > 0);
+                    let boot = if sequenced.is_some() {
+                        let Some(boot) = stream_boot else {
+                            cache.flush_all();
+                            *cursor = None;
+                            return Err("sequenced edge event precedes its boot marker".into());
+                        };
+                        Some(boot)
+                    } else {
+                        None
+                    };
+                    let applied = match sequenced {
+                        Some(seq) => apply_invalidation_checked(&payloads[index], cache, Some(seq)),
+                        None => apply_invalidation(&payloads[index], cache),
+                    };
+                    if !applied {
+                        cache.flush_all();
+                        return Err("edge invalidation was not successfully applied".into());
+                    }
+                    if let (Some(boot), Some(seq)) = (boot, sequenced) {
+                        let previous = cursor.filter(|(b, _)| *b == boot).map(|(_, seq)| seq);
+                        // A dropped live event, or the first positive id from
+                        // an older home, cannot silently preserve stale scope.
+                        if previous.is_none_or(|old| seq > old.saturating_add(1)) {
+                            cache.flush_all();
+                        }
+                        *cursor = Some((boot, previous.map_or(seq, |old| old.max(seq))));
+                    }
+                }
+                SseDelivery::LostBoundary => {
+                    cache.flush_all();
+                    *cursor = None;
+                    return Err("oversized edge frame lost its boundary".into());
                 }
             }
         }
-        for payload in parser.feed(&chunk) {
-            apply_invalidation(&payload, cache);
-        }
-        if let Some(last) = parser.last_id() {
-            match cursor {
-                Some((_, seq)) if *seq < last => *seq = last,
-                _ => {}
-            }
+        // Clear the compatibility marker projection; ordered delivery above
+        // owns checkpoint decisions, while the accessor remains available.
+        if let Some(marker) = parser.take_resume() {
+            tracing::trace!(marker, last_completed = ?parser.last_id(), "edge stream chunk applied");
         }
     }
 }
@@ -272,34 +330,35 @@ fn field(s: &str, name: &str) -> Option<u64> {
 ///    so an entry stamped `H` is only insertable after `invalidate(H)`
 ///    already ran and can never be swept by its own event.
 ///
-/// Unparseable frames are skipped (warn), never fatal.
-fn apply_invalidation(payload: &str, cache: &EdgeCache) {
+/// Invalid payloads return false; the stream owner flushes and reconnects without acknowledging them.
+fn apply_invalidation(payload: &str, cache: &EdgeCache) -> bool {
+    apply_invalidation_checked(payload, cache, None)
+}
+
+fn apply_invalidation_checked(payload: &str, cache: &EdgeCache, expected_seq: Option<u64>) -> bool {
     match serde_json::from_str::<InvalidationEvent>(payload) {
         Ok(ev) => {
+            if expected_seq.is_some_and(|seq| ev.seq != seq) {
+                tracing::warn!(expected_seq = ?expected_seq, actual_seq = ev.seq, "edge event id does not name its payload");
+                return false;
+            }
             let flushed = cache.on_home_epoch(ev.epoch);
             if flushed > 0 {
                 tracing::info!(
                     epoch = ev.epoch,
                     flushed,
-                    "edge client: home epoch changed (home restart) — flushed local cache"
+                    "edge client: home epoch changed — flushed local cache"
                 );
             }
             let dropped = cache.invalidate(ev.up_to_version, &ev.tables);
             cache.observe_home_version(ev.up_to_version);
-            tracing::info!(
-                up_to_version = ev.up_to_version,
-                tables = ?ev.tables,
-                dropped,
-                committed_at = %ev.committed_at,
-                "edge client: applied invalidation from home"
-            );
+            tracing::info!(up_to_version = ev.up_to_version, tables = ?ev.tables,
+                dropped, committed_at = %ev.committed_at, "edge client: applied invalidation from home");
+            true
         }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                payload = %payload,
-                "edge client: skipping unparseable invalidation frame"
-            );
+        Err(error) => {
+            tracing::warn!(error = %error, "edge client: unparseable invalidation frame");
+            false
         }
     }
 }
@@ -318,102 +377,149 @@ fn next_backoff(cur: Duration) -> Duration {
     (cur * 2).min(BACKOFF_CAP)
 }
 
-/// Incremental server-sent-events parser.
-///
-/// Feed raw body bytes as they arrive; the `data:` payloads of every
-/// event completed by that chunk come back in order. Handles frames
-/// split anywhere across chunk boundaries, multiple frames per chunk,
-/// `\r\n` line endings, comment/heartbeat lines (leading `:`), and
-/// ignores non-data fields (`event:`, `id:`, `retry:`) — the home only
-/// ever emits `event: invalidate`, so the event name carries nothing.
+#[derive(Debug)]
+enum SseDelivery {
+    Resume(String),
+    Event { index: usize, id: Option<u64> },
+    LostBoundary,
+}
+
+/// Incremental SSE payload parser with ordered delivery metadata. Partial id
+/// lines do not become completed checkpoints; payload/marker accessors retain
+/// their existing signatures.
 #[derive(Debug, Default)]
 struct SseParser {
-    /// Unconsumed bytes — at most one partial line between feeds.
     buf: Vec<u8>,
-    /// `data:` lines of the event currently being accumulated.
+    /// Raw bytes of completed lines in the current event. Pending buf bytes
+    /// are checked with these before any conversion or accumulation.
+    event_bytes: usize,
+    discard_event: bool,
     data_lines: Vec<String>,
-    /// Last `id:` offset seen on the stream (C-03).
+    /// Highest id belonging to a complete event, never a partial id line.
     last_id: Option<u64>,
-    /// Last `: resume ...` marker seen (C-03).
+    pending_id: Option<u64>,
     resume: Option<String>,
+    /// Metadata for this feed, in stream order; payload indexes name feed's
+    /// existing Vec<String> result without cloning event bodies.
+    deliveries: Vec<SseDelivery>,
 }
 
 impl SseParser {
-    /// Append a chunk and return the payloads of all events it
-    /// completed.
     fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
-        self.buf.extend_from_slice(chunk);
+        self.deliveries.clear();
         let mut completed = Vec::new();
-        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
-            // Take the line out of the buffer, without its terminator.
-            let mut line: Vec<u8> = self.buf.drain(..=nl).collect();
-            line.pop(); // the '\n'
-            if line.last() == Some(&b'\r') {
-                line.pop();
+        let mut remaining = chunk;
+        while !remaining.is_empty() {
+            let newline = remaining.iter().position(|&byte| byte == b'\n');
+            let length = newline.map_or(remaining.len(), |offset| offset + 1);
+            let (part, tail) = remaining.split_at(length);
+            let ends_line = newline.is_some();
+            if self.discard_event {
+                self.discard_part(part, ends_line);
+                remaining = tail;
+                continue;
             }
-            self.process_line(&line, &mut completed);
-        }
-        if self.buf.len() > MAX_BUFFERED_LINE {
-            tracing::warn!(
-                buffered = self.buf.len(),
-                "edge client: oversized SSE line — discarding buffered bytes"
-            );
-            self.buf.clear();
+            let line_bytes = self.buf.len().saturating_add(part.len());
+            let event_bytes = self.event_bytes.saturating_add(line_bytes);
+            if line_bytes > MAX_BUFFERED_LINE || event_bytes > MAX_BUFFERED_LINE {
+                // Check raw sizes before copying the new part or converting
+                // a data/id line. The same bound caps a multiline event.
+                tracing::warn!(line_bytes, event_bytes, "edge client: oversized SSE event");
+                self.data_lines.clear();
+                self.pending_id = None;
+                self.event_bytes = 0;
+                self.deliveries.push(SseDelivery::LostBoundary);
+                self.discard_event = true;
+                // At most a CRLF prefix is needed to find a true empty line
+                // while rejecting the rest of this event, even across chunks.
+                self.buf.truncate(2);
+                self.discard_part(part, ends_line);
+                remaining = tail;
+                continue;
+            }
+            self.buf.extend_from_slice(part);
+            if ends_line {
+                let mut line = std::mem::take(&mut self.buf);
+                self.event_bytes = event_bytes;
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                let boundary = line.is_empty();
+                self.process_line(&line, &mut completed);
+                if boundary {
+                    self.event_bytes = 0;
+                }
+                line.clear();
+                self.buf = line;
+            }
+            remaining = tail;
         }
         completed
     }
 
-    /// Highest stream offset seen so far (C-03), if any.
+    fn discard_part(&mut self, part: &[u8], ends_line: bool) {
+        let content = if ends_line {
+            &part[..part.len() - 1]
+        } else {
+            part
+        };
+        let prefix_len = content.len().min(2usize.saturating_sub(self.buf.len()));
+        self.buf.extend_from_slice(&content[..prefix_len]);
+        if ends_line {
+            let boundary = self.buf.is_empty() || self.buf.as_slice() == b"\r";
+            self.buf.clear();
+            if boundary {
+                self.discard_event = false;
+                self.event_bytes = 0;
+            }
+        }
+    }
+
     fn last_id(&self) -> Option<u64> {
         self.last_id
     }
-
-    /// Take the most recent `: resume` marker, if one arrived (C-03).
     fn take_resume(&mut self) -> Option<String> {
         self.resume.take()
+    }
+    fn take_deliveries(&mut self) -> Vec<SseDelivery> {
+        std::mem::take(&mut self.deliveries)
     }
 
     fn process_line(&mut self, line: &[u8], completed: &mut Vec<String>) {
         if line.is_empty() {
-            // Blank line = event boundary: dispatch what accumulated.
+            let id = self.pending_id.take();
             if !self.data_lines.is_empty() {
+                let index = completed.len();
                 completed.push(self.data_lines.join("\n"));
                 self.data_lines.clear();
+                if let Some(id) = id {
+                    self.last_id = Some(self.last_id.map_or(id, |old| old.max(id)));
+                }
+                self.deliveries.push(SseDelivery::Event { index, id });
             }
             return;
         }
         if line.starts_with(b":") {
-            // Comment — the keepalive heartbeat, or the C-03 resume marker.
             let text = String::from_utf8_lossy(&line[1..]).trim().to_string();
             if text.starts_with("resume ") {
-                self.resume = Some(text);
+                self.resume = Some(text.clone());
+                self.deliveries.push(SseDelivery::Resume(text));
             }
             return;
         }
         if let Some(rest) = line.strip_prefix(b"id:") {
-            if let Ok(id) = rest
-                .strip_prefix(b" ")
-                .unwrap_or(rest)
-                .iter()
-                .collect::<Vec<_>>()
-                .into_iter()
-                .fold(String::new(), |mut s, b| {
-                    s.push(*b as char);
-                    s
-                })
-                .parse()
-            {
-                self.last_id = Some(id);
-            }
+            let rest = rest.strip_prefix(b" ").unwrap_or(rest);
+            self.pending_id = std::str::from_utf8(rest)
+                .ok()
+                .and_then(|value| value.parse().ok());
             return;
         }
         if let Some(rest) = line.strip_prefix(b"data:") {
-            // The SSE spec strips exactly one space after the colon.
             let rest = rest.strip_prefix(b" ").unwrap_or(rest);
             self.data_lines
                 .push(String::from_utf8_lossy(rest).into_owned());
         }
-        // Every other field (`event:`, `id:`, `retry:`) is ignored.
     }
 }
 
@@ -480,10 +586,13 @@ mod tests {
         let mut p = SseParser::default();
         let junk = vec![b'x'; MAX_BUFFERED_LINE + 1];
         assert!(p.feed(&junk).is_empty());
-        assert!(p.buf.is_empty(), "oversized partial line dropped");
+        assert!(
+            p.buf.len() <= 2 && p.discard_event,
+            "only a bounded CRLF prefix remains"
+        );
         // Resynchronises on the next complete frame: the tail of the
         // giant line reads as one junk field line and is ignored.
-        let got = p.feed(b"junk-tail\ndata: ok\n\n");
+        let got = p.feed(b"junk-tail\n\ndata: ok\n\n");
         assert_eq!(got, vec!["ok".to_string()]);
     }
 
@@ -598,5 +707,317 @@ mod c03_cursor_tests {
         let gap = p.feed(b": resume gap boot=8 upto=0\n\n");
         assert!(gap.is_empty());
         assert_eq!(p.take_resume().as_deref(), Some("resume gap boot=8 upto=0"));
+    }
+}
+
+#[cfg(test)]
+mod c03_checkpoint_regressions {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::convert::Infallible;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A finite HTTP body controls Response::chunk boundaries exactly, without
+    /// TCP packing assumptions, sleeps, network services or production hooks.
+    struct Chunks(VecDeque<bytes::Bytes>);
+    impl http_body::Body for Chunks {
+        type Data = bytes::Bytes;
+        type Error = Infallible;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(
+                self.0
+                    .pop_front()
+                    .map(|body| Ok(http_body::Frame::data(body))),
+            )
+        }
+    }
+
+    fn response(chunks: Vec<String>) -> reqwest::Response {
+        let chunks = Chunks(chunks.into_iter().map(bytes::Bytes::from).collect());
+        http::Response::new(reqwest::Body::wrap(chunks)).into()
+    }
+
+    fn event(seq: u64, version: u64, id: bool) -> String {
+        let payload = serde_json::json!({"seq":seq,"up_to_version":version,
+            "tables":["ledger"],"committed_at":"fixture","epoch":0});
+        let id = if id {
+            format!("id: {seq}\n")
+        } else {
+            String::new()
+        };
+        format!("event: invalidate\n{id}data: {payload}\n\n")
+    }
+
+    fn hello() -> String {
+        "event: invalidate\ndata: {\"seq\":0,\"up_to_version\":0,\"tables\":[],\"committed_at\":\"fixture\",\"epoch\":0}\n\n".into()
+    }
+
+    fn warm_cache() -> EdgeCache {
+        let cache = EdgeCache::new(4);
+        cache.insert(
+            crate::edge::CacheKey::new("ledger", "p"),
+            crate::edge::CacheEntry {
+                version: 1,
+                response_bytes: bytes::Bytes::from_static(b"old"),
+                tables: vec!["ledger".into()],
+                expires_at: std::time::Instant::now() + Duration::from_secs(60),
+            },
+        );
+        assert!(cache
+            .get(&crate::edge::CacheKey::new("ledger", "p"))
+            .is_some());
+        cache
+    }
+
+    #[test]
+    fn c03_checkpoint_id_waits_for_complete_event_boundary() {
+        let mut parser = SseParser::default();
+        assert!(parser.feed(b"event: invalidate\nid: 2\n").is_empty());
+        assert_eq!(parser.last_id(), None, "an id line acknowledges no event");
+        assert!(parser.feed(b"data: {\"seq\":2}\n").is_empty());
+        assert_eq!(
+            parser.last_id(),
+            None,
+            "data without a blank terminator is incomplete"
+        );
+        assert_eq!(parser.feed(b"\n"), vec!["{\"seq\":2}".to_string()]);
+        assert_eq!(parser.last_id(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn c03_checkpoint_warm_marker_does_not_ack_queued_tail() {
+        let cache = warm_cache();
+        let mut cursor = Some((7, 1));
+        let chunks = vec![
+            format!(": resume warm boot=7 upto=3 replayed=2\n\n{}", hello()),
+            event(2, 2, true),
+        ];
+        pump_stream(response(chunks), &cache, &mut cursor)
+            .await
+            .unwrap();
+        assert_eq!(
+            cursor,
+            Some((7, 2)),
+            "event3 was queued but never delivered/applied"
+        );
+        assert!(cache
+            .get(&crate::edge::CacheKey::new("ledger", "p"))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn c03_checkpoint_warm_marker_without_replay_keeps_prior_cursor() {
+        let cache = warm_cache();
+        let mut cursor = Some((7, 1));
+        let chunks = vec![
+            ": resume warm boot=7 upto=9 replayed=8\n\n".into(),
+            ": keepalive\n\n".into(),
+        ];
+        pump_stream(response(chunks), &cache, &mut cursor)
+            .await
+            .unwrap();
+        assert_eq!(
+            cursor,
+            Some((7, 1)),
+            "advertised queued tail is not an acknowledgement"
+        );
+    }
+
+    #[tokio::test]
+    async fn c03_checkpoint_partial_event_at_eof_does_not_advance_cursor() {
+        let cache = warm_cache();
+        let mut cursor = Some((7, 1));
+        let chunks = vec![
+            format!(": resume warm boot=7 upto=1 replayed=0\n\n{}", hello()),
+            "event: invalidate\nid: 2\n".into(),
+            "data: {\"seq\":2".into(),
+        ];
+        pump_stream(response(chunks), &cache, &mut cursor)
+            .await
+            .unwrap();
+        assert_eq!(cursor, Some((7, 1)), "partial event2 was never applied");
+    }
+
+    #[tokio::test]
+    async fn c03_checkpoint_coalesced_gap_marker_precedes_first_event() {
+        let cache = warm_cache();
+        let mut cursor = None;
+        let body = format!(": resume gap boot=7 upto=0\n\n{}", event(1, 2, true));
+        pump_stream(response(vec![body]), &cache, &mut cursor)
+            .await
+            .unwrap();
+        assert_eq!(
+            cursor,
+            Some((7, 1)),
+            "feed and process the boot marker before the same chunk's event"
+        );
+    }
+
+    #[tokio::test]
+    async fn c03_checkpoint_malformed_event_never_acknowledges_its_id() {
+        let cache = warm_cache();
+        let mut cursor = Some((7, 1));
+        let chunks = vec![
+            format!(": resume warm boot=7 upto=1 replayed=0\n\n{}", hello()),
+            "event: invalidate\nid: 2\ndata: not-json\n\n".into(),
+        ];
+        assert!(pump_stream(response(chunks), &cache, &mut cursor)
+            .await
+            .is_err());
+        assert_eq!(cursor, Some((7, 1)));
+        assert!(
+            cache
+                .get(&crate::edge::CacheKey::new("ledger", "p"))
+                .is_none(),
+            "unknown event scope fails closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn c03_checkpoint_id_must_name_the_applied_event() {
+        let cache = warm_cache();
+        let mut cursor = Some((7, 1));
+        let bad = event(2, 2, true).replace("id: 2", "id: 9");
+        let chunks = vec![
+            format!(": resume warm boot=7 upto=1 replayed=0\n\n{}", hello()),
+            bad,
+        ];
+        assert!(pump_stream(response(chunks), &cache, &mut cursor)
+            .await
+            .is_err());
+        assert_eq!(cursor, Some((7, 1)));
+        assert!(cache
+            .get(&crate::edge::CacheKey::new("ledger", "p"))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn c03_checkpoint_later_marker_cannot_anchor_an_earlier_event() {
+        let cache = warm_cache();
+        let mut cursor = None;
+        let body = format!("{}: resume gap boot=7 upto=0\n\n", event(1, 2, true));
+        assert!(pump_stream(response(vec![body]), &cache, &mut cursor)
+            .await
+            .is_err());
+        assert_eq!(cursor, None);
+    }
+
+    #[tokio::test]
+    async fn c03_checkpoint_oversized_partial_frame_forces_cold_resume() {
+        let cache = warm_cache();
+        let mut cursor = Some((7, 1));
+        let chunks = vec![
+            format!(": resume warm boot=7 upto=1 replayed=0\n\n{}", hello()),
+            "event: invalidate\nid: 2\n".into(),
+            "data: ".to_string() + &"x".repeat(MAX_BUFFERED_LINE + 1),
+        ];
+        assert!(pump_stream(response(chunks), &cache, &mut cursor)
+            .await
+            .is_err());
+        assert_eq!(cursor, None);
+        assert!(cache
+            .get(&crate::edge::CacheKey::new("ledger", "p"))
+            .is_none());
+    }
+
+    fn multiline_event(seq: u64, padding_lines: usize) -> String {
+        let mut body = format!("event: invalidate\nid: {seq}\ndata: {{\"seq\":{seq},\n");
+        for n in 0..padding_lines {
+            body.push_str(&format!("data: \"padding{n}\":\"{}\",\n", "x".repeat(1024)));
+        }
+        body.push_str("data: \"up_to_version\":2,\n");
+        body.push_str("data: \"tables\":[\"ledger\"],\n");
+        body.push_str("data: \"committed_at\":\"fixture\",\n");
+        body.push_str("data: \"epoch\":0}\n\n");
+        body
+    }
+
+    #[tokio::test]
+    async fn c03_checkpoint_complete_oversized_line_is_not_acknowledged() {
+        let cache = warm_cache();
+        let mut cursor = Some((7, 1));
+        let payload = serde_json::json!({"seq":2,"up_to_version":2,"tables":["ledger"],
+            "committed_at":"x".repeat(MAX_BUFFERED_LINE+1),"epoch":0});
+        let chunks = vec![
+            format!(": resume warm boot=7 upto=1 replayed=0\n\n{}", hello()),
+            format!("event: invalidate\nid: 2\ndata: {payload}\n\n"),
+        ];
+        assert!(pump_stream(response(chunks), &cache, &mut cursor)
+            .await
+            .is_err());
+        assert_eq!(cursor, None);
+        assert!(cache
+            .get(&crate::edge::CacheKey::new("ledger", "p"))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn c03_checkpoint_cumulative_multiline_budget_is_enforced() {
+        let cache = warm_cache();
+        let mut cursor = Some((7, 1));
+        let multiline = multiline_event(2, MAX_BUFFERED_LINE / 1024 + 1);
+        assert!(multiline
+            .lines()
+            .all(|line| line.len() + 1 < MAX_BUFFERED_LINE));
+        assert!(multiline.len() > MAX_BUFFERED_LINE);
+        let chunks = vec![
+            format!(": resume warm boot=7 upto=1 replayed=0\n\n{}", hello()),
+            multiline,
+        ];
+        assert!(pump_stream(response(chunks), &cache, &mut cursor)
+            .await
+            .is_err());
+        assert_eq!(cursor, None);
+        assert!(cache
+            .get(&crate::edge::CacheKey::new("ledger", "p"))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn c03_checkpoint_valid_multiline_event_is_applied_and_acknowledged() {
+        let cache = warm_cache();
+        let mut cursor = Some((7, 1));
+        let chunks = vec![
+            format!(": resume warm boot=7 upto=1 replayed=0\n\n{}", hello()),
+            multiline_event(2, 1),
+        ];
+        pump_stream(response(chunks), &cache, &mut cursor)
+            .await
+            .unwrap();
+        assert_eq!(cursor, Some((7, 2)));
+        assert!(cache
+            .get(&crate::edge::CacheKey::new("ledger", "p"))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn c03_checkpoint_legacy_unsequenced_delivery_remains_supported() {
+        let cache = warm_cache();
+        let mut cursor = None;
+        pump_stream(response(vec![event(0, 2, false)]), &cache, &mut cursor)
+            .await
+            .unwrap();
+        assert_eq!(cursor, None);
+        assert!(cache
+            .get(&crate::edge::CacheKey::new("ledger", "p"))
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn c03_checkpoint_caught_up_warm_stream_preserves_cache() {
+        let cache = warm_cache();
+        let mut cursor = Some((7, 1));
+        let body = format!(": resume warm boot=7 upto=1 replayed=0\n\n{}", hello());
+        pump_stream(response(vec![body]), &cache, &mut cursor)
+            .await
+            .unwrap();
+        assert_eq!(cursor, Some((7, 1)));
+        assert!(cache
+            .get(&crate::edge::CacheKey::new("ledger", "p"))
+            .is_some());
     }
 }

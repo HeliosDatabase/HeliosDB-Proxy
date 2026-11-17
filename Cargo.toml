@@ -259,6 +259,9 @@ include_dir = "0.7"
 wasmtime = { version = "36.0.16", default-features = false, features = ["cranelift", "runtime", "parallel-compilation"], optional = true }
 
 [dev-dependencies]
+# Deterministic reqwest response chunks for cursor checkpoint regressions.
+http = "1"
+http-body = "1"
 tokio-test = "0.4"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 # Inline-WASM (.wat → .wasm) for plugin runtime tests so we don't have

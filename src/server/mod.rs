@@ -49,6 +49,7 @@ mod metrics;
 #[cfg(feature = "pool-modes")]
 pub use metrics::PoolModeStatsSnapshot;
 use metrics::ServerMetrics;
+pub(crate) use metrics::SessionPolicyCounters;
 #[cfg(test)]
 use metrics::TrMetrics;
 pub use metrics::{ServerMetricsSnapshot, TrMetricsSnapshot};
@@ -95,6 +96,12 @@ use backend_conn::{ForwardCtx, OffloadRefusals, OpenCycle, ReadRoute, ReadRoutin
 mod ext_set;
 use ext_set::{Bound, ExtSetBoundary, ExtSetCycle, ExtSetOutcome, SettingsOp, TxVerb};
 
+mod fastpath;
+use fastpath::FunctionCallClass;
+
+#[cfg(feature = "query-cache")]
+mod ext_cache;
+
 mod relay;
 
 mod sql_classify;
@@ -118,6 +125,9 @@ mod snapshot;
 mod node_control;
 
 mod cache_source;
+
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+mod cache_scope;
 
 mod gateway;
 
@@ -485,7 +495,7 @@ struct ServerState {
     /// this directly. Always present; journaling is skipped when
     /// `tr_enabled = false`.
     transaction_journal: Arc<crate::transaction_journal::TransactionJournal>,
-    /// TR-03 read re-execution eligibility (built-ins + `tr_read_functions`).
+    /// TR-03 explicit call trust (`tr_read_functions`); no implicit builtin-name trust.
     tr_read_policy: Arc<TrReadPolicy>,
     /// Anomaly detector (T3.1). Records every query and every
     /// auth outcome; surfaces detections via /api/anomalies.
@@ -646,6 +656,9 @@ enum ClientRead {
     /// entry is gone from `conns` and nothing of the client was read. The
     /// caller settles what died with it, then waits on the client again.
     BackendGone,
+    /// A backend response entered or left COPY while a COPY input timeout
+    /// is configured. Recompute deadlines without consuming client input.
+    CopyStateChanged,
 }
 
 /// What the idle watch needs from the session while it relays backend
@@ -657,6 +670,9 @@ struct IdleWatch<'a> {
     /// The session's TR re-homes it: a backend's own FATAL/PANIC is
     /// dropped, not forwarded (see `forward_idle_backend_frames`).
     keep_session: bool,
+    /// Completion tally before COPY ended, when waiting for its delayed
+    /// answer to arm the final-Sync deadline.
+    copy_end_wait: Option<u32>,
 }
 
 /// SQLSTATE `too_many_connections`: the backend is at `max_connections`.
@@ -986,6 +1002,7 @@ impl ProxyServer {
             tracing::info!(
                 ttl_secs = c.ttl_secs,
                 max_result_bytes = c.max_result_bytes,
+                max_dependency_tables = c.max_dependency_tables,
                 l2_max_bytes = c.l2_max_bytes,
                 l2_compression = c.l2_compression.as_str(),
                 semantic = c.semantic_enabled,
@@ -1037,10 +1054,13 @@ impl ProxyServer {
                     "cache heatmap on: GET /api/cache/heatmap"
                 );
             }
-            Some(Arc::new(crate::cache::QueryCache::with_generations(
-                c.to_cache_config(),
-                generations.clone(),
-            )))
+            Some(Arc::new(
+                crate::cache::QueryCache::with_generations(
+                    c.to_cache_config(),
+                    generations.clone(),
+                )
+                .with_max_dependency_tables(c.max_dependency_tables)?,
+            ))
         } else {
             None
         };
@@ -1466,16 +1486,43 @@ impl ProxyServer {
             );
             new_config.edge = old.edge.clone();
         }
-        // [multi_tenancy] is built once at startup (tenant manager, client
-        // caps, request budgets): warn and keep the running section, like
-        // [edge].
-        if new_config.multi_tenancy != old.multi_tenancy {
+        if new_config.mcp.trust_backend_read_effects != old.mcp.trust_backend_read_effects {
             tracing::warn!(
-                old = ?old.multi_tenancy,
-                new = ?new_config.multi_tenancy,
-                "[multi_tenancy] changed on SIGHUP but is applied at startup only — keeping the running settings (restart, or a SIGUSR2 handoff, to apply)"
+                "[mcp] trust_backend_read_effects changed on SIGHUP but is startup-only; keeping the running contract (restart to apply)"
             );
-            new_config.multi_tenancy = old.multi_tenancy.clone();
+            new_config.mcp.trust_backend_read_effects = old.mcp.trust_backend_read_effects;
+        }
+        // [multi_tenancy] is built once at startup (tenant manager, client
+        // caps, request budgets). A reload resizes the caps and byte budgets
+        // the running tenants already have; any other change is refused
+        // whole: warn and keep the running section, like [edge].
+        if new_config.multi_tenancy != old.multi_tenancy {
+            match self
+                .state
+                .tenant_slots
+                .reload_caps(&old.multi_tenancy, &new_config.multi_tenancy)
+            {
+                Ok(changes) => {
+                    for change in &changes {
+                        tracing::info!(
+                            tenant = %change.tenant,
+                            cap = change.cap.keys(),
+                            from = change.from,
+                            to = change.to,
+                            "[multi_tenancy] cap resized on SIGHUP; a lowered cap admits nobody new until its holders are back under it"
+                        );
+                    }
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        %reason,
+                        old = ?old.multi_tenancy,
+                        new = ?new_config.multi_tenancy,
+                        "[multi_tenancy] changed on SIGHUP beyond resizing existing per-tenant caps — keeping the running settings (restart, or a SIGUSR2 handoff, to apply)"
+                    );
+                    new_config.multi_tenancy = old.multi_tenancy.clone();
+                }
+            }
         }
         // tr_mode follows a reload for new sessions; the tenant replay-byte
         // budgets apply only to sessions that record their transactions.
@@ -1519,6 +1566,7 @@ impl ProxyServer {
         // rather than let an operator believe a SIGHUP armed them.
         if new_config.limits.max_client_connections != old.limits.max_client_connections
             || new_config.limits.client_idle_timeout_secs != old.limits.client_idle_timeout_secs
+            || new_config.limits.copy_idle_timeout_secs != old.limits.copy_idle_timeout_secs
             || new_config.limits.client_admission_wait_secs != old.limits.client_admission_wait_secs
             || new_config.limits.client_tcp_keepalive_secs != old.limits.client_tcp_keepalive_secs
         {
@@ -1531,13 +1579,14 @@ impl ProxyServer {
                 new_client_admission_wait_secs = new_config.limits.client_admission_wait_secs,
                 old_client_tcp_keepalive_secs = old.limits.client_tcp_keepalive_secs,
                 new_client_tcp_keepalive_secs = new_config.limits.client_tcp_keepalive_secs,
-                "[limits] max_client_connections / client_idle_timeout_secs / client_admission_wait_secs / client_tcp_keepalive_secs changed on SIGHUP but are applied at startup only — keeping the running values (restart to apply)"
+                "[limits] max_client_connections / client_idle_timeout_secs / copy_idle_timeout_secs / client_admission_wait_secs / client_tcp_keepalive_secs changed on SIGHUP but are applied at startup only — keeping the running values (restart to apply)"
             );
             // Keep the published config truthful: `/config` must not advertise
             // a cap/idle timeout that is not the one in effect (same treatment
             // as `[edge]` above).
             new_config.limits.max_client_connections = old.limits.max_client_connections;
             new_config.limits.client_idle_timeout_secs = old.limits.client_idle_timeout_secs;
+            new_config.limits.copy_idle_timeout_secs = old.limits.copy_idle_timeout_secs;
             new_config.limits.client_admission_wait_secs = old.limits.client_admission_wait_secs;
             new_config.limits.client_tcp_keepalive_secs = old.limits.client_tcp_keepalive_secs;
         }
@@ -1813,7 +1862,7 @@ impl ProxyServer {
                 );
             }
             #[cfg(not(feature = "query-cache"))]
-            if mcp_cfg.tool_cache_enabled {
+            if mcp_cfg.tool_cache_on() {
                 tracing::warn!(
                     "[mcp] tool_cache_enabled = true but this build lacks the `query-cache` \
                      feature: tool results are not cached"
@@ -1838,12 +1887,28 @@ impl ProxyServer {
             let gw_cfg = self.config.http_gateway.clone();
             let pool = http_pool.clone();
             let policy = gateway_policy_for(&gw_cfg.tenant_header);
+            #[cfg(feature = "query-cache")]
+            let trust_backend_read_effects = self.config.cache.trust_backend_read_effects;
+            #[cfg(feature = "query-cache")]
+            let query_cache = if self.config.http_gateway_cache_sees_writes() {
+                self.state.query_cache.clone()
+            } else {
+                if self.state.query_cache.is_some() {
+                    tracing::warn!(
+                        backend = %format!("{}:{}", gw_cfg.backend_host, gw_cfg.backend_port),
+                        "HTTP SQL result caching is bypassed because writes to this backend are not visible to C-02 invalidation"
+                    );
+                }
+                None
+            };
             Some(tokio::spawn(async move {
-                if let Err(e) = crate::http_gateway::HttpGateway::new(gw_cfg, pool)
-                    .with_policy(policy)
-                    .run()
-                    .await
-                {
+                let gateway =
+                    crate::http_gateway::HttpGateway::new(gw_cfg, pool).with_policy(policy);
+                #[cfg(feature = "query-cache")]
+                let gateway = gateway
+                    .with_query_cache(query_cache)
+                    .with_trusted_read_effects(trust_backend_read_effects);
+                if let Err(e) = gateway.run().await {
                     tracing::error!("HTTP gateway error: {}", e);
                 }
             }))
@@ -2067,6 +2132,9 @@ impl ProxyServer {
 
             // P-03: latency histograms and the query cache's counters.
             admin_state.with_latency(state.latency.clone()).await;
+            admin_state
+                .with_session_policy(state.metrics.policy.clone())
+                .await;
             admin_state.with_node_slots(state.node_slots.clone()).await;
             admin_state
                 .with_tenant_slots(state.tenant_slots.clone())

@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicUsize;
 /// settings.
 const SEMANTIC_CACHE: &str = r#"
 enabled = true
+max_dependency_tables = 7
 ttl_secs = 120
 semantic_enabled = true
 semantic_match = "canonical"
@@ -39,6 +40,7 @@ fn daemon_cache_config_carries_semantic_keys_and_table_ttls() {
     config.validate().unwrap();
     let server = ProxyServer::new(config).unwrap();
     let qc = server.state.query_cache.as_ref().expect("cache enabled");
+    assert_eq!(qc.max_dependency_tables(), 7);
     let cc = qc.config();
     let l3 = &cc.l3;
     assert!(l3.enabled);
@@ -190,6 +192,7 @@ impl Relay {
         };
         config.add_node(&addr, "primary").unwrap();
         config.cache.enabled = true;
+        config.cache.trust_backend_read_effects = true;
         tune(&mut config);
         let server = ProxyServer::new(config.clone()).unwrap();
         let shared = crate::cache::CacheContext {
@@ -208,10 +211,11 @@ impl Relay {
             .await;
         }
         let mut conns = HashMap::new();
-        conns.insert(
-            addr.clone(),
-            BackendConn::new(TcpStream::connect(&addr).await.unwrap()),
-        );
+        let mut backend_conn = BackendConn::new(TcpStream::connect(&addr).await.unwrap());
+        // This fixture implements only business-query replies. Its scope is
+        // an explicit test proof; production must obtain a backend proof.
+        backend_conn.cache_scope_test_override = Some([0; 32]);
+        conns.insert(addr.clone(), backend_conn);
         let (client_raw, peer) = pair().await;
         let relay = Self {
             server,
@@ -285,6 +289,35 @@ impl Relay {
             .load(Ordering::Relaxed)
     }
 
+    /// Model another caller sharing this cache, with a pristine startup
+    /// context. These relay tests invoke forwarding directly; the synthetic
+    /// backend has no session settings. The original reader and its L1 remain
+    /// intact, so a writer's sticky bypass cannot hide a C-02 regression.
+    async fn separate_session_query(&mut self, sql: &str) -> (Option<String>, Vec<u8>) {
+        let original = std::mem::replace(&mut self.session, make_test_session());
+        // Preserve the exact old L1 payload in the pristine synthetic caller
+        // too: exclusion/invalidation tests must still reject a seeded L1.
+        if let Some(cache) = self.server.state.query_cache.as_ref() {
+            if let Some(entry) = cache.get_l1_cache(original.id.as_u64_pair().0).get(sql) {
+                cache
+                    .get_l1_cache(self.session.id.as_u64_pair().0)
+                    .put(sql.to_string(), entry);
+            }
+        }
+        let reply = self.query(sql).await;
+        if let Some(cache) = self.server.state.query_cache.as_ref() {
+            cache.remove_l1_cache(self.session.id.as_u64_pair().0);
+        }
+        self.session = original;
+        reply
+    }
+
+    async fn write_from_another_session(&mut self, sql: &str) {
+        let (node, got) = self.separate_session_query(sql).await;
+        assert_eq!(node.as_deref(), Some(self.addr.as_str()), "{sql}");
+        assert_eq!(got, backend_reply(), "{sql}");
+    }
+
     /// `heliosdb_proxy_cache_ambiguous_text_skipped_total`.
     fn ambiguous_skipped(&self) -> u64 {
         self.server
@@ -327,7 +360,7 @@ impl Relay {
 /// (another session's `work_mem`, a frozen `pg_stat_activity` count).
 const CATALOG_READS: [&str; 5] = [
     "SELECT setting FROM pg_settings WHERE name = 'work_mem'",
-    "SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE state = 'active'",
+    "SELECT state FROM pg_catalog.pg_stat_activity WHERE state = 'active'",
     "SELECT table_name FROM Information_Schema.tables",
     "SELECT relname FROM \"pg_class\"",
     "SELECT oid FROM t WHERE r = 'pg_class'::regclass",
@@ -370,6 +403,16 @@ async fn ambiguous_reads_skip_l1_and_l2() {
         relay.prefill_l1(sql).await;
     }
     relay.prefill_l1("SELECT value FROM widgets").await;
+    // Unknown-scope unreadable statements may retire the existing fill.
+    // Keep the pristine-reader positive control before they run.
+    let (node, got) = relay
+        .separate_session_query("SELECT value FROM widgets")
+        .await;
+    assert_eq!(
+        (node, got),
+        (None, cached_reply()),
+        "control: a pristine reader still hits the shared cache"
+    );
     let puts = relay.cache().stats().puts;
     for sql in AMBIGUOUS_READS {
         relay.answered_by_backend(sql).await;
@@ -377,8 +420,6 @@ async fn ambiguous_reads_skip_l1_and_l2() {
     }
     assert_eq!(relay.cache().stats().puts, puts, "nothing stored");
     assert_eq!(relay.ambiguous_skipped(), 2 * AMBIGUOUS_READS.len() as u64);
-    let (node, got) = relay.query("SELECT value FROM widgets").await;
-    assert_eq!((node, got), (None, cached_reply()), "control: L1 hit");
     drop(relay);
     assert_eq!(backend.await.unwrap().len(), 2 * AMBIGUOUS_READS.len());
 }
@@ -468,6 +509,13 @@ async fn catalog_and_time_travel_reads_skip_the_semantic_tier() {
     .await;
     let l3 = relay.cache().semantic_cache().unwrap().clone();
     assert_eq!(l3.len(), 1);
+    // Later unreadable statements may retire this shared semantic fill.
+    let (node, got) = relay
+        .separate_session_query(
+            "select value from widgets as w where id = 1 /*helios:cache=semantic*/",
+        )
+        .await;
+    assert_eq!((node, got), (None, cached_reply()), "control: L3 hit");
     let ineligible = l3.health().ineligible;
     for sql in refused {
         relay.answered_by_backend(sql).await;
@@ -482,10 +530,6 @@ async fn catalog_and_time_travel_reads_skip_the_semantic_tier() {
         ),
         (1, 2, 2)
     );
-    let (node, got) = relay
-        .query("select value from widgets as w where id = 1 /*helios:cache=semantic*/")
-        .await;
-    assert_eq!((node, got), (None, cached_reply()), "control: L3 hit");
     drop(relay);
     assert_eq!(backend.await.unwrap().len(), refused.len());
 }
@@ -511,9 +555,14 @@ async fn catalog_and_time_travel_reads_skip_the_edge_cache() {
         refused.len() * 2 + 1,
     )
     .await;
+    // Each exclusion is measured from a pristine caller: an earlier ambiguous
+    // statement must not hide later exclusion checks behind its sticky bypass.
     for sql in &refused {
-        relay.answered_by_backend(sql).await;
-        relay.answered_by_backend(sql).await;
+        for _ in 0..2 {
+            let (node, got) = relay.separate_session_query(sql).await;
+            assert_eq!(node.as_deref(), Some(relay.addr.as_str()), "{sql}");
+            assert_eq!(got, backend_reply(), "{sql}");
+        }
     }
     assert_eq!(relay.server.state.edge_cache.stats().current_entries, 0);
     assert_eq!(
@@ -708,7 +757,7 @@ async fn a_semicolon_in_an_ambiguous_rest_retires_the_cache() {
         "SELECT $\u{e9}$ $$ $\u{e9}$; DELETE FROM b",
         "SELECT $\u{e9}$;$\u{e9}$; UPDATE b SET v = 2",
     ];
-    const PLAIN: [&str; 12] = [
+    const PLAIN: [&str; 11] = [
         "SELECT 1; SELECT 2",
         "SELECT 'a;b' FROM t",
         "SELECT 'a;b' FROM t /*app*/",
@@ -718,17 +767,24 @@ async fn a_semicolon_in_an_ambiguous_rest_retires_the_cache() {
         "SELECT 1; -- done",
         "SELECT * FROM products WHERE name ILIKE '%a;b%' /*controller='search'*/",
         "SELECT * FROM t /*controller='users'*/ WHERE note LIKE '%;%'",
-        "SELECT 'C:\\' ;",
         "SELECT 1 -- done;",
         "SELECT 1 /* it's */ ;",
     ];
+    // The backslash-escaped quote is backend-ambiguous, but its only
+    // semicolon is trailing in the proxy's reading: there is no hidden later
+    // statement that could mutate data and require a whole-cache invalidation.
+    const UNREADABLE: &str = "SELECT 'C:\\' ;";
+    assert!(!ProxyServer::stmt_has_interior_semicolon(UNREADABLE));
+    assert!(crate::sql_text::ambiguous_rest(UNREADABLE).is_some());
     for heliosdb in [false, true] {
-        for (sql, hidden) in HIDDEN
+        for (sql, hidden, retires) in HIDDEN
             .iter()
-            .map(|s| (s, true))
-            .chain(PLAIN.iter().map(|s| (s, false)))
+            .map(|s| (*s, true, true))
+            .chain(PLAIN.iter().map(|s| (*s, false, false)))
+            .chain(std::iter::once((UNREADABLE, false, false)))
         {
-            let (mut relay, backend) = Relay::start(|_| {}, &[READ], 1 + usize::from(hidden)).await;
+            let (mut relay, backend) =
+                Relay::start(|_| {}, &[READ], 1 + usize::from(retires)).await;
             relay
                 .server
                 .state
@@ -744,8 +800,8 @@ async fn a_semicolon_in_an_ambiguous_rest_retires_the_cache() {
                 u64::from(hidden),
                 "{sql:?}"
             );
-            let (node, got) = relay.query(READ).await;
-            if hidden {
+            let (node, got) = relay.separate_session_query(READ).await;
+            if retires {
                 assert_eq!(node.as_deref(), Some(relay.addr.as_str()), "{sql:?}");
             } else {
                 assert_eq!((node, got), (None, cached_reply()), "{sql:?}: still served");
@@ -753,7 +809,7 @@ async fn a_semicolon_in_an_ambiguous_rest_retires_the_cache() {
             drop(relay);
             assert_eq!(
                 backend.await.unwrap().len(),
-                1 + usize::from(hidden),
+                1 + usize::from(retires),
                 "{sql:?}"
             );
         }
@@ -852,7 +908,7 @@ async fn a_quoted_column_or_a_query_tag_keeps_the_write_targeted() {
         "/*application='app',action='save'*/ UPDATE t SET note = 'a;b' WHERE id = 1",
     ] {
         let (mut relay, backend) = Relay::start(|_| {}, &[OTHER, OWN], 2).await;
-        relay.answered_by_backend(sql).await;
+        relay.write_from_another_session(sql).await;
         assert_eq!(relay.cache().unseen_write_invalidations(), 0, "{sql:?}");
         let (node, got) = relay.query(OTHER).await;
         assert_eq!(
@@ -1136,7 +1192,7 @@ async fn the_heatmap_counts_reads_and_writes_through_the_relay() {
     let (node, _) = relay.query(READ).await;
     assert_eq!(node, None, "served from the cache");
     relay
-        .answered_by_backend("UPDATE t SET v = 2 WHERE id = 1")
+        .write_from_another_session("UPDATE t SET v = 2 WHERE id = 1")
         .await;
     relay.answered_by_backend(READ).await;
     let s = relay.cache().heatmap_snapshot().expect("heatmap on");
@@ -1783,6 +1839,7 @@ impl HotKey {
         };
         config.add_node(&addr, "primary").unwrap();
         config.cache.enabled = true;
+        config.cache.trust_backend_read_effects = true;
         tune(&mut config);
         config.validate().unwrap();
         let server = ProxyServer::new(config.clone()).unwrap();
@@ -1806,10 +1863,9 @@ impl HotKey {
         let mut hot_clients = Vec::with_capacity(clients);
         for _ in 0..clients {
             let mut conns = HashMap::new();
-            conns.insert(
-                addr.clone(),
-                BackendConn::new(TcpStream::connect(&addr).await.unwrap()),
-            );
+            let mut backend_conn = BackendConn::new(TcpStream::connect(&addr).await.unwrap());
+            backend_conn.cache_scope_test_override = Some([0; 32]);
+            conns.insert(addr.clone(), backend_conn);
             let (client_raw, peer) = pair().await;
             hot_clients.push(HotClient {
                 session: make_test_session(),
@@ -2136,6 +2192,7 @@ mod gateway_writes {
                     pool,
                     Arc::new(tokio::sync::Semaphore::new(4)),
                     policy,
+                    crate::http_gateway::HttpSqlCache::default(),
                 )
             },
             post("/sql", &body),
@@ -2143,6 +2200,80 @@ mod gateway_writes {
         .await;
         assert_eq!(*seen.lock(), [sql]);
         resp
+    }
+
+    #[cfg(feature = "query-cache")]
+    #[tokio::test]
+    async fn http_gateway_reuses_only_complete_safe_reads() {
+        let (relay, _backend) = cached_relay(0).await;
+        let cache = relay.server.state.query_cache.clone().unwrap();
+        let (port, seen) = start_gateway_backend().await;
+        let cfg = Arc::new(crate::config::HttpGatewayConfig {
+            backend_port: port,
+            ..Default::default()
+        });
+        let policy = Arc::new(relay.server.gateway_policy());
+        let pool: crate::gateway_pool::SharedBackendPool =
+            Arc::new(crate::gateway_pool::BackendClientPool::new(0));
+
+        let body = serde_json::json!({ "query": READ }).to_string();
+        let request = |array_mode: bool| {
+            let header = if array_mode {
+                "Neon-Array-Mode: true\r\n"
+            } else {
+                ""
+            };
+            format!(
+                "POST /sql HTTP/1.1\r\n{header}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+
+        for (trust_backend_read_effects, array_mode) in [
+            (false, false),
+            (false, false),
+            (true, false),
+            (true, false),
+            (true, true),
+        ] {
+            let cfg = cfg.clone();
+            let pool = pool.clone();
+            let policy = policy.clone();
+            let cache = cache.clone();
+            let response = http_exchange(
+                move |stream, peer| {
+                    crate::http_gateway::HttpGateway::handle(
+                        stream,
+                        peer,
+                        cfg,
+                        pool,
+                        Arc::new(tokio::sync::Semaphore::new(4)),
+                        policy,
+                        crate::http_gateway::HttpSqlCache {
+                            cache: Some(cache),
+                            trust_backend_read_effects,
+                        },
+                    )
+                },
+                request(array_mode),
+            )
+            .await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(
+                response.contains(if array_mode {
+                    "\"rowAsArray\":true"
+                } else {
+                    "\"rowAsArray\":false"
+                }),
+                "{response}"
+            );
+        }
+
+        assert_eq!(
+            *seen.lock(),
+            [READ, READ, READ, READ],
+            "untrusted broad read bypasses; trusted identical key hits; array mode is isolated"
+        );
     }
 
     /// An `UPDATE` through `POST /sql` retires the cached read of its table:
@@ -2302,6 +2433,7 @@ mod mcp_tool_cache {
                 c.cache.enabled = query_cache;
                 c.mcp.enabled = true;
                 c.mcp.tool_cache_enabled = true;
+                c.mcp.trust_backend_read_effects = true;
                 tune(c);
             },
             &[],
@@ -2323,6 +2455,7 @@ mod mcp_tool_cache {
             backend_port: port,
             read_only: false,
             tool_cache_enabled: true,
+            trust_backend_read_effects: true,
             ..Default::default()
         };
         tune(&mut cfg);
@@ -2566,6 +2699,7 @@ mod mcp_tool_cache {
             backend_port: port,
             read_only: false,
             tool_cache_enabled: true,
+            trust_backend_read_effects: true,
             tenant_header: "X-Helios-Tenant".into(),
             ..Default::default()
         };
@@ -2813,6 +2947,7 @@ async fn explain_without_analyze_keeps_the_cached_read() {
 
 /// The edge home's write invalidation (the relay's edge check) also covers an
 /// EXPLAIN ANALYZE write, as the fingerprint of the statement it runs.
+#[cfg(feature = "edge-proxy")]
 #[tokio::test]
 async fn explain_analyze_write_invalidates_the_edge_entry() {
     const READ: &str = "SELECT v FROM kv WHERE id = 1";
@@ -2837,4 +2972,658 @@ async fn explain_analyze_write_invalidates_the_edge_entry() {
     );
     drop(relay);
     assert_eq!(backend.await.unwrap(), [READ, WRITE]);
+}
+
+#[tokio::test]
+async fn cache_startup_identity_frames_and_sorts_every_parameter() {
+    async fn identity(params: &[(&str, &str)]) -> [u8; 32] {
+        let session = make_test_session();
+        for (key, value) in params {
+            session
+                .variables
+                .write()
+                .await
+                .insert((*key).into(), (*value).into());
+        }
+        *ProxyServer::cache_startup_namespace(&session).await
+    }
+    let a = identity(&[
+        ("user", "alice"),
+        ("options", "-c search_path=a"),
+        ("application_name", "tenant-a"),
+    ])
+    .await;
+    assert_eq!(
+        a,
+        identity(&[
+            ("application_name", "tenant-a"),
+            ("options", "-c search_path=a"),
+            ("user", "alice")
+        ])
+        .await
+    );
+    for params in [
+        vec![
+            ("user", "alice"),
+            ("options", "-c search_path=b"),
+            ("application_name", "tenant-a"),
+        ],
+        vec![
+            ("user", "alice"),
+            ("options", "-c search_path=a"),
+            ("application_name", "tenant-b"),
+        ],
+        vec![
+            ("user", "alice"),
+            ("options", "-c search_path=a"),
+            ("application_name", "tenant-a"),
+            ("custom", "x"),
+        ],
+    ] {
+        assert_ne!(a, identity(&params).await);
+    }
+    assert_ne!(
+        identity(&[("ab", "c")]).await,
+        identity(&[("a", "bc")]).await
+    );
+}
+
+#[test]
+fn result_cache_context_gate_refuses_unknown_side_effects() {
+    for sql in [
+        "SET ROLE tenant_a",
+        "RESET ALL",
+        "DISCARD ALL",
+        "CREATE TEMP TABLE t(id int)",
+        "SELECT set_config('app.tenant','a',false)",
+        "SELECT hidden_mutator()",
+        "INSERT INTO t VALUES(1)",
+        "SELECT 1; SET ROLE tenant_a",
+        "/* normal read */ SELECT count(*) FROM widgets",
+    ] {
+        assert!(ProxyServer::cache_context_may_change(sql), "{sql}");
+    }
+    for sql in ["SELECT value FROM widgets", "SELECT 1"] {
+        assert!(!ProxyServer::cache_context_may_change(sql), "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn cache_context_change_refuses_previous_l1_and_stays_sticky() {
+    let (mut relay, backend) = Relay::start(|_| {}, &[], 3).await;
+    let sql = "SELECT value FROM widgets";
+    assert!(relay.query(sql).await.0.is_some());
+    assert!(
+        relay.query(sql).await.0.is_none(),
+        "control read must hit L1"
+    );
+    relay.query("SET search_path = private").await;
+    assert!(relay.session.cache_ineligible.load(Ordering::Relaxed));
+    assert!(
+        relay.query(sql).await.0.is_some(),
+        "old L1 result cannot answer"
+    );
+    assert_eq!(
+        relay
+            .server
+            .state
+            .metrics
+            .policy
+            .query_cache_context_bypassed
+            .load(Ordering::Relaxed),
+        1
+    );
+    drop(relay);
+    assert_eq!(backend.await.unwrap().len(), 3);
+}
+
+#[test]
+fn cache_call_identity_guard_does_not_trust_builtin_names() {
+    for sql in [
+        "SELECT abs(-1)",
+        "SELECT public.abs(1)",
+        "SELECT abs('opaque'::text)",
+        "SELECT pg_catalog.count(*) FROM widgets",
+        "SELECT hidden_mutator /* trivia */ ()",
+        "EXPLAIN SELECT hidden_mutator()",
+    ] {
+        assert!(
+            ProxyServer::cache_context_may_change(sql),
+            "unverified call: {sql}"
+        );
+    }
+    for sql in ["SELECT value FROM widgets WHERE id = 1", "SELECT 1"] {
+        assert!(
+            !ProxyServer::cache_context_may_change(sql),
+            "plain read: {sql}"
+        );
+    }
+}
+
+fn effective_scope_reply(path: &str) -> Vec<u8> {
+    let mut desc = 3u16.to_be_bytes().to_vec();
+    for name in ["name", "setting", "description"] {
+        desc.extend_from_slice(name.as_bytes());
+        desc.push(0);
+        desc.extend_from_slice(&0u32.to_be_bytes());
+        desc.extend_from_slice(&0u16.to_be_bytes());
+        desc.extend_from_slice(&25u32.to_be_bytes());
+        desc.extend_from_slice(&(-1i16).to_be_bytes());
+        desc.extend_from_slice(&(-1i32).to_be_bytes());
+        desc.extend_from_slice(&0u16.to_be_bytes());
+    }
+    let mut wire = wire_frame(b'T', &desc);
+    for (name, value) in [
+        ("search_path", path),
+        ("row_security", "on"),
+        ("DateStyle", "ISO, MDY"),
+        ("TimeZone", "UTC"),
+        ("client_encoding", "UTF8"),
+        ("standard_conforming_strings", "on"),
+        ("server_version", "18.4"),
+    ] {
+        let mut row = 3u16.to_be_bytes().to_vec();
+        for part in [name, value, ""] {
+            row.extend_from_slice(&(part.len() as i32).to_be_bytes());
+            row.extend_from_slice(part.as_bytes());
+        }
+        wire.extend(wire_frame(b'D', &row));
+    }
+    wire.extend(wire_frame(b'C', b"SHOW\0"));
+    wire.extend(wire_frame(b'Z', b"I"));
+    wire
+}
+
+async fn scope_script(
+    listener: TcpListener,
+    responses: Vec<(&'static str, Vec<u8>)>,
+) -> Vec<String> {
+    let (mut sock, _) = listener.accept().await.unwrap();
+    let mut seen = Vec::new();
+    for (expected, reply) in responses {
+        let sql = read_query(&mut sock).await;
+        assert_eq!(sql, expected);
+        seen.push(sql);
+        sock.write_all(&reply).await.unwrap();
+    }
+    seen
+}
+
+#[tokio::test]
+async fn effective_scope_change_cannot_reuse_same_client_l1() {
+    const SQL: &str = "SELECT value FROM widgets";
+    let script = vec![
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+        (SQL, backend_reply()),
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+        ("SHOW ALL", effective_scope_reply("schema_b")),
+        (SQL, cached_reply()),
+        ("SHOW ALL", effective_scope_reply("schema_b")),
+        ("SHOW ALL", effective_scope_reply("schema_b")),
+    ];
+    let (mut relay, backend) = Relay::start_with(
+        |_| {},
+        &[],
+        |listener| tokio::spawn(scope_script(listener, script)),
+    )
+    .await;
+    relay
+        .conns
+        .get_mut(&relay.addr)
+        .unwrap()
+        .cache_scope_test_override = None;
+    assert_eq!(relay.query(SQL).await.1, backend_reply());
+    let (node, first_hit) = relay.query(SQL).await;
+    assert!(node.is_none(), "equal scope must produce a real cache hit");
+    assert_eq!(first_hit, backend_reply());
+    let (node, changed) = relay.query(SQL).await;
+    assert!(
+        node.is_some(),
+        "a different effective scope must execute natively"
+    );
+    assert_eq!(changed, cached_reply());
+    let (node, second_hit) = relay.query(SQL).await;
+    assert!(node.is_none(), "new scope must also retain cache hits");
+    assert_eq!(second_hit, cached_reply());
+    drop(relay);
+    assert_eq!(backend.await.unwrap().len(), 8);
+}
+
+#[tokio::test]
+async fn effective_scope_change_during_native_read_declines_fill() {
+    const SQL: &str = "SELECT value FROM widgets";
+    let script = vec![
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+        (SQL, backend_reply()),
+        ("SHOW ALL", effective_scope_reply("schema_b")),
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+        (SQL, cached_reply()),
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+    ];
+    let (mut relay, backend) = Relay::start_with(
+        |_| {},
+        &[],
+        |listener| tokio::spawn(scope_script(listener, script)),
+    )
+    .await;
+    relay
+        .conns
+        .get_mut(&relay.addr)
+        .unwrap()
+        .cache_scope_test_override = None;
+    assert_eq!(relay.query(SQL).await.1, backend_reply());
+    let (node, reply) = relay.query(SQL).await;
+    assert!(
+        node.is_some(),
+        "unstable execution scope must not populate L1/L2"
+    );
+    assert_eq!(reply, cached_reply());
+    drop(relay);
+    assert_eq!(backend.await.unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn effective_scope_unsupported_reply_drains_and_executes_natively() {
+    const SQL: &str = "SELECT value FROM widgets";
+    let mut unsupported = wire_frame(b'E', b"SERROR\0C0A000\0Munsupported\0\0");
+    unsupported.extend(wire_frame(b'Z', b"I"));
+    let script = vec![
+        ("SHOW ALL", unsupported),
+        (SQL, backend_reply()),
+        (SQL, backend_reply()),
+    ];
+    let (mut relay, backend) = Relay::start_with(
+        |_| {},
+        &[SQL],
+        |listener| tokio::spawn(scope_script(listener, script)),
+    )
+    .await;
+    relay
+        .conns
+        .get_mut(&relay.addr)
+        .unwrap()
+        .cache_scope_test_override = None;
+    for _ in 0..2 {
+        let (node, reply) = relay.query(SQL).await;
+        assert!(node.is_some());
+        assert_eq!(
+            reply,
+            backend_reply(),
+            "internal probe error/RFQ must not leak"
+        );
+    }
+    assert!(relay.conns[&relay.addr].cache_scope_unsupported);
+    drop(relay);
+    assert_eq!(backend.await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn effective_scope_immutable_contract_reuses_only_this_socket_proof() {
+    const SQL: &str = "SELECT value FROM widgets";
+    let script = vec![
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+        (SQL, backend_reply()),
+    ];
+    let (mut relay, backend) = Relay::start_with(
+        |c| c.cache.backend_context_immutable = true,
+        &[],
+        |listener| tokio::spawn(scope_script(listener, script)),
+    )
+    .await;
+    relay
+        .conns
+        .get_mut(&relay.addr)
+        .unwrap()
+        .cache_scope_test_override = None;
+    relay.query(SQL).await;
+    assert!(relay.conns[&relay.addr].cache_scope_verified.is_some());
+    assert!(
+        relay.query(SQL).await.0.is_none(),
+        "contract permits proof reuse on the same socket"
+    );
+    drop(relay);
+    assert_eq!(backend.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn effective_scope_wire_faults_abandon_before_user_query() {
+    for (reply, budget) in [
+        (vec![b'T', 0, 0, 0, 3], 524288), // invalid minimum length
+        (vec![b'T', 0xff, 0xff, 0xff, 0xff], 524288),
+        (wire_frame(b'Z', b"T"), 524288),  // no clean idle boundary
+        (effective_scope_reply("a"), 128), // total wire budget exceeded
+        (Vec::new(), 524288),              // EOF
+    ] {
+        let (mut relay, backend) = Relay::start_with(
+            |c| c.cache.max_backend_context_bytes = budget,
+            &[],
+            |listener| tokio::spawn(scope_script(listener, vec![("SHOW ALL", reply)])),
+        )
+        .await;
+        relay
+            .conns
+            .get_mut(&relay.addr)
+            .unwrap()
+            .cache_scope_test_override = None;
+        let msg = QueryMessage {
+            query: "SELECT value FROM widgets".into(),
+        }
+        .encode();
+        let mut fault = None;
+        let result = ProxyServer::forward_simple_query(
+            ForwardCtx {
+                client: &mut relay.client,
+                conns: &mut relay.conns,
+                current_node: Some(&relay.addr),
+                reads: &ReadRouting::OFF,
+                session: &relay.session,
+                state: &relay.server.state,
+                config: &relay.config,
+                fault: &mut fault,
+                continues_cycle: None,
+            },
+            &msg,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "unverifiable wire must fail before delivering the user query"
+        );
+        assert!(fault.is_some());
+        assert!(
+            !relay.conns.contains_key(&relay.addr),
+            "failed probe socket must be abandoned"
+        );
+        drop(relay);
+        assert_eq!(backend.await.unwrap(), ["SHOW ALL"]);
+    }
+}
+
+#[tokio::test]
+async fn effective_scope_probe_preserves_async_notices_and_hides_its_own_rows() {
+    const SQL: &str = "SELECT value FROM widgets";
+    let notice = wire_frame(b'N', b"SNOTICE\0Mscope test\0\0");
+    let mut scope = notice.clone();
+    scope.extend(effective_scope_reply("schema_a"));
+    let script = vec![
+        ("SHOW ALL", scope),
+        (SQL, backend_reply()),
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+    ];
+    let (mut relay, backend) = Relay::start_with(
+        |_| {},
+        &[],
+        |listener| tokio::spawn(scope_script(listener, script)),
+    )
+    .await;
+    relay
+        .conns
+        .get_mut(&relay.addr)
+        .unwrap()
+        .cache_scope_test_override = None;
+    let msg = QueryMessage { query: SQL.into() }.encode();
+    let mut fault = None;
+    let (_, sent) = ProxyServer::forward_simple_query(
+        ForwardCtx {
+            client: &mut relay.client,
+            conns: &mut relay.conns,
+            current_node: Some(&relay.addr),
+            reads: &ReadRouting::OFF,
+            session: &relay.session,
+            state: &relay.server.state,
+            config: &relay.config,
+            fault: &mut fault,
+            continues_cycle: None,
+        },
+        &msg,
+    )
+    .await
+    .unwrap();
+    assert_eq!(sent as usize, backend_reply().len());
+    let expected = [notice, backend_reply()].concat();
+    let mut observed = vec![0; expected.len()];
+    relay.peer.read_exact(&mut observed).await.unwrap();
+    assert_eq!(observed, expected);
+    drop(relay);
+    assert_eq!(backend.await.unwrap().len(), 3);
+}
+
+#[cfg(feature = "pool-modes")]
+#[tokio::test]
+async fn effective_scope_pool_checkout_reprobes_and_cache_hits_return_the_lease() {
+    const SQL: &str = "SELECT value FROM widgets";
+    let script = vec![
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+        (SQL, backend_reply()),
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+    ];
+    let (mut relay, backend) = Relay::start_with(
+        |c| {
+            c.pool_mode.mode = crate::config::PoolingMode::Transaction;
+            c.pool_mode.skip_clean_reset = true;
+            c.cache.backend_context_immutable = true;
+        },
+        &[],
+        |listener| tokio::spawn(scope_script(listener, script)),
+    )
+    .await;
+    relay
+        .conns
+        .get_mut(&relay.addr)
+        .unwrap()
+        .cache_scope_test_override = None;
+    assert!(relay.query(SQL).await.0.is_some());
+    ProxyServer::release_to_pool_if_idle(
+        &mut relay.conns,
+        Some(&relay.addr),
+        &relay.session,
+        &relay.server.state,
+        &relay.config,
+    )
+    .await;
+    assert_eq!(
+        relay
+            .server
+            .state
+            .backend_pool
+            .as_ref()
+            .unwrap()
+            .idle_count(),
+        1
+    );
+    for _ in 0..2 {
+        let (node, reply) = relay.query(SQL).await;
+        assert!(node.is_none());
+        assert_eq!(reply, backend_reply());
+        assert!(
+            !relay.conns.contains_key(&relay.addr),
+            "cache-hit lease must return to the pool"
+        );
+        assert_eq!(
+            relay
+                .server
+                .state
+                .backend_pool
+                .as_ref()
+                .unwrap()
+                .idle_count(),
+            1
+        );
+    }
+    drop(relay);
+    assert_eq!(backend.await.unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn effective_scope_failed_post_probe_preserves_native_response_without_a_fill() {
+    const SQL: &str = "SELECT value FROM widgets";
+    let script = vec![
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+        (SQL, backend_reply()),
+        ("SHOW ALL", vec![b'T', 0, 0, 0, 3]),
+    ];
+    let (mut relay, backend) = Relay::start_with(
+        |_| {},
+        &[],
+        |listener| tokio::spawn(scope_script(listener, script)),
+    )
+    .await;
+    relay
+        .conns
+        .get_mut(&relay.addr)
+        .unwrap()
+        .cache_scope_test_override = None;
+    assert_eq!(relay.query(SQL).await.1, backend_reply());
+    assert!(!relay.conns.contains_key(&relay.addr));
+    assert_eq!(relay.cache().stats().puts, 0);
+    drop(relay);
+    assert_eq!(backend.await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn effective_scope_cancellation_and_refusal_never_execute_the_business_query() {
+    const SQL: &str = "SELECT value FROM widgets";
+    for code in ["57014", "53200", "42501"] {
+        let mut response = wire_frame(
+            b'E',
+            format!("SERROR\0C{code}\0Mscope refused\0\0").as_bytes(),
+        );
+        response.extend(wire_frame(b'Z', b"I"));
+        let wire_response = response.clone();
+        let (mut relay, backend) = Relay::start_with(
+            |_| {},
+            &[],
+            |listener| {
+                tokio::spawn(async move {
+                    let (mut sock, _) = listener.accept().await.unwrap();
+                    let probe = read_query(&mut sock).await;
+                    assert_eq!(probe, "SHOW ALL");
+                    sock.write_all(&wire_response).await.unwrap();
+                    let mut seen = vec![probe];
+                    let mut head = [0; 5];
+                    if sock.read_exact(&mut head).await.is_ok() {
+                        assert_eq!(head[0], b'Q');
+                        let length = u32::from_be_bytes(head[1..].try_into().unwrap()) as usize;
+                        let mut body = vec![0; length - 4];
+                        sock.read_exact(&mut body).await.unwrap();
+                        seen.push(String::from_utf8(body[..body.len() - 1].to_vec()).unwrap());
+                        sock.write_all(&backend_reply()).await.unwrap();
+                    }
+                    seen
+                })
+            },
+        )
+        .await;
+        relay
+            .conns
+            .get_mut(&relay.addr)
+            .unwrap()
+            .cache_scope_test_override = None;
+        let msg = QueryMessage {
+            query: SQL.to_string(),
+        }
+        .encode();
+        let mut fault = None;
+        let (_, sent) = ProxyServer::forward_simple_query(
+            ForwardCtx {
+                client: &mut relay.client,
+                conns: &mut relay.conns,
+                current_node: Some(&relay.addr),
+                reads: &ReadRouting::OFF,
+                session: &relay.session,
+                state: &relay.server.state,
+                config: &relay.config,
+                fault: &mut fault,
+                continues_cycle: None,
+            },
+            &msg,
+        )
+        .await
+        .unwrap();
+        let mut observed = vec![0; sent as usize];
+        relay.peer.read_exact(&mut observed).await.unwrap();
+        let no_retry_fault = fault.is_none();
+        let session_error = relay.session.last_response_error.load(Ordering::Relaxed);
+        drop(relay);
+        let seen = backend.await.unwrap();
+        assert_eq!(
+            observed, response,
+            "scope rejection {code} must terminate the business request"
+        );
+        assert_eq!(seen, ["SHOW ALL"], "business SQL must not run after {code}");
+        assert!(
+            no_retry_fault,
+            "TR must not retry a cancelled/refused request"
+        );
+        assert!(session_error);
+    }
+}
+
+#[tokio::test]
+async fn effective_scope_rejection_then_lost_boundary_never_retries() {
+    for delay in [Duration::ZERO, Duration::from_secs(2)] {
+        let error = wire_frame(b'E', b"SERROR\0C57014\0Mcancelled\0\0");
+        let expected = error.clone();
+        let (mut relay, backend) = Relay::start_with(
+            |c| c.limits.reprepare_timeout_secs = 1,
+            &[],
+            |listener| {
+                tokio::spawn(async move {
+                    let (mut sock, _) = listener.accept().await.unwrap();
+                    let sql = read_query(&mut sock).await;
+                    assert_eq!(sql, "SHOW ALL");
+                    sock.write_all(&error).await.unwrap();
+                    // EOF immediately, or a missing RFQ until the configured
+                    // whole-exchange deadline, must retain cancellation intent.
+                    tokio::time::sleep(delay).await;
+                    vec![sql]
+                })
+            },
+        )
+        .await;
+        relay
+            .conns
+            .get_mut(&relay.addr)
+            .unwrap()
+            .cache_scope_test_override = None;
+        let msg = QueryMessage {
+            query: "SELECT value FROM widgets".into(),
+        }
+        .encode();
+        let mut fault = None;
+        let result = ProxyServer::forward_simple_query(
+            ForwardCtx {
+                client: &mut relay.client,
+                conns: &mut relay.conns,
+                current_node: Some(&relay.addr),
+                reads: &ReadRouting::OFF,
+                session: &relay.session,
+                state: &relay.server.state,
+                config: &relay.config,
+                fault: &mut fault,
+                continues_cycle: None,
+            },
+            &msg,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a lost rejection boundary closes the client loop"
+        );
+        assert!(
+            fault.is_none(),
+            "known cancellation must never become retryable"
+        );
+        assert!(!relay.conns.contains_key(&relay.addr));
+        let mut observed = vec![0; expected.len()];
+        relay.peer.read_exact(&mut observed).await.unwrap();
+        assert_eq!(
+            observed, expected,
+            "publish57014 before the connection closes"
+        );
+        drop(relay);
+        assert_eq!(backend.await.unwrap(), ["SHOW ALL"]);
+    }
 }

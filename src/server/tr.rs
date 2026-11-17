@@ -172,8 +172,9 @@ pub(super) enum InFlight<'a> {
     Simple(&'a Message),
     Extended {
         ext: ExtBatch<'a>,
-        /// Named statements to re-prepare on the replacement connection
-        /// (`forward_extended_batch`'s `reprepare`).
+        /// Referenced named statements, borrowed from the batch's set.
+        /// `forward_extended_batch` excludes the batch's own definitions before
+        /// re-preparing missing names on the replacement connection.
         reprepare: &'a [String],
     },
 }
@@ -321,6 +322,9 @@ pub(super) struct TrSession {
     /// open, so a request continuing it is part of an open cycle (the
     /// recovery never runs it alone on a replacement connection).
     pub(super) ext_copy_end: Option<bool>,
+    /// Completed statements before this COPY end; only a later completion
+    /// acknowledges its end and starts the client final-Sync deadline.
+    pub(super) ext_copy_end_completions: u32,
     /// TR-08: the session's acknowledged named statements. A later cycle that
     /// `Bind`s one is classified (and replayed) from here instead of being
     /// refused as opaque. A name an errored batch `Parse`d or `Close`d, or any
@@ -362,6 +366,7 @@ impl TrSession {
             ext_dispatched: false,
             fault_resent: false,
             ext_copy_end: None,
+            ext_copy_end_completions: 0,
             acked: HashMap::new(),
             tx_portals: HashMap::new(),
             simple_cycle: ExtSetCycle::default(),
@@ -560,8 +565,8 @@ impl ProxyServer {
     }
 
     /// TR-03: can this read-shaped statement be re-executed on an unknown
-    /// outcome? Only if every syntactic function call is a PostgreSQL built-in
-    /// known to be side-effect-free (or operator-listed), no quoted identifier
+    /// outcome? Only if every call-shaped token is explicitly operator-listed
+    /// as side-effect-free, no quoted identifier
     /// is called (its case is opaque to the policy), and the statement does not
     /// select INTO or consume a sequence. Anything else is `Other`: it may have
     /// run once already, so the proxy will not run it again.
@@ -569,21 +574,19 @@ impl ProxyServer {
         if Self::contains_word_ci(core, "into") {
             return false;
         }
-        let mut ok = true;
-        let scanned = crate::replay_sql::words(core, |w| {
-            if w.call && (w.quoted || !policy.allows_call(w.text)) {
-                ok = false;
-                return false;
-            }
-            true
-        });
-        scanned.is_ok() && ok
+        crate::replay_sql::all_calls_satisfy(core, |w| !w.quoted && policy.allows_call(w.text))
+            .unwrap_or(false)
     }
 
     /// Classify one client statement for in-session TR (see `StmtKind`).
     /// Conservative by construction: anything not positively recognised as a
     /// read or as idempotent control is treated as a possible write.
     pub(super) fn tr_classify(sql: &str, policy: &TrReadPolicy) -> StmtKind {
+        Self::tr_routing_classify(sql, policy)
+    }
+
+    /// Read-shape/direct-call classifier kept independent of replay admission.
+    pub(super) fn tr_routing_classify(sql: &str, policy: &TrReadPolicy) -> StmtKind {
         let Ok(boundaries) = crate::replay_sql::boundaries(sql) else {
             // The session's lexical rules or malformed input make commit
             // boundaries uncertain. Never replay a possibly durable outcome.
@@ -654,13 +657,16 @@ impl ProxyServer {
         if kw("COPY") {
             return if Self::contains_word_ci(core, "from") {
                 StmtKind::Write
-            } else {
+            } else if Self::tr_read_eligible(core, policy) {
                 StmtKind::Read
+            } else {
+                StmtKind::Other
             };
         }
         if kw("EXPLAIN") {
             return if Self::contains_word_ci(core, "analyze")
                 || Self::contains_word_ci(core, "analyse")
+                || !Self::tr_read_eligible(core, policy)
             {
                 StmtKind::Other
             } else {
@@ -2067,10 +2073,14 @@ impl ProxyServer {
             // replay a transaction from this incomplete history.
             session.tr_replay_tainted.store(true, Ordering::Relaxed);
         }
-        let sql = crate::protocol::query_text(&msg.payload);
+        let sql = Self::simple_request_sql(msg);
         // Not UTF-8 (a client_encoding such as LATIN1): `tr_after_response`
         // cannot read its settings; they are read below from the raw bytes.
-        let raw = sql.is_none() && tr.track_gucs && !tr.skip_settings;
+        // A FunctionCall's payload is not SQL at all.
+        let raw = sql.is_none()
+            && msg.msg_type == MessageType::Query
+            && tr.track_gucs
+            && !tr.skip_settings;
         let before = tr.prev_status;
         if !tr.acked.is_empty() && sql.is_none_or(Self::tr_touches_statements) {
             // PREPARE / DEALLOCATE / DISCARD ALL act on named statements
@@ -3154,8 +3164,10 @@ impl ProxyServer {
             .copy_in_progress
             .load(std::sync::atomic::Ordering::Relaxed);
         let (kind, wait_ready) = match &inflight {
+            // A FunctionCall has no text: like a Query that is not UTF-8,
+            // its outcome once delivered is never assumed.
             InFlight::Simple(msg) => (
-                crate::protocol::query_text(&msg.payload)
+                Self::simple_request_sql(msg)
                     .map(|sql| Self::tr_classify(sql, &state.tr_read_policy))
                     .unwrap_or(StmtKind::Commit),
                 true,
@@ -3480,6 +3492,9 @@ impl ProxyServer {
                     continues_cycle: None,
                 };
                 let r = match inflight {
+                    InFlight::Simple(msg) if msg.msg_type == MessageType::FunctionCall => {
+                        Self::forward_function_call(fwd, msg).await
+                    }
                     InFlight::Simple(msg) => Self::forward_simple_query(fwd, msg).await,
                     InFlight::Extended { ext, reprepare } => {
                         Self::forward_extended_batch(

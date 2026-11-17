@@ -1,14 +1,148 @@
 use super::*;
 
 impl ProxyServer {
-    /// Register a simple-query string for capture; arms the relay when the
-    /// statement's outcome matters (write, COPY, EXECUTE, transaction control).
-    pub(super) fn journal_register_simple(session: &ClientSession, sql: &str) {
-        let armed = session
-            .journal
+    /// Keep bounded response metadata across Flush and COPY boundaries.
+    pub(super) fn journal_stash_response(
+        session: &ClientSession,
+        mut completions: Vec<crate::journal_capture::Completion>,
+        error: Option<(String, String)>,
+        limit: usize,
+    ) -> Result<()> {
+        use crate::journal_capture::{Completion, ResponseOutcome};
+        if completions.is_empty() && error.is_none() {
+            return Ok(());
+        }
+        let mut held = session
+            .journal_response_prefix
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (prefix, strings) = held.get_or_insert_with(|| (ResponseOutcome::default(), 0));
+        let added = Self::journal_response_strings(
+            &completions,
+            error.as_ref().filter(|_| prefix.error.is_none()),
+        );
+        let needed = prefix.completions.len().saturating_add(completions.len());
+        let charge = prefix
+            .completions
+            .capacity()
+            .max(needed)
+            .saturating_mul(std::mem::size_of::<Completion>())
+            .saturating_add(*strings)
+            .saturating_add(added);
+        if charge > limit {
+            return Err(ProxyError::Protocol("journal response metadata exceeds limits.max_pending_bytes; session ended with an unverified outcome".into()));
+        }
+        prefix
+            .completions
+            .try_reserve_exact(needed.saturating_sub(prefix.completions.len()))
+            .map_err(|e| {
+                ProxyError::Internal(format!("journal response allocation failed: {e}"))
+            })?;
+        prefix.completions.append(&mut completions);
+        if prefix.error.is_none() {
+            prefix.error = error;
+        }
+        *strings = strings.saturating_add(added);
+        session
+            .journal_response_pending
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// String bytes a response's metadata retains: its completion tags and
+    /// the error that would be kept.
+    fn journal_response_strings(
+        completions: &[crate::journal_capture::Completion],
+        error: Option<&(String, String)>,
+    ) -> usize {
+        completions
+            .iter()
+            .map(|c| match c {
+                crate::journal_capture::Completion::Tag(t) => t.capacity(),
+                _ => 0,
+            })
+            .sum::<usize>()
+            .saturating_add(error.map_or(0, |(c, m)| c.capacity().saturating_add(m.capacity())))
+    }
+
+    /// The `limits.max_pending_bytes` bound of [`Self::journal_stash_response`]
+    /// for metadata the relay hands straight to its `ReadyForQuery`
+    /// observation: a complete cycle with nothing held is charged exactly
+    /// what stashing it would have charged, without the stash round trip.
+    pub(super) fn journal_direct_response_fits(
+        completions: &[crate::journal_capture::Completion],
+        error: Option<&(String, String)>,
+        limit: usize,
+    ) -> Result<()> {
+        let charge = completions
+            .len()
+            .saturating_mul(std::mem::size_of::<crate::journal_capture::Completion>())
+            .saturating_add(Self::journal_response_strings(completions, error));
+        if charge > limit {
+            return Err(ProxyError::Protocol("journal response metadata exceeds limits.max_pending_bytes; session ended with an unverified outcome".into()));
+        }
+        Ok(())
+    }
+
+    fn journal_merge_response(
+        session: &ClientSession,
+        outcome: &mut crate::journal_capture::ResponseOutcome,
+    ) {
+        if !session
+            .journal_response_pending
+            .swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        if let Some((mut prefix, _)) = session
+            .journal_response_prefix
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .register_simple(sql);
+            .take()
+        {
+            prefix.completions.append(&mut outcome.completions);
+            outcome.completions = prefix.completions;
+            if prefix.error.is_some() {
+                outcome.error = prefix.error;
+            }
+        }
+    }
+
+    fn journal_clear_response(session: &ClientSession) {
+        if session
+            .journal_response_pending
+            .swap(false, Ordering::AcqRel)
+        {
+            drop(
+                session
+                    .journal_response_prefix
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take(),
+            );
+        }
+    }
+
+    /// Register a simple-query string for capture; arms the relay when the
+    /// statement's outcome matters (write, COPY, EXECUTE, transaction control).
+    #[cfg(test)]
+    pub(super) fn journal_register_simple(session: &ClientSession, sql: &str) {
+        Self::journal_register_simple_cycle(session, sql, true);
+    }
+
+    pub(super) fn journal_register_simple_cycle(
+        session: &ClientSession,
+        sql: &str,
+        starts_cycle: bool,
+    ) {
+        if starts_cycle {
+            Self::journal_clear_response(session);
+        }
+        let mut cap = session.journal.lock().unwrap_or_else(|e| e.into_inner());
+        if starts_cycle {
+            cap.begin_cycle();
+        }
+        let armed = cap.register_simple(sql);
         if armed {
             session.journal_armed.store(true, Ordering::Relaxed);
         }
@@ -21,8 +155,17 @@ impl ProxyServer {
         session: &ClientSession,
         batch: &[u8],
         held_unnamed: Option<&[u8]>,
+        starts_cycle: bool,
+        flush: bool,
     ) {
+        if starts_cycle {
+            Self::journal_clear_response(session);
+        }
         let mut cap = session.journal.lock().unwrap_or_else(|e| e.into_inner());
+        if starts_cycle {
+            cap.begin_cycle();
+        }
+        let mut executed = false;
         if let Some(msg) = held_unnamed {
             if msg.len() >= 5 && msg[0] == b'P' {
                 Self::journal_note_parse(&mut cap, &msg[5..]);
@@ -41,6 +184,7 @@ impl ProxyServer {
                 b'P' => Self::journal_note_parse(&mut cap, payload),
                 b'B' => cap.note_bind(payload),
                 b'E' => {
+                    executed = true;
                     let end = payload
                         .iter()
                         .position(|&b| b == 0)
@@ -53,7 +197,7 @@ impl ProxyServer {
             }
             i += 1 + len;
         }
-        if cap.armed() {
+        if cap.armed() || (flush && executed) {
             session.journal_armed.store(true, Ordering::Relaxed);
         }
     }
@@ -101,15 +245,25 @@ impl ProxyServer {
         frame: &[u8],
         completions: &mut Vec<crate::journal_capture::Completion>,
         first_error: &mut Option<(String, String)>,
-    ) {
+    ) -> Result<()> {
         use crate::journal_capture::Completion;
         match frame.first() {
             Some(b'C') => {
                 let body = frame.get(5..).unwrap_or(&[]);
-                let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
-                completions.push(Completion::Tag(
-                    String::from_utf8_lossy(&body[..end]).into_owned(),
-                ));
+                let Some(tag) = body.strip_suffix(&[0]) else {
+                    return Err(ProxyError::Protocol(
+                        "invalid backend CommandComplete terminator".into(),
+                    ));
+                };
+                if tag.contains(&0) {
+                    return Err(ProxyError::Protocol(
+                        "invalid backend CommandComplete trailing bytes".into(),
+                    ));
+                }
+                let tag = std::str::from_utf8(tag).map_err(|_| {
+                    ProxyError::Protocol("invalid backend CommandComplete UTF8".into())
+                })?;
+                completions.push(Completion::Tag(tag.to_owned()));
             }
             Some(b's') => completions.push(Completion::Suspended),
             Some(b'I') => completions.push(Completion::Empty),
@@ -134,13 +288,14 @@ impl ProxyServer {
             }
             _ => {}
         }
+        Ok(())
     }
 
     /// Source identity of the session's current transaction for the journal.
     pub(super) async fn journal_source(
         session: &ClientSession,
     ) -> crate::transaction_journal::SourceIdentity {
-        let (user, database, tenant) = {
+        let (user, database, configured_tenant) = {
             let vars = session.variables.read().await;
             (
                 vars.get("user").cloned().unwrap_or_default(),
@@ -148,6 +303,15 @@ impl ProxyServer {
                 vars.get("tenant_id").cloned(),
             )
         };
+        // The startup-resolved tenant is attached once to the session's
+        // shared budget. Prefer that canonical identity: database/user-based
+        // tenant configurations do not necessarily populate a `tenant_id`
+        // session variable, but journal accounting must still use the same
+        // tenant key that admitted the session.
+        let tenant = session
+            .tenant_budget()
+            .map(|budget| budget.tenant().to_owned())
+            .or(configured_tenant);
         let backend = session
             .current_node
             .read()
@@ -178,14 +342,21 @@ impl ProxyServer {
             return;
         }
         let node_id = crate::journal_capture::node_id_for_backend(&source.backend);
+        let tenant_journal_budget = source
+            .tenant
+            .as_deref()
+            .and_then(|tenant| state.tenant_slots.budget(tenant))
+            .and_then(|budget| budget.journal_budget())
+            .cloned();
         let applying = std::time::Instant::now();
-        let applied = crate::journal_capture::apply_ops(
+        let applied = crate::journal_capture::apply_ops_with_tenant_budget(
             &state.transaction_journal,
             ops,
             session_id,
             node_id,
             source,
             local,
+            tenant_journal_budget.as_ref(),
         );
         state.latency.journal_apply.record(applying.elapsed());
         if applied.committed > 0 {
@@ -221,6 +392,123 @@ impl ProxyServer {
         }
     }
 
+    /// Retain bounded metadata and apply only an exact extended commit prefix
+    /// proven before the first ErrorResponse. `proven` counts completions in
+    /// this addition, not payload bytes or an advertised future offset.
+    pub(super) async fn journal_stash_proven_response(
+        session: &ClientSession,
+        state: &ServerState,
+        completions: Vec<crate::journal_capture::Completion>,
+        error: Option<(String, String)>,
+        proven: usize,
+    ) -> Result<usize> {
+        // The relay calls this once per backend read chunk while capture is
+        // armed. RowDescription/DataRow-only chunks have nothing to retain;
+        // avoid taking the response-prefix mutex on that common path.
+        if completions.is_empty() && error.is_none() && proven == 0 {
+            return Ok(0);
+        }
+        let (prior, prior_prepared, failed) = {
+            let held = session
+                .journal_response_prefix
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            held.as_ref().map_or((0, 0, false), |(prefix, _)| {
+                (prefix.completions.len(), prefix.completions.iter().filter(|c| matches!(c, crate::journal_capture::Completion::Tag(t) if t.eq_ignore_ascii_case("COMMIT PREPARED"))).count(), prefix.error.is_some())
+            })
+        };
+        let proven = proven.min(completions.len());
+        Self::journal_stash_response(session, completions, error, state.limits.max_pending_bytes)?;
+        if proven == 0 || failed {
+            return Ok(0);
+        }
+        let (ops, newly_consumed) = {
+            let mut held = session
+                .journal_response_prefix
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Some((outcome, strings)) = held.as_mut() else {
+                return Ok(0);
+            };
+            let mut cap = session.journal.lock().unwrap_or_else(|e| e.into_inner());
+            let prepared_before = outcome.completions.iter().filter(|c| matches!(c, crate::journal_capture::Completion::Tag(t) if t.eq_ignore_ascii_case("COMMIT PREPARED"))).count();
+            let ops = cap.observe_committed_prefix(outcome, prior.saturating_add(proven));
+            let prepared_after = outcome.completions.iter().filter(|c| matches!(c, crate::journal_capture::Completion::Tag(t) if t.eq_ignore_ascii_case("COMMIT PREPARED"))).count();
+            let newly = prepared_before
+                .saturating_sub(prepared_after)
+                .saturating_sub(prior_prepared);
+            session
+                .journal_open
+                .store(cap.in_transaction(), Ordering::Relaxed);
+            // Retained Vec capacity remains within the existing R8 charge;
+            // removing proven strings can only reduce the retained budget.
+            *strings = outcome
+                .completions
+                .iter()
+                .fold(0usize, |bytes, completion| {
+                    bytes.saturating_add(match completion {
+                        crate::journal_capture::Completion::Tag(tag) => tag.capacity(),
+                        _ => 0,
+                    })
+                });
+            if let Some((code, message)) = outcome.error.as_ref() {
+                *strings = strings
+                    .saturating_add(code.capacity())
+                    .saturating_add(message.capacity());
+            }
+            if outcome.completions.is_empty() && outcome.error.is_none() {
+                *held = None;
+                session
+                    .journal_response_pending
+                    .store(false, Ordering::Release);
+            }
+            // The real RFQ still owns cycle admission and the armed flag.
+            (ops, newly)
+        };
+        if let Some(cycle) = Self::journal_process_ops(session, state, ops) {
+            // A failed client write cannot erase already committed history.
+            Self::journal_observe_finish(session, state, cycle).await;
+        }
+        Ok(newly_consumed)
+    }
+
+    pub(super) fn journal_mark_raw_prepared(session: &ClientSession, applied: usize) {
+        if applied == 0 {
+            return;
+        }
+        let held = session
+            .journal_response_prefix
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let retained = held.as_ref().map_or(0, |(outcome, _)| outcome.completions.iter().filter(|c| matches!(c, crate::journal_capture::Completion::Tag(t) if t.eq_ignore_ascii_case("COMMIT PREPARED"))).count());
+        if retained > 0 {
+            session
+                .journal
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .note_raw_prepared_published(applied, retained);
+        }
+    }
+
+    pub(super) fn journal_apply_raw_prepared(state: &ServerState) -> bool {
+        #[cfg(feature = "query-cache")]
+        let query = if let Some(g) = state.table_generations.as_ref() {
+            match state.query_cache.as_ref() {
+                Some(q) => q.invalidate_all(),
+                None => g.invalidate_all(),
+            };
+            true
+        } else {
+            false
+        };
+        #[cfg(not(feature = "query-cache"))]
+        let query = {
+            let _ = state;
+            false
+        };
+        query
+    }
+
     /// Phase 1 of observing a completed cycle, synchronous and run before
     /// the `ReadyForQuery` is forwarded: reconcile the capture with what the
     /// backend answered and move the query-cache generations of the tables
@@ -228,8 +516,9 @@ impl ProxyServer {
     pub(super) fn journal_observe_sync(
         session: &ClientSession,
         state: &ServerState,
-        outcome: crate::journal_capture::ResponseOutcome,
+        mut outcome: crate::journal_capture::ResponseOutcome,
     ) -> Option<ObservedCycle> {
+        Self::journal_merge_response(session, &mut outcome);
         let armed = session.journal_armed.swap(false, Ordering::Relaxed);
         // A statement the capture cannot see may have written anything
         // (`cache_unseen_write`): every cached result is retired before the
@@ -266,6 +555,18 @@ impl ProxyServer {
                 .store(cap.in_transaction(), Ordering::Relaxed);
             ops
         };
+        Self::journal_process_ops(session, state, ops)
+    }
+
+    /// Apply one proven observation's cache/edge effects. The exact accepted
+    /// prerequisite's existing observer body is shared, not duplicated.
+    fn journal_process_ops(
+        session: &ClientSession,
+        state: &ServerState,
+        ops: Vec<crate::journal_capture::JournalOp>,
+    ) -> Option<ObservedCycle> {
+        #[cfg(not(any(feature = "query-cache", feature = "edge-proxy")))]
+        let _ = session;
         // The generations are the query cache's when it runs, so its
         // heatmap and invalidation index follow the write; without it (the
         // MCP tool cache alone) only the generations move.
@@ -307,7 +608,9 @@ impl ProxyServer {
         })
     }
 
-    /// Phase 2, after the client has its answer: purge the L2 entries of the
+    /// Finish one observation: explicit committed prefixes finish before C
+    /// is published; ordinary complete cycles retain their existing ordering.
+    /// Purge the L2 entries of the
     /// written tables and apply the journal ops (skipped when TR is off and
     /// the capture ran only for the cache).
     pub(super) async fn journal_observe_finish(
@@ -315,6 +618,22 @@ impl ProxyServer {
         state: &ServerState,
         cycle: ObservedCycle,
     ) {
+        #[cfg(feature = "edge-proxy")]
+        if cycle.ops.iter().any(|op| {
+            matches!(
+                op,
+                crate::journal_capture::JournalOp::Commit { .. }
+                    | crate::journal_capture::JournalOp::AutoCommit { .. }
+                    | crate::journal_capture::JournalOp::PreparedCommitted
+            )
+        }) {
+            let config = state.live_config.load();
+            if config.edge.enabled {
+                // The journal's commit boundary is the first point where a
+                // transaction's writes are durable. Unknown scope flushes all.
+                Self::edge_invalidate_write(state, &config, Vec::new()).await;
+            }
+        }
         #[cfg(feature = "query-cache")]
         if !cycle.purge.is_empty() {
             if let Some(qc) = state.query_cache.as_ref() {
@@ -436,6 +755,7 @@ impl ProxyServer {
     /// The proxy synthesized the `ReadyForQuery` the client just saw: nothing
     /// registered for the cycle reached the backend.
     pub(super) fn journal_discard(session: &ClientSession, status: u8) {
+        Self::journal_clear_response(session);
         session.journal_armed.store(false, Ordering::Relaxed);
         #[cfg(feature = "query-cache")]
         session.cache_unseen_write.store(false, Ordering::Relaxed);

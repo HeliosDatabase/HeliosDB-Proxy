@@ -59,6 +59,8 @@ jobs:
           - "ha-tr"
           - "all-features"
           - "all-features,postgres-topology"
+          - "msrv-features"
+          - "wasm-plugins"
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -71,6 +73,8 @@ jobs:
         run: |
           if [ -z "${{ matrix.features }}" ]; then
             cargo clippy --tests -- -D warnings
+          elif [ "${{ matrix.features }}" = "wasm-plugins" ]; then
+            cargo clippy --no-default-features --features wasm-plugins --tests -- -D warnings
           else
             cargo clippy --features "${{ matrix.features }}" --tests -- -D warnings
           fi

@@ -39,6 +39,8 @@ pub(super) struct ResolvedLimits {
     /// `client_idle_timeout_secs = 0` (the default), which is the pre-timeout
     /// behaviour: the query loop then waits on the client forever.
     pub(super) client_idle_timeout: Option<Duration>,
+    /// Longest pause in client COPY input, including a partial frame; None = off.
+    pub(super) copy_idle_timeout: Option<Duration>,
     /// Bounded admission wait for the `max_client_connections` cap (H-05).
     /// `None` when `client_admission_wait_secs = 0` (refuse immediately).
     pub(super) client_admission_wait: Option<Duration>,
@@ -109,6 +111,8 @@ impl ResolvedLimits {
                 0 => None,
                 secs => Some(Duration::from_secs(secs)),
             },
+            copy_idle_timeout: (l.copy_idle_timeout_secs > 0)
+                .then(|| Duration::from_secs(l.copy_idle_timeout_secs)),
             client_admission_wait: match l.client_admission_wait_secs {
                 0 => None,
                 secs => Some(Duration::from_secs(secs)),

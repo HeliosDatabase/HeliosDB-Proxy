@@ -432,6 +432,12 @@ impl ReplayEngine {
         &self,
         req: &CommittedHistoryRequest,
     ) -> Result<CommittedReplaySummary> {
+        if self.journal.has_capture_gap() {
+            return Err(ProxyError::ReplayFailed(
+                "committed history is incomplete because a transaction could not be retained"
+                    .into(),
+            ));
+        }
         if req.from > req.to {
             return Err(ProxyError::Internal("replay window: from > to".to_string()));
         }
@@ -717,6 +723,26 @@ mod tests {
             query_timeout: Duration::from_millis(200),
             tls_config: default_client_config(),
         }
+    }
+
+    #[tokio::test]
+    async fn committed_replay_fails_closed_after_unrepresented_capture_gap() {
+        let journal = Arc::new(TransactionJournal::new());
+        journal.mark_capture_gap();
+        let engine = ReplayEngine::new(journal, test_template());
+        let now = Utc::now();
+        let request = CommittedHistoryRequest {
+            from: now - chrono::Duration::minutes(1),
+            to: now,
+            after_commit_seq: 0,
+            target_host: "unused.invalid".into(),
+            target_port: 5432,
+            target_user: None,
+            target_password: None,
+            target_database: None,
+        };
+        let error = engine.replay_committed(&request).await.unwrap_err();
+        assert!(error.to_string().contains("history is incomplete"));
     }
 
     #[tokio::test]

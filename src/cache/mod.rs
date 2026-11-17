@@ -131,6 +131,8 @@ impl Default for CacheContext {
 pub struct QueryPrep {
     /// Hints parsed from the query's `helios:` comments.
     hints: CacheHint,
+    /// Complete daemon startup identity; public cache APIs use the zero namespace.
+    namespace: [u8; 32],
     /// Normalized form — present only when the lookup reached the levels that
     /// need it. Absent on a hint-skip or an L1 exact hit (neither normalizes);
     /// `put_prepared` then normalizes lazily, exactly as `put` always did.
@@ -153,6 +155,19 @@ pub struct QueryPrep {
 }
 
 impl QueryPrep {
+    fn skipped(mut hints: CacheHint) -> Self {
+        hints.skip = true;
+        Self {
+            hints,
+            namespace: [0; 32],
+            normalized: None,
+            keyed_verbatim: false,
+            generation: None,
+            semantic: SemanticPrep::NotConsulted,
+            refresh_claim: None,
+        }
+    }
+
     /// Whether the read may be stored: false when its hints say
     /// `cache=skip` (a zero `cache_ttl` included), so the caller need not
     /// capture the response at all.
@@ -166,6 +181,7 @@ impl QueryPrep {
     fn served(hints: CacheHint, normalized: NormalizedQuery, keyed_verbatim: bool) -> Self {
         Self {
             hints,
+            namespace: [0; 32],
             normalized: Some(normalized),
             keyed_verbatim,
             generation: None,
@@ -277,6 +293,7 @@ pub struct TierEntries {
 pub struct QueryCache {
     /// Configuration
     config: CacheConfig,
+    max_dependency_tables: usize,
 
     /// L1: Per-connection hot cache (exact match)
     l1_caches: DashMap<u64, Arc<L1HotCache>>,
@@ -403,6 +420,7 @@ impl QueryCache {
                 config.default_ttl,
             ),
             config: config.clone(),
+            max_dependency_tables: crate::config::DEFAULT_CACHE_MAX_DEPENDENCY_TABLES,
             l1_caches: DashMap::new(),
             l2_cache,
             l3_cache,
@@ -602,10 +620,104 @@ impl QueryCache {
         context: &CacheContext,
         clock: impl FnOnce() -> Instant,
     ) -> (CacheLookup, QueryPrep) {
+        self.lookup_scoped(query, client_sql, context, &[0; 32], clock)
+    }
+
+    /// Daemon lookup with the complete, immutable startup identity.
+    pub(crate) async fn get_scoped(
+        &self,
+        query: &str,
+        client_sql: Option<&str>,
+        context: &CacheContext,
+        namespace: &[u8; 32],
+    ) -> (CacheLookup, QueryPrep) {
+        self.lookup_scoped(query, client_sql, context, namespace, Instant::now)
+    }
+
+    fn lookup_scoped(
+        &self,
+        query: &str,
+        client_sql: Option<&str>,
+        context: &CacheContext,
+        namespace: &[u8; 32],
+        clock: impl FnOnce() -> Instant,
+    ) -> (CacheLookup, QueryPrep) {
+        let (hit, mut prep) = self.lookup_inner(query, client_sql, context, namespace, clock);
+        prep.namespace = *namespace;
+        (hit, prep)
+    }
+
+    fn hint_has_tier(&self, hints: &CacheHint, context: &CacheContext) -> bool {
+        hints.level.is_none()
+            || (hints.allows_l1() && self.config.l1.enabled && context.connection_id.is_some())
+            || (hints.allows_l2() && self.l2_cache.is_some())
+            || (hints.allows_l3() && self.l3_cache.is_some())
+    }
+
+    /// Add the tables a hint declares (`additional`) to the ones a read
+    /// names. False when it then depends on more tables than the cache
+    /// tracks per entry: such a read is neither looked up nor stored. Works
+    /// on the caller's value, so the normalized query is built in place and
+    /// not moved through a return slot (the move was 6-12 ns in a profile;
+    /// the Criterion gate of 2026-11-17 could not separate the difference).
+    fn add_dependencies(&self, normalized: &mut NormalizedQuery, additional: &[String]) -> bool {
+        if normalized.tables.len() > self.max_dependency_tables {
+            return false;
+        }
+        if !additional.is_empty() {
+            normalized.tables.extend_from_slice(additional);
+            normalized.tables.sort_unstable();
+            normalized.tables.dedup();
+        }
+        normalized.tables.len() <= self.max_dependency_tables
+    }
+
+    fn covers_dependencies(result: &CachedResult, additional: &[String]) -> bool {
+        match additional {
+            [] => true,
+            [one] => result.tables.contains(one),
+            many => {
+                let held: std::collections::HashSet<_> =
+                    result.tables.iter().map(String::as_str).collect();
+                many.iter().all(|table| held.contains(table.as_str()))
+            }
+        }
+    }
+
+    fn lookup_inner(
+        &self,
+        query: &str,
+        client_sql: Option<&str>,
+        context: &CacheContext,
+        namespace: &[u8; 32],
+        clock: impl FnOnce() -> Instant,
+    ) -> (CacheLookup, QueryPrep) {
         // Parse cache hints
         let mut hints = parse_cache_hints(query);
         if let Some(client_sql) = client_sql {
             hints.merge(parse_cache_hints(client_sql));
+        }
+
+        if hints
+            .tables
+            .as_ref()
+            .is_some_and(|tables| tables.len() > self.max_dependency_tables)
+        {
+            hints.skip = true;
+        }
+        let additional = if hints.skip {
+            Vec::new()
+        } else {
+            match hints.additional_tables() {
+                Ok(tables) => tables,
+                Err(()) => {
+                    hints.skip = true;
+                    Vec::new()
+                }
+            }
+        };
+        if !self.hint_has_tier(&hints, context) {
+            hints.skip = true;
         }
 
         // Skip cache if hint says so
@@ -615,6 +727,7 @@ impl QueryCache {
                 CacheLookup::Miss,
                 QueryPrep {
                     hints,
+                    namespace: [0; 32],
                     normalized: None,
                     keyed_verbatim: false,
                     generation: None,
@@ -633,7 +746,11 @@ impl QueryCache {
         if hints.refresh {
             self.metrics.record_refresh_hint();
             let keyed_verbatim = self.heliosdb_backend();
-            let normalized = self.normalizer.normalize_with(query, keyed_verbatim);
+            let mut normalized = self.normalizer.normalize_with(query, keyed_verbatim);
+            if !self.add_dependencies(&mut normalized, &additional) {
+                self.metrics.record_skip();
+                return (CacheLookup::Miss, QueryPrep::skipped(hints));
+            }
             let prep = self.miss_prep(
                 hints,
                 normalized,
@@ -650,7 +767,11 @@ impl QueryCache {
         // it (stored by an unhinted read, or under a longer hint) is a miss
         // on every tier, and the refill stores the result with that TTL.
         let max_age = hints.ttl;
-        let young_enough = |r: &CachedResult| max_age.is_none_or(|age| r.age() <= age);
+        let young_enough = |r: &CachedResult| {
+            max_age.is_none_or(|age| r.age() <= age)
+                && r.tables.len() <= self.max_dependency_tables
+                && Self::covers_dependencies(r, &additional)
+        };
 
         // Refresh-ahead: an L1 copy past its refresh point is not served
         // yet; the shared tier decides below (another connection's refill may
@@ -658,7 +779,7 @@ impl QueryCache {
         let mut l1_due = None;
 
         // L1: Check hot cache (exact match)
-        if self.config.l1.enabled {
+        if self.config.l1.enabled && hints.allows_l1() {
             if let Some(conn_id) = context.connection_id {
                 let l1 = self.get_l1_cache(conn_id);
                 let hit = match l1.get(query) {
@@ -686,6 +807,7 @@ impl QueryCache {
                                 },
                                 QueryPrep {
                                     hints,
+                                    namespace: [0; 32],
                                     normalized: None,
                                     keyed_verbatim: false,
                                     generation: None,
@@ -704,13 +826,17 @@ impl QueryCache {
         // them before parsing). The mode is carried to the store, which
         // refuses a key made in the other one.
         let keyed_verbatim = self.heliosdb_backend();
-        let normalized = self.normalizer.normalize_with(query, keyed_verbatim);
-        let cache_key = CacheKey::new(&normalized, context);
+        let mut normalized = self.normalizer.normalize_with(query, keyed_verbatim);
+        if !self.add_dependencies(&mut normalized, &additional) {
+            self.metrics.record_skip();
+            return (CacheLookup::Miss, QueryPrep::skipped(hints));
+        }
+        let cache_key = CacheKey::namespaced(&normalized, context, *namespace);
 
         // L2: Check warm cache (normalized match). Whether the entry was
         // there but past its TTL is the heatmap's `expired`.
         let mut expired = false;
-        if let Some(ref l2) = self.l2_cache {
+        if let Some(l2) = self.l2_cache.as_ref().filter(|_| hints.allows_l2()) {
             let hit = match l2.get_now(&cache_key, &mut expired) {
                 Some(result) if self.is_current(&result) => young_enough(&result).then_some(result),
                 Some(stale) => {
@@ -767,7 +893,7 @@ impl QueryCache {
         // tier is off once a HeliosDB backend was seen (the parse still
         // decides whether the relations are complete, for the TTL).
         let mut semantic = SemanticPrep::NotConsulted;
-        if hints.semantic_cache {
+        if hints.allows_l3() {
             if let Some(ref l3) = self.l3_cache {
                 semantic = SemanticPrep::of(query, &normalized.tables, &self.config.l3);
                 match &semantic {
@@ -775,7 +901,17 @@ impl QueryCache {
                         l3.record_ineligible()
                     }
                     SemanticPrep::Canonical(c) => {
-                        match l3.lookup_within(c, context, &|r| self.is_current(r), max_age) {
+                        match l3.lookup_scoped(
+                            c,
+                            context,
+                            namespace,
+                            &|r| {
+                                self.is_current(r)
+                                    && r.tables.len() <= self.max_dependency_tables
+                                    && Self::covers_dependencies(r, &additional)
+                            },
+                            max_age,
+                        ) {
                             l3_semantic::SemanticLookup::Hit {
                                 result,
                                 approximate,
@@ -795,6 +931,7 @@ impl QueryCache {
                                     },
                                     QueryPrep {
                                         hints,
+                                        namespace: [0; 32],
                                         normalized: Some(normalized),
                                         keyed_verbatim,
                                         generation: None,
@@ -837,6 +974,7 @@ impl QueryCache {
         let generation = Some(self.generation_of(&normalized.tables));
         QueryPrep {
             hints,
+            namespace: [0; 32],
             normalized: Some(normalized),
             keyed_verbatim,
             generation,
@@ -859,7 +997,7 @@ impl QueryCache {
         self.heat.record_hit(&result.tables, start);
 
         // Promote to L1 (raw: L2 returned the payload decompressed)
-        if self.config.l1.enabled {
+        if self.config.l1.enabled && prep.hints.allows_l1() {
             if let Some(conn_id) = context.connection_id {
                 let l1 = self.get_l1_cache(conn_id);
                 self.l1_store(&l1, query, result.clone());
@@ -939,6 +1077,7 @@ impl QueryCache {
     ) {
         let prep = QueryPrep {
             hints: parse_cache_hints(query),
+            namespace: [0; 32],
             normalized: None,
             keyed_verbatim: false,
             generation: None,
@@ -994,7 +1133,7 @@ impl QueryCache {
         let hints = &prep.hints;
 
         // Skip if hint says so
-        if !prep.storable() {
+        if !prep.storable() || !self.hint_has_tier(hints, context) {
             return false;
         }
 
@@ -1005,21 +1144,39 @@ impl QueryCache {
         // read) switches L2 to the verbatim key, and the store is refused
         // below whether or not the snapshot already included the
         // `invalidate_all` that came with the switch.
-        let owned_normalized;
+        let mut owned_normalized;
         let (normalized, keyed_verbatim) = match prep.normalized.as_ref() {
             Some(n) => (n, prep.keyed_verbatim),
             None => {
                 let verbatim = self.heliosdb_backend();
+                if hints
+                    .tables
+                    .as_ref()
+                    .is_some_and(|tables| tables.len() > self.max_dependency_tables)
+                {
+                    return false;
+                }
+                let additional = match hints.additional_tables() {
+                    Ok(tables) => tables,
+                    Err(()) => return false,
+                };
                 owned_normalized = self.normalizer.normalize_with(query, verbatim);
+                if !self.add_dependencies(&mut owned_normalized, &additional) {
+                    return false;
+                }
                 (&owned_normalized, verbatim)
             }
         };
+
+        if normalized.tables.len() > self.max_dependency_tables {
+            return false;
+        }
 
         // The semantic tier's parse: the lookup's, or (a plain `put` of a
         // hinted read) made here, once, for both the TTL and the L3 store.
         let computed;
         let semantic = match &prep.semantic {
-            SemanticPrep::NotConsulted if hints.semantic_cache && self.l3_cache.is_some() => {
+            SemanticPrep::NotConsulted if hints.allows_l3() && self.l3_cache.is_some() => {
                 computed = SemanticPrep::of(query, &normalized.tables, &self.config.l3);
                 &computed
             }
@@ -1053,7 +1210,7 @@ impl QueryCache {
         // compression: a write while it compresses retires the fill. Only
         // zstd waits (boxed: this future then saves a pointer, not the
         // pool job's state, across the store's one suspension point).
-        let l2_payload = match &self.l2_cache {
+        let l2_payload = match self.l2_cache.as_ref().filter(|_| hints.allows_l2()) {
             Some(l2) if l2.compresses_off_worker(data.len()) => {
                 Some(Box::pin(Self::l2_payload_off_worker(l2, &data)).await)
             }
@@ -1088,7 +1245,7 @@ impl QueryCache {
         };
 
         // Store in L1 (exact match), raw
-        if self.config.l1.enabled {
+        if self.config.l1.enabled && hints.allows_l1() {
             if let Some(conn_id) = context.connection_id {
                 let l1 = self.get_l1_cache(conn_id);
                 self.l1_store(&l1, query, result.clone());
@@ -1097,7 +1254,7 @@ impl QueryCache {
 
         // Store in L2 (normalized), in the form made above
         if let (Some(l2), Some(payload)) = (&self.l2_cache, l2_payload) {
-            let cache_key = CacheKey::new(normalized, context);
+            let cache_key = CacheKey::namespaced(normalized, context, prep.namespace);
             // When L2 must make room, one pass sheds every write-retired
             // entry, on the reclaim thread.
             let evicted = l2.put_payload_now(
@@ -1121,9 +1278,10 @@ impl QueryCache {
         // Store in L3 (semantic) if hint enabled, by the form above; never a
         // canonical form once a HeliosDB backend was seen (checked now: the
         // backend may have been dialed for this very read).
-        if hints.semantic_cache && !self.canonical_tier_off() {
+        if hints.allows_l3() && !self.canonical_tier_off() {
             if let (Some(l3), SemanticPrep::Canonical(c)) = (&self.l3_cache, semantic) {
-                let evicted = l3.store(c, context, result, &|r| self.is_current(r));
+                let evicted =
+                    l3.store_scoped(c, context, &prep.namespace, result, &|r| self.is_current(r));
                 self.metrics
                     .record_evictions(CacheLevel::L3Semantic, evicted);
             }
@@ -1311,6 +1469,19 @@ impl QueryCache {
     /// Get cache statistics
     pub fn stats(&self) -> CacheStatsSnapshot {
         self.metrics.snapshot()
+    }
+
+    /// Bound retained dependency metadata. Larger inferred/declaration sets
+    /// bypass caching; zero or an impossible vector capacity is rejected.
+    pub fn with_max_dependency_tables(mut self, limit: usize) -> crate::Result<Self> {
+        crate::config::validate_cache_dependency_limit(limit)?;
+        self.max_dependency_tables = limit;
+        Ok(self)
+    }
+
+    /// Most dependency names retained by one result.
+    pub fn max_dependency_tables(&self) -> usize {
+        self.max_dependency_tables
     }
 
     /// Get configuration
@@ -3428,5 +3599,121 @@ mod write_tables_fast_path_tests {
             let slow = crate::sql_text::with_lexer_only(|| cache.write_tables(&sql));
             assert_eq!(fast, slow, "{sql:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod session_namespace_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn startup_namespace_isolates_l2_and_semantic_results() {
+        for semantic in [false, true] {
+            let mut config = CacheConfig::default();
+            config.l1.enabled = false;
+            config.l2.enabled = !semantic;
+            config.l3.enabled = semantic;
+            let cache = QueryCache::new(config);
+            let context = CacheContext::default();
+            let sql = "SELECT value FROM widgets /*helios:cache=semantic*/";
+            let first = [1; 32];
+            let second = [2; 32];
+            let (hit, prep) = cache.get_scoped(sql, None, &context, &first).await;
+            assert!(matches!(hit, CacheLookup::Miss));
+            cache
+                .put_prepared(
+                    sql,
+                    &context,
+                    &prep,
+                    Bytes::from_static(b"first"),
+                    1,
+                    Duration::ZERO,
+                )
+                .await;
+            assert!(matches!(
+                cache.get_scoped(sql, None, &context, &first).await.0,
+                CacheLookup::Hit { .. }
+            ));
+            assert!(matches!(
+                cache.get_scoped(sql, None, &context, &second).await.0,
+                CacheLookup::Miss
+            ));
+            // Public library callers occupy their own unscoped namespace.
+            assert!(matches!(cache.get(sql, &context).await, CacheLookup::Miss));
+            let (_, prep) = cache.get_scoped(sql, None, &context, &second).await;
+            cache
+                .put_prepared(
+                    sql,
+                    &context,
+                    &prep,
+                    Bytes::from_static(b"second"),
+                    1,
+                    Duration::ZERO,
+                )
+                .await;
+            for (namespace, expected) in
+                [(first, b"first".as_slice()), (second, b"second".as_slice())]
+            {
+                let CacheLookup::Hit { result, level } =
+                    cache.get_scoped(sql, None, &context, &namespace).await.0
+                else {
+                    panic!("scoped fill missing")
+                };
+                assert_eq!(result.data.as_ref(), expected);
+                assert_eq!(
+                    level,
+                    if semantic {
+                        CacheLevel::L3Semantic
+                    } else {
+                        CacheLevel::L2Warm
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod hint_contract_tests;
+
+#[cfg(test)]
+mod dependency_limit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dependency_limits_cover_inferred_declared_and_refresh_paths() {
+        assert!(QueryCache::new(CacheConfig::default())
+            .with_max_dependency_tables(0)
+            .is_err());
+        let cache = QueryCache::new(CacheConfig::default())
+            .with_max_dependency_tables(1)
+            .unwrap();
+        let ctx = CacheContext {
+            connection_id: Some(1),
+            ..Default::default()
+        };
+        for sql in [
+            "SELECT a.v FROM a JOIN b ON a.id = b.id",
+            "SELECT v FROM a /*helios:cache_tables=b*/",
+            "SELECT v FROM a /*helios:cache_tables=b,cache_refresh*/",
+            "SELECT v FROM a /*helios:cache_tables=a,a*/",
+        ] {
+            let (_, prep) = cache.get_with_prep(sql, &ctx).await;
+            assert!(!prep.storable(), "{sql}");
+            cache
+                .put(
+                    sql,
+                    &ctx,
+                    Bytes::from_static(b"not retained"),
+                    1,
+                    Duration::ZERO,
+                )
+                .await;
+            assert!(
+                matches!(cache.get(sql, &ctx).await, CacheLookup::Miss),
+                "{sql}"
+            );
+        }
+        assert_eq!(cache.entry_counts().l1, 0);
     }
 }

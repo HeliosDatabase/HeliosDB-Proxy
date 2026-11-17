@@ -413,6 +413,40 @@ impl ProxyServer {
         query_cache || edge
     }
 
+    /// Whether a result cache may use a backend execution-scope proof for `session`
+    /// outside an explicit transaction: the query cache runs, or the edge
+    /// cache is on and the session is still eligible for it. The relay's
+    /// refusal scans ([`Self::cache_refuses`]) and their counters run only
+    /// then.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) fn cache_scope_eligible(
+        session: &ClientSession,
+        state: &ServerState,
+        config: &ProxyConfig,
+    ) -> bool {
+        #[cfg(feature = "query-cache")]
+        let query_cache = state.query_cache.is_some()
+            && !session
+                .cache_ineligible
+                .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "query-cache"))]
+        let query_cache = {
+            let _ = state;
+            false
+        };
+        #[cfg(feature = "edge-proxy")]
+        let edge = config.edge.enabled
+            && !session
+                .edge_ineligible
+                .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "edge-proxy"))]
+        let edge = {
+            let _ = (session, config);
+            false
+        };
+        query_cache || edge
+    }
+
     /// Whether neither result cache may look up, capture or store the
     /// cacheable read `sql` (the forwarded text), in any tier (L1, L2, L3,
     /// `[edge]`), counting why: it names a system catalog relation
@@ -447,6 +481,65 @@ impl ProxyServer {
         true
     }
 
+    /// Unknown functions, writes (including triggers), and context-control
+    /// statements cannot preserve a shared result cache's execution identity.
+    /// Do not trust the separate operator-extended replay allowlist here.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) fn cache_context_may_change(sql: &str) -> bool {
+        // A name such as abs/count does not prove which catalog function or
+        // overload the backend resolved. Until that identity is verified,
+        // function-call-shaped reads (and EXPLAIN) must execute natively and
+        // make the session ineligible for later cached results too.
+        static POLICY: std::sync::LazyLock<TrReadPolicy> =
+            std::sync::LazyLock::new(TrReadPolicy::default);
+        let core = crate::protocol::skip_leading_comments(sql);
+        Self::tr_routing_classify(core, &POLICY) != StmtKind::Read
+            || !Self::tr_read_eligible(core, &POLICY)
+    }
+
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) async fn cache_startup_namespace(session: &ClientSession) -> &[u8; 32] {
+        if let Some(namespace) = session.cache_startup_namespace.get() {
+            return namespace;
+        }
+        use sha2::{Digest, Sha256};
+        let vars = session.variables.read().await;
+        if vars.is_empty() {
+            return session.cache_startup_namespace.get_or_init(|| [0; 32]);
+        }
+        let mut sorted: Vec<_> = vars.iter().collect();
+        sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let mut hash = Sha256::new();
+        hash.update(b"helios-query-cache-startup-v1");
+        for (key, value) in sorted {
+            for part in [key, value] {
+                hash.update((part.len() as u64).to_be_bytes());
+                hash.update(part.as_bytes());
+            }
+        }
+        session
+            .cache_startup_namespace
+            .get_or_init(|| hash.finalize().into())
+    }
+
+    /// L1 uses raw SQL within a client connection; retire it before changing
+    /// the effective backend namespace (a route, lease or settings change).
+    #[cfg(feature = "query-cache")]
+    pub(super) fn cache_use_namespace(
+        session: &ClientSession,
+        cache: &crate::cache::QueryCache,
+        namespace: [u8; 32],
+    ) {
+        let mut previous = session
+            .cache_effective_namespace
+            .lock()
+            .expect("cache namespace mutex poisoned");
+        if previous.is_some_and(|old| old != namespace) {
+            cache.remove_l1_cache(session.id.as_u64_pair().0);
+        }
+        *previous = Some(namespace);
+    }
+
     /// Decide whether a read query is safe to serve from / store in the cache,
     /// and build its `CacheContext`. Returns `None` for anything not a plain,
     /// deterministic, non-transactional SELECT.
@@ -458,7 +551,11 @@ impl ProxyServer {
         session: &Arc<ClientSession>,
         is_cacheable_read: bool,
     ) -> Option<crate::cache::CacheContext> {
-        if !is_cacheable_read {
+        if !is_cacheable_read
+            || session
+                .cache_ineligible
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return None;
         }
         // Never cache mid-transaction (visibility would be wrong).

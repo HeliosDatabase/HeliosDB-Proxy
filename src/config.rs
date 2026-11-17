@@ -8,6 +8,19 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+/// Default cap on inferred plus explicitly declared result-cache dependencies.
+pub(crate) const DEFAULT_CACHE_MAX_DEPENDENCY_TABLES: usize = 64;
+
+pub(crate) fn validate_cache_dependency_limit(limit: usize) -> Result<()> {
+    let allocation_limit = isize::MAX as usize / std::mem::size_of::<String>();
+    if limit == 0 || limit > allocation_limit {
+        return Err(ProxyError::Config(format!(
+            "cache.max_dependency_tables must be between 1 and {allocation_limit}"
+        )));
+    }
+    Ok(())
+}
+
 // =============================================================================
 // POOL MODE TYPES
 // =============================================================================
@@ -357,6 +370,12 @@ pub struct ProxyConfig {
     /// that somehow depend on the redundant round trip.
     #[serde(default = "default_true")]
     pub optimize_unnamed_parse: bool,
+    /// What the proxy does with PostgreSQL's legacy `FunctionCall` message,
+    /// which runs a function by OID with no SQL text for the proxy's SQL
+    /// controls to read (see [`FunctionCallMode`]). Default: forward the
+    /// built-in large-object functions and refuse every other OID.
+    #[serde(default)]
+    pub function_call: FunctionCallMode,
     /// How long a graceful binary-handoff drain (SIGUSR2) keeps serving
     /// in-flight connections before the old process exits (Batch H). After this
     /// many seconds, any still-open connections are dropped so the handoff
@@ -824,6 +843,13 @@ pub struct McpConfig {
     /// Needs the `query-cache` feature. Default `false`.
     #[serde(default)]
     pub tool_cache_enabled: bool,
+    /// Explicitly vouch that skipping a cached read preserves backend effects,
+    /// stable values and dependencies (including hidden time/random behavior),
+    /// and that every pooled backend context sharing this gateway cache key
+    /// is equivalent, including hidden settings and role/catalog generations.
+    /// Independent of [cache] and TR trust. Default false; startup only.
+    #[serde(default)]
+    pub trust_backend_read_effects: bool,
     /// Longest a cached `query` result is served, seconds (1..=86400); a
     /// shorter `[[cache.tables]] ttl_secs` of a table its text names applies.
     #[serde(default = "default_mcp_tool_cache_ttl_secs")]
@@ -1072,9 +1098,9 @@ fn mcp_principal_id_error(id: &str) -> Option<String> {
 }
 
 impl McpConfig {
-    /// Whether the tool-result cache runs: `[mcp]` and `tool_cache_enabled`.
+    /// Whether the tool cache runs under its explicit backend execution contract.
     pub fn tool_cache_on(&self) -> bool {
-        self.enabled && self.tool_cache_enabled
+        self.enabled && self.tool_cache_enabled && self.trust_backend_read_effects
     }
 
     /// Whether the memory tools run: `[mcp]` and `memory_enabled`.
@@ -1311,6 +1337,7 @@ impl Default for McpConfig {
             max_result_rows: default_mcp_max_result_rows(),
             max_result_bytes: default_mcp_max_result_bytes(),
             tool_cache_enabled: false,
+            trust_backend_read_effects: false,
             tool_cache_ttl_secs: default_mcp_tool_cache_ttl_secs(),
             tool_cache_catalog_ttl_secs: default_mcp_tool_cache_catalog_ttl_secs(),
             tool_cache_max_entries: default_mcp_tool_cache_max_entries(),
@@ -1891,6 +1918,12 @@ pub struct MultiTenancyToml {
     /// Per-tenant overrides of `max_replay_bytes_per_tenant` (`0` = none for
     /// that tenant). Every key must be in `tenants`.
     pub tenant_max_replay_bytes: std::collections::BTreeMap<String, usize>,
+    /// Most recovery-journal bytes one known tenant may retain across active
+    /// and committed transactions. Zero means unlimited.
+    pub max_journal_bytes_per_tenant: usize,
+    /// Per-tenant overrides of `max_journal_bytes_per_tenant` (zero means
+    /// unlimited). Every key must be in `tenants`.
+    pub tenant_max_journal_bytes: std::collections::BTreeMap<String, usize>,
     /// What a session whose tenant cannot be identified may do with the
     /// tenant tables (`tenant_tables`) when row isolation is on. `refuse`
     /// (default): a simple-protocol statement that references a tenant table
@@ -1960,12 +1993,33 @@ impl Default for MultiTenancyToml {
             idle_permit_timeout_ms: 0,
             max_replay_bytes_per_tenant: 0,
             tenant_max_replay_bytes: std::collections::BTreeMap::new(),
+            max_journal_bytes_per_tenant: 0,
+            tenant_max_journal_bytes: std::collections::BTreeMap::new(),
             unknown_tenant: UnknownTenantPolicy::Refuse,
         }
     }
 }
 
 impl MultiTenancyToml {
+    /// This section with every per-tenant cap and byte budget at its
+    /// default: what is left is what a SIGHUP cannot change. Two sections
+    /// equal here differ at most in the caps a reload may resize
+    /// (`tenant_slots::TenantSlots::reload_caps`).
+    pub fn without_caps(&self) -> Self {
+        let defaults = Self::default();
+        Self {
+            max_clients_per_tenant: defaults.max_clients_per_tenant,
+            tenant_max_clients: defaults.tenant_max_clients,
+            max_active_queries_per_tenant: defaults.max_active_queries_per_tenant,
+            tenant_max_active_queries: defaults.tenant_max_active_queries,
+            max_replay_bytes_per_tenant: defaults.max_replay_bytes_per_tenant,
+            tenant_max_replay_bytes: defaults.tenant_max_replay_bytes,
+            max_journal_bytes_per_tenant: defaults.max_journal_bytes_per_tenant,
+            tenant_max_journal_bytes: defaults.tenant_max_journal_bytes,
+            ..self.clone()
+        }
+    }
+
     /// The client-session cap of a known tenant (H-05): its
     /// `tenant_max_clients` override, else `max_clients_per_tenant`; 0 = none.
     pub fn client_cap(&self, tenant: &str) -> usize {
@@ -1993,6 +2047,15 @@ impl MultiTenancyToml {
             .get(tenant)
             .copied()
             .unwrap_or(self.max_replay_bytes_per_tenant)
+    }
+
+    /// The recovery-journal memory budget of a known tenant; zero is
+    /// unlimited.
+    pub fn journal_byte_cap(&self, tenant: &str) -> usize {
+        self.tenant_max_journal_bytes
+            .get(tenant)
+            .copied()
+            .unwrap_or(self.max_journal_bytes_per_tenant)
     }
 }
 
@@ -2135,10 +2198,36 @@ pub const CACHE_HEATMAP_MAX_SLOTS: usize = 1 << 22;
 pub struct CacheToml {
     /// Serve read SELECT results from an in-process L1/L2 cache. Default `false`.
     pub enabled: bool,
+    /// Vouch that arbitrary backend reads accepted by every other cache guard
+    /// may be skipped safely (including hidden per-read actions or volatility)
+    /// and depend only on the proved context and
+    /// declared/observed invalidation dependencies. Applies to query and edge
+    /// caches independently of TR. False restricts caching to tiny scalar
+    /// integer SELECTs; other SQL executes natively. Startup only.
+    pub trust_backend_read_effects: bool,
+    /// Reuse a backend settings proof for this physical connection. Enabling
+    /// this requires the operator to guarantee its effective context never
+    /// changes (including backend configuration reloads). Default false:
+    /// verify before each lookup and again before publishing a native fill.
+    pub backend_context_immutable: bool,
+    /// Answer extended-protocol reads (a prepared statement's
+    /// Bind/Execute/Sync, or an unnamed Parse/Bind/Execute/Sync) from the
+    /// query cache as well. An entry is keyed by the statement text, its
+    /// declared parameter types, the bound parameter values and their format
+    /// codes, and the result format codes, so a text and a binary result
+    /// never share one. Default `true`; `false` leaves every extended batch
+    /// to the backend. Startup only.
+    pub extended_protocol: bool,
+    /// Maximum bytes accepted for the complete backend settings proof, also
+    /// capped by limits.max_pending_bytes. Default 512 KiB; must be positive.
+    pub max_backend_context_bytes: usize,
     /// Time-to-live for cached results, seconds.
     pub ttl_secs: u64,
     /// Maximum single result size to cache, bytes (larger results bypass).
     pub max_result_bytes: usize,
+    /// Maximum retained inferred/declared dependency names per result.
+    /// Larger or unreadable sets bypass caching. Default 64; positive.
+    pub max_dependency_tables: usize,
     /// Hard ceiling, in bytes, on the response the proxy is willing to buffer
     /// in memory while streaming a cacheable read to the client.
     ///
@@ -3018,8 +3107,13 @@ impl Default for CacheToml {
     fn default() -> Self {
         Self {
             enabled: false,
+            trust_backend_read_effects: false,
+            backend_context_immutable: false,
+            extended_protocol: true,
+            max_backend_context_bytes: 512 * 1024,
             ttl_secs: 300,
             max_result_bytes: 1024 * 1024,
+            max_dependency_tables: DEFAULT_CACHE_MAX_DEPENDENCY_TABLES,
             max_cacheable_response_bytes: 4 * 1024 * 1024,
             invalidation_source: CacheInvalidationSource::Proxy,
             logical_dsn: String::new(),
@@ -3218,6 +3312,15 @@ pub struct LimitsToml {
     /// connected and is not re-read).
     #[serde(default = "default_client_idle_timeout_secs")]
     pub client_idle_timeout_secs: u64,
+    /// Longest pause in client input during COPY FROM STDIN, seconds.
+    /// Applies even to a partially received CopyData frame. Client bytes
+    /// reset the timer; unsolicited backend traffic does not. Also bounds
+    /// an extended COPY's final Sync once the backend has completed/failed
+    /// the input; backend processing time is excluded. Expiry ends the
+    /// session with FATAL 57014 and rolls back its unfinished COPY.
+    /// 0 (default) disables it. Applied at startup; at most one year.
+    #[serde(default)]
+    pub copy_idle_timeout_secs: u64,
     /// Bounded admission queue for the `max_client_connections` cap (H-05).
     /// When > 0, a connection arriving at the cap waits up to this many
     /// seconds for a permit (fair, FIFO) before being refused with SQLSTATE
@@ -3488,6 +3591,7 @@ impl Default for LimitsToml {
             pool_reap_interval_secs: default_pool_reap_interval_secs(),
             max_client_connections: default_max_client_connections(),
             client_idle_timeout_secs: default_client_idle_timeout_secs(),
+            copy_idle_timeout_secs: 0,
             client_admission_wait_secs: default_client_admission_wait_secs(),
             client_tcp_keepalive_secs: default_client_tcp_keepalive_secs(),
             gateway_pool_max_idle: default_gateway_pool_max_idle(),
@@ -3836,6 +3940,7 @@ impl Default for ProxyConfig {
             schema_routing: SchemaRoutingToml::default(),
             graphql_gateway: GraphqlGatewayConfig::default(),
             optimize_unnamed_parse: true,
+            function_call: FunctionCallMode::default(),
             shutdown_drain_timeout_secs: default_drain_timeout_secs(),
             limits: LimitsToml::default(),
             journal: JournalToml::default(),
@@ -4633,6 +4738,7 @@ impl ProxyConfig {
             ("tenant_max_clients", &mt.tenant_max_clients),
             ("tenant_max_active_queries", &mt.tenant_max_active_queries),
             ("tenant_max_replay_bytes", &mt.tenant_max_replay_bytes),
+            ("tenant_max_journal_bytes", &mt.tenant_max_journal_bytes),
         ] {
             if let Some(unknown) = overrides.keys().find(|k| !mt.tenants.contains(k)) {
                 return Err(ProxyError::Config(format!(
@@ -4640,9 +4746,39 @@ impl ProxyConfig {
                 )));
             }
         }
+        let tenant_journal_budget_enabled = mt.enabled
+            && mt
+                .tenants
+                .iter()
+                .any(|tenant| mt.journal_byte_cap(tenant) > 0);
+        if tenant_journal_budget_enabled && !self.journal.dir.trim().is_empty() {
+            return Err(ProxyError::Config(
+                "multi_tenancy recovery-journal byte budgets cannot be combined with journal.dir; the durable sink requires complete active transactions in memory"
+                    .to_string(),
+            ));
+        }
         // Each tenant cap builds a tokio semaphore, which panics above
         // `Semaphore::MAX_PERMITS`.
         let max_permits = tokio::sync::Semaphore::MAX_PERMITS;
+        for (key, cap) in [
+            ("pool.max_connections", self.pool.max_connections),
+            (
+                "limits.max_concurrent_reconnects_per_node",
+                self.limits.max_concurrent_reconnects_per_node,
+            ),
+        ]
+        .into_iter()
+        .chain(
+            self.nodes
+                .iter()
+                .map(|node| ("nodes.max_connections", node.max_connections)),
+        ) {
+            if cap > max_permits {
+                return Err(ProxyError::Config(format!(
+                    "{key} must be <= {max_permits}"
+                )));
+            }
+        }
         for (key, cap) in [
             ("max_clients_per_tenant", mt.max_clients_per_tenant),
             (
@@ -4839,11 +4975,17 @@ impl ProxyConfig {
                 }
             }
         }
+        if self.cache.max_backend_context_bytes == 0 {
+            return Err(ProxyError::Config(
+                "cache.max_backend_context_bytes must be >= 1".to_string(),
+            ));
+        }
         if self.cache.max_cacheable_response_bytes == 0 {
             return Err(ProxyError::Config(
                 "cache.max_cacheable_response_bytes must be >= 1".to_string(),
             ));
         }
+        validate_cache_dependency_limit(self.cache.max_dependency_tables)?;
         self.cache.validate_sizes_and_compression()?;
         self.cache.validate_semantic_and_tables()?;
         self.cache.validate_refresh_ahead()?;
@@ -4994,6 +5136,11 @@ impl ProxyConfig {
             if l.client_idle_timeout_secs > MAX_LIMIT_SECS {
                 return Err(ProxyError::Config(format!(
                     "limits.client_idle_timeout_secs must be <= {MAX_LIMIT_SECS} seconds (1 year)"
+                )));
+            }
+            if l.copy_idle_timeout_secs > MAX_LIMIT_SECS {
+                return Err(ProxyError::Config(format!(
+                    "limits.copy_idle_timeout_secs must be <= {MAX_LIMIT_SECS} seconds (1 year)"
                 )));
             }
             if l.client_admission_wait_secs > MAX_LIMIT_SECS {
@@ -5441,6 +5588,43 @@ impl ProxyConfig {
         same_host(listen_host) || (matches!(listen_host, "0.0.0.0" | "::" | "") && loopback)
     }
 
+    /// Whether writes to the HTTP gateway's backend are visible to its SQL
+    /// result cache through proxy routing or logical invalidation (C-02).
+    pub fn http_gateway_cache_sees_writes(&self) -> bool {
+        if self.cache.enabled && self.cache.invalidation_source == CacheInvalidationSource::Logical
+        {
+            return true;
+        }
+        let host = self
+            .http_gateway
+            .backend_host
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let port = self.http_gateway.backend_port;
+        let same_host = |a: &str| {
+            a.trim_start_matches('[')
+                .trim_end_matches(']')
+                .eq_ignore_ascii_case(host)
+        };
+        if self
+            .nodes
+            .iter()
+            .any(|n| n.port == port && same_host(&n.host))
+        {
+            return true;
+        }
+        let Some((listen_host, listen_port)) = self.listen_address.rsplit_once(':') else {
+            return false;
+        };
+        if listen_port.parse::<u16>().ok() != Some(port) {
+            return false;
+        }
+        let listen_host = listen_host.trim_start_matches('[').trim_end_matches(']');
+        let loopback =
+            matches!(host, "127.0.0.1" | "::1") || host.eq_ignore_ascii_case("localhost");
+        same_host(listen_host) || (matches!(listen_host, "0.0.0.0" | "::" | "") && loopback)
+    }
+
     /// Get primary node
     pub fn primary_node(&self) -> Option<&NodeConfig> {
         self.nodes
@@ -5460,6 +5644,35 @@ impl ProxyConfig {
     pub fn enabled_nodes(&self) -> Vec<&NodeConfig> {
         self.nodes.iter().filter(|n| n.enabled).collect()
     }
+}
+
+/// Which legacy `FunctionCall` messages (the fastpath interface: libpq
+/// `PQfn` and the `lo_*` client functions, JDBC `LargeObject`, `pg_dump` of
+/// large objects) the proxy forwards. A forwarded call is a request like any
+/// other for the tenant's active-query cap, the rate limiter and the circuit
+/// breaker, and always runs on the primary. It carries a function OID and
+/// binary arguments, no SQL: plugins, rewrite rules, tenant row filters,
+/// anomaly detection and query analytics never see it, and a transaction
+/// that contains one is never replayed after a failover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FunctionCallMode {
+    /// Forward PostgreSQL's built-in large-object functions (`lo_open`,
+    /// `lo_close`, `loread`, `lowrite`, `lo_lseek`, `lo_lseek64`, `lo_tell`,
+    /// `lo_tell64`, `lo_creat`, `lo_create`, `lo_unlink`, `lo_truncate`,
+    /// `lo_truncate64`, by their fixed catalog OIDs) and refuse every other
+    /// function with `0A000`. They change no setting, take no session lock
+    /// and touch no user table.
+    #[default]
+    LargeObjects,
+    /// Forward every function OID. The proxy cannot know what such a call
+    /// does: each one retires every cached result, keeps the session's reads
+    /// on the primary and its backend connection out of the clean-reset
+    /// shortcut, and, under a tenant active-query cap, counts as holding a
+    /// session-level lock (the session keeps its permit and its connection).
+    Any,
+    /// Refuse every `FunctionCall` with `0A000`.
+    Refuse,
 }
 
 /// TR (Transaction Replay) mode — what the proxy does for a client session
@@ -5852,7 +6065,7 @@ mod tests {
         }
     }
 
-    /// Every example configuration shipped in `config/` loads through the
+    /// Configurations in `config/` and the multi-tenant example load through the
     /// real parser and validation (a generic TOML parse is not enough: it
     /// cannot see a wrong type or a failed `validate()`) AND carries zero
     /// unknown keys at any depth. `config/*.toml` is documentation — a
@@ -5863,20 +6076,43 @@ mod tests {
     #[test]
     fn shipped_example_configs_load() {
         let mut checked = 0;
-        for entry in std::fs::read_dir("config").expect("config/ present") {
-            let path = entry.unwrap().path();
+        let paths = std::fs::read_dir("config")
+            .expect("config/ present")
+            .map(|entry| entry.unwrap().path())
+            .chain(std::iter::once(std::path::PathBuf::from(
+                "examples/multi-tenant/proxy.toml",
+            )));
+        for path in paths {
             if path.extension().and_then(|e| e.to_str()) != Some("toml") {
                 continue;
             }
             let path_str = path.to_str().unwrap();
-            if let Err(e) = ProxyConfig::from_file(path_str) {
-                panic!("{} does not load: {e}", path.display());
+            let needs_multi_tenancy = path_str == "examples/multi-tenant/proxy.toml";
+            match ProxyConfig::from_file(path_str) {
+                Err(e) if needs_multi_tenancy && !cfg!(feature = "multi-tenancy") => {
+                    assert!(
+                        e.to_string().contains("enabled but not compiled"),
+                        "{} should refuse the missing feature by name: {e}",
+                        path.display()
+                    );
+                }
+                Err(e) => panic!("{} does not load: {e}", path.display()),
+                Ok(_) => assert!(
+                    !needs_multi_tenancy || cfg!(feature = "multi-tenancy"),
+                    "the strict multi-tenant example must refuse a build without multi-tenancy"
+                ),
             }
             let raw = std::fs::read_to_string(&path).unwrap();
             let substituted = substitute_env(&raw)
                 .unwrap_or_else(|e| panic!("env substitution failed for {}: {e}", path.display()));
-            let (_, ignored) = deserialize_reporting_ignored_paths(&substituted)
+            let (mut config, ignored) = deserialize_reporting_ignored_paths(&substituted)
                 .unwrap_or_else(|e| panic!("{} failed to parse: {e}", path.display()));
+            // Subset builds must still validate every other setting of the
+            // feature-specific example after proving its strict feature refusal.
+            config.strict_config = false;
+            config
+                .validate()
+                .unwrap_or_else(|e| panic!("{} failed validation: {e}", path.display()));
             assert!(
                 ignored.is_empty(),
                 "{} has unknown keys not recognised by ProxyConfig (fix the \
@@ -6042,14 +6278,17 @@ mod tests {
                 mt.active_query_wait_ms,
                 mt.idle_permit_timeout_ms,
                 mt.replay_byte_cap("acme"),
+                mt.journal_byte_cap("acme"),
             ),
-            (0, 5000, 0, 0)
+            (0, 5000, 0, 0, 0)
         );
         let ok: ProxyConfig = toml::from_str(&format!(
             "{base}max_active_queries_per_tenant = 20\nactive_query_wait_ms = 300\n\
              idle_permit_timeout_ms = 60000\nmax_replay_bytes_per_tenant = 1000\n\
+             max_journal_bytes_per_tenant = 4096\n\
              [multi_tenancy.tenant_max_active_queries]\nacme = 50\ntiny = 0\n\
-             [multi_tenancy.tenant_max_replay_bytes]\ntiny = 7\n"
+             [multi_tenancy.tenant_max_replay_bytes]\ntiny = 7\n\
+             [multi_tenancy.tenant_max_journal_bytes]\ntiny = 0\nacme = 8192\n"
         ))
         .unwrap();
         ok.validate().unwrap();
@@ -6059,13 +6298,20 @@ mod tests {
         assert_eq!(mt.active_query_cap("other"), 20);
         assert_eq!(mt.replay_byte_cap("acme"), 1000);
         assert_eq!(mt.replay_byte_cap("tiny"), 7);
+        assert_eq!(mt.journal_byte_cap("acme"), 8192);
+        assert_eq!(mt.journal_byte_cap("tiny"), 0);
+        assert_eq!(mt.journal_byte_cap("other"), 4096);
         assert_eq!(
             (mt.active_query_wait_ms, mt.idle_permit_timeout_ms),
             (300, 60000)
         );
 
         // Overrides must name configured tenants; the message names the key.
-        for key in ["tenant_max_active_queries", "tenant_max_replay_bytes"] {
+        for key in [
+            "tenant_max_active_queries",
+            "tenant_max_replay_bytes",
+            "tenant_max_journal_bytes",
+        ] {
             let bad: ProxyConfig =
                 toml::from_str(&format!("{base}[multi_tenancy.{key}]\nglobex = 1\n")).unwrap();
             let err = bad.validate().unwrap_err().to_string();
@@ -6117,6 +6363,30 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn durable_journal_rejects_tenant_memory_budget() {
+        let mut config: ProxyConfig = toml::from_str(
+            "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n\
+             [multi_tenancy]\nenabled = true\ntenants = [\"acme\"]\n\
+             max_journal_bytes_per_tenant = 4096\n",
+        )
+        .unwrap();
+        config.journal.dir = "/tmp/proxy-journal".into();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("cannot be combined with journal.dir"),
+            "{error}"
+        );
+
+        config
+            .multi_tenancy
+            .tenant_max_journal_bytes
+            .insert("acme".into(), 0);
+        config
+            .validate()
+            .expect("tenant override disables the budget");
     }
 
     #[test]
@@ -7634,6 +7904,90 @@ database = "helios"
     }
 
     #[test]
+    fn backend_semaphore_caps_validate_before_runtime_construction() {
+        let max = tokio::sync::Semaphore::MAX_PERMITS;
+        let cases: [InvalidCase; 3] = [
+            ("nodes.max_connections", |c| {
+                c.nodes[0].max_connections = tokio::sync::Semaphore::MAX_PERMITS + 1;
+            }),
+            ("limits.max_concurrent_reconnects_per_node", |c| {
+                c.limits.max_concurrent_reconnects_per_node =
+                    tokio::sync::Semaphore::MAX_PERMITS + 1;
+            }),
+            ("pool.max_connections", |c| {
+                c.pool.max_connections = tokio::sync::Semaphore::MAX_PERMITS + 1;
+            }),
+        ];
+        for (key, invalidate) in cases {
+            let mut config = ProxyConfig::default();
+            config.add_node("127.0.0.1:5432", "primary").unwrap();
+            invalidate(&mut config);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains(key) && error.contains(&max.to_string()),
+                "{error}"
+            );
+        }
+        let mut config = ProxyConfig::default();
+        config.add_node("127.0.0.1:5432", "primary").unwrap();
+        config.nodes[0].max_connections = max;
+        config.pool.max_connections = max;
+        config.limits.max_concurrent_reconnects_per_node = max;
+        assert!(config.validate().is_ok());
+        config.nodes[0].max_connections = 0;
+        config.limits.max_concurrent_reconnects_per_node = 0;
+        assert!(
+            config.validate().is_ok(),
+            "zero keeps node/reconnect caps disabled"
+        );
+    }
+
+    #[test]
+    fn cache_dependency_limit_is_known_positive_and_layout_bounded() {
+        assert_eq!(
+            CacheToml::default().max_dependency_tables,
+            DEFAULT_CACHE_MAX_DEPENDENCY_TABLES
+        );
+        let source = r#"[[nodes]]
+host = "db"
+role = "primary"
+[cache]
+max_dependency_tables = 2
+"#;
+        let (mut config, ignored) = deserialize_reporting_ignored_paths(source).unwrap();
+        assert!(ignored.is_empty());
+        assert_eq!(config.cache.max_dependency_tables, 2);
+        assert!(config.validate().is_ok());
+        for invalid in [0, isize::MAX as usize / std::mem::size_of::<String>() + 1] {
+            config.cache.max_dependency_tables = invalid;
+            assert!(config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("cache.max_dependency_tables"));
+        }
+    }
+
+    #[test]
+    fn copy_idle_timeout_is_optional_bounded_and_known() {
+        assert_eq!(LimitsToml::default().copy_idle_timeout_secs, 0);
+        let source =
+            "[[nodes]]\nhost = \"db\"\nrole = \"primary\"\n[limits]\ncopy_idle_timeout_secs = 1\n";
+        let (mut config, ignored) = deserialize_reporting_ignored_paths(source).unwrap();
+        assert!(ignored.is_empty(), "{ignored:?}");
+        assert_eq!(config.limits.copy_idle_timeout_secs, 1);
+        assert!(config.validate().is_ok());
+        config.limits.copy_idle_timeout_secs = MAX_LIMIT_SECS;
+        assert!(config.validate().is_ok());
+        config.limits.copy_idle_timeout_secs += 1;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("limits.copy_idle_timeout_secs"));
+    }
+
+    #[test]
     fn node_max_connections_and_slot_wait_parse_and_validate() {
         let toml = "[[nodes]]\nhost = \"db\"\nport = 5432\nrole = \"primary\"\nmax_connections = 40\n\n[limits]\nbackend_slot_wait_ms = 250\n";
         let c: ProxyConfig = toml::from_str(toml).expect("parse");
@@ -8009,6 +8363,34 @@ database = "helios"
         assert_eq!(parsed.max_cacheable_response_bytes, 4 * 1024 * 1024);
         let parsed: CacheToml = toml::from_str("max_cacheable_response_bytes = 8192\n").unwrap();
         assert_eq!(parsed.max_cacheable_response_bytes, 8192);
+    }
+
+    #[test]
+    fn the_extended_protocol_cache_is_on_unless_switched_off() {
+        let parsed: CacheToml = toml::from_str("").unwrap();
+        assert!(parsed.extended_protocol);
+        let parsed: CacheToml = toml::from_str("extended_protocol = false\n").unwrap();
+        assert!(!parsed.extended_protocol);
+    }
+
+    #[test]
+    fn effective_scope_config_defaults_and_bounds() {
+        let parsed: CacheToml = toml::from_str("").unwrap();
+        assert!(!parsed.backend_context_immutable);
+        assert_eq!(parsed.max_backend_context_bytes, 512 * 1024);
+        let parsed: CacheToml =
+            toml::from_str("backend_context_immutable = true\nmax_backend_context_bytes = 8192\n")
+                .unwrap();
+        assert!(parsed.backend_context_immutable);
+        assert_eq!(parsed.max_backend_context_bytes, 8192);
+        let mut config = ProxyConfig::default();
+        config.add_node("localhost:5432", "primary").unwrap();
+        config.cache.max_backend_context_bytes = 0;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("cache.max_backend_context_bytes"));
     }
 
     /// `[cache] extra_volatile_functions` (Sprinter 87c5caf119f8): a list of
@@ -9045,6 +9427,37 @@ exclude = true
         assert_eq!(config.plugins.timeout_ms, 100);
     }
 
+    /// `function_call` reads its three spellings, defaults to the
+    /// large-object functions, and refuses anything else by name.
+    #[test]
+    fn function_call_mode_parses_its_three_values() {
+        let parse = |line: &str| toml::from_str::<ProxyConfig>(line).map(|c| c.function_call);
+        assert_eq!(parse("").unwrap(), FunctionCallMode::LargeObjects);
+        assert_eq!(
+            parse("function_call = \"large-objects\"").unwrap(),
+            FunctionCallMode::LargeObjects
+        );
+        assert_eq!(
+            parse("function_call = \"any\"").unwrap(),
+            FunctionCallMode::Any
+        );
+        assert_eq!(
+            parse("function_call = \"refuse\"").unwrap(),
+            FunctionCallMode::Refuse
+        );
+        let err = parse("function_call = \"forward\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("large-objects"), "{err}");
+        assert_eq!(
+            toml::to_string(&ProxyConfig::default())
+                .unwrap()
+                .lines()
+                .find(|l| l.starts_with("function_call")),
+            Some("function_call = \"large-objects\"")
+        );
+    }
+
     /// Existing TOML configs (written before this field existed) must
     /// round-trip through `Deserialize` without failing. The `plugins`
     /// section is `#[serde(default)]`, so omitting it yields the default.
@@ -9410,7 +9823,7 @@ exclude = true
         assert_eq!(d.tool_cache_max_entry_bytes, 1024 * 1024);
         assert_eq!(d.tool_cache_max_statement_bytes, 16 * 1024);
         let c: ProxyConfig = toml::from_str(
-            "[mcp]\nenabled = true\ntool_cache_enabled = true\ntool_cache_ttl_secs = 5\n\
+            "[mcp]\nenabled = true\ntool_cache_enabled = true\ntrust_backend_read_effects = true\ntool_cache_ttl_secs = 5\n\
              tool_cache_catalog_ttl_secs = 0\ntool_cache_max_entries = 7\n",
         )
         .unwrap();
@@ -9511,6 +9924,7 @@ exclude = true
             c.add_node("db1.internal:5432", "primary").unwrap();
             c.mcp.enabled = true;
             c.mcp.tool_cache_enabled = true;
+            c.mcp.trust_backend_read_effects = true;
             c.mcp.backend_host = "elsewhere.internal".into();
             c.mcp.backend_port = 5432;
             c
@@ -9558,6 +9972,35 @@ exclude = true
             !c.mcp_tool_cache_sees_writes(),
             "no logical source without [cache]"
         );
+    }
+
+    #[cfg(feature = "query-cache")]
+    #[test]
+    fn http_sql_cache_requires_visible_writes() {
+        let base = || {
+            let mut c = ProxyConfig {
+                listen_address: "0.0.0.0:6432".into(),
+                ..ProxyConfig::default()
+            };
+            c.add_node("db1.internal:5432", "primary").unwrap();
+            c.http_gateway.backend_host = "elsewhere.internal".into();
+            c.http_gateway.backend_port = 5432;
+            c
+        };
+        let mut c = base();
+        assert!(!c.http_gateway_cache_sees_writes());
+        c.http_gateway.backend_host = "db1.internal".into();
+        assert!(c.http_gateway_cache_sees_writes());
+        c.http_gateway.backend_host = "localhost".into();
+        c.http_gateway.backend_port = 6432;
+        assert!(c.http_gateway_cache_sees_writes());
+        c.http_gateway.backend_host = "elsewhere.internal".into();
+        c.http_gateway.backend_port = 5432;
+        c.cache.enabled = true;
+        c.cache.invalidation_source = CacheInvalidationSource::Logical;
+        assert!(c.http_gateway_cache_sees_writes());
+        c.cache.enabled = false;
+        assert!(!c.http_gateway_cache_sees_writes());
     }
 
     /// A config with the memory tools on and one principal.
@@ -9798,5 +10241,37 @@ exclude = true
         c.mcp.max_result_rows = MCP_MAX_RESULT_ROWS_CEILING;
         c.mcp.max_result_bytes = MCP_MAX_RESULT_BYTES_CEILING;
         assert!(c.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod cache_effects_contract_tests {
+    use super::*;
+
+    #[test]
+    fn cache_effects_contract_defaults_and_keys_are_independent() {
+        let mut config = ProxyConfig::default();
+        assert!(!config.cache.trust_backend_read_effects);
+        assert!(!config.mcp.trust_backend_read_effects);
+        for key in [
+            "cache.trust_backend_read_effects",
+            "mcp.trust_backend_read_effects",
+        ] {
+            assert!(known_config_keys().contains(key), "{key}");
+        }
+        for pg in [false, true] {
+            config.cache.trust_backend_read_effects = pg;
+            config.mcp.enabled = true;
+            config.mcp.tool_cache_enabled = true;
+            config.mcp.trust_backend_read_effects = false;
+            assert!(!config.mcp.tool_cache_on());
+            config.mcp.trust_backend_read_effects = true;
+            assert!(config.mcp.tool_cache_on());
+        }
+        let parsed: ProxyConfig = toml::from_str(
+            "[cache]\ntrust_backend_read_effects = true\n[mcp]\ntrust_backend_read_effects = false\n"
+        ).unwrap();
+        assert!(parsed.cache.trust_backend_read_effects);
+        assert!(!parsed.mcp.trust_backend_read_effects);
     }
 }

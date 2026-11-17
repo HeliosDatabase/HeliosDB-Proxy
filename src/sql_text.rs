@@ -1764,7 +1764,12 @@ impl ShorterTtls {
 /// (`U&"…"`), which can spell any name without its bytes
 /// (`U&"s\0065crets"`): a fail-closed name scan must treat it as a match.
 pub(crate) fn unicode_escaped_identifier(sql: &[u8]) -> bool {
-    memchr::memmem::find_iter(sql, b"&\"")
+    /// `&"`, built once (a searcher per call costs more than the search:
+    /// see `sql_lex::LINE_COMMENT_START`).
+    static AMPERSAND_QUOTE: once_cell::sync::Lazy<memchr::memmem::Finder<'static>> =
+        once_cell::sync::Lazy::new(|| memchr::memmem::Finder::new(b"&\""));
+    AMPERSAND_QUOTE
+        .find_iter(sql)
         .any(|at| at > 0 && sql[at - 1].eq_ignore_ascii_case(&b'u'))
 }
 

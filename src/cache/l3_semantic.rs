@@ -245,33 +245,59 @@ struct Counters {
     too_large: AtomicU64,
 }
 
-/// The strings of a session context, shared by the slots that hold it: a
-/// new slot takes them from a live slot of the same bucket (see
-/// [`Inner::shared_context`]), so they are never interned beyond the slots
-/// that use them.
-#[derive(Clone)]
-struct SharedContext {
-    database: Arc<str>,
-    user: Option<Arc<str>>,
-    branch: Option<Arc<str>>,
+/// The session context a slot was stored under: the cache namespace and the
+/// strings of its [`CacheContext`]. Slots hold it behind one pointer, shared
+/// by the slots of a bucket that have the same one (a new slot takes it from
+/// a live slot, see [`Inner::shared_context`]), so it is never interned
+/// beyond the slots that use it. Kept out of the slot itself for the slot's
+/// size: see [`SLOT_BLOCK_BYTES`].
+struct SlotContext {
+    namespace: [u8; 32],
+    database: Box<str>,
+    user: Option<Box<str>>,
+    branch: Option<Box<str>>,
 }
 
-impl SharedContext {
-    fn new(ctx: &CacheContext) -> Self {
-        Self {
-            database: Arc::from(ctx.database.as_str()),
-            user: ctx.user.as_deref().map(Arc::from),
-            branch: ctx.branch.as_deref().map(Arc::from),
-        }
+impl SlotContext {
+    fn new(ctx: &CacheContext, namespace: &[u8; 32]) -> Arc<Self> {
+        Arc::new(Self {
+            namespace: *namespace,
+            database: Box::from(ctx.database.as_str()),
+            user: ctx.user.as_deref().map(Box::from),
+            branch: ctx.branch.as_deref().map(Box::from),
+        })
+    }
+
+    /// This is `ctx` in `namespace`.
+    fn is(&self, ctx: &CacheContext, namespace: &[u8; 32]) -> bool {
+        self.namespace == *namespace
+            && *self.database == *ctx.database
+            && self.user.as_deref() == ctx.user.as_deref()
+            && self.branch.as_deref() == ctx.branch.as_deref()
     }
 }
+
+/// The most a bucket's first block of slots may take. A bucket (and the list
+/// of slots a store evicts) is a `Vec<Slot>`, whose first allocation holds
+/// [`SLOT_BLOCK`] slots, and nearly every bucket stays at one slot: every
+/// store into a full tier allocates and frees such a block. glibc serves a
+/// block of up to this size from its per-thread cache; a larger one takes the
+/// arena's lock and its bin lists, which showed as +6 % on a store into a
+/// full tier and +21 % with eight threads storing at once when the slot grew
+/// from 256 to 288 bytes (`cache/l3/store_full_5000`,
+/// `cache/l3/store_lookup_contended_8`).
+const SLOT_BLOCK_BYTES: usize = 1024;
+
+/// Slots in a `Vec<Slot>`'s first allocation (the standard library's minimum
+/// for an element of this size).
+const SLOT_BLOCK: usize = 4;
+
+const _: () = assert!(SLOT_BLOCK * std::mem::size_of::<Slot>() <= SLOT_BLOCK_BYTES);
 
 /// One cached result of one canonical statement in one session context.
 struct Slot {
     seq: u64,
-    database: Arc<str>,
-    user: Option<Arc<str>>,
-    branch: Option<Arc<str>>,
+    context: Arc<SlotContext>,
     shape: String,
     select: String,
     columns: Vec<Option<String>>,
@@ -280,24 +306,10 @@ struct Slot {
 }
 
 impl Slot {
-    /// Same statement shape in the same context (a bucket can, after a hash
-    /// collision, hold others).
-    fn matches(&self, c: &Canonical, ctx: &CacheContext) -> bool {
-        self.shape == c.shape && self.same_context(ctx)
-    }
-
-    fn same_context(&self, ctx: &CacheContext) -> bool {
-        *self.database == *ctx.database
-            && self.user.as_deref() == ctx.user.as_deref()
-            && self.branch.as_deref() == ctx.branch.as_deref()
-    }
-
-    fn shared_context(&self) -> SharedContext {
-        SharedContext {
-            database: self.database.clone(),
-            user: self.user.clone(),
-            branch: self.branch.clone(),
-        }
+    /// Same statement shape in the same context and namespace (a bucket
+    /// can, after a hash collision, hold others).
+    fn matches(&self, c: &Canonical, ctx: &CacheContext, namespace: &[u8; 32]) -> bool {
+        self.shape == c.shape && self.context.is(ctx, namespace)
     }
 }
 
@@ -588,6 +600,17 @@ fn bucket_key(c: &Canonical, ctx: &CacheContext) -> u64 {
     h.finish()
 }
 
+fn scoped_bucket_key(c: &Canonical, ctx: &CacheContext, namespace: &[u8; 32]) -> u64 {
+    let key = bucket_key(c, ctx);
+    if *namespace == [0; 32] {
+        return key;
+    }
+    let mut h = DefaultHasher::new();
+    key.hash(&mut h);
+    namespace.hash(&mut h);
+    h.finish()
+}
+
 fn expired(result: &CachedResult, now: Instant) -> bool {
     now.saturating_duration_since(result.cached_at) > result.ttl
 }
@@ -598,12 +621,17 @@ impl Inner {
         self.config.similarity_threshold < 1.0
     }
 
-    /// The context's strings for a new slot in shard `shard`, bucket `key`:
-    /// those of a live slot of that bucket holding the same context, else new
-    /// ones. Nothing is interned beyond the live slots (a string is freed with
-    /// the last slot holding it), and the shard is read-locked only for the
-    /// clone.
-    fn shared_context(&self, shard: usize, key: u64, ctx: &CacheContext) -> SharedContext {
+    /// The context of a new slot in shard `shard`, bucket `key`: that of a
+    /// live slot of that bucket holding the same one, else a new one. Nothing
+    /// is interned beyond the live slots (a context is freed with the last
+    /// slot holding it), and the shard is read-locked only for the clone.
+    fn shared_context(
+        &self,
+        shard: usize,
+        key: u64,
+        ctx: &CacheContext,
+        namespace: &[u8; 32],
+    ) -> Arc<SlotContext> {
         let held = self.shards[shard]
             .read()
             .buckets
@@ -611,10 +639,10 @@ impl Inner {
             .and_then(|bucket| {
                 bucket
                     .iter()
-                    .find(|s| s.same_context(ctx))
-                    .map(Slot::shared_context)
+                    .find(|s| s.context.is(ctx, namespace))
+                    .map(|s| s.context.clone())
             });
-        held.unwrap_or_else(|| SharedContext::new(ctx))
+        held.unwrap_or_else(|| SlotContext::new(ctx, namespace))
     }
 
     /// The index of the shard holding bucket `key`.
@@ -854,11 +882,22 @@ impl L3SemanticCache {
         is_current: &dyn Fn(&CachedResult) -> bool,
         max_age: Option<Duration>,
     ) -> SemanticLookup {
+        self.lookup_scoped(c, ctx, &[0; 32], is_current, max_age)
+    }
+
+    pub(crate) fn lookup_scoped(
+        &self,
+        c: &Canonical,
+        ctx: &CacheContext,
+        namespace: &[u8; 32],
+        is_current: &dyn Fn(&CachedResult) -> bool,
+        max_age: Option<Duration>,
+    ) -> SemanticLookup {
         let inner = &self.inner;
         if !inner.config.enabled {
             return SemanticLookup::Miss;
         }
-        let key = bucket_key(c, ctx);
+        let key = scoped_bucket_key(c, ctx, namespace);
         let now = Instant::now();
         let approximate = c.approximable && inner.approximate_on();
         let mut dead = false;
@@ -868,7 +907,7 @@ impl L3SemanticCache {
         {
             let shard = inner.shards[inner.shard_index(key)].read();
             for slot in shard.buckets.get(&key).into_iter().flatten().rev() {
-                if !slot.matches(c, ctx) {
+                if !slot.matches(c, ctx, namespace) {
                     continue;
                 }
                 if expired(&slot.result, now) {
@@ -1079,6 +1118,17 @@ impl L3SemanticCache {
         &self,
         c: &Canonical,
         ctx: &CacheContext,
+        result: CachedResult,
+        is_current: &dyn Fn(&CachedResult) -> bool,
+    ) -> usize {
+        self.store_scoped(c, ctx, &[0; 32], result, is_current)
+    }
+
+    pub(crate) fn store_scoped(
+        &self,
+        c: &Canonical,
+        ctx: &CacheContext,
+        namespace: &[u8; 32],
         mut result: CachedResult,
         is_current: &dyn Fn(&CachedResult) -> bool,
     ) -> usize {
@@ -1089,7 +1139,7 @@ impl L3SemanticCache {
         if result.ttl > inner.config.ttl {
             result.ttl = inner.config.ttl;
         }
-        let key = bucket_key(c, ctx);
+        let key = scoped_bucket_key(c, ctx, namespace);
         let now = Instant::now();
         let charge = result.size()
             + result.tables.iter().map(String::len).sum::<usize>()
@@ -1105,12 +1155,9 @@ impl L3SemanticCache {
             return 0;
         }
         let home = inner.shard_index(key);
-        let shared = inner.shared_context(home, key, ctx);
         let slot = Slot {
             seq: 0,
-            database: shared.database,
-            user: shared.user,
-            branch: shared.branch,
+            context: inner.shared_context(home, key, ctx, namespace),
             shape: c.shape.clone(),
             select: c.select.clone(),
             columns: c.columns.clone(),
@@ -1125,7 +1172,7 @@ impl L3SemanticCache {
             shard.next_seq += 1;
             let bucket = shard.buckets.entry(key).or_default();
             take_where(bucket, &mut dead, |s| {
-                s.matches(c, ctx)
+                s.matches(c, ctx, namespace)
                     && (expired(&s.result, now) || !is_current(&s.result) || s.select == c.select)
             });
             let replaced = dead.len();
@@ -2176,6 +2223,77 @@ mod tests {
             assert!(hit(cache.lookup(&c, &other, &|_| true)).is_none());
         }
         assert!(hit(cache.lookup(&c, &ctx(), &|_| true)).is_some());
+    }
+
+    /// A result stored in one namespace is found in no other, and each
+    /// namespace keeps its own result of the same statement and context.
+    #[test]
+    fn different_namespace_never_matches() {
+        let cache = L3SemanticCache::new(config(&closed_endpoint(), 1.0));
+        let c = canon("SELECT val FROM kv WHERE id = 1");
+        let (unscoped, a, b) = ([0u8; 32], [1u8; 32], [2u8; 32]);
+        cache.store_scoped(&c, &ctx(), &a, create_result("a"), &|_| true);
+        for other in [&unscoped, &b] {
+            assert!(hit(cache.lookup_scoped(&c, &ctx(), other, &|_| true, None)).is_none());
+        }
+        cache.store_scoped(&c, &ctx(), &b, create_result("b"), &|_| true);
+        for (namespace, data) in [(&a, "a"), (&b, "b")] {
+            let found = hit(cache.lookup_scoped(&c, &ctx(), namespace, &|_| true, None));
+            assert_eq!(found, Some((Bytes::from(data), false)));
+        }
+        assert_eq!(cache.len(), 2);
+    }
+
+    /// The slots of a bucket stored under one context share one copy of it;
+    /// another context or namespace reaching that bucket gets its own.
+    #[test]
+    fn slots_of_a_bucket_share_their_context() {
+        let cache = L3SemanticCache::new(config(&closed_endpoint(), 1.0));
+        let inner = &cache.inner;
+        for select in ["val", "alt"] {
+            put(
+                &cache,
+                &format!("SELECT {select} FROM kv WHERE id = 1"),
+                "r",
+            );
+        }
+        let unscoped = [0u8; 32];
+        let key = scoped_bucket_key(&canon("SELECT val FROM kv WHERE id = 1"), &ctx(), &unscoped);
+        let shard = inner.shard_index(key);
+        {
+            let guard = inner.shards[shard].read();
+            let bucket = &guard.buckets[&key];
+            assert_eq!(bucket.len(), 2);
+            assert!(Arc::ptr_eq(&bucket[0].context, &bucket[1].context));
+        }
+        let held = inner.shared_context(shard, key, &ctx(), &unscoped);
+        assert_eq!(Arc::strong_count(&held), 3);
+        let other_user = CacheContext {
+            user: Some("other".into()),
+            ..ctx()
+        };
+        for (context, namespace) in [(other_user, unscoped), (ctx(), [1u8; 32])] {
+            let new = inner.shared_context(shard, key, &context, &namespace);
+            assert!(!Arc::ptr_eq(&new, &held));
+            assert!(new.is(&context, &namespace));
+            assert!(!held.is(&context, &namespace));
+        }
+    }
+
+    /// A bucket's first allocation is the block [`SLOT_BLOCK_BYTES`] bounds:
+    /// the first store into a bucket reserves no more than [`SLOT_BLOCK`]
+    /// slots.
+    #[test]
+    fn a_buckets_first_block_is_bounded() {
+        let cache = L3SemanticCache::new(config(&closed_endpoint(), 1.0));
+        let sql = "SELECT val FROM kv WHERE id = 1";
+        put(&cache, sql, "r");
+        let key = scoped_bucket_key(&canon(sql), &ctx(), &[0u8; 32]);
+        let guard = cache.inner.shards[cache.inner.shard_index(key)].read();
+        let bucket = &guard.buckets[&key];
+        assert_eq!(bucket.len(), 1);
+        assert!(bucket.capacity() <= SLOT_BLOCK);
+        assert!(bucket.capacity() * std::mem::size_of::<Slot>() <= SLOT_BLOCK_BYTES);
     }
 
     /// A retired entry is skipped (Stale) and purged; a refill replaces it

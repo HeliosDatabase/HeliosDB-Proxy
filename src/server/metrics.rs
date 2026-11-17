@@ -1,8 +1,17 @@
 use super::*;
 
+/// Additional daemon policy counters, attached directly to the admin API.
+/// Kept out of the public snapshot struct to preserve its construction API.
+#[derive(Default)]
+pub(crate) struct SessionPolicyCounters {
+    pub(crate) copy_input_timeouts: AtomicU64,
+    pub(crate) query_cache_context_bypassed: AtomicU64,
+}
+
 /// Server metrics
 #[derive(Default)]
 pub(super) struct ServerMetrics {
+    pub(super) policy: Arc<SessionPolicyCounters>,
     /// Total connections accepted
     pub(super) connections_accepted: AtomicU64,
     /// Total connections refused because the `[limits] max_client_connections`

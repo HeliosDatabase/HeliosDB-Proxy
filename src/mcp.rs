@@ -60,7 +60,10 @@ struct Gateway<'a> {
 
 impl Gateway<'_> {
     /// The tool cache's `query` and `list_tables` TTLs, when it runs.
-    fn cache_ttls(&self) -> Option<(Duration, Duration)> {
+    fn cache_ttls(&self, cfg: &McpConfig) -> Option<(Duration, Duration)> {
+        if !cfg.tool_cache_on() {
+            return None;
+        }
         #[cfg(feature = "query-cache")]
         if let Some(cache) = self.cache {
             let s = cache.settings();
@@ -107,8 +110,8 @@ impl CachedTool {
 pub type ToolOutput = (String, Option<Value>);
 
 /// The statement `list_tables` runs.
-const LIST_TABLES_SQL: &str = "SELECT table_schema, table_name FROM information_schema.tables \
-                               WHERE table_schema NOT IN ('pg_catalog','information_schema') \
+pub(crate) const LIST_TABLES_SQL: &str = "SELECT table_schema, table_name FROM information_schema.tables \
+                               WHERE table_schema <> 'pg_catalog' AND table_schema <> 'information_schema' \
                                ORDER BY table_schema, table_name";
 
 /// The bearer tokens the MCP gateway accepts and the principal each names:
@@ -223,11 +226,12 @@ impl McpServer {
     }
 
     /// Serve `query` and `list_tables` through `cache` (`[mcp]
-    /// tool_cache_enabled`). The cache belongs to this gateway: `[mcp]` is
+    /// tool_cache_enabled` and `trust_backend_read_effects`). The cache is
+    /// attached only under that independent execution contract. `[mcp]` is
     /// read at startup only, so nothing reloads under it.
     #[cfg(feature = "query-cache")]
     pub fn with_tool_cache(mut self, cache: Option<Arc<crate::mcp_cache::McpToolCache>>) -> Self {
-        self.cache = cache;
+        self.cache = cache.filter(|_| self.config.tool_cache_on());
         self
     }
 
@@ -538,7 +542,7 @@ impl McpServer {
             "ping" => Some(rpc_ok(id, json!({}))),
             "tools/list" => Some(rpc_ok(
                 id,
-                json!({ "tools": Self::tool_defs(cfg, gateway.cache_ttls(), gateway.memory.is_some()) }),
+                json!({ "tools": Self::tool_defs(cfg, gateway.cache_ttls(cfg), gateway.memory.is_some()) }),
             )),
             "tools/call" => {
                 // Admission cap (H-06 `max_concurrent_requests`): this is the
@@ -783,7 +787,7 @@ impl McpServer {
             Err(denied) => return (Err(denied), None),
         };
         #[cfg(feature = "query-cache")]
-        if let Some(cache) = gateway.cache {
+        if let Some(cache) = gateway.cache.filter(|_| cfg.tool_cache_on()) {
             let owner = crate::mcp_cache::Owner::new(
                 gateway.principal.clone(),
                 gateway.tenant.map(|t| t.0.as_str()),
@@ -2160,3 +2164,7 @@ mod tests {
         assert!(text.contains("backend connect"), "{text}");
     }
 }
+
+#[cfg(all(test, feature = "query-cache"))]
+#[path = "mcp/cache_effects_contract_tests.rs"]
+mod cache_effects_contract_tests;

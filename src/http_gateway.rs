@@ -34,10 +34,26 @@ enum SqlError {
     Failed(String),
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct HttpSqlCache {
+    #[cfg(feature = "query-cache")]
+    pub(crate) cache: Option<Arc<crate::cache::QueryCache>>,
+    #[cfg(feature = "query-cache")]
+    pub(crate) trust_backend_read_effects: bool,
+}
+
+struct HttpSqlRequest<'a> {
+    tenant: Option<&'a GatewayTenant>,
+    sql: &'a str,
+    params: &'a [ParamValue],
+    array_mode: bool,
+}
+
 pub struct HttpGateway {
     config: HttpGatewayConfig,
     pool: SharedBackendPool,
     policy: SharedGatewayPolicy,
+    sql_cache: HttpSqlCache,
 }
 
 impl HttpGateway {
@@ -46,7 +62,24 @@ impl HttpGateway {
             config,
             pool,
             policy: Arc::new(GatewayPolicy::default()),
+            sql_cache: HttpSqlCache::default(),
         }
+    }
+
+    /// Share the daemon's SQL result cache with this stateless gateway.
+    #[cfg(feature = "query-cache")]
+    pub fn with_query_cache(mut self, cache: Option<Arc<crate::cache::QueryCache>>) -> Self {
+        self.sql_cache.cache = cache;
+        self
+    }
+
+    /// Allow broad read caching only when the operator vouches for the
+    /// backend's side-effect and volatility contract. The default still
+    /// permits the conservative literal scalar-read subset.
+    #[cfg(feature = "query-cache")]
+    pub fn with_trusted_read_effects(mut self, trusted: bool) -> Self {
+        self.sql_cache.trust_backend_read_effects = trusted;
+        self
     }
 
     /// Apply the PG-wire request policies (rate limit, rewrite, circuit
@@ -75,6 +108,7 @@ impl HttpGateway {
         let cfg = Arc::new(self.config);
         let pool = self.pool.clone();
         let policy = self.policy.clone();
+        let sql_cache = self.sql_cache.clone();
         loop {
             let (stream, peer) = match listener.accept().await {
                 Ok(x) => x,
@@ -87,8 +121,11 @@ impl HttpGateway {
             let pool = pool.clone();
             let admission = admission.clone();
             let policy = policy.clone();
+            let sql_cache = sql_cache.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle(stream, peer, cfg, pool, admission, policy).await {
+                if let Err(e) =
+                    Self::handle(stream, peer, cfg, pool, admission, policy, sql_cache).await
+                {
                     tracing::debug!(%peer, "HTTP gateway error: {}", e);
                 }
             });
@@ -102,6 +139,7 @@ impl HttpGateway {
         pool: SharedBackendPool,
         admission: Arc<tokio::sync::Semaphore>,
         policy: SharedGatewayPolicy,
+        sql_cache: HttpSqlCache,
     ) -> Result<()> {
         use crate::http_util;
         let (reader, mut writer) = stream.split();
@@ -224,11 +262,21 @@ impl HttpGateway {
                 .await
             }
         };
-        match Self::run_sql(&cfg, &pool, &policy, tenant.as_ref(), sql, &params).await {
-            Ok(qr) => {
-                let body = neon_result(&qr, array_mode);
-                Self::respond(&mut writer, 200, &body).await
-            }
+        match Self::run_sql(
+            &cfg,
+            &pool,
+            &policy,
+            HttpSqlRequest {
+                tenant: tenant.as_ref(),
+                sql,
+                params: &params,
+                array_mode,
+            },
+            &sql_cache,
+        )
+        .await
+        {
+            Ok(body) => Self::respond(&mut writer, 200, &body).await,
             Err(SqlError::TooLarge(msg)) => {
                 Self::respond(&mut writer, 413, &json!({ "error": msg })).await
             }
@@ -242,15 +290,50 @@ impl HttpGateway {
         cfg: &HttpGatewayConfig,
         pool: &SharedBackendPool,
         policy: &GatewayPolicy,
-        tenant: Option<&GatewayTenant>,
-        sql: &str,
-        params: &[ParamValue],
-    ) -> std::result::Result<QueryResult, SqlError> {
+        request: HttpSqlRequest<'_>,
+        _sql_cache: &HttpSqlCache,
+    ) -> std::result::Result<Value, SqlError> {
+        let HttpSqlRequest {
+            tenant,
+            sql,
+            params,
+            array_mode,
+        } = request;
         let rewritten = policy.rewrite(sql);
         let filtered = policy
             .tenant_sql(&rewritten, tenant)
             .map_err(|denied| SqlError::Failed(denied.to_string()))?;
         let sql = filtered.as_ref();
+        #[cfg(feature = "query-cache")]
+        let cache_prep = if let Some(cache) = _sql_cache.cache.as_ref().filter(|_| {
+            crate::server::ProxyServer::is_cacheable_read_sql_with(
+                sql,
+                crate::sql_text::VolatileScan::builtin(),
+            ) && matches!(
+                crate::replay_sql::all_calls_satisfy(sql, |_| false),
+                Ok(true)
+            ) && statement_is_session_neutral(sql)
+                && (_sql_cache.trust_backend_read_effects
+                    || crate::replay_sql::literal_scalar_select(sql))
+        }) {
+            let context = crate::cache::CacheContext {
+                database: cfg.backend_database.clone().unwrap_or_default(),
+                user: Some(cfg.backend_user.clone()),
+                branch: None,
+                connection_id: None,
+            };
+            let namespace = http_cache_namespace(cfg, tenant, params, array_mode);
+            let (lookup, prep) = cache.get_scoped(sql, None, &context, &namespace).await;
+            if let crate::cache::CacheLookup::Hit { result, .. } = lookup {
+                let body = serde_json::from_slice(&result.data).map_err(|error| {
+                    SqlError::Failed(format!("cached HTTP result is invalid JSON: {error}"))
+                })?;
+                return Ok(body);
+            }
+            Some((context, prep))
+        } else {
+            None
+        };
         let node = format!("{}:{}", cfg.backend_host, cfg.backend_port);
         let bcfg = BackendConfig {
             host: cfg.backend_host.clone(),
@@ -271,6 +354,16 @@ impl HttpGateway {
                 return Err(SqlError::Failed(format!("backend connect: {}", e)));
             }
         };
+        #[cfg(feature = "query-cache")]
+        if client
+            .server_parameters
+            .get("server_version")
+            .is_some_and(|version| version.contains("HeliosDB"))
+        {
+            if let Some(cache) = _sql_cache.cache.as_ref() {
+                cache.note_heliosdb_backend();
+            }
+        }
         policy.record(&node, true, "");
         // Bounded reads: a result past `max_result_rows` / `max_result_bytes`
         // is drained (the connection stays in sync) and then refused.
@@ -310,7 +403,27 @@ impl HttpGateway {
                         ),
                     ));
                 }
-                Ok(bounded.result)
+                let body = neon_result(&bounded.result, array_mode);
+                #[cfg(feature = "query-cache")]
+                if let (Some(cache), Some((context, prep))) =
+                    (_sql_cache.cache.as_ref(), cache_prep)
+                {
+                    if prep.storable() {
+                        if let Ok(data) = serde_json::to_vec(&body) {
+                            cache
+                                .put_prepared(
+                                    sql,
+                                    &context,
+                                    &prep,
+                                    bytes::Bytes::from(data),
+                                    bounded.result.rows.len(),
+                                    Duration::ZERO,
+                                )
+                                .await;
+                        }
+                    }
+                }
+                Ok(body)
             }
             Err(e) => {
                 pool.discard(client);
@@ -393,6 +506,62 @@ fn parse_params(v: Option<&Value>) -> Vec<ParamValue> {
             })
             .collect(),
     }
+}
+
+#[cfg(feature = "query-cache")]
+fn http_cache_namespace(
+    cfg: &HttpGatewayConfig,
+    tenant: Option<&GatewayTenant>,
+    params: &[ParamValue],
+    array_mode: bool,
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    fn field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"heliosdb-proxy-http-sql-cache-v1");
+    field(&mut hasher, cfg.backend_host.as_bytes());
+    hasher.update(cfg.backend_port.to_be_bytes());
+    field(&mut hasher, cfg.backend_user.as_bytes());
+    field(
+        &mut hasher,
+        cfg.backend_database.as_deref().unwrap_or("").as_bytes(),
+    );
+    if let Some(tenant) = tenant {
+        hasher.update([1]);
+        field(&mut hasher, tenant.0.as_bytes());
+    } else {
+        hasher.update([0]);
+    }
+    hasher.update([u8::from(array_mode)]);
+    hasher.update((params.len() as u64).to_be_bytes());
+    for param in params {
+        match param {
+            ParamValue::Null => hasher.update([0]),
+            ParamValue::Bool(value) => hasher.update([1, u8::from(*value)]),
+            ParamValue::Int(value) => {
+                hasher.update([2]);
+                hasher.update(value.to_be_bytes());
+            }
+            ParamValue::Float(value) => {
+                hasher.update([3]);
+                hasher.update(value.to_bits().to_be_bytes());
+            }
+            ParamValue::Text(value) => {
+                hasher.update([4]);
+                field(&mut hasher, value.as_bytes());
+            }
+            ParamValue::Lsn(value) => {
+                hasher.update([5]);
+                field(&mut hasher, value.as_bytes());
+            }
+        }
+    }
+    hasher.finalize().into()
 }
 
 /// Build the Neon-serverless-style result body.
@@ -489,6 +658,21 @@ mod tests {
         assert_eq!(v["rows"][0][1], "alice");
     }
 
+    #[cfg(feature = "query-cache")]
+    #[test]
+    fn http_cache_namespace_separates_parameters_tenants_and_result_shape() {
+        let cfg = HttpGatewayConfig::default();
+        let int_param = [ParamValue::Int(1)];
+        let text_param = [ParamValue::Text("1".into())];
+        let base = http_cache_namespace(&cfg, None, &int_param, false);
+        assert_ne!(base, http_cache_namespace(&cfg, None, &text_param, false));
+        assert_ne!(base, http_cache_namespace(&cfg, None, &int_param, true));
+        assert_ne!(
+            base,
+            http_cache_namespace(&cfg, Some(&GatewayTenant("acme".into())), &int_param, false)
+        );
+    }
+
     #[test]
     fn params_mapping() {
         let p = parse_params(Some(&json!([1, "x", true, null, 2.5])));
@@ -532,6 +716,7 @@ mod tests {
             pool,
             admission,
             Arc::new(policy),
+            HttpSqlCache::default(),
         ));
         let body = br#"{"query":"select 1"}"#;
         let req = format!(
@@ -584,6 +769,7 @@ mod tests {
                 pool,
                 Arc::new(tokio::sync::Semaphore::new(4)),
                 policy.clone(),
+                HttpSqlCache::default(),
             ));
             let body = br#"{"query":"select 1"}"#;
             let req = format!(
@@ -618,6 +804,7 @@ mod tests {
             pool,
             admission,
             Arc::new(GatewayPolicy::default()),
+            HttpSqlCache::default(),
         ));
 
         client
@@ -651,6 +838,7 @@ mod tests {
             pool,
             admission,
             Arc::new(GatewayPolicy::default()),
+            HttpSqlCache::default(),
         ));
 
         let body = br#"{"query":"select 1"}"#;
@@ -696,6 +884,7 @@ mod tests {
             pool,
             Arc::new(tokio::sync::Semaphore::new(4)),
             policy,
+            HttpSqlCache::default(),
         ));
         let body = br#"{"query":"select 1"}"#;
         let req = format!(
@@ -763,6 +952,7 @@ mod tests {
             pool,
             Arc::new(tokio::sync::Semaphore::new(4)),
             Arc::new(GatewayPolicy::default()),
+            HttpSqlCache::default(),
         ));
         let body = format!(r#"{{"query":"{sql}"}}"#);
         let req = format!(

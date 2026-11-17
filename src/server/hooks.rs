@@ -14,45 +14,45 @@ impl ProxyServer {
         msg: Message,
         state: &Arc<ServerState>,
         session: &Arc<ClientSession>,
-    ) -> (Message, PreQueryAction) {
+    ) -> (Message, PreQueryAction, bool) {
         #[cfg(feature = "wasm-plugins")]
         {
             let pm = match state.plugin_manager.as_ref() {
                 Some(pm) => pm,
-                None => return (msg, PreQueryAction::Forward),
+                None => return (msg, PreQueryAction::Forward, false),
             };
 
             if msg.msg_type != MessageType::Query {
-                return (msg, PreQueryAction::Forward);
+                return (msg, PreQueryAction::Forward, false);
             }
 
             // Zero plugins registered for this hook — skip the payload
             // clone, SQL parse, and context construction entirely.
             if !pm.has_hook(HookType::PreQuery) {
-                return (msg, PreQueryAction::Forward);
+                return (msg, PreQueryAction::Forward, false);
             }
 
             let query_msg = match QueryMessage::parse(msg.payload.clone()) {
                 Ok(q) => q,
-                Err(_) => return (msg, PreQueryAction::Forward),
+                Err(_) => return (msg, PreQueryAction::Forward, false),
             };
 
             let ctx = Self::build_query_context(&query_msg.query, session);
 
             match pm.execute_pre_query(&ctx) {
-                PreQueryResult::Continue => (msg, PreQueryAction::Forward),
-                PreQueryResult::Block(reason) => (msg, PreQueryAction::Block(reason)),
+                PreQueryResult::Continue => (msg, PreQueryAction::Forward, false),
+                PreQueryResult::Block(reason) => (msg, PreQueryAction::Block(reason), false),
                 PreQueryResult::Rewrite(new_sql) => {
                     let rewritten = QueryMessage { query: new_sql }.encode();
-                    (rewritten, PreQueryAction::Forward)
+                    (rewritten, PreQueryAction::Forward, true)
                 }
-                PreQueryResult::Cached(bytes) => (msg, PreQueryAction::Cached(bytes)),
+                PreQueryResult::Cached(bytes) => (msg, PreQueryAction::Cached(bytes), false),
             }
         }
         #[cfg(not(feature = "wasm-plugins"))]
         {
             let _ = (state, session);
-            (msg, PreQueryAction::Forward)
+            (msg, PreQueryAction::Forward, false)
         }
     }
 

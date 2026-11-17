@@ -321,7 +321,7 @@ fn scan_with<'a, const ATOMIC: bool>(
 }
 
 /// A word token outside quotes and comments, with whether the next
-/// non-whitespace byte is `(` — i.e. whether it syntactically looks like a
+/// non-trivia byte is `(` — i.e. whether it syntactically looks like a
 /// function call. Quoted identifiers are reported with `quoted = true` so a
 /// policy can refuse them rather than guess at case folding.
 pub(crate) struct Word<'a> {
@@ -331,14 +331,49 @@ pub(crate) struct Word<'a> {
 }
 
 /// Walk every word of `sql` outside string literals, quoted identifiers,
-/// dollar quotes and comments, in order, under the non-escaping reading (the
-/// caller has already established via [`boundaries`] that both readings agree
-/// on statement structure, so word order is the same). Stops early when `f`
-/// returns `false`. Allocation-free. Errors mirror [`boundaries`]: unterminated
-/// tokens refuse.
-pub(crate) fn words(sql: &str, mut f: impl FnMut(Word<'_>) -> bool) -> Result<(), ()> {
+/// dollar quotes and comments, in order, under the non-escaping reading.
+/// Stops early when `f` returns `false`. Allocation-free; unterminated tokens
+/// refuse. Policy callers must use [`all_calls_satisfy`]: agreement on statement
+/// boundaries does not imply that both string readings expose the same calls.
+pub(crate) fn words(sql: &str, f: impl FnMut(Word<'_>) -> bool) -> Result<(), ()> {
+    words_reading(sql, false, f).map(|_| ())
+}
+
+/// Require every syntactic call exposed by either backslash reading to satisfy
+/// `allowed`. The predicate may see the same call twice; ordered-token callers
+/// retain [`words`]. A quoted backslash can hide a call in one reading even when
+/// [`boundaries`] agrees on statement structure, so neither reading can vouch
+/// for call eligibility alone. SQL without backslashes needs only one pass.
+pub(crate) fn all_calls_satisfy(
+    sql: &str,
+    mut allowed: impl FnMut(Word<'_>) -> bool,
+) -> Result<bool, ()> {
+    for escapes in [false, true] {
+        let mut ok = true;
+        let quoted_backslash = words_reading(sql, escapes, |word| {
+            if word.call && !allowed(word) {
+                ok = false;
+            }
+            ok
+        })?;
+        if !ok {
+            return Ok(false);
+        }
+        if !quoted_backslash {
+            break;
+        }
+    }
+    Ok(true)
+}
+
+fn words_reading(
+    sql: &str,
+    backslash_escapes: bool,
+    mut f: impl FnMut(Word<'_>) -> bool,
+) -> Result<bool, ()> {
     let b = sql.as_bytes();
     let mut i = 0;
+    let mut saw_quoted_backslash = false;
     while i < b.len() {
         let start = i;
         match b[i] {
@@ -380,17 +415,13 @@ pub(crate) fn words(sql: &str, mut f: impl FnMut(Word<'_>) -> bool) -> Result<()
                 i += 1;
             }
             let text = &sql[start..i];
-            let mut j = i;
-            while j < b.len() && b[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            let call = b.get(j) == Some(&b'(');
+            let call = crate::protocol::skip_leading_comments(&sql[i..]).starts_with('(');
             if !f(Word {
                 text,
                 call,
                 quoted: false,
             }) {
-                return Ok(());
+                return Ok(saw_quoted_backslash);
             }
         } else if b[i] == b'"' {
             // Quoted identifier: report it (opaque to case folding), skip it.
@@ -409,17 +440,13 @@ pub(crate) fn words(sql: &str, mut f: impl FnMut(Word<'_>) -> bool) -> Result<()
                     Some(_) => i += 1,
                 }
             }
-            let mut j = i;
-            while j < b.len() && b[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            let call = b.get(j) == Some(&b'(');
+            let call = crate::protocol::skip_leading_comments(&sql[i..]).starts_with('(');
             if !f(Word {
                 text: &sql[start..i],
                 call,
                 quoted: true,
             }) {
-                return Ok(());
+                return Ok(saw_quoted_backslash);
             }
         } else if b[i] == b'\'' {
             i += 1;
@@ -433,6 +460,10 @@ pub(crate) fn words(sql: &str, mut f: impl FnMut(Word<'_>) -> bool) -> Result<()
                         } else {
                             break;
                         }
+                    }
+                    Some(b'\\') => {
+                        saw_quoted_backslash = true;
+                        i += if backslash_escapes { 2 } else { 1 };
                     }
                     Some(_) => i += 1,
                 }
@@ -460,7 +491,7 @@ pub(crate) fn words(sql: &str, mut f: impl FnMut(Word<'_>) -> bool) -> Result<()
             i += 1;
         }
     }
-    Ok(())
+    Ok(saw_quoted_backslash)
 }
 
 #[cfg(test)]
@@ -694,5 +725,114 @@ mod tests {
         .unwrap();
         assert_eq!(n, 2);
         assert!(words("SELECT 'unterminated", |_| true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod call_trivia_regressions {
+    #[test]
+    fn replay_function_identity_finds_calls_after_comments() {
+        for sql in [
+            "SELECT mutator/*gap*/()",
+            "SELECT mutator -- gap\n()",
+            "SELECT \"Mutator\" /* outer /* inner */ end */ ()",
+        ] {
+            let mut count = 0;
+            super::words(sql, |word| {
+                count += usize::from(word.call);
+                true
+            })
+            .unwrap();
+            assert_eq!(count, 1, "{sql}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod call_identity_tests {
+    #[test]
+    fn word_call_identity_sees_comment_trivia() {
+        for sql in [
+            "SELECT mutator/* gap */(1)",
+            "SELECT mutator -- gap\n(1)",
+            "SELECT mutator /* outer /* inner */ done */ (1)",
+            "SELECT \"Mutator\" /* gap */ (1)",
+        ] {
+            let mut calls = Vec::new();
+            super::words(sql, |word| {
+                if word.call {
+                    calls.push(word.text.to_owned());
+                }
+                true
+            })
+            .unwrap();
+            assert_eq!(calls.len(), 1, "function call was hidden by trivia: {sql}");
+        }
+    }
+}
+
+/// Recognize the deliberately tiny scalar-literal admission grammar.
+///
+/// This pure predicate reads no configuration: TR, cache, edge and MCP trust
+/// contracts stay independent. It accepts ASCII whitespace, SELECT, required
+/// whitespace, 1..=10 decimal digits in int32 range, and an optional final
+/// semicolon. Unsupported syntax declines admission without blocking native SQL.
+/// Pass the actual SQL unchanged; this is not backend/catalog purity verification.
+#[cfg(feature = "query-cache")]
+pub(crate) fn literal_scalar_select(sql: &str) -> bool {
+    let t = sql.trim_ascii();
+    let core = t.strip_suffix(';').unwrap_or(t).trim_ascii_end();
+    let Some(rest) = core.get(6..) else {
+        return false;
+    };
+    if !core[..6].eq_ignore_ascii_case("SELECT")
+        || !rest.as_bytes().first().is_some_and(u8::is_ascii_whitespace)
+    {
+        return false;
+    }
+    let literal = rest.trim_ascii();
+    !literal.is_empty()
+        && literal.len() <= 10
+        && literal.bytes().all(|b| b.is_ascii_digit())
+        && literal.parse::<u32>().is_ok_and(|n| n <= i32::MAX as u32)
+}
+
+#[cfg(test)]
+#[cfg(all(test, feature = "query-cache"))]
+mod literal_scalar_select_tests {
+    #[test]
+    fn literal_scalar_select_grammar_is_independent_and_bounded() {
+        for sql in [
+            "SELECT 42",
+            "\tselect\n00042; \r\n",
+            "SELECT 0",
+            "SELECT 2147483647",
+        ] {
+            assert!(super::literal_scalar_select(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT 2147483648",
+            "SELECT 00000000000",
+            "SELECT -42",
+            "SELECT +42",
+            "SELECT 1 + 1",
+            "SELECT 42::int",
+            "SELECT 42 AS val",
+            "SELECT $1",
+            "SELECT '42'",
+            "SELECT 42, 43",
+            "SELECT 42 FROM t",
+            "SELECT f()",
+            "SELECT 42; SELECT 43",
+            "SELECT 42 -- trailing",
+            "/* hint */ SELECT 42",
+            "SELECT/**/42",
+            "SELECT42",
+            "SELECT \u{0664}\u{0662}",
+            "SELECT \u{2003}42",
+            "",
+        ] {
+            assert!(!super::literal_scalar_select(sql), "{sql}");
+        }
     }
 }

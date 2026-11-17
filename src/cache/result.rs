@@ -98,11 +98,20 @@ pub struct CacheKey {
 
     /// Pre-computed hash for fast lookups
     cached_hash: u64,
+    namespace: [u8; 32],
 }
 
 impl CacheKey {
     /// Create a new cache key from a normalized query and context
     pub fn new(normalized: &NormalizedQuery, context: &CacheContext) -> Self {
+        Self::namespaced(normalized, context, [0; 32])
+    }
+
+    pub(crate) fn namespaced(
+        normalized: &NormalizedQuery,
+        context: &CacheContext,
+        namespace: [u8; 32],
+    ) -> Self {
         let query_hash = normalized.hash;
 
         // Compute combined hash
@@ -111,6 +120,9 @@ impl CacheKey {
         context.database.hash(&mut hasher);
         context.user.hash(&mut hasher);
         context.branch.hash(&mut hasher);
+        if namespace != [0; 32] {
+            namespace.hash(&mut hasher);
+        }
         let cached_hash = hasher.finish();
 
         Self {
@@ -119,6 +131,7 @@ impl CacheKey {
             user: context.user.clone(),
             branch: context.branch.clone(),
             cached_hash,
+            namespace,
         }
     }
 
@@ -142,6 +155,7 @@ impl CacheKey {
             user,
             branch,
             cached_hash,
+            namespace: [0; 32],
         }
     }
 
@@ -164,6 +178,7 @@ impl PartialEq for CacheKey {
             && self.database == other.database
             && self.user == other.user
             && self.branch == other.branch
+            && self.namespace == other.namespace
     }
 }
 

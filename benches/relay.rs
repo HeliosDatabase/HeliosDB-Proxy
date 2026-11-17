@@ -123,7 +123,7 @@ fn bench_switchover_drain(c: &mut Criterion) {
 mod journal_benches {
     use super::*;
     use heliosdb_proxy::transaction_journal::{
-        JournalEntry, JournalValue, StatementOutcome, StatementType, TransactionJournal,
+        JournalEntry, JournalValue, NewEntry, StatementOutcome, StatementType, TransactionJournal,
         TransactionJournalEntry, WireProtocol,
     };
     use heliosdb_proxy::NodeId;
@@ -187,6 +187,57 @@ mod journal_benches {
             group.throughput(Throughput::Elements(n as u64));
             group.bench_with_input(BenchmarkId::from_parameter(n), &entry, |b, e| {
                 b.iter(|| black_box(e.total_size()));
+            });
+        }
+        group.finish();
+    }
+
+    /// One statement appended to an explicit transaction that already holds
+    /// `n` (`append_entry`, the capture path's per-statement call): the
+    /// `max_entries` / `max_size` caps are checked first, and the size cap
+    /// must not walk the earlier statements again (`journal/total_size/n` is
+    /// that walk, about 5.6 ns per statement): at 1024 statements the append
+    /// may cost a cold cache line more than at 16, not microseconds.
+    pub fn bench_append_entry(c: &mut Criterion) {
+        let mut group = c.benchmark_group("journal/append_entry");
+        group.throughput(Throughput::Elements(1));
+        let journal = TransactionJournal::new();
+        let new_entry = || {
+            let sample = sample_entry(0);
+            NewEntry {
+                statement: sample.statement,
+                parameters: sample.parameters,
+                param_types: sample.param_types,
+                result_checksum: sample.result_checksum,
+                rows_affected: sample.rows_affected,
+                duration_ms: sample.duration_ms,
+                outcome: sample.outcome,
+                protocol: sample.protocol,
+            }
+        };
+        for n in [16usize, 1024] {
+            let mut seeded =
+                TransactionJournalEntry::new(Uuid::new_v4(), Uuid::new_v4(), NodeId::new(), 0);
+            for _ in 0..n {
+                journal.append_entry(&mut seeded, new_entry()).unwrap();
+            }
+            group.bench_with_input(BenchmarkId::new("after", n), &seeded, |b, seeded| {
+                b.iter_batched(
+                    || {
+                        // A clone has no spare capacity: without room for the
+                        // entry the append would time a reallocation that
+                        // copies all `n` earlier ones.
+                        let mut tx = seeded.clone();
+                        tx.entries.reserve(1);
+                        (tx, new_entry())
+                    },
+                    |(mut tx, new)| {
+                        journal.append_entry(&mut tx, black_box(new)).unwrap();
+                        // Returned so the journal's drop is not timed.
+                        tx
+                    },
+                    BatchSize::LargeInput,
+                );
             });
         }
         group.finish();
@@ -608,6 +659,7 @@ criterion_group!(
     journal,
     journal_benches::bench_statement_type_from_sql,
     journal_benches::bench_total_size,
+    journal_benches::bench_append_entry,
     journal_benches::bench_add_entry,
     journal_benches::bench_rollback_to_savepoint,
     journal_benches::bench_journal_manager,

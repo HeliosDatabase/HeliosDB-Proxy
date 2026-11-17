@@ -1227,6 +1227,8 @@ dependencies = [
  "ed25519-dalek",
  "flate2",
  "hmac 0.12.1",
+ "http",
+ "http-body",
  "include_dir",
  "ldap3",
  "lru",
