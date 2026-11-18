@@ -92,6 +92,10 @@ pub struct ClientSession {
     /// execution context are not provably neutral makes this sticky.
     #[cfg(feature = "query-cache")]
     pub(crate) cache_ineligible: std::sync::atomic::AtomicBool,
+    /// ParameterStatus messages relayed to this session so far: a reused
+    /// settings proof ([`CacheScopeMemo`]) is valid only while none arrived.
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(crate) parameter_changes: std::sync::atomic::AtomicU64,
     /// Complete startup identity, initialized once before the first lookup.
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     pub(crate) cache_startup_namespace: std::sync::OnceLock<[u8; 32]>,
@@ -406,6 +410,11 @@ pub(super) struct BackendConn {
     /// Reused only under the explicit immutable-backend-context contract.
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     pub(super) cache_scope_verified: Option<[u8; 32]>,
+    /// The last settings proof of this connection, reused for later reads
+    /// within `[cache] proof_ttl_ms` while nothing but proven cacheable reads
+    /// ran on it ([`Self::forget_cache_scope`]).
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) cache_scope_memo: Option<CacheScopeMemo>,
     /// Explicit proof for synthetic protocol fixtures; absent from production.
     #[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
     pub(super) cache_scope_test_override: Option<[u8; 32]>,
@@ -491,6 +500,8 @@ impl BackendConn {
             cache_scope_unsupported: false,
             #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
             cache_scope_verified: None,
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            cache_scope_memo: None,
             #[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
             cache_scope_test_override: None,
             stream,
@@ -526,7 +537,33 @@ impl BackendConn {
         self.unnamed_sig = None;
         self.unnamed_untracked = false;
         self.unnamed_stale = UnnamedStale::default();
+        // A simple Query reached the socket: it may have changed settings.
+        self.forget_cache_scope();
     }
+
+    /// Something other than a proven cacheable read reached the socket (a
+    /// statement that may change its settings): the next cached read proves
+    /// them again.
+    pub(super) fn forget_cache_scope(&mut self) {
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        {
+            self.cache_scope_memo = None;
+        }
+    }
+}
+
+/// A settings proof kept for reuse ([`BackendConn::cache_scope_memo`]).
+#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CacheScopeMemo {
+    /// The proven namespace.
+    pub(super) namespace: [u8; 32],
+    /// When it was proven.
+    pub(super) at: std::time::Instant,
+    /// The session's ParameterStatus count then
+    /// ([`ClientSession::parameter_changes`]): any ParameterStatus since
+    /// retires the memo.
+    pub(super) parameter_changes: u64,
 }
 
 /// Which unnamed objects a backend socket may still hold after the session's

@@ -3504,6 +3504,8 @@ async fn delayed_cache_scope_probe_holds_tenant_admission_through_pool_cleanup()
             c.cache.enabled = true;
             c.cache.trust_backend_read_effects = true;
             c.pool_mode.skip_clean_reset = false;
+            // Every read proves: the probes below are counted.
+            c.cache.proof_ttl_ms = 0;
             transaction_pooling(c, pooled);
         })
         .await;

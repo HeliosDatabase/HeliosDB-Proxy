@@ -877,8 +877,16 @@ impl ProxyServer {
 
         // The Query destroys whatever unnamed statement and portal the socket
         // holds (a failed write drops the socket): an identical unnamed Parse
-        // after it must reach the backend again.
+        // after it must reach the backend again. It also retires the
+        // connection's settings proof, unless it is the read just proven
+        // (a cacheable read leaves the settings as they were).
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        let proof = backend.cache_scope_memo.take();
         backend.unnamed_destroyed();
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        if effective_namespace.is_some() {
+            backend.cache_scope_memo = proof;
+        }
         let backend_err = match tokio::time::timeout(
             state.limits.backend_write_timeout,
             backend.stream.write_all(&forward_msg.encode()),
@@ -1769,6 +1777,15 @@ impl ProxyServer {
             }
         }
 
+        // Anything but a proven cacheable read retires the connection's
+        // settings proof: the batch may change its settings.
+        #[cfg(feature = "query-cache")]
+        let proven = cache_fill.is_some();
+        #[cfg(not(feature = "query-cache"))]
+        let proven = false;
+        if !proven {
+            backend.forget_cache_scope();
+        }
         if let Err((e, phase)) = Self::tr_write_batch(
             &mut backend.stream,
             batch,
@@ -3073,6 +3090,10 @@ impl ProxyServer {
                 session.cycle_completions.fetch_add(1, Ordering::Relaxed);
             }
             b'E' => session.cycle_errored.store(true, Ordering::Relaxed),
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            b'S' => {
+                session.parameter_changes.fetch_add(1, Ordering::Relaxed);
+            }
             _ => {}
         }
     }

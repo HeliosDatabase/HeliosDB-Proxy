@@ -89,6 +89,11 @@ pub(super) struct ServerMetrics {
     pub(super) reads_offloaded: AtomicU64,
     /// Sessions moved to another branch database (`[branch] route_enabled`).
     pub(super) branch_moves: AtomicU64,
+    /// Backend settings proofs (`SHOW ALL`) taken for result-cache reads.
+    pub(super) cache_scope_proofs: AtomicU64,
+    /// Result-cache reads that reused a connection's proof within
+    /// `[cache] proof_ttl_ms` instead of taking one.
+    pub(super) cache_scope_proofs_reused: AtomicU64,
     /// Offloaded reads that went to the primary instead: the standby
     /// connection could not be opened (e.g. it wants a password pass-through
     /// auth does not hold) or could not take the session's settings.
@@ -193,6 +198,10 @@ pub struct ServerMetricsSnapshot {
     pub reads_offloaded: u64,
     /// Sessions moved to another branch database.
     pub branch_moves: u64,
+    /// Backend settings proofs taken for result-cache reads.
+    pub cache_scope_proofs: u64,
+    /// Result-cache reads that reused a recent proof.
+    pub cache_scope_proofs_reused: u64,
     /// Offloaded reads that fell back to the primary (standby connection or
     /// settings mirror failed).
     pub read_mirror_failures: u64,

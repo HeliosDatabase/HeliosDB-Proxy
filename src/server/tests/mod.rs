@@ -266,6 +266,8 @@ fn make_test_session_mode(tr_mode: crate::config::TrMode) -> Arc<ClientSession> 
         #[cfg(feature = "query-cache")]
         cache_ineligible: std::sync::atomic::AtomicBool::new(false),
         #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        parameter_changes: std::sync::atomic::AtomicU64::new(0),
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
         cache_startup_namespace: std::sync::OnceLock::new(),
         branch_blockers: std::sync::atomic::AtomicU8::new(0),
         branch_home: std::sync::OnceLock::new(),

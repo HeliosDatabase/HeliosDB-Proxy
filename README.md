@@ -106,7 +106,7 @@ Sources: [1] [PgBouncer features](https://www.pgbouncer.org/features.html) · [2
 
 ## Status & guarantees
 
-**Verification status (2026-10-30, 2.2.0):** the [September 2026 audit](docs/internal/audit-2026-09/README.md)
+**Verification status (2026-11-18, 2.3.0):** the [September 2026 audit](docs/internal/audit-2026-09/README.md)
 found reproducible Transaction Replay safety defects; all of them are fixed as of
 1.7.0, verified against live PostgreSQL, and replay now checks its own work — a
 replayed statement whose results diverge from what the client already saw is rolled
@@ -117,7 +117,10 @@ offloads reads to standbys, tracks session settings across both wire protocols s
 offloaded reads and failover re-homes carry them (or refuse with `08006`), and bounds the
 Patroni authority lease by Patroni's own. 2.2.0 caps tenants' concurrent requests and
 replay bytes, adds an opt-in semantic cache tier, table exclusions and per-table TTLs, and
-keys the caches so that statements returning different rows never share an entry. The query
+keys the caches so that statements returning different rows never share an entry. 2.3.0
+runs plugin hooks, rewrite rules and the tenant filter on the extended protocol, drains on
+SIGTERM, loads signed plugin artefacts with hot reload, and reuses the cache's settings proof
+per connection for `[cache] proof_ttl_ms`. The query
 cache stays opt-in: its identity does not yet include session state (`SET ROLE`,
 `search_path`, tenant settings), see docs/configuration.md. The audit also records
 advertised library capabilities that are not wired into the daemon. Consult it and the
@@ -166,8 +169,8 @@ The four core jobs above are the product; everything below is optional. HeliosPr
 | **Connection Pooling** | `pool-modes` | Session, Transaction, and Statement pooling with automatic lease management, prepared statement forwarding, and configurable reset sequences. `[pool_mode].skip_clean_reset` opts into conditional connection reset (the G2c throughput win in the benchmarks below) |
 | **Load Balancer** | *(core)* | Round-robin, least-connections, and latency-based routing with automatic read/write splitting across primary and standby nodes |
 | **Health Checker** | *(core)* | Continuous node health monitoring with configurable check intervals, failure thresholds, and custom health-check queries |
-| **Pipeline** | *(core)* | PostgreSQL extended query protocol pipelining — batches Parse/Bind/Execute messages for reduced round trips |
-| **Batch Operations** | *(core)* | Automatic INSERT coalescing — groups individual INSERT statements into multi-row batches for higher throughput |
+| **Pipeline** | *(core)* | Extended-protocol messages are relayed per cycle: everything a client sends up to its `Sync`, `Flush`-chained pipelines included, goes to the backend as one write. Several `Sync`-terminated cycles in flight on one backend connection at once are not overlapped. `src/pipeline.rs` is a library batching module the relay does not use |
+| **Batch Operations** | *(library API)* | INSERT coalescing primitives (`src/batch.rs`) that group single-row INSERTs into multi-row batches; the daemon does not coalesce client INSERTs |
 
 ### High Availability
 
@@ -177,7 +180,7 @@ The four core jobs above are the product; everything below is optional. HeliosPr
 | **Transaction Replay (TR)** | *(default build)* | `tr_mode` keeps client sessions alive across a backend failure: `session` re-homes the connection to the new primary and restores `SET` state, `select` transparently re-runs interrupted reads, and opt-in `transaction` replays the uncommitted transaction on the new primary and continues. A `COMMIT` with unknown outcome is never retried (client gets SQLSTATE 08007), a replay whose results diverge from what the client already saw is rolled back (40001), and a transaction pinned to a `SERIALIZABLE`/`REPEATABLE READ` snapshot is never replayed. Failing over onto password-protected backends requires the proxy to be the auth boundary (`[auth] mode = "scram"`). `tr_enabled = false` turns TR off (journaling, in-session recovery, `/api/replay`) |
 | **Session Migration** | *(default build; library)* | Captures and restores full session state (SET parameters, prepared statements, advisory locks) when moving connections between nodes — not wired into the recovery path |
 | **Cursor Restore** | *(default build; library)* | Preserves open cursor positions across failover — not wired into the recovery path |
-| **Switchover Buffer** | *(core)* | Buffers incoming queries during planned switchover, drains them to the new primary once promotion completes |
+| **Switchover Buffer** | *(library API)* | Buffering primitives for planned switchover (`src/switchover_buffer.rs`); the daemon does not hold client queries during a switchover, it re-homes sessions through Transaction Replay |
 | **Primary Tracker** | *(core)* | Pluggable topology discovery — tracks the current primary via `pg_is_in_recovery()` polling (PostgreSQL), HeliosDB topology events, or manual API calls |
 | **Transaction Journal** | *(default build)* | Write-ahead journal for in-flight transactions with statement-level granularity, parameter capture, and configurable retention |
 
@@ -189,24 +192,24 @@ The four core jobs above are the product; everything below is optional. HeliosPr
 | **Query Routing** | `routing-hints` | Hint-based routing via SQL comments (`/*helios:route=primary*/`) and automatic classification of read vs. write queries |
 | **Lag-Aware Routing** | `lag-routing` | Routes reads to replicas within an acceptable replication lag threshold, with read-your-writes (RYW) session consistency guarantees |
 | **Query Rewriter** | `query-rewriting` | Rule-based SQL transformation engine — rewrite, redirect, or annotate queries before they reach the backend |
-| **Query Analytics** | `query-analytics` | Real-time query fingerprinting, execution statistics, slow query log, N+1 detection, and intent classification |
-| **Schema Routing** | `schema-routing` | Routes queries based on table schema metadata, data temperature classification, and workload type (OLTP vs. analytics vs. vector) |
+| **Query Analytics** | `query-analytics` | Real-time query fingerprinting and execution statistics (`/analytics`, `/api/analytics`); the library's N+1, intent and slow-query results are not exposed by the daemon |
+| **Schema Routing** | `schema-routing` | Sends analytical reads to `[schema_routing] analytics_node`, statement by statement on both protocols. Table metadata, data temperature and the `vector` workload class are library features the daemon does not populate |
 
 ### Security & Access Control
 
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
-| **Auth Proxy** | `auth-proxy` | Authentication gateway supporting JWT, OAuth 2.0, API keys, LDAP, and certificate-based authentication with pluggable role mapping |
-| **Rate Limiter** | `rate-limiting` | Token bucket and sliding window rate limiting with per-user, per-tenant, and per-IP policies, query cost estimation, and concurrency guards |
-| **Circuit Breaker** | `circuit-breaker` | Adaptive circuit breaker with sliding-window failure detection, automatic recovery probes, and per-node breaker state |
+| **Auth Proxy** | `auth-proxy` | The daemon authenticates clients by passthrough to the backend or by SCRAM against `[auth] auth_file`, plus an Authenticate plugin hook. The JWT, OAuth 2.0, API-key and LDAP modules in `src/auth/` are a library API not selectable from `proxy.toml` |
+| **Rate Limiter** | `rate-limiting` | Token bucket per user, database, client address or globally (`key_by`), with an opt-in sliding window (`window_max_requests`) and concurrency guards; every request costs 1 |
+| **Circuit Breaker** | `circuit-breaker` | Per-node circuit breaker with sliding-window failure detection and recovery probes (the adaptive threshold is a library option the daemon does not set) |
 
 ### Multi-Tenancy & Extensibility
 
 | Module | Feature Flag | Description |
 |--------|-------------|-------------|
-| **Multi-Tenancy** | `multi-tenancy` | Tenant-aware connection routing with per-tenant pools, schema isolation, resource quotas, and automatic tenant identification from connection metadata |
+| **Multi-Tenancy** | `multi-tenancy` | Tenant identification from startup parameters, row-level isolation (tenant filter on every statement, both protocols), per-tenant client, active-query, replay and journal budgets. Per-tenant pools and schema or database isolation are not built |
 | **WASM Plugins** | `wasm-plugins` | Sandboxed WebAssembly plugin runtime with hot-reload, host function bindings, and per-plugin resource limits |
-| **GraphQL Gateway** | `graphql-gateway` | GraphQL-to-SQL translation layer with automatic schema introspection, DataLoader batching, and query validation |
+| **GraphQL Gateway** | `graphql-gateway` | GraphQL-to-SQL over the tables listed in `[[graphql_gateway.tables]]` (columns typed as text); no schema introspection or result cache |
 | **MCP Agent Gateway** | *(config-gated, `[mcp]`)* | JSON-RPC 2.0 over HTTP for AI agents — `query`, `list_tables`, `explain` tools. Optional bearer-token auth via `[mcp].auth_token` |
 
 ## Platform Tier

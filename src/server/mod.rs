@@ -2562,6 +2562,14 @@ impl ProxyServer {
                                 .reads_offloaded
                                 .load(Ordering::Relaxed),
                             branch_moves: server_state.metrics.branch_moves.load(Ordering::Relaxed),
+                            cache_scope_proofs: server_state
+                                .metrics
+                                .cache_scope_proofs
+                                .load(Ordering::Relaxed),
+                            cache_scope_proofs_reused: server_state
+                                .metrics
+                                .cache_scope_proofs_reused
+                                .load(Ordering::Relaxed),
                             read_mirror_failures: server_state
                                 .metrics
                                 .read_mirror_failures
@@ -2904,6 +2912,16 @@ impl ProxyServer {
                 .load(Ordering::Relaxed),
             reads_offloaded: self.state.metrics.reads_offloaded.load(Ordering::Relaxed),
             branch_moves: self.state.metrics.branch_moves.load(Ordering::Relaxed),
+            cache_scope_proofs: self
+                .state
+                .metrics
+                .cache_scope_proofs
+                .load(Ordering::Relaxed),
+            cache_scope_proofs_reused: self
+                .state
+                .metrics
+                .cache_scope_proofs_reused
+                .load(Ordering::Relaxed),
             read_mirror_failures: self
                 .state
                 .metrics

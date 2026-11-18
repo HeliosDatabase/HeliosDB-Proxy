@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-11-18
+
+Plugin hooks, query rewrite rules and the tenant row filter now cover the extended
+protocol, so prepared statements and ORMs are filtered like simple queries. SIGTERM and
+SIGINT drain the proxy gracefully, and the SIGUSR2 handoff drains the same way. WASM
+plugins ship as signed `.tar.gz` artefacts, reload from the plugin directory without a
+restart, can route a session to a branch database, and are refused at load when they
+could never run. The query cache keeps each connection's backend settings proof for
+`[cache] proof_ttl_ms` (1 s) instead of proving before every read, which restores cheap
+cached reads to the speed of the proxy without the cache. Failover no longer continues a
+session that held state only the failed backend had, statement pooling behaves as
+statement pooling, the rate limiter enforces rates above 1 000 a second, and routing
+targets must be configured nodes.
+
+### Upgrade notes (behaviour changes)
+
+- **SIGTERM and SIGINT drain instead of killing the process:** each session ends with
+  FATAL `57P01` at its next point with nothing in flight, `/health/ready` answers 503, and
+  the process exits at `shutdown_drain_timeout_secs` at the latest; a second signal exits
+  at once. SIGUSR2 handoffs drain the same way.
+- **The extended protocol passes the statement hooks:** a `Parse` now runs the pre-query
+  and route plugin hooks, the rewrite rules and the tenant row filter, so a prepared
+  statement can be blocked, rewritten, filtered or refused where it used to pass.
+- **Non-UTF-8 statement text is refused (`22021`)** while a plugin hook, rewrite rules or
+  the tenant row filter is configured. Use `client_encoding` UTF8.
+- **Routing targets must be configured nodes:** a `node=` hint or plugin answer naming no
+  `[[nodes]]` entry is refused with `42704`; an unknown `[schema_routing] analytics_node`
+  is a startup error.
+- **Plugin loading is stricter:** a manifest hook the module does not export, a hook the
+  proxy never calls, symlinked files, `enable_threads` and `cache_dir` are refused;
+  `.tar.gz` artefacts in `plugin_dir` are loaded; without `trust_root` signatures are not
+  checked and startup warns.
+- **Cached reads reuse the settings proof for `[cache] proof_ttl_ms` (default 1000):** a
+  backend configuration reload reaches cached reads within that time. `proof_ttl_ms = 0`
+  keeps 2.2's proof before every read.
+- **Sessions holding backend-only state end on a lost backend** (`08006`, or the loss
+  reported under `tr_mode = none`) instead of continuing without their temporary
+  tables, cursors, prepared statements, `LISTEN` or advisory locks.
+- **`[pool_mode] mode = "statement"`** refuses a lone `BEGIN` (`0A000`) and ends a
+  session that leaves a transaction block open.
+- **`[rate_limit]` has no hidden per-minute window:** a `default_qps` above 1 000 is now
+  enforced as configured; the window is opt-in (`window_max_requests`, `window_secs`).
+- **Release binaries are built with `postgres-topology`.**
+- **Library API:** see Library API below: `CacheToml`, `PluginToml`, `BranchConfig`,
+  `RateLimitConfig` and `ServerMetricsSnapshot` gain public fields (struct literals must
+  set them). The daemon's CLI, wire protocol and admin API stay compatible.
+
 ### Security
 
 - **Plugins, rewrite rules and the tenant row filter now apply to the extended protocol.**
@@ -92,10 +139,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Default query/edge result caching to a tiny scalar-literal subset unless the operator explicitly vouches for backend read effects and dependencies. MCP tool-result caching requires a separate effects and pooled-context-equivalence contract, including manually attached caches. Native SQL forwarding remains available. Scope rejection publication now obeys the configured client write timeout and retires lost sockets even when the client write fails.
 
-- Verify daemon query/edge cache execution scope on the selected backend with bounded effective-settings probes, clear L1 when that scope changes, and validate a native fill again before publication. Backend role/database defaults now partition shared entries; unsupported proof responses execute natively. The default adds backend round trips to cache reads (two `SHOW ALL` per miss, one per hit: pgbench's select-only script over the simple protocol at 16 clients measured 4 200 reads per second with the cache on, against 68 000 before the proof and 66 000 with `backend_context_immutable = true`); `cache.backend_context_immutable` permits proof reuse only under an explicit immutable-backend-context contract. Opaque view/RLS dependencies remain unvalidated.
+- Verify daemon query/edge cache execution scope on the selected backend with bounded effective-settings probes, clear L1 when that scope changes, and validate a native fill again before publication. Backend role/database defaults now partition shared entries; unsupported proof responses execute natively. The default adds backend round trips to cache reads (two `SHOW ALL` per miss, one per hit: pgbench's select-only script over the simple protocol at 16 clients measured 4 200 reads per second with the cache on, against 68 000 before the proof and 66 000 with `backend_context_immutable = true`); `cache.backend_context_immutable` permits proof reuse only under an explicit immutable-backend-context contract, and `[cache] proof_ttl_ms` (see Changed) now reuses a connection's proof for one second by default. Opaque view/RLS dependencies remain unvalidated.
 - Refuse function-name-only cache context proof, including schema-qualified builtin names, overloads and comment-separated calls; those sessions keep executing natively after the unverified call.
 
 - Namespace daemon SQL-result cache keys by every startup parameter and permanently bypass lookup/store after statements that may change execution context on either protocol. Mixed read/write sessions may have fewer hits. Opaque backend catalog dependencies still require validation.
+
+
+- **Routing hints are read only from comments outside literals.** With
+  `[routing_hints]` on and `strip_hints = true` (the default), a
+  `/*helios:…*/` sequence inside a `'…'` or `E'…'` string, a `$$…$$` or
+  `$tag$…$tag$` literal, or a `"quoted identifier"` was parsed as a hint and
+  stripped from the statement, so `INSERT INTO notes(body) VALUES ('see
+  /*helios:route=standby*/ here')` stored `'see  here'` and could route the
+  statement. Hints are now found with the crate's quote-aware lexer
+  (`crate::sql_text`): text inside those literals is neither parsed nor
+  changed, and real hint comments keep their behaviour. Tracked as Sprinter
+  6c6503dd6d1e.
+- **Row-level tenant filter: OR, comments and unrewritable shapes (2b3c3706f133,
+  40fae8854295, a497b9ae7c97).** Under `[multi_tenancy]` row isolation the filter is
+  now placed by a quote- and comment-aware lexer, not by searching raw text.
+  - An existing `WHERE` is rewritten as `WHERE <filter> AND <condition>`, with the
+    condition parenthesised when it has a top-level `OR`. Before, `WHERE a OR b` became
+    `WHERE <filter> AND a OR b`, which returned other tenants' rows (SELECT) or deleted
+    them (UPDATE, DELETE).
+  - A missing `WHERE` goes before the first top-level clause or trailing `;`, never
+    after a `--` comment, so the filter is no longer commented out.
+  - Leading comments, `WITH` through a comment, and other shapes are no longer skipped.
+    A statement that touches a tenant table in a shape the rewrite does not cover (a
+    `WITH`, a parenthesised query, `TABLE t`, a `VALUES`, several statements, a tenant
+    table inside a subquery) is refused with SQLSTATE 42501 and never reaches the
+    backend. The HTTP, MCP and GraphQL gateways refuse it the same way.
+  - Statements that touch no tenant table, and tenant statements of the shapes listed
+    in `docs/configuration.md`, are unchanged.
+- **Row-level tenant filter: remaining bypasses.** Unicode-escaped identifiers
+  (`U&"…"`, `UESCAPE`) are refused, since they can spell a tenant table the lexer does not
+  read. `INSERT` into a tenant table is rewritten only for `INSERT INTO <table> (<columns>)
+  VALUES (<row>)[, (<row>)...]` with optional `ON CONFLICT (...) DO NOTHING` and
+  `RETURNING`: the tenant column and value are added to the list and to every row. Other
+  `INSERT` shapes are refused (the old text rewrite put the tenant id into the first column,
+  left `INSERT ... SELECT` and `DEFAULT VALUES` unfiltered, and filled only the first row).
+  `ON CONFLICT ... DO UPDATE` is refused, since a conflicting row may belong to another
+  tenant. An `UPDATE` that assigns the tenant column is refused. A tenant id is escaped in
+  every generated literal (`'` doubled), and one containing a NUL byte is refused.
+- **Row-level tenant filter: round 3.** A tenant table followed by an alias is refused
+  (42501); a derived table reusing a tenant table's name no longer shadows it. `DO`, `CALL`
+  and the functions in the new `[multi_tenancy] refused_functions` key (default: the XML
+  exports, dblink, large-object import/export and server-side file reads) are refused under
+  row isolation. An identified tenant with no configuration is filtered by the default row
+  column, or refused. Identifiers are matched as PostgreSQL truncates them (63 bytes). Writes
+  use the table's own tenant column. A tenant id containing a backslash is refused. Proxy-side
+  filtering is documented as not a hard boundary.
+- **Branch names no longer escape `[[hba]]` or tenancy (69ae2a33ff96).** A startup
+  `database=<db>@<branch>` (HeliosDB-Nano branch selection) was matched as a whole
+  string, so a `database = "prod"` rule with `action = "reject"` did not refuse
+  `prod@feature`, and `[multi_tenancy] identify_by = "database"` treated `acme@b` as
+  an unknown tenant: its session was forwarded unfiltered and held none of acme's caps.
+  An `[[hba]]` rule without `@` now covers the full value and its base (a rule with `@`
+  matches only that exact value). `identify_by = "database"` resolves a name like Nano:
+  the whole value if it is a configured tenant, else its base before the first `@`. Row
+  filtering and the per-tenant caps now share that resolution (`src/database_name.rs`).
 
 ### Added
 
@@ -237,50 +339,173 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Optional `[limits] copy_idle_timeout_secs` (default 0/off) bounds stalled COPY input, including partial frames and the final extended Sync after backend completion. Backend processing time is excluded. Expiry cancels and drops the COPY backend, rolls back unfinished input, closes with FATAL 57014 and returns tenant capacity. JSON/Prometheus counters expose COPY expiries and query-cache context bypasses without changing the public metrics snapshot shape.
 
-### Fixed
 
-- **`helios-plugin install` installs working plugins.** It always wrote `<name>.wasm`
-  with no manifest, so an installed module loaded with no hooks and never ran, and a
-  packed artefact from a registry was saved as `.wasm` and refused. It now installs an
-  artefact as `<name>.tar.gz` (checking it unpacks, names the requested plugin and, with
-  a trust root, is signed), a module as `<name>.wasm` with its `.sig`, writes through a
-  temporary file and a rename (signature first), and removes the other format's files
-  for that plugin.
-- **`helios-plugin new` scaffolds a plugin that builds and loads.** The scaffold's
-  `pre_query` had the wrong signature and no `alloc`/`dealloc`, so the runtime could
-  never call it, and it had no `Cargo.toml`. It is now a complete crate implementing
-  the ABI, with the manifest `pack --manifest` reads and the build, pack and load steps.
-- **Plugin runtime options do what they say.** `enable_simd = false` now disables the
-  SIMD proposals; `enable_threads = true` and an on-disk `cache_dir`, which this build
-  cannot provide, are refused when the runtime is created instead of being ignored; and
-  `cache_modules` keeps compiled modules by content hash (it kept every path's module
-  forever and never read them).
-- Unloading a plugin no longer calls its `on_disconnect` export with an empty payload.
-
-- Reject malformed simple-Query CStrings with bounded FATAL 08P01 before hooks, rewriting or cache lookup; preserve empty queries, native byte encodings and typed Parse payloads.
-
-- Allow proven standalone unnamed extended COMMIT PREPARED and ROLLBACK PREPARED cycles through a saturated tenant query cap, including fragmented wire input, without admitting mixed work.
-
-- Keep edge reconnect cursors at the last complete, successfully applied invalidation. Reserve sequence zero for legacy/hello frames, preserve replay order across chunks, and retain the prior checkpoint while a warm replay tail is still queued.
-
-- Check the executed extended-cycle shape before granting a rate-concurrency completion exemption; a first COMMIT Parse cannot exempt a different executed statement.
-
-- Honor L1/L2 cache-tier restrictions across lookup, promotion, compression and store; combine dependency hints with inferred relations and protect their fill generations. Rewritten/client hints take the shortest TTL and intersect restrictions. Automatic opaque catalog dependencies remain open.
-
-- Compile shared SQL-lexer helpers only for their consuming features and guard the edge-cache regression by its feature, keeping isolated SQL-text test builds warning-free.
-
-- **Query cache on the extended protocol** (`[cache] extended_protocol`, default `true`). The query cache now answers reads sent as `Parse`/`Bind`/`Execute`/`Sync` with an unnamed statement, and the `Bind`/`Execute`/`Sync` of a prepared (named) statement, each optionally with a `Describe` of the portal, under every condition a simple query's lookup has. An entry is keyed by the statement text, the declared parameter types, the bound parameter values and their format codes, the result format codes and the batch's shape, so text and binary results, and different parameter values, never share one; the statement's name is not part of the key. A hit runs nothing on the backend but leaves it holding the unnamed statement the client was told it parsed. Other batch shapes, transactions and sessions that have written go to the backend as before. See "Extended-protocol reads" in `docs/configuration.md`. Like a simple query's lookup, each one runs the backend settings proof (`SHOW ALL`) before the lookup and before the store unless `backend_context_immutable = true`: measured with pgbench's prepared select-only script at 16 clients, 4 400 reads per second with the per-read proof against 84 000 with the proof reused per connection (81 000 with the cache bypassed).
-
-- Borrow existing named-statement references through extended-protocol forwarding and recovery, avoiding a second vector and String clones per batch.
-
-- Legacy FunctionCall (fastpath) messages no longer bypass tenant admission, the rate limiter, the circuit breaker, cache invalidation and replay bookkeeping, and the large-object client API keeps working. New top-level key `function_call`: `"large-objects"` (default) forwards PostgreSQL's built-in large-object functions (`lo_open`, `lo_close`, `loread`, `lowrite`, `lo_lseek`, `lo_lseek64`, `lo_tell`, `lo_tell64`, `lo_creat`, `lo_create`, `lo_unlink`, `lo_truncate`, `lo_truncate64`, by catalog OID) as admitted requests on the primary and refuses every other function with `0A000` and ReadyForQuery; `"any"` forwards every OID and treats each call as a write of unknown scope (all cached results retired, reads pinned to the primary, the tenant permit kept as for a session-level lock); `"refuse"` refuses all. A transaction that ran a forwarded call is never replayed after a failover, and a journaled one that ran a writing call is marked incomplete. Plugins, rewrite rules, tenant row filters, anomaly detection and analytics do not see these calls (they carry no SQL). A malformed FunctionCall and unexpected frontend messages end the session with `08P01`. libpq `lo_*`, JDBC `LargeObject` and `pg_dump` of large objects work through the proxy by default.
-
-- Reject node, pool and reconnect caps above Tokio's semaphore limit during config validation, before startup or a reconnect can panic.
-
-- Replace the multi-tenant example and full-config comments with supported startup-parameter identity, row filtering and tenant budgets; document restart requirements and validate the example through the real config loader.
+- **`GET /api/stats`, schema_version 1, for HeliosDB-Lite and other pollers (Sprinter
+  c3397d898b25).** One versioned JSON document on the admin listener, token-gated like
+  every other `/api/*` route: `schema_version`, `proxy_version`, `generated_at`,
+  `uptime_secs`, and the sections `nodes` (role, health, lag, override, circuit state,
+  per-node backend connections at a `max_connections` cap), `pools`, `sessions`,
+  `traffic`, `cache` (per tier entries, bytes, hits, evictions; heatmap summary),
+  `tenants`, `rate_limit`, `transaction_replay` and `gateways` (HTTP, GraphQL, MCP and its
+  tool cache). Every section is always present: one whose feature is compiled out or
+  switched off is `{"enabled": false, "reason": "..."}`. It is built from the snapshots
+  `/metrics`, `/nodes`, `/topology`, `/api/circuit`, `/api/cache/heatmap` and
+  `/api/mcp/cache` already take, plus configuration values and the existing counters of
+  the transaction/statement-mode idle backend pool; no counter is added to the data path.
+  Lists are sorted and cut at the new `[admin] stats_max_items` (default 1000, must be
+  >= 1) with `count` and `truncated`. Contract: within version 1 fields are only ever
+  added, a breaking change bumps `schema_version`; documented field by field in
+  docs/admin-api.md and pinned by `tests/fixtures/api-stats-v1.schema.json` (JSON Schema)
+  and `tests/fixtures/api-stats-v1.example.json`, against which a test validates the live
+  response strictly. Lite's view poller (S2) reads this instead of linking the proxy
+  crate.
+- **MCP agent memory tools (`[mcp] memory_*`, Sprinter 20bcc218385f).** Off by default
+  (`memory_enabled = false`: the tool catalog and responses are unchanged). With it on, the
+  MCP gateway adds `memory_put` (key, any JSON value, optional `ttl_secs` and `tags`),
+  `memory_get`, `memory_list` (keys, tags and times; `prefix`, `tag`, `limit`, `cursor`),
+  `memory_search` (the same page with values; exact prefix and tag match, no similarity)
+  and `memory_delete`. Entries are rows of `memory_table` (default `heliosdb_mcp_memory`)
+  on the MCP backend, so they survive restarts and are shared by every proxy instance on
+  it. Every row is owned by the request's principal and tenant, which the proxy binds as
+  `$1` and `$2` of every statement and no argument can set. The statements are a fixed set
+  sent through the extended protocol with every value bound (new
+  `BackendClient::query_bound_bounded`), as `memory_backend_user` (default `backend_user`)
+  on connections of their own. The shared principal `default` is refused, and
+  `memory_enabled` needs a `[[mcp.principals]]` entry. `memory_put` and `memory_delete` are
+  writes: refused by `read_only` or a read-only contract. They run after admission, the
+  read-only guard, the rate limit, the circuit breaker and the tenant's active-query permit,
+  and move the C-02 write generations of the memory table. Entries expire
+  (`memory_default_ttl_secs = 604800`, `memory_max_ttl_secs = 2592000`); reads filter
+  expired rows and each put deletes its owner's. Bounds: `memory_max_key_bytes = 256`,
+  `memory_max_value_bytes = 65536`, `memory_max_entries_per_owner = 1000`,
+  `memory_max_tags = 16`, `memory_max_tag_bytes = 64`, `memory_list_max_limit = 100`.
+  `memory_auto_create = false` checks the table at startup and refuses to start, naming the
+  DDL, when it is missing; `true` creates it at the first call. While memory is on, `query`
+  and `explain` refuse statements that name the memory table. `strict_config` refuses a
+  memory role equal to `backend_user` (startup warns otherwise), because that role could
+  read every owner's rows through `query`. Needs a PostgreSQL MCP backend: HeliosDB-Nano and
+  HeliosDB-Lite lack the interval arithmetic, and Lite a bound `LIMIT`. New metrics:
+  `heliosdb_proxy_mcp_memory_ops_total{op}`, `_refused_total{reason}`,
+  `_entries_quota_hits_total` (no principal or tenant labels), `mcp_memory` on `/metrics`,
+  and an `mcp-memory` row on `/capabilities`. Documented under "MCP agent memory tools" in
+  `docs/configuration.md`, with the DDL. Library API: `McpConfig` gains the `memory_*`
+  fields (struct literals must set them); new module `mcp_memory`.
+- **MCP tool-result cache (`[mcp] tool_cache_*`, Sprinter 20bcc218385f).** Off by default
+  (`tool_cache_enabled = false`; needs the `query-cache` feature). With it on, the MCP
+  gateway answers a repeated `query` or `list_tables` from memory; `explain` is never
+  cached. Entries are keyed by owner (principal, tenant), tool and the final backend SQL
+  (after `[query_rewrite]` and the tenant filter), compared on every byte; only a single
+  plain `SELECT` naming at least one table and no system catalog, excluded table,
+  backend-ambiguous text or volatile function (the result caches' scan, with `[cache]
+  extra_volatile_functions`) is cached. Entries are retired by the shared C-02 write
+  generations (writes through the PG-wire listener and every gateway, with or without
+  `[cache]`), with the fill-race rule, and by a TTL (`tool_cache_ttl_secs = 60`, a shorter
+  `[[cache.tables]] ttl_secs` applying; `list_tables` follows DDL and
+  `tool_cache_catalog_ttl_secs = 30`). Admission, the read-only guard or contract and the
+  rate limit run first (hits consume rate-limit tokens); the circuit check and the
+  tenant's active-query permit apply only on a miss (a hit runs nothing on the backend,
+  so it is served while its tenant is at its cap). Bounded per owner and overall in
+  entries and bytes (`tool_cache_max_entries = 10000`, `tool_cache_max_bytes = 64 MiB`,
+  `tool_cache_max_entries_per_principal = 1000`, `tool_cache_max_bytes_per_principal =
+  8 MiB`, `tool_cache_max_entry_bytes = 1 MiB`, `tool_cache_max_statement_bytes = 16384`),
+  with O(1) amortized eviction. `query` and `list_tables` gain an optional `"fresh": true`
+  that bypasses and refreshes the entry; a cacheable call's result carries
+  `_meta["heliosdb.com/cache"]` (hit, age, stored, skip reason; never data). With the cache
+  off, responses are unchanged. `strict_config` refuses the cache when the MCP backend is
+  neither a `[[nodes]]` address nor the proxy's listener and no logical source runs
+  (startup warns otherwise). New admin endpoints `GET /api/mcp/cache` and
+  `POST /api/mcp/cache/clear`; new metrics `heliosdb_proxy_mcp_cache_*` (hits, misses,
+  stores, stale, expired, raced fills, skips by reason, evictions by scope, entries,
+  bytes, owners; no principal or tenant labels); a `mcp-tool-cache` row on
+  `/capabilities`. Documented under `[mcp]` in `docs/configuration.md`.
+- **MCP: per-agent principals (`[[mcp.principals]]`, Sprinter 20bcc218385f).** Each
+  entry has an `id` (`[A-Za-z0-9_.-]{1,64}`, unique; `default` reserved) and a `token`
+  (non-empty, unique, not `auth_token`). The request's bearer token selects its
+  principal: the presented token's SHA-256 is compared in constant time against every
+  configured one, with no early exit; an unknown or missing token gets 401 once any
+  token is configured. Backward compatible: `[mcp] auth_token` keeps working, and its
+  holders (or every caller, with no token configured) are the principal `default`. The
+  principal, with the request's tenant, is the isolation unit for per-agent MCP state; it
+  is logged with each tool call, and tokens are never logged, serialised or shown by
+  `Debug`. Startup-only, like the rest of `[mcp]`. Library API: `config::McpPrincipal`,
+  `McpConfig::principals` (struct literals must set it), `MCP_DEFAULT_PRINCIPAL`.
+- **Query-cache refresh-ahead** (`[cache] refresh_ahead_ratio`, default `0.0` = off;
+  `refresh_ahead_claim_timeout_ms`, default `5000`). Once an L1/L2 entry is at least
+  ratio × its TTL old, exactly one read of it claims the refill: it is treated as a miss
+  (bypassing its own L1 copy), runs on its own backend connection, and its result replaces
+  the entry through the normal store path, while every other read is still served the
+  entry until the refill lands or the TTL ends; connections whose L1 copy is past the
+  refresh point pick the refill up from L2. A hot key no longer stampedes the backend at
+  expiry, and its readers see no latency cliff there, for one extra backend read per hot
+  entry per TTL. A claim ends when its refill is stored or, for any other outcome (error
+  response, oversized result, a write racing the fetch, a standby's answer, a lost client),
+  is abandoned; a claim older than the timeout is taken over, so a lost claimant never
+  blocks refreshes. New counters `heliosdb_proxy_cache_refresh_ahead_claims_total`,
+  `_completed_total`, `_abandoned_total` (JSON `query_cache.refresh_ahead`). Off, the
+  lookup pays one branch. Validated at startup (an error names the key); `[cache]` stays
+  startup-only on SIGHUP. Library API: `CacheConfig` gains `refresh_ahead_ratio` and
+  `refresh_ahead_claim_timeout`, and `CacheToml` the two keys (struct literals must set
+  them).
+- **Query cache: tier sizes and L2 payload compression** (distribcache merge P1,
+  7c860e8a2e14). New flat `[cache]` keys, defaults unchanged behaviour:
+  `l1_max_entries = 500` and `l1_max_bytes = 33554432` (per client connection; were
+  hardcoded), `l2_max_bytes = 268435456` (shared L2; was hardcoded as 256 MiB),
+  `l2_compression = "none" | "lz4" | "zstd"` (default `"none"`),
+  `l2_compression_min_bytes = 4096` and `l2_zstd_level = 3` (1..=19). With a codec, L2
+  stores payloads of at least the threshold compressed when that shrinks them (a
+  marker byte names the codec; an entry that does not decompress is dropped and the
+  read misses), counts the compressed size against `l2_max_bytes`, and decompresses on
+  every L2 hit before serving or promoting to L1, which keeps raw bytes. zstd runs on the
+  blocking thread pool, before the C-02 generation check, which still runs last before
+  the stores; LZ4 runs inline. It only pays when the hot set does not fit `l2_max_bytes`
+  uncompressed. Every key is validated at startup and an error names it. Startup logs
+  `l2_max_bytes` and `l2_compression`; `/capabilities` reports `cache.l2_compression`
+  on a build without `query-cache`.
+- **Query cache metrics:** `heliosdb_proxy_cache_evictions_total{tier="l1|l2|l3"}`
+  (evictions were counted only in tests), `heliosdb_proxy_cache_entries{tier}` and
+  `heliosdb_proxy_cache_compression_saved_bytes` (raw minus stored bytes L2 retains),
+  with `entries`, `evictions` and `compression_saved_bytes` under `query_cache` in
+  `GET /metrics`.
+- **Config hints:** `[cache.l1]`, `[cache.l2]` and `[distribcache]` name the new flat
+  keys.
+- Criterion: `cache/l2/compress_{lz4,zstd}_{4k,64k,1m}`,
+  `cache/l2/hit_{lz4,zstd}_{4k,64k,1m}` and the control `cache/l2/hit_none_64k`, on
+  DataRow payloads.
+- **Query-cache heatmap with recommendations** (distribcache merge P2). With
+  `[cache] heatmap_enabled = true` the cache counts, per table and per time bucket
+  (`heatmap_bucket_secs = 300` × `heatmap_buckets = 288`, a 24 h window), hits, misses
+  (and of those, expired L2 entries), stores and their bytes, C-02 write invalidations,
+  stale rejections and raced fills. `GET /api/cache/heatmap` (token-gated like every
+  `/api/*` route) lists the tables hottest first with hit ratio, temperature and last
+  access, and recommends `cache.exclude_tables` for a table with more invalidations than
+  hits, or a higher `[[cache.tables]] ttl_secs` when most of its misses found the entry
+  expired, once it has `heatmap_min_samples = 100` reads in the window. The table set is
+  bounded by `heatmap_max_tables = 1024` (samples beyond it count in `overflow`; idle
+  tables make room once per bucket). Recording takes no lock (per-table atomic rings, a
+  copy-on-write table set); off (the default), each cache access pays one branch. A
+  `[cache.heatmap]` table gets a hint naming the flat keys. Per-table retained bytes are
+  not reported (the cache keeps no per-table byte count). Library API: `CacheConfig`
+  gains `heatmap` (`cache::HeatmapConfig`) and `CacheToml` the five keys (struct
+  literals must set them); new `QueryCache::heatmap_snapshot` and
+  `L2WarmCache::get_noting_expiry`. Criterion cases
+  `cache/heatmap/record_hit_{off,on,contended_8}`.
 
 ### Changed
 
+- **Cached reads reuse the backend settings proof (`[cache] proof_ttl_ms`, default
+  1000) (perf).** Every cached read proved the backend's effective settings with a
+  `SHOW ALL` round trip before the lookup and again before storing a miss, which cut
+  cheap cached reads to about 4 200 a second at 16 clients, against 68 000 without the
+  cache. A connection's proof is now kept and reused by the reads after it on that
+  connection until `proof_ttl_ms` passes, anything other than a proven cacheable read
+  reaches the connection (a write, a `SET`, a `FunctionCall`, an extended batch that is
+  not a cached read), or a ParameterStatus is relayed to the session. A pooled
+  connection proves again for each lease. `0` restores the per-read proof;
+  `backend_context_immutable` still never re-proves. The proof's reply is read into one
+  buffer with as few reads as the socket allows and its rows are borrowed from it, not
+  copied (it used two reads and three allocations per row); the namespace it proves is
+  unchanged. New counters `heliosdb_proxy_cache_scope_proofs_total` and
+  `heliosdb_proxy_cache_scope_proofs_reused_total`.
 - **Recovery journal: the per-statement size cap no longer re-walks the transaction
   (perf).** Every statement appended to an explicit transaction's journal checked
   `[journal] max_bytes_per_transaction` by summing all earlier entries again, so a
@@ -464,159 +689,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1.2 KiB, and every await copies a future whole: an L1 hit cost 13 % more); the store's
   is 912 bytes, below 2.2.0's. No behaviour change.
 
-### Added
-
-- **`GET /api/stats`, schema_version 1, for HeliosDB-Lite and other pollers (Sprinter
-  c3397d898b25).** One versioned JSON document on the admin listener, token-gated like
-  every other `/api/*` route: `schema_version`, `proxy_version`, `generated_at`,
-  `uptime_secs`, and the sections `nodes` (role, health, lag, override, circuit state,
-  per-node backend connections at a `max_connections` cap), `pools`, `sessions`,
-  `traffic`, `cache` (per tier entries, bytes, hits, evictions; heatmap summary),
-  `tenants`, `rate_limit`, `transaction_replay` and `gateways` (HTTP, GraphQL, MCP and its
-  tool cache). Every section is always present: one whose feature is compiled out or
-  switched off is `{"enabled": false, "reason": "..."}`. It is built from the snapshots
-  `/metrics`, `/nodes`, `/topology`, `/api/circuit`, `/api/cache/heatmap` and
-  `/api/mcp/cache` already take, plus configuration values and the existing counters of
-  the transaction/statement-mode idle backend pool; no counter is added to the data path.
-  Lists are sorted and cut at the new `[admin] stats_max_items` (default 1000, must be
-  >= 1) with `count` and `truncated`. Contract: within version 1 fields are only ever
-  added, a breaking change bumps `schema_version`; documented field by field in
-  docs/admin-api.md and pinned by `tests/fixtures/api-stats-v1.schema.json` (JSON Schema)
-  and `tests/fixtures/api-stats-v1.example.json`, against which a test validates the live
-  response strictly. Lite's view poller (S2) reads this instead of linking the proxy
-  crate.
-- **MCP agent memory tools (`[mcp] memory_*`, Sprinter 20bcc218385f).** Off by default
-  (`memory_enabled = false`: the tool catalog and responses are unchanged). With it on, the
-  MCP gateway adds `memory_put` (key, any JSON value, optional `ttl_secs` and `tags`),
-  `memory_get`, `memory_list` (keys, tags and times; `prefix`, `tag`, `limit`, `cursor`),
-  `memory_search` (the same page with values; exact prefix and tag match, no similarity)
-  and `memory_delete`. Entries are rows of `memory_table` (default `heliosdb_mcp_memory`)
-  on the MCP backend, so they survive restarts and are shared by every proxy instance on
-  it. Every row is owned by the request's principal and tenant, which the proxy binds as
-  `$1` and `$2` of every statement and no argument can set. The statements are a fixed set
-  sent through the extended protocol with every value bound (new
-  `BackendClient::query_bound_bounded`), as `memory_backend_user` (default `backend_user`)
-  on connections of their own. The shared principal `default` is refused, and
-  `memory_enabled` needs a `[[mcp.principals]]` entry. `memory_put` and `memory_delete` are
-  writes: refused by `read_only` or a read-only contract. They run after admission, the
-  read-only guard, the rate limit, the circuit breaker and the tenant's active-query permit,
-  and move the C-02 write generations of the memory table. Entries expire
-  (`memory_default_ttl_secs = 604800`, `memory_max_ttl_secs = 2592000`); reads filter
-  expired rows and each put deletes its owner's. Bounds: `memory_max_key_bytes = 256`,
-  `memory_max_value_bytes = 65536`, `memory_max_entries_per_owner = 1000`,
-  `memory_max_tags = 16`, `memory_max_tag_bytes = 64`, `memory_list_max_limit = 100`.
-  `memory_auto_create = false` checks the table at startup and refuses to start, naming the
-  DDL, when it is missing; `true` creates it at the first call. While memory is on, `query`
-  and `explain` refuse statements that name the memory table. `strict_config` refuses a
-  memory role equal to `backend_user` (startup warns otherwise), because that role could
-  read every owner's rows through `query`. Needs a PostgreSQL MCP backend: HeliosDB-Nano and
-  HeliosDB-Lite lack the interval arithmetic, and Lite a bound `LIMIT`. New metrics:
-  `heliosdb_proxy_mcp_memory_ops_total{op}`, `_refused_total{reason}`,
-  `_entries_quota_hits_total` (no principal or tenant labels), `mcp_memory` on `/metrics`,
-  and an `mcp-memory` row on `/capabilities`. Documented under "MCP agent memory tools" in
-  `docs/configuration.md`, with the DDL. Library API: `McpConfig` gains the `memory_*`
-  fields (struct literals must set them); new module `mcp_memory`.
-- **MCP tool-result cache (`[mcp] tool_cache_*`, Sprinter 20bcc218385f).** Off by default
-  (`tool_cache_enabled = false`; needs the `query-cache` feature). With it on, the MCP
-  gateway answers a repeated `query` or `list_tables` from memory; `explain` is never
-  cached. Entries are keyed by owner (principal, tenant), tool and the final backend SQL
-  (after `[query_rewrite]` and the tenant filter), compared on every byte; only a single
-  plain `SELECT` naming at least one table and no system catalog, excluded table,
-  backend-ambiguous text or volatile function (the result caches' scan, with `[cache]
-  extra_volatile_functions`) is cached. Entries are retired by the shared C-02 write
-  generations (writes through the PG-wire listener and every gateway, with or without
-  `[cache]`), with the fill-race rule, and by a TTL (`tool_cache_ttl_secs = 60`, a shorter
-  `[[cache.tables]] ttl_secs` applying; `list_tables` follows DDL and
-  `tool_cache_catalog_ttl_secs = 30`). Admission, the read-only guard or contract and the
-  rate limit run first (hits consume rate-limit tokens); the circuit check and the
-  tenant's active-query permit apply only on a miss (a hit runs nothing on the backend,
-  so it is served while its tenant is at its cap). Bounded per owner and overall in
-  entries and bytes (`tool_cache_max_entries = 10000`, `tool_cache_max_bytes = 64 MiB`,
-  `tool_cache_max_entries_per_principal = 1000`, `tool_cache_max_bytes_per_principal =
-  8 MiB`, `tool_cache_max_entry_bytes = 1 MiB`, `tool_cache_max_statement_bytes = 16384`),
-  with O(1) amortized eviction. `query` and `list_tables` gain an optional `"fresh": true`
-  that bypasses and refreshes the entry; a cacheable call's result carries
-  `_meta["heliosdb.com/cache"]` (hit, age, stored, skip reason; never data). With the cache
-  off, responses are unchanged. `strict_config` refuses the cache when the MCP backend is
-  neither a `[[nodes]]` address nor the proxy's listener and no logical source runs
-  (startup warns otherwise). New admin endpoints `GET /api/mcp/cache` and
-  `POST /api/mcp/cache/clear`; new metrics `heliosdb_proxy_mcp_cache_*` (hits, misses,
-  stores, stale, expired, raced fills, skips by reason, evictions by scope, entries,
-  bytes, owners; no principal or tenant labels); a `mcp-tool-cache` row on
-  `/capabilities`. Documented under `[mcp]` in `docs/configuration.md`.
-- **MCP: per-agent principals (`[[mcp.principals]]`, Sprinter 20bcc218385f).** Each
-  entry has an `id` (`[A-Za-z0-9_.-]{1,64}`, unique; `default` reserved) and a `token`
-  (non-empty, unique, not `auth_token`). The request's bearer token selects its
-  principal: the presented token's SHA-256 is compared in constant time against every
-  configured one, with no early exit; an unknown or missing token gets 401 once any
-  token is configured. Backward compatible: `[mcp] auth_token` keeps working, and its
-  holders (or every caller, with no token configured) are the principal `default`. The
-  principal, with the request's tenant, is the isolation unit for per-agent MCP state; it
-  is logged with each tool call, and tokens are never logged, serialised or shown by
-  `Debug`. Startup-only, like the rest of `[mcp]`. Library API: `config::McpPrincipal`,
-  `McpConfig::principals` (struct literals must set it), `MCP_DEFAULT_PRINCIPAL`.
-- **Query-cache refresh-ahead** (`[cache] refresh_ahead_ratio`, default `0.0` = off;
-  `refresh_ahead_claim_timeout_ms`, default `5000`). Once an L1/L2 entry is at least
-  ratio × its TTL old, exactly one read of it claims the refill: it is treated as a miss
-  (bypassing its own L1 copy), runs on its own backend connection, and its result replaces
-  the entry through the normal store path, while every other read is still served the
-  entry until the refill lands or the TTL ends; connections whose L1 copy is past the
-  refresh point pick the refill up from L2. A hot key no longer stampedes the backend at
-  expiry, and its readers see no latency cliff there, for one extra backend read per hot
-  entry per TTL. A claim ends when its refill is stored or, for any other outcome (error
-  response, oversized result, a write racing the fetch, a standby's answer, a lost client),
-  is abandoned; a claim older than the timeout is taken over, so a lost claimant never
-  blocks refreshes. New counters `heliosdb_proxy_cache_refresh_ahead_claims_total`,
-  `_completed_total`, `_abandoned_total` (JSON `query_cache.refresh_ahead`). Off, the
-  lookup pays one branch. Validated at startup (an error names the key); `[cache]` stays
-  startup-only on SIGHUP. Library API: `CacheConfig` gains `refresh_ahead_ratio` and
-  `refresh_ahead_claim_timeout`, and `CacheToml` the two keys (struct literals must set
-  them).
-- **Query cache: tier sizes and L2 payload compression** (distribcache merge P1,
-  7c860e8a2e14). New flat `[cache]` keys, defaults unchanged behaviour:
-  `l1_max_entries = 500` and `l1_max_bytes = 33554432` (per client connection; were
-  hardcoded), `l2_max_bytes = 268435456` (shared L2; was hardcoded as 256 MiB),
-  `l2_compression = "none" | "lz4" | "zstd"` (default `"none"`),
-  `l2_compression_min_bytes = 4096` and `l2_zstd_level = 3` (1..=19). With a codec, L2
-  stores payloads of at least the threshold compressed when that shrinks them (a
-  marker byte names the codec; an entry that does not decompress is dropped and the
-  read misses), counts the compressed size against `l2_max_bytes`, and decompresses on
-  every L2 hit before serving or promoting to L1, which keeps raw bytes. zstd runs on the
-  blocking thread pool, before the C-02 generation check, which still runs last before
-  the stores; LZ4 runs inline. It only pays when the hot set does not fit `l2_max_bytes`
-  uncompressed. Every key is validated at startup and an error names it. Startup logs
-  `l2_max_bytes` and `l2_compression`; `/capabilities` reports `cache.l2_compression`
-  on a build without `query-cache`.
-- **Query cache metrics:** `heliosdb_proxy_cache_evictions_total{tier="l1|l2|l3"}`
-  (evictions were counted only in tests), `heliosdb_proxy_cache_entries{tier}` and
-  `heliosdb_proxy_cache_compression_saved_bytes` (raw minus stored bytes L2 retains),
-  with `entries`, `evictions` and `compression_saved_bytes` under `query_cache` in
-  `GET /metrics`.
-- **Config hints:** `[cache.l1]`, `[cache.l2]` and `[distribcache]` name the new flat
-  keys.
-- Criterion: `cache/l2/compress_{lz4,zstd}_{4k,64k,1m}`,
-  `cache/l2/hit_{lz4,zstd}_{4k,64k,1m}` and the control `cache/l2/hit_none_64k`, on
-  DataRow payloads.
-- **Query-cache heatmap with recommendations** (distribcache merge P2). With
-  `[cache] heatmap_enabled = true` the cache counts, per table and per time bucket
-  (`heatmap_bucket_secs = 300` × `heatmap_buckets = 288`, a 24 h window), hits, misses
-  (and of those, expired L2 entries), stores and their bytes, C-02 write invalidations,
-  stale rejections and raced fills. `GET /api/cache/heatmap` (token-gated like every
-  `/api/*` route) lists the tables hottest first with hit ratio, temperature and last
-  access, and recommends `cache.exclude_tables` for a table with more invalidations than
-  hits, or a higher `[[cache.tables]] ttl_secs` when most of its misses found the entry
-  expired, once it has `heatmap_min_samples = 100` reads in the window. The table set is
-  bounded by `heatmap_max_tables = 1024` (samples beyond it count in `overflow`; idle
-  tables make room once per bucket). Recording takes no lock (per-table atomic rings, a
-  copy-on-write table set); off (the default), each cache access pays one branch. A
-  `[cache.heatmap]` table gets a hint naming the flat keys. Per-table retained bytes are
-  not reported (the cache keeps no per-table byte count). Library API: `CacheConfig`
-  gains `heatmap` (`cache::HeatmapConfig`) and `CacheToml` the five keys (struct
-  literals must set them); new `QueryCache::heatmap_snapshot` and
-  `L2WarmCache::get_noting_expiry`. Criterion cases
-  `cache/heatmap/record_hit_{off,on,contended_8}`.
-
 ### Fixed
+
+- **Ed25519 signing keys in PKCS#8 v2 form (with the public key) are accepted.** Their
+  length was checked as 83 bytes instead of 85, so every such key was refused.
+- **A plugin waiting for a `max_plugins` slot loads in the rescan that frees one.**
+  Removed plugins were unloaded after the new ones were tried.
+- **`SELECT set_config(name, value, false)` counts as session state** for branch moves
+  and failover: the `SELECT` was classified before the call was looked at.
+- **Plugins see the tenant of a tenant without a client cap** in `hook_context`
+  (`tenant_id`); it was set only for tenants with `max_clients_per_tenant`.
+- **`helios-plugin install` installs working plugins.** It always wrote `<name>.wasm`
+  with no manifest, so an installed module loaded with no hooks and never ran, and a
+  packed artefact from a registry was saved as `.wasm` and refused. It now installs an
+  artefact as `<name>.tar.gz` (checking it unpacks, names the requested plugin and, with
+  a trust root, is signed), a module as `<name>.wasm` with its `.sig`, writes through a
+  temporary file and a rename (signature first), and removes the other format's files
+  for that plugin.
+- **`helios-plugin new` scaffolds a plugin that builds and loads.** The scaffold's
+  `pre_query` had the wrong signature and no `alloc`/`dealloc`, so the runtime could
+  never call it, and it had no `Cargo.toml`. It is now a complete crate implementing
+  the ABI, with the manifest `pack --manifest` reads and the build, pack and load steps.
+- **Plugin runtime options do what they say.** `enable_simd = false` now disables the
+  SIMD proposals; `enable_threads = true` and an on-disk `cache_dir`, which this build
+  cannot provide, are refused when the runtime is created instead of being ignored; and
+  `cache_modules` keeps compiled modules by content hash (it kept every path's module
+  forever and never read them).
+- Unloading a plugin no longer calls its `on_disconnect` export with an empty payload.
+
+- Reject malformed simple-Query CStrings with bounded FATAL 08P01 before hooks, rewriting or cache lookup; preserve empty queries, native byte encodings and typed Parse payloads.
+
+- Allow proven standalone unnamed extended COMMIT PREPARED and ROLLBACK PREPARED cycles through a saturated tenant query cap, including fragmented wire input, without admitting mixed work.
+
+- Keep edge reconnect cursors at the last complete, successfully applied invalidation. Reserve sequence zero for legacy/hello frames, preserve replay order across chunks, and retain the prior checkpoint while a warm replay tail is still queued.
+
+- Check the executed extended-cycle shape before granting a rate-concurrency completion exemption; a first COMMIT Parse cannot exempt a different executed statement.
+
+- Honor L1/L2 cache-tier restrictions across lookup, promotion, compression and store; combine dependency hints with inferred relations and protect their fill generations. Rewritten/client hints take the shortest TTL and intersect restrictions. Automatic opaque catalog dependencies remain open.
+
+- Compile shared SQL-lexer helpers only for their consuming features and guard the edge-cache regression by its feature, keeping isolated SQL-text test builds warning-free.
+
+- **Query cache on the extended protocol** (`[cache] extended_protocol`, default `true`). The query cache now answers reads sent as `Parse`/`Bind`/`Execute`/`Sync` with an unnamed statement, and the `Bind`/`Execute`/`Sync` of a prepared (named) statement, each optionally with a `Describe` of the portal, under every condition a simple query's lookup has. An entry is keyed by the statement text, the declared parameter types, the bound parameter values and their format codes, the result format codes and the batch's shape, so text and binary results, and different parameter values, never share one; the statement's name is not part of the key. A hit runs nothing on the backend but leaves it holding the unnamed statement the client was told it parsed. Other batch shapes, transactions and sessions that have written go to the backend as before. See "Extended-protocol reads" in `docs/configuration.md`. Like a simple query's lookup, each one runs the backend settings proof (`SHOW ALL`) before the lookup and before the store unless `backend_context_immutable = true`: measured with pgbench's prepared select-only script at 16 clients, 4 400 reads per second with the per-read proof against 84 000 with the proof reused per connection (81 000 with the cache bypassed).
+
+- Borrow existing named-statement references through extended-protocol forwarding and recovery, avoiding a second vector and String clones per batch.
+
+- Legacy FunctionCall (fastpath) messages no longer bypass tenant admission, the rate limiter, the circuit breaker, cache invalidation and replay bookkeeping, and the large-object client API keeps working. New top-level key `function_call`: `"large-objects"` (default) forwards PostgreSQL's built-in large-object functions (`lo_open`, `lo_close`, `loread`, `lowrite`, `lo_lseek`, `lo_lseek64`, `lo_tell`, `lo_tell64`, `lo_creat`, `lo_create`, `lo_unlink`, `lo_truncate`, `lo_truncate64`, by catalog OID) as admitted requests on the primary and refuses every other function with `0A000` and ReadyForQuery; `"any"` forwards every OID and treats each call as a write of unknown scope (all cached results retired, reads pinned to the primary, the tenant permit kept as for a session-level lock); `"refuse"` refuses all. A transaction that ran a forwarded call is never replayed after a failover, and a journaled one that ran a writing call is marked incomplete. Plugins, rewrite rules, tenant row filters, anomaly detection and analytics do not see these calls (they carry no SQL). A malformed FunctionCall and unexpected frontend messages end the session with `08P01`. libpq `lo_*`, JDBC `LargeObject` and `pg_dump` of large objects work through the proxy by default.
+
+- Reject node, pool and reconnect caps above Tokio's semaphore limit during config validation, before startup or a reconnect can panic.
+
+- Replace the multi-tenant example and full-config comments with supported startup-parameter identity, row filtering and tenant budgets; document restart requirements and validate the example through the real config loader.
+
 - **Bounded backend reads drain an oversized row without allocating it (Sprinter 2a43c1f4d4d7).**
   The bounded readers behind the MCP, HTTP `/sql` and GraphQL gateways read a whole
   frame into memory before the result caps applied, so one huge DataRow allocated
@@ -721,61 +843,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Upgrade note:** a `/sql` or GraphQL query that returned more than 10000 rows or
     16 MiB of cell data before now fails with the refusal above. Raise the caps (up to
     1000000 rows and 1 GiB) for such a workload, or narrow the query.
-### Security
-
-- **Routing hints are read only from comments outside literals.** With
-  `[routing_hints]` on and `strip_hints = true` (the default), a
-  `/*helios:…*/` sequence inside a `'…'` or `E'…'` string, a `$$…$$` or
-  `$tag$…$tag$` literal, or a `"quoted identifier"` was parsed as a hint and
-  stripped from the statement, so `INSERT INTO notes(body) VALUES ('see
-  /*helios:route=standby*/ here')` stored `'see  here'` and could route the
-  statement. Hints are now found with the crate's quote-aware lexer
-  (`crate::sql_text`): text inside those literals is neither parsed nor
-  changed, and real hint comments keep their behaviour. Tracked as Sprinter
-  6c6503dd6d1e.
-- **Row-level tenant filter: OR, comments and unrewritable shapes (2b3c3706f133,
-  40fae8854295, a497b9ae7c97).** Under `[multi_tenancy]` row isolation the filter is
-  now placed by a quote- and comment-aware lexer, not by searching raw text.
-  - An existing `WHERE` is rewritten as `WHERE <filter> AND <condition>`, with the
-    condition parenthesised when it has a top-level `OR`. Before, `WHERE a OR b` became
-    `WHERE <filter> AND a OR b`, which returned other tenants' rows (SELECT) or deleted
-    them (UPDATE, DELETE).
-  - A missing `WHERE` goes before the first top-level clause or trailing `;`, never
-    after a `--` comment, so the filter is no longer commented out.
-  - Leading comments, `WITH` through a comment, and other shapes are no longer skipped.
-    A statement that touches a tenant table in a shape the rewrite does not cover (a
-    `WITH`, a parenthesised query, `TABLE t`, a `VALUES`, several statements, a tenant
-    table inside a subquery) is refused with SQLSTATE 42501 and never reaches the
-    backend. The HTTP, MCP and GraphQL gateways refuse it the same way.
-  - Statements that touch no tenant table, and tenant statements of the shapes listed
-    in `docs/configuration.md`, are unchanged.
-- **Row-level tenant filter: remaining bypasses.** Unicode-escaped identifiers
-  (`U&"…"`, `UESCAPE`) are refused, since they can spell a tenant table the lexer does not
-  read. `INSERT` into a tenant table is rewritten only for `INSERT INTO <table> (<columns>)
-  VALUES (<row>)[, (<row>)...]` with optional `ON CONFLICT (...) DO NOTHING` and
-  `RETURNING`: the tenant column and value are added to the list and to every row. Other
-  `INSERT` shapes are refused (the old text rewrite put the tenant id into the first column,
-  left `INSERT ... SELECT` and `DEFAULT VALUES` unfiltered, and filled only the first row).
-  `ON CONFLICT ... DO UPDATE` is refused, since a conflicting row may belong to another
-  tenant. An `UPDATE` that assigns the tenant column is refused. A tenant id is escaped in
-  every generated literal (`'` doubled), and one containing a NUL byte is refused.
-- **Row-level tenant filter: round 3.** A tenant table followed by an alias is refused
-  (42501); a derived table reusing a tenant table's name no longer shadows it. `DO`, `CALL`
-  and the functions in the new `[multi_tenancy] refused_functions` key (default: the XML
-  exports, dblink, large-object import/export and server-side file reads) are refused under
-  row isolation. An identified tenant with no configuration is filtered by the default row
-  column, or refused. Identifiers are matched as PostgreSQL truncates them (63 bytes). Writes
-  use the table's own tenant column. A tenant id containing a backslash is refused. Proxy-side
-  filtering is documented as not a hard boundary.
-- **Branch names no longer escape `[[hba]]` or tenancy (69ae2a33ff96).** A startup
-  `database=<db>@<branch>` (HeliosDB-Nano branch selection) was matched as a whole
-  string, so a `database = "prod"` rule with `action = "reject"` did not refuse
-  `prod@feature`, and `[multi_tenancy] identify_by = "database"` treated `acme@b` as
-  an unknown tenant: its session was forwarded unfiltered and held none of acme's caps.
-  An `[[hba]]` rule without `@` now covers the full value and its base (a rule with `@`
-  matches only that exact value). `identify_by = "database"` resolves a name like Nano:
-  the whole value if it is a configured tenant, else its base before the first `@`. Row
-  filtering and the per-tenant caps now share that resolution (`src/database_name.rs`).
 
 ### Library API (breaking)
 
@@ -788,6 +855,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without a hint is returned borrowed. `QueryRouter::strip_hints` keeps its `String`.
 - `cache::L2Config::size_mb` is replaced by `max_bytes` (see ### Changed above for the
   other cache structs that gained fields).
+- New public fields: `config::CacheToml::proof_ttl_ms`; `ServerMetricsSnapshot::{branch_moves,
+  cache_scope_proofs, cache_scope_proofs_reused}`; `config::PluginToml::{hot_reload_interval_ms,
+  hot_reload_debounce_ms, max_artefact_bytes, require_signed_manifest}`;
+  `config::BranchConfig::{route_enabled, route_mode, route_allow}`;
+  `rate_limit::RateLimitConfig::{window_size, window_max_requests}`. New module
+  `plugin_artefact` (artefact format, signing, trust roots).
 
 ### Development
 

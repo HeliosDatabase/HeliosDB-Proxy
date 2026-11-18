@@ -557,7 +557,7 @@ Example (abridged; the example fixture has every field):
 ```json
 {
   "schema_version": 1,
-  "proxy_version": "2.2.0",
+  "proxy_version": "2.3.0",
   "generated_at": "2026-11-06T10:15:02.123Z",
   "uptime_secs": 86400,
   "nodes": {

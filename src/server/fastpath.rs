@@ -215,6 +215,8 @@ impl ProxyServer {
         }
         let backend = conns.get_mut(&target).expect("just ensured");
         let unknown = class == FunctionCallClass::Unknown;
+        // A function call may change the connection's settings.
+        backend.forget_cache_scope();
         // What an arbitrary function left on the connection is not known.
         #[cfg(feature = "pool-modes")]
         if unknown {

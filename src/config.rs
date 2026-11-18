@@ -2241,6 +2241,16 @@ pub struct CacheToml {
     /// changes (including backend configuration reloads). Default false:
     /// verify before each lookup and again before publishing a native fill.
     pub backend_context_immutable: bool,
+    /// How long a backend connection's settings proof is reused for later
+    /// cached reads on it, in milliseconds. The proof is taken again sooner
+    /// when anything other than a proven cacheable read reaches that
+    /// connection (a write, a `SET`, any statement that may change its
+    /// settings, a `FunctionCall`) or a ParameterStatus is relayed. A backend
+    /// configuration reload reaches cached reads within this time. `0` proves
+    /// before every lookup and again before every fill, as before 2.3.0.
+    /// Default 1000. Ignored with `backend_context_immutable`. Takes effect
+    /// on reload.
+    pub proof_ttl_ms: u64,
     /// Answer extended-protocol reads (a prepared statement's
     /// Bind/Execute/Sync, or an unnamed Parse/Bind/Execute/Sync) from the
     /// query cache as well. An entry is keyed by the statement text, its
@@ -3134,12 +3144,16 @@ impl CacheToml {
     }
 }
 
+/// Upper bound of `[cache] proof_ttl_ms`: five minutes.
+pub const MAX_PROOF_TTL_MS: u64 = 300_000;
+
 impl Default for CacheToml {
     fn default() -> Self {
         Self {
             enabled: false,
             trust_backend_read_effects: false,
             backend_context_immutable: false,
+            proof_ttl_ms: 1000,
             extended_protocol: true,
             max_backend_context_bytes: 512 * 1024,
             ttl_secs: 300,
@@ -5073,6 +5087,12 @@ impl ProxyConfig {
             return Err(ProxyError::Config(
                 "cache.max_backend_context_bytes must be >= 1".to_string(),
             ));
+        }
+        if self.cache.proof_ttl_ms > MAX_PROOF_TTL_MS {
+            return Err(ProxyError::Config(format!(
+                "cache.proof_ttl_ms must be <= {MAX_PROOF_TTL_MS} (a backend settings reload \
+                 reaches cached reads within it); use backend_context_immutable to never re-prove"
+            )));
         }
         if self.cache.max_cacheable_response_bytes == 0 {
             return Err(ProxyError::Config(
@@ -8535,6 +8555,21 @@ max_dependency_tables = 2
         assert!(parsed.extended_protocol);
         let parsed: CacheToml = toml::from_str("extended_protocol = false\n").unwrap();
         assert!(!parsed.extended_protocol);
+    }
+
+    #[test]
+    fn the_settings_proof_is_reused_for_a_second_by_default_and_bounded() {
+        let parsed: CacheToml = toml::from_str("").unwrap();
+        assert_eq!(parsed.proof_ttl_ms, 1000);
+        let parsed: CacheToml = toml::from_str("proof_ttl_ms = 0\n").unwrap();
+        assert_eq!(parsed.proof_ttl_ms, 0);
+        let mut config = ProxyConfig::default();
+        config.add_node("localhost:5432", "primary").unwrap();
+        config.cache.proof_ttl_ms = MAX_PROOF_TTL_MS;
+        assert!(config.validate().is_ok());
+        config.cache.proof_ttl_ms = MAX_PROOF_TTL_MS + 1;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("cache.proof_ttl_ms"), "{err}");
     }
 
     #[test]

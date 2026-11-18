@@ -3164,7 +3164,8 @@ async fn effective_scope_change_cannot_reuse_same_client_l1() {
         ("SHOW ALL", effective_scope_reply("schema_b")),
     ];
     let (mut relay, backend) = Relay::start_with(
-        |_| {},
+        // The per-read proof (2.2 behaviour) sees a change between reads.
+        |c| c.cache.proof_ttl_ms = 0,
         &[],
         |listener| tokio::spawn(scope_script(listener, script)),
     )
@@ -3203,7 +3204,8 @@ async fn effective_scope_change_during_native_read_declines_fill() {
         ("SHOW ALL", effective_scope_reply("schema_a")),
     ];
     let (mut relay, backend) = Relay::start_with(
-        |_| {},
+        // The per-read proof (2.2 behaviour) sees a change between reads.
+        |c| c.cache.proof_ttl_ms = 0,
         &[],
         |listener| tokio::spawn(scope_script(listener, script)),
     )
@@ -3349,8 +3351,8 @@ async fn effective_scope_probe_preserves_async_notices_and_hides_its_own_rows() 
     scope.extend(effective_scope_reply("schema_a"));
     let script = vec![
         ("SHOW ALL", scope),
+        // The fill reuses the proof just taken (`proof_ttl_ms`).
         (SQL, backend_reply()),
-        ("SHOW ALL", effective_scope_reply("schema_a")),
     ];
     let (mut relay, backend) = Relay::start_with(
         |_| {},
@@ -3387,7 +3389,7 @@ async fn effective_scope_probe_preserves_async_notices_and_hides_its_own_rows() 
     relay.peer.read_exact(&mut observed).await.unwrap();
     assert_eq!(observed, expected);
     drop(relay);
-    assert_eq!(backend.await.unwrap().len(), 3);
+    assert_eq!(backend.await.unwrap().len(), 2);
 }
 
 #[cfg(feature = "pool-modes")]
@@ -3466,7 +3468,8 @@ async fn effective_scope_failed_post_probe_preserves_native_response_without_a_f
         ("SHOW ALL", vec![b'T', 0, 0, 0, 3]),
     ];
     let (mut relay, backend) = Relay::start_with(
-        |_| {},
+        // The per-read proof (2.2 behaviour) sees a change between reads.
+        |c| c.cache.proof_ttl_ms = 0,
         &[],
         |listener| tokio::spawn(scope_script(listener, script)),
     )
@@ -3627,4 +3630,123 @@ async fn effective_scope_rejection_then_lost_boundary_never_retries() {
         drop(relay);
         assert_eq!(backend.await.unwrap(), ["SHOW ALL"]);
     }
+}
+
+/// A connection's settings proof is reused (`[cache] proof_ttl_ms`) by the
+/// fill after the read it proved and by later hits, until a statement that
+/// may change the settings reaches the connection (here a catalog read, which
+/// the cache never serves): the next cached read proves them again.
+#[tokio::test]
+async fn a_settings_proof_is_reused_until_a_statement_reaches_the_connection() {
+    const SQL: &str = "SELECT value FROM widgets";
+    const OTHER: &str = "SELECT relname FROM pg_class";
+    let script = vec![
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+        (SQL, backend_reply()),
+        (OTHER, cached_reply()),
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+    ];
+    let (mut relay, backend) = Relay::start_with(
+        |c| c.cache.proof_ttl_ms = 60_000,
+        &[],
+        |listener| tokio::spawn(scope_script(listener, script)),
+    )
+    .await;
+    relay
+        .conns
+        .get_mut(&relay.addr)
+        .unwrap()
+        .cache_scope_test_override = None;
+    assert_eq!(relay.query(SQL).await.1, backend_reply());
+    for _ in 0..3 {
+        let (node, hit) = relay.query(SQL).await;
+        assert!(node.is_none(), "a hit on the reused proof");
+        assert_eq!(hit, backend_reply());
+    }
+    let state = Arc::clone(&relay.server.state);
+    let metrics = &state.metrics;
+    assert_eq!(metrics.cache_scope_proofs.load(Ordering::Relaxed), 1);
+    assert_eq!(metrics.cache_scope_proofs_reused.load(Ordering::Relaxed), 4);
+    let (node, other) = relay.query(OTHER).await;
+    assert!(node.is_some(), "a catalog read runs on the backend");
+    assert_eq!(other, cached_reply());
+    let (node, hit) = relay.query(SQL).await;
+    assert!(node.is_none(), "proved again, same scope: a hit");
+    assert_eq!(hit, backend_reply());
+    assert_eq!(metrics.cache_scope_proofs.load(Ordering::Relaxed), 2);
+    drop(relay);
+    assert_eq!(backend.await.unwrap().len(), 4);
+}
+
+/// A proof older than `proof_ttl_ms` is taken again, so a backend settings
+/// reload reaches cached reads within it.
+#[tokio::test]
+async fn a_settings_proof_expires_after_proof_ttl_ms() {
+    const SQL: &str = "SELECT value FROM widgets";
+    let script = vec![
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+        (SQL, backend_reply()),
+        ("SHOW ALL", effective_scope_reply("schema_b")),
+        (SQL, cached_reply()),
+    ];
+    let (mut relay, backend) = Relay::start_with(
+        |c| c.cache.proof_ttl_ms = 50,
+        &[],
+        |listener| tokio::spawn(scope_script(listener, script)),
+    )
+    .await;
+    relay
+        .conns
+        .get_mut(&relay.addr)
+        .unwrap()
+        .cache_scope_test_override = None;
+    assert_eq!(relay.query(SQL).await.1, backend_reply());
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    // The reload changed search_path: proved again, a new scope, run natively.
+    let (node, reply) = relay.query(SQL).await;
+    assert!(node.is_some(), "a changed scope runs natively");
+    assert_eq!(reply, cached_reply());
+    drop(relay);
+    assert_eq!(backend.await.unwrap().len(), 4);
+}
+
+/// A ParameterStatus relayed to the session (a reported setting changed)
+/// retires the reused proof.
+#[tokio::test]
+async fn a_parameter_status_retires_a_reused_settings_proof() {
+    const SQL: &str = "SELECT value FROM widgets";
+    let script = vec![
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+        (SQL, backend_reply()),
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+    ];
+    let (mut relay, backend) = Relay::start_with(
+        |c| c.cache.proof_ttl_ms = 60_000,
+        &[],
+        |listener| tokio::spawn(scope_script(listener, script)),
+    )
+    .await;
+    relay
+        .conns
+        .get_mut(&relay.addr)
+        .unwrap()
+        .cache_scope_test_override = None;
+    assert_eq!(relay.query(SQL).await.1, backend_reply());
+    assert!(relay.query(SQL).await.0.is_none());
+    // As the idle watch's relay of a ParameterStatus would.
+    ProxyServer::tally_frame(&relay.session, b'S');
+    let (node, hit) = relay.query(SQL).await;
+    assert!(node.is_none(), "proved again, same scope: a hit");
+    assert_eq!(hit, backend_reply());
+    assert_eq!(
+        relay
+            .server
+            .state
+            .metrics
+            .cache_scope_proofs
+            .load(Ordering::Relaxed),
+        2
+    );
+    drop(relay);
+    assert_eq!(backend.await.unwrap().len(), 3);
 }

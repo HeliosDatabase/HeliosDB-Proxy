@@ -3673,6 +3673,22 @@ impl AdminServer {
             metrics.branch_moves
         ));
         output.push_str(
+            "# HELP heliosdb_proxy_cache_scope_proofs_total Backend settings proofs (SHOW ALL) taken for result-cache reads\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_cache_scope_proofs_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_cache_scope_proofs_total {}\n",
+            metrics.cache_scope_proofs
+        ));
+        output.push_str(
+            "# HELP heliosdb_proxy_cache_scope_proofs_reused_total Result-cache reads that reused their connection's settings proof within [cache] proof_ttl_ms\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_cache_scope_proofs_reused_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_cache_scope_proofs_reused_total {}\n",
+            metrics.cache_scope_proofs_reused
+        ));
+        output.push_str(
             "# HELP heliosdb_proxy_read_mirror_failures_total Offloaded reads served by the primary because the standby connection could not be opened or could not take the session's settings\n",
         );
         output.push_str("# TYPE heliosdb_proxy_read_mirror_failures_total counter\n");
@@ -3850,6 +3866,8 @@ impl AdminState {
                 backend_capacity_refusals: 0,
                 reads_offloaded: 0,
                 branch_moves: 0,
+                cache_scope_proofs: 0,
+                cache_scope_proofs_reused: 0,
                 read_mirror_failures: 0,
                 journal_committed: 0,
                 journal_rolled_back: 0,
@@ -5132,6 +5150,8 @@ mod tests {
             backend_capacity_refusals: 0,
             reads_offloaded: 0,
             branch_moves: 0,
+            cache_scope_proofs: 0,
+            cache_scope_proofs_reused: 0,
             read_mirror_failures: 0,
             journal_committed: 0,
             journal_rolled_back: 0,
@@ -5235,6 +5255,8 @@ mod tests {
             backend_capacity_refusals: 0,
             reads_offloaded: 0,
             branch_moves: 0,
+            cache_scope_proofs: 0,
+            cache_scope_proofs_reused: 0,
             read_mirror_failures: 0,
             journal_committed: 0,
             journal_rolled_back: 0,

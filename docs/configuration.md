@@ -850,9 +850,27 @@ guaranteed immutable for that connection, including backend configuration reload
 This opt-in provides a lower guarantee if the contract is violated. It also applies
 to `[edge]` caching. Default `false`; restart to change it.
 
-The default proof is a `SHOW ALL` round trip on the backend before each candidate
-lookup and again before each store, on the simple and the extended protocol alike.
-For a cheap read that is several times the cost of the read itself. Measured on
+`[cache] proof_ttl_ms` (default `1000`, at most `300000`; takes effect on reload)
+keeps each backend connection's proof for that long. The proof is a `SHOW ALL`
+round trip on the connection that would run the read; reads after it on the same
+connection reuse it while nothing but proven cacheable reads reached that
+connection. It is taken again at the next cached read after:
+
+- any other statement on that connection: a write, a `SET` or `RESET`, a
+  `FunctionCall`, a statement the cache does not read, an extended batch that is
+  not a cached read;
+- any ParameterStatus the backend sends to the session (a reported setting
+  changed);
+- `proof_ttl_ms` since it was taken. This bounds how long a backend
+  configuration reload (`pg_reload_conf()`, SIGHUP), which changes settings
+  without telling the session, can go unseen by cached reads.
+
+A pooled connection proves its settings again for each new lease. Proofs taken and
+reused are counted by `heliosdb_proxy_cache_scope_proofs_total` and
+`heliosdb_proxy_cache_scope_proofs_reused_total`. `proof_ttl_ms = 0` proves before
+every lookup and again before every store, as 2.2 did.
+
+That per-read proof is several times the cost of a cheap read. Measured on
 2026-11-16/17 with pgbench's select-only script (random keys, so about two reads in
 three miss and store), 16 clients, session pool mode, one PostgreSQL 18.4 on the same
 host: with `[cache] enabled = true` and `trust_backend_read_effects = true` the proxy
@@ -860,8 +878,8 @@ answered about 4 200 reads per second over the simple protocol and 4 400 over th
 prepared protocol, against 66 000 and 84 000 with `backend_context_immutable = true`
 added (a build from before the proof existed measured 68 000 over the simple protocol
 in the same run). Under the default proof the cache pays off only for reads that cost the backend
-clearly more than two `SHOW ALL` statements; decide on `backend_context_immutable`
-with that in mind.
+clearly more than two `SHOW ALL` statements; `proof_ttl_ms` (2.3.0) removes most of
+that cost without the immutability contract.
 
 #### Extended-protocol reads
 
