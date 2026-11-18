@@ -865,7 +865,14 @@ connection. It is taken again at the next cached read after:
   configuration reload (`pg_reload_conf()`, SIGHUP), which changes settings
   without telling the session, can go unseen by cached reads.
 
-A pooled connection proves its settings again for each new lease. Proofs taken and
+Under transaction and statement pooling the proof is parked with the connection. A
+proof taken while the connection still held its reset settings (nothing but proven
+cacheable reads ran on it since it was opened or last reset) survives the
+`DISCARD ALL` reset, and the next lease reuses it within `proof_ttl_ms` if its
+session has the same startup parameters. With any other `[pool_mode] reset_query`,
+or when the reset reply reports a parameter, the next lease proves again. A lease
+that only served a cache hit is parked again without the reset query, since nothing
+but the proof reached it. Proofs taken and
 reused are counted by `heliosdb_proxy_cache_scope_proofs_total` and
 `heliosdb_proxy_cache_scope_proofs_reused_total`. `proof_ttl_ms = 0` proves before
 every lookup and again before every store, as 2.2 did.
@@ -1050,6 +1057,7 @@ ttl_secs = 10
 | `logical_max_changes_per_poll` | u64 | `10000` | *(logical)* Changes read per poll (whole transactions); a full batch is followed by an immediate next poll. |
 | `logical_max_slot_lag_bytes` | u64 | `1073741824` | *(logical)* A slot lagging more than this behind the primary's WAL invalidates the whole cache and logs an error (an unread slot also retains WAL on the primary). |
 | `l2_shed_batch` | usize | `1024` | When L2 is full and writes have retired entries, one eviction pass sheds them on the `cache-reclaim` thread, this many per step (`0` = all at once). |
+| `l2_evict_headroom_pct` | u8 | `5` | When L2 is full, one eviction pass scans the map once and frees the least recently used entries until the store fits with this percentage of `l2_max_bytes` to spare (`0..=50`), so the next stores need no pass. |
 | `l2_shed_pause_us` | u64 | `2000` | Pause between those steps, microseconds (`0` = none). After a write retires a whole working set (10^5-10^6 entries) the shed then contends with concurrent readers at a lower rate, for longer, instead of at full rate for 3-5 s. |
 | `l1_max_entries` | usize | `500` | Entries each client connection's L1 holds at most; the least recently used is evicted first (`heliosdb_proxy_cache_evictions_total{tier="l1"}`). A connection's L1 allocates its index for this many entries (about 20-40 bytes each) at its first cached read. Range 1..=100000. |
 | `l1_max_bytes` | usize | `33554432` | Bytes each client connection's L1 retains at most: payloads, query texts and per-entry overhead (32 MiB). Least recently used first; a result larger than this is not kept in L1 and evicts the connection's other entries on its way through. Multiply by the client connections for the worst case. Range 1..=1073741824 (1 GiB). |

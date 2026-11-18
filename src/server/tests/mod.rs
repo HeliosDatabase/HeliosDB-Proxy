@@ -2229,6 +2229,30 @@ fn stmt_classifier_dirty_tokens_stay_case_insensitive() {
     assert!(!dirty("SELECT name FROM café"), "plain non-ASCII select");
 }
 
+/// Only `DISCARD ALL` counts as restoring a connection's settings for the
+/// settings proof parked with it (`RESET ALL` keeps the role).
+#[cfg(feature = "pool-modes")]
+#[test]
+fn only_discard_all_restores_the_settings_a_proof_describes() {
+    for sql in [
+        "DISCARD ALL",
+        "discard all;",
+        "  Discard\n  ALL ; ",
+        "DISCARD ALL;;",
+    ] {
+        assert!(ProxyServer::reset_restores_settings(sql), "{sql:?}");
+    }
+    for sql in [
+        "RESET ALL",
+        "DISCARD PLANS",
+        "DISCARD ALL; SET statement_timeout = 0",
+        "SELECT 1",
+        "",
+    ] {
+        assert!(!ProxyServer::reset_restores_settings(sql), "{sql:?}");
+    }
+}
+
 /// `reset_backend` must only report success when the reset query cleanly
 /// completed — no ErrorResponse and an idle ReadyForQuery. A poisoned reset
 /// (error, or a non-idle transaction status) must return `Err` so the caller
@@ -2253,16 +2277,31 @@ async fn reset_backend_rejects_error_and_nonidle() {
     resp.extend_from_slice(&rfq(b'I'));
     server.write_all(&resp).await.unwrap();
     assert!(
-        ProxyServer::reset_backend(
+        !ProxyServer::reset_backend(
             &mut client,
             "DISCARD ALL",
             Duration::from_secs(30),
             usize::MAX
         )
         .await
-        .is_ok(),
-        "clean reset must succeed"
+        .expect("clean reset must succeed"),
+        "no parameter reported"
     );
+
+    // A ParameterStatus in the reply is reported to the caller.
+    let (mut client, mut server) = tokio::io::duplex(4096);
+    let mut resp = frame(b'S', b"TimeZone\0UTC\0");
+    resp.extend_from_slice(&cc);
+    resp.extend_from_slice(&rfq(b'I'));
+    server.write_all(&resp).await.unwrap();
+    assert!(ProxyServer::reset_backend(
+        &mut client,
+        "DISCARD ALL",
+        Duration::from_secs(30),
+        usize::MAX
+    )
+    .await
+    .expect("a reported parameter is no failure"));
 
     // ErrorResponse before RFQ -> Err (connection is poisoned).
     let (mut client, mut server) = tokio::io::duplex(4096);

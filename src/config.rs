@@ -2192,6 +2192,10 @@ pub const CACHE_L1_MAX_ENTRIES_CEILING: u64 = 100_000;
 /// (`max_result_bytes` defaults to 1 MiB).
 pub const CACHE_ENTRY_BYTES_CEILING: u64 = 1 << 30;
 
+/// Upper bound of `[cache] l2_evict_headroom_pct`: an eviction pass frees at
+/// most half the L2 budget beyond what a store needs.
+pub const CACHE_L2_EVICT_HEADROOM_PCT_MAX: u8 = 50;
+
 /// Upper bound of `[cache] l2_max_bytes`, the shared L2 budget: 1 TiB.
 pub const CACHE_L2_MAX_BYTES_CEILING: u64 = 1 << 40;
 
@@ -2323,6 +2327,11 @@ pub struct CacheToml {
     /// contend with concurrent readers at full rate for its whole duration.
     /// Default 2000.
     pub l2_shed_pause_us: u64,
+    /// When L2 is full, an eviction pass frees this percentage of
+    /// `l2_max_bytes` beyond what the store needs, least recently used
+    /// entries first, so one scan of the map makes room for many stores.
+    /// Range 0..=50 ([`CACHE_L2_EVICT_HEADROOM_PCT_MAX`]). Default 5.
+    pub l2_evict_headroom_pct: u8,
     /// Entries each client connection's L1 holds at most (least recently
     /// used evicted first). Range 1..=100000
     /// ([`CACHE_L1_MAX_ENTRIES_CEILING`]). Default 500.
@@ -2763,6 +2772,12 @@ impl CacheToml {
                 )));
             }
         }
+        if self.l2_evict_headroom_pct > CACHE_L2_EVICT_HEADROOM_PCT_MAX {
+            return Err(ProxyError::Config(format!(
+                "cache.l2_evict_headroom_pct must be in 0..={CACHE_L2_EVICT_HEADROOM_PCT_MAX}, got {}",
+                self.l2_evict_headroom_pct
+            )));
+        }
         if !CACHE_ZSTD_LEVELS.contains(&self.l2_zstd_level) {
             return Err(ProxyError::Config(format!(
                 "cache.l2_zstd_level must be in {}..={}, got {}",
@@ -3107,6 +3122,7 @@ impl CacheToml {
                 zstd_level: self.l2_zstd_level,
                 shed_batch: self.l2_shed_batch,
                 shed_pause: Duration::from_micros(self.l2_shed_pause_us),
+                evict_headroom_pct: self.l2_evict_headroom_pct,
                 ..Default::default()
             },
             l3: L3Config {
@@ -3169,6 +3185,7 @@ impl Default for CacheToml {
             logical_max_slot_lag_bytes: 1024 * 1024 * 1024,
             l2_shed_batch: 1024,
             l2_shed_pause_us: 2000,
+            l2_evict_headroom_pct: 5,
             l1_max_entries: 500,
             l1_max_bytes: 32 * 1024 * 1024,
             l2_max_bytes: 256 * 1024 * 1024,
@@ -8630,6 +8647,7 @@ enabled = true
 l1_max_entries = 64
 l1_max_bytes = 1048576
 l2_max_bytes = 8388608
+l2_evict_headroom_pct = 12
 l2_compression = "zstd"
 l2_compression_min_bytes = 512
 l2_zstd_level = 7
@@ -8837,6 +8855,9 @@ exclude = true
             ("cache.l2_zstd_level", |c| c.l2_zstd_level = 0),
             ("cache.l2_zstd_level", |c| c.l2_zstd_level = -1),
             ("cache.l2_zstd_level", |c| c.l2_zstd_level = 20),
+            ("cache.l2_evict_headroom_pct", |c| {
+                c.l2_evict_headroom_pct = CACHE_L2_EVICT_HEADROOM_PCT_MAX + 1
+            }),
         ];
         for enabled in [false, true] {
             for compression in [
@@ -8868,6 +8889,11 @@ exclude = true
             config.cache.l1_max_bytes = pick(CACHE_ENTRY_BYTES_CEILING);
             config.cache.l2_max_bytes = pick(CACHE_L2_MAX_BYTES_CEILING);
             config.cache.l2_compression_min_bytes = pick(CACHE_ENTRY_BYTES_CEILING);
+            config.cache.l2_evict_headroom_pct = if high {
+                CACHE_L2_EVICT_HEADROOM_PCT_MAX
+            } else {
+                0
+            };
             config.cache.l2_zstd_level = if high {
                 *CACHE_ZSTD_LEVELS.end()
             } else {
@@ -8990,6 +9016,7 @@ exclude = true
         assert_eq!(cc.l1.size, 64);
         assert_eq!(cc.l1.max_bytes, 1024 * 1024);
         assert_eq!(cc.l2.max_bytes, 8 * 1024 * 1024);
+        assert_eq!(cc.l2.evict_headroom_pct, 12);
         assert_eq!(cc.l2.compression, CacheCompression::Zstd);
         assert_eq!(cc.l2.compression_min_bytes, 512);
         assert_eq!(cc.l2.zstd_level, 7);

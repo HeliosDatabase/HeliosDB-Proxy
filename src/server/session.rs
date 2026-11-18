@@ -407,14 +407,23 @@ pub(super) struct BackendConn {
     /// A cleanly drained backend that cannot provide the settings proof.
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     pub(super) cache_scope_unsupported: bool,
-    /// Reused only under the explicit immutable-backend-context contract.
+    /// Reused only under the explicit immutable-backend-context contract
+    /// (for the physical connection's life, so it is parked with it).
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
-    pub(super) cache_scope_verified: Option<[u8; 32]>,
+    pub(super) cache_scope_verified: Option<crate::pool::SettingsProof>,
     /// The last settings proof of this connection, reused for later reads
     /// within `[cache] proof_ttl_ms` while nothing but proven cacheable reads
     /// ran on it ([`Self::forget_cache_scope`]).
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     pub(super) cache_scope_memo: Option<CacheScopeMemo>,
+    /// The connection still holds its reset settings: it was opened for
+    /// this session, or leased from the pool parked with them
+    /// (`ParkedSettings::baseline`), and nothing that may change settings
+    /// ran on it since. A proof taken while this holds describes the
+    /// settings `DISCARD ALL` restores, so it survives that reset when the
+    /// connection is parked (`ProxyServer::parked_settings`).
+    #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+    pub(super) settings_baseline: bool,
     /// Explicit proof for synthetic protocol fixtures; absent from production.
     #[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
     pub(super) cache_scope_test_override: Option<[u8; 32]>,
@@ -502,6 +511,8 @@ impl BackendConn {
             cache_scope_verified: None,
             #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
             cache_scope_memo: None,
+            #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+            settings_baseline: true,
             #[cfg(all(test, any(feature = "query-cache", feature = "edge-proxy")))]
             cache_scope_test_override: None,
             stream,
@@ -548,6 +559,21 @@ impl BackendConn {
         #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
         {
             self.cache_scope_memo = None;
+            self.settings_baseline = false;
+        }
+    }
+
+    /// A statement that leaves the settings as they were (the settings proof
+    /// itself, a proven cacheable read) reached the socket through a path
+    /// that calls [`Self::unnamed_destroyed`]: keep what was known about the
+    /// settings before it.
+    pub(super) fn unnamed_destroyed_keeping_settings(&mut self) {
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        let kept = (self.cache_scope_memo.take(), self.settings_baseline);
+        self.unnamed_destroyed();
+        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+        {
+            (self.cache_scope_memo, self.settings_baseline) = kept;
         }
     }
 }
@@ -558,6 +584,9 @@ impl BackendConn {
 pub(super) struct CacheScopeMemo {
     /// The proven namespace.
     pub(super) namespace: [u8; 32],
+    /// The session startup digest it was computed with: a pooled
+    /// connection's proof carries over only to a borrower with the same one.
+    pub(super) startup: [u8; 32],
     /// When it was proven.
     pub(super) at: std::time::Instant,
     /// The session's ParameterStatus count then

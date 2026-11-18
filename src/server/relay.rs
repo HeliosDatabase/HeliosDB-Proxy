@@ -555,6 +555,15 @@ impl ProxyServer {
             },
         };
 
+        // Whether this request leased the connection it ends up on (it was
+        // not held before): a cache hit then parks it again as it was parked,
+        // without the reset, unless settings were mirrored onto it
+        // (`release_lease`).
+        #[cfg(all(
+            feature = "pool-modes",
+            any(feature = "query-cache", feature = "edge-proxy")
+        ))]
+        let mut leased_here = !conns.contains_key(&target);
         // A connect/auth failure trips the breaker (and is propagated as today);
         // for an offloaded read the home serves it instead.
         if let Err(e) = Self::ensure_conn(conns, &target, session, config, state).await {
@@ -576,6 +585,13 @@ impl ProxyServer {
             )
             .await?
             .0;
+            #[cfg(all(
+                feature = "pool-modes",
+                any(feature = "query-cache", feature = "edge-proxy")
+            ))]
+            {
+                leased_here = !conns.contains_key(&target);
+            }
             if let Err(e) = Self::ensure_conn(conns, &target, session, config, state).await {
                 Self::record_backend_failure(state, &target, &e.to_string());
                 BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
@@ -591,10 +607,13 @@ impl ProxyServer {
         let stale_mirror =
             !offloaded && continues_cycle.is_none() && Self::mirror_stale(conns, &target, reads);
         let mut served_by_standby = offloaded;
-        if (offloaded || stale_mirror)
+        // Settings were mirrored onto the connection the request runs on.
+        let mut mirrored = offloaded || stale_mirror;
+        if mirrored
             && !Self::mirror_read_gucs(client, conns, &target, reads, session, state, config).await
         {
             served_by_standby = false;
+            mirrored = false;
             target = Self::choose_target_node(
                 false,
                 None,
@@ -606,6 +625,13 @@ impl ProxyServer {
             )
             .await?
             .0;
+            #[cfg(all(
+                feature = "pool-modes",
+                any(feature = "query-cache", feature = "edge-proxy")
+            ))]
+            {
+                leased_here = !conns.contains_key(&target);
+            }
             if let Err(e) = Self::ensure_conn(conns, &target, session, config, state).await {
                 Self::record_backend_failure(state, &target, &e.to_string());
                 BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
@@ -620,6 +646,18 @@ impl ProxyServer {
         } else if stale_mirror {
             Self::mirror_now_home(conns, &target);
         }
+        // Only the settings proof (or nothing) has reached a connection this
+        // request leased and mirrored nothing onto.
+        #[cfg(all(
+            feature = "pool-modes",
+            any(feature = "query-cache", feature = "edge-proxy")
+        ))]
+        let untouched_lease = leased_here && !mirrored;
+        #[cfg(not(all(
+            feature = "pool-modes",
+            any(feature = "query-cache", feature = "edge-proxy")
+        )))]
+        let _ = mirrored;
         // A shared result must use the effective settings of the exact
         // backend that would execute it, after routing and GUC mirroring.
         #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
@@ -766,8 +804,15 @@ impl ProxyServer {
                         // still returns no business-query node, but must not
                         // pin its transaction/statement pool lease.
                         #[cfg(feature = "pool-modes")]
-                        Self::release_to_pool_if_idle(conns, Some(&target), session, state, config)
-                            .await;
+                        Self::release_lease(
+                            conns,
+                            Some(&target),
+                            session,
+                            state,
+                            config,
+                            untouched_lease,
+                        )
+                        .await;
                         return Ok((None, entry.response_bytes.len() as u64));
                     }
                     // Miss: stamp the read before it reaches a backend, in
@@ -843,12 +888,13 @@ impl ProxyServer {
                             // still returns no business-query node, but must not
                             // pin its transaction/statement pool lease.
                             #[cfg(feature = "pool-modes")]
-                            Self::release_to_pool_if_idle(
+                            Self::release_lease(
                                 conns,
                                 Some(&target),
                                 session,
                                 state,
                                 config,
+                                untouched_lease,
                             )
                             .await;
                             return Ok((None, result.data.len() as u64));
@@ -881,11 +927,13 @@ impl ProxyServer {
         // connection's settings proof, unless it is the read just proven
         // (a cacheable read leaves the settings as they were).
         #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
-        let proof = backend.cache_scope_memo.take();
-        backend.unnamed_destroyed();
-        #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
-        if effective_namespace.is_some() {
-            backend.cache_scope_memo = proof;
+        let keeps_settings = effective_namespace.is_some();
+        #[cfg(not(any(feature = "query-cache", feature = "edge-proxy")))]
+        let keeps_settings = false;
+        if keeps_settings {
+            backend.unnamed_destroyed_keeping_settings();
+        } else {
+            backend.unnamed_destroyed();
         }
         let backend_err = match tokio::time::timeout(
             state.limits.backend_write_timeout,

@@ -3150,6 +3150,28 @@ async fn scope_script(
     seen
 }
 
+/// [`scope_script`], then the socket stays open until the proxy closes it,
+/// and nothing more may arrive on it (a pooled connection outlives the
+/// script; a reset or a proof the script does not expect fails the test).
+#[cfg(feature = "pool-modes")]
+async fn scope_script_held(
+    listener: TcpListener,
+    responses: Vec<(&'static str, Vec<u8>)>,
+) -> Vec<String> {
+    let (mut sock, _) = listener.accept().await.unwrap();
+    let mut seen = Vec::new();
+    for (expected, reply) in responses {
+        let sql = read_query(&mut sock).await;
+        assert_eq!(sql, expected);
+        seen.push(sql);
+        sock.write_all(&reply).await.unwrap();
+    }
+    let mut more = [0u8; 1];
+    let n = sock.read(&mut more).await.unwrap_or(0);
+    assert_eq!(n, 0, "the proxy sent more than the script expects");
+    seen
+}
+
 #[tokio::test]
 async fn effective_scope_change_cannot_reuse_same_client_l1() {
     const SQL: &str = "SELECT value FROM widgets";
@@ -3392,14 +3414,17 @@ async fn effective_scope_probe_preserves_async_notices_and_hides_its_own_rows() 
     assert_eq!(backend.await.unwrap().len(), 2);
 }
 
+/// Under `backend_context_immutable` the proof holds for the physical
+/// connection, so it is parked with it: a lease reuses it, and a cache hit
+/// parks the connection again without a reset. A borrower with other startup
+/// parameters proves it again (the namespace includes them).
 #[cfg(feature = "pool-modes")]
 #[tokio::test]
-async fn effective_scope_pool_checkout_reprobes_and_cache_hits_return_the_lease() {
+async fn effective_scope_pool_keeps_an_immutable_proof_with_its_connection() {
     const SQL: &str = "SELECT value FROM widgets";
     let script = vec![
         ("SHOW ALL", effective_scope_reply("schema_a")),
         (SQL, backend_reply()),
-        ("SHOW ALL", effective_scope_reply("schema_a")),
         ("SHOW ALL", effective_scope_reply("schema_a")),
     ];
     let (mut relay, backend) = Relay::start_with(
@@ -3409,7 +3434,7 @@ async fn effective_scope_pool_checkout_reprobes_and_cache_hits_return_the_lease(
             c.cache.backend_context_immutable = true;
         },
         &[],
-        |listener| tokio::spawn(scope_script(listener, script)),
+        |listener| tokio::spawn(scope_script_held(listener, script)),
     )
     .await;
     relay
@@ -3426,16 +3451,9 @@ async fn effective_scope_pool_checkout_reprobes_and_cache_hits_return_the_lease(
         &relay.config,
     )
     .await;
-    assert_eq!(
-        relay
-            .server
-            .state
-            .backend_pool
-            .as_ref()
-            .unwrap()
-            .idle_count(),
-        1
-    );
+    let state = Arc::clone(&relay.server.state);
+    let pool = state.backend_pool.as_ref().unwrap();
+    assert_eq!(pool.idle_count(), 1);
     for _ in 0..2 {
         let (node, reply) = relay.query(SQL).await;
         assert!(node.is_none());
@@ -3444,19 +3462,185 @@ async fn effective_scope_pool_checkout_reprobes_and_cache_hits_return_the_lease(
             !relay.conns.contains_key(&relay.addr),
             "cache-hit lease must return to the pool"
         );
-        assert_eq!(
-            relay
-                .server
-                .state
-                .backend_pool
-                .as_ref()
-                .unwrap()
-                .idle_count(),
-            1
-        );
+        assert_eq!(pool.idle_count(), 1);
     }
+    assert_eq!(state.metrics.cache_scope_proofs.load(Ordering::Relaxed), 1);
+
+    let key = ProxyServer::pool_key_for(&relay.addr, &relay.session).await;
+    let mut parked = pool.checkout_conn(&key).expect("parked");
+    parked
+        .settings
+        .immutable_proof
+        .as_mut()
+        .expect("the immutable proof is parked with the connection")
+        .startup = [0xAB; 32];
+    assert!(pool.checkin_conn(&key, parked));
+    let (node, reply) = relay.query(SQL).await;
+    assert!(node.is_none(), "proved again, same scope: a hit");
+    assert_eq!(reply, backend_reply());
+    assert_eq!(state.metrics.cache_scope_proofs.load(Ordering::Relaxed), 2);
+    // The pool (in the state) holds the parked socket open.
+    drop(state);
     drop(relay);
-    assert_eq!(backend.await.unwrap().len(), 4);
+    assert_eq!(backend.await.unwrap().len(), 3);
+}
+
+/// Park the relay's connection as the client loop does at an idle boundary.
+#[cfg(feature = "pool-modes")]
+async fn park(relay: &mut Relay) {
+    ProxyServer::release_to_pool_if_idle(
+        &mut relay.conns,
+        Some(&relay.addr),
+        &relay.session,
+        &relay.server.state,
+        &relay.config,
+    )
+    .await;
+}
+
+/// `DISCARD ALL`'s reply to the pool's reset (`extra` frames first).
+#[cfg(feature = "pool-modes")]
+fn discard_all_reply(extra: &[u8]) -> Vec<u8> {
+    [
+        extra,
+        &wire_frame(b'C', b"DISCARD ALL\0"),
+        &wire_frame(b'Z', b"I"),
+    ]
+    .concat()
+}
+
+/// Transaction pooling with the default `DISCARD ALL` reset: a proof taken
+/// while the connection still held its reset settings is parked with it and
+/// reused by the next lease, and a lease that served only a cache hit is
+/// parked again without a reset. A proof taken after something else ran on
+/// the connection describes settings the reset discards, so it is not kept.
+#[cfg(feature = "pool-modes")]
+#[tokio::test]
+async fn a_settings_proof_taken_on_reset_settings_survives_the_pool_reset() {
+    const SQL: &str = "SELECT value FROM widgets";
+    const OTHER: &str = "SELECT relname FROM pg_class";
+    let script = vec![
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+        (SQL, backend_reply()),
+        ("DISCARD ALL", discard_all_reply(&[])),
+        (OTHER, cached_reply()),
+        ("SHOW ALL", effective_scope_reply("schema_b")),
+        (SQL, cached_reply()),
+        ("DISCARD ALL", discard_all_reply(&[])),
+        ("SHOW ALL", effective_scope_reply("schema_a")),
+    ];
+    let (mut relay, backend) = Relay::start_with(
+        |c| {
+            c.pool_mode.mode = crate::config::PoolingMode::Transaction;
+            c.cache.proof_ttl_ms = 60_000;
+        },
+        &[],
+        |listener| tokio::spawn(scope_script_held(listener, script)),
+    )
+    .await;
+    relay
+        .conns
+        .get_mut(&relay.addr)
+        .unwrap()
+        .cache_scope_test_override = None;
+    let state = Arc::clone(&relay.server.state);
+    let pool = state.backend_pool.as_ref().unwrap();
+    // Proved on the connection's startup settings, filled, reset, parked.
+    assert!(relay.query(SQL).await.0.is_some());
+    park(&mut relay).await;
+    assert_eq!(pool.idle_count(), 1);
+    // Leases reuse the parked proof and park without a reset.
+    for _ in 0..2 {
+        let (node, reply) = relay.query(SQL).await;
+        assert!(node.is_none(), "a hit on the parked proof");
+        assert_eq!(reply, backend_reply());
+        assert!(!relay.conns.contains_key(&relay.addr));
+        assert_eq!(pool.idle_count(), 1);
+    }
+    assert_eq!(state.metrics.cache_scope_proofs.load(Ordering::Relaxed), 1);
+    assert_eq!(pool.resets_skipped(), 2);
+    // Another statement on the lease: the proof after it (another scope) is
+    // not that of the reset settings, so the reset does not keep it.
+    assert!(relay.query(OTHER).await.0.is_some());
+    let (node, reply) = relay.query(SQL).await;
+    assert!(node.is_some(), "a changed scope runs natively");
+    assert_eq!(reply, cached_reply());
+    park(&mut relay).await;
+    // The next lease proves the reset settings again: a hit in scope a.
+    for _ in 0..2 {
+        let (node, reply) = relay.query(SQL).await;
+        assert!(node.is_none());
+        assert_eq!(reply, backend_reply());
+    }
+    assert_eq!(state.metrics.cache_scope_proofs.load(Ordering::Relaxed), 3);
+    // The pool (in the state) holds the parked socket open.
+    drop(state);
+    drop(relay);
+    assert_eq!(backend.await.unwrap().len(), 8);
+}
+
+/// A reset that reports a parameter (ParameterStatus), or a reset query the
+/// proxy does not know to restore the settings, leaves them unknown: the next
+/// lease proves them again.
+#[cfg(feature = "pool-modes")]
+#[tokio::test]
+async fn a_reset_that_may_not_restore_the_settings_drops_the_parked_proof() {
+    const SQL: &str = "SELECT value FROM widgets";
+    const CUSTOM: &str = "DISCARD ALL; SET statement_timeout = 0";
+    let status = wire_frame(b'S', b"TimeZone\0UTC\0");
+    let custom_reply = [
+        wire_frame(b'C', b"DISCARD ALL\0"),
+        wire_frame(b'C', b"SET\0"),
+        wire_frame(b'Z', b"I"),
+    ]
+    .concat();
+    for (reset_query, reset_reply) in [
+        ("DISCARD ALL", discard_all_reply(&status)),
+        (CUSTOM, custom_reply),
+    ] {
+        let script = vec![
+            ("SHOW ALL", effective_scope_reply("schema_a")),
+            (SQL, backend_reply()),
+            (reset_query, reset_reply),
+            ("SHOW ALL", effective_scope_reply("schema_a")),
+        ];
+        let (mut relay, backend) = Relay::start_with(
+            |c| {
+                c.pool_mode.mode = crate::config::PoolingMode::Transaction;
+                c.pool_mode.reset_query = reset_query.to_string();
+                c.cache.proof_ttl_ms = 60_000;
+            },
+            &[],
+            |listener| tokio::spawn(scope_script_held(listener, script)),
+        )
+        .await;
+        relay
+            .conns
+            .get_mut(&relay.addr)
+            .unwrap()
+            .cache_scope_test_override = None;
+        assert!(relay.query(SQL).await.0.is_some());
+        ProxyServer::release_to_pool_if_idle(
+            &mut relay.conns,
+            Some(&relay.addr),
+            &relay.session,
+            &relay.server.state,
+            &relay.config,
+        )
+        .await;
+        let (node, reply) = relay.query(SQL).await;
+        assert!(node.is_none(), "{reset_query}: proved again, a hit");
+        assert_eq!(reply, backend_reply());
+        let state = Arc::clone(&relay.server.state);
+        assert_eq!(
+            state.metrics.cache_scope_proofs.load(Ordering::Relaxed),
+            2,
+            "{reset_query}"
+        );
+        drop(state);
+        drop(relay);
+        assert_eq!(backend.await.unwrap().len(), 4, "{reset_query}");
+    }
 }
 
 #[tokio::test]

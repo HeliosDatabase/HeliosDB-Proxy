@@ -655,7 +655,7 @@ Per node:
 | `max_total_idle` | integer | `[limits] max_total_idle_backend_conns`: idle connections kept across all identities. |
 | `idle_timeout_secs` | integer, seconds | `[pool_mode] idle_timeout_secs`. |
 | `acquire_timeout_secs` | integer, seconds | `[pool_mode] acquire_timeout_secs`. |
-| `idle_pool` | object, nullable | The data-path pool of parked, authenticated backend connections (transaction and statement mode); `null` in session mode. `idle` (parked now), `reuses_total` (checkouts that reused one), `parked_total` (check-ins), `over_capacity_total` (check-ins refused at an idle cap), `stale_evicted_total` (found dead at checkout), `reaped_total` (closed by the idle reaper), `resets_skipped_total` (parked without the reset query because provably clean), `capacity_evictions_total` (closed to make room on a backend at `max_connections`). |
+| `idle_pool` | object, nullable | The data-path pool of parked, authenticated backend connections (transaction and statement mode); `null` in session mode. `idle` (parked now), `reuses_total` (checkouts that reused one), `parked_total` (check-ins), `over_capacity_total` (check-ins refused at an idle cap), `stale_evicted_total` (found dead at checkout), `reaped_total` (closed by the idle reaper), `resets_skipped_total` (parked without the reset query because provably clean: `skip_clean_reset`, or a connection leased only to prove its settings for a cache hit), `capacity_evictions_total` (closed to make room on a backend at `max_connections`). |
 
 Version 1 has no per-(user, database) breakdown: the proxy keeps no counters by pool
 identity. Per-node connection counts are `nodes.items[].backend_connections`.

@@ -3,7 +3,9 @@
 //! `cache/l2/*` measure the L2 tier directly, including its payload
 //! compression (`[cache] l2_compression`): `compress_{lz4,zstd}_*` a store
 //! (compression included) and `hit_{lz4,zstd}_*` a hit (decompression
-//! included) of a DataRow payload, `hit_none_64k` the raw control. `cache/query/*` go through the
+//! included) of a DataRow payload, `hit_none_64k` the raw control,
+//! `store_at_capacity_256b` a store into a full L2 with its eviction passes
+//! amortized. `cache/query/*` go through the
 //! public `QueryCache` API (hint parse, normalization, tier lookups) the relay
 //! calls for every cacheable read, and its `write_tables` for every journaled
 //! write (`l1_hit_refresh_ahead_1k` and `l1_due_claim_held_1k` with
@@ -117,6 +119,38 @@ fn bench_l2_cache(c: &mut Criterion) {
     group.bench_function("hit_none_64k", |b| {
         b.iter(|| black_box(rt.block_on(raw.get(black_box(&key))).unwrap()))
     });
+
+    // A store of a new key into a full L2 (16 MiB of 256-byte results, tens
+    // of thousands of entries), eviction passes included: their amortized
+    // cost per store at the default `l2_evict_headroom_pct`.
+    let full = L2WarmCache::new(L2Config {
+        max_bytes: 16 * 1024 * 1024,
+        ..L2Config::default()
+    });
+    let small = CachedResult::new(
+        Bytes::from(vec![b'x'; 256]),
+        1,
+        Duration::from_secs(3600),
+        vec!["bench_table".to_string()],
+        Duration::ZERO,
+    );
+    let mut next = 1u64 << 32;
+    let mut store = |cache: &L2WarmCache| {
+        next += 1;
+        rt.block_on(cache.put(
+            CacheKey::from_parts(next, "bench".to_string(), None, None),
+            small.clone(),
+        ))
+    };
+    while full.memory_usage() + 1024 < 16 * 1024 * 1024 {
+        store(&full);
+    }
+    store(&full);
+    assert!(
+        full.memory_usage() <= 16 * 1024 * 1024,
+        "the pass made room"
+    );
+    group.bench_function("store_at_capacity_256b", |b| b.iter(|| store(&full)));
     group.finish();
 }
 

@@ -221,8 +221,8 @@ impl ProxyServer {
             )
         };
         if immutable {
-            if let Some(namespace) = backend.cache_scope_verified {
-                return Ok(BackendCacheScope::Verified(namespace));
+            if let Some(proof) = backend.cache_scope_verified {
+                return Ok(BackendCacheScope::Verified(proof.namespace));
             }
         } else if let Some(memo) = backend.cache_scope_memo {
             if backend.response_buf.is_empty()
@@ -261,7 +261,8 @@ impl ProxyServer {
                 .write_all(&wire)
                 .await
                 .map_err(|e| ProxyError::Network(format!("cache scope write error: {e}")))?;
-            backend.unnamed_destroyed();
+            // SHOW ALL changes no setting: what was known about them stays.
+            backend.unnamed_destroyed_keeping_settings();
             let hint = PROOF_REPLY_BYTES.load(Ordering::Relaxed);
             let mut buf = BytesMut::with_capacity(hint.max(MIN_PROOF_BUFFER).min(max_bytes.max(5)));
             let mut reply = ScopeReply::default();
@@ -323,7 +324,12 @@ impl ProxyServer {
                         // An unsupported protocol response has been fully
                         // drained. Repeated probes cannot make it supported.
                         backend.cache_scope_unsupported = namespace.is_none();
-                        backend.cache_scope_verified = namespace;
+                        backend.cache_scope_verified =
+                            namespace.map(|namespace| crate::pool::SettingsProof {
+                                namespace,
+                                startup,
+                                proven_at: std::time::Instant::now(),
+                            });
                         return Ok(match namespace {
                             Some(scope) => BackendCacheScope::Verified(scope),
                             None => BackendCacheScope::Unsupported,
@@ -375,6 +381,7 @@ impl ProxyServer {
             {
                 backend.cache_scope_memo = Some(CacheScopeMemo {
                     namespace: *namespace,
+                    startup,
                     at: std::time::Instant::now(),
                     parameter_changes,
                 });

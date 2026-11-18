@@ -86,7 +86,18 @@ pub struct TenantQueryTransformer {
 
     /// Functions a statement may not call under row isolation (lower-case)
     refused_functions: HashSet<String>,
+
+    /// Every word the row rewrite acts on ([`Self::certainly_unchanged`]),
+    /// matched ASCII case-insensitively. Rebuilt whenever the builder
+    /// changes the tables or the refused functions.
+    prefilter: aho_corasick::AhoCorasick,
 }
+
+/// What the row rewrite acts on besides the tenant tables and the refused
+/// functions: a `DO` or `CALL` statement, and the spellings of a
+/// Unicode-escaped identifier (`U&"..."`, an operator ending in `&` before a
+/// quoted identifier, `UESCAPE`).
+const PREFILTER_WORDS: &[&str] = &["do", "call", "u&", "&\"", "uescape"];
 
 impl Default for TenantQueryTransformer {
     fn default() -> Self {
@@ -97,16 +108,63 @@ impl Default for TenantQueryTransformer {
 impl TenantQueryTransformer {
     /// Create a new query transformer
     pub fn new() -> Self {
+        let refused_functions: HashSet<String> = DEFAULT_REFUSED_FUNCTIONS
+            .iter()
+            .map(|f| f.to_string())
+            .collect();
+        let tenant_tables = HashMap::new();
+        let excluded_tables = HashSet::new();
         Self {
-            tenant_tables: HashMap::new(),
-            excluded_tables: HashSet::new(),
+            prefilter: Self::build_prefilter(&tenant_tables, &excluded_tables, &refused_functions),
+            tenant_tables,
+            excluded_tables,
             use_parameters: false,
             filter_template: None,
-            refused_functions: DEFAULT_REFUSED_FUNCTIONS
-                .iter()
-                .map(|f| f.to_string())
-                .collect(),
+            refused_functions,
         }
+    }
+
+    /// The matcher of [`Self::certainly_unchanged`]: the filtered tables,
+    /// the refused functions and [`PREFILTER_WORDS`].
+    fn build_prefilter(
+        tenant_tables: &HashMap<String, String>,
+        excluded_tables: &HashSet<String>,
+        refused_functions: &HashSet<String>,
+    ) -> aho_corasick::AhoCorasick {
+        let words = tenant_tables
+            .keys()
+            .filter(|t| !excluded_tables.contains(t.as_str()))
+            .map(String::as_str)
+            .chain(refused_functions.iter().map(String::as_str))
+            .chain(PREFILTER_WORDS.iter().copied())
+            .filter(|w| !w.is_empty());
+        aho_corasick::AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(words)
+            .expect("a few short literal words always build")
+    }
+
+    /// Rebuild [`Self::prefilter`] after a builder change.
+    fn with_prefilter(mut self) -> Self {
+        self.prefilter = Self::build_prefilter(
+            &self.tenant_tables,
+            &self.excluded_tables,
+            &self.refused_functions,
+        );
+        self
+    }
+
+    /// Whether the row rewrite certainly leaves `query` unchanged, decided
+    /// without lexing it: ASCII text containing none of the words
+    /// [`Self::rewrite_row`] can act on. A tenant table is named in a
+    /// statement only by a spelling that contains its registered name (an
+    /// unquoted or ASCII quoted identifier, lower-cased, cut to 63 bytes) or
+    /// by a Unicode escape; a refusal needs a refused function's name, `DO`,
+    /// `CALL` or a Unicode escape. Without any of them, every path of the
+    /// rewrite passes the statement through. Non-ASCII text (whose case
+    /// folding can produce ASCII letters) always takes the full analysis.
+    fn certainly_unchanged(&self, query: &str) -> bool {
+        query.is_ascii() && !self.prefilter.is_match(query)
     }
 
     /// Register a table with its tenant column
@@ -116,7 +174,7 @@ impl TenantQueryTransformer {
             crate::sql_lex::truncated_identifier(&name).to_string(),
             column.into(),
         );
-        self
+        self.with_prefilter()
     }
 
     /// Register multiple tables with the same column
@@ -129,13 +187,13 @@ impl TenantQueryTransformer {
                 col.clone(),
             );
         }
-        self
+        self.with_prefilter()
     }
 
     /// Exclude a table from filtering
     pub fn exclude_table(mut self, table: impl Into<String>) -> Self {
         self.excluded_tables.insert(table.into().to_lowercase());
-        self
+        self.with_prefilter()
     }
 
     /// Use parameterized queries
@@ -161,7 +219,7 @@ impl TenantQueryTransformer {
             .into_iter()
             .map(|name| name.as_ref().to_lowercase())
             .collect();
-        self
+        self.with_prefilter()
     }
 
     /// Get the tenant column for a table
@@ -204,6 +262,15 @@ impl TenantQueryTransformer {
         if tenant.0.chars().any(|c| c == '\0' || c == '\\') {
             return refuse("the tenant id contains a NUL byte or a backslash");
         }
+        if self.certainly_unchanged(query) {
+            return TransformResult::passthrough(query);
+        }
+        self.rewrite_row_lexed(query, tenant, column)
+    }
+
+    /// [`Self::rewrite_row`] past its tenant-id check and its prefilter: the
+    /// full analysis of the lexed statement.
+    fn rewrite_row_lexed(&self, query: &str, tenant: &TenantId, column: &str) -> TransformResult {
         let Some(all) = lex_units(query) else {
             // The lexer gave up: where the backends end a token is unknown,
             // so fail closed if any tenant table might be named.
@@ -1015,6 +1082,77 @@ mod tests {
             .name("Test")
             .row_isolation("shared_db", "tenant_id")
             .build()
+    }
+
+    /// The prefilter skips the lexer only for statements the full analysis
+    /// passes through unchanged, and lets every statement it acts on
+    /// (rewrite or refusal) reach it, with and without tenant tables.
+    #[test]
+    fn the_prefilter_skips_only_statements_the_rewrite_leaves_unchanged() {
+        let statements = [
+            "SELECT abalance FROM pgbench_accounts WHERE aid = 42;",
+            "UPDATE pgbench_accounts SET abalance = abalance + -1 WHERE aid = 7;",
+            "INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (1, 2, 3, 4, CURRENT_TIMESTAMP);",
+            "BEGIN;",
+            "END;",
+            "SELECT * FROM users WHERE active = true",
+            "select * from USERS",
+            "SELECT * FROM \"Users\"",
+            "SELECT * FROM public.users u",
+            "SELECT * FROM orders o JOIN users ON true",
+            "SELECT 1; SELECT * FROM users",
+            "DO $$ BEGIN PERFORM 1; END $$",
+            "CALL refresh()",
+            "select dblink('x', 'select 1')",
+            "SELECT pg_read_file('/etc/passwd')",
+            "SELECT * FROM U&\"\\0075sers\"",
+            "SELECT * FROM U&\"d!0061ta\" UESCAPE '!'",
+            "SELECT a &\"b\" FROM t",
+            "SELECT 'users' AS label",
+            "SELECT * FROM /* users */ t",
+            "SELECT * FROM t WHERE name = 'dblink('",
+            "SELECT random() FROM t",
+            "SELECT * FROM t WHERE x = $1",
+            "SELECT \u{212A}elvin FROM t",
+            "SELECT * FROM \"USER\u{212A}\"",
+            "",
+            "   ",
+            "SELECT 'unterminated",
+        ];
+        let tenant = TenantId::new("acme");
+        let transformers = [
+            TenantQueryTransformer::new(),
+            TenantQueryTransformer::new()
+                .register_table("users", "tenant_id")
+                .register_table("orders", "tenant_id")
+                .register_table("data", "tenant_id")
+                .register_table("userk", "tenant_id")
+                .exclude_table("orders"),
+            TenantQueryTransformer::new()
+                .register_table("users", "tenant_id")
+                .with_refused_functions(["random"]),
+        ];
+        for (n, transformer) in transformers.iter().enumerate() {
+            for sql in statements {
+                let full = transformer.rewrite_row_lexed(sql, &tenant, "tenant_id");
+                if transformer.certainly_unchanged(sql) {
+                    assert!(
+                        !full.transformed && full.refusal.is_none() && full.query == sql,
+                        "transformer {n}: the prefilter skipped {sql:?}, which the rewrite acts on: {full:?}"
+                    );
+                }
+                let via = transformer.rewrite_row(sql, &tenant, "tenant_id");
+                assert_eq!(
+                    (via.transformed, via.refusal.is_some(), via.query),
+                    (full.transformed, full.refusal.is_some(), full.query),
+                    "transformer {n}: {sql:?}"
+                );
+            }
+        }
+        // The common shape is decided without the lexer.
+        assert!(transformers[1].certainly_unchanged(statements[0]));
+        assert!(!transformers[1].certainly_unchanged("SELECT * FROM users"));
+        assert!(!transformers[2].certainly_unchanged("SELECT random() FROM t"));
     }
 
     #[test]

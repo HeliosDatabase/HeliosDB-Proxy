@@ -201,6 +201,9 @@ targets must be configured nodes.
 
 ### Added
 
+- **`[cache] l2_evict_headroom_pct`** (default 5, `0..=50`): how much of `l2_max_bytes`
+  an L2 eviction pass frees beyond what the store needs, so one scan of the map makes
+  room for many stores. `cache::L2Config::evict_headroom_pct` in the library.
 - **Plugin hot reload works, and the plugin directory loads `.tar.gz` artefacts.**
   `[plugins] hot_reload = true` built a watcher nothing ever polled, and the startup scan
   skipped packed artefacts (the distribution format) entirely. The plugin directory is
@@ -499,8 +502,13 @@ targets must be configured nodes.
   cache. A connection's proof is now kept and reused by the reads after it on that
   connection until `proof_ttl_ms` passes, anything other than a proven cacheable read
   reaches the connection (a write, a `SET`, a `FunctionCall`, an extended batch that is
-  not a cached read), or a ParameterStatus is relayed to the session. A pooled
-  connection proves again for each lease. `0` restores the per-read proof;
+  not a cached read), or a ParameterStatus is relayed to the session. Under
+  transaction and statement pooling the proof is parked with the connection: one taken
+  while the connection held its reset settings survives the `DISCARD ALL` reset and is
+  reused by the next lease of a session with the same startup parameters, and a lease
+  that served only a cache hit is parked again without the reset (v2.2.0 served such a
+  hit without leasing a connection). The `backend_context_immutable` proof is parked
+  with its connection as well. `0` restores the per-read proof;
   `backend_context_immutable` still never re-proves. The proof's reply is read into one
   buffer with as few reads as the socket allows and its rows are borrowed from it, not
   copied (it used two reads and three allocations per row); the namespace it proves is
@@ -691,6 +699,15 @@ targets must be configured nodes.
 
 ### Fixed
 
+- **A full L2 no longer stalls a session for minutes.** When the shared L2 reached
+  `l2_max_bytes`, the store that won the eviction pass scanned the whole map once for
+  every entry it evicted, while concurrent stores kept inserting without evicting. With a
+  few hundred thousand entries, one session's query stalled for 20 s to 23 min after a
+  read-heavy run (measured by the 2.3.0 user-path gate with the cache on, 64 clients;
+  v2.2.0 has the same loop). A pass now scans the map once, selects the least recently
+  used entries (expired ones first) until the store fits with
+  `[cache] l2_evict_headroom_pct` (default 5) of the budget to spare, and keeps entries
+  read since its scan. Criterion case `cache/l2/store_at_capacity_256b`.
 - **Ed25519 signing keys in PKCS#8 v2 form (with the public key) are accepted.** Their
   length was checked as 83 bytes instead of 85, so every such key was refused.
 - **A plugin waiting for a `max_plugins` slot loads in the rescan that frees one.**
@@ -855,6 +872,9 @@ targets must be configured nodes.
   without a hint is returned borrowed. `QueryRouter::strip_hints` keeps its `String`.
 - `cache::L2Config::size_mb` is replaced by `max_bytes` (see ### Changed above for the
   other cache structs that gained fields).
+- New public items: `pool::{SettingsProof, ParkedSettings, PooledConn}` and
+  `BackendIdlePool::{checkin_conn, checkout_conn}`, which park a connection with what
+  is known about its settings (`checkin_keyed` / `checkout_keyed` are unchanged).
 - New public fields: `config::CacheToml::proof_ttl_ms`; `ServerMetricsSnapshot::{branch_moves,
   cache_scope_proofs, cache_scope_proofs_reused}`; `config::PluginToml::{hot_reload_interval_ms,
   hot_reload_debounce_ms, max_artefact_bytes, require_signed_manifest}`;
