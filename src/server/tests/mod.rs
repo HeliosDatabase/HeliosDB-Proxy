@@ -34,6 +34,7 @@ fn watch(session: &ClientSession, keep_session: bool) -> IdleWatch<'_> {
         session,
         keep_session,
         copy_end_wait: None,
+        drain: false,
     }
 }
 
@@ -260,10 +261,14 @@ fn make_test_session_mode(tr_mode: crate::config::TrMode) -> Arc<ClientSession> 
         pool_client_id: crate::pool::lease::ClientId::default(),
         #[cfg(feature = "wasm-plugins")]
         plugin_identity: RwLock::new(None),
+        #[cfg(feature = "wasm-plugins")]
+        plugin_context: std::sync::OnceLock::new(),
         #[cfg(feature = "query-cache")]
         cache_ineligible: std::sync::atomic::AtomicBool::new(false),
         #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
         cache_startup_namespace: std::sync::OnceLock::new(),
+        branch_blockers: std::sync::atomic::AtomicU8::new(0),
+        branch_home: std::sync::OnceLock::new(),
         #[cfg(feature = "query-cache")]
         cache_effective_namespace: std::sync::Mutex::new(None),
         #[cfg(feature = "edge-proxy")]
@@ -280,6 +285,7 @@ fn make_test_session_mode(tr_mode: crate::config::TrMode) -> Arc<ClientSession> 
         last_write: parking_lot::Mutex::new(None),
         tenant_charge: std::sync::OnceLock::new(),
         cancel_key: std::sync::OnceLock::new(),
+        drain_waker: parking_lot::Mutex::new(None),
     })
 }
 
@@ -505,6 +511,7 @@ async fn test_apply_authenticate_hook_with_manager_no_plugins_defers() {
         limits: ResolvedLimits::default(),
         client_slots: None,
         sessions: DashMap::new(),
+        draining: std::sync::atomic::AtomicBool::new(false),
         health: ArcSwap::from_pointee(HashMap::new()),
         health_write: parking_lot::Mutex::new(()),
         live_config: ArcSwap::from_pointee(ProxyConfig::default()),

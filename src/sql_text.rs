@@ -912,6 +912,15 @@ fn continues_identifier_everywhere(c: char) -> bool {
 /// or a `VALUES` list ([`SUBQUERY_WORDS`]) is skipped, never a table, so a
 /// read like `FROM (SELECT f(1)) x` keeps an empty table set (which the edge
 /// cache never stores) instead of a table `select`.
+/// The relations a statement names after `FROM`, `JOIN`, `INTO`, `UPDATE`,
+/// `TABLE`, `COPY` or an `INSERT` form (schema-qualified names whole), for
+/// [`table_names`]: what the plugin hooks' statement context lists.
+pub(crate) static RELATION_PATTERN: once_cell::sync::Lazy<regex::Regex> =
+    once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"(?i)(FROM|JOIN|INTO|UPDATE|TABLE|COPY|INSERT(?:\s+OR\s+[a-zA-Z_]+|\s+REPLACE)?(?:\s+OVERWRITE)?(?:\s+INTO)?(?:\s+TABLE)?)[\s(]+(?:ONLY(?:\s+|\s*\(\s*))?([a-zA-Z_][a-zA-Z0-9_]*(?:\s*\.\s*[a-zA-Z_][a-zA-Z0-9_]*){0,2})")
+            .expect("the relation pattern compiles")
+    });
+
 pub(crate) fn table_names<'a>(
     pattern: &'a regex::Regex,
     text: &'a str,
@@ -1530,6 +1539,38 @@ fn piece_len(piece: Piece<'_>) -> usize {
         | Piece::Number(t)
         | Piece::Rest(t) => t.len(),
     }
+}
+
+/// Why the shared result cache must not look up or store a statement,
+/// whatever caching contract applies: the checks the PG-wire relay and the
+/// HTTP SQL gateway share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheRefusal {
+    /// It names a system catalog (its rows change outside any table write).
+    SystemCatalog,
+    /// A time-travel comment (`AS OF`): not a current read.
+    TimeTravelComment,
+    /// Text the proxy cannot read unambiguously.
+    AmbiguousText,
+    /// It names a table `[cache]` excludes.
+    ExcludedTable,
+}
+
+/// Whether, and why, the shared result cache refuses `sql`
+/// ([`CacheRefusal`]), with `exclusions` the configured table exclusions.
+pub fn cache_refusal(sql: &str, exclusions: Option<&TableExclusions>) -> Option<CacheRefusal> {
+    if names_system_catalog(sql.as_bytes()) {
+        return Some(CacheRefusal::SystemCatalog);
+    }
+    if let Some(why) = uncacheable_text(sql) {
+        return Some(match why {
+            UncacheableText::TimeTravelComment => CacheRefusal::TimeTravelComment,
+            UncacheableText::AmbiguousText => CacheRefusal::AmbiguousText,
+        });
+    }
+    exclusions
+        .is_some_and(|exclusions| exclusions.matches(sql))
+        .then_some(CacheRefusal::ExcludedTable)
 }
 
 /// Tables whose reads neither result cache may serve or store

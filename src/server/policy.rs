@@ -1,5 +1,22 @@
 use super::*;
 
+/// The refusal message for a statement naming a tenant table from a session
+/// with no identified tenant (`[multi_tenancy] unknown_tenant = "refuse"`).
+#[cfg(feature = "multi-tenancy")]
+const UNIDENTIFIED_TENANT_REFUSAL: &str =
+    "statement refused: this session has no identified tenant and the statement references a tenant table";
+
+/// The outcome of [`ProxyServer::tenant_statement`].
+#[cfg(feature = "multi-tenancy")]
+pub(super) enum TenantStatement {
+    /// Forwarded as it is.
+    Unchanged,
+    /// Forwarded with the tenant's row filter: this SQL.
+    Filtered(String),
+    /// Never forwarded: answered SQLSTATE 42501 with this reason.
+    Refused(std::borrow::Cow<'static, str>),
+}
+
 /// The longest a rate-limit backpressure sleep lasts (a `Throttled` or
 /// `Queued` verdict, or the pacing of a message that continues an open cycle),
 /// so a misconfiguration can't pin a connection task indefinitely.
@@ -259,16 +276,16 @@ impl ProxyServer {
         }
     }
 
-    /// True when `node`'s circuit is open (avoid it / fast-fail). A half-open
-    /// circuit returns false so a probe query is admitted.
+    /// True when `node`'s circuit would turn a request away now, so reads
+    /// prefer other nodes: open and still in its cooldown, or half-open with
+    /// every probe slot taken. An open circuit whose cooldown has passed
+    /// admits a probe ([`Self::circuit_admit`]).
     #[cfg(feature = "circuit-breaker")]
     pub(super) fn circuit_is_open(state: &Arc<ServerState>, node: &str) -> bool {
         state
             .circuit_breaker
             .as_ref()
-            .map(|cb| {
-                cb.get_breaker(node).get_state() == crate::circuit_breaker::CircuitState::Open
-            })
+            .map(|cb| !cb.get_breaker(node).admits_now())
             .unwrap_or(false)
     }
 
@@ -285,19 +302,34 @@ impl ProxyServer {
         }
     }
 
-    /// If `node`'s circuit is open, build the fast-fail `ErrorResponse` (without
-    /// a trailing `ReadyForQuery` — the caller appends one). `None` when the
-    /// circuit is closed or half-open and the request may proceed.
+    /// Admit a request to `node` through its circuit breaker. `Ok(None)`:
+    /// closed. `Ok(Some(permit))`: the circuit is half-open (its cooldown
+    /// passed) and this request is one of its probes; hold the permit until
+    /// the request is done, its outcome recorded as usual
+    /// ([`Self::circuit_record`]). `Err`: the fast-fail `ErrorResponse`
+    /// (without a trailing `ReadyForQuery`, which the caller appends): open,
+    /// or every probe slot taken.
     #[cfg(feature = "circuit-breaker")]
-    pub(super) fn circuit_fast_fail(state: &Arc<ServerState>, node: &str) -> Option<Vec<u8>> {
-        if Self::circuit_is_open(state, node) {
-            tracing::info!(node = %node, "circuit open — fast-failing");
-            Some(Self::create_error_response(
-                "08006",
-                &format!("circuit open for node {node}: backend temporarily unavailable"),
-            ))
-        } else {
-            None
+    pub(super) fn circuit_admit(
+        state: &Arc<ServerState>,
+        node: &str,
+    ) -> std::result::Result<Option<crate::circuit_breaker::ProbePermit>, Vec<u8>> {
+        let Some(cb) = state.circuit_breaker.as_ref() else {
+            return Ok(None);
+        };
+        match cb.get_breaker(node).admit() {
+            crate::circuit_breaker::Admission::Allowed => Ok(None),
+            crate::circuit_breaker::Admission::Probe(permit) => {
+                tracing::info!(node = %node, "circuit half-open — probing the node");
+                Ok(Some(permit))
+            }
+            crate::circuit_breaker::Admission::Rejected { .. } => {
+                tracing::info!(node = %node, "circuit open — fast-failing");
+                Err(Self::create_error_response(
+                    "08006",
+                    &format!("circuit open for node {node}: backend temporarily unavailable"),
+                ))
+            }
         }
     }
 
@@ -460,22 +492,13 @@ impl ProxyServer {
     /// a cache would look up.
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     pub(super) fn cache_refuses(state: &ServerState, sql: &str) -> bool {
-        use crate::sql_text::UncacheableText;
-        let counter = if crate::sql_text::names_system_catalog(sql.as_bytes()) {
-            &state.metrics.cache_catalog_skipped
-        } else if let Some(why) = crate::sql_text::uncacheable_text(sql) {
-            match why {
-                UncacheableText::TimeTravelComment => &state.metrics.cache_time_travel_skipped,
-                UncacheableText::AmbiguousText => &state.metrics.cache_ambiguous_skipped,
-            }
-        } else if state
-            .table_exclusions
-            .as_deref()
-            .is_some_and(|exclusions| exclusions.matches(sql))
-        {
-            &state.metrics.cache_excluded
-        } else {
-            return false;
+        use crate::sql_text::CacheRefusal;
+        let counter = match crate::sql_text::cache_refusal(sql, state.table_exclusions.as_deref()) {
+            None => return false,
+            Some(CacheRefusal::SystemCatalog) => &state.metrics.cache_catalog_skipped,
+            Some(CacheRefusal::TimeTravelComment) => &state.metrics.cache_time_travel_skipped,
+            Some(CacheRefusal::AmbiguousText) => &state.metrics.cache_ambiguous_skipped,
+            Some(CacheRefusal::ExcludedTable) => &state.metrics.cache_excluded,
         };
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
@@ -580,6 +603,40 @@ impl ProxyServer {
             branch: None,
             connection_id: Some(session.id.as_u64_pair().0),
         })
+    }
+
+    /// What `[multi_tenancy]` row isolation does to one statement of
+    /// `session`, on either protocol: the session's tenant is resolved and
+    /// its row filter injected, or the statement is refused (a shape the
+    /// filter cannot cover; a tenant table named by a session with no
+    /// identified tenant under `unknown_tenant = "refuse"`).
+    #[cfg(feature = "multi-tenancy")]
+    pub(super) async fn tenant_statement(
+        tm: &crate::multi_tenancy::TenantManager,
+        sql: &str,
+        session: &Arc<ClientSession>,
+    ) -> TenantStatement {
+        let ctx = Self::tenant_request_ctx(session).await;
+        match tm.identify_tenant(&ctx) {
+            Some(tenant) => {
+                let res = tm.transform_query(sql, &tenant);
+                if let Some(reason) = res.refusal {
+                    // Never forwarded: a shape the rewrite cannot filter.
+                    TenantStatement::Refused(reason.into())
+                } else if res.transformed {
+                    tracing::debug!(target: "helios::tenant", tenant = %tenant.0, "tenant filter injected");
+                    TenantStatement::Filtered(res.query)
+                } else {
+                    TenantStatement::Unchanged
+                }
+            }
+            // No tenant to filter by: `unknown_tenant = "refuse"` stops a
+            // statement on a tenant table here.
+            None if tm.refuses_unknown_tenant_query(sql) => {
+                TenantStatement::Refused(UNIDENTIFIED_TENANT_REFUSAL.into())
+            }
+            None => TenantStatement::Unchanged,
+        }
     }
 
     /// Build a multi-tenancy `RequestContext` from the session's startup

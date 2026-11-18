@@ -29,9 +29,10 @@
 #   EXTRA_TOML     TOML appended to both proxies' config  (default empty; e.g. a
 #                  `[multi_tenancy]` section for a capped run, both arms alike)
 #   BUDGET_PCT     regression budget, TPS and p99        (default 3.0, see compare-usertp.py)
-#   BASELINE_ROOT  where labelled runs are archived      (default /home/gpc/HDB/sprint/baselines/proxy)
+#   BASELINE_ROOT  where labelled runs are archived      (default $HELIOS_SPRINT/baselines/proxy)
 #   OUT            this run's archive dir                (default $BASELINE_ROOT/$LABEL/usertp)
-#   LOCK           fleet-wide heavy-job lock file         (default /home/gpc/HDB/sprint/coordination/build.lock)
+#   LOCK           fleet-wide heavy-job lock file         (default $HELIOS_SPRINT/coordination/build.lock)
+#   HELIOS_SPRINT  the maintainers' sprint tree            (default $HOME/HDB/sprint)
 #   MEM            systemd-run MemoryMax per heavy job    (default 24G)
 #   NO_LOCK=1      skip the per-pass flock/systemd-run (CI containers, or when the
 #                  caller already holds the lock around the whole run, see below)
@@ -75,9 +76,9 @@ PGOPTIONS="${PGOPTIONS:--c synchronous_commit=off}"
 PGBENCH_PROTOCOL="${PGBENCH_PROTOCOL:-}"
 case "$PGBENCH_PROTOCOL" in ""|simple|extended|prepared) ;; *) echo "FATAL: PGBENCH_PROTOCOL must be simple, extended or prepared" >&2; exit 2;; esac
 BUDGET_PCT="${BUDGET_PCT:-3.0}"
-BASELINE_ROOT="${BASELINE_ROOT:-/home/gpc/HDB/sprint/baselines/proxy}"
+BASELINE_ROOT="${BASELINE_ROOT:-${HELIOS_SPRINT:-$HOME/HDB/sprint}/baselines/proxy}"
 OUT="${OUT:-$BASELINE_ROOT/$LABEL/usertp}"
-LOCK="${LOCK:-/home/gpc/HDB/sprint/coordination/build.lock}"
+LOCK="${LOCK:-${HELIOS_SPRINT:-$HOME/HDB/sprint}/coordination/build.lock}"
 MEM="${MEM:-24G}"
 NO_LOCK="${NO_LOCK:-0}"
 

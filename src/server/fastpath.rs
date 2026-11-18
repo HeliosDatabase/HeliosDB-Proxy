@@ -198,16 +198,15 @@ impl ProxyServer {
         };
         tracing::debug!(target: "helios::routing", node = %target, ?class, "routed function call");
 
+        // A half-open circuit's probe holds its slot until this call is done.
         #[cfg(feature = "circuit-breaker")]
-        let fast_fail = if continues_cycle.is_some() {
-            None
-        } else {
-            Self::circuit_fast_fail(state, &target)
+        let _probe = match continues_cycle {
+            Some(_) => None,
+            None => match Self::circuit_admit(state, &target) {
+                Ok(probe) => probe,
+                Err(resp) => return Self::answer_before_backend(client, session, resp).await,
+            },
         };
-        #[cfg(feature = "circuit-breaker")]
-        if let Some(resp) = fast_fail {
-            return Self::answer_before_backend(client, session, resp).await;
-        }
 
         if let Err(e) = Self::ensure_conn(conns, &target, session, config, state).await {
             Self::record_backend_failure(state, &target, &e.to_string());

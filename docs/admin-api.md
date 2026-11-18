@@ -48,7 +48,7 @@ All four are routed and token-exempt. The z-suffixed paths are Kubernetes-style 
 | `/health` | — | 200 `{"status":"ok"}` |
 | `/healthz` | `/health` | 200 `{"status":"ok"}` |
 | `/livez` | `/health/live` | 200 `{"alive":true}` |
-| `/readyz` | `/health/ready` | 200 if ≥1 healthy backend, else 503 |
+| `/readyz` | `/health/ready` | 200 if ≥1 healthy backend and the proxy is not draining, else 503 |
 
 The slash-form `/health/live` and `/health/ready` routes are **not** token-exempt, so when `admin_token` is set they require the bearer token like any other route — use the z-suffixed aliases (`/livez`, `/readyz`) for unauthenticated probes.
 
@@ -102,6 +102,8 @@ Auth column: **token** = requires bearer token when `admin_token` is set; **open
 | `GET` | `/pools` | Per-node connection pool stats | — | token |
 | `POST` | `/api/sql` | Execute SQL with transparent write routing | — | token |
 | `GET` | `/plugins` | Loaded WASM plugins (503 if manager not attached) | `wasm-plugins` | token |
+| `GET` | `/plugins/files` | Every file of the plugin directory and its state | `wasm-plugins` | token |
+| `POST` | `/plugins/reload` | Rescan the plugin directory now; report the changes | `wasm-plugins` | token |
 | `GET` | `/admin/kv/{plugin}/{key}` | Read a plugin KV value (`{"plugin","key","value"}`; 404 if absent) | `wasm-plugins` | token |
 | `GET` | `/admin/kv/{plugin}/` | List a plugin's KV keys (trailing slash) | `wasm-plugins` | token |
 | `PUT` | `/admin/kv/{plugin}/{key}` | Set a plugin KV value (UTF-8 body; 413 on cap breach) | `wasm-plugins` | token |
@@ -165,7 +167,7 @@ curl http://localhost:9090/livez
 
 ### GET /health/ready, GET /readyz
 
-Readiness. Returns 200 if at least one backend node is healthy, `503` otherwise. `/health/ready` **requires the bearer token** when `admin_token` is set; its `/readyz` alias is **token-exempt** — prefer `/readyz` for unauthenticated probes.
+Readiness. Returns 200 if at least one backend node is healthy, `503` otherwise, and `503` with `"message": "Proxy is draining"` once the proxy has closed its listener for a drain (SIGUSR2, SIGTERM, SIGINT). `/health/ready` **requires the bearer token** when `admin_token` is set; its `/readyz` alias is **token-exempt** — prefer `/readyz` for unauthenticated probes.
 
 ```bash
 curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/health/ready
@@ -294,7 +296,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 # → {"status":"enabled"}
 ```
 
-> Draining the **whole proxy** is a different operation: send `SIGUSR2` for a graceful drain (bounded by `shutdown_drain_timeout_secs`). There is no `/drain` route.
+> Draining the **whole proxy** is a different operation: send `SIGUSR2` for a binary-handoff drain, or `SIGTERM` / `SIGINT` to shut down (both bounded by `shutdown_drain_timeout_secs`; see [Signals](configuration.md#signals)). While either runs, `GET /health/ready` answers 503 `Proxy is draining`. There is no `/drain` route.
 
 ---
 
@@ -794,7 +796,33 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 ### GET /plugins
 
-Loaded WASM plugins — name, version, description, hooks, state, invocation count. Returns `503 {"error":"plugin manager not attached"}` when the proxy runs without a plugin manager, and `503 {"error":"wasm-plugins feature not compiled in"}` in a build without `--features wasm-plugins`.
+Loaded WASM plugins in dispatch order (the order of their file names) — name, version, description, hooks, state, invocation and error counts, the file each was loaded from (`path`) and the SHA-256 of its module (`sha256`). Returns `503 {"error":"plugin manager not attached"}` when the proxy runs without a plugin manager, and `503 {"error":"wasm-plugins feature not compiled in"}` in a build without `--features wasm-plugins`.
+
+### GET /plugins/files
+
+Every `.wasm` / `.tar.gz` file of `[plugins] plugin_dir`, as of the latest rescan, with its state:
+
+| `state` | Fields | Meaning |
+|---|---|---|
+| `loaded` | `plugin` | Its current version is the loaded plugin. |
+| `stale` | `plugin`, `error` | It changed and the new version failed; the plugin keeps running the version loaded before. |
+| `shadowed` | `plugin`, `provided_by` | It declares a plugin another file provides (a `.tar.gz` before a bare `.wasm`, then file-name order). |
+| `failed` | `error` | No plugin is loaded from it (unreadable, bad signature, refused module, `max_plugins` reached). |
+| `pending` | | It changed within `hot_reload_debounce_ms`; not acted on yet. |
+
+```json
+[
+  {"path": "/etc/heliosproxy/plugins/10-guard.tar.gz", "state": "loaded", "plugin": "guard"},
+  {"path": "/etc/heliosproxy/plugins/20-router.wasm", "state": "failed",
+   "error": "Signature verification failed: ... requires a sidecar .sig file (trust root active)"}
+]
+```
+
+Same `503` answers as `GET /plugins`.
+
+### POST /plugins/reload
+
+Rescan the plugin directory now, as a SIGHUP does (changes count as settled at once), and report what changed: `200 {"loaded": [...], "updated": [...], "unloaded": [...], "failed": [{"path", "error"}]}`. A plugin whose new version failed keeps running its previous one. Same `503` answers as `GET /plugins`. See "Loading, reloading and the plugin directory" in `docs/configuration.md`.
 
 ### /admin/kv/{plugin}/{key} — plugin runtime KV
 

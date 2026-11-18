@@ -18,6 +18,18 @@ pub struct PluginRuntimeConfig {
     /// Hot reload on file change
     pub hot_reload: bool,
 
+    /// How often hot reload rescans the plugin directory.
+    pub hot_reload_interval: Duration,
+
+    /// How long a change must be stable before it is applied.
+    pub hot_reload_debounce: Duration,
+
+    /// Largest plugin file, and largest decompressed artefact content.
+    pub max_artefact_bytes: u64,
+
+    /// With a trust root, load only artefacts with a signed manifest.
+    pub require_signed_manifest: bool,
+
     /// Memory limit per plugin (bytes)
     pub memory_limit: usize,
 
@@ -33,16 +45,20 @@ pub struct PluginRuntimeConfig {
     /// Fuel limit per call (if fuel_metering enabled)
     pub fuel_limit: u64,
 
-    /// Enable WASM SIMD
+    /// Enable the WebAssembly SIMD (and relaxed SIMD) proposals.
     pub enable_simd: bool,
 
-    /// Enable multi-threading
+    /// Enable the threads proposal. This build's engine has no threads
+    /// support: `true` is refused when the runtime is created.
     pub enable_threads: bool,
 
-    /// Cache compiled modules
+    /// Keep compiled modules in memory by content hash, so reloading
+    /// unchanged bytes does not compile them again.
     pub cache_modules: bool,
 
-    /// Module cache directory
+    /// On-disk module cache. Not supported (loading native code from disk
+    /// would bypass the signature check): `Some` is refused when the
+    /// runtime is created.
     pub cache_dir: Option<PathBuf>,
 
     /// Per-plugin configurations
@@ -80,6 +96,10 @@ impl Default for PluginRuntimeConfig {
             enabled: true,
             plugin_dir: PathBuf::from("/etc/heliosproxy/plugins"),
             hot_reload: false,
+            hot_reload_interval: Duration::from_millis(1000),
+            hot_reload_debounce: crate::plugins::hot_reload::DEFAULT_DEBOUNCE,
+            max_artefact_bytes: crate::plugin_artefact::DEFAULT_MAX_ARTEFACT_BYTES,
+            require_signed_manifest: false,
             memory_limit: 64 * 1024 * 1024, // 64MB
             timeout: Duration::from_millis(100),
             max_plugins: 20,
@@ -102,13 +122,18 @@ impl Default for PluginRuntimeConfig {
 /// Convert the TOML-shaped `PluginToml` into a live `PluginRuntimeConfig`.
 ///
 /// Values that aren't exposed in TOML (SIMD, threading, module cache)
-/// take their runtime defaults.
+/// take their runtime defaults: SIMD on, threads off, compiled modules
+/// cached in memory, no on-disk cache.
 impl From<&crate::config::PluginToml> for PluginRuntimeConfig {
     fn from(t: &crate::config::PluginToml) -> Self {
         Self {
             enabled: t.enabled,
             plugin_dir: PathBuf::from(&t.plugin_dir),
             hot_reload: t.hot_reload,
+            hot_reload_interval: Duration::from_millis(t.hot_reload_interval_ms),
+            hot_reload_debounce: Duration::from_millis(t.hot_reload_debounce_ms),
+            max_artefact_bytes: t.max_artefact_bytes,
+            require_signed_manifest: t.require_signed_manifest,
             memory_limit: t.memory_limit_mb.saturating_mul(1024 * 1024),
             timeout: Duration::from_millis(t.timeout_ms),
             max_plugins: t.max_plugins,
@@ -156,6 +181,36 @@ impl PluginRuntimeConfigBuilder {
     /// Set hot reload
     pub fn hot_reload(mut self, enabled: bool) -> Self {
         self.config.hot_reload = enabled;
+        self
+    }
+
+    /// Set how often hot reload rescans the plugin directory
+    pub fn hot_reload_interval(mut self, interval: Duration) -> Self {
+        self.config.hot_reload_interval = interval;
+        self
+    }
+
+    /// Set how long a change must be stable before it is applied
+    pub fn hot_reload_debounce(mut self, debounce: Duration) -> Self {
+        self.config.hot_reload_debounce = debounce;
+        self
+    }
+
+    /// Set the largest plugin file / decompressed artefact content
+    pub fn max_artefact_bytes(mut self, bytes: u64) -> Self {
+        self.config.max_artefact_bytes = bytes;
+        self
+    }
+
+    /// Require signed manifests (with a trust root)
+    pub fn require_signed_manifest(mut self, required: bool) -> Self {
+        self.config.require_signed_manifest = required;
+        self
+    }
+
+    /// Set the trust root (directory, key file or inline hex key)
+    pub fn trust_root(mut self, root: PathBuf) -> Self {
+        self.config.trust_root = Some(root);
         self
     }
 

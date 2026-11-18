@@ -1083,6 +1083,14 @@ impl TenantSlots {
         self.tenants.contains_key(value).then_some(value)
     }
 
+    /// The configured tenant (`[multi_tenancy] tenants`) a startup packet
+    /// names, capped or not; `None` with multi-tenancy off. What plugin
+    /// hooks are told the session's tenant is.
+    pub fn configured_tenant_of<'p>(&self, params: &'p HashMap<String, String>) -> Option<&'p str> {
+        let value = self.key(params)?;
+        self.known.contains(value).then_some(value)
+    }
+
     /// Take a slot of `tenant` for a new client session. Uncapped or unknown
     /// tenant: `None` at once. Full: refuse at once without `wait`, else wait
     /// up to `wait` in FIFO order. Returns the wait in the second value when
@@ -1367,6 +1375,24 @@ mod tests {
         config.multi_tenancy.tenants = vec!["big".into()];
         config.multi_tenancy.max_clients_per_tenant = 1;
         assert!(TenantSlots::from_config(&config).is_empty());
+    }
+
+    /// An uncapped tenant takes no slot but is still the session's
+    /// configured tenant; with multi-tenancy off there is none.
+    #[test]
+    fn an_uncapped_tenant_is_still_a_configured_tenant() {
+        let mut config = ProxyConfig::default();
+        config.multi_tenancy.enabled = true;
+        config.multi_tenancy.identify_by = "user".into();
+        config.multi_tenancy.tenants = vec!["acme".into()];
+        let s = TenantSlots::from_config(&config);
+        let acme = params(&[("user", "acme")]);
+        assert_eq!(s.tenant_of(&acme), None);
+        assert_eq!(s.configured_tenant_of(&acme), Some("acme"));
+        assert_eq!(s.configured_tenant_of(&params(&[("user", "x")])), None);
+        config.multi_tenancy.enabled = false;
+        let off = TenantSlots::from_config(&config);
+        assert_eq!(off.configured_tenant_of(&acme), None);
     }
 
     #[test]

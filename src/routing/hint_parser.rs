@@ -40,9 +40,9 @@ static HINT_MARKER_FINDER: Lazy<memchr::memmem::Finder<'static>> =
 static HINT_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"/\*\s*helios:([^*]+)\*/").expect("Invalid hint regex"));
 
-/// Key-value pair regex
+/// Key-value pair regex (an empty value is read for `branch=` only).
 static KV_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(\w+)\s*=\s*([^,\s]+)").expect("Invalid key-value regex"));
+    Lazy::new(|| Regex::new(r"(\w+)\s*=\s*([^,\s]*)").expect("Invalid key-value regex"));
 
 /// Hint parser for SQL routing hints
 #[derive(Debug, Clone, Default)]
@@ -82,8 +82,12 @@ impl HintParser {
         hints
     }
 
-    /// Parse a single hint from key-value pair
+    /// Parse a single hint from key-value pair. A key with no value is
+    /// ignored, except `branch=`, which asks for the session's own database.
     fn parse_hint(&self, key: &str, value: &str) -> Option<RoutingHint> {
+        if value.is_empty() && !key.eq_ignore_ascii_case("branch") {
+            return None;
+        }
         match key.to_lowercase().as_str() {
             "route" => RouteTarget::from_str(value).ok().map(RoutingHint::Route),
             "node" => Some(RoutingHint::Node(value.to_string())),
@@ -750,6 +754,17 @@ mod tests {
 
         assert!(has_tool);
         assert!(has_workflow);
+    }
+
+    #[test]
+    fn an_empty_branch_hint_asks_for_the_sessions_own_database() {
+        let parser = HintParser::new();
+        let hints = parser.parse("/*helios:branch=,route=primary*/ SELECT 1");
+        assert_eq!(hints.branch.as_deref(), Some(""));
+        assert_eq!(hints.route, Some(RouteTarget::Primary));
+        // Other keys without a value are ignored, as before.
+        let hints = parser.parse("/*helios:node=*/ SELECT 1");
+        assert!(hints.node.is_none());
     }
 
     #[test]

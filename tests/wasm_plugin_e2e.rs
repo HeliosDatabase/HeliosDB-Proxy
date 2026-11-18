@@ -7,7 +7,10 @@
 //!     build --target wasm32-unknown-unknown --release` in the
 //!     plugins workspace.
 //!   - Skipped when the artefact is missing so `cargo test` on a
-//!     fresh checkout still works (CI builds the plugins first).
+//!     fresh checkout still works. The plugins are looked for under
+//!     `HELIOS_PLUGINS_DIR`, else in a sibling checkout of the plugins
+//!     repository. CI builds them and sets `HELIOS_PLUGINS_REQUIRED=1`,
+//!     which turns a missing artefact into a failure instead of a skip.
 //!
 //! What it proves:
 //!   - The plugin's exported `alloc` / `dealloc` / `memory` / hook
@@ -25,18 +28,40 @@ use heliosdb_proxy::plugins::{
     HookContext, HookType, PluginManifest, PluginRuntimeConfig, QueryContext, WasmPluginRuntime,
 };
 
-/// Locate a plugin .wasm built by the sibling plugins workspace.
-/// Returns `None` if the artefact is missing — caller should skip.
-fn find_plugin_wasm(name: &str) -> Option<PathBuf> {
-    let here = std::env::current_dir().ok()?;
-    let candidate = here
-        .join("../heliosdb-proxy-plugins/target/wasm32-unknown-unknown/release")
-        .join(format!("{}.wasm", name.replace('-', "_")));
-    if candidate.exists() {
-        Some(candidate)
-    } else {
-        None
+/// The directory the plugins workspace builds its `.wasm` files into:
+/// `HELIOS_PLUGINS_DIR`, else `target/wasm32-unknown-unknown/release` of a
+/// sibling checkout of the plugins repository.
+fn plugin_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("HELIOS_PLUGINS_DIR") {
+        return Some(PathBuf::from(dir));
     }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    [
+        "../HeliosDB-Proxy-Plugins",
+        "../HDB-HeliosDB-Proxy-Plugins",
+        "../heliosdb-proxy-plugins",
+    ]
+    .iter()
+    .map(|sibling| {
+        root.join(sibling)
+            .join("target/wasm32-unknown-unknown/release")
+    })
+    .find(|dir| dir.is_dir())
+}
+
+/// Locate a plugin .wasm built by the plugins workspace. Returns `None` if
+/// the artefact is missing — the caller skips — unless
+/// `HELIOS_PLUGINS_REQUIRED` is set, when that is a failure.
+fn find_plugin_wasm(name: &str) -> Option<PathBuf> {
+    let found = plugin_dir()
+        .map(|dir| dir.join(format!("{}.wasm", name.replace('-', "_"))))
+        .filter(|path| path.exists());
+    assert!(
+        found.is_some() || std::env::var_os("HELIOS_PLUGINS_REQUIRED").is_none(),
+        "plugin {name} not found under {:?} and HELIOS_PLUGINS_REQUIRED is set",
+        plugin_dir()
+    );
+    found
 }
 
 fn manifest_for(name: &str, wasm_path: &Path, hooks: Vec<HookType>) -> PluginManifest {
@@ -158,6 +183,19 @@ fn cost_governor_blocks_when_budget_exhausted_via_kv() {
         "reason should mention minute window: {}",
         reason
     );
+
+    // The proxy's typed decoding of that answer is a Block, not a decode
+    // error the manager would log and pass over (the plugin ABI writes
+    // `kind`/`reason`, the proxy's own spelling is `action`/`value`).
+    match runtime
+        .call_pre_query(&plugin, &ctx)
+        .expect("typed pre_query call")
+    {
+        heliosdb_proxy::plugins::PreQueryResult::Block(why) => {
+            assert!(why.contains("minute"), "{why}")
+        }
+        other => panic!("expected the plugin's Block, got {other:?}"),
+    }
 }
 
 #[test]

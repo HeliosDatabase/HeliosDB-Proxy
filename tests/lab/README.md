@@ -49,7 +49,7 @@ these ports is in use.
 Tunables (environment): `LEDGER_SECS` (default 60), `LEDGER_WORKERS` (4; even workers
 use `proxy-a`, odd ones `proxy-b`), `STEP_TIMEOUT` (180 s per step).
 
-Output (default `/home/gpc/HDB/sprint/baselines/proxy/ha-lab-<UTC>-<scenario>/`):
+Output (default `$HELIOS_SPRINT/baselines/proxy/ha-lab-<UTC>-<scenario>/`, `HELIOS_SPRINT` defaulting to `$HOME/HDB/sprint`):
 `driver.log`, `compose.log`, `outcomes.tsv` (one line per transfer: id, outcome,
 SQLSTATE, proxy, start/end ms), `check.json`, `topology-proxy-*.json` and
 `metrics-prometheus-proxy-*.prom` (each proxy's `/topology` and `/metrics/prometheus` at

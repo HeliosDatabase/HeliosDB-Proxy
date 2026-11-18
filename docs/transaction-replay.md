@@ -529,15 +529,32 @@ after the savepoint — and replays the resulting state onto the replacement bac
 `[limits] tr_max_session_set_statements` distinct variables. Beyond that cap the failover
 is refused (`08006`) rather than completed with incomplete state.
 
-Not restored: named `PREPARE`d statements, cursor positions, session temp tables and
-advisory locks. `SET`s are tracked inside and outside transactions, alone or batched, in
-either protocol, by reading each multi-statement query's or extended-protocol cycle's
-statements in order. When a failed cycle
-leaves it open which of them ran, the session's settings become unknown, and its
-failover is refused (`08006`) rather than completed without them, until `DISCARD ALL`. The
-library modules `src/cursor_restore.rs` and `src/session_migrate.rs` implement
-parts of this but remain unwired from the recovery path. Applications depending on that
-state surviving a failover still need application-level coordination.
+`SET`s are tracked inside and outside transactions, alone or batched, in either protocol,
+by reading each multi-statement query's or extended-protocol cycle's statements in order.
+When a failed cycle leaves it open which of them ran, the session's settings become
+unknown, and its failover is refused (`08006`) rather than completed without them, until
+`DISCARD ALL`. Protocol-level prepared statements (`Parse` with a name) are re-prepared on
+the replacement from the proxy's registry.
+
+**State only the failed backend had ends the session instead of being left behind.**
+Temporary tables, views and sequences; cursors declared `WITH HOLD`; statements prepared
+with SQL `PREPARE`; `LISTEN` registrations; and session-level advisory locks exist only in
+the backend that failed (an advisory lock was released when it died, so carrying on would
+silently break the application's mutual exclusion). The proxy marks a session once such a
+statement reaches its backend, in either protocol and inside multi-statement queries, and
+a failover of a marked session is refused with `08006` naming what it held ("the session
+held temporary tables, views or sequences, ... on the failed backend, which a replacement
+backend cannot be given"); the client reconnects and recreates them. Marks are
+conservative: a statement counts once it reached the backend, also if it failed, and a kind
+is cleared only by a statement that clears all of it and succeeded: `DISCARD ALL` (every
+kind), `DISCARD TEMP`, `CLOSE ALL`, `DEALLOCATE ALL`, `UNLISTEN *`,
+`pg_advisory_unlock_all()`. Inside a transaction the marks wait for its end: a replay
+(`tr_mode = transaction`) re-runs the statements that made them on the replacement, so only
+state from before the transaction blocks it, while a re-home that aborts the transaction
+is refused for what PostgreSQL keeps after a rollback (SQL prepared statements and advisory
+locks). Under `tr_mode = none`, where nothing is restored, a session whose backend died
+while it was idle is redialed only when it held nothing there; one with settings or any of
+the state above gets `57P01` and is closed, as that mode promises.
 
 ### Snapshot-pinned transactions are not replayed
 A transaction at `SERIALIZABLE` or `REPEATABLE READ` — set on `BEGIN`, through
@@ -581,7 +598,7 @@ be updated after promotion. See [topology providers](topology-providers.md).
 | SELECT re-execution | Yes (`skip_read_only = false`) | Yes (read-only) | Yes | No |
 | WAL-LSN wait before replay | Yes (`pg_last_wal_replay_lsn()`) | N/A | Yes | No |
 | Result verification on replay | Ordered response digest, verified; divergence returns `40001` | Basic | Full | N/A |
-| Session-state migration | `SET` state restored transactionally; cursors/`PREPARE`/temp tables not | Yes | Yes | No |
+| Session-state migration | `SET` state restored transactionally, protocol prepared statements re-prepared; a session holding temp tables, held cursors, SQL `PREPARE`, `LISTEN` or advisory locks is ended with `08006` rather than continued without them | Yes | Yes | No |
 | Planned-switchover buffering | Yes (`SwitchoverBuffer`) | No | Yes | No |
 | Persisted journal | Optional (`[journal] dir`, segmented, CRC-checked) | N/A | N/A | N/A |
 | Open source | Yes | No | No | Yes |

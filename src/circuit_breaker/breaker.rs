@@ -150,6 +150,42 @@ impl Drop for RequestGuard {
     }
 }
 
+/// How long a request refused because every half-open probe slot is taken
+/// is told to wait: probes are single requests, so a slot frees quickly.
+const HALF_OPEN_RETRY_AFTER: Duration = Duration::from_millis(100);
+
+/// What [`CircuitBreaker::admit`] decided.
+#[derive(Debug)]
+pub enum Admission {
+    /// The circuit is closed.
+    Allowed,
+    /// The circuit is half-open: this request is one of its probes. Keep the
+    /// permit until the request is done (dropping it frees the slot; the
+    /// outcome is recorded separately).
+    Probe(ProbePermit),
+    /// Refused: the circuit is open, or every probe slot is taken.
+    Rejected { retry_after: Duration },
+}
+
+/// One of a half-open circuit's probe slots, freed when dropped.
+pub struct ProbePermit {
+    breaker: Arc<CircuitBreakerInner>,
+}
+
+impl std::fmt::Debug for ProbePermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProbePermit")
+            .field("node", &self.breaker.node_id)
+            .finish()
+    }
+}
+
+impl Drop for ProbePermit {
+    fn drop(&mut self) {
+        self.breaker.active_probes.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Internal circuit breaker state
 struct CircuitBreakerInner {
     /// Node this circuit protects
@@ -235,6 +271,54 @@ impl CircuitBreakerInner {
             self.record_transition(from, CircuitState::Open, reason.clone());
 
             self.notify_opened(reason);
+        }
+    }
+
+    /// Move an open circuit to half-open, once: `false` when another caller
+    /// already did, or the circuit is no longer open.
+    fn open_to_half_open(&self) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                CircuitState::Open as u8,
+                CircuitState::HalfOpen as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.success_counter.store(0, Ordering::SeqCst);
+        let reason = TransitionReason::CooldownElapsed {
+            cooldown: self.config.read().cooldown,
+        };
+        self.record_transition(CircuitState::Open, CircuitState::HalfOpen, reason);
+        self.notify_half_opened();
+        true
+    }
+
+    /// Claim one of the half-open circuit's probe slots.
+    fn claim_probe(self: &Arc<Self>) -> Option<ProbePermit> {
+        let max = self.config.read().half_open_max_probes;
+        let mut active = self.active_probes.load(Ordering::SeqCst);
+        loop {
+            if active >= max {
+                return None;
+            }
+            match self.active_probes.compare_exchange(
+                active,
+                active + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Some(ProbePermit {
+                        breaker: Arc::clone(self),
+                    })
+                }
+                Err(now) => active = now,
+            }
         }
     }
 
@@ -432,6 +516,53 @@ impl CircuitBreaker {
         self.inner.get_state()
     }
 
+    /// Admit one request whose outcome the caller records itself (with
+    /// [`CircuitBreaker::record_success`] / [`CircuitBreaker::record_failure`]):
+    /// the data path's check. A closed circuit admits it; an open one refuses
+    /// it until `cooldown` has passed since it opened, then turns half-open;
+    /// a half-open one admits up to `half_open_max_probes` requests at once,
+    /// each holding a [`ProbePermit`] until it is done, and refuses the rest.
+    /// `success_threshold` successes close it, a failure opens it again.
+    pub fn admit(&self) -> Admission {
+        match self.inner.get_state() {
+            CircuitState::Closed => return Admission::Allowed,
+            CircuitState::Open => {
+                if !self.inner.should_try_half_open() {
+                    return Admission::Rejected {
+                        retry_after: self.inner.time_until_half_open(),
+                    };
+                }
+                // Whoever wins the transition, the circuit is now half-open
+                // (or was closed again by a concurrent success).
+                self.inner.open_to_half_open();
+            }
+            CircuitState::HalfOpen => {}
+        }
+        match self.inner.get_state() {
+            CircuitState::Closed => Admission::Allowed,
+            CircuitState::Open => Admission::Rejected {
+                retry_after: self.inner.time_until_half_open(),
+            },
+            CircuitState::HalfOpen => match self.inner.claim_probe() {
+                Some(permit) => Admission::Probe(permit),
+                None => Admission::Rejected {
+                    retry_after: HALF_OPEN_RETRY_AFTER,
+                },
+            },
+        }
+    }
+
+    /// Whether [`CircuitBreaker::admit`] would admit a request now (without
+    /// changing the state or claiming a probe): routing uses it to prefer
+    /// other nodes over one that would only fast-fail.
+    pub fn admits_now(&self) -> bool {
+        match self.inner.get_state() {
+            CircuitState::Closed => true,
+            CircuitState::Open => self.inner.should_try_half_open(),
+            CircuitState::HalfOpen => self.inner.can_probe(),
+        }
+    }
+
     /// Try to get permission for a request
     pub fn allow_request(&self) -> Result<RequestGuard, CircuitOpen> {
         match self.inner.get_state() {
@@ -454,10 +585,8 @@ impl CircuitBreaker {
                 if self.inner.can_probe() {
                     Ok(RequestGuard::new_probe(Arc::clone(&self.inner)))
                 } else {
-                    Err(
-                        CircuitOpen::new(&self.inner.node_id, Duration::from_millis(100))
-                            .with_failure_count(self.inner.failure_counter.count()),
-                    )
+                    Err(CircuitOpen::new(&self.inner.node_id, HALF_OPEN_RETRY_AFTER)
+                        .with_failure_count(self.inner.failure_counter.count()))
                 }
             }
         }
@@ -603,6 +732,65 @@ mod tests {
 
         breaker.record_failure("error 3");
         assert_eq!(breaker.get_state(), CircuitState::Open);
+    }
+
+    /// The data path's admission (`admit`): an open circuit refuses until its
+    /// cooldown has passed, then turns half-open and admits a bounded number
+    /// of probes; their successes close it. Before this, the daemon only read
+    /// the state, which never left Open: one burst of failures fast-failed a
+    /// node until restart.
+    #[test]
+    fn admit_half_opens_after_the_cooldown_and_bounds_its_probes() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            cooldown: Duration::from_millis(50),
+            half_open_success_threshold: 2,
+            half_open_max_probes: 2,
+            ..CircuitBreakerConfig::default()
+        };
+        let breaker = CircuitBreaker::new("n", config);
+        assert!(matches!(breaker.admit(), Admission::Allowed));
+        breaker.record_failure("down");
+        assert_eq!(breaker.get_state(), CircuitState::Open);
+        assert!(!breaker.admits_now());
+        assert!(matches!(breaker.admit(), Admission::Rejected { .. }));
+
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(breaker.admits_now(), "ready to probe");
+        let Admission::Probe(first) = breaker.admit() else {
+            panic!("a probe after the cooldown");
+        };
+        assert_eq!(breaker.get_state(), CircuitState::HalfOpen);
+        let Admission::Probe(second) = breaker.admit() else {
+            panic!("a second probe");
+        };
+        assert!(
+            matches!(breaker.admit(), Admission::Rejected { .. }),
+            "probe slots are bounded"
+        );
+        // An abandoned probe frees its slot without counting as a failure.
+        drop(second);
+        assert_eq!(breaker.get_state(), CircuitState::HalfOpen);
+        let Admission::Probe(third) = breaker.admit() else {
+            panic!("the freed slot");
+        };
+        breaker.record_success();
+        drop(first);
+        breaker.record_success();
+        drop(third);
+        assert_eq!(breaker.get_state(), CircuitState::Closed);
+        assert!(matches!(breaker.admit(), Admission::Allowed));
+
+        // A failed probe opens it again, for another cooldown.
+        breaker.record_failure("down again");
+        std::thread::sleep(Duration::from_millis(60));
+        let Admission::Probe(probe) = breaker.admit() else {
+            panic!("a probe");
+        };
+        breaker.record_failure("still down");
+        drop(probe);
+        assert_eq!(breaker.get_state(), CircuitState::Open);
+        assert!(matches!(breaker.admit(), Admission::Rejected { .. }));
     }
 
     #[test]

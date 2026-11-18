@@ -283,6 +283,9 @@ impl KvBackend {
 pub struct StoreCtx {
     pub plugin_name: String,
     pub kv: KvBackend,
+    /// The call's resource limits (linear-memory size, instance count),
+    /// installed as the store's limiter.
+    pub limits: wasmtime::StoreLimits,
 }
 
 /// Register all host imports under the `env` module against the

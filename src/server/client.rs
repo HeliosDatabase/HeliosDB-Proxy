@@ -57,6 +57,100 @@ pub(super) struct SessionHeld<'a> {
     pub(super) hold: Option<QueryHold<'a>>,
 }
 
+/// The refusal of a transaction block under statement pooling.
+const STATEMENT_POOLING_TRANSACTION: &str =
+    "transaction blocks are not allowed in statement pooling mode ([pool_mode] mode = \
+     \"statement\"): every statement runs on its own; use transaction pooling for \
+     transactions";
+
+/// Where a `COMMIT PREPARED` / `ROLLBACK PREPARED` that found its tenant's
+/// active-query cap full is, in the one cycle shape that proves it runs
+/// nothing else ([`ProxyServer::tenant_gate_exempt`]): the statement Parsed
+/// unnamed in the cycle (no declared parameter types) or a registered named
+/// one, bound to the unnamed portal with no parameter (result format codes,
+/// which a utility statement ignores, may be given), optionally described,
+/// executed once without a row limit, then `Sync`. Such a cycle runs past the
+/// cap: it can only release prepared-transaction locks that permit holders
+/// may be blocked on. PostgreSQL accepts no parameter in these statements, so
+/// there is no parameterised form. The statement is read after the statement
+/// hooks, as it will run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CompletionStep {
+    /// After the unnamed `Parse`: its `Bind`.
+    Bind,
+    /// After the `Bind`: a `Describe` of the portal, or the `Execute`.
+    DescribeOrExecute,
+    /// After the `Describe`: the `Execute`.
+    Execute,
+    /// After the `Execute`: the `Sync`.
+    Sync,
+    /// The `Sync` arrived: proven.
+    Done,
+}
+
+impl CompletionStep {
+    /// The candidate a cycle's first message starts, if it starts one.
+    pub(super) fn start(msg: &Message, registry: &HashMap<String, bytes::Bytes>) -> Option<Self> {
+        match msg.msg_type {
+            MessageType::Parse => {
+                let (name, text) = ProxyServer::parse_name_and_text(&msg.payload)?;
+                let declared = msg.payload.get(name.len() + text.len() + 2..)?;
+                (name.is_empty() && declared == [0, 0] && Self::exempt_text(text))
+                    .then_some(Self::Bind)
+            }
+            MessageType::Bind => {
+                // A named statement; the text of an unnamed one Parsed in an
+                // earlier cycle is not known here.
+                let stmt = Self::unnamed_portal_bind(&msg.payload)?;
+                let parse =
+                    registry.get(std::str::from_utf8(stmt).ok().filter(|s| !s.is_empty())?)?;
+                Self::exempt_text(ProxyServer::parse_msg_sql_bytes(parse)?)
+                    .then_some(Self::DescribeOrExecute)
+            }
+            _ => None,
+        }
+    }
+
+    /// The step after `msg`, `None` when `msg` does not continue the shape.
+    pub(super) fn next(self, msg: &Message) -> Option<Self> {
+        match (self, &msg.msg_type) {
+            (Self::Bind, MessageType::Bind) => Self::unnamed_portal_bind(&msg.payload)
+                .filter(|stmt| stmt.is_empty())
+                .map(|_| Self::DescribeOrExecute),
+            (Self::DescribeOrExecute, MessageType::Describe) => {
+                (msg.payload.as_ref() == b"P\0").then_some(Self::Execute)
+            }
+            (Self::DescribeOrExecute | Self::Execute, MessageType::Execute) => {
+                (msg.payload.as_ref() == [0; 5]).then_some(Self::Sync)
+            }
+            (Self::Sync, MessageType::Sync) => msg.payload.is_empty().then_some(Self::Done),
+            _ => None,
+        }
+    }
+
+    fn exempt_text(text: &[u8]) -> bool {
+        std::str::from_utf8(text)
+            .is_ok_and(|sql| !sql.contains('\\') && ProxyServer::tenant_gate_exempt(sql))
+    }
+
+    /// The statement a `Bind` binds to the unnamed portal with no parameter
+    /// format code and no parameter value, its result format codes each text
+    /// or binary; `None` for any other `Bind`.
+    fn unnamed_portal_bind(payload: &[u8]) -> Option<&[u8]> {
+        let portal_end = memchr::memchr(0, payload)?;
+        if portal_end != 0 {
+            return None;
+        }
+        let rest = &payload[1..];
+        let stmt_end = memchr::memchr(0, rest)?;
+        let after = rest[stmt_end + 1..].strip_prefix(&[0, 0, 0, 0])?;
+        let (count, codes) = after.split_first_chunk::<2>()?;
+        let count = usize::from(u16::from_be_bytes(*count));
+        (codes.len() == 2 * count && codes.chunks(2).all(|c| c == [0, 0] || c == [0, 1]))
+            .then_some(&rest[..stmt_end])
+    }
+}
+
 impl ProxyServer {
     /// PostgreSQL `ErrorResponse` bytes for a connection refused because the
     /// `[limits] max_client_connections` cap is saturated.
@@ -429,26 +523,22 @@ impl ProxyServer {
             && Self::tr_word_is(sql, &words, 1, "PREPARED")
     }
 
-    /// Start a deferred, fresh completion proof without changing frontend or
-    /// backend state. Only the exact unnamed P/B/E/S shape is supported; SQL
-    /// rewriting or row transforms would invalidate this pre-transform proof.
-    fn tenant_completion_parse(msg: &Message, config: &ProxyConfig) -> bool {
-        if msg.msg_type != MessageType::Parse
-            || config.query_rewrite.enabled
-            || config.plugins.enabled
-            || !config.multi_tenancy.tenant_tables.is_empty()
-            || msg.payload.first() != Some(&0)
-        {
+    /// A single statement that opens a transaction block (`BEGIN`, `START
+    /// TRANSACTION`): refused under statement pooling. A multi-statement text
+    /// is not (`BEGIN; ...; COMMIT;` runs whole in one request); one that
+    /// leaves a block open ends its session afterwards.
+    pub(super) fn opens_transaction_block(sql: &str) -> bool {
+        let core = sql.trim_ascii_end();
+        let single = memchr::memchr(b';', core.as_bytes()).is_none_or(|i| i + 1 == core.len());
+        if !single {
             return false;
         }
-        let body = &msg.payload[1..];
-        let Some(end) = body.iter().position(|&b| b == 0) else {
+        let Some(words) = Self::tr_lead_words(sql, 2) else {
             return false;
         };
-        // No parameter OIDs or trailing bytes: PREPARED takes a literal gid.
-        body.get(end + 1..) == Some(&[0, 0][..])
-            && std::str::from_utf8(&body[..end])
-                .is_ok_and(|sql| !sql.contains('\\') && Self::tenant_gate_exempt(sql))
+        Self::tr_word_is(sql, &words, 0, "BEGIN")
+            || (Self::tr_word_is(sql, &words, 0, "START")
+                && Self::tr_word_is(sql, &words, 1, "TRANSACTION"))
     }
 
     /// A single transaction-ending statement (`COMMIT`, `END`, `ROLLBACK`,
@@ -544,13 +634,20 @@ impl ProxyServer {
             && !session
                 .last_response_error
                 .load(std::sync::atomic::Ordering::Relaxed)
-            && (Self::calls_unlock_all(sql)
-                || Self::tr_lead_words(sql, 2).is_some_and(|w| {
-                    Self::tr_word_is(sql, &w, 0, "DISCARD") && Self::tr_word_is(sql, &w, 1, "ALL")
-                }))
+            && Self::releases_session_locks(sql)
         {
             *holds = false;
         }
+    }
+
+    /// Whether `sql`, when it succeeds, ends every session-level advisory
+    /// lock of its connection: a call of `pg_advisory_unlock_all()`
+    /// ([`Self::calls_unlock_all`]) or `DISCARD ALL`.
+    pub(super) fn releases_session_locks(sql: &str) -> bool {
+        Self::calls_unlock_all(sql)
+            || Self::tr_lead_words(sql, 2).is_some_and(|w| {
+                Self::tr_word_is(sql, &w, 0, "DISCARD") && Self::tr_word_is(sql, &w, 1, "ALL")
+            })
     }
 
     /// Whether `sql` (a statement's text, or the protocol frames carrying
@@ -784,12 +881,17 @@ impl ProxyServer {
         // the replacement connection. `tr_handle_fault` picks this up.
         // A standby socket used only for offloaded reads is simply
         // forgotten.
+        // Under `tr_mode = none` a session holding state only that backend
+        // had (settings, temporary objects, cursors, prepared statements,
+        // LISTEN, advisory locks) does not quietly continue without it on a
+        // redial either: its next request reports the loss and closes.
         if watching_home
             && (session.tr_mode != TrMode::None
                 || tr.ext_dispatched
                 || session
                     .in_transaction
-                    .load(std::sync::atomic::Ordering::Relaxed))
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                || tr.bound.blocking(false, false) != 0)
         {
             tr.lost_backend = Some(gone);
         }
@@ -964,6 +1066,7 @@ impl ProxyServer {
                     session,
                     keep_session: session.tr_mode != TrMode::None || !watching_home,
                     copy_end_wait: None,
+                    drain: false,
                 };
                 if Self::probe_watched_backend(client, conns, &node, state, watch).await? {
                     Self::note_watched_gone(
@@ -1129,10 +1232,14 @@ impl ProxyServer {
             pool_client_id: ClientId::new(),
             #[cfg(feature = "wasm-plugins")]
             plugin_identity: RwLock::new(None),
+            #[cfg(feature = "wasm-plugins")]
+            plugin_context: std::sync::OnceLock::new(),
             #[cfg(feature = "query-cache")]
             cache_ineligible: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
             cache_startup_namespace: std::sync::OnceLock::new(),
+            branch_blockers: std::sync::atomic::AtomicU8::new(0),
+            branch_home: std::sync::OnceLock::new(),
             #[cfg(feature = "query-cache")]
             cache_effective_namespace: std::sync::Mutex::new(None),
             #[cfg(feature = "edge-proxy")]
@@ -1149,6 +1256,7 @@ impl ProxyServer {
             last_write: parking_lot::Mutex::new(None),
             tenant_charge: std::sync::OnceLock::new(),
             cancel_key: std::sync::OnceLock::new(),
+            drain_waker: parking_lot::Mutex::new(None),
         });
 
         // Register the session, then attach an RAII guard that deregisters it on
@@ -1224,6 +1332,27 @@ impl ProxyServer {
                 match first {
                     // Client closed before sending a complete startup message.
                     Ok(None) => Ok(()),
+                    // Accepted just before the drain closed the listener: end
+                    // it now rather than authenticate a session the drain
+                    // ends next. A cancel request is still served: it may be
+                    // what lets an in-flight statement finish.
+                    Ok(Some(msg))
+                        if state.draining.load(std::sync::atomic::Ordering::SeqCst)
+                            && !matches!(msg, StartupMessage::CancelRequest { .. }) =>
+                    {
+                        state
+                            .metrics
+                            .policy
+                            .sessions_drained
+                            .fetch_add(1, Ordering::Relaxed);
+                        Self::refuse_with(
+                            &mut client_stream,
+                            &Self::shutdown_error_bytes(),
+                            state.limits.client_write_timeout,
+                        )
+                        .await;
+                        Ok(())
+                    }
                     Ok(Some(msg)) => match Self::admit_tenant_slot(&state, &msg).await {
                         Err(refusal) => {
                             tracing::warn!(
@@ -1330,6 +1459,59 @@ impl ProxyServer {
             return None;
         }
         Some(tokio::time::Instant::now() + idle)
+    }
+
+    /// PostgreSQL `ErrorResponse` bytes for a session the shutdown drain ends:
+    /// SQLSTATE `57P01` (`admin_shutdown`), severity `FATAL`, which a driver
+    /// treats as a lost connection to open again.
+    pub(super) fn shutdown_error_bytes() -> Vec<u8> {
+        Self::create_fatal_response(
+            "57P01",
+            "terminating connection: the proxy is shutting down",
+        )
+    }
+
+    /// Tell a client the shutdown drain is ending its session (it has
+    /// nothing in flight). The caller then leaves the query loop, which
+    /// closes the connection through the normal teardown path. The write is
+    /// bounded like `terminate_idle_session`'s.
+    pub(super) async fn terminate_for_shutdown(
+        stream: &mut ClientStream,
+        state: &Arc<ServerState>,
+        session: &Arc<ClientSession>,
+    ) {
+        tracing::debug!(client = %session.client_addr, "ending session (shutdown drain)");
+        state
+            .metrics
+            .policy
+            .sessions_drained
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let emsg = Self::shutdown_error_bytes();
+        let _ = tokio::time::timeout(state.limits.client_write_timeout, async {
+            let _ = stream.write_all(&emsg).await;
+            let _ = stream.flush().await;
+        })
+        .await;
+    }
+
+    /// [`Self::read_client_bytes`], ended early with [`ClientRead::Draining`]
+    /// when the shutdown drain begins while `watch.drain` allows it. A read
+    /// that already has bytes wins.
+    pub(super) async fn read_client_or_drain(
+        stream: &mut ClientStream,
+        buffer: &mut BytesMut,
+        idle_deadline: Option<tokio::time::Instant>,
+        state: &Arc<ServerState>,
+        watch: IdleWatch<'_>,
+    ) -> Result<ClientRead> {
+        if !watch.drain {
+            return Self::read_client_bytes(stream, buffer, idle_deadline).await;
+        }
+        tokio::select! {
+            biased;
+            read = Self::read_client_bytes(stream, buffer, idle_deadline) => read,
+            _ = (DrainSignal { state, session: watch.session }) => Ok(ClientRead::Draining),
+        }
     }
 
     /// Read the client's next message into `buffer`, optionally under an
@@ -1457,11 +1639,14 @@ impl ProxyServer {
                 *node = None;
             }
         }
+        // As after an idle loss: state only the old home had ends a
+        // `tr_mode = none` session rather than staying behind unnoticed.
         if session.tr_mode != TrMode::None
             || tr.ext_dispatched
             || session
                 .in_transaction
                 .load(std::sync::atomic::Ordering::Relaxed)
+            || tr.bound.blocking(false, false) != 0
         {
             tr.lost_backend = Some(moved);
         }
@@ -1577,7 +1762,7 @@ impl ProxyServer {
         watch: IdleWatch<'_>,
     ) -> Result<ClientRead> {
         let Some(node) = watch_node else {
-            return Self::read_client_bytes(stream, buffer, idle_deadline).await;
+            return Self::read_client_or_drain(stream, buffer, idle_deadline, state, watch).await;
         };
         let watch_copy = state.limits.copy_idle_timeout.is_some();
         let copying_before = watch_copy
@@ -1610,6 +1795,10 @@ impl ProxyServer {
             }
         };
         tokio::pin!(idle_wait);
+        let mut drain_wait = DrainSignal {
+            state,
+            session: watch.session,
+        };
         loop {
             let mut backend_gone = false;
             let mut client_bytes: Option<usize> = None;
@@ -1645,6 +1834,7 @@ impl ProxyServer {
                             })?);
                         }
                         _ = &mut idle_wait => return Ok(ClientRead::IdleTimeout),
+                        _ = &mut drain_wait, if watch.drain => return Ok(ClientRead::Draining),
                         r = bc.stream.read_buf(&mut bc.response_buf) => match r {
                             Ok(0) => backend_gone = true,
                             Ok(_) => {
@@ -1922,6 +2112,12 @@ impl ProxyServer {
         // target connection is known. Holds (full Parse message, signature).
         let promote_unnamed = config.optimize_unnamed_parse;
         let mut held_unnamed: Option<(bytes::Bytes, bytes::Bytes)> = None;
+        // The unnamed statement a plugin's cached result answered (its Parse
+        // and signature): the client holds it, no backend does. A later
+        // cycle that binds it without a Parse gives the backend that
+        // statement first (`ExtBatch::reparked`). Gone at the client's next
+        // unnamed Parse, simple Query or Close of the unnamed statement.
+        let mut plugin_unnamed: Option<(bytes::Bytes, bytes::Bytes)> = None;
         // In-session Transaction Replay state (`tr_mode`, in `tr`): tracked
         // session SETs, the lost-while-idle backend, the aborted-transaction
         // emulation and the open extended-protocol cycle. See
@@ -1937,9 +2133,13 @@ impl ProxyServer {
         // its original wire frames aside until a complete P/B/E/S proof, so
         // TCP fragmentation cannot change admission and rejected candidates
         // leave registry, promotion and transaction state untouched.
-        let mut deferred_completion: Option<(BytesMut, MessageType)> = None;
+        let mut deferred_completion: Option<(BytesMut, CompletionStep)> = None;
         let mut proved_completion = false;
         let mut declined_completion = false;
+        // The first message handled again after a completion candidate was
+        // set aside passed the statement hooks (and the anomaly detector)
+        // before it was: they do not see it twice.
+        let mut hooks_passed_once = false;
         // A Sync or Query was answered (ReadyForQuery) without reaching the
         // backend while a cycle stays open there (`tr.ext_dispatched`,
         // `tr.ext_copy_end`): only a plugin Block refuses a request that
@@ -1964,11 +2164,25 @@ impl ProxyServer {
         let session_pooling = state.backend_pool.is_none();
         #[cfg(not(feature = "pool-modes"))]
         let session_pooling = true;
+        // Statement pooling: the backend connection returns to the pool after
+        // every statement, so no transaction block may stay open across
+        // statements (as in PgBouncer's statement mode).
+        #[cfg(feature = "pool-modes")]
+        let statement_pooling =
+            !session_pooling && config.pool_mode.mode == crate::config::PoolingMode::Statement;
+        #[cfg(not(feature = "pool-modes"))]
+        let statement_pooling = false;
         let track_session_locks = hold.is_some() && session_pooling;
         // The extended batch being accumulated takes a session-level advisory
         // lock (a `Parse` of one, a `Bind` of a named one): the connection it
         // reaches is marked at its Flush or Sync.
         let mut batch_locks = false;
+        // ...and one that releases them all (`pg_advisory_unlock_all()`,
+        // `DISCARD ALL`): the mark is cleared when the cycle succeeds.
+        let mut batch_unlocks = false;
+        // What the batch's statements do to the state only the session's
+        // backend has (`session_bound`), in order.
+        let mut batch_bound = super::session_bound::Effect::default();
         // Which named statements take a session-level advisory lock,
         // memoized against the registry's Parse bytes
         // (`named_takes_session_lock`); kept only while tracking.
@@ -2019,7 +2233,34 @@ impl ProxyServer {
         // The extended batch being accumulated has an Execute (it runs
         // statements of its own: see `OpenCycle::runs`).
         let mut batch_executes = false;
+        // Statement hooks on the extended protocol (`ext_hooks`): the plugin
+        // hooks, the rewrite rules and the tenant row filter a simple Query
+        // passes. Off (no call per message) when none is configured.
+        let ext_hooks_on = Self::extended_hooks_on(state);
+        let mut ext_hooks = ExtHooks::new();
         loop {
+            // Statement pooling: a statement that opened a transaction block
+            // anyway (one the refusal of `BEGIN` below cannot see, such as a
+            // multi-statement query that ends with one) ends the session, as
+            // PgBouncer's statement mode does: its connection is closed, not
+            // parked, so the backend rolls the transaction back.
+            if statement_pooling
+                && session
+                    .in_transaction
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::info!(
+                    client = %session.client_addr,
+                    "transaction block under statement pooling; closing the session"
+                );
+                Self::refuse_with(
+                    stream,
+                    &Self::create_fatal_response("0A000", STATEMENT_POOLING_TRANSACTION),
+                    state.limits.client_write_timeout,
+                )
+                .await;
+                return Ok(());
+            }
             // Read the client's next message directly into the accumulation
             // buffer (no intermediate zeroed scratch, no extra copy). `read_buf`
             // appends into `buffer`'s spare capacity and advances its length.
@@ -2133,6 +2374,34 @@ impl ProxyServer {
             let cycle_watched = !refused_open
                 && (tr.ext_dispatched || tr.ext_copy_end.is_some())
                 && watch_node.is_some_and(|w| cycle_node.as_deref() == Some(w));
+            // Shutdown drain (SIGTERM / SIGINT): the session ends here when
+            // nothing of it is in flight (no transaction, no COPY, no cycle
+            // open on a backend or owed a Sync, no partly received request).
+            // One that began earlier ends it now; one that begins during
+            // the wait below ends that wait.
+            let drain_safe = buffer.is_empty()
+                && pending.is_empty()
+                && held_unnamed.is_none()
+                && deferred_completion.is_none()
+                && !cycle_refused
+                && !refused_flush
+                && !refused_open
+                && !tr.ext_dispatched
+                && tr.ext_copy_end.is_none()
+                && !tr.tx_aborted
+                && !session.copy_in_progress.load(Ordering::Relaxed)
+                && !session.in_transaction.load(Ordering::Relaxed)
+                && session.last_rfq_status.load(Ordering::Relaxed) == b'I';
+            if drain_safe && state.draining.load(Ordering::Relaxed) {
+                Self::terminate_for_shutdown(stream, state, session).await;
+                break;
+            }
+            let idle_watch = IdleWatch {
+                session,
+                keep_session: cycle_watched || session.tr_mode != TrMode::None || !watching_home,
+                copy_end_wait: tr.ext_copy_end.map(|_| tr.ext_copy_end_completions),
+                drain: drain_safe,
+            };
             let mut read = Self::read_next_client_message(
                 stream,
                 &mut buffer,
@@ -2140,13 +2409,7 @@ impl ProxyServer {
                 watch_node,
                 idle_deadline,
                 state,
-                IdleWatch {
-                    session,
-                    keep_session: cycle_watched
-                        || session.tr_mode != TrMode::None
-                        || !watching_home,
-                    copy_end_wait: tr.ext_copy_end.map(|_| tr.ext_copy_end_completions),
-                },
+                idle_watch,
             )
             .await?;
             if read == ClientRead::CopyStateChanged {
@@ -2238,10 +2501,16 @@ impl ProxyServer {
                 } else {
                     client_deadline
                 };
-                read = Self::read_client_bytes(stream, &mut buffer, deadline).await?;
+                read = Self::read_client_or_drain(stream, &mut buffer, deadline, state, idle_watch)
+                    .await?;
             }
             let n: usize = match read {
                 ClientRead::Bytes(n) => n,
+                ClientRead::Draining => {
+                    // Only a wait at a drain-safe point is ended (`drain_safe`).
+                    Self::terminate_for_shutdown(stream, state, session).await;
+                    break;
+                }
                 ClientRead::IdleTimeout if permit_first => {
                     // `[multi_tenancy] idle_permit_timeout_ms`: the permit
                     // returns when the loop ends (after the teardown parking).
@@ -2370,39 +2639,131 @@ impl ProxyServer {
                         _ => continue,
                     }
                 }
-                if let Some((mut wire, expected)) = deferred_completion.take() {
+                if let Some((mut wire, step)) = deferred_completion.take() {
                     if msg.msg_type == MessageType::Terminate {
                         return Ok(());
                     }
-                    let valid = msg.msg_type == expected
-                        && match expected {
-                            // Empty portal and statement, no parameter/result
-                            // formats or parameter values.
-                            MessageType::Bind => msg.payload.as_ref() == [0; 8],
-                            // Empty portal; no Execute row limit.
-                            MessageType::Execute => msg.payload.as_ref() == [0; 5],
-                            MessageType::Sync => msg.payload.is_empty(),
-                            _ => false,
-                        };
+                    let next = step.next(&msg);
                     msg.encode_into(&mut wire);
-                    if valid && expected != MessageType::Sync {
-                        let next = if expected == MessageType::Bind {
-                            MessageType::Execute
-                        } else {
-                            MessageType::Sync
-                        };
-                        deferred_completion = Some((wire, next));
-                    } else {
-                        // Re-enter ordinary handling from the first Parse.
-                        // A declined proof must encounter normal admission
-                        // once, rather than starting the same candidate again.
-                        proved_completion = valid;
-                        declined_completion = !valid;
-                        wire.extend_from_slice(&buffer);
-                        buffer = wire;
+                    match next {
+                        Some(CompletionStep::Done) | None => {
+                            // Re-enter ordinary handling from the cycle's
+                            // first message. A declined proof must encounter
+                            // normal admission once, rather than starting the
+                            // same candidate again.
+                            proved_completion = next.is_some();
+                            declined_completion = next.is_none();
+                            hooks_passed_once = true;
+                            wire.extend_from_slice(&buffer);
+                            buffer = wire;
+                        }
+                        Some(step) => deferred_completion = Some((wire, step)),
                     }
                     continue;
                 }
+                // A Parse, and a Bind that executes a statement of an earlier
+                // cycle, pass the statement hooks before anything of them is
+                // recorded. A rewrite replaces the Parse the proxy registers
+                // and forwards. A refusal refuses the cycle: the message
+                // becomes a Flush that the boundary below answers with the
+                // hook's ErrorResponse, like any Flush batch refused before a
+                // backend (what the proxy holds of the cycle is dropped, the
+                // rest is discarded to its Sync, which gets ReadyForQuery).
+                // A refused statement is never registered, so no later Bind
+                // can re-prepare it.
+                let mut hook_refusal: Option<(Vec<u8>, bool)> = None;
+                let hooks_due = !std::mem::take(&mut hooks_passed_once);
+                // The anomaly detector reads every statement the client sends
+                // on the extended protocol, as the client wrote it (before a
+                // hook rewrites or refuses it), like a simple Query's.
+                #[cfg(feature = "anomaly-detection")]
+                if hooks_due && msg.msg_type == MessageType::Parse {
+                    if let Some(sql) = Self::parse_name_and_text(&msg.payload)
+                        .and_then(|(_, text)| std::str::from_utf8(text).ok())
+                        .filter(|sql| !sql.is_empty())
+                    {
+                        Self::record_anomaly_sql(sql, state, session);
+                    }
+                }
+                // Statement pooling: a `Parse` of `BEGIN` / `START TRANSACTION`
+                // refuses its cycle (0A000), as a hook refusal does.
+                let msg = if statement_pooling
+                    && msg.msg_type == MessageType::Parse
+                    && Self::parse_name_and_text(&msg.payload)
+                        .and_then(|(_, text)| std::str::from_utf8(text).ok())
+                        .is_some_and(Self::opens_transaction_block)
+                {
+                    if tr.ext_dispatched
+                        || tr.ext_copy_end.is_some()
+                        || session.copy_in_progress.load(Ordering::Relaxed)
+                    {
+                        Self::refuse_with(
+                            stream,
+                            &Self::create_fatal_response("0A000", STATEMENT_POOLING_TRANSACTION),
+                            state.limits.client_write_timeout,
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    hook_refusal = Some((
+                        Self::create_error_response("0A000", STATEMENT_POOLING_TRANSACTION),
+                        msg.payload.first() == Some(&0),
+                    ));
+                    Message::empty(MessageType::Flush)
+                } else {
+                    msg
+                };
+                let msg = if ext_hooks_on
+                    && hooks_due
+                    && hook_refusal.is_none()
+                    && matches!(msg.msg_type, MessageType::Parse | MessageType::Bind)
+                {
+                    match ext_hooks
+                        .on_message(&msg, &batch_defines, &stmt_registry, session, state)
+                        .await
+                    {
+                        StmtGate::Pass => msg,
+                        StmtGate::Rewrite(sql) => Self::parse_with_sql(&msg, &sql),
+                        #[cfg(any(
+                            feature = "wasm-plugins",
+                            feature = "multi-tenancy",
+                            feature = "query-rewriting"
+                        ))]
+                        StmtGate::Refuse { sqlstate, reason } => {
+                            if tr.ext_dispatched
+                                || tr.ext_copy_end.is_some()
+                                || session.copy_in_progress.load(Ordering::Relaxed)
+                            {
+                                // Part of the cycle already runs on a
+                                // backend, which would commit it at the
+                                // client's Sync whatever the client is told
+                                // here. Closing the session ends that cycle
+                                // unfinished (`cancel_open_cycle`).
+                                Self::refuse_with(
+                                    stream,
+                                    &Self::create_fatal_response(
+                                        sqlstate,
+                                        &format!(
+                                            "{reason}; the cycle it belongs to is already open on the backend: connection closed"
+                                        ),
+                                    ),
+                                    state.limits.client_write_timeout,
+                                )
+                                .await;
+                                return Ok(());
+                            }
+                            let unnamed_parse = msg.msg_type == MessageType::Parse
+                                && msg.payload.first() == Some(&0);
+                            hook_refusal = Some((
+                                Self::create_error_response(sqlstate, &reason),
+                                unnamed_parse,
+                            ));
+                            Message::empty(MessageType::Flush)
+                        }
+                    }
+                } else {
+                    msg
+                };
                 match msg.msg_type {
                     MessageType::Terminate => return Ok(()),
 
@@ -2485,6 +2846,7 @@ impl ProxyServer {
                         // still recorded.
                         // A FunctionCall destroys neither.
                         if fcall.is_none() {
+                            plugin_unnamed = None;
                             Self::orphan_unnamed(
                                 conns,
                                 UnnamedStale::query(
@@ -2539,6 +2901,33 @@ impl ProxyServer {
                                     .store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
+                        // A statement whose text is not UTF-8 cannot be read by
+                        // the plugins, rewrite rules or tenant row filter: while
+                        // one of them is active it is refused (22021) rather
+                        // than passed through them unread (`ext_hooks`).
+                        #[cfg(any(
+                            feature = "wasm-plugins",
+                            feature = "multi-tenancy",
+                            feature = "query-rewriting"
+                        ))]
+                        let unreadable = ext_hooks_on
+                            && fcall.is_none()
+                            && std::str::from_utf8(&msg.payload[..query_end]).is_err()
+                            && Self::statement_hooks_active(state);
+                        #[cfg(not(any(
+                            feature = "wasm-plugins",
+                            feature = "multi-tenancy",
+                            feature = "query-rewriting"
+                        )))]
+                        let unreadable = false;
+                        // Statement pooling: a lone `BEGIN` / `START
+                        // TRANSACTION` is refused (0A000) and the session
+                        // goes on.
+                        let opens_block = statement_pooling
+                            && fcall.is_none()
+                            && std::str::from_utf8(&msg.payload[..query_end])
+                                .is_ok_and(Self::opens_transaction_block);
+
                         // Anomaly detector — record every Query message before
                         // the plugin hook so a detection lands in the audit
                         // trail even if a plugin later blocks.
@@ -2570,49 +2959,40 @@ impl ProxyServer {
                         #[cfg(not(feature = "wasm-plugins"))]
                         let PreQueryAction::Forward = action;
 
-                        // A plugin's Block, or its cached result, answers the
-                        // query before any backend.
-                        #[cfg(feature = "wasm-plugins")]
-                        let answered = match &action {
-                            PreQueryAction::Block(reason) => {
-                                tracing::info!(reason = %reason, "pre-query plugin blocked query");
-                                Self::send_block_response(
+                        // An unreadable statement's refusal, a plugin's Block,
+                        // or its cached result, answers the query before any
+                        // backend.
+                        let answered = if opens_block {
+                            let sent = Self::write_statement_refusal(
+                                stream,
+                                session,
+                                "0A000",
+                                STATEMENT_POOLING_TRANSACTION,
+                            )
+                            .await?;
+                            state.metrics.bytes_sent.fetch_add(sent, Ordering::Relaxed);
+                            true
+                        } else if unreadable {
+                            #[cfg(any(
+                                feature = "wasm-plugins",
+                                feature = "multi-tenancy",
+                                feature = "query-rewriting"
+                            ))]
+                            {
+                                let sent = Self::write_statement_refusal(
                                     stream,
-                                    reason,
-                                    session
-                                        .last_rfq_status
-                                        .load(std::sync::atomic::Ordering::Relaxed),
-                                    state,
+                                    session,
+                                    super::ext_hooks::UNREADABLE_SQLSTATE,
+                                    super::ext_hooks::UNREADABLE_STATEMENT,
                                 )
                                 .await?;
-                                true
+                                state.metrics.bytes_sent.fetch_add(sent, Ordering::Relaxed);
                             }
-                            PreQueryAction::Cached(bytes) if !continues_cycle => {
-                                match Self::synthesise_cached_response(
-                                    bytes,
-                                    session
-                                        .last_rfq_status
-                                        .load(std::sync::atomic::Ordering::Relaxed),
-                                ) {
-                                    Ok(reply) => {
-                                        stream.write_all(&reply).await.map_err(|e| {
-                                            ProxyError::Network(format!("Write error: {}", e))
-                                        })?;
-                                        state
-                                            .metrics
-                                            .bytes_sent
-                                            .fetch_add(reply.len() as u64, Ordering::Relaxed);
-                                        true
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "failed to synthesise cached response; falling back to backend");
-                                        false
-                                    }
-                                }
-                            }
-                            _ => false,
+                            true
+                        } else {
+                            Self::plugin_answered(&action, continues_cycle, stream, session, state)
+                                .await?
                         };
-                        #[cfg(feature = "wasm-plugins")]
                         if answered {
                             state
                                 .metrics
@@ -2806,6 +3186,9 @@ impl ProxyServer {
                             config,
                         )
                         .await;
+                        let status_before_request = session
+                            .last_rfq_status
+                            .load(std::sync::atomic::Ordering::Relaxed);
                         let fr = match tr.lost_backend.take() {
                             // The session's backend died while idle: the request
                             // was certainly not delivered anywhere.
@@ -2823,6 +3206,11 @@ impl ProxyServer {
                                 ))
                             }
                             None => {
+                                // What a branch move would leave behind.
+                                session.branch_blockers.store(
+                                    tr.bound.blocking(false, false),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                                 let fwd = ForwardCtx {
                                     client: stream,
                                     conns,
@@ -2983,6 +3371,29 @@ impl ProxyServer {
                                 }
                             }
                         }
+                        // State only this backend has (temporary objects, held
+                        // cursors, SQL prepared statements, LISTEN, advisory
+                        // locks): a failover that cannot recreate it ends the
+                        // session instead (`session_bound`).
+                        if reached {
+                            let effect = match query_sql {
+                                Some(sql) => super::session_bound::text_effect(sql),
+                                None if fcall == Some(FunctionCallClass::Unknown) => {
+                                    super::session_bound::any_function_effect()
+                                }
+                                None => super::session_bound::Effect::default(),
+                            };
+                            tr.bound.apply(
+                                effect,
+                                status_before_request,
+                                session
+                                    .last_rfq_status
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                session
+                                    .last_response_error
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                            );
+                        }
                         // Transaction/Statement pooling: park the connection
                         // back to the shared pool once the session is idle
                         // (never with a cycle still open on it).
@@ -3042,66 +3453,71 @@ impl ProxyServer {
                                     match gate.try_acquire_query() {
                                         Some(p) => h.hold(p),
                                         None if proved => {}
-                                        None if !declined
-                                            && tr.ext_copy_end.is_none()
-                                            && !session
-                                                .copy_in_progress
-                                                .load(std::sync::atomic::Ordering::Relaxed)
-                                            && Self::tenant_completion_parse(&msg, config) =>
-                                        {
-                                            deferred_completion =
-                                                Some((msg.encode(), MessageType::Bind));
-                                            continue;
-                                        }
-                                        None => match Self::gate_slow_path(
-                                            GateCtx {
-                                                gate,
-                                                client: stream,
-                                                buffer: &mut buffer,
-                                                conns,
-                                                tr,
-                                                nodes: [&mut home_node, &mut current_node],
-                                                cycle_node: cycle_node.as_deref(),
-                                                offload_on,
-                                                session,
-                                                state,
-                                                config,
-                                            },
-                                            None,
-                                        )
-                                        .await?
-                                        {
-                                            QueryGateWait::Admitted(p, _) => h.hold(p),
-                                            QueryGateWait::Exempt => {}
-                                            QueryGateWait::ClientGone => return Ok(()),
-                                            refused => {
-                                                // The ErrorResponse goes out at
-                                                // once; this message is the
-                                                // first of the discarded cycle.
-                                                Self::write_query_refusal(
-                                                    stream, state, refused, false,
-                                                )
-                                                .await?;
-                                                // PostgreSQL destroys the
-                                                // unnamed statement before it
-                                                // parses an unnamed Parse, so
-                                                // even one that fails leaves
-                                                // none.
-                                                if msg.msg_type == MessageType::Parse
-                                                    && Self::parse_stmt_name(&msg.payload)
-                                                        .is_empty()
-                                                {
-                                                    Self::orphan_unnamed(
-                                                        conns,
-                                                        UnnamedStale::STATEMENT,
-                                                    );
-                                                    unnamed_bound = Bound::Other;
-                                                    unnamed_node = None;
-                                                }
-                                                cycle_refused = true;
+                                        None => {
+                                            // A completion candidate (COMMIT /
+                                            // ROLLBACK PREPARED) is set aside
+                                            // until its whole cycle proves it.
+                                            let candidate = (!declined
+                                                && tr.ext_copy_end.is_none()
+                                                && !session
+                                                    .copy_in_progress
+                                                    .load(std::sync::atomic::Ordering::Relaxed))
+                                            .then(|| CompletionStep::start(&msg, &stmt_registry))
+                                            .flatten();
+                                            if let Some(step) = candidate {
+                                                deferred_completion = Some((msg.encode(), step));
                                                 continue;
                                             }
-                                        },
+                                            match Self::gate_slow_path(
+                                                GateCtx {
+                                                    gate,
+                                                    client: stream,
+                                                    buffer: &mut buffer,
+                                                    conns,
+                                                    tr,
+                                                    nodes: [&mut home_node, &mut current_node],
+                                                    cycle_node: cycle_node.as_deref(),
+                                                    offload_on,
+                                                    session,
+                                                    state,
+                                                    config,
+                                                },
+                                                None,
+                                            )
+                                            .await?
+                                            {
+                                                QueryGateWait::Admitted(p, _) => h.hold(p),
+                                                QueryGateWait::Exempt => {}
+                                                QueryGateWait::ClientGone => return Ok(()),
+                                                refused => {
+                                                    // The ErrorResponse goes out at
+                                                    // once; this message is the
+                                                    // first of the discarded cycle.
+                                                    Self::write_query_refusal(
+                                                        stream, state, refused, false,
+                                                    )
+                                                    .await?;
+                                                    // PostgreSQL destroys the
+                                                    // unnamed statement before it
+                                                    // parses an unnamed Parse, so
+                                                    // even one that fails leaves
+                                                    // none.
+                                                    if msg.msg_type == MessageType::Parse
+                                                        && Self::parse_stmt_name(&msg.payload)
+                                                            .is_empty()
+                                                    {
+                                                        Self::orphan_unnamed(
+                                                            conns,
+                                                            UnnamedStale::STATEMENT,
+                                                        );
+                                                        unnamed_bound = Bound::Other;
+                                                        unnamed_node = None;
+                                                    }
+                                                    cycle_refused = true;
+                                                    continue;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -3127,6 +3543,9 @@ impl ProxyServer {
                                 // borrow the query (2nd cstring) for routing.
                                 let name = Self::parse_stmt_name(&msg.payload);
                                 let unnamed = name.is_empty();
+                                if unnamed {
+                                    plugin_unnamed = None;
+                                }
                                 if tr.track_gucs {
                                     let sql = Self::parse_payload_sql_bytes(&msg.payload);
                                     let set_like = sql.is_some_and(Self::tr_is_set_like_bytes);
@@ -3220,6 +3639,20 @@ impl ProxyServer {
                                 {
                                     batch_locks = true;
                                 }
+                                if track_session_locks
+                                    && !batch_unlocks
+                                    && Self::parse_payload_sql_bytes(&msg.payload)
+                                        .and_then(|sql| std::str::from_utf8(sql).ok())
+                                        .is_some_and(Self::releases_session_locks)
+                                {
+                                    batch_unlocks = true;
+                                }
+                                if let Some(sql) = Self::parse_payload_sql_bytes(&msg.payload)
+                                    .and_then(|sql| std::str::from_utf8(sql).ok())
+                                {
+                                    batch_bound =
+                                        batch_bound.then(super::session_bound::text_effect(sql));
+                                }
                                 if pending_route_sql.is_none() {
                                     if let Some(end) = msg.payload.iter().position(|&b| b == 0) {
                                         if let Some(q) =
@@ -3227,8 +3660,6 @@ impl ProxyServer {
                                         {
                                             if !q.is_empty() {
                                                 pending_route_sql = Some(q.to_string());
-                                                #[cfg(feature = "anomaly-detection")]
-                                                Self::record_anomaly_sql(q, state, session);
                                             }
                                         }
                                     }
@@ -3406,6 +3837,30 @@ impl ProxyServer {
                                 {
                                     batch_locks = true;
                                 }
+                                // One that releases them all. (The unnamed
+                                // statement of an earlier cycle is not read
+                                // here: its locks are taken to stay.)
+                                if track_session_locks
+                                    && !batch_unlocks
+                                    && stmt_ref.is_some_and(|name| {
+                                        stmt_registry
+                                            .get(name)
+                                            .and_then(|p| Self::parse_msg_sql(p))
+                                            .is_some_and(Self::releases_session_locks)
+                                    })
+                                {
+                                    batch_unlocks = true;
+                                }
+                                // A named statement of an earlier cycle runs
+                                // again: what it does counts again.
+                                if let Some(sql) = stmt_ref
+                                    .filter(|name| !batch_defines.iter().any(|d| d == name))
+                                    .and_then(|name| stmt_registry.get(name))
+                                    .and_then(|p| Self::parse_msg_sql(p))
+                                {
+                                    batch_bound =
+                                        batch_bound.then(super::session_bound::text_effect(sql));
+                                }
                                 // Unnamed statement: not tracked in
                                 // batch_refs, but the edge invalidation must
                                 // still see its execution.
@@ -3439,6 +3894,9 @@ impl ProxyServer {
                             MessageType::Close => {
                                 if tr.track_gucs {
                                     ext_set.on_other_message();
+                                }
+                                if msg.payload.starts_with(b"S\0") {
+                                    plugin_unnamed = None;
                                 }
                                 if let Some(name) = Self::stmt_kind_name(&msg.payload) {
                                     Self::remember_batch_name(
@@ -3486,6 +3944,7 @@ impl ProxyServer {
                         if msg.msg_type == MessageType::Flush
                             && pending.is_empty()
                             && held_unnamed.is_none()
+                            && hook_refusal.is_none()
                             && (refused_open || (!tr.ext_dispatched && tr.ext_copy_end.is_none()))
                         {
                             continue;
@@ -3514,6 +3973,8 @@ impl ProxyServer {
                             .load(std::sync::atomic::Ordering::Relaxed);
                         let runs = std::mem::take(&mut batch_executes);
                         let takes_locks = std::mem::take(&mut batch_locks);
+                        let releases_locks = std::mem::take(&mut batch_unlocks);
+                        let bound_effect = std::mem::take(&mut batch_bound);
                         let status_before = session
                             .last_rfq_status
                             .load(std::sync::atomic::Ordering::Relaxed);
@@ -3521,8 +3982,10 @@ impl ProxyServer {
                         let batch = pending.split().freeze();
                         // The batch opens with an unnamed Parse: the one the
                         // promotion held aside, or its first frame.
+                        // ...or a statement hook refused the cycle at one.
                         let leads_unnamed_parse = held_unnamed.is_some()
-                            || (batch.first() == Some(&b'P') && batch.get(5) == Some(&0));
+                            || (batch.first() == Some(&b'P') && batch.get(5) == Some(&0))
+                            || hook_refusal.as_ref().is_some_and(|(_, unnamed)| *unnamed);
                         // Forwarding borrows the referenced names and excludes
                         // this batch's own definitions when it needs to prepare
                         // them. Keep the original set for recording/recovery,
@@ -3534,7 +3997,9 @@ impl ProxyServer {
                         let mut skip_forward = false;
                         // The transaction end the emulation lets through.
                         let mut aborted_end = false;
-                        if tr.tx_aborted {
+                        // (A statement hook's refusal is answered below: the
+                        // emulation answers the Sync that follows it.)
+                        if tr.tx_aborted && hook_refusal.is_none() {
                             let ends = pending_route_sql
                                 .as_deref()
                                 .map(Self::tr_ends_transaction)
@@ -3601,8 +4066,66 @@ impl ProxyServer {
                         // The backend that held the session's open cycle failed
                         // (the recovery cleared `ext_dispatched`).
                         let mut faulted = false;
+                        // A pre-query plugin's cached result answers a cycle
+                        // that is one execution it can stand for (see
+                        // `plugin_cycle_reply`), before any backend.
+                        // The reply, and the unnamed Parse the client sent
+                        // with the cycle.
+                        #[cfg(feature = "wasm-plugins")]
+                        let mut plugin_reply: Option<
+                            super::ext_hooks::PluginCycleAnswer,
+                        > = if wait_ready
+                            && !continues_cycle
+                            && !copy_in
+                            && !skip_forward
+                            && !ends_refused
+                            && hook_refusal.is_none()
+                        {
+                            ext_hooks
+                                .cached()
+                                .and_then(|answer| {
+                                    Self::plugin_cycle_reply(
+                                        answer,
+                                        &batch,
+                                        held_unnamed.as_ref(),
+                                        &stmt_registry,
+                                        status_before,
+                                    )
+                                })
+                                .map(|r| (r.reply, r.parsed_unnamed))
+                        } else {
+                            None
+                        };
+                        #[cfg(not(feature = "wasm-plugins"))]
+                        let mut plugin_reply: Option<
+                            super::ext_hooks::PluginCycleAnswer,
+                        > = None;
+                        // The post-query plugin hook fires once per cycle a
+                        // Sync ended, for the statement it routes by; not for
+                        // a cycle answered here (a hook's refusal, the 25P02
+                        // emulation, a plugin's cached result), as a simple
+                        // Query a plugin blocks or answers fires none.
+                        #[cfg(feature = "wasm-plugins")]
+                        let post_query = state
+                            .plugin_manager
+                            .as_ref()
+                            .filter(|pm| {
+                                wait_ready
+                                    && plugin_reply.is_none()
+                                    && !skip_forward
+                                    && !ends_refused
+                                    && pm.has_hook(HookType::PostQuery)
+                            })
+                            .map(|pm| (pm, std::time::Instant::now()));
                         let (used_node, sent) = if skip_forward {
                             (None, 0)
+                        } else if let Some((refusal, _)) = hook_refusal.take() {
+                            // A statement hook refused the cycle at this
+                            // point: nothing of the batch reaches a backend.
+                            stream.write_all(&refusal).await.map_err(|e| {
+                                ProxyError::Network(format!("Client write error: {}", e))
+                            })?;
+                            (None, refusal.len() as u64)
                         } else if ends_refused {
                             // Nothing of the cycle reached a backend: its
                             // status is the last one relayed.
@@ -3615,6 +4138,27 @@ impl ProxyServer {
                                 ProxyError::Network(format!("Client write error: {}", e))
                             })?;
                             (None, rfq.len() as u64)
+                        } else if let Some((reply, parsed_unnamed)) = plugin_reply.take() {
+                            // Answered by a plugin: no backend saw the cycle.
+                            stream.write_all(&reply).await.map_err(|e| {
+                                ProxyError::Network(format!("Client write error: {}", e))
+                            })?;
+                            // The client's unnamed portal is the plugin's now
+                            // (its unnamed statement too when it sent the
+                            // Parse: see `leads_unnamed_parse` below): what
+                            // the backends hold of them is closed before a
+                            // later cycle could use it.
+                            Self::orphan_unnamed(
+                                conns,
+                                UnnamedStale {
+                                    statement: false,
+                                    portal: true,
+                                },
+                            );
+                            if let Some(parse) = parsed_unnamed {
+                                plugin_unnamed = Some(parse);
+                            }
+                            (None, reply.len() as u64)
                         } else {
                             let mut fault: Option<BackendFault> = None;
                             Self::rehome_if_moved(
@@ -3670,7 +4214,11 @@ impl ProxyServer {
                                         && !batch_parsed_unnamed)
                                         .then(|| unnamed_node.clone())
                                         .flatten();
-                                    let ref_route_sql = if offload_on
+                                    // A cycle with no Parse is routed by the
+                                    // first prepared statement it executes
+                                    // under read offload, or when the route
+                                    // plugin answered for its executions.
+                                    let ref_route_sql = if (offload_on || ext_hooks.routes())
                                         && pending_route_sql.is_none()
                                         && !batch_parsed_unnamed
                                     {
@@ -3682,6 +4230,11 @@ impl ProxyServer {
                                     } else {
                                         None
                                     };
+                                    // What a branch move would leave behind.
+                                    session.branch_blockers.store(
+                                        tr.bound.blocking(false, false),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
                                     let (route_sql, route_from) = match unnamed_home.as_deref() {
                                         Some(node) => (None, Some(node)),
                                         None => (
@@ -3728,10 +4281,16 @@ impl ProxyServer {
                                             wait_ready,
                                             defines: &batch_defines,
                                             unnamed: held_unnamed.as_ref(),
+                                            reparked: (batch_binds_unnamed
+                                                && !batch_parsed_unnamed
+                                                && held_unnamed.is_none())
+                                            .then_some(plugin_unnamed.as_ref())
+                                            .flatten(),
                                         },
                                         &batch_refs,
                                         &stmt_registry,
                                         hold,
+                                        &ext_hooks.route,
                                     )
                                     .await
                                 }
@@ -3761,6 +4320,11 @@ impl ProxyServer {
                                                     wait_ready,
                                                     defines: &batch_defines,
                                                     unnamed: held_unnamed.as_ref(),
+                                                    reparked: (batch_binds_unnamed
+                                                        && !batch_parsed_unnamed
+                                                        && held_unnamed.is_none())
+                                                    .then_some(plugin_unnamed.as_ref())
+                                                    .flatten(),
                                                 },
                                                 reprepare: &batch_refs,
                                             },
@@ -3787,10 +4351,29 @@ impl ProxyServer {
                                 },
                             }
                         };
+                        #[cfg(feature = "wasm-plugins")]
+                        if let Some((pm, started)) = post_query {
+                            let sql = pending_route_sql.as_deref().or_else(|| {
+                                batch_refs
+                                    .first()
+                                    .and_then(|n| stmt_registry.get(n))
+                                    .and_then(|b| Self::parse_msg_sql(b))
+                            });
+                            if let Some(sql) = sql {
+                                Self::fire_post_query_sql(
+                                    pm,
+                                    sql,
+                                    session,
+                                    &Ok((used_node.clone(), sent)),
+                                    started.elapsed(),
+                                );
+                            }
+                        }
                         if used_node.is_none() {
                             // Refused before it reached a backend (rate limit,
-                            // open circuit, failed replacement): as on the
-                            // 25P02 path above, nothing was closed (F2).
+                            // open circuit, a statement hook, failed
+                            // replacement): as on the 25P02 path above,
+                            // nothing was closed (F2).
                             batch_closes.clear();
                             batch_left_closed.clear();
                             // ...but PostgreSQL destroys the unnamed statement
@@ -3838,6 +4421,35 @@ impl ProxyServer {
                         if let Some(n) = used_node {
                             current_node = Some(n);
                         }
+                        // The backend the cycle reached was given the unnamed
+                        // statement a plugin had answered: it holds it now.
+                        if let Some((_, sig)) = plugin_unnamed.as_ref() {
+                            if forwarded
+                                && current_node
+                                    .as_ref()
+                                    .and_then(|n| conns.get(n))
+                                    .is_some_and(|bc| bc.unnamed_sig.as_ref() == Some(sig))
+                            {
+                                plugin_unnamed = None;
+                            }
+                        }
+                        // What the batch did to state only the session's
+                        // backend has: a Flush leaves its cycle open (inside
+                        // an implicit transaction), its Sync settles it.
+                        if delivered {
+                            tr.bound.apply(
+                                bound_effect,
+                                status_before,
+                                if wait_ready {
+                                    session
+                                        .last_rfq_status
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                } else {
+                                    b'T'
+                                },
+                                session.cycle_errored.load(Ordering::Relaxed),
+                            );
+                        }
                         // A session-level advisory lock the batch takes is
                         // held by the connection it reached (one refused or
                         // answered before any backend took none, and one cut
@@ -3845,6 +4457,17 @@ impl ProxyServer {
                         if takes_locks && delivered {
                             if let Some(bc) = current_node.as_ref().and_then(|n| conns.get_mut(n)) {
                                 bc.session_locks = true;
+                            }
+                        } else if releases_locks
+                            && delivered
+                            && !session.cycle_errored.load(Ordering::Relaxed)
+                        {
+                            // `pg_advisory_unlock_all()` / `DISCARD ALL` ran
+                            // without an error (an unlock holds even if the
+                            // transaction fails later): the connection that
+                            // answered holds no session-level lock.
+                            if let Some(bc) = current_node.as_ref().and_then(|n| conns.get_mut(n)) {
+                                bc.session_locks = false;
                             }
                         }
                         // Extended-protocol SETs (JDBC, Npgsql and tokio-postgres
@@ -3909,6 +4532,11 @@ impl ProxyServer {
                                         wait_ready,
                                         defines: &batch_defines,
                                         unnamed: held_unnamed.as_ref(),
+                                        reparked: (batch_binds_unnamed
+                                            && !batch_parsed_unnamed
+                                            && held_unnamed.is_none())
+                                        .then_some(plugin_unnamed.as_ref())
+                                        .flatten(),
                                     },
                                     &batch_refs,
                                     &stmt_registry,
@@ -4065,6 +4693,7 @@ impl ProxyServer {
                                 stmt_registry_bytes =
                                     stmt_registry_bytes.saturating_sub(removed.len());
                             }
+                            ext_hooks.forget(name);
                             stmt_reads.remove(name);
                             if track_session_locks {
                                 stmt_locks.remove(name);
@@ -4106,6 +4735,7 @@ impl ProxyServer {
                             // next Parse can re-route. Flush leaves it intact so
                             // the rest of the in-flight sequence stays put.
                             pending_route_sql = None;
+                            ext_hooks.end_cycle();
                             batch_defines.clear();
                             batch_refs.clear();
                             batch_left_closed.clear();

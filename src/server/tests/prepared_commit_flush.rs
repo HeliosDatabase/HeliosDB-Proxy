@@ -483,6 +483,7 @@ async fn recovery_waits_for_a_promotion_in_progress() {
         &server.state,
         &config,
         tokio::time::Instant::now() + Duration::from_secs(5),
+        false,
     )
     .await
     .unwrap();
@@ -553,6 +554,7 @@ async fn recovery_redials_cached_socket_with_unpublished_tail() {
         &server.state,
         &config,
         tokio::time::Instant::now() + Duration::from_secs(2),
+        false,
     )
     .await
     .unwrap();
@@ -609,6 +611,7 @@ async fn a_restore_on_a_reused_socket_forgets_its_unnamed_statement() {
         &server.state,
         &config,
         tokio::time::Instant::now() + Duration::from_secs(2),
+        false,
     )
     .await
     .unwrap();

@@ -71,6 +71,7 @@ pub mod config;
 pub mod connection_pool;
 pub mod database_name;
 pub mod failover_controller;
+pub mod gateway_drain;
 #[cfg(test)]
 mod gateway_fake_pg;
 pub mod gateway_policy;
@@ -88,6 +89,7 @@ pub mod mirror;
 pub mod node_overrides;
 pub mod node_slots;
 pub mod pipeline;
+pub mod plugin_artefact;
 pub mod plugin_registry;
 pub mod primary_tracker;
 pub mod protocol;
@@ -126,12 +128,18 @@ pub mod cache;
     feature = "query-cache",
     feature = "edge-proxy",
     feature = "routing-hints",
-    feature = "multi-tenancy"
+    feature = "multi-tenancy",
+    feature = "wasm-plugins"
 ))]
 pub(crate) mod sql_lex;
 
-// ── Quote-aware SQL text scanning shared by both result caches ─────
-#[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
+// ── Quote-aware SQL text scanning shared by both result caches (and the
+//    plugin hooks' statement context) ─────────────────────────────────
+#[cfg(any(
+    feature = "query-cache",
+    feature = "edge-proxy",
+    feature = "wasm-plugins"
+))]
 pub mod sql_text;
 
 // ── Query routing hints ─────────────────────────────────────────────

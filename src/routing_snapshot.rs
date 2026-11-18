@@ -13,9 +13,9 @@
 //! The builder is pure ([`RoutingSnapshot::build`]) so the routing rules are
 //! unit-tested without a server.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 
@@ -162,9 +162,14 @@ impl RoutingSnapshot {
 pub struct RoutingView {
     current: ArcSwap<RoutingSnapshot>,
     /// Serializes builders so a snapshot computed from older inputs can never
-    /// be stored after one computed from newer inputs.
-    publish: parking_lot::Mutex<()>,
+    /// be stored after one computed from newer inputs. Holds the last leader
+    /// any published snapshot named, so a leader that is lost and later
+    /// replaced by another node is a move even when snapshots without a
+    /// leader were published in between.
+    publish: parking_lot::Mutex<Option<String>>,
     leader_changes: AtomicU64,
+    /// Wall-clock time of the last move, Unix milliseconds; 0 = none since boot.
+    last_leader_change_ms: AtomicI64,
     evicted_idle: AtomicU64,
 }
 
@@ -172,8 +177,9 @@ impl RoutingView {
     pub fn new(authoritative: bool) -> Self {
         Self {
             current: ArcSwap::from_pointee(RoutingSnapshot::empty(authoritative)),
-            publish: parking_lot::Mutex::new(()),
+            publish: parking_lot::Mutex::new(None),
             leader_changes: AtomicU64::new(0),
+            last_leader_change_ms: AtomicI64::new(0),
             evicted_idle: AtomicU64::new(0),
         }
     }
@@ -185,26 +191,45 @@ impl RoutingView {
 
     /// Build and publish a snapshot. `build` runs under the publish lock, so
     /// it must not block. Returns the previous leader when the leader moved
-    /// from one node to a different node; connections to that node are the
-    /// caller's to retire. A leader that merely disappears (lost lease,
-    /// conflict, outage) returns `None`: that can be transient, and the node
-    /// may still be serving.
+    /// from one node to a different node, including through snapshots with
+    /// no leader in between; connections to that node are the caller's to
+    /// retire. A leader that merely disappears (lost lease, conflict, outage)
+    /// returns `None`: that can be transient, and the node may still be
+    /// serving.
     pub fn publish_with(&self, build: impl FnOnce() -> RoutingSnapshot) -> Option<String> {
-        let _publishing = self.publish.lock();
+        let mut last_leader = self.publish.lock();
         let mut next = build();
         let prev = self.current.load();
         if !next.authoritative {
             next.epoch = prev.epoch + u64::from(prev.leader != next.leader);
         }
-        let moved = match (&prev.leader, &next.leader) {
+        let moved = match (last_leader.as_ref(), next.leader.as_ref()) {
             (Some(old), Some(new)) if old != new => Some(old.clone()),
             _ => None,
         };
+        if let Some(new) = &next.leader {
+            if last_leader.as_ref() != Some(new) {
+                *last_leader = Some(new.clone());
+            }
+        }
         if moved.is_some() {
             self.leader_changes.fetch_add(1, Ordering::Relaxed);
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+            self.last_leader_change_ms.store(now_ms, Ordering::Relaxed);
         }
         self.current.store(Arc::new(next));
         moved
+    }
+
+    /// When the leader last moved from one node to another (wall clock), or
+    /// `None` when it has not since boot.
+    pub fn last_leader_change(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self.last_leader_change_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => chrono::DateTime::from_timestamp_millis(ms),
+        }
     }
 
     /// Record idle pooled connections closed because their node stopped
@@ -391,6 +416,43 @@ mod tests {
         );
         assert_eq!(view.leader_changes_total(), 1);
         assert_eq!(view.load().epoch, 2, "provider epochs are taken as given");
+    }
+
+    #[test]
+    fn a_leader_replaced_after_a_gap_is_a_move_and_is_timestamped() {
+        let view = RoutingView::new(true);
+        let at = |leader: Option<&'static str>| {
+            move || {
+                RoutingSnapshot::build(
+                    &cluster(),
+                    Authority::Provider {
+                        leader,
+                        epoch: 1,
+                        lease: None,
+                    },
+                    Instant::now(),
+                )
+            }
+        };
+        assert_eq!(view.publish_with(at(Some("a:5432"))), None);
+        assert_eq!(view.last_leader_change(), None, "no move since boot yet");
+        assert_eq!(view.publish_with(at(None)), None);
+        assert_eq!(view.publish_with(at(None)), None);
+        let before = chrono::Utc::now() - chrono::Duration::seconds(1);
+        assert_eq!(
+            view.publish_with(at(Some("b:5432"))),
+            Some("a:5432".to_string()),
+            "a lost leader replaced by another node is a move"
+        );
+        assert_eq!(view.leader_changes_total(), 1);
+        let at_time = view.last_leader_change().expect("timestamped");
+        assert!(at_time >= before && at_time <= chrono::Utc::now());
+        assert_eq!(
+            view.publish_with(at(Some("b:5432"))),
+            None,
+            "the same leader again is not a move"
+        );
+        assert_eq!(view.leader_changes_total(), 1);
     }
 
     #[test]

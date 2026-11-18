@@ -80,15 +80,15 @@ heliosdb-proxy --config proxy.toml --check-config
 
 ```toml
 [plugins]
+enabled    = true
 plugin_dir = "/etc/heliosproxy/plugins"
 trust_root = "/etc/heliosproxy/keys/plugin-publisher.pub"
 hot_reload = true
-
-[plugins.config.helios-plugin-cost-governor]
-default_budget_per_second = 1000
 ```
 
-Drop signed `.wasm` artefacts into `plugin_dir`. See
+Drop signed `.tar.gz` artefacts (or `.wasm` modules with a `.sig`) into
+`plugin_dir`. There are no per-plugin tables: push a plugin's settings at
+runtime with `PUT /admin/kv/<plugin>/<key>` (`heliosproxy-plugin-kv`). See
 `heliosproxy-plugin-load`.
 
 ### Recipe 3: Time-Travel Replay (HA-TR)

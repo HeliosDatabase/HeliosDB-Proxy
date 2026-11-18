@@ -437,6 +437,7 @@ fn ext_batch<'a>(
         wait_ready,
         defines,
         unnamed,
+        reparked: None,
     }
 }
 
@@ -1171,10 +1172,10 @@ async fn tr_recorder_session_gucs_are_transactional_and_savepoint_scoped() {
     // refused rather than restoring a partial set.
     step(&mut tr, &session, &state, b'I', "SET work_mem = '64MB'").await;
     assert!(tr.guc_cap_hit);
-    assert!(ProxyServer::tr_restore_preflight(&tr).is_err());
+    assert!(ProxyServer::tr_restore_preflight(&tr, false).is_err());
     step(&mut tr, &session, &state, b'I', "RESET ALL").await;
     assert!(tr.gucs.is_empty() && !tr.guc_cap_hit);
-    assert!(ProxyServer::tr_restore_preflight(&tr).is_ok());
+    assert!(ProxyServer::tr_restore_preflight(&tr, false).is_ok());
 
     // guc_savepoint: a SET after a savepoint that is rolled back to is
     // undone; the base value committed before the transaction survives.
@@ -1327,7 +1328,7 @@ async fn tr_extended_cycles_settle_deferred_settings() {
         false,
     );
     simple(&mut tr, &session, &state, b'I', "ROLLBACK").await;
-    assert!(!tr.gucs_unknown && ProxyServer::tr_restore_preflight(&tr).is_ok());
+    assert!(!tr.gucs_unknown && ProxyServer::tr_restore_preflight(&tr, false).is_ok());
     // ...one that commits does not: reads stay home, the failover is refused.
     simple(&mut tr, &session, &state, b'T', "BEGIN").await;
     ext(
@@ -1343,7 +1344,7 @@ async fn tr_extended_cycles_settle_deferred_settings() {
     assert!(tr.gucs_unknown);
     assert!(session.reads_pinned.load(Ordering::Relaxed));
     assert_eq!(untracked(), 1);
-    let refused = ProxyServer::tr_restore_preflight(&tr).unwrap_err();
+    let refused = ProxyServer::tr_restore_preflight(&tr, false).unwrap_err();
     assert!(refused.to_string().contains("cannot follow"), "{refused}");
     // Unknown again: counted once per session.
     ext(&mut tr, Some(SettingsOp::Unknown), true);
@@ -1351,7 +1352,7 @@ async fn tr_extended_cycles_settle_deferred_settings() {
     // DISCARD ALL resets every setting: known again.
     ext(&mut tr, Some(SettingsOp::Apply("DISCARD ALL".into())), true);
     assert!(!tr.gucs_unknown && tr.gucs.is_empty());
-    assert!(ProxyServer::tr_restore_preflight(&tr).is_ok());
+    assert!(ProxyServer::tr_restore_preflight(&tr, false).is_ok());
 
     // A ROLLBACK TO a savepoint the proxy has no record of undid an unknown
     // share of the deferred SETs.
@@ -5163,10 +5164,12 @@ async fn f2_stale_statement_is_closed_before_the_batch_uses_it() {
                 wait_ready: true,
                 defines: &case.defines,
                 unnamed: None,
+                reparked: None,
             },
             &case.reprepare,
             &registry,
             0,
+            &RouteOverride::None,
         )
         .await
         .unwrap();

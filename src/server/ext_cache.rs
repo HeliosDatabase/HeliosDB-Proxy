@@ -41,21 +41,7 @@ pub(super) struct CacheableBatch<'a> {
     identity: Sha256,
 }
 
-/// The next frontend frame of `rest`: its tag and payload.
-fn frame<'a>(rest: &mut &'a [u8]) -> Option<(u8, &'a [u8])> {
-    let (head, tail) = rest.split_first_chunk::<5>()?;
-    let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
-    let payload = tail.get(..len.checked_sub(4)?)?;
-    *rest = &tail[payload.len()..];
-    Some((head[0], payload))
-}
-
-/// `payload` split after its leading C string: the string's bytes and the
-/// rest.
-fn cstring(payload: &[u8]) -> Option<(&[u8], &[u8])> {
-    let end = payload.iter().position(|b| *b == 0)?;
-    Some((&payload[..end], &payload[end + 1..]))
-}
+use super::frames::{next_frontend_frame as frame, split_cstring as cstring};
 
 impl<'a> CacheableBatch<'a> {
     /// The cacheable reading of `batch` (the frames up to and including the

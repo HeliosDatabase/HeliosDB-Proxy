@@ -247,17 +247,13 @@ impl ProxyServer {
         }
 
         if let Some(forced) = forced_target {
-            // Resolve a node *name* to its address; an address is passed
-            // through unchanged. This lets `/*helios:node=pg-standby*/` (and a
-            // plugin `Node("name")`) target a node by its configured name
-            // rather than requiring the raw host:port.
-            let resolved = config
-                .nodes
-                .iter()
-                .find(|n| n.name.as_deref() == Some(forced.as_str()) || n.address() == forced)
-                .map(|n| n.address().to_string())
-                .unwrap_or(forced);
-            return Ok((resolved, false));
+            // A node *name* resolves to its address, so `/*helios:node=pg-standby*/`
+            // (and a plugin `Node("name")`) can name a node. The callers
+            // refuse anything that is not a configured node before this;
+            // here it is checked again rather than dialed.
+            return Self::resolve_forced_target(config, &forced)
+                .map(|address| (address, false))
+                .map_err(ProxyError::Routing);
         }
 
         let healthy = |addr: &str| {

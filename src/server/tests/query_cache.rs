@@ -2252,6 +2252,7 @@ mod gateway_writes {
                         crate::http_gateway::HttpSqlCache {
                             cache: Some(cache),
                             trust_backend_read_effects,
+                            ..Default::default()
                         },
                     )
                 },

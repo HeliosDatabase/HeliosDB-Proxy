@@ -162,6 +162,8 @@ struct BackendCtl {
     /// of a backend host that does not answer lasts its whole `[limits]
     /// backend_cancel_timeout_ms`.
     stall_cancels: std::sync::atomic::AtomicBool,
+    /// The `database` parameter of each startup packet, in order.
+    startup_databases: StdMutex<Vec<String>>,
 }
 
 /// What a fake backend connection is doing besides answering messages.
@@ -194,19 +196,22 @@ impl BackendCtl {
 /// The status a statement leaves: BEGIN opens a transaction block, its end
 /// closes it.
 fn status_after(sql: &str, status: u8) -> u8 {
-    let upper = sql.trim().to_ascii_uppercase();
-    if upper.starts_with("BEGIN") {
-        b'T'
-    } else if upper.contains("PREPARED") {
-        status
-    } else if upper.starts_with("COMMIT")
-        || upper.starts_with("ROLLBACK")
-        || upper.starts_with("END")
-    {
-        b'I'
-    } else {
-        status
-    }
+    // Statement by statement, as PostgreSQL runs a multi-statement query.
+    sql.split(';').fold(status, |status, statement| {
+        let upper = statement.trim().to_ascii_uppercase();
+        if upper.starts_with("BEGIN") {
+            b'T'
+        } else if upper.contains("PREPARED") {
+            status
+        } else if upper.starts_with("COMMIT")
+            || upper.starts_with("ROLLBACK")
+            || upper.starts_with("END")
+        {
+            b'I'
+        } else {
+            status
+        }
+    })
 }
 
 /// A trust backend: AuthenticationOk + BackendKeyData (pid = connection
@@ -242,6 +247,11 @@ impl FakeBackend {
         Self::launch(discard_delay, None).await
     }
 
+    /// The `database` each connection asked for at startup, in order.
+    fn startup_databases(&self) -> Vec<String> {
+        self.ctl.startup_databases.lock().unwrap().clone()
+    }
+
     /// Every connection reports the BackendKeyData `key`.
     async fn start_shared_key(key: (u32, u32)) -> Self {
         Self::launch(None, Some(key)).await
@@ -259,6 +269,7 @@ impl FakeBackend {
             discard_delay,
             shared_key,
             stall_cancels: std::sync::atomic::AtomicBool::new(false),
+            startup_databases: StdMutex::new(Vec::new()),
         });
         let accept_ctl = Arc::clone(&ctl);
         tokio::spawn(async move {
@@ -297,7 +308,18 @@ impl FakeBackend {
                     }
                     return;
                 }
-                _ => break,
+                _ => {
+                    // key\0value\0 ... \0 after the protocol version.
+                    let fields: Vec<&[u8]> = body[4..].split(|b| *b == 0).collect();
+                    let database = fields
+                        .chunks(2)
+                        .find(|kv| kv[0] == b"database")
+                        .and_then(|kv| kv.get(1))
+                        .map(|v| String::from_utf8_lossy(v).into_owned())
+                        .unwrap_or_default();
+                    ctl.startup_databases.lock().unwrap().push(database);
+                    break;
+                }
             }
         }
         let kill = Arc::new(Notify::new());
@@ -675,6 +697,23 @@ impl Client {
         let r = tokio::time::timeout(Duration::from_millis(150), self.s.read(&mut b)).await;
         assert!(r.is_err(), "unexpected bytes from the proxy: {r:?}");
     }
+
+    /// The ReadyForQuery that follows a refusal, then the end of the stream.
+    async fn closed_after_ready(&mut self) {
+        let ready = self.frame().await;
+        assert_eq!(ready[0], b'Z', "{ready:?}");
+        self.closed().await;
+    }
+
+    /// The proxy closes the connection (end of stream) with nothing more.
+    async fn closed(&mut self) {
+        let mut b = [0u8; 1];
+        let n = tokio::time::timeout(TEST_TIMEOUT, self.s.read(&mut b))
+            .await
+            .expect("the proxy closes the connection")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "unexpected bytes from the proxy before it closed");
+    }
 }
 
 /// The frames are exactly ErrorResponse `code` (whose text contains `text`)
@@ -727,6 +766,7 @@ async fn copy_stall_deadline_arms_for_an_already_buffered_response() {
                 session: &session,
                 keep_session: false,
                 copy_end_wait: None,
+                drain: false,
             },
         ),
     )
@@ -769,6 +809,7 @@ async fn copy_stall_deadline_disarms_on_a_backend_error_before_ready() {
                 session: &session,
                 keep_session: false,
                 copy_end_wait: None,
+                drain: false,
             },
         ),
     )
@@ -799,6 +840,7 @@ async fn copy_stall_deadline_disarms_on_a_backend_error_before_ready() {
                 session: &session,
                 keep_session: false,
                 copy_end_wait: None,
+                drain: false,
             },
         ),
     )
@@ -1587,7 +1629,8 @@ impl Harness {
         self.connect_with(startup_bytes_db(user, database)).await
     }
 
-    async fn connect_with(&self, startup: Vec<u8>) -> Client {
+    /// A client that has sent `startup` and read nothing yet.
+    async fn connect_raw(&self, startup: Vec<u8>) -> Client {
         let (proxy, mut s) = pair().await;
         let peer = proxy.peer_addr().unwrap();
         let task = tokio::spawn(ProxyServer::handle_client(
@@ -1598,11 +1641,15 @@ impl Harness {
             self.server.shutdown_tx.clone(),
         ));
         s.write_all(&startup).await.unwrap();
-        let mut client = Client {
+        Client {
             s,
             key: (0, 0),
             task,
-        };
+        }
+    }
+
+    async fn connect_with(&self, startup: Vec<u8>) -> Client {
+        let mut client = self.connect_raw(startup).await;
         for f in client.until_ready().await {
             match f[0] {
                 b'K' => {
@@ -2855,9 +2902,10 @@ fn keep_healthy(h: &Harness) -> JoinHandle<()> {
 /// with that connection: the idle watch sees the loss and the permit returns
 /// at once, while its client stays silent, not at its next request. Another
 /// session of the tenant is served meanwhile, and `idle_permit_timeout_ms`
-/// never ends the holder, which holds nothing. Its next request runs on a
-/// replacement (re-homed by `tr_mode = session`, simply redialed under
-/// `none`).
+/// never ends the holder, which holds nothing. Its next request is told the
+/// locks are gone and its session ends (`session_bound`): 08006 naming them
+/// under `tr_mode = session`, 57P01 under `none`; it is not quietly run on a
+/// replacement as if it still held them.
 #[tokio::test]
 async fn a_lock_holder_whose_backend_died_idle_returns_its_permit_at_once() {
     for mode in [crate::config::TrMode::Session, crate::config::TrMode::None] {
@@ -2884,7 +2932,18 @@ async fn a_lock_holder_whose_backend_died_idle_returns_its_permit_at_once() {
         tokio::time::sleep(Duration::from_millis(400)).await;
         a.quiet().await;
         assert_eq!(h.stats("acme").idle_permit_timeouts, 0, "{mode:?}");
-        assert_served(&a.query("select 'a'").await, b'I');
+        a.send(&wire(b'Q', b"select 'a'\0")).await;
+        let refusal = a.frame().await;
+        let (code, text) = match mode {
+            crate::config::TrMode::None => ("57P01", "closing connection"),
+            _ => ("08006", "session-level advisory locks"),
+        };
+        assert_eq!(sqlstate(&refusal), code, "{mode:?}: {refusal:?}");
+        assert!(has_text(&refusal, text), "{mode:?}: {refusal:?}");
+        assert!(
+            !h.backend.saw_query("select 'a'"),
+            "{mode:?}: not run on a replacement"
+        );
         h.until("acme", "the permit returned", |s| s.queries_active == 0)
             .await;
         assert_served(&b.query("select 'b'").await, b'I');
@@ -3647,34 +3706,87 @@ async fn a_session_ending_with_a_cycle_open_closes_that_connection_unparked() {
     }
 }
 
-/// A directory for `[plugins] plugin_dir` holding one plugin (compiled from
-/// WAT) whose `hook` answers every simple Query with `result`, the JSON that
-/// hook returns.
+/// Write the plugin `name` (compiled from WAT) into `dir`. Its `hook` answers
+/// `result` (the JSON that hook returns) for every call whose input, the
+/// statement's JSON context, contains `needle`, and nothing (the hook's
+/// default outcome) for any other; an empty `needle` matches every call. The
+/// hooks read statements of both protocols, so a test that needs one
+/// statement through and another answered tells them apart by their SQL.
+/// Returns the path of the `.wasm`.
 #[cfg(feature = "wasm-plugins")]
-fn hook_plugin_dir(hook: &str, result: &str) -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    let payload: String = result.bytes().map(|b| format!("\\{b:02x}")).collect();
+fn write_hook_plugin(
+    dir: &std::path::Path,
+    name: &str,
+    hook: &str,
+    needle: &str,
+    result: &str,
+) -> std::path::PathBuf {
+    let escaped = |text: &str| -> String { text.bytes().map(|b| format!("\\{b:02x}")).collect() };
     let wat = format!(
         r#"(module
   (memory (export "memory") 1)
   (func (export "alloc") (param i32) (result i32) (i32.const 4096))
   (func (export "dealloc") (param i32) (param i32))
+  (func $contains (param $ptr i32) (param $len i32) (result i32)
+    (local $i i32) (local $j i32)
+    (block $absent
+      (loop $next
+        (br_if $absent
+          (i32.gt_u (i32.add (local.get $i) (i32.const {needle_len})) (local.get $len)))
+        (local.set $j (i32.const 0))
+        (block $differs
+          (loop $same
+            (if (i32.eq (local.get $j) (i32.const {needle_len}))
+              (then (return (i32.const 1))))
+            (br_if $differs
+              (i32.ne
+                (i32.load8_u
+                  (i32.add (local.get $ptr) (i32.add (local.get $i) (local.get $j))))
+                (i32.load8_u (i32.add (i32.const 2048) (local.get $j)))))
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br $same)))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $next)))
+    (i32.const 0))
   (func (export "{hook}") (param i32) (param i32) (result i64)
-    (i64.or (i64.shl (i64.const 1024) (i64.const 32)) (i64.const {len})))
-  (data (i32.const 1024) "{payload}"))"#,
-        len = result.len()
+    (if (result i64) (call $contains (local.get 0) (local.get 1))
+      (then (i64.or (i64.shl (i64.const 1024) (i64.const 32)) (i64.const {result_len})))
+      (else (i64.const 0))))
+  (data (i32.const 1024) "{result}")
+  (data (i32.const 2048) "{needle}"))"#,
+        needle_len = needle.len(),
+        result_len = result.len(),
+        result = escaped(result),
+        needle = escaped(needle),
     );
+    assert!(
+        result.len() <= 1024 && needle.len() <= 1024,
+        "fixture too long"
+    );
+    let wasm = dir.join(format!("{name}.wasm"));
+    std::fs::write(&wasm, wat::parse_str(&wat).expect("wat parses")).unwrap();
     std::fs::write(
-        dir.path().join("answer.wasm"),
-        wat::parse_str(&wat).expect("wat parses"),
+        dir.join(format!("{name}.json")),
+        format!(r#"{{"name": "{name}", "version": "1.0.0", "hooks": ["{hook}"]}}"#),
     )
     .unwrap();
-    std::fs::write(
-        dir.path().join("answer.json"),
-        format!(r#"{{"name": "answer", "version": "1.0.0", "hooks": ["{hook}"]}}"#),
-    )
-    .unwrap();
+    wasm
+}
+
+/// A directory for `[plugins] plugin_dir` holding one plugin whose `hook`
+/// answers `result` for the statements whose context contains `needle`
+/// ([`write_hook_plugin`]).
+#[cfg(feature = "wasm-plugins")]
+fn hook_plugin_dir_for(hook: &str, needle: &str, result: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    write_hook_plugin(dir.path(), "answer", hook, needle, result);
     dir
+}
+
+/// [`hook_plugin_dir_for`] answering every statement.
+#[cfg(feature = "wasm-plugins")]
+fn hook_plugin_dir(hook: &str, result: &str) -> tempfile::TempDir {
+    hook_plugin_dir_for(hook, "", result)
 }
 
 /// [`hook_plugin_dir`] for the pre-query hook.
@@ -3701,7 +3813,11 @@ fn plugins_from(c: &mut ProxyConfig, dir: &tempfile::TempDir) {
 #[cfg(feature = "wasm-plugins")]
 #[tokio::test]
 async fn a_blocked_query_after_a_flush_is_an_idle_holder_bounded_by_the_timeout() {
-    let plugins = pre_query_plugin_dir(r#"{"action": "block", "value": "not here"}"#);
+    let plugins = hook_plugin_dir_for(
+        "pre_query",
+        "blocked",
+        r#"{"action": "block", "value": "not here"}"#,
+    );
     for pooled in poolings() {
         let shape = format!("transaction pooling {pooled}");
         let h = Harness::new(0, None, |c| {
@@ -3774,7 +3890,11 @@ async fn a_blocked_query_after_a_flush_is_an_idle_holder_bounded_by_the_timeout(
 #[cfg(feature = "wasm-plugins")]
 #[tokio::test]
 async fn a_blocked_cycle_whose_connection_died_idle_returns_its_permit_at_once() {
-    let plugins = pre_query_plugin_dir(r#"{"action": "block", "value": "not here"}"#);
+    let plugins = hook_plugin_dir_for(
+        "pre_query",
+        "blocked",
+        r#"{"action": "block", "value": "not here"}"#,
+    );
     for pooled in poolings() {
         let shape = format!("transaction pooling {pooled}");
         let h = Harness::new(0, None, |c| {
@@ -3807,7 +3927,7 @@ async fn a_blocked_cycle_whose_connection_died_idle_returns_its_permit_at_once()
             s.queries_active == 0 && s.queries_idle == 0
         })
         .await;
-        // B, extended (plugins see simple Queries only), is served.
+        // B, whose statement the plugin lets through, is served.
         b.send(&[cycle("select 'b'"), sync()].concat()).await;
         let served = b.until_ready().await;
         assert_eq!(tags(&served), b"12CZ", "{shape}");
@@ -3841,7 +3961,11 @@ async fn a_blocked_cycle_whose_connection_died_idle_returns_its_permit_at_once()
 #[cfg(feature = "wasm-plugins")]
 #[tokio::test]
 async fn a_route_blocked_query_continuing_a_lost_cycle_returns_its_permit() {
-    let plugins = hook_plugin_dir("route", r#"{"action": "block", "reason": "not here"}"#);
+    let plugins = hook_plugin_dir_for(
+        "route",
+        "blocked",
+        r#"{"action": "block", "reason": "not here"}"#,
+    );
     let h = Harness::new(0, None, |c| {
         c.tr_mode = crate::config::TrMode::None;
         plugins_from(c, &plugins);
@@ -3867,7 +3991,7 @@ async fn a_route_blocked_query_continuing_a_lost_cycle_returns_its_permit() {
         s.queries_active == 0 && s.queries_idle == 0
     })
     .await;
-    // B, extended (the route hook sees simple Queries only), is served.
+    // B, whose statement the route hook lets through, is served.
     b.send(&[cycle("select 'b'"), sync()].concat()).await;
     let served = b.until_ready().await;
     assert_eq!(tags(&served), b"12CZ");
@@ -3924,7 +4048,11 @@ async fn a_query_continuing_a_flushed_cycle_skips_a_plugin_cached_answer() {
 #[cfg(feature = "wasm-plugins")]
 #[tokio::test]
 async fn a_route_blocked_query_after_a_flush_keeps_the_cycle_and_its_permit() {
-    let plugins = hook_plugin_dir("route", r#"{"action": "block", "reason": "not here"}"#);
+    let plugins = hook_plugin_dir_for(
+        "route",
+        "select 1",
+        r#"{"action": "block", "reason": "not here"}"#,
+    );
     for pooled in poolings() {
         let shape = format!("transaction pooling {pooled}");
         let h = Harness::new(0, None, |c| {
@@ -3975,8 +4103,8 @@ async fn a_route_blocked_query_after_a_flush_keeps_the_cycle_and_its_permit() {
     }
 }
 
-/// Open a transaction (an extended BEGIN: plugins see simple Queries only)
-/// and have a plugin `Block` a Query in it (`text` names which). Nothing
+/// Open a transaction and have a plugin `Block` a Query in it (`text` names
+/// which; the plugin answers only statements that contain `insert`). Nothing
 /// reached the backend, whose transaction stays open: the Block's
 /// ReadyForQuery reports 'T', never 'I', and the transaction keeps its
 /// permit until its end returns it.
@@ -4009,7 +4137,11 @@ async fn a_plugin_block_in_a_transaction_reports_status_t(plugins: &tempfile::Te
 #[cfg(feature = "wasm-plugins")]
 #[tokio::test]
 async fn a_route_plugin_block_in_a_transaction_reports_status_t() {
-    let plugins = hook_plugin_dir("route", r#"{"action": "block", "reason": "not here"}"#);
+    let plugins = hook_plugin_dir_for(
+        "route",
+        "insert",
+        r#"{"action": "block", "reason": "not here"}"#,
+    );
     a_plugin_block_in_a_transaction_reports_status_t(&plugins, "Query blocked by route plugin")
         .await;
 }
@@ -4019,7 +4151,11 @@ async fn a_route_plugin_block_in_a_transaction_reports_status_t() {
 #[cfg(feature = "wasm-plugins")]
 #[tokio::test]
 async fn a_pre_query_plugin_block_in_a_transaction_reports_status_t() {
-    let plugins = pre_query_plugin_dir(r#"{"action": "block", "value": "not here"}"#);
+    let plugins = hook_plugin_dir_for(
+        "pre_query",
+        "insert",
+        r#"{"action": "block", "value": "not here"}"#,
+    );
     a_plugin_block_in_a_transaction_reports_status_t(&plugins, "Query blocked by plugin").await;
 }
 
@@ -4038,7 +4174,8 @@ async fn a_query_after_a_refused_flush_is_discarded_and_its_sync_returns_the_per
     let cached = serde_json::json!({"action": "cached", "data": rows.to_vec()}).to_string();
     let block = r#"{"action": "block", "value": "not here"}"#.to_string();
     for (result, expected) in [(block, &b"EZ"[..]), (cached, &b"TDCZ"[..])] {
-        let plugins = pre_query_plugin_dir(&result);
+        // The plugin answers the two Queries below, not the cycle before them.
+        let plugins = hook_plugin_dir_for("pre_query", "select '", &result);
         for pooled in poolings() {
             let shape = format!("{result}, transaction pooling {pooled}");
             let h = Harness::new(0, None, |c| {
@@ -4793,14 +4930,14 @@ async fn a_query_blocked_in_copy_in_is_an_idle_holder_bounded_by_the_timeout() {
         ("pre_query", r#"{"action": "block", "value": "not here"}"#),
         ("route", r#"{"action": "block", "reason": "not here"}"#),
     ] {
-        let plugins = hook_plugin_dir(hook, result);
+        let plugins = hook_plugin_dir_for(hook, "blocked", result);
         let h = Harness::new(0, None, |c| {
             c.multi_tenancy.idle_permit_timeout_ms = 300;
             plugins_from(c, &plugins);
         })
         .await;
         let mut a = h.connect("acme").await;
-        // An extended COPY: the hooks see simple Queries only.
+        // An extended COPY, which the plugin lets through.
         a.send(&[cycle("COPY t FROM STDIN"), sync()].concat()).await;
         assert_eq!(tags(&a.frames(3).await), b"12G", "{hook}");
         a.send(&wire(b'd', b"1\n")).await;
@@ -5891,23 +6028,29 @@ async fn a_statement_abandoned_on_a_live_backend_is_cancelled_before_its_permit_
                 );
             }
             Shape::Redialed => {
-                // A lock holder keeps its permit while idle; its connection
-                // dies, the permit returns (so the loss was seen), and the
-                // statement below runs on a fresh dial.
-                assert_served(&a.query("SELECT pg_advisory_lock(1)").await, b'I');
-                h.until("acme", "A idle holding the permit", |s| s.queries_idle == 1)
+                // B holds the tenant's only permit (an idle lock holder), so
+                // A's statement waits at the cap; A's startup connection
+                // dies meanwhile. Admitted once B unlocks, A finds it gone
+                // and, holding nothing that connection had, runs the
+                // statement on a fresh dial. (A session that held a lock or
+                // a transaction there would be ended instead: `session_bound`.)
+                assert_served(&b.query("SELECT pg_advisory_lock(1)").await, b'I');
+                h.until("acme", "B idle holding the permit", |s| s.queries_idle == 1)
+                    .await;
+                a.send(&query(SLOW)).await;
+                h.until("acme", "A waiting", |s| s.queries_waiting == 1)
                     .await;
                 h.backend.kill(a.key.0);
-                h.until("acme", "the permit returned", |s| s.queries_active == 0)
-                    .await;
+                assert_served(&b.query("SELECT pg_advisory_unlock_all()").await, b'I');
             }
             _ => {}
         }
-        let slow = "select 'slow: never answered'";
-        if shape == Shape::Extended {
-            a.send(&[cycle(slow), sync()].concat()).await;
-        } else {
-            a.send(&query(slow)).await;
+        const SLOW: &str = "select 'slow: never answered'";
+        let slow = SLOW;
+        match shape {
+            Shape::Extended => a.send(&[cycle(slow), sync()].concat()).await,
+            Shape::Redialed => {}
+            _ => a.send(&query(slow)).await,
         }
         let ran_on = until_conn_ran(&h, slow).await;
         match shape {
@@ -6345,7 +6488,11 @@ async fn a_home_fault_ending_a_session_cancels_its_cycle_on_a_standby() {
     for loss in losses {
         let shape = format!("{loss:?}");
         #[cfg(feature = "wasm-plugins")]
-        let plugins = pre_query_plugin_dir(r#"{"action": "block", "value": "not here"}"#);
+        let plugins = hook_plugin_dir_for(
+            "pre_query",
+            "blocked",
+            r#"{"action": "block", "value": "not here"}"#,
+        );
         let standby = FakeBackend::start(None).await;
         let standby_addr = standby.addr.to_string();
         let tweak = |c: &mut ProxyConfig| {
@@ -6413,8 +6560,7 @@ async fn a_home_fault_ending_a_session_cancels_its_cycle_on_a_standby() {
                 b
             }
         };
-        // B (extended: the plugin sees simple Queries only) waits for A's
-        // permit.
+        // B (a statement the plugin lets through) waits for A's permit.
         b.send(&[cycle("select 'b'"), sync()].concat()).await;
         h.until("acme", "B waiting", |s| s.queries_waiting == 1)
             .await;
@@ -7290,8 +7436,13 @@ async fn extended_2pc_mixed_partial_and_prior_identity_stay_gated() {
     }
 }
 
+/// The statement hooks run before admission reads the cycle, so a completion
+/// is proven on the statement as it will run: with rewrite rules, a tenant
+/// row filter or plugins on, `COMMIT PREPARED` still runs past the cap (it
+/// used to be refused there), and a statement a plugin rewrites into
+/// something else is not exempt.
 #[tokio::test]
-async fn extended_2pc_transform_context_stays_gated() {
+async fn extended_2pc_completion_is_exempt_with_statement_hooks_on() {
     for mode in ["rewrite", "tenant tables", "plugins"] {
         let h = Harness::new(0, None, |c| match mode {
             "rewrite" => c.query_rewrite.enabled = true,
@@ -7303,7 +7454,6 @@ async fn extended_2pc_transform_context_stays_gated() {
         let mut a = h.connect("acme").await;
         let mut b = h.connect("acme").await;
         assert_served(&a.query("BEGIN").await, b'T');
-        let before = h.backend.log().len();
         b.send(
             &[
                 parse("", "COMMIT PREPARED 'x'"),
@@ -7314,9 +7464,160 @@ async fn extended_2pc_transform_context_stays_gated() {
             .concat(),
         )
         .await;
-        assert_refused(&b.until_ready().await, "53300", REFUSED);
-        assert_eq!(h.backend.log().len(), before, "{mode}");
+        assert_eq!(tags(&b.until_ready().await), b"12CZ", "{mode}");
+        assert_eq!(
+            h.stats("acme").queries_active,
+            1,
+            "{mode}: no permit borrowed"
+        );
         assert_served(&a.query("COMMIT").await, b'I');
+    }
+}
+
+/// A plugin that rewrites a `COMMIT PREPARED` into another statement leaves
+/// nothing to exempt: the rewritten statement waits for a permit like any.
+#[cfg(feature = "wasm-plugins")]
+#[tokio::test]
+async fn extended_2pc_rewritten_into_other_work_stays_gated() {
+    let plugins = hook_plugin_dir_for(
+        "pre_query",
+        "PREPARED 'swap'",
+        r#"{"action": "rewrite", "value": "SELECT 'other work'"}"#,
+    );
+    let h = Harness::new(0, None, |c| plugins_from(c, &plugins)).await;
+    let mut a = h.connect("acme").await;
+    let mut b = h.connect("acme").await;
+    assert_served(&a.query("BEGIN").await, b'T');
+    let before = h.backend.log().len();
+    b.send(
+        &[
+            parse("", "COMMIT PREPARED 'swap'"),
+            bind(""),
+            execute(),
+            sync(),
+        ]
+        .concat(),
+    )
+    .await;
+    assert_refused(&b.until_ready().await, "53300", REFUSED);
+    assert_eq!(h.backend.log().len(), before);
+    assert_served(&a.query("COMMIT").await, b'I');
+}
+
+/// The other shapes drivers send a completion in run past the cap too: a
+/// `Describe` of the portal between `Bind` and `Execute` (pgjdbc), result
+/// format codes on the `Bind`, and a named statement prepared earlier and
+/// executed with `Bind`/`Execute`/`Sync` alone (a driver's server-side
+/// prepared statement). Each is answered and borrows no permit.
+#[tokio::test]
+async fn extended_2pc_named_and_described_cycles_are_exempt_at_the_cap() {
+    let describe_portal = || wire(b'D', b"P\0");
+    let text_results = |stmt: &str| {
+        wire(
+            b'B',
+            &[cstring(""), cstring(stmt), vec![0, 0, 0, 0, 0, 1, 0, 0]].concat(),
+        )
+    };
+    let h = Harness::new(0, None, |_| {}).await;
+    let mut a = h.connect("acme").await;
+    let mut b = h.connect("acme").await;
+    // Prepared while a permit is free (the driver's first use).
+    b.send(&[parse("fin", "ROLLBACK PREPARED 'named'"), sync()].concat())
+        .await;
+    assert_eq!(tags(&b.until_ready().await), b"1Z");
+    assert_served(&a.query("BEGIN").await, b'T');
+    type Cycle<'a> = (&'a str, Vec<Vec<u8>>, &'a [u8]);
+    let cycles: [Cycle; 4] = [
+        (
+            "described",
+            vec![
+                parse("", "COMMIT PREPARED 'd'"),
+                bind(""),
+                describe_portal(),
+                execute(),
+                sync(),
+            ],
+            b"12nCZ",
+        ),
+        (
+            "result formats",
+            vec![
+                parse("", "COMMIT PREPARED 'f'"),
+                text_results(""),
+                execute(),
+                sync(),
+            ],
+            b"12CZ",
+        ),
+        ("named", vec![bind("fin"), execute(), sync()], b"2CZ"),
+        (
+            "named, described",
+            vec![bind("fin"), describe_portal(), execute(), sync()],
+            b"2nCZ",
+        ),
+    ];
+    for (shape, frames, expected) in cycles {
+        b.send(&frames.concat()).await;
+        assert_eq!(tags(&b.until_ready().await), expected, "{shape}");
+        assert_eq!(
+            h.stats("acme").queries_active,
+            1,
+            "{shape}: no permit borrowed"
+        );
+    }
+    // A named statement that is not a completion is gated as before.
+    b.send(&[parse("other", "SELECT 1"), sync()].concat()).await;
+    assert_refused(&b.until_ready().await, "53300", REFUSED);
+    assert_served(&a.query("COMMIT").await, b'I');
+}
+
+/// Session pooling: a session-level advisory lock keeps its holder's permit,
+/// and an unlock of all of them sent over the extended protocol returns it,
+/// as the simple protocol's does: `pg_advisory_unlock_all()` and `DISCARD
+/// ALL` in a cycle, and a prepared unlock executed with `Bind` alone. A cycle
+/// whose unlock fails keeps the permit.
+#[tokio::test]
+async fn an_extended_unlock_returns_the_permit() {
+    for unlock in [
+        vec![cycle("SELECT pg_advisory_unlock_all()"), sync()],
+        vec![cycle("DISCARD ALL"), sync()],
+        vec![bind("unlock"), execute(), sync()],
+    ] {
+        let h = Harness::new(0, None, |_| {}).await;
+        let mut a = h.connect("acme").await;
+        let mut b = h.connect("acme").await;
+        a.send(&[parse("unlock", "SELECT pg_advisory_unlock_all()"), sync()].concat())
+            .await;
+        assert_eq!(tags(&a.until_ready().await), b"1Z");
+        assert_served(&a.query("SELECT pg_advisory_lock(1)").await, b'I');
+        h.until("acme", "A idle holding the permit", |s| {
+            s.queries_active == 1 && s.queries_idle == 1
+        })
+        .await;
+        assert_refused(&b.query("select 'b'").await, "53300", REFUSED);
+
+        // An unlock the backend fails releases nothing.
+        a.send(
+            &[
+                cycle("SELECT pg_advisory_unlock_all() /* violates */"),
+                sync(),
+            ]
+            .concat(),
+        )
+        .await;
+        let failed = a.until_ready().await;
+        assert_eq!(sqlstate(&failed[failed.len() - 2]), "23505", "{failed:?}");
+        h.until("acme", "A still holding the permit", |s| {
+            s.queries_active == 1
+        })
+        .await;
+        assert_refused(&b.query("select 'b'").await, "53300", REFUSED);
+
+        a.send(&unlock.concat()).await;
+        assert_served(&a.until_ready().await, b'I');
+        h.until("acme", "the permit returned", |s| s.queries_active == 0)
+            .await;
+        assert_served(&b.query("select 'b'").await, b'I');
     }
 }
 
@@ -7388,7 +7689,9 @@ mod simple_query_payload_regressions {
 
     #[tokio::test]
     async fn simple_query_payload_valid_empty_and_following_query_stay_live() {
-        let h = Harness::new(0, None, |_| {}).await;
+        // No statement hook: the row filter of the harness's tenants refuses
+        // text it cannot read (22021; `extended_hooks`).
+        let h = Harness::new(0, None, |c| c.multi_tenancy.enabled = false).await;
         let mut client = h.connect("acme").await;
         assert_served(&client.query("").await, b'I');
         assert_served(&client.query("SELECT 42").await, b'I');
@@ -7513,3 +7816,13 @@ async fn journal_source_uses_startup_tenant_budget_identity() {
     let source = ProxyServer::journal_source(&session).await;
     assert_eq!(source.tenant.as_deref(), Some("benchdb"));
 }
+
+mod branch_routing;
+mod extended_hooks;
+mod plugin_cached;
+mod plugin_context;
+mod plugin_reload;
+mod routing_targets;
+mod session_bound;
+mod shutdown_drain;
+mod statement_pooling;

@@ -37,7 +37,7 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
    with `--no-run`). All available benchmarks must be non-negative vs the recorded
    baseline, and CUMULATIVE performance degradation across a work session must stay under
    3% vs baseline. Criterion baselines are recorded in
-   `/home/gpc/HDB/Proxy/benches/BASELINE.md` (bench name, metric, value, date, host,
+   `benches/BASELINE.md` (bench name, metric, value, date, host,
    features, commit; entries through 2026-09-21) — add a new entry there when a change
    introduces a benchable code path with no prior baseline. The gate tool is
    `scripts/bench-gate.sh <baseline-tree> <candidate-tree> <label>`: 3 interleaved rounds
@@ -47,11 +47,20 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
    candidate; it is INVALID (exit 2) when any declared case is missing, malformed or stale
    in any round, when outputs for the label already exist (labels are single-use per tree),
    or when the executables that ran are not the ones built. Cases only the candidate
-   declares are reported as NEW (add a BASELINE.md entry). Every separated regression must
-   still be attributed by the reviewer; `bench-gate.json` / the summary classify each bench
-   executable pair by function body (`scripts/bench-gate-fde.py`): `body-identical` means
-   only placement changed (layout class), `code-changed` means a function body differs.
-   Comparator tests: `python3 scripts/tests/bench_gate_compare_test.py`. The
+   declares are reported as NEW (add a BASELINE.md entry). `bench-gate.json` / the summary
+   classify each bench executable pair by function body (`scripts/bench-gate-fde.py`):
+   `body-identical` means only placement changed (layout class), `code-changed` means a
+   function body differs. **Second-build confirmation** (owner decision 2026-11-17,
+   `CONFIRM=1` by default, `scripts/bench-gate-confirm.py`): when the primary comparison
+   fails only on separated regressions, those on body-identical executables are reported,
+   not failing, and those on changed code are re-measured on a second, independent build
+   of both trees (`CONFIRM_TARGET`, default `<tree>/target-confirm`) over the same
+   interleaved rounds; one fails the gate only if it is again separated and slower there.
+   The mean budget, removed cases and INVALID runs are final as before. The final verdict
+   is `bench-gate-final.json` (and the summary's last lines); every reproduced regression
+   must still be attributed by the reviewer. Comparator tests:
+   `python3 scripts/tests/bench_gate_compare_test.py`,
+   `python3 scripts/tests/bench_gate_confirm_test.py`. The
    proxy-path scalability harness is `scripts/regress/bench-scalability.sh
    <proxy-binary>` (Dockerized pgbench against an already-running PG 18.4 backend at
    `127.0.0.1:25433`; heavy — see Resource Constraints); its evidence
@@ -91,12 +100,15 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
     (both CLI-mode only: rejected together with `--config`), `--primary <host:port>`,
     `--standby <host:port>` (repeatable), `--tr` (default true), `--log-level`, `--json-logs`
   - Subcommand: `install skills [--target claude|codex|both] [--symlink] [--force] [--dry-run]`
-  - Signals: SIGHUP = live config reload; SIGUSR2 = graceful drain for zero-downtime
-    binary handoff (bounded by `shutdown_drain_timeout_secs`, env override
-    `HELIOS_DRAIN_TIMEOUT_SECS`). There is NO SIGTERM/ctrl-c handler — SIGTERM kills
-    the process immediately
-- **CLI `helios-plugin`** (src/bin/helios-plugin.rs): `install`, `list`, `verify`, `new`
-  (plugin registry / Ed25519 signature tooling)
+  - Signals: SIGHUP = live config reload; SIGTERM / SIGINT = shutdown drain bounded by
+    `shutdown_drain_timeout_secs` (env override `HELIOS_DRAIN_TIMEOUT_SECS`): listeners
+    closed (PG wire and the HTTP/MCP/GraphQL gateways), `/health/ready` 503, each
+    session ended with FATAL `57P01` once nothing of it is in flight, accepted gateway
+    requests answered, recovery journal flushed, exit 0; a second signal exits at once.
+    SIGUSR2 = the same drain for a zero-downtime binary handoff
+- **CLI `helios-plugin`** (src/bin/helios-plugin.rs, format in src/plugin_artefact.rs):
+  `keygen`, `pack`, `sign`, `inspect`, `verify`, `install`, `list`, `new` (artefacts,
+  Ed25519 signatures, registry install, plugin scaffold)
 - **Config file** `proxy.toml` — examples in `config/proxy.minimal.toml` (smallest valid
   file: one `[[nodes]]` with `host` + `role`; every other key/section has a serde default),
   `config/proxy.example.toml`, `config/proxy.full.toml`, `config/proxy.postgres.toml`; the working configs under
@@ -138,8 +150,9 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
   aliases `/healthz`→`/health`, `/livez`→`/health/live`, `/readyz`→`/health/ready`,
   routed and identical to their slash-form twins), `/metrics`,
   `/metrics/prometheus`, `/version`, `/config`, `/topology`, `/nodes`, `/nodes/{addr}`,
-  `/nodes/{addr}/enable|disable`, `/sessions`, `/pools`, `/plugins`, `/analytics`,
-  `/anomalies`, `/branch`, `/api/sql`, `/api/chaos`, `/api/replay`, `/api/shadow`,
+  `/nodes/{addr}/enable|disable`, `/sessions`, `/pools`, `/plugins` (+`/plugins/files`,
+  `POST /plugins/reload`), `/analytics`, `/anomalies`, `/branch`, `/api/sql`,
+  `/api/chaos`, `/api/replay`, `/api/shadow`,
   `/api/branch`, `/api/circuit`, `/api/promotion`, `/api/analytics`,
   `/api/stats` (schema version 1), `/api/cache/heatmap`,
   `/api/edge` (+`/register`, `/subscribe`, `/invalidate`),
@@ -160,8 +173,8 @@ with this file, `Cargo.toml`, or `.github/workflows/ci.yml`, those win.
 
 ## Resource Constraints
 
-This host crashed on 2026-07-08 (suspected OOM; see
-`/home/gpc/HDB/sprint/status/incident-2026-07-08.md`) and runs production-like services.
+The development host crashed on 2026-07-08 (suspected OOM; see the maintainers'
+incident record `sprint/status/incident-2026-07-08.md`) and runs production-like services.
 Therefore:
 
 - Run at most ONE heavy build/test/benchmark at a time — never in parallel; no
@@ -176,8 +189,8 @@ Therefore:
   evidence baseline in `docs/perf-2026-07/README.md` was run with `CLIENTS="1 4 16 64"`,
   `DUR=10` — match whichever baseline you compare against); never scale them up
   to "stress" the host.
-- NEVER touch `/home/gpc/heliosdb-ada-data`, any `/data` directories, or running
-  heliosdb services/containers. Docker-backed harnesses vary: `tests/docker/*` compose up
+- NEVER touch production data directories (`heliosdb-ada-data` and the like), any `/data`
+  directories, or running heliosdb services/containers. Docker-backed harnesses vary: `tests/docker/*` compose up
   their own cluster and `scripts/regress/ldap-test.sh` starts its own LDAP container, but
   `scripts/regress/run.sh`, `scripts/regress/bench-scalability.sh`, and
   `benchmarks/bench-engines.sh` use Docker only for the psql/pgbench client tooling and
@@ -194,4 +207,4 @@ A runaway benchmark (38 GiB RSS) livelocked this host for 16h. Run ANY heavy ben
 ```bash
 systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 <bench command>
 ```
-Full incident report: /home/gpc/HDB/sprint/status/incident-2026-07-08.md
+Full incident report: the maintainers' `sprint/status/incident-2026-07-08.md`.

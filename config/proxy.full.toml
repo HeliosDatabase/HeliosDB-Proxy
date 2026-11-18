@@ -706,6 +706,7 @@ heatmap_min_samples = 100   # reads in the window before a recommendation
 # event_buffer_size      = 1024      # Max events kept in the in-memory ring buffer (>= 1)
 # emit_novel_queries     = true      # Emit first-seen query fingerprints as info events
 # max_seen_fingerprints  = 100000    # Cap on the novel-query fingerprint set before reset (>= 1)
+# max_auth_windows       = 10000     # Cap on (user, address) failed-auth counts kept at once (>= 1)
 
 # =============================================================================
 # MULTI-TENANCY — Tenant isolation and per-tenant resource limits
@@ -758,14 +759,18 @@ heatmap_min_samples = 100   # reads in the window before a recommendation
 
 # [plugins]
 # enabled       = false
-# plugin_dir    = "/etc/heliosproxy/plugins"   # scanned for *.wasm at startup
-# hot_reload    = false                        # watch plugin_dir and reload changed plugins
-# memory_limit_mb = 64                         # memory per plugin instance, MB
+# plugin_dir    = "/etc/heliosproxy/plugins"   # *.wasm (+ .sig/.yaml/.json sidecars) and *.tar.gz, loaded at startup, SIGHUP, POST /plugins/reload
+# hot_reload    = false                        # also rescan plugin_dir (and trust_root) every hot_reload_interval_ms
+# hot_reload_interval_ms = 1000                # >= 100
+# hot_reload_debounce_ms = 500                 # a change must be stable this long before hot reload applies it
+# max_artefact_bytes = 67108864                # largest plugin file / decompressed .tar.gz content
+# memory_limit_mb = 64                         # linear-memory limit of each hook call, MB
 # timeout_ms    = 100                          # execution timeout per hook call
-# max_plugins   = 20
+# max_plugins   = 20                           # plugins loaded at once
 # fuel_metering = true                         # bound CPU per call
 # fuel_limit    = 1000000
-# # trust_root  = "/etc/heliosproxy/trust"     # Ed25519 *.pub dir: every .wasm then needs a verifying .sig
+# # trust_root  = "/etc/heliosproxy/trust"     # Ed25519 trust root: *.pub dir, one key file, or 64 hex digits; every plugin must then be signed
+# # require_signed_manifest = false            # with trust_root: only .tar.gz artefacts whose manifest.sig verifies
 # kv_max_value_bytes     = 65536       # Max bytes per plugin-KV key OR value (kv_set / PUT /admin/kv); 0 = unlimited
 # kv_max_keys_per_plugin = 1024        # Max distinct keys per plugin KV namespace; 0 = unlimited
 # kv_max_plugins         = 256         # Max distinct plugin KV namespaces (bounds PUT /admin/kv namespace growth); 0 = unlimited
@@ -849,3 +854,19 @@ heatmap_min_samples = 100   # reads in the window before a recommendation
 # [[mcp.principals]]
 # id    = "etl-agent"            # [A-Za-z0-9_.-]{1,64}, unique; "default" is reserved
 # token = "${MCP_ETL_TOKEN}"     # unique, non-empty; never logged
+
+# =============================================================================
+# BRANCH — branch databases: provisioning (/api/branch) and branch routing
+# =============================================================================
+
+# [branch]
+# enabled          = false               # /api/branch provisions CREATE DATABASE <branch> TEMPLATE <base>
+# backend_host     = "127.0.0.1"
+# backend_port     = 5432
+# admin_user       = "postgres"          # a role with CREATEDB
+# # admin_password = "${PGPASSWORD}"
+# admin_database   = "postgres"          # maintenance database for CREATE/DROP DATABASE
+# base_database    = "postgres"          # template when a request omits `base`
+# route_enabled    = false               # a branch= hint / route plugin answer moves the session (else 42000)
+# route_mode       = "database"          # "database" (PostgreSQL) or "nano" (<base>@<name>)
+# route_allow      = []                  # branch names sessions may move to; empty = any valid name

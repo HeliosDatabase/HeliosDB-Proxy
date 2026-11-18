@@ -1,105 +1,110 @@
 ---
 name: heliosproxy-plugin-pack
-description: Use the `helios-plugin` CLI to pack, sign, inspect, and verify WASM plugin artefacts. OCI-style `.tar.gz` (manifest + .wasm + .sig). Generate Ed25519 keys with openssl. Use when the user says "pack a plugin", "sign WASM", "trust root", "helios-plugin", "OCI artefact".
+description: Use the `helios-plugin` CLI to generate keys and to pack, sign, inspect, and verify WASM plugin artefacts. OCI-style `.tar.gz` (manifest + .wasm + signatures). Ed25519 keys from `helios-plugin keygen` or openssl. Use when the user says "pack a plugin", "sign WASM", "trust root", "helios-plugin", "OCI artefact".
 allowed-tools: Bash(helios-plugin *), Bash(openssl *), Bash(tar *), Bash(sha256sum *), Bash(cargo *), Read
 related: [heliosproxy-overview, heliosproxy-plugin-load, heliosproxy-plugin-catalog]
 ---
 
 # Pack, sign, inspect plugins
 
-Plugins ship as OCI-style `.tar.gz` artefacts containing a
-`manifest.json`, the `plugin.wasm` binary, and an optional
-`plugin.sig` (Ed25519). The `helios-plugin` CLI is the canonical
-tool for building, signing, and validating those artefacts.
+Plugins ship as OCI-style `.tar.gz` artefacts: `manifest.json`, the
+`plugin.wasm` module, and optionally `plugin.sig` (Ed25519 over the
+module) and `manifest.sig` (Ed25519 over `manifest.json`, which pins the
+module's SHA-256). The `helios-plugin` CLI builds, signs and checks them.
 
 ## When to use
 
 - Building a fresh plugin from a Rust crate compiled to wasm32
-- Signing an existing `.wasm` so the proxy's trust-root accepts it
+- Signing a module or an artefact so the proxy's trust root accepts it
 - Inspecting a third-party `.tar.gz` before loading it
-- Verifying a signature against a public key in CI
+- Verifying signatures against a trust root in CI
 
-🟠 Mutating on disk (writes the artefact); 🔵 read-only on running
-proxy until the artefact is loaded (see `heliosproxy-plugin-load`).
+🟠 Mutating on disk (writes the artefact or the key files); 🔵 read-only
+on the running proxy until the artefact is loaded (see
+`heliosproxy-plugin-load`).
 
 ## Surfaces
 
 | Verb | Effect |
 |---|---|
-| `helios-plugin pack`    | Build `.tar.gz` from `.wasm` + manifest fields |
-| `helios-plugin inspect` | Print manifest, file list, SHA256s |
-| `helios-plugin verify`  | Check signature against a public key |
-| `openssl genpkey` / `openssl pkey` | Generate / convert Ed25519 keys |
+| `helios-plugin keygen`  | Ed25519 key pair: `<name>.key` (PKCS#8 PEM, mode 0600) and `<name>.pub` (trust-root format) |
+| `helios-plugin pack`    | Build a `.tar.gz` from a module plus manifest fields or a `plugin.yaml`; `--sign-with` signs module and manifest |
+| `helios-plugin sign`    | Write a module's `.sig` sidecar, or re-sign an artefact (in place or `--output`) |
+| `helios-plugin inspect` | Manifest, entries, sizes, SHA-256s, signature status (`--json`); for a module, its exported hooks |
+| `helios-plugin verify`  | Integrity, and signatures against a trust root (`--trust-root` / `--pubkey`) |
+| `helios-plugin new`     | Scaffold a plugin crate that builds and loads |
 
-The CLI binary lives in the sibling repo
-[`HDB-HeliosDB-Proxy-Plugins`](https://github.com/HeliosDatabase/HeliosDB-Proxy-Plugins)
-and installs alongside the proxy:
+The CLI ships with the proxy crate:
 
 ```bash
-cargo install helios-plugin
+cargo install heliosdb-proxy      # installs heliosdb-proxy and helios-plugin
 helios-plugin --version
 ```
+
+Keys: a signing key is a PKCS#8 PEM (`keygen`, `openssl genpkey -algorithm
+Ed25519`), or base64 / 64 hex digits of the 32-byte seed. A public key is a
+SubjectPublicKeyInfo PEM (`openssl pkey -pubout`), or base64 / 64 hex digits
+of the 32 raw bytes. A trust root (`--trust-root`, and the proxy's
+`[plugins] trust_root`) is a directory of `*.pub` files, one key file, or
+one key inline as 64 hex digits.
 
 ## Recipes
 
 ### Recipe 1: Generate an Ed25519 keypair
 
 ```bash
-# Private key (keep secret)
-openssl genpkey -algorithm Ed25519 -out plugin-publisher.key
-
-# Public key (ship to operators as the trust root)
-openssl pkey -in plugin-publisher.key -pubout -out plugin-publisher.pub
-
-# View the public key as raw bytes (32) for embedding
-openssl pkey -in plugin-publisher.pub -pubin -outform DER \
-  | tail -c 32 | xxd -p -c 32
+helios-plugin keygen --out-dir keys --name plugin-publisher
+# signing key: keys/plugin-publisher.key (keep it secret)
+# public key:  keys/plugin-publisher.pub (put it in the proxy's trust root)
 ```
 
-Both PEM and the trailing-32-bytes form are accepted by the proxy's
-`[plugins].trust_root` config — the loader auto-detects.
+Or with openssl — both files are accepted as they are:
+
+```bash
+openssl genpkey -algorithm Ed25519 -out plugin-publisher.key
+openssl pkey -in plugin-publisher.key -pubout -out plugin-publisher.pub
+```
 
 ### Recipe 2: Build a plugin from source (Rust → wasm)
 
 ```bash
-git clone git@github.com:HeliosDatabase/HeliosDB-Proxy-Plugins.git
-cd HDB-HeliosDB-Proxy-Plugins
-cargo build -p helios-plugin-cost-governor \
-  --target wasm32-unknown-unknown --release
-
-ls target/wasm32-unknown-unknown/release/
-# helios_plugin_cost_governor.wasm   (≈120 KiB)
+helios-plugin new my-plugin && cd my-plugin    # or a first-party plugin:
+rustup target add wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown
+ls target/wasm32-unknown-unknown/release/      # my_plugin.wasm
 ```
 
-Note the underscore-vs-hyphen in the artefact name: cargo emits
-`helios_plugin_cost_governor.wasm` for crate
-`helios-plugin-cost-governor`.
+Cargo emits underscore names (`my_plugin.wasm` for crate `my-plugin`); the
+plugin's name comes from the manifest, not the file.
 
 ### Recipe 3: Pack + sign in one step
 
 ```bash
 helios-plugin pack \
-  --wasm   target/wasm32-unknown-unknown/release/helios_plugin_cost_governor.wasm \
+  --wasm        target/wasm32-unknown-unknown/release/helios_plugin_cost_governor.wasm \
   --name        helios-plugin-cost-governor \
   --version     0.1.0 \
   --description "Per-tenant cost / budget gate" \
   --hooks       pre_query,post_query \
   --license     Apache-2.0 \
-  --sign-with   plugin-publisher.key \
+  --sign-with   keys/plugin-publisher.key \
   --output      cost-governor-0.1.0.tar.gz
 ```
 
-Resulting `.tar.gz` layout:
+Or take the fields from the scaffold's manifest: `helios-plugin pack
+--manifest plugin.yaml --wasm ... --sign-with ... --output ...` (flags
+override it). Layout:
 
 ```
-manifest.json    — name, version, description, license, hooks, wasm_sha256, signature_sha256
+manifest.json    — schema 1.1: name, version, description, license, hooks, wasm_sha256, signature_sha256
 plugin.wasm      — the compiled module
-plugin.sig       — Ed25519 detached signature over plugin.wasm
+plugin.sig       — Ed25519 signature over plugin.wasm
+manifest.sig     — Ed25519 signature over manifest.json
 ```
 
-Without `--sign-with`, the artefact has no `plugin.sig` and the
-proxy's `trust_root` policy decides whether to load (rejects by
-default; accepts when `trust_root = "permissive"`).
+`--sig <file>` embeds a signature over the module made elsewhere (no
+`manifest.sig` then). Without either, the artefact is unsigned: a proxy
+with `trust_root` set refuses it; without `trust_root` it loads.
 
 ### Recipe 4: Inspect a foreign artefact before loading
 
@@ -112,71 +117,63 @@ helios-plugin-cost-governor 0.1.0
   description: Per-tenant cost / budget gate
   license:     Apache-2.0
   hooks:       pre_query, post_query
+  schema:      1.1
+  packed at:   2026-11-17T21:00:00Z
+  signatures:  module signed, manifest signed
   files:
-    plugin.wasm  124904 bytes  sha256=8a3b1f...
-    plugin.sig       64 bytes  sha256=f12a09...
+    manifest.json        412 bytes  sha256=...
+    plugin.wasm       124904 bytes  sha256=8a3b1f...
+    plugin.sig            88 bytes  sha256=...
+    manifest.sig          88 bytes  sha256=...
 ```
 
-The output is what the proxy logs at load time. If the file list
-includes anything beyond `manifest.json`, `plugin.wasm`, and
-`plugin.sig`, the loader rejects it.
+`inspect` (like the proxy) refuses an artefact holding anything but those
+four entries, an entry twice, or a module whose SHA-256 differs from the
+manifest's.
 
-### Recipe 5: Verify a signature manually
+### Recipe 5: Verify signatures
 
 ```bash
-helios-plugin verify cost-governor-0.1.0.tar.gz \
-  --pubkey plugin-publisher.pub
-# OK: signature valid for plugin-publisher.pub
+helios-plugin verify cost-governor-0.1.0.tar.gz --trust-root keys/
+#   OK: module signed by 'plugin-publisher', manifest signed by 'plugin-publisher'
+helios-plugin verify cost-governor-0.1.0.tar.gz --pubkey plugin-publisher.pub --require-signed-manifest
 ```
 
-Returns 0 on valid signature, non-zero on missing / mismatched.
-Useful in CI gates before publishing artefacts to a registry.
+Exit 0 when valid, non-zero (with the reason) otherwise. A bare module is
+verified against its `.sig` sidecar (or `--sig`).
 
-### Recipe 6: Pack without signing (dev)
+### Recipe 6: Sign later
 
 ```bash
-helios-plugin pack \
-  --wasm  target/wasm32-unknown-unknown/release/my_plugin.wasm \
-  --name  my-plugin \
-  --version 0.0.1 \
-  --hooks pre_query \
-  --output my-plugin-dev.tar.gz
+helios-plugin sign my-plugin.tar.gz --key keys/plugin-publisher.key   # re-signs in place
+helios-plugin sign my-plugin.wasm   --key keys/plugin-publisher.key   # writes my-plugin.sig
 ```
-
-The proxy will refuse to load this unless `[plugins].trust_root =
-"permissive"` (dev-only) or `trust_root = ""` (no signature
-required).
 
 ## Pitfalls
 
-- **`tar.gz` MUST contain only `manifest.json`, `plugin.wasm`,
-  and optionally `plugin.sig`.** Extra files cause the loader to
-  reject. Don't `tar -czf` a directory with `.DS_Store`,
-  `Cargo.lock`, etc.
-- **Signature is over `plugin.wasm` bytes only**, not the full
-  `.tar.gz`. So a signature is portable across re-packs as long as
-  the .wasm doesn't change.
-- **PEM vs raw bytes** for keys: the CLI handles both. The proxy's
-  `trust_root` config accepts a path to a PEM file or a 64-char hex
-  string. `openssl pkey -in foo.pub -pubin -outform DER | tail -c 32 | xxd -p -c 32`
-  produces the hex.
-- **Don't reuse signing keys across environments.** One key per
-  publisher per environment (dev, staging, prod). Compromise of one
-  key doesn't taint others.
-- **Cargo emits underscore names**, but plugin names in
-  `manifest.json` should be hyphenated. Match the crate's
-  declared `name`.
-- **`--hooks` must include exactly the export names the .wasm
-  actually defines.** Mismatch = the proxy loads but never invokes
-  the hook. Verify with `wasm-objdump -j Export your.wasm`.
+- **An artefact holds only `manifest.json`, `plugin.wasm`, `plugin.sig`
+  and `manifest.sig`.** Don't `tar -czf` a directory: extra entries
+  (`.DS_Store`, `Cargo.lock`, a `./` entry) make the proxy refuse it.
+  Use `helios-plugin pack`.
+- **`plugin.sig` covers the module only**, so it survives a re-pack; a
+  re-pack under another name is caught by `manifest.sig`. Set
+  `[plugins] require_signed_manifest = true` to load only artefacts that
+  carry it.
+- **Don't reuse signing keys across environments.** One key per publisher
+  per environment (dev, staging, prod). Compromise of one key doesn't
+  taint others; removing a key from the trust root unloads what it signed.
+- **`--hooks` must match the module's exports.** The proxy refuses a
+  plugin that does not export a declared hook with the ABI signature, or
+  declares a hook it never calls; `helios-plugin inspect <module.wasm>`
+  lists the hooks a module exports.
 
 ## See also
 
 - `heliosproxy-plugin-load` — drop the artefact into the proxy
 - `heliosproxy-plugin-catalog` — what each first-party plugin does
-- `heliosproxy-config` — `[plugins].trust_root` config
+- `heliosproxy-config` — `[plugins]` block
 - Demo: [`demos/v0.4.0/05-plugin-signatures/`](../../demos/v0.4.0/05-plugin-signatures/) — sig demo
 - Demo: [`demos/v0.4.0/06-plugin-oci/`](../../demos/v0.4.0/06-plugin-oci/) — pack-and-load
 - Demo: [`demos/v0.4.0/19-helios-plugin-cli/`](../../demos/v0.4.0/19-helios-plugin-cli/) — CLI walkthrough
-- Sibling repo: <https://github.com/HeliosDatabase/HeliosDB-Proxy-Plugins>
-- Code: [`src/plugins/loader.rs`](../../src/plugins/loader.rs) — verifier
+- Code: [`src/plugin_artefact.rs`](../../src/plugin_artefact.rs) — format, keys, trust roots
+- Code: [`src/bin/helios-plugin.rs`](../../src/bin/helios-plugin.rs) — the CLI

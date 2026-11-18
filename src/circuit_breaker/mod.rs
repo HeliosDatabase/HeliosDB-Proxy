@@ -59,7 +59,7 @@ pub mod state;
 // Re-exports for public API
 pub use adaptive::{AdaptiveThreshold, RollingStats};
 pub use agent::{AgentRetryStrategy, ConversationFallback, RetryDecision};
-pub use breaker::{CircuitBreaker, CircuitOpen, RequestGuard};
+pub use breaker::{Admission, CircuitBreaker, CircuitOpen, ProbePermit, RequestGuard};
 pub use config::{
     CircuitBreakerConfig, CircuitBreakerConfigBuilder, FailureConditions, NodeOverride,
     SyncModeThresholds,

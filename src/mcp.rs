@@ -206,6 +206,8 @@ pub struct McpServer {
     /// daemon on its shared write generations.
     #[cfg(feature = "query-cache")]
     cache: Option<Arc<crate::mcp_cache::McpToolCache>>,
+    /// The daemon's shutdown drain (stop accepting, count in-flight requests).
+    drain: crate::gateway_drain::GatewayDrain,
 }
 
 impl McpServer {
@@ -222,7 +224,15 @@ impl McpServer {
             strict_read_only_role: false,
             #[cfg(feature = "query-cache")]
             cache: None,
+            drain: crate::gateway_drain::GatewayDrain::new(),
         }
+    }
+
+    /// Take part in the daemon's shutdown drain: stop accepting when it
+    /// closes, and count each accepted request until it is answered.
+    pub fn with_drain(mut self, drain: crate::gateway_drain::GatewayDrain) -> Self {
+        self.drain = drain;
+        self
     }
 
     /// Serve `query` and `list_tables` through `cache` (`[mcp]
@@ -320,6 +330,7 @@ impl McpServer {
                 ),
             }
         }
+        let drain = self.drain.clone();
         let shared = self.into_shared();
         if shared.principals.count() > 0 {
             tracing::info!(
@@ -355,15 +366,25 @@ impl McpServer {
             );
         }
         loop {
-            let (stream, peer) = match listener.accept().await {
+            let accepted = tokio::select! {
+                biased;
+                () = drain.closed() => {
+                    tracing::info!(addr = %shared.cfg.listen_address, "MCP gateway draining: listener closed");
+                    return Ok(());
+                }
+                accepted = listener.accept() => accepted,
+            };
+            let (stream, peer) = match accepted {
                 Ok(x) => x,
                 Err(e) => {
                     tracing::warn!("MCP accept error: {}", e);
                     continue;
                 }
             };
+            let in_flight = drain.track();
             let shared = shared.clone();
             tokio::spawn(async move {
+                let _in_flight = in_flight;
                 if let Err(e) = Self::handle_connection(stream, peer, shared).await {
                     tracing::debug!(%peer, "MCP connection error: {}", e);
                 }
@@ -934,7 +955,8 @@ impl McpServer {
     ) -> std::result::Result<BoundedQueryResult, String> {
         let (pool, policy) = (gateway.pool, gateway.policy);
         let node = format!("{}:{}", cfg.backend_host, cfg.backend_port);
-        policy
+        // Held for the call: a half-open circuit's probe slot.
+        let _node_admission = policy
             .check_node(&node)
             .map_err(|denied| denied.to_string())?;
         // `[multi_tenancy]` active-query cap: taken here, where the call runs

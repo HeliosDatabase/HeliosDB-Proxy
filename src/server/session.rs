@@ -95,6 +95,15 @@ pub struct ClientSession {
     /// Complete startup identity, initialized once before the first lookup.
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
     pub(crate) cache_startup_namespace: std::sync::OnceLock<[u8; 32]>,
+    /// Kinds of state ([`super::session_bound`]) the session holds on its
+    /// backend connection, refreshed before each request: a branch move
+    /// (which gives the session a connection to another database) is refused
+    /// while any is held.
+    pub(crate) branch_blockers: std::sync::atomic::AtomicU8,
+    /// The database the session started on, recorded at its first branch
+    /// move: `branch=` with no name moves it back there, and a Nano branch
+    /// is named after its base.
+    pub(crate) branch_home: std::sync::OnceLock<String>,
     /// Last effective scope used by this client's raw-SQL L1 cache.
     #[cfg(feature = "query-cache")]
     pub(crate) cache_effective_namespace: std::sync::Mutex<Option<[u8; 32]>>,
@@ -141,6 +150,11 @@ pub struct ClientSession {
     /// deferred to the default auth flow.
     #[cfg(feature = "wasm-plugins")]
     pub plugin_identity: RwLock<Option<Identity>>,
+    /// What every plugin hook call of this session carries in its
+    /// `hook_context` (identity, database, branch, attributes), built once
+    /// after authentication ([`ProxyServer::plugin_session_context`]).
+    #[cfg(feature = "wasm-plugins")]
+    pub plugin_context: std::sync::OnceLock<crate::plugins::HookContext>,
     /// Sticky edge-cache ineligibility: set once the session executes any
     /// statement that alters execution context (SET/SET ROLE/search_path,
     /// temp tables, ...). The shared edge cache keys on (fingerprint,
@@ -197,6 +211,9 @@ pub struct ClientSession {
     /// ends that at the session's end. It is also the startup backend
     /// connection's own (`BackendConn::backend_key`).
     pub(crate) cancel_key: std::sync::OnceLock<(u32, u32)>,
+    /// The waker of the task serving this session while it waits for its
+    /// client at a point where a shutdown drain may end it ([`DrainSignal`]).
+    pub(super) drain_waker: parking_lot::Mutex<Option<std::task::Waker>>,
 }
 
 impl ClientSession {
@@ -591,6 +608,47 @@ impl Drop for SessionGuard {
         #[cfg(feature = "query-cache")]
         if let Some(ref qc) = self.state.query_cache {
             qc.remove_l1_cache(self.session_id.as_u64_pair().0);
+        }
+    }
+}
+
+/// Resolves once the server has begun its shutdown drain
+/// ([`ServerState::draining`], set by `ProxyServer::begin_drain` on SIGTERM
+/// or SIGINT). A session awaits it next to its client read only while it
+/// waits at a point where ending it loses nothing (no transaction, cycle,
+/// COPY or partly received request), so a drain closes idle sessions at once
+/// instead of waiting for their clients to leave.
+///
+/// The session's task waker is left in [`ClientSession::drain_waker`];
+/// `begin_drain` sets the flag first and wakes it afterwards, and the flag is
+/// read again here after the waker is stored, so a drain that begins between
+/// the two is never missed.
+pub(super) struct DrainSignal<'a> {
+    pub(super) state: &'a ServerState,
+    pub(super) session: &'a ClientSession,
+}
+
+impl std::future::Future for DrainSignal<'_> {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        use std::sync::atomic::Ordering;
+        if self.state.draining.load(Ordering::Relaxed) {
+            return std::task::Poll::Ready(());
+        }
+        {
+            let mut slot = self.session.drain_waker.lock();
+            if !slot.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
+                *slot = Some(cx.waker().clone());
+            }
+        }
+        if self.state.draining.load(Ordering::SeqCst) {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
         }
     }
 }

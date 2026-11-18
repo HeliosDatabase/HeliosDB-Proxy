@@ -63,7 +63,7 @@ curl -s http://127.0.0.1:9090/nodes     # backend health as the proxy sees it
 docker rm -f hp-demo-pg
 ```
 
-Add standbys with repeated `--standby host:port`, or use a config file (smallest valid file: [config/proxy.minimal.toml](config/proxy.minimal.toml); fuller examples under [Quick Start: config file](#connect-to-a-postgresql-cluster) below). A plain `cargo install` builds the default feature set (pooling and Transaction Replay); the `postgres` / `patroni` topology providers need `--features postgres-topology` (the prebuilt release binaries are built with `all-features` only and do not include them), and cache, auth, and plugins have their own flags (see [Feature Flags](#feature-flags)).
+Add standbys with repeated `--standby host:port`, or use a config file (smallest valid file: [config/proxy.minimal.toml](config/proxy.minimal.toml); fuller examples under [Quick Start: config file](#connect-to-a-postgresql-cluster) below). A plain `cargo install` builds the default feature set (pooling and Transaction Replay); the `postgres` / `patroni` topology providers need `--features postgres-topology` (the prebuilt release binaries and the Docker image are built with `all-features,postgres-topology` and include them), and cache, auth, and plugins have their own flags (see [Feature Flags](#feature-flags)).
 
 If HeliosProxy saves you a PgBouncer plus an HAProxy, a ⭐ helps others find it.
 

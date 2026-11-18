@@ -376,11 +376,11 @@ pub struct ProxyConfig {
     /// built-in large-object functions and refuse every other OID.
     #[serde(default)]
     pub function_call: FunctionCallMode,
-    /// How long a graceful binary-handoff drain (SIGUSR2) keeps serving
-    /// in-flight connections before the old process exits (Batch H). After this
-    /// many seconds, any still-open connections are dropped so the handoff
-    /// completes in bounded time. Overridable at runtime via the
-    /// `HELIOS_DRAIN_TIMEOUT_SECS` env var.
+    /// How long a drain keeps serving in-flight connections before the
+    /// process exits: the graceful binary-handoff drain (SIGUSR2, Batch H)
+    /// and the shutdown drain (SIGTERM, SIGINT). After this many seconds, any
+    /// still-open connections are dropped so the drain completes in bounded
+    /// time. Overridable at runtime via the `HELIOS_DRAIN_TIMEOUT_SECS` env var.
     #[serde(default = "default_drain_timeout_secs")]
     pub shutdown_drain_timeout_secs: u64,
     /// Operational safety limits and timeouts for the PG-wire data path
@@ -591,6 +591,33 @@ pub struct BranchConfig {
     /// Default template database to branch from when a request omits `base`.
     #[serde(default = "default_admin_db")]
     pub base_database: String,
+    /// Let a `/*helios:branch=<name>*/` routing hint or a route plugin's
+    /// `branch` answer move a session to a branch database before its
+    /// statement runs (see `route_mode`); `branch=` with no name moves it
+    /// back. Off: such a statement is refused (42000) rather than run on the
+    /// session's own database.
+    #[serde(default)]
+    pub route_enabled: bool,
+    /// How a branch name becomes the database a session connects to:
+    /// `"database"` (PostgreSQL: a database of that name, as `/api/branch`
+    /// provisions them) or `"nano"` (HeliosDB-Nano: `<base>@<name>`).
+    #[serde(default)]
+    pub route_mode: BranchRouteMode,
+    /// Branch names a session may be moved to; empty: any valid name
+    /// (letters, digits and `_`, not starting with a digit, at most 63).
+    #[serde(default)]
+    pub route_allow: Vec<String>,
+}
+
+/// How [`BranchConfig::route_mode`] names a branch's database.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BranchRouteMode {
+    /// The branch is a database of its own name (PostgreSQL).
+    #[default]
+    Database,
+    /// The branch is `<base>@<name>` on the base database (HeliosDB-Nano).
+    Nano,
 }
 
 impl Default for BranchConfig {
@@ -603,6 +630,9 @@ impl Default for BranchConfig {
             admin_password: None,
             admin_database: default_admin_db(),
             base_database: default_admin_db(),
+            route_enabled: false,
+            route_mode: BranchRouteMode::Database,
+            route_allow: Vec::new(),
         }
     }
 }
@@ -1926,8 +1956,9 @@ pub struct MultiTenancyToml {
     pub tenant_max_journal_bytes: std::collections::BTreeMap<String, usize>,
     /// What a session whose tenant cannot be identified may do with the
     /// tenant tables (`tenant_tables`) when row isolation is on. `refuse`
-    /// (default): a simple-protocol statement that references a tenant table
-    /// is refused with 42501, since it could not be row-filtered. `passthrough`:
+    /// (default): a statement that references a tenant table (a simple Query
+    /// or an extended-protocol Parse) is refused with 42501, since it could
+    /// not be row-filtered. `passthrough`:
     /// it is forwarded unfiltered (the behaviour before this key existed).
     pub unknown_tenant: UnknownTenantPolicy,
 }
@@ -3731,6 +3762,11 @@ pub struct AnomalyToml {
     /// (bounds memory on high-cardinality SQL). Must be >= 1.
     #[serde(default = "default_anomaly_max_seen_fingerprints")]
     pub max_seen_fingerprints: usize,
+    /// Most `(user, client address)` failed-authentication windows tracked at
+    /// once by the credential-stuffing detector (bounds memory when failures
+    /// come from many sources). Must be >= 1.
+    #[serde(default = "default_anomaly_max_auth_windows")]
+    pub max_auth_windows: usize,
 }
 
 fn default_anomaly_rate_window_secs() -> u64 {
@@ -3757,6 +3793,9 @@ fn default_anomaly_emit_novel_queries() -> bool {
 fn default_anomaly_max_seen_fingerprints() -> usize {
     100_000
 }
+fn default_anomaly_max_auth_windows() -> usize {
+    10_000
+}
 
 impl Default for AnomalyToml {
     fn default() -> Self {
@@ -3769,6 +3808,7 @@ impl Default for AnomalyToml {
             event_buffer_size: default_anomaly_event_buffer_size(),
             emit_novel_queries: default_anomaly_emit_novel_queries(),
             max_seen_fingerprints: default_anomaly_max_seen_fingerprints(),
+            max_auth_windows: default_anomaly_max_auth_windows(),
         }
     }
 }
@@ -3788,6 +3828,7 @@ impl AnomalyToml {
             event_buffer_size: self.event_buffer_size,
             emit_novel_queries: self.emit_novel_queries,
             max_seen_fingerprints: self.max_seen_fingerprints,
+            max_auth_windows: self.max_auth_windows,
         }
     }
 }
@@ -3855,6 +3896,17 @@ pub struct RateLimitToml {
     pub max_concurrent: u32,
     /// What each bucket is keyed on.
     pub key_by: RateLimitKeyBy,
+    /// An optional second limit beside the token bucket: at most
+    /// `window_max_requests` requests per bucket within any `window_secs`.
+    /// `0` (default) = no window.
+    pub window_max_requests: u32,
+    /// Length of that window, seconds. Default `60`; must be >= 1.
+    pub window_secs: u64,
+    /// How often the state of idle buckets is dropped (a bucket back at its
+    /// capacity, a window with nothing in it: what a new request of that key
+    /// would create anyway), seconds. Bounds memory with many distinct keys
+    /// (`key_by = "client_ip"`). Default `60`; must be >= 1.
+    pub cleanup_interval_secs: u64,
 }
 
 impl Default for RateLimitToml {
@@ -3865,6 +3917,9 @@ impl Default for RateLimitToml {
             default_burst: 2000,
             max_concurrent: 0,
             key_by: RateLimitKeyBy::User,
+            window_max_requests: 0,
+            window_secs: 60,
+            cleanup_interval_secs: 60,
         }
     }
 }
@@ -3962,18 +4017,38 @@ impl Default for ProxyConfig {
 ///
 /// Converted to `crate::plugins::PluginRuntimeConfig` at startup via a
 /// feature-gated `From` impl in `src/plugins/config.rs`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginToml {
     /// Enable the plugin subsystem. Defaults to `false` — plugins are
     /// strictly opt-in.
     #[serde(default)]
     pub enabled: bool,
-    /// Directory to scan at startup for `.wasm` plugin files.
+    /// Directory loaded at startup: every `.wasm` module (with its `.sig`,
+    /// `.yaml` / `.json` sidecars) and `.tar.gz` artefact in it. A SIGHUP
+    /// and `POST /plugins/reload` rescan it.
     #[serde(default = "default_plugin_dir")]
     pub plugin_dir: String,
-    /// Watch `plugin_dir` for file changes and reload plugins hot.
+    /// Watch `plugin_dir` (and `trust_root`) and apply changes without a
+    /// rescan request: new and changed plugins load, removed ones unload.
     #[serde(default)]
     pub hot_reload: bool,
+    /// How often hot reload scans `plugin_dir`, in milliseconds (>= 100).
+    #[serde(default = "default_plugin_hot_reload_interval_ms")]
+    pub hot_reload_interval_ms: u64,
+    /// How long a file change must be stable before it is applied, in
+    /// milliseconds, so a file still being written is never loaded.
+    #[serde(default = "default_plugin_hot_reload_debounce_ms")]
+    pub hot_reload_debounce_ms: u64,
+    /// Largest plugin file accepted, and largest decompressed content of a
+    /// `.tar.gz` artefact, in bytes (>= 1).
+    #[serde(default = "default_plugin_max_artefact_bytes")]
+    pub max_artefact_bytes: u64,
+    /// With `trust_root`, load only `.tar.gz` artefacts whose manifest is
+    /// signed too (`manifest.sig`, which `helios-plugin pack --sign-with`
+    /// writes): the signature then also binds the plugin's name, version
+    /// and hooks, not only its code. Requires `trust_root`.
+    #[serde(default)]
+    pub require_signed_manifest: bool,
     /// Memory limit per plugin instance, in megabytes.
     #[serde(default = "default_plugin_memory_mb")]
     pub memory_limit_mb: usize,
@@ -3989,11 +4064,12 @@ pub struct PluginToml {
     /// Fuel units allowed per hook call when `fuel_metering = true`.
     #[serde(default = "default_plugin_fuel")]
     pub fuel_limit: u64,
-    /// Optional Ed25519 trust-root directory. When set, every loaded
-    /// .wasm requires a sidecar .sig that verifies against one of
-    /// the *.pub files in this directory. When omitted, signatures
-    /// are not checked (preserves the dev-loop ergonomic of dropping
-    /// unsigned .wasm files in the plugin dir).
+    /// Optional Ed25519 trust root: a directory of `*.pub` files, a single
+    /// public-key file (PEM, base64 or hex), or the key itself as 64 hex
+    /// digits. When set, every plugin must be signed by one of its keys (a
+    /// bare `.wasm` by its `.sig` sidecar, an artefact by its `plugin.sig`).
+    /// When omitted, signatures are not checked (the dev-loop ergonomic of
+    /// dropping unsigned modules in the plugin dir; logged at startup).
     #[serde(default)]
     pub trust_root: Option<String>,
     /// Max bytes for a single plugin-KV value (via `kv_set` or the
@@ -4024,6 +4100,15 @@ pub struct PluginToml {
 
 fn default_plugin_dir() -> String {
     "/etc/heliosproxy/plugins".to_string()
+}
+fn default_plugin_hot_reload_interval_ms() -> u64 {
+    1000
+}
+fn default_plugin_hot_reload_debounce_ms() -> u64 {
+    500
+}
+fn default_plugin_max_artefact_bytes() -> u64 {
+    64 * 1024 * 1024
 }
 fn default_plugin_memory_mb() -> usize {
     64
@@ -4059,6 +4144,10 @@ impl Default for PluginToml {
             enabled: false,
             plugin_dir: default_plugin_dir(),
             hot_reload: false,
+            hot_reload_interval_ms: default_plugin_hot_reload_interval_ms(),
+            hot_reload_debounce_ms: default_plugin_hot_reload_debounce_ms(),
+            max_artefact_bytes: default_plugin_max_artefact_bytes(),
+            require_signed_manifest: false,
             memory_limit_mb: default_plugin_memory_mb(),
             timeout_ms: default_plugin_timeout_ms(),
             max_plugins: default_plugin_max(),
@@ -4254,6 +4343,11 @@ const IGNORED_KEY_ALIASES: &[(&str, &str)] = &[
     (
         "logging",
         "there is no [logging] section: use --log-level and --json-logs",
+    ),
+    (
+        "plugins.config",
+        "there are no per-plugin tables: push a plugin's settings at runtime with \
+         PUT /admin/kv/<plugin>/<key>",
     ),
     (
         "metrics",
@@ -5371,6 +5465,30 @@ impl ProxyConfig {
             ));
         }
 
+        if self.rate_limit.window_secs == 0 || self.rate_limit.cleanup_interval_secs == 0 {
+            return Err(ProxyError::Config(
+                "rate_limit.window_secs and rate_limit.cleanup_interval_secs must be >= 1"
+                    .to_string(),
+            ));
+        }
+
+        // `[schema_routing] analytics_node` must name a configured node (by
+        // name or address): the proxy only ever routes to configured nodes,
+        // and an unknown one would refuse every analytical read.
+        if self.schema_routing.enabled && !self.schema_routing.analytics_node.is_empty() {
+            let target = self.schema_routing.analytics_node.as_str();
+            if !self
+                .nodes
+                .iter()
+                .any(|n| n.name.as_deref() == Some(target) || n.address() == target)
+            {
+                return Err(ProxyError::Config(format!(
+                    "schema_routing.analytics_node {target:?} is not a configured node (give a \
+                     [[nodes]] name or host:port)"
+                )));
+            }
+        }
+
         // Anomaly detector tunables. Parsed on every build; only consumed when
         // the `anomaly-detection` feature is compiled in, but the values are
         // degenerate regardless of feature, so validate them unconditionally.
@@ -5379,6 +5497,45 @@ impl ProxyConfig {
         // novel-query set; a non-positive or non-finite z-threshold would never
         // (or always) fire; a warning count above the critical count inverts
         // the severity ladder.
+        // `[branch] route_allow` names branches a session may be moved to.
+        if let Some(bad) = self
+            .branch
+            .route_allow
+            .iter()
+            .find(|b| !crate::branch::valid_ident(b))
+        {
+            return Err(ProxyError::Config(format!(
+                "branch.route_allow: {bad:?} is not a valid branch name (letters, digits and \
+                 '_', not starting with a digit, at most 63)"
+            )));
+        }
+        // `[plugins]`: degenerate values are refused whether or not the
+        // section is enabled, so turning it on later cannot surprise.
+        {
+            let p = &self.plugins;
+            if p.hot_reload_interval_ms < 100 {
+                return Err(ProxyError::Config(
+                    "plugins.hot_reload_interval_ms must be >= 100".to_string(),
+                ));
+            }
+            if p.max_artefact_bytes == 0 {
+                return Err(ProxyError::Config(
+                    "plugins.max_artefact_bytes must be >= 1".to_string(),
+                ));
+            }
+            if p.max_plugins == 0 {
+                return Err(ProxyError::Config(
+                    "plugins.max_plugins must be >= 1".to_string(),
+                ));
+            }
+            if p.require_signed_manifest && p.trust_root.is_none() {
+                return Err(ProxyError::Config(
+                    "plugins.require_signed_manifest needs plugins.trust_root: a manifest \
+                     signature is checked against the trust root's keys"
+                        .to_string(),
+                ));
+            }
+        }
         {
             let a = &self.anomaly;
             if a.rate_window_secs == 0 {
@@ -5399,6 +5556,11 @@ impl ProxyConfig {
             if a.max_seen_fingerprints == 0 {
                 return Err(ProxyError::Config(
                     "anomaly.max_seen_fingerprints must be >= 1".to_string(),
+                ));
+            }
+            if a.max_auth_windows == 0 {
+                return Err(ProxyError::Config(
+                    "anomaly.max_auth_windows must be >= 1".to_string(),
                 ));
             }
             if !(a.spike_z_threshold.is_finite() && a.spike_z_threshold > 0.0) {
@@ -7406,6 +7568,7 @@ database = "helios"
             auth_critical_count: 20,
             auth_warning_count: 8,
             event_buffer_size: 4096,
+            max_auth_windows: 77,
             emit_novel_queries: false,
             max_seen_fingerprints: 250_000,
         };
@@ -7519,6 +7682,7 @@ database = "helios"
             auth_critical_count: 12,
             auth_warning_count: 6,
             event_buffer_size: 2048,
+            max_auth_windows: 77,
             emit_novel_queries: false,
             max_seen_fingerprints: 500_000,
         };

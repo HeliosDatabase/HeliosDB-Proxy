@@ -547,8 +547,9 @@ impl AdminServer {
         Ok(())
     }
 
-    /// Route a request to the appropriate handler
-    async fn route_request(
+    /// Route a request to the appropriate handler (crate-visible so the
+    /// daemon's own tests can drive an endpoint against a live state).
+    pub(crate) async fn route_request(
         method: &str,
         path: &str,
         body: Option<&str>,
@@ -572,11 +573,21 @@ impl AdminServer {
                 Ok((200, serde_json::to_value(health)?))
             }
             ("GET", "/health/ready") | ("GET", "/readyz") => {
-                let ready = Self::check_readiness(state).await;
+                // A draining process has closed its listener: not ready,
+                // whatever its nodes' health.
+                let draining = state
+                    .session_policy
+                    .read()
+                    .await
+                    .as_ref()
+                    .is_some_and(|p| p.draining.load(Ordering::Relaxed));
+                let ready = !draining && Self::check_readiness(state).await;
                 let response = ReadinessResponse {
                     ready,
                     message: if ready {
                         "Proxy is ready"
+                    } else if draining {
+                        "Proxy is draining"
                     } else {
                         "Proxy is not ready"
                     },
@@ -609,6 +620,20 @@ impl AdminServer {
                             .map_or(0, |p| {
                                 p.query_cache_context_bypassed.load(Ordering::Relaxed)
                             })
+                            .into(),
+                    );
+                    map.insert(
+                        "sessions_drained".into(),
+                        policy
+                            .as_ref()
+                            .map_or(0, |p| p.sessions_drained.load(Ordering::Relaxed))
+                            .into(),
+                    );
+                    map.insert(
+                        "draining".into(),
+                        policy
+                            .as_ref()
+                            .is_some_and(|p| p.draining.load(Ordering::Relaxed))
                             .into(),
                     );
                     if let Some(l) = state.latency.read().await.as_ref() {
@@ -692,6 +717,13 @@ impl AdminServer {
                             policy.as_ref().map_or(0, |p| {
                                 p.query_cache_context_bypassed.load(Ordering::Relaxed)
                             }),
+                        ),
+                        (
+                            "heliosdb_proxy_sessions_drained_total",
+                            "Sessions ended by the shutdown drain once nothing of them was in flight",
+                            policy
+                                .as_ref()
+                                .map_or(0, |p| p.sessions_drained.load(Ordering::Relaxed)),
                         ),
                     ] {
                         let _ = writeln!(
@@ -848,6 +880,12 @@ impl AdminServer {
             // is attached (proxy started without --features
             // wasm-plugins or with plugins disabled in config).
             ("GET", "/plugins") => Self::handle_plugins_list(state).await,
+            // Every file of the plugin directory and its state (loaded,
+            // stale after a failed new version, shadowed, failed, pending).
+            ("GET", "/plugins/files") => Self::handle_plugin_files(state).await,
+            // Rescan the plugin directory now (as a SIGHUP does) and report
+            // what changed.
+            ("POST", "/plugins/reload") => Self::handle_plugins_reload(state).await,
 
             // Anomaly detector recent-events feed (T3.1). Optional
             // ?limit query string clamps the response size; default
@@ -2292,18 +2330,29 @@ impl AdminServer {
         let plugins: Vec<PluginListEntry> = pm
             .list_plugins()
             .into_iter()
-            .map(|info| PluginListEntry {
-                name: info.name,
-                version: info.version,
-                description: info.description,
-                hooks: info
-                    .hooks
-                    .iter()
-                    .map(|h| h.export_name().to_string())
-                    .collect(),
-                state: format!("{:?}", info.state),
-                invocations: info.stats.total_calls,
-                errors: info.stats.error_count,
+            .map(|info| {
+                let loaded = pm.plugin(&info.name);
+                PluginListEntry {
+                    path: loaded
+                        .as_ref()
+                        .map(|p| p.path.display().to_string())
+                        .unwrap_or_default(),
+                    sha256: loaded
+                        .as_ref()
+                        .map(|p| p.wasm_sha256().to_string())
+                        .unwrap_or_default(),
+                    name: info.name,
+                    version: info.version,
+                    description: info.description,
+                    hooks: info
+                        .hooks
+                        .iter()
+                        .map(|h| h.export_name().to_string())
+                        .collect(),
+                    state: format!("{:?}", info.state),
+                    invocations: info.stats.total_calls,
+                    errors: info.stats.error_count,
+                }
             })
             .collect();
         Ok((200, serde_json::to_value(plugins)?))
@@ -2311,6 +2360,99 @@ impl AdminServer {
 
     #[cfg(not(feature = "wasm-plugins"))]
     async fn handle_plugins_list(_state: &Arc<AdminState>) -> Result<(u16, serde_json::Value)> {
+        Ok((
+            503,
+            serde_json::json!({ "error": "wasm-plugins feature not compiled in" }),
+        ))
+    }
+
+    /// Handle `GET /plugins/files`: every file of the plugin directory with
+    /// its state, as of the latest rescan. 503 without a plugin manager.
+    #[cfg(feature = "wasm-plugins")]
+    async fn handle_plugin_files(state: &Arc<AdminState>) -> Result<(u16, serde_json::Value)> {
+        use crate::plugins::PluginFileState;
+        let Some(pm) = state.plugin_manager.read().await.clone() else {
+            return Ok((
+                503,
+                serde_json::json!({ "error": "plugin manager not attached" }),
+            ));
+        };
+        let files: Vec<serde_json::Value> = pm
+            .files()
+            .into_iter()
+            .map(|f| {
+                let path = f.path.display().to_string();
+                match f.state {
+                    PluginFileState::Loaded { name } => {
+                        serde_json::json!({ "path": path, "state": "loaded", "plugin": name })
+                    }
+                    PluginFileState::Stale { name, error } => serde_json::json!({
+                        "path": path, "state": "stale", "plugin": name, "error": error
+                    }),
+                    PluginFileState::Shadowed { name, by } => serde_json::json!({
+                        "path": path, "state": "shadowed", "plugin": name,
+                        "provided_by": by.display().to_string()
+                    }),
+                    PluginFileState::Failed { error } => {
+                        serde_json::json!({ "path": path, "state": "failed", "error": error })
+                    }
+                    PluginFileState::Pending => {
+                        serde_json::json!({ "path": path, "state": "pending" })
+                    }
+                }
+            })
+            .collect();
+        Ok((200, serde_json::Value::Array(files)))
+    }
+
+    #[cfg(not(feature = "wasm-plugins"))]
+    async fn handle_plugin_files(_state: &Arc<AdminState>) -> Result<(u16, serde_json::Value)> {
+        Ok((
+            503,
+            serde_json::json!({ "error": "wasm-plugins feature not compiled in" }),
+        ))
+    }
+
+    /// Handle `POST /plugins/reload`: rescan the plugin directory now (every
+    /// change counts as settled) and report what changed. 503 without a
+    /// plugin manager.
+    #[cfg(feature = "wasm-plugins")]
+    async fn handle_plugins_reload(state: &Arc<AdminState>) -> Result<(u16, serde_json::Value)> {
+        let Some(pm) = state.plugin_manager.read().await.clone() else {
+            return Ok((
+                503,
+                serde_json::json!({ "error": "plugin manager not attached" }),
+            ));
+        };
+        let report = match tokio::task::spawn_blocking(move || pm.rescan(true)).await {
+            Ok(report) => report,
+            Err(e) => {
+                return Ok((
+                    500,
+                    serde_json::json!({ "error": format!("rescan failed: {e}") }),
+                ))
+            }
+        };
+        let failed: Vec<serde_json::Value> = report
+            .failed
+            .iter()
+            .map(|(path, error)| {
+                serde_json::json!({ "path": path.display().to_string(), "error": error })
+            })
+            .collect();
+        Ok((
+            200,
+            serde_json::json!({
+                "loaded": report.loaded,
+                "updated": report.updated,
+                "unloaded": report.unloaded,
+                "failed": failed,
+            }),
+        ))
+    }
+
+    #[cfg(not(feature = "wasm-plugins"))]
+    async fn handle_plugins_reload(_state: &Arc<AdminState>) -> Result<(u16, serde_json::Value)> {
         Ok((
             503,
             serde_json::json!({ "error": "wasm-plugins feature not compiled in" }),
@@ -2500,6 +2642,13 @@ impl AdminServer {
         if let Some(r) = &routing {
             current_primary = r.leader.clone();
         }
+        let last_failover_at = state
+            .routing
+            .read()
+            .await
+            .as_ref()
+            .and_then(|view| view.last_leader_change())
+            .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
 
         if current_primary.is_none() && routing.is_none() {
             for n in &cfg.nodes {
@@ -2522,7 +2671,7 @@ impl AdminServer {
             healthy_nodes,
             unhealthy_nodes,
             total_nodes,
-            last_failover_at: None,
+            last_failover_at,
             authoritative,
             conflicting_primaries_total,
             routing,
@@ -3516,6 +3665,14 @@ impl AdminServer {
             metrics.reads_offloaded
         ));
         output.push_str(
+            "# HELP heliosdb_proxy_branch_moves_total Sessions moved to another branch database by a branch= routing hint or a route plugin's branch answer\n",
+        );
+        output.push_str("# TYPE heliosdb_proxy_branch_moves_total counter\n");
+        output.push_str(&format!(
+            "heliosdb_proxy_branch_moves_total {}\n",
+            metrics.branch_moves
+        ));
+        output.push_str(
             "# HELP heliosdb_proxy_read_mirror_failures_total Offloaded reads served by the primary because the standby connection could not be opened or could not take the session's settings\n",
         );
         output.push_str("# TYPE heliosdb_proxy_read_mirror_failures_total counter\n");
@@ -3692,6 +3849,7 @@ impl AdminState {
                 backend_capacity_waits: 0,
                 backend_capacity_refusals: 0,
                 reads_offloaded: 0,
+                branch_moves: 0,
                 read_mirror_failures: 0,
                 journal_committed: 0,
                 journal_rolled_back: 0,
@@ -4277,6 +4435,10 @@ struct PluginListEntry {
     name: String,
     version: String,
     description: String,
+    /// The file it was loaded from.
+    path: String,
+    /// SHA-256 of the loaded module.
+    sha256: String,
     /// Hook export names (`pre_query`, `post_query`, `route`, ...).
     hooks: Vec<String>,
     /// `Loading` | `Running` | `Paused` | `Error(...)` | `Unloading`.
@@ -4334,8 +4496,9 @@ struct TopologyResponse {
     unhealthy_nodes: u32,
     #[serde(rename = "totalNodes")]
     total_nodes: u32,
-    /// RFC 3339 timestamp of the last detected primary change.
-    /// `None` when the proxy hasn't observed a failover since boot.
+    /// RFC 3339 timestamp (UTC, milliseconds) of the last time the published
+    /// write leader moved from one node to another, also through a period
+    /// without a leader. `None` when it has not moved since boot.
     #[serde(rename = "lastFailoverAt")]
     last_failover_at: Option<String>,
     /// H-01: present when an authoritative topology provider is attached.
@@ -4968,6 +5131,7 @@ mod tests {
             backend_capacity_waits: 0,
             backend_capacity_refusals: 0,
             reads_offloaded: 0,
+            branch_moves: 0,
             read_mirror_failures: 0,
             journal_committed: 0,
             journal_rolled_back: 0,
@@ -5070,6 +5234,7 @@ mod tests {
             backend_capacity_waits: 0,
             backend_capacity_refusals: 0,
             reads_offloaded: 0,
+            branch_moves: 0,
             read_mirror_failures: 0,
             journal_committed: 0,
             journal_rolled_back: 0,
@@ -5764,9 +5929,46 @@ mod tests {
                 std::time::Instant::now(),
             )
         });
-        state.with_routing_view(view).await;
+        state.with_routing_view(view.clone()).await;
 
         let topo = AdminServer::compute_topology(&state).await;
+        assert_eq!(
+            topo.last_failover_at, None,
+            "the first leader is not a failover"
+        );
+        view.publish_with(|| {
+            RoutingSnapshot::build(
+                &facts,
+                Authority::Provider {
+                    leader: Some("primary.svc:5432"),
+                    epoch: 5,
+                    lease: Some(std::time::Duration::from_secs(10)),
+                },
+                std::time::Instant::now(),
+            )
+        });
+        let moved = AdminServer::compute_topology(&state)
+            .await
+            .last_failover_at
+            .expect("a leader move is reported");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&moved).is_ok(),
+            "RFC 3339: {moved}"
+        );
+        view.publish_with(|| {
+            RoutingSnapshot::build(
+                &facts,
+                Authority::Provider {
+                    leader: Some("standby.svc:5432"),
+                    epoch: 4,
+                    lease: Some(std::time::Duration::from_secs(10)),
+                },
+                std::time::Instant::now(),
+            )
+        });
+
+        let topo = AdminServer::compute_topology(&state).await;
+        assert!(topo.last_failover_at.is_some());
         assert_eq!(topo.current_primary.as_deref(), Some("standby.svc:5432"));
         let routing = topo.routing.expect("routing block present");
         assert_eq!(routing.epoch, 4);
@@ -7023,12 +7225,15 @@ mod session_policy_counter_tests {
         counters
             .query_cache_context_bypassed
             .store(3, Ordering::Relaxed);
+        counters.sessions_drained.store(4, Ordering::Relaxed);
         state.with_session_policy(counters).await;
         let (_, json) = AdminServer::route_request("GET", "/metrics", None, &state)
             .await
             .unwrap();
         assert_eq!(json["copy_input_timeouts"], 2);
         assert_eq!(json["query_cache_context_bypassed"], 3);
+        assert_eq!(json["sessions_drained"], 4);
+        assert_eq!(json["draining"], false);
         let (_, json) = AdminServer::route_request("GET", "/metrics/prometheus", None, &state)
             .await
             .unwrap();
@@ -7036,8 +7241,49 @@ mod session_policy_counter_tests {
         for metric in [
             "heliosdb_proxy_copy_input_timeouts_total 2",
             "heliosdb_proxy_query_cache_context_bypassed_total 3",
+            "heliosdb_proxy_sessions_drained_total 4",
         ] {
             assert!(text.lines().any(|line| line == metric), "missing {metric}");
         }
+    }
+
+    /// A draining process is not ready, whatever its nodes' health, and says
+    /// so: a load balancer stops sending it connections its closed listener
+    /// would refuse.
+    #[tokio::test]
+    async fn readiness_is_503_while_draining() {
+        let state = Arc::new(AdminState::new());
+        state.node_health.write().await.insert(
+            "localhost:5432".to_string(),
+            NodeHealth {
+                address: "localhost:5432".to_string(),
+                healthy: true,
+                last_check: chrono::Utc::now(),
+                failure_count: 0,
+                last_error: None,
+                latency_ms: 1.0,
+                replication_lag_bytes: None,
+                success_count: 0,
+                lag_sampled_at: None,
+            },
+        );
+        let counters = Arc::new(crate::server::SessionPolicyCounters::default());
+        state.with_session_policy(counters.clone()).await;
+        let (status, _) = AdminServer::route_request("GET", "/health/ready", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        counters.draining.store(true, Ordering::Relaxed);
+        for path in ["/health/ready", "/readyz"] {
+            let (status, body) = AdminServer::route_request("GET", path, None, &state)
+                .await
+                .unwrap();
+            assert_eq!(status, 503, "{path}");
+            assert_eq!(body["message"], "Proxy is draining", "{path}");
+        }
+        let (_, json) = AdminServer::route_request("GET", "/metrics", None, &state)
+            .await
+            .unwrap();
+        assert_eq!(json["draining"], true);
     }
 }

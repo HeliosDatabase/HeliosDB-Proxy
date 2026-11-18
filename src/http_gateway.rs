@@ -40,6 +40,38 @@ pub(crate) struct HttpSqlCache {
     pub(crate) cache: Option<Arc<crate::cache::QueryCache>>,
     #[cfg(feature = "query-cache")]
     pub(crate) trust_backend_read_effects: bool,
+    /// `[cache] extra_volatile_functions` with the built-in list (`None`:
+    /// the built-in list alone), as the PG-wire relay reads them.
+    #[cfg(feature = "query-cache")]
+    pub(crate) volatile_scan: Option<Arc<crate::sql_text::VolatileScan>>,
+    /// `[cache]` table exclusions, as the relay applies them.
+    #[cfg(feature = "query-cache")]
+    pub(crate) table_exclusions: Option<Arc<crate::sql_text::TableExclusions>>,
+}
+
+#[cfg(feature = "query-cache")]
+impl HttpSqlCache {
+    /// Whether the shared result cache may answer or store `sql` (the final
+    /// statement, after the rewrite rules and the tenant filter): the
+    /// relay's refusals (system catalogs, time-travel and ambiguous text,
+    /// excluded tables), a read with no volatile or unknown call that leaves
+    /// the session as it was, and either the operator's read-effects
+    /// contract or a literal scalar read.
+    pub(crate) fn may_cache(&self, sql: &str) -> bool {
+        crate::sql_text::cache_refusal(sql, self.table_exclusions.as_deref()).is_none()
+            && crate::server::ProxyServer::is_cacheable_read_sql_with(
+                sql,
+                self.volatile_scan
+                    .as_deref()
+                    .unwrap_or_else(|| crate::sql_text::VolatileScan::builtin()),
+            )
+            && matches!(
+                crate::replay_sql::all_calls_satisfy(sql, |_| false),
+                Ok(true)
+            )
+            && statement_is_session_neutral(sql)
+            && (self.trust_backend_read_effects || crate::replay_sql::literal_scalar_select(sql))
+    }
 }
 
 struct HttpSqlRequest<'a> {
@@ -54,6 +86,7 @@ pub struct HttpGateway {
     pool: SharedBackendPool,
     policy: SharedGatewayPolicy,
     sql_cache: HttpSqlCache,
+    drain: crate::gateway_drain::GatewayDrain,
 }
 
 impl HttpGateway {
@@ -63,7 +96,15 @@ impl HttpGateway {
             pool,
             policy: Arc::new(GatewayPolicy::default()),
             sql_cache: HttpSqlCache::default(),
+            drain: crate::gateway_drain::GatewayDrain::new(),
         }
+    }
+
+    /// Take part in the daemon's shutdown drain: stop accepting when it
+    /// closes, and count each accepted request until it is answered.
+    pub fn with_drain(mut self, drain: crate::gateway_drain::GatewayDrain) -> Self {
+        self.drain = drain;
+        self
     }
 
     /// Share the daemon's SQL result cache with this stateless gateway.
@@ -79,6 +120,20 @@ impl HttpGateway {
     #[cfg(feature = "query-cache")]
     pub fn with_trusted_read_effects(mut self, trusted: bool) -> Self {
         self.sql_cache.trust_backend_read_effects = trusted;
+        self
+    }
+
+    /// Apply the relay's cache rules to this gateway's statements: the
+    /// configured volatile functions and table exclusions (system catalogs,
+    /// time-travel and ambiguous text are refused regardless).
+    #[cfg(feature = "query-cache")]
+    pub fn with_cache_rules(
+        mut self,
+        volatile_scan: Arc<crate::sql_text::VolatileScan>,
+        table_exclusions: Option<Arc<crate::sql_text::TableExclusions>>,
+    ) -> Self {
+        self.sql_cache.volatile_scan = Some(volatile_scan);
+        self.sql_cache.table_exclusions = table_exclusions;
         self
     }
 
@@ -105,24 +160,35 @@ impl HttpGateway {
         let admission = Arc::new(tokio::sync::Semaphore::new(
             self.config.max_concurrent_requests,
         ));
+        let drain = self.drain.clone();
         let cfg = Arc::new(self.config);
         let pool = self.pool.clone();
         let policy = self.policy.clone();
         let sql_cache = self.sql_cache.clone();
         loop {
-            let (stream, peer) = match listener.accept().await {
+            let accepted = tokio::select! {
+                biased;
+                () = drain.closed() => {
+                    tracing::info!(addr = %cfg.listen_address, "HTTP SQL gateway draining: listener closed");
+                    return Ok(());
+                }
+                accepted = listener.accept() => accepted,
+            };
+            let (stream, peer) = match accepted {
                 Ok(x) => x,
                 Err(e) => {
                     tracing::warn!("HTTP gateway accept error: {}", e);
                     continue;
                 }
             };
+            let in_flight = drain.track();
             let cfg = cfg.clone();
             let pool = pool.clone();
             let admission = admission.clone();
             let policy = policy.clone();
             let sql_cache = sql_cache.clone();
             tokio::spawn(async move {
+                let _in_flight = in_flight;
                 if let Err(e) =
                     Self::handle(stream, peer, cfg, pool, admission, policy, sql_cache).await
                 {
@@ -236,18 +302,22 @@ impl HttpGateway {
             database: cfg.backend_database.as_deref(),
         };
         let node = format!("{}:{}", cfg.backend_host, cfg.backend_port);
-        if let Err(denied) = policy
+        // Held for the request: a half-open circuit's probe slot.
+        let _node_admission = match policy
             .admit_request(who)
             .await
-            .and(policy.check_node(&node))
+            .and_then(|()| policy.check_node(&node))
         {
-            return Self::respond(
-                &mut writer,
-                denied.http_status(),
-                &json!({"error": denied.to_string()}),
-            )
-            .await;
-        }
+            Ok(admission) => admission,
+            Err(denied) => {
+                return Self::respond(
+                    &mut writer,
+                    denied.http_status(),
+                    &json!({"error": denied.to_string()}),
+                )
+                .await;
+            }
+        };
 
         // `[multi_tenancy]` active-query cap: the tenant's permit is held for
         // the request and returned on every path when it drops.
@@ -305,17 +375,11 @@ impl HttpGateway {
             .map_err(|denied| SqlError::Failed(denied.to_string()))?;
         let sql = filtered.as_ref();
         #[cfg(feature = "query-cache")]
-        let cache_prep = if let Some(cache) = _sql_cache.cache.as_ref().filter(|_| {
-            crate::server::ProxyServer::is_cacheable_read_sql_with(
-                sql,
-                crate::sql_text::VolatileScan::builtin(),
-            ) && matches!(
-                crate::replay_sql::all_calls_satisfy(sql, |_| false),
-                Ok(true)
-            ) && statement_is_session_neutral(sql)
-                && (_sql_cache.trust_backend_read_effects
-                    || crate::replay_sql::literal_scalar_select(sql))
-        }) {
+        let cache_prep = if let Some(cache) = _sql_cache
+            .cache
+            .as_ref()
+            .filter(|_| _sql_cache.may_cache(sql))
+        {
             let context = crate::cache::CacheContext {
                 database: cfg.backend_database.clone().unwrap_or_default(),
                 user: Some(cfg.backend_user.clone()),
@@ -671,6 +735,89 @@ mod tests {
             base,
             http_cache_namespace(&cfg, Some(&GatewayTenant("acme".into())), &int_param, false)
         );
+    }
+
+    /// The shutdown drain: closing it returns `run` and closes the listener,
+    /// while a request accepted before is still answered and counted until
+    /// its handler returns.
+    #[tokio::test]
+    async fn drain_closes_the_listener_and_finishes_accepted_requests() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr = format!("127.0.0.1:{port}");
+        let cfg = HttpGatewayConfig {
+            listen_address: addr.clone(),
+            ..HttpGatewayConfig::default()
+        };
+        let pool: SharedBackendPool = Arc::new(crate::gateway_pool::BackendClientPool::new(0));
+        let drain = crate::gateway_drain::GatewayDrain::new();
+        let task = tokio::spawn(HttpGateway::new(cfg, pool).with_drain(drain.clone()).run());
+
+        // Connected (accepted) but the request is not sent yet.
+        let mut held = loop {
+            match TcpStream::connect(&addr).await {
+                Ok(s) => break s,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while drain.in_flight() == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "never accepted");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        drain.close();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("run returns once the drain closes")
+            .unwrap()
+            .unwrap();
+        assert!(
+            TcpStream::connect(&addr).await.is_err(),
+            "the listener is closed"
+        );
+        assert_eq!(drain.in_flight(), 1, "the accepted request is in flight");
+
+        held.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        held.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while drain.in_flight() != 0 {
+            assert!(tokio::time::Instant::now() < deadline, "guard not released");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The HTTP gateway applies the relay's cache rules: system catalogs and
+    /// excluded tables are never cached, and the configured volatile
+    /// functions count, not only the built-in list.
+    #[cfg(feature = "query-cache")]
+    #[test]
+    fn the_http_cache_applies_the_relays_rules() {
+        let cache = HttpSqlCache {
+            trust_backend_read_effects: true,
+            volatile_scan: Some(Arc::new(crate::sql_text::VolatileScan::new(["my_clock"]))),
+            table_exclusions: Some(Arc::new(crate::sql_text::TableExclusions::new(["secrets"]))),
+            ..HttpSqlCache::default()
+        };
+        assert!(cache.may_cache("SELECT id FROM orders WHERE id = 1"));
+        for sql in [
+            "SELECT * FROM secrets",
+            "SELECT relname FROM pg_class",
+            "SELECT my_clock()",
+        ] {
+            assert!(!cache.may_cache(sql), "{sql}");
+        }
+        // Without the operator's contract only literal scalar reads.
+        let strict = HttpSqlCache::default();
+        assert!(strict.may_cache("SELECT 1"));
+        assert!(!strict.may_cache("SELECT id FROM orders"));
     }
 
     #[test]

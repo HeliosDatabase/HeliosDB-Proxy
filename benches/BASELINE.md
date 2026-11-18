@@ -8,7 +8,7 @@ stay under 3%.
 - **Host:** gpc001ca (Rocky/RHEL9, kernel 5.14.0-611.34.1.el9_7, 125.7 GiB RAM)
 - **Commit:** 96eba7a (main)
 - **Features:** `--features all-features`
-- **Command:** `flock /home/gpc/HDB/sprint/coordination/build.lock systemd-run --user --scope --collect -p MemoryMax=24G -p MemorySwapMax=0 cargo bench --features all-features`
+- **Command:** `flock sprint/coordination/build.lock systemd-run --user --scope --collect -p MemoryMax=24G -p MemorySwapMax=0 cargo bench --features all-features`
   (fleet build-lock + memory bound are mandatory on this host — see CLAUDE.md Resource Constraints)
 - **Criterion data:** saved as the default baseline in `target/criterion/` at this commit;
   a plain re-run auto-reports the delta vs this run.
@@ -45,7 +45,7 @@ NEW cases in `scripts/bench-gate.sh` (no base arm) from the 2026-11-06 batch. Va
 1.95.0 as bench-gate ran it, 3 interleaved rounds), each the median of the three rounds' Criterion median
 estimates. The two perf commits that followed (552afe9 hint reader, bec0345 plain-ASCII scan order) do not change
 these cases' statements (all plain ASCII) beyond placement; the gate archive and its ATTRIBUTION.md are under
-/home/gpc/HDB/sprint/baselines/proxy/final-crit-20261106/.
+sprint/baselines/proxy/final-crit-20261106/.
 
 - `benches/cache.rs` `bench_l2_codec` (P1, sprinter `7c860e8a2e14`): L2 payload compression on DataRow payloads; `compress_*` is the store path, `hit_*` an L2 hit including decompression, `hit_none_64k` the uncompressed control.
 - `bench_heatmap` (P2, `c6271bc39d4b`): one heatmap record on the read path, off / on / 8 threads on one table.
@@ -180,7 +180,7 @@ L2 file-cache TTL repair (sprinter `21cc434afb5c`). Host **gpc001ca**, rustc **1
 scope. Base: `16d6ba8` with the candidate's `benches/cache.rs` and the same gate scripts, so
 both arms run the same 120 cases. Gate: `scripts/bench-gate.sh`, whole-arm mode, 3 rounds
 AB/BA/AB, thresholds unchanged. Evidence:
-`/home/gpc/HDB/sprint/baselines/proxy/l2-ttl-20261004/criterion-r3layout-full-r7-output/`;
+`sprint/baselines/proxy/l2-ttl-20261004/criterion-r3layout-full-r7-output/`;
 acceptance rules were written and hashed before launch (`R7-FULL-GATE-PLAN-20261007.md`).
 
 New `benches/cache.rs` target (ns, median of the three per-round medians). The two cases sit
@@ -222,7 +222,7 @@ rejection). Host **gpc001ca**, rustc **1.95.0**, `--features all-features`, gove
 `performance`, one fleet-lock acquisition for the whole sequence. Base: `7d450aa` (2.0.0)
 with the candidate's `benches/protocol.rs` copied in, so both arms run the same 118 cases
 (SHA256 `d2d00c87…`). Gate: `scripts/bench-gate.sh`, 3 rounds AB/BA/AB, thresholds unchanged.
-Evidence: `/home/gpc/HDB/sprint/baselines/proxy/2.0.1-deploy-integ/perf/`. An independent
+Evidence: `sprint/baselines/proxy/2.0.1-deploy-integ/perf/`. An independent
 audit (`criterion/audit.json`) reran the gate's maths from the raw outputs and found the run
 complete: 118 expected cases from each executable's `--list`, all present in all six rounds,
 no stale outputs, and the executables that ran are the ones that were built.
@@ -305,8 +305,8 @@ First run of the user-path harness (`scripts/regress/bench-usertp.sh`, P-01) aga
 change, and the fix it forced. Backend PostgreSQL 18.4 at 127.0.0.1:25433 (host-network container
 on the bench volume), pgbench scale 10, host gpc001ca, proxy binaries `--features all-features`
 release profile, one heavy job at a time under the fleet lock. Evidence under
-`/home/gpc/HDB/sprint/baselines/proxy/1.8.1-tr07h-usertp/` (discovery, isolation runs, stack
-samples) and `/home/gpc/HDB/sprint/baselines/proxy/1.8.1-tr07fix/` (the fix).
+`sprint/baselines/proxy/1.8.1-tr07h-usertp/` (discovery, isolation runs, stack
+samples) and `sprint/baselines/proxy/1.8.1-tr07fix/` (the fix).
 
 **What the Criterion A/B above did not show.** With `synchronous_commit=off` (the write path
 CPU-bound instead of fsync-bound; with it on, every commit is an fsync on the Docker volume and
@@ -351,7 +351,7 @@ CPU-bound (`PGOPTIONS="-c synchronous_commit=off"`), before the Criterion verdic
 microbenchmarks run one task per lock acquisition and cannot show a scheduler convoy.
 
 **Criterion A/B for the fix** (`scripts/bench-gate.sh`, 3 interleaved rounds, 107 cases, vs
-`4b25899`, rustc 1.95.0, evidence `/home/gpc/HDB/sprint/baselines/proxy/1.8.1-tr07fix/`):
+`4b25899`, rustc 1.95.0, evidence `sprint/baselines/proxy/1.8.1-tr07fix/`):
 **mean +2.96 % (cumulative budget 3 % — PASS), median +0.44 %, 11 separated improvements, 19
 separated regressions.** This is the cumulative TR-07 + fix delta against the pre-TR-07 tree, so
 the journal-manager cluster of the 2026-09-19 record is present unchanged — it is the cost of
@@ -371,10 +371,10 @@ at ≤ 13 ns absolute — `pool_mode/prepared_parse/prepare/named` +18 % (13 ns)
 ## 2026-09-19 — TR-07 recovery journal (sprinter `e11dbf2094f6`, #49)
 
 Controlled A/B with `scripts/bench-gate.sh`: baseline = main `4b25899` (worktree
-`/home/gpc/HDB/Proxy-base-1.8.0`), candidate = the TR-07 recovery-journal change; 3
+`Proxy-base-1.8.0`), candidate = the TR-07 recovery-journal change; 3
 interleaved rounds per tree, own target dir per tree, fleet lock + bounded scope, rustc 1.95.0,
 host gpc001ca, `--features all-features`, all 107 cases. Evidence under
-`/home/gpc/HDB/sprint/baselines/proxy/1.8.1-tr07h-bench/`.
+`sprint/baselines/proxy/1.8.1-tr07h-bench/`.
 
 **Aggregate: mean delta +2.97% (cumulative budget 3% — PASS), median +0.78%, 9 separated
 improvements, 14 separated regressions.** The strict separated-regression rule fails; each
@@ -409,12 +409,12 @@ commit its transactions, as the window is committed history only).
 ## 2026-09-18 — 1.8.0 codegen-regression recovery (sprinter `1d70b68fa7cc`)
 
 Controlled A/B with the new `scripts/bench-gate.sh`: baseline tree = pre-change `main`
-`a455707` (worktree `/home/gpc/HDB/Proxy-base-1.8.0`), candidate = the same commit plus
+`a455707` (worktree `Proxy-base-1.8.0`), candidate = the same commit plus
 the allocation-free classifier change; **3 interleaved rounds per tree (A B / B A / A B),
 own target dir per tree, fleet build lock + 24 GiB bounded scope, rustc 1.95.0, host
 gpc001ca, governor `performance`, `--features all-features`, all 107 cases.** Per-case
 medians across rounds; evidence archived under
-`/home/gpc/HDB/sprint/baselines/proxy/1.8.1-perf-final/` (`bench-gate-summary.txt`,
+`sprint/baselines/proxy/1.8.1-perf-final/` (`bench-gate-summary.txt`,
 `bench-gate.json`, per-round Criterion logs, `stamp.txt`).
 
 **Aggregate: mean delta −13.64%, median −1.34%, 30 separated improvements, 7 separated
@@ -652,7 +652,7 @@ This section is the reference for the next gate-3 comparison.
 
 Recorded per CLAUDE.md quality gate 3 at commit `a6b47d1` (main tip), host **gpc001ca**, `--features all-features`, fleet-locked + 24 GiB-bounded (same command as the header). Toolchain rustc/cargo **1.95.0**. This supersedes the 2026-07-15 numbers as the active baseline.
 
-**Command:** `flock /home/gpc/HDB/sprint/coordination/build.lock systemd-run --user --scope --collect -p MemoryMax=24G -p MemorySwapMax=0 cargo bench --features all-features`
+**Command:** `flock sprint/coordination/build.lock systemd-run --user --scope --collect -p MemoryMax=24G -p MemorySwapMax=0 cargo bench --features all-features`
 
 **No performance regression (gate-3 PASS).** No source or benched hot-path code changed between the prior baseline and `a6b47d1` (every intervening commit is demos/docs). Criterion's change report vs the stored run was the documented shared-host scatter: **28 improved / 40 within-noise / 20 regressed**, every delta small and spread across unrelated modules rather than localized to a changed path. Two full-run outliers — `journal/statement_type/other` (spiked to 122 ns) and `pool_mode/txn_event_detect/statement` (spiked to 152 ns) — were isolated and **re-run back-to-back**, both returning to baseline (32.4 ns / 15.8 ns); confirmed co-tenant CPU-spike artifacts, and the corrected values are recorded below. Host load rose 2.1 to 3.0 during the run, the direct cause of the scatter.
 

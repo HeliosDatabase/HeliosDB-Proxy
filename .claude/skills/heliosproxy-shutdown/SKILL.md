@@ -14,7 +14,7 @@ allowed to finish. Read this before you `kill -9` something.
 ## When to use
 
 - Clean stop (any planned shutdown)
-- Restart-for-config-reload (there's no SIGHUP — see `heliosproxy-config`)
+- Restart for a change a `SIGHUP` reload does not apply (see `heliosproxy-config`)
 - Killing a stuck dev instance
 - Tearing down a demo / test fixture
 
@@ -22,12 +22,17 @@ allowed to finish. Read this before you `kill -9` something.
 
 ## Drain semantics
 
-1. SIGTERM (or SIGINT) received.
-2. Listener stops accepting new client connections (PG port).
-3. Active sessions are allowed to complete their current
-   transaction. Sessions in `Idle` state get an immediate close.
-4. Once `/sessions` count reaches zero (or the configured
-   `shutdown_grace_secs` elapses), the process exits.
+1. SIGTERM (or SIGINT) received. SIGUSR2 (binary handoff) runs the
+   same drain.
+2. Listeners stop accepting: the PG port and the HTTP SQL, MCP and
+   GraphQL gateway ports. `/readyz` answers 503 `Proxy is draining`.
+3. Active sessions complete their current transaction, extended
+   cycle or COPY, then get FATAL `57P01`. Idle sessions get it at
+   once. Gateway requests already accepted are answered.
+4. Once no session and no gateway request is left (or the configured
+   `shutdown_drain_timeout_secs` elapses), the recovery journal is
+   flushed and the process exits 0. A second SIGTERM / SIGINT exits
+   at once.
 
 The admin port is the last thing closed — `/health` keeps responding
 during drain so a load balancer can de-register the node before
@@ -92,7 +97,7 @@ kill -KILL $(pgrep -x heliosdb-proxy)   # nuclear, no drain
 ```
 
 Use only when graceful failed (typically `kill -TERM` already sat
-for `>2× shutdown_grace_secs`). Force-kill drops in-flight queries
+for `>2× shutdown_drain_timeout_secs`). Force-kill drops in-flight queries
 on the floor — clients see "server closed the connection" mid-result.
 
 ### Recipe 5: Docker / Compose
@@ -120,13 +125,15 @@ ss -tnlp | grep -E ':6432|:9090'    # Linux: confirm no listeners
 - **`kill -9` skips drain.** In-flight queries die with `connection
   reset`; the application sees that as a backend crash even though
   the backend was fine. Almost always wrong outside dev.
-- **Long-running idle sessions stretch the drain indefinitely.**
-  If your app pool keeps idle sessions for hours, set
-  `[server] shutdown_grace_secs = 60` to cap drain. Anything still
+- **A transaction left open stretches the drain to its timeout.**
+  Idle sessions are closed at once (FATAL `57P01`), but a session
+  inside a transaction is waited for. The top-level key
+  `shutdown_drain_timeout_secs` (default 60, env override
+  `HELIOS_DRAIN_TIMEOUT_SECS`) caps the drain. Anything still
   active after that gets closed forcibly.
-- **`systemctl reload` does nothing.** There's no SIGHUP handler.
-  Use `restart`. If you typed `reload` and nothing changed, that's
-  why.
+- **`SIGHUP` reloads the config file; it does not restart.** Keys
+  that are read at startup only are reported in the log and need a
+  `restart`.
 - **Docker default grace is 10 s.** Production deploys should pass
   `--stop-timeout 30` or set it in the compose file:
   `stop_grace_period: 30s`. Without it, you'll see corrupted

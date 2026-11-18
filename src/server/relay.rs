@@ -1,10 +1,19 @@
 use super::*;
 
-/// The refusal message for a statement naming a tenant table from a session
-/// with no identified tenant (`[multi_tenancy] unknown_tenant = "refuse"`).
-#[cfg(feature = "multi-tenancy")]
-const UNIDENTIFIED_TENANT_REFUSAL: &str =
-    "statement refused: this session has no identified tenant and the statement references a tenant table";
+/// SQLSTATE of a statement whose routing target is not a configured node
+/// (`undefined_object`).
+const UNKNOWN_TARGET_SQLSTATE: &str = "42704";
+
+/// What [`ProxyServer::prepare_out_of_band`] got from the backend.
+pub(super) enum OutOfBand {
+    /// The backend holds the statement; `relay`: asynchronous messages that
+    /// arrived meanwhile, for the client.
+    Prepared { relay: Vec<u8> },
+    /// The backend refused it: `reply` (asynchronous messages, then its
+    /// `ErrorResponse` and `ReadyForQuery`) answers the client's batch, and
+    /// `status` is that `ReadyForQuery`'s.
+    Refused { reply: Vec<u8>, status: u8 },
+}
 
 impl ProxyServer {
     #[cfg(any(feature = "query-cache", feature = "edge-proxy"))]
@@ -19,13 +28,31 @@ impl ProxyServer {
             .map_err(|e| ProxyError::Network(format!("cache scope rejection write error: {e}")))
     }
 
+    /// The configured node a forced target names, by its `name` or its
+    /// address; `Err` (the client-visible reason) for anything else.
+    pub(super) fn resolve_forced_target(
+        config: &ProxyConfig,
+        target: &str,
+    ) -> std::result::Result<String, String> {
+        config
+            .nodes
+            .iter()
+            .find(|n| n.name.as_deref() == Some(target) || n.address() == target)
+            .map(|n| n.address().to_string())
+            .ok_or_else(|| {
+                format!(
+                    "routing target {target:?} is not a configured node (a hint, plugin or \
+                     schema routing named it); the statement was not run"
+                )
+            })
+    }
+
     /// Answer a simple Query the proxy refuses before any backend: an
     /// ErrorResponse (`sqlstate`, `reason`) then ReadyForQuery with the
     /// backend's own transaction status, the last one relayed (nothing reached
     /// it, so a transaction open there stays 'T' or 'E'). Returns the bytes
-    /// written. Shared by every tenant-isolation refusal.
-    #[cfg(feature = "multi-tenancy")]
-    async fn write_statement_refusal(
+    /// written. Shared by every statement refusal made before a backend.
+    pub(super) async fn write_statement_refusal(
         client: &mut ClientStream,
         session: &ClientSession,
         sqlstate: &str,
@@ -168,15 +195,44 @@ impl ProxyServer {
             return Ok((None, response.len() as u64));
         }
 
+        // A route plugin's branch answer moves the session (below).
+        let plugin_branch = Self::plugin_branch(&plugin_override);
+
         // SQL-comment routing hints (feature + `[routing_hints] enabled`)
         // refine the override, recompute the write flag on the stripped SQL,
         // and may rewrite the message to drop the hint comment.
         #[cfg(feature = "routing-hints")]
-        let (route_override, default_is_write, stripped_msg) =
+        let (route_override, default_is_write, stripped_msg, hint_branch) =
             Self::resolve_simple_route(msg, plugin_override, default_is_write, state);
         #[cfg(not(feature = "routing-hints"))]
-        let (route_override, stripped_msg): (RouteOverride, Option<Message>) =
-            (plugin_override, None);
+        let (route_override, stripped_msg, hint_branch): (
+            RouteOverride,
+            Option<Message>,
+            Option<String>,
+        ) = (plugin_override, None, None);
+
+        // A branch request (a `branch=` hint, else the route plugin's answer)
+        // moves the session to that branch database before the statement
+        // runs, or refuses the statement.
+        if let Some(branch) = hint_branch.or(plugin_branch) {
+            if let Err(refusal) = Self::switch_branch(
+                &branch,
+                continues_cycle.is_none(),
+                conns,
+                session,
+                state,
+                config,
+            )
+            .await
+            {
+                let reply = Self::branch_refusal_reply(&refusal, session, true);
+                client
+                    .write_all(&reply)
+                    .await
+                    .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+                return Ok((None, reply.len() as u64));
+            }
+        }
 
         // A route=standby hint offloads a statement the proxy cannot classify,
         // never one it classifies as a write or transaction control.
@@ -191,6 +247,9 @@ impl ProxyServer {
                 RouteOverride::Node(name) => (default_is_write, Some(name), false),
                 #[cfg(feature = "wasm-plugins")]
                 RouteOverride::Block(_) => unreachable!("handled above"),
+                // The session moved to the branch above.
+                #[cfg(feature = "wasm-plugins")]
+                RouteOverride::Branch(_) => (default_is_write, None, false),
             };
 
         // Read-your-writes: stamp the session on a write so subsequent reads
@@ -237,57 +296,35 @@ impl ProxyServer {
         // tenant filter. Done BEFORE the cache lookup so each tenant's results
         // are cached under their own (filtered) SQL — no cross-tenant leakage.
         #[cfg(feature = "multi-tenancy")]
-        let mut tenant_refusal: Option<std::borrow::Cow<'static, str>> = None;
-        #[cfg(feature = "multi-tenancy")]
-        let tenant_msg: Option<Message> = if let Some(tm) = state.tenant_manager.as_ref() {
-            match crate::protocol::query_text(&forward_msg.payload) {
-                Some(sql) => {
-                    let ctx = Self::tenant_request_ctx(session).await;
-                    match tm.identify_tenant(&ctx) {
-                        Some(tenant) => {
-                            let res = tm.transform_query(sql, &tenant);
-                            if let Some(reason) = res.refusal {
-                                // Never forwarded: a shape the rewrite cannot filter.
-                                tenant_refusal = Some(reason.into());
-                                None
-                            } else if res.transformed {
-                                tracing::debug!(target: "helios::tenant", tenant = %tenant.0, "tenant filter injected");
-                                Some(crate::protocol::QueryMessage { query: res.query }.encode())
-                            } else {
-                                None
-                            }
-                        }
-                        None => {
-                            // No tenant to filter by: `unknown_tenant = "refuse"`
-                            // stops a statement on a tenant table here.
-                            if tm.refuses_unknown_tenant_query(sql) {
-                                tenant_refusal = Some(UNIDENTIFIED_TENANT_REFUSAL.into());
-                            }
-                            None
-                        }
-                    }
-                }
-                None => None,
-            }
-        } else {
-            None
+        let tenant_verdict = match state.tenant_manager.as_ref() {
+            Some(tm) => match crate::protocol::query_text(&forward_msg.payload) {
+                Some(sql) => Self::tenant_statement(tm, sql, session).await,
+                None => TenantStatement::Unchanged,
+            },
+            None => TenantStatement::Unchanged,
         };
         // A refused tenant statement (a shape the row filter cannot cover, or
         // a tenant table named by a session with no identified tenant) is
         // answered here, with SQLSTATE 42501 and ReadyForQuery, and never
         // reaches a backend.
         #[cfg(feature = "multi-tenancy")]
-        if let Some(reason) = tenant_refusal {
-            tracing::info!(target: "helios::tenant", reason = %reason, "tenant statement refused");
-            let sent = Self::write_statement_refusal(
-                client,
-                session,
-                crate::multi_tenancy::transformer::REFUSAL_SQLSTATE,
-                &reason,
-            )
-            .await?;
-            return Ok((None, sent));
-        }
+        let tenant_msg: Option<Message> = match tenant_verdict {
+            TenantStatement::Refused(reason) => {
+                tracing::info!(target: "helios::tenant", reason = %reason, "tenant statement refused");
+                let sent = Self::write_statement_refusal(
+                    client,
+                    session,
+                    crate::multi_tenancy::transformer::REFUSAL_SQLSTATE,
+                    &reason,
+                )
+                .await?;
+                return Ok((None, sent));
+            }
+            TenantStatement::Filtered(query) => {
+                Some(crate::protocol::QueryMessage { query }.encode())
+            }
+            TenantStatement::Unchanged => None,
+        };
         #[cfg(feature = "multi-tenancy")]
         if tenant_msg.is_some() {
             session
@@ -444,6 +481,23 @@ impl ProxyServer {
         if is_write {
             reads.note_write(session);
         }
+        // A target a hint, a plugin or schema routing names must be one of
+        // the configured nodes: the proxy never dials an address a client or
+        // plugin made up.
+        let forced_target = match forced_target.map(|f| Self::resolve_forced_target(config, &f)) {
+            None => None,
+            Some(Ok(address)) => Some(address),
+            Some(Err(reason)) => {
+                let sent = Self::write_statement_refusal(
+                    client,
+                    session,
+                    UNKNOWN_TARGET_SQLSTATE,
+                    &reason,
+                )
+                .await?;
+                return Ok((None, sent));
+            }
+        };
         // A query continuing an open cycle goes to the connection holding it
         // (only that backend's reply settles the cycle), wherever routing
         // would send a new one.
@@ -482,23 +536,24 @@ impl ProxyServer {
         // Circuit breaker: fast-fail when the chosen node's circuit is open
         // (not a query continuing a cycle that node holds open: its reply,
         // or its failure, settles that cycle).
+        // A half-open circuit's probe holds its slot until this query is done.
         #[cfg(feature = "circuit-breaker")]
-        let fast_fail = if continues_cycle.is_some() {
-            None
-        } else {
-            Self::circuit_fast_fail(state, &target)
+        let _probe = match continues_cycle {
+            Some(_) => None,
+            None => match Self::circuit_admit(state, &target) {
+                Ok(probe) => probe,
+                Err(mut resp) => {
+                    resp.extend_from_slice(&Self::create_ready_for_query(
+                        session.last_rfq_status.load(Ordering::Relaxed),
+                    ));
+                    client
+                        .write_all(&resp)
+                        .await
+                        .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+                    return Ok((None, resp.len() as u64));
+                }
+            },
         };
-        #[cfg(feature = "circuit-breaker")]
-        if let Some(mut resp) = fast_fail {
-            resp.extend_from_slice(&Self::create_ready_for_query(
-                session.last_rfq_status.load(Ordering::Relaxed),
-            ));
-            client
-                .write_all(&resp)
-                .await
-                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
-            return Ok((None, resp.len() as u64));
-        }
 
         // A connect/auth failure trips the breaker (and is propagated as today);
         // for an offloaded read the home serves it instead.
@@ -1134,6 +1189,8 @@ impl ProxyServer {
     /// `ext.defines` are the named statements this batch's own `Parse`s
     /// create — recorded against the connection once it accepts the batch.
     /// `hold` is the TR-09 small-read hold budget (`tr_hold_bytes`), 0 = stream.
+    /// `plugin_route` is the route plugin's override for the cycle's first
+    /// `Parse` (`ExtHooks::route`).
     ///
     /// `fwd.fault` is filled on a backend fault exactly like
     /// `forward_simple_query`.
@@ -1143,6 +1200,7 @@ impl ProxyServer {
         reprepare: &[String],
         registry: &HashMap<String, bytes::Bytes>,
         hold: usize,
+        plugin_route: &RouteOverride,
     ) -> Result<(Option<String>, u64)> {
         let ForwardCtx {
             client,
@@ -1161,6 +1219,7 @@ impl ProxyServer {
             wait_ready,
             defines,
             unnamed,
+            reparked,
         } = ext;
         let starts_cycle = continues_cycle.is_none();
         // Rate-limit gate. The terminating ReadyForQuery is only appended when
@@ -1220,16 +1279,69 @@ impl ProxyServer {
             }
             None => None,
         };
-        let (mut target, mut offloaded) = match route_sql {
-            Some(sql) => {
-                // Routing-hints, when active, can override the verb-based
-                // target (and recompute the write flag on the stripped SQL).
-                #[cfg(feature = "routing-hints")]
-                let (is_write, forced, standby_hint) = Self::extended_hint_route(state, sql)
-                    .unwrap_or_else(|| (Self::is_write_query(sql), None, false));
-                #[cfg(not(feature = "routing-hints"))]
-                let (is_write, forced, standby_hint): (bool, Option<String>, bool) =
-                    (Self::is_write_query(sql), None, false);
+        // A branch request (a `branch=` hint in the routing SQL, else the
+        // route plugin's answer for the cycle) moves the session to that
+        // branch database before the batch runs, or refuses the batch.
+        let mut routed = route_sql.map(|sql| Self::extended_route(state, sql, plugin_route));
+        let branch = match routed.as_mut() {
+            Some((_, branch)) => branch.take(),
+            None => Self::plugin_branch(plugin_route),
+        };
+        if let Some(branch) = branch {
+            if let Err(refusal) =
+                Self::switch_branch(&branch, starts_cycle, conns, session, state, config).await
+            {
+                let reply = Self::branch_refusal_reply(&refusal, session, wait_ready);
+                client
+                    .write_all(&reply)
+                    .await
+                    .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+                return Ok((None, reply.len() as u64));
+            }
+        }
+        let (mut target, mut offloaded) = match routed {
+            Some(((is_write, forced, standby_hint), _)) => {
+                // A routing hint, else the route plugin's override for the
+                // cycle's first Parse, replaced the verb-based target (the
+                // write flag is taken from the hint-stripped SQL).
+                // Schema/workload routing: pin a whole cycle of analytical
+                // (OLAP) reads to the configured analytics node, unless
+                // something already forced a target (as on the simple path).
+                // Every statement of the cycle must be one: a cycle runs on
+                // one connection, and a write or point read among them does
+                // not belong there. A cycle split by a Flush is decided
+                // before its rest is known, so it stays where it is.
+                #[cfg(feature = "schema-routing")]
+                let forced = if forced.is_none()
+                    && !is_write
+                    && reads.batch_whole
+                    && !config.schema_routing.analytics_node.is_empty()
+                    && Self::batch_is_analytical(state, batch, unnamed, registry)
+                {
+                    tracing::debug!(target: "helios::schema", "OLAP extended batch routed to analytics node");
+                    Some(config.schema_routing.analytics_node.clone())
+                } else {
+                    forced
+                };
+                // Only a configured node is ever a target (see the simple
+                // path).
+                let forced = match forced.map(|f| Self::resolve_forced_target(config, &f)) {
+                    None => None,
+                    Some(Ok(address)) => Some(address),
+                    Some(Err(reason)) => {
+                        let mut resp =
+                            Self::create_error_response(UNKNOWN_TARGET_SQLSTATE, &reason);
+                        if wait_ready {
+                            resp.extend_from_slice(&Self::create_ready_for_query(
+                                session.last_rfq_status.load(Ordering::Relaxed),
+                            ));
+                        }
+                        client.write_all(&resp).await.map_err(|e| {
+                            ProxyError::Network(format!("Client write error: {}", e))
+                        })?;
+                        return Ok((None, resp.len() as u64));
+                    }
+                };
                 #[cfg(feature = "lag-routing")]
                 if is_write && config.lag_routing.enabled {
                     *session.last_write_at.write().await = Some(std::time::Instant::now());
@@ -1283,25 +1395,26 @@ impl ProxyServer {
         // Circuit breaker: fast-fail when the chosen node's circuit is open
         // (not a batch continuing a cycle that node holds open: its reply, or
         // its failure, settles that cycle).
+        // A half-open circuit's probe holds its slot until this batch is done.
         #[cfg(feature = "circuit-breaker")]
-        let fast_fail = if continues_cycle.is_some() {
-            None
-        } else {
-            Self::circuit_fast_fail(state, &target)
+        let _probe = match continues_cycle {
+            Some(_) => None,
+            None => match Self::circuit_admit(state, &target) {
+                Ok(probe) => probe,
+                Err(mut resp) => {
+                    if wait_ready {
+                        resp.extend_from_slice(&Self::create_ready_for_query(
+                            session.last_rfq_status.load(Ordering::Relaxed),
+                        ));
+                    }
+                    client
+                        .write_all(&resp)
+                        .await
+                        .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
+                    return Ok((None, resp.len() as u64));
+                }
+            },
         };
-        #[cfg(feature = "circuit-breaker")]
-        if let Some(mut resp) = fast_fail {
-            if wait_ready {
-                resp.extend_from_slice(&Self::create_ready_for_query(
-                    session.last_rfq_status.load(Ordering::Relaxed),
-                ));
-            }
-            client
-                .write_all(&resp)
-                .await
-                .map_err(|e| ProxyError::Network(format!("Client write error: {}", e)))?;
-            return Ok((None, resp.len() as u64));
-        }
 
         if let Err(e) = Self::ensure_conn(conns, &target, session, config, state).await {
             if !offloaded {
@@ -1515,6 +1628,56 @@ impl ProxyServer {
             }
         }
 
+        // The unnamed statement a plugin answered exists for the client only:
+        // a batch binding it without a Parse of its own gives this backend
+        // that statement first, out of band (its own Parse and Sync, at a
+        // cycle start). A backend that refuses the statement answers the
+        // batch with its error, as PostgreSQL answers a Bind of a statement
+        // it does not hold; nothing of the batch is sent.
+        if let Some((parse_msg, sig)) = reparked {
+            if starts_cycle && backend.unnamed_sig.as_deref() != Some(&sig[..]) {
+                let established = async {
+                    Self::finish_pending_backend_frames(client, backend, session, state).await?;
+                    Self::prepare_out_of_band(
+                        &mut backend.stream,
+                        parse_msg,
+                        state.limits.reprepare_timeout,
+                        state.limits.max_backend_frame_bytes,
+                    )
+                    .await
+                }
+                .await;
+                match established {
+                    Ok(OutOfBand::Prepared { relay }) => {
+                        if !relay.is_empty() {
+                            client.write_all(&relay).await.map_err(|e| {
+                                ProxyError::Network(format!("Client write error: {}", e))
+                            })?;
+                        }
+                        backend.unnamed_sig = Some(sig.clone());
+                        backend.unnamed_untracked = false;
+                    }
+                    Ok(OutOfBand::Refused { reply, status }) => {
+                        backend.unnamed_sig = None;
+                        client.write_all(&reply).await.map_err(|e| {
+                            ProxyError::Network(format!("Client write error: {}", e))
+                        })?;
+                        Self::tally_frames(session, &reply);
+                        Self::note_ready_for_query(session, status, true);
+                        return Ok((Some(target), reply.len() as u64));
+                    }
+                    Err(e) => {
+                        if matches!(e, ProxyError::Network(_)) {
+                            Self::record_backend_failure(state, &target, &e.to_string());
+                            BackendFault::set(fault, &target, FaultPhase::NotDelivered, &e);
+                        }
+                        Self::drop_undelivered(conns, &target, false, session, state).await;
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
         // The query cache on the extended protocol (`ext_cache`): a batch of
         // one of its two shapes that starts a cycle outside a transaction is
         // looked up before anything of it is written, and answered here on a
@@ -1624,7 +1787,7 @@ impl ProxyServer {
             Self::journal_register_batch(
                 session,
                 batch,
-                unnamed.map(|(msg, _)| &msg[..]),
+                unnamed.or(reparked).map(|(msg, _)| &msg[..]),
                 starts_cycle,
                 !wait_ready,
             );
@@ -1822,6 +1985,80 @@ impl ProxyServer {
                 "unexpected re-prepare reply: {}",
                 other as char
             ))),
+        }
+    }
+
+    /// Give a backend socket a statement out of band, as its own cycle: the
+    /// `Parse` message `parse_bytes`, then `Sync`, reading to the
+    /// `ReadyForQuery`. Asynchronous messages that arrive meanwhile (notices,
+    /// parameter changes, notifications) are returned for the client; a
+    /// backend that refuses the statement returns its `ErrorResponse` and
+    /// `ReadyForQuery`, the reply to give the client instead of the batch
+    /// that needed the statement. Bounded by the re-prepare timeout per
+    /// read and by `max_frame_bytes` per frame.
+    pub(super) async fn prepare_out_of_band<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+        backend: &mut S,
+        parse_bytes: &[u8],
+        timeout: Duration,
+        max_frame_bytes: usize,
+    ) -> Result<OutOfBand> {
+        let mut wire = Vec::with_capacity(parse_bytes.len() + 5);
+        wire.extend_from_slice(parse_bytes);
+        wire.extend_from_slice(&[b'S', 0, 0, 0, 4]);
+        tokio::time::timeout(timeout, backend.write_all(&wire))
+            .await
+            .map_err(|_| ProxyError::Network("out-of-band prepare write timeout".to_string()))?
+            .map_err(|e| ProxyError::Network(format!("out-of-band prepare write error: {}", e)))?;
+        let mut relay = Vec::new();
+        let mut error: Option<Vec<u8>> = None;
+        let mut parsed = false;
+        loop {
+            let mut header = [0u8; 5];
+            tokio::time::timeout(timeout, backend.read_exact(&mut header))
+                .await
+                .map_err(|_| ProxyError::Network("out-of-band prepare read timeout".to_string()))?
+                .map_err(|e| {
+                    ProxyError::Network(format!("out-of-band prepare read error: {}", e))
+                })?;
+            let len =
+                backend_frame_len(&header, max_frame_bytes)?.expect("5 header bytes were read");
+            let mut frame = Vec::with_capacity(len + 1);
+            frame.extend_from_slice(&header);
+            frame.resize(len + 1, 0);
+            tokio::time::timeout(timeout, backend.read_exact(&mut frame[5..]))
+                .await
+                .map_err(|_| ProxyError::Network("out-of-band prepare read timeout".to_string()))?
+                .map_err(|e| {
+                    ProxyError::Network(format!("out-of-band prepare read error: {}", e))
+                })?;
+            match header[0] {
+                b'1' => parsed = true,
+                b'E' => error = Some(frame),
+                b'N' | b'S' | b'A' => relay.extend_from_slice(&frame),
+                b'Z' => {
+                    let status = frame.get(5).copied().unwrap_or(b'I');
+                    return match error {
+                        Some(mut reply) => {
+                            reply.extend_from_slice(&frame);
+                            relay.extend_from_slice(&reply);
+                            Ok(OutOfBand::Refused {
+                                reply: relay,
+                                status,
+                            })
+                        }
+                        None if parsed => Ok(OutOfBand::Prepared { relay }),
+                        None => Err(ProxyError::Protocol(
+                            "out-of-band prepare ended without a ParseComplete".to_string(),
+                        )),
+                    };
+                }
+                other => {
+                    return Err(ProxyError::Protocol(format!(
+                        "unexpected reply to an out-of-band prepare: {}",
+                        other as char
+                    )))
+                }
+            }
         }
     }
 
@@ -2024,6 +2261,71 @@ impl ProxyServer {
     /// Prepared-statement name a `Bind` references: the *second* cstring
     /// (portal name first, then statement name). `None` for the unnamed
     /// statement.
+    /// Whether `sql` is a read `[schema_routing]` sends to the analytics
+    /// node.
+    #[cfg(feature = "schema-routing")]
+    pub(super) fn analytical_read(state: &ServerState, sql: &str) -> bool {
+        state
+            .schema_analyzer
+            .as_ref()
+            .is_some_and(|a| !Self::is_write_query(sql) && a.analyze(sql).is_analytics())
+    }
+
+    /// Whether every statement the extended `batch` runs is an analytical
+    /// read: each `Parse`'s, and for each `Bind` the statement it executes
+    /// (Parsed earlier in the batch, the unnamed `Parse` held ahead of it, or
+    /// a registered one). A frame or a statement the proxy cannot read makes
+    /// the batch not analytical, and so does a batch with no statement.
+    #[cfg(feature = "schema-routing")]
+    pub(super) fn batch_is_analytical(
+        state: &ServerState,
+        batch: &[u8],
+        unnamed: Option<&(bytes::Bytes, bytes::Bytes)>,
+        registry: &HashMap<String, bytes::Bytes>,
+    ) -> bool {
+        let mut rest = batch;
+        let mut parsed_unnamed = false;
+        let mut defined: Vec<&[u8]> = Vec::new();
+        let mut statements = 0usize;
+        while let Some((&tag, tail)) = rest.split_first() {
+            let Some(len) = tail
+                .first_chunk::<4>()
+                .map(|b| u32::from_be_bytes(*b) as usize)
+            else {
+                return false;
+            };
+            let Some(payload) = len.checked_sub(4).and_then(|n| tail.get(4..4 + n)) else {
+                return false;
+            };
+            rest = &tail[4 + payload.len()..];
+            let sql = match tag {
+                b'P' => {
+                    let Some((name, text)) = Self::parse_name_and_text(payload) else {
+                        return false;
+                    };
+                    if name.is_empty() {
+                        parsed_unnamed = true;
+                    } else {
+                        defined.push(name);
+                    }
+                    std::str::from_utf8(text).ok()
+                }
+                b'B' => match Self::bind_stmt_ref(payload) {
+                    None if parsed_unnamed => continue,
+                    None => unnamed.and_then(|(parse, _)| Self::parse_msg_sql(parse)),
+                    Some(name) if defined.contains(&name.as_bytes()) => continue,
+                    Some(name) => registry.get(name).and_then(|b| Self::parse_msg_sql(b)),
+                },
+                _ => continue,
+            };
+            match sql {
+                Some(sql) if Self::analytical_read(state, sql) => statements += 1,
+                _ => return false,
+            }
+        }
+        statements > 0
+    }
+
     pub(super) fn bind_stmt_ref(payload: &[u8]) -> Option<&str> {
         let portal_end = payload.iter().position(|&b| b == 0)?;
         let rest = &payload[portal_end + 1..];

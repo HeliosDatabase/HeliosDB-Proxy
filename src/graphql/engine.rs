@@ -937,10 +937,14 @@ impl GraphQLEngine {
         let node = format!("{}:{}", bcfg.host, bcfg.port);
         let mut out = Vec::with_capacity(queries.len());
         for q in queries {
-            if let Some(p) = &self.policy {
-                p.check_node(&node)
-                    .map_err(|denied| GraphQLError::internal(denied.to_string()))?;
-            }
+            // Held for this statement: a half-open circuit's probe slot.
+            let _node_admission = match &self.policy {
+                Some(p) => Some(
+                    p.check_node(&node)
+                        .map_err(|denied| GraphQLError::internal(denied.to_string()))?,
+                ),
+                None => None,
+            };
             let sql = match &self.policy {
                 Some(p) => {
                     // H-06: the request's tenant (set by the gateway) gets its

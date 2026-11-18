@@ -1,17 +1,18 @@
 ---
 name: heliosproxy-plugin-load
-description: Get a packed/signed `.wasm` or `.tar.gz` plugin into the running proxy. Drop into `plugin_dir`, hot-reload, verify via `GET /plugins`. Configure `trust_root`. Use when the user says "load a plugin", "drop the wasm", "/plugins is empty", "trust root", "hot reload".
+description: Get a packed/signed `.tar.gz` or bare `.wasm` plugin into the running proxy. Drop into `plugin_dir`, rescan (hot reload, SIGHUP or `POST /plugins/reload`), verify via `GET /plugins` and `GET /plugins/files`. Configure `trust_root`. Use when the user says "load a plugin", "drop the wasm", "/plugins is empty", "trust root", "hot reload".
 allowed-tools: Bash(curl *), Bash(cp *), Bash(ls *), Read
 related: [heliosproxy-overview, heliosproxy-plugin-pack, heliosproxy-plugin-kv, heliosproxy-plugin-catalog]
 ---
 
 # Load a plugin into the proxy
 
-The proxy scans `[plugins].plugin_dir` at startup and on the hot-
-reload watch. Drop a `.wasm` or `.tar.gz` artefact into the directory;
-the proxy validates the signature (if `trust_root` is set), instantiates
-the WASM module, and registers its hooks. Status appears in
-`GET /plugins`.
+The plugin directory (`[plugins].plugin_dir`) is the source of truth. The
+proxy reconciles it at startup, on SIGHUP, on `POST /plugins/reload`, and
+with `hot_reload = true` every `hot_reload_interval_ms`: it verifies each
+`.tar.gz` / `.wasm` (signature, if `trust_root` is set), compiles and links
+it, checks its exports, and registers its hooks. `GET /plugins` lists what
+is loaded; `GET /plugins/files` says why a file is not.
 
 Requires `--features wasm-plugins` at build time.
 
@@ -30,11 +31,14 @@ in prod.
 
 | Verb | How |
 |---|---|
-| Add plugin       | `cp my-plugin.tar.gz $PLUGIN_DIR/` (and reload) |
-| Remove plugin    | `rm $PLUGIN_DIR/my-plugin.tar.gz` (and reload) |
-| Hot-reload       | `[plugins].hot_reload = true` (FS watcher); else restart |
+| Add plugin       | `cp my-plugin.tar.gz $PLUGIN_DIR/`, then rescan |
+| Remove plugin    | `rm $PLUGIN_DIR/my-plugin.tar.gz`, then rescan |
+| Rescan now       | `POST /plugins/reload`, or `kill -HUP <pid>` |
+| Hot reload       | `[plugins].hot_reload = true` (rescans every `hot_reload_interval_ms`) |
 | List loaded      | `GET /plugins` |
-| Trust root       | `[plugins].trust_root = "/path/to/pubkey.pem"` |
+| Per-file state   | `GET /plugins/files` |
+| Trust root       | `[plugins].trust_root = "/path/to/keys/"` (dir of `*.pub`), a key file, or a hex key |
+| Runtime settings | `PUT /admin/kv/<plugin>/<key>` (see `heliosproxy-plugin-kv`) |
 
 ## Recipes
 
@@ -42,46 +46,37 @@ in prod.
 
 ```toml
 [plugins]
+enabled    = true
 plugin_dir = "/etc/heliosproxy/plugins"
-trust_root = "/etc/heliosproxy/keys/plugin-publisher.pub"
-hot_reload = true       # watch plugin_dir for changes
-
-# optional — per-plugin runtime config (passed via env-style map)
-[plugins.config.helios-plugin-cost-governor]
-default_budget_per_second = 1000
+trust_root = "/etc/heliosproxy/keys"     # dir of *.pub, a .pub/.pem file, or 64 hex digits
+hot_reload = true                        # rescan every hot_reload_interval_ms (1000)
+# require_signed_manifest = true         # only artefacts whose manifest is signed too
 ```
 
-`trust_root` accepts:
-- a PEM file path,
-- a raw hex string of the 32-byte public key,
-- or `"permissive"` to disable signature requirement (dev only).
-
-If `trust_root` is unset, signature is **not** required, but a
-warning is logged. Treat that as a misconfiguration in production.
+A key file is a SubjectPublicKeyInfo PEM (`openssl pkey -pubout`), base64
+of the 32 raw bytes (`helios-plugin keygen` writes this), or 64 hex digits.
+If `trust_root` is unset, signatures are **not** checked and startup logs a
+warning: treat that as a misconfiguration in production. There are no
+per-plugin `[plugins.<name>]` tables: plugins read their settings from
+their KV namespace (`PUT /admin/kv/<plugin>/<key>`).
 
 ### Recipe 2: Drop a packed artefact and watch it load
 
 ```bash
 PLUGIN_DIR=/etc/heliosproxy/plugins
 sudo cp cost-governor-0.1.0.tar.gz $PLUGIN_DIR/
-journalctl -u heliosproxy -f | grep -E 'plugin|wasm'
+curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/plugins/reload | jq .
 ```
 
-Expected log lines:
-
-```
-INFO  PluginLoader: scanning /etc/heliosproxy/plugins
-INFO  PluginLoader: validating cost-governor-0.1.0.tar.gz manifest
-INFO  PluginLoader: signature OK (Ed25519)
-INFO  PluginLoader: instantiating helios-plugin-cost-governor 0.1.0
-INFO  PluginLoader: hooks pre_query, post_query registered
-INFO  PluginLoader: 1 plugin loaded
+```json
+{"loaded": ["helios-plugin-cost-governor"], "updated": [], "unloaded": [], "failed": []}
 ```
 
-Then verify via the admin API:
+The log shows `Plugin loaded` with the plugin's name, version, hooks,
+file, module SHA-256 and the key that signed it. Then:
 
 ```bash
-curl -s http://localhost:9090/plugins | jq .
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/plugins | jq .
 ```
 
 ```json
@@ -90,6 +85,8 @@ curl -s http://localhost:9090/plugins | jq .
     "name":        "helios-plugin-cost-governor",
     "version":     "0.1.0",
     "description": "Per-tenant cost / budget gate",
+    "path":        "/etc/heliosproxy/plugins/cost-governor-0.1.0.tar.gz",
+    "sha256":      "8a3b1f...",
     "hooks":       ["pre_query", "post_query"],
     "state":       "Running",
     "invocations": 0,
@@ -98,85 +95,80 @@ curl -s http://localhost:9090/plugins | jq .
 ]
 ```
 
-### Recipe 3: Hot-reload an updated plugin
+### Recipe 3: Update a plugin
 
 ```bash
 sudo cp cost-governor-0.1.1.tar.gz $PLUGIN_DIR/
 sudo rm $PLUGIN_DIR/cost-governor-0.1.0.tar.gz
 ```
 
-With `[plugins].hot_reload = true`, the FS watcher picks up the
-change within ~1 s. The proxy unloads the old version, loads the
-new one, and resets per-plugin invocation/error counters.
+One file provides each plugin name (a `.tar.gz` before a bare `.wasm`, then
+the first file name in sort order), so while both files exist
+`cost-governor-0.1.0.tar.gz` keeps providing it and the new file shows as
+`shadowed`; once the old file is removed the new version takes over at the
+next rescan (within ~1 s with hot reload). Replacing a file in place works
+the same way. The new version replaces the old one only after it has
+loaded: if it fails (bad signature, bad module) the old version keeps
+running and `GET /plugins/files` shows the file as `stale` with the error.
+Calls in flight finish on the version they started with. Invocation and
+error counters are per plugin name and carry over.
 
-In-flight requests being handled by the old version finish on the
-old version; new requests use the new.
+### Recipe 4: Disable a plugin
 
-### Recipe 4: Disable a plugin without removing the file
-
-The proxy doesn't have a runtime "disable" toggle in v0.4.x. Three
-options:
-1. Move the file out of `plugin_dir`:
-   ```bash
-   sudo mv $PLUGIN_DIR/cost-governor-0.1.0.tar.gz /tmp/
-   ```
-2. Set `[plugins.config.<plugin-name>].enabled = false` if the
-   plugin honours that key (most first-party plugins do — see
-   `heliosproxy-plugin-catalog`).
-3. Remove the trust root (effectively unsigns all artefacts) —
-   nuclear, affects every plugin.
-
-### Recipe 5: Verify trust-root rejection of an unsigned artefact
+Move or delete its file and rescan:
 
 ```bash
-# Pack without signing (see heliosproxy-plugin-pack)
-helios-plugin pack --wasm my.wasm --name my-plugin --version 0 \
+sudo mv $PLUGIN_DIR/cost-governor-0.1.0.tar.gz /var/lib/heliosproxy/disabled/
+curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/plugins/reload
+```
+
+Some first-party plugins also read an on/off switch from their KV
+namespace (see `heliosproxy-plugin-catalog`). Removing a key from the trust
+root unloads every plugin it signed at the next rescan.
+
+### Recipe 5: See why a file did not load
+
+```bash
+helios-plugin pack --wasm my.wasm --name my-plugin --version 0.0.1 \
   --hooks pre_query --output my-plugin-unsigned.tar.gz
-
 sudo cp my-plugin-unsigned.tar.gz $PLUGIN_DIR/
-
-journalctl -u heliosproxy -f | grep -i 'plugin\|signature'
-# WARN  PluginLoader: my-plugin-unsigned.tar.gz: signature absent and trust_root requires it; rejected
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:9090/plugins/files | jq .
 ```
 
-The artefact stays on disk but isn't loaded. `GET /plugins`
-doesn't list it.
+```json
+[{"path": ".../my-plugin-unsigned.tar.gz", "state": "failed",
+  "error": "Signature verification failed: plugin.sig: the artefact has no plugin.sig"}]
+```
 
-### Recipe 6: Bare `.wasm` without packaging
+The file stays on disk and is retried when it, a sidecar or the trust root
+changes. Other states: `loaded`, `stale`, `shadowed`, `pending` (changed
+within `hot_reload_debounce_ms`).
 
-For local development, a bare `.wasm` is allowed when
-`trust_root = "permissive"` or unset:
+### Recipe 6: Bare `.wasm` for development
 
 ```bash
-sudo cp my-plugin.wasm $PLUGIN_DIR/
+sudo cp my-plugin.wasm my-plugin.json $PLUGIN_DIR/    # manifest sidecar
 ```
 
-The loader synthesises a default manifest (`name = filename`,
-`version = "0.0.0-dev"`, hooks discovered from exports). Useful for
-iteration; never for production.
+A bare module takes its manifest from a `.yaml` or `.json` sidecar, else
+from a `helios_manifest` custom section; with none, it loads under its
+file name (version `0.0.0-dev`) with the hooks it exports. With
+`trust_root` set it needs a `.sig` sidecar (`helios-plugin sign`); with
+`require_signed_manifest` bare modules are refused. Pack for production.
 
 ## Pitfalls
 
-- **503 from `/plugins`** — `wasm-plugins` feature not compiled in.
-  Rebuild with `--features wasm-plugins`.
-- **Plugin loads but never fires** — `manifest.hooks` may not match
-  the actual `.wasm` exports. The proxy registers what's declared,
-  not what's exported. Inspect via `helios-plugin inspect` and
-  `wasm-objdump`.
-- **`state: Error(...)`** in `/plugins` — instantiation failed
-  (out-of-memory at allocation, bad ABI, missing import). Read the
-  error string; usually points at a missing host import the plugin
-  expected.
-- **Hot-reload can race** if you replace a file while the previous
-  version is in the middle of a hook invocation. Inflight requests
-  use the old plugin; future requests use the new. Don't expect a
-  hard barrier.
-- **`trust_root = "permissive"` in prod is a CVE in waiting.** Any
-  attacker who can write to `plugin_dir` runs WASM with full
-  host-import access. Set the trust root and treat the public key
-  like a code-signing cert.
-- **Symlinks in `plugin_dir` are not followed.** Place real files
-  there (or use copy-on-write at the package-manager level).
+- **503 from `/plugins`** — `wasm-plugins` feature not compiled in, or
+  `[plugins] enabled = false`.
+- **A plugin that would never run is refused**: a hook the module does not
+  export with the ABI signature, a hook the proxy never calls (it calls
+  `pre_query`, `route`, `post_query`, `authenticate`), or no hooks. The
+  reason is in `GET /plugins/files` and the log.
+- **`max_plugins`** (default 20) bounds the loaded set; a plugin over it
+  waits (state `failed`, "max_plugins") until another is unloaded.
+- **Symlinks in `plugin_dir` are skipped.** Place real files there.
+- **Changing `[plugins]` itself needs a restart**; a SIGHUP keeps the
+  running settings (logged) and only rescans the directory.
 
 ## See also
 
@@ -185,6 +177,6 @@ iteration; never for production.
 - `heliosproxy-plugin-catalog` — what's available to load
 - `heliosproxy-config` — `[plugins]` block
 - Demo: [`demos/v0.4.0/06-plugin-oci/`](../../demos/v0.4.0/06-plugin-oci/) — pack-and-load end-to-end
-- Demo: [`demos/v0.4.0/08-trust-root/`](../../demos/v0.4.0/08-trust-root/) — permissive vs enforced
-- Code: [`src/plugins/loader.rs`](../../src/plugins/loader.rs)
-- Code: [`src/plugins/runtime.rs`](../../src/plugins/runtime.rs)
+- Demo: [`demos/v0.4.0/08-trust-root/`](../../demos/v0.4.0/08-trust-root/) — unsigned vs enforced
+- Docs: "Loading, reloading and the plugin directory" in `docs/configuration.md`
+- Code: [`src/plugins/mod.rs`](../../src/plugins/mod.rs) (`PluginManager::rescan`)

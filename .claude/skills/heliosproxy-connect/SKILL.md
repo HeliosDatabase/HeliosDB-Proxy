@@ -1,6 +1,6 @@
 ---
 name: heliosproxy-connect
-description: Connect a PostgreSQL client to HeliosProxy. psql / asyncpg / jdbc / Rust tokio-postgres / Go pgx. Sanity-check `SELECT 1`. Force routing with `/*+ route=primary */` hints. Use when the user says "connect to the proxy", "psql -h proxy", "first SQL round-trip", "force read to primary".
+description: Connect a PostgreSQL client to HeliosProxy. psql / asyncpg / jdbc / Rust tokio-postgres / Go pgx. Sanity-check `SELECT 1`. Force routing with `/*helios:route=primary*/` hints. Use when the user says "connect to the proxy", "psql -h proxy", "first SQL round-trip", "force read to primary".
 allowed-tools: Bash(psql *), Bash(curl *), Read
 related: [heliosproxy-overview, heliosproxy-topology, heliosproxy-health]
 ---
@@ -41,25 +41,27 @@ psql -h localhost -p 6432 -U postgres -d demo -c "SELECT 1"
 ```
 
 If it hangs: probably PG listen-port mismatch. `curl /version` to
-confirm proxy is up; check `[server] listen_address` in `proxy.toml`.
+confirm proxy is up; check the top-level `listen_address` in `proxy.toml`.
 
 ### Recipe 2: Pin to primary with a route hint
 
 ```sql
-/*+ route=primary */ SELECT current_setting('server_version');
-/*+ route=standby */ SELECT * FROM read_only_view LIMIT 10;
-/*+ route=node:pg-replica-2:5432 */ SELECT 1;
+/*helios:route=primary*/ SELECT current_setting('server_version');
+/*helios:route=standby*/ SELECT * FROM read_only_view LIMIT 10;
+/*helios:node=pg-replica-2*/ SELECT 1;     -- a configured [[nodes]] name or host:port
 ```
 
-Hints survive a `psql -c` invocation if quoted carefully:
+The syntax is `/*helios:key=value,key=value*/`. A `node=` that names no
+configured node is refused (42704), never dialed. Hints survive a `psql -c`
+invocation if quoted carefully:
 
 ```bash
 psql -h localhost -p 6432 -U postgres -d demo \
-  -c "/*+ route=primary */ SELECT pg_is_in_recovery()"
+  -c "/*helios:route=primary*/ SELECT pg_is_in_recovery()"
 ```
 
-The `routing-hints` feature must be enabled in the build (see
-`heliosproxy-install`).
+Hints need the `routing-hints` feature in the build (see
+`heliosproxy-install`) and `[routing_hints] enabled = true`.
 
 ### Recipe 3: Inspect routing with the admin SQL endpoint
 
@@ -118,19 +120,19 @@ mode, the same applies to HeliosProxy in Transaction mode (see
 
 ```bash
 for query in \
-  "SELECT pg_is_in_recovery() AS standby" \
-  "/*+ route=primary */ SELECT pg_is_in_recovery() AS primary"
+  "/*helios:route=standby*/ SELECT pg_is_in_recovery() AS standby" \
+  "/*helios:route=primary*/ SELECT pg_is_in_recovery() AS primary"
 do
   psql -h localhost -p 6432 -U postgres -d demo -At -c "$query"
 done
+# true    ← standby (correctly routed to a replica; needs [load_balancer] standby_reads)
 # false   ← primary
-# true    ← standby (correctly routed to a replica)
 ```
 
 ## Pitfalls
 
 - **`FATAL: SSL required`** when proxy is in TLS mode but driver isn't —
-  check `[tls.client]` in `proxy.toml` and pass `sslmode=require` (or
+  check `[tls]` in `proxy.toml` and pass `sslmode=require` (or
   stronger) on the connection string.
 - **`unsupported startup parameter: …`** — proxy passes through most
   parameters, but a few (`replication`, `client_encoding` overrides
@@ -138,9 +140,9 @@ done
 - **PgBouncer-Transaction-mode caveats apply** to HeliosProxy in
   Transaction or Statement modes: prepared statements break unless
   the driver disables them or uses Named mode. See `[pool_mode]`.
-- **A sticky session pinned by route hint stays sticky** for the
-  duration of the transaction. `BEGIN; /*+ route=standby */ SELECT
-  …` keeps subsequent statements on that standby until COMMIT.
+- **A transaction stays on its connection.** Once `BEGIN` ran, every
+  statement of the transaction runs where it started; a route hint inside
+  it does not move it. Put the hint on statements outside transactions.
 - **`/api/sql` is admin-grade** — it executes with the proxy's
   credentials, not the caller's. Don't expose it externally; it's
   for ops/CI on the admin port.

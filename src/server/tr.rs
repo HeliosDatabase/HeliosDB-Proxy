@@ -165,6 +165,12 @@ pub(super) struct ExtBatch<'a> {
     pub(super) defines: &'a [String],
     /// The held unnamed Parse and its signature.
     pub(super) unnamed: Option<&'a (bytes::Bytes, bytes::Bytes)>,
+    /// The unnamed statement the client holds and no backend does (a
+    /// plugin's cached result answered its Parse), when the batch binds the
+    /// unnamed statement without a Parse of its own: the backend is given
+    /// it out of band before the batch, and it counts as the batch's held
+    /// Parse for the journal and Transaction Replay.
+    pub(super) reparked: Option<&'a (bytes::Bytes, bytes::Bytes)>,
 }
 
 /// The request a fault interrupted, borrowed so it can be re-executed.
@@ -343,6 +349,10 @@ pub(super) struct TrSession {
     pub(super) skip_settings: bool,
     /// A simple query that yielded for COPY, to read at the drain.
     pub(super) copy_query: Option<bytes::Bytes>,
+    /// State only the session's backend has (temporary objects, held
+    /// cursors, SQL prepared statements, LISTEN, advisory locks): a re-home
+    /// that cannot recreate it is refused (see `session_bound`).
+    pub(super) bound: super::session_bound::Bound,
 }
 
 impl TrSession {
@@ -372,6 +382,7 @@ impl TrSession {
             simple_cycle: ExtSetCycle::default(),
             skip_settings: false,
             copy_query: None,
+            bound: super::session_bound::Bound::default(),
         }
     }
 }
@@ -1805,7 +1816,18 @@ impl ProxyServer {
     /// Before re-homing: an incomplete restore set is not something to hand
     /// the client silently. Refuse the failover instead (surfaces as `08006`
     /// "session state could not be restored").
-    pub(super) fn tr_restore_preflight(tr: &TrSession) -> Result<()> {
+    pub(super) fn tr_restore_preflight(tr: &TrSession, replays_transaction: bool) -> Result<()> {
+        // Tracked settings are restored here; everything else must not be
+        // left behind.
+        let bound = tr.bound.blocking(replays_transaction, true);
+        if bound != 0 {
+            return Err(ProxyError::Protocol(format!(
+                "the session held {} on the failed backend, which a replacement backend \
+                 cannot be given; reconnect and recreate them (DISCARD ALL clears what \
+                 the proxy counts)",
+                super::session_bound::describe(bound)
+            )));
+        }
         if tr.gucs_unknown {
             return Err(ProxyError::Protocol(
                 "the session changed settings in a way the proxy cannot follow (see \
@@ -2146,7 +2168,9 @@ impl ProxyServer {
             wait_ready,
             defines,
             unnamed,
+            reparked,
         } = ext;
+        let unnamed = unnamed.or(reparked);
         if !tr.record_tx {
             return;
         }
@@ -2729,6 +2753,7 @@ impl ProxyServer {
         state: &Arc<ServerState>,
         config: &ProxyConfig,
         deadline: tokio::time::Instant,
+        replays_transaction: bool,
     ) -> Result<String> {
         let expired = || ProxyError::Network("recovery deadline exceeded".to_string());
         // The request's responses now come from two backends (and a replay
@@ -2781,7 +2806,7 @@ impl ProxyServer {
                 }
                 Ok(()) => {
                     let bc = conns.get_mut(&node).expect("just ensured");
-                    Self::tr_restore_preflight(tr)?;
+                    Self::tr_restore_preflight(tr, replays_transaction)?;
                     let (wt, rt, mf) = (
                         state.limits.backend_write_timeout,
                         state.limits.backend_read_timeout,
@@ -3178,6 +3203,7 @@ impl ProxyServer {
                         batch,
                         wait_ready,
                         unnamed,
+                        reparked,
                         ..
                     },
                 ..
@@ -3187,7 +3213,7 @@ impl ProxyServer {
                 // registry (which re-execution re-prepares from) agrees.
                 Self::tr_extended_kind_prior(
                     batch,
-                    unnamed.map(|(p, _)| p.as_ref()),
+                    unnamed.or(*reparked).map(|(p, _)| p.as_ref()),
                     state.limits.max_prepared_statements,
                     &state.tr_read_policy,
                     PriorCycles {
@@ -3286,6 +3312,9 @@ impl ProxyServer {
             FaultPhase::OutcomeUnknown => "while the statement was in flight (outcome unknown)",
         };
 
+        // A replay recreates what the open transaction made on the
+        // replacement; any other re-home does not.
+        let replays_transaction = action == TrAction::ReplayThenReexecute;
         match action {
             TrAction::CloseIncompleteResponse => {
                 state.latency.record_refusal(not_replayable);
@@ -3315,18 +3344,25 @@ impl ProxyServer {
                 } else {
                     not_replayable
                 });
-                let node =
-                    match Self::tr_acquire_replacement(conns, tr, session, state, config, deadline)
-                        .await
-                    {
-                        Ok(n) => n,
-                        Err(e) => {
-                            return Self::tr_fail_no_replacement(
-                                client, &fault, &e, in_tx, wait_ready, session,
-                            )
-                            .await;
-                        }
-                    };
+                let node = match Self::tr_acquire_replacement(
+                    conns,
+                    tr,
+                    session,
+                    state,
+                    config,
+                    deadline,
+                    replays_transaction,
+                )
+                .await
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        return Self::tr_fail_no_replacement(
+                            client, &fault, &e, in_tx, wait_ready, session,
+                        )
+                        .await;
+                    }
+                };
                 state
                     .latency
                     .failover_reconnect
@@ -3357,25 +3393,32 @@ impl ProxyServer {
                 Ok(Some((Some(node), sent)))
             }
             TrAction::Reexecute | TrAction::ReplayThenReexecute => {
-                let node =
-                    match Self::tr_acquire_replacement(conns, tr, session, state, config, deadline)
-                        .await
-                    {
-                        Ok(n) => n,
-                        Err(e) => {
-                            state.latency.record_refusal(
-                                if tokio::time::Instant::now() >= deadline {
-                                    ReplayRefusal::Deadline
-                                } else {
-                                    ReplayRefusal::BackendUnavailable
-                                },
-                            );
-                            return Self::tr_fail_no_replacement(
-                                client, &fault, &e, in_tx, wait_ready, session,
-                            )
-                            .await;
-                        }
-                    };
+                let node = match Self::tr_acquire_replacement(
+                    conns,
+                    tr,
+                    session,
+                    state,
+                    config,
+                    deadline,
+                    replays_transaction,
+                )
+                .await
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        state
+                            .latency
+                            .record_refusal(if tokio::time::Instant::now() >= deadline {
+                                ReplayRefusal::Deadline
+                            } else {
+                                ReplayRefusal::BackendUnavailable
+                            });
+                        return Self::tr_fail_no_replacement(
+                            client, &fault, &e, in_tx, wait_ready, session,
+                        )
+                        .await;
+                    }
+                };
                 state
                     .latency
                     .failover_reconnect
@@ -3503,6 +3546,10 @@ impl ProxyServer {
                             reprepare,
                             registry,
                             Self::tr_hold_bytes(session, state, || kind),
+                            // Re-executed on the replacement the recovery
+                            // chose; the batch holds the statements as the
+                            // hooks left them.
+                            &RouteOverride::None,
                         )
                         .await
                     }
@@ -3615,6 +3662,9 @@ impl ProxyServer {
         tr.pending_tx_gucs.clear();
         tr.tx_savepoints.clear();
         tr.tx_gucs_unknown = false;
+        // What the lost transaction made vanished with it (what survives a
+        // rollback refused this re-home).
+        tr.bound.transaction_lost();
         // The response the client just saw ended with ErrorResponse + RFQ.
         Self::note_ready_for_query(session, if in_tx { b'E' } else { b'I' }, true);
         Self::journal_discard(session, if in_tx { b'E' } else { b'I' });

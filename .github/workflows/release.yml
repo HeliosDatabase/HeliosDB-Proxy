@@ -49,10 +49,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
+      # Same feature set as the Docker image (docker/Dockerfile) and the CI
+      # matrix: `all-features` carries no topology provider, and without
+      # `postgres-topology` a `[topology] provider = "postgres"` / "patroni"
+      # config is refused, leaving the binary on static roles only.
       - name: Build release binary
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }} --features all-features
+        run: cargo build --release --target ${{ matrix.target }} --features "all-features,postgres-topology"
 
       - name: Package artifact
         shell: bash

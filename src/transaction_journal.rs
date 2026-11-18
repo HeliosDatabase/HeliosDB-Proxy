@@ -598,6 +598,10 @@ pub trait JournalSink: Send + Sync {
     fn append(&self, tx: &Arc<TransactionJournalEntry>) -> bool;
     /// Whether records this sink accepted survive a process restart.
     fn durable(&self) -> bool;
+    /// Block until every record accepted so far is written out under the
+    /// sink's sync policy. Called once at shutdown; a sink that keeps no
+    /// buffered state has nothing to do.
+    fn flush(&self) {}
 }
 
 /// Committed transactions in commit order, bounded by count and bytes.
@@ -876,6 +880,19 @@ impl TransactionJournal {
     pub fn with_sink(mut self, sink: Arc<dyn JournalSink>) -> Self {
         self.sink = Some(sink);
         self
+    }
+
+    /// Write out what the sink holds (the shutdown path). Blocks: call it
+    /// from a blocking context.
+    pub fn flush_sink(&self) {
+        if let Some(sink) = &self.sink {
+            sink.flush();
+        }
+    }
+
+    /// Whether a sink is attached (a `[journal] dir` is configured).
+    pub fn has_sink(&self) -> bool {
+        self.sink.is_some()
     }
 
     /// Whether committed transactions are handed to a durable sink.

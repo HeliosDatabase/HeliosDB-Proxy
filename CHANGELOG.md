@@ -9,6 +9,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Plugins, rewrite rules and the tenant row filter now apply to the extended protocol.**
+  The pre-query and route plugin hooks, the `[query_rewrite]` rules and the
+  `[multi_tenancy]` row filter (with `unknown_tenant`) read simple queries only: a
+  statement sent as `Parse`/`Bind`/`Execute`, which is how most drivers send every
+  statement, passed a plugin's Block or rewrite, the rewrite rules and the row filter
+  untouched. Every `Parse` now passes them before the proxy records anything of it: a
+  rewrite replaces the SQL of the `Parse` the proxy registers, routes by, caches,
+  journals and re-prepares; a refusal (42000 from a plugin, 42501 from the row filter)
+  refuses the whole cycle, registers nothing and never reaches a backend. A `Bind` that
+  executes a statement prepared in an earlier cycle runs the plugin hooks again for
+  their Block, so a plugin that limits executions sees each one. `[schema_routing]`, the
+  route plugin's node choice and the post-query hook cover extended cycles as well. See
+  "Statement hooks on the extended protocol" in `docs/configuration.md` for the exact
+  semantics and limits.
+  **Upgrade note:** deployments with `[plugins]`, `[query_rewrite]` or
+  `[multi_tenancy] tenant_tables` will see prepared statements blocked, rewritten or
+  filtered that previously ran as sent.
+- **The first-party plugins' answers take effect.** They answer the pre-query hook in
+  the plugin ABI's spelling (`{"kind": "block", "reason": ...}`), which the proxy did not
+  read: every Block of the cost governor, token budget and LLM guardrail and every
+  Rewrite of the column mask failed to decode, was logged as a hook error, and the
+  statement ran. Both spellings are read now, and an answer the proxy does not know is a
+  failed hook call instead of a silent pass. The plugins' end-to-end tests looked for
+  the plugin build in a path that does not exist and skipped; a CI job now builds the
+  plugins and runs them.
+- **Plugins see who and where a statement comes from.** `hook_context` carried only the
+  session id, so the plugins that decide by tenant, roles, region, client address or AI
+  agent decided without them. It now carries the identity, database, branch and the
+  attributes they read (see "What a hook call carries" in `docs/configuration.md`), and
+  `normalized` and `tables` are filled.
+- **A plugin's memory limit is enforced.** `[plugins] memory_limit_mb` (and a lower
+  `max_memory` in a plugin's manifest) bounded nothing: a call could grow its linear
+  memory without limit. Each call's store is now limited: growing past the limit fails
+  inside the plugin, and a module whose initial memory is above it cannot be called.
+- **Plugin signatures can bind the manifest.** A signed module could be repacked under
+  another plugin's name, and so reach that plugin's KV namespace, without breaking its
+  signature. Artefacts packed with `helios-plugin pack --sign-with` (schema 1.1) also
+  carry `manifest.sig`, a signature over `manifest.json`, which pins the module's
+  SHA-256; a present `manifest.sig` must verify, and `[plugins] require_signed_manifest
+  = true` (with `trust_root`) loads only artefacts that have one.
+- **A plugin artefact must contain exactly what the format allows.** The loader ignored
+  unknown archive entries, never validated an artefact's plugin name or version, and
+  read archives without a size bound. An artefact with any entry but `manifest.json`,
+  `plugin.wasm`, `plugin.sig` and `manifest.sig` (or one twice, or a non-file entry), an
+  invalid name, version or hook list, or a file or decompressed content over `[plugins]
+  max_artefact_bytes` (default 64 MiB) is refused.
+- **A plugin that would never run is refused at load.** A manifest hook name the proxy
+  does not know was dropped silently, a hook the proxy never calls (`on_connect`,
+  `cache_get`, ...) was registered and never ran, and a module missing a declared hook's
+  export (or `alloc`, `dealloc`, `memory`, or with the wrong signature) loaded and then
+  failed every call — for a pre-query guard, letting every statement through. Each of
+  these now refuses the plugin when it is loaded, with the reason in the log and in
+  `GET /plugins/files`.
+- **Plugin files in the plugin directory are not followed through symlinks**, so a
+  plugin is always a file of that directory.
+- **A routing target must be a configured node.** A `node=` routing hint, a route
+  plugin's `node` answer or `[schema_routing] analytics_node` that named no `[[nodes]]`
+  entry was dialed as a raw `host:port`: a client with routing hints enabled could make
+  the proxy connect to any address, and with an `auth_file` authenticate there with the
+  proxy-held credentials. Such a target is now refused with `42704` and the statement is
+  not run; an unknown `analytics_node` is a startup error.
+- **A statement no statement hook can read is refused while one is active.** A statement
+  whose text is not valid UTF-8 (a `LATIN1` or other non-UTF-8 `client_encoding` sending
+  non-ASCII characters) passed the plugins, the rewrite rules, the tenant row filter and
+  `unknown_tenant` unread, on both protocols. While any of them is configured it is now
+  refused with `22021` (use `client_encoding` UTF8); without them nothing changes.
+- **Extended-protocol routing reads every statement of a cycle.** `[schema_routing]` sent
+  a whole cycle to `analytics_node` when its first statement was an analytical read,
+  also when a write or a point read followed in the same cycle; it now needs every
+  statement of an unsplit cycle to be one. The route plugin's answers for all
+  statements of a cycle (not only the first `Parse`'s) are combined, a cycle that only
+  executes prepared statements is routed by the plugin's answer for them instead of
+  staying on the session's current node, and answers that cannot be honoured together
+  refuse the cycle (42000). The anomaly detector reads every `Parse`, as the client
+  sent it, instead of the first one per cycle after the hooks rewrote it.
+- **At a later execution of a prepared statement the plugin hooks read the client's
+  text**, as at its `Parse`, instead of the text the rewrite rules or the row filter
+  registered (a plugin loaded after the `Parse` included). A pre-query plugin that now
+  rewrites the statement differently than when it was prepared refuses that execution
+  with `0A000` (prepare it again) instead of being ignored.
+
 - Default query/edge result caching to a tiny scalar-literal subset unless the operator explicitly vouches for backend read effects and dependencies. MCP tool-result caching requires a separate effects and pooled-context-equivalence contract, including manually attached caches. Native SQL forwarding remains available. Scope rejection publication now obeys the configured client write timeout and retires lost sockets even when the client write fails.
 
 - Verify daemon query/edge cache execution scope on the selected backend with bounded effective-settings probes, clear L1 when that scope changes, and validate a native fill again before publication. Backend role/database defaults now partition shared entries; unsupported proof responses execute natively. The default adds backend round trips to cache reads (two `SHOW ALL` per miss, one per hit: pgbench's select-only script over the simple protocol at 16 clients measured 4 200 reads per second with the cache on, against 68 000 before the proof and 66 000 with `backend_context_immutable = true`); `cache.backend_context_immutable` permits proof reuse only under an explicit immutable-backend-context contract. Opaque view/RLS dependencies remain unvalidated.
@@ -18,6 +99,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Plugin hot reload works, and the plugin directory loads `.tar.gz` artefacts.**
+  `[plugins] hot_reload = true` built a watcher nothing ever polled, and the startup scan
+  skipped packed artefacts (the distribution format) entirely. The plugin directory is
+  now reconciled at startup, on every SIGHUP, on `POST /plugins/reload` and — with
+  `hot_reload` — every `hot_reload_interval_ms` (default 1000): every `.wasm` module
+  (with its `.sig`, `.yaml` / `.json` sidecars) and `.tar.gz` artefact whose version has
+  been stable for `hot_reload_debounce_ms` (default 500) is loaded; one file provides
+  each plugin name (an artefact before a bare module, then file-name order); a new
+  version replaces the running one only once it has loaded, so a version that fails
+  (bad signature, bad module) leaves the old one running; a removed file unloads its
+  plugin, and a file that failed is retried when it, a sidecar or the trust root
+  changes. After a trust-root change a plugin that no longer verifies is unloaded.
+  Changes are detected by size, time, inode and content digest. Plugins of a hook run in
+  file-name order. A missing plugin directory holds no plugins instead of disabling the
+  subsystem, and `max_plugins` is enforced. `GET /plugins/files` shows each file's state
+  (loaded, stale, shadowed, failed, pending) and `GET /plugins` each plugin's file and
+  SHA-256. A hook call no longer holds a lock or a map entry across the WASM call, and a
+  reload of unchanged bytes reuses the compiled module.
+- **Branch routing.** A route plugin's `branch` answer was logged and refused, and the
+  `/*helios:branch=<name>*/` routing hint was parsed and ignored (so the statement ran on
+  the session's own database). With `[branch] route_enabled = true` either now moves the
+  session to the branch database before the statement runs — `<name>` on PostgreSQL,
+  `<base>@<name>` on HeliosDB-Nano (`route_mode`), limited to `route_allow` — and the
+  session stays there; `branch=` with no name moves it back. A move is made only at a
+  request boundary outside a transaction (`25001`), when the session holds no state a
+  connection to another database would lack (`0A000`), and when `[[hba]]` admits the new
+  database (`28000`). Without `route_enabled`, a branch request refuses its statement
+  (`42000`) instead of running it on the wrong database. New metric
+  `heliosdb_proxy_branch_moves_total`.
+- **A plugin's cached result answers extended-protocol statements.** A pre-query plugin's
+  `cached` answer was honoured for simple queries only: the same statement sent as
+  `Parse`/`Bind`/`Execute` ran on the backend. A cycle that is one execution the answer
+  can stand for (unnamed portal, no parameter values, text results, the portal described,
+  no row limit, ending with `Sync`) is now answered by the proxy — for a statement the
+  cycle Parses, a named statement prepared earlier, or the unnamed statement of an
+  earlier cycle — without any backend. When the plugin stops answering, a later cycle
+  binding an unnamed statement it had answered gives the backend that statement first.
+  See "Statement hooks on the extended protocol" in `docs/configuration.md`.
+- **`helios-plugin` packs, signs, inspects and verifies artefacts.** New verbs: `keygen`
+  (an Ed25519 key pair: PKCS#8 PEM signing key, trust-root public key), `pack` (from
+  flags or a `plugin.yaml` manifest; `--sign-with` signs module and manifest), `sign`
+  (writes a module's `.sig`, re-signs an artefact), `inspect` (manifest, entries, sizes,
+  digests; a module's exported hooks; `--json`). `verify` accepts artefacts and
+  `--require-signed-manifest`. Keys and trust roots are read as PEM (what `openssl
+  genpkey -algorithm Ed25519` and `openssl pkey -pubout` write), base64 or hex, and
+  `[plugins] trust_root` takes a directory of `*.pub` keys, one key file, or a hex key.
+- **A bare plugin module may carry its manifest** in a `helios_manifest` custom section,
+  and one with no manifest at all loads (for development) under its file name with the
+  hooks it exports.
+
+- **SIGTERM and SIGINT shut the proxy down gracefully.** Until now only SIGHUP (reload)
+  and SIGUSR2 (binary handoff) were handled, so `docker stop`, a Kubernetes pod
+  termination or `systemctl stop` ended every session at once, mid-statement. On SIGTERM
+  or SIGINT the listener now closes, `/health/ready` answers 503 `Proxy is draining`, and
+  each session is ended with FATAL `57P01` as soon as nothing of it is in flight: idle
+  sessions at once, the others when their transaction, extended cycle or COPY is over.
+  The process exits 0 when the last session is gone or after
+  `shutdown_drain_timeout_secs` (default 60, env `HELIOS_DRAIN_TIMEOUT_SECS`); a second
+  signal exits at once. New counters `sessions_drained` /
+  `heliosdb_proxy_sessions_drained_total` and the `draining` flag in `GET /metrics`.
+  The HTTP SQL, MCP and GraphQL gateways take part: they stop accepting with the
+  PG-wire listener and answer the requests they already accepted before the process
+  exits (they used to be cut). A connection accepted just before the listener closed
+  is ended at its startup message instead of after authenticating, and the recovery
+  journal's queued records are written out before exit.
+- **Tenant active-query permits: extended-protocol unlocks and two-phase completions.**
+  Under session pooling a session holding a session-level advisory lock keeps its
+  tenant permit until it releases the locks; `pg_advisory_unlock_all()` and `DISCARD ALL`
+  sent over the extended protocol (as most drivers send everything) did not release it,
+  so such a session held its permit until it disconnected. They now do once their cycle
+  succeeds. The `COMMIT PREPARED` / `ROLLBACK PREPARED` exemption from the tenant cap now
+  also covers the shapes drivers send: a named statement prepared earlier and executed
+  with `Bind`/`Execute`/`Sync`, a `Describe` of the portal (pgjdbc), result format codes,
+  and sessions with plugins, `[query_rewrite]` or tenant tables configured (the statement
+  is read after those hooks, as it runs).
+- **Credential-stuffing detection is fed.** The anomaly detector's failed-auth burst
+  detection (`[anomaly] auth_window_secs`, `auth_warning_count`, `auth_critical_count`)
+  was never given an authentication event, so it could not fire. Every client
+  authentication outcome now reaches it: the proxy's own SCRAM check, a plugin's
+  Authenticate denial, and in pass-through mode the backend's class-28 refusal of the
+  client's credentials. New key `[anomaly] max_auth_windows` (default 10000) bounds the
+  per-`(user, address)` counts it keeps.
+- **`[pool_mode] mode = "statement"` behaves as statement pooling.** It behaved exactly
+  like transaction pooling: a client could hold a backend connection across a whole
+  transaction block. A lone `BEGIN` / `START TRANSACTION` is now refused with `0A000`
+  (the session goes on), and a request that leaves a block open anyway ends its session
+  (FATAL `0A000`, connection closed, block rolled back), as in PgBouncer's statement
+  mode; a block one request opens and ends still runs.
+- **A failover no longer continues a session without state only the failed backend had.**
+  Transaction replay restored a session's `SET`s on the replacement but quietly dropped
+  its temporary tables, `WITH HOLD` cursors, SQL `PREPARE`d statements, `LISTEN`
+  registrations and session-level advisory locks (the last released when the backend
+  died, so the application's mutual exclusion was gone without a sign). A session that
+  holds any of them is now ended with `08006` naming what it held; what a transaction
+  replay recreates and what the session cleared (`DISCARD ALL` and the like) does not
+  count. Under `tr_mode = none` an idle session whose backend died was redialed even
+  when it held settings or such state; it now gets `57P01` and is closed, as documented.
+- **An open circuit recovers.** The daemon and the gateways only read a node's
+  circuit state, and the move from open to half-open happened only in a library call
+  they never made: once `[circuit_breaker]` opened a circuit, every request to that node
+  was fast-failed until the proxy restarted, and `open_secs` and `success_threshold`
+  had no effect. After `open_secs` a request is now admitted as a half-open probe (at
+  most two at once), `success_threshold` successes close the circuit and a failed probe
+  opens it again; reads stop avoiding the node once it may be probed.
+- **`[rate_limit]` enforces the configured rate, and its memory is bounded.** Every
+  bucket also carried a hidden 60 000-requests-per-minute window, so a `default_qps`
+  above 1 000 was cut to 1 000 a second after the first minute's 60 000 requests, and
+  each bucket preallocated room for 60 000 timestamps; no bucket was ever dropped, so
+  `key_by = "client_ip"` grew without bound. The window is now opt-in
+  (`window_max_requests`, `window_secs`), and idle buckets are dropped every
+  `cleanup_interval_secs` without changing any decision.
+- **The HTTP SQL gateway's result cache follows the relay's rules.** It cached
+  statements the PG-wire relay refuses (a system catalog, a `[cache]` excluded table,
+  time-travel or ambiguous text) and read only the built-in volatile-function list, not
+  `extra_volatile_functions`. It now applies the same checks.
+- **The SIGUSR2 binary handoff drains like a shutdown.** It used to wait for clients to
+  disconnect on their own and then cut every session still open at
+  `shutdown_drain_timeout_secs`, in-flight transactions included; a pooled client
+  rarely disconnects, so most handoffs ended that way. It now ends each session at its
+  next point with nothing in flight, as SIGTERM does, so clients reconnect to the new
+  process without losing work.
+- **Release binaries include the `postgres` and `patroni` topology providers.** The
+  prebuilt binaries were built with `all-features`, which carries no topology provider,
+  so `[topology] provider = "postgres"` was refused by them while the Docker image
+  accepted it. They are now built with `all-features,postgres-topology`, like the image
+  and the CI matrix.
 - **SIGHUP resizes per-tenant caps.** A reload that only changes the size of caps or
   byte budgets tenants already run under (`[multi_tenancy]` client caps, active-query
   caps, replay-byte and recovery-journal budgets, defaults and per-tenant overrides)
@@ -31,6 +238,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional `[limits] copy_idle_timeout_secs` (default 0/off) bounds stalled COPY input, including partial frames and the final extended Sync after backend completion. Backend processing time is excluded. Expiry cancels and drops the COPY backend, rolls back unfinished input, closes with FATAL 57014 and returns tenant capacity. JSON/Prometheus counters expose COPY expiries and query-cache context bypasses without changing the public metrics snapshot shape.
 
 ### Fixed
+
+- **`helios-plugin install` installs working plugins.** It always wrote `<name>.wasm`
+  with no manifest, so an installed module loaded with no hooks and never ran, and a
+  packed artefact from a registry was saved as `.wasm` and refused. It now installs an
+  artefact as `<name>.tar.gz` (checking it unpacks, names the requested plugin and, with
+  a trust root, is signed), a module as `<name>.wasm` with its `.sig`, writes through a
+  temporary file and a rename (signature first), and removes the other format's files
+  for that plugin.
+- **`helios-plugin new` scaffolds a plugin that builds and loads.** The scaffold's
+  `pre_query` had the wrong signature and no `alloc`/`dealloc`, so the runtime could
+  never call it, and it had no `Cargo.toml`. It is now a complete crate implementing
+  the ABI, with the manifest `pack --manifest` reads and the build, pack and load steps.
+- **Plugin runtime options do what they say.** `enable_simd = false` now disables the
+  SIMD proposals; `enable_threads = true` and an on-disk `cache_dir`, which this build
+  cannot provide, are refused when the runtime is created instead of being ignored; and
+  `cache_modules` keeps compiled modules by content hash (it kept every path's module
+  forever and never read them).
+- Unloading a plugin no longer calls its `on_disconnect` export with an empty payload.
 
 - Reject malformed simple-Query CStrings with bounded FATAL 08P01 before hooks, rewriting or cache lookup; preserve empty queries, native byte encodings and typed Parse payloads.
 
@@ -2039,7 +2264,7 @@ bounded by `ttl_secs` (see docs/configuration.md `[cache]`).
   scope per heavy step, per-case medians across rounds, and a verdict that fails on
   a mean delta above 3% or any *separated* regression above 2% (every candidate round
   slower than every baseline round). Archives per-round Criterion estimates, a per-case
-  table and JSON under `/home/gpc/HDB/sprint/baselines/proxy/<label>/`.
+  table and JSON under `sprint/baselines/proxy/<label>/`.
 
 ### Fixed
 
@@ -2056,7 +2281,7 @@ bounded by `ttl_secs` (see docs/configuration.md `[cache]`).
   clients is now above the pre-TR-07 baseline (15.2k vs 13.3k) with write p99 down
   from 2.3 ms to 1.5 ms; read paths unchanged. The pre-TR-07 baseline paid a smaller
   version of the same convoy (15.8k with journaling off → 12.5k on), which is why the
-  fix lands above it. Evidence: `/home/gpc/HDB/sprint/baselines/proxy/1.8.1-tr07h-usertp/`.
+  fix lands above it. Evidence: `sprint/baselines/proxy/1.8.1-tr07h-usertp/`.
 
 - `scripts/regress/bench-usertp.sh` (P-01 harness) produced no usable results: the
   generated proxy config lacked the required `[pool] test_on_acquire` key and doubled
